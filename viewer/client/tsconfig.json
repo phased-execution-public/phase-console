@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true,
+
+    // `node` is for the guards under src/**/*.test.ts, which read the
+    // stylesheet off disk to assert what it declares; `vitest/globals` matches
+    // `test.globals` in vite.config.ts.
+    "types": ["node", "vitest/globals"],
+
+    "allowJs": true,
+    "checkJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+
+    "paths": {
+      "@/*": ["./src/*"],
+      "@shared/*": ["../shared/*"]
+    }
+  },
+  "include": ["src", "vite-env.d.ts"],
+  // The service worker is a WebWorker program, not a DOM one — `tsconfig.sw.json`
+  // compiles it with the right libs. Leaving it here would fail on `FetchEvent`
+  // and every other name only a worker has.
+  //
+  // Its TEST is excluded for the same reason and must stay that way: the test
+  // imports the worker, and an import drags it into whatever program the test
+  // belongs to — so a test left here re-admits `src/sw.ts` to the DOM program
+  // through the back door, and `ServiceWorkerGlobalScope` stops existing again.
+  "exclude": ["src/sw.ts", "src/sw.test.ts"]
+}

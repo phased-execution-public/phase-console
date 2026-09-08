@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Phase Console — local viewer for phased-execution plans, phases and handoffs.
+#
+#   ./run                          pick the source directory in the browser
+#   ./run --root ~/code/your-repo        open a directory straight away
+#   ./run --allow-writes           enable the guarded write verbs
+#
+# The server is plain Node run as TypeScript directly, which needs >= 22.18
+# (or >= 23.6 — 23.0-23.5 still kept type stripping behind a flag). The
+# client is BUILT output: on a fresh clone run `cd viewer && npm ci && npm run
+# build` first — until then the console serves a page saying exactly that.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---- resolve a node that meets the floor, BEFORE anything execs one ---------
+# This block used to sit below the two case blocks, so every lifecycle verb and
+# every agent verb was handed whatever bare `node` the PATH happened to have.
+# On a machine whose default node is an old nvm alias that is a type-stripping
+# crash out of `phase-console start` — while the search below had a perfectly
+# good v24 one directory over and would have found it a few lines later.
+#
+# The floor itself: >=22.18, or >=23.6 — 23.0-23.5 kept type stripping behind
+# a flag.
+node_ok() { "$1" -e 'const [maj, min] = process.versions.node.split(".").map(Number);
+process.exit(maj >= 24 || (maj === 23 && min >= 6) || (maj === 22 && min >= 18) ? 0 : 1)' 2>/dev/null; }
+
+# PATH's node is not the last word — the same search the Desktop launcher does.
+# A machine whose default `node` is an old nvm alias (v22.6 was seen doing
+# exactly this) would otherwise refuse a command the docs promised works,
+# while a perfectly good v24 sat one directory over. nvm's versions are walked
+# newest-first because a plain glob sorts v10 before v8.
+if ! command -v node >/dev/null 2>&1 || ! node_ok "$(command -v node)"; then
+  candidates="/opt/homebrew/bin /usr/local/bin $HOME/.volta/bin"
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    for v in $(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -rV); do
+      candidates="$candidates $HOME/.nvm/versions/node/$v/bin"
+    done
+  fi
+  for candidate in $candidates; do
+    if [ -x "$candidate/node" ] && node_ok "$candidate/node"; then
+      PATH="$candidate:$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "phase-console: node is required (>= 22.18, or >= 23.6) — none found on PATH," >&2
+  echo "in Homebrew, /usr/local, volta or nvm." >&2
+  exit 1
+fi
+if ! node_ok "$(command -v node)"; then
+  echo "phase-console: node $(node -v) is too old — >=22.18 or >=23.6 runs TypeScript directly," >&2
+  echo "and no newer node was found in Homebrew, /usr/local, volta or nvm." >&2
+  exit 1
+fi
+
+
+# The skill and hook verbs are free, and live in bin/phase-console.mjs in both
+# trees — dropped as a proPath and put back by the override, which keeps
+# exactly these five.
+case "${1:-}" in
+  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status)
+    exec node "$here/../bin/phase-console.mjs" "$@" ;;
+esac
+
+# Unreachable here — the Pro cases above exec first — and the whole answer in
+# the free tree, where they are stripped. `start` is not a fleet verb once there
+# is one console: drop the word and run it. The rest name Pro rather than
+# reaching the server, which would read the verb as a repository path.
+# The agent flags are matched by SHAPE rather than spelled out: this file ships in
+# the free tree, where naming a verb it does not have is what the scrub forbids.
+# `--*install-agent` and NOT `--*-agent`: the loose one also matches
+# `--allow-agent`, one of the seven capability switches, and refused it as a fleet
+# verb in BOTH trees. `viewer/test/fleet-refusal.test.ts` runs this very pattern
+# against every agent flag and every capability flag, so it cannot happen twice.
+case "${1:-}" in
+  start) shift ;;
+  stop|restart|status|log|logs|update|list|open|remove|--*install-agent|--agent-*)
+    echo "phase-console: '$1' manages a fleet of consoles, which is Phase Console Pro." >&2
+    echo "This build runs one console for one repository: ./start [<repo>]" >&2
+    exit 2
+    ;;
+esac
+
+# Warn — never build — when the built client is missing or older than the code.
+node "$here/scripts/check-stamp.mjs" || true
+
+# Node refuses to type-strip .ts under any node_modules directory — an npm
+# global install lives there, and its tarball ships a pre-stripped
+# server/index.js for exactly this case. Everywhere else the .ts is the truth.
+entry="$here/server/index.ts"
+case "$here" in
+  */node_modules/*) [ -f "$here/server/index.js" ] && entry="$here/server/index.js" ;;
+esac
+
+exec node "$entry" "$@"

@@ -1,0 +1,1037 @@
+/**
+ * The wire protocol between the runner and a session.
+ *
+ * Every other test fakes `spawnClaude` away, which is right for testing the
+ * loop and useless for testing the thing the loop stands on. The parts most
+ * able to break are exactly the parts a fake hides: whether the boot prompt
+ * reaches the child at all, whether a flag we think we pass is in argv,
+ * whether an injected message becomes a turn, whether the process ever exits.
+ *
+ * So this runs the real `spawnClaude` against a stub `claude` on a temporary
+ * PATH that speaks the same NDJSON both directions. The stub's behaviour is
+ * copied from a real session observed at CLI v2.1.220 — one `result` per turn,
+ * a cumulative `total_cost_usd`, `--replay-user-messages` echoing our own
+ * messages back, `stream_event` deltas carrying `parent_tool_use_id`.
+ */
+
+// Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them — the
+// console's state directory holds the operator's real push subscriptions.
+import './state-sandbox.ts';
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+process.env.PHASE_CONSOLE_LOG = '';
+
+const { spawnClaude, markFor } = await import('../server/runner/spawn.ts');
+import type { SpawnHandle, StreamEvent } from '../server/runner/spawn.ts';
+// The REAL framing, not a copy of it. This file used to build its operator
+// messages by hand, and the hand-copy had already drifted from `frameQuestion`
+// — so the one test proving a message reaches the child was proving it about a
+// string the runner has not sent in months. Importing the functions the runner
+// actually calls is what makes this a protocol test rather than a test of its
+// own fixture.
+const { frameQuestion, frameSteer } = await import('../server/runner/runner-core.ts');
+
+/* ------------------------------------------------------------------ *
+ * A `claude` that is not claude
+ * ------------------------------------------------------------------ */
+
+const STUB = `#!/usr/bin/env node
+'use strict';
+const fs = require('node:fs');
+const argv = process.argv.slice(2);
+if (process.env.PC_STUB_ARGV) fs.writeFileSync(process.env.PC_STUB_ARGV, JSON.stringify(argv));
+// The account vars, dumped for the test that proves credentials arrive as
+// ENVIRONMENT and never as argv.
+if (process.env.PC_STUB_ENV) {
+  fs.writeFileSync(process.env.PC_STUB_ENV, JSON.stringify({
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR ?? null,
+    CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
+    // The session id the console tells the child about itself (Phase 5).
+    PE_SESSION_ID: process.env.PE_SESSION_ID ?? null,
+  }));
+}
+
+// D21 — the two shapes that produce NO usable stream event and then live for
+// ever. \`armIdle\` cannot see either: it refuses to arm until the phase's turn
+// has produced a result, and neither of these ever does. Both stay alive on a
+// held-open stdin, which is exactly what the incident's child did.
+if (process.env.PC_STUB_MUTE === '1') {
+  process.stdin.resume(); setInterval(() => {}, 1000); return;
+}
+// The third shape, and the one that survived both watchdogs above for eleven
+// hours: a session that emits a STREAM — retry after retry, with a category the
+// CLI often does not send — and never a turn, a tool call or a result.
+if (process.env.PC_STUB_RETRIES === '1') {
+  let n = 0;
+  const t = setInterval(() => {
+    n += 1;
+    process.stdout.write(JSON.stringify({
+      type: 'system', subtype: 'api_retry', attempt: n, error: 'Error: 429 Too Many Requests',
+    }) + '\\n');
+  }, 20);
+  t.unref && t.unref();
+  process.stdin.resume(); setInterval(() => {}, 1000); return;
+}
+if (process.env.PC_STUB_GARBAGE === '1') {
+  // Output, but nothing this build can read — the case a bare \`catch { return }\`
+  // used to make indistinguishable from silence.
+  process.stdout.write('this is not json\\n');
+  process.stdout.write('{"half of an object\\n');
+  process.stdin.resume(); setInterval(() => {}, 1000); return;
+}
+
+const say = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
+const sid = '11111111-2222-3333-4444-555555555555';
+
+// Turns whose result is withheld, so the NEXT turn's result covers both — this
+// is the CLI folding two injected messages into one turn, which is what the old
+// counter could not survive.
+const noResult = new Set((process.env.PC_STUB_NO_RESULT || '').split(',').filter(Boolean).map(Number));
+// A history replayed on --resume: user echoes for turns that are not ours.
+const replayHistory = Number(process.env.PC_STUB_REPLAY_HISTORY || 0);
+// A duplicate result for a turn already reported, which the CLI has been seen
+// to emit and which used to decrement the counter a second time.
+const extraResult = new Set((process.env.PC_STUB_EXTRA_RESULT || '').split(',').filter(Boolean).map(Number));
+// Answer an operator message by repeating its tag, as the frame asks.
+const answering = process.env.PC_STUB_ANSWER === '1';
+// Say nothing at all after the boot turn: never echo, never result.
+const goSilent = process.env.PC_STUB_SILENT === '1';
+// The tool traffic a real session makes: a call and its result, a task list,
+// and a Task whose subagent makes a call of its own and fails it.
+const tools = process.env.PC_STUB_TOOLS === '1';
+const tag = (text) => (/\\[\\[(ask|steer):[0-9a-z]{4,16}\\]\\]/i.exec(text) || [])[0];
+
+say({ type: 'system', subtype: 'init', session_id: sid, model: process.env.PC_STUB_MODEL || 'stub-1', tools: [] });
+for (let i = 0; i < replayHistory; i++) {
+  say({ type: 'user', session_id: sid,
+        message: { role: 'user', content: [{ type: 'text', text: 'replayed history ' + i }] } });
+}
+
+let buffer = '';
+let turn = 0;
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index).trim();
+    buffer = buffer.slice(index + 1);
+    if (!line) continue;
+    let message;
+    try { message = JSON.parse(line); } catch { continue; }
+    const text = (message.message && message.message.content || []).map((b) => b.text).join('');
+    turn += 1;
+    // NUL-delimited, not newline-delimited: a real operator message is MULTI-LINE
+// (see \`frameQuestion\`/\`frameSteer\`), so a newline separator counted one
+// message as four, and every "how many did the child hear" assertion was
+// silently measuring lines. NUL cannot occur in the framing.
+if (process.env.PC_STUB_HEARD) fs.appendFileSync(process.env.PC_STUB_HEARD, text + '\\u0000');
+    // The turn that ends on a usage wall: the limit text as the result, a
+    // non-zero exit — the shape the classifier reads off a real limited session.
+    if (process.env.PC_STUB_LIMIT_EXIT) {
+      say({ type: 'result', subtype: 'error_during_execution', total_cost_usd: 0,
+            result: process.env.PC_STUB_LIMIT_EXIT, num_turns: turn, session_id: sid });
+      process.exit(1);
+    }
+    if (goSilent && turn > 1) continue;
+
+    if (argv.includes('--replay-user-messages')) {
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [{ type: 'text', text }] } });
+    }
+    if (argv.includes('--include-partial-messages')) {
+      for (const piece of ['answer ', 'in ', 'pieces']) {
+        say({ type: 'stream_event', session_id: sid, parent_tool_use_id: null,
+              event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } } });
+      }
+      say({ type: 'stream_event', session_id: sid, parent_tool_use_id: 'toolu_sub',
+            event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'from a subagent' } } });
+    }
+    if (tools && turn === 1) {
+      say({ type: 'assistant', session_id: sid, message: { role: 'assistant', content: [
+        { type: 'tool_use', id: 'toolu_bash', name: 'Bash', input: { command: 'npm test -- --run' } },
+        { type: 'tool_use', id: 'toolu_todo', name: 'TodoWrite', input: { todos: [
+          { content: 'wire the endpoint', status: 'completed', activeForm: 'Wiring the endpoint' },
+          { content: 'add the test', status: 'in_progress', activeForm: 'Adding the test' },
+        ] } },
+        { type: 'tool_use', id: 'toolu_task', name: 'Task',
+          input: { subagent_type: 'Explore', description: 'map the callers' } },
+        // The CLI's own name for the same tool, and with no type stated —
+        // which is legal, and still a delegation.
+        { type: 'tool_use', id: 'toolu_agent', name: 'Agent',
+          input: { description: 'count the widgets' } },
+        // What the CLI ACTUALLY calls for a task list — one row per call, with
+        // the id coming back in the result rather than going out in the input.
+        { type: 'tool_use', id: 'toolu_new', name: 'TaskCreate',
+          input: { subject: 'wire the endpoint', description: 'the long brief', activeForm: 'Wiring it' } },
+        { type: 'tool_use', id: 'toolu_upd', name: 'TaskUpdate',
+          input: { taskId: '1', status: 'in_progress' } },
+      ] } });
+      // Results come back as USER messages, which is why they were being
+      // dropped: the old handler joined \`.text\` and a tool_result has none.
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_bash', is_error: false,
+          content: [{ type: 'text', text: '40 tests passed' }] },
+      ] } });
+      // The subagent's own call, parented — and failing.
+      say({ type: 'assistant', session_id: sid, parent_tool_use_id: 'toolu_task',
+            message: { role: 'assistant', content: [
+              { type: 'tool_use', id: 'toolu_inner', name: 'Grep', input: { pattern: 'createOrder' } },
+            ] } });
+      say({ type: 'user', session_id: sid, parent_tool_use_id: 'toolu_task',
+            message: { role: 'user', content: [
+              { type: 'tool_result', tool_use_id: 'toolu_inner', is_error: true, content: 'no matches' },
+            ] } });
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'toolu_task', is_error: false, content: 'found 3 callers' },
+      ] } });
+    }
+    const mark = answering ? tag(text) : undefined;
+    say({ type: 'assistant', session_id: sid,
+          message: { role: 'assistant', stop_reason: 'end_turn',
+                     content: [{ type: 'text', text: mark ? mark + ' yes, because the cache was cold' : 'turn ' + turn }] } });
+    if (noResult.has(turn)) continue;
+    // total_cost_usd is the SESSION total, not this turn's share.
+    say({ type: 'result', subtype: 'success', session_id: sid, num_turns: turn,
+          total_cost_usd: turn, is_error: false, result: 'done ' + turn });
+    if (extraResult.has(turn)) {
+      // Same num_turns: a duplicate, not a new turn.
+      say({ type: 'result', subtype: 'success', session_id: sid, num_turns: turn,
+            total_cost_usd: turn, is_error: false, result: 'done ' + turn + ' (again)' });
+    }
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+`;
+
+type Bench = {
+  dir: string;
+  env: NodeJS.ProcessEnv;
+  argvFile: string;
+  heardFile: string;
+  argv: () => string[];
+  heard: () => string[];
+  cleanup: () => void;
+};
+
+function bench(): Bench {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-stub-'));
+  const bin = join(dir, 'claude');
+  writeFileSync(bin, STUB, 'utf8');
+  chmodSync(bin, 0o755);
+  const argvFile = join(dir, 'argv.json');
+  const heardFile = join(dir, 'heard.txt');
+  return {
+    dir,
+    argvFile,
+    heardFile,
+    env: {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH ?? ''}`,
+      PC_STUB_ARGV: argvFile,
+      PC_STUB_HEARD: heardFile,
+      PC_STUB_ENV: join(dir, 'env.json'),
+    },
+    argv: () => JSON.parse(readFileSync(argvFile, 'utf8')) as string[],
+    // One entry per MESSAGE the child heard — see the stub's NUL note. Splitting
+    // on newlines made one multi-line operator message read as several.
+    heard: () => (existsSync(heardFile) ? readFileSync(heardFile, 'utf8').split('\u0000').filter(Boolean) : []),
+    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * The prompt
+ * ------------------------------------------------------------------ */
+
+test('the boot prompt reaches the session on stdin, and never as argv', async () => {
+  const b = bench();
+  const outcome = await spawnClaude({ prompt: 'BOOT phase 3', cwd: b.dir, env: b.env });
+
+  assert.deepEqual(b.heard(), ['BOOT phase 3'], 'the session was told what to do');
+  // In streaming-input mode the CLI ignores a positional prompt entirely, so a
+  // prompt passed there would look right on screen and run nothing at all.
+  assert.ok(!b.argv().includes('BOOT phase 3'), 'the prompt is not in argv');
+  assert.equal(outcome.signal.subtype, 'success');
+  assert.equal(outcome.sessionId, '11111111-2222-3333-4444-555555555555');
+  b.cleanup();
+});
+
+test('account credentials arrive as ENVIRONMENT, and never appear in argv', async () => {
+  const b = bench();
+  const envFile = join(b.dir, 'env.json');
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: {
+      ...b.env,
+      PC_STUB_ENV: envFile,
+      CLAUDE_CONFIG_DIR: '/tmp/pc-profile-a/config',
+      CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-testtoken',
+    },
+  });
+  const seen = JSON.parse(readFileSync(envFile, 'utf8')) as Record<string, string | null>;
+  assert.equal(seen.CLAUDE_CONFIG_DIR, '/tmp/pc-profile-a/config');
+  assert.equal(seen.CLAUDE_CODE_OAUTH_TOKEN, 'sk-ant-oat01-testtoken');
+  const argv = b.argv().join(' ');
+  assert.ok(!argv.includes('testtoken'), 'a credential in argv is a credential in `ps` output');
+  assert.ok(!argv.includes('pc-profile-a'), 'the config dir is env, not a flag');
+  b.cleanup();
+});
+
+test('a limit exit carries the wall text in the result and a non-zero code', async () => {
+  const b = bench();
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_LIMIT_EXIT: "You've hit your session limit · resets 3:45pm" },
+  });
+  assert.equal(outcome.signal.subtype, 'error_during_execution');
+  assert.match(outcome.signal.text ?? '', /hit your session limit/);
+  assert.equal(outcome.sessionId, '11111111-2222-3333-4444-555555555555',
+    'the session id survives the wall — it is what a switch resumes');
+  b.cleanup();
+});
+
+test('the session ends by itself once its turn is answered', async () => {
+  const b = bench();
+  // Nothing kills this child: stdin closes when the last turn is answered and
+  // the process exits on its own. If that logic is wrong the test hangs, which
+  // is exactly the failure it needs to catch.
+  const outcome = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env });
+  assert.equal(outcome.turns, 1);
+  assert.ok(outcome.durationMs >= 0);
+  b.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * The flags we believe we are passing
+ * ------------------------------------------------------------------ */
+
+test('effort, model, fallback chain and name all reach the child', async () => {
+  const b = bench();
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: b.env,
+    model: 'fable',
+    effort: 'max',
+    fallbackModels: ['opus', 'sonnet'],
+    name: 'demo p1',
+  });
+  const argv = b.argv();
+  assert.equal(argv[argv.indexOf('--model') + 1], 'fable');
+  assert.equal(argv[argv.indexOf('--effort') + 1], 'max');
+  assert.equal(argv[argv.indexOf('--fallback-model') + 1], 'opus,sonnet');
+  assert.equal(argv[argv.indexOf('--name') + 1], 'demo p1');
+  b.cleanup();
+});
+
+test('an effort the CLI would only warn about never leaves this process', async () => {
+  const b = bench();
+  await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, effort: 'ludicrous' });
+  assert.ok(!b.argv().includes('--effort'));
+  b.cleanup();
+});
+
+test('a caller cannot smuggle the guard rails off through the tool list', async () => {
+  const b = bench();
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: b.env,
+    permissionMode: 'bypassPermissions' as never,
+  });
+  const argv = b.argv();
+  assert.equal(argv[argv.indexOf('--permission-mode') + 1], 'acceptEdits');
+  b.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * Talking to a session that is already running
+ * ------------------------------------------------------------------ */
+
+/** A tagged operator question, framed by the function the runner calls. */
+function tagged(id: string, body: string): string {
+  return frameQuestion(body, markFor('ask', id));
+}
+
+/** A tagged course correction, framed by the function the runner calls. */
+function steered(id: string, body: string): string {
+  return frameSteer(body, markFor('steer', id));
+}
+
+test('an injected message becomes a second turn in the same session', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  let handle: SpawnHandle | null = null;
+  let asked = false;
+
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 2',
+    cwd: b.dir,
+    env: b.env,
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      events.push(event);
+      // Ask the moment the phase's own turn lands. The send has to be seen
+      // BEFORE stdin is closed, which is why the result event is emitted
+      // before the close decision is taken — load-bearing ordering.
+      if (event.kind === 'result' && !asked) {
+        asked = true;
+        assert.equal(handle!.send(tagged('aaaa1111', 'by the way, why?')), true);
+      }
+    },
+  });
+
+  assert.equal(b.heard().length, 2);
+  assert.equal(outcome.injected, 1);
+  assert.equal(outcome.turns, 2, 'the question was a turn of its own');
+  // Cumulative, not summed: the stub reports 1 then 2, and the session cost 2.
+  assert.equal(outcome.costUsd, 2, 'per-turn totals must not be added together');
+
+  const injected = events.filter((e) => e.kind === 'injected') as { mark?: string; delivered?: boolean }[];
+  assert.equal(injected.length, 1, 'the echo is the only proof it landed');
+  assert.equal(injected[0].mark, 'ask:aaaa1111', 'and it is attributable to the message that caused it');
+  assert.equal(injected[0].delivered, true);
+  b.cleanup();
+});
+
+test('a steer reaches the live session as its own turn, framed as an instruction and attributed', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  let handle: SpawnHandle | null = null;
+  let sent = false;
+
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 4',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_ANSWER: '1' },
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      events.push(event);
+      if (event.kind !== 'result' || sent) return;
+      sent = true;
+      assert.equal(handle!.send(steered('bbbb2222', 'use the existing helper rather than a new one')), true);
+    },
+  });
+
+  // The wire half: it became a turn of its own in the SAME session, which is
+  // the whole point of steering rather than stopping and restarting.
+  assert.equal(outcome.injected, 1);
+  assert.equal(outcome.turns, 2, 'the instruction was a turn, not an append to the boot turn');
+
+  // The framing half, read off what the child actually received. `runner.test.ts`
+  // pins these words against a FAKE handle; this is the same words arriving over
+  // a real pipe, at the other end of a real process.
+  const heard = b.heard();
+  assert.equal(heard.length, 2, 'one boot prompt and one instruction');
+  assert.match(heard[1], /course correction/i);
+  assert.match(heard[1], /this IS an instruction/);
+  assert.match(heard[1], /verification commands still decide/);
+  assert.match(heard[1], /Instruction: use the existing helper rather than a new one$/);
+  // And NOT the other frame — an instruction delivered through the question
+  // wording is the bug `frameSteer` exists to fix, and it would still look like
+  // a delivered message from out here.
+  assert.doesNotMatch(heard[1], /It is NOT a change to the phase/);
+
+  // The attribution half: the echo carries the steer mark, so the console can
+  // show a course correction as a course correction rather than as a question.
+  const injected = events.filter((e) => e.kind === 'injected') as { mark?: string; delivered?: boolean }[];
+  assert.equal(injected.length, 1);
+  assert.equal(injected[0].mark, 'steer:bbbb2222');
+  assert.equal(injected[0].delivered, true);
+
+  const answers = events.filter((e) => e.kind === 'answer') as { mark: string }[];
+  assert.equal(answers.length, 1, 'the acknowledgement is not lost in the phase output');
+  assert.equal(answers[0].mark, 'steer:bbbb2222', 'and it is an acknowledgement, not an answer to a question');
+  b.cleanup();
+});
+
+test('steering a session that has settled is refused at the pipe, not written into a void', async () => {
+  const b = bench();
+  let handle: SpawnHandle | null = null;
+  await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, onHandle: (h) => { handle = h; } });
+
+  assert.equal(handle!.open(), false, 'a settled lane says it is settled');
+  assert.equal(
+    handle!.send(steered('cccc3333', 'change course')), false,
+    'and refuses the instruction rather than accepting it nowhere',
+  );
+  assert.deepEqual(b.heard(), ['BOOT phase 1'], 'nothing reached the child after it settled');
+  b.cleanup();
+});
+
+test('the boot prompt is not echoed back as if the operator had said it', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, onEvent: (e) => events.push(e) });
+  assert.equal(events.filter((e) => e.kind === 'injected').length, 0);
+  b.cleanup();
+});
+
+test('a replayed history is not mistaken for messages the operator just sent', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  // A session started with `--resume` replays its history as `user` messages.
+  // The old rule was positional — "the first echo is the boot prompt" — so
+  // every replayed turn after it was shown as something the operator had
+  // supposedly just typed, and the count was wrong from then on.
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_REPLAY_HISTORY: '3' },
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(events.filter((e) => e.kind === 'injected').length, 0);
+  b.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * When stdin closes — the wedge, and the two ways of causing it
+ * ------------------------------------------------------------------ */
+
+test('two messages folded into one turn still let the session end', async () => {
+  const b = bench();
+  let handle: SpawnHandle | null = null;
+  let asked = false;
+
+  // The measured wedge. `outstanding` went up twice and down once — the CLI
+  // answered both messages in a single turn — so it never reached zero, stdin
+  // never closed, and the child sat blocked on it at 0.1% CPU with the phase
+  // still reading `running` 80 minutes later. If this regresses, this test does
+  // not fail: it hangs, which is the honest shape of the bug.
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 2',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_NO_RESULT: '2' },
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      if (event.kind !== 'result' || asked) return;
+      asked = true;
+      assert.equal(handle!.send(tagged('bbbb2222', 'first question')), true);
+      assert.equal(handle!.send(tagged('cccc3333', 'second question')), true);
+    },
+  });
+
+  assert.equal(outcome.injected, 2, 'both were written');
+  assert.equal(b.heard().length, 3, 'and both reached the session, after the boot prompt');
+  // Two questions, three turns, two results. The session ended anyway.
+  assert.equal(outcome.turns, 3);
+  b.cleanup();
+});
+
+test('an extra result for a turn already counted does not close stdin early', async () => {
+  const b = bench();
+  let handle: SpawnHandle | null = null;
+  let asked = false;
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 2',
+    cwd: b.dir,
+    // A duplicate result for turn 1, reporting the same `num_turns`. The
+    // counter treated it as an answer and decremented to zero, closing stdin
+    // with a question still in flight.
+    env: { ...b.env, PC_STUB_EXTRA_RESULT: '1' },
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      if (event.kind !== 'result' || asked) return;
+      asked = true;
+      assert.equal(handle!.send(tagged('dddd4444', 'still there?')), true);
+    },
+  });
+
+  assert.equal(b.heard().length, 2, 'the question was written');
+  assert.equal(outcome.turns, 2, 'and got a turn of its own rather than a closed pipe');
+  b.cleanup();
+});
+
+test('a session that goes silent with stdin open is closed by the watchdog', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  let handle: SpawnHandle | null = null;
+  let asked = false;
+
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    // Never echoes and never results after the boot turn, so nothing the close
+    // rule waits for will ever arrive. Without the watchdog this hangs.
+    env: { ...b.env, PC_STUB_SILENT: '1' },
+    idleCloseMs: 250,
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      events.push(event);
+      if (event.kind !== 'result' || asked) return;
+      asked = true;
+      handle!.send(tagged('eeee5555', 'anyone home?'));
+    },
+  });
+
+  const idle = events.filter((e) => e.kind === 'idle') as { reason: string; afterMs: number }[];
+  assert.equal(idle.length, 1, 'the close is announced, not silent');
+  assert.match(idle[0].reason, /never echoed back/, 'and says which evidence never came');
+  assert.ok(idle[0].afterMs >= 200);
+  assert.ok(outcome.durationMs >= 200);
+  b.cleanup();
+});
+
+/**
+ * D21 — the bound that exists when no other clock in this file can arm.
+ *
+ * The measured hole: `armIdle` bails unless `phaseTurnDone`, which is set
+ * exactly once inside the `result` handler, so a child hung BEFORE its first
+ * result had no timer at all — not on a fresh attempt, not on a retry, not on a
+ * recovery or a resume. Seven of eight boarding gaps over fifteen minutes in the
+ * incident were that shape.
+ *
+ * `idleCloseMs: 0` in both tests is doing real work: it switches the OTHER
+ * watchdog off, so a green here cannot be the idle close taking the credit.
+ * Failing-before: with the backstop removed, `spawnClaude` never resolves and
+ * the test times out rather than failing — the signature of this defect class.
+ */
+test('a session that never says anything at all is ended by the first-event backstop', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_MUTE: '1' },
+    idleCloseMs: 0,
+    firstEventMs: 250,
+    onEvent: (event) => events.push(event),
+  });
+
+  const idle = events.filter((e) => e.kind === 'idle') as { reason: string; afterMs: number }[];
+  assert.equal(idle.length, 1, 'the kill is announced, not silent');
+  assert.match(idle[0].reason, /no output at all/, 'and says exactly what was observed');
+  assert.ok(idle[0].afterMs >= 200);
+  // Ended through the ordinary teardown, so the attempt settles as a session
+  // exit that the normal machinery already knows how to classify — the whole
+  // reason this reuses `onAbort` instead of a kill path of its own.
+  assert.ok(outcome.durationMs >= 200);
+  assert.equal(outcome.turns, 0);
+  assert.equal(outcome.costUsd, 0);
+  b.cleanup();
+});
+
+test('a session that emits nothing but API retries is NOT productive — the backstop still fires', async () => {
+  // The eleven-hour lane. `emit` used to clear the first-event timer on the
+  // first event of ANY kind, and a retry is an event — so the one clock that
+  // would ever have ended this lane disarmed itself on the first symptom of the
+  // thing it exists to catch. `sawProductive` is the split: `isProductiveEvent`
+  // (runner/liveness.ts) is the codebase's single definition of the
+  // distinction, and this is the second reader of it.
+  const b = bench();
+  const events: StreamEvent[] = [];
+
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_RETRIES: '1' },
+    idleCloseMs: 0,
+    // Long enough for the child to boot and emit a dozen retries first: at a
+    // shorter bound this could go green on "no output at all", which is the
+    // very claim it exists to disprove.
+    //
+    // 10s, not the 1.5s this used to be. The bound races node's process boot,
+    // and boot is what stretches under a loaded suite: at 1.5s this file was
+    // one of the handful the phase 3 and 5 handoffs recorded flaking, and it
+    // failed again on a full paced run (`expected /nothing but API retries/,
+    // actual "no output at all"`) — the backstop reading the counter before
+    // the child had written to it. Nothing here is timing-sensitive in the
+    // other direction, so the margin is free: the test still ends the moment
+    // the backstop fires, and only a genuinely regressed backstop waits 10s.
+    firstEventMs: 10_000,
+    onEvent: (event) => events.push(event),
+  });
+
+  const retries = events.filter((e) => e.kind === 'retry') as { category?: string; inferred?: boolean }[];
+  assert.ok(retries.length >= 2, `the retries were streamed and parsed (${retries.length})`);
+  // Inferred, because the CLI sent no category field — and marked as inferred,
+  // so nothing downstream can mistake a guess for the CLI's own verdict.
+  assert.equal(retries[0].category, 'rate_limit', 'read out of "429 Too Many Requests"');
+  assert.equal(retries[0].inferred, true);
+
+  const idle = events.filter((e) => e.kind === 'idle') as { reason: string }[];
+  assert.equal(idle.length, 1, 'the backstop fired despite the stream');
+  assert.match(
+    idle[0].reason, /nothing but API retries/,
+    'and says what it actually saw — "no output at all" would send a person looking for a dead process',
+  );
+  b.cleanup();
+});
+
+test('output nobody can parse is not silence — it is counted, and it is said', async () => {
+  // Before: a bare `catch { return; }` with no log and no counter, so "the
+  // session produced nothing" and "the session produced output this build
+  // cannot read" were the same observation with opposite remedies.
+  const b = bench();
+  const events: StreamEvent[] = [];
+
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_GARBAGE: '1' },
+    idleCloseMs: 0,
+    // Longer than the mute test's, and deliberately: this child has to be
+    // STARTED and have written its two lines before the backstop reads the
+    // counter. At 250 ms the bound fired while node was still booting and the
+    // test went green for the wrong reason — "no output at all", which is the
+    // very claim it exists to disprove.
+    //
+    // 1.5s was not enough either. Same failure, same cause, one order of
+    // magnitude further out: see the sibling retries test above.
+    firstEventMs: 10_000,
+    onEvent: (event) => events.push(event),
+  });
+
+  const idle = events.filter((e) => e.kind === 'idle') as { reason: string }[];
+  assert.equal(idle.length, 1);
+  assert.match(
+    idle[0].reason, /could not parse/,
+    'the two lines the child DID write are named, rather than reported as silence',
+  );
+  b.cleanup();
+});
+
+/**
+ * D12 — a freeze SUSPENDS the idle watchdog, and thawing forgives the silence.
+ *
+ * Held frozen for longer than `idleCloseMs`, this session would have had its
+ * stdin closed by the watchdog: a SIGSTOPped child emits nothing, and to a clock
+ * that measures silence a freeze and a wedged session look identical. That made
+ * the lane card's promise — "continues mid-token, in the same process" — false
+ * for any freeze longer than ten minutes, five minutes BEFORE the 15-minute
+ * escalation that is supposed to be the only clock allowed to end one.
+ *
+ * The proportions are the real ones, scaled: the freeze here outlasts the idle
+ * window by the same ratio a 12-minute freeze outlasts the 10-minute default.
+ * Failing-before: with `setFrozen` a no-op, `send()` after the thaw returns
+ * false and an `idle` event is on the wire.
+ */
+test('a frozen session is not idle-closed, and carries on after the thaw', async () => {
+  const b = bench();
+  const idleAt: number[] = [];
+  let handle: SpawnHandle | null = null;
+  let started = false;
+  let thawedAt = 0;
+  let resendOk: boolean | null = null;
+
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_SILENT: '1' },
+    idleCloseMs: 200,
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      if (event.kind === 'idle') { idleAt.push(Date.now()); return; }
+      if (event.kind !== 'result' || started) return;
+      started = true;
+      // An outstanding question first, so the close rule cannot settle this
+      // session by itself: from here the watchdog is the ONLY thing that can
+      // close stdin, which is exactly the collision this test is about.
+      handle!.send(tagged('c0c0feed', 'anyone home?'));
+      handle!.setFrozen(true);
+      // Held longer than the whole idle window — the stretch that used to close
+      // it, in the same proportion a 12-minute freeze outlasts the 10-minute
+      // default.
+      setTimeout(() => {
+        handle!.setFrozen(false);
+        thawedAt = Date.now();
+        // Mid-token resumption, as far as this stub can stand for it: the pipe
+        // is still there and still takes a write.
+        resendOk = handle!.send(tagged('c0c0feed', 'still there?'));
+      }, 400);
+    },
+  });
+
+  assert.equal(resendOk, true, 'stdin was never closed under the freeze');
+  // The watchdog is not disabled, only suspended: it may still close this
+  // session AFTER the thaw, and that is the behaviour being preserved.
+  for (const at of idleAt) {
+    assert.ok(at > thawedAt, 'no idle-close landed while the session was frozen');
+  }
+  assert.ok(outcome.durationMs >= 400, 'the freeze really did outlast the idle window');
+  b.cleanup();
+});
+
+test('the session answers a tagged question, and the answer is attributed', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  let handle: SpawnHandle | null = null;
+  let asked = false;
+
+  await spawnClaude({
+    prompt: 'BOOT phase 1',
+    cwd: b.dir,
+    env: { ...b.env, PC_STUB_ANSWER: '1' },
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      events.push(event);
+      if (event.kind !== 'result' || asked) return;
+      asked = true;
+      handle!.send(tagged('ffff6666', 'why was it cold?'));
+    },
+  });
+
+  const answers = events.filter((e) => e.kind === 'answer') as { text: string; mark: string }[];
+  assert.equal(answers.length, 1, 'the reply is not lost in the phase\'s own output');
+  assert.equal(answers[0].mark, 'ask:ffff6666');
+  // The tag is plumbing. It belongs in the correlation, not on the screen.
+  assert.equal(answers[0].text, 'yes, because the cache was cold');
+  b.cleanup();
+});
+
+test('a message sent after the session has finished is refused, not lost', async () => {
+  const b = bench();
+  let handle: SpawnHandle | null = null;
+  await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, onHandle: (h) => { handle = h; } });
+
+  assert.equal(handle!.open(), false, 'the session is gone and says so');
+  assert.equal(handle!.send('too late'), false, 'refusing beats accepting into a void');
+  assert.deepEqual(b.heard(), ['BOOT phase 1']);
+  b.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * What the console gets to show
+ * ------------------------------------------------------------------ */
+
+test('streamed deltas are coalesced, and a subagent keeps its own voice', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: b.env,
+    partialMessages: true,
+    onEvent: (event) => events.push(event),
+  });
+
+  const partial = events.filter((e) => e.kind === 'partial') as { text: string }[];
+  assert.ok(partial.length >= 1, 'the words arrived as they were written');
+  assert.equal(partial.map((p) => p.text).join(''), 'answer in pieces');
+  assert.ok(partial.length < 3, 'and were gathered rather than sent one frame per token');
+
+  const sub = events.filter((e) => e.kind === 'subagent') as { text: string; parent: string }[];
+  assert.equal(sub.length, 1, 'a subagent is not interleaved into the phase text');
+  assert.equal(sub[0].parent, 'toolu_sub');
+  b.cleanup();
+});
+
+test('a tool call and its result are joined by id, and timed', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onEvent: (event) => events.push(event),
+  });
+
+  const call = events.find((e) => e.kind === 'tool' && e.id === 'toolu_bash') as
+    { name: string; summary: string; id: string } | undefined;
+  assert.ok(call, 'the tool_use id is captured — without it nothing can be correlated');
+  assert.equal(call.name, 'Bash');
+  assert.equal(call.summary, 'npm test -- --run');
+
+  const result = events.find((e) => e.kind === 'tool-result' && e.id === 'toolu_bash') as
+    { ok: boolean; ms?: number; detail?: string } | undefined;
+  assert.ok(result, 'the result was dropped entirely before this');
+  assert.equal(result.ok, true);
+  assert.equal(typeof result.ms, 'number', 'a call with no duration is a name and nothing else');
+  assert.ok(result.ms! >= 0);
+  assert.match(result.detail ?? '', /40 tests passed/);
+  b.cleanup();
+});
+
+test("every turn of the phase's own conversation is a step, and a subagent's never is", async () => {
+  // The stream already said everything a turn CONTAINS; what it never said is
+  // that a turn happened at all — and counting turns is the only way to see a
+  // session reasoning in circles. `tool` events cannot be counted for it (one
+  // turn calling three tools emits three) and `result` fires per turn only
+  // after the stdin dance.
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onEvent: (event) => events.push(event),
+  });
+
+  const steps = events.filter((e) => e.kind === 'step') as { tools: number }[];
+  // Two turns of the phase's own: the one that called six tools, and the one
+  // that only spoke. The subagent's turn — parented to `toolu_task`, and one
+  // tool call of its own — is deliberately NOT among them: a delegating phase
+  // sits with its own conversation stopped while the agent works, and counting
+  // that as activity would hide exactly the stretch worth asking about.
+  assert.deepEqual(steps.map((s) => s.tools), [6, 0]);
+
+  // ...and the step for a turn arrives AFTER what that turn contained, so a
+  // listener that counts steps and reacts to tools sees them in order.
+  const firstStep = events.findIndex((e) => e.kind === 'step');
+  const bashCall = events.findIndex((e) => e.kind === 'tool' && e.id === 'toolu_bash');
+  assert.ok(bashCall >= 0 && bashCall < firstStep, 'the turn is reported once its contents have been');
+  b.cleanup();
+});
+
+test('a session that only talks still reports its turn, with no tools in it', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, onEvent: (event) => events.push(event),
+  });
+  assert.deepEqual((events.filter((e) => e.kind === 'step') as { tools: number }[]).map((s) => s.tools), [0]);
+  b.cleanup();
+});
+
+test('a Task names the agent it hands to, and its subagent\'s failures stay its own', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onEvent: (event) => events.push(event),
+  });
+
+  const task = events.find((e) => e.kind === 'tool' && e.id === 'toolu_task') as
+    { agent?: string; delegates?: boolean; summary: string } | undefined;
+  assert.equal(task?.agent, 'Explore', '"agent" as a label says nothing when three are running');
+  assert.equal(task?.delegates, true);
+  assert.equal(task?.summary, 'map the callers');
+
+  // Measured, not assumed: the current CLI calls this `Agent`, and matching
+  // only `Task` is silent — the subagent's words still arrive carrying a
+  // parent, so the lane simply never opens and nothing says why.
+  const agentCall = events.find((e) => e.kind === 'tool' && e.id === 'toolu_agent') as
+    { agent?: string; delegates?: boolean } | undefined;
+  assert.equal(agentCall?.delegates, true, 'a delegation under the CLI\'s own name for it');
+  assert.equal(agentCall?.agent, undefined, 'and `subagent_type` is optional, so it may be unnamed');
+
+  // A subagent's own calls used to be invisible: the whole `user` branch was
+  // skipped whenever `parent_tool_use_id` was set.
+  const inner = events.find((e) => e.kind === 'tool-result' && e.id === 'toolu_inner') as
+    { ok: boolean; parent?: string; detail?: string } | undefined;
+  assert.ok(inner, 'the subagent\'s result reached the console');
+  assert.equal(inner.ok, false);
+  assert.equal(inner.parent, 'toolu_task', 'attributed to the agent, not to the phase');
+  assert.match(inner.detail ?? '', /no matches/);
+  b.cleanup();
+});
+
+test('a TodoWrite surfaces the whole list, not a sentence about it', async () => {
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onEvent: (event) => events.push(event),
+  });
+
+  const todos = events.find((e) => e.kind === 'todos') as
+    { items: { content: string; status: string; activeForm?: string }[] } | undefined;
+  assert.ok(todos, 'the array was being discarded one function call before it was kept');
+  assert.equal(todos.items.length, 2);
+  assert.deepEqual(todos.items.map((t) => t.status), ['completed', 'in_progress']);
+  assert.equal(todos.items[1].activeForm, 'Adding the test');
+
+  // And the console line for the same call says something rather than nothing.
+  const line = events.find((e) => e.kind === 'tool' && e.id === 'toolu_todo') as { summary: string };
+  assert.match(line.summary, /1\/2 done · Adding the test/);
+  b.cleanup();
+});
+
+test('the task list the CLI really keeps — one row per call — reaches the client', async () => {
+  // The plan for this phase said the list arrives as `TodoWrite`'s array. It
+  // does not: a real run emits `TaskCreate` and `TaskUpdate`, one task at a
+  // time. Both spellings are carried, because only one of them ever fires.
+  const b = bench();
+  const events: StreamEvent[] = [];
+  await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onEvent: (event) => events.push(event),
+  });
+
+  const created = events.find((e) => e.kind === 'task' && e.op === 'create') as
+    { call?: string; content?: string; activeForm?: string } | undefined;
+  assert.equal(created?.content, 'wire the endpoint', 'the title, not the brief');
+  assert.equal(created?.activeForm, 'Wiring it');
+  assert.equal(created?.call, 'toolu_new', 'carries its own call id, so its result can name it');
+
+  const updated = events.find((e) => e.kind === 'task' && e.op === 'update') as
+    { taskId?: string; status?: string } | undefined;
+  assert.deepEqual([updated?.taskId, updated?.status], ['1', 'in_progress']);
+
+  // A TaskUpdate's input has no summarisable key at all, so its console line
+  // used to be the bare word "TaskUpdate".
+  const line = events.find((e) => e.kind === 'tool' && e.id === 'toolu_upd') as { summary: string };
+  assert.equal(line.summary, '#1 → in_progress');
+  b.cleanup();
+});
+
+test('tool results do not disturb the close rule or the operator echo', async () => {
+  // Both live in the same `user` branch now. If a result were mistaken for an
+  // echo the phase would wedge, which is the bug this whole protocol exists to
+  // have stopped — so it is worth asserting rather than assuming.
+  const b = bench();
+  const events: StreamEvent[] = [];
+  let handle: SpawnHandle | null = null;
+  let sent = false;
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_TOOLS: '1' },
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => {
+      events.push(event);
+      // Send amid turn 1's tool traffic — after a tool event, before the
+      // turn's result — which is the situation under test. This was a 60ms
+      // wall-clock delay once, and a fast machine finished the whole stub
+      // session inside it: a send after exit is a send to nobody.
+      if (event.kind === 'tool' && !sent) {
+        sent = true;
+        handle!.send(tagged('bbbb2222', 'and this?'));
+      }
+    },
+  });
+
+  const injected = events.filter((e) => e.kind === 'injected') as { mark?: string; delivered?: boolean }[];
+  assert.equal(injected.length, 1, 'the operator message was still recognised');
+  assert.equal(injected[0].delivered, true);
+  assert.equal(outcome.turns, 2, 'and the session ended by itself, both turns answered');
+  b.cleanup();
+});
+
+test('a missing claude is reported as a missing claude', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-nostub-'));
+  const outcome = await spawnClaude({
+    prompt: 'BOOT phase 1', cwd: dir,
+    env: { ...process.env, PATH: dir },
+  });
+  assert.match(outcome.resultText, /not on PATH/);
+  assert.equal(outcome.costUsd, 0, 'a session that never started spent nothing');
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------------------ *
+ * The session id the child is told about itself (Phase 5)
+ * ------------------------------------------------------------------ */
+
+test('PE_SESSION_ID rides into the child\'s environment — the minted --session-id for a fresh session, the --resume id for a resumed one', async () => {
+  const b = bench();
+  try {
+    await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env });
+    const argv = b.argv();
+    const minted = argv[argv.indexOf('--session-id') + 1];
+    assert.match(minted, /^[0-9a-f-]{36}$/, 'a fresh session gets a minted uuid');
+    const seen = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as { PE_SESSION_ID: string | null };
+    assert.equal(seen.PE_SESSION_ID, minted, `the child knows its own id — phase-lock.sh and phase-outcome.sh read it (seen=${JSON.stringify(seen)} argv=${JSON.stringify(argv)})`);
+
+    await spawnClaude({ prompt: 'go on', cwd: b.dir, env: b.env, resume: '11111111-2222-3333-4444-555555555555' });
+    const again = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as { PE_SESSION_ID: string | null };
+    assert.equal(again.PE_SESSION_ID, '11111111-2222-3333-4444-555555555555');
+    assert.ok(b.argv().includes('--resume'));
+
+    // A caller that fixed the id ahead of time is honoured, not re-minted.
+    await spawnClaude({ prompt: 'BOOT phase 2', cwd: b.dir, env: b.env, sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+    const fixed = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as { PE_SESSION_ID: string | null };
+    assert.equal(fixed.PE_SESSION_ID, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    assert.equal(b.argv()[b.argv().indexOf('--session-id') + 1], 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  } finally { b.cleanup(); }
+});

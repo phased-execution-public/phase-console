@@ -1,0 +1,436 @@
+/**
+ * The pulse panel — the "what is happening right now" answer, pinned.
+ *
+ * The derivations are pure and tested as data; the render test pins what an
+ * operator actually reads off the panel: which phase, in what vehicle, for
+ * how long, and what is parked waiting on the world.
+ *
+ * ⚠️ `pulseRuns` and `otherSessions` moved to `features/now/model.ts` in Phase
+ * 8, with `#/pulse`; their cases live in `features/now/model.test.ts`. What is
+ * left here is the per-plan PANEL, which is the plan page's (Phase 9 owns it).
+ */
+
+import { render, screen } from '@testing-library/react';
+import { describe, expect, it } from 'vitest';
+import {
+  PlanPulse,
+  convergenceLines,
+  fmtElapsed,
+  foreignLanesFor,
+  foreignVehicle,
+  isLiveRun,
+  pulseLanes,
+  pulseWaits,
+} from './pulse';
+import type { ConvergeView, ForeignSession } from '@/lib/api';
+import type { RunState } from '@/lib/api';
+
+function run(over: Partial<RunState> = {}): RunState {
+  return {
+    id: 'r1',
+    slug: 'demo',
+    root: '/tmp/demo',
+    status: 'running',
+    autonomy: 'auto',
+    model: 'sonnet',
+    phaseBudgetUsd: null,
+    runBudgetUsd: null,
+    spentUsd: 1.25,
+    maxConsecutiveFailures: 2,
+    consecutiveFailures: 0,
+    createdAt: '2026-08-15T10:00:00Z',
+    updatedAt: new Date().toISOString(),
+    activePhase: 4,
+    phases: {},
+    ...over,
+  } as RunState;
+}
+
+describe('pulseLanes', () => {
+  it("one lane per live child, carrying the record's model, clock and cost", () => {
+    const state = run({
+      children: { '4': { pid: 1, phase: 4, sessionId: 's4', startedAt: '2026-08-15T10:05:00Z' } },
+      phases: {
+        '4': {
+          phase: 4,
+          status: 'running',
+          attempts: 1,
+          costUsd: 0.42,
+          startedAt: '2026-08-15T10:05:00Z',
+          actualModel: 'claude-sonnet-5',
+        },
+      },
+    } as never);
+    const lanes = pulseLanes(state, new Map([[4, 'cart api']]));
+    expect(lanes).toHaveLength(1);
+    expect(lanes[0]).toMatchObject({
+      phase: 4,
+      title: 'cart api',
+      vehicle: 'Autopilot session',
+      model: 'claude-sonnet-5',
+      costUsd: 0.42,
+      frozen: false,
+      sessionId: 's4',
+    });
+  });
+
+  it('falls back to the active phase when the run predates the pool', () => {
+    const lanes = pulseLanes(
+      run({
+        activePhase: 2,
+        phases: { '2': { phase: 2, status: 'running', attempts: 1, costUsd: 0 } },
+      } as never),
+    );
+    expect(lanes.map((l) => l.phase)).toEqual([2]);
+  });
+
+  it('a stopped run has no lanes — the pulse never invents motion', () => {
+    expect(pulseLanes(run({ status: 'halted' }))).toEqual([]);
+  });
+});
+
+describe('pulseWaits', () => {
+  it('separates queued-behind-a-lock from parked-on-the-world', () => {
+    const state = run({
+      phases: {
+        '5': { phase: 5, status: 'queued', attempts: 0, costUsd: 0, lockWaitSince: '2026-08-15T10:00:00Z' },
+        '6': {
+          phase: 6,
+          status: 'waiting',
+          attempts: 1,
+          costUsd: 0,
+          parkedUntil: '2026-08-15T12:00:00Z',
+          parkReason: 'CI run 812 is still building',
+          watch: ['gh:owner/repo#run/812'],
+        },
+      },
+    } as never);
+    const waits = pulseWaits(state);
+    expect(waits.map((w) => w.kind)).toEqual(['queued', 'parked']);
+    expect(waits[0].why).toMatch(/behind a lock/);
+    expect(waits[1]).toMatchObject({ why: 'CI run 812 is still building', watch: ['gh:owner/repo#run/812'] });
+  });
+
+  /**
+   * Issue #6, the client half. A pause used to arm the word and tell the
+   * scheduler nothing, so this surface — and the Runs page, and the plan's
+   * Autopilot tab, all three of which read the RECORD — went on listing phases
+   * as queued with multi-hour ETAs on a run the operator had stopped.
+   *
+   * The fix is entirely server-side, which is exactly why it fixes three
+   * surfaces at once; what is pinned here is the other half of that claim —
+   * that this surface reads the record and nothing else, so a withdrawn phase
+   * disappears from it with no client change at all.
+   */
+  it('a pausing run whose queue was withdrawn lists nothing as coming next', () => {
+    const before = run({
+      status: 'pausing',
+      pause: { requestedAt: '2026-08-15T10:14:28Z', afterPhase: 12, by: 'console' },
+      phases: {
+        '12': { phase: 12, status: 'running', attempts: 1, costUsd: 0 },
+        '14': {
+          phase: 14,
+          status: 'queued',
+          attempts: 0,
+          costUsd: 0,
+          lockWaitSince: '2026-08-15T10:00:00Z',
+          waitingOn: [{ slug: 'demo', phase: 12, owner: 'autopilot/x', eta: { label: '~9 h-18 h left' } }],
+        },
+        '15': { phase: 15, status: 'queued', attempts: 0, costUsd: 0 },
+      },
+    } as never);
+    expect(pulseWaits(before).map((w) => w.phase)).toEqual([14, 15]);
+
+    // What `Runner.withdrawQueued` leaves behind: `pending`, and no `waitingOn`.
+    const after = run({
+      status: 'pausing',
+      pause: { requestedAt: '2026-08-15T10:14:28Z', afterPhase: 12, by: 'console' },
+      phases: {
+        '12': { phase: 12, status: 'running', attempts: 1, costUsd: 0 },
+        '14': { phase: 14, status: 'pending', attempts: 0, costUsd: 0 },
+        '15': { phase: 15, status: 'pending', attempts: 0, costUsd: 0 },
+      },
+    } as never);
+    expect(pulseWaits(after)).toEqual([]);
+  });
+});
+
+describe('fmtElapsed', () => {
+  it('reads like a clock at every magnitude', () => {
+    expect(fmtElapsed(38_000)).toBe('38s');
+    expect(fmtElapsed(14 * 60_000 + 5_000)).toBe('14m 05s');
+    expect(fmtElapsed(2 * 3_600_000 + 14 * 60_000)).toBe('2h 14m');
+    expect(fmtElapsed(-5)).toBe('—');
+  });
+});
+
+describe('PlanPulse', () => {
+  it('shows the lane — phase, vehicle, model — and the parked row with its reason', () => {
+    const state = run({
+      children: {
+        '4': { pid: 1, phase: 4, sessionId: 's4', startedAt: new Date(Date.now() - 90_000).toISOString() },
+      },
+      phases: {
+        '4': {
+          phase: 4,
+          status: 'running',
+          attempts: 1,
+          costUsd: 0.42,
+          startedAt: new Date(Date.now() - 90_000).toISOString(),
+          model: 'opus',
+        },
+        '6': {
+          phase: 6,
+          status: 'waiting',
+          attempts: 1,
+          costUsd: 0,
+          parkReason: 'waiting on the image build',
+        },
+      },
+    } as never);
+    render(
+      <PlanPulse
+        slug="demo"
+        run={state}
+        board={[
+          { phase: 4, title: 'cart api', state: 'ready' },
+          { phase: 6, title: 'deploy', state: 'ready' },
+          { phase: 7, title: 'docs', state: 'waiting', dependsOn: [6] },
+        ]}
+      />,
+    );
+    expect(screen.getByText('P4')).toBeInTheDocument();
+    expect(screen.getByText('cart api')).toBeInTheDocument();
+    expect(screen.getByText(/Autopilot session/)).toBeInTheDocument();
+    // `1:30`, not `1m 30s`: a lane's elapsed comes from the shared fact atom
+    // now (`components/lane-facts.tsx` → `Duration` → `format.elapsed`), which
+    // is the clock spelling every other lane surface has always used. This
+    // card carried a second formatter of its own — the C2 finding, in one
+    // figure. `fmtElapsed` survives here for the facts that are NOT lane facts
+    // (a park's countdown, a converge pass's age, a foreign session).
+    expect(screen.getByText(/^1:3\d$/)).toBeInTheDocument();
+    expect(screen.getByText('waiting on the image build')).toBeInTheDocument();
+    // Up next, from the board's own dependency column.
+    expect(screen.getByText(/after P6/)).toBeInTheDocument();
+  });
+
+  it('renders nothing for an idle plan', () => {
+    const { container } = render(
+      <PlanPulse slug="demo" run={run({ status: 'finished', activePhase: null })} />,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+});
+
+describe('isLiveRun', () => {
+  it('counts the states with a process behind them, nothing else', () => {
+    expect(isLiveRun(run({ status: 'running' }))).toBe(true);
+    expect(isLiveRun(run({ status: 'frozen' }))).toBe(true);
+    expect(isLiveRun(run({ status: 'halted' }))).toBe(false);
+    expect(isLiveRun(null)).toBe(false);
+  });
+});
+
+/* ---------------- foreign sessions (the presence hook) ---------------- */
+
+function foreign(over: Partial<ForeignSession> = {}): ForeignSession {
+  return {
+    sessionId: 'sess-hand',
+    kind: 'foreign',
+    cwd: '/work/demo',
+    startedAt: new Date(Date.now() - 90_000).toISOString(),
+    lastSeen: new Date().toISOString(),
+    turns: 2,
+    presence: 'live',
+    user: 'sam',
+    host: 'laptop',
+    plan: { slug: 'demo', phase: 3, strong: true },
+    ...over,
+  };
+}
+
+describe('foreignLanesFor', () => {
+  it("keeps live sessions correlated to THIS plan, drops ended ones, other plans, and the run's own lanes", () => {
+    const state = run({
+      children: { '4': { pid: 1, phase: 4, sessionId: 'own-4', startedAt: '2026-08-15T10:05:00Z' } },
+    } as never);
+    const lanes = foreignLanesFor(
+      [
+        foreign(),
+        foreign({ sessionId: 'ended', presence: 'ended' }),
+        foreign({ sessionId: 'elsewhere', plan: { slug: 'other', phase: 1, strong: true } }),
+        foreign({ sessionId: 'own-4', plan: { slug: 'demo', phase: 4, strong: true } }),
+        foreign({ sessionId: 'no-plan', plan: undefined }),
+      ],
+      'demo',
+      state,
+    );
+    expect(lanes.map((l) => l.sessionId)).toEqual(['sess-hand']);
+    expect(foreignLanesFor(undefined, 'demo')).toEqual([]);
+  });
+
+  it('names the vehicle by kind', () => {
+    expect(foreignVehicle({ kind: 'foreign' })).toBe('Terminal session');
+    expect(foreignVehicle({ kind: 'agent' })).toBe('Console agent');
+    expect(foreignVehicle({ kind: 'autopilot' })).toBe('Autopilot session');
+  });
+});
+
+describe('PlanPulse — a hand-run session beside the lanes', () => {
+  it('draws a live hook-reported session as a lane of its own kind, with its phase, its owner and its clock', () => {
+    const state = run({ status: 'halted', phases: {} } as never);
+    render(
+      <PlanPulse
+        slug="demo"
+        run={state}
+        board={[{ phase: 3, title: 'checkout', state: 'in-progress' }]}
+        foreign={[foreign()]}
+      />,
+    );
+    const lane = screen.getByTestId('foreign-lane');
+    expect(lane.textContent).toContain('P3');
+    expect(lane.textContent).toContain('checkout');
+    expect(lane.textContent).toContain('Terminal session');
+    expect(lane.textContent).toContain('sam@laptop');
+    expect(lane.textContent).toContain('2 turns');
+    expect(lane.getAttribute('title')).toContain('sess-hand');
+  });
+
+  it('a weakly correlated session says so; with nothing foreign and nothing live the panel still renders nothing', () => {
+    const state = run({ status: 'halted', phases: {} } as never);
+    const { container, rerender } = render(
+      <PlanPulse
+        slug="demo"
+        run={state}
+        foreign={[foreign({ plan: { slug: 'demo', phase: 3, strong: false } })]}
+      />,
+    );
+    expect(screen.getByTestId('foreign-lane').textContent).toContain('probably');
+    rerender(<PlanPulse slug="demo" run={state} foreign={[]} />);
+    expect(container.querySelector('section')).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The convergence line
+ * ------------------------------------------------------------------ */
+
+const report = (over: Partial<ConvergeView> = {}): ConvergeView => ({
+  slug: 'demo',
+  trigger: 'boot',
+  at: new Date(Date.now() - 90_000).toISOString(),
+  launched: true,
+  noop: false,
+  errands: 0,
+  actions: [
+    {
+      kind: 'release-debris',
+      phase: 3,
+      owner: 'autopilot/r0',
+      ok: true,
+      why: 'the run that held it is dead',
+    },
+    {
+      kind: 'relaunch',
+      ok: true,
+      why: 'phase 12 never started',
+      reboard: [{ phase: 12, situation: 'never-started', rung: 'reboard-fresh', brief: 'fresh' }],
+      rearm: [5],
+    },
+  ],
+  ...over,
+});
+
+describe('convergenceLines', () => {
+  it("says what the pass did, phase by phase, in the shared table's words", () => {
+    expect(convergenceLines(report())).toEqual([
+      'released a stale claim on P3 (autopilot/r0)',
+      're-boarded P12 (Never started → Re-board fresh)',
+      "re-armed P5's lock wait",
+    ]);
+  });
+
+  it("names a heal's rung when it launched, and its reason when it did not", () => {
+    expect(
+      convergenceLines(
+        report({
+          actions: [
+            {
+              kind: 'heal',
+              phase: 2,
+              situation: 'verify-red',
+              rung: 'fix-agent',
+              vehicle: 'agent',
+              launched: true,
+              ok: true,
+              why: '',
+            },
+          ],
+        }),
+      ),
+    ).toEqual(['P2: Verification red → Fix with a stronger new agent']);
+    expect(
+      convergenceLines(
+        report({
+          actions: [
+            {
+              kind: 'heal',
+              phase: 2,
+              launched: false,
+              ok: true,
+              why: "phase 2 reads Declared blocked · credential — a person's to settle",
+            },
+          ],
+        }),
+      ),
+    ).toEqual(["looked at P2 — phase 2 reads Declared blocked · credential — a person's to settle"]);
+  });
+
+  it('names an errand, a skip, and a failure by what they are', () => {
+    expect(
+      convergenceLines(
+        report({
+          actions: [
+            {
+              kind: 'errand',
+              phase: 5,
+              situation: 'gated-manual',
+              need: 'A person to clear the manual gate.',
+              ok: true,
+              why: 'exhausted',
+            },
+            { kind: 'skip', ok: true, why: 'the operator stopped it' },
+            { kind: 'release-debris', phase: 1, owner: 'x', ok: false, why: 'dead run' },
+          ],
+        }),
+      ),
+    ).toEqual([
+      'left an errand on P5 — A person to clear the manual gate.',
+      'left it alone — the operator stopped it',
+      'failed: released a stale claim on P1 (x)',
+    ]);
+    expect(convergenceLines(report({ actions: [], noop: true, launched: false }))).toEqual(['nothing to do']);
+  });
+});
+
+describe('<PlanPulse> — the convergence line', () => {
+  it('draws the last pass under the lanes, even on a plan that is otherwise idle', () => {
+    render(<PlanPulse slug="demo" run={run({ status: 'parked' })} converge={report()} />);
+    const line = screen.getByTestId('converge-line');
+    expect(line).toHaveTextContent('Converge');
+    expect(line).toHaveTextContent('boot');
+    expect(line).toHaveTextContent('re-boarded P12 (Never started → Re-board fresh)');
+    expect(line).toHaveTextContent('released a stale claim on P3');
+  });
+
+  it('ignores a pass about another plan, and one older than a day', () => {
+    const { container } = render(
+      <PlanPulse slug="demo" run={run({ status: 'parked' })} converge={report({ slug: 'other' })} />,
+    );
+    expect(container.firstChild).toBeNull();
+    const stale = report({ at: new Date(Date.now() - 36 * 3600 * 1000).toISOString() });
+    expect(
+      render(<PlanPulse slug="demo" run={run({ status: 'parked' })} converge={stale} />).container.firstChild,
+    ).toBeNull();
+  });
+});

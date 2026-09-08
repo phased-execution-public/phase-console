@@ -1,0 +1,81 @@
+{
+  "_comment": "The FREE tree's package manifest. Differs from the Pro one in exactly three ways, all of which follow from what the free tree IS: (1) the identity fields name the PUBLIC repository, because this file ships inside it and a bug report has to reach a repository the reporter can see; (2) the `files` allowlist drops `viewer/deploy/` — the launchd agent and the desktop launcher are Pro, and the directory is a proPath, so listing it here would name a path that does not exist; (3) the `free:preview` and `free:diff` scripts are gone, because both run the split tooling, which is a proPath too. Everything else is deliberately identical, version included: the two trees are one product at one version, and a free tarball that disagreed about the node floor or the bin target would be a second packaging contract to keep in step. `.github/scripts/assert-tarball.sh` reads this list in whichever tree it runs in.",
+  "name": "phase-console",
+  "version": "4.1.0",
+  "description": "Phase Console — local web console for the phased-execution Claude Code skill: plan boards, phase handoffs, QA gating, autopilot runs.",
+  "license": "MIT",
+  "author": "phased-execution-public (https://github.com/phased-execution-public)",
+  "homepage": "https://github.com/phased-execution-public/phase-console#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/phased-execution-public/phase-console.git"
+  },
+  "bugs": {
+    "url": "https://github.com/phased-execution-public/phase-console/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "phased-execution",
+    "planning",
+    "workflow",
+    "console",
+    "handoff"
+  ],
+  "type": "module",
+  "bin": {
+    "phase-console": "bin/phase-console.mjs"
+  },
+  "engines": {
+    "node": ">=22.18 <23 || >=23.6"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "files": [
+    "SKILL.md",
+    "USAGE.md",
+    "start",
+    "bin/",
+    "scripts/",
+    "scripts/repair-artefacts.sh",
+    "templates/",
+    "references/",
+    "assets/report-template.md",
+    "viewer/run",
+    "viewer/package.json",
+    "viewer/server/",
+    "viewer/shared/scope.js",
+    "viewer/shared/instances.mjs",
+    "viewer/shared/recovery-model.js",
+    "viewer/shared/situation-model.js",
+    "viewer/shared/ladder-model.js",
+    "viewer/shared/attention-model.js",
+    "viewer/shared/run-lifecycle.js",
+    "viewer/shared/fact-map.js",
+    "viewer/shared/evidence-model.js",
+    "viewer/shared/routes.js",
+    "viewer/shared/run-settings.js",
+    "viewer/shared/status-vocab.js",
+    "viewer/shared/plan-vocab.js",
+    "viewer/shared/diff.js",
+    "viewer/shared/ops-vocab.js",
+    "viewer/shared/task-model.js",
+    "viewer/shared/schedule-policy.js",
+    "viewer/shared/projection.js",
+    "viewer/shared/worktree-model.js",
+    "viewer/shared/automation-model.js",
+    "viewer/shared/orchestration-model.js",
+    "viewer/scripts/check-stamp.mjs",
+    "viewer/client/dist/",
+    "viewer/client/src/assets/fonts/OFL.txt"
+  ],
+  "scripts": {
+    "prepack": "cd viewer && npm ci && npm run build && npm run check:dist && npx tsc -p server/tsconfig.pack.json",
+    "postpack": "find viewer/server -name '*.js' ! -name 'fallback-sw.js' -delete"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0",
+    "ws": "^8.21.1"
+  }
+}

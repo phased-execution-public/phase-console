@@ -1,0 +1,173 @@
+/**
+ * The live session console's line grid.
+ *
+ * Utilities cannot express this: every rule below paints a *descendant* chosen
+ * by the parent's kind (`.live-line.k-tool .live-k`), and the kind arrives from
+ * the console model at runtime — there is no set of classes a component could
+ * hold. Same reasoning as `prose.css` and `route-map.css`, and the same
+ * mechanism: `@import`ed by `theme.css` inside `@layer components`, so layer
+ * order (not file order) decides the cascade and a utility on the element still
+ * wins.
+ *
+ * The colour vocabulary is the board's, unchanged: progress for a tool call,
+ * done for verification, blocked for a failure, ready/amber for anything an
+ * operator did or must attend to. Nothing invents a hue.
+ */
+
+@layer components {
+
+.live-line {
+  display: grid;
+  /* `ch` rather than px for the clock: it is exactly eight monospace characters
+     at whatever size the console is rendering, so the column cannot drift out
+     of step with the font the way a magic pixel width does. */
+  /* `minmax(0, 1fr)`, not `1fr`: a bare `1fr` track carries an automatic
+     minimum of min-content, so one unbreakable token in a tool result would
+     widen the track past its share and push the tick off the line. The text
+     already breaks words; this is what lets it. */
+  grid-template-columns: 8ch 62px minmax(0, 1fr) auto;
+  gap: 0.5rem;
+  padding: 1px 0;
+}
+
+/* The wall clock. Unselectable for the same reason the kind label is: dragging
+   across a line should put the session's words on the clipboard, not a column
+   of times down the left of them. */
+.live-time {
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.live-k {
+  color: var(--ink-faint);
+  text-align: right;
+  user-select: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-t {
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--ink-muted);
+}
+
+/* Replayed from the transcript rather than watched live. Legible, but visibly
+   not the present tense. */
+.live-line.is-replayed .live-t { opacity: 0.72; }
+
+/* The line a `?line=` permalink names. A ruled band rather than a background
+   wash, so it stays legible against every kind colour below — and it survives
+   the reader scrolling away and back, because the hash still says so. */
+.live-line.is-linked {
+  background: color-mix(in oklch, var(--accent) 12%, transparent);
+  box-shadow: inset 2px 0 0 0 var(--accent);
+  border-radius: 2px;
+}
+
+.live-line.k-tool .live-k,
+.live-line.k-tool .live-t { color: var(--line-progress); }
+
+.live-line.k-verify .live-k,
+.live-line.k-verify .live-t { color: var(--line-done); }
+
+.live-line.k-phase .live-k { color: var(--line-done); }
+.live-line.k-phase .live-t { color: var(--ink); }
+
+.live-line.k-runner .live-t { color: var(--line-ready); }
+
+.live-line.k-retry .live-k,
+.live-line.k-retry .live-t { color: var(--line-ready); }
+
+.live-line.k-limits .live-k,
+.live-line.k-limits .live-t { color: var(--line-ready); }
+
+.live-line.k-stderr .live-k,
+.live-line.k-stderr .live-t,
+.live-line.k-tool-fail .live-k,
+.live-line.k-tool-fail .live-t,
+.live-line.k-idle .live-k,
+.live-line.k-idle .live-t { color: var(--line-blocked); }
+
+.live-line.k-init .live-t { color: var(--ink-faint); }
+
+/* The model's working, and the hook noise. Both are behind Detail. */
+.live-line.k-thinking .live-k,
+.live-line.k-thinking .live-t {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+.live-line.k-hook .live-k,
+.live-line.k-hook .live-t { color: var(--ink-faint); }
+
+/* A subagent speaks in its own margin — the visual half of what `parent` does
+   in the fold. */
+.live-line.k-subagent {
+  border-left: 2px solid var(--rule);
+  padding-left: 0.25rem;
+  margin-left: 2px;
+}
+.live-line.k-subagent .live-k,
+.live-line.k-subagent .live-t { color: var(--line-progress); }
+
+/* The operator's own words, and the session's reply to them. */
+.live-line.k-injected .live-k,
+.live-line.k-steer .live-k,
+.live-line.k-answer .live-k { color: var(--line-ready); }
+
+.live-line.k-injected .live-t,
+.live-line.k-steer .live-t {
+  color: var(--ink);
+  font-style: italic;
+}
+
+.live-line.k-answer .live-t { color: var(--ink); }
+
+.live-line.k-steer,
+.live-line.k-answer {
+  border-left: 2px solid var(--line-ready);
+  padding-left: 0.25rem;
+  margin-left: 2px;
+}
+
+/* The session ended: a rule, because it is the end of something. */
+.live-line.k-result {
+  border-top: 1px solid var(--rule);
+  margin-top: 0.25rem;
+  padding-top: 0.25rem;
+}
+.live-line.k-result .live-t { color: var(--ink); }
+
+.live-tick {
+  color: var(--ink-faint);
+  user-select: none;
+  padding-top: 2px;
+}
+.live-tick.is-delivered { color: var(--line-done); }
+
+/*
+ * One thumb, one column: the kind gutter is the first thing to give.
+ *
+ * FOUR tracks, because a line has four children. This rule declared three, and
+ * it was right when it was written — the clock was added to `.live-line` later
+ * and nothing brought the phone rule with it. Grid then laid the eight-character
+ * time into the 46px track meant for the kind, where `white-space: nowrap`
+ * carried it straight over the label beside it, and pushed the text and the
+ * delivery tick one column right into implicit tracks nobody had sized.
+ *
+ * So the clock keeps its own `8ch` (the point of `ch`: exactly its content at
+ * whatever size the console renders) and the KIND gutter is what narrows, which
+ * is what the sentence above always said. It ellipsises already.
+ */
+@media (width <= 640px) {
+  .live-line {
+    grid-template-columns: 8ch 46px minmax(0, 1fr) auto;
+    gap: 0.25rem;
+  }
+}
+
+}

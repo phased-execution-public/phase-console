@@ -1,0 +1,46 @@
+{
+  "name": "Phase Console",
+  "short_name": "Phase",
+  "description": "The console for phased execution: what needs you, what is running and what it costs, every plan's route map, and the sessions doing the work.",
+  "lang": "en",
+  "dir": "ltr",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "launch_handler": { "client_mode": "focus-existing" },
+  "orientation": "any",
+  "background_color": "#0e1b22",
+  "theme_color": "#0e1b22",
+  "categories": ["productivity", "developer"],
+  "shortcuts": [
+    {
+      "name": "Now",
+      "short_name": "Now",
+      "description": "What needs you, what is running and what is next",
+      "url": "/#/now",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Runs",
+      "short_name": "Runs",
+      "description": "Every run, its status and what it has spent",
+      "url": "/#/runs",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "Sessions",
+      "short_name": "Sessions",
+      "description": "Every process this console owns or can see, with its terminal",
+      "url": "/#/sessions",
+      "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }]
+    }
+  ],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/icon-badge-96.png", "sizes": "96x96", "type": "image/png", "purpose": "monochrome" }
+  ]
+}

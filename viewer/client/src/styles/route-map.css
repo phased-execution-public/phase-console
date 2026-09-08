@@ -1,0 +1,615 @@
+/* ------------------------------------------------------------------ *
+ * The route map — the plan drawn as a transit network
+ *
+ * Why CSS and not utilities: an SVG station is a group whose *children* change
+ * appearance on hover, focus and selection of the group. That is a descendant
+ * relationship — `.station:hover .halo` — which is exactly the shape a utility
+ * class cannot express without inventing a variant per child. The geometry
+ * lives in `components/dag.tsx`; only the paint is here.
+ *
+ * ---- One hue, read in one place ----
+ *
+ * Nothing below names a `--status-*` token. A station's class (`.state-done`,
+ * `.state-running`, …) sets `--state` once — that is theme.css's bridge, and
+ * `status-badge.tsx` is the only other place a hue is read — and every rule
+ * here that paints by state reads `var(--state)`. This file used to restate
+ * `--status-done` / `--line-progress` / `--line-done` about fifteen times, so
+ * a state added to the vocabulary painted correctly everywhere except a map.
+ * The tokens that are NOT status hues — `--track`, `--hatch`, `--line-gated`,
+ * `--line-progress` for the batch line — stay named, because they describe
+ * ink rather than state.
+ *
+ * ---- And nothing reads by hue alone ----
+ *
+ * `done`, `running` and `needs-you` used to differ only in colour. Every state
+ * now carries a drawn glyph and a ring treatment (`dag.tsx`'s `StationMark`),
+ * so the map survives greyscale, a projector and 8% of men.
+ * ------------------------------------------------------------------ */
+
+@layer components {
+  /* The frame is a fixed window and the SVG's viewBox is what moves inside it.
+     It used to be the other way round — the SVG grew taller as you zoomed and
+     the frame clipped whatever spilled — which meant zooming in made the map
+     *longer* rather than closer, and the page grew with it. */
+  /* Flat, because the DRAWING carries the structure now.
+     This was a 24px radial dot grid — the graph-editor bed every node canvas
+     ships with. It says nothing about a plan, it is the most templated surface
+     in the category, and it competed with the network for the reader's eye. The
+     wave ruling below rules the map by the one number the engine already
+     computes and has never shown, so the frame's own job is to be the paper the
+     network is printed on — ONE paper, which is what lets the trunk have a
+     casing. What shows past the ruling is the edge of the plan. */
+  .route-frame {
+    background: var(--ground-deep);
+    overflow: hidden;
+    /* Sized by the VISIBLE viewport. This was `clamp(300px, 56dvh, 640px)`, and
+       `dvh` is the unit that ignores the iOS software keyboard — `--app-height`
+       is the token the shell corrects and every overlay already sizes by. */
+    block-size: clamp(300px, calc(var(--app-height, 100dvh) * 0.56), 640px);
+    /* Locked (the resting state): the map is a picture. Every gesture belongs
+       to the page — scroll, swipe, pinch-the-page all behave exactly as they
+       do over any other card — because the wheel listener is not even attached
+       (see `useMapView`) and pointers are ignored. Stations stay tappable. */
+    cursor: default;
+    touch-action: auto;
+  }
+  .route-frame[data-interactive] {
+    cursor: grab;
+    /* `pan-y`, not `none`.
+       `none` gave the map every touch that started inside it — and on a phone
+       the map is half the screen, so the Route tab could not be scrolled with a
+       finger at all: you had to find the sliver of card beside it. The browser
+       keeps vertical panning (the page scrolls, which is what a swipe down
+       means everywhere else); a horizontal drag and the second finger of a
+       pinch still reach the element, so pan and zoom are intact. Vertical
+       panning of the map itself is the one thing traded away, and the map is
+       fitted to the frame by default — Fit and the zoom buttons get you back. */
+    touch-action: pan-y;
+    overscroll-behavior: contain;
+  }
+  .route-frame[data-interactive]:active { cursor: grabbing; }
+
+  .route-svg { display: block; user-select: none; width: 100%; height: 100%; }
+
+  /* The station's target, sized in plan units by `dag.tsx` so it lands at 44 CSS
+     px at any zoom. `transparent` and not `none`: `fill: none` is invisible to
+     pointer events, which is the difference between a hit area and a decoration. */
+  .station-hit { fill: transparent; }
+
+  /* ---------------------------------------------------------------- *
+   * Platforms — the board, ruled
+   *
+   * A departures board is ruled columns under headings, and this map's columns
+   * were already real: the engine lays a phase out by its LONGEST-PATH DEPTH,
+   * which is the earliest wave it could possibly run in. That number decided
+   * every station's position and the map never printed it, so the strongest
+   * structural fact on screen was the one thing a reader had to infer.
+   *
+   * So the columns are ruled and numbered — by a HAIRLINE and a heading, which
+   * is what a departures board is actually ruled by. This shipped with
+   * alternating fills for one QA round and they were the wrong device twice
+   * over: a stripe is a table's way of separating rows, not a map's, and a
+   * second paper colour broke the thing the trunk's casing depends on. A casing
+   * is a wider stroke in the PAPER's colour, and a paper that alternates cannot
+   * have one — half the trunk drew a visible light channel down the middle of
+   * the network. One paper, ruled. Chanel's mirror.
+   *
+   * Two rules this layer must never break:
+   *   - `pointer-events: none` on the whole group. The ruling spans the frame;
+   *     if it took a pointer it would take every one meant for a station.
+   *   - It paints in GROUND and RULE tones, never a status hue. This is the
+   *     paper; the vocabulary belongs to the marks.
+   * ---------------------------------------------------------------- */
+
+  .platforms { pointer-events: none; }
+
+  .platform-rule { stroke: var(--rule); stroke-width: 1; }
+
+  /* 12px and `--ink-muted`, and both numbers are the design file's, not taste.
+     §10.9 makes 12px the type floor non-negotiable, and `--ink-faint` is held
+     by `contrast.test.ts` only to the 3:1 LARGE-text floor — measured 3.12:1
+     here, which is a fail for text this size. `--ink-muted` is held to 4.5:1.
+     ⚠️ An earlier spelling of this note said "the bands stay quiet through
+     their FILL" — written when the ruling was an alternating band, which was
+     deleted the next round. Read literally it is a warrant for putting the
+     labels back under the floor, so: the ruling stays quiet because a hairline
+     and two small words ARE quiet, never by under-inking them. */
+  .platform-label {
+    font-family: var(--font-display);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    fill: var(--ink-muted);
+  }
+  /* The count under the number: how many phases stand on this platform. Mono,
+     because it is a figure, and tabular by the base rule. It differs from the
+     label by FACE and position — never by being lighter, which is the move that
+     put it under the contrast floor. */
+  .platform-count {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    fill: var(--ink-muted);
+  }
+
+  /* ---------------------------------------------------------------- *
+   * Track
+   * ---------------------------------------------------------------- */
+
+  .track {
+    fill: none;
+    stroke: var(--track);
+    stroke-width: 3;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* Direction, said rather than implied. Left-to-right is a convention a
+       reader has to be taught; an arrowhead is one a reader already has. */
+    marker-end: url(#track-arrow);
+    transition: opacity var(--duration-fast) var(--ease-transit),
+                stroke var(--duration-fast) var(--ease-transit);
+    /* `pathLength="100"` on every path (dag.tsx) normalises the geometry, so
+       one dash length draws every edge exactly. The old hard-coded 1400 was a
+       guess at the longest edge: a short one drew as a dotted line and a long
+       one never closed. */
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
+    animation: draw-track var(--duration-draw) var(--ease-transit) backwards;
+    /* `--i` is the column, capped at 8 by `dag.tsx` — a fifteen-layer plan
+       spent over a second and a half looking half-drawn. */
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+  .track-done { stroke: color-mix(in oklab, var(--state) 65%, var(--track)); }
+  /* The longest remaining chain: every day this plan is late is a day one of
+     these phases was late. Thicker and in the action colour, which is the one
+     colour this design reserves for "this is what to do next". */
+  .track-critical {
+    stroke: color-mix(in oklab, var(--action) 70%, var(--track));
+    stroke-width: 4.5;
+    marker-end: url(#track-arrow-critical);
+  }
+
+  /**
+   * The casing — what makes the trunk a LINE rather than a thicker edge.
+   *
+   * Every transit map in the world draws its lines with a casing: a wider
+   * stroke in the paper's own colour laid under the colour, so where two lines
+   * cross one of them visibly passes OVER the other. Without it a junction is
+   * an ambiguous blot and the eye cannot follow a line through it — which is
+   * exactly what the critical path looked like on a plan with any fan-out,
+   * because 4.5px of amber crossing 3px of track just made a darker crossing.
+   *
+   * SVG has no z-index — paint order is document order — so `dag.tsx` draws the
+   * ordinary edges first and the trunk LAST, in a `.trunk` group whose own
+   * children are every casing and then every line. That is two orderings doing
+   * two jobs: the trunk passes over what it crosses, and each casing sits under
+   * its own line. It is `--surface`, not transparent: the point of a casing is
+   * to hide what it covers.
+   */
+  .track-casing {
+    fill: none;
+    /* THE PAPER, and it must stay identical to `.route-frame`'s background.
+       It read `--surface` for one QA round while the frame was `--ground-deep`
+       — 10% lighter on Paper, 7.3% at Night — so the "casing" painted a light
+       channel tracing the whole trunk instead of hiding what it covered. That
+       is the exact inverse of the job. A guard below pins the two together. */
+    stroke: var(--ground-deep);
+    stroke-width: 9;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* Drawn in with its own edge, on the same stagger — a casing that arrived
+       before its line would flash a white channel across the map. */
+    stroke-dasharray: 100;
+    animation: draw-track var(--duration-draw) var(--ease-transit) backwards;
+    animation-delay: calc(var(--i, 0) * 70ms);
+  }
+  .track-casing.dim { opacity: 0.25; }
+  .track.dim { opacity: 0.25; }
+
+  /* The arrowhead has no dash to hide behind, so it fades in with its edge
+     instead of hovering over paper for the length of the stagger. */
+  @keyframes draw-track {
+    from { stroke-dashoffset: 100; opacity: 0; }
+    12% { opacity: 1; }
+    to { stroke-dashoffset: 0; }
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The station mark
+   * ---------------------------------------------------------------- */
+
+  .station { cursor: pointer; }
+
+  .route-mark .dot {
+    fill: var(--surface);
+    stroke: var(--state, var(--track));
+    stroke-width: 3;
+    transition: transform var(--duration-fast) var(--ease-transit);
+  }
+  /* Departed: filled solid, and quieter than everything still to come. */
+  .route-mark.state-done .dot { fill: var(--state); stroke: var(--state); }
+  .station.state-done { opacity: 0.82; }
+  .route-mark.state-running .dot { fill: color-mix(in oklab, var(--state) 30%, var(--surface)); }
+  .route-mark.state-queued .dot { stroke-width: 4.5; }
+  .route-mark.state-needs-you .dot {
+    fill: color-mix(in oklab, var(--state) 25%, var(--surface));
+    stroke-width: 4.5;
+  }
+  .route-mark.state-waiting .dot { stroke-dasharray: 3 3; opacity: 0.85; }
+
+  /* The emphasis ring, drawn for the two states that are not merely a position
+     in a queue: running is happening, needs-you is stopped on a person. Dashed
+     for the one that is moving, solid and heavy for the one that is not. */
+  .route-mark .state-ring { fill: none; stroke: var(--state); stroke-width: 2; }
+  .route-mark.state-running .state-ring { stroke-dasharray: 6 5; opacity: 0.8; }
+  .route-mark.state-needs-you .state-ring { stroke-width: 2.6; }
+
+  /* The chip: a glyph on its own disc, so it reads over track, hatch and the
+     station's own fill without needing any of them to move. */
+  .mark-chip .chip-disc {
+    fill: var(--surface);
+    stroke: var(--state, var(--track));
+    stroke-width: 1.4;
+  }
+  .mark-glyph {
+    fill: none;
+    stroke: var(--state, var(--ink));
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .mark-glyph.filled { fill: var(--state, var(--ink)); stroke: none; }
+
+  /* A gate is a barrier across the track that a person must lift. The hatched
+     disc says it at a glance and the boom-bar chip says it without the legend. */
+  .gate-chip .chip-disc { stroke: var(--line-gated); }
+  .gate-chip .mark-glyph { stroke: var(--line-gated); }
+
+  /* Who is driving, over an OBSERVED live fact — the lucide icon the sessions
+     page uses for the same vehicle, tinted with the progress line's ink. */
+  .actor-chip { color: var(--line-progress); }
+  .actor-chip .chip-disc { stroke: var(--line-progress); }
+
+  /**
+   * A claimed station wears a cordon.
+   *
+   * Deliberately not the gate's hatched disc: a gate is a barrier across the
+   * track that a person must lift, a claim is somebody already standing on the
+   * platform. Dashed rather than solid because a claim is temporary — it holds
+   * for a lease and then it does not. A claim is drawn only where there is NO
+   * live process to draw instead: a driver chip is the stronger fact.
+   */
+  .route-mark .claim-ring {
+    fill: none;
+    stroke-width: 1.5;
+    stroke-dasharray: 2 3.5;
+    stroke-linecap: round;
+  }
+  .route-mark .claim-ring.live { stroke: var(--line-progress); }
+  .route-mark .claim-ring.stale { stroke: var(--action); opacity: 0.75; }
+
+  .station .halo { fill: none; stroke: transparent; stroke-width: 2; }
+  .station:hover .halo,
+  .station:focus-visible .halo,
+  .station.selected .halo { stroke: color-mix(in oklab, var(--state, var(--ink)) 55%, transparent); }
+  .station.selected .halo { stroke-width: 3; }
+  .station.dim { opacity: 0.32; }
+  /* The group carries the focus ring; the browser's own outline would trace the
+     bounding box of a two-line label rather than the station. */
+  .station:focus-visible { outline: none; }
+
+  .station-number {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    fill: var(--ink);
+    pointer-events: none;
+  }
+  /* A departed station is filled solid with its own state colour, so its number
+     has to invert — against the darkest form of that colour in either theme. */
+  .station.state-done .station-number {
+    fill: color-mix(in oklab, var(--state) 18%, light-dark(white, black));
+  }
+
+  .station-label {
+    font-family: var(--font-display);
+    font-size: 11.5px;
+    letter-spacing: 0.03em;
+    fill: var(--ink-muted);
+    pointer-events: none;
+    /* A halo in the surface colour keeps names readable where track passes behind. */
+    stroke: var(--surface);
+    stroke-width: 3px;
+    paint-order: stroke fill;
+  }
+  /* `queued` is the UI state a board `ready` paints as — the selector used to
+     say `.state-ready`, a class the map has not set since the vocabulary
+     landed, so "next up" has been unemphasised ever since. */
+  .station.state-queued .station-label { fill: var(--ink); font-weight: 600; }
+
+  /* THE only pulse, and only over a live fact.
+     `in-progress` is a word out of a markdown file; a word must not breathe.
+     `.live` is set from `PhaseLive` — something observed to be working the
+     phase — which is the same rule `PhaseStateChip` keeps for its own chip. */
+  .station.state-running.live .dot { animation: station-pulse 2.6s var(--ease-transit) infinite; }
+  @keyframes station-pulse {
+    0%, 100% { filter: drop-shadow(0 0 0 transparent); }
+    50% { filter: drop-shadow(0 0 6px color-mix(in oklab, var(--state) 60%, transparent)); }
+  }
+
+  /* Stated here rather than left to theme.css's blanket, because this file is
+     where the animations are: a map that draws itself in and breathes over a
+     live phase is exactly what "reduce" means, and a reader should find the
+     opt-out beside the thing it opts out of. */
+  @media (prefers-reduced-motion: reduce) {
+    .track,
+    .track-casing,
+    .station.state-running.live .dot,
+    .guide-strip-rail::before {
+      animation: none;
+    }
+    .route-mark .dot,
+    .track { transition: none; }
+  }
+
+  /* A train: the stations one session carries, threaded rather than boxed. */
+  .train-line {
+    fill: none;
+    stroke: color-mix(in oklab, var(--line-progress) 55%, transparent);
+    stroke-width: 8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.22;
+  }
+  .train-ring {
+    fill: none;
+    stroke: color-mix(in oklab, var(--line-progress) 45%, transparent);
+    stroke-width: 1.5;
+    stroke-dasharray: 4 4;
+  }
+  .band-label {
+    font-family: var(--font-display);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    fill: color-mix(in oklab, var(--line-progress) 75%, var(--ink-faint));
+    stroke: var(--surface);
+    stroke-width: 3px;
+    paint-order: stroke fill;
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The guide's line — the same network language, one dimension.
+   *
+   * The map above is a graph and needs an SVG. A section of the guide is a
+   * straight sequence, so it is markup: real buttons, real focus, text that
+   * wraps, tap targets that survive a phone. Only the paint is shared, and it
+   * is shared deliberately — a station in the guide has to read as the same
+   * object as a station on a plan, or the metaphor is decoration.
+   *
+   * Two states, and they are the ones `concepts.md` used to spend two emoji on:
+   * a SOLID station is work the machine does alone, a RINGED one waits for a
+   * person. `--line-gated` is not a new colour for "you" — it is already the
+   * engine's word for "a person must decide".
+   * ---------------------------------------------------------------- */
+  .guide-strip { --dot: 11px; --rail: 34px; }
+
+  .guide-strip ol {
+    display: flex;
+    gap: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    /* The strip hides its scrollbar, so nothing said it scrolled: 720px of
+       stops in a 328px sheet, with the last visible label cut mid-word at
+       every width — which reads as a broken label rather than as more to
+       come. The fade is `components/ui/tabs.tsx`'s, for the same reason and
+       by the same mechanism: a mask works on both themes without a painted
+       cap over the ground it sits on. */
+  }
+
+  /* Gated, like the precedent it takes. `tabs.tsx` writes the same mask as
+     `max-md:`, and this one shipped bare: a mask paints against the BOX, not
+     the content, so on a wide sheet where the strip fits it faded the last 12%
+     of a strip with nothing more to come, held the fade at the right edge once
+     scrolled to the end, and clipped the last button's focus ring. `--bp-shell`
+     is `md`, the width the help sheet stops being a phone's.
+
+     Logical, not physical: `90deg` fades the right edge whichever way the text
+     runs, which is the wrong edge under RTL. `:dir()` is how CSS says "the end
+     edge" for a mask. */
+  @media (max-width: 899px) {
+    .guide-strip ol {
+      mask-image: linear-gradient(to right, black 88%, transparent);
+    }
+    .guide-strip ol:dir(rtl) {
+      mask-image: linear-gradient(to left, black 88%, transparent);
+    }
+  }
+  .guide-strip ol::-webkit-scrollbar { display: none; }
+  .guide-strip li { flex: 1 0 7.5rem; min-width: 0; }
+
+  .guide-strip button {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+    inline-size: 100%;
+    padding-block-end: 0.5rem;
+    text-align: center;
+    cursor: pointer;
+  }
+
+  /* The track: a full-width rule through the row, with the dot sitting on it.
+     Drawn per station rather than as one line behind them so the ends stop at
+     the first and last stop instead of running off into the margin. */
+  .guide-strip-rail {
+    position: relative;
+    display: block;
+    inline-size: 100%;
+    block-size: var(--rail);
+  }
+  .guide-strip-rail::before {
+    content: '';
+    position: absolute;
+    inset-block-start: calc(50% - 1.5px);
+    inset-inline: 0;
+    block-size: 3px;
+    background: var(--track);
+    animation: draw-strip var(--duration-draw) var(--ease-transit) backwards;
+  }
+  .guide-strip li:first-child .guide-strip-rail::before { inset-inline-start: 50%; }
+  .guide-strip li:last-child .guide-strip-rail::before { inset-inline-end: 50%; }
+
+  @keyframes draw-strip { from { opacity: 0; transform: scaleX(0.2); } }
+
+  .guide-strip-dot {
+    position: absolute;
+    inset-block-start: calc(50% - var(--dot) / 2);
+    inset-inline-start: calc(50% - var(--dot) / 2);
+    inline-size: var(--dot);
+    block-size: var(--dot);
+    border-radius: 50%;
+    border: 3px solid var(--track);
+    background: var(--surface);
+    transition: transform var(--duration-fast) var(--ease-transit);
+  }
+  [data-actor='machine'] .guide-strip-dot,
+  [data-actor='machine'] > .guide-strip-dot {
+    border-color: var(--line-done);
+    background: var(--line-done);
+  }
+  [data-actor='person'] .guide-strip-dot,
+  [data-actor='person'] > .guide-strip-dot {
+    border-color: var(--line-gated);
+    background: var(--surface);
+  }
+
+  .guide-strip button:hover .guide-strip-dot,
+  .guide-strip button:focus-visible .guide-strip-dot { transform: scale(1.25); }
+  .guide-strip button[aria-current] .guide-strip-dot {
+    box-shadow: 0 0 0 4px color-mix(in oklab, var(--action) 30%, transparent);
+  }
+
+  .guide-strip-num {
+    font-family: var(--font-mono);
+    font-size: var(--text-2xs);
+    font-weight: 600;
+    color: var(--ink-faint);
+  }
+  .guide-strip button[aria-current] .guide-strip-num { color: var(--action); }
+
+  .guide-strip-label {
+    font-family: var(--font-display);
+    font-size: var(--text-2xs);
+    line-height: 1.25;
+    color: var(--ink-muted);
+    padding-inline: 0.375rem;
+    /* Two lines, then ellipsis — a station name is a signpost, not the card. */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
+  .guide-strip button:hover .guide-strip-label,
+  .guide-strip button[aria-current] .guide-strip-label { color: var(--ink); }
+
+  .guide-strip-key {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1rem;
+    margin-block-start: 0.5rem;
+    font-size: var(--text-2xs);
+    color: var(--ink-faint);
+  }
+  .guide-strip-key span {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 1rem;
+    padding-inline-start: 0.25rem;
+  }
+  .guide-strip-key .guide-strip-dot { position: static; inline-size: 9px; block-size: 9px; }
+
+  /* The connective tissue between the cards themselves: the same track, turned
+     vertical, running down the gutter. This is what a route looks like on a
+     phone, and it is the reason the cards read as stops rather than as a list
+     that happens to be in order. */
+  .guide-route { position: relative; --stop-y: 1.35rem; --card-gap: 0.75rem; }
+  .guide-route > li { position: relative; padding-inline-start: 1.75rem; }
+  .guide-route > li::before {
+    content: '';
+    position: absolute;
+    inset-inline-start: 0.3125rem;
+    /* Down through the gap between cards, not stopping at each card's edge.
+       Track that restarts at every station is a dashed line, and a dashed line
+       already means something else here — a phase whose dependency is not met. */
+    inset-block: 0 calc(-1 * var(--card-gap));
+    inline-size: 3px;
+    background: var(--track);
+  }
+  /* The line starts at the first stop and ends at the last: a route has two
+     ends, and track running off past them says there is more to come. */
+  .guide-route > li:first-child::before { inset-block-start: var(--stop-y); }
+  .guide-route > li:last-child::before {
+    inset-block-end: calc(100% - var(--stop-y));
+  }
+  .guide-route > li > .guide-stop {
+    position: absolute;
+    inset-block-start: calc(var(--stop-y) - 6.5px);
+    inset-inline-start: 0;
+    inline-size: 13px;
+    block-size: 13px;
+    border-radius: 50%;
+    border: 3px solid var(--track);
+    background: var(--surface);
+  }
+  .guide-route > li > .guide-stop[data-actor='machine'] {
+    border-color: var(--line-done);
+    background: var(--line-done);
+  }
+  .guide-route > li > .guide-stop[data-actor='person'] { border-color: var(--line-gated); }
+
+  /* ---------------------------------------------------------------- *
+   * The legend
+   *
+   * It draws the REAL mark, at the map's own radius, scaled by its viewBox —
+   * so a legend of five plain dots can never again teach a language the map
+   * does not speak.
+   * ---------------------------------------------------------------- */
+  .legend-mark { display: inline-block; flex: none; vertical-align: middle; overflow: visible; }
+  .legend-line {
+    display: inline-block;
+    inline-size: 18px;
+    block-size: 3px;
+    border-radius: 2px;
+    background: var(--track);
+  }
+  .legend-line.critical {
+    block-size: 4px;
+    background: color-mix(in oklab, var(--action) 70%, var(--track));
+  }
+  .legend-line.train {
+    block-size: 6px;
+    background: color-mix(in oklab, var(--line-progress) 55%, transparent);
+  }
+  /* The ruling, as the map draws it: a hairline, on the map's own paper. Two
+     earlier versions of this swatch taught the wrong thing — first two bands
+     side by side (the alternating fill, since deleted), then a block of paper
+     with the rule on its leading EDGE, which reads as a border. The rule is
+     what separates two waves, so it stands between two halves of paper. */
+  .legend-band {
+    display: inline-block;
+    inline-size: 18px;
+    block-size: 12px;
+    background: linear-gradient(
+      to right,
+      var(--ground-deep) calc(50% - 0.5px),
+      var(--rule) calc(50% - 0.5px),
+      var(--rule) calc(50% + 0.5px),
+      var(--ground-deep) calc(50% + 0.5px)
+    );
+  }
+}

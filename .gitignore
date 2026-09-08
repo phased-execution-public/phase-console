@@ -1,0 +1,26 @@
+.DS_Store
+node_modules/
+dist/
+*.local.json
+
+# Local token drop-point — nothing in it is ever tracked. How to create the one
+# useful token lives in docs/releasing.md §Secrets.
+.secrets/
+# `npm pack` emits type-stripped .js beside each server .ts (see
+# viewer/server/tsconfig.pack.json) and postpack deletes them — this guards a
+# crashed pack from committing strays. fallback-sw.js is real, tracked source.
+viewer/server/**/*.js
+!viewer/server/fallback-sw.js
+
+
+# Session worktrees and local Claude state (EnterWorktree puts worktrees here).
+.claude/
+
+# Skill-eval fixtures and their runs — `claude plugin eval` writes them here.
+# Machine-generated, sized by whoever ran them, and never part of what ships
+# (`.github/scripts/assert-tarball.sh` names `evals/` in its never-ship set).
+# This lived in .git/info/exclude, which is per-clone: on anybody else's machine
+# the directory came back as untracked noise, and the rule it encodes was
+# invisible. A shared exclusion belongs in the tracked file.
+evals/
+

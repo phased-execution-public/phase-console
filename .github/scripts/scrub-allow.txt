@@ -1,0 +1,23 @@
+# Exact strings the email check may ignore, one per line — vendor license
+# banners that surface inside built client assets, and URL userinfo that only
+# LOOKS like an address. Placeholders (@example.com, @example.org, @x.com) are
+# always allowed and do not belong here.
+TAP_TOKEN@github.com
+TOKEN@github.com
+# The SSH userinfo every GitHub clone URL carries — `git@github.com:owner/repo.git`.
+# It is nobody's address: `git` is the fixed account name GitHub's SSH endpoint
+# answers to, and the issue inventory has to recognise that spelling of a remote
+# to know which repositories it may ask `gh` about at all.
+git@github.com
+# URL userinfo in the fixture that proves the webhook masker strips credentials
+# (`https://admin:hunter2@internal.example.com/x`). `internal.example.com` is a
+# subdomain of an RFC 2606 reserved name, so it is documentation by definition —
+# but the always-allowed placeholder list matches `@example.com` exactly, not its
+# subdomains, and widening that rule to please one fixture is the kind of
+# loosening this gate exists to refuse.
+hunter2@internal.example.com
+# A real WSL1 kernel banner, verbatim, in the fixture that proves platform.ts
+# tells WSL1 from WSL2 — `Linux version 4.4.0-19041-Microsoft (Microsoft@…)`.
+# It is a build-host string that happens to match the email shape; changing the
+# fixture to please the scanner would make the test stop testing the thing.
+Microsoft@Microsoft.com

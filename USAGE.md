@@ -1,0 +1,91 @@
+# Using phased-execution (right-sized sessions, QA on request)
+
+**English** · [فارسی](USAGE.fa.md)
+
+`phased-execution` **plans** large multi-phase work and **runs** it in right-sized sessions — several
+phases usually share a session (sized to ~0.2 × the model's window in phase weight; ~200K for 1M-class
+models), each phase still gets its own handoff, and a copy-pasteable boot prompt chains the sessions.
+Phases whose **scopes are disjoint** (the repos each touches, from the plan's Repos column) may run as
+separate sessions at the same time; anything sharing a repo runs one at a time. Every phase-finish runs
+the phase's own **Verification commands green** before handing off.
+
+**QA subagents are opt-in (off by default).** When you ask for QA — a `**QA gate:** on` line in the
+plan's §Session budget, `new-handoff.sh --qa` at a finish, or a plan that already has a
+`test-status.md` — each finished phase is verified by a **fresh-context QA subagent** that reads the
+real diff cold and records `pass | fail | waived`; a `fail` — and a verdict still **`pending`** — gates
+every dependent until re-QA'd. Three ways out: re-QA to `pass`/`waived`, `**QA gate:** off` in the plan's
+§Session budget (the verdicts stay recorded, they stop holding dependents), or **closing** the plan,
+which retires its reports without pretending they passed. The autopilot climbs the first of those by
+itself and asks you only when it runs out.
+`scripts/phase-graph.sh <slug> --qa-mode` tells you which regime a plan is in.
+
+**A plan you will never finish can be closed.** `scripts/close-plan.sh <slug> --reason "…"` marks it
+`abandoned` (or `superseded`, or `complete`) with a date and a reason; `--reopen` reverses it. A closed
+plan stops reporting ready phases, boot prompts, warnings and notifications, while its board, its
+history and its search results stay exactly where they were — closing quiets a plan, it never hides one.
+
+This file is a human-facing orientation. The executable procedure — the three modes, the helper scripts,
+and the guardrails — lives in `SKILL.md` + `references/`; that is what Claude loads and follows.
+
+## Seeing it all at once — the console
+
+```bash
+~/.claude/skills/phased-execution/start        # opens http://127.0.0.1:4123 in your browser
+phase-console                                  # same thing, when installed as a plugin or from a clone
+phase-console ~/code/your-repo                 # or point it straight at a repository
+```
+
+
+**Phase Console** (`viewer/`) is a local web app for reading this system: every plan with its live
+board, the dependency graph drawn as a route map, phase and handoff detail, the boot prompt for any
+ready phase, portfolio statistics (velocity, critical paths, locks, health), and full-text search
+across plans and handoffs. It updates itself as agent sessions write files, and it takes every status
+claim from `scripts/phase-graph.sh` rather than recomputing it. Read-only unless you pass
+`--allow-writes` (guarded scaffold / QA / lock / close verbs), `--allow-run` (the **autopilot** — one
+`claude -p` per phase, driving a plan unattended, with approvals for anything reaching outside the
+working tree), `--allow-agent` (interactive `claude` sessions in a browser terminal, on the
+**Sessions** page, plus a *New plan with AI* wizard that authors a plan from a brief),
+`--allow-accounts` (register several **Claude accounts** per instance — sign-ins or
+`claude setup-token` tokens — pick one per run, and let a run that hits its usage limit switch to
+the account with headroom; the usage meters themselves need no flag),
+`--allow-mcp` (register **MCP servers** — a browser, an issue tracker, a docs server — hold their
+credentials, and attach them to a plan, a run or one phase; a phase whose servers cannot connect
+runs without them and says so — or parks *before* it spends anything, if the plan or the run asks
+for that — and reading the registry and its statuses needs no flag),
+`--allow-webhooks` (**POST every announcement somewhere else** — a Slack channel, a Discord server,
+a Telegram chat, your own relay; the one switch that sends anything off this machine, so off means
+no outbound request at all even for a URL already registered, payloads carry ids and titles with
+secret-shaped strings masked, and reading the destination list needs no flag —
+[docs/webhooks.md](https://github.com/phased-execution-public/phase-console/blob/main/docs/webhooks.md)),
+or `--allow-terminal` (a real shell). The server itself never pushes — a session's `git push` is denied
+unless the run opens a PR, and then it is a card and one tap. All seven default off. One-time setup per machine:
+`cd viewer && npm ci && npm run build` — see `viewer/README.md`.
+
+**It heals its own runs, and asks once.** A phase that stopped short is classified (never started,
+work in progress, done but unrecorded, verification red, declared blocked, a resource wall, a stale
+or live foreign claim, a manual gate…) and its situation's ladder is climbed by the autopilot itself —
+at boot, on a docs change, every few minutes, a minute after any stop, and on Recover & continue —
+within caps in rungs **and** dollars you set in Settings ▸ Automation; when the ladder is spent it
+leaves **one errand** (what is needed, how to give it, what it tried) and drives everything else.
+Every Ways forward shows the situation, the rungs tried and the next one; the dashboard's *Waiting on
+you* lists only errands, permission cards and sign-ins; the Pulse shows each plan's last convergence
+pass. Install the session-presence hook (Settings ▸ Automation ▸ Session presence or `phase-console
+install-hooks`) and a hand-run `claude` in the repository is seen too — queued behind while it lives,
+its lock released the moment it ends. A **boarding schedule** (Settings ▸ Automation, off by default)
+says when this console may START phases at all — windows, cron openings and quiet hours that win over
+both; outside it a ready phase queues saying when boarding opens, a recovery you ask for is never
+held, and a phase already running is never interrupted. `docs/loop.md` is the specification.
+
+
+## Where things live (two places)
+
+- **The skill** (this repo — cloned to `~/.claude/skills/phased-execution`, installed as a plugin,
+  or a copy inside a hub folder): the procedure (`SKILL.md`), `scripts/`, `references/`, `templates/`,
+  `tests/` and `viewer/`. If you run several Claude homes (`~/.claude`, `~/.claude-a`, …), each
+  holds its own clone — edit one, then `commit → push → pull` in the others so all stay identical.
+- **The work-state** (your project repo's `docs/`): `plans/<slug>.md` and
+  `handoffs/<slug>/{phase-NN-*.md, INDEX.md, .locks/}` (+ `reports/` and `test-status.md` when QA is
+  enabled, and `gate-status.md` once any gate is cleared) — committed + pushed, so any account or
+  machine can pull and continue a partially-finished plan.
+
+Full procedure: `SKILL.md` and its `references/`.

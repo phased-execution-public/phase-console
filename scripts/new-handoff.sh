@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# Scaffold a phase handoff + create/update the per-plan INDEX.md.
+# Auto-fills graph-derived frontmatter (depends_on / blocks) and the
+# "▶ Start next phase(s)" section (one boot prompt per phase THIS phase unblocks)
+# by delegating to scripts/phase-graph.sh.
+#
+# Usage: new-handoff.sh <slug> <phase-number> <title> [status]
+#   status : complete | in-progress | blocked | pending  (default: complete)
+#   --qa   : force QA ON for this finish (the user asked for QA now) even if the
+#            plan's qa-mode is off — creates test-status.md and turns on gating.
+# Run from repo root that owns docs/, or set DOCS_ROOT.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENGINE="$SKILL_DIR/scripts/phase-graph.sh"
+
+# F8: optional --force (anywhere in args) re-scaffolds an existing handoff (repair).
+force=0; force_qa=0; _args=()
+for _a in "$@"; do
+  case "$_a" in
+    --force) force=1 ;;
+    --qa)    force_qa=1 ;;
+    *)       _args+=("$_a") ;;
+  esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+slug="${1:?usage: new-handoff.sh <slug> <phase-number> <title> [status] [--force] [--qa]}"
+phase="${2:?phase number required}"
+title="${3:?title required}"
+status="${4:-complete}"
+# `08` is what the handoff FILENAME says, so it is what gets typed. Normalise at
+# the door: below it is arithmetic (`phase + 1`), a `printf '%02d'` and a
+# comparison against the engine's own (unpadded) phase numbers.
+case "$phase" in ''|*[!0-9]*) echo "phase must be a number, got: $phase" >&2; exit 2 ;; esac
+phase=$((10#$phase))
+
+# shellcheck source=/dev/null
+. "$SKILL_DIR/scripts/instance.sh"
+DOCS_ROOT="$(pe_docs_root)"; export DOCS_ROOT
+if [ ! -d "$DOCS_ROOT/docs" ]; then
+  printf 'ERROR: docs/ not found under DOCS_ROOT=%s\n' "$DOCS_ROOT" >&2
+  printf '  → run from the repo root, or: DOCS_ROOT=/path/to/repo %s ...\n' "$(basename "$0")" >&2
+  exit 1
+fi
+
+dir="$DOCS_ROOT/docs/handoffs/${slug}"
+mkdir -p "$dir"
+padded="$(printf '%02d' "$((10#$phase))")"
+date_str="$(date +%F)"
+this_handoff="phase-${padded}-${title}.md"
+
+# Read memory key from plan frontmatter (default: project_<slug>).
+plan_file="$DOCS_ROOT/docs/plans/${slug}.md"
+memory_key="$(grep -m1 '^memory:' "$plan_file" 2>/dev/null \
+  | sed 's/^memory:[[:space:]]*//' | sed 's/[[:space:]]*#.*$//' || true)"
+memory_key="${memory_key:-project_${slug}}"
+
+# Determine next phase number (or "none" if this is the final phase).
+next_phase="$((phase + 1))"
+if [ -f "$plan_file" ]; then
+  total_phases="$(grep -m1 '^phases:' "$plan_file" \
+    | sed 's/^phases:[[:space:]]*//' | sed 's/[[:space:]]*#.*$//' || true)"
+  if [ -n "$total_phases" ] && [ "$total_phases" != "TODO" ] && [ "$phase" = "$total_phases" ]; then
+    next_phase="none"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Graph-derived frontmatter. Degrade gracefully if the plan has no parseable
+# "## Phase graph" table yet (GRAPH_OK=0 → legacy linear behaviour).
+# ---------------------------------------------------------------------------
+# Scaffolding a handoff into a closed plan is almost always a mistake — someone is
+# working from a stale boot prompt on a plan that has been walked away from. Say so,
+# and name the way back, rather than silently producing a handoff nobody will read.
+if closed="$(bash "$ENGINE" "$slug" --closed 2>/dev/null)" && [ "$force" = 0 ]; then
+  echo "refusing: $slug is closed (${closed#closed })" >&2
+  echo "  → reopen it first:  scripts/close-plan.sh $slug --reopen" >&2
+  echo "  → or pass --force to scaffold into the closed plan anyway" >&2
+  exit 2
+fi
+
+GRAPH_OK=0
+if bash "$ENGINE" "$slug" --ready >/dev/null 2>&1; then GRAPH_OK=1; fi
+
+# Is this the LAST phase — the one that earns the closeout brief?
+#
+# The frontmatter `phases:` count was the only answer, and `phases: TODO` is what
+# the shipped template writes, so a plan whose author never filled it in never
+# got a closeout: the final handoff of a finished plan was told "this does not
+# unblock any phase yet — downstream phases still wait on other dependencies",
+# which is precisely backwards. Ask the GRAPH instead, and keep the frontmatter
+# as the fast path it always was. This handoff does not exist yet, so this phase
+# is still in one of the open buckets — exclude it and see whether anything else
+# is left. A handoff that is not `complete` finishes nothing, so it never closes.
+if [ "$next_phase" != none ] && [ "$GRAPH_OK" = 1 ] && [ "$status" = complete ]; then
+  open_left="$(bash "$ENGINE" "$slug" --memory-block 2>/dev/null \
+    | awk -F':' '/^(ready|waiting|in-progress|stuck):/ { sub(/^[^:]*:/, ""); print }' \
+    | tr -c '0-9' '\n' | grep -v '^$' | grep -vx "$phase" || true)"
+  [ -z "$open_left" ] && next_phase=none
+fi
+
+deps_csv=""; blocks_csv=""
+if [ "$GRAPH_OK" = 1 ]; then
+  deps_csv="$(bash "$ENGINE" "$slug" --deps "$phase" 2>/dev/null | sed 's/^ *//; s/ *$//; s/  */, /g')"
+  blocks_csv="$(bash "$ENGINE" "$slug" --dependents "$phase" 2>/dev/null | sed 's/^ *//; s/ *$//; s/  */, /g')"
+fi
+
+# Create INDEX.md if missing.
+index="$dir/INDEX.md"
+if [ ! -e "$index" ]; then
+  sed -e "s|{{SLUG}}|${slug}|g" \
+      -e "s|{{MEMORY_KEY}}|${memory_key}|g" \
+    "$SKILL_DIR/templates/INDEX.md" > "$index"
+  echo "created $index"
+fi
+
+# Track QA status — OPT-IN since v3. The engine's --qa-mode says whether this plan
+# runs QA (on: dispatch a subagent at finish · waived: record rows, never dispatch ·
+# off: no QA artifact at all — the default). Only a non-off mode creates/updates
+# test-status.md, whose existence is what turns on dependent gating.
+# The PLAN's regime decides whether a QA artifact exists at all (and whether the
+# backfill runs); THIS PHASE's decides the row we are about to write, because the
+# row is the phase's claim about itself. Asking the plan for both meant a phase
+# that opted IN with `- **QA:** on` on a waived plan was recorded `waived` — a
+# verdict nobody gave, on the one phase the operator singled out for review.
+plan_qa_mode="$(bash "$ENGINE" "$slug" --qa-mode 2>/dev/null || echo off)"
+qa_mode="$(bash "$ENGINE" "$slug" --qa-mode "$phase" 2>/dev/null || echo "$plan_qa_mode")"
+if [ "$force_qa" = 1 ]; then
+  case "$qa_mode" in off) qa_mode="on (--qa flag)" ;; esac
+  case "$plan_qa_mode" in off) plan_qa_mode="on (--qa flag)" ;; esac
+fi
+# A phase that opts IN needs the artifact even when the plan says nothing — its
+# verdict has to have somewhere to live.
+case "$qa_mode" in on*) case "$plan_qa_mode" in off) plan_qa_mode="on (phase directive)" ;; esac ;; esac
+qa_status="$dir/test-status.md"
+# Append a row to the `## QA status` TABLE — after its last row, before the
+# next heading — never to the end of the file. A ledger `qa-record.sh` has
+# written since rounds existed carries a `## QA rounds` table below the status
+# table, so an end-of-file append landed the phase's `pending` row there as a
+# three-cell line under the wrong header: `qa_result` (which stops at the first
+# table) read the phase as `none`, the boot prompt never named its verdict
+# duty, and the dependents were held behind a phase that read as unreviewed.
+# Measured on phase-console-commerce, phases 9, 11, 12 and 13.
+qa_status_append_row() {  # qa_status_append_row <file> <row>
+  local tmp="$1.tmp.$$"
+  awk -v row="$2" '
+    BEGIN{ insec=0; seen=0; done=0 }
+    {
+      if ($0 ~ /^[[:space:]]*#/) {
+        if (insec && !done) { print row; done=1 }
+        insec = (tolower($0) ~ /^[[:space:]]*##[[:space:]]+qa[[:space:]]+status/) ? 1 : 0
+        seen=0; print; next
+      }
+      if (insec) {
+        if ($0 ~ /^[[:space:]]*\|/) { seen=1; print; next }
+        if (seen && !done) { print row; done=1; insec=0 }
+      }
+      print
+    }
+    END{ if (!done) print row }
+  ' "$1" > "$tmp" && mv "$tmp" "$1"
+}
+# Whether a QA artifact exists at all is the PLAN's call (plus a phase opting in
+# above): a phase that exempts itself on a gating plan still needs the table, so
+# its `waived` row can say so where the engine reads it.
+if [ "$plan_qa_mode" != off ]; then
+  created_qa=0
+  if [ ! -f "$qa_status" ]; then
+    {
+      printf '# QA / test status — %s\n\n' "$slug"
+      printf 'Per-phase QA results recorded by phased-execution'\''s QA step. The engine reads the\n'
+      printf '"Result" column to gate dependents: a phase is *verified* only when its handoff is\n'
+      printf 'complete AND its Result is `pass` or `waived`. Values: pass | fail | pending | waived.\n\n'
+      printf '## QA status\n\n| Phase | Result | Report |\n|------:|--------|--------|\n'
+    } > "$qa_status"
+    created_qa=1
+    echo "created $qa_status"
+  fi
+  # Mid-plan activation backfill: if the file is NEW but earlier phases already have
+  # complete handoffs, record them as waived (pre-activation) — otherwise gating turns
+  # on plan-wide and every previously-done phase reads qa_result=none, retroactively
+  # flipping its dependents ready→waiting.
+  if [ "$created_qa" = 1 ]; then
+    for _hf in "$dir"/phase-*.md; do
+      [ -e "$_hf" ] || continue
+      _hn="$(basename "$_hf" | sed -E 's/^phase-0*([0-9]+)-.*/\1/')"
+      case "$_hn" in ''|*[!0-9]*) continue ;; esac
+      [ "$_hn" = "$phase" ] && continue
+      _hst="$(grep -m1 '^status:' "$_hf" | sed 's/^status:[[:space:]]*//; s/[[:space:]]*#.*$//' || true)"
+      [ "$_hst" = complete ] || continue
+      if ! grep -qE "^\|[[:space:]]*${_hn}[[:space:]]*\|" "$qa_status"; then
+        qa_status_append_row "$qa_status" "| $_hn | waived | - |"
+        echo "backfilled phase $_hn as waived (completed before QA activation)"
+      fi
+    done
+  fi
+  if ! grep -qE "^\|[[:space:]]*${phase}[[:space:]]*\|" "$qa_status"; then
+    # `off` here is a PHASE that exempted itself (`- **QA:** off`) on a plan that
+    # otherwise gates — the artifact exists because of the plan. Its row is
+    # `waived`, the same word a plan-level waiver writes: no verdict is owed and
+    # none will hold anything. `pending` would be a debt nobody intends to pay.
+    case "$qa_mode" in
+      waived*|off*) qa_res="waived" ;;
+      *)            qa_res="pending"; [ "$status" = complete ] || qa_res="-" ;;
+    esac
+    qa_status_append_row "$qa_status" "| $phase | $qa_res | - |"
+    echo "updated $qa_status"
+  fi
+fi
+
+# Scaffold the handoff from template.
+dest="$dir/${this_handoff}"
+if [ -e "$dest" ] && [ "$force" = 0 ]; then
+  echo "refusing to overwrite existing handoff: $dest (use --force to repair)" >&2
+  exit 1
+fi
+[ -e "$dest" ] && echo "overwriting existing handoff (--force): $dest"
+sed -e "s|{{SLUG}}|${slug}|g" \
+    -e "s|{{DATE}}|${date_str}|g" \
+    -e "s|{{PHASE}}|${phase}|g" \
+    -e "s|{{TITLE}}|${title}|g" \
+    -e "s|{{STATUS}}|${status}|g" \
+    -e "s|{{NEXT_PHASE}}|${next_phase}|g" \
+    -e "s|{{THIS_HANDOFF}}|${this_handoff}|g" \
+    -e "s|{{DEPENDS_ON}}|${deps_csv}|g" \
+    -e "s|{{BLOCKS}}|${blocks_csv}|g" \
+    -e "s|{{MEMORY_KEY}}|${memory_key}|g" \
+  "$SKILL_DIR/templates/handoff.md" > "$dest"
+
+# ---------------------------------------------------------------------------
+# Build the "▶ Start next phase(s)" body and splice it into the {{NEXT_PROMPTS}}
+# placeholder. One self-contained boot prompt per phase this phase unblocks.
+# ---------------------------------------------------------------------------
+prompts_tmp="$(mktemp)"
+{
+  if [ "$next_phase" = none ]; then
+    printf '## 🏁 Final phase — closeout\n\n'
+    # The closeout brief is a claim about the PLAN, not about this phase.
+    case "$plan_qa_mode" in
+      on*)     printf -- '- Dispatch the fresh **qa-full** QA subagent (this plan runs QA) — brief via `scripts/next-phase-prompt.sh %s none`.\n' "$slug" ;;
+      waived*) printf -- '- QA gate waived for this plan — no qa-full subagent; verify yourself.\n' ;;
+    esac
+    printf -- '- Set `status: complete` in `docs/plans/%s.md`.\n' "$slug"
+    printf -- '- Run §End-to-end verification in the plan (always — QA on or off).\n'
+    printf -- '- Confirm every phase is `done` (`scripts/phase-graph.sh %s` shows 🏁), not just this one.\n' "$slug"
+    printf -- '- Check memory `%s` for outstanding user gates (push / prod deploy).\n' "$memory_key"
+    printf -- '- `/clear` when done.\n'
+  elif [ "$GRAPH_OK" = 1 ]; then
+    ready="$(bash "$ENGINE" "$slug" --ready-after "$phase" 2>/dev/null || true)"
+    if [ -z "$ready" ]; then
+      printf '_Completing Phase %s does not unblock any phase yet — downstream phases still\n' "$phase"
+      printf 'wait on other dependencies. Run `scripts/phase-graph.sh %s` for the WAITING list._\n' "$slug"
+    else
+      nready=$(printf '%s\n' $ready | grep -c . || true)
+      if [ "$nready" -gt 1 ]; then
+        printf '> Phases **%s** are all unblocked — run them in any order. Ones with DISJOINT\n' "$(echo $ready | sed 's/ /, /g')"
+        printf '> scopes may run as concurrent sessions; ones sharing a repo run one at a time. Each boot\n'
+        printf '> prompt below states its scope and the `phase-lock.sh … conflicts` check to run first.\n'
+        printf '> If the remaining budget allows, the finishing session MAY instead continue straight into\n'
+        printf '> ONE of them (not a 🔒GATED one). Commit before switching sessions; never `git stash`.\n\n'
+      else
+        # Single next phase — batch-friendly whenever the remaining budget fits (gated
+        # phases excepted: they always start fresh after their gates are confirmed).
+        sz="$(bash "$ENGINE" "$slug" --size "$ready" 2>/dev/null || echo M)"
+        rdeps=" $(bash "$ENGINE" "$slug" --deps "$ready" 2>/dev/null || true) "
+        gated_next="$(bash "$ENGINE" "$slug" --gated "$ready" 2>/dev/null || echo no)"
+        if [ "$gated_next" != yes ]; then
+          case "$rdeps" in
+            *" $phase "*)
+              printf '> _Phase %s (size %s) is sequential on this one — you MAY continue into it in the SAME\n> session if it fits the remaining budget (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
+            *)
+              printf '> _Phase %s (size %s) is independent of this one — it may still share the SAME session\n> if the remaining budget allows (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
+          esac
+        fi
+      fi
+      for p in $ready; do
+        gated="$(bash "$ENGINE" "$slug" --gated "$p" 2>/dev/null || echo no)"
+        gmark=""
+        if [ "$gated" = yes ]; then
+          gk="$(bash "$ENGINE" "$slug" --gate-kind "$p" 2>/dev/null || echo human)"
+          case "$gk" in
+            ai)   gmark=' — 🔒 GATED·ai (the session clears the gate first)' ;;
+            auto) gmark=' — 🔒 GATED·auto (confirm --gate-status reads clear)' ;;
+            *)    gmark=' — 🔒 GATED·human (operator must approve first)' ;;
+          esac
+        fi
+        printf '### Phase %s%s\n\n' "$p" "$gmark"
+        printf '```\n'
+        bash "$ENGINE" "$slug" --boot-prompt "$p"
+        printf '```\n\n'
+      done
+    fi
+  else
+    # Legacy fallback: no parseable graph → single linear next-phase prompt.
+    printf '```\n'
+    printf '/phased-execution\n\n'
+    printf 'Continue the "%s" plan — start Phase %s in this fresh session.\n' "$slug" "$next_phase"
+    printf 'Bootstrap from disk only:\n'
+    printf -- '- docs/handoffs/%s/%s\n' "$slug" "$this_handoff"
+    printf -- '- docs/plans/%s.md §Phase %s + §Session budget (model, budget, branch)\n' "$slug" "$next_phase"
+    printf -- '- memory %s\n' "$memory_key"
+    printf 'Then build the p%s.task* list and implement Phase %s to its exit criteria.\n' "$next_phase" "$next_phase"
+    printf 'Finish with the handoff (bash scripts/new-handoff.sh %s %s <kebab-title> complete) —\n' "$slug" "$next_phase"
+    printf 'never end the session without one.\n'
+    printf '```\n'
+  fi
+} > "$prompts_tmp"
+
+awk -v sf="$prompts_tmp" '
+  $0 == "{{NEXT_PROMPTS}}" { while ((getline l < sf) > 0) print l; next }
+  { print }
+' "$dest" > "$dest.tmp" && mv "$dest.tmp" "$dest"
+rm -f "$prompts_tmp"
+
+# Append INDEX row if not already listed.
+if ! grep -qF "${this_handoff}" "$index"; then
+  printf '| %s | %s | %s | [%s](%s) |\n' \
+    "$padded" "$title" "$status" "${this_handoff}" "${this_handoff}" >> "$index"
+fi
+
+echo "created $dest"
+echo "updated $index"

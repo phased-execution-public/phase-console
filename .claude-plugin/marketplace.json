@@ -1,0 +1,55 @@
+{
+  "name": "phased-execution-public",
+  "description": "Claude Code plugins by phased-execution-public.",
+  "owner": {
+    "name": "phased-execution-public",
+    "url": "https://github.com/phased-execution-public"
+  },
+  "plugins": [
+    {
+      "name": "phased-execution",
+      "source": "./",
+      "strict": false,
+      "description": "Run large work as a dependency graph of right-sized Claude sessions — a plan, a handoff per phase, and a ready-set that is RECOMPUTED from the files every time rather than stored as a cursor, so out-of-order and resumed work stay correct. Ships a zero-dependency local web console for the repository you point it at: eight destinations in three bands — the work (Now · Plans · Runs · Sessions), the record (Repo · Insights · Debug) and the console (Settings). Its autopilot heals its own runs. A stopped phase is never treated by the shape of its halt: the console classifies it from evidence — the board, the handoff, the run record, the lock, the working tree, the transcript, the declared outcome — and climbs a bounded ladder of remediations, each one journalled and never tried twice for the same situation. What the ladder cannot settle is parked with ONE errand naming what a person has to do, and the rest of the plan keeps moving. Gates are categorized by who can clear them: an ai gate is the booted session’s first task — verify the conditions, do the work to make them true, record the clearance, continue — while a human gate carries numbered operator steps beside an Approve button, and one approval clears a gate of any kind and can resume the run it parked. QA is opt-in and can be decided per phase, and a pending verdict holds dependents exactly as a failure does. Register more than one Claude account and watch their real usage meters: at a wall a run switches accounts, waits out the window and resumes itself, or pauses — your choice, per run. Name the MCP servers a plan needs and they are proved BEFORE a run spends anything, because an unattended session cannot sign one in; by default the phase runs without the unreachable server and records what it could not do, and a plan or a single phase can insist instead. A session declares how it ended rather than leaving the runner to read prose — a phase waiting on a CI build, a deploy window or a PR merging itself parks with its window and its watch refs and resumes its own session when the window elapses. Runs can take a git worktree of their own, including on a superproject, where isolation builds a mirror: one linked worktree per scoped repository, granted all-or-nothing and torn down keeping anything that holds work. Plus scope-aware concurrency, freeze at four sizes up to the whole console, closable plans, remaining-time estimates, a plan-mode wizard, an issues estate that turns somebody else’s bug report into a plan in one click, a redacted debug bundle sized for a context window, and Tailscale onboarding to drive it from your phone — every destination measured at 320–430 px with 44 px tap targets. v4.0 is the parallel repaint that added Repo and Debug and made the automation posture explicit. v4.1 is the first tagged release: alongside the plugin channel, which is unchanged and is still every push to main, each version now also carries a vX.Y.Z tag and a GitHub Release with the packed tarball — so a machine without git can be handed exactly what a tag holds, and an install can be pinned to a version rather than tracking main.",
+      "author": {
+        "name": "phased-execution-public",
+        "url": "https://github.com/phased-execution-public"
+      },
+      "homepage": "https://github.com/phased-execution-public/phase-console",
+      "repository": "https://github.com/phased-execution-public/phase-console",
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": [
+        "planning",
+        "phases",
+        "handoff",
+        "gates",
+        "approvals",
+        "sessions",
+        "context",
+        "workflow",
+        "dependency-graph",
+        "concurrency",
+        "scheduler",
+        "queue",
+        "estimates",
+        "dashboard",
+        "autopilot",
+        "unattended",
+        "recovery",
+        "accounts",
+        "usage-limits",
+        "mcp",
+        "multi-project",
+        "monorepo",
+        "tailscale",
+        "remote-access"
+      ],
+      "tags": [
+        "planning",
+        "workflow",
+        "productivity"
+      ]
+    }
+  ]
+}

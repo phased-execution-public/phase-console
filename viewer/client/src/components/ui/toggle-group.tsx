@@ -1,0 +1,56 @@
+import * as ToggleGroupPrimitive from '@radix-ui/react-toggle-group';
+import type { ComponentProps } from 'react';
+import { cn } from '@/lib/cn';
+
+/**
+ * A segmented control — the theme switcher, a sort, a density. One value of
+ * several (`type="single"`) or a set (`type="multiple"`); Radix owns the
+ * roving focus and the `aria-pressed`/`aria-checked` semantics that the old
+ * hand-rolled `ButtonGroup` had to be given by each caller.
+ *
+ * The selected segment is amber ONLY when the control narrows a view (a
+ * filter); for a plain choice (theme, sort) pass `accent={false}` and it reads
+ * as the raised surface. Amber is for what needs a person, not for "selected".
+ *
+ * `shrink-0`, and the radius on the end segments rather than an
+ * `overflow-hidden` on the root — for the reason spelled out at `ButtonGroup`
+ * (`button.tsx`), which is the same primitive with the roving focus written by
+ * hand and which shipped the defect: a segmented control that both clips and
+ * shrinks will one day be narrower than the floors its own items declare, and
+ * then it hides them rather than showing them squeezed. Nothing between a
+ * control and the viewport may clip it.
+ */
+export function ToggleGroup({
+  className,
+  accent = false,
+  ...props
+}: ComponentProps<typeof ToggleGroupPrimitive.Root> & { accent?: boolean }) {
+  return (
+    <ToggleGroupPrimitive.Root
+      data-accent={accent ? '' : undefined}
+      className={cn('group/toggle inline-flex shrink-0 rounded border border-rule', className)}
+      {...props}
+    />
+  );
+}
+
+export function ToggleItem({ className, ...props }: ComponentProps<typeof ToggleGroupPrimitive.Item>) {
+  return (
+    <ToggleGroupPrimitive.Item
+      className={cn(
+        'inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap border-r border-rule px-2.5 text-xs font-medium text-ink-muted last:border-r-0',
+        // −1px on the end segments: they nest inside the root's 1px border, and
+        // the root no longer clips them into its own radius (see `ToggleGroup`).
+        'first:rounded-l-[calc(var(--radius)-1px)] last:rounded-r-[calc(var(--radius)-1px)]',
+        'transition-colors duration-fast ease-transit hover:bg-surface hover:text-ink',
+        'disabled:pointer-events-none disabled:opacity-50',
+        '[@media(hover:none)]:min-h-(--tap-min) [@media(hover:none)]:min-w-(--tap-min)',
+        // Selected: the raised surface by default; amber when the group narrows a view.
+        'data-[state=on]:bg-surface-raised data-[state=on]:text-ink',
+        'group-data-[accent]/toggle:data-[state=on]:bg-accent/15 group-data-[accent]/toggle:data-[state=on]:text-accent',
+        className,
+      )}
+      {...props}
+    />
+  );
+}

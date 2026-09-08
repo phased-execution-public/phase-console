@@ -1,0 +1,323 @@
+/**
+ * What is worth waking someone for.
+ *
+ * The console already knew how to raise a notification; what it lacked was a
+ * way to reach a device that is not looking at it. Push closes that, and the
+ * moment it does, restraint becomes the whole design problem: a channel that
+ * fires for everything is a channel that gets muted, and the notification it
+ * gets muted for is the one that mattered.
+ *
+ * So the catalogue is graded. Things that stop work dead are on by default;
+ * progress you would like to know about is on because it is infrequent; the
+ * firehose of "a file changed" is present, off, and honest about why.
+ *
+ * Categories rather than one switch, because "tell me when a run needs me" and
+ * "tell me when a phase lands" are different appetites, and a phone and a
+ * laptop rarely want the same ones.
+ */
+
+export type CategoryId =
+  | 'approval' | 'session-ask' | 'needs-you' | 'gate' | 'qa' | 'halted' | 'parked' | 'stalled'
+  | 'phase' | 'finished' | 'ready' | 'changed' | 'session' | 'health' | 'limits' | 'usage-climbing';
+
+export type Category = {
+  id: CategoryId;
+  label: string;
+  detail: string;
+  /** On for a new subscription unless it is asked to be otherwise. */
+  byDefault: boolean;
+  /** Interrupts a focus mode and buzzes a wrist. Reserved for "nothing proceeds without you". */
+  urgent: boolean;
+};
+
+export const CATEGORIES: readonly Category[] = [
+  {
+    id: 'approval',
+    label: 'Permission needed',
+    detail: 'A session is blocked on a decision only you can make — a command outside its rules, '
+      + 'a gate, or a check it cannot make itself. Nothing proceeds until you answer.',
+    byDefault: true,
+    urgent: true,
+  },
+  {
+    id: 'session-ask',
+    label: 'Session waiting on you',
+    detail: 'A Claude session outside the autopilot — one you ran in a terminal, or an agent '
+      + 'session — hit a permission prompt or asked for input. It sits blocked until you answer '
+      + 'it there; the console cannot answer for it.',
+    byDefault: true,
+    urgent: true,
+  },
+  {
+    id: 'needs-you',
+    label: 'A phase needs you',
+    detail: 'A phase did its work and stopped at something no automation may sign off — a check '
+      + 'written as prose, a verification only a person can make. It is not failed and not finished; '
+      + 'it is waiting, and it will keep waiting.',
+    byDefault: true,
+    urgent: true,
+  },
+  {
+    id: 'gate',
+    label: 'Gate needs a person',
+    detail: 'A phase is held at a gate only a person may clear — a physical act, a third party, a '
+      + 'credential no session holds. The board will call the phase ready the moment it is '
+      + 'approved and not one second before, so nothing else moves and nothing else will ask.',
+    // Not urgent, and the distinction is the point: a gate is waiting on a
+    // DECISION, not on a session parked dead with a hook open. Nothing is
+    // spending while it waits. Its own category rather than `needs-you`
+    // because the remedy is a single button with a different door — the phase
+    // page's Gate card — and a channel that cannot say which of the two it
+    // means is a channel that gets muted for the wrong one.
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'qa',
+    label: 'QA verdict owed or failed',
+    detail: 'A finished phase still owes its QA verdict, or QA recorded a fail. Either way the '
+      + 'plan gates on it: every dependent phase is held until pass or waived is recorded, and '
+      + 'nothing records one by itself.',
+    byDefault: true,
+    urgent: true,
+  },
+  {
+    id: 'halted',
+    label: 'Run halted',
+    detail: 'A run stopped on something that must not be automated past — a failed verification, '
+      + 'a phase that would not settle. Includes a run that was interrupted with nothing driving it.',
+    byDefault: true,
+    urgent: true,
+  },
+  {
+    id: 'parked',
+    label: 'Run parked or waiting',
+    detail: 'Every remaining phase needs a person, or the run is asleep until a usage window '
+      + 'reopens. Not an error — it just will not move on its own.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'stalled',
+    label: 'Nothing is happening',
+    detail: 'A session is still running and still spending, and it has stopped producing work — '
+      + 'silent for ten minutes, six turns without touching a tool, or three attempts that changed '
+      + 'nothing. Not urgent: it is not blocked on you, and the run has not stopped. It is the '
+      + 'money question rather than the permission question. One exception, once: a stall nothing '
+      + 'has resolved 45 minutes later is said again, urgently — at minute ten "it is thinking" is '
+      + 'still likely, and at minute seventy it is not. Each card stands itself down when the lane '
+      + 'produces work again, its phase ends, the run settles, or the silent-session watchdog '
+      + 'recycles the session the card was about — the one case that replaces the card with a line '
+      + 'saying what the console did on your behalf.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'phase',
+    label: 'Phase finished or failed',
+    detail: 'Each phase as it lands, with what it cost. The steady pulse of a run you are not '
+      + 'watching.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'finished',
+    label: 'Plan finished',
+    detail: 'A run reached the end of its plan. The one you actually wanted to be told about.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'ready',
+    label: 'Work became ready',
+    detail: 'A phase became startable because what it was waiting on finished — including work '
+      + 'finished by a session you ran yourself, elsewhere.',
+    byDefault: false,
+    urgent: false,
+  },
+  {
+    id: 'changed',
+    label: 'Plans changed on disk',
+    detail: 'Any plan or handoff was written. Genuinely everything — an agent editing a handoff '
+      + 'mid-phase fires this. Off by default because it is a firehose, not a signal.',
+    byDefault: false,
+    urgent: false,
+  },
+  {
+    id: 'session',
+    label: 'A session ended',
+    detail: 'An agent session or terminal finished while you were not watching it, or exited with '
+      + 'an error. Closing one yourself is not announced — you already know.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'health',
+    label: 'Console problems',
+    detail: 'The console degraded, its file watch went deaf, or it restarted after a crash. '
+      + 'The supervisor failing quietly is the worst case, because everything else still looks fine.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'limits',
+    label: 'Usage limits',
+    detail: 'A Claude account this console runs work as hit a usage window — the 5-hour session, '
+      + 'the weekly allowance, or a per-model one — with when it resets, plus what the run did '
+      + 'about it (waited, switched account, paused) and an account that needs signing in again.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'usage-climbing',
+    label: 'Usage climbing',
+    detail: 'Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next '
+      + 'long phase will not finish". Off by default: the meters show the same numbers all the '
+      + 'time, and the wall itself still announces under Usage limits.',
+    byDefault: false,
+    urgent: false,
+  },
+];
+
+/**
+ * The categories that are claims about a PLAN's progress — silenced entirely for
+ * a closed plan, wherever they are announced from.
+ *
+ * The split is deliberate and narrower than "everything with a slug". A closed
+ * plan must not keep reporting phases landing or work becoming ready: that is
+ * the pulse an operator closed the plan to stop. But `approval`, `needs-you`,
+ * `halted`, `parked`, `session` and `health` are not about the plan — they are
+ * about a live process that has stopped and cannot continue without a person.
+ * Silencing those because a plan's front matter says `abandoned` would strand a
+ * running session with nothing to tell anyone, which is a far worse failure than
+ * a stray notification: closing a plan quiets a record, it never gags a
+ * process.
+ */
+export const PLAN_PROGRESS_CATEGORIES: readonly CategoryId[] = ['phase', 'finished', 'ready', 'changed'];
+
+export function isPlanProgress(category: CategoryId): boolean {
+  return PLAN_PROGRESS_CATEGORIES.includes(category);
+}
+
+const BY_ID = new Map(CATEGORIES.map((c) => [c.id, c]));
+
+export function isCategory(value: unknown): value is CategoryId {
+  return typeof value === 'string' && BY_ID.has(value as CategoryId);
+}
+
+export function categoryOf(id: CategoryId): Category {
+  const found = BY_ID.get(id);
+  if (!found) throw new Error(`unknown category ${id}`);
+  return found;
+}
+
+export function defaultCategories(): Record<CategoryId, boolean> {
+  const out = {} as Record<CategoryId, boolean>;
+  for (const c of CATEGORIES) out[c.id] = c.byDefault;
+  return out;
+}
+
+/**
+ * A client may send anything. Unknown keys are dropped and missing ones take
+ * their default, so an older client's preferences survive a new category rather
+ * than silently turning it on.
+ */
+export function sanitiseCategories(value: unknown): Record<CategoryId, boolean> {
+  const out = defaultCategories();
+  if (!value || typeof value !== 'object') return out;
+  for (const [key, on] of Object.entries(value as Record<string, unknown>)) {
+    if (isCategory(key) && typeof on === 'boolean') out[key] = on;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Where a notification goes when you tap it
+ * ------------------------------------------------------------------ */
+
+/** What a notification knows about itself, in as much as decides where it lands. */
+export type RouteContext = {
+  slug?: string | null;
+  phase?: number | null;
+  /** A terminal/agent session id — `session` notifications deep-link to the one that ended. */
+  sessionId?: string | null;
+  /** Which page owns it. A claude session lives on `#/agent`, a shell on `#/terminal`. */
+  sessionKind?: 'shell' | 'claude' | null;
+};
+
+/**
+ * The ONLY place a notification URL is constructed.
+ *
+ * It was written by hand at two call sites and was wrong at both: they built
+ * `/#/plan/<slug>/autopilot`, while the tab is registered as `run`
+ * (`web/views/plan.js`). An unknown tab is not an error the router reports — it
+ * silently falls back — so every approval notification for the life of the
+ * feature opened the Route tab, and the queue you were woken for was one more
+ * tap away with nothing saying so.
+ *
+ * One builder does not make that impossible; it makes it a single line to fix
+ * and a single line to test, which is why `test/notifications.test.ts` walks
+ * this table against the client's own router rather than trusting it.
+ *
+ * A category whose payload is missing the slug it needs degrades upwards — to
+ * the runs list, or the plan list — rather than producing `#/plan/undefined`.
+ */
+export function routeFor(category: CategoryId, context: RouteContext = {}): string {
+  const slug = context.slug ? encodeURIComponent(context.slug) : null;
+  const phase = typeof context.phase === 'number' && Number.isInteger(context.phase) && context.phase > 0
+    ? context.phase : null;
+
+  switch (category) {
+    // Everything about a run in flight lands on the run itself, because that is
+    // where the queue, the console and the controls are.
+    case 'approval':
+    case 'needs-you':
+    case 'halted':
+    case 'parked':
+    // A stall is about one lane of one run, and the run page is where the lane,
+    // its tail and the verbs that answer it (steer, freeze, stop) all live.
+    case 'stalled':
+    case 'finished':
+      return slug ? `/#/plan/${slug}/run` : '/#/runs';
+    case 'phase':
+    // A QA hold is answered on the phase page — the QA launcher and Record
+    // verdict both live there.
+    case 'qa':
+    // And so is a gate: the Gate card with its Approve button and the numbered
+    // operator steps is on the phase page and nowhere else.
+    case 'gate':
+      return slug && phase ? `/#/plan/${slug}/phase/${phase}` : slug ? `/#/plan/${slug}/run` : '/#/plans';
+    case 'ready':
+      return '/#/ready';
+    case 'changed':
+      return slug ? `/#/plan/${slug}/route` : '/#/plans';
+    // The session that ended, on the page that owns its kind. Both pages keep
+    // the ended record until it is dismissed, so this link is still good when
+    // the notification is tapped an hour later — and if the record HAS gone,
+    // the page falls back to its own list rather than a dead end.
+    case 'session': {
+      const head = context.sessionKind === 'claude' ? 'agent' : 'terminal';
+      const id = context.sessionId ? encodeURIComponent(context.sessionId) : null;
+      return id ? `/#/${head}/${id}` : `/#/${head}`;
+    }
+    // The sessions list, where the waiting badge is: a registry session has no
+    // detail pane of its own (an agent/terminal id is a different address), so
+    // the list is the honest landing.
+    case 'session-ask':
+      return '/#/sessions';
+    case 'health':
+      return '/#/settings';
+    // The meters and the account list live on Settings; a limit that stopped a
+    // specific run still carries its slug and lands on the run instead.
+    case 'limits':
+    case 'usage-climbing':
+      return slug ? `/#/plan/${slug}/run` : '/#/settings';
+    default: {
+      // Exhaustiveness: a new category added to CATEGORIES without a route here
+      // is a compile error, not a notification that silently opens the
+      // dashboard.
+      const unreachable: never = category;
+      return String(unreachable);
+    }
+  }
+}

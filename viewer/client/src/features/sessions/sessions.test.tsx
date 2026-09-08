@@ -1,0 +1,522 @@
+/**
+ * Sessions — the agent half: the launcher, the mode chip, the plan wizard.
+ *
+ * (`session-page.test.tsx` is the shell half of the same page, and
+ * `keybar.test.tsx` the key bar. They were three files when this was two pages
+ * plus a shared pane, and splitting them by SUBJECT rather than by page is what
+ * let the merge happen without rewriting either suite to agree with it.)
+ *
+ * The pane is mocked: xterm measures real fonts and owns a live socket, neither
+ * of which jsdom has, and neither of which is what this page is responsible
+ * for. Everything the pane used to re-export now comes through for real, from
+ * its own module — see the note at the bottom of `pane.tsx` for why that is the
+ * point rather than an accident. What IS asserted is ours:
+ *
+ * - Both absence states name their own fix (the two flags vs `node-pty`).
+ * - Visiting the page spawns nothing; `?new=agent` is the LAUNCHER, and only
+ *   its Start button mints — with exactly the enum body it collected.
+ * - The launcher's navigation survives the refetch its own mint triggers
+ *   (the isFetching bounce regression, inherited from the terminal page).
+ * - ONE strip holds both kinds — the split into two pages is what Phase 10
+ *   removed — and the cap has always counted both.
+ * - An ended session offers `claude --resume <id>` — button and copyable.
+ * - Every mint carries a `cols/rows` for the pty to be born at, and the
+ *   strip is a tab list.
+ */
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { queryClientConfig } from '@/lib/queries';
+import type { Route } from '@/app/router';
+import type { ConsoleState, TerminalState } from '@/lib/api';
+
+/* ------------------------------------------------------------------ *
+ * Mocks
+ * ------------------------------------------------------------------ */
+
+const { state, terminal, agentTicket, terminalClose, skills, plansApi, pane } = vi.hoisted(() => ({
+  state: vi.fn(),
+  terminal: vi.fn(),
+  agentTicket: vi.fn(),
+  terminalClose: vi.fn(),
+  skills: vi.fn(),
+  plansApi: vi.fn(),
+  pane: vi.fn(),
+}));
+
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>();
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      state,
+      terminal,
+      agentTicket,
+      terminalClose,
+      skills,
+      plans: plansApi,
+      approvals: vi.fn(async () => []),
+      // Since Phase 8 the page RESOLVES an address against the presence
+      // registry before it will say a session is gone — an id it does not
+      // recognise as a pty may still be a conversation it can offer to resume.
+      // An unmocked fetch here leaves that read pending through its retry and
+      // the gone panel with it.
+      sessionRegistry: vi.fn(async () => ({ sessions: [] })),
+    },
+  };
+});
+
+// ONLY the emulator is stubbed, and after Phase 10 that is all this mock has
+// to say: `pane.tsx` re-exports nothing, so the ended/gone panels, the vitals,
+// the controls and the strip reach the page from their own modules and are
+// under test for real. `default` is what `lazy()` resolves — the page reaches
+// the pane through a dynamic import so the emulator stays out of the precached
+// `sessions-*` chunk, and a mock without it renders an empty Suspense forever.
+vi.mock('./pane', () => {
+  const Stub = (props: { sessionId: string }) => {
+    pane(props.sessionId);
+    return <div data-testid="pane">{props.sessionId}</div>;
+  };
+  return { TerminalPane: Stub, default: Stub };
+});
+
+const BASE_STATE: ConsoleState = {
+  autopilot: true,
+  allowRun: false,
+  allowWrites: false,
+  allowTerminal: false,
+  allowAgent: true,
+  root: { path: '/repo', ok: true, planCount: 1, handoffCount: 1 },
+  recentRoots: [],
+  unread: 0,
+};
+
+const CLAUDE = {
+  id: 'c1',
+  label: 'Claude: hello',
+  kind: 'claude' as const,
+  cwd: '/repo',
+  shell: 'claude',
+  cols: 100,
+  rows: 30,
+  pid: 901,
+  clients: 1,
+  createdAt: 0,
+  meta: { model: 'opus', claudeSessionId: '00000000-0000-4000-8000-000000000000' },
+};
+
+const SHELL = {
+  id: 's1',
+  label: 'Terminal 1',
+  kind: 'shell' as const,
+  cwd: '/repo',
+  shell: '/bin/zsh',
+  cols: 100,
+  rows: 30,
+  pid: 900,
+  clients: 1,
+  createdAt: 0,
+};
+
+const TERMINALS: TerminalState = {
+  allowed: false,
+  agentAllowed: true,
+  available: 'yes',
+  limit: 8,
+  sessions: [CLAUDE, SHELL],
+};
+
+function mount(node: React.ReactElement) {
+  const client = new QueryClient(queryClientConfig);
+  return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
+}
+
+/** A mint carries the size the pane will settle on, inside the server's clamps. */
+function expectSized(body: { cols?: unknown; rows?: unknown } | undefined) {
+  expect(body).toBeDefined();
+  expect(body!.cols).toEqual(expect.any(Number));
+  expect(body!.rows).toEqual(expect.any(Number));
+  expect(body!.cols as number).toBeGreaterThanOrEqual(20);
+  expect(body!.cols as number).toBeLessThanOrEqual(500);
+  expect(body!.rows as number).toBeGreaterThanOrEqual(5);
+  expect(body!.rows as number).toBeLessThanOrEqual(200);
+}
+
+/** `#/sessions?new=agent` — the launcher, which is where `#/agent` now lands. */
+const NEW_AGENT = { segments: ['sessions'], query: { new: 'agent' }, path: 'sessions' };
+
+async function openPage(route: Route = NEW_AGENT) {
+  const { default: SessionsView } = await import('./index');
+  return mount(<SessionsView route={route} />);
+}
+
+/** The page reading the route live from the hash, the way `App` does. */
+async function openLive(hash: string) {
+  window.location.hash = hash;
+  const { default: SessionsView } = await import('./index');
+  const { useRoute } = await import('@/app/router');
+  const Harness = () => <SessionsView route={useRoute()} />;
+  return mount(<Harness />);
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  window.location.hash = '';
+  state.mockResolvedValue(BASE_STATE);
+  terminal.mockResolvedValue(TERMINALS);
+  skills.mockResolvedValue([]);
+  plansApi.mockResolvedValue([]);
+  agentTicket.mockResolvedValue({
+    ok: true,
+    sessionId: 'a1',
+    token: 't',
+    expiresAt: 0,
+    path: '/ws/terminal',
+    session: { ...CLAUDE, id: 'a1', label: 'Claude 1' },
+  });
+  terminalClose.mockResolvedValue({ closed: true, state: { ...TERMINALS, sessions: [] } });
+});
+
+/* ------------------------------------------------------------------ *
+ * The two ways there is no agent
+ * ------------------------------------------------------------------ */
+
+describe('when this console starts no sessions', () => {
+  it('names BOTH flags — one page now, so one message that covers both', async () => {
+    state.mockResolvedValue({ ...BASE_STATE, allowAgent: false, allowTerminal: false });
+    await openPage();
+
+    expect(await screen.findByText(/starts no sessions of its own/i)).toBeInTheDocument();
+    // Two pages each named their own flag; one page that named only the flag
+    // you happened to arrive under would send half its readers to restart with
+    // a flag they already have.
+    expect(screen.getByText('--allow-agent')).toBeInTheDocument();
+    expect(screen.getByText('--allow-terminal')).toBeInTheDocument();
+    expect(terminal).not.toHaveBeenCalled();
+    expect(agentTicket).not.toHaveBeenCalled();
+  });
+
+  it('distinguishes "node-pty did not load" from "the flags are off"', async () => {
+    terminal.mockResolvedValue({ ...TERMINALS, available: 'no', sessions: [] });
+    await openPage();
+
+    expect(await screen.findByText(/no terminal available/i)).toBeInTheDocument();
+    expect(screen.getByText('node-pty')).toBeInTheDocument();
+    expect(screen.queryByText(/starts no sessions of its own/i)).not.toBeInTheDocument();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The launcher
+ * ------------------------------------------------------------------ */
+
+describe('the launcher', () => {
+  it('is the empty state, and visiting it spawns nothing', async () => {
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [] });
+    await openPage();
+
+    expect(await screen.findByText(/new claude session/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /start session/i })).toBeInTheDocument();
+    // Under StrictMode a mount that minted would mint twice.
+    expect(agentTicket).not.toHaveBeenCalled();
+  });
+
+  it('sends exactly the enum body it collected, and stays on the new session', async () => {
+    const opened = { ...CLAUDE, id: 'a1', label: 'Claude: say hello' };
+    let live: (typeof CLAUDE)[] = [];
+    terminal.mockImplementation(async () => ({ ...TERMINALS, sessions: live }));
+    agentTicket.mockImplementation(async () => {
+      live = [...live, opened];
+      return { ok: true, sessionId: 'a1', token: 't', expiresAt: 0, path: '/ws/terminal', session: opened };
+    });
+
+    await openLive('#/sessions?new=agent');
+    fireEvent.change(await screen.findByPlaceholderText(/sent as your first message/i), {
+      target: { value: 'say hello' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /start session/i }));
+
+    await waitFor(() =>
+      expect(agentTicket).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'opus',
+          effort: 'max',
+          permissionMode: '',
+          prompt: 'say hello',
+        }),
+      ),
+    );
+    // …plus the size: the CLI is born laid out for the window it is in.
+    expectSized(agentTicket.mock.calls[0]?.[0]);
+    expect(Object.keys(agentTicket.mock.calls[0][0]).sort()).toEqual([
+      'cols',
+      'effort',
+      'model',
+      'permissionMode',
+      'prompt',
+      'rows',
+    ]);
+    await waitFor(() => expect(window.location.hash).toBe('#/sessions/a1'));
+    await waitFor(() => expect(screen.getByTestId('pane')).toHaveTextContent('a1'));
+
+    // ⚠️ The bounce regression: the mint invalidates the very list the
+    // fallback effect reads; without the isFetching gate the page navigates
+    // straight back off the session it just opened.
+    await waitFor(() => expect(terminal).toHaveBeenCalledTimes(2));
+    expect(window.location.hash).toBe('#/sessions/a1');
+    expect(screen.getByTestId('pane')).toHaveTextContent('a1');
+  });
+
+  it('hides the skills picker when no source directory is open', async () => {
+    state.mockResolvedValue({ ...BASE_STATE, root: undefined });
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [] });
+    await openPage();
+
+    expect(await screen.findByText(/open a source directory to pick skills/i)).toBeInTheDocument();
+    // `/api/skills` sits behind the open-root wall server-side — a disabled
+    // picker must not turn into a 409 toast.
+    expect(skills).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Sessions
+ * ------------------------------------------------------------------ */
+
+describe('sessions', () => {
+  it('shows BOTH kinds in one strip, and attaches to the routed one', async () => {
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+
+    expect(await screen.findByTestId('pane')).toHaveTextContent('c1');
+    expect(pane).toHaveBeenCalledWith('c1');
+    // The whole point of the merge: the shell used to be invisible from here,
+    // on a page that disabled New because of it.
+    expect(screen.getByText('Claude: hello')).toBeInTheDocument();
+    expect(screen.getByText('Terminal 1')).toBeInTheDocument();
+  });
+
+  it('says which mode the open session was LAUNCHED in, both ways', async () => {
+    // No mode on the record is the CLI's own default, which is an omission
+    // rather than a value — the chip still has to name it.
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+    expect(await screen.findByText(/launched in default/i)).toBeInTheDocument();
+
+    const planned = { ...CLAUDE, meta: { ...CLAUDE.meta, permissionMode: 'plan' } };
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [planned] });
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+    expect(await screen.findByText(/launched in plan/i)).toBeInTheDocument();
+  });
+
+  it('the mode chip admits it is a launch record, and offers the shortcut', async () => {
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+
+    // The honesty is the point: ⇧Tab changes the mode inside the session and
+    // tells nothing out here, so a label read as live would be wrong within a
+    // keystroke.
+    const chip = await screen.findByText(/launched in default/i);
+    expect(chip).toHaveAttribute('title', expect.stringMatching(/does not update this label/i));
+    expect(screen.getByText('⇧Tab')).toBeInTheDocument();
+    expect(screen.getByText(/cycles permission modes/i)).toBeInTheDocument();
+  });
+
+  it('no session open, no launch record to report', async () => {
+    await openPage();
+    // The launcher, not a session — a chip here would be about nothing.
+    expect(await screen.findByRole('button', { name: /start session/i })).toBeInTheDocument();
+    expect(screen.queryByText(/launched in/i)).not.toBeInTheDocument();
+  });
+
+  it('counts the cap across BOTH kinds', async () => {
+    const shells = Array.from({ length: 7 }, (_, i) => ({ ...SHELL, id: `s${i}` }));
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [CLAUDE, ...shells] });
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+
+    expect(await screen.findByRole('button', { name: /^new$/i })).toBeDisabled();
+  });
+
+  it('the strip is one tab list over every session this console owns', async () => {
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+    await screen.findByRole('tablist');
+    expect(screen.getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Claude: hello', 'Terminal 1']);
+    expect(screen.getByRole('tab', { name: /claude: hello/i })).toHaveAttribute('data-state', 'active');
+  });
+
+  it('New goes to the launcher, never straight to a pty', async () => {
+    await openLive('#/sessions/c1');
+    fireEvent.click(await screen.findByRole('button', { name: /^new$/i }));
+
+    // `?new=agent` rather than a bare `#/sessions`: the four choices that must
+    // exist before an agent pty does are what the launcher is for, and a bare
+    // address would show the list instead.
+    await waitFor(() => expect(window.location.hash).toBe('#/sessions?new=agent'));
+    expect(agentTicket).not.toHaveBeenCalled();
+  });
+
+  it('an ended session offers resume, as a button and as a copyable command', async () => {
+    const ended = { ...CLAUDE, exited: { code: 0 }, exitedAt: Date.now() - 60_000 };
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [ended], live: 0 });
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+
+    // The record outlives the CLI now, so this is a state the page renders
+    // rather than a moment it had ~30 seconds to catch.
+    expect(await screen.findByText(/exited cleanly/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /resume here/i }));
+    await waitFor(() =>
+      expect(agentTicket).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resume: '00000000-0000-4000-8000-000000000000',
+        }),
+      ),
+    );
+    expectSized(agentTicket.mock.calls[0]?.[0]);
+  });
+
+  it('reports a failed session as failed, and offers to clear the record', async () => {
+    const failed = { ...CLAUDE, exited: { code: 1, signal: 9 }, exitedAt: Date.now() - 1_000 };
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [failed], live: 0 });
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+
+    // A signal is the case a bare exit code loses: killed by 9 with code 1 is
+    // not "exited cleanly", and the panel must not say it was.
+    expect(await screen.findByText(/killed by signal 9/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /dismiss/i })).toBeInTheDocument();
+  });
+
+  it('says a session is gone instead of stranding a dead link', async () => {
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [] });
+    await openPage({ segments: ['sessions', 'long-gone'], query: {}, path: 'sessions/long-gone' });
+
+    expect(await screen.findByText(/not here any more/i)).toBeInTheDocument();
+    // The harness renders a route object without touching the URL, so any
+    // `navigate()` shows up here as a hash — which is exactly how the old test
+    // detected the bounce. Staying empty is the assertion that it is gone.
+    await waitFor(() => expect(window.location.hash).toBe(''));
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The plan wizard
+ * ------------------------------------------------------------------ */
+
+describe('the plan wizard', () => {
+  it('gates on the agent capability, not on writes', async () => {
+    const { NewPlanWizardButton } = await import('./wizard');
+    const { container } = mount(<NewPlanWizardButton allowAgent={false} />);
+    expect(container).toBeEmptyDOMElement();
+
+    mount(<NewPlanWizardButton allowAgent />);
+    expect(screen.getByRole('button', { name: /new plan with ai/i })).toBeInTheDocument();
+  });
+
+  it('sends the brief as a plan intent and lands on the session', async () => {
+    const { NewPlanWizard } = await import('./wizard');
+    const onClose = vi.fn();
+    mount(<NewPlanWizard onClose={onClose} />);
+
+    const start = await screen.findByRole('button', { name: /start authoring/i });
+    // An empty brief cannot start a session that would have nothing to author.
+    expect(start).toBeDisabled();
+
+    fireEvent.change(screen.getByPlaceholderText(/what should this plan achieve/i), {
+      target: { value: 'Ship a cart API.' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /start authoring/i }));
+
+    // NO `permissionMode` in the ticket: the omission is the choice. The
+    // server defaults a plan intent to plan mode, and the select this form
+    // used to offer was the one hole left in that rule — `auto` here launched
+    // an authoring session that could write a plan nobody approved.
+    await waitFor(() =>
+      expect(agentTicket).toHaveBeenCalledWith(
+        expect.objectContaining({
+          intent: 'plan',
+          brief: 'Ship a cart API.',
+          model: 'opus',
+          effort: 'max',
+        }),
+      ),
+    );
+    expectSized(agentTicket.mock.calls[0]?.[0]);
+    expect(agentTicket.mock.calls[0][0]).not.toHaveProperty('permissionMode');
+    await waitFor(() => expect(window.location.hash).toBe('#/sessions/a1'));
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('permissions are fixed to plan mode — shown, not selectable', async () => {
+    const { NewPlanWizard } = await import('./wizard');
+    mount(<NewPlanWizard onClose={() => {}} />);
+
+    // The fact is stated where the select used to be…
+    expect(await screen.findByText(/plan mode — fixed for authoring/i)).toBeInTheDocument();
+    // …and there is genuinely nothing to change: no permissions control exists.
+    expect(screen.queryByLabelText(/permissions/i)).toBeNull();
+  });
+
+  it('needs an open source directory before it can author anywhere', async () => {
+    state.mockResolvedValue({ ...BASE_STATE, root: undefined });
+    const { NewPlanWizard } = await import('./wizard');
+    mount(<NewPlanWizard onClose={() => {}} />);
+
+    expect(await screen.findByText(/open a source directory first/i)).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText(/what should this plan achieve/i), {
+      target: { value: 'Ship it.' },
+    });
+    expect(screen.getByRole('button', { name: /start authoring/i })).toBeDisabled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The plan-created banner
+ * ------------------------------------------------------------------ */
+
+describe('the plan-created banner', () => {
+  it('appears when a NEW slug enters the plans list, and links to it', async () => {
+    const planning = {
+      ...CLAUDE,
+      meta: { ...CLAUDE.meta, intent: 'plan' as const },
+    };
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [planning] });
+    plansApi.mockResolvedValue([{ slug: 'existing', phases: 1, ready: [] }]);
+
+    const client = new QueryClient(queryClientConfig);
+    const { default: SessionsView } = await import('./index');
+    render(
+      <QueryClientProvider client={client}>
+        <SessionsView route={{ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' }} />
+      </QueryClientProvider>,
+    );
+    await screen.findByTestId('pane');
+    // The baseline must exist before the "new" list arrives — flipping the
+    // mock while the FIRST fetch is still in flight lets the query cache
+    // dedupe the refetch and the diff never sees a second list.
+    await waitFor(() => expect(client.getQueryData(['plans'])).toBeTruthy());
+    expect(screen.queryByText(/was created/i)).not.toBeInTheDocument();
+
+    // `new-plan.sh` writes the file → watcher emits `changed` → EVENT_EFFECTS
+    // invalidates keys.plans() → the refetch is what the watcher diffs.
+    plansApi.mockResolvedValue([
+      { slug: 'existing', phases: 1, ready: [] },
+      { slug: 'cart-api-endpoint', phases: 4, ready: [] },
+    ]);
+    await client.invalidateQueries({ queryKey: ['plans'] });
+    await waitFor(() => expect(plansApi).toHaveBeenCalledTimes(2));
+
+    expect(await screen.findByText(/was created/i)).toBeInTheDocument();
+    expect(screen.getByText('cart-api-endpoint')).toBeInTheDocument();
+    const link = screen.getByRole('link', { name: /open it/i });
+    expect(link).toHaveAttribute('href', '#/plan/cart-api-endpoint/route');
+
+    // Dismiss is a choice, not a timeout.
+    fireEvent.click(screen.getByRole('button', { name: /dismiss/i }));
+    expect(screen.queryByText(/was created/i)).not.toBeInTheDocument();
+  });
+
+  it('does not watch plain claude sessions', async () => {
+    terminal.mockResolvedValue({ ...TERMINALS, sessions: [CLAUDE] });
+    await openPage({ segments: ['sessions', 'c1'], query: {}, path: 'sessions/c1' });
+    await screen.findByTestId('pane');
+    expect(plansApi).not.toHaveBeenCalled();
+  });
+});

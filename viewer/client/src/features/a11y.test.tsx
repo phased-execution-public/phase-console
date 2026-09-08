@@ -1,0 +1,448 @@
+/**
+ * The accessibility smoke — every destination, and every Settings section.
+ *
+ * The SHELL's own axe cases live in `app/shell/a11y.test.tsx` (the chrome is on
+ * screen everywhere, so a violation there is a violation on every page). This
+ * file is the other half: the eight pages that render inside it.
+ *
+ * `test/axe.ts` was built in Phase 2 and **nothing called it for nine phases**.
+ * The primitives were checked by hand as they were written and no page was ever
+ * run through axe at all, which is how a page ends up with two navigations
+ * sharing one accessible name (Settings did, until this file) or a control
+ * whose label is really a paragraph.
+ *
+ * jsdom lays nothing out, so this cannot see contrast (asserted from the
+ * stylesheet by `styles/contrast.test.ts`) or anything that needs a viewport.
+ * What it CAN see is everything structural: names, roles, labels, ARIA
+ * validity, heading and landmark nesting, duplicate ids, form labelling. Those
+ * are the failures that make a page unusable with a screen reader, and they are
+ * the ones a human reviewer never notices because the page looks right.
+ *
+ * The fixtures are deliberately POPULATED rather than empty. An empty page
+ * renders empty states, and an empty state has no table, no list, no toolbar
+ * and no dialog trigger — a smoke that only ever saw those would pass on every
+ * page in the app while proving nothing about any of them.
+ */
+
+import { Suspense } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { render, screen } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DESTINATIONS as SHELL_DESTINATIONS } from '@shared/route-meta.js';
+import { queryClientConfig } from '@/lib/queries';
+import { expectNoAxeViolations } from '@/test/axe';
+
+/* ------------------------------------------------------------------ *
+ * One fetch stub for the whole app.
+ *
+ * Every fetcher in `lib/api/*` funnels through `client.ts` `request()`, which
+ * funnels through `fetch`. Stubbing there rather than mocking `api` is what
+ * lets eight destinations share one harness — and it exercises the real
+ * fetchers, so a page that asks for something nobody has fixtured fails here
+ * rather than silently rendering a skeleton forever.
+ * ------------------------------------------------------------------ */
+
+const STATE = {
+  autopilot: true,
+  allowRun: true,
+  allowWrites: true,
+  allowMcp: false,
+  staticRoot: 'dist',
+  distRev: 'abc123def456',
+  root: { path: '/repo', ok: true, planCount: 3, handoffCount: 2 },
+  scriptsDir: '/scripts',
+  sizing: { S: 15_000, M: 40_000, L: 90_000, budgetBig: 200_000, budgetHaiku: 40_000 },
+  searchDocs: 42,
+  supervisor: { detail: 'launchd', supervised: true },
+  repo: { available: true, branch: 'main', dirty: ['docs/plans/demo.md'] },
+  recentRoots: [],
+  models: ['claude-opus-5', 'claude-fable-5'],
+  port: 4123,
+  unread: 2,
+  prefs: {},
+};
+
+const PLANS = [
+  {
+    slug: 'demo',
+    kind: 'plan',
+    title: 'A demo plan',
+    phases: 8,
+    ready: [2],
+    status: 'active',
+    closed: false,
+  },
+  { slug: 'other', kind: 'plan', title: 'Another', phases: 6, ready: [], status: 'complete', closed: true },
+];
+
+const PORTFOLIO = {
+  generatedAt: Date.parse('2026-08-22T12:00:00Z'),
+  totals: {
+    plans: 2,
+    documents: 1,
+    orphans: 1,
+    closed: 1,
+    phases: 14,
+    done: 9,
+    ready: 2,
+    waiting: 2,
+    inProgress: 1,
+    stuck: 0,
+    percent: 64,
+    remainingWeight: 310_000,
+    remainingSessions: 2,
+  },
+  byStatus: [
+    { status: 'active', count: 1, closed: false },
+    { status: 'complete', count: 1, closed: true },
+  ],
+  activeLocks: [{ slug: 'demo', phase: 2, owner: 'someone@host', expired: true, leaseUntil: 0 }],
+  issues: [
+    { slug: 'demo', kind: 'index-drift', severity: 'warning', message: 'INDEX.md disagrees', phase: 2 },
+    { slug: 'other', kind: 'orphan', severity: 'info', message: 'a handoff folder with no plan' },
+  ],
+  velocity: [
+    { week: '2026-W30', count: 2 },
+    { week: '2026-W31', count: 5 },
+  ],
+  calendar: [{ date: '2026-08-21', count: 3 }],
+  medianCycleDays: 1,
+  sizeMix: [
+    { size: 'S', count: 3 },
+    { size: 'M', count: 8 },
+  ],
+  repos: [{ repo: 'phased-execution', count: 11 }],
+  skills: [{ skill: 'phased-execution', count: 4 }],
+  models: [{ model: 'claude-fable-5', count: 11 }],
+  stalled: [{ slug: 'demo', days: 12, ready: [2, 3] }],
+  busiest: [{ slug: 'demo', completions: 9 }],
+  rate: { ratePerWeight: 60, basis: 'plan', samples: 5, spread: 0.4 },
+};
+
+const SPEND = {
+  today: { settledUsd: 12.5, ladderUsd: 3.25, capUsd: 600 },
+  runs: [{ runId: 'r1', slug: 'demo', spentUsd: 12.5, budgetUsd: 40 }],
+  series: [
+    { day: '2026-08-21', settledUsd: 8, ladderUsd: 1 },
+    { day: '2026-08-22', settledUsd: 12.5, ladderUsd: 3.25 },
+  ],
+};
+
+const INBOX = [
+  {
+    id: 'demo#2#gate',
+    kind: 'gate',
+    severity: 'needs-you',
+    title: 'Phase 2 is behind a human gate',
+    detail: 'Approve it on the plan page.',
+    slug: 'demo',
+    phase: 2,
+    at: Date.parse('2026-08-22T11:00:00Z'),
+    actions: [],
+  },
+];
+
+/**
+ * `PolicyView`, in the shape `lib/api/policy.ts` declares it — not a plausible
+ * one. `PolicyCard` indexes `effective` and `defaults` by list name, so a body
+ * missing either is not an empty page, it is a `TypeError` mid-render.
+ *
+ * Populated on purpose: chips only exist when there are rules, the strike path
+ * only exists when a shipped default is present, and `inert`/`support`/`seen`
+ * each render a section that axe would otherwise never see.
+ */
+const POLICY = {
+  defaults: {
+    deny: ['Bash(rm -rf /)', 'Read(./.env)'],
+    ask: ['Bash(git push:*)', 'WebFetch'],
+    allow: ['Read', 'Glob', 'Grep'],
+  },
+  extra: {
+    deny: [],
+    ask: ['Bash(docker:*)'],
+    allow: ['Bash(npm test:*)'],
+    removed: { deny: [], ask: ['WebFetch'], allow: [] },
+  },
+  plan: null,
+  effective: {
+    deny: ['Bash(rm -rf /)', 'Read(./.env)'],
+    ask: ['Bash(git push:*)', 'Bash(docker:*)'],
+    allow: ['Read', 'Glob', 'Grep', 'Bash(npm test:*)'],
+  },
+  file: '/repo/.claude/settings.json',
+  profiles: [
+    { id: 'trusted', label: 'Trusted' },
+    { id: 'guarded', label: 'Guarded' },
+  ],
+  inert: [{ raw: 'Bash(*)', note: 'a bare wildcard matches nothing the hook honours' }],
+  support: [{ raw: 'Bash(npm test:*)', tool: 'Bash', form: 'prefix', support: 'honoured' }],
+  hookTools: ['Bash', 'Write'],
+  wrappersNotStripped: ['env'],
+  seen: ['Bash', 'Read', 'Write'],
+};
+
+/**
+ * `TailscaleStatus` is a three-way union on `state` (`lib/api/system.ts`,
+ * mirrored by `server/tailscale.ts`) — there is no `available` field anywhere in
+ * it. An unrecognised body falls past both early returns in `Body` and reads
+ * `status.serve`, which is how a fixture becomes a crash.
+ *
+ * `running` is the state worth fixturing: it is the only one that renders the
+ * key/value table, the device list and the command blocks.
+ */
+const TAILSCALE = {
+  state: 'running',
+  tailnet: 'example.ts.net',
+  magicDns: true,
+  magicDnsSuffix: 'example.ts.net',
+  self: {
+    hostName: 'mac',
+    dnsName: 'mac.example.ts.net',
+    ips: ['100.64.0.1'],
+    os: 'macOS',
+    online: true,
+  },
+  peers: [
+    { hostName: 'phone', dnsName: 'phone.example.ts.net', ips: ['100.64.0.2'], os: 'iOS', online: true },
+    {
+      hostName: 'laptop',
+      dnsName: 'laptop.example.ts.net',
+      ips: ['100.64.0.3'],
+      os: 'Linux',
+      online: false,
+      lastSeen: '2026-08-21T09:00:00Z',
+    },
+  ],
+  serve: { active: true, forOurPort: true, url: 'https://mac.example.ts.net' },
+};
+
+/** path → body. A miss is an explicit 404, never an accidental empty object. */
+const ROUTES: [RegExp, unknown][] = [
+  [/^\/api\/state/, STATE],
+  [/^\/api\/plans\/[^/]+\/verify-preflight/, { warnings: [] }],
+  [/^\/api\/plans\/[^/]+/, null],
+  [/^\/api\/plans/, PLANS],
+  [/^\/api\/stats/, PORTFOLIO],
+  [/^\/api\/spend/, SPEND],
+  [/^\/api\/inbox/, INBOX],
+  [/^\/api\/approvals/, []],
+  [/^\/api\/runs\/scopes/, { scopes: [] }],
+  [/^\/api\/runs/, []],
+  [/^\/api\/queue/, { max: 3, live: 0, queued: 0, throttledUntil: null, grants: [], entries: [] }],
+  [/^\/api\/sessions/, { sessions: [], max: 8 }],
+  [/^\/api\/terminal/, { sessions: [], max: 8 }],
+  [/^\/api\/mcp\/catalog/, { entries: [] }],
+  [/^\/api\/mcp/, { servers: [], allowMcp: false }],
+  [/^\/api\/policy/, POLICY],
+  [/^\/api\/accounts/, { accounts: [], active: null }],
+  [/^\/api\/push/, { publicKey: 'k', devices: [], categories: [] }],
+  [
+    /^\/api\/notifications/,
+    {
+      items: [],
+      total: 0,
+      unread: 0,
+      more: false,
+      categories: [],
+      devices: 0,
+      outOfBand: { configured: false },
+    },
+  ],
+  [/^\/api\/tailscale/, TAILSCALE],
+  [/^\/api\/hook/, { installed: false }],
+  [/^\/api\/skills/, { skills: [] }],
+  [/^\/api\/auth/, { loggedIn: true, checkedAt: '2026-08-22T00:00:00Z' }],
+  [/^\/api\/search/, { query: '', total: 0, groups: [] }],
+  // Populated on purpose, like every fixture above it: an empty index
+  // renders an `Empty` with no list, no toolbar rows and no inspector
+  // trigger, and a smoke that only ever saw that would prove nothing
+  // about the destination it is named for.
+  [
+    /^\/api\/debug\/index/,
+    {
+      entries: [
+        {
+          source: 'console',
+          at: '2026-09-01T10:00:00.000Z',
+          level: 'error',
+          event: 'api.unhandled',
+          text: 'the route threw',
+          data: { path: '/api/x' },
+        },
+        {
+          source: 'journal',
+          at: '2026-09-01T09:59:00.000Z',
+          level: 'info',
+          event: 'phase.boarded',
+          text: 'model=opus',
+          slug: 'demo',
+          runId: 'aaaa1111',
+          phase: 2,
+        },
+      ],
+      sources: [
+        { source: 'console', available: true, count: 1, path: '~/.local/state/phase-console/console.log' },
+        { source: 'supervisor', available: false, count: 0, note: 'Not started by launchd here.' },
+        { source: 'journal', available: true, count: 1 },
+        { source: 'outcome', available: true, count: 0 },
+        { source: 'ruling', available: true, count: 0 },
+        { source: 'delivery', available: true, count: 0 },
+        { source: 'health', available: true, count: 0 },
+      ],
+      truncated: false,
+      slugs: ['demo'],
+    },
+  ],
+];
+
+function body(path: string): unknown | undefined {
+  for (const [pattern, value] of ROUTES) if (pattern.test(path)) return value;
+  return undefined;
+}
+
+beforeEach(() => {
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(
+        typeof input === 'string' ? input : input instanceof URL ? input.pathname : input.url,
+      );
+      const value = body(path);
+      if (value === undefined) {
+        return new Response('not fixtured', { status: 404, headers: { 'content-type': 'text/plain' } });
+      }
+      return new Response(JSON.stringify(value), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }),
+  );
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/* ------------------------------------------------------------------ *
+ * The destinations
+ * ------------------------------------------------------------------ */
+
+/** Every destination, the route it renders at, and a string proving it painted. */
+const DESTINATIONS: { id: string; route: string[]; query?: Record<string, string>; settled: RegExp }[] = [
+  { id: 'now', route: ['now'], settled: /needs you|running now|next up|nothing/i },
+  { id: 'plans', route: ['plans'], settled: /demo/i },
+  { id: 'runs', route: ['runs'], settled: /run|nothing/i },
+  { id: 'sessions', route: ['sessions'], settled: /session|nothing|new/i },
+  // The two 4.0 stubs. Settle on content ONLY THE LOADED BRANCH renders — the
+  // subtitle is drawn by the pending branch too, so settling on it let axe walk
+  // a `CardSkeleton` and pass a page of `div`s. (QA round 2 proved it: an
+  // `<img>` with no alt injected into Repo's loaded content did not fail the
+  // smoke; the same injection into the pending branch did.)
+  { id: 'repo', route: ['repo'], settled: /checked out/i },
+  { id: 'insights', route: ['insights'], settled: /how long is left/i },
+  // Not the L0 card: that is drawn as soon as `/api/state` lands, while the
+  // log explorer under it is still a spinner — settling on it would let axe
+  // walk a `Spinner` and pass a page that never rendered the surface this
+  // destination is for. Not a log ROW either: those live in a virtualized
+  // `DataList`, and jsdom lays nothing out, so the virtualizer measures a
+  // zero-height scroller and renders none of them. Stubbing layout here would
+  // change how `useTableFit` folds columns on every OTHER destination in this
+  // table, which is a bigger change than this file is for. The source-status
+  // strip is loaded-only, unvirtualized, and the one piece of the explorer
+  // that is structural rather than a row. The rows' own accessibility is held
+  // by `components/ui/data-list.test.tsx` (which does stub layout) and their
+  // content by `features/debug/debug.test.tsx`.
+  { id: 'debug', route: ['debug'], settled: /not readable here/i },
+  { id: 'settings', route: ['settings'], settled: /essentials/i },
+];
+
+/**
+ * Settings is eight sections and each is its own screen — smoke them all, from
+ * the same vocabulary the nav renders, so a ninth section cannot be added
+ * without a smoke arriving with it.
+ */
+const { SETTINGS_SECTIONS } = await import('@/features/settings/nav');
+
+async function mountAt(segments: string[], query: Record<string, string> = {}) {
+  const head = segments[0];
+  const { ROUTE_TABLE } = await import('@/app/router');
+  const entry = ROUTE_TABLE[head];
+  if (!entry || entry.kind !== 'page') throw new Error(`${head} is not a page`);
+  const View = entry.lazy;
+  const route = { segments, query, path: segments.join('/') };
+  const client = new QueryClient(queryClientConfig);
+  return render(
+    <QueryClientProvider client={client}>
+      <Suspense fallback={<div>loading</div>}>
+        <View route={route} />
+      </Suspense>
+    </QueryClientProvider>,
+  );
+}
+
+/*
+ * Two generous clocks, for two different reasons.
+ *
+ * `TIMEOUT` — axe over a whole page takes seconds in jsdom and this file runs
+ * it fourteen times; the default 5 s turns a slow assertion into a timeout
+ * that reads like a page that never painted.
+ *
+ * `WAIT` — every destination and every Settings section is behind a `lazy()`,
+ * and `findBy*`'s default is ONE second. In isolation a chunk resolves inside
+ * it; under the full 95-file parallel suite it does not, and `now` failed on
+ * three consecutive runs with the Suspense fallback still on screen. Both
+ * waits carry this explicitly. Raised rather than retried: a chunk that
+ * genuinely never resolves must still fail, and a retry would hide exactly
+ * that — as would leaving the default in place and calling the result flaky.
+ */
+const TIMEOUT = 40_000;
+const WAIT = 30_000;
+
+describe('axe — every destination', () => {
+  /*
+   * The roster above is a local fixture list — each destination needs a route,
+   * sometimes a query, and a `settled` matcher that only its LOADED branch
+   * renders, and none of that belongs in shared vocabulary. But "local" was
+   * also why it could silently fall behind: `shared/route-meta.js` is where a
+   * destination is added, and adding a ninth there would have left it with no
+   * axe coverage and nothing saying so. Settings sections are already held to
+   * their vocabulary this way; this is the same promise for the eight.
+   */
+  it('covers exactly the destinations the shell actually has', () => {
+    expect([...DESTINATIONS.map((d) => d.id)].sort()).toEqual([...SHELL_DESTINATIONS].sort());
+  });
+
+  for (const destination of DESTINATIONS) {
+    it(
+      `${destination.id} has no accessibility violations`,
+      async () => {
+        const { container } = await mountAt(destination.route, destination.query);
+        // Wait for the real content, not the skeleton: a skeleton is a div, and a
+        // page of divs passes every rule there is — and wait EXPLICITLY, because
+        // the destination is behind a `lazy()` and `findBy`'s 1 s default is not
+        // enough for a chunk under a 95-file parallel suite.
+        await screen.findAllByText(destination.settled, undefined, { timeout: WAIT });
+        await expectNoAxeViolations(container);
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe('axe — every settings section', () => {
+  for (const section of SETTINGS_SECTIONS) {
+    it(
+      `settings/${section.id} has no accessibility violations`,
+      async () => {
+        const { container } = await mountAt(['settings', section.id]);
+        // BY NAME. A bare `{ level: 2 }` matches the section heading AND every
+        // CardTitle, and `findBy*` retries on "found multiple" exactly as it
+        // retries on "found none" — so an ambiguous query does not fail, it
+        // times out, which reads as a page that never rendered.
+        await screen.findByRole('heading', { name: section.title, level: 2 }, { timeout: WAIT });
+        await expectNoAxeViolations(container);
+      },
+      TIMEOUT,
+    );
+  }
+});

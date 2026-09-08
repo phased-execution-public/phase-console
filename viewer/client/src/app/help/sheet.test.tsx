@@ -1,0 +1,327 @@
+/**
+ * The help sheet.
+ *
+ * The property worth a test is **totality in both directions**. `GUIDE_SECTIONS`
+ * lives in `shared/route-meta.js` because it is the frozen URL vocabulary; the
+ * content lives in `client/src/content/guide/*.md`. A section added to one and
+ * forgotten in the other is either a section that renders nothing or content
+ * nothing can reach — neither of which is visible in a screenshot of the eight
+ * that do work.
+ *
+ * The deep-link case is the second: `?help=mobile` has to land on Mobile setup,
+ * not on the first section, because `#/guide/mobile` — which redirects to
+ * exactly that — is the URL the phone-setup instructions tell people to open.
+ * Every case below was a `#/guide/:section` case before 3.0 turned the page
+ * into an overlay; what changed is the address, not the content model.
+ */
+
+import { homedir, hostname, userInfo } from 'node:os';
+import { render, screen, within, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { GUIDE_SECTIONS } from '@shared/route-meta.js';
+import { queryClientConfig } from '@/lib/queries';
+import { expectNoAxeViolations } from '@/test/axe';
+import { SECTIONS, resolveSection, sectionIds } from './sections';
+import { BODIES } from './bodies';
+import { splitGuide } from './split';
+import { HelpSheet } from './sheet';
+
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>();
+  return {
+    ...actual,
+    api: { ...actual.api, state: vi.fn(async () => ({ autopilot: true, allowRun: true })) },
+  };
+});
+
+/**
+ * Viewport width, per test.
+ *
+ * `lib/media.ts` memoises each `MediaQueryList` in a module-level cache, so
+ * swapping `window.matchMedia` after import changes nothing — the first query
+ * of a run wins for the whole file. Mocking the hook is the honest way to ask
+ * "what does this render on a phone", and it is the pattern the rest of the
+ * suite already uses for `@/router` and `@/lib/api`.
+ */
+let phone = false;
+vi.mock('@/lib/media', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/media')>();
+  return { ...actual, usePhone: () => phone };
+});
+
+afterEach(() => {
+  phone = false;
+});
+
+/**
+ * The sheet, open at a section.
+ *
+ * `?help=` is the open state, so "render the guide at mobile setup" is
+ * `renderHelp('mobile')` — and `renderHelp()` is the bare `#/guide` a More-sheet
+ * tap or an old link produces, which must land on the first section.
+ */
+function renderHelp(section?: string, query: Record<string, string> = {}) {
+  const client = new QueryClient(queryClientConfig);
+  return render(
+    <QueryClientProvider client={client}>
+      <HelpSheet route={{ segments: ['now'], query: { help: section ?? '', ...query }, path: 'now' }} />
+    </QueryClientProvider>,
+  );
+}
+
+/** The sheet's own body — every query below is scoped to it, not to the page. */
+const panelOf = () => screen.findByRole('dialog');
+
+/** A section's prose. It moved to `bodies.ts` when the sheet went lazy. */
+const bodyOf = (id: string) => BODIES[id] ?? '';
+const outlineOf = (id: string) => splitGuide(bodyOf(id));
+
+describe('the help section registry', () => {
+  it('covers every frozen GUIDE_SECTIONS id, in both directions', () => {
+    expect([...sectionIds].sort()).toEqual([...GUIDE_SECTIONS].sort());
+  });
+
+  it('gives every section a label, a lede and real content', () => {
+    for (const section of SECTIONS) {
+      expect(section.label, section.id).toBeTruthy();
+      expect(section.lede, section.id).toBeTruthy();
+      // `?raw` returning '' is exactly what a renamed or deleted markdown file
+      // looks like — the import succeeds and the tab is blank.
+      expect(bodyOf(section.id).length, section.id).toBeGreaterThan(400);
+      expect(bodyOf(section.id), section.id).toMatch(/^##? /m);
+    }
+  });
+
+  it('falls back to the first section for an unknown or missing id', () => {
+    expect(resolveSection(undefined).id).toBe(GUIDE_SECTIONS[0]);
+    expect(resolveSection('nope').id).toBe(GUIDE_SECTIONS[0]);
+  });
+
+  it('names no private host, repo or path', () => {
+    // The guide ships in a public repository. Placeholders only.
+    //
+    // `127.0.0.1` and `0.0.0.0` are deliberately allowed: they are the two
+    // literals the security model is *about*, and a guide that could not print
+    // them could not explain itself. Everything else that looks like an address
+    // is somebody's actual machine.
+    const addresses = /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g;
+    const ALLOWED = new Set(['127.0.0.1', '0.0.0.0']);
+    // Whoever is running this, derived — never written down. A test that spells
+    // out the name it forbids leaks it to everyone who reads the test.
+    // A generic machine account is nobody's identity: on a CI box the username
+    // is literally `runner`, and forbidding it would forbid the word this
+    // guide's autopilot chapter is made of.
+    const GENERIC = new Set(['runner', 'ci', 'build', 'agent', 'admin', 'user', 'root', 'ubuntu']);
+    const local = [userInfo().username, hostname(), homedir()].filter(
+      (s) => s.length >= 3 && !GENERIC.has(s.toLowerCase()),
+    );
+    const forbidden = [/\.ts\.net\/[a-z]/i, /\/Users\//, /\/home\/[a-z]/i];
+    // As a token, never a bare substring: this machine's hostname is `Mac`, and
+    // the guide is full of the word "machine". A leak names the identity alone.
+    const names = (body: string, secret: string) =>
+      new RegExp(`(?<![A-Za-z0-9])${secret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9])`, 'i').test(
+        body,
+      );
+
+    for (const section of SECTIONS) {
+      for (const pattern of forbidden) {
+        expect(bodyOf(section.id), `${section.id} matched ${pattern}`).not.toMatch(pattern);
+      }
+      for (const secret of local) {
+        expect(names(bodyOf(section.id), secret), `${section.id} names local identity`).toBe(false);
+      }
+      for (const found of bodyOf(section.id).match(addresses) ?? []) {
+        expect(ALLOWED.has(found), `${section.id} names ${found}`).toBe(true);
+      }
+      // Placeholder hostnames only — never a real tailnet.
+      for (const host of bodyOf(section.id).match(/[\w.-]+\.ts\.net/g) ?? []) {
+        expect(host, section.id).toBe('your-machine.your-tailnet.ts.net');
+      }
+    }
+  });
+
+  it('warns against the one flag that would undo the whole security model', () => {
+    const mobile = SECTIONS.find((s) => s.id === 'mobile')!;
+    expect(bodyOf(mobile.id)).toMatch(/--host 0\.0\.0\.0/);
+    expect(bodyOf(mobile.id)).toMatch(/127\.0\.0\.1|loopback/);
+  });
+});
+
+describe('the help sheet', () => {
+  it('renders the section named by the route, not the first one', async () => {
+    // Asserted against the section's OWN first card rather than a heading
+    // spelled out here. A test that names a heading turns editing prose into
+    // breaking the build, which is the coupling the markdown split exists to
+    // avoid — and it is how this test failed the first time the guide was
+    // rewritten.
+    renderHelp('mobile');
+    const panel = await panelOf();
+    const first = outlineOf('mobile').groups[0].cards[0];
+    // `findBy`, not `getBy`: the panel is behind the sheet's `lazy()` — the
+    // guide's prose, its splitter and `marked` are ~40 KB that has no business
+    // in the entry chunk, so the dialog paints before its body resolves.
+    expect(await within(panel).findByRole('heading', { name: first.title })).toBeTruthy();
+  });
+
+  it('marks that section current so a reload lands where you were', async () => {
+    renderHelp('reference');
+    const chip = await screen.findByRole('button', { name: 'Reference' });
+    expect(chip.getAttribute('aria-current')).toBe('page');
+  });
+
+  it('offers every section, and falls back to the first when none is named', async () => {
+    renderHelp();
+    const panel = await panelOf();
+    const nav = within(panel).getByRole('navigation', { name: 'Guide sections' });
+    expect(within(nav).getAllByRole('button')).toHaveLength(SECTIONS.length);
+    // `?help=` with no value is what `#/guide` and the More sheet produce.
+    expect(within(nav).getByRole('button', { name: SECTIONS[0].label }).getAttribute('aria-current')).toBe(
+      'page',
+    );
+  });
+
+  it('says what this console can actually do before describing what one can', async () => {
+    renderHelp();
+    expect(await screen.findByText(/Runs are enabled on this console/i)).toBeTruthy();
+  });
+
+  it('renders nothing at all when the URL does not ask for it', () => {
+    const client = new QueryClient(queryClientConfig);
+    render(
+      <QueryClientProvider client={client}>
+        <HelpSheet route={{ segments: ['now'], query: {}, path: 'now' }} />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('renders markdown through the sanitizer — a table becomes a real table', async () => {
+    renderHelp('reference');
+    const panel = await panelOf();
+    expect((await within(panel).findAllByRole('table')).length).toBeGreaterThan(0);
+  });
+
+  it('paints the reference glossary words as their real badges, with the hover help', async () => {
+    renderHelp('reference');
+    const panel = await panelOf();
+
+    // The decoration runs in an effect after the sanitizer fills the DOM.
+    await waitFor(() => {
+      const halted = [...panel.querySelectorAll('code')].find((el) => el.textContent === 'halted');
+      expect(halted, 'the glossary names halted as inline code').toBeTruthy();
+      // A halted run needs a person: the badge wears the needs-you state class
+      // and paints by `--state`, never a colour of its own.
+      expect(halted!.className, "painted as the run badge's own UI state").toContain('state-needs-you');
+      expect(halted!.className).toContain('text-state');
+      expect(halted!.getAttribute('title')).toMatch(/must not be automated past/);
+    });
+
+    // The eight UI states are words in the same glossary, and wear themselves.
+    const done = [...panel.querySelectorAll('code')].find((el) => el.textContent === 'done');
+    expect(done, 'done appears as inline code in the eight-states table').toBeTruthy();
+    expect(done!.className).toContain('state-done');
+    expect(done!.getAttribute('title')).toMatch(/Finished/);
+
+    // A code word that is NOT a status stays a plain code span.
+    const flag = [...panel.querySelectorAll('code')].find((el) => el.textContent?.startsWith('--allow'));
+    if (flag) expect(flag.className).not.toContain('border-');
+  });
+});
+
+describe('the section is cards, not a wall', () => {
+  it('breaks the reference glossary into separate cards', async () => {
+    // The section this refactor exists for: ~90 table rows under one heading.
+    renderHelp('reference');
+    const panel = await panelOf();
+    expect(within(panel).getAllByRole('heading', { level: 3 }).length).toBeGreaterThan(6);
+  });
+
+  it('gives every card in every section an accessible name', async () => {
+    for (const section of SECTIONS) {
+      const { unmount } = renderHelp(section.id);
+      const panel = await panelOf();
+      const summaries = [...panel.querySelectorAll('summary')];
+      expect(summaries.length, `${section.id} rendered no cards`).toBeGreaterThan(1);
+      for (const summary of summaries) {
+        expect(summary.textContent?.trim(), `${section.id}: a card with no name`).toBeTruthy();
+      }
+      unmount();
+    }
+  });
+
+  it('renders a group band as a real heading above its cards', async () => {
+    const banded = SECTIONS.find((s) => outlineOf(s.id).groups.some((g) => g.banded));
+    if (!banded) return; // Every file is flat today; this guards the shape, not the content.
+    renderHelp(banded.id);
+    const panel = await panelOf();
+    const group = outlineOf(banded.id).groups.find((g) => g.banded)!;
+    expect(within(panel).getByRole('heading', { level: 2, name: group.title })).toBeTruthy();
+  });
+
+  it('opens every card on a desktop, except the bulky ones', async () => {
+    renderHelp('reference');
+    const panel = await panelOf();
+    // No reference card is bulky — a glossary you cannot Cmd-F is not a
+    // glossary — so every one of them is open at desktop width.
+    for (const card of panel.querySelectorAll('details')) {
+      expect((card as HTMLDetailsElement).open).toBe(true);
+    }
+  });
+
+  it('opens only the first card on a phone', async () => {
+    phone = true;
+    renderHelp('reference');
+    const panel = await panelOf();
+    const cards = [...panel.querySelectorAll('details')] as HTMLDetailsElement[];
+    expect(cards.length).toBeGreaterThan(1);
+    // Asserted on `open`, not on a role query: whether jsdom exposes content
+    // inside a closed `<details>` depends on its UA stylesheet, which is not a
+    // thing to bet a test on.
+    expect(cards[0].open).toBe(true);
+    expect(cards.some((c) => !c.open)).toBe(true);
+  });
+});
+
+describe('deep links to a card', () => {
+  it('opens the card named by ?card=', async () => {
+    const target = outlineOf('reference').groups[3].cards[0];
+    renderHelp('reference', { card: target.id });
+    const panel = await panelOf();
+    const card = panel.querySelector<HTMLDetailsElement>(`#card-${CSS.escape(target.id)}`);
+    expect(card, `no card with id ${target.id}`).toBeTruthy();
+    expect(card!.open).toBe(true);
+  });
+
+  it('ignores an unknown ?card= rather than rendering nothing', async () => {
+    // Card ids come from prose, so they are deliberately NOT frozen vocabulary
+    // — which means a stale link has to degrade, not break.
+    renderHelp('reference', { card: 'no-such-card' });
+    const panel = await panelOf();
+    expect(within(panel).getAllByRole('table').length).toBeGreaterThan(0);
+  });
+
+  /**
+   * The three overlays were the only surfaces in the client with no axe pass —
+   * eight destinations, eight Settings sections, the rail, the header, the tab
+   * bar, the More sheet and every `components/ui/*` primitive had one. They are
+   * also the surfaces most likely to fail one, because an overlay has to own
+   * focus, name itself and be escapable: a dialog is exactly where a missing
+   * accessible name or a focus trap that never closed goes unnoticed.
+   *
+   * Mounted OPEN with real prose, so the assertion is about what an operator
+   * actually meets.
+   */
+  it('opens with no axe violations, on real prose', async () => {
+    const { container } = renderHelp('reference');
+    await panelOf();
+    await expectNoAxeViolations(container);
+  });
+
+  it('opens with no axe violations on a card permalink', async () => {
+    const target = outlineOf('reference').groups[3].cards[0];
+    const { container } = renderHelp('reference', { card: target.id });
+    await panelOf();
+    await expectNoAxeViolations(container);
+  });
+});

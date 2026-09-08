@@ -1,0 +1,371 @@
+/**
+ * The autopilot: what the run is doing, and the controls to change it.
+ *
+ * Two audiences at once. Sitting at the desk you want the transcript, the costs
+ * and the board. On a phone at 11pm you want one question answered — "does this
+ * need me?" — so approvals come first, carry their evidence, and are answerable
+ * without scrolling past anything.
+ *
+ * Every number here comes from the server's run state. Nothing is recomputed in
+ * the browser, for the same reason the board never is: two sources of truth
+ * disagree eventually, and the one on screen is the one that gets believed.
+ *
+ * ## What changed from the 1,646-line original
+ *
+ * - **The nine-plus banners are one `StatusStack`** with a declared priority
+ *   (`status.tsx`), instead of eleven independent call sites in source order.
+ * - **The data plane is TanStack Query**, so the page no longer blanks itself on
+ *   every event: the old view held the run in `useState` and set it to `null`
+ *   before each refetch. Nothing here calls `refresh()`; the cache is
+ *   invalidated by `EVENT_EFFECTS` and re-renders when the answer changes.
+ * - **The firehose stays out of the cache.** `run:stream` is subscribed to
+ *   directly (`useSessionStream`, inside each `SessionPanes`) and appended.
+ * - **The monolith is eight modules.** This one is composition and the two
+ *   things that genuinely need to live at the top: the `act()` wrapper and the
+ *   `busy` label it drives.
+ *
+ * ## One window per session
+ *
+ * The page had one console because a run had one session. It can now drive
+ * several phases at once, so the console is a tab strip: a **Run** tab carrying
+ * the whole run's narration, and one tab per live or queued lane, each owning its
+ * own console, task list and tool log (`session-panes.tsx`). Two sessions'
+ * sentences in one window is a page that is wrong with nothing on it to say so.
+ */
+
+import { useCallback, useState } from 'react';
+import { Button, Spinner, toast } from '@/components/ui';
+import { api, type PlanDetail } from '@/lib/api';
+import {
+  useAccounts,
+  useApiMutation,
+  useApprovals,
+  useAuth,
+  useConsoleState,
+  useJournal,
+  useQueue,
+  useTimeline,
+  useRulings,
+  useRun,
+  useRunScopes,
+  useSessions,
+} from '@/lib/queries';
+import { keys } from '@/lib/queries';
+import { useQueryClient } from '@tanstack/react-query';
+import { planHref } from '@/app/routes';
+import { isLive } from './defaults';
+import { ApprovalQueue, type Decide } from './approvals';
+import { Controls } from './lane-setup';
+import { LiveConsole } from './console';
+import { RunHeader, RunTiles } from './tiles';
+import { GitCard } from './git-card';
+import { PhaseTable } from './phase-table';
+import { NextSteps } from './ways-forward';
+import { SessionTabs } from './lanes';
+import { lanesOf } from './session-panes';
+import { AuthCard, RunStatusStack, StaleServerNote, looksLikeAuthFailure } from './status-strip';
+import { RunHistory } from './history';
+import { Timeline } from './timeline';
+import { Gantt } from './gantt';
+import { AttemptCompare } from './attempt-compare';
+import { Journal } from './journal';
+import { RecoveryActions } from '@/components/recovery-actions';
+
+export function RunView({ detail }: { detail: PlanDetail }) {
+  const slug = detail.summary.slug;
+  const planPhases = detail.phases;
+  const planSkills = detail.plan?.sessionBudget?.skills ?? [];
+  const planMcp = detail.plan?.sessionBudget?.mcpServers ?? [];
+
+  const client = useQueryClient();
+  const { data: state } = useConsoleState();
+  // The client is served fresh from disk; the server is whatever Node loaded at
+  // startup. Upgrading the skill under a running console leaves this page talking
+  // to an API that has no run endpoints, and the honest thing to show is why —
+  // not a stack of failed requests.
+  const stale = state != null && state.autopilot === false;
+  const allowRun = Boolean(state?.allowRun);
+  const enabled = !stale;
+
+  const { data: detailRun, isPending } = useRun(slug, enabled);
+  const { data: queue } = useApprovals(enabled);
+  const { data: auth } = useAuth(enabled);
+
+  const run = detailRun?.run ?? null;
+  const live = isLive(run?.status);
+
+  // Admission — the only place an answer to "why is this not running" can come
+  // from, because the answer is always about some OTHER plan. The queue is asked
+  // for only when this run actually has a phase in it: on the ordinary page
+  // nothing renders the answer, and a request whose result is never read is a
+  // request that should not have been made.
+  const queuedHere = lanesOf(run).some((lane) => lane.queued);
+  const { data: admission } = useQueue(enabled && queuedHere);
+  const { data: scopes } = useRunScopes(slug, enabled && Boolean(run));
+  // The audit trail and the ledger. The journal is per RUN and asked for only
+  // once there is one; the ledger is per PLAN and answers before any run
+  // exists — which is every plan somebody is driving by hand.
+  const { data: journal } = useJournal(slug, undefined, 500, enabled && Boolean(run));
+  const { data: timeline } = useTimeline(slug, undefined, enabled && Boolean(run));
+  // Which phase's attempts are open in the drawer. `null` is closed; the Gantt
+  // is the only thing that opens it, and only for a phase with two boardings.
+  const [comparePhase, setComparePhase] = useState<number | null>(null);
+  const { data: ledger } = useRulings(slug, enabled);
+
+  const approvals = (queue ?? []).filter((a) => a.status === 'pending');
+
+  /* ---- recovery: what an AI session could put right, and whether one is on it ---- */
+  const { data: terminals } = useSessions(state);
+  const allowAgent = Boolean(state?.allowAgent);
+  // The run's OWN account decides whether this is an auth halt: the machine
+  // login's probe says nothing about the profile a pinned run pays with.
+  const { data: accountsState } = useAccounts();
+  const runAccount = run?.accountId
+    ? accountsState?.accounts.find((candidate) => candidate.id === run.accountId)
+    : undefined;
+  const authFailure = Boolean(looksLikeAuthFailure(run, auth, runAccount));
+  const haltPhase = run?.halt?.phase ?? run?.activePhase ?? undefined;
+
+  /**
+   * Run one action, then re-read.
+   *
+   * The mechanism is the shared `useApiMutation`, which is what puts the
+   * re-read in `onSettled` — the whole point. A card answered on a phone leaves
+   * this tab holding one that no longer exists; pressing it 404s, the error is
+   * toasted, and with the refresh in the success leg it was skipped, so the
+   * phantom stayed on screen and the next press 404'd again. The failure is
+   * exactly the case where re-reading matters most.
+   *
+   * What is local is the LABEL. Every verb on this page disables itself and
+   * renames itself while it is in flight ("Stopping…", "Arming…"), and the
+   * mutation's own `variables` is where the label in flight lives — one
+   * mutation, one label, no second piece of state to leave set when a request
+   * dies with the tab.
+   */
+  const action = useApiMutation<{ label: string; call: () => Promise<unknown> }, unknown>({
+    fn: ({ call }) => call(),
+    invalidates: keys.afterRunAct(slug),
+  });
+  const { mutateAsync } = action;
+  const busy = action.isPending ? (action.variables?.label ?? '') : '';
+
+  const act = useCallback(
+    (label: string, call: () => Promise<unknown>): Promise<void> =>
+      // Settled, never rejected: every caller writes `void act(…)`, and a
+      // rejection here would be an unhandled one. The failure has already been
+      // reported — `useApiMutation` toasts the server's own words.
+      mutateAsync({ label, call }).then(
+        () => undefined,
+        () => undefined,
+      ),
+    [mutateAsync],
+  );
+
+  const decide: Decide = useCallback(
+    (id, decision, reason, remember, rule) => {
+      void act('decide', async () => {
+        const result = await api.decide(id, decision, reason, remember, rule);
+        // The rule is reported back rather than assumed: a card can be answered and
+        // the remembering still refused (an unparseable rule), and saying
+        // "Approved" to both would hide the half that failed.
+        if (result?.error) toast(result.error, 'warn');
+        else if (result?.wrote) {
+          toast(
+            `${decision === 'allow' ? 'Approved' : 'Denied'} · wrote ${result.wrote} (${result.scope})`,
+            'ok',
+          );
+        } else {
+          toast(decision === 'allow' ? 'Approved' : 'Denied', decision === 'allow' ? 'ok' : 'warn');
+        }
+      });
+    },
+    [act],
+  );
+
+  if (stale) return <StaleServerNote />;
+  if (isPending && !detailRun) return <Spinner label="Reading run state" />;
+
+  const phases = Object.values(run?.phases ?? {}).sort((a, b) => a.phase - b.phase);
+  const history = detailRun?.history ?? [];
+
+  return (
+    <div className="flex flex-col gap-4">
+      {run && (
+        <RunHeader run={run} live={live} eta={detailRun?.eta ?? null} phaseEta={detailRun?.phaseEta ?? []} />
+      )}
+
+      {/* First, always: a session parked with its hand up is the only thing on
+          this page that is waiting on a person. */}
+      <ApprovalQueue approvals={approvals} allowRun={allowRun} onDecide={decide} />
+
+      {authFailure && (
+        <AuthCard
+          auth={auth}
+          allowRun={allowRun}
+          account={runAccount}
+          onRecheck={() => {
+            if (run?.accountId) {
+              // Re-read THAT account, not the machine login — this is the
+              // "I signed in over there, look again" button.
+              void api
+                .accountRefresh(run.accountId)
+                .then(() => client.invalidateQueries({ queryKey: keys.accounts() }))
+                .catch(() => client.invalidateQueries({ queryKey: keys.accounts() }));
+              return;
+            }
+            void client.invalidateQueries({ queryKey: keys.auth() });
+            void api.auth(true).then((fresh) => client.setQueryData(keys.auth(), fresh));
+          }}
+        />
+      )}
+
+      <RunStatusStack
+        run={run}
+        live={live}
+        allowRun={allowRun}
+        busy={busy}
+        git={detailRun?.git}
+        onClearScope={() =>
+          void act('scope', async () => {
+            await api.runSettings(slug, { onlyPhases: [] });
+            toast('Scope cleared — this run continues through the whole plan', 'ok');
+          })
+        }
+        onGuard={() =>
+          void act('profile', async () => {
+            await api.runSettings(slug, { permissionProfile: 'guarded' });
+            toast('Back to Guarded — the next call that matters raises a card', 'ok');
+          })
+        }
+        recovery={{
+          ...(authFailure ? { authFailure: true } : {}),
+          target: {
+            slug,
+            ...(haltPhase != null ? { phase: haltPhase } : {}),
+            ...(run?.id ? { runId: run.id } : {}),
+          },
+        }}
+      />
+
+      {/* The plan-level recovery, one press: confirm the stop against the
+          board, stand down what it settled, recover or continue what is real.
+          The phase-level offers live on the halt banner and each row. */}
+      {run && !live && !run.resolved && ['halted', 'interrupted', 'parked'].includes(run.status) && (
+        <RecoveryActions target={{ slug, runId: run.id }} ctx={{ run }} max={2} legend account />
+      )}
+
+      {/* Every stopped phase's cause in its own words, with the action that
+          moves it — a status word alone was a dead end (reported twice). */}
+      <NextSteps slug={slug} planPhases={planPhases} run={run} live={live} authFailure={authFailure} />
+
+      <Controls
+        slug={slug}
+        run={run}
+        live={live}
+        busy={busy}
+        allowRun={allowRun}
+        planPhases={planPhases}
+        planSkills={planSkills}
+        planMcp={planMcp}
+        qaMode={detail.summary.qaMode}
+        allowWrites={Boolean(state?.allowWrites)}
+        liveness={detailRun?.liveness}
+      />
+
+      {run && <RunTiles run={run} phases={phases} total={detail.phases.length} />}
+
+      {/* Where the work IS, under the tiles that say how it is going. Only for
+          a run with a checkout story — an isolated one, or one that asked and
+          was refused; an ordinary shared run gets nothing here. */}
+      <GitCard run={run} git={detailRun?.git} />
+
+      {/* Always rendered: a plan with no phase graph is a fact about the PLAN,
+          and the table says so in the plan's words. The card that used to stand
+          in here was titled "No run yet" and said nothing had been run — a
+          claim about the RUN, on a page where the plan is what is missing. */}
+      <PhaseTable
+        slug={slug}
+        run={run}
+        planPhases={planPhases}
+        live={live}
+        allowRun={allowRun}
+        queue={admission?.entries}
+        scopes={scopes?.scopes}
+        phaseEta={detail.eta?.perPhase}
+        liveness={detailRun?.liveness}
+        rulings={ledger?.rulings}
+        recovery={{
+          allowAgent,
+          authFailure,
+          sessions: terminals?.sessions,
+          qaMode: detail.summary.qaMode,
+          planSkills,
+          allowWrites: Boolean(state?.allowWrites),
+        }}
+      />
+
+      {/* The console before the panels.
+          What the session is saying right now is the thing you came to read —
+          and it carries the ask box, the one control on this page that is only
+          useful *while* you are watching. The task list and the tool log are
+          the summary of what it said, so they read after it. */}
+      {run ? (
+        <SessionTabs
+          slug={slug}
+          run={run}
+          live={live}
+          allowRun={allowRun}
+          enabled={enabled}
+          entries={admission?.entries}
+          scopes={scopes?.scopes}
+          phaseEta={detailRun?.phaseEta ?? []}
+          detail={detail}
+        />
+      ) : (
+        <LiveConsole lines={[]} subtitle="idle" />
+      )}
+
+      {/* Where the wall clock went, then the audit trail. Both AFTER the
+          console: the console is the present tense and the reason the page is
+          open; these two are what you scroll to when the present tense has
+          stopped explaining itself. */}
+      {/* Two timelines, two questions. The Gantt says WHEN each phase held the
+          lane and which chain made the run as long as it was; the card below
+          says how each phase's own clock was split. Neither answers the
+          other's question, which is why both are here. */}
+      {run && timeline ? (
+        <Gantt
+          timeline={timeline}
+          onCompare={setComparePhase}
+          // The panel knows nothing about this plan, so the page hands it the
+          // destination: an axis with nothing on it is answered by the ORDER
+          // the plan declared, which the route map has drawn all along.
+          emptyAction={
+            <Button size="sm" variant="default" asChild>
+              <a href={planHref(slug, 'route')}>See the planned order</a>
+            </Button>
+          }
+        />
+      ) : null}
+
+      {run && (
+        <Timeline
+          phases={phases}
+          emptyAction={
+            <Button size="sm" variant="default" asChild>
+              <a href={planHref(slug, 'phases')}>Open the phase board</a>
+            </Button>
+          }
+        />
+      )}
+
+      <AttemptCompare slug={slug} phase={comparePhase} onClose={() => setComparePhase(null)} />
+
+      {run && <Journal entries={journal ?? []} />}
+
+      <RunHistory history={history} />
+    </div>
+  );
+}
+
+export default RunView;

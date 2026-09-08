@@ -1,0 +1,110 @@
+{
+  "note": "Every distinct run-status and phase-status SHAPE this console had on disk when 3.5.0 was written, anonymised to the fields the lifecycle fold reads. Slugs, paths, ids, notes and timestamps are gone; only the shape is the point. Regenerate by widening the keys in test/run-lifecycle.test.ts if a new field starts deciding a fold.",
+  "sampledRunFiles": 108,
+  "runs": [
+    {
+      "status": "parked"
+    },
+    {
+      "status": "paused"
+    },
+    {
+      "status": "halted"
+    },
+    {
+      "status": "stopping"
+    },
+    {
+      "status": "finished"
+    },
+    {
+      "status": "complete"
+    },
+    {
+      "status": "interrupted"
+    },
+    {
+      "status": "waiting",
+      "waitUntil": "2026-08-31T00:00:00.000Z",
+      "waitReason": "external"
+    }
+  ],
+  "phases": [
+    {
+      "status": "failed"
+    },
+    {
+      "status": "pending"
+    },
+    {
+      "status": "interrupted"
+    },
+    {
+      "status": "done",
+      "verification": {
+        "ok": true
+      }
+    },
+    {
+      "status": "parked"
+    },
+    {
+      "status": "failed",
+      "verification": {
+        "ok": false
+      }
+    },
+    {
+      "status": "gated"
+    },
+    {
+      "status": "done",
+      "verification": {
+        "ok": false
+      }
+    },
+    {
+      "status": "done"
+    },
+    {
+      "status": "pending",
+      "lockWaitSince": "2026-08-31T00:00:00.000Z"
+    },
+    {
+      "status": "waiting"
+    },
+    {
+      "status": "skipped",
+      "verification": {
+        "ok": false
+      }
+    },
+    {
+      "status": "skipped"
+    },
+    {
+      "status": "pending",
+      "declared": {
+        "status": "no-defect"
+      }
+    },
+    {
+      "status": "parked",
+      "declared": {
+        "status": "needs-human"
+      }
+    },
+    {
+      "status": "waiting",
+      "declared": {
+        "status": "waiting-external"
+      }
+    },
+    {
+      "status": "failed",
+      "declared": {
+        "status": "blocked"
+      }
+    }
+  ]
+}

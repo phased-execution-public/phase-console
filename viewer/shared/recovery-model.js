@@ -1,0 +1,940 @@
+/**
+ * The recovery model: ONE table of every way forward the console can offer a
+ * stuck run or phase, and one vocabulary for what each way is called and what
+ * it will actually do.
+ *
+ * Before this file there were two unrelated systems both called "recovery" —
+ * a fresh briefed agent session ("Fix with AI", `server/recovery.ts`) and the
+ * runner's resume-of-the-phase's-own-session verbs (`recheck`/`closeout`/
+ * `resume`) — five word-books describing them, four different subsets of the
+ * same actions on one page, and a halt-kind classification duplicated in
+ * three places that disagreed about `phase-blocked`. Every one of those
+ * consumers now reads THIS module:
+ *
+ *   - `server/recovery.ts` re-exports `RECOVERY_CLASSES`/`RECOVERY_TITLES`;
+ *   - `server/service.ts` builds `PhaseDiagnosis.actions` and the unattended
+ *     `autoRecoveryClass` from `recoveryActionsFor`/`KIND_PROFILE`;
+ *   - `client/src/lib/recovery.ts` re-exports the classifiers and words;
+ *   - `client/src/components/recovery-actions.tsx` renders the actions.
+ *
+ * Dependency-free ESM (`.js` + JSDoc), the `phase-model.js` precedent: the
+ * client imports it as `@shared/recovery-model.js`, the server as
+ * `../shared/recovery-model.js`, and the node tests directly — so one parity
+ * test can hold every layer to the same ids and words by import identity.
+ */
+
+import { qaGateHolds } from './plan-vocab.js';
+
+/* ------------------------------------------------------------------ *
+ * Mechanisms — the user-visible taxonomy
+ * ------------------------------------------------------------------ */
+
+/**
+ * @typedef {'check'|'own-session'|'new-agent'|'run-control'|'claim'|'mcp'|'qa'} Mechanism
+ */
+
+/**
+ * What each mechanism IS, said once. The badge sits on the button; the blurb
+ * is the legend a surface shows when two mechanisms are on offer side by side
+ * — the exact confusion ("Fix with AI" vs "Finish this phase") this module
+ * exists to end.
+ * @type {Record<Mechanism, { badge: string, blurb: string }>}
+ */
+export const MECHANISMS = {
+  check: {
+    badge: 'check',
+    blurb: 'A deterministic re-read: board, §Verification commands, validate.sh. No AI session. Free.',
+  },
+  'own-session': {
+    badge: 'own session',
+    blurb:
+      "Resumes this phase's OWN Claude session (claude -p --resume) inside the runner — its context is intact, and the run's settings, deny rules and hooks all apply.",
+  },
+  'new-agent': {
+    badge: 'new agent',
+    blurb:
+      'Opens a FRESH interactive Claude session briefed by the console with the evidence. Fresh eyes — it knows the facts, not the conversation. Costs a full session.',
+  },
+  'run-control': {
+    badge: 'run',
+    blurb: 'Acts on the run record and the loop — no new AI session by itself.',
+  },
+  claim: {
+    badge: 'claim',
+    blurb: 'Edits the phase-lock file only.',
+  },
+  mcp: {
+    badge: 'MCP',
+    blurb: "Changes this run's MCP policy and retries only the phases that policy parked.",
+  },
+  qa: {
+    badge: 'QA',
+    blurb:
+      'Acts on the recorded QA verdict — the row in test-status.md that is holding every dependent phase. A round is a fix session plus a fresh-context review; the round budget stops the loop.',
+  },
+};
+
+/** The one-line legend shown when both AI mechanisms are on offer together. */
+export const MECHANISM_LEGEND =
+  "Two ways to hand this to AI: resume the phase's own session (cheap — its " +
+  'context is intact), or brief a new agent (fresh eyes — it knows the ' +
+  'evidence, not the conversation).';
+
+/* ------------------------------------------------------------------ *
+ * Halt kinds — one profile, three consumers
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every `kind` a halt can carry. The runner writes these at the halt site;
+ * `state.ts` mirrors this list as the `HaltKind` union and a parity test
+ * holds the two identical. Records written before kinds existed have none
+ * and fall to the legacy reason-regexes below.
+ */
+/**
+ * A halt kind, as a type — the array below is the one truth and this is the only
+ * way to name it in a type position. Without it every consumer had to retype the
+ * seventeen words, which is exactly what `server/runner/state.ts` and
+ * `client/src/lib/api/runs.ts` both did.
+ * @typedef {(typeof HALT_KINDS)[number]} HaltKind
+ */
+export const HALT_KINDS = [
+  'verify-failed',
+  'no-handoff',
+  'phase-blocked',
+  'waiting-external-timeout',
+  'needs-human',
+  'plan-lint',
+  'phase-crashed',
+  'budget',
+  'plan-unreadable',
+  'failure-streak',
+  'models-exhausted',
+  'verification-preflight',
+  'mcp-preflight',
+  // Kinds added when the formerly-kindless halt sites were named:
+  'run-preflight', // start() refused: auth/config preflight failed
+  'recovery-failed', // a recovery attempt crashed or explained why it could not finish
+  'orphaned-session', // adopt() found a live session from an earlier console
+  'runner-crashed', // the drive loop itself threw
+  // A worktree lane's commits would not merge into the run branch. The merge
+  // was aborted and every commit survives on `pe/<slug>/pN`; what is missing is
+  // a decision only a person can make about two edits to the same lines.
+  'worktree-merge',
+];
+
+/**
+ * Which halt kinds are facts about ONE PHASE, and which stop the whole RUN.
+ *
+ * The runner used to have a single `halt()`: whatever the kind, it wrote
+ * `state.halt`, flipped the run to `halting`, and the drive loop drained every
+ * queued sibling lane — `phase.not-started` "the run was stopped / halted while
+ * this phase waited for its scope" appears **125×** in the corpus, later read
+ * as `never-started` and answered with `reboard-fresh`. One phase failing its
+ * §Verification is not a reason to stop the other five.
+ *
+ * The split is by what the kind is ABOUT, not by how bad it is:
+ *
+ *   - **phase-level** — the evidence names one phase and says nothing about
+ *     the rest of the plan. `settlePhase()` writes `record.halt` and the phase
+ *     is settled; the siblings already queued or in flight keep their places and
+ *     board, which is the point. (Whether a NEW candidate is then admitted is
+ *     the drive loop's call and is not uniform across these kinds — see
+ *     `Runner.settlePhase`.) The run still ends when it runs out of candidates,
+ *     and `failure-streak` (run-level) is what turns a plan that keeps failing
+ *     into a stop.
+ *   - **run-level** — the evidence is about the RUN: its money, its models, its
+ *     plan file, its own crash. Nothing downstream can usefully proceed, so
+ *     `halt()` keeps its old meaning and stops everything.
+ *
+ * Exhaustive and disjoint over `HALT_KINDS` — `test/waiting-is-a-state.test.ts`
+ * pins both directions, so a new kind must choose a side.
+ *
+ * ⚠️ **The split governs `Runner.halt()`, which is not the only writer.**
+ * `park()` and a handful of sites assign `state.halt` directly, and three
+ * phase-level kinds — `verification-preflight`, `mcp-preflight` and
+ * `orphaned-session` — reach the record ONLY that way today, so for them the
+ * ending still lands on the run. Four readers depend on that
+ * (`inbox.ts`, `service-base.ts`, `converge.ts`), which is why moving them is
+ * Phase 4/7's job and not a silent change here. This list is the
+ * CLASSIFICATION — what each kind is about — and `halt()` is the one router
+ * that acts on it so far.
+ */
+export const PHASE_HALT_KINDS = [
+  'verify-failed',
+  'no-handoff',
+  'phase-blocked',
+  'waiting-external-timeout',
+  'needs-human',
+  'phase-crashed',
+  'verification-preflight',
+  'mcp-preflight',
+  'recovery-failed',
+  'orphaned-session',
+  'worktree-merge',
+];
+
+/** The kinds that stop the whole run — see `PHASE_HALT_KINDS`. */
+export const RUN_HALT_KINDS = [
+  'budget',
+  'plan-unreadable',
+  'plan-lint',
+  'failure-streak',
+  'models-exhausted',
+  'run-preflight',
+  'runner-crashed',
+];
+
+/** True when this halt kind settles one phase rather than stopping the run. */
+export function isPhaseHalt(kind) {
+  return PHASE_HALT_KINDS.includes(kind);
+}
+
+/**
+ * The phase-level kinds that are a VERDICT this run reached about the work,
+ * rather than an account of how this run failed to reach one.
+ *
+ * The distinction only matters in one place, and it matters a lot there:
+ * `reconcileRecordsAgainstBoard` closes a record the board has overtaken and
+ * retires its ending with it ("a halt anchored to a phase that is now done is a
+ * card about nothing"). Which of those is right turns entirely on where the
+ * board's `done` CAME from:
+ *
+ *   - **adjudicated** — the phase's handoff already read complete, this run ran
+ *     its §Verification against it (or asked a person to), and the answer was
+ *     no. The board's `done` is that same handoff, so it is not new evidence
+ *     and it does not outrank the verdict. Measured (D27): a phase's
+ *     `pnpm verify:local` ran 9.7 minutes, failed, and sixty seconds later the
+ *     reconciler wrote `phase.reconciled {outcome: done}` over it — a green
+ *     board on a red suite, with no trace of the disagreement.
+ *   - **everything else** — `no-handoff`, a session that vanished, a preflight
+ *     that could not start, a merge that conflicted. The run never reached a
+ *     verdict, so a board that NOW reads `done` is a handoff that did not exist
+ *     when it stopped: genuinely closed outside this run, and the ending
+ *     describes nothing any more.
+ *
+ * Holding the second group back is not a harmless over-guard — it is round 1's
+ * misclassification wedge with a new door. Nothing else retires such an ending
+ * (the phase is done, so it never re-boards and never retries), the classifier
+ * prefers `record.halt` to `state.halt`, and `endedBadly` keeps the run out of
+ * `finished` for as long as it lives.
+ *
+ * ⚠️ **`needs-human` is the impure member, and the guard's `status === 'failed'`
+ * is what keeps it honest.** Only ONE of its three writers adjudicates: the
+ * sign-off a person rejected (`Runner.askHuman`'s deny arm), which sets
+ * `record.status = 'failed'`. The other two — no approval broker configured, and
+ * the credential wall — reach the same kind having judged nothing, and are
+ * excluded here only because they leave the record `awaiting-verification` or
+ * `parked`, neither of which the guard looks at. If you ever set one of those
+ * arms to `failed`, split the kind first: a phase halted on an expired login
+ * that a person then completes would otherwise be held out of reconcile for
+ * ever, which is this docblock's whole subject. Pinned by
+ * `test/waiting-is-a-state.test.ts`.
+ */
+export const ADJUDICATED_HALT_KINDS = ['verify-failed', 'needs-human'];
+
+/** True when this ending is a verdict on the work — see `ADJUDICATED_HALT_KINDS`. */
+export function isAdjudicatedHalt(kind) {
+  return ADJUDICATED_HALT_KINDS.includes(kind);
+}
+
+/**
+ * How each kind is treated, decided ONCE:
+ *
+ *   - `sessionShaped`: the halt banner may offer the phase's own session
+ *     (`closeout`). `phase-blocked` is DELIBERATELY false since 2026-08-14 —
+ *     the session already wrote its blocked handoff, and the measured failure
+ *     was four closeout resumes looping on a phase whose brief forbade the
+ *     work that would unblock it. Its session-path is `resume` (with an
+ *     instruction, after the blocker is cleared), never `closeout`.
+ *   - `humanClass`: which agent briefing the "new agent" button offers a
+ *     PERSON — null means an agent session is the wrong tool (a budget halt
+ *     wants Continue; a needs-human park wants the person it asked for).
+ *   - `autoClass`: what the UNATTENDED machinery does with the kind by itself.
+ *     An agent class (`RECOVERY_CLASSES`) names the briefing the legacy healer
+ *     launched; a LADDER class (`LADDER_CLASSES`) says the kind is no longer
+ *     healed by halt kind at all — the situation classifier reads the phase
+ *     and the remediation ladder climbs (`server/runner/{situation,ladder}.ts`):
+ *     `ladder:unblock` for a declared blocker (one bounded unblock session,
+ *     then an errand), `ladder:resource` for the resource walls (switch
+ *     account/model, wait for the window, raise the budget once, then an
+ *     errand), `ladder` for everything the situation ladder sorts out. Null
+ *     means a person's, at once (a needs-human park, a live orphan).
+ *   - `park`: the kind describes a parked run, not a halted one.
+ *
+ * @type {Record<string, { sessionShaped: boolean, humanClass: string|null, autoClass: string|null, park?: boolean }>}
+ */
+export const KIND_PROFILE = {
+  'verify-failed': {
+    sessionShaped: true,
+    humanClass: 'halted-verification',
+    autoClass: 'halted-verification',
+  },
+  'no-handoff': {
+    sessionShaped: true,
+    humanClass: 'halted-missing-handoff',
+    autoClass: 'halted-missing-handoff',
+  },
+  'phase-blocked': { sessionShaped: false, humanClass: null, autoClass: 'ladder:unblock' },
+  'waiting-external-timeout': {
+    sessionShaped: true,
+    humanClass: 'halted-missing-handoff',
+    autoClass: 'halted-missing-handoff',
+  },
+  'needs-human': { sessionShaped: false, humanClass: null, autoClass: null },
+  'plan-lint': { sessionShaped: false, humanClass: 'plan-repair', autoClass: 'halted-verification' },
+  'phase-crashed': {
+    sessionShaped: false,
+    humanClass: 'interrupted-resume',
+    autoClass: 'interrupted-resume',
+  },
+  budget: { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource' },
+  'plan-unreadable': { sessionShaped: false, humanClass: 'plan-repair', autoClass: null },
+  'failure-streak': { sessionShaped: false, humanClass: 'interrupted-resume', autoClass: 'ladder' },
+  'models-exhausted': { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource' },
+  'verification-preflight': {
+    sessionShaped: false,
+    humanClass: 'plan-repair',
+    autoClass: 'plan-repair',
+    park: true,
+  },
+  'mcp-preflight': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  'run-preflight': { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource', park: true },
+  'recovery-failed': { sessionShaped: false, humanClass: 'interrupted-resume', autoClass: 'ladder' },
+  'orphaned-session': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  'runner-crashed': { sessionShaped: false, humanClass: 'interrupted-resume', autoClass: 'ladder' },
+  // `autoClass: null` on purpose. Two lanes edited the same lines and git
+  // declined to guess which is right; no rung of the ladder can know either,
+  // and a healer that "fixed" it would be picking a side of somebody's work at
+  // 3am. The errand names both lanes and the conflicted files, and both lane
+  // branches are intact for whoever reads it.
+  'worktree-merge': { sessionShaped: false, humanClass: null, autoClass: null },
+};
+
+/**
+ * The `autoClass` values that mean "the ladder, not an agent class": the
+ * situation classifier reads the phase and the remediation ladder climbs —
+ * `server/runner/situation.ts` + `ladder.ts`, the table in
+ * `shared/ladder-model.js`. A surface reading a halt's profile says which
+ * ladder in the words below; nothing launches from these by name.
+ */
+export const LADDER_CLASSES = Object.freeze(['ladder', 'ladder:unblock', 'ladder:resource']);
+
+/** @param {unknown} value */
+export function isLadderClass(value) {
+  return typeof value === 'string' && LADDER_CLASSES.includes(value);
+}
+
+/**
+ * What each ladder class promises — the one-line contract a halt banner shows
+ * where it used to show the agent class an unattended healer would launch.
+ * @type {Record<string, string>}
+ */
+export const LADDER_CLASS_BLURBS = {
+  ladder:
+    "The autopilot classifies the phase (never-started, work in progress, done but unrecorded, verification red…) and climbs that situation's ladder — its own session first, a fresh briefed session next — within the caps in Settings ▸ Automation; exhausted, it leaves one errand.",
+  'ladder:unblock':
+    'The autopilot reads the blocker the session declared: a lock queues, an external wait parks, a credential or gate goes straight to you, and anything else gets ONE bounded unblock session allowed to do the work — then an errand.',
+  'ladder:resource':
+    "The autopilot climbs the resource ladder by itself: an account with headroom or a signed-in one, the next model, the window's reset, a single budget raise within the policy cap — and leaves an errand only when none of those holds.",
+};
+
+/**
+ * Legacy reason-matching for records written before halt kinds existed.
+ * The OFFER pair is what a button may be shown on (loose is fine — a person
+ * decides); the AUTO pair is what an unattended loop may act on (strict:
+ * only the runner's own unmistakable sentences).
+ */
+export const NO_HANDOFF_OFFER_RE = /no handoff was written|not marked complete|ended cleanly but the board/i;
+export const VERIFICATION_OFFER_RE = /did not verify|failing validate\.sh|verification/i;
+export const NO_HANDOFF_AUTO_RE = /no handoff was written|not marked complete/i;
+export const VERIFICATION_AUTO_RE = /did not verify|failing validate\.sh/i;
+
+/* ------------------------------------------------------------------ *
+ * Agent classes — one word-book
+ * ------------------------------------------------------------------ */
+
+/**
+ * The failure classes a briefed agent session exists for. The server refuses
+ * anything off this list by name; `server/recovery.ts` re-exports this array
+ * so the two can never drift.
+ */
+export const RECOVERY_CLASSES = [
+  'halted-verification',
+  'halted-missing-handoff',
+  'interrupted-resume',
+  'auth-interrupted',
+  'stale-claim-takeover',
+  'plan-repair',
+];
+
+/** @param {unknown} value */
+export function isRecoveryClass(value) {
+  return typeof value === 'string' && RECOVERY_CLASSES.includes(value);
+}
+
+/**
+ * What a notification and a card heading call each class — a short noun
+ * phrase naming the JOB, reused as the running-chip label ("Fix the failing
+ * verification — running") so two differently-labelled buttons can no longer
+ * silently share one session unnoticed.
+ * @type {Record<string, string>}
+ */
+export const RECOVERY_TITLES = {
+  'halted-verification': 'Fix the failing verification',
+  'halted-missing-handoff': 'Finish the closeout',
+  'interrupted-resume': 'Resume where it stopped',
+  'auth-interrupted': 'Continue after signing in',
+  'stale-claim-takeover': 'Take over the claim',
+  'plan-repair': 'Repair the plan',
+};
+
+/**
+ * What the BUTTON says. Every label names the mechanism ("a new agent") so it
+ * can never read as the same thing as the own-session verbs beside it.
+ * @type {Record<string, string>}
+ */
+export const RECOVERY_LABELS = {
+  'halted-verification': 'Fix with a new agent',
+  'halted-missing-handoff': 'Close out with a new agent',
+  'interrupted-resume': 'Pick up with a new agent',
+  'auth-interrupted': 'Pick up with a new agent',
+  'stale-claim-takeover': 'Take over with a new agent',
+  'plan-repair': 'Repair the plan with a new agent',
+};
+
+/** Appended to every agent blurb — the cost is part of the promise. */
+const AGENT_COST =
+  " Opens a fresh interactive session — a new conversation, not the phase's " +
+  'own — briefed with the evidence. Costs a full session; you choose model ' +
+  'and skills next, and watch it in the Agent tab.';
+
+/**
+ * What each agent class will actually do — the tooltip contract: exactly what
+ * starts, on what, and what it costs.
+ * @type {Record<string, string>}
+ */
+export const RECOVERY_BLURBS = {
+  'halted-verification':
+    'Diagnoses the failing verification, fixes the cause and finishes the phase.' + AGENT_COST,
+  'halted-missing-handoff':
+    'Checks the phase against the repository and writes the handoff it never wrote.' + AGENT_COST,
+  'interrupted-resume':
+    'Reads the working tree, claims the phase and carries it to its exit criteria.' + AGENT_COST,
+  'auth-interrupted': 'Picks the phase up now that the CLI is signed in again.' + AGENT_COST,
+  'stale-claim-takeover': 'Takes the expired claim and finishes the phase.' + AGENT_COST,
+  'plan-repair': 'Repairs the plan, its handoffs or its INDEX until validate.sh passes.' + AGENT_COST,
+};
+
+/** What every surface heads its action group with. */
+export const WAYS_FORWARD = 'Ways forward';
+
+/* ------------------------------------------------------------------ *
+ * Deterministic actions — one vocabulary
+ * ------------------------------------------------------------------ */
+
+/**
+ * @typedef {Object} RecoveryActionView
+ * @property {string} id
+ * @property {Mechanism} mechanism
+ * @property {string} label
+ * @property {string} blurb   Exactly what will happen: what starts, on which session, what it costs, what changes on disk.
+ * @property {'run'|'agent'|'writes'|null} flag   Which console capability gates it.
+ * @property {'primary'|'secondary'|'overflow'} group
+ * @property {string} [recoveryClass]   Set on `fix-agent` — which briefing to launch.
+ * @property {string} [disabledReason]  Present ⇒ render disabled, with this exact sentence.
+ */
+
+/**
+ * The non-agent vocabulary. `fix-agent` composes its words from the class
+ * tables above; everything else is one row here.
+ * @type {Record<string, { label: string, blurb: string, mechanism: Mechanism, flag: 'run'|'agent'|'writes'|null }>}
+ */
+export const ACTION_VOCAB = {
+  recheck: {
+    label: 'Re-check',
+    mechanism: 'check',
+    flag: 'run',
+    blurb:
+      "Re-reads the board, re-runs this phase's §Verification commands and validate.sh. " +
+      'Starts no session and costs nothing; if the work is already done on disk this closes the phase and clears the halt.',
+  },
+  closeout: {
+    label: 'Finish in its own session',
+    mechanism: 'own-session',
+    flag: 'run',
+    blurb:
+      "Resumes this phase's own session (claude -p --resume) through the runner and asks it to " +
+      "verify, commit and write the handoff — nothing else. Its context is intact; the run's settings, deny rules and hooks all apply.",
+  },
+  resume: {
+    label: 'Resume with an instruction',
+    mechanism: 'own-session',
+    flag: 'run',
+    blurb:
+      "The same resume of the phase's own session, carrying the words you type first — " +
+      'for when it must fix something before closing out.',
+  },
+  retry: {
+    label: 'Retry from scratch',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb:
+      "Resets this phase's record and continues the run from here: a fresh session boots from the " +
+      "phase's boot prompt, under normal admission. Discards the stopped session's conversation; committed work stays.",
+  },
+  'retry-edits': {
+    label: 'Retry with edits…',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb:
+      'The same retry, carrying words and settings for THAT ATTEMPT ONLY — an instruction the session ' +
+      'reads after the failure evidence, and optionally a different model or effort. Recorded on the attempt ' +
+      'and in the journal; the plan file is never touched.',
+  },
+  skip: {
+    label: 'Skip',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb:
+      'Marks the phase abandoned in this run and moves on. The board will still read it as not done; nothing on disk is deleted.',
+  },
+  // The three QA-recovery verbs. A recorded `fail` — and a `pending` — holds
+  // every dependent phase exactly as hard as a failure does, and before these
+  // existed there was nothing on any surface to press: the ladder's `qa-fix`
+  // rung climbed until its attempt and dollar caps were spent and then parked
+  // with an errand nothing could act on, and a hand-driven plan had no rung at
+  // all. Issue #11. Ordered here the way they are offered: fix, re-review,
+  // waive — cheapest belief first ("the work is wrong"), then "the review was
+  // wrong", then "the finding does not apply".
+  'qa-recover': {
+    label: 'Fix & re-QA',
+    mechanism: 'qa',
+    flag: 'run',
+    blurb:
+      'Runs the QA loop with settings of its own: a fix session carrying the last report’s findings verbatim, ' +
+      'then a fresh-context review that records the next round — repeating while rounds remain. A pass releases ' +
+      'every dependent; a spent round budget parks the phase with one errand naming the last report.',
+  },
+  'qa-rerun': {
+    label: 'Re-run QA',
+    mechanism: 'qa',
+    flag: 'run',
+    blurb:
+      'Dispatches a fresh-context review again and records the next round — and starts no fix session. ' +
+      'For a verdict that failed on the environment rather than the work: a flake, a missing binary, a review that read the wrong tree.',
+  },
+  'qa-waive': {
+    label: 'Waive with a reason',
+    mechanism: 'qa',
+    flag: 'writes',
+    blurb:
+      'Records `waived` with your reason through qa-record.sh, so the gate stops holding dependents. The reason is ' +
+      'written into test-status.md beside the round it answers — a waiver nobody can explain later is how a plan ' +
+      'forgets what it decided not to fix.',
+  },
+  'mcp-continue': {
+    label: 'Continue without these servers',
+    mechanism: 'mcp',
+    flag: 'run',
+    blurb:
+      "Sets this run's MCP policy to continue and retries exactly the phases that parked on unreachable " +
+      'servers. They run without those servers, are told so in their prompt, and record it in the handoff.',
+  },
+  'continue-run': {
+    label: 'Continue',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb: 'Restarts the loop from the board — nothing is re-run; the board decides what is next.',
+  },
+  release: {
+    label: 'Release the claim',
+    mechanism: 'claim',
+    flag: 'writes',
+    blurb:
+      'Deletes the expired lock file so the phase reads free again. Nobody is in it — the lease ran out.',
+  },
+  'force-release': {
+    label: 'Force release',
+    mechanism: 'claim',
+    flag: 'writes',
+    blurb:
+      'Deletes a LIVE claim held by someone else. Only do this if you know that session is dead — ' +
+      "two sessions on one phase overwrite each other's work.",
+  },
+  'auto-recover': {
+    label: 'Recover & continue',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb:
+      'One press, three honest steps: re-reads the board and stands down any halt it has ' +
+      'already moved past (retracting the stale alarm); if a REAL halt remains, arms bounded ' +
+      "auto-recovery and launches the right vehicle — the phase's own session for paperwork " +
+      'and verification, a fresh briefed agent for the rest (that leg costs a session); and ' +
+      'continues the run when the board reads clean. Anything only a person can settle is ' +
+      'reported back by name instead of being retried blindly.',
+  },
+  dismiss: {
+    label: 'Dismiss',
+    mechanism: 'run-control',
+    flag: 'run',
+    blurb: "Stops this run's card asking for attention. The record is untouched and stays on the Runs page.",
+  },
+};
+
+/** Disabled-state sentences, one per capability flag. */
+export const FLAG_OFF = {
+  run: 'Runs are disabled. Restart the console with --allow-run.',
+  agent: 'Agent sessions are disabled. Restart the console with --allow-agent.',
+  writes: 'Writes are disabled. Restart the console with --allow-writes.',
+};
+
+/** The mutual-exclusion sentence both AI families show while one is live. */
+export const RECOVERY_BUSY = 'A recovery session is already working on this phase — open it instead.';
+
+/* ------------------------------------------------------------------ *
+ * Classification — one place
+ * ------------------------------------------------------------------ */
+
+/**
+ * @typedef {{ status: string, halt?: { reason?: string, kind?: string, phase?: number } | null, resolved?: unknown }} RunLike
+ */
+
+/**
+ * Which agent briefing a stopped RUN wants — or undefined when an agent is
+ * the wrong tool. Auth first (every other reading of an auth halt is wrong);
+ * then the halt's own kind through `KIND_PROFILE`; legacy records fall to
+ * the reason-regexes and then to the generic resume.
+ *
+ * @param {RunLike | null | undefined} run
+ * @param {{ authFailure?: boolean }} [opts]
+ * @returns {string | undefined}
+ */
+export function classifyRun(run, opts = {}) {
+  if (!run) return undefined;
+  // A RESOLVED stop is settled: somebody (or the board resolver) already
+  // answered it. Offering an agent for it re-litigates a closed question —
+  // the observed shape was a halted-status run whose halt had dissolved and
+  // whose phases all read done, still wearing a "Fix with AI" banner.
+  if (run.resolved) return undefined;
+  if (run.status === 'parked') {
+    const profile = run.halt?.kind ? KIND_PROFILE[run.halt.kind] : undefined;
+    return profile?.park ? (profile.humanClass ?? undefined) : undefined;
+  }
+  if (run.status !== 'halted' && run.status !== 'interrupted') return undefined;
+  if (opts.authFailure) return 'auth-interrupted';
+  if (run.status === 'interrupted') return 'interrupted-resume';
+
+  const kind = run.halt?.kind;
+  if (kind && KIND_PROFILE[kind]) return KIND_PROFILE[kind].humanClass ?? undefined;
+
+  const reason = run.halt?.reason ?? '';
+  if (NO_HANDOFF_OFFER_RE.test(reason)) return 'halted-missing-handoff';
+  if (VERIFICATION_OFFER_RE.test(reason)) return 'halted-verification';
+  return 'interrupted-resume';
+}
+
+/**
+ * Which agent briefing a phase ROW wants, from its own record's status.
+ * `done` and `skipped` want nothing — a recovery is only ever offered for a
+ * phase that is genuinely stuck.
+ *
+ * @param {string} status
+ * @param {RunLike | null} [run]
+ * @param {{ authFailure?: boolean }} [opts]
+ * @returns {string | undefined}
+ */
+export function classifyPhase(status, run, opts = {}) {
+  if (opts.authFailure) return 'auth-interrupted';
+  switch (status) {
+    case 'failed': {
+      const kind = run?.halt?.kind;
+      if (kind && KIND_PROFILE[kind]) return KIND_PROFILE[kind].humanClass ?? undefined;
+      return NO_HANDOFF_OFFER_RE.test(run?.halt?.reason ?? '')
+        ? 'halted-missing-handoff'
+        : 'halted-verification';
+    }
+    case 'interrupted':
+    case 'running':
+    case 'verifying':
+    case 'pending':
+      return 'interrupted-resume';
+    case 'parked':
+      return run?.halt?.kind === 'verification-preflight' ? 'plan-repair' : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/** Every health issue is repaired by the same class; the prompt branches by kind.
+ * @param {{ severity?: string }} issue */
+export function classifyIssue(issue) {
+  return issue.severity === 'error' || issue.severity === 'warning' ? 'plan-repair' : undefined;
+}
+
+/** A phase the BOARD calls stuck (handoff blocked/in-progress, often with no
+ * run record at all) — plan-repair's stale-handoff job.
+ * @param {string} state */
+export function classifyBoardPhase(state) {
+  return state === 'stuck' ? 'plan-repair' : undefined;
+}
+
+/* ------------------------------------------------------------------ *
+ * The pure action function
+ * ------------------------------------------------------------------ */
+
+/**
+ * @typedef {Object} RecoveryContext
+ * @property {string} [boardState]  The engine's word for the phase (`done` ⇒ nothing to offer).
+ * @property {{ status: string, resumable?: boolean } | null} [record]  This run's record of the phase.
+ * @property {RunLike | null} [run]
+ * @property {{ allowRun?: boolean, allowWrites?: boolean, allowAgent?: boolean }} [flags]
+ * @property {{ recoverySessionId?: string | null }} [live]  A live agent recovery on this exact target.
+ * @property {{ holder?: string | null, expired?: boolean }} [lock]
+ * @property {boolean} [authFailure]
+ * @property {boolean} [planIssues]  The plan itself fails lint/health — plan-repair's own case.
+ * @property {{ id: string, sub?: string } | null} [situation]  The classifier's word for the phase
+ *   (`situation-model.js`). Additive: when present and a record is held, the situation's own first
+ *   rung leads the ordering (`leadActionFor`); everything else is unchanged.
+ * @property {{ mode?: string, result?: string, rounds?: number, maxRounds?: number } | null} [qa]
+ *   The plan's QA regime and this phase's recorded verdict. When the gate HOLDS
+ *   (`qaGateHolds`), the three QA verbs lead — including for a phase the board reads `done`, which
+ *   is the case that had no action at all (issue #11).
+ */
+
+/**
+ * Which deterministic action a SITUATION leads with — the same vehicle the
+ * unattended ladder climbs first (`server/runner/ladder.ts`), so the button a
+ * person sees first is the thing the autopilot would have pressed.
+ *
+ * @param {string|undefined|null} id
+ * @param {string|undefined} sub
+ * @param {boolean} resumable
+ * @returns {'retry'|'resume'|'closeout'|'recheck'|'plan-repair'|undefined}
+ */
+export function leadActionFor(id, sub, resumable) {
+  switch (id) {
+    case 'never-started':
+      return 'retry';
+    case 'work-in-progress':
+      return resumable ? 'resume' : 'retry';
+    case 'done-unrecorded':
+      return resumable ? 'closeout' : 'recheck';
+    case 'verify-red':
+      return resumable ? 'resume' : undefined;
+    case 'blocked-declared':
+      if (sub === 'lock') return 'retry';
+      if (sub === 'external') return 'recheck';
+      if (sub === 'unknown' || sub == null) return resumable ? 'resume' : undefined;
+      return undefined;
+    case 'plan-broken':
+      return 'plan-repair';
+    case 'superseded':
+      return 'recheck';
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Every way forward for this state, ordered primary → secondary → overflow.
+ *
+ * The invariant (held by `test/recovery-model.test.ts`, widened from the old
+ * `recoveryActions`): **a phase that is not done always yields at least one
+ * action**, disabled ones carrying the exact sentence that says why. Flags
+ * disable rather than hide — a button that vanishes teaches nothing.
+ *
+ * @param {RecoveryContext} ctx
+ * @returns {RecoveryActionView[]}
+ */
+export function recoveryActionsFor(ctx = {}) {
+  const { boardState, record, run, flags = {}, live = {}, lock, authFailure, planIssues, situation } = ctx;
+  const status = record?.status;
+  // The two "nothing is wrong" early returns used to stand HERE, above
+  // everything. They are now below the QA block, and that is the whole shape of
+  // issue #11: a phase held by a recorded `fail` reads `done` on the board (its
+  // handoff IS complete — the engine holds its DEPENDENTS, not the phase), so
+  // both of them fired and every surface offered nothing to press.
+  const kind = run?.halt?.kind;
+  const profile = kind ? KIND_PROFILE[kind] : undefined;
+  const resumable = Boolean(record?.resumable);
+  const busy = live.recoverySessionId ? RECOVERY_BUSY : undefined;
+
+  /** @type {RecoveryActionView[]} */
+  const out = [];
+  const gate = (/** @type {'run'|'agent'|'writes'|null} */ flag) => {
+    if (flag === 'run' && flags.allowRun === false) return FLAG_OFF.run;
+    if (flag === 'agent' && flags.allowAgent === false) return FLAG_OFF.agent;
+    if (flag === 'writes' && flags.allowWrites === false) return FLAG_OFF.writes;
+    return undefined;
+  };
+  const push = (
+    /** @type {string} */ id,
+    /** @type {'primary'|'secondary'|'overflow'} */ group,
+    disabled = undefined,
+  ) => {
+    const vocab = ACTION_VOCAB[id];
+    if (!vocab || out.some((a) => a.id === id)) return;
+    const disabledReason = disabled ?? gate(vocab.flag);
+    out.push({
+      id,
+      mechanism: vocab.mechanism,
+      label: vocab.label,
+      blurb: vocab.blurb,
+      flag: vocab.flag,
+      group,
+      ...(disabledReason ? { disabledReason } : {}),
+    });
+  };
+  const pushAgent = (
+    /** @type {string|undefined} */ cls,
+    /** @type {'primary'|'secondary'|'overflow'} */ group,
+  ) => {
+    if (!cls || out.some((a) => a.id === 'fix-agent')) return;
+    const disabledReason = busy ?? gate('agent');
+    out.push({
+      id: 'fix-agent',
+      mechanism: 'new-agent',
+      label: RECOVERY_LABELS[cls],
+      blurb: RECOVERY_BLURBS[cls],
+      flag: 'agent',
+      group,
+      recoveryClass: cls,
+      ...(disabledReason ? { disabledReason } : {}),
+    });
+  };
+
+  /* -- The QA gate outranks everything, because it is the one hold that
+        survives a phase being finished. The three verbs are offered whenever
+        the gate holds — on `fail` AND on `pending`, which hold identically. -- */
+
+  const qaHeld = qaGateHolds(ctx.qa?.mode, ctx.qa?.result);
+  if (qaHeld) {
+    // Fix & re-QA on a `fail` ONLY. A `pending` verdict names no findings for a
+    // fix session to read, so the honest first move there is the review — the
+    // same rule `QaRecoveryActions` and the inbox row keep, and it belongs here
+    // rather than three times over. (QA round 1, M3: this offered all three on
+    // both words while the comment beside it asserted the rule it broke, which
+    // is exactly the drift this module exists to end.)
+    if (qaHeld === 'fail') push('qa-recover', 'primary');
+    push('qa-rerun', qaHeld === 'fail' ? 'secondary' : 'primary');
+    push('qa-waive', 'overflow');
+  }
+
+  /* -- Nothing else is wrong: the work landed and only the verdict is owed.
+        Answering with `out` rather than `[]` is what the block above buys. -- */
+
+  if (boardState === 'done') return out;
+  if (record && (status === 'done' || status === 'skipped')) return out;
+
+  /* -- Run-level shapes with a dedicated remedy come first -- */
+
+  if (kind === 'mcp-preflight') {
+    push('mcp-continue', 'primary');
+    if (record) {
+      push('retry', 'overflow', busy);
+      push('retry-edits', 'overflow', busy);
+    }
+    push('dismiss', 'overflow');
+    return out;
+  }
+
+  /* -- Phase-level actions, when the caller holds a record -- */
+
+  if (record) {
+    // The situation's own first rung leads, when the caller knows it — the
+    // button a person sees first is what the autopilot would have pressed.
+    // Additive: `push` dedupes, so the rest of the ordering is untouched.
+    const lead = situation ? leadActionFor(situation.id, situation.sub, resumable) : undefined;
+    // The QA verbs, when the gate holds, have already taken `primary` — and a
+    // surface that renders "the primary one" would then have two. The gate is
+    // the one hold that survives a phase being FINISHED, so it keeps the slot
+    // and the situation's own lead steps down beside it. (QA round 2, L4:
+    // currently only reachable once a caller populates `ctx.qa` on a phase that
+    // also holds a record, which is why it was dead rather than visible.)
+    const first = qaHeld ? 'secondary' : 'primary';
+    if (lead === 'retry') push('retry', first, busy);
+    else if (lead === 'resume') push('resume', first, busy);
+    else if (lead === 'closeout') push('closeout', first, busy);
+    else if (lead === 'recheck') push('recheck', first);
+    else if (lead === 'plan-repair') pushAgent('plan-repair', first);
+    const sessionShaped = profile ? profile.sessionShaped : true;
+    if (resumable && sessionShaped) {
+      push('closeout', first, busy);
+      push('resume', 'secondary', busy);
+    } else if (resumable && kind === 'phase-blocked') {
+      // The declared blocker's session path: resume WITH WORDS once the
+      // blocker is cleared — never the closeout that looped on it.
+      push('resume', first, busy);
+    }
+    push('recheck', out.length ? 'secondary' : 'primary');
+    pushAgent(
+      authFailure
+        ? 'auth-interrupted'
+        : run
+          ? (classifyRun(run, { authFailure }) ?? classifyPhase(status ?? '', run, { authFailure }))
+          : classifyPhase(status ?? '', run, { authFailure }),
+      out.some((a) => a.group === 'primary') ? 'secondary' : 'primary',
+    );
+    if (kind === 'phase-blocked') pushAgent('plan-repair', 'overflow');
+    push('retry', 'overflow', busy);
+    // Always beside plain Retry and never instead of it: the plain one is the
+    // right answer far more often, and a person who wants to change something
+    // is already looking at the row that says "Retry". Overflow, because the
+    // inline slots are for the action the autopilot would have taken.
+    push('retry-edits', 'overflow', busy);
+    push('skip', 'overflow');
+    if (lock?.holder) push(lock.expired ? 'release' : 'force-release', 'overflow');
+    return out;
+  }
+
+  /* -- A phase the BOARD calls stuck, with no run record: a blocked or
+        in-progress handoff whose work happened in another session. The board
+        state itself is the fact, and the repair is plan-repair's
+        stale-handoff job — establish what really happened, finish it if
+        finishable, set the status the repository supports. -- */
+
+  if (boardState === 'stuck') {
+    pushAgent('plan-repair', 'primary');
+    return out;
+  }
+
+  /* -- The plan itself fails lint or health checks: plan-repair's own case. -- */
+  if (planIssues) {
+    pushAgent('plan-repair', 'primary');
+    return out;
+  }
+
+  /* -- Run-only surfaces (fleet rows, dashboard cards) -- */
+
+  if (run) {
+    if (run.resolved) return out; // settled — nothing to relitigate
+    if (run.status === 'halted' || run.status === 'interrupted' || run.status === 'parked') {
+      push('auto-recover', 'primary');
+      push('continue-run', 'secondary');
+      pushAgent(classifyRun(run, { authFailure }), 'secondary');
+      push('dismiss', 'overflow');
+    }
+    return out;
+  }
+
+  /* -- A bare lock (ready page) -- */
+  if (lock?.holder) {
+    push(lock.expired ? 'release' : 'force-release', 'primary');
+    if (lock.expired) pushAgent('stale-claim-takeover', 'secondary');
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Identity
+ * ------------------------------------------------------------------ */
+
+/**
+ * The identity a duplicate recovery is judged by — `(slug, phase)`, never the
+ * class: two sessions repairing one phase from different angles edit the same
+ * files, and the second is never what anyone meant to press.
+ * @param {{ slug?: string, phase?: number }} target
+ */
+export function recoveryKey(target) {
+  return `${target.slug ?? ''}#${target.phase ?? ''}`;
+}

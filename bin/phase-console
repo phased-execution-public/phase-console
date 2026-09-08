@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Phase Console, as a bare command.
+#
+# Claude Code puts a plugin's bin/ on the Bash tool's PATH while the plugin is
+# enabled, so an installed plugin can start the console from any directory:
+#
+#   phase-console                        pick the plan directory in the browser
+#   phase-console ~/code/your-repo       open that directory straight away
+#   phase-console --allow-writes         also enable the guarded write verbs
+#
+# The verbs live in phase-console.mjs — dispatch them there rather than deciding
+# anything here. Without this dispatch,
+# `phase-console stop` fell through to ./start, which read "stop" as a --root
+# path and BOOTED a console on the directory-picker page: the verb meant to
+# stop one started one.
+#
+# Cloned the repo instead of installing the plugin? Run ./start — for anything
+# that is not a verb, this is a wrapper around it, and every argument means the
+# same thing.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The same search scripts/session-hook.sh and viewer/run make: PATH first, then
+# the usual homes. The .mjs enforces its own Node floor; any hit will do here.
+_find_node() {
+  if command -v node >/dev/null 2>&1; then command -v node; return 0; fi
+  local candidates="/opt/homebrew/bin /usr/local/bin $HOME/.volta/bin" v c
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    for v in $(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -r); do
+      candidates="$candidates $HOME/.nvm/versions/node/$v/bin"
+    done
+  fi
+  for c in $candidates; do
+    if [ -x "$c/node" ]; then printf '%s' "$c/node"; return 0; fi
+  done
+  return 1
+}
+
+_to_mjs() {
+  node_bin="$(_find_node)" || {
+    echo "phase-console: '$1' needs node, and none was found on PATH or in the usual homes" >&2
+    exit 127
+  }
+  exec "$node_bin" "$here/phase-console.mjs" "$@"
+}
+
+
+# The skill and hook verbs are free — all five of them. `uninstall-skill`,
+# `uninstall-hooks` and `hooks-status` were missing from the list above, so each
+# fell through to ./start, which read the verb as a --root path and BOOTED a
+# console: the same defect the header describes for `stop`, in three verbs that
+# nobody had typed yet.
+case "${1:-}" in
+  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status)
+    _to_mjs "$@" ;;
+esac
+
+# Unreachable in this tree — the Pro case above execs these away — and the whole
+# answer in the free one, where the region is stripped. Say what the verb was
+# and where it lives; falling through to ./start would read the verb as a --root
+# path and boot a console named `list`.
+#
+# `start` is the exception, because with one console it is not a fleet verb at
+# all: drop the word and run the console for this directory, which is what it
+# already meant to whoever typed it.
+case "${1:-}" in
+  start) shift ;;
+esac
+# The agent flags are matched by SHAPE rather than spelled out: this file ships in
+# the free tree, where naming a verb it does not have is what the scrub forbids.
+# `--*install-agent` and NOT `--*-agent`: the loose one also matches
+# `--allow-agent`, one of the seven capability switches, and refused it as a fleet
+# verb in BOTH trees. `viewer/test/fleet-refusal.test.ts` runs this very pattern
+# against every agent flag and every capability flag, so it cannot happen twice.
+case "${1:-}" in
+  list|open|stop|restart|status|log|logs|update|remove|--*install-agent|--agent-*)
+    echo "phase-console: '$1' manages a fleet of consoles, which is Phase Console Pro." >&2
+    echo "This build runs one console for one repository: phase-console [<repo>]" >&2
+    exit 2
+    ;;
+esac
+
+exec "$here/../start" "$@"

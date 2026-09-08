@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# pre-push — run the gates before a push leaves this machine. Installed by
+# `scripts/gates.sh --install-hook` (core.hooksPath = scripts/git-hooks), so
+# this file is versioned and the same for every clone.
+#
+#   main or a tag among the refs  → scripts/gates.sh          (the full matrix)
+#   anything else                 → scripts/gates.sh --quick
+#   a delete (local sha all zero) → counts for nothing
+#
+# A green full run recorded for HEAD on a clean tree stands in for the full
+# matrix, so pushing main right after `scripts/gates.sh` does not cost the ten
+# minutes twice. PHASE_CONSOLE_SKIP_GATES=1 skips everything and says so —
+# the emergency door, named in docs/releasing.md.
+#
+# git passes: <remote name> <remote url> as argv, and one line per ref on
+# stdin: <local ref> <local sha> <remote ref> <remote sha>.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATES="$HERE/../gates.sh"
+ZERO=0000000000000000000000000000000000000000
+
+# git hands a hook its own view of this repository — in a submodule checkout an
+# ABSOLUTE GIT_DIR. The gates run git in other repositories (the bats suites'
+# temp repos, a sibling checkout the site reads), and an inherited GIT_DIR
+# points every one of them here. Drop it; discovery from the cwd finds this
+# repository again for the two git calls below.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
+
+if [ "${PHASE_CONSOLE_SKIP_GATES:-}" = "1" ]; then
+  echo "pre-push: PHASE_CONSOLE_SKIP_GATES=1 — gates skipped; what you are pushing is unverified." >&2
+  exit 0
+fi
+
+mode=quick
+while read -r _lref lsha rref _rsha; do
+  [ "$lsha" = "$ZERO" ] && continue
+  case "$rref" in
+    refs/heads/main|refs/tags/*) mode=full ;;
+  esac
+done
+
+if [ "$mode" = full ]; then
+  marker="$(git rev-parse --git-path phase-console-gates-ok 2>/dev/null || true)"
+  if [ -n "$marker" ] && [ -f "$marker" ] \
+     && [ "$(cat "$marker")" = "$(git rev-parse HEAD 2>/dev/null)" ] \
+     && [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "pre-push: a recorded green run covers $(cut -c1-7 "$marker") on a clean tree — not rerunning the full gates." >&2
+    exit 0
+  fi
+  echo "pre-push: main or a tag is being pushed — running the full gates (scripts/gates.sh)." >&2
+  exec bash "$GATES"
+fi
+echo "pre-push: running the quick gates (scripts/gates.sh --quick)." >&2
+exec bash "$GATES" --quick

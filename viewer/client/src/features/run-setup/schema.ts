@@ -1,0 +1,351 @@
+/**
+ * One form's shape, and what each field is called on the wire.
+ *
+ * `RunSetupValues` is the whole vocabulary — every choice any launch surface
+ * ever offered, in one object. A mode does not get its own type: it gets a
+ * subset of these fields to SHOW (`modes.ts`) and a payload builder that reads
+ * the same values. That is the point of the consolidation; four shapes with
+ * four spellings of "which model" is what let a run start on a model nobody
+ * chose.
+ *
+ * ## The wire map is the contract
+ *
+ * `WIRE` says which server field each value becomes, or `null` for the ones
+ * that never reach a run door (`prompt` is a session's first message;
+ * `permissionMode` belongs to an agent ticket). `schema-parity.test.ts` walks
+ * it against `shared/run-settings.js` in both directions, so:
+ *
+ * - a field the server accepts and this form cannot send fails the test, and
+ * - a field this form would send that no door reads fails it too.
+ *
+ * `shared/run-settings.js` in turn is held against the route module's own
+ * source by `test/run-settings-parity.test.ts`. Three files, one list.
+ *
+ * ## Why the numbers are strings
+ *
+ * Budgets, `maxParallel` and `maxConsecutiveFailures` are `<input type=number>`
+ * values, and an empty one is `''`, not `0`. The distinction is load-bearing on
+ * every one of them — `''` means "no ceiling" and `0` means "never" — so they
+ * stay text through the form and are coerced once, at the payload boundary,
+ * where the meaning of empty can be stated per field.
+ */
+
+import * as z from 'zod/mini';
+import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions } from '@/lib/api';
+import { RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
+import {
+  DEFAULT_SETTLE,
+  ISOLATION_MODES,
+  SETTLE_STRATEGIES,
+  type IsolationMode,
+  type SettleStrategy,
+} from '@shared/worktree-model.js';
+import {
+  AUTONOMY_MODES,
+  GIT_MODES,
+  MCP_POLICIES,
+  ON_LIMIT_POLICIES,
+  REVIEWER_POLICIES,
+  ULTRA_REVIEW_MODES,
+} from '@shared/run-lifecycle.js';
+import type {
+  AutonomyMode,
+  GitMode,
+  OnLimitPolicy,
+  ReviewerPolicy,
+  UltraReviewMode,
+} from '@shared/run-lifecycle.js';
+
+/** The one permission vocabulary. `plan` is offered to sessions only. */
+export type PermissionChoice = PermissionProfile | 'plan';
+
+export interface RunSetupValues {
+  model: string;
+  effort: string;
+  autonomy: Autonomy;
+  /** Guarded / Trusted / Bypass, plus `plan` where a session is being minted. */
+  permissionProfile: PermissionChoice;
+  /** A session's CLI `--permission-mode`, when the choice above does not spell it. */
+  permissionMode: string;
+  accountId: string;
+  onLimit: OnLimitPolicy;
+  phaseBudgetUsd: string;
+  runBudgetUsd: string;
+  gitMode: GitMode;
+  openPr: boolean;
+  /**
+   * Whether this run gets a checkout of its own. Rendered only when
+   * `gitMode === 'new-branch'` — a run with no branch has nothing to check out.
+   */
+  isolation: IsolationMode;
+  /**
+   * What happens to the finished branch. Rendered with `isolation`, and only
+   * under `new-branch`, for the same reason: a run with no branch of its own
+   * has nothing to settle.
+   */
+  settle: SettleStrategy;
+  /** Which class this run's admissions are scanned in (`shared/orchestration-model.js`). */
+  priority: RunPriority;
+  /** A plan slug this run begins AFTER. Empty means no chain. Start-only. */
+  startAfter: string;
+  /** Launch a fresh reviewer session at each phase-finish (`server/reviewer.ts`). */
+  reviewEachPhase: boolean;
+  /** Whether a reviewer's `requested-changes` may actually hold dependents. */
+  reviewerPolicy: ReviewerPolicy;
+  /** Carry the standing `ultracode` licence into every prompt this run composes. */
+  ultracode: boolean;
+  /** When this run spends the operator's cloud budget on `claude ultrareview`. */
+  ultraReview: UltraReviewMode;
+  qa: boolean;
+  /**
+   * QA's own three. All optional-by-emptiness: `''` says nothing, and the
+   * reviewer then keeps inheriting the builder's model and effort while the
+   * round budget keeps its shipped default — which is what every run before
+   * these existed did.
+   */
+  qaMaxRounds: string;
+  qaModel: string;
+  qaEffort: string;
+  /**
+   * QA RECOVERY's two — how a Fix & re-QA round boards its fix session, and
+   * what ONE round may spend. Only the `qa-fix` mode shows them: they say
+   * nothing about a run that is not recovering a verdict.
+   */
+  qaFixStrategy: string;
+  qaRoundBudgetUsd: string;
+  attachDefaultSkills: boolean;
+  skills: string[];
+  mcpServers: string[];
+  mcpPolicy: McpPolicy;
+  autoRecover: boolean;
+  maxParallel: string;
+  maxConsecutiveFailures: string;
+  /** `"1,3,5-7"` — parsed at the payload boundary, so a half-typed range is not an error yet. */
+  onlyPhases: string;
+  phaseOptions: Record<string, PhaseOptions>;
+  /** A session's first message. Never a run field. */
+  prompt: string;
+}
+
+export type RunSetupField = keyof RunSetupValues;
+
+/**
+ * What each value is called on a run door — `null` where it is not a run field.
+ *
+ * Every name on the right-hand side must appear in `shared/run-settings.js`,
+ * and every field in that module must appear here. The test says so.
+ */
+export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freeze({
+  model: 'model',
+  effort: 'effort',
+  autonomy: 'autonomy',
+  permissionProfile: 'permissionProfile',
+  permissionMode: null,
+  accountId: 'accountId',
+  onLimit: 'onLimit',
+  phaseBudgetUsd: 'phaseBudgetUsd',
+  runBudgetUsd: 'runBudgetUsd',
+  gitMode: 'gitMode',
+  openPr: 'openPr',
+  isolation: 'isolation',
+  settle: 'settle',
+  priority: 'priority',
+  startAfter: 'startAfter',
+  reviewEachPhase: 'reviewEachPhase',
+  reviewerPolicy: 'reviewerPolicy',
+  ultracode: 'ultracode',
+  ultraReview: 'ultraReview',
+  qa: 'qa',
+  qaMaxRounds: 'qaMaxRounds',
+  qaModel: 'qaModel',
+  qaEffort: 'qaEffort',
+  qaFixStrategy: 'qaFixStrategy',
+  qaRoundBudgetUsd: 'qaRoundBudgetUsd',
+  attachDefaultSkills: 'attachDefaultSkills',
+  skills: 'skills',
+  mcpServers: 'mcpServers',
+  mcpPolicy: 'mcpPolicy',
+  autoRecover: 'autoRecover',
+  maxParallel: 'maxParallel',
+  maxConsecutiveFailures: 'maxConsecutiveFailures',
+  onlyPhases: 'onlyPhases',
+  phaseOptions: 'phaseOptions',
+  prompt: null,
+});
+
+/**
+ * The two run fields no VALUE carries, because they are facts about the
+ * launch rather than choices in it: which run to resume, and which phases a
+ * "run only this" was scoped to. The payload builders add them from context.
+ */
+export const CONTEXT_FIELDS = Object.freeze(['resumeRunId']);
+
+/**
+ * The resolver's schema.
+ *
+ * Deliberately permissive on vocabulary — the server re-validates every model
+ * name against `scripts/models.env` and answers 400 with the reason, and a
+ * client-side allow-list would refuse a name the CLI accepts the morning a new
+ * model lands. What is checked here is what the server CANNOT explain as well
+ * as the form can: a budget that is not a number, a parallel count outside the
+ * console's own ceiling, a phase list that is not a phase list.
+ */
+export const runSetupSchema = z.object({
+  model: z.string(),
+  effort: z.string(),
+  autonomy: z.enum([...AUTONOMY_MODES] as [AutonomyMode, ...AutonomyMode[]]),
+  permissionProfile: z.enum(['guarded', 'trusted', 'bypass', 'plan']),
+  permissionMode: z.string(),
+  accountId: z.string(),
+  onLimit: z.enum([...ON_LIMIT_POLICIES] as [OnLimitPolicy, ...OnLimitPolicy[]]),
+  phaseBudgetUsd: money('Budget per phase'),
+  runBudgetUsd: money('Budget for the run'),
+  gitMode: z.enum([...GIT_MODES] as [GitMode, ...GitMode[]]),
+  openPr: z.boolean(),
+  // From the owner list, not a second literal — `shared/worktree-model.js` is
+  // the one place the two words are spelled, and `vocab-owners.test.ts` scans
+  // this file for a copy of them.
+  isolation: z.enum(ISOLATION_MODES as unknown as [IsolationMode, ...IsolationMode[]]),
+  // From the owner list for the same reason isolation is — see above.
+  settle: z.enum(SETTLE_STRATEGIES as unknown as [SettleStrategy, ...SettleStrategy[]]),
+  // From the owner list for the same reason isolation is — see above.
+  priority: z.enum(RUN_PRIORITIES as unknown as [RunPriority, ...RunPriority[]]),
+  startAfter: z.string(),
+  reviewEachPhase: z.boolean(),
+  reviewerPolicy: z.enum([...REVIEWER_POLICIES] as [ReviewerPolicy, ...ReviewerPolicy[]]),
+  ultracode: z.boolean(),
+  // From the owner list, like the two enums above it: `shared/run-lifecycle.js`
+  // is the one place these three words are spelled.
+  ultraReview: z.enum(ULTRA_REVIEW_MODES as unknown as [UltraReviewMode, ...UltraReviewMode[]]),
+  qa: z.boolean(),
+  // The same ceiling the run door enforces, so a refusal is caught in the form
+  // rather than as a 400 after the operator has pressed the button.
+  qaMaxRounds: whole('QA rounds', 1, 20),
+  qaModel: z.string(),
+  qaEffort: z.string(),
+  qaFixStrategy: z.string(),
+  qaRoundBudgetUsd: money('Budget per QA round'),
+  attachDefaultSkills: z.boolean(),
+  skills: z.array(z.string()),
+  mcpServers: z.array(z.string()),
+  mcpPolicy: z.enum([...MCP_POLICIES] as [McpPolicy, ...McpPolicy[]]),
+  autoRecover: z.boolean(),
+  maxParallel: whole('Max parallel', 1, 99),
+  maxConsecutiveFailures: whole('Stop after N failures', 1, 50),
+  onlyPhases: z.string().check(
+    z.refine(
+      (text) => text.trim() === '' || /^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(text),
+      {
+        message: 'Phases look like 1, 3, 5-7',
+      },
+    ),
+  ),
+  phaseOptions: z.record(z.string(), z.any()),
+  prompt: z.string(),
+});
+
+/** `''` is "no ceiling"; anything else must be a non-negative number. */
+function money(label: string) {
+  return z.string().check(
+    z.refine((text) => text.trim() === '' || (Number.isFinite(Number(text)) && Number(text) >= 0), {
+      message: `${label} is a number of dollars, or empty for no ceiling`,
+    }),
+  );
+}
+
+/** `''` is "this console's own default"; anything else is a whole number in range. */
+function whole(label: string, min: number, max: number) {
+  return z
+    .string()
+    .check(
+      z.refine(
+        (text) =>
+          text.trim() === '' ||
+          (Number.isInteger(Number(text)) && Number(text) >= min && Number(text) <= max),
+        { message: `${label} is a whole number between ${min} and ${max}` },
+      ),
+    );
+}
+
+/**
+ * A blank form. Never rendered as-is — every mode seeds over it from the
+ * preferences, the run's own record, or the plan's bullets — but it is what
+ * makes a missing seed a visible default rather than `undefined` reaching a
+ * controlled input and turning it uncontrolled mid-edit.
+ */
+export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
+  model: '',
+  effort: '',
+  autonomy: 'keep-going',
+  permissionProfile: 'guarded',
+  permissionMode: '',
+  accountId: 'default',
+  onLimit: 'wait',
+  phaseBudgetUsd: '',
+  runBudgetUsd: '',
+  gitMode: 'default-branch',
+  openPr: true,
+  // The shared checkout: exactly what the console did before the setting
+  // existed, so a form nobody touched launches the run it always launched.
+  isolation: 'queue',
+  // The pull request: exactly what a new-branch run has always ended with, so
+  // a form nobody touched settles the way this console has always settled.
+  settle: DEFAULT_SETTLE,
+  // The ordinary class and no chain: a form nobody touched queues exactly the
+  // way this console queued before either control existed.
+  priority: 'normal',
+  startAfter: '',
+  // Off, and the cautious policy behind it. This spends money per phase and
+  // — under `may-hold` — can park every phase behind the one it reviewed;
+  // neither may arrive switched on in a console somebody merely upgraded.
+  reviewEachPhase: false,
+  reviewerPolicy: 'comment-only',
+  // Both ultra tiers off, for the reason above and one more: `ultracode` fans a
+  // session out across dozens of agents and `ultraReview` bills a cloud review
+  // to whichever account the run spends. Neither may arrive switched on.
+  ultracode: false,
+  ultraReview: 'off',
+  qa: false,
+  qaMaxRounds: '',
+  qaModel: '',
+  qaEffort: '',
+  qaFixStrategy: '',
+  qaRoundBudgetUsd: '',
+  attachDefaultSkills: false,
+  skills: [],
+  mcpServers: [],
+  mcpPolicy: 'continue',
+  autoRecover: false,
+  maxParallel: '',
+  maxConsecutiveFailures: '',
+  onlyPhases: '',
+  phaseOptions: {},
+  prompt: '',
+});
+
+/** `"1, 3, 5-7"` → `[1, 3, 5, 6, 7]`; empty or unreadable → `undefined`. */
+export function parsePhases(text: string): number[] | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const out = new Set<number>();
+  for (const part of trimmed.split(',')) {
+    const range = /^\s*(\d+)\s*-\s*(\d+)\s*$/.exec(part);
+    if (range) {
+      const from = Number(range[1]);
+      const to = Number(range[2]);
+      // A backwards range is read the way it is written rather than dropped:
+      // "7-5" is a typo with an obvious meaning, and silently sending nothing
+      // would scope the run to the whole plan.
+      for (let n = Math.min(from, to); n <= Math.max(from, to); n += 1) out.add(n);
+      continue;
+    }
+    const one = Number(part.trim());
+    if (Number.isInteger(one)) out.add(one);
+  }
+  return out.size ? [...out].sort((a, b) => a - b) : undefined;
+}
+
+/** The inverse, for seeding the field from a run that already has a scope. */
+export function formatPhases(phases: number[] | null | undefined): string {
+  return phases?.length ? phases.join(', ') : '';
+}

@@ -1,0 +1,36 @@
+{
+  // The server's TYPE GATE — `npm run typecheck:server`, wired into CI.
+  //
+  // Why a config of its own rather than the root `viewer/tsconfig.json`: that
+  // one also covers `test/**`, whose fakes carry their own large backlog, and a
+  // gate named `typecheck:server` that goes red for a stale test double is a
+  // gate people learn to ignore. `typecheck:client` is the same shape — two
+  // narrow programs (app + service worker), each checked against the libs it
+  // really runs under. This is the third.
+  //
+  // It is the sibling of `tsconfig.pack.json`, which EMITS and never checks;
+  // this one CHECKS and never emits. Both must keep `erasableSyntaxOnly`, which
+  // is what makes the type checker agree with Node's native type stripping:
+  // a parameter property or an enum throws at import time, and this is where
+  // that is caught rather than at a user's first run.
+  "compilerOptions": {
+    "target": "es2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    // `dom` matches the root config: the server uses the web-standard globals
+    // Node implements (fetch/Response/URL/crypto) and the push code speaks
+    // their types. `node` is the runtime itself.
+    "lib": ["es2023", "dom"],
+    "types": ["node"]
+  },
+  "include": ["./**/*.ts"]
+}

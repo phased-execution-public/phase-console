@@ -14,11 +14,14 @@
  * enough to be safe to call from inside a crash handler.
  */
 
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
+import { INSTANCE_STATE_DIR } from './config.ts';
 import { log } from './log.ts';
+import { STOP_MARKER_NAME } from '../shared/instances.mjs';
+import type { ShutdownDurability, ShutdownIntent, ShutdownMode } from '../shared/ops-vocab.js';
 
 /* ------------------------------------------------------------------ *
  * Degraded state
@@ -79,7 +82,21 @@ export function clearDegraded(kind: string): void {
  * Ordered shutdown
  * ------------------------------------------------------------------ */
 
-export type ShutdownHandler = () => Promise<void> | void;
+/**
+ * What a drain handler is told about the drain it is part of (SHD-8): WHY the
+ * process is going away — a Shut down press, a Restart press, or a signal no
+ * request explains — so a checkpoint can say which on the run's own journal
+ * instead of naming only a pid and a signal.
+ */
+export type ShutdownContext = {
+  intent: ShutdownIntent;
+  /** What asked for it: the press's sentence, or the signal's name. */
+  reason: string;
+  /** The strength of a Shut down press, when that is what it was. */
+  mode?: ShutdownMode;
+};
+
+export type ShutdownHandler = (context: ShutdownContext) => Promise<void> | void;
 
 const handlers = new Map<string, ShutdownHandler>();
 
@@ -137,12 +154,26 @@ export type Supervisor = {
   detail: string;
   /** True when supervision is inferred rather than read. */
   assumed?: boolean;
+  /**
+   * The stop marker, when a `mode: 'unload'` Shut down left one (SHD-5): this
+   * console was stopped on purpose and holds its automation until it is
+   * cleared. Read beside the supervisor because both answer "what will bring
+   * this console's work back", and a page showing one without the other would
+   * promise a comeback the boot is going to refuse.
+   */
+  stopped?: StopMarker;
 };
 
 export function detectSupervisor(
   env: NodeJS.ProcessEnv = process.env,
   platform: string = process.platform,
 ): Supervisor {
+  const found = supervision(env, platform);
+  const stopped = readStopMarker();
+  return stopped ? { ...found, stopped } : found;
+}
+
+function supervision(env: NodeJS.ProcessEnv, platform: string): Supervisor {
   const declared = env.PHASE_CONSOLE_SUPERVISED;
   if (declared === '1') {
     return { supervised: true, kind: 'declared', detail: 'PHASE_CONSOLE_SUPERVISED=1 — you have said something will restart it' };
@@ -278,20 +309,54 @@ export function supervisor(): Supervisor {
  * How this process is actually stopped — which is not the same question as how
  * it is restarted, and is the reason there was no off switch for so long.
  *
- * Under launchd `KeepAlive` an exit is a *restart*: the one mechanism the
- * Restart button depends on is the one that makes "stop" impossible to express
- * as an exit. Ending the job means telling launchd, and `launchctl bootout
- * gui/<uid>/<label>` is that sentence — the same one the installer uses to
- * uninstall. Under systemd `Restart=always` the same trap has the same shape,
- * and the sentence is `systemctl --user stop <unit>`. Anywhere else, exiting
- * IS stopping.
+ * Two strengths since zero-touch phase 16 (SHD-2, SHD-5), because one verb was
+ * doing two jobs and promising a third:
+ *
+ *  - **`exit`** — the default. The process drains and exits. Under launchd
+ *    `KeepAlive` (or systemd `Restart=`) the supervisor brings it straight back,
+ *    so this stops the WORK — every run checkpoints and resumes — and not the
+ *    console; nothing supervising means it stays stopped.
+ *  - **`unload`** — the explicit "stay off". The unit is DISABLED and unloaded
+ *    (`launchctl disable` + `bootout`, or `systemctl --user disable --now`) and
+ *    the stop marker is written, so neither the next login nor a hand-started
+ *    process picks the automation back up until somebody clears it. The old
+ *    Shut down was a bare `bootout` that promised "it stays off" and came back
+ *    at the next login with the plist still on disk.
+ *
+ * `unload` needs a unit this process can name; with none there is nothing to
+ * unload (`exit` already stops it), and the plan is `null`.
  *
  * Pure, so the decision can be asserted without spawning anything.
  */
-export type StopPlan =
-  | { via: 'launchctl' | 'systemctl'; file: string; args: string[]; label: string; detail: string }
-  | { via: 'exit'; detail: string };
+export type ExitPlan = {
+  via: 'exit';
+  mode: 'exit';
+  durability: Exclude<ShutdownDurability, 'disabled'>;
+  detail: string;
+};
 
+export type UnloadPlan = {
+  via: 'launchctl' | 'systemctl';
+  mode: 'unload';
+  file: string;
+  /** Every command, in order — each is `file` + these args. The last one ends this process. */
+  steps: string[][];
+  /** The step that ends the process (kept for `bootout`, which runs exactly this). */
+  args: string[];
+  label: string;
+  durability: 'disabled';
+  /** A stop marker is written before any step runs. */
+  marker: true;
+  /** The command that undoes it — the last thing this console will tell you. */
+  resurrect: string;
+  detail: string;
+};
+
+export type StopPlan = ExitPlan | UnloadPlan;
+
+export function stopPlan(sup?: Supervisor, env?: NodeJS.ProcessEnv, uid?: number | null, mode?: 'exit'): ExitPlan;
+export function stopPlan(sup: Supervisor, env: NodeJS.ProcessEnv, uid: number | null, mode: 'unload'): UnloadPlan | null;
+export function stopPlan(sup: Supervisor, env: NodeJS.ProcessEnv, uid: number | null, mode: ShutdownMode): StopPlan | null;
 export function stopPlan(
   sup: Supervisor = detectSupervisor(),
   env: NodeJS.ProcessEnv = process.env,
@@ -299,38 +364,148 @@ export function stopPlan(
   // `undefined` to a defaulted parameter re-triggers the default, so the
   // no-uid case would be untestable — and it is a real case (Windows).
   uid: number | null = process.getuid?.() ?? null,
-): StopPlan {
+  mode: ShutdownMode = 'exit',
+): StopPlan | null {
+  if (mode === 'unload') return unloadPlan(sup, env, uid);
+  if (sup.supervised) {
+    return {
+      via: 'exit',
+      mode: 'exit',
+      durability: 'returns',
+      detail: sup.kind === 'launchd' || (sup.kind === 'systemd' && !sup.assumed)
+        ? `${sup.detail} — it exits and comes straight back; every run checkpoints and resumes`
+        : `${sup.detail} — this console cannot name that supervisor, so it exits and may be brought back`,
+    };
+  }
+  if (sup.kind === 'launchd' || sup.kind === 'systemd') {
+    return {
+      via: 'exit',
+      mode: 'exit',
+      durability: 'until-login',
+      detail: `${sup.detail} — it stays stopped until the next login starts the unit again`,
+    };
+  }
+  return { via: 'exit', mode: 'exit', durability: 'stays-off', detail: 'nothing is supervising this process, so exiting stops it' };
+}
+
+function unloadPlan(sup: Supervisor, env: NodeJS.ProcessEnv, uid: number | null): UnloadPlan | null {
   const label = env.XPC_SERVICE_NAME;
   if (sup.kind === 'launchd' && label && label !== '0' && uid != null) {
+    const target = `gui/${uid}/${label}`;
     return {
       via: 'launchctl',
+      mode: 'unload',
       file: 'launchctl',
-      // `bootout` on the service target, not `stop` — `stop` under KeepAlive is
-      // a restart with extra steps, which is exactly the trap being avoided.
-      args: ['bootout', `gui/${uid}/${label}`],
+      // `disable` FIRST, and synchronously: it only writes launchd's override
+      // database, and it has to land before `bootout` — whose SIGTERM is what
+      // ends this process. `bootout` on the service target, not `stop`: `stop`
+      // under KeepAlive is a restart with extra steps.
+      steps: [['disable', target], ['bootout', target]],
+      args: ['bootout', target],
       label,
-      detail: `launchd · ${label} · the job is unloaded, so it stays off until you install or start it again`,
+      durability: 'disabled',
+      marker: true,
+      resurrect: `launchctl enable gui/$(id -u)/${label} && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${label}.plist`
+        + '',
+      detail: `launchd · ${label} · the job is unloaded and disabled and a stop marker holds its automation, so it stays off — a login does not bring it back`,
     };
   }
   const unit = env.PHASE_CONSOLE_UNIT;
   if (sup.kind === 'systemd' && unit) {
     return {
       via: 'systemctl',
+      mode: 'unload',
       file: 'systemctl',
-      // `stop`, which under systemd really does mean stop — Restart= only
-      // covers exits, not deliberate stops. The unit stays enabled, so it
-      // returns at the next login unless disabled.
-      args: ['--user', 'stop', unit],
+      // `disable --now` is both halves in one command: the unit stops (its
+      // SIGTERM ends this process) and no longer starts at login.
+      steps: [['--user', 'disable', '--now', unit]],
+      args: ['--user', 'disable', '--now', unit],
       label: unit,
-      detail: `systemd · ${unit} · the unit is stopped until you start it again (it still starts at login unless you disable it)`,
+      durability: 'disabled',
+      marker: true,
+      resurrect: `systemctl --user enable --now ${unit}`
+        + '',
+      detail: `systemd · ${unit} · the unit is stopped and disabled and a stop marker holds its automation, so it stays off — a login does not bring it back`,
     };
   }
-  return {
-    via: 'exit',
-    detail: sup.supervised
-      ? `${sup.detail} — this console cannot unload that supervisor, so it exits and may be brought back`
-      : 'nothing is supervising this process, so exiting stops it',
-  };
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * The stop marker
+ * ------------------------------------------------------------------ */
+
+/**
+ * "This console was stopped on purpose, and meant it" — on disk (SHD-5).
+ *
+ * `INSTANCE_STATE_DIR/stopped-by-console.json`, written by a `mode: 'unload'`
+ * Shut down BEFORE anything is unloaded. A boot that finds it holds its
+ * automation — `readoptQueued` re-adopts nothing, converge converges nothing —
+ * and says why, until an operator clears it: `phase-console start` removes the
+ * file, and so does Settings' release. The unit being disabled keeps the
+ * process from coming back; the marker keeps a process that comes back anyway
+ * (a hand-run `launchctl bootstrap`, a foreground start) from picking the work
+ * back up behind the operator's back.
+ *
+ * Tolerant in one direction only, like the freeze marker: every unreadable
+ * shape answers "not stopped". A console that wrongly believes itself stopped
+ * does nothing, silently; one that wrongly believes itself released starts work
+ * a person can see and stop.
+ */
+export type StopMarker = {
+  at: string;
+  by: string;
+  via?: string;
+  origin?: string;
+  remoteUser?: string | null;
+  mode: 'unload';
+  durability: ShutdownDurability;
+  label?: string;
+  resurrect?: string;
+};
+
+export const STOP_MARKER_FILE = join(INSTANCE_STATE_DIR, STOP_MARKER_NAME);
+
+export function readStopMarker(file: string = STOP_MARKER_FILE): StopMarker | null {
+  let raw: string;
+  try { raw = readFileSync(file, 'utf8'); } catch { return null; }
+  try {
+    const parsed = JSON.parse(raw) as Partial<StopMarker> | null;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (typeof parsed.at !== 'string' || !Number.isFinite(Date.parse(parsed.at))) return null;
+    return {
+      ...parsed,
+      at: parsed.at,
+      by: typeof parsed.by === 'string' && parsed.by ? parsed.by : 'console',
+      mode: 'unload',
+      durability: parsed.durability ?? 'disabled',
+    } as StopMarker;
+  } catch {
+    log.warn('shutdown.marker-unreadable', { file });
+    return null;
+  }
+}
+
+/** Write the marker atomically; returns what the next reader will see. */
+export function writeStopMarker(marker: Omit<StopMarker, 'at' | 'mode'> & { at?: string }, file: string = STOP_MARKER_FILE): StopMarker {
+  const record: StopMarker = { ...marker, at: marker.at ?? new Date().toISOString(), mode: 'unload' };
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.tmp.${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+  renameSync(tmp, file);
+  return record;
+}
+
+/**
+ * Remove the marker; returns the marker that stood, or null. Throws when the
+ * file is still there afterwards — a release that could not happen must not
+ * leave a process believing it released while the next boot holds again.
+ */
+export function clearStopMarker(file: string = STOP_MARKER_FILE): StopMarker | null {
+  const was = readStopMarker(file);
+  try { rmSync(file, { force: true }); } catch (error) { log.warn('shutdown.marker-clear-failed', { file, error }); }
+  if (readStopMarker(file)) throw new Error(`the stop marker could not be removed (${file}) — the console still holds its automation`);
+  return was;
 }
 
 /**
@@ -367,24 +542,82 @@ export function bootout(plan: StopPlan, spawn: Spawner): boolean {
   }
 }
 
+/** The narrow slice of `child_process.spawnSync` `unload` needs — a test passes a fake. */
+export type SyncRunner = (file: string, args: string[], options: { timeout: number; stdio: 'ignore' }) => { status: number | null; error?: Error };
+
+/**
+ * Carry out an `unload` plan: every step but the last synchronously (they only
+ * write the supervisor's own records, and each has to land before the step
+ * that ends this process), then the last one detached through `bootout`.
+ * Returns what was achieved — `disabled` is false when a disable step failed,
+ * and the marker the caller already wrote is then the only thing holding the
+ * boot, which the log says (`shutdown.disabled`).
+ */
+export function unload(plan: UnloadPlan, spawn: Spawner, run: SyncRunner): { disabled: boolean; spawned: boolean } {
+  let disabled = true;
+  for (const args of plan.steps.slice(0, -1)) {
+    let ok = false;
+    try {
+      const result = run(plan.file, args, { timeout: 5_000, stdio: 'ignore' });
+      ok = !result.error && result.status === 0;
+    } catch { ok = false; }
+    disabled &&= ok;
+  }
+  // systemd's single `disable --now` step both disables and stops, so it has
+  // nothing to run ahead of the step that ends the process.
+  const spawned = bootout({ ...plan, args: plan.steps.at(-1) ?? plan.args }, spawn);
+  log.warn('shutdown.disabled', { label: plan.label, disabled, spawned, steps: plan.steps.length });
+  return { disabled, spawned };
+}
+
+/**
+ * Disable this console's own unit WITHOUT stopping it — what spending an
+ * `autostart: 'once'` means (FLT-9): this boot was the one start the profile
+ * granted, so the next login must not start it again. launchd's `disable`
+ * writes only its override database; systemd's `disable` (no `--now`) only
+ * removes the login link. Null when there is no unit this process can name.
+ */
+export function disableOwnUnit(
+  run: SyncRunner,
+  sup: Supervisor = detectSupervisor(),
+  env: NodeJS.ProcessEnv = process.env,
+  uid: number | null = process.getuid?.() ?? null,
+): { label: string; ok: boolean } | null {
+  const plan = stopPlan(sup, env, uid, 'unload');
+  if (!plan) return null;
+  const args = plan.via === 'launchctl' ? plan.steps[0] : ['--user', 'disable', plan.label];
+  let ok = false;
+  try {
+    const result = run(plan.file, args, { timeout: 5_000, stdio: 'ignore' });
+    ok = !result.error && result.status === 0;
+  } catch { ok = false; }
+  return { label: plan.label, ok };
+}
+
 /**
  * The Shut-down button's other half, registered by `index.ts` for the same
  * reason `onRestartRequest` is: `shutdown()` closes over the server handle and
  * the drain budget.
  */
-let stopper: ((reason: string) => void) | null = null;
+/** What a Shut down press asks for beyond its sentence — the strength it chose. */
+export type ShutdownRequest = { mode: ShutdownMode };
 
-export function onShutdownRequest(handler: (reason: string) => void): void {
+let stopper: ((reason: string, request: ShutdownRequest) => void) | null = null;
+
+export function onShutdownRequest(handler: (reason: string, request: ShutdownRequest) => void): void {
   stopper = handler;
 }
 
-export function requestShutdown(reason: string): boolean {
+export function requestShutdown(reason: string, request: ShutdownRequest = { mode: 'exit' }): boolean {
   if (!stopper) return false;
-  try { stopper(reason); } catch (error) { log.error('shutdown.failed', { reason, error }); return false; }
+  try { stopper(reason, request); } catch (error) { log.error('shutdown.failed', { reason, error }); return false; }
   return true;
 }
 
-export async function runShutdownHandlers(perHandlerMs: number): Promise<void> {
+export async function runShutdownHandlers(
+  perHandlerMs: number,
+  context: ShutdownContext = { intent: 'signal', reason: 'unknown' },
+): Promise<void> {
   const pending = [...handlers.entries()];
   handlers.clear();
 
@@ -392,7 +625,7 @@ export async function runShutdownHandlers(perHandlerMs: number): Promise<void> {
     const started = Date.now();
     try {
       await Promise.race([
-        Promise.resolve(handler()),
+        Promise.resolve(handler(context)),
         new Promise<void>((_, reject) =>
           setTimeout(() => reject(new Error(`shutdown handler "${name}" exceeded ${perHandlerMs}ms`)), perHandlerMs).unref()),
       ]);

@@ -32,5 +32,5 @@
     "lib": ["es2023", "dom"],
     "types": ["node"]
   },
-  "include": ["./**/*.ts"]
+  "include": ["./**/*.ts", "../fleet/**/*.ts"]
 }

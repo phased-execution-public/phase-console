@@ -233,3 +233,78 @@ test('uninstall on a file that never had our entries (or does not exist) changes
     assert.equal(defaultSettingsPath({ CLAUDE_CONFIG_DIR: conf }), join(conf, 'settings.json'));
   } finally { cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * The hook itself, with no console to answer (zero-touch phase 16)
+ * ------------------------------------------------------------------ */
+
+/**
+ * REG-2 and REG-3 (iv), end to end through the real script. With no console
+ * the hook used to write a drop and stop — nothing drained it until a console
+ * booted, and a starting session learned nothing about who else was in its
+ * repository. Now it drains the inbox itself (`phase-console sessions ingest`,
+ * through the registry's own code) and, at SessionStart, names the live peers.
+ */
+test('REG-2 / REG-3 (iv): with no console answering, the hook drains its own inbox and tells a starting session who else is live in the repository', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { createServer } = await import('node:net');
+  const { realpathSync } = await import('node:fs');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-hook-e2e-'));
+  try {
+    const root = join(dir, 'project');
+    mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+    const real = realpathSync(root);
+    const port = await new Promise<number>((resolve, reject) => {
+      const probe = createServer();
+      probe.on('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const address = probe.address() as { port: number };
+        probe.close(() => resolve(address.port));
+      });
+    });
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      XDG_CONFIG_HOME: join(dir, 'config'), XDG_STATE_HOME: join(dir, 'state'),
+      CLAUDE_PID: String(process.pid),
+    };
+    for (const key of ['DOCS_ROOT', 'PE_SESSION_ID', 'PE_OWNER', 'PE_SCOPE', 'PE_OUTCOME_FILE', 'PHASE_CONSOLE_URL', 'PHASE_CONSOLE_HOOK_OFF', 'PHASE_CONSOLE_HOOK_INGEST', 'PHASE_CONSOLE_PROBE', 'CLAUDE_CODE_SESSION_ID']) {
+      delete env[key];
+    }
+    // The instance, on a port nothing listens on — so the POST is refused.
+    const registered = spawnSync(process.execPath, [join(SKILL_DIR, 'viewer', 'shared', 'instances.mjs'), 'register', real, '--name', 'hook-e2e', '--port', String(port), '--default'], { env, encoding: 'utf8' });
+    assert.equal(registered.status, 0, registered.stderr);
+    const shell = spawnSync(process.execPath, [join(SKILL_DIR, 'viewer', 'shared', 'instances.mjs'), 'shell', '--root', real], { env, encoding: 'utf8' });
+    const stateDir = /^state_dir=(.*)$/m.exec(shell.stdout)![1];
+    const hook = (event: string, sessionId: string) => spawnSync('/bin/bash', [join(SKILL_DIR, 'scripts', 'session-hook.sh')], {
+      input: JSON.stringify({ session_id: sessionId, hook_event_name: event, cwd: real, transcript_path: `/t/${sessionId}.jsonl`, source: 'startup' }),
+      env, encoding: 'utf8', cwd: real, timeout: 20_000,
+    });
+
+    const first = hook('SessionStart', 's-hook-first');
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stdout, /this Claude session's id is s-hook-first/);
+    assert.doesNotMatch(first.stdout, /other live Claude session/, 'alone in its repository, it is told nothing new');
+    const firstRecord = JSON.parse(readFileSync(join(stateDir, 'sessions', 's-hook-first.json'), 'utf8'));
+    assert.equal(firstRecord.lastEvent.via, 'cli', 'drained by the hook\'s own ingest, with no console');
+
+    const second = hook('SessionStart', 's-hook-second');
+    assert.equal(second.status, 0, second.stderr);
+    const context = JSON.parse(second.stdout.trim()).hookSpecificOutput.additionalContext as string;
+    assert.match(context, /this Claude session's id is s-hook-second/);
+    assert.match(context, /The session registry shows one other live Claude session in this repository: s-hook-f/);
+
+    // Any other event drains in the background and returns at once.
+    const stop = hook('Stop', 's-hook-second');
+    assert.equal(stop.status, 0);
+    assert.equal(stop.stdout, '', 'a Stop says nothing to the session');
+    let turns = 0;
+    for (let i = 0; i < 200 && turns !== 1; i++) {
+      try { turns = JSON.parse(readFileSync(join(stateDir, 'sessions', 's-hook-second.json'), 'utf8')).turns; } catch { turns = 0; }
+      if (turns !== 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(turns, 1, 'the background drain applied the Stop');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

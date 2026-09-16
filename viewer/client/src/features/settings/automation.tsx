@@ -23,6 +23,7 @@
 import { SettingsSectionFrame, sectionFor } from './nav';
 import { AutomationCard } from './automation-card';
 import { LadderCard } from './ladder';
+import { PolicyAnswersCard } from './policy';
 import { ScheduleCard } from './schedule-card';
 import { SessionHookCard } from './hooks';
 import { PostureCard } from './posture';
@@ -33,6 +34,9 @@ export function AutomationSection() {
     <SettingsSectionFrame section={section}>
       <AutomationCard />
       <LadderCard />
+      {/* The answers the ladder gives by itself — read at every park, so
+          they sit right under the caps that bound the climbing. */}
+      <PolicyAnswersCard />
       {/* After the ladder and before the hook: the ladder is what happens when
           a phase stops, the schedule is whether one may start at all, and the
           hook is the input both act on. */}

@@ -106,6 +106,64 @@ export const SITUATIONS = Object.freeze(
 export const EXIT_SUB_KINDS = Object.freeze(['sleep', 'refusal', 'skill-missing']);
 
 /**
+ * WHY a `refusal` refused — the cause beside the sub-kind, never a fourth
+ * sub-kind (the rung table is keyed `never-started:refusal` and stays empty
+ * for every cause, because none of them changes on a re-board).
+ *
+ * `aup` is the content refusal the sub-kind was written for. The other three
+ * are the ones the audit found the reader could not see (RCV-2): of 49
+ * zero-cost sessions, 16 signed off with "Your organization has disabled
+ * Claude subscription access for Claude Code" and 2 with "Self-signed
+ * certificate detected", and every one of them landed in bare `never-started`
+ * and was re-boarded into the same wall — `reboard-fresh`, the exact act this
+ * sub-kind exists to stop. The runner's own halt sentence for the third
+ * ("organization policy blocks this credential") joins them so a record from a
+ * console that halted on it reads the same way on any console.
+ * @type {readonly string[]}
+ */
+export const REFUSAL_CAUSES = Object.freeze(['aup', 'org-policy', 'org-subscription', 'certificate']);
+
+/**
+ * The cause a refusal names, or undefined when the words name none — in which
+ * case `classifyExitSaid` answers no `refusal` either: the two are one read.
+ *
+ * Order matters only where the phrases could overlap: the organisation's
+ * SUBSCRIPTION ("disabled … subscription access") is asked before the
+ * organisation's POLICY, because the CLI's subscription sentence also
+ * contains the word "organization".
+ *
+ * @param {string|null|undefined} said
+ * @returns {'aup'|'org-policy'|'org-subscription'|'certificate'|undefined}
+ */
+export function refusalCauseOf(said) {
+  const text = String(said ?? '');
+  if (!text.trim()) return undefined;
+  if (/organization has (?:been )?disabled|disabled claude subscription/i.test(text))
+    return 'org-subscription';
+  if (/organization policy blocks|oauth_org_not_allowed|disabled api key authentication/i.test(text))
+    return 'org-policy';
+  if (
+    /self.signed certificate|certificate (?:verify|verification|validation) failed|unable to (?:get local issuer|verify the first) certificate|SELF_SIGNED_CERT_IN_CHAIN|DEPTH_ZERO_SELF_SIGNED_CERT/i.test(
+      text,
+    )
+  ) {
+    return 'certificate';
+  }
+  // The AUP refusal carried the `[reasoning_extraction]` marker. The two
+  // phrases beside it are the CLI's standard refusal openings; nothing looser
+  // belongs here, because a session that merely QUOTED a policy is not one
+  // that was refused by it.
+  if (
+    /\[reasoning_extraction\]/i.test(text) ||
+    /\b(usage policies|acceptable use policy)\b/i.test(text) ||
+    /\bI (?:can(?:'|’)?t|cannot|won(?:'|’)?t) (?:help with|assist with|comply)\b/i.test(text)
+  ) {
+    return 'aup';
+  }
+  return undefined;
+}
+
+/**
  * Read a zero-turn exit's own words. Returns undefined when they name none of
  * the known shapes — which is a `never-started` with no sub-kind, exactly as
  * before this existed.
@@ -129,17 +187,9 @@ export function classifyExitSaid(said) {
   if (/\b(went to sleep|sleep mid-response|machine (?:was )?suspended|system went to sleep)\b/i.test(text)) {
     return 'sleep';
   }
-  // The AUP refusal carried the `[reasoning_extraction]` marker. The two
-  // phrases beside it are the CLI's standard refusal openings; nothing looser
-  // belongs here, because a session that merely QUOTED a policy is not one
-  // that was refused by it.
-  if (
-    /\[reasoning_extraction\]/i.test(text) ||
-    /\b(usage policies|acceptable use policy)\b/i.test(text) ||
-    /\bI (?:can(?:'|’)?t|cannot|won(?:'|’)?t) (?:help with|assist with|comply)\b/i.test(text)
-  ) {
-    return 'refusal';
-  }
+  // A refusal is whatever `refusalCauseOf` can name — the content policy, or
+  // the three walls RCV-2 found the reader blind to.
+  if (refusalCauseOf(text)) return 'refusal';
   return undefined;
 }
 
@@ -147,7 +197,11 @@ export const SUB_KINDS = Object.freeze({
   // `permission` joined 2026-09-02 (console-parallel-repaint P12): a tool the
   // run's own permission policy refused, which two real sessions had declared
   // as `unknown` and spent an unblock session walking into the same wall.
-  'blocked-declared': Object.freeze(['lock', 'permission', 'credential', 'gate', 'external', 'unknown']),
+  // `const`-typed so the runner's `BlockerSubKind` and the decision manifest's
+  // `NEED_CLASSES` (`decisions-model.js`) DERIVE from it instead of spelling it.
+  'blocked-declared': Object.freeze(
+    /** @type {const} */ (['lock', 'permission', 'credential', 'gate', 'external', 'unknown']),
+  ),
   'resource-wall': Object.freeze(['usage', 'auth', 'budget', 'model']),
   'plan-broken': Object.freeze(['lint', 'unreadable', 'verification', 'issue']),
   'never-started': EXIT_SUB_KINDS,
@@ -192,6 +246,46 @@ export const SITUATION_ACTOR = Object.freeze({
   'never-started': 'machine',
   unknown: 'person',
 });
+
+/**
+ * The sub-kinds whose actor DIFFERS from their parent's — and only those.
+ *
+ * Four tables are empty on purpose and each is a person's from the start: a
+ * credential or a gate the session named, a policy refusal, a skill this
+ * machine cannot load. Their parent situations are `machine` (the other
+ * sub-kinds climb), so `nextRung` read them as a machine's with "no automatic
+ * rung exists", `loop.md` called them a person's, and the errand's reason
+ * disagreed with both (LFC-3's third clause). One table, three readers —
+ * the classifier's `Situation.actor`, `nextRung`, the client's ladder view —
+ * through `actorFor`, so an empty sub-table is a person's everywhere or
+ * nowhere. `blocked-declared:permission` is deliberately NOT here: it has a
+ * rung (`widen-rule`), so it is the machine's until that rung is answered.
+ * @type {Readonly<Record<string, 'machine'|'person'|'wait'|'none'>>}
+ */
+export const SITUATION_SUB_ACTOR = Object.freeze({
+  'blocked-declared:credential': 'person',
+  'blocked-declared:gate': 'person',
+  'never-started:refusal': 'person',
+  'never-started:skill-missing': 'person',
+});
+
+/**
+ * Who a situation is for, sub-kind applied — `SITUATION_SUB_ACTOR` first, the
+ * parent's word otherwise. An unknown id answers `person`, never throws: a
+ * word from a newer build should reach a person rather than a crash.
+ * @param {string|null|undefined} id
+ * @param {string|null|undefined} [sub]
+ * @returns {'machine'|'person'|'wait'|'none'}
+ */
+export function actorFor(id, sub) {
+  const key = sub ? `${id}:${sub}` : String(id ?? '');
+  const override = /** @type {Record<string, 'machine'|'person'|'wait'|'none'>} */ (SITUATION_SUB_ACTOR)[key];
+  if (override) return override;
+  return (
+    /** @type {Record<string, 'machine'|'person'|'wait'|'none'>} */ (SITUATION_ACTOR)[String(id ?? '')] ??
+    'person'
+  );
+}
 
 /**
  * What a card, a chip and a journal line call each situation — a short noun

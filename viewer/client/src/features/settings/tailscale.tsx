@@ -22,7 +22,7 @@
 import { Wifi, WifiOff } from 'lucide-react';
 import { SETUP_PROMPTS } from '@shared/setup-prompts.js';
 import { useTailscale } from '@/lib/queries';
-import type { TailscaleDevice, TailscaleStatus } from '@/lib/api';
+import type { ServeCommand, TailscaleDevice, TailscaleServe, TailscaleStatus } from '@/lib/api';
 import {
   Badge,
   Banner,
@@ -48,6 +48,12 @@ import {
  * default console port keeps 443 (the URL every earlier install already has);
  * any other console publishes on 4000 + its own port, which is unique on the
  * machine for the same reason the port is.
+ *
+ * That is only the port when nothing stands in the way, and the server owns it
+ * now (`httpsPortFor` in `server/tailscale.ts`): it reads the whole Serve table
+ * and sends the command to print, because a live sibling can hold even the
+ * derived port. This import-free copy is the fallback for a server that
+ * predates `serve.command`, and both suites pin the same table.
  */
 export const DEFAULT_CONSOLE_PORT = 4123;
 export function httpsPortFor(port: number): number {
@@ -68,6 +74,36 @@ export function servedPort(url: string | undefined): number | undefined {
 /** The port the console is served on, for the commands this card prints. */
 function serveCommand(port: number): string {
   return `tailscale serve --bg --https=${httpsPortFor(port)} http://127.0.0.1:${port}`;
+}
+
+/**
+ * The serve command to print, or `null` when there is nothing to run.
+ *
+ * The server's, whenever it sent one: it read the whole Serve table, so it
+ * knows when the natural port belongs to a live sibling and offers one that
+ * leaves it alone. Deriving it here is only for a server that predates the
+ * field — it can see this console's port and nothing else.
+ */
+function commandFor(serve: TailscaleServe, port: number): ServeCommand | null {
+  if (serve.command !== undefined) return serve.command;
+  return serve.forOurPort
+    ? null
+    : { httpsPort: httpsPortFor(port), text: serveCommand(port), displaces: null };
+}
+
+/**
+ * Who Tailscale publishes instead of this console — by name.
+ *
+ * "Something else" was true and useless: one tailnet name has one Serve table,
+ * the handler in it is usually a sibling console, and whether to leave it
+ * alone depends on which one it is.
+ */
+function occupantLabel(serve: TailscaleServe): string {
+  if (serve.occupant?.name) return `${serve.occupant.name} (port ${serve.occupant.port})`;
+  if (serve.targetPort !== undefined)
+    return `port ${serve.targetPort} — a program no console on this machine knows`;
+  if (serve.handlers) return 'a handler that does not forward to a port on this machine';
+  return 'another port — this server is too old to say which';
 }
 
 function Devices({ self, peers }: { self: TailscaleDevice; peers: TailscaleDevice[] }) {
@@ -154,15 +190,16 @@ function Devices({ self, peers }: { self: TailscaleDevice; peers: TailscaleDevic
  * and anything asserting about "the command this card shows" needs the same
  * distinction to be real in the accessibility tree rather than visual only.
  */
-function Commands({ port, serving }: { port: number; serving: boolean }) {
+function Commands({ command }: { command: ServeCommand | null }) {
   return (
     <div role="group" aria-label="Setup commands" className="flex flex-col gap-2">
-      {!serving && (
+      {command?.displaces && <Displaced offered={command.httpsPort} displaces={command.displaces} />}
+      {command && (
         <div>
           <p className="mb-1 text-2xs text-ink-faint">
             Publish it on the tailnet. It stays bound to loopback — Tailscale does the listening.
           </p>
-          <Block text={serveCommand(port)} />
+          <Block text={command.text} />
         </div>
       )}
       <div>
@@ -176,6 +213,37 @@ function Commands({ port, serving }: { port: number; serving: boolean }) {
         />
       </div>
     </div>
+  );
+}
+
+/**
+ * Why the printed port is not the natural one: a live sibling holds that one.
+ *
+ * Said out loud because the refused command is the one an operator would type
+ * from memory or copy from an older card — and running it takes the phone away
+ * from a console that is up.
+ */
+function Displaced({
+  offered,
+  displaces,
+}: {
+  offered: number;
+  displaces: NonNullable<ServeCommand['displaces']>;
+}) {
+  const { occupant } = displaces;
+  return (
+    <Banner severity="warn">
+      {displaces.httpsPort} is held by the live console{' '}
+      {occupant.name ? (
+        <>
+          <code>{occupant.name}</code> (port {occupant.port})
+        </>
+      ) : (
+        <>on port {occupant.port}</>
+      )}{' '}
+      — publishing this console there would take the phone away from it. The command below publishes on{' '}
+      {offered} instead, which leaves {occupant.name ?? 'it'} alone.
+    </Banner>
   );
 }
 
@@ -226,7 +294,8 @@ function Mismatch({
     return (
       <Banner severity="warn">
         This console answers to <code>{remoteHosts.join(', ')}</code>, but nothing is being served on{' '}
-        {httpsPortFor(port)} for it — the URL will not resolve. Run the serve command below.
+        {commandFor(status.serve, port)?.httpsPort ?? httpsPortFor(port)} for it — the URL will not resolve.
+        Run the serve command below.
       </Banner>
     );
   }
@@ -378,7 +447,7 @@ function Body({
                 this console, on {servedPort(status.serve.url) ?? httpsPortFor(port)}
               </span>
             ) : status.serve.active ? (
-              <span className="text-action">something else — not this console&apos;s port</span>
+              <span className="text-action">{occupantLabel(status.serve)}</span>
             ) : (
               'nothing'
             ),
@@ -408,7 +477,7 @@ function Body({
         </Banner>
       ) : null}
 
-      <Commands port={port} serving={status.serve.forOurPort} />
+      <Commands command={commandFor(status.serve, port)} />
 
       <details className="text-sm">
         <summary className="cursor-pointer text-ink-muted">First time on a tailnet</summary>

@@ -120,7 +120,14 @@ const LOCAL_JOB = new RegExp(
   '(^|[\\s\'"(&|;])(pgrep|pkill|jobs -p|wait \\$|wait %)'
   + '|/tmp/|/var/folders/|tasks/[^\\s]*\\.output|\\.claude/jobs/|\\$CLAUDE_JOB_DIR'
   + '|\\[ -[a-z] |test -[a-z] '
-  + '|\\.log($|[^a-z])|\\.out($|[^a-z])',
+  + '|\\.log($|[^a-z])|\\.out($|[^a-z])'
+  // A `--watch` flag, a `watch -n` loop and a `tail -f` are a session
+  // supervising something IT started — a test runner re-running, a build
+  // re-building, a log it is reading — and were the commonest refusal in the
+  // corpus (`--watch` ×16 of 37). `REMOTE_WAIT` is asked first, so
+  // `gh pr checks --watch` and `kubectl … --watch` stay somebody else's clock
+  // (zero-touch-console phase 9, RCV-5).
+  + '| --watch([^A-Za-z]|$)|(^|[\\s;&|])watch -n|(^|[\\s;&|])tail -[a-zA-Z]*f',
 );
 
 /**
@@ -198,6 +205,69 @@ export function localWatchRef(summary: string): string | null {
 }
 
 /**
+ * The ref the console mints for a wait it refused or found open — the whole
+ * family, where `localWatchRef` is the poll-loop arm (phase 9, RCV-5/TRS-3).
+ * Every shape answers with what the session was actually waiting FOR:
+ *
+ *   `until <c>; do …` / `while ! <c>; do …`   → `cmd:"<c>"`     (`localWatchRef`)
+ *   `<cmd> --watch …`                         → `cmd:"<cmd …>"` — the flag and any
+ *                                               redirection stripped; the lead must be a
+ *                                               probe or a `WATCH_ONESHOT_LEADS` runner
+ *   `watch -n N <cmd>`                        → `cmd:"<cmd>"`   (same lead rule)
+ *   `sleep N`                                 → `date:<now + N s>` — a clock, not a probe
+ *   `gh run watch <id> [-R o/r]`              → `gh:o/r#run/<id>` when the repo is named
+ *   `gh pr checks <n> --watch [-R o/r]`       → `gh:o/r#pr/<n>`  — else `cmd:"gh …"` one-shot
+ *
+ * Null for anything else (`tail -f`, `docker compose logs -f`, a bare `while
+ * true`): a ref that cannot be honest is worse than none. `at` is the clock
+ * a `sleep` is measured from — the caller's `now`, never `Date.now()`, so a
+ * test's fake clock and the park agree.
+ */
+export function mintWatchRef(command: string, at: number = Date.now()): string | null {
+  const loop = localWatchRef(command);
+  if (loop) return loop;
+  const text = foldWhitespace(command);
+  // A `sleep` is the wait's whole duration only when it IS the statement — a
+  // `while true; do sleep 30; done` sleeps thirty seconds for ever, and a
+  // clock minted from its body would resume the lane into the same loop.
+  const sleep = /\b(until|while)\b/.test(text) ? null : /(^|[\s;&|])sleep\s+(\d+)([smh])?(?=$|[\s;&|])/.exec(text);
+  if (sleep) {
+    const unit = sleep[3] === 'm' ? 60_000 : sleep[3] === 'h' ? 3_600_000 : 1_000;
+    return `date:${new Date(at + Number(sleep[2]) * unit).toISOString().replace(/\.\d{3}Z$/, 'Z')}`;
+  }
+  const repo = /(?:^|\s)(?:-R|--repo)[= ]([\w.-]+\/[\w.-]+)(?=$|\s)/.exec(text)?.[1] ?? null;
+  const ghRun = /(^|[\s;&|])gh run watch\s+(\d+)/.exec(text);
+  if (ghRun) return repo ? `gh:${repo}#run/${ghRun[2]}` : `cmd:"gh run view ${ghRun[2]} --exit-status${repo ? ` -R ${repo}` : ''}"`;
+  const ghPr = /(^|[\s;&|])gh pr checks\s+(\d+)/.exec(text);
+  if (ghPr && / --watch(?=$|[^A-Za-z])/.test(text)) {
+    return repo ? `gh:${repo}#pr/${ghPr[2]}` : `cmd:"gh pr checks ${ghPr[2]}${repo ? ` -R ${repo}` : ''}"`;
+  }
+  // `watch -n N <cmd>` — the watched command is the probe.
+  const watched = /(^|[\s;&|])watch\s+(?:-n\s*\d+(?:\.\d+)?\s+|--interval[= ]\d+\s+)?(?:-[a-z]+\s+)*(.+)$/.exec(text);
+  if (watched && /(^|[\s;&|])watch\s/.test(text) && !/ --watch/.test(text)) {
+    return oneShot(watched[2]);
+  }
+  // `<cmd> --watch` — the one-shot form of the same command.
+  if (/ --watch(?=$|[^A-Za-z])/.test(text)) {
+    return oneShot(text.replace(/ --watch(?:=[^\s]*)?(?=$|[^A-Za-z])/g, ''));
+  }
+  return null;
+}
+
+/** A command as a `cmd:` ref when its lead is one the console will mint for — redirections dropped. */
+function oneShot(command: string): string | null {
+  const bare = command
+    .replace(/\s*\d*>>?\s*(?:&\d|[^\s;&|]+)/g, '')   // `> /tmp/x.log`, `2>&1`, `2> file`
+    .replace(/\s*&\s*$/, '')
+    .replace(/\s+--\s*$/, '')                           // `npm test -- --watch` → `npm test`
+    .trim();
+  if (!bare) return null;
+  const lead = bare.split(/\s+/)[0]?.replace(/^.*\//, '') ?? '';
+  if (!WATCH_REF_PROBES.has(lead) && !WATCH_ONESHOT_LEADS.has(lead)) return null;
+  return `cmd:"${bare.replace(/"/g, "'")}"`;
+}
+
+/**
  * The only leads a console-minted `cmd:` ref may carry.
  *
  * Every one of them ASKS something and changes nothing, which is the property
@@ -209,6 +279,20 @@ export function localWatchRef(summary: string): string | null {
 export const WATCH_REF_PROBES = new Set([
   'test', 'grep', 'rg', 'ls', 'stat', 'cat', 'head', 'tail', 'wc',
   'jq', 'curl', 'docker', 'diff',
+]);
+
+/**
+ * The leads a `--watch` / `watch -n` command may be minted from, beside the
+ * probes above (phase 9, RCV-5): a test runner, a build, a type-checker —
+ * commands whose ONE-SHOT form is its own landing probe (`vitest --watch`
+ * re-runs the suite on every change; `vitest` runs it once and exits 0 when
+ * it is green). The verify policy stays the second gate and
+ * `watchMintedCmdRefs` (off by default) the third: a minted ref is held on
+ * the record, never run, until an operator says minted refs may run.
+ */
+export const WATCH_ONESHOT_LEADS = new Set([
+  'node', 'npm', 'pnpm', 'yarn', 'npx', 'bun', 'deno',
+  'vitest', 'jest', 'mocha', 'tsc', 'cargo', 'go', 'pytest', 'bats', 'swift', 'xcodebuild',
 ]);
 
 /*
@@ -1069,6 +1153,13 @@ export type StallState = {
    * `external`, the behaviour those checkpoints were written under.
    */
   scope?: WaitScope;
+  /**
+   * `external-wait` only: what the evidence is. `open` — a Bash call matching
+   * the vocabulary is still out. `denied` — the console's own in-turn-wait
+   * guard refused one, so no call ever opened, and the lane is reached through
+   * `LaneSignals.waitDenied` instead (RCV-5). Absent reads as `open`.
+   */
+  source?: 'open' | 'denied';
 };
 
 /**
@@ -1192,6 +1283,18 @@ export type LaneSignals = {
   frozen: boolean;
   /** The episode in progress, so a transition can be told from a repeat. */
   stall: StallState | null;
+  /**
+   * The wait the console REFUSED on this lane (`noteWaitDenied`) — the signal
+   * the plan calls `lane.wait-denied`. `externalWaitTool` sees only a call that
+   * is still open, and the in-turn-wait guard denies the call before it opens,
+   * so the local-job ladder — nudge, then park with a `cmd:` ref at
+   * `stallLocalJobMs` — could never reach exactly the wait it was built for
+   * (RCV-5; measured: `until ! pgrep …` and `--watch` denied, then the session
+   * declared somebody else's clock with prose for refs). One episode: `since`
+   * is the first denial and holds while denials keep coming; durable progress
+   * (a commit, a declared outcome) ends it.
+   */
+  waitDenied?: { since: number; lastAt: number; command: string; matched: string; scope: WaitScope; count: number };
 };
 
 type OpenToolAt = { id: string; name: string; since: number; summary?: string };
@@ -1247,6 +1350,24 @@ export function isProductiveEvent(event: StreamEvent): boolean {
   return event.kind !== 'retry' && event.kind !== 'limits';
 }
 
+/**
+ * Did the session say something DURABLE about where the phase stands — a commit,
+ * or an outcome declared through `phase-outcome.sh`?
+ *
+ * Narrower than `isProductiveEvent` on purpose. A declared wait is the session's
+ * testimony about the world, and it used to be spent by the first productive
+ * event of the resume — a single `git status` — so a resume that did nothing
+ * but look left a record that could no longer say what it was waiting for
+ * (WAI-4; measured: spent 0.8 s into a resume that then produced nothing). A
+ * denied in-turn wait's episode ends on the same evidence (`noteWaitDenied`):
+ * the session moved on only when it did something that lasts.
+ */
+export function isDurableProgress(event: StreamEvent): boolean {
+  if (event.kind !== 'tool' || event.name !== 'Bash') return false;
+  const command = event.summary ?? '';
+  return /\bgit\b[^;&|\n]*\bcommit\b/.test(command) || /phase-outcome\.sh\b/.test(command);
+}
+
 export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number): void {
   // Every event is output. `stderr` included: a session writing to stderr is a
   // session doing something, and a lane that only ever complained is not
@@ -1270,6 +1391,9 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
   }
 
   signals.lastProductiveAt = at;
+  // A denied wait's episode ends when the session does something that lasts —
+  // the rule a declaration is spent by (`isDurableProgress`).
+  if (signals.waitDenied && isDurableProgress(event)) delete signals.waitDenied;
   // The burst is consecutive by definition: one real event ends it. Left
   // as-is when nothing productive has happened, so a burst's `since` is when
   // the FIRST retry landed rather than when the tick noticed the fifth.
@@ -1361,7 +1485,8 @@ const EXTERNAL_WAIT_TOOL = 'Bash';
 export function externalWaitTool(
   signals: LaneSignals, at: number, thresholdMs: number, env?: VerifyEnv,
 ): { tool: OpenToolAt; matched: string; scope: WaitScope } | null {
-  if (!env) return null;
+  // Zero is "never": `stallExternalWaitMs: 0` switches the signal off.
+  if (!env || thresholdMs <= 0) return null;
   for (const tool of signals.openTools) {
     if (tool.name !== EXTERNAL_WAIT_TOOL || !tool.summary) continue;
     if (at - tool.since < thresholdMs) continue;
@@ -1376,6 +1501,45 @@ export function externalWaitTool(
   return null;
 }
 
+/**
+ * Record a wait the console's in-turn-wait guard refused on this lane — see
+ * `LaneSignals.waitDenied`. A denial more than `episodeMs` after the last one
+ * starts a new episode; one inside it keeps `since` and counts.
+ */
+export function noteWaitDenied(
+  signals: LaneSignals, denial: { command: string; matched: string }, at: number, episodeMs: number,
+): void {
+  const prior = signals.waitDenied;
+  const continuing = Boolean(prior) && at - prior!.lastAt < episodeMs;
+  signals.waitDenied = {
+    since: continuing ? prior!.since : at,
+    lastAt: at,
+    command: denial.command,
+    matched: denial.matched,
+    scope: waitScope(denial.command),
+    count: continuing ? prior!.count + 1 : 1,
+  };
+}
+
+/**
+ * Is a refused wait still the lane's story? Only while the session is either
+ * PRESSING — refused again inside the external-wait threshold — or has gone
+ * quiet for that long since; a session that took the refusal, backgrounded its
+ * job and went on working is left alone. A refusal older than the local budget
+ * plus that threshold has been over for a while, whatever the lane does now.
+ */
+function deniedWait(
+  signals: LaneSignals, thresholds: StallThresholds, now: number,
+): NonNullable<LaneSignals['waitDenied']> | null {
+  const denied = signals.waitDenied;
+  if (!denied || thresholds.stallExternalWaitMs <= 0) return null;
+  if (now - denied.lastAt > thresholds.stallLocalJobMs + thresholds.stallExternalWaitMs) return null;
+  if (now - denied.since < thresholds.stallExternalWaitMs) return null;
+  const pressing = denied.count >= 2 && now - denied.lastAt < thresholds.stallExternalWaitMs;
+  const stalled = now - signals.lastProductiveAt >= thresholds.stallExternalWaitMs;
+  return pressing || stalled ? denied : null;
+}
+
 /** Fall back to the shipped numbers for anything a caller left out or spelled wrong. */
 export function stallThresholds(prefs?: Partial<StallThresholds> | null): StallThresholds {
   const positive = (value: unknown, fallback: number): number =>
@@ -1385,7 +1549,10 @@ export function stallThresholds(prefs?: Partial<StallThresholds> | null): StallT
     stallSpinTurns: positive(prefs?.stallSpinTurns, STALL_DEFAULTS.stallSpinTurns),
     stallStalemateAttempts: positive(prefs?.stallStalemateAttempts, STALL_DEFAULTS.stallStalemateAttempts),
     stallRetryBurst: positive(prefs?.stallRetryBurst, STALL_DEFAULTS.stallRetryBurst),
-    stallExternalWaitMs: positive(prefs?.stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs),
+    // Zero is kept: it means "never call a lane waiting" (SLF-9) — the one
+    // detector threshold where a zero is a setting rather than nonsense.
+    stallExternalWaitMs: typeof prefs?.stallExternalWaitMs === 'number' && Number.isFinite(prefs.stallExternalWaitMs)
+      && prefs.stallExternalWaitMs >= 0 ? prefs.stallExternalWaitMs : STALL_DEFAULTS.stallExternalWaitMs,
     stallLocalJobMs: positive(prefs?.stallLocalJobMs, STALL_LOCAL_JOB_MS),
   };
 }
@@ -1472,6 +1639,24 @@ export function evaluateStall(
           ? 'a background job this session started'
           : 'a clock outside this session'),
       scope: waiting.scope,
+      source: 'open',
+    };
+  }
+
+  // The same signal with no call open, because the console refused it (RCV-5):
+  // the lane asked to wait inside its turn, was told no, and is still acting on
+  // that wait — asking again, or gone quiet. The local-job ladder reaches it
+  // exactly as it reaches an open poll loop.
+  const denied = deniedWait(signals, thresholds, now);
+  if (denied) {
+    return {
+      signal: 'external-wait',
+      since: new Date(denied.since).toISOString(),
+      detail: `the console refused ${denied.count} in-turn wait(s) matching \`${denied.matched}\` since `
+        + `${minutes(now - denied.since)} min ago — it waits on `
+        + (denied.scope === 'local' ? 'a background job this session started' : 'a clock outside this session'),
+      scope: denied.scope,
+      source: 'denied',
     };
   }
 

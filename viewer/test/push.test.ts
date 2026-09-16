@@ -12,7 +12,7 @@
 
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -586,4 +586,110 @@ test('a fan-out that was entirely deduped is not an undelivered notification', a
   restore2();
 
   assert.equal(fired, 0, 'no attempt was made, so nothing failed to arrive');
+});
+
+/* ------------------------------------------------------------------ *
+ * Nobody to send to, and whose tag it is (zero-touch phase 17, FLT-1 / FLT-4)
+ * ------------------------------------------------------------------ */
+
+test('ACC-10.1: a fan-out to zero devices is a `no-device` report, not silence', () => {
+  const register = registerWith([]);
+  const reports: { outcome: string; detail?: string }[] = [];
+  const nobody: { category: string; subscribed: number }[] = [];
+  register.onNoDevice = (info) => { nobody.push({ category: info.category, subscribed: info.subscribed }); };
+  const attempt = register.announce(
+    'needs-you', { title: 'A phase needs you', body: 'b', tag: 'flt1-none', url: '/' }, Date.now(),
+    (report) => { reports.push(report); },
+  );
+  assert.equal(attempt, null, 'nothing was attempted, so nothing is in flight');
+  assert.deepEqual(reports.map((r) => r.outcome), ['no-device'], 'the record says there was nobody to send it to');
+  assert.match(reports[0]!.detail ?? '', /no device is subscribed/);
+  assert.deepEqual(nobody, [{ category: 'needs-you', subscribed: 0 }]);
+
+  // A device that opted out of the category is a different fact — named as such.
+  const opted = registerWith(['Mac · Chrome']);
+  const [device] = opted.list();
+  opted.setCategories(device!.id, { ready: false });
+  const optedReports: { outcome: string; detail?: string }[] = [];
+  opted.announce('ready', { title: 'Ready', body: 'b', tag: 'flt1-opted', url: '/' }, Date.now(), (r) => { optedReports.push(r); });
+  assert.deepEqual(optedReports.map((r) => r.outcome), ['no-device']);
+  assert.match(optedReports[0]!.detail ?? '', /1 device subscribed, none to ready/);
+});
+
+test('ACC-10.1: a console with no device and --remote set files push-broken ONCE, naming the category', async () => {
+  const { Service } = await import('../server/service.ts');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false, allowRun: false,
+    remoteHosts: ['console.example.ts.net'], remoteUsers: ['you@example.com'],
+    scriptsDir: new URL('../../scripts', import.meta.url).pathname, logFile: null, maxSessions: 3, defaultSkills: [],
+  } as never);
+  try {
+    for (const device of svc.push.list()) svc.push.unsubscribe(device.id);
+    const channel = () => svc.environment.issues.filter((issue) => issue.kind === 'push-broken');
+    assert.equal(channel().length, 1, 'the boot doctor files the channel row: no device, no notifier, no webhook');
+    assert.match(channel()[0]!.detail, /no delivery channel/);
+
+    // The real fan-out, twice: the row names the category once and is not repeated.
+    svc.push.announce('needs-you', { title: 'A phase needs you', body: 'b', tag: 'flt1-svc-1', url: '/' });
+    svc.push.announce('halted', { title: 'A run halted', body: 'b', tag: 'flt1-svc-2', url: '/' });
+    assert.equal(channel().length, 1, 'once per process, however many announcements found nobody');
+    assert.match(channel()[0]!.detail, /"needs-you" announcements are reaching nobody/);
+
+    // A device subscribing clears it at once — not at the next restart.
+    const browser = makeBrowser();
+    const subscribed = svc.push.subscribe({ ...browser.subscription, endpoint: 'https://push.example.com/sub/flt1-svc' }, undefined, 'iPhone · Safari');
+    assert.ok(!('error' in subscribed));
+    assert.equal(channel().length, 0, 'a console that can reach someone is not broken');
+    svc.push.unsubscribe('https://push.example.com/sub/flt1-svc');
+    assert.equal(channel().length, 1, 'and losing the last device brings the row back');
+  } finally {
+    svc.close();
+  }
+});
+
+test('ACC-10.1: tagFor is namespaced by instance before hashing — two consoles never share a topic', () => {
+  const a = push.tagForInstance('4557c636-hub', 'health', 'env-doctor');
+  const b = push.tagForInstance('f922d743-pe-hub', 'health', 'env-doctor');
+  assert.notEqual(a, b, 'identical parts, two instances, two tags');
+  assert.notEqual(send.topicFor(a), send.topicFor(b), 'and so two topics: one card never replaces the other');
+  assert.equal(push.tagForInstance('4557c636-hub', 'health', 'env-doctor'), a, 'still stable for one console');
+  // This process's own tagFor is the same function over this console's id.
+  assert.match(push.tagFor('needs-you', 'demo', 2), /^[0-9a-f]{16}$/);
+  assert.notEqual(push.tagFor('needs-you', 'demo', 2), push.tagForInstance('some-other-console', 'needs-you', 'demo', 2));
+});
+
+/* ------------------------------------------------------------------ *
+ * A register of its own (zero-touch phase 18)
+ * ------------------------------------------------------------------ */
+
+test('a register over a directory of its own keeps its own key and devices, and every message names the console that spoke', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'phase-push-register-'));
+  const bodies: Buffer[] = [];
+  const impl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    bodies.push(Buffer.from(init?.body as Uint8Array));
+    return new Response(null, { status: 201 });
+  }) as unknown as typeof fetch;
+  const register = new push.Push([], { dir, console: { id: 'relay', name: 'relay' }, fetchImpl: impl });
+  assert.ok(register.publicKey, 'it minted a key');
+  assert.notEqual(register.publicKey, fixtureVapid().publicKey, 'a pair of its own — never this console’s');
+  assert.ok(existsSync(join(dir, 'vapid.json')));
+  const browser = makeBrowser();
+  assert.ok(!('error' in register.subscribe(browser.subscription, undefined, 'phone')));
+  assert.ok(existsSync(join(dir, 'subscriptions.json')), 'its devices, beside its key');
+
+  // The fleet subscription's tags carry the instance id: the console namespaced
+  // the tag before hashing, and the register carries it as it came.
+  const tag = push.tagForInstance('4557c636-hub', 'needs-you', 'demo', 2);
+  await register.announce('halted', {
+    title: 'A run halted', body: 'b', tag, url: '/c/4557c636-hub/#/', console: { id: '4557c636-hub', name: 'hub' },
+  });
+  assert.equal(bodies.length, 1);
+  const spoken = JSON.parse(browser.decrypt(bodies[0]));
+  assert.deepEqual(spoken.console, { id: '4557c636-hub', name: 'hub' }, 'the console that spoke, not the register');
+  assert.equal(spoken.tag, tag);
+  assert.notEqual(tag, push.tagForInstance('f922d743-pe-hub', 'needs-you', 'demo', 2), 'and no other console shares it');
+
+  await register.announce('halted', { title: 'Its own', body: 'b', tag: 'relay-own', url: '/' });
+  assert.deepEqual(JSON.parse(browser.decrypt(bodies[1])).console, { id: 'relay', name: 'relay' },
+    'a message naming nobody speaks as the register');
 });

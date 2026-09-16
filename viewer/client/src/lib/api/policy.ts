@@ -4,6 +4,7 @@
  */
 
 import { request, post, q } from './client';
+import type { PolicyAdvisoryKind } from '../../../../shared/ops-vocab.js';
 
 /* ---------------- the permission policy ---------------- */
 
@@ -53,6 +54,13 @@ export interface PolicyView {
   profiles: { id: string; label: string }[];
   /** Rules the syntax accepts that nothing honours. */
   inert: { raw: string; note: string }[];
+  /**
+   * What the policy in force cannot do (phase 12): an empty ask list, a
+   * struck deny wall — each with the rules it names and whether the operator
+   * has acknowledged it against exactly those rules. Absent on a server from
+   * before the feature; the banner then has nothing to show.
+   */
+  advisory?: PolicyAdvisory[];
   support: RuleSupport[];
   hookTools: string[];
   wrappersNotStripped: string[];
@@ -64,6 +72,15 @@ export interface PolicyView {
    * ON. Absent on a server from before the feature; hide the editor then.
    */
   autoApprove?: { global: boolean | null; plan: boolean | null; effective: boolean };
+}
+
+/** One standing advisory (`shared/ops-vocab.js` `POLICY_ADVISORY_KINDS`). */
+export interface PolicyAdvisory {
+  kind: PolicyAdvisoryKind;
+  rules: string[];
+  message: string;
+  acknowledged: boolean;
+  fingerprint: string;
 }
 
 /** What `POST /api/policy` accepts — one scope, one edit. */
@@ -89,9 +106,13 @@ export interface PolicyEdit {
 export const policyApi = {
   policy: (slug?: string) => request<PolicyView>(`/api/policy${slug ? `?slug=${q(slug)}` : ''}`),
   addPolicy: (rules: unknown) => post<PolicyView>('/api/policy', rules),
+  /** The operator has read a standing advisory — recorded against its rules. */
+  acknowledgePolicyAdvisory: (kind: PolicyAdvisoryKind) =>
+    post<{ ok: boolean; kind: string; advisory: PolicyAdvisory[] }>('/api/policy/advisory/acknowledge', {
+      kind,
+    }),
   editPolicy: ({ autoApprove, ...edit }: PolicyEdit) =>
     post<PolicyView>('/api/policy', {
-      by: 'console',
       ...edit,
       // The scalar rides `set` on the wire; a request without it sends no `set`
       // at all, so a rule edit can never accidentally clear the stored value.

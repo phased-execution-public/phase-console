@@ -409,16 +409,20 @@ engine and the console):
   session's FIRST task: verify each condition in the Gates bullet for real, do the work to make
   failing ones true, record the clearance, then implement. **Bias gates here** — a person should only
   be interrupted by gates that genuinely need one.
-- **human** (`Gate-check: manual <who/what>`, or a `*(GATED)*` heading with no directive at all) — a
+- **human** (`Gate-check: manual <who/what>`; a `*(GATED)*` heading with no directive at all reads as
+  **ai** since 5.0.0 — `scripts/gates.env` `GATE_DEFAULT` — and fails `validate.sh`, F24) — a
   person does the Gates bullet's numbered steps, then approves: the console's phase-page **Gate
   card**, or `scripts/gate-approve.sh <slug> <N> --by "<who>" --note "<what was done>"`. Sessions and
-  the autopilot stop at an unapproved human gate — **unless the operator delegates it**
-  (Settings ▸ Automation ▸ *Delegate human gates*, **off by default**, per console). Delegation does not
+  the autopilot stop at an unapproved human gate — **unless it is delegated**, which is the shipped
+  answer since 5.0.0. The `gates` decision decides: the plan's `## Decisions` row first, then this
+  console's `policy.gates` answer (Settings ▸ Automation ▸ *Delegate human gates* folds into it, **on by
+  default**), then the shipped `delegated`. Delegation does not
   make the gate the session's judgement to make: the boot prompt requires evidence it can cite for each
   condition, records the clearance as `by: ai-session-delegated`, and STOPS with the condition named
-  (`phase-outcome.sh … blocked --reason`) the moment one cannot be verified — a visual sign-off nobody
-  has given, a credential it lacks, a preview nobody has looked at. Turn it on for a plan whose gates are
-  machine-verifiable in practice; leave it off when a gate means what it says.
+  (`phase-outcome.sh … blocked --needs gates --reason`) the moment one cannot be verified — a visual sign-off nobody
+  has given, a credential it lacks, a preview nobody has looked at. A delegated gate whose Gates bullet
+  states **no condition** a session could evidence is not boarded: it stays `gated` for a person. Answer
+  `operator` in the plan's `gates` row when its gates mean what they say.
 - **auto** (`date` / `deadline` / `by` / `phase` / `phases` / `plan` / `cmd`) — the engine evaluates
   it by itself. `cmd` executes only under `PHASE_EXEC_GATES=1` — the autopilot's deliberate opt-in;
   page views and boot prompts never execute a gate command, and report **`unevaluated:`** when they
@@ -451,13 +455,17 @@ paragraph of a handoff that the next session skims, because at the time it felt 
 **Record it as it happens:**
 
 ```bash
-bash scripts/phase-outcome.sh <slug> <N> ruling --kind ambiguity|deviation|deferral   --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"]
+bash scripts/phase-outcome.sh <slug> <N> ruling --kind ambiguity|deviation|deferral   --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"]   [--needs <decision key>] [--remember plan|global] [--by WHO]
 ```
 
 One appended NDJSON line, to `$PE_RULINGS_FILE` (the runner injects it) or, unsupervised, to
-`runs/<instance>/<slug>/rulings.ndjson` beside the outcomes inbox. Phase Console ingests it into the
-run, journals it as `phase.ruling`, and shows it on the run page, the phase diagnosis and the inbox
-as an `fyi` row. The three kinds:
+`runs/<instance>/<slug>/rulings.ndjson` beside the outcomes inbox — stamped with its id (the digest
+the console derives, so an ack, the inbox and `decisions.sh promote` all name one ruling by one id).
+Phase Console ingests it into the run, journals it as `phase.ruling`, and shows it on the run page,
+the phase diagnosis and the inbox as an `fyi` row. **Name the decision key it answers** (`--needs
+<key>`, one of the manifest's — never a blocker short form, a ruling is not a blocker) whenever there
+is one: a keyed ruling is a row of its own in the inbox with **Remember for this plan** and, when its
+words are an answer the console can hold for the key, **Remember on this console**. The three kinds:
 
 - **`ambiguity`** — the plan admitted two readings and you picked one. The reader needs to know a
   choice was made at all. **The default** when `--kind` is absent: it is the weakest of the three,
@@ -478,6 +486,38 @@ The ledger is per PLAN and append-only, so a decision made in phase 3 is still t
 phase 9 two runs later, and an acknowledgement is a further appended line rather than an edit.
 Put the same decisions in the handoff's **Key decisions / gotchas** in words: the ledger is what the
 console reads, the handoff is what a person reads.
+
+**A ruling can be remembered, at once or later.** `--remember plan` writes it as a `## Decisions` row
+of the plan's twin the moment it is recorded (`decisions.sh promote`: value `--what`, source `ruling`,
+evidence the id) and acks it in the ledger with `--by` (default `$PE_OWNER`, else user@host); the
+inbox's action does the same for a person. `--remember global` asks the console that owns the
+repository to hold the words as its own `policy.<key>` answer — the same door the inbox's second
+action uses, `POST /api/run/<slug>/rulings/<id>/remember` — so `--what` must be an answer word for the
+key (the console names the words when it is not), and with no console answering the script exits 1
+naming Settings ▸ Automation ▸ Policy answers rather than dropping the request. Either way the ruling
+itself was recorded first: the request failing is not the ruling failing.
+
+**A question the console answered is a ruling too.** When a run's relay (`relay: last-resort`) answers
+an `AskUserQuestion` a session raised (`references/console-surface.md` §Questions), the console appends
+the line itself: kind `ambiguity`, `decisionKey: ambiguity`, `by` either `relay` or the person who
+answered inside the window, and a `relay` object — `{tool, key, answer, answeredBy, ruleId?}`, where
+`answeredBy` is `human`, `rule`, `recommended` or `first-option` (`QUESTION_ANSWERED_BY`) and `ruleId`
+names the relay rule that chose it. It reads like any other ruling, and the inbox offers one more action
+for it, **Remember as a relay rule** (the same remember route with `scope: 'rule'`): "this question,
+this answer" is a relay rule, never a `## Decisions` row.
+
+**The decisions the plan DID make live in its `## Decisions` manifest** (`references/plan-format.md`
+§Decisions): one row per key of a closed vocabulary — `credentials`, `accounts`, `gates`, `waits`,
+`human-acts`, `ambiguity`, … (`scripts/decisions.env`). Every ruling, errand and `needs-human`
+reason names the row it belongs to as its **`decisionKey`**, and the two ledgers meet in two places:
+a ruling can be promoted to a standing answer (`scripts/decisions.sh <slug> promote --from-ruling
+<id> [--key <key>]` writes it to the twin with `source: ruling`; a ruling that carries its own
+`decisionKey` needs no `--key`), and a block is declared **by key** —
+`phase-outcome.sh <slug> <N> blocked|needs-human --needs <key>`, required there (exit 2 without),
+where `<key>` is a decision key or a blocker class as its short form (`credential`, `permission`,
+`gate`, `external`, `lock`). The runner reads the key BEFORE the prose, so what a session needs is
+its own word rather than a regex's guess over its sentences; a key the manifest lacks is a defect
+report, not a routine ask. Never ask in prose: prose reaches nobody.
 
 ## Docs layout & repo split
 - **Work-state lives in the project repo** under `docs/` (its `.gitignore` tracks only `/docs/`):

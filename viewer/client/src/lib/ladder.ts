@@ -21,6 +21,11 @@ export {
   DEFAULT_LADDER_CAPS,
   LADDER_CAP_PREFS,
   RUNG_OUTCOME_LABELS,
+  RUNG_DRIVERS,
+  RUNG_DRIVER_LABELS,
+  VEHICLE_DRIVERS,
+  drivableBy,
+  operatorOnlyTables,
   rungsFor,
   rungKey,
   untriedRungs,
@@ -32,38 +37,21 @@ import {
   untriedRungs as untried,
   rungLabel as labelOf,
 } from '../../../shared/ladder-model.js';
+import type { RUNG_VEHICLES as VEHICLES, RUNG_DRIVERS as DRIVERS } from '../../../shared/ladder-model.js';
 // `.ts` spelled out: the node test suite imports this file directly and node's
 // resolver adds no extensions (the client's bundler and tsc both accept it).
-import {
-  SITUATION_ACTOR,
-  SITUATION_LABELS,
-  parseSituationKey,
-  situationKey,
-  situationLabel,
-} from './situation.ts';
+import { actorFor, SITUATION_LABELS, parseSituationKey, situationKey, situationLabel } from './situation.ts';
 import type { Errand, RecoverySlot, RungRecord } from './api';
 
-export type RungVehicle =
-  | 'reboard-fresh'
-  | 'resume-own-session'
-  | 'reboard-resume-brief'
-  | 'unblock-session'
-  | 'closeout-own-session'
-  | 'closeout-agent'
-  | 'fix-agent'
-  | 'plan-repair-script'
-  | 'plan-repair-agent'
-  | 'switch-account'
-  | 'switch-model'
-  | 'wait-window'
-  | 'raise-budget'
-  | 'stale-claim-takeover'
-  | 'queue'
-  | 'poll-park'
-  | 'timed-park'
-  | 'recheck-watch'
-  | 'wait-heal'
-  | 'mcp-continue';
+/**
+ * Derived from the owner, never re-typed: the union used to be spelled out
+ * here as a second copy of `RUNG_VEHICLES`, and a vehicle renamed in the
+ * shared file (`recheck-watch` → `watch-clock`, phase 10) would have left
+ * this list naming a rung nothing owns.
+ */
+export type RungVehicle = (typeof VEHICLES)[number];
+/** Who drives a vehicle — `console` · `writes` · `agent` · `never` (the shared column). */
+export type RungDriver = (typeof DRIVERS)[number];
 
 /** One row of the shared rung table. */
 export interface Rung {
@@ -143,7 +131,8 @@ export function errandsOf(run: LadderRunLike | null | undefined): Errand[] {
 function situationOf(key: string | undefined): LadderSituation | undefined {
   if (!key) return undefined;
   const { id, sub } = parseSituationKey(key);
-  const actor = (SITUATION_ACTOR as Record<string, LadderSituation['actor']>)[id] ?? 'person';
+  // Sub-kind applied — the four empty sub-tables are a person's (LFC-3).
+  const actor = actorFor(id, sub) as LadderSituation['actor'];
   return { key: situationKey(id, sub), id, sub, label: situationLabel(id, sub), actor };
 }
 

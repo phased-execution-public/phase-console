@@ -1775,3 +1775,126 @@ test('P1/W8 — the live read OUTRANKS a stale store row: a lapsed-then-refreshe
   s.release(await admission);
   s.close();
 });
+
+/* ------------------------------------------------------------------ *
+ * Zero-touch phase 16 — a peer in the repository, with no lock (REG-3)
+ * ------------------------------------------------------------------ */
+
+test('ACC-7.3 (REG-3): a live session in the repository with no lock is a `session` holder — named, scope-aware, never cappable, and the only thing the guard keeps is a peer on the same phase', async () => {
+  const { isCappableBlocker } = await import('../server/runner/scheduler.ts');
+  let peers: {
+    sessionId: string; pid: number | null; cwd: string; presence: 'live' | 'unknown'; owner: string;
+    scope: string[]; plan: { slug: string; phase: number } | null;
+  }[] = [
+    { sessionId: 's-hand-peer-0001', pid: 4242, cwd: '/work/hub', presence: 'live', owner: 'sam@laptop', scope: ['all'], plan: null },
+    { sessionId: 's-other-repo-0002', pid: 4343, cwd: '/work/hub/site', presence: 'live', owner: 'kim@desk', scope: ['site'], plan: null },
+  ];
+  const asked: { slug: string; phase: number; scope: readonly string[] }[] = [];
+  let guard = true;
+  const s = new Scheduler({
+    max: 8, locks: () => [], guard: () => guard,
+    peers: (entry) => { asked.push({ slug: entry.slug, phase: entry.phase, scope: entry.scope }); return peers; },
+  });
+  try {
+    const request = { slug: 'alpha', phase: 2, runId: 'run-a', scope: ['app'] };
+    const holders = s.wouldBlock(request);
+    assert.equal(holders.length, 1, 'the session in `site` is disjoint from `app`; the one in the root is not');
+    const [holder] = holders;
+    assert.equal(holder.kind, 'session');
+    assert.equal(holder.session, 's-hand-peer-0001');
+    assert.equal(holder.pid, 4242);
+    assert.equal(holder.cwd, '/work/hub');
+    assert.equal(holder.presence, 'live');
+    assert.equal(holder.owner, 'session s-hand-p (pid 4242)');
+    assert.equal(holder.phase, null, 'uncorrelated: it could be about to work anything in its scope');
+    assert.equal(isCappableBlocker(holder), false, 'a person in the tree is not a lease to outlive — never capped into a park');
+    assert.deepEqual(asked.at(-1), { slug: 'alpha', phase: 2, scope: ['app'] });
+
+    // A run-level admission is not a unit of work a peer can be inside.
+    assert.deepEqual(s.wouldBlock({ slug: 'alpha', phase: null, runId: 'run-a', scope: ['app'] }), []);
+
+    // Queued, and admitted when the peer goes.
+    const admission = s.admit(request);
+    assert.equal(await pending(admission), true, 'queued behind the peer');
+    peers = [];
+    s.poll();
+    assert.equal(await pending(admission), false, 'the peer gone, the scan admits');
+    s.release(await admission);
+
+    // With the repository guard OFF, an uncorrelated peer stops blocking — the
+    // guard's documented purpose — but a peer correlated to THIS phase is the
+    // same unit of work, which no setting licenses.
+    guard = false;
+    peers = [{ sessionId: 's-hand-peer-0001', pid: 4242, cwd: '/work/hub', presence: 'live', owner: 'sam@laptop', scope: ['all'], plan: null }];
+    assert.deepEqual(s.wouldBlock(request), []);
+    peers = [{ sessionId: 's-hand-peer-0001', pid: 4242, cwd: '/work/hub', presence: 'live', owner: 'sam@laptop', scope: ['all'], plan: { slug: 'alpha', phase: 2 } }];
+    const same = s.wouldBlock(request);
+    assert.equal(same.length, 1);
+    assert.equal(same[0].phase, 2);
+  } finally { s.close(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * The machine ceiling (zero-touch phase 17, FLT-7 / ACC-10.7)
+ * ------------------------------------------------------------------ */
+
+test('ACC-10.7: with a machine cap of 1 and two consoles, the second queues behind a holder naming the first — and a release admits it', async (t) => {
+  const { MachineLanes } = await import('../server/fleet.ts');
+  const { MACHINE_HOLDER } = await import('../server/runner/scheduler.ts');
+  const { laneTokensDir, liveLaneTokens, updateFleetProfile } = await import('../shared/instances.mjs');
+  // The machine profile both consoles read: one lane on the whole machine.
+  assert.ok(updateFleetProfile((profile) => ({ ...profile, maxSessions: 1 })), 'the profile is written');
+  t.after(() => { updateFleetProfile((profile) => { const next = { ...profile }; delete next.maxSessions; return next; }); });
+
+  // Two consoles in one sandbox — one XDG state home, two instance ids — each
+  // allowed three lanes of its own, so only the MACHINE can hold the second.
+  const alpha = new Scheduler({ max: 3, machine: new MachineLanes('11111111-alpha', { name: 'alpha', port: () => 4555 }) });
+  const beta = new Scheduler({ max: 3, machine: new MachineLanes('22222222-beta', { name: 'beta', port: () => 4556 }) });
+  t.after(() => { alpha.close(); beta.close(); });
+
+  const first = await alpha.admit({ slug: 'one', phase: 1, runId: 'run-a', scope: ['repo-a'] });
+  assert.equal(liveLaneTokens().length, 1, 'the lane is a token every console on the machine counts');
+
+  let admitted = false;
+  const second = beta.admit({ slug: 'two', phase: 4, runId: 'run-b', scope: ['repo-b'] }).then((grant) => { admitted = true; return grant; });
+  await tick();
+  await tick();
+  assert.equal(admitted, false, 'a disjoint scope on another console still waits: the machine is full');
+
+  const entry = beta.snapshot().entries.find((e) => e.slug === 'two');
+  assert.ok(entry, 'the lane is queued, not refused');
+  const holder = entry.waitingOn.find((h) => h.slug === MACHINE_HOLDER);
+  assert.ok(holder, `the holder is the machine cap: ${JSON.stringify(entry.waitingOn)}`);
+  assert.equal(holder.instance?.id, '11111111-alpha', 'and it names the OTHER console');
+  assert.match(holder.owner, /the machine is full — 1 of 1 lane: alpha \(one P1\)/);
+  assert.deepEqual(beta.snapshot().machine, { live: 1, max: 1 });
+  // The console's own ceiling is a different sentence, and it is not the one in force.
+  assert.ok(!entry.waitingOn.some((h) => h.slug === 'session cap'));
+
+  // The first console gives its lane back; the second hears it through the token directory.
+  alpha.release(first);
+  const grant = await Promise.race([
+    second,
+    new Promise<null>((resolve) => setTimeout(() => { beta.poll(); }, 1_500)).then(() => second),
+  ]);
+  assert.equal(grant.slug, 'two', 'releasing the first admits the second');
+  assert.equal(liveLaneTokens().length, 1);
+  assert.equal(liveLaneTokens()[0]!.instance, '22222222-beta');
+  beta.release(grant);
+  assert.equal(liveLaneTokens().length, 0, 'and the machine is empty again');
+  assert.ok(laneTokensDir().endsWith('/fleet/lanes'));
+});
+
+test('FLT-7: with no machine ceiling a lane is still counted, and the console cap alone decides', async (t) => {
+  const { MachineLanes } = await import('../server/fleet.ts');
+  const { liveLaneTokens } = await import('../shared/instances.mjs');
+  const gamma = new Scheduler({ max: 2, machine: new MachineLanes('33333333-gamma', { name: 'gamma', port: () => 4557 }) });
+  t.after(() => gamma.close());
+  const a = await gamma.admit({ slug: 'g', phase: 1, runId: 'run-g', scope: ['x'] });
+  const b = await gamma.admit({ slug: 'g', phase: 2, runId: 'run-g', scope: ['y'] });
+  assert.equal(liveLaneTokens().filter((lane) => lane.instance === '33333333-gamma').length, 2);
+  assert.deepEqual(gamma.snapshot().machine, { live: 2, max: null });
+  gamma.release(a);
+  gamma.release(b);
+  assert.equal(liveLaneTokens().filter((lane) => lane.instance === '33333333-gamma').length, 0);
+});

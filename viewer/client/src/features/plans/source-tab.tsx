@@ -30,6 +30,7 @@ import {
 } from '@/components/ui';
 import { Markdown, MarkdownInline } from '@/components/markdown';
 import { usePlanRaw } from '@/lib/queries';
+import { DECISION_STATES } from '@shared/decisions-model.js';
 import { countdown, pad2 } from '@/lib/format';
 import { navigate, phaseHref, planHref } from '@shared/routes.js';
 import type { PlanDetail } from '@/lib/api';
@@ -317,6 +318,122 @@ function Reading({ detail, switcher }: { detail: PlanDetail; switcher: React.Rea
             <Markdown text={plan.sessionBudget.raw} />
           </CardBody>
         </Card>
+
+        {/* The `## Decisions` manifest as it holds (plan ⊕ decisions.md), the
+            same rows `phase-graph.sh --decisions` prints. Absent when the plan
+            carries none — an older plan is not nagged from the Source tab. */}
+        {(plan.decisions?.length ?? 0) > 0 && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Decisions</CardTitle>
+            </CardHeader>
+            <DataTable
+              label="Decisions"
+              className="rounded-none border-x-0 border-t"
+              columns={[
+                {
+                  id: 'key',
+                  head: 'Key',
+                  priority: 1,
+                  min: 150,
+                  identity: true,
+                  card: 'title',
+                  cell: (row) => <span className="font-mono text-xs">{row.key}</span>,
+                },
+                {
+                  id: 'state',
+                  head: 'State',
+                  priority: 1,
+                  min: 110,
+                  // A chip only for the closed vocabulary (`DECISION_STATES`); a
+                  // state the plan misspelt — lint F25 already fails it — is
+                  // shown as breakable text rather than dressed as a word we know.
+                  cell: (row) =>
+                    (DECISION_STATES as readonly string[]).includes(row.state) ? (
+                      <Chip
+                        tone={
+                          row.state === 'answered' ? 'ok' : row.state === 'outstanding' ? 'accent' : 'neutral'
+                        }
+                        dot={row.state === 'outstanding'}
+                      >
+                        {row.state}
+                      </Chip>
+                    ) : (
+                      <span className="max-w-full break-all whitespace-normal font-mono text-xs">
+                        {row.state || '—'}
+                      </span>
+                    ),
+                },
+                // A per-phase row answers for one phase only; the column appears
+                // only when the manifest holds one (zero-touch phase 19).
+                ...((plan.decisions ?? []).some((row) => row.phase != null)
+                  ? [
+                      {
+                        id: 'phase',
+                        head: 'Phase',
+                        priority: 2 as const,
+                        min: 70,
+                        cell: (row: NonNullable<typeof plan.decisions>[number]) => (
+                          <span className="font-mono text-xs">
+                            {row.phase != null ? `p${row.phase}` : 'plan'}
+                          </span>
+                        ),
+                      },
+                    ]
+                  : []),
+                {
+                  id: 'owner',
+                  head: 'Owner',
+                  priority: 3,
+                  min: 110,
+                  cell: (row) => <span className="text-xs">{row.owner || '—'}</span>,
+                },
+                {
+                  id: 'blocking',
+                  head: 'Blocking',
+                  priority: 3,
+                  min: 90,
+                  cell: (row) => <span className="font-mono text-xs">{row.blocking}</span>,
+                },
+                {
+                  id: 'source',
+                  head: 'Source',
+                  priority: 2,
+                  min: 90,
+                  // Where the answer came from (`DECISION_SOURCES`): the plan's
+                  // own row, a run, a promoted ruling, or the shipped default.
+                  cell: (row) => <span className="font-mono text-xs">{row.source || '—'}</span>,
+                },
+                {
+                  id: 'value',
+                  head: 'Value',
+                  priority: 2,
+                  min: 220,
+                  flex: true,
+                  // The plan's own prose, clamped like the exit criteria column.
+                  cell: (row) => (
+                    <span className="line-clamp-2 text-xs" title={row.value}>
+                      {row.value ? <MarkdownInline text={row.value} /> : '—'}
+                    </span>
+                  ),
+                },
+                {
+                  id: 'evidence',
+                  head: 'Evidence',
+                  priority: 3,
+                  min: 160,
+                  cell: (row) => (
+                    <span className="line-clamp-2 text-xs text-ink-muted" title={row.evidence}>
+                      {row.evidence ? <MarkdownInline text={row.evidence} /> : '—'}
+                    </span>
+                  ),
+                },
+              ]}
+              rows={plan.decisions ?? []}
+              getRowKey={(row) => `${row.key}@${row.phase ?? 'plan'}`}
+            />
+          </Card>
+        )}
 
         <Card>
           <CardHeader>

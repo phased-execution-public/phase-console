@@ -24,12 +24,30 @@ import {
   type WatchRefTarget, type WatchState,
 } from '../server/watch-refs.ts';
 import { WatchScheduler, MAX_WATCH_REFS, MAX_LANDING_DELIVERIES } from '../server/watch-scheduler.ts';
-import { clearWatchBookkeeping, consumeDeclaration, resetForRetry } from '../server/runner/state.ts';
+import {
+  chargeDeclaration, clearWatchBookkeeping, consumeDeclaration, journalFile, loadRun, newRun, phaseRecord,
+  prepareReboard, resetForRetry, saveRun, soonestWaitingClock, waitClockOf,
+} from '../server/runner/state.ts';
+import { waitClockVerdict } from '../server/converge.ts';
+import {
+  DECLARATION_COOLDOWN_MS, DECLARATIONS_MAX_PER_PHASE, DECLARED_CLOCK_MAX_MS, WAIT_SETTLE_GRACE_MS, declarationCooldownFor, declaredClock,
+} from '../server/runner/wait-budget.ts';
 import { evidenceFingerprint } from '../server/converge.ts';
 import { inferRetryCategory } from '../server/runner/spawn.ts';
 import { landingDirective } from '../server/service-recovery.ts';
 import { runSingleCommand } from '../server/runner/verify.ts';
-import type { RunState } from '../server/runner/state.ts';
+import type { PhaseRecord, RunState } from '../server/runner/state.ts';
+import {
+  closeWaitEntry, evaluateWait, openWaitEntry, parkedMsOf, waitBudgetFrom,
+  DEFAULT_WAIT_BUDGET_MS, WAIT_MAX_PER_PHASE, WATCHDOG_PARKS_MAX_PER_PHASE, type WaitBudget,
+} from '../server/runner/wait-budget.ts';
+import { waitResumePrompt } from '../server/runner/runner-core.ts';
+import { dateOfRef, unpollableRefs, watchRefProblem } from '../server/watch-refs.ts';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SKILL_DIR } from '../server/config.ts';
 
 /* ------------------------------------------------------------------ *
  * Harness
@@ -251,16 +269,27 @@ test('criterion 1: a refusal is journalled once, EVER — across declarations, n
   assert.deepEqual(journal, ['phase.watch-refused'], 'said once, not argued with every pass');
   assert.equal(asks, 1, 'a refused ref is dropped from the rotation, not re-asked on a cadence');
 
-  // The half that made the first version of this test VACUOUS (QA F8): with the
-  // ref retired from the rotation, `apply()` was never reached twice, so
-  // replacing the dedupe with `const speak = true` left every test green. The
-  // dedupe's real job is ACROSS declarations — a reset clears `watchState`
-  // (F1), the ref is probed again, and the policy reaches the same verdict it
-  // will always reach. That line must still not be written twice.
+  // A refused `cmd:` ref is RETIRED on the record (SLF-8, zero-touch-console
+  // phase 6): a new declaration clears `watchState` (F1) but not `watchRetired`,
+  // so the same command is not asked again — the world's answer to it was
+  // final. (Until phase 6 the re-declared ref WAS asked again, and this test
+  // held that; the retirement is the plan's own ruling.)
+  assert.deepEqual(state.phases[1].watchRetired, ['cmd:"rm -rf /"'], 'retired on the record');
   clearWatchBookkeeping(state.phases[1]);
   clock.time += WATCH_POLL_MS.cmd;
   await scheduler.tick();
-  assert.equal(asks, 2, 'the re-declared ref IS asked again');
+  assert.equal(asks, 1, 'the re-declared ref is NOT asked again — it is retired');
+  assert.deepEqual(state.phases[1].watchRetired, ['cmd:"rm -rf /"'], 'clearWatchBookkeeping keeps the retirement');
+
+  // Only an operator's Retry un-retires. The policy then reaches the same
+  // verdict it will always reach — and that line must still not be written
+  // twice: the in-process dedupe (QA F8) is what this half holds.
+  resetForRetry(state.phases[1], { by: 'operator', journal: () => {} });
+  state.phases[1].status = 'waiting';
+  state.phases[1].declared = { status: 'waiting-external', reason: 'again', watch: ['cmd:"rm -rf /"'], at: new Date(clock.time).toISOString() };
+  clock.time += WATCH_POLL_MS.cmd;
+  await scheduler.tick();
+  assert.equal(asks, 2, 'un-retired by the operator, the ref is asked again');
   assert.deepEqual(journal, ['phase.watch-refused'], 'and the refusal is still said only once');
   scheduler.close();
 });
@@ -286,6 +315,9 @@ test('criterion 1: a cmd: ref is bounded — it runs a command, it does not just
   assert.equal(row.state, 'refused', 'and the operator sees a state, not a silence');
   assert.match(row.detail!, /will not run it again/);
   assert.equal(row.runs, MAX_CMD_RUNS_PER_PHASE, 'the count is on the row, not in memory');
+  // …and the exhausted ref is RETIRED, not merely re-labelled (SLF-8): the row
+  // stays for the operator to read, the ref is never a probe target again.
+  assert.deepEqual(state.phases[1].watchRetired, ['cmd:"gh run list"']);
   scheduler.close();
 });
 
@@ -629,7 +661,7 @@ test('criterion 2: resetForRetry clears the watch bookkeeping even with no decla
   };
   record.watchChecked = { at: new Date(NOW).toISOString(), ref: 'gh:acme/app#run/9', state: 'landed' };
   record.watch = ['gh:acme/app#run/9'];
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
   assert.equal(record.watchState, undefined);
   assert.equal(record.watchChecked, undefined);
   assert.equal(record.watch, undefined, 'the pre-`declared` shadow starts over too');
@@ -907,4 +939,545 @@ test('criterion 4: an uncategorised retry is classified from its detail, conserv
   assert.equal(inferRetryCategory('socket hang up'), undefined);
   assert.equal(inferRetryCategory(''), undefined);
   assert.equal(inferRetryCategory(undefined), undefined);
+});
+
+/* ------------------------------------------------------------------ *
+ * The wait budget, answered — never cut (zero-touch-console phase 5)
+ * ------------------------------------------------------------------ */
+
+const HOUR = 60 * 60_000;
+const DEFAULT: WaitBudget = { budgetMs: DEFAULT_WAIT_BUDGET_MS, source: 'default', countersignedUntil: null, refs: [] };
+
+test('WAI-1: a declared window past the budget is REFUSED with the arithmetic — never a silent eight hours', () => {
+  // The measured soak: 48 hours asked, eight granted, woken early, halted with
+  // 2 377 of 2 880 minutes still to run. The answer is now given at park.
+  const verdict = evaluateWait({ now: NOW, requestedUntil: NOW + 48 * HOUR, parkedMs: 0, waits: 0, budget: DEFAULT, ledger: 'session' });
+  assert.equal(verdict.verdict, 'timeout');
+  assert.ok(verdict.verdict === 'timeout');
+  assert.equal(verdict.ledger, 'budget');
+  assert.match(verdict.reason, /asked to wait until 2026-09-01T12:00:00\.000Z \(48 h from now\)/);
+  assert.match(verdict.reason, /wait budget is 8\.0 h \(the console default\) with 0\.0 h already parked, so 8\.0 h remain/);
+  assert.match(verdict.reason, /does not cut a declared window short/);
+  assert.match(verdict.reason, /Waits on:/, 'and it names the line that would have allowed it');
+
+  // Inside the budget: granted exactly as asked, not capped.
+  const inside = evaluateWait({ now: NOW, requestedUntil: NOW + 2 * HOUR, parkedMs: HOUR, waits: 1, budget: DEFAULT, ledger: 'session' });
+  assert.ok(inside.verdict === 'park');
+  assert.equal(inside.until, NOW + 2 * HOUR);
+  assert.equal(inside.granted, 2 * HOUR);
+  assert.equal(inside.capped, false);
+  assert.equal(inside.requestedSource, 'declared');
+  assert.equal(inside.budgetRemainingMs, 7 * HOUR);
+
+  // A window already in the past floors to a minute, never to the default.
+  const lapsed = evaluateWait({ now: NOW, requestedUntil: NOW - HOUR, parkedMs: 0, waits: 0, budget: DEFAULT, ledger: 'session' });
+  assert.ok(lapsed.verdict === 'park' && lapsed.until === NOW + 60_000);
+});
+
+test('WAI-1: only a DEFAULT window is ever capped, and the per-phase cap refuses by its own ledger', () => {
+  // No `resume_after`: the session named no window, so what is left is what it gets.
+  const tail = evaluateWait({ now: NOW, parkedMs: 7.9 * HOUR, waits: 1, budget: DEFAULT, ledger: 'session' });
+  assert.ok(tail.verdict === 'park');
+  assert.equal(tail.capped, true);
+  assert.equal(tail.requestedSource, 'default');
+  assert.equal(Math.round(tail.granted / 60_000), 6);
+
+  const spent = evaluateWait({ now: NOW, requestedUntil: NOW + HOUR, parkedMs: 0, waits: WAIT_MAX_PER_PHASE, budget: DEFAULT, ledger: 'session' });
+  assert.ok(spent.verdict === 'timeout');
+  assert.equal(spent.ledger, 'waits');
+  assert.match(spent.reason, /already declared 4 wait\(s\)/);
+});
+
+test('WAI-11: a declared `date:` ref extends the park to its instant — or is named in the refusal; the plan can countersign it', () => {
+  const soak = NOW + 3 * HOUR;
+  const extended = evaluateWait({
+    now: NOW, requestedUntil: NOW + 30 * 60_000, parkedMs: 0, waits: 0, budget: DEFAULT, ledger: 'session',
+    dates: [['date:2026-08-30T15:00:00Z', soak]],
+  });
+  assert.ok(extended.verdict === 'park');
+  assert.equal(extended.until, soak, 'the date ref is the session saying exactly when the wait ends');
+  assert.equal(extended.extendedBy, 'date:2026-08-30T15:00:00Z');
+
+  const far = NOW + 46 * HOUR;
+  const named = evaluateWait({
+    now: NOW, requestedUntil: NOW + HOUR, parkedMs: 0, waits: 0, budget: DEFAULT, ledger: 'session',
+    dates: [['date:2026-09-01T10:00:00Z', far]],
+  });
+  assert.ok(named.verdict === 'timeout');
+  assert.equal(named.overriddenRef, 'date:2026-09-01T10:00:00Z');
+  assert.match(named.reason, /names `date:2026-09-01T10:00:00Z`/);
+
+  // The plan's own `- **Waits on:** date:…` countersigns it: granted past the budget.
+  const countersigned = waitBudgetFrom('', 'date:2026-09-02T00:00:00Z\ngh:acme/app#run/9\n', dateOfRef);
+  assert.equal(countersigned.source, 'default');
+  assert.equal(countersigned.countersignedUntil, Date.parse('2026-09-02T00:00:00Z'));
+  const honoured = evaluateWait({
+    now: NOW, requestedUntil: NOW + HOUR, parkedMs: 0, waits: 0, budget: countersigned, ledger: 'session',
+    dates: [['date:2026-09-01T10:00:00Z', far]],
+  });
+  assert.ok(honoured.verdict === 'park' && honoured.until === far && honoured.capped === false);
+
+  // …and the engine's `Waits on:` max is the phase's own budget, in minutes.
+  assert.deepEqual(waitBudgetFrom('45\tphase\n', '', dateOfRef), { budgetMs: 45 * 60_000, source: 'phase', countersignedUntil: null, refs: [] });
+  assert.equal(waitBudgetFrom('', '', dateOfRef).budgetMs, DEFAULT_WAIT_BUDGET_MS, 'silence is the console default');
+});
+
+test('WAI-5: the watchdog parks on a ledger of its own — four automatic parks spend nothing of the session\'s', () => {
+  const auto = evaluateWait({ now: NOW, parkedMs: 20 * HOUR, waits: 3, budget: DEFAULT, ledger: 'watchdog' });
+  assert.ok(auto.verdict === 'park', 'a watchdog park is never refused by the declared budget');
+  const fifthAuto = evaluateWait({ now: NOW, parkedMs: 0, waits: WATCHDOG_PARKS_MAX_PER_PHASE, budget: DEFAULT, ledger: 'watchdog' });
+  assert.ok(fifthAuto.verdict === 'timeout');
+  assert.equal(fifthAuto.ledger, 'watchdog');
+  assert.match(fifthAuto.reason, /parked this phase 4 time\(s\) by itself/);
+  assert.match(fifthAuto.reason, /session's own wait allowance is untouched/);
+
+  // After four AUTOMATIC parks, a declared wait still has all of its own.
+  const record = { status: 'waiting', waits: 0, watchdogParks: 4 } as unknown as PhaseRecord;
+  for (let i = 0; i < 4; i++) {
+    openWaitEntry(record, { parkedFrom: new Date(NOW - (8 - i) * HOUR).toISOString(), parkedUntil: new Date(NOW - (7.5 - i) * HOUR).toISOString(), by: 'watchdog' }, NOW);
+  }
+  closeWaitEntry(record, new Date(NOW - 3 * HOUR).toISOString());
+  assert.equal(parkedMsOf(record, NOW), 0, 'the watchdog\'s parked time is not the declared ledger\'s');
+  const declared = evaluateWait({ now: NOW, requestedUntil: NOW + HOUR, parkedMs: parkedMsOf(record, NOW), waits: record.waits ?? 0, budget: DEFAULT, ledger: 'session' });
+  assert.ok(declared.verdict === 'park', 'the fifth wait — the first DECLARED one — is granted');
+});
+
+test('WAI-3: parked time comes from the park\'s own stamps — correct with no resume, superseded parks included', () => {
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const record = { status: 'waiting' } as unknown as PhaseRecord;
+  // Parked at T-10h for a 4 h window, superseded at T-8h by a second park, which
+  // the console outlived: its clock went by at T-2h and nothing stamped an end.
+  openWaitEntry(record, { parkedFrom: iso(NOW - 10 * HOUR), parkedUntil: iso(NOW - 6 * HOUR), by: 'session' }, NOW);
+  openWaitEntry(record, { parkedFrom: iso(NOW - 8 * HOUR), parkedUntil: iso(NOW - 2 * HOUR), by: 'session' }, NOW);
+  assert.equal(record.waitHistory![0].resumedAt, iso(NOW - 8 * HOUR), 'the superseded park ended when the next began');
+  // The second is the park still holding (status waiting): it counts to now.
+  assert.equal(parkedMsOf(record, NOW), 2 * HOUR + 8 * HOUR, 'both windows, the elapsed hours included — never zero for a park that did not resume');
+  // Not waiting any more and never stamped: bounded by its own clock.
+  record.status = 'pending';
+  assert.equal(parkedMsOf(record, NOW), 2 * HOUR + 6 * HOUR);
+  // A record from before the history reads its legacy accrual, and carries it in once.
+  const legacy = { status: 'pending', parkedMs: 3 * HOUR } as unknown as PhaseRecord;
+  assert.equal(parkedMsOf(legacy, NOW), 3 * HOUR);
+  openWaitEntry(legacy, { parkedFrom: iso(NOW - HOUR), parkedUntil: iso(NOW), by: 'session' }, NOW);
+  legacy.status = 'waiting';
+  assert.equal(parkedMsOf(legacy, NOW), 4 * HOUR);
+});
+
+test('WAI-4: at resume, a park past its budget is not boarded — unless the plan countersigned the wait', () => {
+  const over = evaluateWait({ purpose: 'resume', now: NOW, parkedMs: 11.76 * HOUR, waits: 1, budget: DEFAULT, ledger: 'session' });
+  assert.ok(over.verdict === 'timeout');
+  assert.match(over.reason, /parked 12 h against its 8\.0 h wait budget/);
+  assert.match(over.reason, /will not board it on a stale clock/);
+  const within = evaluateWait({ purpose: 'resume', now: NOW, parkedMs: 2 * HOUR, waits: 1, budget: DEFAULT, ledger: 'session' });
+  assert.ok(within.verdict === 'resume' && within.budgetRemainingMs === 6 * HOUR);
+  const countersigned = evaluateWait({
+    purpose: 'resume', now: NOW, parkedMs: 30 * HOUR, waits: 1, ledger: 'session',
+    budget: { ...DEFAULT, countersignedUntil: NOW + HOUR },
+  });
+  assert.ok(countersigned.verdict === 'resume' && countersigned.extendedBy);
+  assert.equal(evaluateWait({ purpose: 'resume', now: NOW, parkedMs: 99 * HOUR, waits: 0, budget: DEFAULT, ledger: 'watchdog' }).verdict, 'resume');
+});
+
+test('WAI-2: only a declared window that really elapsed is called one', () => {
+  const facts = {
+    scriptsDir: '/skill/scripts', slug: 'soak', phase: 16, reason: 'the 48 h soak', watch: ['date:2026-09-01T12:00:00Z'],
+    externalLeftMs: 40 * HOUR, budgetMs: DEFAULT_WAIT_BUDGET_MS, budgetRemainingMs: 0, budgetSource: 'default' as const, lateMs: 0,
+  };
+  const declared = waitResumePrompt({ ...facts, cause: 'declared-window', externalLeftMs: null });
+  assert.match(declared, /The wait window you declared for phase 16 of `soak` has elapsed/);
+  for (const cause of ['budget-elapsed', 'watchdog'] as const) {
+    const prompt = waitResumePrompt({ ...facts, cause });
+    assert.doesNotMatch(prompt, /the wait window you declared/i, `${cause}: never claims the declared window`);
+    assert.doesNotMatch(prompt, /has elapsed/, `${cause}: never says "has elapsed"`);
+  }
+  const budget = waitResumePrompt({ ...facts, cause: 'budget-elapsed' });
+  assert.match(budget, /wait BUDGET ran out — NOT because the window you declared is over/);
+  assert.match(budget, /still 40 h away/, 'it names the external time left');
+  assert.match(budget, /Waits on:/, 'and the one act that extends it');
+  assert.match(waitResumePrompt({ ...facts, cause: 'watchdog' }), /The CONSOLE parked phase 16 .* you did not declare this wait/);
+  // Every re-file instruction carries the real path and the allowance left.
+  assert.match(budget, /bash \/skill\/scripts\/phase-outcome\.sh soak 16 waiting-external/);
+  assert.match(budget, /may stay parked 0\.0 h more \(its wait\s+budget is 8\.0 h, the console default\)/);
+  // A resume that came hours late says so.
+  assert.match(waitResumePrompt({ ...facts, cause: 'declared-window', lateMs: 9.7 * HOUR }), /came 9\.7 h after the clock/);
+});
+
+test('WAI-11: an unparseable ref is named with why — one gh: ref polls, the other is unpollable', () => {
+  const refs = ['gh:acme/app#run/42', 'config/fleet-pin.yaml:app-prod'];
+  assert.deepEqual(pollableRefs(refs).map((t) => t.ref), ['gh:acme/app#run/42']);
+  const unpollable = unpollableRefs(refs);
+  assert.equal(unpollable.length, 1);
+  assert.equal(unpollable[0].ref, 'config/fleet-pin.yaml:app-prod');
+  assert.match(unpollable[0].reason, /no watch scheme/);
+  assert.equal(watchRefProblem('gh:acme/app#run/42'), null);
+  assert.match(watchRefProblem('date:2026-09-31T00:00:00Z') ?? '', /not a real ISO8601 instant/, 'the calendar is read, not just the shape');
+});
+
+test('WAI-11: phase-outcome.sh warns at write time about exactly the refs the console cannot poll', () => {
+  // The script checks shape; the console also reads the calendar — so the list
+  // holds only refs where shape and calendar agree.
+  const refs = [
+    'gh:acme/app#run/42', 'gh:acme/app#pr/7', 'gh:acme#run/1', 'gh:acme/app#issue/3',
+    'date:2026-09-20T06:00:00Z', 'until:2026-09-20 06:00', 'date:soon',
+    'lock:alpha/2', 'lock:alpha/02', 'lock:alpha/0', 'lock:/2',
+    'cmd:"npm test"', "cmd:'make check'", 'cmd:""', 'cmd:',
+    'config/fleet-pin.yaml:app-prod', 'https://ci.example/run/9',
+  ];
+  const dir = mkdtempSync(join(tmpdir(), 'pc-watch-warn-'));
+  try {
+    for (const ref of refs) {
+      let stderr = '';
+      try {
+        execFileSync('/bin/bash', [join(SKILL_DIR, 'scripts', 'phase-outcome.sh'), 'demo', '3', 'waiting-external', '--wait-minutes', '30', '--watch', ref], {
+          env: { ...process.env, PE_OUTCOME_FILE: join(dir, 'outcome.json') }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (error) { stderr = String((error as { stderr?: string }).stderr ?? ''); }
+      // execFileSync hides stderr on success — ask again with it folded in.
+      stderr ||= execFileSync('/bin/bash', ['-c', `"$0" demo 3 waiting-external --wait-minutes 30 --watch "$1" 2>&1 >/dev/null || true`, join(SKILL_DIR, 'scripts', 'phase-outcome.sh'), ref], {
+        env: { ...process.env, PE_OUTCOME_FILE: join(dir, 'outcome.json') }, encoding: 'utf8',
+      });
+      const warned = stderr.includes('will never be checked');
+      assert.equal(warned, watchRefProblem(ref) !== null, `${ref}: the script ${warned ? 'warned' : 'said nothing'}, the console reads ${watchRefProblem(ref) ?? 'pollable'}`);
+      assert.ok(readFileSync(join(dir, 'outcome.json'), 'utf8').includes('"watch"'), 'recorded either way');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+/* ------------------------------------------------------------------ *
+ * WAI-6 — a `waiting` record whose clock nothing will fire
+ * ------------------------------------------------------------------ */
+
+/** Every journal line of a run, parsed. */
+function journalLines(root: string, slug: string, id: string): { event: string; phase?: number; data?: Record<string, unknown> }[] {
+  try {
+    return readFileSync(journalFile(root, slug, id), 'utf8').split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line) as { event: string; phase?: number; data?: Record<string, unknown> });
+  } catch {
+    return [];
+  }
+}
+
+/** A stored run with one `waiting` record parked until `parkedUntil`, and no run clock. */
+function storedWait(root: string, over: { status: RunState['status']; stoppedBy?: 'operator' | 'system'; parkedUntil: string; resolved?: boolean }) {
+  const state = newRun({ slug: 'alpha', root, model: 'opus' });
+  state.status = over.status;
+  if (over.stoppedBy) state.stoppedBy = over.stoppedBy;
+  state.waitUntil = null;
+  if (over.resolved) state.resolved = { at: new Date(NOW).toISOString(), by: 'operator', note: 'done with it' } as never;
+  const record = phaseRecord(state, 4);
+  record.status = 'waiting';
+  record.sessionId = 'sess-p4';
+  record.parkedUntil = over.parkedUntil;
+  record.parkReason = 'the Monday deploy window';
+  record.declared = { status: 'waiting-external', reason: 'the Monday deploy window', at: new Date(NOW).toISOString() };
+  saveRun(state);
+  return state;
+}
+
+test('WAI-6: a run that lost its clock is re-armed from the record on load, and the journal says which', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-'));
+  try {
+    const ahead = new Date(Date.now() + 3_600_000).toISOString();
+    const stored = storedWait(root, { status: 'waiting', stoppedBy: 'system', parkedUntil: ahead });
+    assert.equal(stored.waitUntil, null, 'precondition: the run carries no clock');
+    const loaded = loadRun(root, 'alpha', stored.id);
+    assert.ok(loaded);
+    // Re-armed, not orphaned: `reconcileRun` used to send a clockless `waiting`
+    // run to `interrupted-by-restart`; with the record's clock read first it is
+    // the paused-with-clock shape the boot re-arm knows.
+    assert.equal(loaded.waitUntil, ahead);
+    assert.equal(loaded.waitReason, 'external');
+    assert.equal(loaded.status, 'paused');
+    assert.equal(loaded.phases[4].status, 'waiting');
+    assert.equal(loaded.phases[4].parkedUntil, ahead);
+    const settled = journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled');
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0].phase, 4);
+    assert.equal(settled[0].data?.to, 'rearmed');
+    assert.equal(settled[0].data?.clock, ahead);
+    // The one reader both re-arm paths use answers the same clock, and the
+    // converge predicate arms it rather than calling it not-a-wait.
+    assert.equal(waitClockOf(loaded), ahead);
+    assert.equal(waitClockVerdict(loaded, { now: Date.now(), prefs: {} }).verdict, 'arm');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('WAI-6: waitClockVerdict reads the record\'s clock when the run has none — a wait, not not-a-wait', () => {
+  const run = waitingRun([], { status: 'paused', stoppedBy: 'system', waitUntil: null } as never);
+  assert.equal(run.waitUntil, null);
+  assert.equal(soonestWaitingClock(run), run.phases[1].parkedUntil);
+  const verdict = waitClockVerdict(run, { now: NOW, prefs: {} });
+  assert.equal(verdict.verdict, 'arm');
+  // …and with no waiting record either, it is what it always was.
+  run.phases[1].status = 'done';
+  assert.equal(waitClockVerdict(run, { now: NOW, prefs: {} }).verdict, 'not-a-wait');
+});
+
+test('WAI-6: an operator-stopped run\'s dead clock is SETTLED — `pending`, the declaration intact, the session kept', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-'));
+  try {
+    // The audit's two: `paused`/`stoppedBy: operator`, 189 hours past the clock.
+    const dead = new Date(Date.now() - 189 * 3_600_000).toISOString();
+    const stored = storedWait(root, { status: 'paused', stoppedBy: 'operator', parkedUntil: dead });
+    const loaded = loadRun(root, 'alpha', stored.id)!;
+    const record = loaded.phases[4];
+    assert.equal(record.status, 'pending');
+    assert.equal(record.parkedUntil, undefined, 'the dead clock is gone from the record');
+    assert.equal(record.declared?.status, 'waiting-external', 'the testimony stands');
+    assert.equal(record.resumeSessionId, 'sess-p4', 'a Retry resumes the session, not a restart');
+    assert.equal(loaded.waitUntil, null, 'an operator\'s stop is not re-armed');
+    assert.equal(loaded.status, 'paused');
+    const settled = journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled');
+    assert.equal(settled.length, 1);
+    assert.deepEqual(
+      { to: settled[0].data?.to, why: settled[0].data?.why, clock: settled[0].data?.clock, phase: settled[0].phase },
+      { to: 'pending', why: 'operator-stopped', clock: dead, phase: 4 },
+    );
+    assert.ok((settled[0].data?.lateByMs as number) > 188 * 3_600_000);
+    // Idempotent: a second load settles nothing more and writes nothing more.
+    loadRun(root, 'alpha', stored.id);
+    assert.equal(journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled').length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('WAI-6: a record still inside the settlement grace is left standing — the row and the settlement agree on when', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-'));
+  try {
+    const recent = new Date(Date.now() - WAIT_SETTLE_GRACE_MS / 2).toISOString();
+    const stored = storedWait(root, { status: 'paused', stoppedBy: 'operator', parkedUntil: recent });
+    const loaded = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(loaded.phases[4].status, 'waiting');
+    assert.equal(loaded.phases[4].parkedUntil, recent);
+    assert.equal(journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled').length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('WAI-6: a `waiting` record on a run that is OVER is `interrupted`, naming the dead clock — at once', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-'));
+  try {
+    const clock = new Date(Date.now() + 60_000).toISOString(); // not even past: the run is over, so the clock is dead anyway
+    const stored = storedWait(root, { status: 'finished', parkedUntil: clock });
+    const loaded = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(loaded.phases[4].status, 'interrupted');
+    assert.match(loaded.phases[4].note ?? '', /run ended before the clock fired/);
+    assert.equal(loaded.phases[4].declared?.status, 'waiting-external');
+    const settled = journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled');
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0].data?.to, 'interrupted');
+    assert.equal(settled[0].data?.why, 'run-over');
+    assert.equal(settled[0].data?.clock, clock);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('WAI-6: a `waiting` record on an interrupted run whose clock died is `pending` after the grace, why: clock-unarmed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-'));
+  try {
+    const dead = new Date(Date.now() - 2 * WAIT_SETTLE_GRACE_MS).toISOString();
+    const stored = storedWait(root, { status: 'interrupted', stoppedBy: 'system', parkedUntil: dead });
+    const loaded = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(loaded.phases[4].status, 'pending');
+    assert.equal(loaded.phases[4].declared?.status, 'waiting-external');
+    const settled = journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled');
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0].data?.why, 'clock-unarmed');
+    assert.equal(settled[0].data?.runStatus, 'interrupted');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * WAI-8 — every declared word counted, capped and cooled
+ * ------------------------------------------------------------------ */
+
+test('WAI-8: N+1 declarations of one word are N acts and one refusal — on every word but the wait, which its own ledger bounds', () => {
+  for (const status of ['partial', 'needs-human', 'blocked', 'complete', 'no-defect'] as const) {
+    const record: PhaseRecord = phaseRecord(newRun({ slug: 'alpha', root: '/tmp/x' }), 1);
+    const verdicts: string[] = [];
+    for (let i = 0; i < DECLARATIONS_MAX_PER_PHASE + 1; i++) {
+      verdicts.push(chargeDeclaration(record, status, { now: NOW + i * 3_600_000 }).verdict);
+    }
+    assert.deepEqual(verdicts, [...Array(DECLARATIONS_MAX_PER_PHASE).fill('act'), 'refused'], status);
+    assert.equal(record.declarations?.[status]?.count, DECLARATIONS_MAX_PER_PHASE);
+    assert.equal(record.declarations?.[status]?.refused, 1);
+    // The refusal names the arithmetic.
+    const again = chargeDeclaration(record, status, { now: NOW + 10 * 3_600_000 });
+    assert.deepEqual({ verdict: again.verdict, count: again.count, max: again.max, refused: again.refused },
+      { verdict: 'refused', count: DECLARATIONS_MAX_PER_PHASE, max: DECLARATIONS_MAX_PER_PHASE, refused: 2 });
+  }
+  // `waiting-external` is COUNTED here and refused only by `waits` (evaluateWait):
+  // one word is never refused twice.
+  const record: PhaseRecord = phaseRecord(newRun({ slug: 'alpha', root: '/tmp/x' }), 1);
+  for (let i = 0; i < 6; i++) assert.equal(chargeDeclaration(record, 'waiting-external', { now: NOW + i * 3_600_000 }).verdict, 'act');
+  assert.equal(record.declarations?.['waiting-external']?.count, 6);
+});
+
+test('WAI-8 / SLF-4: inside the cooldown a second `partial` collapses into the act that stands — anchored to the act, not the repeat', () => {
+  const record: PhaseRecord = phaseRecord(newRun({ slug: 'alpha', root: '/tmp/x' }), 1);
+  const cooldown = declarationCooldownFor('partial');
+  assert.equal(cooldown, DECLARATION_COOLDOWN_MS);
+  assert.equal(chargeDeclaration(record, 'partial', { now: NOW, cooldownMs: cooldown }).verdict, 'act');
+  assert.equal(chargeDeclaration(record, 'partial', { now: NOW + 60_000, cooldownMs: cooldown }).verdict, 'cooled');
+  // A stream of repeats every minute never buys a fresh window: the anchor is the last ACT.
+  assert.equal(chargeDeclaration(record, 'partial', { now: NOW + 4 * 60_000, cooldownMs: cooldown }).verdict, 'cooled');
+  assert.equal(record.declarations?.partial?.count, 1);
+  assert.equal(record.declarations?.partial?.refused, 2);
+  assert.equal(chargeDeclaration(record, 'partial', { now: NOW + DECLARATION_COOLDOWN_MS + 1, cooldownMs: cooldown }).verdict, 'act');
+  assert.equal(record.declarations?.partial?.count, 2);
+  // Only `partial` has a cooldown: a wait has its own floor and budget, a blocker rewrites an errand.
+  for (const status of ['waiting-external', 'needs-human', 'blocked', 'complete', 'no-defect']) {
+    assert.equal(declarationCooldownFor(status), undefined, status);
+  }
+});
+
+test('WAI-8 / SLF-4: prepareReboard keeps the phase\'s bounds; only an operator\'s Retry clears them', () => {
+  const record: PhaseRecord = phaseRecord(newRun({ slug: 'alpha', root: '/tmp/x' }), 1);
+  record.status = 'failed';
+  record.stallRemedy = { nudges: 2, recycles: 1 };
+  record.said = 'I ran out of context';
+  record.stall = { kind: 'silent', since: new Date(NOW).toISOString(), detail: 'quiet' } as never;
+  record.idleAttempts = 3;
+  record.watchRetired = ['cmd:npm ci'];
+  chargeDeclaration(record, 'partial', { now: NOW });
+  prepareReboard(record);
+  assert.equal(record.status, 'pending');
+  assert.equal(record.stall, undefined, 'the attempt\'s stall episode goes');
+  assert.equal(record.idleAttempts, undefined);
+  assert.deepEqual(record.stallRemedy, { nudges: 2, recycles: 1 }, 'the watchdog\'s bound stays (SLF-4)');
+  assert.equal(record.said, 'I ran out of context', 'the session\'s last words stay (phase 9 reads them)');
+  assert.equal(record.declarations?.partial?.count, 1, 'the ledger stays');
+  assert.deepEqual(record.watchRetired, ['cmd:npm ci'], 'a retired ref stays retired');
+  // The console's own Retry (a converge relaunch, the ladder) carries every bound forward too…
+  record.status = 'failed';
+  const lines: string[] = [];
+  resetForRetry(record, { by: 'console', journal: (event) => { lines.push(event); } });
+  assert.deepEqual(record.stallRemedy, { nudges: 2, recycles: 1 });
+  assert.equal(record.declarations?.partial?.count, 1);
+  assert.deepEqual(record.watchRetired, ['cmd:npm ci']);
+  // …and only a person's press clears them.
+  record.status = 'failed';
+  resetForRetry(record, { by: 'operator', journal: (event) => { lines.push(event); } });
+  assert.equal(record.stallRemedy, undefined);
+  assert.equal(record.declarations, undefined);
+  assert.equal(record.watchRetired, undefined);
+  assert.deepEqual(lines, [], 'nothing declared, nothing spent, nothing journalled');
+});
+
+test('WAI-8: a blocked / needs-human clock a month out is CAPPED at seven days, and says so', () => {
+  const monthOut = new Date(NOW + 30 * 24 * 3_600_000).toISOString();
+  const clock = declaredClock(monthOut, { now: NOW });
+  assert.ok(clock);
+  assert.equal(clock.requested, monthOut);
+  assert.equal(clock.until, new Date(NOW + DECLARED_CLOCK_MAX_MS).toISOString());
+  assert.equal(clock.capped, true);
+  assert.equal(DECLARED_CLOCK_MAX_MS, 7 * 24 * 3_600_000);
+  // Inside the ceiling: granted as asked, `capped: false`.
+  const tomorrow = new Date(NOW + 24 * 3_600_000).toISOString();
+  assert.deepEqual(declaredClock(tomorrow, { now: NOW }), { until: tomorrow, requested: tomorrow, capped: false });
+  // A moment already past is floored, exactly as `parkWaiting` floors — and that is not a cap.
+  const past = new Date(NOW - 3_600_000).toISOString();
+  assert.deepEqual(declaredClock(past, { now: NOW, floorMs: 60_000 }), { until: new Date(NOW + 60_000).toISOString(), requested: past, capped: false });
+  assert.equal(declaredClock(undefined), null);
+  assert.equal(declaredClock('not a date'), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * SLF-8 — minted refs never run by default; retirement outlives the process
+ * ------------------------------------------------------------------ */
+
+test('SLF-8: a cmd: ref the console MINTED is never run by default — one `unknown` row, no clock, never asked; the pref turns it on', async () => {
+  const clock = new FakeClock();
+  const mint = (enabled: boolean) => {
+    const state = waitingRun(['cmd:"pgrep -f build"']);
+    // The watchdog's park marks what it lifted out of the tool summary.
+    state.phases[1].declared!.minted = ['cmd:"pgrep -f build"'];
+    state.phases[1].declared!.by = 'watchdog';
+    const asked: string[] = [];
+    const journal: string[] = [];
+    const scheduler = new WatchScheduler({
+      clock,
+      runs: () => [{ slug: 'alpha', state }],
+      journal: (_s, _st, kind) => { journal.push(kind); },
+      probe: async (t) => { asked.push(t.ref); return { ref: t.ref, state: 'pending', detail: 'exit 1' }; },
+      mintedCmdRefsEnabled: () => enabled,
+    });
+    return { state, scheduler, asked, journal };
+  };
+
+  const held = mint(false);
+  held.scheduler.open();
+  for (let i = 0; i < 4; i += 1) {
+    await held.scheduler.tick();
+    clock.time += WATCH_POLL_MS.cmd;
+  }
+  assert.deepEqual(held.asked, [], 'the probe never receives a minted cmd ref');
+  const row = held.state.phases[1].watchState!.refs[0];
+  assert.equal(row.state, 'unknown', 'unknown, not refused — the console did not ask');
+  assert.equal(row.minted, true);
+  assert.match(row.detail!, /console-minted cmd ref — not run/);
+  assert.equal(row.nextDueAt, undefined, 'no clock: nothing will advance it, and the fingerprint must not churn');
+  assert.equal(row.runs, undefined, 'nothing ran, nothing charged');
+  assert.deepEqual(held.journal, ['phase.watch-checked'], 'said once');
+  assert.equal(held.state.phases[1].watchRetired, undefined, 'not RETIRED either: turn the pref on and it runs');
+  held.scheduler.close();
+
+  // With the operator's yes, a minted ref runs exactly as a declared one.
+  const allowed = mint(true);
+  allowed.scheduler.open();
+  await allowed.scheduler.tick();
+  assert.deepEqual(allowed.asked, ['cmd:"pgrep -f build"']);
+  assert.equal(allowed.state.phases[1].watchState!.refs[0].runs, 1);
+  allowed.scheduler.close();
+});
+
+test('SLF-8: retirement lives on the record — a re-loaded run, a new scheduler, and the refused ref is still not asked', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-retired-'));
+  try {
+    const clock = new FakeClock();
+    const state = newRun({ slug: 'alpha', root, model: 'opus' });
+    state.status = 'parked';
+    const record = phaseRecord(state, 1);
+    record.status = 'waiting';
+    record.parkedUntil = new Date(NOW + 3_600_000).toISOString();
+    record.declared = { status: 'waiting-external', reason: 'the build', watch: ['cmd:"rm -rf dist"'], at: new Date(NOW).toISOString() };
+    let asks = 0;
+    const first = new WatchScheduler({
+      clock, runs: () => [{ slug: 'alpha', state }],
+      probe: async (t) => { asks += 1; return { ref: t.ref, state: 'refused', detail: 'a destructive verb' }; },
+    });
+    first.open();
+    await first.tick();
+    first.close();
+    assert.equal(asks, 1);
+    assert.deepEqual(record.watchRetired, ['cmd:"rm -rf dist"']);
+    saveRun(state);
+
+    // A RESTART: a fresh scheduler with a blank in-memory refusal set, over the
+    // run read back from disk, after the session re-declared the same ref.
+    const back = loadRun(root, 'alpha', state.id)!;
+    clearWatchBookkeeping(back.phases[1]);
+    back.phases[1].declared = { status: 'waiting-external', reason: 'again', watch: ['cmd:"rm -rf dist"'], at: new Date(NOW).toISOString() };
+    const journal: string[] = [];
+    const second = new WatchScheduler({
+      clock, runs: () => [{ slug: 'alpha', state: back }],
+      journal: (_s, _st, kind) => { journal.push(kind); },
+      probe: async (t) => { asks += 1; return { ref: t.ref, state: 'refused', detail: 'a destructive verb' }; },
+    });
+    second.open();
+    clock.time += WATCH_POLL_MS.cmd;
+    await second.tick();
+    second.close();
+    assert.equal(asks, 1, 'not asked again after the restart — the retirement is on disk, not in a Set');
+    assert.deepEqual(journal, [], 'and not journalled again either');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

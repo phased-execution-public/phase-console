@@ -67,12 +67,18 @@ export const DEFAULT_PERMISSION_PROFILE = /** @type {const} */ ('guarded');
  * client's wording wins (it is the one a person reads while choosing, and it
  * was two sites to one). console-audit-hardening P23 reconciled it
  * deliberately; it is the only user-visible string that phase changed.
+ *
+ * Since zero-touch phase 12 each label says what the profile SILENCES, and
+ * that deny refuses on every one of them (chapter 08 TRS-9: a picker offering
+ * three postures must not imply a difference the policy cannot deliver — and
+ * with the ask list struck empty, Guarded and Trusted are one posture, which
+ * the policy page's advisory says out loud).
  * @type {Readonly<Record<PermissionProfile, string>>}
  */
 export const PROFILE_LABELS = Object.freeze({
-  guarded: 'Guarded — ask me about the irreversible',
-  trusted: 'Trusted — only the deny list stops it',
-  bypass: 'Bypass — the CLI stops asking too',
+  guarded: 'Guarded — asks about everything on the ask list; deny still refuses',
+  trusted: 'Trusted — silences the ask list; deny still refuses',
+  bypass: 'Bypass — silences the ask list and the CLI’s own prompts; deny still refuses',
 });
 
 /**
@@ -201,7 +207,78 @@ export const RUN_START_FIELDS = Object.freeze([
   'accountId',
   'onLimit',
   'autoRecover',
+  // The prelude's four required answers and its one recorded override (phase
+  // 11, ZTD-2/QRL-2). START-only, every one: they are the run's answers to the
+  // decision manifest — `resume.on-restart`, `relay`, `accounts` and the
+  // acknowledgement of every `waived` row — and a settings patch cannot
+  // re-answer what the door was refused on. `accounts` is a list of
+  // `{id, minHeadroomPct}` (the plan's `**Accounts:**` clause, `id:min`);
+  // `manifestOverride` is `{rows, by}` — the one way past a blocking row, and
+  // it is journalled as `run.manifest-override` so nothing is silent.
+  'resumeOnRestart',
+  'relay',
+  'accounts',
+  'acknowledgedWaivers',
+  'manifestOverride',
 ]);
+
+/**
+ * The relay (Tier 2, phase 14) a run may arm: `off` — the console answers
+ * nothing on the session's behalf and every `relay: off` run carries
+ * `--permission-prompts none`; `last-resort` — a question a session raises
+ * reaches a person and, unanswered after the window, the console's rule table.
+ * The manifest's `relay` row and the run's `relay` field share this list.
+ * @typedef {'off'|'last-resort'} RelayMode
+ * @type {readonly RelayMode[]}
+ */
+export const RELAY_MODES = Object.freeze(/** @type {const} */ (['off', 'last-resort']));
+
+/**
+ * The CLI version the relay arms at — the first release whose
+ * `PermissionRequest` `http` hook fires in `-p` (phase 1's spike S2, measured
+ * on 2.1.270; the floor is the audit's, chapter 13 §4). Read from
+ * `system/init.claude_code_version`, never from `capabilities`; `phase-console
+ * doctor` compares the installed CLI against it and phase 14 refuses to arm below it.
+ */
+export const RELAY_CLI_FLOOR = '2.1.268';
+
+/**
+ * The CLI version `--permission-prompts none` arrived in (the CLI reference:
+ * "Requires Claude Code v2.1.259 or later. Earlier versions reject it with an
+ * unknown-option error"). Every `relay: off` run carries the flag — the floor
+ * for a run nobody can answer (QRL-9): anything that would prompt is denied,
+ * the session is told nobody can approve and not to retry, `AskUserQuestion`
+ * is removed and elicitations are cancelled. A run under a KNOWN older CLI
+ * gets no flag and a `run.permission-prompts-skipped` line instead.
+ */
+export const PERMISSION_PROMPTS_CLI_FLOOR = '2.1.259';
+
+/**
+ * Is `version` at or above `floor`? 3 numeric parts, a leading `v` ignored, a
+ * missing part read as 0; `null` when there is no version to compare. The one
+ * comparison the doctor's `cli` row and the floor flag share.
+ * @param {string | null | undefined} version
+ * @param {string} floor
+ * @returns {boolean | null}
+ */
+export function versionAtLeast(version, floor) {
+  if (!version) return null;
+  /** @param {string} v */
+  const parse = (v) =>
+    v
+      .trim()
+      .replace(/^v/, '')
+      .split('.')
+      .slice(0, 3)
+      .map((n) => Number.parseInt(n, 10) || 0);
+  const a = parse(version);
+  const b = parse(floor);
+  for (let i = 0; i < 3; i += 1) {
+    if ((a[i] ?? 0) > (b[i] ?? 0)) return true;
+    if ((a[i] ?? 0) < (b[i] ?? 0)) return false;
+  }
+  return true;
+}
 
 /**
  * Fields `POST /api/run/:slug/settings` reads off the body.

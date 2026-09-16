@@ -100,6 +100,8 @@ const PRE_CHANGE_PLAN_KEYS: Record<string, string> = {
   slug: '', title: '', sessionBudget: '', path: '',
   provenance: 'document', context: 'document', architecture: 'document', endToEnd: 'document',
   graph: 'document', callouts: 'document', sections: 'document',
+  // The `## Decisions` manifest (zero-touch-console P3): Source-tab only.
+  decisions: 'document',
 };
 
 /* ------------------------------------------------------------------ *

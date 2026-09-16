@@ -342,6 +342,20 @@ export function QueuedPane({
                       · on <code className="font-mono">{holder.branch}</code>
                     </span>
                   )}
+                  {holder.kind === 'session' && (
+                    // A peer in the repository holds no lease to outlive: the
+                    // wait ends when that session ends or claims (REG-3).
+                    <span className="text-ink-faint" data-testid="holder-session">
+                      {' '}
+                      · {holder.owner}
+                      {holder.cwd ? (
+                        <>
+                          {' '}
+                          in <code className="font-mono">{holder.cwd}</code>
+                        </>
+                      ) : null}
+                    </span>
+                  )}
                   {holder.kind === 'lock' && holder.leaseUntil != null && (
                     // The lease is the holder's promise to lapse — the honest
                     // answer to "how long can this possibly block me".
@@ -388,6 +402,10 @@ export function QueuedPane({
 export function holderLabel(kind: string, slug: string, phase: number | null): string {
   if (kind === 'reserved') return slug;
   const where = phase != null ? `${slug} P${phase}` : slug;
+  if (kind === 'session')
+    return phase != null
+      ? `${where} (a live session, no lock)`
+      : 'a live session in this repository (no lock)';
   return kind === 'lock' ? `${where} (lock)` : where;
 }
 

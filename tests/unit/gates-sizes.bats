@@ -24,11 +24,17 @@ load ../helpers/test_helper
   run pg gatecheck --gate-kind 1;  [ "$output" = "none" ]
 }
 
-@test "gate-kind: a GATED heading with no Gate-check is human (fail-safe)" {
+@test "gate-kind: a GATED heading with no Gate-check reads as ai (GATE_DEFAULT) — and the lint names it" {
   setup_docs gated gated
   sed -i.bak '/Gate-check/d' "$DOCS_ROOT/docs/plans/gated.md"
   run pg gated --gate-kind 2
-  [ "$output" = "human" ]
+  [ "$output" = "ai" ]
+  run pg gated --gate-status 2
+  [ "$status" -eq 1 ]
+  [[ "$output" == ai:* ]]
+  run pg gated --lint
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "phase 2: gate-directive-missing"
 }
 
 @test "size: explicit S/M/L tags are read" {

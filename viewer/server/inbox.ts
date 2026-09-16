@@ -80,13 +80,15 @@
  * What is NOT here
  * ------------------------------------------------------------------
  *
- * `stall` and `ruling` are declared in the shared vocabulary and PRODUCED BY
- * NOBODY in Phase 4. A stall needs the run records' own clocks, the scheduler
- * snapshot and the session registry read together against `STALL_META`'s five
- * thresholds; a ruling needs the approvals' `remember: 'plan'|'global'` and the
- * policy-strike path. Both are Phase 5. They are in the kind list, the labels
- * and the ack file's key space from the first day precisely so that landing
- * their detector changes no type, no route and no stored ack.
+ * `stall` and `ruling` were declared in the shared vocabulary and PRODUCED BY
+ * NOBODY in Phase 4; both landed later — the stall from the run records' own
+ * clocks against `STALL_META`, the ruling from the plans' ledgers. Since
+ * zero-touch phase 12 a ruling that names its decision key is a row of its
+ * own carrying `remember: plan|global` (the feedback loop chapter 10 ZTD-7
+ * found missing: 2 315 rulings that reached no plan and no default); an
+ * un-keyed one stays folded into its phase's fyi row. They were in the kind
+ * list, the labels and the ack file's key space from the first day precisely
+ * so that landing their detector changed no type, no route and no stored ack.
  */
 
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -96,6 +98,9 @@ import {
   RULING_KIND_LABELS, SESSION_ASK_WAIT_KINDS, STALL_META, deriveAttention, inboxItemId,
   situationRaises, sortInbox, type InboxKind, type InboxSeverity,
 } from '../shared/attention-model.js';
+import { DECISION_KEYS, type DecisionKey } from '../shared/decisions-model.js';
+import { POLICY_DEFAULTS, isAnswerWord } from '../shared/policy-model.js';
+import { recommendedOption } from '../shared/relay-model.js';
 import { phaseHref, planHref, toHash } from '../shared/routes.js';
 import { parseSituationKey, situationLabel } from '../shared/situation-model.js';
 import { isLiveStatus } from '../shared/status-vocab.js';
@@ -180,6 +185,13 @@ export type InboxItem = {
    * every ack stale on the next request, which is the same as having no acks.
    */
   since: string;
+  /**
+   * ISO 8601 — when the ask stops being a person's to answer. A relayed
+   * question's window (phase 14): the console answers it by rule then, so a
+   * surface can count down to it. Absent on every ask that waits for a person
+   * however long it takes.
+   */
+  expiresAt?: string;
   actions: InboxAction[];
   /** Where in the console it lives. */
   href: string;
@@ -320,10 +332,19 @@ export type InboxApproval = {
   slug?: string;
   phase?: number | null;
   kind?: string;
+  /** A card no session holds a hook open for — the ladder's `widen-rule` offer (phase 9). */
+  standing?: true;
   title?: string;
   detail?: string;
   createdAt?: string;
+  expiresAt?: string;
   status?: string;
+  /** A relayed question's own part (phase 14) — `runner/approvals.ts` `ApprovalQuestion`, narrowed. */
+  question?: {
+    items: { key: string; question: string; header?: string; options: { label: string; description?: string }[]; multiSelect?: boolean }[];
+    answers?: Record<string, { label: string; by: string }>;
+    deferred?: unknown;
+  };
 };
 
 /** One phase of a plan, as `Service.detail()` already projects it. */
@@ -447,6 +468,15 @@ export type InboxMcpServer = {
  * is a diagnostic. Pass everything you have; the empty object is a legal call
  * and returns an empty view.
  */
+/** How the phone reaches this console under `--remote` — `InboxFacts.fleet.remote`. */
+export type InboxReach = {
+  running: boolean;
+  detail?: string;
+  forOurPort: boolean;
+  hosts: readonly string[];
+  occupant?: { port: number; id?: string; name?: string };
+};
+
 export type InboxFacts = {
   /**
    * Every run across every plan. `Service.allRuns()` — async, and it resolves
@@ -481,6 +511,33 @@ export type InboxFacts = {
   mcp?: readonly InboxMcpServer[];
   /** `state().environment.issues` — each carries its own `fix` sentence. */
   environment?: readonly { kind: string; detail: string; fix: string }[];
+  /**
+   * This console's reach, and the other consoles of the machine (zero-touch
+   * phase 17, FLT-1 iv / FLT-6) — `ServiceBase.inboxFleetFacts()`. A console
+   * nobody can reach is work, and so is a sibling that is down or orphaned:
+   * each raises a `needs-you` health row (`INSTANCE_HEALTH_KINDS`).
+   */
+  fleet?: {
+    /** The boot doctor's delivery verdict — `probeDelivery` over the live register. */
+    delivery?: { ok: boolean; reason: string };
+    /** `notifications.unread()`. */
+    unread?: number;
+    /** Only under `--remote`: whether Tailscale runs and whose port Serve fronts. */
+    remote?: InboxReach | null;
+    /** Every OTHER registered console, as the census reads it. */
+    siblings?: readonly {
+      id: string;
+      name: string;
+      root: string | null;
+      liveness: string;
+      discrepancies: readonly string[];
+      unit: boolean;
+      autostart: boolean | 'once';
+      stopMarker: boolean;
+      lastSeenAt: string | null;
+      stoppedAt: string | null;
+    }[];
+  };
   /** `this.watcher.status()`. A deaf watcher looks fine from everywhere else. */
   watcher?: { healthy?: boolean; watching?: number; expected?: number; failures?: number };
   /** `degradedState()`. */
@@ -514,7 +571,18 @@ export type InboxFacts = {
   rulings?: readonly {
     id: string; slug: string; phase: number; kind: string; what: string;
     why?: string; costIfWrong?: string; at: string;
+    /** The manifest key the ruling answers — what makes it rememberable. */
+    decisionKey?: string;
+    /** A relayed question's answer (phase 14) — remembered as a relay rule, never as a decision row. */
+    relay?: { tool: string; key: string; answer: string; answeredBy: string };
   }[];
+  /**
+   * What the policy table answered BY ITSELF (zero-touch phase 19) — each open
+   * plan's newest run: its journal's `phase.policy-answered` lines and the
+   * fingerprints the run keeps on `recoveries[phase].policyAnswered`. Only the
+   * recent ones raise a row — see `policyDrafts`.
+   */
+  policyAnswers?: readonly InboxPolicyAnswer[];
   /** The acks file, keyed by `InboxItem.id`. `readAcks()` below reads it. */
   acks?: Readonly<Record<string, InboxAck>>;
   /**
@@ -919,7 +987,8 @@ function errandDrafts(facts: InboxFacts): Draft[] {
 function approvalDrafts(facts: InboxFacts): Draft[] {
   const flags = facts.flags ?? {};
   return (facts.approvals ?? [])
-    .filter((approval) => approval.status === 'pending')
+    // A relayed question is its own kind, with its own actions (`questionDrafts`).
+    .filter((approval) => approval.status === 'pending' && approval.kind !== 'question')
     .map((approval) => {
       const phase = positivePhase(approval.phase);
       const decide = (decision: 'allow' | 'deny', label: string): InboxAction => ({
@@ -944,9 +1013,13 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
         ...(approval.slug ? { slug: approval.slug } : {}),
         ...(phase != null ? { phase } : {}),
         ...(approval.runId ? { runId: approval.runId } : {}),
-        title: approval.title || 'A session is waiting on a decision',
+        title: approval.title || (approval.standing ? 'A phase is parked on a decision' : 'A session is waiting on a decision'),
         need: approval.detail || 'A session is parked until you answer.',
-        how: 'Allow it or deny it — the session is holding a hook open until you do.',
+        // A STANDING card (the ladder's `widen-rule` offer, phase 9) holds no
+        // hook open: the phase is parked behind it and nothing spends.
+        how: approval.standing
+          ? 'Allow it to strike the rule for this plan and resume the phase\'s own session, or deny it and do the step by hand — the phase is parked, nothing spends, until you do.'
+          : 'Allow it or deny it — the session is holding a hook open until you do.',
         since: stableSince(approval.createdAt),
         href: approval.slug ? planHref(approval.slug, 'run') : toHash(routeFor('approval')),
         actions: [decide('allow', 'Allow'), decide('deny', 'Deny')],
@@ -954,12 +1027,66 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
     });
 }
 
+/* ------------------------------------------------------------------ *
+ * question
+ * ------------------------------------------------------------------ */
+
 /**
- * A Claude session outside the autopilot, stopped at its own prompt — an agent
- * session, or someone's own CLI — reported by the machine-wide Notification
- * hook. Autopilot lanes never appear here: their asks are approval cards with
- * verbs. Only a LIVE session asks — `ended` is over, and `unknown` is a claim
- * nobody can vouch for.
+ * A question a session raised on a relay-armed run (phase 14), one row per
+ * question it has not had answered — a call carries 1 to 4 — with one action
+ * per option. `urgent`: a session is holding a hook open for it. The row says
+ * what the console will answer when the window closes, and when that is
+ * (`expiresAt`), so a person deciding whether to bother knows what silence
+ * chooses. A deferred card (the console went away with it open) is nobody's to
+ * answer from here — its answer is the boot's — and raises nothing.
+ */
+function questionDrafts(facts: InboxFacts): Draft[] {
+  const flags = facts.flags ?? {};
+  const out: Draft[] = [];
+  for (const approval of facts.approvals ?? []) {
+    if (approval.status !== 'pending' || approval.kind !== 'question' || !approval.question || !approval.slug) continue;
+    if (approval.question.deferred) continue;
+    const phase = positivePhase(approval.phase);
+    const answered = approval.question.answers ?? {};
+    for (const item of approval.question.items) {
+      if (answered[item.key]) continue;
+      const silence = recommendedOption(item.options) ?? item.options[0]?.label;
+      out.push({
+        kind: 'question',
+        severity: 'urgent',
+        subject: `${approval.id}:${item.key}`,
+        slug: approval.slug,
+        ...(phase != null ? { phase } : {}),
+        ...(approval.runId ? { runId: approval.runId } : {}),
+        title: item.question.slice(0, 240),
+        need: `${approval.slug}${phase != null ? ` phase ${phase}` : ''} asks${item.header ? ` (${item.header})` : ''} — pick one.`,
+        how: `Unanswered, the console answers by its relay rules when the window closes${silence ? ` — "${silence}" unless a rule says otherwise` : ''}.`,
+        since: stableSince(approval.createdAt),
+        ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}),
+        href: planHref(approval.slug, 'run'),
+        actions: item.options.map((option, index) => ({
+          verb: `answer-${index + 1}`,
+          label: option.label.slice(0, 80),
+          endpoint: runVerb(approval.slug!, 'answer'),
+          method: 'POST' as const,
+          body: { approvalId: approval.id, key: item.key, label: option.label },
+          ...gatedBy('run', flags.allowRun),
+        })),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * A Claude session stopped at its own prompt — an agent session, someone's own
+ * CLI, or (since 5.0.0, REG-5/TRS-6) an autopilot lane — reported by the
+ * machine-wide Notification hook. A lane is left out only while an approval
+ * card for its own phase is pending, because that card IS the ask; otherwise
+ * its wait is a row in its own right, carrying the question and an answer
+ * action, since the console CAN write to a lane's session (`steer`). Only a
+ * LIVE session asks — `ended` is over, and `unknown` is a claim nobody can
+ * vouch for.
  *
  * The id's subject is the sessionId ALONE — no slug, phase or runId. The weak
  * plan correlation flaps as locks come and go, and an id that moved would shed
@@ -968,17 +1095,22 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
  *
  * `severity` follows the approval test: a permission prompt is a session
  * parked dead (`urgent`); idle-waiting-for-input is a person's turn
- * (`needs-you`). No actions: the console has no verb that can answer someone
- * else's terminal.
+ * (`needs-you`). A foreign or agent row has no actions: the console has no verb
+ * that can answer someone else's terminal.
  */
 function sessionAskDrafts(facts: InboxFacts): Draft[] {
+  const carded = (slug: string | undefined, phase: number | null | undefined) =>
+    Boolean(slug) && phase != null && (facts.approvals ?? []).some(
+      (approval) => approval.status === 'pending' && approval.slug === slug && approval.phase === phase,
+    );
   return (facts.sessions ?? [])
     // `SESSION_ASK_WAIT_KINDS`, not "any Notification": the hook fires for more
     // than a prompt, and every one of them used to become an urgent push. A
     // channel that fires for everything is a channel that gets muted, and the
     // one it gets muted for is the permission card holding a lane dead.
-    .filter((session) => session.presence === 'live' && session.kind !== 'autopilot'
-      && SESSION_ASK_WAIT_KINDS.includes(String(session.waiting?.kind ?? '')))
+    .filter((session) => session.presence === 'live'
+      && SESSION_ASK_WAIT_KINDS.includes(String(session.waiting?.kind ?? ''))
+      && !(session.kind === 'autopilot' && carded(session.plan?.slug, positivePhase(session.plan?.phase))))
     .map((session) => {
       const permission = session.waiting?.kind === 'permission';
       const ask = permission ? 'permission' : session.waiting?.kind === 'elicitation' ? 'answer' : 'input';
@@ -988,6 +1120,11 @@ function sessionAskDrafts(facts: InboxFacts): Draft[] {
         : session.cwd
           ? `in ${session.cwd}`
           : 'on this machine';
+      // A lane of the autopilot the console knows the plan and phase of can be
+      // answered from here: the words go into its session as an instruction.
+      const lane = session.kind === 'autopilot' && session.plan?.slug && phase != null
+        ? { slug: session.plan.slug, phase }
+        : null;
       return {
         kind: 'session-ask' as const,
         severity: (permission ? 'urgent' : 'needs-you') as InboxSeverity,
@@ -995,10 +1132,22 @@ function sessionAskDrafts(facts: InboxFacts): Draft[] {
         title: `A session is waiting on your ${ask}`,
         need: session.waiting?.note
           || `A Claude session working ${where} is stopped until you answer it.`,
-        how: 'Go to the terminal it is running in and answer the prompt — the console cannot answer for it.',
+        how: lane
+          ? 'Answer it here — your words reach the lane’s session as an instruction for the rest of the phase.'
+          : 'Go to the terminal it is running in and answer the prompt — the console cannot answer for it.',
         since: stableSince(session.waiting?.since),
         href: toHash(routeFor('session-ask')),
-        actions: [],
+        actions: lane
+          ? [{
+            verb: 'steer',
+            label: 'Answer it',
+            endpoint: runVerb(lane.slug, 'steer'),
+            method: 'POST' as const,
+            body: { phase: lane.phase },
+            says: { field: 'instruction', label: 'Your answer', placeholder: 'What the session should do' },
+            ...gatedBy('run', facts.flags?.allowRun),
+          }]
+          : [],
       };
     });
 }
@@ -1858,15 +2007,24 @@ function stallDrafts(facts: InboxFacts, now: number): Draft[] {
 const RULING_INBOX_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
- * One `fyi` row per PHASE with recent rulings.
+ * One `fyi` row per PHASE with recent rulings — and one row per KEYED ruling.
  *
  * `fyi` and not `needs-you`, because nothing is waiting: a ruling has already
- * been acted on by the session that recorded it. The row exists so the
+ * been acted on by the session that recorded it. The folded row exists so the
  * decision is SEEN once — acknowledging it is the whole interaction, which is
  * why it carries no action of its own beyond the inbox's own ack.
+ *
+ * A ruling that names its decision key (`phase-outcome.sh … ruling --needs
+ * <key>`) is different: it is an answer somebody could keep. It gets its own
+ * row, keyed by the ruling id so the ledger's ack (which `--remember` and the
+ * route both append) is the row's ack, with two actions — remember it for the
+ * plan (a `## Decisions` row, source `ruling`) and, when its words are an
+ * answer this console can hold for the key, remember it on this console
+ * (`policy.<key>`). Both go through `POST /api/run/<slug>/rulings/<id>/remember`.
  */
 function rulingDrafts(facts: InboxFacts, now: number): Draft[] {
   const closed = new Set((facts.plans ?? []).filter((plan) => plan.closed).map((plan) => plan.slug));
+  const out: Draft[] = [];
   /**
    * ONE row per phase, not one per ruling.
    *
@@ -1886,13 +2044,16 @@ function rulingDrafts(facts: InboxFacts, now: number): Draft[] {
     if (!Number.isFinite(at) || now - at > RULING_INBOX_WINDOW_MS) continue;
     const phase = positivePhase(ruling.phase);
     if (phase == null) continue;
+    if (ruling.decisionKey && ruling.id) {
+      out.push(keyedRulingDraft(ruling, phase, facts));
+      continue;
+    }
     const key = `${ruling.slug}:${phase}`;
     const slot = byPhase.get(key) ?? { slug: ruling.slug, phase, rulings: [] };
     slot.rulings.push(ruling);
     byPhase.set(key, slot);
   }
 
-  const out: Draft[] = [];
   for (const { slug, phase, rulings } of byPhase.values()) {
     // Newest first: the title names the most recent decision, which is the one
     // a reader is most likely to be reading about.
@@ -1925,6 +2086,156 @@ function rulingDrafts(facts: InboxFacts, now: number): Draft[] {
     });
   }
   return out;
+}
+
+/** Where a person sets a console-level answer by hand when the row cannot offer it. */
+const POLICY_SETTINGS_POINTER = 'to answer it on every plan, set the key under Settings ▸ Automation ▸ Policy answers';
+
+function keyedRulingDraft(
+  ruling: NonNullable<InboxFacts['rulings']>[number],
+  phase: number,
+  facts: InboxFacts,
+): Draft {
+  const key = String(ruling.decisionKey);
+  const label = RULING_KIND_LABELS[ruling.kind as keyof typeof RULING_KIND_LABELS] ?? 'Ruling';
+  const endpoint = runVerb(ruling.slug, `rulings/${encodeURIComponent(ruling.id)}/remember`);
+  // A relayed answer (phase 14): the one thing worth remembering is the answer
+  // itself, as a relay rule — never a `## Decisions` row, whose value is a
+  // policy word, and never a console policy answer.
+  if (ruling.relay) {
+    return {
+      kind: 'ruling',
+      severity: 'fyi',
+      subject: ruling.id,
+      slug: ruling.slug,
+      phase,
+      title: `${ruling.slug} phase ${phase} — a question answered by ${ruling.relay.answeredBy === 'human' ? 'a person' : 'the relay'}`,
+      need: ruling.what,
+      how: `${ruling.why ? `Why: ${ruling.why} · ` : ''}Remember it to answer "${ruling.relay.answer}" to this question on every run from now on.`,
+      since: new Date(Date.parse(ruling.at)).toISOString(),
+      href: phaseHref(ruling.slug, phase),
+      actions: [{ verb: 'remember-rule', label: 'Remember as a relay rule', endpoint, method: 'POST', body: { scope: 'rule' } }],
+    };
+  }
+  // `global` only when the ruling's own words are an answer the console can
+  // hold for the key: a prose ruling on `qa.exhausted` cannot become a
+  // `policy.qa.exhausted` word, and an action that would be refused on
+  // arrival is a button that lies.
+  const holdable = (DECISION_KEYS as readonly string[]).includes(key) && isAnswerWord(key as DecisionKey, ruling.what);
+  const actions: InboxAction[] = [
+    {
+      verb: 'remember-plan',
+      label: 'Remember for this plan',
+      endpoint,
+      method: 'POST',
+      body: { scope: 'plan' },
+      ...gatedBy('writes', facts.flags?.allowWrites),
+    },
+    ...(holdable ? [{
+      verb: 'remember-global',
+      label: 'Remember on this console',
+      endpoint,
+      method: 'POST',
+      body: { scope: 'global' },
+    } satisfies InboxAction] : []),
+  ];
+  const because = [
+    ruling.why ? `Why: ${ruling.why}` : '',
+    ruling.costIfWrong ? `If it was wrong: ${ruling.costIfWrong}` : '',
+    holdable ? '' : POLICY_SETTINGS_POINTER,
+  ].filter(Boolean).join(' · ');
+  return {
+    kind: 'ruling',
+    severity: 'fyi',
+    // The ruling id, not the phase: the ledger's ack line names this id, and
+    // `--remember` / the route append one — so remembering it is what takes
+    // the row off the list, on every clone that reads the ledger.
+    subject: ruling.id,
+    slug: ruling.slug,
+    phase,
+    title: `${ruling.slug} phase ${phase} — ${label} · ${key}`,
+    need: ruling.what,
+    how: because || `A ruling on \`${key}\`. Remember it for the plan, or acknowledge it — it stays in the ledger either way.`,
+    since: new Date(Date.parse(ruling.at)).toISOString(),
+    href: phaseHref(ruling.slug, phase),
+    actions,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * policy — what the console decided by itself (zero-touch phase 19)
+ * ------------------------------------------------------------------ */
+
+/** One answer the policy table gave in a run's name — a `phase.policy-answered` line, or the run's fingerprint of one. */
+export type InboxPolicyAnswer = {
+  slug: string;
+  runId?: string;
+  phase: number;
+  decisionKey: string;
+  answer: string;
+  source: string;
+  situation?: string;
+  label?: string;
+  at: string;
+};
+
+/** Where an answer came from, in words a row can say (`POLICY_SOURCES`). */
+const POLICY_SOURCE_WORDS: Readonly<Record<string, string>> = {
+  run: 'the run’s own start answer',
+  plan: 'the plan’s `## Decisions` row',
+  console: 'this console’s policy answers',
+  default: 'the shipped default',
+};
+
+/**
+ * One `fyi` row per phase and decision key: the newest answer the policy table
+ * gave there, inside the same two-week window as a ruling.
+ *
+ * `fyi`, because nothing is waiting — the console already acted. What the row is
+ * for is the other half of "zero touch": a person must be able to SEE the console
+ * deciding in their name, what it decided, by whose word, and what the shipped
+ * default would have said, so an answer they disagree with is one they can
+ * change (Settings ▸ Automation ▸ Policy answers, or the plan's `## Decisions`).
+ * One row per key rather than per line, for the rulings' reason: a phase that
+ * waived QA three times is one decision, seen once.
+ */
+function policyDrafts(facts: InboxFacts, now: number): Draft[] {
+  const closed = new Set((facts.plans ?? []).filter((plan) => plan.closed).map((plan) => plan.slug));
+  const newest = new Map<string, InboxPolicyAnswer & { phase: number }>();
+  for (const answer of facts.policyAnswers ?? []) {
+    if (!answer?.slug || !answer.decisionKey || closed.has(answer.slug)) continue;
+    const at = Date.parse(answer.at);
+    if (!Number.isFinite(at) || now - at > RULING_INBOX_WINDOW_MS) continue;
+    const phase = positivePhase(answer.phase);
+    if (phase == null) continue;
+    const key = `${answer.slug}:${phase}:${answer.decisionKey}`;
+    const held = newest.get(key);
+    if (!held || Date.parse(held.at) < at) newest.set(key, { ...answer, phase });
+  }
+  return [...newest.values()].map((answer) => {
+    const shipped = (POLICY_DEFAULTS as Readonly<Record<string, unknown>>)[answer.decisionKey];
+    const shippedWord = shipped == null ? 'none' : typeof shipped === 'string' ? shipped : JSON.stringify(shipped);
+    const from = POLICY_SOURCE_WORDS[answer.source] ?? (answer.source || 'an unnamed source');
+    return {
+      kind: 'policy',
+      severity: 'fyi',
+      // The key, not the run: one decision per phase, whichever run met it last —
+      // a newer answer moves `since`, which is what re-raises an acknowledged row.
+      subject: answer.decisionKey,
+      slug: answer.slug,
+      phase: answer.phase,
+      title: `${answer.slug} phase ${answer.phase} — Policy answered · ${answer.decisionKey}`,
+      need:
+        `The console answered "${answer.answer}" by ${from}${answer.label ? ` (${answer.label})` : ''}`
+        + ' — nobody was asked.',
+      how:
+        `Shipped default for \`${answer.decisionKey}\`: ${shippedWord}. To answer differently, set it under `
+        + 'Settings ▸ Automation ▸ Policy answers, or in the plan’s `## Decisions` table.',
+      since: new Date(Date.parse(answer.at)).toISOString(),
+      href: phaseHref(answer.slug, answer.phase),
+      actions: [],
+    } satisfies Draft;
+  });
 }
 
 /* ------------------------------------------------------------------ *
@@ -1993,6 +2304,113 @@ function healthDrafts(facts: InboxFacts): Draft[] {
     }
   }
 
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * instance health — a console nobody can reach, and the siblings
+ * ------------------------------------------------------------------ */
+
+/**
+ * The console's reach and its siblings as work (zero-touch phase 17, FLT-1 iv,
+ * FLT-6, R-F1's rule): every row is `needs-you`, because a console that cannot
+ * reach a person, or a console that should be up and is not, is exactly the
+ * failure an operator finds out about too late — 36 urgent cards once sat in a
+ * file only their own console could read, and a second console was down for
+ * thirteen hours with nothing reporting it.
+ */
+function instanceHealthDrafts(facts: InboxFacts): Draft[] {
+  const fleet = facts.fleet;
+  if (!fleet) return [];
+  const out: Draft[] = [];
+  const settings = toHash(routeFor('health'));
+
+  const unread = fleet.unread ?? 0;
+  if (fleet.delivery && !fleet.delivery.ok && unread > 0) {
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: 'unread-unheard',
+      title: `${unread} notification${unread === 1 ? '' : 's'} nobody was told about`,
+      need:
+        `A way for this console to reach you — ${fleet.delivery.reason}. Every unread notification here `
+        + 'was an announcement that arrived nowhere.',
+      how:
+        'Subscribe a device (Settings → Notifications, from the phone), set a notifier or register a webhook; '
+        + 'then read what was missed in the bell.',
+      since: '',
+      href: settings,
+      actions: [],
+    });
+  }
+
+  const remote = fleet.remote;
+  if (remote && !remote.running) {
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: 'tailscale-stopped',
+      title: 'Tailscale is not running — the phone cannot reach this console',
+      need:
+        `This console answers to ${remote.hosts.join(', ')} only through Tailscale Serve, and Tailscale is `
+        + `${remote.detail ? `\`${remote.detail}\`` : 'not running'}.`,
+      how: 'Open the Tailscale app and sign in; the console needs no restart.',
+      since: '',
+      href: settings,
+      actions: [],
+    });
+  } else if (remote && !remote.forOurPort && remote.occupant) {
+    const holder = remote.occupant.name
+      ? `the console "${remote.occupant.name}" (port ${remote.occupant.port})`
+      : `port ${remote.occupant.port}, which no console on this machine claims`;
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: 'serve-elsewhere',
+      title: 'Tailscale Serve points at another console',
+      need: `The phone reaches ${holder}, not this console.`,
+      how: 'Settings → Reach this console from your phone names the command that publishes this console without displacing it.',
+      since: '',
+      href: settings,
+      actions: [],
+    });
+  }
+
+  for (const sibling of fleet.siblings ?? []) {
+    if (sibling.liveness === 'orphaned') {
+      out.push({
+        kind: 'health',
+        severity: 'needs-you',
+        subject: `sibling-orphaned:${sibling.id}`,
+        title: `The console "${sibling.name}" is registered for a directory that is gone`,
+        need: `A decision about ${sibling.root ?? 'its root'} — it no longer exists, so that console can never start again.`,
+        how: `Forget it: phase-console remove ${sibling.id}. Its state directories are left where they are.`,
+        since: '',
+        href: settings,
+        actions: [],
+      });
+      continue;
+    }
+    // Down is work only where up was expected: it died without a clean exit, or
+    // a unit that should have brought it back did not — and nobody chose "stay off".
+    const crashed = sibling.liveness === 'stopped' && sibling.discrepancies.includes('stale-heartbeat');
+    const supervisedDown = sibling.liveness === 'stopped' && sibling.unit && sibling.autostart !== false;
+    if ((crashed || supervisedDown) && !sibling.stopMarker) {
+      out.push({
+        kind: 'health',
+        severity: 'needs-you',
+        subject: `sibling-down:${sibling.id}`,
+        title: `The console "${sibling.name}" is down`,
+        need:
+          `${crashed ? 'It stopped beating without a clean exit' : 'Its unit should keep it up, and it is not running'}`
+          + `${sibling.lastSeenAt ? ` — last seen ${sibling.lastSeenAt}` : ''}; nothing of ${sibling.root ?? 'its project'} is being watched or driven.`,
+        how: `Start it: phase-console start ${sibling.id} — or, if it should stay down, Shut down → Stay off from its own Settings.`,
+        since: stableSince(sibling.lastSeenAt ?? sibling.stoppedAt ?? undefined),
+        href: settings,
+        actions: [],
+      });
+    }
+  }
   return out;
 }
 
@@ -2201,6 +2619,7 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
   const drafts = [
     ...errandDrafts(facts),
     ...approvalDrafts(facts),
+    ...questionDrafts(facts),
     ...sessionAskDrafts(facts),
     ...planDrafts(facts),
     ...signInDrafts(facts),
@@ -2208,9 +2627,11 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
     ...lockDrafts(facts),
     ...stallDrafts(facts, now),
     ...rulingDrafts(facts, now),
+    ...policyDrafts(facts, now),
     ...conflictDrafts(facts),
     ...isolationDrafts(facts),
     ...healthDrafts(facts),
+    ...instanceHealthDrafts(facts),
   ];
 
   // Dedupe by id, first writer wins. The builders are written so that two

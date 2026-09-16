@@ -145,7 +145,7 @@ export const PHASE_STATUSES = Object.freeze(
     'running',
     /** The session is gone and its §Verification commands are executing. */
     'verifying',
-    /** Verification passed and the loop signed it off. */
+    /** Every command that could run has passed; a person still owes the sign-off on the checks that could not (`PHASE_STOP_FOLD` → `human-check`). */
     'awaiting-verification',
     /** Admitted, waiting on scope. */
     'queued',
@@ -305,6 +305,33 @@ export const OUTCOME_STATUSES = Object.freeze(
  */
 
 /**
+ * The licences under which a phase's standing declaration may be SPENT — the
+ * only ways `record.declared` is ever deleted (`consumeDeclaration` in
+ * `server/runner/state.ts` is the one writer, and takes one of these as `why`).
+ *
+ * `new-outcome`: the session declared something else, and the new word
+ * supersedes the old. `session-productive`: the parked session resumed and made
+ * durable progress (a commit, a `phase-outcome.sh` call), so the wait it
+ * declared is over. `board-closed`: the board reads the phase done, whatever the
+ * record still says. `retry`: a Retry — an operator's press, or a console path
+ * that says so — asks for the phase again from the top.
+ *
+ * Every one of them journals `phase.declaration-consumed` naming itself (the
+ * audit's WAI-9 found two of the four spending testimony in silence, and the
+ * commonest ending — the board closing a parked phase — leaving no line at
+ * all). Owned here since zero-touch-console phase 6, so the server's type is
+ * derived and a fifth licence is one edit.
+ *
+ */
+export const DECLARATION_CONSUMERS = Object.freeze(
+  /** @type {const} */ (['new-outcome', 'session-productive', 'board-closed', 'retry']),
+);
+
+/**
+ * @typedef {(typeof DECLARATION_CONSUMERS)[number]} DeclarationConsumer
+ */
+
+/**
  * What a watch ref's last probe saw.
  *
  * `unknown` is "I could not ask" — no `gh`, no auth, no oracle wired — and the
@@ -339,6 +366,20 @@ export const PRESENCE = Object.freeze(/** @type {const} */ (['live', 'ended', 'u
  */
 
 /**
+ * Who said a session ended — `sessions/registry.ts` `SessionRecord.endedBy`
+ * (zero-touch phase 16, REG-9). `hook` is a SessionEnd the session reported
+ * itself, at the moment it gave; `probe` is the registry finding the process
+ * gone, which is an INFERENCE: `endedAt` is then the last evidence of life
+ * (`lastSeen`) and `endedDetectedAt` the moment the probe noticed, and every
+ * page draws it differently from a reported end.
+ */
+export const PRESENCE_END_SOURCES = Object.freeze(/** @type {const} */ (['hook', 'probe']));
+
+/**
+ * @typedef {(typeof PRESENCE_END_SOURCES)[number]} PresenceEndSource
+ */
+
+/**
  * What is holding a queue entry up — `runner/scheduler.ts` `Holder.kind`.
  *
  */
@@ -350,6 +391,13 @@ export const HOLDER_KINDS = Object.freeze(
     'lock',
     /** A clock or a policy, not scope: a freeze, a window, a hold, a throttle. */
     'reserved',
+    /**
+     * A live Claude session the presence registry shows in this repository,
+     * holding no lock (zero-touch phase 16, REG-3) — the first minute of every
+     * hand session, before its claim. Named with its session id, pid and cwd;
+     * queued behind, never capped into a park, never force-released.
+     */
+    'session',
   ]),
 );
 
@@ -406,6 +454,328 @@ export const CONVERGE_TRIGGERS = Object.freeze(
 /**
  * @typedef {(typeof CONVERGE_TRIGGERS)[number]} ConvergeTrigger
  */
+
+/**
+ * What woke an automatic resume — the `trigger` on `phase.resume-automatic`
+ * (LFC-7). The convergence loop's own triggers, plus the two resumes that are
+ * not the loop's: a landed watch ref (`watch`) and the outcome inbox acting on
+ * a session's declaration (`inbox`). The event used to be called
+ * `phase.resume-at-boot`, and that name was true of 15 of its 25 lines: the
+ * rest were a docs change and a sweep.
+ * @type {readonly (ConvergeTrigger | 'watch' | 'inbox')[]}
+ */
+export const RESUME_TRIGGERS = Object.freeze([...CONVERGE_TRIGGERS, 'watch', 'inbox']);
+
+/** @typedef {(typeof RESUME_TRIGGERS)[number]} ResumeTrigger */
+
+/**
+ * WHICH automatic resume it was — the `path` on `phase.resume-automatic`. Six
+ * ways the console resumes a phase with no person in the loop, and until
+ * zero-touch-console phase 5 the shipped ask and its counter bounded two:
+ *
+ *   - `killed-lane` — a lane a console restart cut off, resumed on its own session.
+ *   - `overdue-wait` — a park whose clock went by while nothing ran, ruled on
+ *     (lateness journalled, refs checked, budget re-read) before it resumed.
+ *   - `rearm` — a lock-cap park whose lock is gone.
+ *   - `system-stop` — a run a console shutdown stopped between lanes.
+ *   - `inbox-partial` — a session nobody here started declared `partial`.
+ *   - `watch-landed` — a declared watch ref landed.
+ */
+export const RESUME_PATHS = Object.freeze(
+  /** @type {const} */ ([
+    'killed-lane',
+    'overdue-wait',
+    'rearm',
+    'system-stop',
+    'inbox-partial',
+    'watch-landed',
+  ]),
+);
+
+/** @typedef {(typeof RESUME_PATHS)[number]} ResumePath */
+
+/**
+ * Who parked a phase — `by` on the declaration and on `phase.waiting` (SLF-9).
+ * The session itself (`phase-outcome.sh` under a supervisor), a session nobody
+ * here started, through the inbox (`unsupervised`), the console's own stall
+ * watchdog (`watchdog`) — whose park is the console's inference, never the
+ * session's testimony, and spends a ledger of its own (WAI-5) — or the
+ * ladder (`ladder`, zero-touch-console phase 10): a `wait-window`, `poll-park`
+ * or `timed-park` rung the healer climbed on a stopped run, bounded by the
+ * rung caps and the same-rung-once rule rather than by the declared wait
+ * budget, and, like the watchdog's, shown but never budgeted.
+ */
+export const WAIT_AUTHORS = Object.freeze(
+  /** @type {const} */ (['session', 'watchdog', 'unsupervised', 'ladder']),
+);
+
+/** @typedef {(typeof WAIT_AUTHORS)[number]} WaitAuthor */
+
+/* ------------------------------------------------------------------ *
+ * The doors an automatic start comes through, and who opened one
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every code path that starts a `claude` process with no person in the loop —
+ * the sep-review audit's chapter 02 census (SLF-1). Fourteen doors: nine are
+ * `startRun` callers and five spawn a session some other way, and until this
+ * list existed no record named which one had opened — 324 of 326 `run.start`
+ * lines carried no `by` at all, and "the autopilot keeps invoking itself"
+ * needed three logs correlated by timestamp to attribute.
+ *
+ * The list is the VOCABULARY, and since zero-touch-console phase 7 every site
+ * says its word: `run.start` carries an `Actor` with a `door` always, a lint
+ * in `test/invariants.test.ts` fails any `startRun(` site naming none, and
+ * `test/vocab-owners.test.ts` holds the members to this one owner. Order is
+ * the census's: the nine `startRun` doors first, then the five that are not.
+ * A verb several doors share (`retryPhase`, `recoverPhase`) carries its
+ * CALLER's actor through rather than naming a door of its own — the door is
+ * where the decision to start was made, not where the start happens.
+ *
+ *   - `boot-readopt` — `open()` re-adopting a `queued` run at console boot.
+ *   - `wait-clock` — `armLimitResume`'s timer firing on a `waitUntil`.
+ *   - `converge-relaunch` — the convergence loop's `relaunch` verb, on any of
+ *     its triggers (`CONVERGE_TRIGGERS`).
+ *   - `converge-heal` — the convergence loop's `heal` verb climbing a ladder.
+ *   - `recovery-continue` — a ladder recovery resolved `fixed`, so the run
+ *     continues.
+ *   - `pty-continue` — a pty recovery agent exited `fixed`, so the run
+ *     continues.
+ *   - `watch-landed` — a watch ref landed, the drive settled, the run continues.
+ *   - `mcp-require-timeout` — the `require` park's clock ran out and the run
+ *     continues without the server.
+ *   - `outcome-inbox` — the unsupervised outcome inbox re-boarding a session
+ *     that declared `waiting-external` or `partial`.
+ *   - `mcp-health-probe` — the MCP registry's `claude --print ok` health probe.
+ *   - `mcp-boarding-preflight` — the per-boarding MCP preflight session.
+ *   - `auto-reviewer` — the automatic reviewer session over a finished phase.
+ *   - `ultrareview` — the cloud `ultrareview` child.
+ *   - `ladder-pty-agent` — the ladder's interactive pty agent.
+ */
+export const START_DOORS = Object.freeze(
+  /** @type {const} */ ([
+    'boot-readopt',
+    'wait-clock',
+    'converge-relaunch',
+    'converge-heal',
+    'recovery-continue',
+    'pty-continue',
+    'watch-landed',
+    'mcp-require-timeout',
+    'outcome-inbox',
+    'mcp-health-probe',
+    'mcp-boarding-preflight',
+    'auto-reviewer',
+    'ultrareview',
+    'ladder-pty-agent',
+  ]),
+);
+
+/** @typedef {(typeof START_DOORS)[number]} StartDoor */
+
+/**
+ * How an actor reached the console — the transport a verb arrived by. `api`
+ * is an HTTP request (a browser, a phone, a curl), `cli` the command line
+ * (`bin/btw`, `phase-console`), `signal` a process signal (SIGTERM, a launchd
+ * unload), `timer` one of the console's own clocks, `boot` the console
+ * starting up, `hook` a Claude Code hook body (a session's presence or
+ * permission traffic), and `event` something the console OBSERVED rather than
+ * scheduled — a recovery session exiting, a declaration landing in the
+ * outcome inbox. Phase 7 added `event` when it wired the doors: three of the
+ * fourteen are opened by an observation, and calling that a `timer` would
+ * have been the record lying about its own clock.
+ *
+ * For an HTTP request the transport is DERIVED, never supplied: the User-Agent
+ * class decides `api` against `cli`, the Host header decides `origin`, and the
+ * proxy's identity header fills `remoteUser` (`server/api/actor.ts`).
+ */
+export const ACTOR_VIAS = Object.freeze(
+  /** @type {const} */ (['api', 'cli', 'signal', 'timer', 'boot', 'hook', 'event']),
+);
+
+/** @typedef {(typeof ACTOR_VIAS)[number]} ActorVia */
+
+/**
+ * The one door that is not automatic: a person pressed Start, Retry, Recover
+ * or Continue. Deliberately NOT a member of `START_DOORS` — that list is the
+ * census of starts nobody asked for, and the per-instance start ceiling
+ * (`server/start-ceiling.ts`) counts exactly its members — but it is still a
+ * word the `door` field carries, because the lint that holds every
+ * `startRun(` site to a door has to accept the press sites too.
+ */
+export const OPERATOR_DOOR = 'operator';
+
+/** @typedef {StartDoor | typeof OPERATOR_DOOR} AnyDoor */
+
+/**
+ * Who classified a phase — the `by` on `phase.situation` and `phase.rung`
+ * (chapter 05 RCV-9: 1 249 of 1 332 situation lines and 132 of 170 rung lines
+ * carried none). One vocabulary for both writers: the runner's drive loop
+ * (`drive`), its outcome and closed-session arms (`outcome`, `closed`), and
+ * the convergence loop's healer (`heal`). The watch clock and the outcome
+ * inbox RESUME a phase and never classify one, so they have no word here —
+ * a member nobody writes is the shape LFC-5 spent a phase removing.
+ */
+export const CLASSIFIED_BY = Object.freeze(/** @type {const} */ (['drive', 'outcome', 'closed', 'heal']));
+
+/** @typedef {(typeof CLASSIFIED_BY)[number]} ClassifiedBy */
+
+/**
+ * The one attribution shape every verb that acts on a run records —
+ * `run.start`, `run.stop-requested`, `shutdown.requested`, `restart.requested`,
+ * `run.account-switch`, `phase.situation`, `phase.rung`, `phase.waiting` — so
+ * that "who did this, from where, through which door" is one question with one
+ * answer wherever it is asked (chapter 02 SLF-1, chapter 01 LFC-6).
+ *
+ *   - `by` — who: `operator`, `console`, `watchdog`, `autopilot`, a session id.
+ *   - `via` — the transport, one of `ACTOR_VIAS`.
+ *   - `origin` — where it came from: a remote address, a hostname, `local`, or
+ *     the timer's or hook's own name.
+ *   - `remoteUser` — the authenticated remote user when the access layer knows
+ *     one, else `null` — never omitted, so a record with no user is
+ *     distinguishable from a record written before the field.
+ *   - `door` — for a start, one of `START_DOORS`, or `OPERATOR_DOOR` when a
+ *     person pressed it.
+ *   - `trigger` — what fired the door: a converge trigger, a timer's name, a
+ *     watch ref, an inbox file.
+ *   - `guard` — the predicate that let it through, by name.
+ *   - `counter` — the bound it spent (`MAX_BOOT_RESUMES`, a rung cap, the
+ *     per-instance ceiling), with the count after this start.
+ *
+ * The field names are ALSO an array, not only a typedef, because a typedef in
+ * a `.js` file is invisible to a source scan and this shape is a vocabulary
+ * with one owner that a test can hold emitters to.
+ *
+ * @typedef {{ by: string, via: ActorVia, origin: string, remoteUser: string|null,
+ *             door?: AnyDoor, trigger?: string, guard?: string, counter?: string }} Actor
+ */
+export const ACTOR_FIELDS = Object.freeze(
+  /** @type {const} */ (['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter']),
+);
+
+/* ------------------------------------------------------------------ *
+ * How a session ended, what it was for, and where its caps came from
+ * ------------------------------------------------------------------ */
+
+/**
+ * Who ended a `claude -p` session — the `endedBy` every `phase.session` record
+ * carries (the sep-review audit's chapter 03, SES-1 and SES-11).
+ *
+ * The CLI books a session's turns and dollars on its `result` message, and
+ * until zero-touch-console phase 4 every ending the console caused was a bare
+ * SIGTERM — which leaves the turn unfinished and writes no `result` at all. In
+ * the audit's six plans 27 of 88 records read 0 turns and $0 for 18.99 hours of
+ * work, and nothing said why. A record now names its ending instead of leaving
+ * an absent `subtype` to imply one:
+ *
+ *   - `exit` — nothing in the console ended it: the CLI finished its turn and
+ *     left, failed on its own, or never started.
+ *   - `stop` — an operator's Stop, of the whole run or of this lane.
+ *   - `checkpoint` — the console checkpointed a live lane to resume it later: a
+ *     freeze past its escalation clock, a usage wall under `pause`.
+ *   - `shutdown` — the console shut down or restarted with the lane live.
+ *   - `account-switch` — checkpointed to carry on under another account.
+ *   - `watchdog` — the runner's liveness remedies: a silent-lane recycle, a
+ *     retry-storm recycle or park, a stall park, an external-wait park.
+ *   - `spawn-watchdog` — `spawn.ts`'s own clocks, which need no runner behind
+ *     them: the first-event backstop and the init→first-result bound.
+ */
+export const ENDED_BY = Object.freeze(
+  /** @type {const} */ ([
+    'exit',
+    'stop',
+    'checkpoint',
+    'shutdown',
+    'account-switch',
+    'watchdog',
+    'spawn-watchdog',
+  ]),
+);
+
+/** @typedef {(typeof ENDED_BY)[number]} EndedBy */
+
+/**
+ * What a spawned session was for — `phase.session.mode`. Every site under
+ * `server/runner/` that starts a `claude -p` goes through one door
+ * (`RunnerBase.spawnSession`) and names its purpose with one of these, so the
+ * ledger's spend reads per purpose instead of being lumped into the phase — and
+ * a session no census could see (a resume wrote three fields; a closeout, a QA
+ * round, a PR session and the reviewer wrote none) has a record like the rest.
+ *
+ *   - `phase` — a phase attempt: a fresh boot, a wait-resume, a ladder brief, a
+ *     checkpoint resume.
+ *   - `resume` — `resumeWithInstruction`: the phase's own session resumed with
+ *     an operator's or a rung's instruction.
+ *   - `repair` — a repair session briefed for one recovery class.
+ *   - `qa` — a QA round: the finish-time verdict or a `qa-recover` round.
+ *   - `closeout` — the phase's own session resumed to finish its paperwork.
+ *   - `pr` — the session that opens the run's pull request or settles its merge
+ *     queue.
+ *   - `review` — the automatic reviewer over a finished phase.
+ */
+export const SESSION_MODES = Object.freeze(
+  /** @type {const} */ (['phase', 'resume', 'repair', 'qa', 'closeout', 'pr', 'review']),
+);
+
+/** @typedef {(typeof SESSION_MODES)[number]} SessionMode */
+
+/**
+ * Where a session's turn cap or dollar cap came from — the `source` beside
+ * `phase.session.maxTurns` and `.maxBudgetUsd` (SES-8, LFC-8). Every spawn
+ * carries both `--max-turns` and `--max-budget-usd`, and a spent cap is only
+ * distinguishable from a crash when the record says which policy set it:
+ *
+ *   - `run` — the run's own `phaseBudgetUsd`, whole or a quarter of it.
+ *   - `size` — the phase's `Size:` in the plan, through the console's
+ *     per-size defaults.
+ *   - `closeout` — `CLOSEOUT_MAX_TURNS`: a closeout, a wait-resume, a resume
+ *     with an instruction, a PR or review session.
+ *   - `repair` — `REPAIR_MAX_TURNS`.
+ *   - `qa-round` — a `qa-recover` round's own budget.
+ *   - `raise` — doubled after the CLI reported the cap spent and the session
+ *     was resumed to carry on.
+ *   - `caller` — a number handed to `spawnClaude` with no source named; no
+ *     runner spawn writes it.
+ *   - `spawn-default` — nothing was handed in, so `spawn.ts` applied its own
+ *     floor; no runner spawn writes it either.
+ */
+export const CAP_SOURCES = Object.freeze(
+  /** @type {const} */ ([
+    'run',
+    'size',
+    'closeout',
+    'repair',
+    'qa-round',
+    'raise',
+    'caller',
+    'spawn-default',
+  ]),
+);
+
+/** @typedef {(typeof CAP_SOURCES)[number]} CapSource */
+
+/**
+ * What the console decided about an in-session usage warning —
+ * `run.usage-decision.action` (SES-9). The CLI's `rate_limit_event` says
+ * `allowed_warning` with the window's utilization long before it says
+ * `rejected`; past the alert threshold the run's `onLimit` picks one of these:
+ *
+ *   - `throttle` — `wait` with automatic account switching off: hold new work
+ *     for the window.
+ *   - `switch` — `switch`, or `wait` with automatic switching on: move to an
+ *     account with headroom.
+ *   - `park` — `pause`: checkpoint the lane for a person.
+ *   - `none` — nothing can act on it (no other account, a lane standing down).
+ *
+ * Journalled with `enacted: false` until zero-touch-console phase 8's account
+ * helper carries the action out: the record exists so a warning at 99 % stops
+ * being a line nothing reads.
+ */
+export const USAGE_DECISION_ACTIONS = Object.freeze(
+  /** @type {const} */ (['throttle', 'switch', 'park', 'none']),
+);
+
+/** @typedef {(typeof USAGE_DECISION_ACTIONS)[number]} UsageDecisionAction */
 
 /* ------------------------------------------------------------------ *
  * The six policy words an operator sets
@@ -514,7 +884,7 @@ export const RUN_LIFECYCLE_STATES = Object.freeze(
 /** @typedef {(typeof RUN_LIFECYCLE_STATES)[number]} RunLifecycleState */
 
 /**
- * What a PHASE RECORD is. Nine words against `PHASE_STATUSES`' twelve.
+ * What a PHASE RECORD is. Eight words against `PHASE_STATUSES`' twelve.
  *
  * `queued` folds into `waiting` (its reason is scope), `gated` and
  * `awaiting-verification` into `parked` (their reason is a decision somebody
@@ -700,9 +1070,14 @@ export function runLifecycle(run) {
   // A word the vocabulary does not hold folds to `waiting`, and the choice is
   // forced rather than aesthetic: `status-vocab.js` paints an unrecognised word
   // as `UNKNOWN_STATE`, which IS `waiting`, so any other fallback would repaint
-  // it. There is live data that needs this — two run files on this machine read
-  // `status: "complete"`, a word `RUN_STATUSES` has never held — and a fold
-  // that turned those red would be a regression shipped as a cleanup.
+  // it. (This comment used to cite "two run files on this machine reading
+  // `status: "complete"`" as live data needing the fold. Under the loader's own
+  // pattern — `run-<8 hex>.json`, `state.ts` `listRuns` — no such file exists;
+  // the three that say `complete` are `run-<id>-p<N>-outcome.json`
+  // declarations, where `complete` is a legal `OUTCOME_STATUSES` member, and
+  // `listRuns` never loads them. The fold stands on the paint argument alone: a
+  // justification citing live data has to cite files the loader accepts —
+  // LFC-5, LFC-10.)
   const state = RUN_STATE_FOLD[status] ?? 'waiting';
   /** @type {RunLifecycle} */
   const lifecycle = { state };
@@ -735,7 +1110,8 @@ export function runLifecycle(run) {
           recorded === 'external' ||
             recorded === 'usage-limit' ||
             recorded === 'scope' ||
-            recorded === 'schedule'
+            recorded === 'schedule' ||
+            recorded === 'person'
           ? recorded
           : Object.values(run?.phases ?? {}).some((record) => record?.status === 'waiting')
             ? 'external'

@@ -136,19 +136,27 @@ export function consoleKeychainService(accountId: string): string {
   return `phase-console-account-${accountId}`;
 }
 
-function tokenFile(accountId: string): string {
-  return join(ACCOUNTS_DIR, accountId, 'token');
+function tokenFile(accountId: string, dir: string = ACCOUNTS_DIR): string {
+  return join(dir, accountId, 'token');
 }
 
 export class Credentials {
   private readonly exec: Exec;
   private readonly platform: NodeJS.Platform;
   private readonly home: string;
+  /** Where this instance's token files and profile logins live — another console's, for a process reading its registrations. */
+  private readonly accountsDir: string;
 
-  constructor(exec: Exec = realExec, platform: NodeJS.Platform = process.platform, home: string = homedir()) {
+  constructor(
+    exec: Exec = realExec,
+    platform: NodeJS.Platform = process.platform,
+    home: string = homedir(),
+    accountsDir: string = ACCOUNTS_DIR,
+  ) {
     this.exec = exec;
     this.platform = platform;
     this.home = home;
+    this.accountsDir = accountsDir;
   }
 
   /* ---------------- token accounts: secrets we own ---------------- */
@@ -159,8 +167,8 @@ export class Credentials {
       return;
     }
     if (/[\r\n]/.test(token)) throw new Error(SECRET_MUST_BE_ONE_LINE);
-    mkdirSync(join(ACCOUNTS_DIR, accountId), { recursive: true, mode: 0o700 });
-    writeFileSync(tokenFile(accountId), `${token}\n`, { encoding: 'utf8', mode: 0o600 });
+    mkdirSync(join(this.accountsDir, accountId), { recursive: true, mode: 0o700 });
+    writeFileSync(tokenFile(accountId, this.accountsDir), `${token}\n`, { encoding: 'utf8', mode: 0o600 });
   }
 
   async readToken(accountId: string): Promise<string | null> {
@@ -175,7 +183,7 @@ export class Credentials {
       }
     }
     try {
-      return readFileSync(tokenFile(accountId), 'utf8').trim() || null;
+      return readFileSync(tokenFile(accountId, this.accountsDir), 'utf8').trim() || null;
     } catch {
       return null;
     }
@@ -188,7 +196,7 @@ export class Credentials {
       } catch { /* never stored, or already gone — same outcome */ }
       return;
     }
-    try { unlinkSync(tokenFile(accountId)); } catch { /* same */ }
+    try { unlinkSync(tokenFile(accountId, this.accountsDir)); } catch { /* same */ }
   }
 
   /**
@@ -220,11 +228,19 @@ export class Credentials {
    * account must NOT also set `CLAUDE_CONFIG_DIR`: the token outranks the
    * stored login in the CLI's precedence, and the default config dir is what
    * keeps its session transcripts portable to and from the machine login.
+   *
+   * **A token's reach is the whole child process tree** (ACT-12). The
+   * environment is inherited by everything the CLI launches — every stdio MCP
+   * server, `npx -y <third-party>@latest` among them — and there is no route to
+   * the CLI its grandchildren cannot read. So the runner scopes what a token
+   * account's run may attach (`runner-attempt.ts` `tokenScoped`: only the
+   * stdio servers the plan declares; remote transports inherit nothing) and
+   * journals it as `run.token-scope`.
    */
   async envFor(account: AccountMeta | null): Promise<NodeJS.ProcessEnv | null> {
     if (!account || account.kind === 'default') return null;
     if (account.kind === 'profile') {
-      return { CLAUDE_CONFIG_DIR: profileConfigDir(account.id) };
+      return { CLAUDE_CONFIG_DIR: profileConfigDir(account.id, this.accountsDir) };
     }
     const token = await this.readToken(account.id);
     if (!token) {
@@ -236,8 +252,29 @@ export class Credentials {
 
   /** The config dir a child under this env would use — for transcript porting. */
   configDirFor(account: AccountMeta | null): string {
-    if (account?.kind === 'profile') return profileConfigDir(account.id);
+    if (account?.kind === 'profile') return profileConfigDir(account.id, this.accountsDir);
     return join(this.home, '.claude');
+  }
+
+  /**
+   * WHERE this account's credential lives — the keychain item on macOS, the
+   * file elsewhere — spelled as a string and never read. It is the input to the
+   * machine-wide learned store's fingerprint (`learned.ts`): stable across
+   * consoles and restarts, because two instances registering the machine login
+   * as `default` name the same item, while two profiles are two directories and
+   * therefore two credentials. A token account's locator is OUR keychain
+   * service (or its 0600 file), which is what the secret is stored under.
+   */
+  credentialLocator(account: AccountMeta | null): string {
+    if (account?.kind === 'token') {
+      return this.platform === 'darwin'
+        ? `keychain:${consoleKeychainService(account.id)}`
+        : `file:${tokenFile(account.id, this.accountsDir)}`;
+    }
+    const configDir = account?.kind === 'profile' ? profileConfigDir(account.id, this.accountsDir) : null;
+    return this.platform === 'darwin'
+      ? `keychain:${claudeKeychainService(configDir)}`
+      : `file:${join(configDir ?? join(this.home, '.claude'), '.credentials.json')}`;
   }
 
   /* ---------------- the CLI's credentials: read-only ---------------- */
@@ -275,17 +312,22 @@ export class Credentials {
    * The machine login keeps that file at `~/.claude.json`; a redirected
    * profile keeps it inside its config dir.
    */
-  readIdentity(configDir: string | null): { email?: string; org?: string } | null {
+  readIdentity(configDir: string | null): { email?: string; org?: string; orgId?: string } | null {
     const file = configDir ? join(configDir, '.claude.json') : join(this.home, '.claude.json');
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as {
-        oauthAccount?: { emailAddress?: string; organizationName?: string };
+        oauthAccount?: { emailAddress?: string; organizationName?: string; organizationUuid?: string };
       };
       const account = parsed?.oauthAccount;
       if (!account) return null;
       return {
         ...(typeof account.emailAddress === 'string' && account.emailAddress ? { email: account.emailAddress } : {}),
         ...(typeof account.organizationName === 'string' && account.organizationName ? { org: account.organizationName } : {}),
+        // The same value `claude auth status` reports as `orgId` (verified
+        // equal on 2.1.270) — the key the breaker hangs an entitlement on,
+        // readable without a probe. It is a machine-wide learned fact, never
+        // a view field: the browser sees it hashed.
+        ...(typeof account.organizationUuid === 'string' && account.organizationUuid ? { orgId: account.organizationUuid } : {}),
       };
     } catch {
       return null;

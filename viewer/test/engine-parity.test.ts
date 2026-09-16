@@ -38,7 +38,9 @@ import { run, readMemoryBlock, readSessionPlan, type EngineResult, type PhaseSta
 import { loadGateVocab, gateKindOf } from '../server/analysis/gates.ts';
 import { parseQaRounds, parseTestStatus } from '../server/parse/folder.ts';
 import { nextQaRound } from '../server/qa-round.ts';
-import { parsePlan, mcpServersFor } from '../server/parse/plan.ts';
+import { parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor } from '../server/parse/plan.ts';
+import { mergeDecisions, formatDecisionsTsv, parseDecisionsTsv } from '../shared/decisions-model.js';
+import { readDecisions, readCredentials, readWaitBudget, readWaitsOn } from '../server/engine.ts';
 import { extractCommands } from '../server/runner/verify.ts';
 import { scopeOfRow, formatScope } from '../shared/scope.js';
 
@@ -140,6 +142,26 @@ function fixtureCorpus(): Corpus & { slugs: string[]; cleanup: () => void } {
     mkdirSync(dir, { recursive: true });
     const name = `phase-${String(phase).padStart(2, '0')}-synthesized.md`;
     writeFileSync(join(dir, name), handoffBody(slug, phase, status));
+  }
+  // The decision manifest's mutable twin, in the exact shape decisions.sh
+  // writes, for the one fixture that carries a `## Decisions` table: a
+  // plan-wide row that REPLACES the plan's, a phase-scoped row, and a row the
+  // plan does not have — so the merge, not just the parse, is what parity
+  // compares.
+  if (slugs.includes('decisions')) {
+    const dir = join(root, 'docs', 'handoffs', 'decisions');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'decisions.md'), [
+      '# Decisions — decisions', '',
+      '<!-- written by scripts/decisions.sh; the plan\'s `## Decisions` table is the base -->', '',
+      '## Decisions', '',
+      '| key | value | owner | state | blocking | source | evidence | phase |',
+      '|---|---|---|---|---|---|---|---|',
+      '| `credentials` | `gh` only — `npm-token` retired | operator | answered | yes | run | decisions.sh | — |',
+      '| `waits` | bounded at 30m | dev-lead | answered | yes | run | decisions.sh | 2 |',
+      '| `stop` | halt-on-everything | operator | answered | no | ruling | ruling r-17 | — |',
+      '',
+    ].join('\n'));
   }
   return {
     name: 'fixtures', root, live: false, slugs,
@@ -439,6 +461,148 @@ test('the two parsers agree about a phase\'s MCP servers', async () => {
   });
 });
 
+/* ------------------------------------------------------------------ *
+ * The decision manifest (zero-touch-console P3, chapter 13 §1.1): the plan's
+ * `## Decisions` table with the `decisions.md` twin merged over it. Compared
+ * as the TSV BYTES the engine prints against what the shared merge formats —
+ * the same line phase 11's prelude and the boot prompt read.
+ * ------------------------------------------------------------------ */
+
+test('the two engines agree about the decision manifest — plan-wide, and resolved per phase', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    let carrying = 0;
+    for (const record of samplePlans(corpus)) {
+      const plan = record.plan!;
+      const twin = record.decisionsTwin;
+      const planWide = await engine(corpus, [record.slug, '--decisions'], `${record.slug} --decisions`);
+      const fromJs = formatDecisionsTsv(mergeDecisions(plan.decisions, twin));
+      if (planWide !== fromJs) problems.push(`${record.slug}: decisions JS\n${fromJs}\n  vs engine\n${planWide}`);
+      if (planWide) carrying++;
+      // The engine's TSV read back through readDecisions is the merge, row for row.
+      const parsed = readDecisions({ code: 0, stdout: planWide, stderr: '', ms: 0, timedOut: false }).rows;
+      const expected = mergeDecisions(plan.decisions, twin).map((r) => ({ ...r, evidence: '', phase: null }));
+      assert.deepEqual(parsed, expected, `${record.slug}: readDecisions() is not the merge`);
+      assert.deepEqual(parseDecisionsTsv(planWide), parsed);
+      await forEachPhase(plan.graph.map((row) => ({ slug: record.slug, plan, phase: row.phase })), async ({ slug, phase }) => {
+        const perPhase = await engine(corpus, [slug, '--decisions', String(phase)], `${slug} --decisions ${phase}`);
+        const js = formatDecisionsTsv(mergeDecisions(plan.decisions, twin, phase));
+        if (perPhase !== js) problems.push(`${slug} p${phase}: decisions JS\n${js}\n  vs engine\n${perPhase}`);
+      });
+    }
+    assert.deepEqual(problems, [], `${corpus.name} decision-manifest mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) assert.ok(carrying >= 1, 'the fixture corpus must carry at least one manifest, or this proves nothing');
+  });
+});
+
+test('the two engines agree about a phase\'s credentials, credential policy and the accounts line', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const [creds, policy] = await Promise.all([
+        engine(corpus, [slug, '--credentials', String(phase)], `${slug} p${phase} --credentials`),
+        engine(corpus, [slug, '--credential-policy', String(phase)], `${slug} p${phase} --credential-policy`),
+      ]);
+      const jsCreds = credentialsFor(plan, phase).join(', ');
+      if (creds !== jsCreds) problems.push(`${slug} p${phase}: credentials JS "${jsCreds}" vs engine "${creds}"`);
+      assert.deepEqual(readCredentials({ code: 0, stdout: creds, stderr: '', ms: 0, timedOut: false }), credentialsFor(plan, phase));
+      const jsPolicy = credentialPolicyFor(plan, phase) ?? '';
+      if (policy !== jsPolicy) problems.push(`${slug} p${phase}: credential policy JS "${jsPolicy}" vs engine "${policy}"`);
+      // …and the phase's `Person-check:` word (phase 11, ZTD-6).
+      const check = await engine(corpus, [slug, '--person-check', String(phase)], `${slug} p${phase} --person-check`);
+      const jsCheck = personCheckFor(plan, phase) ?? '';
+      if (check !== jsCheck) problems.push(`${slug} p${phase}: person-check JS "${jsCheck}" vs engine "${check}"`);
+    });
+    for (const record of samplePlans(corpus)) {
+      const plan = record.plan!;
+      // The plan's `QA exhausted:` word (phase 11, ZTD-9).
+      const exhausted = await engine(corpus, [record.slug, '--qa-exhausted'], `${record.slug} --qa-exhausted`);
+      const jsExhausted = plan.sessionBudget.qaExhausted ?? '';
+      if (exhausted !== jsExhausted) problems.push(`${record.slug}: QA exhausted JS "${jsExhausted}" vs engine "${exhausted}"`);
+      const accounts = await engine(corpus, [record.slug, '--accounts'], `${record.slug} --accounts`);
+      // `engine()` trims the whole stdout, which eats the tab after an id
+      // with no minimum on the LAST line; compare line by line, each trimmed.
+      const norm = (t: string) => t.split('\n').map((l) => l.trimEnd()).join('\n');
+      const js = plan.sessionBudget.accounts
+        .map((a) => `${a.id}\t${a.minHeadroom === undefined ? '' : a.minHeadroom}`).join('\n');
+      if (norm(accounts) !== norm(js)) problems.push(`${record.slug}: accounts JS "${js}" vs engine "${accounts}"`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} credential mismatches:\n  ${problems.join('\n  ')}`);
+    // The fixture spells all three words and an owner, so the agreement above is not vacuous.
+    if (!corpus.live) {
+      const store = new Store(checkRoot(corpus.root));
+      store.scan();
+      const plan = store.get('credentials')!.plan!;
+      assert.equal(plan.sessionBudget.qaExhausted, 'waive');
+      assert.equal(personCheckFor(plan, 1), undefined);
+      assert.equal(personCheckFor(plan, 2), 'allow');
+      assert.equal(personCheckFor(plan, 3), 'dev-lead');
+      assert.equal(personCheckFor(plan, 4), 'halt');
+    }
+  });
+});
+
+test('the console tells the engine which credentials it holds and which accounts it registered, and F15 advises without failing (ACT-9, phase 11)', async () => {
+  const fixtures = fixtureCorpus();
+  try {
+    // The fixture names `gh` and `claude-login`, and `default:20`, `work:10`, `spare`.
+    const told = await run({ ...optsFor(fixtures), credentials: ['gh'], accounts: ['default'] }, 'phase-graph.sh', ['credentials', '--lint']);
+    assert.equal(told.code, 0, `lint must stay OK: ${told.stderr}`);
+    assert.match(told.stdout, /LINT OK/);
+    assert.match(told.stderr, /F15 plan: credential\(s\) the console does not hold: claude-login/);
+    assert.match(told.stderr, /F15 plan: account `work` is not registered on this console/);
+    assert.match(told.stderr, /F15 plan: account `spare` is not registered on this console/);
+    // Everything held and registered: nothing to advise.
+    const held = await run({ ...optsFor(fixtures), credentials: ['gh', 'claude-login'], accounts: ['default', 'work', 'spare'] }, 'phase-graph.sh', ['credentials', '--lint']);
+    assert.equal(held.code, 0);
+    assert.doesNotMatch(held.stderr, /F15 plan: (credential|account)/);
+    // Nothing said (a bare install): the check is off, exactly as `PE_MCP_SERVERS` absent turns its half off.
+    const bare = await run(optsFor(fixtures), 'phase-graph.sh', ['credentials', '--lint']);
+    assert.equal(bare.code, 0);
+    assert.doesNotMatch(bare.stderr, /F15 plan: (credential|account)/);
+    // Set-but-empty is a real answer: a console holding nothing advises on everything named.
+    const empty = await run({ ...optsFor(fixtures), credentials: [], accounts: [] }, 'phase-graph.sh', ['credentials', '--lint']);
+    assert.equal(empty.code, 0);
+    assert.match(empty.stderr, /F15 plan: credential\(s\) the console does not hold: gh, claude-login/);
+    assert.match(empty.stderr, /account `default` is not registered/);
+  } finally {
+    fixtures.cleanup();
+  }
+});
+
+test('the two engines agree about a phase\'s wait budget, its source, and the refs it waits on', async () => {
+  // The console reads both through the engine (`RunnerBase.waitBudgetOf`), and
+  // the page reads the plan through the JS parser: a phase that the engine
+  // allows 45 minutes and the page says may wait 12 hours is the silent-clamp
+  // defect again, one layer up.
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    let carrying = 0;
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const [budget, refs] = await Promise.all([
+        engine(corpus, [slug, '--wait-budget', String(phase)], `${slug} p${phase} --wait-budget`),
+        engine(corpus, [slug, '--waits-on', String(phase)], `${slug} p${phase} --waits-on`),
+      ]);
+      const js = waitBudgetFor(plan, phase);
+      const jsLine = js ? `${js.minutes}\t${js.source}` : '';
+      if (budget !== jsLine) problems.push(`${slug} p${phase}: wait budget JS "${jsLine}" vs engine "${budget}"`);
+      assert.deepEqual(readWaitBudget({ code: 0, stdout: budget, stderr: '', ms: 0, timedOut: false }), js);
+      const jsRefs = waitsOnFor(plan, phase);
+      if (refs !== jsRefs.join('\n')) problems.push(`${slug} p${phase}: waits-on JS ${JSON.stringify(jsRefs)} vs engine ${JSON.stringify(refs)}`);
+      assert.deepEqual(readWaitsOn({ code: 0, stdout: refs, stderr: '', ms: 0, timedOut: false }), jsRefs);
+      if (js || jsRefs.length) carrying += 1;
+    });
+    for (const record of samplePlans(corpus)) {
+      const planWide = await engine(corpus, [record.slug, '--wait-budget'], `${record.slug} --wait-budget`);
+      const js = waitBudgetFor(record.plan!);
+      const jsLine = js ? `${js.minutes}\t${js.source}` : '';
+      if (planWide !== jsLine) problems.push(`${record.slug}: plan wait budget JS "${jsLine}" vs engine "${planWide}"`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} wait-budget mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) assert.ok(carrying >= 4, 'the fixture corpus must carry the waits fixture, or this proves nothing');
+  });
+});
+
 test('the two parsers agree about a phase\'s MCP policy — including silence', async () => {
   // Silence is the case worth pinning. Three states (`require`, `continue`,
   // nothing) collapse to two the moment one parser decides absence means
@@ -699,8 +863,8 @@ test('a phase F14 accepts has commands the preflight can run', async () => {
         // is a declared-but-unreadable one, and a phase with no bullet at all
         // is a different warning both sides already agree about.
         if (detail?.verification === undefined) continue;
-        const warned = new RegExp(`F14[^\\n]*phase ${row.phase}\\b`).test(warnings)
-          || new RegExp(`F14 phase ${row.phase}:`).test(warnings);
+        // F14 is a GATE since 5.0.0 and names itself in the issue line.
+        const warned = new RegExp(`phase ${row.phase}: verification-empty-open`).test(warnings);
         // READ, not RUN. `extractCommands` also REFUSES what it will not
         // execute — an unbounded `gh run watch`, a mutating `task deploy` — and
         // those land in `notRun` with a reason. That is a deliberate difference
@@ -863,6 +1027,7 @@ test('the fixture corpus is real, and covers the divergences this suite exists f
     'qa-per-phase.md',            // the per-phase QA regime
     'skilled.md', 'unbolded.md',  // the skills line, bolded and not
     'nested-verification.md', 'sibling-verification.md',  // both §Verification shapes
+    'decisions.md', 'credentials.md',  // the decision manifest (with an undeclared gate) and the credential directives
   ]) {
     assert.ok(files.includes(required), `fixture ${required} is missing from the parity corpus`);
   }

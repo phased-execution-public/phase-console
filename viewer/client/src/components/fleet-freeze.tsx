@@ -59,7 +59,7 @@ export function FleetFrozenBanner() {
         <strong>This console is frozen.</strong> Every running session is stopped where it stands and nothing
         new will start — no queued phase, no wait, no recovery.
         {fleet.by ? ` Frozen by ${fleet.by}` : ' Frozen'}
-        {since ? ` ${since}` : ''}. Thawing puts the whole fleet back exactly where it was.
+        {since ? ` ${since}` : ''}. Thawing puts every run of this console back exactly where it was.
       </div>
       {state?.allowRun && (
         <Button size="sm" disabled={busy != null} onClick={() => void thaw()}>
@@ -115,7 +115,7 @@ export function FleetFreezeControl({ confirm = false }: { confirm?: boolean } = 
       </AlertDialogTrigger>
       <AlertDialogContent
         title="Freeze the whole console?"
-        description="Every running session is stopped where it stands and nothing new starts — no queued phase, no wait, no recovery. Nothing is lost: thawing puts the fleet back exactly where it was, mid-token."
+        description="Every running session is stopped where it stands and nothing new starts — no queued phase, no wait, no recovery. Nothing is lost: thawing puts every run back exactly where it was, mid-token."
         confirmLabel="Freeze all"
         onConfirm={() => void freeze()}
       />

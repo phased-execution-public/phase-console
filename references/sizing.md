@@ -5,6 +5,7 @@ Contents: [The real cost model](#the-real-cost-model-why-fresh-sessions-help--an
 [Step 2 — pick the session budget](#step-2--pick-the-session-budget-from-the-model) ·
 [Step 3 — right-size and batch](#step-3--right-size-and-batch) ·
 [Size annotation](#size-annotation-optional-drives-the-engine) ·
+[What a size caps](#what-a-size-caps-under-phase-console) ·
 [Keep the session lean](#keep-the-session-lean-so-the-budget-goes-further)
 
 This is the source of truth for **how big one session should be** (the prose + rationale). The **machine
@@ -175,6 +176,30 @@ A phase estimated **above the session budget** is too big for one session — sp
 models that's ~200K of weight; on Haiku ~40K, so an `L` phase never fits a Haiku session). Phases with
 **no** `Size:` tag are treated as `M`. These map to token weights `S=15K`, `M=40K`, `L=90K` for batch
 math (kept in sync with `scripts/phase-graph.sh` via `scripts/sizing.env`).
+
+### What a size caps under Phase Console
+
+A phase's `Size:` also caps the session the console spawns for it. Every session carries both a dollar
+and a turn cap (`--max-budget-usd`, `--max-turns`), and when the run set no `phaseBudgetUsd` a phase
+session's pair comes from its size — `SESSION_CAPS_BY_SIZE`:
+
+| Size | Dollars | Turns |
+|---|---|---|
+| `S` | $25 | 150 |
+| `M` (and an unreadable size) | $60 | 300 |
+| `L` | $120 | 600 |
+
+A run's `phaseBudgetUsd` replaces the dollars when it sets one. The sessions around a phase — a closeout,
+a QA round, a PR session, the reviewer — get a quarter of the same dollars (never under $1; a QA round's
+own budget, when the run set one, wins) and 60 turns (`CLOSEOUT_MAX_TURNS`); a repair gets 90
+(`REPAIR_MAX_TURNS`). A cap that bites is not a failure: the
+same session is resumed with that cap doubled (`raiseCap`). The numbers are about three times the most
+any measured session spent, so they bound a runaway without cutting a long phase.
+
+They are a **runner constant**, not a `sizing.env` key: `viewer/server/runner/session-record.ts` owns
+them, and `capsFor` there reads them at every spawn. F5 is unchanged — `scripts/sizing.env` stays the
+one source for the weights and budgets that decide batching; a session's spending cap is the console's
+policy, and nothing in the engine batches by it.
 
 ### Let the engine propose batches
 

@@ -24,12 +24,24 @@ the default-to-M behavior). Drives --size and --session-plan batching.
 
 ### Phase 1 — a
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 2 — b
 - **Size:** S
+- **Verification:**
+  - `true`
+
+### Phase 3 — c
+- **Verification:**
+  - `true`
 
 ### Phase 4 — d
 - **Size:** L
+- **Verification:**
+  - `true`
 
 ### Phase 5 — e
 - **Size:** S
+- **Verification:**
+  - `true`

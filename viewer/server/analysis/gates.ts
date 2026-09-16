@@ -15,7 +15,19 @@ import { GATE_KINDS } from '../../shared/plan-vocab.js';
 
 export type GateKind = (typeof GATE_KINDS)[number];
 
-export type GateVocab = { types: string[]; human: string[]; ai: string[] };
+export type GateVocab = {
+  types: string[];
+  human: string[];
+  ai: string[];
+  /**
+   * `GATE_DEFAULT` — the TYPE a *(GATED)* heading with no Gate-check line reads
+   * as. `ai` since 5.0.0 (it was `human`): the sep-review audit's ZTD-5 found
+   * 84 of 143 gated headings in the estate demanding a person, 15 of them by
+   * that fallback alone. The lint still fails such a heading (F24); the
+   * default only answers for the board and the Gate card.
+   */
+  default: string;
+};
 
 /**
  * What this module answers when `scripts/gates.env` cannot be read — a packed
@@ -32,6 +44,7 @@ export const GATES_ENV_FALLBACK: GateVocab = {
   types: ['phase', 'phases', 'plan', 'cmd', 'date', 'deadline', 'by', 'manual', 'ai'],
   human: ['manual'],
   ai: ['ai'],
+  default: 'ai',
 };
 
 const FALLBACK = GATES_ENV_FALLBACK;
@@ -54,6 +67,7 @@ export function loadGateVocab(scriptsDir: string): GateVocab {
       types: tokens(values.GATE_TYPES) ?? FALLBACK.types,
       human: tokens(values.GATE_TYPES_HUMAN) ?? FALLBACK.human,
       ai: tokens(values.GATE_TYPES_AI) ?? FALLBACK.ai,
+      default: tokens(values.GATE_DEFAULT)?.[0] ?? FALLBACK.default,
     };
   } catch {
     return { ...FALLBACK };
@@ -61,16 +75,16 @@ export function loadGateVocab(scriptsDir: string): GateVocab {
 }
 
 /**
- * Mirrors the engine's `gate_kind`: human for `manual`, for a *(GATED)* phase
- * with no Gate-check line at all, and for unknown types (fail-safe); ai for
- * the `ai` type; auto for the self-evaluating rest; none when not gated.
+ * Mirrors the engine's `gate_kind`: human for `manual` and for unknown types
+ * (fail-safe — and a lint failure); a *(GATED)* phase with no Gate-check line
+ * at all reads as `vocab.default` (`ai`, gates.env `GATE_DEFAULT`); ai for the
+ * `ai` type; auto for the self-evaluating rest; none when not gated.
  * Deliberately case-sensitive on the type token, exactly like the engine —
  * `Date 2026-01-01` is an unknown type there, so it must be one here too.
  */
 export function gateKindOf(gateCheck: string | undefined, gated: boolean, vocab: GateVocab): GateKind {
   if (!gated) return 'none';
-  const type = (gateCheck ?? '').trim().split(/\s+/)[0] ?? '';
-  if (!type) return 'human';
+  const type = (gateCheck ?? '').trim().split(/\s+/)[0] || vocab.default;
   if (vocab.human.includes(type)) return 'human';
   if (vocab.ai.includes(type)) return 'ai';
   return vocab.types.includes(type) ? 'auto' : 'human';

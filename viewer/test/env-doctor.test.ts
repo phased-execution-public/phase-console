@@ -68,3 +68,20 @@ test('an empty PATH reports nothing rather than an issue about nothing', () => {
   assert.deepEqual(environmentReport({}, HOME), []);
   assert.deepEqual(environmentReport({ PATH: '' }, HOME), []);
 });
+
+test('FLT-1: the channel row is a push-broken issue with a stable id, naming the category that found nobody — and nothing when a channel exists', async () => {
+  const { DELIVERY_ISSUE_ID, deliveryIssue } = await import('../server/env-doctor.ts');
+  const { probeDelivery } = await import('../server/prelude.ts');
+  const none = probeDelivery({ devices: 0, notifyCommand: false, webhooks: 0, remote: false });
+  const issue = deliveryIssue(none, 'needs-you');
+  assert.equal(issue?.kind, 'push-broken');
+  assert.equal(issue?.id, DELIVERY_ISSUE_ID);
+  assert.match(issue!.detail, /no delivery channel/);
+  assert.match(issue!.detail, /"needs-you" announcements are reaching nobody/);
+  assert.match(issue!.fix, /Settings → Notifications/);
+  // The same verdict the run-start prelude reads: a notifier alone is a channel.
+  assert.equal(deliveryIssue(probeDelivery({ devices: 0, notifyCommand: true, webhooks: 0, remote: false })), null);
+  // Under --remote a channel is not enough: Tailscale must serve this port.
+  const elsewhere = probeDelivery({ devices: 1, notifyCommand: false, webhooks: 0, remote: true, tailscale: { running: true, forOurPort: false } });
+  assert.match(deliveryIssue(elsewhere)!.detail, /Serve does not point at this port/);
+});

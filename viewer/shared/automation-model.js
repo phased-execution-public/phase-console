@@ -53,6 +53,13 @@ export const AUTOMATION_MAP = Object.freeze({
   resumeAtBoot: ['recover', 'resumeAtBoot'],
   convergeEveryMs: ['recover', 'convergeEveryMs'],
   delegateHumanGates: ['recover', 'delegateHumanGates'],
+  // The policy table's console half (phase 11): `policy.<decisionKey>` — an
+  // object keyed by decision key, one answer word each.
+  policy: ['policy', 'answers'],
+  // …and Tier 2's (phase 14): the relay's rule table, a LIST of rules that
+  // answer a question nobody else did. Beside the answers because it is the
+  // same card's to edit and the same kind of decision, one tier down.
+  relayRules: ['policy', 'relayRules'],
   allowUnverifiedPhases: ['recover', 'allowUnverifiedPhases'],
   staleClaimTakeover: ['recover', 'staleClaimTakeover'],
   unblockAttempts: ['recover', 'unblockSessions'],
@@ -63,6 +70,9 @@ export const AUTOMATION_MAP = Object.freeze({
   ladderPerRunRungs: ['caps', 'perRunRungs'],
   ladderPerRunUsd: ['caps', 'perRunUsd'],
   ladderPerDayUsd: ['caps', 'perDayUsd'],
+  // The per-instance start ceiling (zero-touch-console phase 7, SLF-1).
+  ceilingStartsPerHour: ['caps', 'startsPerHour'],
+  ceilingUsdPerHour: ['caps', 'usdPerHour'],
   budgetAutoRaisePct: ['caps', 'budgetAutoRaisePct'],
   ladderExtendOnProgress: ['caps', 'extendOnProgress'],
 
@@ -70,6 +80,7 @@ export const AUTOMATION_MAP = Object.freeze({
   mcpPolicy: ['mcp', 'policy'],
   mcpRequireTimeoutMs: ['mcp', 'requireTimeoutMs'],
   watchCmdRefs: ['watch', 'cmdRefs'],
+  watchMintedCmdRefs: ['watch', 'mintedCmdRefs'],
 
   // When a lane stops being work.
   stallSilentMs: ['stall', 'silentMs'],
@@ -77,6 +88,7 @@ export const AUTOMATION_MAP = Object.freeze({
   stallStalemateAttempts: ['stall', 'stalemateAttempts'],
   stallRetryBurst: ['stall', 'retryBurst'],
   stallExternalWaitMs: ['stall', 'externalWaitMs'],
+  stallAutomaticPark: ['stall', 'automaticPark'],
   stallLocalJobMs: ['stall', 'localJobMs'],
   stallEscalateMs: ['stall', 'escalateMs'],
 

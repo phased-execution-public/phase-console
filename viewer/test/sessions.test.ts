@@ -25,18 +25,20 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { VIEWER_DIR, SKILL_DIR } from '../server/config.ts';
-import { bootout, detectSupervisor, stopPlan, type Supervisor } from '../server/lifecycle.ts';
+import { bootout, detectSupervisor, stopPlan, unload, type Supervisor } from '../server/lifecycle.ts';
 import { Service } from '../server/service.ts';
+import { handleApi } from '../server/api/routes.ts';
+import { journalFile, newRun, phaseRecord, saveRun } from '../server/runner/state.ts';
 import { defaultCategories, routeFor } from '../server/push/catalogue.ts';
 import type { SessionEvent, SessionInfo } from '../server/terminal.ts';
-import { spawnConsole } from './spawn-console.ts';
+import { sandbox, spawnConsole } from './spawn-console.ts';
 
 /* ------------------------------------------------------------------ *
  * The announce policy
@@ -281,28 +283,59 @@ const LAUNCHD: Supervisor = {
   supervised: true, kind: 'launchd', detail: 'launchd · com.example.console · KeepAlive is on',
 };
 
-test('under launchd, stopping means booting the job out — not exiting', () => {
-  const plan = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501);
-  assert.equal(plan.via, 'launchctl');
-  assert.equal(plan.via === 'launchctl' && plan.file, 'launchctl');
-  // `stop` under KeepAlive is a restart with extra steps; `bootout` on the
-  // service target is the sentence that means "and stay off".
-  assert.deepEqual(plan.via === 'launchctl' && plan.args, ['bootout', 'gui/501/com.example.console']);
-  assert.match(plan.detail, /stays off/);
+test('SHD-2/SHD-5: under launchd, `exit` comes straight back and `unload` disables, boots out, marks and names its way back', () => {
+  // `exit` — the default. KeepAlive is on, so an exit IS a comeback: the plan
+  // says so and claims no durability it does not have.
+  const exit = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501);
+  assert.equal(exit.via, 'exit');
+  assert.equal(exit.mode, 'exit');
+  assert.equal(exit.durability, 'returns');
+  assert.match(exit.detail, /comes straight back/);
+
+  // `unload` — "stay off". The old Shut down was a bare `bootout` that promised
+  // "it stays off" and came back at the next login with the plist on disk; the
+  // plan now DISABLES first (launchd's override database, synchronously, before
+  // the SIGTERM the bootout sends), boots out, and writes the marker a boot
+  // honours.
+  const unload = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501, 'unload');
+  assert.ok(unload, 'a named launchd job can be unloaded');
+  assert.equal(unload.via, 'launchctl');
+  assert.equal(unload.file, 'launchctl');
+  assert.deepEqual(unload.steps, [['disable', 'gui/501/com.example.console'], ['bootout', 'gui/501/com.example.console']]);
+  assert.deepEqual(unload.args, ['bootout', 'gui/501/com.example.console'], '`bootout` on the service target — `stop` under KeepAlive is a restart');
+  assert.equal(unload.marker, true);
+  assert.equal(unload.durability, 'disabled');
+  assert.match(unload.resurrect, /^launchctl enable gui\/\$\(id -u\)\/com\.example\.console && launchctl bootstrap gui\/\$\(id -u\) ~\/Library\/LaunchAgents\/com\.example\.console\.plist/);
+  assert.match(unload.detail, /disabled/);
+  assert.match(unload.detail, /a login does not bring it back/);
+
+  // KeepAlive OFF: nothing brings an exit back now, and the next login does.
+  const noKeepAlive = stopPlan(
+    { supervised: false, kind: 'launchd', detail: 'launchd · com.example.console · KeepAlive is off' },
+    { XPC_SERVICE_NAME: 'com.example.console' }, 501,
+  );
+  assert.equal(noKeepAlive.durability, 'until-login');
 });
 
-test('with nothing supervising, stopping is just exiting', () => {
+test('with nothing supervising, stopping is just exiting — and there is nothing to unload', () => {
   const plan = stopPlan(
     { supervised: false, kind: 'none', detail: 'nothing is supervising this process' },
     {}, 501,
   );
   assert.equal(plan.via, 'exit');
+  assert.equal(plan.durability, 'stays-off', 'nothing starts it again');
+  assert.equal(
+    stopPlan({ supervised: false, kind: 'none', detail: '' }, {}, 501, 'unload'), null,
+    '`exit` already stops it, so a "stay off" has nothing to unload',
+  );
 
   // A launchd job whose label this process cannot read cannot be booted out by
   // name — exiting is the honest fallback, not a guessed label.
   assert.equal(stopPlan(LAUNCHD, {}, 501).via, 'exit');
+  assert.equal(stopPlan(LAUNCHD, {}, 501, 'unload'), null);
   // A platform with no uid (Windows) cannot name a `gui/<uid>/…` target.
   assert.equal(stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, null).via, 'exit');
+  assert.equal(stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, null, 'unload'), null);
 
   // A FOREIGN systemd unit — one that never stamped PHASE_CONSOLE_UNIT — is
   // supervision this process cannot name, so it cannot be stopped by name
@@ -313,21 +346,29 @@ test('with nothing supervising, stopping is just exiting', () => {
   );
   assert.equal(systemd.via, 'exit');
   assert.match(systemd.detail, /may be brought back/);
+  assert.equal(
+    stopPlan({ supervised: true, kind: 'systemd', detail: '', assumed: true }, { INVOCATION_ID: 'x' }, 501, 'unload'),
+    null,
+  );
 });
 
-test('under systemd with a known unit, stopping means systemctl --user stop', () => {
+test('under systemd with a known unit, `unload` is disable --now and names enable --now; `exit` returns', () => {
   // The unit agent.sh writes stamps its own name (%n) into the environment —
   // the XPC_SERVICE_NAME of this platform. With the name known, Stop can mean
   // what the button says.
-  const plan = stopPlan(
-    { supervised: true, kind: 'systemd', detail: 'systemd · phase-console.service' },
-    { INVOCATION_ID: 'x', PHASE_CONSOLE_UNIT: 'phase-console.service' }, 501,
-  );
-  assert.equal(plan.via, 'systemctl');
-  assert.deepEqual(plan.via === 'systemctl' && plan.args, ['--user', 'stop', 'phase-console.service']);
-  // Restart= covers exits, not deliberate stops — but the unit stays enabled,
-  // so the plan must say the login caveat out loud.
-  assert.match(plan.detail, /starts at login/);
+  const sup: Supervisor = { supervised: true, kind: 'systemd', detail: 'systemd · phase-console.service' };
+  const env = { INVOCATION_ID: 'x', PHASE_CONSOLE_UNIT: 'phase-console.service' };
+  const unload = stopPlan(sup, env, 501, 'unload');
+  assert.ok(unload);
+  assert.equal(unload.via, 'systemctl');
+  // Both halves in one command: the unit stops (its SIGTERM ends the console)
+  // and loses its login link.
+  assert.deepEqual(unload.steps, [['--user', 'disable', '--now', 'phase-console.service']]);
+  assert.equal(unload.resurrect.startsWith('systemctl --user enable --now phase-console.service'), true);
+  assert.equal(unload.durability, 'disabled');
+  const exit = stopPlan(sup, env, 501);
+  assert.equal(exit.via, 'exit');
+  assert.equal(exit.durability, 'returns');
 });
 
 test('a stamped unit file is read for Restart=, not assumed', () => {
@@ -360,7 +401,7 @@ test('a stamped unit file is read for Restart=, not assumed', () => {
 
 test('bootout spawns detached, and a spawn that throws does not take the shutdown with it', () => {
   const calls: { file: string; args: string[]; options: unknown }[] = [];
-  const plan = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501);
+  const plan = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501, 'unload')!;
 
   const ok = bootout(plan, (file, args, options) => {
     calls.push({ file, args, options });
@@ -376,16 +417,190 @@ test('bootout spawns detached, and a spawn that throws does not take the shutdow
 
   assert.equal(bootout(plan, () => { throw new Error('launchctl: not found'); }), false,
     'a missing launchctl is a false, so the caller falls through to exiting');
-  assert.equal(bootout({ via: 'exit', detail: '' }, () => { throw new Error('must not spawn'); }), false);
+  assert.equal(bootout({ via: 'exit', mode: 'exit', durability: 'stays-off', detail: '' }, () => { throw new Error('must not spawn'); }), false);
+});
 
-  // The systemctl plan rides the same handoff.
+test('SHD-5: `unload` disables SYNCHRONOUSLY before handing over the stop, and a failed disable is said — the stop still goes', () => {
+  const order: string[] = [];
+  const plan = stopPlan(LAUNCHD, { XPC_SERVICE_NAME: 'com.example.console' }, 501, 'unload')!;
+  const carried = unload(
+    plan,
+    (file, args) => { order.push(`spawn ${file} ${args.join(' ')}`); return { unref() {} }; },
+    (file, args) => { order.push(`run ${file} ${args.join(' ')}`); return { status: 0 }; },
+  );
+  assert.deepEqual(order, [
+    'run launchctl disable gui/501/com.example.console',
+    'spawn launchctl bootout gui/501/com.example.console',
+  ], 'the disable lands before the bootout whose SIGTERM ends this process');
+  assert.deepEqual(carried, { disabled: true, spawned: true });
+
+  const failed = unload(plan, () => ({ unref() {} }), () => ({ status: 1 }));
+  assert.deepEqual(failed, { disabled: false, spawned: true }, 'the marker is then the only thing holding the boot — and the log says so');
+
+  // systemd's single `disable --now` has nothing to run ahead of it.
   const sd = stopPlan(
     { supervised: true, kind: 'systemd', detail: '' },
-    { INVOCATION_ID: 'x', PHASE_CONSOLE_UNIT: 'phase-console.service' }, 501,
-  );
-  const sdCalls: { file: string; args: string[] }[] = [];
-  assert.equal(bootout(sd, (file, args) => { sdCalls.push({ file, args }); return { unref() {} }; }), true);
-  assert.deepEqual(sdCalls, [{ file: 'systemctl', args: ['--user', 'stop', 'phase-console.service'] }]);
+    { INVOCATION_ID: 'x', PHASE_CONSOLE_UNIT: 'phase-console.service' }, 501, 'unload',
+  )!;
+  const sdCalls: string[] = [];
+  unload(sd, (file, args) => { sdCalls.push(`spawn ${file} ${args.join(' ')}`); return { unref() {} }; }, () => {
+    sdCalls.push('run');
+    return { status: 0 };
+  });
+  assert.deepEqual(sdCalls, ['spawn systemctl --user disable --now phase-console.service']);
+});
+
+/* ------------------------------------------------------------------ *
+ * The refusals, in process (SHD-1, SHD-2)
+ * ------------------------------------------------------------------ */
+
+/** Set env keys for one case and put them back — `supervisor()` reads the process environment. */
+async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
+  const was: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(patch)) {
+    was[key] = process.env[key];
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
+  try { return await fn(); } finally {
+    for (const [key, value] of Object.entries(was)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+}
+
+const REFUSAL_PLAN = `---
+slug: demo
+created: 2026-09-15
+status: active
+phases: 2
+---
+
+# demo
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | first | — | — | demo | it works |
+| 2 | second | 1 | — | demo | it still works |
+
+## Phases
+
+### Phase 1 — first
+- **Size:** S
+
+### Phase 2 — second
+- **Size:** S
+`;
+
+/** A run parked on a declared wait whose clock is two hours ahead — the 09-12 lane, in miniature. */
+function parkedRun(root: string): { id: string; until: string } {
+  const state = newRun({ slug: 'demo', root });
+  const until = new Date(Date.now() + 2 * 60 * 60_000).toISOString();
+  state.status = 'paused';
+  state.stoppedBy = 'system';
+  state.waitReason = 'external';
+  state.waitUntil = until;
+  const record = phaseRecord(state, 1);
+  record.status = 'waiting';
+  record.parkedUntil = until;
+  record.sessionId = 's-parked';
+  record.resumeSessionId = 's-parked';
+  record.declared = { status: 'waiting-external', reason: 'the image build', watch: ['date:2030-01-01T00:00:00Z'], at: new Date().toISOString() };
+  saveRun(state);
+  return { id: state.id, until };
+}
+
+async function callApi(
+  sv: Service, method: string, path: string, body?: unknown,
+): Promise<{ status: number; payload: Record<string, unknown> }> {
+  let status = 0;
+  let payload: Record<string, unknown> = {};
+  const res = {
+    writeHead(code: number) { status = code; return this; },
+    end(text: string) { try { payload = JSON.parse(text); } catch { payload = { text }; } },
+    on() { return this; },
+    writableEnded: false, destroyed: false,
+  };
+  const raw = body === undefined ? '' : JSON.stringify(body);
+  const req = {
+    method,
+    headers: { host: '127.0.0.1:4123', 'content-type': 'application/json', 'x-phase-console': '1' },
+    socket: { remoteAddress: '127.0.0.1' },
+    on() { return this; },
+    [Symbol.asyncIterator]: async function* () { if (raw) yield Buffer.from(raw); },
+  };
+  await handleApi({ service: sv } as never, req as never, res as never, new URL(`http://127.0.0.1:4123${path}`));
+  return { status, payload };
+}
+
+test('ACC-6.1 (SHD-1, SHD-2): readiness names the armed clock; a bare {confirm:true} is refused naming it; unload needs acknowledge; an unknown mode is a 400', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-shutdown-refusal-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  mkdirSync(join(root, 'docs', 'handoffs'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), REFUSAL_PLAN, 'utf8');
+  const parked = parkedRun(root);
+  // A systemd unit this process can name, so `unload` has a plan — without
+  // touching launchd (no label) whatever the machine running the suite is.
+  await withEnv({ XPC_SERVICE_NAME: '0', PHASE_CONSOLE_SUPERVISED: undefined, INVOCATION_ID: 'test-invocation', PHASE_CONSOLE_UNIT: 'phase-console-test.service' }, async () => {
+    const sv = service({ allowRun: true, allowWrites: true, converge: false });
+    try {
+      assert.equal(sv.open(root).ok, true);
+      await sv.bootSettled;
+
+      // The inventory is WORK: the run's wait clock re-armed at boot, and the run
+      // on disk the next boot picks up — not pty terminals and a handler count.
+      const readiness = sv.shutdownReadiness();
+      assert.equal(readiness.empty, false);
+      const clock = readiness.inventory.clocks.find((c) => c.source === 'wait-resume' && c.slug === 'demo');
+      assert.ok(clock, `the armed resume is named: ${JSON.stringify(readiness.inventory.clocks)}`);
+      assert.equal(Date.parse(clock.at), Date.parse(parked.until));
+      assert.deepEqual(readiness.soonestClock?.source, 'wait-resume');
+      const run = readiness.inventory.runs.find((r) => r.id === parked.id);
+      assert.ok(run, 'the parked run is on the inventory');
+      assert.equal(run.live, false);
+      assert.equal(run.waitUntil, parked.until);
+      assert.equal(readiness.modes.exit.durability, 'returns');
+      assert.ok(readiness.modes.unload, 'a named unit can be unloaded');
+      assert.match(String(readiness.unloadHint), /systemctl --user enable --now phase-console-test\.service/);
+
+      // GET /api/shutdown returns the same inventory.
+      const got = await callApi(sv, 'GET', '/api/shutdown');
+      assert.equal(got.status, 200);
+      assert.ok((got.payload.inventory as { clocks: unknown[] }).clocks.length >= 1);
+
+      // A bare confirm over that inventory: refused, NAMING the clock.
+      const bare = await callApi(sv, 'POST', '/api/shutdown', { confirm: true });
+      assert.equal(bare.status, 409, JSON.stringify(bare.payload));
+      assert.equal(bare.payload.ok, false);
+      assert.equal(bare.payload.needs, 'acknowledge');
+      assert.match(String(bare.payload.reason), /wait-resume clock for demo due/);
+      assert.match(String(bare.payload.reason), /acknowledge/);
+      assert.ok(bare.payload.inventory, 'the refusal carries the inventory it is about');
+
+      // Stay off, unacknowledged: refused, naming its way back.
+      const unloadBare = await callApi(sv, 'POST', '/api/shutdown', { confirm: true, mode: 'unload' });
+      assert.equal(unloadBare.status, 409);
+      assert.equal(unloadBare.payload.needs, 'acknowledge');
+      assert.match(String(unloadBare.payload.reason), /stay off/);
+      assert.match(String(unloadBare.payload.reason), /systemctl --user enable --now/);
+
+      const bogus = await callApi(sv, 'POST', '/api/shutdown', { confirm: true, mode: 'halt', acknowledge: true });
+      assert.equal(bogus.status, 400);
+      assert.equal(bogus.payload.needs, 'mode');
+    } finally { sv.close(); }
+  });
+  // With nothing supervising there is nothing to unload — even acknowledged.
+  await withEnv({ XPC_SERVICE_NAME: '0', PHASE_CONSOLE_SUPERVISED: '0', INVOCATION_ID: undefined, PHASE_CONSOLE_UNIT: undefined }, () => {
+    const sv = service({});
+    try {
+      const refused = sv.shutdown('a test', { mode: 'unload', acknowledge: true });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.needs, 'unload');
+      assert.match(String(refused.reason), /nothing supervises this console/);
+    } finally { sv.close(); }
+  });
+  rmSync(root, { recursive: true, force: true });
 });
 
 /* ------------------------------------------------------------------ *
@@ -433,24 +648,50 @@ const CONSOLE_HEADERS = { 'x-phase-console': '1', 'content-type': 'application/j
 
 test('POST /api/shutdown stops an unsupervised console, and refuses to do it by accident', async () => {
   const port = await freePort();
-  const { child, box } = spawnConsole(VIEWER_DIR, port, ['--allow-terminal'], {
+  const box = sandbox('shutdown');
+  // A plan with a run parked on a declared wait two hours out, on disk where the
+  // spawned console reads it: the test process's own (sandboxed) state home is
+  // handed to the child, so `saveRun` here is the console's run file there.
+  const parked = parkedRun(box.root);
+  const logFile = join(box.stateHome, 'console-under-test.log');
+  const { child } = spawnConsole(VIEWER_DIR, port, ['--allow-terminal', '--allow-run', '--no-converge', '--log-file', logFile], {
+    sandbox: box,
+    withRoot: true,
     // Nothing supervising: the graceful path, and the one that is safe to run
     // for real on the machine running the tests.
-    env: { PHASE_CONSOLE_SUPERVISED: '0', XPC_SERVICE_NAME: '' },
+    env: { PHASE_CONSOLE_SUPERVISED: '0', XPC_SERVICE_NAME: '', XDG_STATE_HOME: process.env.XDG_STATE_HOME },
+    // Piped, because what the console WRITES about the shutdown is under test
+    // too: `shutdown.requested` mirrors to stderr, and its actor is the point.
+    stdio: 'pipe',
   });
+  let stderr = '';
+  child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8'); });
+  child.stdout?.on('data', () => {});
   const exited = new Promise<number | null>((resolve) => child.on('exit', (code) => resolve(code)));
 
   try {
     if (!await waitFor(port)) assert.fail('the console did not come up');
 
-    // The readiness read is what the confirm dialog renders — an inventory, and
-    // never a refusal: a console you cannot turn off because it is busy is the
-    // bug this endpoint exists to fix.
-    const readiness = JSON.parse((await http(port, '/api/shutdown')).body);
+    // The readiness read is what the confirm dialog renders — an inventory of
+    // WORK (SHD-1). The boot re-armed the parked run's resume, so the clock the
+    // exit would discard is named with its moment, and the run is listed.
+    let readiness: Record<string, any> = {};
+    for (let i = 0; i < 60; i++) {
+      readiness = JSON.parse((await http(port, '/api/shutdown')).body);
+      if (readiness.inventory?.clocks?.length) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
     assert.equal(readiness.stop.via, 'exit');
+    assert.equal(readiness.stop.durability, 'stays-off');
+    assert.equal(readiness.modes.unload, null, 'nothing supervises it, so there is nothing to unload');
     assert.equal(readiness.sessions.live, 0);
     assert.ok('busy' in readiness && 'run' in readiness);
     assert.match(String(readiness.restartHint), /start it again/);
+    assert.equal(readiness.empty, false);
+    const clock = readiness.inventory.clocks.find((c: { source: string }) => c.source === 'wait-resume');
+    assert.ok(clock, `readiness names the armed clock: ${JSON.stringify(readiness.inventory)}`);
+    assert.equal(Date.parse(clock.at), Date.parse(parked.until));
+    assert.ok(readiness.inventory.runs.some((run: { id: string }) => run.id === parked.id));
 
     // Same-origin + console header, like every other mutation.
     assert.equal((await http(port, '/api/shutdown', { method: 'POST', body: '{"confirm":true}' })).status, 403);
@@ -462,12 +703,20 @@ test('POST /api/shutdown stops an unsupervised console, and refuses to do it by 
     const bare = await http(port, '/api/shutdown', { method: 'POST', headers: CONSOLE_HEADERS, body: '{}' });
     assert.equal(bare.status, 400);
     assert.match(bare.body, /confirm/);
+
+    // …and neither may a confirm that has not seen what it stops (SHD-1): the
+    // 09-12 press went through over a lane 36.8 minutes from its resume.
+    const unseen = await http(port, '/api/shutdown', {
+      method: 'POST', headers: CONSOLE_HEADERS, body: '{"confirm":true,"by":"a test"}',
+    });
+    assert.equal(unseen.status, 409, unseen.body);
+    assert.match(JSON.parse(unseen.body).reason, /wait-resume clock for demo due/);
     assert.ok(await waitFor(port, 10), 'and it is still serving');
 
     const done = await http(port, '/api/shutdown', {
-      method: 'POST', headers: CONSOLE_HEADERS, body: '{"confirm":true,"by":"a test"}',
+      method: 'POST', headers: CONSOLE_HEADERS, body: '{"confirm":true,"acknowledge":true,"by":"a test"}',
     });
-    assert.equal(done.status, 200);
+    assert.equal(done.status, 200, done.body);
     assert.equal(JSON.parse(done.body).ok, true);
 
     // The response reaches the browser BEFORE the socket it arrived on closes —
@@ -480,6 +729,51 @@ test('POST /api/shutdown stops an unsupervised console, and refuses to do it by 
       new Promise<'timeout'>((r) => { setTimeout(() => r('timeout'), 20_000).unref(); }),
     ]);
     assert.equal(code, 0, 'an unsupervised shutdown exits 0 after the drain');
+
+    // SHD-3: the record names WHO — the body's label — and the transport it
+    // arrived by, derived from the request rather than supplied: `api` from
+    // `local` (a loopback Host), no proxy user, and how the stop is carried
+    // out beside it. Exactly one such line: the SIGTERM the drain sends
+    // itself must not be written a second time as an unattributed signal.
+    const requested = stderr.split('\n').filter((line) => line.includes('shutdown.requested'));
+    assert.equal(requested.length, 1, `one shutdown.requested line: ${requested.join(' | ')}`);
+    const payload = JSON.parse(requested[0].slice(requested[0].indexOf('{'))) as Record<string, any>;
+    assert.equal(payload.by, 'a test');
+    assert.equal(payload.via, 'api');
+    assert.equal(payload.origin, 'local');
+    assert.equal(payload.remoteUser, null);
+    assert.equal(payload.stop, 'exit');
+    // …and what it chose, what that achieves, and what it acknowledged (SHD-1, SHD-5).
+    assert.equal(payload.mode, 'exit');
+    assert.equal(payload.durability, 'stays-off');
+    assert.equal(payload.acknowledged, true);
+    assert.equal(payload.inventory.soonestClock.source, 'wait-resume');
+
+    // SHD-8: the parked plan learns from its OWN journal that the console went
+    // away, and which clock went with it — no runner was driving it.
+    const journal = readFileSync(journalFile(box.root, 'demo', parked.id), 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line) as { event: string; data: Record<string, any> });
+    const abandoned = journal.find((line) => line.event === 'run.console-shutdown');
+    assert.ok(abandoned, `run.console-shutdown on the parked run: ${journal.map((l) => l.event).join(', ')}`);
+    assert.equal(abandoned.data.intent, 'shutdown');
+    assert.match(String(abandoned.data.reason), /^shutdown \(a test via api from local\)/);
+    assert.equal(abandoned.data.live, false);
+    assert.equal(abandoned.data.clock?.source, 'wait-resume');
+    assert.match(String(abandoned.data.discards), /wait-resume clock due/);
+
+    // …and the exit record names the intent beside the reason (SHD-8).
+    assert.ok(existsSync(logFile), 'the console wrote its log');
+    const entries = readFileSync(logFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { event: string; data?: Record<string, any> });
+    const exit = entries.filter((entry) => entry.event === 'exit').at(-1);
+    assert.ok(exit, 'an exit record');
+    assert.equal(exit.data?.intent, 'shutdown');
+    assert.match(String(exit.data?.reason), /^shutdown \(a test via api from local\)/);
+    const begin = entries.find((entry) => entry.event === 'shutdown.begin');
+    assert.equal(begin?.data?.intent, 'shutdown');
+    assert.equal(begin?.data?.via, 'exit');
+    const announced = entries.find((entry) => entry.event === 'shutdown.announced');
+    assert.ok(announced, 'the drain waited on the shutdown announcement');
+    assert.ok((announced.data?.delivery as string[]).length > 0, 'and it left with a delivery, never []');
   } finally {
     child.kill('SIGKILL');
     box.cleanup();

@@ -10,9 +10,11 @@
  */
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
-import { instanceId, instanceUrl } from '../shared/instances.mjs';
+import { execFile, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { census, consumeAutostartOnce, fleetProfile, instanceId, instanceUrl, profileFor, readAutostart } from '../shared/instances.mjs';
+import type { BootHoldKind, ShutdownClockSource } from '../shared/ops-vocab.js';
 import {
   INSTANCE,
   INSTANCE_STATE_DIR,
@@ -21,6 +23,7 @@ import {
   agentEnabled,
   checkRoot,
   distRev,
+  notifyCommand,
   rememberRoot,
   loadPrefs,
   savePrefs,
@@ -34,6 +37,8 @@ import {
   SessionRegistry,
   correlate,
   parseHookPayload,
+  type ChangeMeta,
+  type RegistryChange,
   type RunLink,
   type SessionEventName,
   type SessionRecord,
@@ -56,7 +61,10 @@ import {
   type ConvergeTrigger,
   convergeView,
   type ConvergeView,
-} from './converge.ts';
+  automaticResumes, waitClockPhases, waitClockVerdict, waitHoldWhy, WAIT_OVERDUE_GRACE_MS, evidenceFingerprint } from './converge.ts';
+import { evaluateWait, parkedMsOf, RESUME_REFUSED_RECHECK_MS, WAIT_OVERDUE_ANNOUNCE_MS } from './runner/wait-budget.ts';
+import { pollableRefs, probeWatchRef } from './watch-refs.ts';
+import type { ResumeTrigger } from '../shared/run-lifecycle.js';
 import { WatchScheduler, type WatchLandingOutcome } from './watch-scheduler.ts';
 import type { WatchState as WatchStateView } from './watch-refs.ts';
 import { runSingleCommand } from './runner/verify.ts';
@@ -83,15 +91,36 @@ import { SearchIndex, type SearchResult } from './search.ts';
 import { listSkills, type SkillInfo } from './skills.ts';
 import { DocsWatcher } from './watch.ts';
 import {
+  clearStopMarker,
   degradedState,
+  disableOwnUnit,
   hasShutdownWork,
+  offShutdown,
   onDegraded,
+  onShutdown,
+  readStopMarker,
   requestRestart,
   requestShutdown,
   restartVerdict,
   stopPlan,
   supervisor,
+  writeStopMarker,
+  type ExitPlan,
+  type ShutdownContext,
+  type StopMarker,
+  type StopPlan,
+  type UnloadPlan,
 } from './lifecycle.ts';
+import {
+  emptyInventory,
+  inventoryDigest,
+  inventoryEmpty,
+  inventorySentence,
+  shutdownVerdict,
+  soonestClock,
+  type InventoryClock,
+  type ShutdownInventory,
+} from './shutdown.ts';
 import { log } from './log.ts';
 import {
   CATEGORIES,
@@ -132,6 +161,7 @@ import {
   INBOX_ACKS_DIR,
   type InboxAck,
   type InboxFacts,
+  type InboxReach,
   type InboxView,
 } from './inbox.ts';
 import { STALL_SIGNAL_META, inboxItemId, parseInboxItemId } from '../shared/attention-model.js';
@@ -156,7 +186,10 @@ import {
 } from './analysis/stats.ts';
 import {
   detachRequestedIn,
+  credentialPolicyFor,
+  credentialsFor,
   mcpServersFor,
+  personCheckFor,
   type Plan,
   type PhaseDetail,
   type PhaseRow,
@@ -196,8 +229,13 @@ import {
   settleRung,
   type Rung,
 } from './runner/ladder.ts';
-import type { McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
-import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
+import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import { policyPrefsOf } from './runner/policy.ts';
+import { credentialsHeld } from './credentials-probe.ts';
+import { asActor, describeActor, doorActor, viaOfTrigger, type StartActor } from './actor.ts';
+import { ceilingSentence, DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR, StartCeiling, type CeilingRefusal, type CeilingVerdict } from './start-ceiling.ts';
+import type { WaitBudget } from './runner/wait-budget.ts';
+import { formatScope, normalizeToken, parseScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE,
   NO_HANDOFF_AUTO_RE,
@@ -206,7 +244,11 @@ import {
   recoveryActionsFor,
 } from '../shared/recovery-model.js';
 import { isLiveStatus } from '../shared/status-vocab.js';
-import { environmentReport, type EnvIssue } from './env-doctor.ts';
+import { DELIVERY_ISSUE_ID, deliveryIssue, environmentReport, type EnvIssue } from './env-doctor.ts';
+import { probeDelivery, type DeliveryFacts } from './prelude.ts';
+import { tailscaleStatus } from './tailscale.ts';
+import { CONSOLE_VERSION, Heartbeat, MachineLanes, instancesView, type HeartbeatFacts } from './fleet.ts';
+import { accessLedger } from './api/access.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
 import {
@@ -218,11 +260,15 @@ import {
 import type { LaneLiveness } from './runner/liveness.ts';
 import {
   appendAck as appendRulingAck,
+  appendRuling,
   ingestRulings,
   readRulings,
   rulingsFile,
   type Ruling,
 } from './runner/rulings.ts';
+import { Relay } from './relay.ts';
+import { initVersionFor, noteCliInit } from './cli-init.ts';
+import { RELAY_RULE_DEFAULTS, RELAY_WINDOW_MS, sanitiseRelayRules } from '../shared/relay-model.js';
 import {
   autoResolveRun,
   childrenOf,
@@ -234,6 +280,7 @@ import {
   phaseRecord,
   pidAlive,
   pidHoldsWork,
+  procIdentity,
   pruneRuns,
   reconcileRecordsAgainstBoard,
   resetForRetry,
@@ -241,6 +288,7 @@ import {
   saveRun,
   slugsNeedingBoard,
   runDir,
+  waitClockOf,
   waitReasonOf,
   IN_FLIGHT,
   PHASE_IN_FLIGHT,
@@ -256,6 +304,7 @@ import {
   type RunState,
   type VerifySummary,
   consoleRunsDir,
+  settleStoredWaitTimeout, setRunState, DECLARATION_CONSUMED_EVENT,
 } from './runner/state.ts';
 import {
   consumeOutcome,
@@ -293,8 +342,9 @@ import { HEALTH_TTL_MS, Mcp, type McpServerView } from './mcp/index.ts';
 import { IDLE_POLL_MS as ISSUES_SWEEP_MS } from './issues/fetch.ts';
 import { IssuesStore } from './issues/index.ts';
 import { pruneMcpConfigs } from './mcp/config.ts';
-import { pruneSettingsFiles } from './runner/approvals.ts';
-import { portTranscript } from './accounts/transcripts.ts';
+import { pruneSettingsFiles, tokenFromSettingsFile, type Approval, type ApprovalEvent } from './runner/approvals.ts';
+import { assertTranscriptLayout, cliVersion, portTranscript } from './accounts/transcripts.ts';
+import type { HeadroomVerdict } from './accounts/index.ts';
 import { FULL_FLAGS, installDesktopLauncher, launcherPlan } from './launcher.ts';
 import { Webhooks } from './webhooks.ts';
 import {
@@ -334,9 +384,12 @@ import {
   DEFAULT_ASK,
   DEFAULT_ALLOW,
   POLICY_PATH,
+  policyAdvisory,
+  struckFor,
   type Evidence,
   type PolicyScope,
   type PermissionProfile,
+  type PolicyAdvisory,
 } from './runner/approvals.ts';
 import {
   AUTO_GRANT_REASONS,
@@ -351,6 +404,7 @@ import {
   OUTCOME_INBOX_DEBOUNCE_MS,
   OUTCOME_INBOX_MAX_AGE_MS,
   PRESENCE_BACKLOG_MAX,
+  SHUTDOWN_ANNOUNCE_WAIT_MS,
   PhaseClaimedError,
   RecoveryBusyError,
   UNSUPERVISED_WAIT_DEFAULT_MS,
@@ -386,8 +440,46 @@ import {
   type RecoveryAction,
   type RouteView,
 } from './service-core.ts';
+
 import type { Service } from './service.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
+
+/**
+ * The presence moves a full construction backlog may throw away (SHD-7): a
+ * `prune` (the record is already gone, and `onPresenceChange` returns before
+ * the debris path for one) and a `heartbeat` (the next one repeats it). Every
+ * other move is a fact with a reaction behind it and is never dropped.
+ */
+function droppablePresence(event: RegistryChange): boolean {
+  return event === 'prune' || event === 'heartbeat';
+}
+
+/**
+ * A live Claude session in this repository that holds no lock for the phase in
+ * question — somebody the phase would collide with (REG-3). `scope` is what
+ * the session is working in, as far as the console can tell: its `PE_SCOPE`,
+ * else the repository directory its cwd is inside, else `all`.
+ */
+export type SessionPeer = {
+  sessionId: string;
+  pid: number | null;
+  cwd: string;
+  kind: string;
+  presence: 'live' | 'unknown';
+  owner: string;
+  scope: string[];
+  plan: { slug: string; phase: number; strong: boolean } | null;
+};
+
+/** Why a console boots holding its automation — see `ServiceBase.bootHold`. */
+export type BootHold = {
+  kind: BootHoldKind;
+  /** ISO — when the hold began: the stop's moment, or this boot's. */
+  at: string;
+  by: string;
+  why: string;
+  marker?: StopMarker;
+};
 
 /**
  * The cap the "already announced" collections share.
@@ -455,6 +547,40 @@ export function trimOldest(collection: Map<string, unknown> | Set<string>, cap: 
   }
 }
 
+/**
+ * Where the operator's acknowledgements of policy advisories live: per
+ * instance, beside the policy file, keyed by kind to the fingerprint of the
+ * rule set acknowledged. Not a preference — a pref is a choice about
+ * behaviour, and this is a receipt.
+ */
+const ADVISORY_ACK_FILE = join(INSTANCE_STATE_DIR, 'policy-advisory.json');
+
+function readAdvisoryAcks(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(readFileSync(ADVISORY_ACK_FILE, 'utf8')) as { acknowledged?: unknown };
+    const acks = parsed?.acknowledged;
+    if (!acks || typeof acks !== 'object' || Array.isArray(acks)) return {};
+    return Object.fromEntries(Object.entries(acks as Record<string, unknown>)
+      .filter(([, v]) => typeof v === 'string')) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+/** The advisory's identity: its kind over the sorted rules it names. */
+function advisoryFingerprint(advisory: PolicyAdvisory): string {
+  return createHash('sha256').update(`${advisory.kind}:${[...advisory.rules].sort().join('|')}`).digest('hex').slice(0, 16);
+}
+
+/** The machine profile's webhook rows for THIS console — its override first — or none on an unreadable file. */
+function machineProfileHooks(): { url: string; name?: string; categories?: string[] }[] {
+  try {
+    return profileFor(INSTANCE.id).webhooks ?? [];
+  } catch {
+    return [];
+  }
+}
+
 export abstract class ServiceBase {
   /**
    * The fleet freeze, cached.
@@ -474,14 +600,31 @@ export abstract class ServiceBase {
   protected mcpHealthTimer: NodeJS.Timeout | null = null;
 
   abstract activateQa(slug: string, phase: number): Promise<{ ok: boolean; mode: string; detail: string }>;
+  abstract qaWaive(
+    slug: string, phase: number, opts?: { reason?: string; by?: string },
+  ): Promise<{ ok: boolean; verdict: string; round?: number; report?: string; detail: string }>;
   protected abstract announceMcpDegraded(state: RunState, phase: number, degraded: McpDegradation[]): void;
   protected abstract announceMcpTimeout(state: RunState, phase: number, result: McpContinueResult): void;
   protected abstract armFreezeEscalation(slug: string, state: RunState): void;
   protected abstract armMcpRequireTimer(slug: string, phase: number, dueAt: number): void;
   protected abstract armMcpRequireTimersFor(state: RunState): void;
+  /* The ladder's two availability readers (phase 10), implemented in
+   * ServiceRuns and ServiceRecovery and handed to every runner as
+   * `rungDrivable`/`rungUnavailable` — the loop's exhaustion predicate is the
+   * healer's, so the two cannot disagree about what this console can drive. */
+  protected abstract vehicleForRung(
+    rung: Rung, situation: Situation, record: RunPhaseRecord | undefined, evidence: PhaseEvidence | null,
+    slug?: string, state?: RunState | null,
+  ): DriveVehicle | null;
+  protected abstract unavailableRungHint(
+    situation: Situation, record: RunPhaseRecord | undefined, evidence: PhaseEvidence | null,
+    slug: string, state: RunState | null,
+  ): string | null;
   protected abstract armSessionInbox(root: string): void;
   abstract authStatus(force?: boolean): Promise<AuthStatus>;
   abstract board(slug: string): Promise<Board>;
+  /** A phase's wait budget through the engine — `ServiceLive.waitBudget`. */
+  abstract waitBudget(slug: string, phase: number): Promise<WaitBudget>;
   abstract continueMcpParkedPhase(
     slug: string,
     phase: number,
@@ -530,12 +673,13 @@ export abstract class ServiceBase {
     phase: number,
     landed: WatchStateView,
   ): Promise<WatchLandingOutcome>;
-  abstract maybeAutoRecover(slug: string): Promise<AutoRecoverResult>;
+  abstract maybeAutoRecover(slug: string, pass?: { trigger?: string; fingerprint?: string }): Promise<AutoRecoverResult>;
   protected abstract mcpRequireTimeoutMs(): number;
   protected abstract onChange(paths: string[]): void;
   protected abstract onPresenceChange(
     record: SessionRecord,
-    event: SessionEventName | 'prune' | 'heartbeat',
+    event: RegistryChange,
+    meta?: ChangeMeta,
   ): void;
   protected abstract onRunnerEvent(event: string, data: unknown): void;
   protected abstract planRate(slug: string, ownSamples?: EtaSample[]): RateReading;
@@ -543,8 +687,13 @@ export abstract class ServiceBase {
     slug: string,
     state: RunState,
     phase: number,
-  ): Promise<'proceed' | 'superseded' | 'resolved'>;
-  protected abstract preflightAccount(accountId: string | undefined): void;
+    opts?: { verb?: boolean },
+  ): Promise<'proceed' | 'superseded' | 'resolved' | 'unchanged' | 'capped'>;
+  /** The evidence fingerprint over this console's facts — the converge pass's function (phase 9). */
+  protected abstract fingerprintFor(
+    slug: string, state: RunState, board: Record<number, string>, qa?: Parameters<typeof evidenceFingerprint>[4],
+  ): string;
+  protected abstract preflightAccount(accountId: string | undefined, forModel?: string): HeadroomVerdict;
   abstract qaOutcome(link: {
     slug: string;
     phase: number;
@@ -564,10 +713,26 @@ export abstract class ServiceBase {
   ): void;
   abstract refreshMcp(force?: boolean): Promise<McpServerView[]>;
   abstract releaseMcpBridge(id: string, configDir?: string): Promise<void>;
+  /** The recover verb — declared here so the runner's deps can reach it from the constructor (phase 9). */
+  abstract recoverPhase(
+    slug: string, phase: number, mode: RecoverMode,
+    opts?: { instruction?: string; by?: string; settled?: boolean; cls?: RecoveryClass; situation?: string },
+  ): Promise<RunState | null>;
+  /** The policy editor — declared here for the same reason: the `widen-rule` dep strikes through it. */
+  abstract editPolicy(edit: {
+    scope?: PolicyScope; slug?: string | null;
+    add?: { deny?: string[]; ask?: string[]; allow?: string[] };
+    remove?: { deny?: string[]; ask?: string[]; allow?: string[] };
+    reset?: ('deny' | 'ask' | 'allow')[];
+    restore?: { deny?: string[]; ask?: string[]; allow?: string[] };
+    set?: { autoApprove?: boolean | null };
+    by?: string;
+  }): unknown;
   abstract retryPhase(
     slug: string,
     phase: number,
-    override?: { addendum?: string; options?: PhaseOptions; by?: string },
+    override: { addendum?: string; options?: PhaseOptions; by?: string } | undefined,
+    actor: StartActor,
   ): Promise<RunState | null>;
   abstract sessionViews(): SessionView[];
   abstract startRun(slug: string, options?: Partial<StartOptions>): Promise<RunState>;
@@ -604,6 +769,8 @@ export abstract class ServiceBase {
   readonly environment: { issues: EnvIssue[] };
   /** Push-health announcements already made this process, per service|reason. */
   private readonly pushHealthAnnounced = new Set<string>();
+  /** The policy advisory has been emitted this boot (once, whatever changes after). */
+  private policyAdvisoryAnnounced = false;
   root: RootCheck | null = null;
   store: Store | null = null;
   readonly search = new SearchIndex();
@@ -758,6 +925,10 @@ export abstract class ServiceBase {
   protected degradedAnnounced = new Set<string>();
   /** Admission control shared by every runner in the pool. See `scheduler.ts`. */
   readonly scheduler: Scheduler;
+  /** The machine lane ceiling every console acquires against (FLT-7). */
+  readonly machineLanes: MachineLanes;
+  /** This console's beat into its registry row — started by `index.ts` once the port is bound (FLT-5). */
+  readonly heartbeat: Heartbeat;
   /** The convergence loop's clock — boot, change, timer, halt, button. See `converge.ts`. */
   readonly converger: ConvergeScheduler;
   /**
@@ -775,6 +946,12 @@ export abstract class ServiceBase {
    */
   bootSettled: Promise<void> = Promise.resolve();
   readonly approvals: Approvals;
+  /**
+   * Tier 2 (zero-touch-console phase 14): the one place a question a session
+   * raised is answered on its behalf — rule, recommendation, first option — and
+   * the card a person may beat it on. Built beside the broker it keeps its cards in.
+   */
+  readonly relay: Relay;
   readonly push: Push;
   /**
    * The fourth leg out of `announce` — the same events, to a channel the
@@ -841,9 +1018,18 @@ export abstract class ServiceBase {
   >();
   /** This instance's Claude accounts — registry, meters, per-run environments. */
   readonly accounts: Accounts;
+  /** The installed CLI's version, read once at boot — stamped on every transcript port (ACT-12). */
+  protected cliVersionSeen: string | undefined;
   protected accountsEmitTimer: NodeJS.Timeout | null = null;
   /** This instance's MCP servers — registry, credentials, health, per-run configs. */
   readonly mcp: Mcp;
+  /**
+   * The per-instance ceiling over every automatic `claude` start
+   * (`start-ceiling.ts`, SLF-1): consulted by `startRun` for the nine doors
+   * that go through it, by the runner for the reviewer and the cloud review,
+   * and by the MCP facade for its probe. Reads the two `ceiling*` prefs live.
+   */
+  readonly startCeiling: StartCeiling;
   protected mcpEmitTimer: NodeJS.Timeout | null = null;
   /**
    * The issue estate — every repository this console stands on, and its issues.
@@ -874,10 +1060,28 @@ export abstract class ServiceBase {
    * `queuePresenceChange`). Bounded, because a poisoned inbox is exactly the
    * case that produces a lot of them at once.
    */
-  private presenceBacklog: Array<{ record: SessionRecord; event: SessionEventName | 'prune' | 'heartbeat' }> =
+  private presenceBacklog: Array<{ record: SessionRecord; event: RegistryChange; meta?: ChangeMeta }> =
     [];
   /** False until construction has unwound; see `presenceBacklog`. */
   private presenceReady = false;
+  /**
+   * What the bound cost, by kind (SHD-7): `dropped` — the droppable moves
+   * (`prune`, `heartbeat`) thrown away to make room; `deferred` — real moves
+   * that could not be parked because nothing droppable was left to evict, kept
+   * as a pending reconciliation instead. Reported once, at the flush.
+   */
+  private presenceBacklogCost: { dropped: Record<string, number>; deferred: Record<string, number> } = {
+    dropped: {}, deferred: {},
+  };
+  /**
+   * Real presence moves the bounded backlog could not hold, by session: the
+   * latest event per session, re-applied against the record as it then stands
+   * by the registry's next poll (SHD-7). A `SessionEnd` or `SessionStart` is
+   * never dropped — its record was persisted before the callback, and what a
+   * dropped callback lost was the REACTION (the scheduler poll, `correlate`,
+   * the lock-debris release), which nothing else would ever re-raise.
+   */
+  private presenceReconcile = new Map<string, { event: RegistryChange; meta?: ChangeMeta }>();
 
   constructor(flags: Flags) {
     this.flags = flags;
@@ -924,6 +1128,7 @@ export abstract class ServiceBase {
     this.webhooks = new Webhooks({
       enabled: flags.allowWebhooks,
       instance: INSTANCE.name,
+      profileHooks: machineProfileHooks(),
       link: (url) => `${instanceUrl(flags.port, flags.host)}${url}`,
     });
     // The console's own alarm channel must not fail silently: 29 real sends
@@ -986,6 +1191,21 @@ export abstract class ServiceBase {
     // change), carried on state(), and — for the one finding that means the
     // unit was installed as somebody else — announced on the health channel.
     this.environment = { issues: environmentReport() };
+    // The boot doctor's channel row (FLT-1 ii): this console must reach a
+    // person — a device, the notifier, a webhook — or it files `push-broken`,
+    // re-judged whenever the register or the webhook rows change, and named
+    // with the category of the first announcement that found nobody. The
+    // Tailscale half under `--remote` is asked once the port is bound
+    // (`checkDeliveryReachable`, from `index.ts`).
+    this.push.onNoDevice = ({ category, subscribed }) => {
+      if (subscribed > 0 || this.noDeviceCategory) return;
+      this.noDeviceCategory = category;
+      log.warn('push.no-device', { category });
+      this.refreshDeliveryIssue();
+    };
+    this.push.onDevicesChanged = () => this.refreshDeliveryIssue();
+    this.webhooks.onRowsChanged = () => this.refreshDeliveryIssue();
+    this.refreshDeliveryIssue();
     // The announce is suppressed under a test runner: the doctor reads the
     // AMBIENT machine env, and a developer whose own shell PATH carries the
     // defect would otherwise leak a health notification into every suite that
@@ -1020,20 +1240,65 @@ export abstract class ServiceBase {
         tag: tagFor('health', 'env-doctor'),
       });
     }
+    // The policy in force, judged once per boot (phase 12, TRS-9): an empty
+    // ask list or a struck deny wall is logged and — unless acknowledged
+    // against exactly this rule set — announced on the health channel, the
+    // way the environment doctor's one finding is.
+    this.announcePolicyAdvisories(Boolean(testing));
     this.watcher = new DocsWatcher((paths) => this.onChange(paths));
     // The session registry: loaded from disk (records + whatever the hook
     // dropped in the inbox while no console was up), then watching the inbox.
     this.sessions = new SessionRegistry({
       dir: join(INSTANCE_STATE_DIR, 'sessions'),
-      onChange: (record, event) => this.queuePresenceChange(record, event),
+      onChange: (record, event, meta) => this.queuePresenceChange(record, event, meta),
       onWarn: (what, detail) => log.warn(what, detail),
+      onInfo: (what, detail) => log.info(what, detail),
+      // The 30 s poll is what re-applies a real move the construction backlog
+      // could not hold (SHD-7) — a deferral, never a drop.
+      onPoll: () => this.applyPresenceReconciliations(),
     })
       .load()
       .start();
     this.approvals = new Approvals({
       notify: (approval) => {
-        this.emit('approval', approval);
         const where = `${approval.slug}${approval.phase != null ? ` phase ${approval.phase}` : ''}`;
+        // A card born decided — a grant under a plan's publishing exception
+        // (TRS-4) — is announced once, as news rather than as a question:
+        // nothing is left to answer, so no verbs ride it and no `approval`
+        // event puts it in a queue. `approval:resolved` already told the pages.
+        if (approval.status !== 'pending') {
+          this.announce(
+            'approval',
+            {
+              title: 'Published under a plan exception',
+              body: `${where} — ${approval.title}`,
+              tag: tagFor('approval', approval.id),
+              detail: approval.reason ?? approval.detail,
+            },
+            { slug: approval.slug, phase: approval.phase, runId: approval.runId, approvalId: approval.id },
+          );
+          return;
+        }
+        this.emit('approval', approval);
+        // A relayed question (phase 14) is a session ASKING — the `session-ask`
+        // push, with the question and its options as the body — and it carries
+        // no verbs: a notification button may allow or deny, never choose one
+        // of four labels, so the answer is a tap on the approve page.
+        if (approval.kind === 'question') {
+          const first = approval.question?.items[0];
+          const options = first?.options.map((option) => option.label).join(' · ') ?? '';
+          this.announce(
+            'session-ask',
+            {
+              title: `A session asks — answered by rule in ${Math.round(RELAY_WINDOW_MS / 1000)} s unless you do`,
+              body: `${where} — ${approval.title}${options ? ` (${options})` : ''}`.slice(0, 400),
+              tag: tagFor('session-ask', 'question', approval.id),
+              detail: approval.detail,
+            },
+            { slug: approval.slug, phase: approval.phase, runId: approval.runId, approvalId: approval.id },
+          );
+          return;
+        }
         this.announce(
           'approval',
           {
@@ -1079,9 +1344,38 @@ export abstract class ServiceBase {
           title: approval.title,
         });
       },
+      // The run journal's twins of a raise and of every ending (TRS-7).
+      record: (event, approval) => this.journalApproval(event, approval),
+      // A relayed question the broker would end on its own is the relay's.
+      questionEnding: (approval, why) => this.relay?.end(approval, why) ?? false,
     });
+    this.relay = new Relay({
+      approvals: this.approvals,
+      runner: (runId) => this.runnerByRunId(runId),
+      journal: (slug, runId, event, data, phase) => {
+        if (this.root?.ok) new Journal(this.root.path, slug, runId).append(event, data, phase);
+      },
+      announce: (category, message, context) => this.announce(category, message, context),
+      tagFor: (...parts) => tagFor(...parts),
+      appendRuling: (slug, ruling) => {
+        if (!this.root?.ok) return;
+        appendRuling(rulingsFile(this.root.path, slug), {
+          slug, phase: ruling.phase, kind: 'ambiguity', what: ruling.what, why: ruling.why,
+          decisionKey: 'ambiguity', by: ruling.by, relay: ruling.relay,
+          ...(ruling.sessionId ? { sessionId: ruling.sessionId } : {}),
+        });
+      },
+      rules: () => [...RELAY_RULE_DEFAULTS, ...sanitiseRelayRules(this.prefs?.relayRules)],
+      scriptsDir: flags.scriptsDir,
+    });
+    // The machine's lanes, every console's (zero-touch phase 17, FLT-7):
+    // `fleet.json` `maxSessions` is the ceiling on the machine, and each lane
+    // this console starts is a token every sibling counts at its own admission.
+    this.machineLanes = new MachineLanes(INSTANCE.id, { name: INSTANCE.name, port: () => this.flags.port });
+    this.heartbeat = new Heartbeat(INSTANCE.id, () => this.heartbeatFacts());
     this.scheduler = new Scheduler({
       max: () => this.flags.maxSessions,
+      machine: this.machineLanes,
       // The usage walls, read from the ONE place that persists them. Without
       // this the scheduler kept its own `Map` of the same fact, and the two
       // diverged across a restart — the registry remembered the window, the
@@ -1137,6 +1431,11 @@ export abstract class ServiceBase {
       // Presence beats the lease: a lock whose session the registry shows
       // ended stops blocking NOW; a live one is named as live on the queue.
       presence: (lock) => this.sessions.presenceOfLock(lock),
+      // …and presence speaks with no lock at all (REG-3): a live session in
+      // this repository that has not claimed yet is a holder, named.
+      peers: (entry) => (this.root?.ok
+        ? this.peersInRepository(this.root.path, { slug: entry.slug, phase: entry.phase }, [], entry.scope)
+        : []),
       // The repository guard is a preference, read per call so a flip in the
       // settings page lands on the very next poll. Off never means unguarded
       // within one run — see `SchedulerDeps.guard`.
@@ -1223,6 +1522,8 @@ export abstract class ServiceBase {
       // unattended act real; a console that may not spawn a session must not
       // execute a session's recorded command either.
       cmdRefsEnabled: () => this.flags.allowRun && this.prefs.watchCmdRefs !== false,
+      // …and a ref the console MINTED runs only on an explicit yes (SLF-8).
+      mintedCmdRefsEnabled: () => this.flags.allowRun && this.prefs.watchMintedCmdRefs === true,
       runCommand: (command, timeoutMs) =>
         runSingleCommand(command, {
           cwd: this.root?.path ?? process.cwd(),
@@ -1273,8 +1574,25 @@ export abstract class ServiceBase {
         });
       },
     });
+    // The poller's adaptive cadence, wired at last (ACT-3): an account one of
+    // this console's runners is spending RIGHT NOW is read every ~90 s, the
+    // rest every ten minutes. `runners` is a map on this instance, so the
+    // probe is late-bound like every other runner seam here.
+    this.accounts.setActiveProbe((accountId) =>
+      [...this.runners.values()].some((runner) => runner.isSpending(accountId)));
+    this.startCeiling = new StartCeiling(() => ({
+      startsPerHour: this.prefs.ceilingStartsPerHour ?? DEFAULT_STARTS_PER_HOUR,
+      usdPerHour: this.prefs.ceilingUsdPerHour ?? DEFAULT_USD_PER_HOUR,
+    }));
     this.mcp = new Mcp({
       onChange: () => this.emitMcp(),
+      // The probe is one of the fourteen automatic starts: counted against
+      // the instance's ceiling, refused past it (health goes stale, which is
+      // what it does overnight anyway), refused and announced by `admitStart`.
+      ceiling: {
+        admit: (actor) => this.admitStart(actor, null, null),
+        charge: (actor) => this.startCeiling.charge(actor, null),
+      },
       // A server's advertised tools changed under a plan that already trusted
       // it. This is the documented MCP supply-chain attack — a server that was
       // safe when it was attached, republished with a tool that is not — and a
@@ -1331,6 +1649,15 @@ export abstract class ServiceBase {
     // Meters run for the life of the process, not the life of a source dir —
     // accounts are an instance fact, and the header shows them on every page.
     this.accounts.startPolling();
+    // The transcript layout the switch-and-resume path depends on is the CLI's
+    // and undocumented (ACT-12): read once here and logged, so a release that
+    // moves the files is noticed at boot rather than at the first switch that
+    // finds nothing; the CLI's version is remembered so every port records
+    // the layout it was made under.
+    const layout = assertTranscriptLayout(this.accounts.configDirFor(undefined));
+    if (layout.ok) log.info('accounts.transcript-layout', { ...layout });
+    else log.warn('accounts.transcript-layout', { ...layout });
+    void cliVersion().then((version) => { this.cliVersionSeen = version; });
     // A fault anywhere in the process reaches the browser as a health event,
     // so a degraded console announces itself instead of looking healthy.
     onDegraded((state) => {
@@ -1356,19 +1683,38 @@ export abstract class ServiceBase {
    *
    * See `presenceBacklog`. The bound is 500 records: a poisoned inbox is the
    * case that mints these, and a backlog nobody could ever drain is a second
-   * way to fall over at boot. Oldest wins — the first events of a boot are the
-   * ones that carry the ended sessions whose locks are debris.
+   * way to fall over at boot. What the bound bites is chosen by KIND, never by
+   * arrival (SHD-7): `load()` ingests the inbox before it prunes, so on a deep
+   * inbox the moves at the back of the queue were exactly the ingested
+   * `SessionEnd`s whose locks are debris — and an early `return` threw the
+   * newest away. Now a full backlog evicts its oldest droppable move (`prune`,
+   * `heartbeat`) to make room, drops an incoming droppable when there is none,
+   * and parks a real move it cannot hold as a pending reconciliation the next
+   * poll re-applies.
    */
-  private queuePresenceChange(record: SessionRecord, event: SessionEventName | 'prune' | 'heartbeat'): void {
+  private queuePresenceChange(record: SessionRecord, event: RegistryChange, meta?: ChangeMeta): void {
     if (this.presenceReady) {
-      this.onPresenceChange(record, event);
+      this.onPresenceChange(record, event, meta);
       return;
     }
-    if (this.presenceBacklog.length >= PRESENCE_BACKLOG_MAX) {
-      log.warn('sessions.presence-backlog-full', { dropped: `${record.sessionId}:${event}` });
+    if (this.presenceBacklog.length < PRESENCE_BACKLOG_MAX) {
+      this.presenceBacklog.push({ record, event, ...(meta ? { meta } : {}) });
       return;
     }
-    this.presenceBacklog.push({ record, event });
+    const cost = this.presenceBacklogCost;
+    const evictable = this.presenceBacklog.findIndex((entry) => droppablePresence(entry.event));
+    if (evictable >= 0) {
+      const [evicted] = this.presenceBacklog.splice(evictable, 1);
+      cost.dropped[evicted.event] = (cost.dropped[evicted.event] ?? 0) + 1;
+      this.presenceBacklog.push({ record, event, ...(meta ? { meta } : {}) });
+      return;
+    }
+    if (droppablePresence(event)) {
+      cost.dropped[event] = (cost.dropped[event] ?? 0) + 1;
+      return;
+    }
+    cost.deferred[event] = (cost.deferred[event] ?? 0) + 1;
+    this.presenceReconcile.set(record.sessionId, { event, ...(meta ? { meta } : {}) });
   }
 
   /**
@@ -1381,9 +1727,18 @@ export abstract class ServiceBase {
     this.presenceReady = true;
     const pending = this.presenceBacklog;
     this.presenceBacklog = [];
-    for (const { record, event } of pending) {
+    const cost = this.presenceBacklogCost;
+    if (Object.keys(cost.dropped).length || Object.keys(cost.deferred).length) {
+      // Once, at the flush, by kind — so a reader can see the bound bit only
+      // what it may (`prune`, `heartbeat` under `dropped`) and how many real
+      // moves wait for the poll (`deferred`).
+      log.warn('sessions.presence-backlog-full', {
+        max: PRESENCE_BACKLOG_MAX, dropped: cost.dropped, deferred: cost.deferred,
+      });
+    }
+    for (const { record, event, meta } of pending) {
       try {
-        this.onPresenceChange(record, event);
+        this.onPresenceChange(record, event, meta);
       } catch (error) {
         log.warn('sessions.presence-apply-failed', {
           session: record.sessionId,
@@ -1392,6 +1747,33 @@ export abstract class ServiceBase {
         });
       }
     }
+  }
+
+  /**
+   * Re-apply the real moves the construction backlog deferred, against each
+   * session's record as it stands NOW — the registry's poll calls this, so a
+   * deferred `SessionEnd` reaches the scheduler and the convergence loop within
+   * one poll instead of never (SHD-7). A session pruned in the meantime is
+   * skipped: its record is gone, and a lock naming it reads `unknown` and
+   * lapses on its lease.
+   */
+  protected applyPresenceReconciliations(): number {
+    if (!this.presenceReady || !this.presenceReconcile.size) return 0;
+    const pending = [...this.presenceReconcile];
+    this.presenceReconcile.clear();
+    let applied = 0;
+    for (const [sessionId, { event, meta }] of pending) {
+      const record = this.sessions.get(sessionId);
+      if (!record) continue;
+      try {
+        this.onPresenceChange(record, event, meta);
+        applied++;
+      } catch (error) {
+        log.warn('sessions.presence-apply-failed', { session: sessionId, event, error: (error as Error).message });
+      }
+    }
+    if (applied) log.info('sessions.presence-reconciled', { applied, events: pending.map(([, e]) => e.event) });
+    return applied;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1544,6 +1926,80 @@ export abstract class ServiceBase {
     }
   }
 
+  /** Runs whose surviving child's hook token could not be read back — `token-lost` for their cards. */
+  protected tokenLostRuns = new Set<string>();
+
+  /**
+   * What an earlier console left of its approvals (TRS-11), judged once the
+   * runs can be read: a run whose child outlived that console gets its token
+   * ADOPTED from the settings file the child is still holding — never a fresh
+   * one, which would make every later hook call from that child unauthorised,
+   * and this hook fails open — and each outstanding card is kept answerable or
+   * filed `unanswerable` with the reason that holds.
+   */
+  protected recoverApprovals(): void {
+    if (!this.root?.ok) return;
+    const live = this.liveRunIds();
+    for (const record of this.store?.list() ?? []) {
+      let state: RunState | null = null;
+      try { state = latestRun(this.root.path, record.slug, live); } catch { state = null; }
+      if (!state || live.has(state.id)) continue;
+      const alive = childrenOf(state).filter((child) => pidHoldsWork(child.pid, procIdentity(child)));
+      if (!alive.length) continue;
+      const token = tokenFromSettingsFile(state.id);
+      if (token && this.approvals.adoptToken(state.id, token)) {
+        log.info('approvals.token-adopted', { runId: state.id, slug: record.slug, pids: alive.map((child) => child.pid) });
+      } else {
+        this.tokenLostRuns.add(state.id);
+        log.warn('approvals.token-lost', { runId: state.id, slug: record.slug, pids: alive.map((child) => child.pid) });
+      }
+    }
+    this.approvals.recover((card) => {
+      // A relayed question (phase 14): answered by rule NOW, the outage in its
+      // `waitedMs` — answerable when it was deferred, `hook-closed` when not.
+      if (card.kind === 'question') return this.relay.recoverCard(card);
+      if (card.standing) return { unanswerable: 'reoffered' };
+      if (card.kind !== 'tool') return { unanswerable: 'asker-gone' };
+      if (this.approvals.liveToken(card.runId)) return { answerable: true };
+      return { unanswerable: this.tokenLostRuns.has(card.runId) ? 'token-lost' : 'session-gone' };
+    });
+  }
+
+  /**
+   * The run journal's twin of an approval moment (TRS-7): a raise and every
+   * ending — a person, `disarm()`, the timeout — on the run that asked, through
+   * its live runner when one drives it and onto its journal file when none
+   * does. A grant's twin is written by its one caller, which alone knows the
+   * scope that answered (`phase.approval-auto-granted`).
+   */
+  protected journalApproval(event: ApprovalEvent, approval: Approval): void {
+    if (event === 'auto-granted' || approval.runId === 'unknown') return;
+    const name = event === 'raised' ? 'phase.approval-raised' : 'phase.approval-decided';
+    const data: Record<string, unknown> = event === 'raised'
+      ? {
+        approvalId: approval.id, kind: approval.kind, title: approval.title.slice(0, 200), expiresAt: approval.expiresAt,
+        ...(approval.tool ? { tool: approval.tool.name } : {}),
+        ...(approval.matched !== undefined ? { matched: approval.matched } : {}),
+        ...(approval.standing ? { standing: true } : {}),
+      }
+      : {
+        approvalId: approval.id, kind: approval.kind, decision: approval.status, decidedBy: approval.decidedBy ?? null,
+        waitedMs: Math.max(0, (Date.parse(approval.decidedAt ?? '') || Date.now()) - Date.parse(approval.createdAt)),
+        ...(approval.recovered ? { recovered: true } : {}),
+      };
+    const phase = approval.phase ?? undefined;
+    try {
+      const runner = this.runnerByRunId(approval.runId);
+      if (runner) {
+        runner.note(name, data, phase);
+        return;
+      }
+      if (this.root?.ok && approval.slug && approval.slug !== 'unknown') {
+        new Journal(this.root.path, approval.slug, approval.runId).append(name, data, phase);
+      }
+    } catch { /* the journal twin is bookkeeping: it never costs the decision */ }
+  }
+
   /**
    * Drop every per-run secret file no live run claims.
    *
@@ -1556,7 +2012,10 @@ export abstract class ServiceBase {
    * processes rather than a status on disk.
    */
   protected sweepRunSecrets(): void {
-    const keep = this.liveRunIds();
+    // …and every run whose token this console adopted from a surviving child
+    // (TRS-11): that child is still holding the file, and the file is the only
+    // place its token can be read back from on the next restart.
+    const keep = new Set([...this.liveRunIds(), ...this.approvals.armedRuns()]);
     const removed = [...pruneMcpConfigs(keep), ...pruneSettingsFiles(keep)];
     if (removed.length) log.info('run.secrets-swept', { files: removed.length, kept: keep.size });
   }
@@ -1683,9 +2142,16 @@ export abstract class ServiceBase {
     throttledUntil: number | null;
     throttledAccounts: { accountId: string; until: number }[];
     schedule?: { open: boolean; opensAt: number | null; reason: string | null } | null;
+    console: { live: number; max: number };
+    machine: { live: number; max: number | null } | null;
   } {
     const snapshot = this.scheduler.snapshot();
     return {
+      // Both ceilings, named apart (FLT-7): this console's own `maxSessions`,
+      // and the machine's — every console's live lanes against `fleet.json`
+      // `maxSessions`. `max`/`live` stay the console's for older readers.
+      console: { live: snapshot.live, max: snapshot.max },
+      machine: snapshot.machine,
       max: snapshot.max,
       // Lanes, not runs. One run driving three phases is three sessions on this
       // machine, and the cap is about sessions.
@@ -1696,6 +2162,161 @@ export abstract class ServiceBase {
       // Reported even when open, so the header can say "boarding paused until
       // 09:00" without a phase having to fail to start first.
       schedule: snapshot.schedule ?? null,
+    };
+  }
+
+  /**
+   * The attention inbox's `needs-you` count as it was last built, with when —
+   * what the heartbeat reports to a fleet reader. Set by `attention()`; null
+   * until the first build.
+   */
+  protected needsYouCount: { count: number; at: number } | null = null;
+
+  /** The category of the first announcement that found no device at all — named once per process (FLT-1). */
+  private noDeviceCategory: string | null = null;
+  /** Tailscale as last asked under `--remote`; null until `checkDeliveryReachable` has asked. */
+  private tailscaleFacts: DeliveryFacts['tailscale'] = null;
+
+  /**
+   * Judge the delivery channel again and set or withdraw the one
+   * `push-broken` issue it owns. The same `probeDelivery` the run-start
+   * prelude asks (phase 11), over the live register: a device that subscribes
+   * after boot clears the row at once, rather than at the next restart.
+   */
+  refreshDeliveryIssue(): void {
+    let verdict: ReturnType<typeof probeDelivery>;
+    try {
+      verdict = probeDelivery({
+        devices: this.push.list().length,
+        notifyCommand: Boolean(notifyCommand()),
+        webhooks: this.webhooks.list().length,
+        // Only once it has been asked: a console is not called unreachable on a
+        // guess about a daemon nobody has probed yet.
+        remote: (this.flags.remoteHosts?.length ?? 0) > 0 && this.tailscaleFacts !== null,
+        tailscale: this.tailscaleFacts,
+      });
+    } catch {
+      return;
+    }
+    const issue = deliveryIssue(verdict, this.noDeviceCategory);
+    const at = this.environment.issues.findIndex((existing) => existing.id === DELIVERY_ISSUE_ID);
+    const before = at >= 0 ? this.environment.issues[at] : null;
+    if ((issue?.detail ?? null) === (before?.detail ?? null)) return;
+    if (at >= 0) this.environment.issues.splice(at, 1);
+    if (issue) this.environment.issues.unshift(issue);
+    if (issue) log.warn('env.delivery-channel', { ok: false, reason: verdict.reason, category: this.noDeviceCategory });
+    else log.info('env.delivery-channel', { ok: true, reason: verdict.reason });
+  }
+
+  /** The `--remote` half of the channel row: Tailscale running and serving this port. */
+  async checkDeliveryReachable(): Promise<void> {
+    if (!this.flags.remoteHosts.length) return;
+    try {
+      const status = await tailscaleStatus(this.flags.port);
+      this.tailscaleFacts = status.state === 'running'
+        ? { running: true, forOurPort: status.serve.forOurPort }
+        : { running: false, forOurPort: false };
+    } catch {
+      this.tailscaleFacts = { running: false, forOurPort: false };
+    }
+    this.refreshDeliveryIssue();
+  }
+
+  /**
+   * What the inbox's instance-health rows read (FLT-1 iv, FLT-6): this
+   * console's delivery verdict and unread count, Tailscale under `--remote`
+   * (the 30 s memo the Settings card reads), and every OTHER registered console
+   * of the machine as the census sees it.
+   */
+  async inboxFleetFacts(): Promise<NonNullable<InboxFacts['fleet']>> {
+    const delivery = probeDelivery({
+      devices: this.push.list().length,
+      notifyCommand: Boolean(notifyCommand()),
+      webhooks: this.webhooks.list().length,
+      remote: false,
+    });
+    let remote: InboxReach | null = null;
+    if ((this.flags.remoteHosts?.length ?? 0) > 0) {
+      const status = await tailscaleStatus(this.flags.port);
+      remote = status.state === 'running'
+        ? {
+          running: true, forOurPort: status.serve.forOurPort, hosts: this.flags.remoteHosts,
+          ...(status.serve.occupant ? {
+            occupant: {
+              port: status.serve.occupant.port,
+              ...(status.serve.occupant.id ? { id: status.serve.occupant.id } : {}),
+              ...(status.serve.occupant.name ? { name: status.serve.occupant.name } : {}),
+            },
+          } : {}),
+        }
+        : {
+          running: false, forOurPort: false, hosts: this.flags.remoteHosts,
+          ...(status.state === 'installed-not-running' && status.detail ? { detail: status.detail } : {}),
+          ...(status.state === 'not-installed' ? { detail: 'not installed' } : {}),
+        };
+    }
+    const siblings = census().rows
+      .filter((row) => row.id !== INSTANCE.id && row.provenance !== 'state-only')
+      .map((row) => ({
+        id: row.id, name: row.name, root: row.root, liveness: row.liveness, discrepancies: row.discrepancies,
+        unit: row.sources.unit, autostart: row.autostart, stopMarker: row.stopMarker,
+        lastSeenAt: row.lastSeenAt, stoppedAt: row.stoppedAt,
+      }));
+    return { delivery: { ok: delivery.ok, reason: delivery.reason }, unread: this.notifications.unread(), remote, siblings };
+  }
+
+  /** `GET /api/instances` — the machine's census, the same report `phase-console list --json` prints. */
+  instancesView(): ReturnType<typeof instancesView> {
+    return instancesView();
+  }
+
+  /**
+   * `GET /api/fleet/profile` — the machine profile as every console reads it,
+   * and what THIS console runs with: each setting's value and its source
+   * (`flag`, `env`, this console's `override`, or the machine `profile`).
+   */
+  fleetProfileView(): {
+    profile: ReturnType<typeof fleetProfile>;
+    console: {
+      id: string;
+      name: string;
+      remoteHosts: string[];
+      remoteUsers: string[];
+      notifyCommand: boolean;
+      maxSessions: number;
+      machineMaxSessions: number | null;
+      autostart: boolean | 'once';
+      sources: NonNullable<Flags['profile']>['sources'];
+      overridden: string[];
+    };
+  } {
+    const profile = fleetProfile();
+    return {
+      profile,
+      console: {
+        id: INSTANCE.id,
+        name: INSTANCE.name,
+        remoteHosts: this.flags.remoteHosts,
+        remoteUsers: this.flags.remoteUsers,
+        notifyCommand: Boolean(notifyCommand()),
+        maxSessions: this.flags.maxSessions,
+        machineMaxSessions: profile.maxSessions ?? null,
+        autostart: readAutostart(INSTANCE.id),
+        sources: this.flags.profile?.sources ?? {},
+        overridden: this.flags.profile?.overridden ?? [],
+      },
+    };
+  }
+
+  /** What this console's beat says about it (FLT-5, FLT-6, FLT-10). */
+  protected heartbeatFacts(): HeartbeatFacts {
+    return {
+      port: this.flags.port,
+      supervisor: supervisor().kind,
+      lanes: { live: this.scheduler.snapshot().live, max: this.flags.maxSessions },
+      needsYou: this.needsYouCount?.count ?? null,
+      lastRemoteAt: accessLedger.lastRemoteAt(),
+      build: { version: CONSOLE_VERSION, rev: distRev() },
     };
   }
 
@@ -1737,6 +2358,31 @@ export abstract class ServiceBase {
       }
       return { phase: row.phase, scope, conflicts: [...new Set(conflicts)] };
     });
+  }
+
+  /**
+   * Whether the session that wrote a declaration still holds its phase — the
+   * presence read every resume of THAT session must pass first (REG-1).
+   *
+   * A session the registry shows LIVE is still working: a hand session that
+   * declared its wait and carried on, or one that took the phase over. Arming a
+   * `--resume` of it would put a second `claude` on its transcript in its
+   * working tree — the one act nothing can undo. `unknown` (no record, a stale
+   * one, a stopped process) falls back to the lease: an unexpired lock naming
+   * that session says it still holds the phase. `ended`, or no session named at
+   * all, holds nothing. Returns what held it, or null.
+   */
+  protected declarerHold(
+    slug: string, phase: number, sessionId: string | undefined,
+  ): { why: 'session-live' | 'session-lease'; sessionId: string; pid?: number; lock?: string } | null {
+    if (!sessionId) return null;
+    const { presence, pid } = this.sessions.presenceDetail(sessionId);
+    if (presence === 'live') return { why: 'session-live', sessionId, ...(pid ? { pid } : {}) };
+    if (presence === 'ended') return null;
+    const now = Date.now();
+    const lock = this.allLocks().find((held) => held.slug === slug && held.phase === phase
+      && held.session === sessionId && !lockLapsed(held, now));
+    return lock ? { why: 'session-lease', sessionId, lock: lock.owner, ...(pid ? { pid } : {}) } : null;
   }
 
   /** Every lock on disk, across every plan — the scheduler's view of the world. */
@@ -1961,6 +2607,98 @@ export abstract class ServiceBase {
     return out;
   }
 
+  /**
+   * The ONE peer predicate (REG-3): the sessions the registry shows `live` (or
+   * `unknown` with a process behind them) in this repository, which could be
+   * about to work `phase` — read at admission, at boarding and by the
+   * classifier, independently of any lock.
+   *
+   * Every registry consultation on a decision path used to be reached THROUGH
+   * a lock, so a session that had started and not yet claimed — the first
+   * minute of every hand session, which is exactly when two sessions collide —
+   * was invisible to the lane about to board beside it, and a person had to be
+   * interrupted to ask whether a peer was on the phase. Left out, because
+   * something else already speaks for each: the console's own lanes (an
+   * `autopilot/<runId>` owner this console drives — its grant holds the scope),
+   * a session strongly correlated to a DIFFERENT phase (its lock does), one
+   * whose lock on THIS phase names it (the lock is the holder), probes, the
+   * sessions named in `excluding`, and a session whose inferred scope is
+   * disjoint from the phase's. What remains — uncorrelated, or correlated to
+   * this phase with no lock — is a peer.
+   */
+  peersInRepository(
+    root: string,
+    phase: { slug: string; phase: number } | null,
+    excluding: readonly (string | undefined)[] = [],
+    scope?: readonly string[],
+  ): SessionPeer[] {
+    let present: ReturnType<SessionRegistry['inRoot']>;
+    try {
+      present = this.sessions.inRoot(root, { excluding });
+    } catch {
+      return [];
+    }
+    if (!present.length) return [];
+    const locks = this.allLocks();
+    const liveIds = this.liveRunIds();
+    const runs: RunLink[] = [];
+    for (const state of this.runStates()) {
+      for (const [key, record] of Object.entries(state.phases ?? {})) {
+        runs.push({
+          runId: state.id, slug: state.slug, phase: Number(key),
+          ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          ...(PHASE_IN_FLIGHT.includes(record.status) ? { active: true } : {}),
+        });
+      }
+    }
+    const wanted = scope?.length ? scope : phase ? (this.scopeOf(phase.slug, phase.phase) ?? ['all']) : ['all'];
+    const now = Date.now();
+    const out: SessionPeer[] = [];
+    for (const record of present) {
+      const ownerRun = /^autopilot\/([A-Za-z0-9._-]{1,64})$/.exec(record.owner ?? '')?.[1];
+      if (ownerRun && liveIds.has(ownerRun)) continue;
+      const plan = correlate(record, locks.map((lock) => ({
+        slug: lock.slug, phase: lock.phase, owner: lock.owner, ...(lock.session ? { session: lock.session } : {}),
+      })), now, runs) ?? null;
+      if (plan && phase && plan.strong && (plan.slug !== phase.slug || plan.phase !== phase.phase)) continue;
+      if (phase && locks.some((lock) => lock.slug === phase.slug && lock.phase === phase.phase && lock.session === record.sessionId)) continue;
+      const peerScope = this.scopeOfSession(record, root);
+      if (!scopesIntersect(peerScope, wanted)) continue;
+      out.push({
+        sessionId: record.sessionId,
+        pid: record.pid ?? null,
+        cwd: record.cwd,
+        kind: record.kind,
+        presence: record.presence,
+        owner: record.owner ?? (record.user && record.host ? `${record.user}@${record.host}` : 'a Claude session'),
+        scope: peerScope,
+        plan,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * What a session is working in, as far as the console can tell: the scope
+   * its environment declared (`PE_SCOPE`), else the REPOSITORY its cwd sits in
+   * under the root — a directory directly under the root that is a checkout of
+   * its own (a submodule: it has a `.git`), which is what a scope token names
+   * in a monorepo-of-submodules — else everything. A session in the root
+   * itself, in an ordinary subdirectory of a single repository, or in a
+   * worktree the console cannot map might touch anything, and the safe reading
+   * of "might" is "does".
+   */
+  protected scopeOfSession(record: Pick<SessionRecord, 'scope' | 'cwd'>, root: string): string[] {
+    const declared = parseScope(record.scope ?? '');
+    if (declared.length) return declared;
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    if (!record.cwd.startsWith(prefix)) return ['all'];
+    const first = record.cwd.slice(prefix.length).split('/')[0] ?? '';
+    if (!first || first.startsWith('.') || !existsSync(join(prefix, first, '.git'))) return ['all'];
+    const token = normalizeToken(first);
+    return token ? [token] : ['all'];
+  }
+
   /** What a phase's Repos column says it touches. Undefined for an unknown plan. */
   protected scopeOf(slug: string, phase: number): string[] | undefined {
     const row = this.store?.get(slug)?.plan?.graph.find((r) => r.phase === phase);
@@ -1980,6 +2718,13 @@ export abstract class ServiceBase {
       // The registry's word on a lock's session, for the boarding belt-check:
       // an ended session's claim is released and boarding goes on.
       lockPresence: (lock) => this.sessions.presenceOfLock(lock),
+      // A session's own presence, for the resume gate. This console's own lanes
+      // never reach it as `live`: a lane's session has exited by the time
+      // anything resumes it, and its pid probe says so (REG-1).
+      sessionPresence: (sessionId) => this.sessions.presenceDetail(sessionId),
+      // The peer belt-check at boarding (REG-3) — the same predicate admission
+      // read, for the grant→spawn window.
+      peers: (slug, phase, excluding) => (this.root?.ok ? this.peersInRepository(this.root.path, { slug, phase }, excluding) : []),
       // The registry cannot learn a lane's liveness any other way: the run's
       // own settings file displaces the presence hook. See `RunnerDeps
       // .sessionHeartbeat`. Throttling is the registry's, not ours.
@@ -2083,6 +2828,20 @@ export abstract class ServiceBase {
         const plan = this.store?.get(slug)?.plan;
         return plan?.phases[phase]?.mcpPolicy ?? plan?.sessionBudget.mcpPolicy;
       },
+      // The credentials the PLAN names for a phase and its policy for a missing
+      // one (phase 11, ZTD-4) — read from the parsed plan like `planMcp`, held
+      // to `phase-graph.sh --credentials N` by `engine-parity.test.ts`.
+      planCredentials: (slug, phase) => {
+        const plan = this.store?.get(slug)?.plan;
+        return { ids: credentialsFor(plan, phase), policy: credentialPolicyFor(plan, phase) ?? null };
+      },
+      // …and whether they are held, by id, through the one registry the
+      // prelude and `doctor` read (memoised, never a value).
+      credentialsHeld: (ids) => credentialsHeld(ids, { cwd: this.root?.path }),
+      // The plan's answer once the QA round budget is spent (phase 11, ZTD-9).
+      planQaExhausted: (slug) => this.store?.get(slug)?.plan?.sessionBudget.qaExhausted,
+      // …and a phase's answer for a §Verification fragment written as prose (ZTD-6).
+      personCheck: (slug, phase) => personCheckFor(this.store?.get(slug)?.plan, phase),
       // A phase boarded without servers it asked for. The runner has no
       // notification vocabulary; this is where the fact becomes something an
       // operator hears, once per run per server rather than once per phase.
@@ -2094,6 +2853,7 @@ export abstract class ServiceBase {
       mcp: {
         preflight: (ids, cwd) => this.mcp.preflight(ids, { cwd }),
         configFor: (runId, phase, ids) => this.mcp.configFor(runId, phase, ids),
+        transportOf: (id) => this.mcp.resolve([id]).servers[0]?.transport,
       },
       // The plan's Branch prose and title, for the git-strategy block: the
       // prose is read only to WARN on a mismatch, the title names the PR.
@@ -2216,7 +2976,12 @@ export abstract class ServiceBase {
         stallStalemateAttempts: this.prefs.stallStalemateAttempts,
         stallRetryBurst: this.prefs.stallRetryBurst,
         stallExternalWaitMs: this.prefs.stallExternalWaitMs,
+        // Forwarded at last: without it the runner always read the shipped 45
+        // minutes, whatever Settings said.
+        stallLocalJobMs: this.prefs.stallLocalJobMs,
       }),
+      // The watchdog's own park, switchable off (SLF-9, KNOWN-SINCE).
+      stallAutomaticPark: () => this.prefs.stallAutomaticPark !== false,
       onMcpRequireTimeout: (state, phase, result) => this.announceMcpTimeout(state, phase, result),
       // The preflight probe, under the RUN's account env. Signed out, the
       // refusal names the account and the exact command that fixes it —
@@ -2225,6 +2990,10 @@ export abstract class ServiceBase {
         const env = await this.accounts.envFor(accountId);
         const root = this.root?.ok ? this.root.path : process.cwd();
         const status = await checkAuthFor(root, env, accountId ?? 'default', true);
+        // The organisation the probe named is the breaker's key — learned
+        // machine-wide, so a token account (no `.claude.json` to read) still
+        // gets one (ACT-8).
+        this.accounts.noteAuthProbe(accountId, status);
         if (!status.loggedIn && accountId && accountId !== DEFAULT_ACCOUNT_ID) {
           const meta = this.accounts.meta(accountId);
           const fix =
@@ -2241,23 +3010,123 @@ export abstract class ServiceBase {
         }
         return status;
       },
-      onAccountLimited: (accountId, window, resetsAt, detail) => {
-        if (resetsAt) this.accounts.markLimited(accountId, window, resetsAt.toISOString());
+      // The one helper (ACT-5, SES-2): the facade writes the account's fact
+      // machine-wide and answers what to hold; the runner throttles and
+      // journals from the answer. A wall is announced under `limits` as it
+      // always was; a RETIREMENT is announced too — it is the account fact
+      // that costs the most to discover twice.
+      leaveAccount: (accountId, leaving) => {
+        // A credential refusal goes through `retire` — the one door onto the
+        // breaker's `retired`, the same one phase 11's prelude probe will use
+        // with an explicit orgId; the classifier is account-blind, so the
+        // organisation is whatever the learned store already knows.
+        const result = leaving.kind === 'credential'
+          ? this.accounts.retire(accountId, undefined, leaving.reason, leaving.by, leaving.class)
+          : this.accounts.leaveAccount(accountId, leaving);
         const name = this.accounts.labelFor(accountId);
-        this.announce('limits', {
-          title: `Usage limit hit — ${name}`,
-          body: detail,
-          tag: tagFor('limits', accountId ?? 'default', window, resetsAt?.toISOString() ?? 'unknown'),
+        if (leaving.kind === 'usage' && !leaving.perModel) {
+          this.announce('limits', {
+            title: `Usage limit hit — ${name}`,
+            body: leaving.reason,
+            tag: tagFor('limits', result.accountId, leaving.bucket ?? 'window', result.until ?? 'unknown'),
+          });
+        } else if (leaving.kind === 'credential') {
+          this.announce('limits', {
+            title: `Account retired — ${name}`,
+            body: `${leaving.reason}. The console will not start work as ${name}`
+              + `${result.orgId ? ' or any account in its organisation' : ''} until you clear it under Settings ▸ Accounts.`,
+            tag: tagFor('limits', 'retired', result.accountId),
+          });
+        }
+        return result;
+      },
+      // The quota door's verdict (ACT-2) — read from cache, never thrown; the
+      // runner climbs or parks on it beside the auth door.
+      accountHeadroom: (accountId, forModel) => this.preflightAccount(accountId, forModel),
+      // The healer's availability, for the loop's own exhaustion predicate
+      // (LFC-2, phase 10): a rung the loop cannot drive but the healer can is
+      // deferred; one neither can drive is exhausted, with the reasons.
+      // `state` is null here — the loop asks about its OWN run, whose record
+      // it holds; the vehicles that need the run answer from the record and
+      // the meters alone, which is the conservative reading.
+      rungDrivable: (slug, rung, situation, record, evidence, state) =>
+        this.vehicleForRung(rung, situation, record, evidence, slug, state) !== null,
+      rungUnavailable: (slug, situation, record, evidence, state) =>
+        this.unavailableRungHint(situation, record, evidence, slug, state),
+      // The `widen-rule` rung's two acts (phase 9, TRS-10): strike the deny
+      // rule for this plan once a person approved the card, and — when the
+      // loop that offered it has since ended — resume the phase's own session
+      // through the recover verb, which is the stopped-run door.
+      widenRule: (slug, rule, by) => {
+        this.editPolicy({ scope: 'plan', slug, remove: { deny: [rule] }, by });
+      },
+      resumeOwnSession: (slug, phase, instruction, by) => {
+        void this.recoverPhase(slug, phase, 'resume', { instruction, by }).catch((error) => {
+          log.warn('runner.widen-rule.resume-failed', { slug, phase, error });
         });
       },
+      accountKind: (accountId) => this.accounts.meta(accountId ?? DEFAULT_ACCOUNT_ID)?.kind,
+      onLiveWallEscalated: (state, phase, detail) => {
+        const name = this.accounts.labelFor(state.accountId);
+        this.announce('limits', {
+          title: detail.action === 'wait'
+            ? `Usage wall — ${state.slug} phase ${phase} waits for the window`
+            : `Usage wall — ${state.slug} phase ${phase} is parked`,
+          body: `${name}: ${detail.reason}. No other account has headroom`
+            + (detail.until ? `; the phase resumes at ${new Date(detail.until).toLocaleString()}.` : ' and the wall reported no reset time.'),
+          tag: tagFor('limits', 'live-wall', state.id, String(phase)),
+        });
+      },
+      // The CLI version the floor flag is judged against (`permissionPromptsFor`):
+      // one memoised `claude --version`, shared with the transcript port.
+      cliVersion: () => cliVersion(),
+      // The relay's floor (phase 14): read from the newest `system/init` any
+      // session on this console reported, and remembered for the next spawn.
+      initVersion: (binary) => initVersionFor(binary),
+      noteCliInit: (version, binary) => noteCliInit(version, binary),
       portTranscript: (sessionId, fromAccount, toAccount) =>
         portTranscript(
           sessionId,
           this.accounts.configDirFor(fromAccount),
           this.accounts.configDirFor(toAccount),
+          this.cliVersionSeen ? { cliVersion: this.cliVersionSeen } : {},
         ),
       onEvent: (event, data) => this.onRunnerEvent(event, data),
+      // The ceiling, for the two starts the runner owns and for the dollars
+      // every session reports (`spawnSession` charges them as it ends).
+      startCeiling: {
+        admit: (actor) => this.startCeiling.admit(actor),
+        charge: (actor, slug) => this.startCeiling.charge(actor, slug ?? null),
+        spendUsd: (usd) => this.startCeiling.spendUsd(usd),
+        shouldAnnounce: (refusal) => this.startCeiling.shouldAnnounce(refusal as CeilingRefusal),
+      },
     });
+  }
+
+  /**
+   * May this automatic start happen? A press always may. A refusal is written
+   * where a reader will look — `run.start-refused` on the run when there is
+   * one, `start-ceiling.refused` on the console log otherwise — and announced
+   * on `health` ONCE per window, since the second refusal in the hour is the
+   * same fact. Returns the refusal (never throws) so each door can decline in
+   * its own way: `startRun` throws it, the probe skips, the reviewer notes.
+   */
+  protected admitStart(actor: Actor, slug: string | null, runId: string | null): CeilingVerdict {
+    const verdict = this.startCeiling.admit(actor);
+    if (verdict.ok) return verdict;
+    const payload = { ...actor, ceiling: verdict.ceiling, limit: verdict.limit, count: verdict.count, until: verdict.until };
+    if (slug && runId && this.root?.ok) {
+      try { new Journal(this.root.path, slug, runId).append('run.start-refused', payload); } catch { /* the log line below still says it */ }
+    }
+    log.warn('start-ceiling.refused', { slug, runId, ...payload });
+    if (this.startCeiling.shouldAnnounce(verdict)) {
+      this.announce('health', {
+        title: `Start ceiling reached — ${verdict.ceiling === 'startsPerHour' ? `${verdict.count} automatic starts` : `$${verdict.count.toFixed(2)} of session spend`} in the last hour`,
+        body: ceilingSentence(verdict),
+        tag: tagFor('health', 'start-ceiling', verdict.until),
+      });
+    }
+    return verdict;
   }
 
   /* ---------------------------------------------------------------- *
@@ -2291,6 +3160,67 @@ export abstract class ServiceBase {
    * decides whether the console speaks at all, the device switch decides whether
    * this phone is one of the places it speaks to.
    */
+  /**
+   * What the permission policy in force can be warned about, with whether
+   * the operator has acknowledged each against its current rule set. Pure
+   * over the merge and the strikes at one scope — the global policy, or a
+   * plan's merged view — and read on every `GET /api/policy`.
+   */
+  policyAdvisories(slug: string | null = null): (PolicyAdvisory & { acknowledged: boolean; fingerprint: string })[] {
+    const acks = readAdvisoryAcks();
+    return policyAdvisory(loadPolicyFor(slug), struckFor(slug)).map((advisory) => {
+      const fingerprint = advisoryFingerprint(advisory);
+      return { ...advisory, fingerprint, acknowledged: acks[advisory.kind] === fingerprint };
+    });
+  }
+
+  /**
+   * The operator has read it: recorded against the rule set it named, so the
+   * same advisory over a CHANGED set (one more strike) stands again. `true`
+   * when the kind currently stands; a kind that does not is nothing to
+   * acknowledge and answers `false`.
+   */
+  acknowledgePolicyAdvisory(kind: string): boolean {
+    const standing = this.policyAdvisories().find((advisory) => advisory.kind === kind);
+    if (!standing) return false;
+    const acks = readAdvisoryAcks();
+    acks[kind] = standing.fingerprint;
+    mkdirSync(join(ADVISORY_ACK_FILE, '..'), { recursive: true });
+    writeFileSync(ADVISORY_ACK_FILE, `${JSON.stringify({ version: 1, acknowledged: acks }, null, 2)}\n`, 'utf8');
+    log.info('policy.advisory-acknowledged', { kind, rules: standing.rules.length });
+    return true;
+  }
+
+  /**
+   * Once per boot: log every standing advisory (`policy.advisory {kind,
+   * rules}`) and announce the unacknowledged ones on the health channel. The
+   * log line is the console's record and is never suppressed; the announce
+   * is skipped under a test runner like the environment doctor's, because it
+   * reads the AMBIENT policy files. Returns what it logged, for the caller
+   * that wants to know.
+   */
+  protected announcePolicyAdvisories(quiet = false): PolicyAdvisory[] {
+    if (this.policyAdvisoryAnnounced) return [];
+    this.policyAdvisoryAnnounced = true;
+    let standing: ReturnType<ServiceBase['policyAdvisories']>;
+    try {
+      standing = this.policyAdvisories();
+    } catch (error) {
+      log.warn('policy.advisory-unread', { error: (error as Error).message });
+      return [];
+    }
+    for (const advisory of standing) {
+      log.warn('policy.advisory', { kind: advisory.kind, rules: advisory.rules, acknowledged: advisory.acknowledged });
+      if (advisory.acknowledged || quiet) continue;
+      this.announce('health', {
+        title: advisory.kind === 'ask-empty' ? 'No run here asks about anything' : 'The deny wall has been struck',
+        body: `${advisory.message} Settings ▸ Permissions shows the rules and takes the acknowledgement.`,
+        tag: tagFor('health', `policy-advisory-${advisory.kind}`),
+      });
+    }
+    return standing;
+  }
+
   protected announce(
     category: CategoryId,
     message: { title: string; body: string; tag: string; detail?: string },
@@ -2384,19 +3314,20 @@ export abstract class ServiceBase {
     const callback = context.answer ? mintActionToken(context.answer.item, context.answer.verbs) : null;
     const buttons = callback ? notificationButtons(context.answer!.verbs) : [];
 
-    this.push.announce(
+    const payload = {
+      title: message.title,
+      body: message.body,
+      tag: message.tag,
+      url,
+      ...(context.approvalId ? { approvalId: context.approvalId } : {}),
+      // Both or neither: a button with no token is a button that cannot be
+      // pressed, and a token with no button is unreachable.
+      ...(callback && buttons.length ? { actions: buttons, callback } : {}),
+      notificationId: record.id,
+    };
+    const pushed = this.push.announce(
       category,
-      {
-        title: message.title,
-        body: message.body,
-        tag: message.tag,
-        url,
-        ...(context.approvalId ? { approvalId: context.approvalId } : {}),
-        // Both or neither: a button with no token is a button that cannot be
-        // pressed, and a token with no button is unreachable.
-        ...(callback && buttons.length ? { actions: buttons, callback } : {}),
-        notificationId: record.id,
-      },
+      payload,
       Date.now(),
       (report) => {
         this.notifications.delivery(record.id, { ...report, at: new Date().toISOString() });
@@ -2415,7 +3346,7 @@ export abstract class ServiceBase {
     // token (it is same-origin by construction and means nothing to a third
     // party), no `approvalId`, no buttons. Fire-and-forget like the rest — a
     // relay being down must not be able to touch a run.
-    this.webhooks.announce(category, {
+    const hooked = this.webhooks.announce(category, {
       title: message.title,
       body: message.detail ?? message.body,
       url,
@@ -2425,7 +3356,26 @@ export abstract class ServiceBase {
       runId: context.runId ?? null,
       ...(opts.urgent === undefined ? {} : { urgent: opts.urgent }),
     });
+    const legs: unknown[] = [pushed, hooked];
+    this.trackDelivery(record.id, legs);
     return record;
+  }
+
+
+  /**
+   * The deliveries still in flight, by notification id — kept only until they
+   * settle. Nothing awaits them on the ordinary path (a slow push service must
+   * never stall a phase); the shutdown announcement is the one reader, because
+   * the process that sent it is about to exit (SHD-4).
+   */
+  protected readonly deliveries = new Map<string, Promise<void>>();
+
+  private trackDelivery(id: string, legs: readonly unknown[]): void {
+    const pending = legs.filter((leg): leg is Promise<unknown> => leg instanceof Promise);
+    if (!pending.length) return;
+    const settled = Promise.allSettled(pending).then(() => undefined);
+    this.deliveries.set(id, settled);
+    void settled.finally(() => { if (this.deliveries.get(id) === settled) this.deliveries.delete(id); });
   }
 
   /**
@@ -2674,6 +3624,13 @@ export abstract class ServiceBase {
       try {
         log.info('run.recovery-continue', { slug: link.slug, runId: synced.id });
         await this.startRun(link.slug, {
+          // The pty agent's exit is an OBSERVATION, not a clock: the console
+          // continues because the recovery it launched said `fixed`.
+          actor: doorActor('pty-continue', {
+            by: 'console', via: 'event', origin: 'pty-agent:exit',
+            trigger: `${link.kind}:${outcome.fixed ? 'fixed' : 'not-fixed'}`,
+            guard: 'autoContinueRecovery,allowRun,!liveRunner,!fleetHold',
+          }),
           resumeRunId: synced.id,
           ...(synced.onlyPhases?.length ? { onlyPhases: synced.onlyPhases } : {}),
           skills: synced.skills ?? [],
@@ -2832,6 +3789,9 @@ export abstract class ServiceBase {
     // the rest — a crash, a SIGKILL, a machine that lost power — and it is the
     // only sweep that can, because nothing else survives to know those runs
     // existed. Runs still in flight are kept: their sessions may be adopted.
+    // The cards and tokens a previous console left go FIRST (TRS-11): a
+    // surviving child's token lives only in the settings file this sweeps.
+    this.recoverApprovals();
     this.sweepRunSecrets();
     this.sweepOldRuns();
     // The health cache is empty in a fresh process, so every server reads
@@ -2847,8 +3807,14 @@ export abstract class ServiceBase {
     // does NOT tick at open: it refreshes only repositories somebody has
     // already fetched, so a console nobody has asked spends no GitHub quota.
     this.startIssuesSweepClock();
+    // What this boot holds, read before anything below asks `convergeAutomatic()`
+    // or re-adopts: the stop marker and the profile's `autostart` (SHD-5, FLT-9).
+    this.settleBootHold();
     // The convergence loop: the boot pass once the queued re-adoption is done (a
     // queued run must be live before the loop reads it), then the sweep clock.
+    // The watch clock opens BEFORE the re-adoption when the loop runs, so an
+    // overdue wait's refs are read with it open, ahead of any resume (SHD-6).
+    if (this.convergeAutomatic()) this.watchClock.open();
     this.bootSettled = this.readoptQueued()
       .catch((error) => log.warn('run.readopt-failed', { error }))
       // After the re-adoption, so a queued run this console just picked up
@@ -2880,7 +3846,9 @@ export abstract class ServiceBase {
    * may still be running, a tree that may be half-edited — is precisely what a
    * queued run does not have.
    */
-  protected async readoptQueued(): Promise<void> {
+  protected async readoptQueued(
+    opts: { trigger: ResumeTrigger; operatorPress?: boolean } = { trigger: 'boot' },
+  ): Promise<void> {
     if (!this.flags.allowRun || !this.root?.ok) return;
     // A console that boots into a standing freeze re-adopts NOTHING.
     //
@@ -2894,6 +3862,15 @@ export abstract class ServiceBase {
     const frozen = this.fleetHold();
     if (frozen) {
       log.info('run.readopt-frozen', { by: frozen.by, at: frozen.at });
+      return;
+    }
+    // …and so does one that boots holding its automation (SHD-5, FLT-9): a
+    // console stopped with "stay off", or one the profile says does not start
+    // its work unattended. Whole-pass, for the freeze's reason — every door
+    // below ends in a spawned session. The release runs this pass again.
+    const held = this.bootHold();
+    if (held) {
+      log.info('run.readopt-held', { kind: held.kind, by: held.by, at: held.at });
       return;
     }
     for (const record of this.store?.list() ?? []) {
@@ -2917,6 +3894,13 @@ export abstract class ServiceBase {
         try {
           log.info('run.readopt-queued', { slug: record.slug, runId: state.id });
           await this.startRun(record.slug, {
+            // At boot this is the console starting up; from `thawFleet` it is
+            // the operator's press, and the trigger word says which.
+            actor: doorActor('boot-readopt', {
+              by: 'console', via: opts.trigger === 'boot' ? 'boot' : viaOfTrigger(opts.trigger),
+              origin: `readoptQueued:${opts.trigger}`, trigger: 'queued',
+              guard: 'allowRun,root.ok,!fleetHold,!liveRunner', counter: 'one per plan per boot',
+            }),
             resumeRunId: state.id,
             // Resume clears a scope it is not handed, and an omitted skills list
             // would let machine defaults overwrite the run's sticky one — the
@@ -2939,14 +3923,35 @@ export abstract class ServiceBase {
       // The second readoptable shape: a run reconciled off a wait
       // (`reconcileRun` turned waiting→paused, keeping `waitUntil`). Two wait
       // kinds share that clock — the usage window, and a park on external work
-      // some phase declared — and `waitReason` is which (`waitReasonOf` falls
-      // back to the record scan for runs written before it). A park is always
-      // re-armed (it is not a limit, so `onLimit: 'pause'` does not speak for
-      // it); a limit honors the run's own policy.
-      if (state?.status === 'paused' && state.waitUntil) {
-        const parked = waitReasonOf(state) === 'external';
-        if (parked || (state.onLimit ?? 'wait') !== 'pause') {
-          this.armLimitResume(record.slug, state);
+      // some phase declared.
+      //
+      // Asked through the convergence loop's OWN predicate (`waitClockVerdict`),
+      // so the two paths give one answer with one `why` (SLF-6): this arm used
+      // to arm whatever clock was on disk, the operator's stop unread, and fire
+      // a past one on the next tick — five resumes 64 to 581 minutes late, each
+      // reading as on time (SLF-5, SHD-6). A clock still ahead is armed; one
+      // that went by is RULED ON (`resumeOverdueWait`) or asked about; a pinned
+      // one is left, and says why.
+      if (state && (state.status === 'paused' || state.status === 'waiting') && waitClockOf(state)) {
+        const verdict = waitClockVerdict(state, {
+          now: Date.now(), prefs: this.prefs,
+          // A thaw is the operator's own press: it answers the question a restart asks.
+          decision: opts.operatorPress ? 'continue' : (this.resumeDecisions.get(state.id) ?? null),
+        });
+        if (verdict.verdict === 'arm') { this.armLimitResume(record.slug, state, 'boot'); continue; }
+        if (verdict.verdict === 'resume') {
+          void this.resumeOverdueWait(record.slug, state.id, opts.trigger, { count: true });
+          continue;
+        }
+        if (verdict.verdict === 'ask') {
+          this.registerResumeAsk(record.slug, state.id, verdict.phases, verdict.sessions, verdict.why, opts.trigger);
+          continue;
+        }
+        if (verdict.verdict !== 'not-a-wait') {
+          // `hold` and `errand`: nothing starts. The errand is the convergence
+          // loop's to write — one writer, one dedupe — and a console running
+          // without the loop still logs what it decided and why.
+          log.info('run.readopt-wait-held', { slug: record.slug, runId: state.id, verdict: verdict.verdict, why: verdict.why });
           continue;
         }
       }
@@ -2984,10 +3989,31 @@ export abstract class ServiceBase {
    * `waitUntil` is a no-op — the arm now also rides every `waiting` run
    * emit (see `onRunnerEvent`), which repeats.
    */
-  private limitResumeTimers = new Map<string, { timer: NodeJS.Timeout; at: number }>();
+  private limitResumeTimers = new Map<string, { timer: NodeJS.Timeout; at: number; armedBy?: 'boot' | 'runtime' }>();
 
   /** Freeze escalations re-armed at boot, keyed `slug:runId`. */
   protected freezeTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * When each in-process clock with no moment of its own will fire (SHD-1):
+   * the freeze escalations, the MCP `require` clocks and the outcome inbox's
+   * debounce, keyed `source|key`, written beside every arm and dropped beside
+   * every clear. `limitResumeTimers` carries its own `at` and is read directly.
+   * It is what lets the shutdown inventory name a clock and its moment rather
+   * than count timers.
+   */
+  protected readonly clockLedger = new Map<string, InventoryClock>();
+
+  protected noteClock(
+    source: ShutdownClockSource, key: string, atMs: number, where: { slug?: string; runId?: string; phase?: number } = {},
+  ): void {
+    if (!Number.isFinite(atMs)) return;
+    this.clockLedger.set(`${source}|${key}`, { source, at: new Date(atMs).toISOString(), ...where });
+  }
+
+  protected dropClock(source: ShutdownClockSource, key: string): void {
+    this.clockLedger.delete(`${source}|${key}`);
+  }
 
   /**
    * A stop asks the convergence loop for a pass a minute out, per plan.
@@ -3012,7 +4038,148 @@ export abstract class ServiceBase {
    * never set it). The operator's press is not gated here.
    */
   protected convergeAutomatic(): boolean {
-    return this.flags.converge === true && this.flags.allowRun;
+    // A boot hold (the stop marker, `autostart: false`) switches the loop's
+    // automatic triggers off exactly as `--no-converge` does, for as long as it
+    // stands (SHD-5, FLT-9).
+    return this.flags.converge === true && this.flags.allowRun && !this.bootHold();
+  }
+
+  /* ---------------------------------------------------------------- *
+   * The boot hold — a stop that meant it, and a start policy
+   * ---------------------------------------------------------------- */
+
+  /**
+   * The stop marker as this process last read or wrote it. `undefined` until
+   * the first read; `null` for "no marker". See `bootHold()` for when it is
+   * re-read.
+   */
+  protected stopMarkerCache: StopMarker | null | undefined = undefined;
+  /** The profile said `autostart: false` for this instance when it booted (FLT-9). */
+  protected autostartOff = false;
+  /** An operator released this boot's hold; nothing holds again until the next boot. */
+  protected bootHoldReleased = false;
+  /** When this console opened its root — the moment an `autostart-off` hold began. */
+  private bootHoldSince: string | null = null;
+  /** `boot.hold` is said once per hold. */
+  private bootHoldSaid = false;
+
+  /**
+   * Why this console is holding its automation, or null (SHD-5, FLT-9).
+   *
+   * Two reasons, one answer, read by everything that would start work on its
+   * own: the stop marker a `mode: 'unload'` Shut down wrote (a console stopped
+   * on purpose that came back anyway), and the machine profile saying this
+   * instance does not start its work unattended. While either holds,
+   * `readoptQueued` re-adopts nothing and `convergeAutomatic()` is false — so no
+   * boot pass, no sweep, no watch clock, no outcome-inbox boarding. An
+   * operator's press is never held: this is the console's automation, not a
+   * lock on the operator's hands.
+   *
+   * The marker is re-read while it is known to stand (cheap, and the only way a
+   * `phase-console start` that removed it reaches a console already up) and
+   * never while it is known absent — only this process writes it.
+   *
+   * A marker that vanishes under a console holding for it is that start: the
+   * agent removes the file, finds the job already running and starts nothing,
+   * so the boot pass the hold skipped would otherwise never run — a console
+   * reporting no hold with no re-adoption and no sweep behind it. It runs here,
+   * once, as the boot it stands in for (`boot.hold-released`, `how:
+   * 'marker-removed'`), and `bootSettled` follows it.
+   */
+  bootHold(): BootHold | null {
+    if (this.bootHoldReleased) return null;
+    if (this.stopMarkerCache === undefined || this.stopMarkerCache !== null) {
+      const before = this.stopMarkerCache;
+      this.stopMarkerCache = readStopMarker();
+      if (before && !this.stopMarkerCache && !this.autostartOff) {
+        log.warn('boot.hold-released', {
+          kind: 'stopped', how: 'marker-removed', heldSince: before.at, heldBy: before.by,
+          by: 'outside this console — the stop marker was removed',
+        });
+        const settled = this.bootSettled;
+        this.bootSettled = settled.then(() => this.runHeldBoot({ trigger: 'boot' }));
+      }
+    }
+    const marker = this.stopMarkerCache;
+    if (marker) {
+      return {
+        kind: 'stopped', at: marker.at, by: marker.by, marker,
+        why: `stopped on purpose by ${marker.by} at ${marker.at} (stay off) — nothing is re-adopted or converged until the stop is cleared`,
+      };
+    }
+    if (this.autostartOff) {
+      return {
+        kind: 'autostart-off', at: this.bootHoldSince ?? new Date().toISOString(), by: 'fleet.json',
+        why: 'the machine profile says this console does not start its work unattended (autostart: false) — nothing is re-adopted or converged until an operator releases it',
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Read the start policy for this boot and say what holds, once. `once` is
+   * spent here: this boot is the start the profile granted, so the profile's
+   * entry becomes `false` and this console's own unit is disabled, so the next
+   * login does not start it again (both journalled as `boot.autostart-once`).
+   */
+  protected settleBootHold(): void {
+    this.bootHoldSince = new Date().toISOString();
+    this.bootHoldReleased = false;
+    this.bootHoldSaid = false;
+    // Read fresh: a marker cached by an earlier open is not one that vanished
+    // under THIS boot, and must not run a second boot pass beside open()'s own.
+    this.stopMarkerCache = undefined;
+    const autostart = readAutostart(INSTANCE.id);
+    this.autostartOff = autostart === false;
+    if (autostart === 'once') {
+      const spent = consumeAutostartOnce(INSTANCE.id);
+      const unit = spent ? disableOwnUnit((file, args, options) => spawnSync(file, args, options)) : null;
+      log.info('boot.autostart-once', { instance: INSTANCE.id, spent, unit: unit?.label ?? null, disabled: unit?.ok ?? null });
+    }
+    const hold = this.bootHold();
+    if (hold && !this.bootHoldSaid) {
+      this.bootHoldSaid = true;
+      log.warn('boot.hold', { kind: hold.kind, by: hold.by, at: hold.at, why: hold.why });
+    }
+  }
+
+  /**
+   * The operator lifts the hold (Settings, or the route behind it): the marker
+   * is removed, this boot is released, and the boot pass that was held runs now
+   * — the re-adoption, then the convergence loop and its clocks. The profile is
+   * not edited: `autostart: false` still holds the NEXT boot, which is what the
+   * profile says.
+   */
+  async releaseBootHold(who: Actor | string): Promise<{ ok: boolean; reason?: string; was?: BootHoldKind }> {
+    const actor = asActor(who, 'Service.releaseBootHold');
+    const hold = this.bootHold();
+    if (!hold) return { ok: false, reason: 'nothing is holding this console’s automation' };
+    if (hold.kind === 'stopped') {
+      try {
+        clearStopMarker();
+      } catch (error) {
+        return { ok: false, reason: (error as Error).message };
+      }
+      this.stopMarkerCache = null;
+    }
+    this.bootHoldReleased = true;
+    log.warn('boot.hold-released', { ...actor, kind: hold.kind, how: 'release', heldSince: hold.at, by: actor.by, heldBy: hold.by });
+    await this.runHeldBoot({ trigger: 'button', operatorPress: true });
+    return { ok: true, was: hold.kind };
+  }
+
+  /** The boot pass a hold skipped: the re-adoption, then the loop, its sweep and the watch clock. */
+  private async runHeldBoot(opts: { trigger: ResumeTrigger; operatorPress?: boolean }): Promise<void> {
+    try {
+      await this.readoptQueued(opts);
+    } catch (error) {
+      log.warn('run.readopt-failed', { error });
+    }
+    if (this.convergeAutomatic()) {
+      this.converger.start();
+      this.watchClock.open();
+      await this.converger.boot(this.convergeSlugs()).catch((error) => log.warn('converge.boot-failed', { error }));
+    }
   }
 
   /* ---------------------------------------------------------------- *
@@ -3031,6 +4198,7 @@ export abstract class ServiceBase {
     if (this.fleetHoldCache === undefined) this.fleetHoldCache = readFleetHold();
     return this.fleetHoldCache;
   }
+
 
   /** Write the marker and remember it. Returns the record every reader will see. */
   protected markFleetFrozen(by: string): FleetHold {
@@ -3052,13 +4220,27 @@ export abstract class ServiceBase {
    * `ServiceLive` builds `/api/state` and sits BELOW that class — the reader is
    * lower in the chain than the writers, so the read has to live at the root.
    */
-  fleetState(): { frozen: boolean; at: string | null; by: string | null } {
+  fleetState(): {
+    frozen: boolean;
+    at: string | null;
+    by: string | null;
+    url?: string | null;
+    reachable?: boolean;
+    hold?: FleetHold | null;
+  } {
     const hold = this.fleetHold();
-    return { frozen: Boolean(hold), at: hold?.at ?? null, by: hold?.by ?? null };
+    // `frozen` is THIS console's own freeze, the console tier's word; a machine
+    // hold is carried beside it, never folded into it — a held console's live
+    // sessions are still running, and the banner must not say otherwise.
+    const own = hold && hold.scope !== 'machine' ? hold : null;
+    const state: ReturnType<ServiceBase['fleetState']> = { frozen: Boolean(own), at: own?.at ?? null, by: own?.by ?? null };
+    return state;
   }
 
-  protected armLimitResume(slug: string, state: RunState): void {
-    const at = Date.parse(state.waitUntil ?? '');
+  protected armLimitResume(slug: string, state: RunState, armedBy: 'boot' | 'runtime' = 'runtime'): void {
+    // The run's clock, else the soonest waiting record's (WAI-6) — one reader.
+    const until = waitClockOf(state);
+    const at = Date.parse(until ?? '');
     if (!Number.isFinite(at)) return;
     const delay = at - Date.now();
     // Whatever clock the run recorded is honoured. The 12-hour ceiling that
@@ -3080,11 +4262,207 @@ export abstract class ServiceBase {
       Math.max(0, delay),
     );
     timer.unref?.();
-    this.limitResumeTimers.set(slug, { timer, at });
-    log.info('run.rearmed-wait', { slug, runId: state.id, until: state.waitUntil });
+    this.limitResumeTimers.set(slug, { timer, at, armedBy });
+    log.info('run.rearmed-wait', { slug, runId: state.id, until, armedBy, inMs: Math.max(0, delay) });
+    // A clock a restart re-armed goes on the RUN's journal too, where the
+    // resume it leads to lands — it lived only in `console.log`, so the run's
+    // own history could not say its resume was re-armed at all (SHD-6).
+    if (armedBy === 'boot' && this.root?.ok) {
+      new Journal(this.root.path, slug, state.id).append('run.rearmed-wait', {
+        until, now: new Date().toISOString(), inMs: Math.max(0, delay), armedBy,
+      });
+    }
+  }
+
+  /** Overdue rulings in flight, by `slug:runId` — the boot pass and the loop may reach one clock together. */
+  private readonly overdueRulings = new Set<string>();
+
+  /** The late-resume announcements already made, by `runId@until` — lateness is said once. */
+  private readonly lateAnnounced = new Set<string>();
+
+  /**
+   * Register that a run is waiting on the operator's word — the question a
+   * restart asks (`resumeAtBoot: 'ask'`), for the boot's re-adoption as for the
+   * loop's `await-decision`. Journalled once per boot, on the run.
+   */
+  protected registerResumeAsk(
+    slug: string, runId: string, phases: number[], sessions: string[], why: string, trigger: ResumeTrigger,
+  ): void {
+    const first = !this.resumeAsks.has(runId);
+    this.resumeAsks.set(runId, { slug, runId, phases, sessions, at: new Date().toISOString() });
+    if (first && this.root?.ok) {
+      new Journal(this.root.path, slug, runId).append('run.resume-asked', { phases, reason: why, trigger });
+    }
+  }
+
+  /**
+   * An overdue wait, RULED ON rather than fired (SHD-6, SLF-5).
+   *
+   * A clock that went by while nothing ran — a console restart, a freeze, a
+   * machine asleep — used to fire on the next tick: `setTimeout(…, 0)`, no
+   * lateness recorded, no ref checked, no budget re-read, and in the measured
+   * case a session resumed 9.7 hours late into work that had moved on. Now, in
+   * order and before anything starts:
+   *
+   *  1. the lateness and what the refs say NOW go on the run's journal
+   *     (`run.wait-overdue`), with the watch clock open;
+   *  2. each declared park's budget is re-read through `evaluateWait` — spent
+   *     is a `waiting-external-timeout` on that phase, never a boarding;
+   *  3. a park whose declaring session is still RUNNING is not resumed over it
+   *     (REG-1) — refused, recorded, re-checked shortly; an author the registry
+   *     shows ended is recorded on the ruling;
+   *  4. lateness past `WAIT_OVERDUE_ANNOUNCE_MS` is announced, once;
+   *  5. the resume is counted (`phase.resume-automatic`) when the caller's gate
+   *     did not already count it — and only then `run.limit-resume` starts it.
+   *
+   * Answers whether it launched. One ruling per run at a time: the boot pass
+   * and the convergence loop can meet the same clock.
+   */
+  async resumeOverdueWait(slug: string, runId: string, trigger: ResumeTrigger, opts: { count: boolean }): Promise<boolean> {
+    if (!this.flags.allowRun || !this.root?.ok) return false;
+    const key = `${slug}:${runId}`;
+    if (this.overdueRulings.has(key)) return false;
+    this.overdueRulings.add(key);
+    try {
+      const armed = this.limitResumeTimers.get(slug);
+      if (armed) { clearTimeout(armed.timer); this.limitResumeTimers.delete(slug); }
+      const frozen = this.fleetHold();
+      if (frozen) { log.info('run.limit-resume-frozen', { slug, runId, by: frozen.by }); return false; }
+      const root = this.root.path;
+      const state = latestRun(root, slug, this.liveRunIds());
+      if (!state || state.id !== runId || !state.waitUntil) return false;
+      if (state.status !== 'paused' && state.status !== 'waiting') return false;
+      if (this.liveRunner(slug)) return false;
+      const held = waitHoldWhy(state);
+      if (held) { log.info('run.limit-resume-held', { slug, runId, why: held }); return false; }
+      const now = Date.now();
+      const until = state.waitUntil;
+      const lateByMs = Math.max(0, now - Date.parse(until));
+      const journal = new Journal(root, slug, runId);
+      const parks = waitClockPhases(state);
+
+      // 1. What the world says now — the refs, with the watch clock open.
+      if (this.convergeAutomatic()) this.watchClock.open();
+      const refs: { phase: number; ref: string; state: string; detail?: string }[] = [];
+      for (const record of parks) {
+        for (const target of pollableRefs(record.declared?.watch ?? record.watch).filter((t) => t.kind !== 'cmd').slice(0, 8)) {
+          const answer = await probeWatchRef(target, {
+            lockFree: (lockSlug, lockPhase) => {
+              const lock = this.allLocks().find((l) => l.slug === lockSlug && l.phase === lockPhase);
+              return !lock || lock.expired || this.lockPresenceFor(lock) === 'ended';
+            },
+          });
+          refs.push({ phase: record.phase, ref: answer.ref, state: answer.state, ...(answer.detail ? { detail: answer.detail } : {}) });
+        }
+      }
+      const declarers = parks.map((record) => {
+        const sessionId = record.resumeSessionId ?? record.sessionId;
+        return { phase: record.phase, sessionId: sessionId ?? null, presence: sessionId ? this.sessions.presence(sessionId) : null };
+      });
+      journal.append('run.wait-overdue', {
+        until, now: new Date(now).toISOString(), lateByMs, trigger, refs, declarers,
+      });
+      log.warn('run.wait-overdue', { slug, runId, until, lateByMs, trigger });
+
+      // 2. The budget, re-read through the one expression.
+      const halted: number[] = [];
+      for (const record of parks) {
+        if (record.declared?.status !== 'waiting-external') continue;
+        const verdict = evaluateWait({
+          purpose: 'resume', now, parkedMs: parkedMsOf(record, now), waits: record.waits ?? 0,
+          budget: await this.waitBudget(slug, record.phase),
+          ledger: record.declared.by === 'watchdog' ? 'watchdog' : 'session',
+        });
+        if (verdict.verdict !== 'timeout') continue;
+        const reason = `phase ${record.phase} was not resumed — ${verdict.reason}`;
+        const spent = settleStoredWaitTimeout(state, record.phase, reason, new Date(now).toISOString());
+        if (spent) journal.append(DECLARATION_CONSUMED_EVENT, { ...spent, next: 'waiting-external-timeout' }, record.phase);
+        journal.append('phase.halted', { reason, kind: 'waiting-external-timeout' }, record.phase);
+        halted.push(record.phase);
+      }
+      const resumable = parks.filter((record) => !halted.includes(record.phase));
+
+      // 3. The author: a session still running is not resumed over (REG-1).
+      for (const record of resumable) {
+        const hold = this.declarerHold(slug, record.phase, record.resumeSessionId ?? record.sessionId);
+        if (!hold) continue;
+        journal.append('phase.resume-refused', { ...hold, by: 'console', trigger }, record.phase);
+        log.warn('run.resume-refused', { slug, runId, phase: record.phase, ...hold });
+        this.announce('parked', {
+          title: 'A resume is held — its session is still running',
+          body: `${slug} phase ${record.phase} — session ${hold.sessionId.slice(0, 8)}${hold.pid ? ` (pid ${hold.pid})` : ''} `
+            + 'is still running, so the console did not resume it on top of itself. It checks again shortly.',
+          tag: tagFor('parked', slug, String(record.phase), 'resume-refused'),
+        }, { slug, phase: record.phase, runId });
+        saveRun(state);
+        this.emit('run:state', { state });
+        const retry = setTimeout(() => { void this.resumeOverdueWait(slug, runId, trigger, opts); }, RESUME_REFUSED_RECHECK_MS);
+        retry.unref?.();
+        return false;
+      }
+
+      // 4. Lateness worth saying out loud, once.
+      if (lateByMs > WAIT_OVERDUE_ANNOUNCE_MS && !this.lateAnnounced.has(`${runId}@${until}`)) {
+        this.lateAnnounced.add(`${runId}@${until}`);
+        this.announce('parked', {
+          title: 'A wait was resumed late',
+          body: `${slug} — the wait clock (${until}) went by ${Math.round(lateByMs / 60_000)} min before anything could `
+            + 'resume it. The console checked the refs and the budget before resuming; the session is told the world may have moved on.',
+          tag: tagFor('parked', slug, runId, 'wait-overdue'),
+        }, { slug, runId });
+      }
+
+      if (!resumable.length) {
+        state.waitUntil = null;
+        state.waitReason = null;
+        setRunState(state, 'parked');
+        state.stoppedBy = 'system';
+        state.finishedReason = `the wait budget ran out while this run was parked (phase ${halted.join(', ')}) — nothing was resumed.`;
+        saveRun(state);
+        this.emit('run:state', { state });
+        return false;
+      }
+
+      // 5. Counted, then started.
+      if (opts.count) {
+        const at = new Date(now).toISOString();
+        for (const record of resumable) {
+          const slot = ((state.recoveries ??= {})[String(record.phase)] ??= { attempts: 0, lastAt: at });
+          slot.bootResumes = automaticResumes(state, record.phase) + 1;
+          slot.lastAt = at;
+          delete slot.errand;
+          journal.append('phase.resume-automatic', {
+            trigger, path: 'overdue-wait', count: slot.bootResumes,
+            sessionId: record.resumeSessionId ?? record.sessionId ?? null, lateByMs, by: 'console',
+          }, record.phase);
+        }
+      }
+      saveRun(state);
+      journal.append('run.limit-resume', { until, lateByMs, trigger, overdue: true });
+      log.info('run.limit-resume', { slug, runId, lateByMs, trigger });
+      await this.startRun(slug, {
+        actor: doorActor('wait-clock', {
+          by: 'console', via: trigger === 'boot' ? 'boot' : viaOfTrigger(trigger),
+          origin: `resumeOverdueWait:${trigger}`, trigger: `overdue:${until}`,
+          guard: 'waitClockVerdict,evaluateWait,resumableSession',
+          ...(opts.count ? { counter: `MAX_BOOT_RESUMES:${Math.max(...resumable.map((record) => automaticResumes(state, record.phase)))}` } : {}),
+        }),
+        resumeRunId: runId,
+        ...(state.onlyPhases?.length ? { onlyPhases: state.onlyPhases } : {}),
+        skills: state.skills ?? [],
+        ...(state.accountId ? { accountId: state.accountId } : {}),
+      });
+      return true;
+    } catch (error) {
+      log.warn('run.limit-resume-failed', { slug, runId, error });
+      return false;
+    } finally {
+      this.overdueRulings.delete(key);
+    }
   }
 
   private async resumeLimitPaused(slug: string, runId: string): Promise<void> {
+    const armedBy = this.limitResumeTimers.get(slug)?.armedBy ?? 'runtime';
     this.limitResumeTimers.delete(slug);
     if (!this.flags.allowRun || !this.root?.ok) return;
     // The wait's moment arrived while the console was frozen. Nothing is
@@ -3115,12 +4493,31 @@ export abstract class ServiceBase {
         void this.resumeLimitPaused(slug, runId);
       }, LIMIT_RESUME_RETRY_MS);
       timer.unref?.();
-      this.limitResumeTimers.set(slug, { timer, at: Date.parse(state.waitUntil) });
+      this.limitResumeTimers.set(slug, { timer, at: Date.parse(state.waitUntil), armedBy });
+      return;
+    }
+    // The same pins as the boot and the loop, read at the moment of firing:
+    // the operator may have stopped it in the hours this timer slept.
+    const held = waitHoldWhy(state);
+    if (held) { log.info('run.limit-resume-held', { slug, runId, why: held }); return; }
+    // Fired LATE — a machine asleep, a blocked loop, a clock a restart armed
+    // already in the past: ruled on, never fired bare. Counted only when a
+    // restart armed it; a live console's own late clock is the session's.
+    const lateByMs = Date.now() - Date.parse(state.waitUntil);
+    if (lateByMs > WAIT_OVERDUE_GRACE_MS) {
+      await this.resumeOverdueWait(slug, runId, 'timer', { count: armedBy === 'boot' });
       return;
     }
     try {
-      log.info('run.limit-resume', { slug, runId });
+      log.info('run.limit-resume', { slug, runId, lateByMs: Math.max(0, lateByMs) });
+      new Journal(this.root.path, slug, runId).append('run.limit-resume', {
+        until: state.waitUntil, lateByMs: Math.max(0, lateByMs), trigger: 'timer', overdue: false,
+      });
       await this.startRun(slug, {
+        actor: doorActor('wait-clock', {
+          by: 'console', via: armedBy === 'boot' ? 'boot' : 'timer', origin: `armLimitResume:${armedBy}`,
+          trigger: `until:${state.waitUntil}`, guard: 'waitHoldWhy', counter: 'one per wait clock',
+        }),
         resumeRunId: runId,
         ...(state.onlyPhases?.length ? { onlyPhases: state.onlyPhases } : {}),
         skills: state.skills ?? [],
@@ -3135,6 +4532,12 @@ export abstract class ServiceBase {
   }
 
   close(): void {
+    this.heartbeat.stop();
+    // First, while every socket is still open: a question whose window is open
+    // is DEFERRED (phase 14) — its session ends the turn with the call kept, and
+    // the card stays on disk for the next boot to answer — rather than dying
+    // with the hook socket the drain is about to close.
+    try { this.relay.deferOpen(null, 'shutdown'); } catch (error) { log.warn('relay.bookkeeping-failed', { what: 'defer', error: String(error) }); }
     this.accounts.stop();
     if (this.accountsEmitTimer) clearTimeout(this.accountsEmitTimer);
     this.accountsEmitTimer = null;
@@ -3153,6 +4556,7 @@ export abstract class ServiceBase {
     this.freezeTimers.clear();
     for (const timer of this.mcpRequireTimers.values()) clearTimeout(timer);
     this.mcpRequireTimers.clear();
+    this.clockLedger.clear();
     if (this.mcpHealthTimer) clearInterval(this.mcpHealthTimer);
     this.mcpHealthTimer = null;
     if (this.issuesSweepTimer) clearInterval(this.issuesSweepTimer);
@@ -3206,7 +4610,7 @@ export abstract class ServiceBase {
       ...this.notifications.list(query),
       categories: CATEGORIES,
       devices: this.push.list().length,
-      outOfBand: { configured: Boolean(process.env.PHASE_CONSOLE_NOTIFY) },
+      outOfBand: { configured: Boolean(notifyCommand()) },
     };
   }
 
@@ -3276,80 +4680,380 @@ export abstract class ServiceBase {
    * ---------------------------------------------------------------- */
 
   /**
-   * What pressing Shut down will actually stop — everything the confirm dialog
-   * needs to be an inventory rather than a warning.
+   * What pressing Shut down will actually stop — computed from WORK (SHD-1).
    *
-   * Unlike `restartReadiness()` this never refuses. A restart while a run is
-   * driving is a mistake (it aborts the child and expires its cards
-   * unanswerably); a *shutdown* while a run is driving is a decision — the
-   * runner checkpoints on the way out and the run resumes when the console
-   * comes back. Refusing to turn something off because it is busy is how you
-   * get a machine with no off switch, which is the bug this is fixing.
+   * It used to be two numbers that measured nothing a shutdown discards: pty
+   * terminals and "is a drain handler registered". Now: the lanes live runners
+   * hold, every in-process clock the exit throws away (with when it would have
+   * fired), the runs on disk the next boot picks back up, the sessions the
+   * presence registry shows live, the pending approval cards and the unread
+   * inbox depth — plus both strengths the button can use (`modes`), what each
+   * achieves, and the command that undoes the strong one.
+   *
+   * Still never a refusal by itself: this is what the dialog RENDERS. The
+   * refusal is `shutdown()`'s, and it is a demand for acknowledgement rather
+   * than a wall — a console you cannot turn off is the bug that made this
+   * endpoint exist.
    */
   shutdownReadiness(): {
     supervisor: ReturnType<typeof supervisor>;
-    stop: ReturnType<typeof stopPlan>;
+    /** The strength a bare press uses. */
+    mode: 'exit';
+    /** The plan for that strength (`modes.exit`). */
+    stop: ExitPlan;
+    modes: { exit: ExitPlan; unload: UnloadPlan | null };
+    inventory: ShutdownInventory;
+    /** Nothing in flight, armed, owed, live, pending or unread — a bare `{confirm: true}` goes through. */
+    empty: boolean;
+    soonestClock: InventoryClock | null;
     busy: boolean;
     run: { slug: string; status: string } | null;
     sessions: ReturnType<Service['sessionInventory']>;
+    /** How to get it back after `exit`. */
     restartHint: string;
+    /** How to undo `unload`, when there is a unit to unload. */
+    unloadHint: string | null;
+    /** Why this console is holding its automation right now, if it is. */
+    bootHold: BootHold | null;
   } {
     const state = this.runStates()[0] ?? null;
     const supervision = supervisor();
-    const stop = stopPlan(supervision);
-    // The Pro tree can also offer to reinstall the unit; the free tree ships no
-    // agent script, so both tails assemble to nothing there.
-    const reinstallLaunchctl = [
-    ].join('');
-    const reinstallSystemctl = [
-    ].join('');
+    const exitPlan = stopPlan(supervision);
+    const unloadPlan = stopPlan(supervision, process.env, process.getuid?.() ?? null, 'unload');
+    const modes = { exit: exitPlan, unload: unloadPlan };
+    let inventory: ShutdownInventory;
+    try {
+      inventory = this.shutdownInventory();
+    } catch (error) {
+      // An inventory that could not be read must not take the off switch with
+      // it — but it must not read as "nothing is running" either. An empty one
+      // would let a bare press through, so the failure is logged and the empty
+      // shape is returned with `empty: false`, which still demands acknowledgement.
+      log.warn('shutdown.inventory-failed', { error: (error as Error).message });
+      inventory = emptyInventory();
+      return {
+        supervisor: supervision, mode: 'exit', stop: exitPlan, modes, inventory, empty: false,
+        soonestClock: null, busy: hasShutdownWork(), run: state ? { slug: state.slug, status: state.status } : null,
+        sessions: this.sessionInventory(), restartHint: this.restartHintFor(exitPlan), unloadHint: unloadPlan?.resurrect ?? null,
+        bootHold: this.bootHold(),
+      };
+    }
     return {
       supervisor: supervision,
-      stop,
+      mode: 'exit',
+      stop: exitPlan,
+      modes,
+      inventory,
+      empty: inventoryEmpty(inventory),
+      soonestClock: soonestClock(inventory),
       busy: hasShutdownWork(),
       run: state ? { slug: state.slug, status: state.status } : null,
       sessions: this.sessionInventory(),
-      // Where a person has to go to get it back. Under launchd the job is
-      // unloaded, so the page they are looking at is about to be the last thing
-      // this console says to them.
-      restartHint:
-        stop.via === 'launchctl'
-          ? `launchctl kickstart -k gui/$(id -u)/${stop.label}${reinstallLaunchctl}`
-          : stop.via === 'systemctl'
-            ? `systemctl --user start ${stop.label}${reinstallSystemctl}`
-            : 'start it again with `bash <skill>/start` (or viewer/run)',
+      restartHint: this.restartHintFor(exitPlan),
+      unloadHint: unloadPlan?.resurrect ?? null,
+      bootHold: this.bootHold(),
     };
   }
 
+  /** Where a person goes to get the console back after an `exit` of this strength. */
+  private restartHintFor(plan: ExitPlan): string {
+    if (plan.durability === 'returns') return 'nothing to do — its supervisor starts it again by itself';
+    const label = process.env.XPC_SERVICE_NAME;
+    if (plan.durability === 'until-login') {
+      return label && label !== '0'
+        ? `launchctl kickstart -k gui/$(id -u)/${label} — or wait for the next login`
+        : process.env.PHASE_CONSOLE_UNIT
+          ? `systemctl --user start ${process.env.PHASE_CONSOLE_UNIT}`
+          : 'the next login starts it again';
+    }
+    return 'start it again with `bash <skill>/start` (or viewer/run)';
+  }
+
   /**
-   * Stop this console and everything it owns.
-   *
-   * The order is the same as any other exit — `shutdown()` in `index.ts` closes
-   * the server, calls `service.close()` (which kills every pty), then drains the
-   * registered handlers so a run checkpoints. What differs is that under launchd
-   * the job is unloaded first, so nothing brings it back.
+   * The inventory itself (SHD-1). Each section reads the thing it names, never
+   * a proxy for it: the lanes from the runners' own child records, the clocks
+   * from the timer maps and the ledger beside them, the runs from disk, the
+   * sessions from the registry, the cards from the broker, the depth from the
+   * inbox directories.
    */
-  shutdown(by: string): { ok: boolean; reason?: string; stop?: ReturnType<typeof stopPlan> } {
+  protected shutdownInventory(): ShutdownInventory {
+    const inventory = emptyInventory();
+    const liveIds = this.liveRunIds();
+
+    for (const runner of this.liveRunners()) {
+      const state = runner.current();
+      if (!state) continue;
+      for (const child of childrenOf(state)) {
+        inventory.lanes.push({
+          slug: state.slug, runId: state.id, phase: child.phase,
+          pid: child.pid ?? null, sessionId: child.sessionId ?? null,
+        });
+      }
+      inventory.runs.push({
+        slug: state.slug, id: state.id, status: state.status, waitUntil: waitClockOf(state) ?? null, live: true, clock: null,
+      });
+    }
+
+    for (const [slug, armed] of this.limitResumeTimers) {
+      inventory.clocks.push({ source: 'wait-resume', at: new Date(armed.at).toISOString(), slug });
+    }
+    for (const clock of this.clockLedger.values()) inventory.clocks.push(clock);
+    const drainAt = this.sessions.pendingDrainAt();
+    if (drainAt != null) inventory.clocks.push({ source: 'session-inbox', at: new Date(drainAt).toISOString() });
+    for (const pass of this.converger.snapshot().pending) {
+      inventory.clocks.push({ source: 'converge', at: new Date(pass.dueAt).toISOString(), slug: pass.slug });
+    }
+
+    if (this.root?.ok) {
+      const root = this.root.path;
+      for (const record of this.store?.list() ?? []) {
+        if (record.plan?.closed) continue;
+        let outcomes = 0;
+        try {
+          outcomes = readdirSync(outcomeInboxDir(root, record.slug)).filter((name) => /^phase-\d{2,}\.json$/.test(name)).length;
+        } catch { outcomes = 0; }
+        inventory.inboxDepth.outcomes += outcomes;
+        if (this.liveRunner(record.slug)) continue;
+        const state = latestRun(root, record.slug, liveIds);
+        if (!state || state.resolved) continue;
+        const until = waitClockOf(state) ?? null;
+        const clock = this.soonestClockFor(inventory.clocks, record.slug);
+        const owed = state.status === 'queued'
+          || state.status === 'waiting'
+          || ((state.status === 'paused' || state.status === 'parked') && (until != null || clock != null));
+        if (!owed) continue;
+        inventory.runs.push({ slug: record.slug, id: state.id, status: state.status, waitUntil: until, live: false, clock });
+      }
+    }
+    // A live runner's run carries the soonest clock of its plan too.
+    for (const run of inventory.runs) {
+      if (run.live) run.clock = this.soonestClockFor(inventory.clocks, run.slug);
+    }
+
+    const laneSessions = new Set(inventory.lanes.map((lane) => lane.sessionId).filter(Boolean));
+    for (const view of this.sessionViews()) {
+      if (view.presence !== 'live' || view.probe || laneSessions.has(view.sessionId)) continue;
+      inventory.liveSessions.push({
+        sessionId: view.sessionId, kind: view.kind, pid: view.pid ?? null, cwd: view.cwd,
+        plan: view.plan ? { slug: view.plan.slug, phase: view.plan.phase } : null,
+      });
+    }
+
+    for (const card of this.approvals.pending()) {
+      inventory.pendingApprovals.push({
+        id: card.id, slug: card.slug, phase: card.phase, kind: card.kind, expiresAt: card.expiresAt,
+      });
+    }
+    inventory.inboxDepth.sessions = this.sessions.depth();
+    inventory.clocks.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+    return inventory;
+  }
+
+  private soonestClockFor(clocks: readonly InventoryClock[], slug: string): InventoryClock | null {
+    let soonest: InventoryClock | null = null;
+    for (const clock of clocks) {
+      if (clock.slug !== slug) continue;
+      if (!soonest || Date.parse(clock.at) < Date.parse(soonest.at)) soonest = clock;
+    }
+    return soonest;
+  }
+
+  /**
+   * Stop this console — at the strength asked for, and only on purpose.
+   *
+   * The order is the same as any other exit — `shutdown()` in `index.ts` notes
+   * what is abandoned, closes the server, calls `service.close()`, then drains
+   * the registered handlers so a run checkpoints. What the press decides:
+   *
+   *  - **refusals first** (`shutdownVerdict`): a bare `{confirm: true}` over a
+   *    non-empty inventory is refused with the inventory named; `unload` always
+   *    needs `acknowledge: true`, and needs a unit to unload;
+   *  - **`unload` writes the stop marker before anything is unloaded**, so a
+   *    process that comes back anyway boots holding its automation;
+   *  - `shutdown.requested` carries the actor, the strength, the durability the
+   *    plan achieves and the inventory in digest — the reason survives the
+   *    process;
+   *  - the announcement is AWAITED inside the drain (SHD-4) rather than left to
+   *    a push callback the exit outruns, and records `skipped` when nothing
+   *    could be seen delivered.
+   */
+  shutdown(
+    who: Actor | string,
+    ask: { mode?: unknown; acknowledge?: unknown } = {},
+  ): {
+    ok: boolean;
+    status?: 400 | 409;
+    reason?: string;
+    needs?: 'mode' | 'unload' | 'acknowledge';
+    mode?: string;
+    stop?: StopPlan;
+    inventory?: ShutdownInventory;
+  } {
+    const actor = asActor(who, 'Service.shutdown');
     const readiness = this.shutdownReadiness();
+    const acknowledged = ask.acknowledge === true;
+    const unread = !readiness.empty && inventoryEmpty(readiness.inventory);
+    const verdict = unread && !acknowledged
+      ? {
+        ok: false as const, status: 409 as const, needs: 'acknowledge' as const,
+        reason: 'the console could not read what it is holding, so it cannot say it is holding nothing — '
+          + 'pass "acknowledge": true to shut it down anyway',
+      }
+      : shutdownVerdict(
+        { mode: ask.mode === undefined ? readiness.mode : ask.mode, acknowledge: acknowledged },
+        readiness.modes.unload,
+        readiness.inventory,
+      );
+    if (!verdict.ok) {
+      log.info('shutdown.refused', {
+        ...actor, mode: ask.mode ?? readiness.mode, needs: verdict.needs, reason: verdict.reason,
+        inventory: inventoryDigest(readiness.inventory),
+      });
+      return {
+        ok: false, status: verdict.status, reason: verdict.reason, needs: verdict.needs,
+        mode: typeof ask.mode === 'string' ? ask.mode : readiness.mode,
+        inventory: readiness.inventory,
+        ...(verdict.needs === 'unload' ? {} : { stop: ask.mode === 'unload' && readiness.modes.unload ? readiness.modes.unload : readiness.modes.exit }),
+      };
+    }
+    const plan: StopPlan = verdict.mode === 'unload' ? readiness.modes.unload! : readiness.modes.exit;
+    let marker: StopMarker | null = null;
+    if (plan.mode === 'unload') {
+      try {
+        marker = writeStopMarker({
+          by: actor.by, via: actor.via, origin: actor.origin, remoteUser: actor.remoteUser ?? null,
+          durability: plan.durability, label: plan.label, resurrect: plan.resurrect,
+        });
+        this.stopMarkerCache = marker;
+      } catch (error) {
+        // Without the marker `unload` is the old bare bootout that a login
+        // undoes — refused rather than carried out weaker than it was named.
+        log.warn('shutdown.marker-write-failed', { error: (error as Error).message });
+        return {
+          ok: false, status: 409, needs: 'unload', mode: 'unload', inventory: readiness.inventory,
+          reason: `the stop marker could not be written (${(error as Error).message}) — "stay off" would not hold, so nothing was stopped`,
+        };
+      }
+    }
+    // The actor DERIVED from the request (SHD-3), then what the press chose and
+    // what it achieves, and the inventory it acknowledged — in digest, because
+    // this line has to survive the process it is about.
     log.warn('shutdown.requested', {
-      by,
+      ...actor,
       supervisor: readiness.supervisor.kind,
-      via: readiness.stop.via,
+      stop: plan.via,
+      mode: plan.mode,
+      durability: plan.durability,
+      acknowledged,
       sessions: readiness.sessions.live,
       busy: readiness.busy,
+      inventory: inventoryDigest(readiness.inventory),
     });
     // Announced before it happens, because afterwards there is nothing here to
     // announce anything — and a push that arrives on a phone is the only record
     // an operator elsewhere will get that the console went down on purpose.
-    this.announce('health', {
+    const record = this.announce('health', {
       title: 'Phase Console is shutting down',
-      body: `asked for by ${by} · ${readiness.stop.detail}`,
+      body: `${describeActor(actor)} · ${plan.detail}`
+        + (readiness.empty ? '' : ` · it was holding: ${inventorySentence(readiness.inventory)}`),
       tag: tagFor('health', 'shutdown', String(Date.now())),
     });
-    if (!requestShutdown(`shutdown (${by})`)) {
-      return { ok: false, reason: 'this build has no shutdown verb registered — stop it by hand' };
+    if (record) this.awaitAnnouncementAtShutdown(record);
+    if (!requestShutdown(`shutdown (${actor.by} via ${actor.via} from ${actor.origin})`, { mode: plan.mode })) {
+      // Nothing is draining: neither the announcement's handler nor the marker
+      // may outlive a press that did not happen.
+      offShutdown('shutdown-announcement');
+      if (marker) {
+        try { clearStopMarker(); this.stopMarkerCache = null; } catch { /* the refusal below still stands */ }
+      }
+      return { ok: false, status: 409, reason: 'this build has no shutdown verb registered — stop it by hand' };
     }
-    return { ok: true, stop: readiness.stop };
+    return { ok: true, mode: plan.mode, stop: plan, inventory: readiness.inventory };
+  }
+
+  /**
+   * Hold the drain open for the shutdown announcement's delivery (SHD-4).
+   *
+   * Registered as a drain handler, so `runShutdownHandlers` awaits it inside the
+   * console's 120 s budget — bounded by `SHUTDOWN_ANNOUNCE_WAIT_MS` so a push
+   * service that never answers cannot eat the drain. Whatever the wait ends on,
+   * the record leaves with a non-empty `delivery`: the reports that landed, or
+   * the console's own `skipped` row saying why none did. Both shutdown rows the
+   * audit measured carried `delivery: []`.
+   */
+  private awaitAnnouncementAtShutdown(record: NotificationRecord): void {
+    onShutdown('shutdown-announcement', async () => {
+      const pending = this.deliveries.get(record.id);
+      let timedOut = false;
+      if (pending) {
+        await Promise.race([
+          pending,
+          new Promise<void>((resolve) => {
+            setTimeout(() => { timedOut = true; resolve(); }, SHUTDOWN_ANNOUNCE_WAIT_MS).unref();
+          }),
+        ]);
+      }
+      if (!record.delivery.length) {
+        this.notifications.delivery(record.id, {
+          device: 'console',
+          label: 'this console',
+          outcome: 'skipped',
+          detail: pending && timedOut
+            ? `process exiting — no delivery report within ${SHUTDOWN_ANNOUNCE_WAIT_MS / 1000} s`
+            : pending
+              ? 'process exiting — nothing reported a delivery'
+              : 'process exiting — no device or webhook to deliver to',
+          at: new Date().toISOString(),
+        });
+      }
+      this.notifications.flush();
+      log.info('shutdown.announced', {
+        id: record.id, waitedFor: Boolean(pending), timedOut, delivery: record.delivery.map((row) => row.outcome),
+      });
+    });
+  }
+
+  /**
+   * Every run the shutdown abandons, on its OWN journal (SHD-8) — called by
+   * `index.ts` before anything closes, on every path (a press, a restart, a
+   * signal). A run a live runner drives writes its own `run.console-shutdown`
+   * from its checkpoint; this is every other one — queued, waiting, paused on a
+   * clock, parked on one — which used to learn nothing from its journal about
+   * the console going away, or about the clock that went with it.
+   */
+  noteShutdown(context: ShutdownContext): void {
+    if (!this.root?.ok) return;
+    let inventory: ShutdownInventory;
+    try {
+      inventory = this.shutdownInventory();
+    } catch (error) {
+      log.warn('shutdown.inventory-failed', { error: (error as Error).message });
+      return;
+    }
+    for (const run of inventory.runs) {
+      if (run.live) continue;
+      try {
+        new Journal(this.root.path, run.slug, run.id).append('run.console-shutdown', {
+          intent: context.intent,
+          reason: context.reason,
+          ...(context.mode ? { mode: context.mode } : {}),
+          live: false,
+          status: run.status,
+          pids: [],
+          phases: [],
+          waitUntil: run.waitUntil,
+          clock: run.clock,
+          discards: run.clock
+            ? `the ${run.clock.source} clock due ${run.clock.at}`
+            : run.waitUntil
+              ? `the wait clock due ${run.waitUntil}`
+              : null,
+        });
+      } catch (error) {
+        log.warn('shutdown.journal-failed', { slug: run.slug, runId: run.id, error: (error as Error).message });
+      }
+    }
+    log.info('shutdown.inventory', { intent: context.intent, ...inventoryDigest(inventory) });
   }
 
   /**
@@ -3365,20 +5069,21 @@ export abstract class ServiceBase {
    * something a flag should be able to talk you into.
    */
   restart(
-    by: string,
+    who: Actor | string,
     force = false,
   ): { ok: boolean; reason?: string; supervisor?: ReturnType<typeof supervisor> } {
+    const actor = asActor(who, 'Service.restart');
     const readiness = this.restartReadiness();
     if (!readiness.ok && (readiness.busy || !force)) {
       return { ok: false, reason: readiness.reason, supervisor: readiness.supervisor };
     }
-    log.warn('restart.requested', { by, supervisor: readiness.supervisor.kind, force });
+    log.warn('restart.requested', { ...actor, supervisor: readiness.supervisor.kind, force });
     this.announce('health', {
       title: 'Phase Console is restarting',
-      body: `asked for by ${by} · ${readiness.supervisor.detail}`,
+      body: `${describeActor(actor)} · ${readiness.supervisor.detail}`,
       tag: tagFor('health', 'restart', String(Date.now())),
     });
-    if (!requestRestart(`restart (${by})`)) {
+    if (!requestRestart(`restart (${actor.by} via ${actor.via} from ${actor.origin})`)) {
       return { ok: false, reason: 'this build has no restart verb registered — restart it by hand' };
     }
     return { ok: true, supervisor: readiness.supervisor };

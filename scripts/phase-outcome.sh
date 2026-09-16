@@ -7,8 +7,10 @@
 #
 # Usage: phase-outcome.sh <slug> <phase> <status> [--reason TEXT] [--watch REF]...
 #                         [--wait-minutes N | --until ISO8601]
+#                         [--needs KEY] [--rule TEXT] [--command TEXT]
 #        phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]
 #                         [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]
+#                         [--needs KEY] [--remember plan|global]
 #   status: complete | waiting-external | blocked | needs-human | partial | no-defect
 #   no-defect "I looked, and there was nothing to fix" — the REPAIR family's
 #             word, declared by a session the console sent to mend one specific
@@ -27,6 +29,15 @@
 #                             and needs-human it does not replace the ask: the
 #                             errand still stands, the clock only says when the
 #                             console next brings the phase up.
+#   --needs   REQUIRED on blocked and needs-human (exit 2 without it), refused on
+#             the rest: the decision KEY the session is missing — one of the
+#             manifest's seventeen (scripts/decisions.env DECISION_KEYS) or a
+#             blocker class as its short form (NEED_CLASSES: lock permission
+#             credential gate external). Read by the runner BEFORE the prose
+#             (chapter 10 ZTD-3): `blocked-declared:unknown` then means "a key
+#             the manifest lacks", a defect report, not 39 % of asks.
+#   --rule / --command  optional structured fields for a permission block —
+#             the rule that refused and the command it refused — beside --needs.
 #   --watch   repeatable (max 8); free-form refs. The console polls these on its
 #             own timer (viewer/server/watch-scheduler.ts) and resumes THIS
 #             session when one lands:
@@ -49,6 +60,26 @@
 # beside the outcomes/ inbox. Append-only: the console folds acks in as further
 # lines rather than rewriting the file under a live session. Declaring a ruling
 # does not declare an outcome — do both.
+#   Every ruling line carries an "id" — sha256("<slug> <phase> <at> <what>")
+#   cut to 12 hex, the same bytes viewer/server/runner/rulings.ts derives, so
+#   the ledger's ack lines, the inbox row and `decisions.sh promote` all name
+#   one ruling by one id.
+#   --needs KEY  optional on a ruling: the decision KEY the ruling answers (one
+#             of DECISION_KEYS, never a blocker short form — a ruling is not a
+#             blocker), stamped as "decisionKey". A keyed ruling is what the
+#             console's inbox offers to remember, and what --remember needs.
+#   --remember plan|global  promote the ruling the moment it is recorded
+#             (chapter 10 ZTD-7 — 2 315 rulings once reached no plan and no
+#             default). `plan` writes a `## Decisions` row for its key into
+#             docs/handoffs/<slug>/decisions.md through decisions.sh promote
+#             (source: ruling, value: --what, evidence: the id), then acks the
+#             ruling in the ledger with --by. `global` asks the console that
+#             owns this repository to set its own `policy.<key>` answer — the
+#             same door the inbox's "Remember on this console" action uses,
+#             POST /api/run/<slug>/rulings/<id>/remember — so --what must be an
+#             answer word for the key (the console names the words when it is
+#             not); with no console answering, exit 1 and the Settings page
+#             named, nothing dropped silently.
 #
 # Writes ONE atomic JSON file to $PE_OUTCOME_FILE (tmp+mv) — the runner injects
 # that path into every session it supervises and consumes the file on exit.
@@ -70,14 +101,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/instance.sh"
+# The decision manifest's vocabulary — the OWNER is viewer/shared/decisions-model.js,
+# decisions.env its bash twin (held equal by viewer/test/decisions-model.test.ts).
+DECISION_KEYS="permission.policy permission.destructive credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
+NEED_CLASSES="lock permission credential gate external"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
 
 usage() {
   echo 'usage: phase-outcome.sh <slug> <phase> <complete|waiting-external|blocked|needs-human|partial|no-defect>' >&2
   echo '                        [--reason TEXT] [--watch REF]... [--wait-minutes N | --until ISO8601]' >&2
+  echo '                        [--needs KEY] [--rule TEXT] [--command TEXT]' >&2
   echo '   --wait-minutes/--until: waiting-external | blocked | needs-human' >&2
+  echo '   --needs KEY: REQUIRED on blocked | needs-human — a decision key from scripts/decisions.env' >&2
+  echo "               ($DECISION_KEYS) or a blocker class as its short form ($NEED_CLASSES)" >&2
   echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · cmd:"<command>"' >&2
   echo '       phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]' >&2
   echo '                        [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]' >&2
+  echo '                        [--needs KEY] [--remember plan|global]' >&2
+  echo '   --needs KEY on a ruling: the decision key it answers (stamped as decisionKey)' >&2
+  echo '   --remember plan: write the ruling as a ## Decisions row (source ruling) and ack it' >&2
+  echo '   --remember global: ask the owning console to set its policy.<key> answer to --what' >&2
   exit 2
 }
 
@@ -108,22 +152,63 @@ _json_str() {
   printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# Why the console would never poll a --watch ref, or nothing when it would — the
+# shapes `viewer/server/watch-refs.ts` `parseWatchRef` accepts, checked by shape
+# (the console reads the calendar too). The-clock-is-evidence holds the two to
+# one answer over a shared list of refs.
+_watch_problem() {  # _watch_problem <ref>
+  local body
+  case "$1" in
+    gh:*)
+      printf '%s' "$1" | grep -Eq '^gh:[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*#(run|pr)/[0-9]+$' \
+        || printf '%s' 'a gh: ref is gh:<owner/repo>#run/<id> or gh:<owner/repo>#pr/<n>'
+      ;;
+    date:*|until:*)
+      printf '%s' "${1#*:}" | sed 's/^[[:space:]]*//' | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}' \
+        || printf '%s' 'not an ISO8601 instant (date:2026-09-20T06:00:00Z)'
+      ;;
+    lock:*)
+      printf '%s' "${1#lock:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/0*[1-9][0-9]*$' \
+        || printf '%s' 'a lock: ref is lock:<slug>/<phase>'
+      ;;
+    cmd:*)
+      body="$(printf '%s' "${1#cmd:}" | sed "s/^[[:space:]]*//; s/[[:space:]]*\$//; s/^\"\\(.*\\)\"\$/\\1/; s/^'\\(.*\\)'\$/\\1/" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -n "$body" ] || printf '%s' 'a cmd: ref names no command'
+      ;;
+    *)
+      printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · cmd:"<command>"'
+      ;;
+  esac
+}
+
 reason=""; wait_minutes=""; until_iso=""
+needs=""; rule=""; command_text=""
 watch_count=0; watch_json=""
-what=""; why=""; kind=""; cost=""
+what=""; why=""; kind=""; cost=""; remember=""; by_word=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --reason)       reason="${2:?--reason needs text}"; shift 2 ;;
+    --needs)        needs="${2:?--needs needs a decision key}"; shift 2 ;;
+    --rule)         rule="${2:?--rule needs text}"; shift 2 ;;
+    --command)      command_text="${2:?--command needs text}"; shift 2 ;;
     --what)         what="${2:?--what needs text}"; shift 2 ;;
     --why)          why="${2:?--why needs text}"; shift 2 ;;
     --kind)         kind="${2:?--kind needs a word}"; shift 2 ;;
     --cost-if-wrong) cost="${2:?--cost-if-wrong needs text}"; shift 2 ;;
+    --remember)     remember="${2:?--remember needs plan or global}"; shift 2 ;;
+    --by)           by_word="${2:?--by needs a name}"; shift 2 ;;
     --wait-minutes) wait_minutes="${2:?--wait-minutes needs a number}"; shift 2 ;;
     --until)        until_iso="${2:?--until needs an ISO8601 time}"; shift 2 ;;
     --watch)
       ref="${2:?--watch needs a ref}"
       if [ "$watch_count" -lt 8 ]; then
         ref="$(printf '%s' "$ref" | cut -c1-200)"
+        # Recorded either way — the reason still helps a person — but a ref no
+        # scheme can parse is a ref nothing will ever probe, and saying so now,
+        # while the session can still fix it, beats a park that silently runs on
+        # a clock instead (WAI-11). The console names it on the park as well.
+        problem="$(_watch_problem "$ref")"
+        [ -n "$problem" ] && echo "warning: --watch \"$ref\" will never be checked: $problem" >&2
         watch_json="${watch_json:+$watch_json, }\"$(_json_str "$ref")\""
         watch_count=$((watch_count + 1))
       else
@@ -137,8 +222,9 @@ done
 # The two shapes share one option loop and are then held apart, so a flag that
 # belongs to the other one is an error rather than a silent no-op.
 if [ "$mode" = ruling ]; then
-  if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ]; then
-    echo '--reason/--watch/--wait-minutes/--until belong to an outcome status, not to a ruling' >&2; exit 2
+  if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
+     || [ -n "$rule" ] || [ -n "$command_text" ]; then
+    echo '--reason/--watch/--wait-minutes/--until/--rule/--command belong to an outcome status, not to a ruling' >&2; exit 2
   fi
   [ -n "$what" ] || { echo '--what is required for a ruling (say what you decided)' >&2; exit 2; }
   # Absent means the weakest of the three: a session that simply chose between
@@ -147,13 +233,50 @@ if [ "$mode" = ruling ]; then
   [ -n "$kind" ] || kind=ambiguity
   case "$kind" in ambiguity|deviation|deferral) : ;; *)
     echo "invalid --kind: $kind (want ambiguity|deviation|deferral)" >&2; exit 2 ;; esac
-elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ]; then
-  echo "--what/--why/--kind/--cost-if-wrong only make sense with ruling, not $status" >&2; exit 2
+  # The key a ruling answers is a manifest KEY, never a blocker short form: a
+  # ruling decided something, it is not declaring what blocks it.
+  if [ -n "$needs" ]; then
+    case " $DECISION_KEYS " in
+      *" $needs "*) : ;;
+      *) echo "unknown --needs key on a ruling: $needs (want one of: $DECISION_KEYS)" >&2; exit 2 ;;
+    esac
+  fi
+  case "$remember" in
+    '') : ;;
+    plan|global)
+      [ -n "$needs" ] || { echo "--remember $remember needs --needs <key>: a ruling is remembered under the decision key it answers" >&2; exit 2; } ;;
+    *) echo "invalid --remember: $remember (want plan|global)" >&2; exit 2 ;;
+  esac
+elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ] || [ -n "$remember" ] || [ -n "$by_word" ]; then
+  echo "--what/--why/--kind/--cost-if-wrong/--remember/--by only make sense with ruling, not $status" >&2; exit 2
 fi
 
 if [ -n "$wait_minutes" ] && [ -n "$until_iso" ]; then
   echo '--wait-minutes and --until are mutually exclusive' >&2; exit 2
 fi
+# The decision key is the machine field on the two statuses that ASK (chapter
+# 10 ZTD-3): without it the classifier is a regex over prose, and `unknown` was
+# 39 % of every ask. Required there, refused elsewhere — a key on `complete` is
+# a session describing a block it is not declaring.
+case "$status" in
+  blocked|needs-human)
+    if [ -z "$needs" ]; then
+      echo "--needs <key> is required on $status: name the decision you are missing — one of: $DECISION_KEYS — or its short form: $NEED_CLASSES" >&2
+      exit 2
+    fi
+    case " $DECISION_KEYS $NEED_CLASSES " in
+      *" $needs "*) : ;;
+      *) echo "unknown --needs word: $needs (want one of: $DECISION_KEYS — or: $NEED_CLASSES)" >&2; exit 2 ;;
+    esac
+    ;;
+  *)
+    if [ "$mode" = outcome ] && { [ -n "$needs" ] || [ -n "$rule" ] || [ -n "$command_text" ]; }; then
+      echo "--needs/--rule/--command only make sense with blocked or needs-human, not $status" >&2; exit 2
+    fi
+    ;;
+esac
+rule="$(printf '%s' "$rule" | cut -c1-200)"
+command_text="$(printf '%s' "$command_text" | cut -c1-500)"
 # The clock belongs to the three statuses that PARK. `complete` has nothing to
 # resume and `partial` is resumed at once, so a clock on either is a session
 # describing a wait it is not taking — refused rather than silently dropped.
@@ -234,17 +357,25 @@ if [ "$mode" = ruling ]; then
   what="$(printf '%s' "$what" | cut -c1-500)"
   why="$(printf '%s' "$why" | cut -c1-800)"
   cost="$(printf '%s' "$cost" | cut -c1-300)"
+  # The id the console derives on read (rulings.ts rulingId), stamped here so
+  # the ack line, the inbox row and decisions.sh promote can name this ruling
+  # without re-deriving it — and an old ledger line without one still reads.
+  ruling_id="$(pe_sha256_hex "$slug $phase $now $what" | cut -c1-12)"
   why_json="$( [ -n "$why" ] && printf ',"why":"%s"' "$(_json_str "$why")" || true )"
   cost_json="$( [ -n "$cost" ] && printf ',"cost_if_wrong":"%s"' "$(_json_str "$cost")" || true )"
+  key_json="$( [ -n "$needs" ] && printf ',"decisionKey":"%s"' "$needs" || true )"
   session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
+  id_json="$( [ -n "$ruling_id" ] && printf '"id":"%s",' "$ruling_id" || true )"
   # ONE line: the file is NDJSON and a pretty-printed record would make every
   # reader a parser with state.
-  line="{\"version\":1,\"type\":\"ruling\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"kind\":\"$kind\",\"what\":\"$(_json_str "$what")\"${why_json}${cost_json}${session_json},\"at\":\"$(_json_str "$now")\"}"
+  line="{\"version\":1,\"type\":\"ruling\",${id_json}\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"kind\":\"$kind\",\"what\":\"$(_json_str "$what")\"${why_json}${cost_json}${key_json}${session_json},\"at\":\"$(_json_str "$now")\"}"
 
+  written=0
   if [ -n "${PE_RULINGS_FILE:-}" ]; then
     ledger="$PE_RULINGS_FILE"
     if mkdir -p "$(dirname "$ledger")" 2>/dev/null && printf '%s\n' "$line" >> "$ledger" 2>/dev/null; then
       echo "ruling recorded: $slug phase $phase ($kind)  ->  $ledger"
+      written=1
     else
       echo "note: $ledger could not be written — printing the ruling only" >&2
       printf '%s\n' "$line"
@@ -254,12 +385,62 @@ if [ "$mode" = ruling ]; then
     ledger="$(pe_runs_dir "$root" "$slug")/rulings.ndjson"
     if mkdir -p "$(dirname "$ledger")" 2>/dev/null && printf '%s\n' "$line" >> "$ledger" 2>/dev/null; then
       echo "note: PE_RULINGS_FILE is not set (no runner is supervising this session) — recorded for the console at $ledger" >&2
+      written=1
     else
       echo "note: PE_RULINGS_FILE is not set and $ledger could not be written — printing the ruling only" >&2
     fi
     printf '%s\n' "$line"
   fi
-  exit 0
+  [ -n "$remember" ] || exit 0
+
+  # ---- --remember: the ruling becomes a standing answer -----------------------
+  # Only a recorded ruling can be remembered: the row's evidence and the
+  # console's action both name the id, and an id that is in no ledger is a
+  # promise nobody can check.
+  if [ "$written" != 1 ] || [ -z "$ruling_id" ]; then
+    echo "not remembered: the ruling could not be written to a ledger (or no sha256 tool is installed), so there is nothing to promote" >&2
+    exit 1
+  fi
+  # Who remembers it. The autopilot's exported owner, else user@host —
+  # decisions.sh's own default, spelled here so the ack line says the same.
+  [ -n "$by_word" ] || by_word="${PE_OWNER:-$(whoami 2>/dev/null || echo operator)@$(hostname -s 2>/dev/null || hostname)}"
+  by_word="$(printf '%s' "$by_word" | tr '\r\n\t' '   ' | cut -c1-64)"
+  if [ "$remember" = plan ]; then
+    # decisions.sh reads the same ledger: exported so an injected
+    # PE_RULINGS_FILE (a lane, a test) is honoured rather than re-derived.
+    if PE_RULINGS_FILE="$ledger" "$SCRIPT_DIR/decisions.sh" "$slug" promote --from-ruling "$ruling_id" --key "$needs" --by "$by_word"; then
+      ack="{\"version\":1,\"type\":\"ack\",\"id\":\"$ruling_id\",\"at\":\"$(_json_str "$now")\",\"by\":\"$(_json_str "$by_word")\"}"
+      printf '%s\n' "$ack" >> "$ledger" 2>/dev/null || echo "note: the ruling was promoted but its ack could not be appended to $ledger" >&2
+      echo "remembered for plan $slug: $needs  ->  docs/handoffs/$slug/decisions.md (source ruling, evidence ruling $ruling_id)"
+      exit 0
+    fi
+    echo "the ruling is recorded ($ruling_id) but was not promoted — see decisions.sh above; promote it by hand: decisions.sh $slug promote --from-ruling $ruling_id --key $needs" >&2
+    exit 1
+  fi
+  # global: the console that owns this repository holds the policy override,
+  # and it is the only writer of its own preferences — so it is asked, over
+  # the same door the inbox's "Remember on this console" action uses.
+  url="$(pe_console_url "$(pe_docs_root)")"
+  fallback="set \`$needs\` under Settings ▸ Automation ▸ Policy answers, or run --remember plan"
+  if [ -z "$url" ]; then
+    echo "not remembered globally: no console is registered for this repository (and PHASE_CONSOLE_URL is unset) — $fallback" >&2
+    exit 1
+  fi
+  command -v curl >/dev/null 2>&1 || { echo "not remembered globally: curl is not installed — $fallback" >&2; exit 1; }
+  body="{\"scope\":\"global\",\"by\":\"$(_json_str "$by_word")\"}"
+  reply_file="$(mktemp "${TMPDIR:-/tmp}/pe-remember.XXXXXX")"
+  code="$(curl -sS -o "$reply_file" -w '%{http_code}' --connect-timeout 2 --max-time 10 \
+      -X POST "$url/api/run/$slug/rulings/$ruling_id/remember" \
+      -H 'content-type: application/json' -H 'x-phase-console: 1' --data "$body" 2>/dev/null || true)"
+  # curl prints 000 AND exits non-zero on a refused connection; anything that
+  # is not three digits reads as "nobody answered".
+  case "$code" in [0-9][0-9][0-9]) : ;; *) code=000 ;; esac
+  reply="$(cat "$reply_file" 2>/dev/null | cut -c1-600)"; rm -f "$reply_file"
+  case "$code" in
+    200) echo "remembered on this console ($url): policy.$needs  ->  $reply"; exit 0 ;;
+    000) echo "not remembered globally: no console answers at $url — $fallback" >&2; exit 1 ;;
+    *)   echo "not remembered globally: the console at $url answered $code: $reply — $fallback" >&2; exit 1 ;;
+  esac
 fi
 
 resume_after=""
@@ -280,6 +461,9 @@ fi
 # skipped field from failing the assignment under `set -e` (an assignment's
 # exit status is its last command substitution's).
 reason_line="$( [ -n "$reason" ] && printf '\n  "reason": "%s",' "$(_json_str "$reason")" || true )"
+needs_line="$( [ -n "$needs" ] && printf '\n  "needs": "%s",' "$(_json_str "$needs")" || true )"
+rule_line="$( [ -n "$rule" ] && printf '\n  "rule": "%s",' "$(_json_str "$rule")" || true )"
+command_line="$( [ -n "$command_text" ] && printf '\n  "command": "%s",' "$(_json_str "$command_text")" || true )"
 resume_line="$( [ -n "$resume_after" ] && printf '\n  "resume_after": "%s",' "$(_json_str "$resume_after")" || true )"
 session_line="$( [ -n "$session" ] && printf '\n  "session_id": "%s",' "$session" || true )"
 
@@ -287,7 +471,7 @@ json="{
   \"version\": 1,
   \"slug\": \"$(_json_str "$slug")\",
   \"phase\": $phase,
-  \"status\": \"$status\",${reason_line}${resume_line}${session_line}
+  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${resume_line}${session_line}
   \"watch\": [$watch_json],
   \"written_at\": \"$(_json_str "$now")\"
 }"

@@ -393,7 +393,7 @@ test('a named-phase start refuses a claim nobody can vouch AGAINST, and ignores 
     // the fix preserves; what changed is WHICH presence answer is asked for.
     writeLock(root, 2, { session: 'a-session-nobody-knows' });
     await assert.rejects(
-      () => service.startRun('alpha', { onlyPhases: [2] }),
+      () => service.startRun('alpha', { acknowledgedWaivers: ['announce'], onlyPhases: [2] }),
       (error: unknown) => error instanceof PhaseClaimedError,
       'an unexpired claim with unvouched presence is a holder',
     );
@@ -480,7 +480,7 @@ test('a start is refused over a live child this console is not driving', async (
     saveRun(run);
 
     await assert.rejects(
-      () => service.startRun('alpha', {}),
+      () => service.startRun('alpha', { acknowledgedWaivers: ['announce'] }),
       /still being worked by a live session/,
       'a live child of a run we cannot see must refuse a second run',
     );

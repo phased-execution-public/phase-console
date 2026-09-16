@@ -24,13 +24,14 @@ import { join } from 'node:path';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
-const { SKILL_DIR } = await import('../server/config.ts');
+const { SKILL_DIR, savePrefs } = await import('../server/config.ts');
 const { Service, HOOK_EVENTS_PER_MINUTE } = await import('../server/service.ts');
 const { handleApi } = await import('../server/api/routes.ts');
 const { lockPath, readLock } = await import('../server/store.ts');
 const { latestRun, journalFile, newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
 const { inboxOutcomeFile } = await import('../server/runner/outcome.ts');
 const { instanceId } = await import('../shared/instances.mjs');
+const { recent: recentLog } = await import('../server/log.ts');
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
 
@@ -309,10 +310,13 @@ test('phase-outcome.sh from a shell with no PE_OUTCOME_FILE lands in the inbox; 
       await settle(svc);
       assert.equal(latestRun(root, 'alpha'), null, 'no run yet — a person is driving phase 2 by hand');
       // The real script, the real identity rule: no PE_OUTCOME_FILE, DOCS_ROOT = the repo, XDG_STATE_HOME = the sandbox.
-      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-hand' };
+      // Its own session id: `s-hand` is registered LIVE by an earlier test in
+      // this file, and a live declaring session is exactly what the inbox now
+      // refuses to arm a resume of (REG-1) — the case beside this one pins that.
+      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-inbox' };
       delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
       const out = execFileSync('/bin/bash', [join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'waiting-external', '--wait-minutes', '45', '--reason', 'image build', '--watch', 'gh:x#run/1'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      assert.match(out, /"session_id": "s-hand"/);
+      assert.match(out, /"session_id": "s-inbox"/);
       const expected = inboxOutcomeFile(root, 'alpha', 2);
       assert.equal(expected.includes(instanceId(root)), true);
       // Picked up (by the watcher, or the boot scan had it been written before) and consumed.
@@ -322,7 +326,7 @@ test('phase-outcome.sh from a shell with no PE_OUTCOME_FILE lands in the inbox; 
       assert.equal(rec.status, 'waiting');
       assert.equal(rec.parkReason, 'image build');
       assert.deepEqual(rec.watch, ['gh:x#run/1']);
-      assert.equal(rec.resumeSessionId, 's-hand', 'THAT session is what resumes');
+      assert.equal(rec.resumeSessionId, 's-inbox', 'THAT session is what resumes');
       assert.ok(rec.parkedUntil && Date.parse(rec.parkedUntil) > Date.now() + 30 * 60_000, 'parked on the declared window');
       assert.equal(state.status, 'paused');
       assert.equal(state.stoppedBy, 'system');
@@ -337,24 +341,118 @@ test('phase-outcome.sh from a shell with no PE_OUTCOME_FILE lands in the inbox; 
       assert.equal(situation.id, 'waiting-external');
       // Journalled on the run it created.
       const lines = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
-      assert.ok(lines.some((l) => l.event === 'phase.outcome' && l.data.by === 'unsupervised' && l.data.sessionId === 's-hand'));
+      assert.ok(lines.some((l) => l.event === 'phase.outcome' && l.data.by === 'unsupervised' && l.data.sessionId === 's-inbox'));
       assert.ok(lines.some((l) => l.event === 'run.waiting-external'));
     } finally { svc.close(); }
   } finally { cleanup(); }
 });
 
 /**
- * xcut-6 — the unsupervised park gets the caps the supervised one has.
+ * REG-1 — the console resumed a session it never asked the registry about.
  *
- * `Runner.parkWaiting` enforces `WAIT_MAX_PER_PHASE` and `WAIT_BUDGET_MS` and
- * clamps the park to the remaining budget, "so the timeout must be reachable".
- * Its unsupervised twin — a hand-run session declaring an outcome with no
- * `PE_OUTCOME_FILE` — had neither: a `--until` a week out parked the plan a
- * week out, past `setTimeout`'s reach, with nothing to wake it and nothing
- * anywhere saying why. And a session that kept re-declaring the same wait
- * could do so for ever.
+ * The standing case: a hand session declared `waiting-external`, took the phase
+ * over and kept working, and the inbox armed a `--resume` of it for 21:15 — a
+ * second `claude` on a live transcript in the same tree, with no confirm and no
+ * record. Presence is now read BEFORE the declaration is spent: a live author
+ * is a recorded refusal, nothing is armed, and the file is kept until that
+ * session ends.
  */
-test('an unsupervised waiting-external park is clamped to the wait budget, and refused once it is spent (xcut-6)', async () => {
+test('REG-1: a declaration from a session still running is refused and kept — no run parked, no resume armed, no resumeSessionId', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const announced: { category: string; title: string }[] = [];
+    const svc = service(root, {}, (s) => {
+      s.prefs.convergeEveryMs = 3_600_000;
+      s.push.announce = ((category: string, message: { title: string }) => { announced.push({ category, title: message.title }); }) as typeof s.push.announce;
+    });
+    try {
+      await settle(svc);
+      // The declaring session, alive: its pid is this very test process.
+      svc.ingestSessionEvent({ version: 1, session_id: 's-took-over', event: 'SessionStart', cwd: root, pid: process.pid, source: 'startup', at: new Date().toISOString() });
+      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-took-over' };
+      delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
+      execFileSync('/bin/bash', [join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'waiting-external', '--wait-minutes', '45', '--reason', 'took the phase over', '--watch', 'date:2026-09-13T21:15:00Z'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const file = inboxOutcomeFile(root, 'alpha', 2);
+      assert.ok(await poll(() => announced.some((a) => /A resume is held/.test(a.title)), 6_000), 'the refusal is announced');
+      assert.ok(existsSync(file), 'the declaration is KEPT, as evidence, until its author ends');
+      assert.equal(latestRun(root, 'alpha'), null, 'no run was parked on it');
+      const timers = (svc as unknown as { limitResumeTimers: Map<string, unknown> }).limitResumeTimers;
+      assert.equal(timers.has('alpha'), false, 'no armLimitResume');
+      assert.equal(announced.filter((a) => /A resume is held/.test(a.title)).length, 1, 'said once, however many sweeps read it');
+      // …and the moment that session ends, the same declaration is acted on.
+      svc.ingestSessionEvent({ version: 1, session_id: 's-took-over', event: 'SessionEnd', cwd: root, reason: 'other', at: new Date().toISOString() });
+      (svc as unknown as { ingestOutcomeFile: (slug: string, file: string) => void }).ingestOutcomeFile('alpha', file);
+      assert.ok(await poll(() => latestRun(root, 'alpha')?.phases['2']?.status === 'waiting', 6_000), 'parked once its author ended');
+      assert.equal(latestRun(root, 'alpha')!.phases['2'].resumeSessionId, 's-took-over');
+      assert.ok(timers.has('alpha'), 'and only now is the resume armed');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('SHD-6: an overdue wait is ruled on with the watch clock already open — refs read before run.limit-resume', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'paused';
+    state.stoppedBy = 'system';
+    state.waitReason = 'external';
+    const until = new Date(Date.now() - 90 * 60_000).toISOString();
+    state.waitUntil = until;
+    const rec = phaseRecord(state, 2);
+    rec.status = 'waiting';
+    rec.parkedUntil = until;
+    rec.sessionId = 's-overdue';
+    rec.resumeSessionId = 's-overdue';
+    rec.declared = { status: 'waiting-external', reason: 'the image build', watch: ['date:2026-01-01T00:00:00Z'], at: new Date(Date.now() - 2 * 60 * 60_000).toISOString() };
+    saveRun(state);
+    const started: string[] = [];
+    let clockOpenAtResume: boolean | null = null;
+    const svc = service(root, {}, (s) => {
+      s.prefs.resumeAtBoot = 'auto';
+      s.prefs.convergeEveryMs = 3_600_000;
+      (s as never as { startRun: (slug: string, o: Record<string, unknown>) => Promise<unknown> }).startRun = async (slug, o) => {
+        clockOpenAtResume = s.watchClock.snapshot().open;
+        started.push(String(o.resumeRunId ?? slug));
+        return null;
+      };
+    });
+    try {
+      await settle(svc);
+      assert.ok(await poll(() => started.length > 0, 6_000), 'the overdue wait resumed');
+      assert.equal(clockOpenAtResume, true, 'the watch clock was open before anything resumed');
+      const lines = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
+      const order = lines.map((l) => l.event);
+      assert.ok(order.indexOf('run.wait-overdue') >= 0 && order.indexOf('run.wait-overdue') < order.indexOf('run.limit-resume'), order.join(', '));
+      const overdue = lines.find((l) => l.event === 'run.wait-overdue')!;
+      assert.deepEqual((overdue.data.refs as { state: string }[]).map((r) => r.state), ['landed']);
+    } finally {
+      // `open()` wrote `auto` into the sandbox's prefs; every other case in this
+      // file assumes the shipped `ask`, under which a system-stopped run is
+      // asked about rather than relaunched. Put it back.
+      svc.prefs.resumeAtBoot = 'ask';
+      savePrefs(svc.prefs);
+      svc.close();
+    }
+  } finally { cleanup(); }
+});
+
+/**
+ * xcut-6 — the unsupervised park gets the answer the supervised one gets.
+ *
+ * Its unsupervised twin — a hand-run session declaring an outcome with no
+ * `PE_OUTCOME_FILE` — once had no caps at all: a `--until` a week out parked the
+ * plan a week out, past `setTimeout`'s reach. Then it had the supervised
+ * clamp, which cut any window to the eight hours left and recorded neither the
+ * ask nor the cut (WAI-1). Both twins now go through `evaluateWait`: a window
+ * past the budget is REFUSED with the arithmetic, a window inside it parks for
+ * exactly what it asked, and the per-phase cap still turns a re-filed wait into
+ * a refusal.
+ */
+test('an unsupervised waiting-external park is answered by the wait budget — refused with the arithmetic past it, never cut (xcut-6, WAI-1)', async () => {
   const { root, cleanup } = scratch();
   try {
     gitInit(root);
@@ -362,9 +460,16 @@ test('an unsupervised waiting-external park is clamped to the wait budget, and r
     const svc = service(root, {}, (s) => { s.prefs.convergeEveryMs = 3_600_000; });
     try {
       await settle(svc);
-      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-hand' };
+      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-budget' };
       delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
       const inbox = inboxOutcomeFile(root, 'alpha', 2);
+      const lines = (): { event: string; data: Record<string, unknown> }[] => {
+        const run = latestRun(root, 'alpha');
+        if (!run || !existsSync(journalFile(root, 'alpha', run.id))) return [];
+        return readFileSync(journalFile(root, 'alpha', run.id), 'utf8').trim().split('\n').filter(Boolean)
+          .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      };
+      const refusals = (): number => lines().filter((line) => line.event === 'phase.wait-budget-spent').length;
       const declare = (minutes: string): void => {
         execFileSync('/bin/bash', [
           join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'waiting-external',
@@ -372,16 +477,31 @@ test('an unsupervised waiting-external park is clamped to the wait budget, and r
         ], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       };
 
-      // A week out. The budget is eight hours.
+      // A week out. The budget is eight hours: REFUSED, with the arithmetic —
+      // never parked for a silent eight and then woken 51 hours early.
       declare(String(7 * 24 * 60));
       assert.ok(await poll(() => latestRun(root, 'alpha') !== null, 6_000), 'a run exists');
-      assert.ok(await poll(() => latestRun(root, 'alpha')!.phases['2']?.status === 'waiting', 6_000));
+      assert.ok(await poll(() => refusals() === 1, 12_000), 'the week-long window is refused on the record');
+      const refused = latestRun(root, 'alpha')!;
+      assert.notEqual(refused.phases['2']?.status, 'waiting', 'not parked for a cut-down eight hours');
+      assert.equal(refused.phases['2']?.waits ?? 0, 0, 'a refused window spends no wait');
+      const refusal = lines().find((line) => line.event === 'phase.wait-budget-spent')!.data;
+      assert.equal(refusal.ledger, 'budget');
+      assert.match(String(refusal.refusal), /8\.0 h \(the console default\)/, 'the arithmetic names the budget and its source');
+      assert.match(String(refusal.refusal), /does not cut a declared window short/);
 
+      // Inside the budget: parked for exactly the window it asked for.
+      declare('60');
+      assert.ok(await poll(() => latestRun(root, 'alpha')!.phases['2']?.status === 'waiting', 12_000));
       const parked = latestRun(root, 'alpha')!;
       const until = Date.parse(parked.phases['2'].parkedUntil!);
-      assert.ok(until <= Date.now() + 8 * 60 * 60_000 + 60_000,
-        `parked past the eight-hour budget (${parked.phases['2'].parkedUntil}) — nothing would wake it`);
-      assert.ok(until > Date.now() + 60_000, 'and not in the past either');
+      assert.ok(Math.abs(until - (Date.now() + 60 * 60_000)) < 3 * 60_000,
+        `parked for the declared hour (${parked.phases['2'].parkedUntil})`);
+      const waiting = lines().filter((line) => line.event === 'phase.waiting').at(-1)!.data;
+      assert.equal(waiting.capped, false);
+      assert.equal(waiting.requestedSource, 'declared');
+      assert.equal(waiting.budgetMs, 8 * 60 * 60_000);
+      assert.equal(waiting.by, 'unsupervised');
 
       // Re-declared until the per-phase cap is spent. The fourth park is the
       // last one; the fifth must be refused rather than parking again.
@@ -409,18 +529,9 @@ test('an unsupervised waiting-external park is clamped to the wait budget, and r
 
       const parkedUntilBefore = spent.phases['2'].parkedUntil;
       declare('60');
-      assert.ok(
-        await poll(
-          () => readFileSync(journalFile(root, 'alpha', spent.id), 'utf8')
-            .includes('phase.wait-budget-spent'),
-          12_000,
-          // Same remedy, same reason — and unconditional, because re-declaring
-          // at the spent cap is refused again by construction: it can only ever
-          // produce the line being waited for, never another park.
-          () => declare('60'),
-        ),
-        'the refusal is journalled',
-      );
+      assert.ok(await poll(() => refusals() === 2, 12_000), 'the refusal is journalled');
+      assert.equal(lines().filter((line) => line.event === 'phase.wait-budget-spent').at(-1)!.data.ledger, 'waits',
+        'and it names the ledger that ran out — the declared waits, not the hours');
       const after = latestRun(root, 'alpha')!;
       assert.equal(after.phases['2'].waits, 4, 'the fifth declaration does NOT park again');
       assert.equal(after.phases['2'].parkedUntil, parkedUntilBefore, 'and the clock is not pushed out');
@@ -428,21 +539,60 @@ test('an unsupervised waiting-external park is clamped to the wait budget, and r
   } finally { cleanup(); }
 });
 
-test('a stale or invalid inbox file is consumed and changes nothing; a live runner gets the declaration through its own verb', async () => {
+test('WAI-7: a stale or invalid inbox file is SET ASIDE under outcomes/ignored/ and journalled — never destroyed; a live runner gets a valid declaration through its own verb', async () => {
   const { root, cleanup } = scratch();
   try {
     gitInit(root);
     const svc = service(root);
     try {
       await settle(svc);
+      // A stored run to journal on — "the plan's latest run".
+      const state = newRun({ slug: 'alpha', root, model: 'opus' });
+      state.status = 'paused';
+      state.stoppedBy = 'operator';
+      saveRun(state);
+      const journal = () => {
+        try {
+          return readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').filter(Boolean)
+            .map((l) => JSON.parse(l) as { event: string; phase?: number; data: Record<string, unknown> });
+        } catch { return []; }
+      };
+      const ignored = (reason: string) => join(inboxOutcomeFile(root, 'alpha', 2), '..', 'ignored', `phase-02.json.${reason}`);
+
       const file = inboxOutcomeFile(root, 'alpha', 2);
       mkdirSync(join(file, '..'), { recursive: true });
-      writeInbox(file, JSON.stringify({ version: 1, slug: 'alpha', phase: 2, status: 'waiting-external', watch: [], written_at: '2020-01-01T00:00:00Z' }));
-      assert.ok(await poll(() => !existsSync(file)), 'consumed');
-      assert.equal(latestRun(root, 'alpha'), null, 'a declaration from 2020 is history');
+      const stale = JSON.stringify({ version: 1, slug: 'alpha', phase: 2, status: 'waiting-external', watch: [], written_at: '2020-01-01T00:00:00Z' });
+      writeInbox(file, stale);
+      assert.ok(await poll(() => !existsSync(file)), 'gone from the inbox');
+      assert.ok(existsSync(ignored('stale')), 'kept beside it, named for why');
+      assert.equal(readFileSync(ignored('stale'), 'utf8').trim(), stale, 'the bytes are intact');
+      assert.equal(state.phases[2], undefined, 'a declaration from 2020 changes nothing');
+      let line = journal().find((l) => l.event === 'phase.outcome-ignored');
+      assert.ok(line, 'journalled on the plan\'s latest run');
+      assert.equal(line!.phase, 2);
+      assert.equal(line!.data.reason, 'stale');
+      assert.equal(line!.data.writtenAt, '2020-01-01T00:00:00Z');
+      assert.ok((line!.data.ageMs as number) > 24 * 3_600_000);
+      assert.equal(line!.data.status, 'waiting-external');
+      assert.equal(line!.data.kept, 'ignored/phase-02.json.stale');
+
       writeInbox(file, 'not json');
-      assert.ok(await poll(() => !existsSync(file)), 'junk consumed too');
-      assert.equal(latestRun(root, 'alpha'), null);
+      assert.ok(await poll(() => !existsSync(file)), 'junk gone from the inbox too');
+      assert.ok(existsSync(ignored('invalid')));
+      assert.equal(readFileSync(ignored('invalid'), 'utf8').trim(), 'not json');
+      line = journal().filter((l) => l.event === 'phase.outcome-ignored').at(-1);
+      assert.equal(line!.data.reason, 'invalid');
+      assert.equal(line!.data.writtenAt, null, 'nothing to peek in non-JSON');
+
+      // A second invalid one with the same name is NOT overwritten: `.1`.
+      const wrongVersion = JSON.stringify({ version: 2, slug: 'alpha', phase: 2, status: 'complete', written_at: '2026-09-14T09:00:00Z' });
+      writeInbox(file, wrongVersion);
+      assert.ok(await poll(() => !existsSync(file)));
+      assert.ok(existsSync(`${ignored('invalid')}.1`), 'evidence is never overwritten');
+      line = journal().filter((l) => l.event === 'phase.outcome-ignored').at(-1);
+      assert.equal(line!.data.writtenAt, '2026-09-14T09:00:00Z', 'the rejected file\'s own stamp is still read');
+      assert.equal(line!.data.kept, 'ignored/phase-02.json.invalid.1');
+
       // A live runner: the declaration goes through `declareOutcome`.
       const declared: unknown[] = [];
       (svc as unknown as { runners: Map<string, unknown> }).runners.set('alpha', {
@@ -451,7 +601,7 @@ test('a stale or invalid inbox file is consumed and changes nothing; a live runn
         declareOutcome: (phase: number, outcome: unknown, by: string) => { declared.push({ phase, outcome, by }); return 'parked'; },
         noteDocsChanged: () => {},
       });
-      const live = JSON.stringify({ version: 1, slug: 'alpha', phase: 2, status: 'partial', reason: 'budget', watch: [], written_at: new Date().toISOString(), session_id: 's-hand' });
+      const live = JSON.stringify({ version: 1, slug: 'alpha', phase: 2, status: 'partial', reason: 'budget', watch: [], written_at: new Date().toISOString(), session_id: 's-verb' });
       writeInbox(file, live);
       // Re-delivered, unconditionally, until it lands: on a loaded Linux runner
       // the watcher can miss the rename onto a path it has already seen
@@ -464,7 +614,163 @@ test('a stale or invalid inbox file is consumed and changes nothing; a live runn
         await poll(() => declared.length === 1, 20_000, () => writeInbox(file, live)),
         'handed to the live runner',
       );
-      assert.deepEqual(declared[0], { phase: 2, outcome: { version: 1, slug: 'alpha', phase: 2, status: 'partial', reason: 'budget', watch: [], written_at: (declared[0] as { outcome: { written_at: string } }).outcome.written_at, session_id: 's-hand' }, by: 'unsupervised' });
+      assert.deepEqual(declared[0], { phase: 2, outcome: { version: 1, slug: 'alpha', phase: 2, status: 'partial', reason: 'budget', watch: [], written_at: (declared[0] as { outcome: { written_at: string } }).outcome.written_at, session_id: 's-verb' }, by: 'unsupervised' });
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('WAI-7: a valid declaration is consumed only AFTER its act settles — and a thrown act sets it aside as `failed`', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    const svc = service(root);
+    try {
+      await settle(svc);
+      const state = newRun({ slug: 'alpha', root, model: 'opus' });
+      state.status = 'paused';
+      state.stoppedBy = 'operator';
+      saveRun(state);
+      let release!: () => void;
+      let fail!: (error: Error) => void;
+      let applied = 0;
+      (svc as unknown as { applyUnsupervisedOutcome: unknown }).applyUnsupervisedOutcome = () => {
+        applied++;
+        return new Promise<void>((resolve, reject) => { release = resolve; fail = reject; });
+      };
+      const file = inboxOutcomeFile(root, 'alpha', 3);
+      mkdirSync(join(file, '..'), { recursive: true });
+      writeInbox(file, JSON.stringify({ version: 1, slug: 'alpha', phase: 3, status: 'complete', watch: [], written_at: new Date().toISOString() }));
+      assert.ok(await poll(() => applied === 1), 'the act was asked');
+      // The sweep fires every 10 s and the watcher on every change; while the
+      // act is in flight the file is still there and is NOT applied again.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.ok(existsSync(file), 'consume LAST: the file stands until the act settles');
+      assert.equal(applied, 1, 'in flight ⇒ not re-applied');
+      release();
+      assert.ok(await poll(() => !existsSync(file)), 'consumed once the act settled');
+      assert.ok(!existsSync(join(file, '..', 'ignored')), 'nothing set aside for a clean act');
+
+      // A thrown act: kept as `failed`, journalled, never re-applied every sweep.
+      writeInbox(file, JSON.stringify({ version: 1, slug: 'alpha', phase: 3, status: 'complete', watch: [], written_at: new Date().toISOString() }));
+      assert.ok(await poll(() => applied === 2));
+      fail(new Error('the board could not be read'));
+      assert.ok(await poll(() => !existsSync(file)));
+      assert.ok(existsSync(join(file, '..', 'ignored', 'phase-03.json.failed')));
+      const lines = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').filter(Boolean)
+        .map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
+      const failed = lines.find((l) => l.event === 'phase.outcome-ignored' && l.data.reason === 'failed');
+      assert.ok(failed, 'journalled as failed');
+      assert.equal(failed!.data.error, 'the board could not be read');
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(applied, 2, 'a failed file is not re-applied');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('WAI-8 / SLF-4: an unsupervised `partial` past its cap is recorded, not boarded; one inside the cooldown collapses; stallRemedy survives the re-board', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const boards: unknown[] = [];
+    const svc = service(root, {}, (s) => {
+      s.prefs.convergeEveryMs = 3_600_000;
+      // The boarding is what a `partial` buys; here it is counted, never spawned.
+      (s as unknown as { startRun: unknown }).startRun = async (slug: string, opts: unknown) => { boards.push({ slug, opts }); return null; };
+    });
+    try {
+      await settle(svc);
+      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-partial' };
+      delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
+      const declare = (): void => {
+        execFileSync('/bin/bash', [
+          join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'partial', '--reason', 'context',
+        ], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      };
+      const lines = (): { event: string; data: Record<string, unknown> }[] => {
+        const run = latestRun(root, 'alpha');
+        if (!run || !existsSync(journalFile(root, 'alpha', run.id))) return [];
+        return readFileSync(journalFile(root, 'alpha', run.id), 'utf8').trim().split('\n').filter(Boolean)
+          .map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      };
+      const count = (event: string) => lines().filter((l) => l.event === event).length;
+
+      // A stored run whose phase 2 carries the watchdog's bound and three acts on `partial` already.
+      const state = newRun({ slug: 'alpha', root, model: 'opus' });
+      state.status = 'paused';
+      state.stoppedBy = 'system';
+      const record = phaseRecord(state, 2);
+      record.status = 'failed';
+      record.stallRemedy = { nudges: 2, recycles: 1 };
+      record.declarations = { partial: { count: 3, lastAt: new Date(Date.now() - 60 * 60_000).toISOString() } };
+      saveRun(state);
+
+      // The fourth act: re-boarded, with the bound INTACT (it used to be wiped here).
+      declare();
+      assert.ok(await poll(() => boards.length === 1, 12_000), 'the fourth partial boards');
+      let stored = latestRun(root, 'alpha')!;
+      assert.equal(stored.phases['2'].status, 'pending');
+      assert.deepEqual(stored.phases['2'].stallRemedy, { nudges: 2, recycles: 1 }, 'stallRemedy survives an unsupervised re-board');
+      assert.equal(stored.phases['2'].boardingHint?.situation, 'work-in-progress');
+      assert.equal(stored.phases['2'].declarations?.partial?.count, 4);
+      assert.equal(count('phase.reboard-requested'), 1);
+
+      // The fifth, a second later: inside the cooldown of the fourth — collapsed, not boarded.
+      declare();
+      assert.ok(await poll(() => count('phase.declaration-refused') === 1, 12_000), 'refused on the record');
+      let refused = lines().filter((l) => l.event === 'phase.declaration-refused').at(-1)!.data;
+      assert.equal(refused.why, 'cooldown');
+      assert.equal(refused.status, 'partial');
+      assert.equal(boards.length, 1, 'no second boarding');
+      assert.equal(count('phase.reboard-requested'), 1);
+
+      // Past the cooldown but past the cap too: recorded, not acted on — the count is a Retry's to clear.
+      stored = latestRun(root, 'alpha')!;
+      stored.phases['2'].declarations!.partial!.lastAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      saveRun(stored);
+      declare();
+      assert.ok(await poll(() => count('phase.declaration-refused') === 2, 12_000));
+      refused = lines().filter((l) => l.event === 'phase.declaration-refused').at(-1)!.data;
+      assert.equal(refused.why, 'cap');
+      assert.equal(refused.count, 4);
+      assert.equal(refused.max, 4);
+      assert.equal(boards.length, 1, 'N acts and one refusal: the fifth act never happens');
+      assert.equal(latestRun(root, 'alpha')!.phases['2'].declarations?.partial?.refused, 2);
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('WAI-8: an unsupervised needs-human --until a month out is capped at seven days, and the cap is journalled', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const svc = service(root, {}, (s) => { s.prefs.convergeEveryMs = 3_600_000; });
+    try {
+      await settle(svc);
+      const state = newRun({ slug: 'alpha', root, model: 'opus' });
+      state.status = 'paused';
+      state.stoppedBy = 'system';
+      saveRun(state);
+      const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-month' };
+      delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
+      const monthOut = new Date(Date.now() + 30 * 24 * 3_600_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+      execFileSync('/bin/bash', [
+        join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'needs-human', '--needs', 'credential',
+        '--reason', 'the token', '--until', monthOut,
+      ], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const lines = (): { event: string; data: Record<string, unknown> }[] => readFileSync(journalFile(root, 'alpha', state.id), 'utf8')
+        .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string; data: Record<string, unknown> });
+      assert.ok(await poll(() => existsSync(journalFile(root, 'alpha', state.id)) && lines().some((l) => l.event === 'phase.outcome'), 12_000));
+      const outcome = lines().find((l) => l.event === 'phase.outcome')!.data;
+      assert.equal(outcome.capped, true, 'the ceiling applied, and said so');
+      assert.equal(Date.parse(String(outcome.requested)), Date.parse(monthOut), 'the ask is recorded as asked');
+      const granted = Date.parse(String(outcome.granted));
+      assert.ok(Math.abs(granted - (Date.now() + 7 * 24 * 3_600_000)) < 5 * 60_000, `granted seven days out (${outcome.granted})`);
+      const stored = latestRun(root, 'alpha')!;
+      assert.equal(stored.phases['2'].parkedUntil, outcome.granted);
+      assert.equal(stored.phases['2'].declared?.status, 'needs-human');
+      assert.equal(stored.phases['2'].declarations?.['needs-human']?.count, 1);
     } finally { svc.close(); }
   } finally { cleanup(); }
 });
@@ -568,12 +874,12 @@ test('GET/POST /api/hooks-install: status, install, uninstall — behind --allow
  * Session asks — the waiting flag reaching a push and the inbox
  * ------------------------------------------------------------------ */
 
-test('a session ask announces once per episode: repeats are silent, a new episode re-announces, autopilot never does', async () => {
+test('a session ask announces once per episode: repeats are silent, a new episode re-announces, and the body is the question — never the cwd', async () => {
   const { root, cleanup } = scratch();
-  const pushed: { category: string; title: string; tag: string }[] = [];
+  const pushed: { category: string; title: string; tag: string; body: string }[] = [];
   const svc = service(root, {}, (instance) => {
-    instance.push.announce = ((category: string, message: { title: string; tag: string }) => {
-      pushed.push({ category, title: message.title, tag: message.tag });
+    instance.push.announce = ((category: string, message: { title: string; tag: string; body: string }) => {
+      pushed.push({ category, title: message.title, tag: message.tag, body: message.body });
     }) as never as typeof instance.push.announce;
   });
   try {
@@ -590,6 +896,9 @@ test('a session ask announces once per episode: repeats are silent, a new episod
     const asks = () => pushed.filter((c) => c.category === 'session-ask');
     assert.equal(asks().length, 1, 'the transition announces');
     assert.match(asks()[0].title, /permission/);
+    // TRS-6: the audit's one real question reached the phone as a directory.
+    assert.match(asks()[0].body, /Claude needs your permission to use Bash/, 'the question itself');
+    assert.ok(!asks()[0].body.includes(root), 'and not the cwd');
 
     // The CLI nags again while still waiting — same episode, same silence.
     svc.ingestSessionEvent({
@@ -608,14 +917,55 @@ test('a session ask announces once per episode: repeats are silent, a new episod
     assert.match(asks()[1].title, /answer/);
     assert.equal(asks()[0].tag, asks()[1].tag, 'one tag per session — repeats collapse on the device');
 
-    // An autopilot lane's ask is an approval card, never a session-ask push.
+  } finally {
+    svc.close();
+    cleanup();
+  }
+});
+
+test('ACC-8.9 (REG-5): an autopilot lane\'s wait announces in its own right — once — and is deduplicated against a pending card for its phase, logged', async () => {
+  const { root, cleanup } = scratch();
+  const pushed: { category: string; body: string }[] = [];
+  const svc = service(root, { converge: false }, (instance) => {
+    instance.push.announce = ((category: string, message: { body: string }) => {
+      pushed.push({ category, body: message.body });
+    }) as never as typeof instance.push.announce;
+  });
+  try {
+    await settle(svc);
+    const at = (plusMs: number) => new Date(Date.now() - 60_000 + plusMs).toISOString();
+    const asks = () => pushed.filter((c) => c.category === 'session-ask');
+    // The run on disk names the lane's session — the correlation a lane really has.
+    const laneAsks = (session: string, phase: number) => {
+      runNaming(root, phase, session);
+      svc.ingestSessionEvent({ session_id: session, event: 'SessionStart', owner: 'autopilot/ab12cd34', cwd: root, at: at(0) });
+      svc.ingestSessionEvent({
+        session_id: session, event: 'Notification', notification_type: 'permission_prompt', owner: 'autopilot/ab12cd34',
+        message: `Claude needs your permission to use WebFetch (lane ${phase})`, cwd: root, at: at(1_000),
+      });
+    };
+
+    // No approval channel armed for the lane's phase: the wait is announced, once.
+    laneAsks('lane-1', 2);
+    assert.equal(asks().length, 1, 'a lane stopped at a prompt is no longer silent');
+    assert.match(asks()[0].body, /lane 2/);
+    assert.match(asks()[0].body, /alpha phase 2/, 'with the plan and phase it works');
     svc.ingestSessionEvent({
-      session_id: 'lane-1', event: 'SessionStart', owner: 'autopilot/ab12cd34', cwd: root, at: at(0),
+      session_id: 'lane-1', event: 'Notification', notification_type: 'permission_prompt', owner: 'autopilot/ab12cd34',
+      message: 'Claude needs your permission to use WebFetch (lane 2)', cwd: root, at: at(30_000),
     });
-    svc.ingestSessionEvent({
-      session_id: 'lane-1', event: 'Notification', message: 'permission', cwd: root, at: at(1_000),
+    assert.equal(asks().length, 1, 'the same episode stays silent');
+
+    // A pending card for THAT phase is already the ask: no second announcement, and the suppression is logged.
+    const { approval } = svc.approvals.request({
+      runId: 'ab12cd34', slug: 'alpha', phase: 3, kind: 'tool', title: 'Bash: psql', detail: 'd', evidence: [],
     });
-    assert.equal(asks().length, 2, 'autopilot is excluded — its asks have their own channel');
+    laneAsks('lane-2', 3);
+    assert.equal(asks().length, 1, 'deduplicated against the card, not suppressed by kind');
+    const suppressed = recentLog(200).filter((entry) => entry.event === 'sessions.ask-suppressed' && entry.data?.sessionId === 'lane-2');
+    assert.equal(suppressed.length, 1, 'and the one suppression left says so');
+    assert.equal(suppressed[0].data?.approvalId, approval.id);
+    svc.approvals.settle(approval.id, 'deny', 'test');
   } finally {
     svc.close();
     cleanup();
@@ -643,6 +993,22 @@ test('a waiting session is an inbox item — and the registry beat nudges the de
     assert.equal(item?.severity, 'urgent', 'a permission prompt is a session parked dead');
     assert.match(item?.title ?? '', /permission/);
     assert.equal(item?.actions.length, 0, "no verb can answer someone else's terminal");
+    assert.match(item?.need ?? '', /permission to use WebFetch/, 'the row carries the question');
+
+    // A lane's row carries an answer: the words reach its session as a steer (TRS-6).
+    runNaming(root, 2, 'lane-ask');
+    svc.ingestSessionEvent({ session_id: 'lane-ask', event: 'SessionStart', owner: 'autopilot/ab12cd34', cwd: root, at: new Date().toISOString() });
+    svc.ingestSessionEvent({
+      session_id: 'lane-ask', event: 'Notification', notification_type: 'elicitation_dialog', owner: 'autopilot/ab12cd34',
+      message: 'Which schema should I migrate first?', cwd: root, at: new Date().toISOString(),
+    });
+    const lane = (await svc.attention()).items.find((i) => i.kind === 'session-ask' && i.need === 'Which schema should I migrate first?');
+    assert.ok(lane, 'a lane waiting on a person is a row in its own right');
+    assert.equal(lane?.actions.length, 1);
+    assert.equal(lane?.actions[0].verb, 'steer');
+    assert.equal(lane?.actions[0].endpoint, '/api/run/alpha/steer');
+    assert.deepEqual(lane?.actions[0].body, { phase: 2 });
+    assert.equal(lane?.actions[0].says?.field, 'instruction');
 
     assert.ok(await poll(() => events.includes('inbox'), 5_000),
       'the sessions beat schedules the debounced inbox tick (INBOX_SOURCES includes sessions)');
@@ -735,6 +1101,215 @@ test('a lock still outranks the run, and a run nobody has resolved is the only o
       state.resolved = { at: new Date().toISOString(), by: 'operator', reason: 'closed' } as never;
       saveRun(state);
       assert.equal(await read(), undefined);
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * Zero-touch phase 16 — the backlog, the inbox without a console, the peers
+ * ------------------------------------------------------------------ */
+
+const { INSTANCE_STATE_DIR } = await import('../server/config.ts');
+const SESSIONS_DIR = join(INSTANCE_STATE_DIR, 'sessions');
+const INBOX_DIR = join(SESSIONS_DIR, 'inbox');
+
+/** One presence drop exactly as the hook writes it: tmp + rename, a millisecond name. */
+function drop(n: number, payload: Record<string, unknown>): void {
+  mkdirSync(INBOX_DIR, { recursive: true });
+  const file = join(INBOX_DIR, `${Date.now()}${String(n).padStart(4, '0')}-${String(payload.session_id)}-${String(payload.event)}.json`);
+  writeInbox(file, `${JSON.stringify({ version: 1, ...payload })}\n`);
+}
+
+/**
+ * ACC-6.6 (SHD-7). `load()` ingests the inbox before it prunes, so on a deep
+ * inbox the moves at the BACK of the construction backlog are the ingested
+ * events — and the old bound dropped the newest by arrival: a `SessionEnd`
+ * whose lock was debris, lost with no way to re-raise the reaction, the lock
+ * standing for its two-hour lease. Now the bound bites by kind.
+ */
+test('ACC-6.6 (SHD-7): with the backlog exceeded during construction, every SessionEnd is applied — lock debris released — and only prune/heartbeat are ever dropped', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    // The debris the reaction exists for: a person's claim, naming its session.
+    const lock = claim(root, 2, 'sam@laptop', 3600, 's-backlog-gone');
+    // A run of the plan for converge to act on.
+    const state = newRun({ slug: 'alpha', root, autoRecover: false });
+    state.status = 'halted';
+    state.halt = { at: new Date().toISOString(), reason: 'x' };
+    Object.assign(phaseRecord(state, 2), { status: 'failed', attempts: 1 });
+    saveRun(state);
+
+    // 520 real moves (turns of one busy session), then the SessionEnd — the
+    // 521st, the one the old bound threw away — then 30 records old enough to
+    // prune, whose `prune` moves arrive last.
+    const base = Date.now() - 5 * 60_000;
+    for (let i = 0; i < 520; i++) {
+      drop(i, { session_id: 's-backlog-busy', event: 'Stop', cwd: root, at: new Date(base + i).toISOString() });
+    }
+    drop(9999, { session_id: 's-backlog-gone', event: 'SessionEnd', cwd: root, reason: 'other', at: new Date(base + 60_000).toISOString() });
+    mkdirSync(SESSIONS_DIR, { recursive: true });
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60_000).toISOString();
+    for (let i = 0; i < 30; i++) {
+      writeFileSync(join(SESSIONS_DIR, `s-backlog-old-${i}.json`), JSON.stringify({
+        sessionId: `s-backlog-old-${i}`, kind: 'foreign', cwd: root, startedAt: old, lastSeen: old, endedAt: old, turns: 0,
+      }), 'utf8');
+    }
+
+    // What reached the reaction, and when — the prototype's method, observed.
+    const applied: string[] = [];
+    const svc = service(root, {}, (s) => {
+      s.prefs.convergeEveryMs = 3_600_000;
+      const internals = s as unknown as { onPresenceChange: (record: { sessionId: string }, event: string, meta?: unknown) => void };
+      const original = internals.onPresenceChange.bind(s);
+      internals.onPresenceChange = (record, event, meta) => { applied.push(`${event}:${record.sessionId}`); original(record, event, meta); };
+    });
+    try {
+      await settle(svc);
+      const full = recentLog(200).filter((entry) => entry.event === 'sessions.presence-backlog-full').at(-1);
+      assert.ok(full, 'the bound bit, and said so once at the flush');
+      const dropped = full.data?.dropped as Record<string, number>;
+      const deferred = full.data?.deferred as Record<string, number>;
+      assert.deepEqual(
+        Object.keys(dropped).filter((kind) => kind !== 'prune' && kind !== 'heartbeat'), [],
+        `only droppable kinds appear under dropped: ${JSON.stringify(dropped)}`,
+      );
+      assert.equal(dropped.prune, 30, 'the prunes were the moves thrown away');
+      assert.equal(deferred.SessionEnd, 1, 'the SessionEnd was deferred, never dropped');
+      assert.equal(svc.sessions.presence('s-backlog-gone'), 'ended', 'its record was persisted all along');
+      assert.equal(applied.filter((move) => move === 'SessionEnd:s-backlog-gone').length, 0, 'deferred: its reaction has not run yet');
+      assert.equal(applied.filter((move) => move.startsWith('Stop:')).length, 500, 'the backlog held its bound of real moves');
+
+      // The registry's poll re-applies what the backlog deferred — the reaction
+      // the old bound lost for good.
+      svc.sessions.poll();
+      assert.equal(applied.filter((move) => move === 'SessionEnd:s-backlog-gone').length, 1, 'the SessionEnd reached the reaction');
+      assert.ok(recentLog(200).some((entry) => entry.event === 'sessions.presence-reconciled'), 'journalled as reconciled');
+      assert.ok(await poll(() => !existsSync(lock), 10_000), 'and its lock is released as debris');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+/**
+ * ACC-7.1, the REG-2 half. The inbox replays as history, not as news: a drop
+ * two hours old is applied with its lateness and raises no `session-ask`,
+ * while one a minute old does — and the inbox's depth is on the shutdown
+ * readiness, because stopping the console stops the reading.
+ */
+test('ACC-7.1 (REG-2): an inbox drop two hours old applies on load() with its lateness and raises no session-ask; one a minute old does; depth is on shutdownReadiness()', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    const announced: { category: string; title: string; body: string }[] = [];
+    const twoHours = Date.now() - 2 * 60 * 60_000;
+    const minute = Date.now() - 60_000;
+    for (const [n, id, at] of [[1, 's-late-ask', twoHours], [3, 's-fresh-ask', minute]] as const) {
+      drop(n, { session_id: id, event: 'SessionStart', cwd: root, pid: process.pid, at: new Date(at - 1_000).toISOString() });
+      drop(n + 1, {
+        session_id: id, event: 'Notification', cwd: root, pid: process.pid, notification_type: 'permission_prompt',
+        message: `${id} needs permission to use Bash`, at: new Date(at).toISOString(),
+      });
+    }
+    const svc = service(root, {}, (s) => {
+      s.prefs.convergeEveryMs = 3_600_000;
+      s.push.announce = ((category: string, message: { title: string; body: string }) => {
+        announced.push({ category, title: message.title, body: message.body });
+      }) as typeof s.push.announce;
+    });
+    try {
+      await settle(svc);
+      const late = svc.sessions.get('s-late-ask')!;
+      assert.ok(late, 'the two-hour-old drop was applied');
+      assert.equal(late.lastEvent?.via, 'inbox');
+      assert.ok((late.lastEvent?.lateMs ?? 0) >= 2 * 60 * 60_000 - 5_000, `lateness recorded: ${late.lastEvent?.lateMs}`);
+      assert.equal(late.lastEvent?.history, true, 'past the horizon: history');
+      const fresh = svc.sessions.get('s-fresh-ask')!;
+      assert.equal(fresh.lastEvent?.history, undefined, 'a minute late is news');
+      assert.ok((fresh.lastEvent?.lateMs ?? 0) >= 55_000);
+
+      const asks = announced.filter((a) => a.category === 'session-ask');
+      assert.ok(asks.some((a) => a.body.includes('s-fresh-ask')), `the fresh ask is pushed: ${JSON.stringify(asks)}`);
+      assert.equal(asks.filter((a) => a.body.includes('s-late-ask')).length, 0, 'the two-hour-old ask raises no session-ask — asking nor unanswered');
+      // Past the answer cap before it was even read, so the same load closed it
+      // unanswered — a fact on the record, and still not a push.
+      assert.equal(svc.sessions.get('s-late-ask')?.lastWait?.outcome, 'unanswered');
+
+      // Depth: stop the registry's reading, write two drops, and the readiness
+      // counts them — what a shutdown would leave unread.
+      svc.sessions.close();
+      drop(7, { session_id: 's-unread-1', event: 'Stop', cwd: root, at: new Date().toISOString() });
+      drop(8, { session_id: 's-unread-2', event: 'Stop', cwd: root, at: new Date().toISOString() });
+      const readiness = svc.shutdownReadiness();
+      assert.equal(readiness.inventory.inboxDepth.sessions, 2);
+      assert.equal(readiness.empty, false, 'unread presence is something a shutdown stops reading');
+    } finally {
+      svc.close();
+      rmSync(INBOX_DIR, { recursive: true, force: true });
+    }
+  } finally { cleanup(); }
+});
+
+/**
+ * ACC-7.3, the REG-3 half. Every registry consultation on a decision path was
+ * reached THROUGH a lock, so a session that started and had not claimed — the
+ * first minute of every hand session — was invisible to the lane about to
+ * board beside it. Presence now speaks with no lock at all.
+ */
+test('ACC-7.3 (REG-3): a live foreign session in the plan\'s root with no lock on disk queues an admission with the peer named, spawns nothing, and is the classifier\'s registry witness', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const svc = service(root, { converge: false });
+    try {
+      await settle(svc);
+      // A person's session, started in the root, no owner, no lock — alive.
+      const started = await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-hand', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        user: 'sam', host: 'laptop', source: 'startup', at: new Date().toISOString(),
+      });
+      assert.equal(started.status, 200, JSON.stringify(started.payload));
+      assert.equal(existsSync(lockPath(join(root, 'docs', 'handoffs'), 'alpha', 2)), false, 'no lock on disk');
+
+      // Admission for phase 2: blocked, the holder is the SESSION, named.
+      const request = { slug: 'alpha', phase: 2, runId: 'peer-test-run', scope: ['app'] };
+      const holders = svc.scheduler.wouldBlock(request);
+      const peer = holders.find((holder) => holder.kind === 'session');
+      assert.ok(peer, `a session holder: ${JSON.stringify(holders)}`);
+      assert.equal(peer.session, 's-peer-hand');
+      assert.equal(peer.pid, process.pid);
+      assert.equal(peer.cwd, root);
+      assert.equal(peer.presence, 'live');
+      assert.match(peer.owner, /^session s-peer-h/);
+
+      // And it queues — nothing is granted, so nothing can spawn — until the
+      // peer ends, which wakes the scan.
+      let granted: unknown = null;
+      const admission = svc.scheduler.admit(request).then((grant) => { granted = grant; return grant; });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(granted, null, 'queued behind the peer: no grant, no spawn');
+
+      // The classifier reads the same peer with no lock: `foreign-live` from presence alone.
+      const { evidence, situation } = await svc.classifyPhase('alpha', 2, null, { 1: 'done', 2: 'ready', 3: 'waiting' });
+      assert.equal(evidence.lock, null);
+      assert.equal(evidence.registry?.peer, true);
+      assert.equal(evidence.registry?.sessionId, 's-peer-hand');
+      assert.equal(situation.id, 'foreign-live');
+
+      // A second session starting in the root is told the first is there.
+      const second = await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-second', event: 'SessionStart', cwd: root, root, pid: process.pid, at: new Date().toISOString(),
+      });
+      assert.match(String((second.payload as { peers?: string }).peers), /s-peer-h/);
+      await call(svc, 'POST', '/hooks/session', { version: 1, session_id: 's-peer-second', event: 'SessionEnd', cwd: root, root, at: new Date().toISOString() });
+
+      await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-hand', event: 'SessionEnd', cwd: root, root, reason: 'other', at: new Date().toISOString(),
+      });
+      const grant = await Promise.race([admission, new Promise((resolve) => setTimeout(() => resolve('still-queued'), 5_000))]);
+      assert.notEqual(grant, 'still-queued', 'the peer ended: the admission is granted');
+      svc.scheduler.release(grant as never);
     } finally { svc.close(); }
   } finally { cleanup(); }
 });

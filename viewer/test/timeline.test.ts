@@ -393,3 +393,44 @@ test('consecutive pairs are what an operator reads: three attempts give two comp
 test('one attempt has nothing to compare against', () => {
   assert.deepEqual(compareConsecutive(attemptsOf(CLEAN, 1)), []);
 });
+
+/* ------------------------------------------------------------------ *
+ * The ledgers on the axis (zero-touch phase 19)
+ * ------------------------------------------------------------------ */
+
+test('a session ending is a session mark naming its mode, how it ended and its cost — unknown, never $0', () => {
+  const timeline = projectTimeline([
+    at(0, 'run.start', undefined, { door: 'operator', by: 'operator', resumed: false }),
+    at(0, 'phase.start', 1, {}),
+    at(10, 'phase.session', 1, { mode: 'phase', endedBy: 'watchdog', costUsd: 0.75, costSource: 'result', isError: false }),
+    at(20, 'phase.session', 1, { mode: 'repair', endedBy: 'exit', costUsd: 0, costSource: 'none', isError: true }),
+    at(30, 'phase.done', 1, {}),
+  ]);
+  const sessions = timeline.marks.filter((mark) => mark.kind === 'session');
+  assert.deepEqual(sessions.map((mark) => [mark.atMs, mark.phase, mark.label, mark.ok]), [
+    [10 * MIN, 1, 'phase · ended by watchdog · $0.75', true],
+    [20 * MIN, 1, 'repair · ended by exit · cost unknown', false],
+  ]);
+  assert.equal(timeline.unmapped, 0, 'a session line is placed, not counted as unmapped');
+});
+
+test('asks and policy answers tick their lane, and each start of the run ticks the axis with its door', () => {
+  const timeline = projectTimeline([
+    at(0, 'run.start', undefined, { door: 'operator', by: 'operator', resumed: false }),
+    at(0, 'phase.start', 2, {}),
+    at(5, 'phase.question-raised', 2, { question: 'Which branch?' }),
+    at(6, 'phase.approval-decided', 2, { decision: 'allow' }),
+    at(7, 'phase.policy-answered', 2, { decisionKey: 'qa.exhausted', answer: 'waive', source: 'default' }),
+    at(40, 'run.start', undefined, { door: 'converge-relaunch', by: 'console', resumed: true }),
+    at(50, 'phase.done', 2, {}),
+  ]);
+  const of = (kind: string) => timeline.marks.filter((mark) => mark.kind === kind);
+  assert.equal(of('ask').length, 2);
+  assert.ok(of('ask').every((mark) => mark.phase === 2));
+  assert.deepEqual(of('policy').map((mark) => mark.label), ['qa.exhausted → waive (default)']);
+  assert.deepEqual(of('start').map((mark) => [mark.atMs, mark.phase, mark.label]), [
+    [0, undefined, 'operator · operator'],
+    [40 * MIN, undefined, 'converge-relaunch (resumed) · console'],
+  ]);
+  assert.equal(timeline.unmapped, 0);
+});

@@ -41,17 +41,22 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
-  IN_FLIGHT, PHASE_IN_FLIGHT, loadRun, newRun, phaseRecord, saveRun,
+  IN_FLIGHT, PHASE_IN_FLIGHT, loadRun, newRun, phaseRecord, runFile, saveRun,
   type PhaseStatus, type RunState, type RunStatus,
 } from '../server/runner/state.ts';
 import { setPsReader, forgetPid, type ProcessState } from '../server/pid.ts';
 import { newLaneSignals } from '../server/runner/liveness.ts';
 import { Runner } from '../server/runner/runner.ts';
+import { sessionLedgerDefect, sessionRecordOf } from '../server/runner/session-record.ts';
+import type { SpawnOutcome } from '../server/runner/spawn.ts';
+import { ENDED_BY, SESSION_MODES, START_DOORS } from '../shared/run-lifecycle.js';
+import { fixtureJournals, fixtureRuns } from './journal-fixture.ts';
 
 /* ================================================================== *
  * Clause 1 — the choke points
@@ -169,10 +174,11 @@ const KILL_ALLOWED: Record<string, string> = {
   'api/routes.ts':
     'service.terminals.kill(id) — the Terminals class\'s own method, closing a pty SESSION',
   'mcp/health.ts':
-    'the one-turn `claude -p` MCP probe, killed when it answers or times out. Since Phase 5 the '
-    + 'GROUP kill goes through signals.ts\'s groupSignal() — the probe is spawned detached, because '
-    + 'it is the one console child guaranteed to have started MCP servers — and what is left here is '
-    + 'the no-group fallback (a spawn seam that gave us no pid)',
+    'the one-turn `claude -p` MCP probe, ended when it answers or times out. Since zero-touch-console '
+    + 'phase 7 the ending is signals.ts\'s killLadder() with the interrupt rung off — SIGCONT, SIGTERM '
+    + 'to the GROUP so the CLI runs its SessionEnd hook, then the SIGKILL the npx shims need (the probe '
+    + 'is spawned detached, because it is the one console child guaranteed to have started MCP '
+    + 'servers) — and what is left here is the no-group fallback (a spawn seam that gave us no pid)',
   'runner/auth.ts':
     'the `claude auth status` probe, killed at its 20s timeout',
   'runner/spawn.ts':
@@ -223,6 +229,59 @@ test('clause 1: one definition each for the derivations that used to disagree', 
   ];
   for (const { what, pattern, file, why } of single) {
     assert.deepEqual(filesOf(hits(pattern)), [file], `${what} must be defined once, in ${file}: ${why}`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The session ledger's one door (zero-touch-console phase 4, SES-6)
+ * ------------------------------------------------------------------ */
+
+test('clause 1: every claude -p session under runner/ goes through the one door, and the door writes the record', () => {
+  // Two of seven spawn sites wrote `phase.session`, one wrote three fields
+  // under another name, and four wrote nothing: 50 of the 138 sessions the
+  // audit's six plans spawned were invisible to every census built on the
+  // record. The door is `RunnerBase.spawnSession`; a new site that calls the
+  // spawner directly would be a session with no record again.
+  const spawns = hits(/\bspawnClaude\s*\(|\bdeps\.spawn\b/).filter((hit) => hit.startsWith('runner/'));
+  assert.deepEqual(filesOf(spawns), ['runner/runner-base.ts'],
+    'a session is being spawned outside spawnSession — route it through the door, which writes its phase.session');
+  assert.equal(spawns.length, 1, `exactly one raw spawn, inside the door (${spawns.join(', ')})`);
+
+  const writers = hits(/record\(\s*'phase\.session'/);
+  assert.deepEqual(writers.map((hit) => hit.split(':')[0]), ['runner/runner-base.ts'],
+    'phase.session has ONE writer, so it has one shape (session-record.ts sessionRecordOf)');
+
+  // And every purpose the vocabulary names is a site that really calls it —
+  // the positive half, so a comment-skipping bug cannot pass the lint empty.
+  for (const mode of SESSION_MODES) {
+    const sites = hits(new RegExp(`spawnSession\\(phase, '${mode}'`));
+    assert.equal(sites.length, 1, `SESSION_MODES names '${mode}', and exactly one spawn site says it (${sites.join(', ')})`);
+  }
+});
+
+test('clause 1: no session record the ledger writes can be the 4.1.0 defect — and the fixture still shows the defect it replaced', () => {
+  // The predicate: a session that ran over a minute, did no turn, and was
+  // ended by nobody named. Every record the 4.1.0 console wrote for a session
+  // it SIGTERMed had that shape; the journal fixture keeps them as the
+  // before-picture (build.mjs copies them raw).
+  const fixtureSessions = fixtureJournals()
+    .flatMap((journal) => journal.lines)
+    .filter((line) => line.event === 'phase.session')
+    .map((line) => (line.data ?? {}) as Record<string, unknown>);
+  assert.ok(fixtureSessions.length >= 80, `the fixture's session records are readable (${fixtureSessions.length})`);
+  assert.equal(fixtureSessions.filter(sessionLedgerDefect).length, 28,
+    'the 4.1.0 before-picture: 28 records of more than a minute, zero turns and no ending (inventory.json)');
+
+  // The after-picture: a zero-turn session of 61 s, ended every way there is,
+  // through the one function that builds the record — never the defect.
+  for (const endedBy of [...ENDED_BY, undefined]) {
+    const outcome = {
+      signal: { code: 130 }, costUsd: 0, turns: 0, resultText: '', durationMs: 61_000, argv: ['--print'], injected: 0,
+      ...(endedBy ? { endedBy } : {}),
+    } as SpawnOutcome;
+    const record = sessionRecordOf({ mode: 'phase', request: { prompt: 'BOOT', cwd: '/tmp' }, outcome });
+    assert.equal(sessionLedgerDefect(record), false, `a record ended by ${endedBy ?? '(nothing said)'} still names its ending`);
+    assert.ok(record.endedBy, 'endedBy is never blank');
   }
 });
 
@@ -529,4 +588,602 @@ test('clause 3: the run-status axis is the whole vocabulary, and IN_FLIGHT is a 
     assert.ok(RUN_STATUSES.includes(status), `IN_FLIGHT names ${status}, which the matrix does not cover`);
   }
   assert.equal(new Set(RUN_STATUSES).size, RUN_STATUSES.length, 'no duplicates in the axis');
+});
+
+/* ================================================================== *
+ * The plan that drives this work is held to the tree it names
+ * ================================================================== */
+
+/**
+ * `docs/plans/zero-touch-console.md` lives in the superproject that carries
+ * this repository as a submodule, and every one of its 23 phases names the
+ * suites that prove it. Chapter 14 of the audit found gates citing files that
+ * did not exist (`test/decisions.test.ts`) — a §Verification line pointing at
+ * a file that is not there is a phase that can never go green, and the runner
+ * only learns it at boarding. So: every suite path a §Verification line names
+ * either resolves in this tree, or the plan marks it `(new)` — on the same
+ * line, or in a sentence that names the file and says `(new)` (the plan keeps
+ * one such sentence in its closing section). Skipped where the plan is not
+ * beside this checkout (a hub copy, a plain clone, the free tree): the lint is
+ * about THIS plan, and only the superproject has it.
+ */
+test('every suite path the zero-touch-console plan names resolves, or the plan marks it (new)', (t) => {
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  let dir = repo;
+  let plan: string | null = null;
+  for (let i = 0; i < 4 && !plan; i++) {
+    dir = dirname(dir.replace(/\/$/, ''));
+    const candidate = join(dir, 'docs', 'plans', 'zero-touch-console.md');
+    if (existsSync(candidate)) plan = candidate;
+  }
+  if (!plan) { t.skip('docs/plans/zero-touch-console.md is not beside this checkout'); return; }
+  // The free tree is materialized INSIDE this checkout (`.free-preview-*`), so the walk above finds the
+  // plan from there too — and the plan names Pro suites that tree does not carry. `free/` is a proPath,
+  // so its manifest's absence is the free tree's own signature.
+  if (!existsSync(join(repo, 'free', 'manifest.json'))) { t.skip('the free tree: the plan names Pro suites it does not carry'); return; }
+
+  const lines = readFileSync(plan, 'utf8').split('\n');
+  const newSentences = lines.filter((line) => /\(new\)/.test(line));
+  const markedNew = (path: string): boolean => {
+    const base = path.split('/').pop()!.replace(/\.test\.ts$/, '');
+    return newSentences.some((line) => line.includes(path) || line.includes(`\`${base}\``));
+  };
+  const missing: string[] = [];
+  let named = 0;
+  lines.forEach((line, i) => {
+    if (!/^\s*- `/.test(line)) return;
+    for (const m of line.matchAll(/(?:node --test|bats)\s+((?:viewer\/test|tests)\/[\w./-]+\.(?:test\.ts|bats))/g)) {
+      named++;
+      const path = m[1];
+      if (existsSync(join(repo, path))) continue;
+      if (markedNew(path)) continue;
+      missing.push(`${path} (plan line ${i + 1})`);
+    }
+  });
+  assert.ok(named >= 100, `the plan names ${named} suite paths — the §Verification lines are not being read`);
+  assert.deepEqual(missing, [],
+    'these §Verification suite paths neither exist nor are marked `(new)` in the plan — a phase citing one can never go green');
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 5: one resume gate, one wait expression
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every read of `record.resumeSessionId` under `runner/`, by file, with why it is
+ * allowed — asserted as an exact table, so a new reader fails and a removed one
+ * must delete its entry (the `.kill(` rule's shape). The rule behind it: the id
+ * a `--resume` would take is only ever INPUT to `resumableSession`, the gate that
+ * reads the gone stamp, the transcript's account and the session's presence.
+ * The drive loop's boarding once read it straight into a spawn (SLF-10), and no
+ * `--resume` path read presence at all (REG-1).
+ */
+const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
+  'runner/runner-attempt.ts': {
+    count: 2,
+    why: 'attemptSession hands it to resumableSession (the gate) before anything spawns; the shutdown '
+      + 'checkpoint\'s finishedReason only phrases a sentence with it',
+  },
+  'runner/runner-control.ts': { count: 1, why: 'resumeWithInstruction hands it to resumableSession before the spawn' },
+  'runner/runner-loop.ts': {
+    count: 1,
+    why: 'the wait-resume bookkeeping asks whether one is named — a gone own-session is journalled, never re-armed',
+  },
+  'runner/runner.ts': {
+    count: 3,
+    why: 'the ladder\'s own-session availability (the hint still boards through composeBrief\'s gate), an errand '
+      + 'sentence, and the widen-rule card\'s answer, which re-boards through the same hint and the same gate (phase 9)',
+  },
+  'runner/situation.ts': { count: 2, why: 'the evidence a situation is classified from — display, no spawn' },
+  'runner/state.ts': { count: 1, why: 'isSessionGone, the predicate the gate itself reads' },
+};
+
+test('clause 1: every --resume passes the one gate, the gate reads presence, and the id reaches no spawn around it', () => {
+  // The door admits only a vetted resume: `SessionRequest` omits the raw string.
+  const core = SOURCES.find((s) => s.rel === 'runner/runner-core.ts')!.lines.join('\n');
+  assert.match(core, /export type SessionRequest = Omit<SpawnRequest, 'resume'> & \{ resumeFrom\?: VettedResume \}/);
+  const base = SOURCES.find((s) => s.rel === 'runner/runner-base.ts')!.lines.join('\n');
+  assert.match(base, /protected async spawnSession\(\s*phase: number, mode: SessionMode, request: SessionRequest,/);
+
+  // …and a vetted resume is minted in exactly one place — the gate — which reads presence.
+  const mints = hits(/as VettedResume\b/);
+  assert.deepEqual(filesOf(mints), ['runner/runner-control.ts'], `one mint, in the gate (${mints.join(', ')})`);
+  assert.equal(mints.length, 1);
+  const control = SOURCES.find((s) => s.rel === 'runner/runner-control.ts')!.lines;
+  const start = control.findIndex((line) => /protected resumableSession\(record: PhaseRecord, sessionId: string \| undefined\): ResumeVerdict/.test(line));
+  assert.ok(start >= 0, 'resumableSession returns the verdict');
+  const body = control.slice(start, start + 40).join('\n');
+  assert.match(body, /this\.deps\.sessionPresence\?\.\(sessionId\)/, 'the gate reads the registry\'s presence');
+  assert.match(body, /isSessionGone\(record, sessionId\)/, 'and the gone stamp');
+  assert.ok(Number(mints[0].split(':')[1]) - 1 > start && Number(mints[0].split(':')[1]) - 1 < start + 40, 'the mint is inside it');
+
+  // Every read of the id a --resume would take, by file.
+  const reads = hits(/\.resumeSessionId\b(?!\s*(?:=(?!=)|\?\?=))/)
+    .filter((hit) => hit.startsWith('runner/'))
+    .filter((hit) => {
+      const [rel, line] = hit.split(':');
+      const text = SOURCES.find((s) => s.rel === rel)!.lines[Number(line) - 1];
+      return !/\bdelete\b/.test(text);
+    });
+  const byFile: Record<string, number> = {};
+  for (const hit of reads) byFile[hit.split(':')[0]] = (byFile[hit.split(':')[0]] ?? 0) + 1;
+  assert.deepEqual(byFile, Object.fromEntries(Object.entries(RESUME_ID_READERS).map(([f, v]) => [f, v.count])),
+    'record.resumeSessionId is read somewhere new, or an allowed read is gone. A spawn path must hand it to '
+    + 'resumableSession; a removed read must delete its RESUME_ID_READERS entry.\n'
+    + Object.entries(RESUME_ID_READERS).map(([f, v]) => `  ${f} ×${v.count} — ${v.why}`).join('\n')
+    + `\nfound: ${reads.join(', ')}`);
+});
+
+test('the wait budget is evaluated through ONE expression — at park and at resume, and nowhere else', () => {
+  // WAI-3: the budget lived in four copies of one arithmetic, each a little different.
+  const callers = hits(/\bevaluateWait\(\{/);
+  assert.deepEqual(filesOf(callers), ['runner/runner-attempt.ts', 'runner/runner-loop.ts', 'service-base.ts', 'service-runs.ts'],
+    `evaluateWait callers: parkWaiting, the boarding, the overdue ruling, the unsupervised twin (${callers.join(', ')})`);
+  assert.equal(callers.length, 4, callers.join(', '));
+  // …and no second copy of the arithmetic: the budget constant and the per-phase
+  // cap are read in wait-budget.ts, the directive's sentence and the re-exports.
+  const budgetMath = hits(/DEFAULT_WAIT_BUDGET_MS\s*[-+*/<>]|[-+*/<>]\s*DEFAULT_WAIT_BUDGET_MS|WAIT_MAX_PER_PHASE\s*[<>]|[<>]=?\s*WAIT_MAX_PER_PHASE|parkedMs\s*>=\s*DEFAULT_WAIT_BUDGET_MS/)
+    .filter((hit) => !hit.startsWith('runner/wait-budget.ts'));
+  assert.deepEqual(budgetMath, [], 'the budget is arithmetic in wait-budget.ts alone');
+});
+
+/**
+ * WAI-6 — no loaded run holds a `waiting` record whose `parkedUntil` is past
+ * while the run carries no clock. Over the phase-2 fixture, through the real
+ * loader: each such record is either RE-ARMED (the run's clock read from the
+ * record) or SETTLED (`pending` with the declaration intact, or `interrupted`
+ * on a run that is over), and `phase.wait-settled` says which. The fixture
+ * holds the audit's own case — `customer-app-ios-release` p4, `paused` by the
+ * operator, 189 hours past its clock — raw.
+ */
+test('WAI-6: no fixture run loads with a waiting record past its clock and no run clock — re-armed or settled, and journalled', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai6-fixture-'));
+  try {
+    const runs = fixtureRuns();
+    let raw = 0;
+    let settledOrRearmed = 0;
+    for (const { slug, runId, state } of runs) {
+      const phases = Object.values((state.phases ?? {}) as Record<string, { status?: string; parkedUntil?: string }>);
+      const stale = phases.filter((r) => r.status === 'waiting' && r.parkedUntil && Date.parse(r.parkedUntil) < Date.now());
+      if (stale.length && !state.waitUntil) raw++;
+      const target = runFile(root, slug, runId);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, JSON.stringify(state));
+      const loaded = loadRun(root, slug, runId);
+      assert.ok(loaded, `${slug}/${runId} did not load`);
+      for (const record of Object.values(loaded.phases)) {
+        if (record.status !== 'waiting' || !record.parkedUntil) continue;
+        if (Date.parse(record.parkedUntil) >= Date.now()) continue;
+        assert.ok(loaded.waitUntil,
+          `${slug}/${runId} p${record.phase}: still waiting until ${record.parkedUntil} with state.waitUntil null — nothing will ever fire it`);
+      }
+      if (stale.length && !state.waitUntil) {
+        const lines = readFileSync(join(dirname(runFile(loaded.root, slug, runId)), `run-${runId}.jsonl`), 'utf8')
+          .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string; data?: { to?: string } });
+        const which = lines.filter((line) => line.event === 'phase.wait-settled');
+        assert.ok(which.length >= 1, `${slug}/${runId}: the settlement was not journalled`);
+        assert.ok(which.every((line) => ['rearmed', 'pending', 'interrupted'].includes(line.data?.to ?? '')));
+        settledOrRearmed++;
+      }
+    }
+    assert.ok(raw >= 1, 'the fixture is the evidence: at least one raw stale waiting record went in');
+    assert.equal(settledOrRearmed, raw);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * WAI-9 — every licence journals. `consumeDeclaration` is the one deleter of
+ * `record.declared`; a site that spends testimony either hands it a journal
+ * (the third argument) or writes `DECLARATION_CONSUMED_EVENT` itself within
+ * the next few lines. `settleStoredWaitTimeout` returns the spend for ITS one
+ * caller to pair, and that caller is held here too.
+ */
+test('WAI-9: every consumeDeclaration( site is paired with phase.declaration-consumed — a sink, or the line beside it', () => {
+  const sites = hits(/\bconsumeDeclaration\(/);
+  const unpaired: string[] = [];
+  const shapes = { sink: 0, beside: 0, returned: 0 };
+  for (const hit of sites) {
+    const [rel, lineNo] = hit.split(':');
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    const idx = Number(lineNo) - 1;
+    const text = lines[idx];
+    if (/export function consumeDeclaration\(/.test(text)) continue; // the definition
+    // The call, possibly wrapped: take the text from the call to the closing paren.
+    const window = lines.slice(idx, idx + 3).join(' ');
+    const args = /consumeDeclaration\(([^;]*?)\)(?:;|\s*$|\s*\))/.exec(window)?.[1] ?? '';
+    const passesSink = args.split(',').length >= 3;
+    const pairedBeside = lines.slice(idx, idx + 5).some((l) => l.includes('DECLARATION_CONSUMED_EVENT'));
+    const returnsForCaller = /^\s*const spent = consumeDeclaration\(record, 'new-outcome'\);/.test(text)
+      && lines.slice(Math.max(0, idx - 40), idx).some((l) => /export function settleStoredWaitTimeout\(/.test(l));
+    if (passesSink) shapes.sink++; else if (pairedBeside) shapes.beside++; else if (returnsForCaller) shapes.returned++;
+    if (!passesSink && !pairedBeside && !returnsForCaller) unpaired.push(hit);
+  }
+  assert.deepEqual(unpaired, [], `a declaration is spent here with no journal line: ${unpaired.join(', ')}`);
+  assert.ok(sites.length >= 8, `the licences have callers (${sites.length})`);
+  // Not vacuous: all three shapes exist today (the sink form, the paired line, the one returned spend).
+  assert.ok(shapes.sink >= 3 && shapes.beside >= 3 && shapes.returned === 1, JSON.stringify(shapes));
+  // …and the one site that returns its spend has its caller pair it.
+  const callers = hits(/\bsettleStoredWaitTimeout\(/).filter((hit) => !hit.startsWith('runner/state.ts'));
+  assert.deepEqual(filesOf(callers), ['service-base.ts']);
+  for (const hit of callers) {
+    const [rel, lineNo] = hit.split(':');
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    assert.ok(lines.slice(Number(lineNo) - 1, Number(lineNo) + 4).some((l) => l.includes('DECLARATION_CONSUMED_EVENT')),
+      `${hit}: the returned spend is not journalled`);
+  }
+});
+
+/**
+ * SLF-4 / WAI-8 — an unsupervised `partial` re-boards through `prepareReboard`,
+ * never `resetForRetry`: the reset that wipes the watchdog's bound is an
+ * OPERATOR's press, and these two arms are driven from outside the console.
+ */
+test('SLF-4: the unsupervised partial arms never reach resetForRetry — prepareReboard keeps the bounds', () => {
+  const functions: [string, RegExp][] = [
+    ['service-runs.ts', /private async applyUnsupervisedOutcome\(/],
+    ['runner/runner-control.ts', /async declareOutcome\(/],
+  ];
+  for (const [rel, head] of functions) {
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    const start = lines.findIndex((l) => head.test(l));
+    assert.ok(start >= 0, `${rel}: ${head} found`);
+    // The body runs to the next method at the same indentation.
+    const indent = /^(\s*)/.exec(lines[start])![1];
+    let end = start + 1;
+    while (end < lines.length && !(new RegExp(`^${indent}(?:private |protected |async |public )*[a-zA-Z]+\\(`).test(lines[end]) && !/^\s*\*|^\s*\/\//.test(lines[end]))) end++;
+    const body = lines.slice(start, end).join('\n');
+    assert.ok(!/\bresetForRetry\(/.test(body), `${rel}: the unsupervised arm calls resetForRetry`);
+    assert.ok(/\bprepareReboard\(/.test(body), `${rel}: the partial arm re-boards through prepareReboard`);
+    assert.ok(/\bchargeDeclaration\(/.test(body), `${rel}: the arm charges the declarations ledger`);
+  }
+  // …and every resetForRetry caller says who asked.
+  const resets = hits(/\bresetForRetry\(/).filter((hit) => !/runner\/state\.ts/.test(hit));
+  for (const hit of resets) {
+    const [rel, lineNo] = hit.split(':');
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    const window = lines.slice(Number(lineNo) - 1, Number(lineNo) + 3).join(' ');
+    // `press ? 'operator' : 'console'` is phase 9's word (RCV-3): a Retry whose
+    // actor is a person's press clears the bounds; the healer's or a watch
+    // landing's carries them, exactly as it carries the streak.
+    assert.match(window, /by: '(?:operator|console)'|by: (?:opts\.by === 'operator'|press) \? 'operator' : 'console'/, `${hit}: resetForRetry with no by`);
+  }
+  assert.ok(resets.length >= 7, `the reset has its callers (${resets.length})`);
+});
+
+/* ================================================================== *
+ * SLF-1 / RCV-9 — every automatic start names its door, every
+ * classification names who classified (zero-touch-console phase 7)
+ * ================================================================== */
+
+/**
+ * The text of the argument list that begins at `open` (the index of a `(`),
+ * spanning lines, with parentheses balanced. Strings are not parsed — the
+ * same conservative posture as `hits()`: a paren inside a string literal
+ * would truncate an argument list, and a truncated list fails the assertion
+ * below LOUDLY rather than passing it.
+ */
+function argumentsFrom(lines: string[], lineIdx: number, open: number): string {
+  let depth = 0;
+  let out = '';
+  for (let i = lineIdx; i < lines.length; i += 1) {
+    const line = i === lineIdx ? lines[i].slice(open) : lines[i];
+    for (const ch of line) {
+      if (ch === '(') depth += 1;
+      else if (ch === ')') { depth -= 1; if (depth === 0) return out; }
+      out += ch;
+    }
+    out += '\n';
+    if (out.length > 20_000) break;
+  }
+  return out;
+}
+
+/**
+ * Every `startRun(` CALL under `server/`, with the door its options name.
+ *
+ * Fourteen doors are the census (`START_DOORS`); `operator` is the press. A
+ * site names its door one of three ways, and the lint reads all three: a
+ * literal `doorActor('<door>', …)`; `pressActor(…)` for a person's press; or
+ * an actor THREADED from its caller — an identifier the same file built with
+ * `doorActor('<door>'…)`, a helper that returns one, or the method's own
+ * `actor: StartActor` parameter (a relay verb such as `retryPhase`, whose
+ * door is whoever called it). Anything else is an unnamed start, which is the
+ * thing the audit found 324 of.
+ */
+function startSites(): { site: string; door: string }[] {
+  const out: { site: string; door: string }[] = [];
+  for (const { rel, lines } of SOURCES) {
+    const file = lines.join('\n');
+    const built = new Map<string, string>();
+    for (const m of file.matchAll(/const (\w+) = (?:\([^)]*\)(?::\s*\w+)?\s*=>\s*)?doorActor\('([a-z-]+)'/g)) built.set(m[1], m[2]);
+    const relay = /\bactor:\s*StartActor\b/.test(file);
+    lines.forEach((line, i) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) return;
+      const at = line.indexOf('startRun(');
+      if (at < 0) return;
+      // Not calls: the definition, the abstract declaration, the dep wiring.
+      if (/\b(async|abstract)\s+startRun\(|startRun:\s*\(/.test(line)) return;
+      const args = argumentsFrom(lines, i, at + 'startRun'.length);
+      const site = `${rel}:${i + 1}`;
+      const literal = /\bdoorActor\(\s*'([a-z-]+)'/.exec(args);
+      if (literal) { out.push({ site, door: literal[1] }); return; }
+      if (/\bpressActor\(/.test(args)) { out.push({ site, door: 'operator' }); return; }
+      const threaded = /\bactor:\s*(\w+)\b/.exec(args);
+      if (threaded && built.has(threaded[1])) { out.push({ site, door: built.get(threaded[1])! }); return; }
+      if (threaded && threaded[1] === 'actor' && relay) { out.push({ site, door: "the caller's" }); return; }
+      out.push({ site, door: '(unnamed)' });
+    });
+  }
+  return out.sort((a, b) => a.site.localeCompare(b.site));
+}
+
+test('SLF-1: every startRun( site names its door, and the doors named are the census', () => {
+  const sites = startSites();
+  const unnamed = sites.filter((s) => s.door === '(unnamed)').map((s) => s.site);
+  assert.deepEqual(unnamed, [], `startRun( sites naming no door: ${unnamed.join(', ')}`);
+  const words = new Set([...START_DOORS, 'operator', "the caller's"]);
+  const unknown = sites.filter((s) => !words.has(s.door));
+  assert.deepEqual(unknown, [], `doors that are not in START_DOORS: ${unknown.map((s) => `${s.site}=${s.door}`).join(', ')}`);
+  // The census, site by site — a new door site must be added here by name,
+  // and a site that stops naming its door is caught above.
+  const census = Object.fromEntries(sites.map((s) => [s.site.replace(/:\d+$/, ''), s.door]));
+  assert.deepEqual(
+    sites.map((s) => `${s.site.replace(/:\d+$/, '')} → ${s.door}`).sort(),
+    [
+      'api/routes.ts → operator',
+      'converge.ts → converge-relaunch',
+      'service-base.ts → boot-readopt',
+      'service-base.ts → pty-continue',
+      'service-base.ts → wait-clock',
+      'service-base.ts → wait-clock',
+      // Three heal doors since phase 10: the reboard vehicle, and the two
+      // stopped-run resource rungs that relaunch after moving the run — the
+      // account switch and the budget raise — each under `converge-heal`.
+      'service-recovery.ts → converge-heal',
+      'service-recovery.ts → converge-heal',
+      'service-recovery.ts → converge-heal',
+      'service-recovery.ts → recovery-continue',
+      'service-recovery.ts → watch-landed',
+      "service-runs.ts → the caller's",
+      "service-runs.ts → the caller's",
+      'service-runs.ts → outcome-inbox',
+      'service.ts → mcp-require-timeout',
+    ].sort(),
+    `the startRun census moved: ${JSON.stringify(census)}`,
+  );
+  // Every `startRun` door in START_DOORS is opened by some site — the five
+  // that spawn some other way (the probe, the preflight, the reviewer,
+  // ultrareview, the pty agent) name themselves on `session.start` /
+  // `phase.session-start` instead and are held by the tests of those files.
+  const opened = new Set(sites.map((s) => s.door));
+  for (const door of START_DOORS.slice(0, 9)) assert.ok(opened.has(door), `no startRun( site opens ${door}`);
+  // …and the relay verbs are the only place an actor is threaded rather than named.
+  const relays = hits(/\bactor: actor \?\? unattributedActor\(/);
+  assert.deepEqual(filesOf(relays), ['service-runs.ts'], `relays: ${relays.join(', ')}`);
+});
+
+/**
+ * RCV-6 (zero-touch-console phase 10) — a rung is settled through ONE door per
+ * side, and the door writes the journal line with the whole payload. All 132
+ * `phase.rung-settled` payloads the audit read said `{outcome, rung}` and
+ * nothing else; twenty-five bare `settleRung(` sites each wrote (or forgot)
+ * their own line. The definition, the two doors, the attempt-end backstop and
+ * the MCP flip's in-place settle are the whole allowed set — by file and
+ * count, failing in either direction so a reason cannot rot.
+ */
+const SETTLE_SITES: Record<string, { count: number; why: string }> = {
+  'runner/ladder.ts': { count: 3, why: 'the two definitions, and `settleRung` handing the newest open rung to `settleRungRecord` — the one writer of `outcome`' },
+  'runner/runner-base.ts': { count: 2, why: "the runner's door (`settleOpenRung`) and its attempt-end backstop (`settleRungsAfterAttempt`), both writing `phase.rung-settled` through `rungSettledPayload`" },
+  'service-recovery.ts': { count: 1, why: "the service's door (`settleRungOn`), writing the same payload on the stored run's journal" },
+  'runner/mcp-park.ts': { count: 1, why: "the `require` flip settles the `wait-heal` rung the healer accounted while the clock ran, in place, and journals it through the caller's sink" },
+};
+
+test('RCV-6: settleRung and settleRungRecord are called only at the doors, and every phase.rung-settled line is built from rungSettledPayload', () => {
+  const calls = hits(/\bsettleRung(?:Record)?\(/);
+  const byFile = new Map<string, number>();
+  for (const hit of calls) {
+    const file = hit.split(':')[0];
+    byFile.set(file, (byFile.get(file) ?? 0) + 1);
+  }
+  // The definition file's own `export function` lines are calls to the
+  // pattern's eye; they are the definitions, counted in its three.
+  assert.deepEqual([...byFile.keys()].sort(), Object.keys(SETTLE_SITES).sort(),
+    `settleRung callers moved: ${[...byFile.entries()].map(([f, n]) => `${f}×${n}`).join(', ')}`);
+  for (const [file, { count }] of Object.entries(SETTLE_SITES)) {
+    assert.equal(byFile.get(file), count, `${file}: ${byFile.get(file)} settle sites, ${count} allowed`);
+  }
+  // …and no `phase.rung-settled` line is composed by hand any more: every
+  // append of it spreads `rungSettledPayload(`.
+  const lines = hits(/'phase\.rung-settled'/);
+  assert.ok(lines.length >= 4, `the writers are visible (${lines.join(', ')})`);
+  for (const hit of lines) {
+    const [rel, lineNo] = hit.split(':');
+    const src = SOURCES.find((f) => f.rel === rel)!.lines;
+    // A READER of the line composes nothing: the run ledger's projection
+    // (`analysis/ledger.ts`, zero-touch phase 19) names the event in a `case`
+    // to read the payload back. Only a comparison is let through — any other
+    // mention is still held to the one payload builder.
+    if (/\bcase\s+'phase\.rung-settled'\s*:|===\s*'phase\.rung-settled'/.test(src[Number(lineNo) - 1])) continue;
+    const window = src.slice(Number(lineNo) - 1, Number(lineNo) + 2).join('\n');
+    assert.match(window, /rungSettledPayload\(/, `${hit}: a settlement line not built from rungSettledPayload`);
+  }
+});
+
+/**
+ * RCV-9 — every `phase.situation` and `phase.rung` append carries `by`. The
+ * runner's climb always did (`drive` · `outcome` · `closed`); the healer's
+ * 1 249 unsigned situation lines are what this holds shut.
+ */
+test('RCV-9: every phase.situation / phase.rung append carries by', () => {
+  const sites = hits(/\b(record|append)\('phase\.(situation|rung)'/);
+  assert.ok(sites.length >= 4, `the writers are visible (${sites.join(', ')})`);
+  for (const hit of sites) {
+    const [rel, lineNo] = hit.split(':');
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    const idx = Number(lineNo) - 1;
+    const open = lines[idx].indexOf('(', lines[idx].indexOf("'phase."));
+    const args = open >= 0 ? argumentsFrom(lines, idx, open) : lines.slice(idx, idx + 4).join('\n');
+    // The line before the open paren too — `this.record('phase.situation', {` has its paren before the literal.
+    const call = argumentsFrom(lines, idx, Math.max(0, lines[idx].lastIndexOf('(', lines[idx].indexOf("'phase.")))) || args;
+    assert.match(call, /[{,\s]by[,:}\s]/, `${hit}: the append carries no by`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 8: accounts — the account on every start, the
+ * mark before every switch, no dead setter, a token's reach scoped
+ * ------------------------------------------------------------------ */
+
+/**
+ * ACT-1 — every `startRun(` site passes `accountId`, or passes `resumeRunId`
+ * (from which `Service.startRun` resolves the stored run's account before any
+ * door is asked — ONE resolver), or is named here with a reason. Nine of the
+ * twelve automatic doors omitted the field, so the quota and auth doors judged
+ * the machine login while the runner resumed under `state.accountId`.
+ */
+const ACCOUNT_SITE_ALLOWLIST: Record<string, string> = {
+  // The browser's launch form names the account itself (`accountId` in the
+  // body, `auto` resolved once against the meters) and may also carry a
+  // `resumeRunId`; a FRESH start with neither is the machine login by design.
+  'api/routes.ts': 'the one door a person opens: the body names the account, or the machine login is meant',
+};
+
+test('ACT-1: every startRun( site passes accountId or resumeRunId, or is allowlisted with a reason', () => {
+  const unnamed: string[] = [];
+  let sites = 0;
+  for (const { rel, lines } of SOURCES) {
+    lines.forEach((line, i) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) return;
+      const at = line.indexOf('startRun(');
+      if (at < 0) return;
+      if (/\b(async|abstract)\s+startRun\(|startRun:\s*\(/.test(line)) return;
+      sites += 1;
+      const args = argumentsFrom(lines, i, at + 'startRun'.length);
+      if (/\baccountId\b/.test(args) || /\bresumeRunId\b/.test(args)) return;
+      if (ACCOUNT_SITE_ALLOWLIST[rel]) return;
+      unnamed.push(`${rel}:${i + 1}`);
+    });
+  }
+  assert.ok(sites >= 13, `the startRun( sites are visible (${sites})`);
+  assert.deepEqual(unnamed, [], `startRun( sites that name no account and resume no stored run: ${unnamed.join(', ')}`);
+  // …and the resolver exists, in ONE place: the service reads the stored run's
+  // account before the runner is asked.
+  const resolver = hits(/options\.accountId === undefined && options\.resumeRunId/);
+  assert.deepEqual(filesOf(resolver), ['service-runs.ts'], `the account resolver: ${resolver.join(', ')}`);
+  // Every allowlisted file still exists and still calls startRun( — a stale
+  // allowlist entry is a lie about the census.
+  for (const rel of Object.keys(ACCOUNT_SITE_ALLOWLIST)) {
+    assert.ok(SOURCES.some((s) => s.rel === rel && s.lines.some((l) => l.includes('startRun('))), `${rel} no longer calls startRun( — drop it from the allowlist`);
+  }
+});
+
+/**
+ * ACT-5 — every `trySwitchAccount(` call under `server/runner/` is preceded, in
+ * the same file within the same arm, by a `leaveAccount(` call: the account is
+ * marked BEFORE the switch, every time. The live wall was the one mover that
+ * did not, and 16 of 17 lifetime switches ping-ponged.
+ */
+test('ACT-5: every trySwitchAccount( site is paired with a leaveAccount( before it', () => {
+  const calls = hits(/\bthis\.trySwitchAccount\(/);
+  assert.ok(calls.length >= 3, `the movers are visible (${calls.join(', ')})`);
+  const unpaired: string[] = [];
+  for (const hit of calls) {
+    const [rel, lineNo] = hit.split(':');
+    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
+    const idx = Number(lineNo) - 1;
+    // Look back to the arm's opening — the nearest `case '…':` or the method's
+    // own signature — and demand the mark inside it.
+    let start = idx;
+    while (start > 0 && !/^\s*case '[\w-]+':|^\s*(private|protected|public)?\s*(async\s+)?\w+\(.*\)[^;]*\{\s*$/.test(lines[start])) start -= 1;
+    const arm = lines.slice(start, idx).join('\n');
+    if (!/\bthis\.leaveAccount\(/.test(arm)) unpaired.push(hit);
+  }
+  assert.deepEqual(unpaired, [], `trySwitchAccount( sites with no leaveAccount( before them: ${unpaired.join(', ')}`);
+  // The definition lives in one file, and the marks reach the facade through
+  // one dep (`deps.leaveAccount`) — no site calls the facade around it.
+  assert.deepEqual(filesOf(hits(/protected leaveAccount\(/)), ['runner/runner-control.ts']);
+  assert.deepEqual(filesOf(hits(/deps\.leaveAccount\?\.\(/)), ['runner/runner-control.ts']);
+  assert.deepEqual(hits(/onAccountLimited/), [], 'the three-of-four hook is gone; every mover goes through the one helper');
+});
+
+/**
+ * ACT-3 — every SETTER the accounts facade exports has a caller under
+ * `server/` that is not the facade itself. `setActiveProbe` had none, so the
+ * poller's adaptive cadence was dead for as long as the seam existed.
+ */
+test('ACT-3: every exported setter on Accounts has a production caller', () => {
+  const facade = SOURCES.find((s) => s.rel === 'accounts/index.ts')!;
+  const setters: string[] = [];
+  for (const line of facade.lines) {
+    const m = /^  (?:async )?((?:set|mark|leave|retire|clear|note|add|begin|complete|remove|rename|start|stop|refresh)\w*)\(/.exec(line);
+    if (m && !setters.includes(m[1])) setters.push(m[1]);
+  }
+  assert.ok(setters.includes('setActiveProbe') && setters.includes('leaveAccount') && setters.includes('retire') && setters.includes('clearRetired'),
+    `the setters are visible: ${setters.join(', ')}`);
+  const uncalled = setters.filter((name) => {
+    const re = new RegExp(`\\baccounts\\.${name}\\(`);
+    return !SOURCES.some((s) => !s.rel.startsWith('accounts/') && s.lines.some((l) => re.test(l)));
+  });
+  assert.deepEqual(uncalled, [], `Accounts setters nothing under server/ calls: ${uncalled.join(', ')}`);
+});
+
+/**
+ * ACT-12 — a token account's secret rides the whole child process tree, so a
+ * spawn that carries `--mcp-config` under a token account attaches only the
+ * stdio servers the PLAN declares. Held statically: the secret is minted in
+ * one place, the server set is scoped in one place before the preflight, and
+ * the scoping journals itself.
+ */
+test('ACT-12: the token secret is minted once, and a token run\'s MCP set is scoped before it is probed or written', () => {
+  const minted = hits(/CLAUDE_CODE_OAUTH_TOKEN:\s*token/);
+  assert.deepEqual(minted, ['accounts/credentials.ts:234'.replace(/:\d+$/, `:${minted[0]?.split(':')[1]}`)],
+    `the token env is produced in exactly one place: ${minted.join(', ')}`);
+  assert.deepEqual(filesOf(minted), ['accounts/credentials.ts']);
+  const attempt = SOURCES.find((s) => s.rel === 'runner/runner-attempt.ts')!.lines.join('\n');
+  const resolve = attempt.slice(attempt.indexOf('protected async resolveMcp('));
+  const scoped = resolve.indexOf('this.tokenScoped(');
+  const probed = resolve.indexOf('this.deps.mcp.preflight(');
+  assert.ok(scoped >= 0 && probed > scoped, 'resolveMcp scopes the ids for a token account BEFORE the preflight probes them');
+  assert.ok(/this\.record\('run\.token-scope'/.test(attempt), 'the scoping journals run.token-scope');
+  assert.ok(/log\.warn\('accounts\.token-scope'/.test(attempt), 'and a drop is a console log line');
+  assert.deepEqual(filesOf(hits(/'run\.token-scope'/)), ['runner/runner-attempt.ts']);
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 14: ONE auto-answer call site, deny list first
+ * ------------------------------------------------------------------ */
+
+test('AC-14 (QRL-6): exactly one auto-answer call site under server/ — the relay picks, the service relays from one place, and the deny list is read before any window', () => {
+  // The console answering a question on a session's behalf used to be spread
+  // over the classifier, the auto-grant block and a card's timeout — which is
+  // how auto-grant came to answer the two rules the carve-out pinned for a
+  // person. Now one function chooses an answer and one file calls it.
+  const picks = hits(/\bpickAnswer\(/);
+  assert.deepEqual(filesOf(picks), ['relay.ts'], `pickAnswer( is called outside the relay: ${picks.join(', ')}`);
+  // The answers map a hook carries back is built in exactly one place.
+  const built = hits(/\banswers:\s*byText\b/);
+  assert.deepEqual(built, built.filter((hit) => hit.startsWith('relay.ts:')));
+  assert.equal(built.length, 1, `the answers map is built ${built.length} times: ${built.join(', ')}`);
+  // And the relay is entered from exactly one line: the hook's decision, which
+  // both hooks (PreToolUse and PermissionRequest) reach.
+  const entered = hits(/\brelayQuestion\(/).filter((hit) => !hit.startsWith('relay.ts:'));
+  assert.deepEqual(filesOf(entered), ['service.ts']);
+  assert.equal(entered.length, 1, `relayQuestion( is entered from ${entered.length} places: ${entered.join(', ')}`);
+  const service = SOURCES.find((s) => s.rel === 'service.ts')!.lines.join('\n');
+  assert.match(service, /decidePermissionRequest[\s\S]*?this\.decideToolUse\(body, runId, \{ mechanism: 'permission-request' \}\)/,
+    'the PermissionRequest hook reaches the relay through the same decision as PreToolUse');
+
+  // Deny list first: inside `relayQuestion`, the wall is read before a kept
+  // answer is given and before a window is opened.
+  const relay = SOURCES.find((s) => s.rel === 'relay.ts')!.lines.join('\n');
+  const body = relay.slice(relay.indexOf('async relayQuestion('), relay.indexOf('/* ---------------- a person\'s answer'));
+  const wall = body.indexOf('matchedDenyRule(');
+  assert.ok(wall > 0, 'relayQuestion reads the deny list');
+  for (const later of ['this.takeKept(', 'this.hold(', 'destructiveOption(', 'runStopped(']) {
+    assert.ok(body.indexOf(later) > wall, `${later} comes after the deny list`);
+  }
 });

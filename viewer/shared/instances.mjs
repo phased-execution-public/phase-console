@@ -3,7 +3,7 @@
  *
  * This file replaces `viewer/shared/instances.mjs` when
  * `scripts/build-free-tree.mjs` materializes the public repository. It is not
- * a smaller module: it exports the SAME 36 names, with the same signatures and
+ * a smaller module: it exports the SAME 56 names, with the same signatures and
  * the same return shapes, because eleven other modules import from here and a
  * missing export is a crash at load rather than a feature that is absent.
  * `viewer/test/free-tree-shape.test.ts` diffs the two export sets and fails on
@@ -44,6 +44,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -52,6 +53,8 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+
+import { HEARTBEAT_STALE_MS } from './fleet-model.js';
 
 /** The port a single-console machine has always used. The default keeps it. */
 export const DEFAULT_PORT = 4123;
@@ -184,6 +187,338 @@ export function registryPath(env = process.env) {
 /** Per-instance preferences: `~/.config/phase-console/instances/<id>.json`. */
 export function instancePrefsPath(id, env = process.env) {
   return join(configDir(env), 'instances', `${safeId(id)}.json`);
+}
+
+/* ------------------------------------------------------------------ *
+ * The stop marker and the machine profile (zero-touch phase 16)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The file a `mode: 'unload'` Shut down leaves in the instance's state
+ * directory (SHD-5). While it stands the console boots holding its automation:
+ * nothing is re-adopted and nothing converges until an operator clears it —
+ * `phase-console start` removes it, and so does Settings. Named here because
+ * three readers need it and one is bash: the server, the bin, and
+ * `deploy/agent.sh` through the `shell` op's `stop_marker=` line.
+ */
+export const STOP_MARKER_NAME = 'stopped-by-console.json';
+
+export function stopMarkerPath(id, isDefault, env = process.env) {
+  return join(instanceStateDir(id, isDefault, env), STOP_MARKER_NAME);
+}
+
+/**
+ * The machine profile — `~/.config/phase-console/fleet.json` (FLT-3, FLT-7,
+ * FLT-9). Everything the phone path and the machine's limits need is a property
+ * of the machine and the person, not of one console, so it is written once here
+ * and read by every console:
+ *
+ *   { version, remoteHost, remoteUsers[], notifyCommand, webhooks[{url, name?, categories?}],
+ *     categories{<id>: bool}, quietHours{start, end, allowUrgent}, maxSessions, hookScript,
+ *     instances: { <id>: { autostart: true|false|'once', overrides: {…} } } }
+ *
+ * `maxSessions` is the MACHINE lane ceiling (every console's live lanes summed);
+ * each console's own `--max-sessions` stays its per-console ceiling. `overrides`
+ * replaces the six per-console fields (`OVERRIDABLE_PROFILE_KEYS`) for one
+ * instance, and a console reports which ones it took from there on `state()`.
+ */
+export function fleetProfilePath(env = process.env) {
+  return join(configDir(env), 'fleet.json');
+}
+
+/** The profile as JSON, or null for a missing or unreadable file — never a throw. */
+function readFleetProfile(env) {
+  try {
+    const parsed = JSON.parse(readFileSync(fleetProfilePath(env), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Does this instance start its work unattended? `true` (the default, and the
+ * answer for a missing or unreadable profile — a console that wrongly believes
+ * it may not start is a console that silently does nothing), `false`, or
+ * `'once'` — the next boot starts it and spends the word.
+ */
+export function readAutostart(id, env = process.env) {
+  const value = readFleetProfile(env)?.instances?.[id]?.autostart;
+  return value === false || value === 'once' ? value : true;
+}
+
+/**
+ * Spend a `once`: the instance's entry becomes `autostart: false`, every other
+ * key of the profile carried through. Atomic (temp file + rename). Returns
+ * whether it changed anything.
+ */
+export function consumeAutostartOnce(id, env = process.env) {
+  const profile = readFleetProfile(env);
+  if (profile?.instances?.[id]?.autostart !== 'once') return false;
+  const next = {
+    ...profile,
+    instances: { ...profile.instances, [id]: { ...profile.instances[id], autostart: false } },
+  };
+  const file = fleetProfilePath(env);
+  const tmp = `${file}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    renameSync(tmp, file);
+    return true;
+  } catch {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* the temp file is not the point */
+    }
+    return false;
+  }
+}
+
+/** The six profile fields one console may override for itself. */
+export const OVERRIDABLE_PROFILE_KEYS = Object.freeze([
+  'remoteHost',
+  'remoteUsers',
+  'notifyCommand',
+  'webhooks',
+  'categories',
+  'quietHours',
+]);
+
+const QUIET_TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+/**
+ * One profile's fields, each kept only in the shape a console can act on.
+ *
+ * A hand-edited profile is the normal case, and a field a console cannot read
+ * must not turn into a console that cannot boot: `remoteUsers` that are not
+ * strings, a quiet window with no end, a ceiling of zero — each is dropped
+ * rather than half-honoured, exactly as the per-device quiet hours are.
+ */
+function sanitizeProfileFields(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  if (typeof raw.remoteHost === 'string' && raw.remoteHost.trim()) {
+    out.remoteHost = stripControl(raw.remoteHost).trim().toLowerCase().replace(/\.$/, '');
+  }
+  if (Array.isArray(raw.remoteUsers)) {
+    const users = [
+      ...new Set(
+        raw.remoteUsers
+          .filter((user) => typeof user === 'string' && user.trim())
+          .map((user) => stripControl(user).trim().toLowerCase()),
+      ),
+    ];
+    if (users.length) out.remoteUsers = users;
+  }
+  if (typeof raw.notifyCommand === 'string' && raw.notifyCommand.trim())
+    out.notifyCommand = raw.notifyCommand;
+  if (Array.isArray(raw.webhooks)) {
+    const hooks = raw.webhooks
+      .filter((hook) => hook && typeof hook.url === 'string' && /^https?:\/\//.test(hook.url))
+      .map((hook) => ({
+        url: hook.url,
+        ...(typeof hook.name === 'string' && hook.name.trim()
+          ? { name: stripControl(hook.name).trim() }
+          : {}),
+        ...(Array.isArray(hook.categories)
+          ? { categories: hook.categories.filter((c) => typeof c === 'string') }
+          : {}),
+      }));
+    if (hooks.length) out.webhooks = hooks;
+  }
+  if (raw.categories && typeof raw.categories === 'object' && !Array.isArray(raw.categories)) {
+    const categories = Object.fromEntries(
+      Object.entries(raw.categories).filter(([, on]) => typeof on === 'boolean'),
+    );
+    if (Object.keys(categories).length) out.categories = categories;
+  }
+  const quiet = raw.quietHours;
+  if (
+    quiet &&
+    typeof quiet === 'object' &&
+    QUIET_TIME.test(String(quiet.start ?? '')) &&
+    QUIET_TIME.test(String(quiet.end ?? '')) &&
+    quiet.start !== quiet.end
+  ) {
+    out.quietHours = { start: quiet.start, end: quiet.end, allowUrgent: quiet.allowUrgent !== false };
+  }
+  if (Number.isInteger(raw.maxSessions) && raw.maxSessions > 0) out.maxSessions = raw.maxSessions;
+  if (typeof raw.hookScript === 'string' && raw.hookScript.startsWith('/')) out.hookScript = raw.hookScript;
+  return out;
+}
+
+/**
+ * @typedef {{
+ *   remoteHost?: string,
+ *   remoteUsers?: string[],
+ *   notifyCommand?: string,
+ *   webhooks?: { url: string, name?: string, categories?: string[] }[],
+ *   categories?: Record<string, boolean>,
+ *   quietHours?: { start: string, end: string, allowUrgent: boolean },
+ *   maxSessions?: number,
+ *   hookScript?: string,
+ * }} ProfileFields
+ */
+
+/**
+ * The machine profile as every console reads it: the sanitised fields, each
+ * instance's `autostart` and `overrides`, and whether a file exists at all.
+ * A missing or unreadable file is `present: false` with nothing set — never a throw.
+ */
+/**
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {ProfileFields & { present: boolean, path: string, instances: Record<string, { autostart?: boolean | 'once', overrides?: ProfileFields }> }}
+ */
+export function fleetProfile(env = process.env) {
+  const raw = readFleetProfile(env);
+  const fields = sanitizeProfileFields(raw);
+  const instances = {};
+  for (const [id, entry] of Object.entries(raw?.instances ?? {})) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const value = entry.autostart;
+    const overrides = Object.fromEntries(
+      Object.entries(sanitizeProfileFields(entry.overrides)).filter(([key]) =>
+        OVERRIDABLE_PROFILE_KEYS.includes(key),
+      ),
+    );
+    instances[id] = {
+      ...(value === true || value === false || value === 'once' ? { autostart: value } : {}),
+      ...(Object.keys(overrides).length ? { overrides } : {}),
+    };
+  }
+  return { present: raw !== null, path: fleetProfilePath(env), ...fields, instances };
+}
+
+/**
+ * What ONE console takes from the profile: each overridable field from its
+ * own `overrides` when set there, else from the machine-wide value, with the
+ * source of each named — so `state()` can say which settings are this
+ * console's own and which it inherited.
+ */
+/**
+ * @param {string} id
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {Omit<ProfileFields, 'maxSessions' | 'hookScript'> & {
+ *   present: boolean, path: string, maxSessions: number | null, hookScript: string | null,
+ *   autostart: boolean | 'once',
+ *   sources: Partial<Record<'remoteHost' | 'remoteUsers' | 'notifyCommand' | 'webhooks' | 'categories' | 'quietHours', 'profile' | 'override'>>,
+ *   overridden: string[],
+ * }}
+ */
+export function profileFor(id, env = process.env) {
+  const profile = fleetProfile(env);
+  const overrides = profile.instances[id]?.overrides ?? {};
+  const effective = {};
+  const sources = {};
+  for (const key of OVERRIDABLE_PROFILE_KEYS) {
+    if (overrides[key] !== undefined) {
+      effective[key] = overrides[key];
+      sources[key] = 'override';
+    } else if (profile[key] !== undefined) {
+      effective[key] = profile[key];
+      sources[key] = 'profile';
+    }
+  }
+  return {
+    present: profile.present,
+    path: profile.path,
+    ...effective,
+    maxSessions: profile.maxSessions ?? null,
+    hookScript: profile.hookScript ?? null,
+    autostart: readAutostart(id, env),
+    sources,
+    overridden: Object.keys(overrides),
+  };
+}
+
+/**
+ * Rewrite the profile under its lock: `mutate` receives the file as it is on
+ * disk (unknown keys kept — a newer console's fields survive an older one's
+ * write) and returns the next object, or null for "nothing to write". Atomic
+ * (temp file + rename). Returns the profile as read back, or null when the
+ * write failed.
+ */
+export function updateFleetProfile(mutate, env = process.env) {
+  const file = fleetProfilePath(env);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+  } catch {
+    return null;
+  }
+  return withLockFile(`${file}.lock`, () => {
+    const current = readFleetProfile(env) ?? { version: 1 };
+    const next = mutate(structuredClone(current));
+    if (next === null || next === undefined) return fleetProfile(env);
+    const tmp = `${file}.tmp.${process.pid}`;
+    try {
+      writeFileSync(tmp, `${JSON.stringify({ version: 1, ...next }, null, 2)}\n`, 'utf8');
+      renameSync(tmp, file);
+    } catch {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* the temp file is not the point */
+      }
+      return null;
+    }
+    return fleetProfile(env);
+  });
+}
+
+/** Set one instance's start policy — `true`, `false` or `'once'`. False on a bad value or a failed write. */
+export function setAutostart(id, value, env = process.env) {
+  if (value !== true && value !== false && value !== 'once') return false;
+  const written = updateFleetProfile((profile) => {
+    const instances = profile.instances && typeof profile.instances === 'object' ? profile.instances : {};
+    return { ...profile, instances: { ...instances, [id]: { ...instances[id], autostart: value } } };
+  }, env);
+  return written?.instances[id]?.autostart === value;
+}
+
+/**
+ * Hold `lock` (an `O_EXCL` file) while `fn` runs — the registry's discipline,
+ * for the other machine files two consoles write: the profile and the lane
+ * tokens. A lock older than `LOCK_STALE_MS` is reclaimed and a live one waited
+ * for up to `LOCK_WAIT_MS`; then `fn` runs anyway, because a pathological
+ * holder must not be able to stop a console.
+ */
+function withLockFile(lock, fn) {
+  let held = false;
+  try {
+    for (let waited = 0; !held; waited += LOCK_POLL_MS) {
+      try {
+        closeSync(openSync(lock, 'wx'));
+        held = true;
+      } catch {
+        let age = 0;
+        try {
+          age = Date.now() - statSync(lock).mtimeMs;
+        } catch {
+          age = LOCK_STALE_MS + 1;
+        }
+        if (age > LOCK_STALE_MS) {
+          try {
+            rmSync(lock, { force: true });
+          } catch {
+            /* raced */
+          }
+          continue;
+        }
+        if (waited >= LOCK_WAIT_MS) break;
+        sleepSync(LOCK_POLL_MS);
+      }
+    }
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        rmSync(lock, { force: true });
+      } catch {
+        /* released by expiry */
+      }
+    }
+  }
 }
 
 /** Anything that could add a line to output someone parses line by line. */
@@ -715,9 +1050,425 @@ export function reservedPorts(exceptRoot, env = process.env) {
   const taken = new Set();
   for (const entry of listInstances(env)) {
     if (entry.id === skip) continue;
+    // An ORPHANED row — its root is gone — speaks for nobody (FLT-5): a
+    // deleted `/tmp` project must not hold a port against a live one forever.
+    if (!rootExists(entry.root)) continue;
     if (Number.isInteger(entry.port) && entry.port > 0) taken.add(entry.port);
   }
   return taken;
+}
+
+function rootExists(root) {
+  try {
+    return typeof root === 'string' && root !== '' && existsSync(root);
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * The heartbeat and the census (zero-touch phase 17, FLT-5 / FLT-6)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A console's own beat: `lastSeenAt` now, `stoppedAt` cleared, and whatever
+ * else it reports about itself (`pid`, `port`, `build`, `supervisor`, `lanes`,
+ * `needsYou`, `lastRemoteAt`) patched into its registry row. Written by the
+ * console every `HEARTBEAT_MS`, so liveness is read, never probed. A row that
+ * is not there is not invented — `phase-console remove` refuses a live row, and
+ * a console whose row was removed anyway re-registers on its next boot.
+ */
+export function beatInstance(id, patch = {}, env = process.env) {
+  return updateInstance(id, { ...patch, lastSeenAt: new Date().toISOString(), stoppedAt: null }, env);
+}
+
+/** A clean exit, said by the console itself — the other half of liveness. */
+export function markInstanceStopped(id, env = process.env) {
+  return updateInstance(id, { stoppedAt: new Date().toISOString() }, env);
+}
+
+/** A beat inside the window, with no clean exit recorded after it. */
+function beating(row, now) {
+  const seen = Date.parse(String(row?.lastSeenAt ?? ''));
+  if (!Number.isFinite(seen) || now - seen > HEARTBEAT_STALE_MS) return false;
+  const stopped = Date.parse(String(row?.stoppedAt ?? ''));
+  return !(Number.isFinite(stopped) && stopped >= seen);
+}
+
+/**
+ * Is the console behind this REGISTRY row up — the one implementation every
+ * reader shares (`LIVENESS` in `shared/fleet-model.js` says what each word
+ * means). Decided from the row and the filesystem alone: the census never
+ * probes a port, so `list`, `status`, `agent.sh status` and `GET /api/instances`
+ * cannot disagree about the same row at the same moment. `siblings` are the
+ * other registry rows, which is how `port-taken` is known without a probe.
+ */
+export function liveness(row, now = Date.now(), siblings = []) {
+  if (!rootExists(row?.root)) return 'orphaned';
+  if (beating(row, now)) return 'running';
+  const port = Number(row?.port);
+  if (
+    Number.isInteger(port) &&
+    port > 0 &&
+    siblings.some(
+      (other) =>
+        other?.id !== row?.id &&
+        Number(other?.port) === port &&
+        rootExists(other?.root) &&
+        beating(other, now),
+    )
+  ) {
+    return 'port-taken';
+  }
+  const seen = Date.parse(String(row?.lastSeenAt ?? ''));
+  const stopped = Date.parse(String(row?.stoppedAt ?? ''));
+  return Number.isFinite(seen) || Number.isFinite(stopped) ? 'stopped' : 'unknown';
+}
+
+function listNames(dir, predicate) {
+  try {
+    return readdirSync(dir).filter(predicate).sort();
+  } catch {
+    return [];
+  }
+}
+
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** The supervisor units on disk, each with the instance id its label names (null for the bare default label). */
+function unitsOnDisk(platform, home, env) {
+  if (platform === 'darwin') {
+    return listNames(join(home, 'Library', 'LaunchAgents'), (name) =>
+      /^com\.phase-console(\..+)?\.plist$/.test(name),
+    ).map((name) => {
+      const label = name.slice(0, -'.plist'.length);
+      return { label, id: label === 'com.phase-console' ? null : label.slice('com.phase-console.'.length) };
+    });
+  }
+  return listNames(join(configHome(env), 'systemd', 'user'), (name) =>
+    /^phase-console(-.+)?\.service$/.test(name),
+  ).map((name) => ({
+    label: name,
+    id: name === 'phase-console.service' ? null : name.slice('phase-console-'.length, -'.service'.length),
+  }));
+}
+
+/** The desktop launchers on disk, each with the instance NAME its filename carries (null for the bare one). */
+function launchersOnDisk(platform, home) {
+  const desktop = join(home, 'Desktop');
+  if (platform === 'darwin') {
+    return listNames(desktop, (name) => /^Phase Console( — .+)?\.command$/.test(name)).map((name) => ({
+      file: name,
+      name:
+        name === 'Phase Console.command' ? null : name.slice('Phase Console — '.length, -'.command'.length),
+    }));
+  }
+  return listNames(desktop, (name) => /^phase-console(-.+)?\.desktop$/.test(name)).map((name) => ({
+    file: name,
+    name: name === 'phase-console.desktop' ? null : name.slice('phase-console-'.length, -'.desktop'.length),
+  }));
+}
+
+/**
+ * Every console this machine knows of, from all five places that record one —
+ * the registry, the state directories, the prefs files, the supervisor units and
+ * the desktop launchers — reconciled into one row per instance id (FLT-5).
+ *
+ * Each row names its `provenance` (`CENSUS_PROVENANCES`), its `liveness`
+ * (`liveness()` for a registry row; a row with no registry entry has nothing
+ * registered to be running and reads `stopped`), which sources hold it, and its
+ * `discrepancies` (`CENSUS_DISCREPANCIES`). `counts` are the raw source sizes —
+ * the numbers an audit compares — and `unowned` the presence drops no console
+ * claimed (FLT-8). Never probes and never writes.
+ */
+export function census(env = process.env, opts = {}) {
+  const now = opts.now ?? Date.now();
+  const home = opts.home ?? homedir();
+  const platform = opts.platform ?? process.platform;
+  const registry = readRegistry(env).instances;
+  const registryRows = Object.entries(registry).map(([id, entry]) => ({ id, ...entry }));
+  const defaultId = registryRows.find((row) => row.default === true)?.id ?? null;
+
+  const stateDirs = listNames(join(stateHome(env), 'instances'), (name) =>
+    isDirectory(join(stateHome(env), 'instances', name)),
+  );
+  const prefs = listNames(join(configDir(env), 'instances'), (name) => name.endsWith('.json')).map((name) =>
+    name.slice(0, -'.json'.length),
+  );
+  const units = unitsOnDisk(platform, home, env);
+  const launchers = launchersOnDisk(platform, home);
+  const profile = fleetProfile(env);
+
+  const rows = new Map();
+  const blank = (id) => ({
+    id,
+    name: id.replace(/^[0-9a-f]{8}-/, ''),
+    root: null,
+    port: null,
+    default: false,
+    provenance: 'state-only',
+    liveness: 'stopped',
+    unit: null,
+    pid: null,
+    startedAt: null,
+    lastSeenAt: null,
+    stoppedAt: null,
+    lastRemoteAt: null,
+    build: null,
+    supervisor: null,
+    lanes: null,
+    needsYou: null,
+    autostart: readAutostart(id, env),
+    stopMarker: false,
+    sources: { registry: false, stateDir: false, prefs: false, unit: false, launcher: false },
+    discrepancies: [],
+  });
+  const row = (id) => {
+    if (!rows.has(id)) rows.set(id, blank(id));
+    return rows.get(id);
+  };
+
+  for (const entry of registryRows) {
+    const out = row(entry.id);
+    Object.assign(out, {
+      name: entry.name ?? out.name,
+      root: entry.root,
+      port: Number.isInteger(entry.port) ? entry.port : null,
+      default: entry.default === true,
+      unit: entry.unit || null,
+      pid: Number.isInteger(entry.pid) ? entry.pid : null,
+      startedAt: entry.startedAt ?? null,
+      lastSeenAt: entry.lastSeenAt ?? null,
+      stoppedAt: entry.stoppedAt ?? null,
+      lastRemoteAt: entry.lastRemoteAt ?? null,
+      build: entry.build ?? null,
+      supervisor: entry.supervisor ?? null,
+      lanes: entry.lanes ?? null,
+      needsYou: Number.isInteger(entry.needsYou) ? entry.needsYou : null,
+      stopMarker: existsSync(stopMarkerPath(entry.id, entry.default === true, env)),
+    });
+    out.sources.registry = true;
+    out.liveness = liveness(entry, now, registryRows);
+    if (out.liveness === 'orphaned') {
+      out.provenance = 'orphaned';
+      out.discrepancies.push('root-missing');
+    } else {
+      out.provenance = 'registry';
+    }
+    if (!entry.lastSeenAt && !entry.stoppedAt) out.discrepancies.push('no-heartbeat');
+    else if (out.liveness === 'stopped' && !entry.stoppedAt && entry.lastSeenAt) {
+      out.discrepancies.push('stale-heartbeat');
+    }
+    if (
+      out.port !== null &&
+      registryRows.some((other) => other.id !== entry.id && other.port === out.port && rootExists(other.root))
+    ) {
+      out.discrepancies.push('port-shared');
+    }
+  }
+  // The default instance keeps the flat state and config directories, so its
+  // presence in those two sources is its registry row, not a listing.
+  if (defaultId) {
+    rows.get(defaultId).sources.stateDir = true;
+    rows.get(defaultId).sources.prefs = true;
+  }
+  for (const id of stateDirs) row(id).sources.stateDir = true;
+  for (const id of prefs) row(id).sources.prefs = true;
+
+  const machineDiscrepancies = [];
+  for (const unit of units) {
+    const id = unit.id ?? defaultId;
+    if (!id || !rows.has(id)) {
+      machineDiscrepancies.push({ kind: 'unit-without-row', detail: unit.label });
+      continue;
+    }
+    rows.get(id).sources.unit = true;
+  }
+  for (const launcher of launchers) {
+    if (launcher.name === null) continue;
+    const match = [...rows.values()].find(
+      (candidate) => candidate.name === launcher.name || candidate.id === launcher.name,
+    );
+    if (match) match.sources.launcher = true;
+  }
+  for (const out of rows.values()) {
+    if (!out.sources.registry) out.discrepancies.push('no-registry-row');
+  }
+
+  const order = { registry: 0, orphaned: 1, 'state-only': 2 };
+  return {
+    version: 1,
+    at: new Date(now).toISOString(),
+    rows: [...rows.values()].sort(
+      (a, b) =>
+        order[a.provenance] - order[b.provenance] ||
+        Number(b.default) - Number(a.default) ||
+        a.id.localeCompare(b.id),
+    ),
+    counts: {
+      registry: registryRows.length,
+      stateDirs: stateDirs.length,
+      prefs: prefs.length,
+      units: units.length,
+      launchers: launchers.length,
+    },
+    unowned: unownedCount(env),
+    machine: { maxSessions: profile.maxSessions ?? null, lanes: liveLaneTokens(env).length },
+    discrepancies: machineDiscrepancies,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * The machine: lane tokens and the unowned presence sink (FLT-7, FLT-8)
+ * ------------------------------------------------------------------ */
+
+/** Where every console's live lanes are recorded, one file each: `<stateHome>/fleet/lanes/`. */
+export function laneTokensDir(env = process.env) {
+  return join(stateHome(env), 'fleet', 'lanes');
+}
+
+/** `<id>-<slug>-<phase>` — or `-g<grant>` for an admission that is not about one phase. */
+function laneTokenName(token) {
+  const unit = Number.isInteger(token?.phase) ? String(token.phase) : `g${safeId(token?.grant)}`;
+  return `${safeId(token?.instance)}-${safeId(token?.slug)}-${unit}`;
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return /** @type {NodeJS.ErrnoException} */ (error).code === 'EPERM';
+  }
+}
+
+/**
+ * The lanes live on this machine right now, every console's: each token file
+ * whose console process is still alive. A token whose console died is not a
+ * lane — `acquireLaneToken` reclaims it under the lock; a plain read skips it.
+ */
+export function liveLaneTokens(env = process.env) {
+  const dir = laneTokensDir(env);
+  const out = [];
+  for (const name of listNames(dir, (entry) => !entry.startsWith('.') && !entry.includes('.tmp.'))) {
+    try {
+      const token = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      if (token && typeof token === 'object' && pidAlive(token.pid)) out.push({ ...token, file: name });
+    } catch {
+      /* a half-written or foreign file is not a lane */
+    }
+  }
+  return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+}
+
+/**
+ * Take one lane on the machine, or be told who holds them all.
+ *
+ * `token` is `{instance, name, port, slug, phase, runId, grant}`; the file
+ * records it with this process's pid and the moment. `max` is the machine
+ * ceiling (`fleet.json` `maxSessions`), or null for none — a token is written
+ * either way, so the census counts machine lanes with no ceiling set. Under a
+ * lock, so two consoles admitting in the same instant cannot both take the last
+ * lane. Returns `{ok: true, file}` or `{ok: false, holders}`.
+ */
+export function acquireLaneToken(token, max, env = process.env) {
+  const dir = laneTokensDir(env);
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    return { ok: true, file: null, holders: [] };
+  }
+  return withLockFile(join(dir, '.lock'), () => {
+    const name = laneTokenName(token);
+    for (const entry of listNames(dir, (file) => !file.startsWith('.') && !file.includes('.tmp.'))) {
+      try {
+        const held = JSON.parse(readFileSync(join(dir, entry), 'utf8'));
+        if (!pidAlive(held?.pid)) rmSync(join(dir, entry), { force: true });
+      } catch {
+        rmSync(join(dir, entry), { force: true });
+      }
+    }
+    const holders = liveLaneTokens(env).filter((held) => held.file !== name);
+    if (Number.isInteger(max) && max > 0 && holders.length >= max) return { ok: false, holders };
+    const file = join(dir, name);
+    const tmp = `${file}.tmp.${process.pid}`;
+    try {
+      writeFileSync(
+        tmp,
+        `${JSON.stringify({ ...token, pid: process.pid, at: new Date().toISOString() })}\n`,
+        'utf8',
+      );
+      renameSync(tmp, file);
+    } catch {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* the temp file is not the point */
+      }
+      return { ok: true, file: null, holders };
+    }
+    return { ok: true, file: name, holders };
+  });
+}
+
+/** Give a lane back. Only this process's own token is removed. */
+export function releaseLaneToken(token, env = process.env) {
+  const file = join(laneTokensDir(env), laneTokenName(token));
+  try {
+    const held = JSON.parse(readFileSync(file, 'utf8'));
+    if (held?.pid !== process.pid || (token?.grant && held?.grant && held.grant !== token.grant))
+      return false;
+    rmSync(file, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Where a presence event no registered console claims is recorded: `<stateHome>/fleet/sessions/inbox/`. */
+export function unownedInboxDir(env = process.env) {
+  return join(stateHome(env), 'fleet', 'sessions', 'inbox');
+}
+
+function unownedCount(env) {
+  const dir = unownedInboxDir(env);
+  const names = listNames(dir, (name) => name.endsWith('.json'));
+  let oldestAt = null;
+  for (const name of names) {
+    const stamp = Number(name.split('-')[0]);
+    if (Number.isFinite(stamp) && stamp > 0) {
+      const at = new Date(stamp).toISOString();
+      if (!oldestAt || at < oldestAt) oldestAt = at;
+    }
+  }
+  return { count: names.length, oldestAt, dir };
+}
+
+/**
+ * Which REGISTERED console owns a session standing here — with no sole-instance
+ * fallback (FLT-8): "the only console" is not evidence a directory belongs to
+ * it. `root` (the console-minted `$DOCS_ROOT`) is an exact statement; `cwd`
+ * walks up. Anything no registered console claims answers `unowned`, with the
+ * project root it would have been (`candidate`) or none.
+ */
+export function resolveOwner({ root, cwd } = {}, env = process.env) {
+  if (root) {
+    const path = resolve(String(root));
+    const entry = getInstance(instanceId(path), env);
+    if (entry) return { kind: 'registered', how: 'root', ...entry };
+    return { kind: 'unowned', how: looksLikeProject(path, env) ? 'candidate' : 'none', root: path };
+  }
+  const here = resolveInstance(cwd ?? process.cwd(), env);
+  if (here.kind === 'registered') return { how: 'cwd', ...here };
+  if (here.kind === 'candidate') return { kind: 'unowned', how: 'candidate', root: here.root };
+  return { kind: 'unowned', how: 'none', root: '' };
 }
 
 /* ------------------------------------------------------------------ *
@@ -862,8 +1613,120 @@ export function runCli(argv, env = process.env) {
         ['unit_file', unitPath(unit, flag('platform') ?? process.platform, env)],
         ['state_dir', instanceStateDir(found.id, isDefault, env)],
         ['pid', String(found.pid ?? '')],
+        // The machine profile's start policy and the stop marker's path (phase
+        // 16): `agent.sh install` writes RunAtLoad and enables or disables the
+        // unit from the first; `agent.sh start` clears the second.
+        ['autostart', String(readAutostart(found.id, env))],
+        ['stop_marker', stopMarkerPath(found.id, isDefault, env)],
       ];
       return { out: pairs.map(([key, value]) => `${key}=${stripControl(value)}`).join('\n'), code: 0 };
+    }
+
+    // The census (FLT-5): `--json` is the whole report `GET /api/instances`
+    // serves; the bare form is one line per row — id, liveness, provenance,
+    // name, port, root — TAB-separated with `-` for an empty field, because
+    // bash's `read` collapses runs of TAB and silently drops an empty one.
+    case 'census': {
+      const report = census(env, { home: flag('home'), platform: flag('platform') });
+      if (rest.includes('--json')) return { out: JSON.stringify(report), code: 0 };
+      return {
+        out: report.rows
+          .map((row) =>
+            [row.id, row.liveness, row.provenance, row.name || '-', row.port ?? '-', row.root || '-']
+              .map((value) => stripControl(value))
+              .join('\t'),
+          )
+          .join('\n'),
+        code: 0,
+      };
+    }
+
+    // Who owns a session standing here — the presence hook's question, with
+    // no sole-instance fallback (FLT-8). `kind=unowned` names the fleet's sink.
+    case 'owner': {
+      const found = resolveOwner({ root: flag('root'), cwd: flag('cwd') }, env);
+      const pairs =
+        found.kind === 'registered'
+          ? [
+              ['kind', 'registered'],
+              ['how', found.how],
+              ['id', found.id],
+              ['name', found.name ?? ''],
+              ['root', found.root ?? ''],
+              [
+                'url',
+                instanceUrl(
+                  found.port ?? preferredPort(found.root, { isDefault: found.default === true }, env),
+                ),
+              ],
+              ['state_dir', instanceStateDir(found.id, found.default === true, env)],
+            ]
+          : [
+              ['kind', 'unowned'],
+              ['how', found.how],
+              ['root', found.root ?? ''],
+              ['inbox', unownedInboxDir(env)],
+            ];
+      return { out: pairs.map(([key, value]) => `${key}=${stripControl(value)}`).join('\n'), code: 0 };
+    }
+
+    // The machine profile: the whole file sanitised, or — with `--instance` —
+    // what that one console takes from it, each field's source named.
+    case 'profile': {
+      const id = flag('instance');
+      return { out: JSON.stringify(id ? profileFor(id, env) : fleetProfile(env), null, 2), code: 0 };
+    }
+
+    // `profile-set <key> <json>` writes one machine-wide field (`null` clears
+    // it); with `--instance <id>` it writes that console's override instead.
+    // A value the profile cannot act on is refused rather than written.
+    case 'profile-set': {
+      const [key, raw] = positional;
+      const instance = flag('instance');
+      const keys = instance
+        ? OVERRIDABLE_PROFILE_KEYS
+        : [...OVERRIDABLE_PROFILE_KEYS, 'maxSessions', 'hookScript'];
+      if (!key || raw === undefined || !keys.includes(key)) {
+        return {
+          err: `usage: instances.mjs profile-set <${keys.join('|')}> <json>`,
+          code: 2,
+        };
+      }
+      let value;
+      try {
+        value = JSON.parse(raw);
+      } catch {
+        return { err: `not JSON: ${raw}`, code: 2 };
+      }
+      if (value !== null && sanitizeProfileFields({ [key]: value })[key] === undefined) {
+        return { err: `${key}: ${raw} is not a value the profile can use`, code: 1 };
+      }
+      const written = updateFleetProfile((profile) => {
+        if (!instance) {
+          const next = { ...profile };
+          if (value === null) delete next[key];
+          else next[key] = value;
+          return next;
+        }
+        const instances = profile.instances && typeof profile.instances === 'object' ? profile.instances : {};
+        const overrides = { ...instances[instance]?.overrides };
+        if (value === null) delete overrides[key];
+        else overrides[key] = value;
+        return { ...profile, instances: { ...instances, [instance]: { ...instances[instance], overrides } } };
+      }, env);
+      return written
+        ? { out: JSON.stringify(instance ? profileFor(instance, env) : written, null, 2), code: 0 }
+        : { err: `could not write ${fleetProfilePath(env)}`, code: 1 };
+    }
+
+    case 'autostart': {
+      const [id, word] = positional;
+      const value = word === 'true' ? true : word === 'false' ? false : word === 'once' ? 'once' : undefined;
+      if (!id || value === undefined)
+        return { err: 'usage: instances.mjs autostart <id> true|false|once', code: 2 };
+      return setAutostart(id, value, env)
+        ? { out: `${id} autostart=${word}`, code: 0 }
+        : { err: `could not write ${fleetProfilePath(env)}`, code: 1 };
     }
 
     case 'port':
@@ -875,8 +1738,9 @@ export function runCli(argv, env = process.env) {
     default:
       return {
         err:
-          'usage: instances.mjs id|register|update|remove|list|resolve|select|shell|port|url [<path-or-selector>]' +
-          ' [--name n] [--port p] [--unit u] [--pid n] [--started-at s] [--cwd d] [--platform p] [--default] [--json]',
+          'usage: instances.mjs id|register|update|remove|list|census|resolve|select|shell|owner|profile|profile-set|autostart|port|url' +
+          ' [<path-or-selector>] [--name n] [--port p] [--unit u] [--pid n] [--started-at s] [--cwd d] [--root d]' +
+          ' [--platform p] [--default] [--json]',
         code: 2,
       };
   }

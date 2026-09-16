@@ -25,6 +25,8 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, w
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
+import { fleetProfile } from '../shared/instances.mjs';
+
 // Notification appended 2026-08-23: it is what tells the console a session is
 // stopped waiting on a person (permission prompt, idle input) — the session-ask
 // signal. An install from before then reads `partial: true` until re-installed.
@@ -78,17 +80,28 @@ export function defaultSettingsPath(env: NodeJS.ProcessEnv = process.env): strin
   return join(dir, 'settings.json');
 }
 
-export function hookScriptPath(skillDir: string): string {
+/**
+ * The script every config dir's hooks run. A machine fact since zero-touch
+ * phase 17 (FLT-8): the machine profile's `hookScript`, when it names a script
+ * that exists, is the one path every console installs and every status
+ * compares against — so two console copies on one machine stop pointing the
+ * same four hooks at two different checkouts. Without it, this checkout's own.
+ */
+export function hookScriptPath(skillDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  try {
+    const machine = fleetProfile(env).hookScript;
+    if (machine && existsSync(machine)) return machine;
+  } catch { /* an unreadable profile keeps this checkout's script */ }
   return join(skillDir, HOOK_SCRIPT_REL);
 }
 
 /** The command string the entry runs: bash on the absolute script path, quoted for a path with spaces. */
-export function hookCommand(skillDir: string): string {
-  return `bash "${hookScriptPath(skillDir)}"`;
+export function hookCommand(skillDir: string, env: NodeJS.ProcessEnv = process.env): string {
+  return `bash "${hookScriptPath(skillDir, env)}"`;
 }
 
-export function hookEntry(skillDir: string): HookCommand {
-  return { type: 'command', command: hookCommand(skillDir), timeout: HOOK_TIMEOUT_SECONDS };
+export function hookEntry(skillDir: string, env: NodeJS.ProcessEnv = process.env): HookCommand {
+  return { type: 'command', command: hookCommand(skillDir, env), timeout: HOOK_TIMEOUT_SECONDS };
 }
 
 function isOurs(command: unknown): boolean {
@@ -287,8 +300,8 @@ function writeAtomic(path: string, text: string, mode: number | undefined): void
  * Status, install, uninstall
  * ------------------------------------------------------------------ */
 
-function statusOf(file: ReadSettings, path: string, skillDir: string): HooksStatus {
-  const command = hookCommand(skillDir);
+function statusOf(file: ReadSettings, path: string, skillDir: string, env: NodeJS.ProcessEnv = process.env): HooksStatus {
+  const command = hookCommand(skillDir, env);
   const events = {} as Record<HookEvent, boolean>;
   let stale = false;
   let current = 0;
@@ -314,7 +327,7 @@ function statusOf(file: ReadSettings, path: string, skillDir: string): HooksStat
 /** What is installed, without writing anything. */
 export function hooksStatus(options: HooksOptions): HooksStatus {
   const path = options.settingsPath ?? defaultSettingsPath(options.env);
-  return statusOf(readSettingsFile(path), path, options.skillDir);
+  return statusOf(readSettingsFile(path), path, options.skillDir, options.env);
 }
 
 export type HooksWrite = { ok: true; path: string; changed: boolean; status: HooksStatus };
@@ -326,7 +339,7 @@ function refuseUnparsed(path: string, file: ReadSettings): void {
 }
 
 /**
- * Add (or refresh) the three entries. Every other key and every other hook
+ * Add (or refresh) the four entries. Every other key and every other hook
  * group is carried through unchanged; an entry of ours that already points at
  * this checkout is left alone, one that points elsewhere is rewritten in place.
  * A file that does not parse is refused — the one thing worse than a missing
@@ -339,7 +352,7 @@ export function installHooks(options: HooksOptions): HooksWrite {
   const hooks = (file.json.hooks && typeof file.json.hooks === 'object' && !Array.isArray(file.json.hooks)
     ? { ...(file.json.hooks as Record<string, unknown>) }
     : {}) as Record<string, unknown>;
-  const wanted = hookEntry(options.skillDir);
+  const wanted = hookEntry(options.skillDir, options.env);
   let changed = false;
   for (const event of HOOK_EVENTS) {
     const groups = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
@@ -360,7 +373,7 @@ export function installHooks(options: HooksOptions): HooksWrite {
     hooks[event] = groups;
   }
   if (changed || !file.exists) writeAtomic(path, spliceHooks(file, hooks), file.mode);
-  return { ok: true, path, changed: changed || !file.exists, status: statusOf(readSettingsFile(path), path, options.skillDir) };
+  return { ok: true, path, changed: changed || !file.exists, status: statusOf(readSettingsFile(path), path, options.skillDir, options.env) };
 }
 
 /**
@@ -371,7 +384,7 @@ export function installHooks(options: HooksOptions): HooksWrite {
 export function uninstallHooks(options: HooksOptions): HooksWrite {
   const path = options.settingsPath ?? defaultSettingsPath(options.env);
   const file = readSettingsFile(path);
-  if (!file.exists) return { ok: true, path, changed: false, status: statusOf(file, path, options.skillDir) };
+  if (!file.exists) return { ok: true, path, changed: false, status: statusOf(file, path, options.skillDir, options.env) };
   refuseUnparsed(path, file);
   const hooks = (file.json.hooks && typeof file.json.hooks === 'object' && !Array.isArray(file.json.hooks)
     ? { ...(file.json.hooks as Record<string, unknown>) }
@@ -389,5 +402,5 @@ export function uninstallHooks(options: HooksOptions): HooksWrite {
     }
     if (changed) writeAtomic(path, spliceHooks(file, Object.keys(hooks).length ? hooks : null), file.mode);
   }
-  return { ok: true, path, changed, status: statusOf(readSettingsFile(path), path, options.skillDir) };
+  return { ok: true, path, changed, status: statusOf(readSettingsFile(path), path, options.skillDir, options.env) };
 }

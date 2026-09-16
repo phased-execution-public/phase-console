@@ -246,7 +246,8 @@ function facts(over: Partial<InboxFacts> = {}): InboxFacts {
         sessionId: 'sess-live', kind: 'foreign', presence: 'live', cwd: '/work/hub',
         waiting: { since: '2026-08-22T11:05:00.000Z', kind: 'permission', note: 'Claude needs your permission to use Bash' },
       },
-      // Everything below is skipped: not waiting, not live, or not ours to relay.
+      // Everything below is skipped: not waiting, not live, or already asked by
+      // a pending approval card for the lane's own phase (a1, demo phase 4).
       { sessionId: 'sess-quiet', kind: 'foreign', presence: 'live', cwd: '/work/hub' },
       {
         sessionId: 'sess-ended', kind: 'foreign', presence: 'ended', cwd: '/work/hub',
@@ -255,6 +256,7 @@ function facts(over: Partial<InboxFacts> = {}): InboxFacts {
       {
         sessionId: 'sess-lane', kind: 'autopilot', presence: 'live', cwd: '/work/hub',
         waiting: { since: '2026-08-22T10:00:00.000Z', kind: 'permission' },
+        plan: { slug: 'demo', phase: 4, strong: true },
       },
     ],
     acks: {},
@@ -584,6 +586,73 @@ test('a stopped run does not raise stall rows off the liveness its lane left beh
 });
 
 /* ------------------------------------------------------------------ *
+ * policy — what the console decided by itself (zero-touch phase 19)
+ * ------------------------------------------------------------------ */
+
+const ANSWER = {
+  slug: 'demo', runId: 'r1', phase: 4, decisionKey: 'qa.exhausted', answer: 'waive', source: 'default',
+  at: ago(1 * HOUR),
+};
+
+test('a policy answer is an fyi row naming its key, the answer, where it came from and the shipped default', () => {
+  const { items } = buildInbox({ policyAnswers: [ANSWER], acks: {} }, NOW);
+  assert.equal(items.length, 1);
+  const [row] = items;
+  assert.equal(row.kind, 'policy');
+  assert.equal(row.severity, 'fyi', 'nothing is waiting — the console already acted');
+  // Keyed on the decision key, not the run: one decision per phase, whichever run met it last.
+  assert.equal(row.id, inboxItemId({ kind: 'policy', slug: 'demo', phase: 4, subject: 'qa.exhausted' }));
+  assert.match(row.title, /demo phase 4 — Policy answered · qa\.exhausted/);
+  assert.match(row.need, /"waive" by the shipped default/);
+  assert.match(row.need, /nobody was asked/);
+  assert.match(row.how, /Shipped default for `qa\.exhausted`: waive/);
+  assert.match(row.how, /Settings ▸ Automation ▸ Policy answers/);
+  assert.equal(row.since, ANSWER.at);
+  assert.equal(row.href, '#/plan/demo/phase/4');
+  assert.deepEqual(row.actions, [], 'seeing it IS the interaction');
+});
+
+test('answers to one key on one phase are ONE row — the newest; another key or another phase is another row', () => {
+  const { items } = buildInbox({
+    policyAnswers: [
+      ANSWER,
+      { ...ANSWER, answer: 'halt', source: 'plan', at: ago(10 * MIN) },
+      { ...ANSWER, decisionKey: 'gates', answer: 'delegated', at: ago(2 * HOUR) },
+      { ...ANSWER, phase: 7, at: ago(3 * HOUR) },
+    ],
+    acks: {},
+  }, NOW);
+  assert.equal(items.length, 3);
+  const qa = items.find((i) => i.id === inboxItemId({ kind: 'policy', slug: 'demo', phase: 4, subject: 'qa.exhausted' }));
+  assert.ok(qa);
+  assert.match(qa.need, /"halt" by the plan’s `## Decisions` row/, 'the newest answer is the one shown');
+  assert.ok(items.some((i) => i.id === inboxItemId({ kind: 'policy', slug: 'demo', phase: 4, subject: 'gates' })));
+  assert.ok(items.some((i) => i.id === inboxItemId({ kind: 'policy', slug: 'demo', phase: 7, subject: 'qa.exhausted' })));
+});
+
+test('a policy answer older than the window, on a closed plan, or with no phase raises nothing', () => {
+  const { items } = buildInbox({
+    policyAnswers: [
+      { ...ANSWER, at: ago(20 * 24 * HOUR) },
+      { ...ANSWER, slug: 'shut' },
+      { ...ANSWER, phase: 0 },
+    ],
+    plans: [{ slug: 'shut', closed: true }],
+    acks: {},
+  }, NOW);
+  assert.deepEqual(items, []);
+});
+
+test('an acknowledged policy row stays down until the console answers that key again', () => {
+  const id = inboxItemId({ kind: 'policy', slug: 'demo', phase: 4, subject: 'qa.exhausted' });
+  const acks = { [id]: { at: ago(MIN), by: 'op' } };
+  assert.deepEqual(buildInbox({ policyAnswers: [ANSWER], acks }, NOW).items, []);
+  const again = buildInbox({ policyAnswers: [ANSWER, { ...ANSWER, at: ago(1000) }], acks }, NOW);
+  assert.equal(again.items.length, 1, 'a newer answer moves `since` past the ack');
+  assert.equal(again.items[0].id, id);
+});
+
+/* ------------------------------------------------------------------ *
  * ruling — a decision worth remembering
  * ------------------------------------------------------------------ */
 
@@ -653,6 +722,56 @@ test('one busy plan cannot own the list', () => {
   assert.equal(items.length, 1);
   assert.equal(items[0].need, 'decision 0', 'the newest is the one shown');
   assert.match(items[0].title, /39 more rulings/);
+});
+
+test('a ruling that names its decision key is a row of its OWN, keyed on the ruling, offering remember', () => {
+  // The feedback loop (chapter 10 ZTD-7): a keyed ruling is an answer somebody
+  // could keep, so it gets its own row with the actions to keep it — and the
+  // un-keyed rulings of the same phase still fold into their fyi row.
+  const keyed = { ...RULING, id: 'abcdef012345', what: 'the window is the cap', decisionKey: 'waits', at: ago(1 * HOUR) };
+  const { items } = buildInbox({ rulings: [RULING, keyed], acks: {}, flags: { allowWrites: true } }, NOW);
+  assert.equal(items.length, 2);
+  const row = items.find((i) => i.id === inboxItemId({ kind: 'ruling', slug: 'demo', phase: 4, subject: 'abcdef012345' }));
+  assert.ok(row, 'keyed on the ruling id — the ledger ack (which remembering appends) is the row\'s ack');
+  assert.equal(row.kind, 'ruling');
+  assert.equal(row.severity, 'fyi');
+  assert.match(row.title, /Deviation · waits/);
+  assert.equal(row.need, 'the window is the cap');
+  // The plan action, always; the global action only when the words are an
+  // answer the console can hold for the key — `waits` takes window|refuse, and
+  // "the window is the cap" is prose, so a button that would be refused on
+  // arrival is not offered; the pointer to the editor is.
+  assert.deepEqual(row.actions.map((a) => a.verb), ['remember-plan']);
+  const [plan] = row.actions;
+  assert.equal(plan.endpoint, '/api/run/demo/rulings/abcdef012345/remember');
+  assert.equal(plan.method, 'POST');
+  assert.deepEqual(plan.body, { scope: 'plan' });
+  assert.equal(plan.flag, undefined, 'writes are on');
+  assert.match(row.how, /Settings ▸ Automation ▸ Policy answers/);
+  // The folded row is exactly what it was: one un-keyed ruling, no actions.
+  const folded = items.find((i) => i.id === inboxItemId({ kind: 'ruling', slug: 'demo', phase: 4, subject: 'rulings' }));
+  assert.ok(folded);
+  assert.doesNotMatch(folded.title, /more ruling/);
+  assert.deepEqual(folded.actions, []);
+});
+
+test('a keyed ruling whose words ARE an answer offers to remember it on this console too, and writes-off flags the plan action', () => {
+  const keyed = { ...RULING, id: 'abcdef012345', what: 'waive', decisionKey: 'qa.exhausted', at: ago(1 * HOUR) };
+  const { items } = buildInbox({ rulings: [keyed], acks: {}, flags: { allowWrites: false } }, NOW);
+  assert.equal(items.length, 1);
+  const [row] = items;
+  assert.deepEqual(row.actions.map((a) => a.verb), ['remember-plan', 'remember-global']);
+  assert.equal(row.actions[0].flag, 'writes', 'a docs write behind --allow-writes');
+  assert.deepEqual(row.actions[1].body, { scope: 'global' });
+  assert.equal(row.actions[1].flag, undefined, 'a preference needs no capability');
+  assert.doesNotMatch(row.how, /Settings ▸/);
+});
+
+test('a keyed ruling the ledger has acked is off the list — remembering it is what acks it', () => {
+  const keyed = { ...RULING, id: 'abcdef012345', what: 'waive', decisionKey: 'qa.exhausted', at: ago(1 * HOUR) };
+  const id = inboxItemId({ kind: 'ruling', slug: 'demo', phase: 4, subject: 'abcdef012345' });
+  const { items } = buildInbox({ rulings: [keyed], acks: { [id]: { at: ago(MIN), by: 'op' } } }, NOW);
+  assert.deepEqual(items, []);
 });
 
 test('a closed plan raises no rulings, like every other progress claim', () => {
@@ -1360,10 +1479,10 @@ test('a QA verdict that is holding a plan is needs-you, not fyi', () => {
  * Session asks
  * ------------------------------------------------------------------ */
 
-test('a session ask: only a live, waiting, non-autopilot session raises one — permission urgent, input needs-you', () => {
+test('a session ask: only a live, waiting session raises one — a lane already asked by its phase\'s card excepted — permission urgent, input needs-you', () => {
   const { items } = buildInbox(facts(), NOW);
   const asks = items.filter((i) => i.kind === 'session-ask');
-  assert.equal(asks.length, 1, 'quiet, ended and autopilot sessions raise nothing');
+  assert.equal(asks.length, 1, 'quiet and ended sessions raise nothing, and a carded lane is not asked twice');
   const ask = asks[0];
   assert.equal(ask.severity, 'urgent', 'a permission prompt is a session parked dead');
   assert.match(ask.title, /permission/);
@@ -1383,6 +1502,45 @@ test('a session ask: only a live, waiting, non-autopilot session raises one — 
   }), NOW);
   assert.equal(elicit.items.find((i) => i.kind === 'session-ask')?.severity, 'needs-you',
     'an elicitation stops the session, but nothing is burning while it waits');
+});
+
+test('ACC-8.9 (REG-5, TRS-6): a lane waiting on a person is a row in its own right — carrying the question and a steer that answers it', () => {
+  const view = buildInbox(facts({
+    approvals: [],
+    flags: { allowRun: true },
+    sessions: [{
+      sessionId: 'sess-lane', kind: 'autopilot', presence: 'live', cwd: '/work/hub',
+      waiting: { since: '2026-08-22T11:00:00.000Z', kind: 'elicitation', note: 'Which schema should I migrate first?' },
+      plan: { slug: 'demo', phase: 4, strong: true },
+    }],
+  }), NOW);
+  const row = view.items.find((i) => i.kind === 'session-ask');
+  assert.ok(row, 'no approval card stands for the phase, so the lane\'s own wait is the ask');
+  assert.equal(row?.need, 'Which schema should I migrate first?', 'the question itself');
+  assert.match(row?.how ?? '', /Answer it here/);
+  assert.equal(row?.actions.length, 1);
+  assert.equal(row?.actions[0].verb, 'steer');
+  assert.equal(row?.actions[0].endpoint, '/api/run/demo/steer');
+  assert.deepEqual(row?.actions[0].body, { phase: 4 });
+  assert.equal(row?.actions[0].says?.field, 'instruction');
+  assert.equal(row?.actions[0].flag, undefined, 'pressable where runs are allowed');
+
+  // Gated like every run verb, and a lane the console cannot place has no verb to offer.
+  const gated = buildInbox(facts({
+    approvals: [],
+    flags: {},
+    sessions: [{
+      sessionId: 'sess-lane', kind: 'autopilot', presence: 'live', cwd: '/work/hub',
+      waiting: { since: '2026-08-22T11:00:00.000Z', kind: 'permission' }, plan: { slug: 'demo', phase: 4, strong: true },
+    }],
+  }), NOW).items.find((i) => i.kind === 'session-ask');
+  assert.equal(gated?.actions[0].flag, 'run');
+  const unplaced = buildInbox(facts({
+    approvals: [],
+    sessions: [{ sessionId: 'sess-lane', kind: 'autopilot', presence: 'live', cwd: '/work/hub', waiting: { since: '2026-08-22T11:00:00.000Z', kind: 'permission' } }],
+  }), NOW).items.find((i) => i.kind === 'session-ask');
+  assert.ok(unplaced, 'an uncorrelated lane still asks');
+  assert.deepEqual(unplaced?.actions, []);
 });
 
 test('an idle prompt is NOT a session ask — a finished turn is what fine looks like', () => {
@@ -1876,4 +2034,142 @@ test('P9 (QA round 1, M1): a per-phase `- **QA:** on` still raises the fail on a
   const rows = items.filter((i: { kind: string }) => i.kind === 'qa');
   assert.equal(rows.length, 1, "the phase's own regime gates, so the ask must show");
   assert.ok(rows[0].actions.some((a: { verb: string }) => a.verb === 'qa-recover'));
+});
+
+/* ------------------------------------------------------------------ *
+ * The relay's question rows (zero-touch-console phase 14)
+ * ------------------------------------------------------------------ */
+
+test('a relayed question is one urgent row per unanswered question, one action per option, with the window it closes on — and never a permission row', () => {
+  const createdAt = '2026-08-22T11:59:30.000Z';
+  const expiresAt = '2026-08-22T12:00:30.000Z';
+  const view = buildInbox(facts({
+    runs: [], plans: [], locks: [],
+    approvals: [{
+      id: 'q1', runId: 'run-9', slug: 'demo', phase: 3, kind: 'question', status: 'pending', createdAt, expiresAt,
+      title: 'Which colour should the banner be?', detail: 'Phase 3 of demo asks.',
+      question: {
+        items: [
+          { key: 'colour:which-colour', question: 'Which colour should the banner be?', header: 'Colour', options: [{ label: 'Red' }, { label: 'Blue (Recommended)' }] },
+          { key: 'port:which-port', question: 'Which port?', options: [{ label: '8080' }, { label: '9090' }] },
+          { key: 'done:already', question: 'Already answered?', options: [{ label: 'Yes' }] },
+        ],
+        answers: { 'done:already': { label: 'Yes', by: 'human' } },
+      },
+    }, {
+      id: 'q2', runId: 'run-9', slug: 'demo', phase: 4, kind: 'question', status: 'pending', createdAt, expiresAt,
+      question: { items: [{ key: 'kept:one', question: 'Kept for the resume?', options: [{ label: 'Yes' }] }], answers: {}, deferred: { toolUseId: 't' } },
+    }],
+    flags: { allowRun: true },
+  }), NOW);
+  const questions = view.items.filter((item) => item.kind === 'question');
+  assert.deepEqual(questions.map((item) => item.title).sort(), ['Which colour should the banner be?', 'Which port?'],
+    'one row per question still open — not the answered one, not the deferred card');
+  assert.ok(!view.items.some((item) => item.kind === 'approval'), 'a question is not a permission card');
+  const colour = questions.find((item) => item.title.startsWith('Which colour'))!;
+  assert.equal(colour.severity, 'urgent');
+  assert.equal(colour.expiresAt, expiresAt, 'the window a surface counts down to');
+  assert.match(colour.how, /"Blue \(Recommended\)" unless a rule says otherwise/, 'what silence will choose');
+  assert.deepEqual(colour.actions.map((action) => action.label), ['Red', 'Blue (Recommended)']);
+  assert.deepEqual(colour.actions[1], {
+    verb: 'answer-2', label: 'Blue (Recommended)', endpoint: '/api/run/demo/answer', method: 'POST',
+    body: { approvalId: 'q1', key: 'colour:which-colour', label: 'Blue (Recommended)' },
+  });
+  assert.equal(colour.id, inboxItemId({ kind: 'question', slug: 'demo', phase: 3, runId: 'run-9', subject: 'q1:colour:which-colour' }));
+  // Gated like the permission card beside it.
+  const locked = buildInbox(facts({ runs: [], plans: [], locks: [], approvals: [{
+    id: 'q1', runId: 'run-9', slug: 'demo', phase: 3, kind: 'question', status: 'pending', createdAt, expiresAt,
+    question: { items: [{ key: 'a:b', question: 'A?', options: [{ label: 'x' }] }], answers: {} },
+  }], flags: { allowRun: false } }), NOW).items.find((item) => item.kind === 'question')!;
+  assert.equal(locked.actions[0].flag, 'run');
+});
+
+test('a relayed answer\'s ruling offers to become a relay RULE — never a ## Decisions row', () => {
+  const at = '2026-08-22T11:00:00.000Z';
+  const view = buildInbox(facts({
+    runs: [], plans: [], locks: [], approvals: [],
+    rulings: [{
+      id: 'abc123def456', slug: 'demo', phase: 3, kind: 'ambiguity', decisionKey: 'ambiguity', at,
+      what: 'answered "Which port?" with "8080"', why: 'no operator answered within the window; the console answered by first-option',
+      relay: { tool: 'AskUserQuestion', key: 'port:which-port', answer: '8080', answeredBy: 'first-option' },
+    }],
+    flags: { allowWrites: true },
+  }), NOW);
+  const row = view.items.find((item) => item.kind === 'ruling')!;
+  assert.ok(row, 'the ruling is a row');
+  assert.deepEqual(row.actions.map((action) => action.verb), ['remember-rule']);
+  assert.deepEqual(row.actions[0].body, { scope: 'rule' });
+  assert.match(row.how, /answer "8080" to this question on every run/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Instance health is work (zero-touch phase 17, FLT-1 iv / FLT-6)
+ * ------------------------------------------------------------------ */
+
+test('instance health: unread on a console that can reach nobody is itself a needs-you — and not once a channel exists', () => {
+  const unheard = {
+    fleet: { delivery: { ok: false, reason: 'no delivery channel: no subscribed device' }, unread: 29, remote: null, siblings: [] },
+  } satisfies InboxFacts;
+  const rows = buildInbox(unheard, NOW).items.filter((item) => item.kind === 'health');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.severity, 'needs-you');
+  assert.match(rows[0]!.title, /29 notifications nobody was told about/);
+  assert.match(rows[0]!.need, /no subscribed device/);
+
+  const reached = { fleet: { ...unheard.fleet, delivery: { ok: true, reason: '1 subscribed device' } } } satisfies InboxFacts;
+  assert.equal(buildInbox(reached, NOW).items.filter((item) => item.kind === 'health').length, 0, 'unread with a recipient is just unread');
+  const nothingUnread = { fleet: { ...unheard.fleet, unread: 0 } } satisfies InboxFacts;
+  assert.equal(buildInbox(nothingUnread, NOW).items.length, 0);
+});
+
+test('instance health: under --remote, Tailscale stopped and Serve pointing elsewhere are each a needs-you naming what to do', () => {
+  const stopped = {
+    fleet: { delivery: { ok: true, reason: 'x' }, unread: 0, siblings: [], remote: { running: false, detail: 'Stopped', forOurPort: false, hosts: ['console.example.ts.net'] } },
+  } satisfies InboxFacts;
+  const down = buildInbox(stopped, NOW).items;
+  assert.equal(down.length, 1);
+  assert.equal(down[0]!.severity, 'needs-you');
+  assert.match(down[0]!.title, /Tailscale is not running/);
+  assert.match(down[0]!.need, /console\.example\.ts\.net/);
+
+  const elsewhere = {
+    fleet: { ...stopped.fleet, remote: { running: true, forOurPort: false, hosts: ['console.example.ts.net'], occupant: { port: 4130, id: 'f922d743-pe-hub', name: 'pe-hub' } } },
+  } satisfies InboxFacts;
+  const serve = buildInbox(elsewhere, NOW).items;
+  assert.equal(serve.length, 1);
+  assert.match(serve[0]!.title, /Serve points at another console/);
+  assert.match(serve[0]!.need, /the console "pe-hub" \(port 4130\)/, 'the occupant by name, never "something else"');
+
+  const ours = { fleet: { ...stopped.fleet, remote: { running: true, forOurPort: true, hosts: ['console.example.ts.net'] } } } satisfies InboxFacts;
+  assert.equal(buildInbox(ours, NOW).items.length, 0);
+});
+
+test('instance health: an orphaned sibling and a sibling with no live process are needs-you; one stopped on purpose is not', () => {
+  const sibling = (over: Record<string, unknown>) => ({
+    id: '3a3a6ca6-tour', name: 'tour', root: '/tmp/tour', liveness: 'stopped', discrepancies: [] as string[],
+    unit: false, autostart: true as boolean | 'once', stopMarker: false, lastSeenAt: '2026-09-13T04:12:17.000Z', stoppedAt: null as string | null,
+    ...over,
+  });
+  const facts = (siblings: ReturnType<typeof sibling>[]) => ({
+    fleet: { delivery: { ok: true, reason: 'x' }, unread: 0, remote: null, siblings },
+  }) satisfies InboxFacts;
+
+  const orphaned = buildInbox(facts([sibling({ liveness: 'orphaned', discrepancies: ['root-missing'] })]), NOW).items;
+  assert.equal(orphaned.length, 1);
+  assert.match(orphaned[0]!.title, /registered for a directory that is gone/);
+  assert.match(orphaned[0]!.how, /phase-console remove 3a3a6ca6-tour/);
+
+  const crashed = buildInbox(facts([sibling({ discrepancies: ['stale-heartbeat'] })]), NOW).items;
+  assert.equal(crashed.length, 1, 'stopped beating without a clean exit');
+  assert.match(crashed[0]!.title, /"tour" is down/);
+  assert.equal(crashed[0]!.severity, 'needs-you');
+
+  const supervised = buildInbox(facts([sibling({ unit: true, stoppedAt: '2026-09-13T04:12:17.000Z' })]), NOW).items;
+  assert.equal(supervised.length, 1, 'a unit that should keep it up, and it is not running');
+
+  assert.equal(buildInbox(facts([sibling({ unit: true, stopMarker: true })]), NOW).items.length, 0, 'Stay off is a decision');
+  assert.equal(buildInbox(facts([sibling({ unit: true, autostart: false })]), NOW).items.length, 0, 'autostart:false is a decision');
+  assert.equal(buildInbox(facts([sibling({ stoppedAt: '2026-09-13T04:12:17.000Z' })]), NOW).items.length, 0,
+    'a foreground console closed cleanly is not down — nothing was meant to keep it up');
+  assert.equal(buildInbox(facts([sibling({ liveness: 'running' })]), NOW).items.length, 0);
 });

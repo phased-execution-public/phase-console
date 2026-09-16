@@ -44,13 +44,16 @@ import { autopilotRunId, debrisLocks, type LockView } from './runner/scheduler.t
 import { sameErrand } from './runner/ladder.ts';
 import {
   CONSOLE_STOPPED_NOTE, IN_FLIGHT, childrenOf, resetForRetry, pidAlive as realPidAlive,
-  processState as realProcessState, waitReasonOf, type ProcessState,
+  processState as realProcessState, waitClockOf, waitReasonOf, type ProcessState,
   type Errand, type PhaseRecord, type RunState,
 } from './runner/state.ts';
 import { log } from './log.ts';
-import { WATCH_INELIGIBLE_STATUSES } from './watch-refs.ts';
+import { doorActor, viaOfTrigger, type StartActor } from './actor.ts';
+import { WATCH_INELIGIBLE_ROW_STATES, WATCH_INELIGIBLE_STATUSES } from './watch-refs.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
-import type { ConvergeTrigger as ConvergeTriggerWord } from '../shared/run-lifecycle.js';
+import type {
+  ConvergeTrigger as ConvergeTriggerWord, ResumePath, ResumeTrigger,
+} from '../shared/run-lifecycle.js';
 import { resumeAtBootMode } from '../shared/automation-model.js';
 
 /* ------------------------------------------------------------------ *
@@ -78,6 +81,19 @@ export const DEFAULT_SWEEP_MS = 300_000;
  * problem a person should hear about — not a loop to run for ever.
  */
 export const MAX_BOOT_RESUMES = 3;
+
+/**
+ * The run-level halts nobody but a person's press relaunches (phase 9).
+ *
+ * `failure-streak` is the run's one "this plan is broken, stop" bound, and the
+ * loop's own relaunch used to answer it — and zero the counter on the way in
+ * (RCV-3: 25 resets against 3 such halts). `credential-refused` opens only
+ * when a person clears the account in the breaker, so a relaunch by clock
+ * meets the same wall at the preflight and parks again (RCV-1). The heal
+ * pass still classifies their phases and climbs, bounded by RCV-9's
+ * fingerprint; only the run-level relaunch is a person's.
+ */
+export const PRESS_ONLY_HALT_KINDS: readonly string[] = Object.freeze(['failure-streak', 'credential-refused']);
 
 /**
  * How far past its own `waitUntil` a sleeping run may read before the loop
@@ -177,7 +193,19 @@ export type ConvergeAction =
    * gone are reset, and a run the console's own shutdown stopped simply
    * continues. ONE launch per run, whatever the reasons.
    */
-  | { kind: 'relaunch'; runId: string; reboard: ReboardRequest[]; rearm: number[]; why: string[] }
+  | {
+    kind: 'relaunch'; runId: string; reboard: ReboardRequest[]; rearm: number[]; why: string[];
+    /**
+     * The phases this launch resumes automatically, beyond the killed lanes in
+     * `reboard` — each is counted against `MAX_BOOT_RESUMES` and journalled
+     * `phase.resume-automatic` by the executor (LFC-7).
+     */
+    counted?: { phase: number; path: ResumePath; sessionId?: string }[];
+    /** A wait whose clock went by while nothing ran: the launch is the overdue ruling, not a bare start. */
+    wait?: { until: string; lateByMs: number; phases: number[] };
+    /** Launched on the operator's `continue` — spent by this launch, so the next restart asks again. */
+    decided?: true;
+  }
   /** A person is asked, once, with what is needed and how to give it. `phase` null = run level. */
   | { kind: 'errand'; runId: string; phase: number | null; errand: Errand; why: string }
   /** Classify the open phases and climb the ladder — the healer. */
@@ -376,6 +404,10 @@ export function evidenceFingerprint(
     if (WATCH_INELIGIBLE_STATUSES.has(record.status)) continue;
     for (const row of record.watchState?.refs ?? []) {
       if (row.nextDueAt === undefined) continue;
+      // …and only rows the scheduler will advance: a `refused` row is terminal,
+      // and one written before its clock was dropped would move the term every
+      // minute for ever (SLF-7).
+      if (WATCH_INELIGIBLE_ROW_STATES.has(row.state)) continue;
       if (soonest === null || row.nextDueAt < soonest) soonest = row.nextDueAt;
     }
   }
@@ -385,23 +417,207 @@ export function evidenceFingerprint(
   return JSON.stringify([run.id, run.status, run.halt?.at ?? '', run.halt?.reason ?? '', run.resolved?.at ?? '', phases, held, gateStamp ?? '', words, verdicts, watch]);
 }
 
-function resumeErrand(phase: number, at: string, why: 'off' | 'capped', sessionId?: string): Errand {
+export function resumeErrand(
+  phase: number, at: string, why: 'off' | 'capped', sessionId?: string, shape: 'lane' | 'wait' = 'lane',
+  /** Whose word refused it: the run's own `resumeOnRestart: false` or the console's `resumeAtBoot: off`. */
+  refusedBy: 'run' | 'console' = 'console',
+): Errand {
   const session = sessionId ? `session ${sessionId}` : 'its session';
+  const switchedOff = refusedBy === 'run'
+    ? 'this run was launched with resume-on-restart off'
+    : shape === 'wait'
+      ? 'resuming what a restart stopped is switched off on this console'
+      : 'resuming killed lanes at boot is switched off on this console';
   return {
     phase,
-    situation: 'work-in-progress',
+    situation: shape === 'wait' ? 'waiting-external' : 'work-in-progress',
+    decisionKey: 'resume.on-restart',
     tried: why === 'capped' ? [`resume-at-boot ×${MAX_BOOT_RESUMES}`] : [],
     need: why === 'off'
-      ? `Someone to continue phase ${phase} — its lane was cut off by a console restart, and resuming `
-        + 'killed lanes at boot is switched off on this console.'
+      ? shape === 'wait'
+        ? `Someone to continue phase ${phase} — its wait clock went by while the console was not running, `
+          + `and ${switchedOff}.`
+        : `Someone to continue phase ${phase} — its lane was cut off by a console restart, and ${switchedOff}.`
       : `A look at phase ${phase} before it is resumed again — the console has resumed ${session} after `
         + `${MAX_BOOT_RESUMES} restarts in a row and the phase still has not landed.`,
     how: why === 'off'
-      ? 'Press Continue on the run (it resumes the session), or turn Settings ▸ Automation ▸ Resume at boot on '
-        + 'and the console does it by itself next time.'
+      ? refusedBy === 'run'
+        ? 'Press Continue on the run (it resumes the session); the run\'s own answer stands for the next restart.'
+        : 'Press Continue on the run (it resumes the session), or turn Settings ▸ Automation ▸ Resume at boot on '
+          + 'and the console does it by itself next time.'
       : 'Open the phase (Why is this not done?), then Continue or Retry — or stop the run if it should not go on.',
     at,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * The one gate every automatic resume passes
+ * ------------------------------------------------------------------ */
+
+export type ResumeGate = 'proceed' | 'ask' | 'dismissed' | 'off' | 'capped';
+
+/**
+ * May the console resume this by itself, now?
+ *
+ * Six paths resume a phase with no person in the loop (`RESUME_PATHS`), and
+ * the shipped answer to "shall I carry on?" (`resumeAtBoot`) and its counter
+ * (`MAX_BOOT_RESUMES`) bounded exactly two of them: an armed wait, a lock-cap
+ * re-arm, a shutdown between lanes and a hand session's `partial` resumed with
+ * no ask and no count, and the armed wait fired 581 minutes late (LFC-7). One
+ * function now, so the paths cannot disagree again:
+ *
+ *  - a resume the console's own RESTART caused — a killed lane, a run a
+ *    shutdown stopped, a wait whose clock went by while nothing ran — answers
+ *    to the operator's standing word: `ask` with no decision registers the
+ *    question and launches nothing, a dismissal leaves it, `off` writes the
+ *    errand. A resume a live console makes on its own clock is the session's
+ *    own declaration and is not asked about — gating THAT behind the shipped
+ *    `ask` would stop every declared wait for a person.
+ *  - every path, restart or not, is COUNTED per phase: `count` is how often
+ *    this phase has already been resumed automatically, and at
+ *    `MAX_BOOT_RESUMES` it is a person's errand, whatever woke it.
+ */
+export function automaticResumeGate(input: {
+  prefs: { resumeAtBoot?: boolean | string };
+  decision: 'continue' | 'dismiss' | null | undefined;
+  restartCaused: boolean;
+  count: number;
+  /**
+   * The RUN's own answer (phase 11, ZTD-8): `resumeOnRestart` as the launch
+   * form answered it — `true` continues without a question, `false` writes the
+   * errand, and only a run carrying NEITHER (a run from before the field, or a
+   * harness that never said) falls through to the console's `resumeAtBoot`
+   * preference and its ask. A person's `continue` on the boot card still
+   * outranks a stored `false`: the card is answered per boot, on purpose.
+   */
+  run?: { resumeOnRestart?: boolean | null } | null;
+}): ResumeGate {
+  if (input.restartCaused) {
+    if (input.decision === 'dismiss') return 'dismissed';
+    const answered = input.run?.resumeOnRestart;
+    if (input.decision !== 'continue' && answered === false) return 'off';
+    if (input.decision !== 'continue' && typeof answered !== 'boolean') {
+      const mode = resumeAtBootMode(input.prefs.resumeAtBoot);
+      if (mode === 'ask') return 'ask';
+      if (mode === 'off') return 'off';
+    }
+  }
+  return input.count >= MAX_BOOT_RESUMES ? 'capped' : 'proceed';
+}
+
+/** Which word refused a restart resume: the run's own answer, or the console's preference. */
+export function resumeRefusedBy(run: { resumeOnRestart?: boolean | null } | null | undefined): 'run' | 'console' {
+  return run?.resumeOnRestart === false ? 'run' : 'console';
+}
+
+/** How often a phase has been resumed automatically — the counter the gate reads. */
+export function automaticResumes(run: RunState, phase: number): number {
+  return run.recoveries?.[String(phase)]?.bootResumes ?? 0;
+}
+
+/** The phases a run's wait clock resumes: its parks, else the lanes a wall checkpointed. */
+function waitingPhasesOf(run: RunState): PhaseRecord[] {
+  const records = Object.values(run.phases);
+  const parked = records.filter((r) => r.status === 'waiting');
+  return parked.length ? parked : records.filter((r) => r.status === 'pending' && r.resumeSessionId);
+}
+
+/**
+ * Why a run's wait clock may NOT resume it by itself, or null — the pins every
+ * reader of that clock honours with the same words: the boot's re-adoption, the
+ * loop, and the timer's own fire.
+ */
+export function waitHoldWhy(run: RunState): string | null {
+  // A usage wait honours `onLimit: 'pause'` — the operator chose to stay down;
+  // a park on external work always resumes, and so does a person's card (its
+  // clock is the card's expiry, and a usage policy has nothing to say about it).
+  if (waitReasonOf(run) === 'usage-limit' && (run.onLimit ?? 'wait') === 'pause') {
+    return 'the run is waiting on its own clock — its usage wall pauses for a person (onLimit: pause)';
+  }
+  if (stoppedByOperator(run)) return 'the operator stopped it — its own clock stays pinned until they continue it';
+  if (run.resolved) return 'the stop is resolved — its own clock stays pinned';
+  return null;
+}
+
+/** The phases a run's wait clock resumes — `waitingPhasesOf`, exported for the overdue ruling. */
+export function waitClockPhases(run: RunState): PhaseRecord[] {
+  return waitingPhasesOf(run);
+}
+
+export type WaitClockVerdict =
+  | { verdict: 'not-a-wait' }
+  /** The clock is ahead, or inside the grace: the armed timer owns the resume. */
+  | { verdict: 'arm'; why: string }
+  /** Pinned — an operator's stop, a resolved run, a wall that pauses for a person. */
+  | { verdict: 'hold'; why: string }
+  | { verdict: 'ask'; phases: number[]; sessions: string[]; why: string }
+  | { verdict: 'errand'; phase: number; errand: Errand; why: string }
+  /** Overdue past the grace and cleared to go: RULE on it (lateness, refs, budget), then resume. */
+  | { verdict: 'resume'; lateByMs: number; phases: number[]; why: string };
+
+/**
+ * What to do about a run sleeping on a wait clock — ONE predicate for the
+ * boot's re-adoption (`readoptQueued`) and the convergence loop, which used to
+ * differ on four of five clauses: the boot armed whatever clock was on disk,
+ * operator stop and resolution unread, and fired a past one on the next tick
+ * (SLF-5, SLF-6, SHD-6). Both paths now give the same answer with the same
+ * `why`, and an overdue clock is ruled on rather than fired.
+ */
+export function waitClockVerdict(
+  run: RunState,
+  facts: { now: number; prefs: { resumeAtBoot?: boolean | string }; decision?: 'continue' | 'dismiss' | null },
+): WaitClockVerdict {
+  // The clock is the run's, else the soonest waiting RECORD's (WAI-6): a loop
+  // killed between a phase's park and the run's `enterRunWaiting` left the run
+  // without one, and a reader that asked only the run saw no wait at all.
+  const until = waitClockOf(run);
+  if (!until || (run.status !== 'paused' && run.status !== 'waiting')) return { verdict: 'not-a-wait' };
+  const held = waitHoldWhy(run);
+  if (held) return { verdict: 'hold', why: held };
+  const due = Date.parse(until);
+  const lateByMs = Number.isFinite(due) ? facts.now - due : 0;
+  // While the clock is AHEAD the armed timer owns the resume; within a
+  // minute's grace past it, the timer's own fire still does.
+  if (!Number.isFinite(due) || lateByMs <= WAIT_OVERDUE_GRACE_MS) {
+    return { verdict: 'arm', why: 'the run is waiting on its own clock — the wait re-arms itself' };
+  }
+  const parks = waitingPhasesOf(run);
+  const phases = parks.map((r) => r.phase);
+  const count = Math.max(0, ...phases.map((phase) => automaticResumes(run, phase)));
+  const gate = automaticResumeGate({ prefs: facts.prefs, decision: facts.decision, restartCaused: true, count, run });
+  const first = parks[0];
+  const sessionOf = (record: PhaseRecord | undefined) => record?.resumeSessionId ?? record?.sessionId;
+  switch (gate) {
+    case 'ask':
+      return {
+        verdict: 'ask', phases,
+        sessions: parks.map((r) => sessionOf(r)).filter((s): s is string => Boolean(s)),
+        why: `its wait clock (${until}) went by while nothing ran, and nobody has said whether to continue it`,
+      };
+    case 'dismissed':
+      return { verdict: 'hold', why: 'the operator declined to pick this run up after the restart' };
+    case 'off':
+      return {
+        verdict: 'errand', phase: first?.phase ?? 0,
+        errand: resumeErrand(first?.phase ?? 0, new Date(facts.now).toISOString(), 'off', sessionOf(first), 'wait', resumeRefusedBy(run)),
+        why: resumeRefusedBy(run) === 'run'
+          ? 'the run was launched with resume-on-restart off'
+          : 'resume at boot is switched off on this console',
+      };
+    case 'capped': {
+      const worst = parks.find((r) => automaticResumes(run, r.phase) === count) ?? first;
+      return {
+        verdict: 'errand', phase: worst?.phase ?? 0,
+        errand: resumeErrand(worst?.phase ?? 0, new Date(facts.now).toISOString(), 'capped', sessionOf(worst), 'wait'),
+        why: `resumed ${count} times automatically`,
+      };
+    }
+    default:
+      return {
+        verdict: 'resume', lateByMs, phases,
+        why: `its wait clock (${until}) has passed and nothing resumed it — ${Math.round(lateByMs / 60_000)} min late`,
+      };
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -449,32 +665,49 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   if (run.status === 'finished') return skip(run.id, 'the run is finished');
   if (run.status === 'queued') return skip(run.id, 'the run is queued — admission owns it');
   if (IN_FLIGHT.includes(run.status)) return skip(run.id, `the run reads ${run.status} under another process — not ours to touch`);
-  if (run.waitUntil && (run.status === 'paused' || run.status === 'waiting')) {
-    // While the clock is AHEAD the armed timer owns the resume. Once it is
-    // PAST — with a minute's grace for the timer's own fire — a run still
-    // sleeping proves the timer is gone (a restart between arms, an arm
-    // consumed while the loop was draining), and the loop does what the
-    // operator's Recheck would. Run 258e1cc7 slept from 02:53Z to a hand at
-    // 06:52Z over exactly this. A usage wait honors `onLimit: 'pause'` (the
-    // operator chose to stay down); a park always resumes, as at boot
-    // (`readoptQueued` makes the same distinction). An operator's stop and a
-    // resolved run stay pinned here as everywhere.
-    const due = Date.parse(run.waitUntil);
-    const overdue = Number.isFinite(due) && facts.now - due > WAIT_OVERDUE_GRACE_MS;
-    const honored = waitReasonOf(run) === 'external' || (run.onLimit ?? 'wait') !== 'pause';
-    if (!overdue || !honored || stoppedByOperator(run) || run.resolved) {
-      return skip(run.id, 'the run is waiting on its own clock — the wait re-arms itself');
-    }
-    actions.push({
-      kind: 'relaunch', runId: run.id, reboard: [], rearm: [],
-      why: [`its wait clock (${run.waitUntil}) has passed and nothing resumed it`],
-    });
-    return plan;
+  // A run sleeping on a wait clock. While the clock is AHEAD the armed timer
+  // owns the resume; once it is PAST — with a minute's grace for the timer's
+  // own fire — a run still sleeping proves the timer is gone (a restart
+  // between arms, an arm consumed while the loop was draining; run 258e1cc7
+  // slept from 02:53Z to a hand at 06:52Z over exactly this). The same
+  // predicate as the boot's re-adoption, so the two can no longer disagree
+  // about an operator's stop (SLF-6), and an overdue clock is RULED ON — the
+  // relaunch carries `wait`, and the executor's vehicle journals the lateness,
+  // checks the refs and re-reads the budget before anything starts (SHD-6).
+  const clock = waitClockVerdict(run, { now: facts.now, prefs: facts.prefs, decision: facts.resumeDecision?.(run.id) });
+  switch (clock.verdict) {
+    case 'not-a-wait': break;
+    case 'arm':
+    case 'hold':
+      return skip(run.id, clock.why);
+    case 'ask':
+      actions.push({ kind: 'await-decision', runId: run.id, phases: clock.phases, sessions: clock.sessions, why: clock.why });
+      return plan;
+    case 'errand':
+      actions.push({ kind: 'errand', runId: run.id, phase: clock.phase, errand: clock.errand, why: clock.why });
+      return plan;
+    case 'resume':
+      actions.push({
+        kind: 'relaunch', runId: run.id, reboard: [], rearm: [], why: [clock.why],
+        wait: { until: run.waitUntil!, lateByMs: clock.lateByMs, phases: clock.phases },
+        ...(facts.resumeDecision?.(run.id) === 'continue' ? { decided: true as const } : {}),
+      });
+      return plan;
   }
 
   const pressed = facts.trigger === 'button';
   if (!pressed && run.resolved) return skip(run.id, `the stop is resolved (${run.resolved.auto ? 'the board settled it' : 'a person dismissed it'}) — pinned`);
   if (!pressed && stoppedByOperator(run)) return skip(run.id, 'the operator stopped it — pinned until they continue it');
+  // A halt only a person's press relaunches (RCV-3, RCV-1): the failure
+  // streak is the run's one "this plan is broken" bound, and relaunching it
+  // by clock was the very act that reset it (25 resets against 3 such halts);
+  // a refused credential opens again only when a person clears the account
+  // in the breaker, so a relaunch meets the same wall at the preflight. Both
+  // still reach the HEALER below — the phases' own situations are classified
+  // and their ladders climb, once per evidence — only the run-level relaunch
+  // branches are closed to everything but `button`.
+  const pressOnly = !pressed && run.status === 'halted'
+    && PRESS_ONLY_HALT_KINDS.includes(run.halt?.kind ?? '');
   if (!facts.board) return skip(run.id, 'the board could not be read — nothing is decided on an empty board');
   const board = facts.board;
 
@@ -560,15 +793,18 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   }
 
   const reboard: ReboardRequest[] = [];
+  const counted: { phase: number; path: ResumePath; sessionId?: string }[] = [];
   const why: string[] = [];
-  if (killed.length || orphan || (systemStop && remaining.length)) {
+  const decision = facts.resumeDecision?.(run.id) ?? null;
+  if ((!pressOnly && killed.length) || orphan || (!pressOnly && systemStop && remaining.length)) {
     // Three answers, and the middle one is the default. `ask` neither launches
     // nor writes an errand — an errand is a job for a person, and "shall I
     // carry on?" is a question. It is asked once per console boot, in the app,
-    // and the answer lives only as long as that boot: a restart is exactly the
-    // event the question is about, so a restart asks again.
-    const boot = resumeAtBootMode(facts.prefs.resumeAtBoot);
-    if (boot === 'ask' && !facts.resumeDecision?.(run.id)) {
+    // and a `continue` is spent by the launch it authorises: a restart is
+    // exactly the event the question is about, so the next restart asks again.
+    // The one gate (`automaticResumeGate`) answers it for every path.
+    const restartGate = automaticResumeGate({ prefs: facts.prefs, decision, restartCaused: true, count: 0, run });
+    if (restartGate === 'ask') {
       const phases = killed.length ? killed.map((r) => r.phase) : remaining;
       const sessions = killed
         .map((r) => r.resumeSessionId ?? r.sessionId)
@@ -589,31 +825,35 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     // notification whose text said the setting was "switched off" when it is
     // `ask`. `off` is a standing policy and keeps its errand; a dismissal is
     // one answer to one question on one boot.
-    if (facts.resumeDecision?.(run.id) === 'dismiss') {
+    if (restartGate === 'dismissed') {
       return skip(run.id, 'the operator declined to pick this run up after the restart');
     }
-    if (boot === 'off') {
+    if (restartGate === 'off') {
+      const refusedBy = resumeRefusedBy(run);
+      const offWhy = refusedBy === 'run'
+        ? 'the run was launched with resume-on-restart off'
+        : 'resume at boot is switched off on this console';
       if (killed.length) {
         for (const record of killed) {
           actions.push({
             kind: 'errand', runId: run.id, phase: record.phase,
-            errand: resumeErrand(record.phase, at, 'off', record.resumeSessionId ?? record.sessionId),
-            why: 'resume at boot is switched off on this console',
+            errand: resumeErrand(record.phase, at, 'off', record.resumeSessionId ?? record.sessionId, 'lane', refusedBy),
+            why: offWhy,
           });
         }
       } else {
         const phase = remaining[0] ?? 0;
         actions.push({
-          kind: 'errand', runId: run.id, phase: null, errand: resumeErrand(phase, at, 'off'),
-          why: 'resume at boot is switched off on this console',
+          kind: 'errand', runId: run.id, phase: null, errand: resumeErrand(phase, at, 'off', undefined, 'lane', refusedBy),
+          why: offWhy,
         });
       }
       return plan;
     }
     for (const record of killed) {
-      const count = run.recoveries?.[String(record.phase)]?.bootResumes ?? 0;
+      const count = automaticResumes(run, record.phase);
       const sessionId = record.resumeSessionId ?? record.sessionId;
-      if (count >= MAX_BOOT_RESUMES) {
+      if (automaticResumeGate({ prefs: facts.prefs, decision, restartCaused: false, count }) === 'capped') {
         actions.push({
           kind: 'errand', runId: run.id, phase: record.phase,
           errand: resumeErrand(record.phase, at, 'capped', sessionId),
@@ -631,12 +871,60 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     if (killed.length && !reboard.length && !rearm.length) return plan; // every killed lane is capped: the errands stand
     if (reboard.length) why.push(`${reboard.length === 1 ? 'a lane' : `${reboard.length} lanes`} a console restart killed resume${reboard.length === 1 ? 's' : ''}`);
     if (orphan) why.push('the session that outlived the earlier console has ended');
-    if (systemStop && remaining.length && !reboard.length && !orphan) why.push('the console shut down while this run was working');
+    if (systemStop && remaining.length && !reboard.length && !orphan) {
+      // A shutdown between lanes: no lane was cut off, but a phase the
+      // shutdown checkpointed still resumes its session when the run goes on.
+      // Each such resume is counted like a killed lane's (LFC-7) — it used to
+      // be the one restart resume with no count at all.
+      for (const record of Object.values(run.phases)) {
+        if (!remaining.includes(record.phase) || !record.resumeSessionId) continue;
+        const count = automaticResumes(run, record.phase);
+        if (automaticResumeGate({ prefs: facts.prefs, decision, restartCaused: false, count }) === 'capped') {
+          actions.push({
+            kind: 'errand', runId: run.id, phase: record.phase,
+            errand: resumeErrand(record.phase, at, 'capped', record.resumeSessionId),
+            why: `resumed ${count} times after console restarts`,
+          });
+          return plan;
+        }
+        counted.push({ phase: record.phase, path: 'system-stop', sessionId: record.resumeSessionId });
+      }
+      // True to the run's own record (RCV-11, phase 10). A `halt()`-stopped
+      // run never reaches here — `halted` is not `systemStop` — but a run the
+      // console's own checkpoint paused, or one `reconcileRun` found dead, may
+      // still carry a halt of its own from before the shutdown; the sentence
+      // says which of the two facts the relaunch answers.
+      const own = run.halt && run.halt.kind !== 'interrupted-by-restart' ? run.halt : null;
+      why.push(own
+        ? `the console shut down after this run stopped on its own (${own.kind ?? 'a halt'}: ${own.reason.slice(0, 80)}) — the stop is answered, the console is back`
+        : 'the console shut down while this run was working');
+    }
   }
-  if (rearm.length) why.push(`the lock phase ${rearm.join(', ')} waited out is gone`);
-  if (reboard.length || rearm.length || (systemStop && remaining.length) || orphan) {
+  if (rearm.length) {
+    // A lock-cap park whose lock is gone resumes the phase's checkpointed
+    // session with no restart involved — counted, never asked (LFC-7).
+    for (const phase of rearm) {
+      const count = automaticResumes(run, phase);
+      if (automaticResumeGate({ prefs: facts.prefs, decision: null, restartCaused: false, count }) === 'capped') {
+        actions.push({
+          kind: 'errand', runId: run.id, phase,
+          errand: resumeErrand(phase, at, 'capped', run.phases[String(phase)]?.resumeSessionId),
+          why: `resumed ${count} times automatically`,
+        });
+        return plan;
+      }
+      const sessionId = run.phases[String(phase)]?.resumeSessionId;
+      counted.push({ phase, path: 'rearm', ...(sessionId ? { sessionId } : {}) });
+    }
+    why.push(`the lock phase ${rearm.join(', ')} waited out is gone`);
+  }
+  if (!pressOnly && (reboard.length || rearm.length || (systemStop && remaining.length)) || orphan) {
     if (!remaining.length && !reboard.length && !rearm.length) return skip(run.id, 'nothing remains on the board for this run');
-    actions.push({ kind: 'relaunch', runId: run.id, reboard, rearm, why });
+    actions.push({
+      kind: 'relaunch', runId: run.id, reboard, rearm, why,
+      ...(counted.length ? { counted } : {}),
+      ...(decision === 'continue' ? { decided: true as const } : {}),
+    });
     return plan;
   }
 
@@ -655,7 +943,7 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
    * touched, and a run with nothing ready is left alone — relaunching that
    * would only re-park it, which is the oscillation this loop must not become. */
   if ((run.status === 'parked' || run.status === 'halted')
-    && !stoppedByOperator(run) && !run.resolved) {
+    && !stoppedByOperator(run) && !run.resolved && !pressOnly) {
     const readyNow = remaining.filter((p) => board[p] === 'ready');
     const boarded = new Set(Object.keys(run.phases).map(Number));
     if (readyNow.length && readyNow.some((p) => !boarded.has(p))) {
@@ -672,7 +960,11 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
    * phases, climb one rung, drive it through the runner. Once per evidence. */
   if (run.status === 'halted' || run.status === 'interrupted' || run.status === 'parked' || run.status === 'paused') {
     const fingerprint = evidenceFingerprint(run, board, facts.locks, facts.gateStamp, facts.qa);
-    if (!pressed && facts.lastNoop === fingerprint) {
+    // The latch is the scheduler's for this process, else the RUN's — persisted
+    // by the last heal that found nothing, so a restart does not heal the same
+    // evidence again (SLF-7).
+    const latch = facts.lastNoop ?? run.converge?.lastNoop ?? null;
+    if (!pressed && latch === fingerprint) {
       return skip(run.id, 'nothing has changed since the last pass found nothing to climb');
     }
     actions.push({ kind: 'heal', runId: run.id, fingerprint, why: `the run reads ${run.status}${run.halt ? ` — ${run.halt.reason.slice(0, 100)}` : ''}` });
@@ -718,6 +1010,15 @@ export type ConvergeDeps = {
    * Returns false when the question was already registered on this boot.
    */
   awaitDecision?: (slug: string, runId: string, phases: number[], sessions: string[]) => boolean;
+  /** Forget the operator's boot answer for a run — it was spent by the launch it authorised. */
+  consumeDecision?: (runId: string) => void;
+  /**
+   * The overdue-wait vehicle (`Service.resumeOverdueWait`): rule on a wait whose
+   * clock went by while nothing ran — lateness, refs, budget, the declaring
+   * session's presence — count the resume, and launch. Answers whether it
+   * launched. Absent (a hand-built dep set), a wait relaunch is a plain start.
+   */
+  resumeWait?: (slug: string, runId: string, trigger: ConvergeTrigger) => Promise<boolean>;
   pidAlive?: (pid: number) => boolean;
   /**
    * The four-valued probe. Separate from `pidAlive` because the answer that
@@ -727,10 +1028,15 @@ export type ConvergeDeps = {
   processState?: (pid: number) => ProcessState;
   /** The session registry's presence for a lock's session — see `ConvergeFacts.presence`. */
   presence?: (lock: LockView) => Presence;
-  /** Classify + ladder + drive for the plan's latest run. */
-  heal: (slug: string) => Promise<HealResult>;
+  /**
+   * Classify + ladder + drive for the plan's latest run. The pass's trigger
+   * and evidence fingerprint ride along (RCV-9): the healer signs every
+   * `phase.situation` and `phase.rung` with them, and writes no situation
+   * line for a phase whose situation the same fingerprint already produced.
+   */
+  heal: (slug: string, pass?: { trigger: ConvergeTrigger; fingerprint: string }) => Promise<HealResult>;
   startRun: (slug: string, options: {
-    resumeRunId: string; reboard?: ReboardRequest[]; onlyPhases?: number[]; skills?: string[];
+    actor: StartActor; resumeRunId: string; reboard?: ReboardRequest[]; onlyPhases?: number[]; skills?: string[];
   }) => Promise<unknown>;
   /** Edit a stored (not live) run and write it back. */
   editRun: (slug: string, runId: string, apply: (state: RunState) => void) => RunState | null;
@@ -852,22 +1158,44 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
 
       case 'relaunch': {
         const at = new Date(deps.now?.() ?? Date.now()).toISOString();
+        /** The highest per-phase resume count this launch reached — the counter `run.start` names. */
+        let counted = 0;
         const edited = deps.editRun(slug, action.runId, (state) => {
           for (const phase of action.rearm) {
             const record = state.phases[String(phase)];
             if (!record) continue;
             const was = record.note;
-            resetForRetry(record);
+            resetForRetry(record, {
+              by: 'console',
+              journal: (event, data, at) => deps.journal(slug, action.runId, event, data, at),
+            });
             deps.journal(slug, action.runId, 'phase.lock-cap-rearmed',
               { was, note: 'the lock it waited on is gone — the wait starts over', by: 'converge', trigger }, phase);
           }
-          for (const ask of action.reboard) {
-            const slot = ((state.recoveries ??= {})[String(ask.phase)] ??= { attempts: 0, lastAt: at });
+          // Every automatic resume this launch makes, counted against the one
+          // per-phase bound and journalled with what woke it and which path it
+          // took (LFC-7). A wait's resumes are counted by its own vehicle
+          // (`resumeWait`), which knows whether the ruling let it launch.
+          const resumes: { phase: number; path: ResumePath; sessionId: string | null; brief?: string }[] = [
+            ...action.reboard.map((ask) => ({ phase: ask.phase, path: 'killed-lane' as const, sessionId: ask.sessionId ?? null, brief: ask.brief })),
+            ...(action.counted ?? []).map((entry) => ({ phase: entry.phase, path: entry.path, sessionId: entry.sessionId ?? null })),
+            ...(action.wait && !deps.resumeWait
+              ? action.wait.phases.map((phase) => ({
+                phase, path: 'overdue-wait' as const,
+                sessionId: state.phases[String(phase)]?.resumeSessionId ?? state.phases[String(phase)]?.sessionId ?? null,
+              }))
+              : []),
+          ];
+          for (const resume of resumes) {
+            const slot = ((state.recoveries ??= {})[String(resume.phase)] ??= { attempts: 0, lastAt: at });
             slot.bootResumes = (slot.bootResumes ?? 0) + 1;
+            counted = Math.max(counted, slot.bootResumes);
             slot.lastAt = at;
             delete slot.errand;
-            deps.journal(slug, action.runId, 'phase.resume-at-boot',
-              { sessionId: ask.sessionId ?? null, brief: ask.brief, count: slot.bootResumes, trigger, by: 'converge' }, ask.phase);
+            deps.journal(slug, action.runId, 'phase.resume-automatic', {
+              trigger, path: resume.path, count: slot.bootResumes, sessionId: resume.sessionId,
+              ...(resume.brief ? { brief: resume.brief } : {}), by: 'converge',
+            }, resume.phase);
           }
           // The run-level errand was about the stop this launch ends.
           delete state.errand;
@@ -876,15 +1204,34 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
         deps.journal(slug, action.runId, 'run.converge', {
           trigger, action: 'relaunch', why: action.why,
           reboard: action.reboard.map((ask) => ask.phase), rearm: action.rearm, by: 'converge',
+          ...(action.wait ? { wait: action.wait } : {}),
         });
         try {
-          await deps.startRun(slug, {
-            resumeRunId: action.runId,
-            ...(action.reboard.length ? { reboard: action.reboard } : {}),
-            ...(edited.onlyPhases?.length ? { onlyPhases: edited.onlyPhases } : {}),
-            skills: edited.skills ?? [],
-          });
-          launched = true;
+          if (action.wait && deps.resumeWait) {
+            // An overdue wait is ruled on by its vehicle, not started bare:
+            // lateness journalled, refs checked, budget re-read — and it may
+            // decide not to launch at all.
+            if (await deps.resumeWait(slug, action.runId, trigger)) launched = true;
+          } else {
+            await deps.startRun(slug, {
+              // The loop's own word on the run it relaunches: which trigger
+              // woke it, what the planner saw, and the per-phase bound spent.
+              actor: doorActor('converge-relaunch', {
+                by: 'converge', via: viaOfTrigger(trigger), origin: `converge:${trigger}`,
+                trigger: action.why[0] ?? trigger,
+                guard: action.decided ? 'resumeDecision:continue' : 'automaticResumeGate',
+                counter: `MAX_BOOT_RESUMES:${counted}/${MAX_BOOT_RESUMES}`,
+              }),
+              resumeRunId: action.runId,
+              ...(action.reboard.length ? { reboard: action.reboard } : {}),
+              ...(edited.onlyPhases?.length ? { onlyPhases: edited.onlyPhases } : {}),
+              skills: edited.skills ?? [],
+            });
+            launched = true;
+          }
+          // The operator's `continue` answered THIS restart; spent, so the next
+          // one is asked again ("the decision survives only for its trigger").
+          if (action.decided) deps.consumeDecision?.(action.runId);
           outcomes.push({ action, ok: true });
         } catch (error) {
           const detail = (error as Error)?.message ?? String(error);
@@ -896,10 +1243,18 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
 
       case 'heal': {
         let result: HealResult;
-        try { result = await deps.heal(slug); } catch (error) {
+        try { result = await deps.heal(slug, { trigger, fingerprint: action.fingerprint }); } catch (error) {
           result = { launched: false, reason: (error as Error)?.message ?? String(error) };
         }
         if (result.launched) { launched = true; noop = null; } else noop = action.fingerprint;
+        // The latch rides the run, where its evidence already lives (SLF-7): a
+        // heal that found nothing writes the fingerprint it found nothing in;
+        // one that launched clears it.
+        try {
+          deps.editRun(slug, action.runId, (state) => {
+            state.converge = result.launched ? null : { lastNoop: action.fingerprint, at: new Date(deps.now?.() ?? Date.now()).toISOString() };
+          });
+        } catch { /* the in-memory latch still holds for this process */ }
         deps.journal(slug, action.runId, 'run.converge', {
           trigger, action: 'heal', why: action.why, launched: result.launched,
           ...(result.reason ? { reason: result.reason } : {}),
@@ -932,6 +1287,10 @@ export async function convergePlan(
     gateStamp: deps.gateStamp?.(slug) ?? null,
     qa: (deps.qa ? await deps.qa(slug) : null) ?? null,
     prefs: deps.prefs(),
+    // The operator's boot answer. This dep existed and was never forwarded, so
+    // answering "continue" re-registered the same question and launched
+    // nothing — an ask with no way to say yes.
+    ...(deps.resumeDecision ? { resumeDecision: deps.resumeDecision } : {}),
     ...(deps.pidAlive ? { pidAlive: deps.pidAlive } : {}),
     ...(deps.presence ? { presence: deps.presence } : {}),
     lastNoop,

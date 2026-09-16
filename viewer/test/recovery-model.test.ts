@@ -24,6 +24,7 @@ import {
 } from '../shared/recovery-model.js';
 import { RECOVERY_CLASSES as SERVER_CLASSES, RECOVERY_TITLES as SERVER_TITLES } from '../server/recovery.ts';
 import { autoRecoveryClass } from '../server/service.ts';
+import { haltKindLiterals } from './halt-kind-scan.ts';
 
 /* ------------------------------------------------------------------ *
  * Parity by identity
@@ -54,7 +55,11 @@ test('the client re-exports the SAME model objects', async () => {
 
 test('every halt kind has a profile, and no profile is for an unknown kind', () => {
   assert.deepEqual(Object.keys(KIND_PROFILE).sort(), [...HALT_KINDS].sort());
-  for (const kind of HALT_KINDS) {
+  // Over every kind a WRITER names as well as the list (`test/halt-kind-scan.ts`):
+  // a word written under `server/` and missing here is exactly the escape
+  // `plan-deadlocked` made — profiled nowhere, so `classifyRun` answered
+  // `undefined` for a park the loop had diagnosed precisely (LFC-1).
+  for (const kind of new Set([...HALT_KINDS, ...haltKindLiterals().keys()])) {
     const profile = KIND_PROFILE[kind];
     assert.equal(typeof profile.sessionShaped, 'boolean', kind);
     if (profile.humanClass) assert.ok(RECOVERY_CLASSES.includes(profile.humanClass), kind);

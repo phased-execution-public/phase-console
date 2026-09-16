@@ -28,7 +28,7 @@ import { useNow } from '@/lib/clock';
 import { elapsed, plural } from '@/lib/format';
 import type { ForeignSession, QueueSnapshot } from '@/lib/api';
 import { NoBands, SwimlaneBand } from './swimlane';
-import { idleReason, type NowLane } from './model';
+import { endedLabel, idleReason, type NowLane } from './model';
 import { swimlanes, waitersByLane } from './ops-model';
 
 /** How many lines of a lane's stream this page keeps. A glance, not a log. */
@@ -185,7 +185,7 @@ function OtherSessions({ sessions }: { sessions: ForeignSession[] }) {
                   dot={session.presence === 'live'}
                 >
                   {session.kind}
-                  {session.presence === 'ended' ? ' · ended' : ''}
+                  {endedLabel(session) ? ` · ${endedLabel(session)}` : ''}
                 </Badge>
                 {session.user && (
                   <span className="font-mono">
@@ -200,7 +200,9 @@ function OtherSessions({ sessions }: { sessions: ForeignSession[] }) {
               {session.presence === 'live'
                 ? elapsed(now - Date.parse(session.startedAt))
                 : session.endedAt
-                  ? `ended ${elapsed(now - Date.parse(session.endedAt))} ago`
+                  ? session.endedBy === 'probe'
+                    ? `last seen ${elapsed(now - Date.parse(session.endedAt))} ago`
+                    : `ended ${elapsed(now - Date.parse(session.endedAt))} ago`
                   : null}
             </span>
           </li>

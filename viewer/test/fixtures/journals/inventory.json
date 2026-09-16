@@ -1,0 +1,200 @@
+{
+  "builtFrom": "runs/<instance> of the hub console",
+  "plans": [
+    "ai-builder-v3",
+    "ci-cd-hardening",
+    "customer-app-ios-release",
+    "mql-build-lane-hardening",
+    "mql-lane-followups",
+    "scroll-world-focus-cut"
+  ],
+  "pseudonyms": 113,
+  "files": [
+    {
+      "slug": "ai-builder-v3",
+      "file": "ai-builder-v3/run-4cc22182.json",
+      "bytes": 56620,
+      "status": "finished",
+      "halt": null,
+      "phases": 4
+    },
+    {
+      "slug": "ai-builder-v3",
+      "file": "ai-builder-v3/run-4cc22182.jsonl",
+      "bytes": 118365,
+      "lines": 357,
+      "distinctEvents": 52,
+      "sessions": 3,
+      "sessionCostUsd": 104.5901,
+      "liveWalls": 1,
+      "usageWindows": 89,
+      "waits": 3
+    },
+    {
+      "slug": "ai-builder-v3",
+      "file": "ai-builder-v3/run-6784b222.json",
+      "bytes": 99126,
+      "status": "paused",
+      "halt": null,
+      "phases": 6
+    },
+    {
+      "slug": "ai-builder-v3",
+      "file": "ai-builder-v3/run-6784b222.jsonl",
+      "bytes": 150480,
+      "lines": 485,
+      "distinctEvents": 47,
+      "sessions": 6,
+      "sessionCostUsd": 99.6103,
+      "liveWalls": 7,
+      "usageWindows": 61,
+      "waits": 0
+    },
+    {
+      "slug": "ci-cd-hardening",
+      "file": "ci-cd-hardening/run-ea11c10d.json",
+      "bytes": 198670,
+      "status": "parked",
+      "halt": {
+        "kind": null,
+        "reason": "nothing left to run on its own — phase 19 is gated (gate not"
+      },
+      "phases": 19
+    },
+    {
+      "slug": "ci-cd-hardening",
+      "file": "ci-cd-hardening/run-ea11c10d.jsonl",
+      "bytes": 898698,
+      "lines": 2947,
+      "distinctEvents": 67,
+      "sessions": 20,
+      "sessionCostUsd": 270.692,
+      "liveWalls": 11,
+      "usageWindows": 428,
+      "waits": 0
+    },
+    {
+      "slug": "customer-app-ios-release",
+      "file": "customer-app-ios-release/run-31285928.json",
+      "bytes": 89709,
+      "status": "parked",
+      "halt": {
+        "kind": null,
+        "reason": "nothing left to run on its own — phase 4 needs you — Ship-ga"
+      },
+      "phases": 5
+    },
+    {
+      "slug": "customer-app-ios-release",
+      "file": "customer-app-ios-release/run-31285928.jsonl",
+      "bytes": 174859,
+      "lines": 595,
+      "distinctEvents": 48,
+      "sessions": 4,
+      "sessionCostUsd": 385.5616,
+      "liveWalls": 0,
+      "usageWindows": 106,
+      "waits": 1
+    },
+    {
+      "slug": "customer-app-ios-release",
+      "file": "customer-app-ios-release/run-977825da.json",
+      "bytes": 18905,
+      "status": "paused",
+      "halt": null,
+      "phases": 3
+    },
+    {
+      "slug": "customer-app-ios-release",
+      "file": "customer-app-ios-release/run-977825da.jsonl",
+      "bytes": 28605,
+      "lines": 103,
+      "distinctEvents": 32,
+      "sessions": 2,
+      "sessionCostUsd": 29.0193,
+      "liveWalls": 0,
+      "usageWindows": 0,
+      "waits": 1
+    },
+    {
+      "slug": "mql-build-lane-hardening",
+      "file": "mql-build-lane-hardening/run-ce8311fa.json",
+      "bytes": 142598,
+      "status": "paused",
+      "halt": null,
+      "phases": 1
+    },
+    {
+      "slug": "mql-build-lane-hardening",
+      "file": "mql-build-lane-hardening/run-ce8311fa.jsonl",
+      "bytes": 142318,
+      "lines": 169,
+      "distinctEvents": 19,
+      "sessions": 1,
+      "sessionCostUsd": 0,
+      "liveWalls": 0,
+      "usageWindows": 2,
+      "waits": 0
+    },
+    {
+      "slug": "mql-build-lane-hardening",
+      "file": "mql-build-lane-hardening/run-e42cee9d.json",
+      "bytes": 349416,
+      "status": "finished",
+      "halt": null,
+      "phases": 20
+    },
+    {
+      "slug": "mql-build-lane-hardening",
+      "file": "mql-build-lane-hardening/run-e42cee9d.jsonl",
+      "bytes": 879545,
+      "lines": 2546,
+      "distinctEvents": 71,
+      "sessions": 17,
+      "sessionCostUsd": 389.6681,
+      "liveWalls": 1,
+      "usageWindows": 342,
+      "waits": 1
+    },
+    {
+      "slug": "mql-lane-followups",
+      "file": "mql-lane-followups/run-a968152f.json",
+      "bytes": 32489,
+      "status": "paused",
+      "halt": null,
+      "phases": 2
+    },
+    {
+      "slug": "mql-lane-followups",
+      "file": "mql-lane-followups/run-a968152f.jsonl",
+      "bytes": 40711,
+      "lines": 74,
+      "distinctEvents": 21,
+      "sessions": 0,
+      "sessionCostUsd": 19.9634,
+      "liveWalls": 0,
+      "usageWindows": 9,
+      "waits": 2
+    },
+    {
+      "slug": "scroll-world-focus-cut",
+      "file": "scroll-world-focus-cut/run-e535b570.json",
+      "bytes": 46156,
+      "status": "paused",
+      "halt": null,
+      "phases": 2
+    },
+    {
+      "slug": "scroll-world-focus-cut",
+      "file": "scroll-world-focus-cut/run-e535b570.jsonl",
+      "bytes": 113315,
+      "lines": 280,
+      "distinctEvents": 41,
+      "sessions": 5,
+      "sessionCostUsd": 32.2551,
+      "liveWalls": 0,
+      "usageWindows": 25,
+      "waits": 0
+    }
+  ]
+}

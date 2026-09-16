@@ -16,8 +16,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  liveBuckets, UsagePoller, parseBuckets, USAGE_STALE_MS,
-  type AccountUsage, type TokenAnswer,
+  liveBuckets, UsagePoller, parseBuckets, parseUsageBody, USAGE_ACTIVE_MS, USAGE_IDLE_MS, USAGE_STALE_MS,
+  type AccountUsage, type TokenAnswer, type UsageMeta,
 } from '../server/accounts/usage.ts';
 import type { Exec } from '../server/accounts/credentials.ts';
 
@@ -48,7 +48,7 @@ function fakeFetch(...answers: Answer[]) {
 function poller(opts: {
   fetchFn: typeof fetch;
   resolveToken?: (id: string) => Promise<TokenAnswer>;
-  onUpdate?: (id: string, usage: AccountUsage) => void;
+  onUpdate?: (id: string, usage: AccountUsage, meta: UsageMeta) => void;
   isActive?: (id: string) => boolean;
 }): UsagePoller {
   return new UsagePoller({
@@ -133,7 +133,83 @@ test('a failure keeps the last-known buckets and stamps the reason beside them',
   const stale = p.snapshot('a');
   assert.equal(stale?.buckets.five_hour.utilization, 42.5, 'yesterday beats blank');
   assert.equal(stale?.fetchedAt, good.fetchedAt, 'the age is honest — only a success moves it');
+  assert.ok(stale?.lastErrorAt, 'and the failure has a clock of its own');
   assert.match(stale?.error ?? '', /500/);
+});
+
+test('ACT-4: a poller whose every fetch fails yields NO fetchedAt and an advancing lastErrorAt; one success sets it; a later failure leaves it frozen', async () => {
+  // The measured defect: `account` presented "meters read 04:07" for fourteen
+  // hours of refusals, because the failure branch minted a `fetchedAt` from the
+  // FIRST failure's clock and carried it on every later one — so "never
+  // readable" and "read hours ago" were one fact, and the ranking scored a
+  // credential whose poller was failing as merely never-polled.
+  const { fetchFn } = fakeFetch({ status: 500 }, { status: 500 }, OK, { status: 503 });
+  const metas: UsageMeta[] = [];
+  const p = poller({ fetchFn, onUpdate: (_id, _usage, meta) => { metas.push(meta); } });
+  p.track('a');
+  p.kick('a');
+  await sleep(50);
+  const first = p.snapshot('a');
+  assert.equal(first?.fetchedAt, undefined, 'no read has succeeded, so there is no reading time');
+  assert.ok(first?.lastErrorAt, 'the failure is timed');
+  assert.deepEqual(liveBuckets(first, Date.now()), {}, 'and nothing here is evidence');
+  await sleep(5);
+  p.kick('a');
+  await sleep(50);
+  const second = p.snapshot('a');
+  assert.equal(second?.fetchedAt, undefined);
+  assert.ok(Date.parse(second!.lastErrorAt!) > Date.parse(first!.lastErrorAt!), 'lastErrorAt advances on every failure');
+
+  p.kick('a');
+  await sleep(50);
+  const good = p.snapshot('a');
+  assert.ok(good?.fetchedAt, 'one success sets it');
+  assert.equal(good?.error, undefined);
+  assert.equal(good?.lastErrorAt, second?.lastErrorAt, 'the last failure stays on the record beside a fresh success');
+
+  await sleep(5);
+  p.kick('a');
+  await sleep(50);
+  p.stop();
+  const after = p.snapshot('a');
+  assert.equal(after?.fetchedAt, good?.fetchedAt, 'a later failure leaves fetchedAt frozen at the last SUCCESS');
+  assert.ok(Date.parse(after!.lastErrorAt!) > Date.parse(good!.lastErrorAt!));
+  assert.deepEqual(metas.map((m) => m.outcome), ['error', 'error', 'ok', 'error'], 'the facade is told which it was');
+});
+
+test('the body\'s organisation reaches the facade as meta, never as a bucket or a view field', async () => {
+  const body = {
+    ...OK.body,
+    organization: { uuid: 'org-0000-1111', name: 'Someone Org' },
+  };
+  const { fetchFn } = fakeFetch({ status: 200, body });
+  const metas: UsageMeta[] = [];
+  const p = poller({ fetchFn, onUpdate: (_id, _usage, meta) => { metas.push(meta); } });
+  p.track('a');
+  p.kick('a');
+  await sleep(50);
+  p.stop();
+  assert.deepEqual(Object.keys(p.snapshot('a')!.buckets).sort(), ['five_hour', 'seven_day'], 'an object without a utilization is not a meter');
+  assert.deepEqual(metas, [{ orgId: 'org-0000-1111', outcome: 'ok' }]);
+  assert.equal(JSON.stringify(p.snapshot('a')).includes('org-0000'), false, 'the snapshot carries no orgId');
+  // Every spelling an evolving endpoint might use, one reader.
+  assert.equal(parseUsageBody({ org_id: 'x1' }).orgId, 'x1');
+  assert.equal(parseUsageBody({ organization_uuid: 'x2' }).orgId, 'x2');
+  assert.equal(parseUsageBody({ organization: { id: 'x3' } }).orgId, 'x3');
+  assert.equal(parseUsageBody({ five_hour: { utilization: 1, resets_at: 'z' } }).orgId, undefined);
+});
+
+test('ACT-3: the active probe moves the cadence — ~90 s for an account a run is spending, ten minutes otherwise', async () => {
+  const { fetchFn } = fakeFetch(OK);
+  const live = new Set<string>();
+  const p = poller({ fetchFn, isActive: (id) => live.has(id) });
+  p.track('a');
+  p.kick('a');
+  await sleep(50);
+  assert.equal(p.cadenceFor('a'), USAGE_IDLE_MS, 'nobody is spending it');
+  live.add('a');
+  assert.equal(p.cadenceFor('a'), USAGE_ACTIVE_MS, 'a live session makes it the account whose meters move');
+  p.stop();
 });
 
 test('429 backs off and says so', async () => {

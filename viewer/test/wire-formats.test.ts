@@ -38,6 +38,7 @@
  *   scripts/gate-approve.sh           → server/engine.ts           readGateStatus
  *   scripts/phase-tasks.sh            → server/runner/tasks.ts     readTaskEvents
  *   scripts/phase-graph.sh            → server/engine.ts           readMemoryBlock
+ *   scripts/phase-graph.sh --decisions → server/engine.ts          readDecisions
  *   PE_MCP_SERVERS (env, both ways)   → server/engine.ts           scriptEnv
  *
  * Needs bash, a writable tmpdir and no client build.
@@ -558,6 +559,62 @@ test('phase-graph.sh --memory-block writes what readMemoryBlock reads', () => {
   // ready" and "the engine could not answer" must not look alike.
   const failed = readMemoryBlock(asResult('', { code: 2, stderr: 'ERROR: no such plan' }));
   assert.equal(failed.error, 'no such plan');
+});
+
+/* ------------------------------------------------------------------ *
+ * 6b. phase-graph.sh --decisions → readDecisions (zero-touch-console P3)
+ * ------------------------------------------------------------------ */
+
+test('phase-graph.sh --decisions writes what readDecisions reads — plan rows, and the twin over them', async () => {
+  const { readDecisions } = await import('../server/engine.ts');
+  const root = library();
+  const planPath = join(root, 'docs', 'plans', `${SLUG}.md`);
+  writeFileSync(planPath, readFileSync(planPath, 'utf8').replace('## Phase graph', [
+    '## Decisions', '',
+    '| key | value | owner | state | blocking | source | evidence |',
+    '|---|---|---|---|---|---|---|',
+    '| `credentials` | `gh` | operator | answered | yes | plan | E7 |',
+    '| `waits` | | dev-lead | outstanding | yes | plan | |',
+    '', '## Phase graph',
+  ].join('\n')));
+
+  const raw = sh('phase-graph.sh', [SLUG, '--decisions'], { DOCS_ROOT: root });
+  const read = readDecisions(asResult(raw));
+  assert.equal(read.error, undefined);
+  assert.deepEqual(read.rows.map((r) => [r.key, r.state, r.owner, r.blocking, r.source, r.value]), [
+    ['credentials', 'answered', 'operator', 'yes', 'plan', '`gh`'],
+    ['waits', 'outstanding', 'dev-lead', 'yes', 'plan', ''],
+  ]);
+
+  // The twin, in the shape decisions.sh writes: its plan-wide row replaces the
+  // plan's WHOLE row (source included), its phase row shows only for that phase.
+  writeFileSync(join(root, 'docs', 'handoffs', SLUG, 'decisions.md'), [
+    '## Decisions', '',
+    '| key | value | owner | state | blocking | source | evidence | phase |',
+    '|---|---|---|---|---|---|---|---|',
+    '| `waits` | `gh:acme/x#run/1` · 45m | dev-lead | answered | yes | run | decisions.sh | — |',
+    '| `waits` | no wait at all in phase 3 | dev-lead | waived | no | run | decisions.sh | 3 |',
+    '',
+  ].join('\n'));
+  const merged = readDecisions(asResult(sh('phase-graph.sh', [SLUG, '--decisions'], { DOCS_ROOT: root })));
+  assert.deepEqual(merged.rows.find((r) => r.key === 'waits'), {
+    key: 'waits', state: 'answered', owner: 'dev-lead', blocking: 'yes', source: 'run',
+    value: '`gh:acme/x#run/1` · 45m', evidence: '', phase: null,
+  });
+  const p3 = readDecisions(asResult(sh('phase-graph.sh', [SLUG, '--decisions', '3'], { DOCS_ROOT: root })), 3);
+  assert.deepEqual([p3.rows.find((r) => r.key === 'waits')?.state, p3.rows.find((r) => r.key === 'waits')?.phase], ['waived', 3]);
+
+  // One byte on a tab and the row shifts a column: `state` reads the owner.
+  // The reader does not guess — the parity test is what keeps the columns in
+  // the order both engines agree on; this proves the wire is positional.
+  const shifted = readDecisions(asResult(mutate(raw, 'credentials\tanswered', 'credentials answered')));
+  assert.notEqual(shifted.rows[0].state, 'answered');
+
+  // A non-zero exit is an ERROR, never an empty manifest — "nothing
+  // outstanding" and "the engine could not answer" must not look alike.
+  const failed = readDecisions(asResult('', { code: 2, stderr: 'ERROR: no such plan' }));
+  assert.equal(failed.error, 'no such plan');
+  assert.deepEqual(failed.rows, []);
 });
 
 /* ------------------------------------------------------------------ *

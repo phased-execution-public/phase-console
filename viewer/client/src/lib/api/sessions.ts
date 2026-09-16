@@ -7,7 +7,7 @@ import { request, post, q } from './client';
 import type { PhaseTask } from './runs';
 import type { RecoveryClass } from '../recovery';
 import type { QaProfile } from '../qa';
-import type { Presence } from '@shared/run-lifecycle.js';
+import type { Presence, PresenceEndSource } from '@shared/run-lifecycle.js';
 
 /* ---------------- the terminal ---------------- */
 
@@ -116,10 +116,22 @@ export interface ForeignSession {
   pid?: number;
   startedAt: string;
   lastSeen: string;
+  /** For a reported end the moment it gave; for an inferred one (`endedBy: 'probe'`) the last evidence of life. */
   endedAt?: string;
+  /** Who said it ended (REG-9) — the session's SessionEnd, or the probe finding its process gone. */
+  endedBy?: PresenceEndSource;
+  /** When the probe noticed an inferred end. */
+  endedDetectedAt?: string;
   reason?: string;
   source?: string;
   turns: number;
+  /**
+   * Where `turns` came from (REG-9): the run's stream (the Stop hook is
+   * displaced by the run's settings), the hook, or `unknown` — a record that
+   * moved many times and never saw a Stop, whose 0 is not a count. Absent from
+   * a server before 5.0.0.
+   */
+  turnsSource?: 'stream' | 'hook' | 'unknown';
   presence: Presence;
   /**
    * The plan and phase this session works. `strong` when a lock's `session=`

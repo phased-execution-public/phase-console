@@ -38,7 +38,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
 import { INSTANCE_STATE_DIR } from './config.ts';
@@ -118,6 +118,8 @@ export type Webhook = {
   lastFailure?: { at: string; status: number; reason: string | null };
   /** Epoch ms before which nothing is attempted. Backoff, not a setting. */
   quietUntil?: number;
+  /** A row read from the machine profile (`fleet.json`) — delivered to, never persisted or removed here. */
+  profile?: true;
 };
 
 /** A row as the API serves it: everything except the URL, which is a secret. */
@@ -341,15 +343,39 @@ export type WebhooksOptions = {
   /** Injected by tests; the real one is `globalThis.fetch`. */
   fetch?: WebhookFetch;
   now?: () => number;
+  /** The machine profile's rows (`fleet.json` `webhooks[]`), this console's override first. */
+  profileHooks?: readonly { url: string; name?: string; categories?: readonly string[] }[];
 };
 
 export class Webhooks {
   private hooks: Webhook[] = [];
   private readonly options: WebhooksOptions;
+  /** Fired after a row is added or removed — the delivery-channel check re-reads the count. */
+  onRowsChanged?: () => void;
 
   constructor(options: WebhooksOptions) {
     this.options = options;
     this.hooks = read();
+    // The machine profile's rows (`fleet.json` `webhooks[]`, FLT-3): every
+    // console delivers to them, none persists or removes them — they are the
+    // file's, changed where the file is. A URL this console registered itself
+    // keeps its own row.
+    for (const row of options.profileHooks ?? []) {
+      if (webhookUrlRefusal(row.url) || this.hooks.some((hook) => hook.url === row.url)) continue;
+      const categories = Array.isArray(row.categories)
+        ? Object.fromEntries(row.categories.map((id) => [id, true]))
+        : undefined;
+      this.hooks.push({
+        id: `profile-${createHash('sha256').update(row.url).digest('hex').slice(0, 8)}`,
+        label: row.name?.trim().slice(0, 60) || `${maskUrl(row.url).origin.replace(/^https:\/\//, '')} (machine profile)`,
+        url: row.url,
+        categories: categories ? sanitiseCategories(categories) : defaultCategories(),
+        createdAt: '',
+        lastOkAt: null,
+        failures: 0,
+        profile: true,
+      });
+    }
   }
 
   /** Whether this console may make an outbound request at all. */
@@ -401,15 +427,25 @@ export class Webhooks {
     };
     this.hooks.push(hook);
     this.persist();
+    this.rowsChanged();
     return this.publicOf(hook);
   }
 
   remove(id: unknown): boolean {
     const before = this.hooks.length;
-    this.hooks = this.hooks.filter((hook) => hook.id !== id);
+    // A machine-profile row is the file's: removing it here would come back on
+    // the next boot, so it is refused rather than pretended.
+    this.hooks = this.hooks.filter((hook) => hook.id !== id || hook.profile);
     if (this.hooks.length === before) return false;
     this.persist();
+    this.rowsChanged();
     return true;
+  }
+
+  private rowsChanged(): void {
+    try {
+      this.onRowsChanged?.();
+    } catch { /* a health re-check must never affect the register */ }
   }
 
   setCategories(id: unknown, categories: unknown): PublicWebhook | null {
@@ -428,19 +464,22 @@ export class Webhooks {
    * the flag is the first of them — a console started without `--allow-webhooks`
    * makes no outbound request even with rows on disk.
    */
-  announce(category: CategoryId, event: WebhookEvent): void {
-    if (!this.enabled) return;
+  announce(category: CategoryId, event: WebhookEvent): Promise<void> | null {
+    if (!this.enabled) return null;
     const now = this.options.now?.() ?? Date.now();
     const targets = this.hooks.filter((hook) => hook.categories[category]
       && !(hook.quietUntil && hook.quietUntil > now));
-    if (!targets.length) return;
+    if (!targets.length) return null;
 
     const payload = composeWebhookPayload(category, event, {
       instance: this.options.instance,
       link: this.options.link,
       at: new Date(now),
     });
-    for (const hook of targets) void this.post(hook, payload);
+    // Fire-and-forget for every caller but the shutdown announcement, which
+    // awaits the settled posts before its process exits (SHD-4). Null above
+    // means nothing was sent at all.
+    return Promise.allSettled(targets.map((hook) => this.post(hook, payload))).then(() => undefined);
   }
 
   /** The Settings button: prove one URL, on demand, whatever its categories say. */
@@ -517,7 +556,7 @@ export class Webhooks {
     try {
       mkdirSync(INSTANCE_STATE_DIR, { recursive: true, mode: 0o700 });
       // Each URL is a bearer credential for somebody's chat channel.
-      writeFileSync(FILE, `${JSON.stringify(this.hooks, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      writeFileSync(FILE, `${JSON.stringify(this.hooks.filter((hook) => !hook.profile), null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     } catch (error) {
       log.warn('webhook.persist-failed', { error });
     }

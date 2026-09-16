@@ -54,6 +54,7 @@ import {
   useMcp,
   useSkills,
   useVerifyPreflight,
+  usePrelude,
 } from '@/lib/queries';
 import { startSession } from '@/lib/start-session';
 import { cn } from '@/lib/cn';
@@ -79,9 +80,10 @@ import {
   type RunSetupContext,
   type RunSetupMode,
 } from './modes';
-import { runSetupSchema, type RunSetupField, type RunSetupValues } from './schema';
+import { formatAccounts, runSetupSchema, type RunSetupField, type RunSetupValues } from './schema';
 import { FlatForm, accountWho } from './sections';
-import { BASELINE, seedFor } from './seed';
+import { BASELINE, seedFor, type Origins } from './seed';
+import { Decisions, preludeDraft } from './decisions';
 import { HowItRuns } from './how-it-runs';
 import { MoneyAndStops } from './money-and-stops';
 import { LaunchReview, LaunchTicket, NoAllowRun } from './review';
@@ -153,8 +155,8 @@ export function RunSetup({
   pushBroken,
   allowWrites,
   skillsEnabled = true,
-  blocked = false,
-  blockedReason,
+  blocked: blockedProp = false,
+  blockedReason: blockedReasonProp,
   onDone,
   onLaunch,
   children,
@@ -209,7 +211,7 @@ export function RunSetup({
   const rawPrefsKey = JSON.stringify(rawPrefs);
   const contextKey = JSON.stringify(context);
   const skillsKey = defaultSkills.join(',');
-  const [seed, origins] = useMemo(
+  const [seedBase, originsBase] = useMemo(
     () => seedFor(mode, { run, prefs, rawPrefs, qaMode, context, defaultSkills, memory }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [mode, run, prefsKey, rawPrefsKey, qaMode, contextKey, skillsKey, memory],
@@ -219,13 +221,52 @@ export function RunSetup({
   // answering, and keeps re-deriving as `/api/state` and the run arrive.
   const [touched, setTouched] = useState<Partial<RunSetupValues>>({});
   const [busy, setBusy] = useState(false);
+
+  // The prelude for THIS draft (phase 11): asked whenever the mode asks the
+  // Decisions stage's questions, and it gates the submit — a blocking row
+  // still open disables Launch and names itself in the footer, unless the
+  // operator has signed an override. The stage asks the same key; two hooks,
+  // one request. Asked over the BASE seed and the operator's edits, so the
+  // account list it resolves can seed the form below without the draft
+  // changing under it.
+  const asksDecisions = shows(mode, 'resumeOnRestart') || shows(mode, 'relay') || shows(mode, 'accounts');
+  const { data: prelude } = usePrelude(
+    context.slug,
+    preludeDraft({ ...seedBase, ...touched }),
+    asksDecisions,
+  );
+  // The account list a fresh start opens on is the prelude's resolved clause
+  // — the plan's `**Accounts:**` line, else the machine login — SEEDED rather
+  // than typed, so the review reads it as the plan's word (or the default),
+  // never as a change the operator made here. A run answers for itself.
+  const [seed, origins] = useMemo<[RunSetupValues, Origins]>(() => {
+    // A run with a stored list keeps it; one without (from before the field,
+    // or a finished run a phase launch starts afresh) takes the prelude's.
+    if (!prelude?.accounts.length || seedBase.accounts) return [seedBase, originsBase];
+    const row = prelude.rows.find((r) => r.key === 'accounts');
+    return [
+      { ...seedBase, accounts: formatAccounts(prelude.accounts) },
+      { ...originsBase, accounts: row?.origin === 'plan' ? 'plan' : 'defaults' },
+    ];
+  }, [prelude, seedBase, originsBase]);
   const values: RunSetupValues = { ...seed, ...touched };
   const parsed = runSetupSchema.safeParse(values);
   const errors = fieldErrors(parsed);
+  const openDecision =
+    asksDecisions && !values.manifestOverride.trim() ? (prelude?.blocking[0] ?? null) : null;
+  const decisionsBlocked = Boolean(openDecision);
+  const decisionsReason = openDecision
+    ? `Decision outstanding: ${openDecision.key} — ${openDecision.why}`
+    : undefined;
+  const blocked = blockedProp || decisionsBlocked;
+  const blockedReason = blockedProp ? blockedReasonProp : decisionsReason;
 
-  // The stage — the overlay's, and the review's "Change" links'.
-  const [stage, setStage] = useState<StageId>('what');
-  const [visited, setVisited] = useState<ReadonlySet<StageId>>(() => new Set<StageId>(['what']));
+  // The stage — the overlay's, and the review's "Change" links'. A launch that
+  // asks the Decisions stage's questions opens ON it (phase 11): the point of
+  // the prelude is that these are answered first.
+  const first: StageId = asksDecisions && isStaged(mode, Boolean(overlay)) ? 'decisions' : 'what';
+  const [stage, setStage] = useState<StageId>(first);
+  const [visited, setVisited] = useState<ReadonlySet<StageId>>(() => new Set<StageId>([first]));
   const goStage = (next: StageId) => {
     setStage(next);
     setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
@@ -472,7 +513,9 @@ export function RunSetup({
               {STAGES.map((s) => (
                 <TabsContent key={s.id} forceMount hidden={stage !== s.id} value={s.id} className="pt-0">
                   <StageIntro id={s.id} />
-                  {s.id === 'what' ? (
+                  {s.id === 'decisions' ? (
+                    <Decisions />
+                  ) : s.id === 'what' ? (
                     <WhatRuns />
                   ) : s.id === 'how' ? (
                     <HowItRuns />

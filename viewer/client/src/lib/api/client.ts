@@ -12,6 +12,8 @@
  * `api` from `@/lib/api` and never call these directly.
  */
 
+import { consolePath } from '../base';
+
 /** Every request carries this; non-GETs additionally need a same-origin Origin,
  *  which the dev proxy rewrites (see vite.config.ts). */
 const CSRF = { 'x-phase-console': '1' } as const;
@@ -37,7 +39,7 @@ export class ApiError extends Error {
 }
 
 export async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(consolePath(path), {
     ...options,
     headers: { ...CSRF, ...(options.headers ?? {}) },
   });

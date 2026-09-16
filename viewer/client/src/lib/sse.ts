@@ -16,6 +16,7 @@
  */
 
 import { useSyncExternalStore } from 'react';
+import { consolePath } from './base';
 
 /**
  * Every event name the server emits, as it appears on the wire.
@@ -141,7 +142,7 @@ function fanOut(name: SseEvent, data: unknown): void {
 /** Open the shared stream. Idempotent; safe to call from any subscriber. */
 export function connect(): void {
   if (source || typeof EventSource === 'undefined') return;
-  const stream = new EventSource('/events');
+  const stream = new EventSource(consolePath('/events'));
   source = stream;
 
   stream.onopen = () => setStatus('live');

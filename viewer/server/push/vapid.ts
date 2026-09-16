@@ -39,8 +39,10 @@ export type Vapid = {
 };
 
 /**
- * Per instance, deliberately: each console mints its own VAPID pair on the
- * first subscribe, and a browser's subscription is bound to the key that
+ * Per instance, deliberately — and a directory a caller may name, which is how
+ * a supervisor keeps a pair of its own beside its own register: each console
+ * mints its own VAPID pair on the first subscribe, and a browser's subscription
+ * is bound to the key that
  * created it. Sharing one pair across instances would let any console deliver
  * to any other's devices — and the default instance keeping the legacy path is
  * what stops an upgrade from invalidating the subscriptions an operator's
@@ -63,37 +65,38 @@ export function vapidSubject(remoteUsers: string[]): string {
 /** Why there is no key, when there is none — one sentence, plus the errand. */
 export type VapidRefusal = { error: string; fix: string };
 
-export function loadVapid(subject: string): Vapid | VapidRefusal {
-  let found = read();
+export function loadVapid(subject: string, dir: string = PUSH_DIR): Vapid | VapidRefusal {
+  const keyFile = join(dir, 'vapid.json');
+  let found = read(keyFile);
   // One retry, and only for the transient half: EMFILE under fd pressure and
   // EIO are moments, and a moment must not cost an operator their
   // notifications for the life of the process.
-  if (found.kind === 'unreadable') found = read();
+  if (found.kind === 'unreadable') found = read(keyFile);
 
   if (found.kind === 'unreadable') {
     // Deliberately no write, and deliberately no move-aside either: minting
     // over this file is the accident the header warns about, and moving it
     // aside to mint beside it is the same accident with a receipt. Push stays
     // off until a person decides.
-    log.error('push.vapid.unreadable', { file: KEY_FILE, why: found.why });
+    log.error('push.vapid.unreadable', { file: keyFile, why: found.why });
     return {
       error: `the VAPID key file could not be read (${found.why}) — push is off`,
       // Deliberately NO "move it aside": we could not read the file, which is
       // not the same as knowing it is broken. It is probably intact, and moving
       // an intact key is exactly what unsubscribes every device.
       fix: 'The key file was left untouched. Restart the console; if it keeps failing, check for '
-        + `file-descriptor or disk trouble and inspect ${KEY_FILE} — do NOT delete or move it `
+        + `file-descriptor or disk trouble and inspect ${keyFile} — do NOT delete or move it `
         + 'unless it is genuinely corrupt, because a new key unsubscribes every device.',
     };
   }
 
   if (found.kind === 'damaged') {
     // Here we DID read it and the content is wrong, so naming the repair is fair.
-    log.error('push.vapid.damaged', { file: KEY_FILE, why: found.why });
+    log.error('push.vapid.damaged', { file: keyFile, why: found.why });
     return {
       error: `the VAPID key file is damaged (${found.why}) — push is off`,
       fix: 'Push stays off rather than mint a new key, which would silently unsubscribe every '
-        + `device. Inspect ${KEY_FILE}; if it cannot be repaired, move it aside and re-subscribe `
+        + `device. Inspect ${keyFile}; if it cannot be repaired, move it aside and re-subscribe `
         + 'each device in Settings → Notifications.',
     };
   }
@@ -108,10 +111,10 @@ export function loadVapid(subject: string): Vapid | VapidRefusal {
     } catch (error) {
       // A shaped file whose JWK the crypto layer refuses. This used to throw
       // out of the Push constructor and take the whole Service down with it.
-      log.error('push.vapid.unusable', { file: KEY_FILE, error: (error as Error).message });
+      log.error('push.vapid.unusable', { file: keyFile, error: (error as Error).message });
       return {
         error: `the stored VAPID private key is not usable (${(error as Error).message}) — push is off`,
-        fix: `Inspect ${KEY_FILE}; if it cannot be repaired, move it aside and re-subscribe each `
+        fix: `Inspect ${keyFile}; if it cannot be repaired, move it aside and re-subscribe each `
           + 'device in Settings → Notifications.',
       };
     }
@@ -123,13 +126,13 @@ export function loadVapid(subject: string): Vapid | VapidRefusal {
     privateKeyJwk: privateKey.export({ format: 'jwk' }) as Record<string, string>,
   };
   try {
-    write(created);
+    write(created, dir);
   } catch (error) {
     // EEXIST is the race, not a failure: something minted a key between our
     // read and our write. Ours was never published — read theirs and use it.
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-      log.warn('push.vapid.raced', { file: KEY_FILE });
-      const again = read();
+      log.warn('push.vapid.raced', { file: keyFile });
+      const again = read(keyFile);
       if (again.kind === 'ok') {
         try {
           return {
@@ -141,18 +144,18 @@ export function loadVapid(subject: string): Vapid | VapidRefusal {
       }
       return {
         error: 'another writer created the VAPID key file while this console was minting one — push is off',
-        fix: `Restart the console. If it persists, inspect ${KEY_FILE}.`,
+        fix: `Restart the console. If it persists, inspect ${keyFile}.`,
       };
     }
     // A key that cannot be persisted is worse than none: it changes every boot,
     // and each boot unsubscribes whatever the last one subscribed.
-    log.error('push.vapid.write-failed', { file: KEY_FILE, error: (error as Error).message });
+    log.error('push.vapid.write-failed', { file: keyFile, error: (error as Error).message });
     return {
       error: `the VAPID key could not be written (${(error as Error).message}) — push is off`,
-      fix: `Make ${PUSH_DIR} writable by this console and restart it.`,
+      fix: `Make ${dir} writable by this console and restart it.`,
     };
   }
-  log.info('push.vapid.created', { file: KEY_FILE });
+  log.info('push.vapid.created', { file: keyFile });
   return { publicKey: created.publicKey, privateKey, subject };
 }
 
@@ -238,10 +241,10 @@ type ReadResult =
    */
   | { kind: 'unreadable'; why: string };
 
-function read(): ReadResult {
+function read(keyFile: string = KEY_FILE): ReadResult {
   let text: string;
   try {
-    text = readFileSync(KEY_FILE, 'utf8');
+    text = readFileSync(keyFile, 'utf8');
   } catch (error) {
     // ENOENT is the only failure that means "first run". EACCES, EISDIR, EMFILE
     // and friends all mean "there is something there I could not read", and
@@ -274,15 +277,16 @@ function read(): ReadResult {
  * renaming the old key out of the way and minting beside it is the same
  * rotation with a receipt.
  */
-function write(value: Stored): void {
-  mkdirSync(PUSH_DIR, { recursive: true, mode: 0o700 });
-  const tmp = `${KEY_FILE}.${process.pid}.tmp`;
+function write(value: Stored, dir: string = PUSH_DIR): void {
+  const keyFile = join(dir, 'vapid.json');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${keyFile}.${process.pid}.tmp`;
   // A private key, so nobody else's mode bits. `mode` applies on create only,
   // and a crashed predecessor could have left this path behind, so chmod too.
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   chmodSync(tmp, 0o600);
   try {
-    linkSync(tmp, KEY_FILE);
+    linkSync(tmp, keyFile);
   } finally {
     try { unlinkSync(tmp); } catch { /* the link is what matters */ }
   }

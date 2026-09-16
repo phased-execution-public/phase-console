@@ -72,6 +72,47 @@ test('a line written by phase-outcome.sh reads back whole, with a content-derive
   });
 });
 
+test('the id bash stamps is the id the console derives, and the stamped one is what is believed', () => {
+  const file = ledger();
+  const run = (what: string, at: string, extra: string[] = []) => execFileSync('/bin/bash', [
+    join(SCRIPTS, 'phase-outcome.sh'), 'demo', '5', 'ruling', '--what', what, ...extra,
+  ], { env: { ...process.env, PE_RULINGS_FILE: file, PE_NOW: at } });
+
+  // ASCII: the two digests agree byte for byte (the bats suite pins the bytes;
+  // this pins the JOIN — `decisions.sh promote --from-ruling <id>` is given
+  // the console's id and greps the line for it).
+  run('kept the old field', '2026-08-10T21:10:03Z');
+  const raw = readFileSync(file, 'utf8');
+  const stamped = /"id":"([0-9a-f]{12})"/.exec(raw)?.[1];
+  assert.equal(stamped, rulingId('demo', 5, '2026-08-10T21:10:03Z', 'kept the old field'));
+  assert.equal(readRulings(file)[0].id, stamped);
+
+  // A stamped id wins over the derivation — a multi-byte `what` cut at 500 by
+  // bash (characters) and here (UTF-16 units) would otherwise be two ids, and
+  // the writer's id is the one every ack and every promote was given.
+  writeFileSync(file, line({ ...RULING, id: 'abcdef012345', what: 'écrit à la main' }));
+  assert.equal(readRulings(file)[0].id, 'abcdef012345');
+  // …but only a well-formed one: a line carrying junk in `id` falls back.
+  writeFileSync(file, line({ ...RULING, id: 'r-17', what: 'hand-written fixture' }));
+  assert.equal(readRulings(file)[0].id, rulingId('demo', 5, RULING.at, 'hand-written fixture'));
+});
+
+test('a decision key rides along when it is one of the manifest keys, and is dropped when it is not', () => {
+  const file = ledger();
+  execFileSync('/bin/bash', [
+    join(SCRIPTS, 'phase-outcome.sh'), 'demo', '5', 'ruling', '--what', 'the window is the cap', '--needs', 'waits',
+  ], { env: { ...process.env, PE_RULINGS_FILE: file, PE_NOW: '2026-08-10T21:10:03Z' } });
+  assert.equal(readRulings(file)[0].decisionKey, 'waits');
+
+  // The script refuses a key outside the vocabulary; a line written by some
+  // other hand carrying one is read without it rather than trusted.
+  assert.throws(() => execFileSync('/bin/bash', [
+    join(SCRIPTS, 'phase-outcome.sh'), 'demo', '5', 'ruling', '--what', 'x', '--needs', 'lock',
+  ], { env: { ...process.env, PE_RULINGS_FILE: file }, stdio: 'pipe' }));
+  writeFileSync(file, line({ ...RULING, decisionKey: 'not-a-key' }));
+  assert.equal(readRulings(file)[0].decisionKey, undefined);
+});
+
 test('a ledger that does not exist is an empty ledger, not an error', () => {
   assert.deepEqual(readRulings(join(tmpdir(), 'pc-rulings-nope', 'rulings.ndjson')), []);
 });
@@ -148,6 +189,19 @@ test('an ack naming nothing in the ledger is ignored rather than invented', () =
   const rulings = readRulings(file);
   assert.equal(rulings.length, 1);
   assert.equal(rulings[0].ack, undefined);
+});
+
+test('an ack with nobody behind it is refused, not written', () => {
+  // 184 acks on disk, 0 with a name (chapter 10 §4): "seen by somebody" is
+  // not a record. The route derives the actor; a script names itself.
+  const file = ledger();
+  appendFileSync(file, line({ ...RULING, what: 'first' }));
+  const [ruling] = readRulings(file);
+  const bytes = readFileSync(file, 'utf8');
+  assert.equal(appendAck(file, ruling.id, ''), false);
+  assert.equal(appendAck(file, ruling.id, '   '), false);
+  assert.equal(readFileSync(file, 'utf8'), bytes, 'nothing appended');
+  assert.equal(readRulings(file)[0].ack, undefined);
 });
 
 test('a ledger that cannot be written refuses quietly rather than throwing', () => {

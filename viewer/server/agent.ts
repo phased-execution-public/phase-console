@@ -50,9 +50,16 @@ import {
 } from './issues/prompt.ts';
 import type { LaunchSpec, SessionMeta } from './terminal.ts';
 import { inboxTasksFile } from './runner/tasks.ts';
+import { MANIFEST_ORDER, MANIFEST_QUESTIONS, PLAN_FIELDS, manifestDefault } from './plan-fields.ts';
 
-/** A prompt bigger than this is a file, not a message. */
-export const MAX_AGENT_PROMPT_BYTES = 16 * 1024;
+/**
+ * A prompt bigger than this is a file, not a message. 32 KB since phase 12:
+ * the plan wizard's prompt carries the manifest and the plan's fields as
+ * numbered questions plus a digest of the repository's ledgers, and 16 KB was
+ * jointly unsatisfiable with an 8 KB brief and twenty issues. The prompt is
+ * one argv slot — macOS allows a megabyte, Linux 128 KB per argument.
+ */
+export const MAX_AGENT_PROMPT_BYTES = 32 * 1024;
 
 /** The plan wizard's brief — roomy, but the composed prompt must still fit. */
 export const MAX_BRIEF_BYTES = 8 * 1024;
@@ -181,6 +188,25 @@ export type AgentContext = {
    * Absent (or a null env) means the machine login.
    */
   account?: { id: string; env: Record<string, string> | null };
+  /**
+   * What this repository's ledgers say, for `intent: 'plan'` — composed by the
+   * service (`Service.planFacts`), which can read every plan's manifest, its
+   * twin and its rulings; the browser names nothing here. Absent when no root
+   * is open, and the prompt says so rather than pretending to have read.
+   */
+  plan?: PlanFacts;
+};
+
+/** The repository's ledgers, digested for the plan wizard's opening. */
+export type PlanFacts = {
+  /** Open plans whose manifests and ledgers were read. */
+  plans: number;
+  /** Decision keys some open plan still has `outstanding`, with the plans. */
+  outstanding: readonly { key: string; plans: readonly string[] }[];
+  /** The newest rulings that named a decision key, newest first. */
+  rulings: readonly { slug: string; phase: number; key: string; what: string; at: string }[];
+  /** Manifest rows that came from a promoted ruling (source `ruling`). */
+  promoted: number;
 };
 
 /**
@@ -193,7 +219,7 @@ export type AgentContext = {
  *                   the `[1m]` window suffix; optional (absent = CLI default)
  *   effort          ∈ EFFORTS, optional
  *   permissionMode  ∈ PERMISSION_MODES, optional
- *   prompt          ≤ 16 KB, may not begin with `-`, exclusive with intent
+ *   prompt          ≤ MAX_AGENT_PROMPT_BYTES, may not begin with `-`, exclusive with intent
  *   skills          extra skill ids appended as a directive line
  *   resume          a claude session uuid → `--resume`, started in the
  *                   conversation's OWN directory when the registry knows it
@@ -281,7 +307,7 @@ export function buildAgentLaunch(
 
   const prompt = str(body.prompt)?.trim();
   if (prompt && Buffer.byteLength(prompt) > MAX_AGENT_PROMPT_BYTES) {
-    return bad('the prompt is too long (16 KB max).');
+    return bad(`the prompt is too long (${MAX_AGENT_PROMPT_BYTES / 1024} KB max).`);
   }
   if (prompt && prompt.startsWith('-')) {
     return bad("a prompt may not begin with '-' — the CLI would read it as a flag.");
@@ -331,7 +357,7 @@ export function buildAgentLaunch(
     // failing. An operator can always send a long brief OR many issues.
     let section = '';
     if (refs.length) {
-      const base = Buffer.byteLength(planPrompt(brief, planSkill, ctx.scriptsDir));
+      const base = Buffer.byteLength(planPrompt(brief, planSkill, ctx.scriptsDir, '', ctx.plan));
       // The margin covers what is appended AFTER this — the skill directive and
       // the `ultracode` line — plus the section's own head and discipline block.
       const room = MAX_AGENT_PROMPT_BYTES - base - ISSUES_FIXED_BYTES - ISSUES_MARGIN_BYTES;
@@ -340,7 +366,7 @@ export function buildAgentLaunch(
       }
       section = issuesSection(ctx.issues?.issues ?? [], room);
     }
-    text = planPrompt(brief, planSkill, ctx.scriptsDir, section);
+    text = planPrompt(brief, planSkill, ctx.scriptsDir, section, ctx.plan);
     named = brief;
   } else if (recoveryIntent) {
     if (prompt) return bad('a recovery session composes its own prompt.');
@@ -406,7 +432,7 @@ export function buildAgentLaunch(
   if (ultracode) text = text ? `${text}\n${ultracode.trim()}` : ultracode.trim();
 
   if (text && Buffer.byteLength(text) > MAX_AGENT_PROMPT_BYTES) {
-    return bad('the composed prompt is too long (16 KB max).');
+    return bad(`the composed prompt is too long (${MAX_AGENT_PROMPT_BYTES / 1024} KB max).`);
   }
 
   const claudeSessionId = resume ?? randomUUID();
@@ -533,7 +559,18 @@ export function phasedExecutionSkillId(skills: SkillInfo[]): string {
  * it was told as the most specific. It is plain text in a prompt; nothing in
  * this console renders it as markup.
  */
-export function planPrompt(brief: string, skillId: string, scriptsDir: string, issues = ''): string {
+export function planPrompt(
+  brief: string, skillId: string, scriptsDir: string, issues = '', facts?: PlanFacts,
+): string {
+  // The questions, numbered Q1… so a session (and the test) can count them:
+  // the manifest's keys first, the plan's own machine-read fields after — the
+  // shape `INSTALL_PROMPT` uses for the capability flags, one at a time, the
+  // recommended default named first.
+  const manifest = MANIFEST_ORDER.map((key, i) => {
+    const fallback = manifestDefault(key);
+    return `   Q${i + 1}. \`${key}\` — ${MANIFEST_QUESTIONS[key]}${fallback ? ` (default ${fallback})` : ''}`;
+  });
+  const fields = PLAN_FIELDS.map((f, i) => `   Q${MANIFEST_ORDER.length + i + 1}. ${f.field} — ${f.question} → ${f.home}`);
   return [
     `Invoke the ${skillId} skill (/${skillId}) and use its Mode 1 — plan — for the brief below.`,
     "You are in the repository this plan is for; the skill's helper scripts live at:",
@@ -542,35 +579,88 @@ export function planPrompt(brief: string, skillId: string, scriptsDir: string, i
     'This session starts in PLAN MODE: first explore and PRESENT the plan for approval —',
     'write nothing until the operator approves and plan mode exits.',
     '',
+    ...ledgerDigest(facts, scriptsDir),
+    '',
     'Before approval — read and decide, change nothing on disk:',
     '',
     '1. Pick the session budget for the model that will EXECUTE the phases (the skill\'s',
     '   references/sizing.md) and author the FEWEST phases that fit it.',
-    '2. Work out the plan in the shape references/plan-format.md requires, and present it:',
+    '2. Ask the decision manifest ONE QUESTION AT A TIME — each numbered question below on',
+    '   its own, the recommended default first, and wait for the answer before the next',
+    '   (AskUserQuestion). Every answer becomes a row of the plan\'s "## Decisions" table; a',
+    '   decision the operator leaves open stays outstanding WITH AN OWNER, and one they rule',
+    '   out is waived with the reason as its value:',
+    ...manifest,
+    '3. Then the plan\'s own machine-read fields, the same way — each is a line',
+    '   phase-graph.sh reads back, so an unasked one is a default nobody chose:',
+    ...fields,
+    '4. Work out the plan in the shape references/plan-format.md requires, and present it:',
     '   the "## Phase graph" table is machine-read, so every phase lists every dependency,',
     '   plus Size tags (S/M/L), exit criteria, and the blocking-vs-simultaneous callout —',
     '   and a runnable **Verification:** per phase (whole backticked commands or a fenced',
     '   block; the autopilot parks any phase whose verification nothing can execute).',
-    '   Present that table, the session budget, and anything the brief left open.',
+    '   Present that table, the session budget, and the "## Decisions" table with EVERY',
+    '   row answered, waived or owned — the manifest is shown filled in BEFORE anything is',
+    '   written, so the operator approves the answers and the phases together.',
     '',
     'After the operator approves the plan:',
     '',
-    `3. Scaffold the file first: bash ${scriptsDir}/new-plan.sh <slug> — then fill the`,
-    '   template in at docs/plans/<slug>.md.',
-    `4. Sanity-check: bash ${scriptsDir}/phase-graph.sh <slug> (every phase listed, the`,
-    `   roots ready, suggested batches printed) and bash ${scriptsDir}/validate.sh <slug>.`,
-    '5. Commit docs/plans/<slug>.md with a message naming the plan.',
-    '6. Then STOP and summarise the plan — do not begin implementing phases; they run from',
+    `5. Scaffold the file first: bash ${scriptsDir}/new-plan.sh <slug> — then fill the`,
+    '   template in at docs/plans/<slug>.md, the manifest rows included.',
+    `6. Sanity-check: bash ${scriptsDir}/phase-graph.sh <slug> (every phase listed, the`,
+    `   roots ready, suggested batches printed), bash ${scriptsDir}/phase-graph.sh <slug> --decisions`,
+    `   (every row as it holds) and bash ${scriptsDir}/validate.sh <slug>.`,
+    '7. Commit docs/plans/<slug>.md with a message naming the plan.',
+    '8. Then STOP and summarise the plan — do not begin implementing phases; they run from',
     '   the console (or from later sessions) once the operator has read the plan.',
     '',
-    'If the brief leaves a real decision open, ask before authoring — the operator is',
-    'watching this terminal and will answer here.',
+    'A question the numbered list does not cover is still asked before authoring — the',
+    'operator is watching this terminal and will answer here.',
     '',
     'The brief:',
     '',
     brief,
     ...(issues ? ['', issues] : []),
   ].join('\n');
+}
+
+/** How much of the ledger digest a prompt may carry — bounded, so it never crowds the brief. */
+const DIGEST_OUTSTANDING_MAX = 8;
+const DIGEST_RULINGS_MAX = 6;
+const DIGEST_WHAT_MAX = 100;
+
+/**
+ * The opening: what this repository's ledgers already say. The last plans'
+ * surprises — a key nobody answered, a ruling a session had to make — are
+ * exactly the questions the next manifest should answer up front, which is
+ * the feedback loop chapter 10 ZTD-7 found missing. Relative paths only: the
+ * prompt must stay neutral (no absolute path outside the scripts dir).
+ */
+function ledgerDigest(facts: PlanFacts | undefined, scriptsDir: string): string[] {
+  const lines = ['Open by reading this repository\'s ledgers — the last plans\' surprises are the next plan\'s questions.'];
+  if (!facts) {
+    lines.push('(No source root is open on this console, so nothing could be read for you: read',
+      ' docs/plans/*.md "## Decisions" and docs/handoffs/<slug>/decisions.md yourself.)');
+    return lines;
+  }
+  lines.push(`Read for you: ${facts.plans} open plan${facts.plans === 1 ? '' : 's'}, ${facts.promoted} answer${facts.promoted === 1 ? '' : 's'} promoted from rulings.`);
+  if (facts.outstanding.length) {
+    const shown = facts.outstanding.slice(0, DIGEST_OUTSTANDING_MAX)
+      .map((o) => `\`${o.key}\` (${o.plans.length} plan${o.plans.length === 1 ? '' : 's'}: ${o.plans.slice(0, 3).join(', ')}${o.plans.length > 3 ? ', …' : ''})`);
+    const more = facts.outstanding.length - shown.length;
+    lines.push(`Still outstanding somewhere: ${shown.join(' · ')}${more > 0 ? ` · and ${more} more` : ''} — ask these first.`);
+  } else {
+    lines.push('No open plan leaves a decision outstanding.');
+  }
+  if (facts.rulings.length) {
+    lines.push('Recent rulings that named a key (a decision a session had to make on the way — the next manifest answers it up front):');
+    for (const r of facts.rulings.slice(0, DIGEST_RULINGS_MAX)) {
+      const what = r.what.length > DIGEST_WHAT_MAX ? `${r.what.slice(0, DIGEST_WHAT_MAX - 1)}…` : r.what;
+      lines.push(`   - ${r.slug} phase ${r.phase} · \`${r.key}\`: ${what}`);
+    }
+  }
+  lines.push(`Read more with bash ${scriptsDir}/phase-graph.sh <slug> --decisions, and in docs/handoffs/<slug>/decisions.md.`);
+  return lines;
 }
 
 /* ------------------------------------------------------------------ *

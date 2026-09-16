@@ -22,17 +22,37 @@
  */
 
 import { realExec, type Exec } from './credentials.ts';
+import { WALL_PCT } from '../../shared/ops-vocab.js';
+
+/**
+ * A utilization in PERCENT, 0–100 — the unit every meter in this file carries
+ * and the unit the console decides in (`WARN_PCT` · `ALERT_PCT` · `WALL_PCT`).
+ * The CLI's own `rate_limit_event` speaks in a 0–1 FRACTION; that value is
+ * normalised at its boundary (`spawn.ts` → `utilizationPct`) and never
+ * compared against these numbers raw (ACT-7). The alias exists so a reader can
+ * tell which unit a field is in from its type rather than from a comment.
+ */
+export type Percent = number;
 
 export type UsageBucket = {
   /** Percent, 0–100 — NOT the 0–1 fraction the CLI's rate_limit_event uses. */
-  utilization: number;
+  utilization: Percent;
   /** ISO 8601, straight from the endpoint. */
   resetsAt: string;
 };
 
 export type AccountUsage = {
   buckets: Record<string, UsageBucket>;
-  fetchedAt: string;
+  /**
+   * ISO — when the buckets were last read SUCCESSFULLY. Absent when no read
+   * has ever succeeded: "never readable" and "read hours ago" are different
+   * facts, and the error path used to stamp the first failure's clock here and
+   * carry it for ever, so a credential the endpoint had refused for fourteen
+   * hours presented as meters read at 04:07 (ACT-4).
+   */
+  fetchedAt?: string;
+  /** ISO — the last read that FAILED. Advances on every failure; the failure's own clock. */
+  lastErrorAt?: string;
   /**
    * The endpoint refused this credential in a way retrying will not fix
    * (a setup-token the usage API does not serve). Distinct from `error`,
@@ -40,6 +60,17 @@ export type AccountUsage = {
    */
   unsupported?: boolean;
   error?: string;
+};
+
+/**
+ * What the poller tells the facade beside the redacted snapshot: facts about
+ * the CREDENTIAL that belong in the machine-wide learned store and never in a
+ * view — the organisation the endpoint says the credential belongs to, when
+ * the body carries one.
+ */
+export type UsageMeta = {
+  orgId?: string;
+  outcome: 'ok' | 'error' | 'unsupported' | 'no-credentials';
 };
 
 /** What the facade hands the poller when asked for a way in. */
@@ -50,7 +81,7 @@ export type TokenAnswer =
 
 export type UsagePollerOptions = {
   resolveToken: (accountId: string) => Promise<TokenAnswer>;
-  onUpdate?: (accountId: string, usage: AccountUsage) => void;
+  onUpdate?: (accountId: string, usage: AccountUsage, meta: UsageMeta) => void;
   /** Does this account have a live session right now? Drives cadence. */
   isActive?: (accountId: string) => boolean;
   fetchFn?: typeof fetch;
@@ -74,15 +105,19 @@ const ERROR_CAP_MS = 30 * 60_000;
  * disqualified an account for as long as the poll kept failing, which — at
  * `ERROR_CAP_MS` — could be for ever. That inverts the rule this file opens
  * with: the poller is telemetry, never the detector. The detector is the
- * runner's own limit classifier, and what it learns is written to
- * `AccountMeta.limitedUntil`, which carries its own expiry.
+ * runner's own limit classifier, and what it learns is written to the
+ * machine-wide learned store's walls (`learned.ts`), which carry their own expiry.
  *
  * Set to the error backoff cap: a meter older than the longest gap the poller
  * itself will ever leave is one no successful poll is behind.
  */
 export const USAGE_STALE_MS = ERROR_CAP_MS;
-/** A meter at or past this reads as exhausted — no point asking often. */
-const EXHAUSTED_PCT = 99;
+/** A meter at or past this reads as exhausted — no point asking often. The wall's own number. */
+const EXHAUSTED_PCT = WALL_PCT;
+
+/** The adaptive cadence, exported so the runner's test can assert the number it wires. */
+export const USAGE_ACTIVE_MS = ACTIVE_MS;
+export const USAGE_IDLE_MS = IDLE_MS;
 
 export class UsagePoller {
   private readonly opts: Required<Pick<UsagePollerOptions, 'resolveToken'>> & UsagePollerOptions;
@@ -188,14 +223,14 @@ export class UsagePoller {
       if (!answer) {
         // Nothing to ask with — not signed in yet, profile mid-login. Quietly
         // idle-cadence; the facade kicks when that changes.
-        this.remember(accountId, { error: 'no credentials to ask with' });
+        this.remember(accountId, { error: 'no credentials to ask with', outcome: 'no-credentials' });
       } else if ('error' in answer) {
         this.remember(accountId, { error: answer.error });
       } else {
         const outcome = await this.fetchUsage(answer.token);
         if (outcome.kind === 'ok') {
           this.failures.delete(accountId);
-          this.remember(accountId, { buckets: outcome.buckets });
+          this.remember(accountId, { buckets: outcome.buckets, ...(outcome.orgId ? { orgId: outcome.orgId } : {}) });
           nextMs = this.cadence(accountId);
         } else if (outcome.kind === 'refused') {
           if (answer.tokenKind === 'setup-token') {
@@ -221,11 +256,17 @@ export class UsagePoller {
     if (!this.stopped && this.timers.has(accountId)) this.schedule(accountId, nextMs);
   }
 
+
   /** Drop the timer but keep the cache — `unsupported` is an answer, not a gap. */
   private untrackTimerOnly(accountId: string): void {
     const timer = this.timers.get(accountId);
     if (timer) clearTimeout(timer);
     this.timers.delete(accountId);
+  }
+
+  /** The cadence the poller would use for this account now — for the facade's test seam. */
+  cadenceFor(accountId: string): number {
+    return this.cadence(accountId);
   }
 
   private cadence(accountId: string): number {
@@ -245,18 +286,31 @@ export class UsagePoller {
 
   /**
    * A failure keeps the old buckets and stamps the reason beside them; only a
-   * success moves `fetchedAt`. Stale-and-said-so beats blank.
+   * success moves `fetchedAt`, and a failure moves `lastErrorAt` instead.
+   * Stale-and-said-so beats blank.
+   *
+   * The `?? now` that used to sit on the failure branch's `fetchedAt` is gone:
+   * it minted a reading time for a read that never happened, once, and then
+   * carried it on every later failure (ACT-4 — `account` showed "meters read
+   * 04:07" for fourteen hours of refusals). A snapshot with no successful read
+   * behind it now has no `fetchedAt` at all, and `liveBuckets`, `rankAccounts`
+   * and the panels each say so in their own way.
    */
   private remember(
     accountId: string,
-    result: { buckets?: Record<string, UsageBucket>; error?: string; unsupported?: boolean },
+    result: {
+      buckets?: Record<string, UsageBucket>; error?: string; unsupported?: boolean;
+      orgId?: string; outcome?: UsageMeta['outcome'];
+    },
   ): void {
     const previous = this.cache.get(accountId);
+    const now = new Date(this.now()).toISOString();
     const usage: AccountUsage = result.buckets
-      ? { buckets: result.buckets, fetchedAt: new Date(this.now()).toISOString() }
+      ? { buckets: result.buckets, fetchedAt: now, ...(previous?.lastErrorAt ? { lastErrorAt: previous.lastErrorAt } : {}) }
       : {
           buckets: previous?.buckets ?? {},
-          fetchedAt: previous?.fetchedAt ?? new Date(this.now()).toISOString(),
+          ...(previous?.fetchedAt ? { fetchedAt: previous.fetchedAt } : {}),
+          lastErrorAt: now,
           ...(result.error ? { error: result.error } : {}),
           // `unsupported` is a verdict about the CREDENTIAL KIND, not about
           // today: the usage endpoint does not serve setup-tokens, and it will
@@ -273,11 +327,14 @@ export class UsagePoller {
           ...(result.unsupported || previous?.unsupported ? { unsupported: true } : {}),
         };
     this.cache.set(accountId, usage);
-    this.opts.onUpdate?.(accountId, usage);
+    this.opts.onUpdate?.(accountId, usage, {
+      ...(result.orgId ? { orgId: result.orgId } : {}),
+      outcome: result.outcome ?? (result.buckets ? 'ok' : result.unsupported ? 'unsupported' : 'error'),
+    });
   }
 
   private async fetchUsage(token: string): Promise<
-    | { kind: 'ok'; buckets: Record<string, UsageBucket> }
+    | { kind: 'ok'; buckets: Record<string, UsageBucket>; orgId?: string }
     | { kind: 'refused' }
     | { kind: 'rate-limited' }
     | { kind: 'failed'; detail: string }
@@ -296,7 +353,8 @@ export class UsagePoller {
     if (response.status === 429) return { kind: 'rate-limited' };
     if (!response.ok) return { kind: 'failed', detail: `usage endpoint answered ${response.status}` };
     const body = (await response.json()) as Record<string, unknown>;
-    return { kind: 'ok', buckets: parseBuckets(body) };
+    const parsed = parseUsageBody(body);
+    return { kind: 'ok', buckets: parsed.buckets, ...(parsed.orgId ? { orgId: parsed.orgId } : {}) };
   }
 
   /**
@@ -346,6 +404,8 @@ export function liveBuckets(
   usage: AccountUsage | undefined, nowMs: number,
 ): Record<string, UsageBucket> {
   if (!usage) return {};
+  // No successful read ever: nothing here is evidence, whatever `buckets` holds.
+  if (!usage.fetchedAt) return {};
   const fetchedAt = Date.parse(usage.fetchedAt);
   if (Number.isFinite(fetchedAt) && nowMs - fetchedAt > USAGE_STALE_MS) return {};
   const live: Record<string, UsageBucket> = {};
@@ -364,9 +424,35 @@ export function parseBuckets(body: Record<string, unknown>): Record<string, Usag
     const entry = value as { utilization?: unknown; resets_at?: unknown };
     if (typeof entry.utilization !== 'number' || typeof entry.resets_at !== 'string') continue;
     buckets[key] = {
-      utilization: Math.max(0, Math.min(100, entry.utilization)),
+      // The endpoint speaks PERCENT already; the clamp is the unit's contract,
+      // stated at the boundary (`Percent`), not a conversion.
+      utilization: asPercent(entry.utilization),
       resetsAt: entry.resets_at,
     };
   }
   return buckets;
+}
+
+/** A percent as the meters carry it: clamped to 0–100, never a fraction. */
+export function asPercent(value: number): Percent {
+  return Math.max(0, Math.min(100, value));
+}
+
+/**
+ * The whole answer: the meters, plus the one CREDENTIAL fact the body may carry
+ * — an organisation id, under any of the spellings an evolving endpoint might
+ * use. Kept for the machine-wide learned store (`learned.ts`), which the
+ * breaker keys by orgId; never for a view, which sees orgIds hashed. Reading it
+ * here costs nothing and means a token account — which `claude auth status`
+ * cannot describe — still learns which organisation it spends against.
+ */
+export function parseUsageBody(body: Record<string, unknown>): { buckets: Record<string, UsageBucket>; orgId?: string } {
+  const buckets = parseBuckets(body);
+  const org = (body?.organization ?? body?.org) as Record<string, unknown> | undefined;
+  const candidates = [
+    body?.organization_id, body?.organization_uuid, body?.org_id, body?.orgId,
+    org && typeof org === 'object' ? org.uuid ?? org.id : undefined,
+  ];
+  const orgId = candidates.find((v): v is string => typeof v === 'string' && v.length > 0 && v.length <= 128);
+  return { buckets, ...(orgId ? { orgId } : {}) };
 }

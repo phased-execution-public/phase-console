@@ -46,6 +46,7 @@ export const NOTIFICATION_BADGE = '/icons/icon-badge-96.png';
  * @property {string|null} [notificationId]
  * @property {{action: string, title: string}[]|null} [actions]
  * @property {string|null} [callback]
+ * @property {{id?: string, name?: string}|null} [console] which console spoke (zero-touch phase 17, FLT-4)
  */
 
 /**
@@ -72,7 +73,26 @@ export function parsePayload(text) {
  * @returns {string}
  */
 export function notificationTitle(data) {
-  return data.title || 'Phase Console';
+  const title = data.title || 'Phase Console';
+  const name = consoleName(data);
+  return name && !title.includes(name) ? `${title} · ${name}` : title;
+}
+
+/**
+ * The console a payload names, or null (FLT-4). One device can hear several
+ * consoles — and, once the fleet has one subscription, every console's traffic
+ * arrives through it — so a card that does not say whose it is sends the
+ * operator to the wrong console. A name, never an id: the id is for the
+ * machine, the name is what the operator called the project.
+ *
+ * @param {PushPayload} data
+ * @returns {string|null}
+ */
+export function consoleName(data) {
+  const spoke = data.console;
+  if (!spoke || typeof spoke !== 'object' || typeof spoke.name !== 'string') return null;
+  const name = spoke.name.trim();
+  return name ? name.slice(0, 40) : null;
 }
 
 /**
@@ -96,6 +116,7 @@ export function notificationOptions(data) {
       // time a button is pressed, which may be hours later.
       actions: notificationActions(data) || null,
       callback: data.callback || null,
+      console: consoleName(data),
     },
     // Answering from the lock screen, without unlocking and finding the queue.
     // (Android and desktop honour these; iOS ignores the array and shows the

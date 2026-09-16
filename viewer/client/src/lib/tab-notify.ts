@@ -31,6 +31,7 @@ import type { NotificationRecord } from './api';
 import { notifyState, type NotifyState } from './notify';
 import { currentEndpoint } from './push';
 import { onSse } from './sse';
+import { consolePath } from './base';
 
 /** A replayed or annotated record older than this is history, not news. */
 export const TAB_NOTIFY_FRESH_MS = 60_000;
@@ -83,7 +84,7 @@ export function raiseTabNotification(record: NotificationRecord): Notification |
     const url = String(record.url ?? '');
     const hash = url.indexOf('#');
     if (hash >= 0) window.location.hash = url.slice(hash);
-    else if (url) window.location.assign(url);
+    else if (url) window.location.assign(consolePath(url));
     card.close();
   };
   return card;

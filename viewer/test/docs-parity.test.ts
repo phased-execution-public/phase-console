@@ -47,10 +47,26 @@ import { METRIC_FAMILIES, PHASE_STATES } from '../server/analysis/metrics.ts';
 import { BAR_KINDS, MARK_KINDS } from '../server/analysis/timeline.ts';
 import { MANIFEST, PATCH_DIR } from '../server/landing.ts';
 import { sanitiseSchedule } from '../shared/schedule-policy.js';
+import { ENTITLEMENT_STATES } from '../shared/ops-vocab.js';
 import {
   WEBHOOK_PAYLOAD_FIELDS, WEBHOOK_BACKOFF_BASE_MS, WEBHOOK_BACKOFF_MAX_MS, WEBHOOK_TIMEOUT_MS,
 } from '../server/webhooks.ts';
 import { runFile, journalFile } from '../server/runner/state.ts';
+import { HALT_KINDS, PHASE_HALT_KINDS, RUN_HALT_KINDS } from '../shared/recovery-model.js';
+import { DECLARED_SITUATION } from '../shared/fact-map.js';
+import { CLOSED_PLAN_STATUSES, HANDOFF_STATUSES, PLAN_STATUSES, QA_RESULTS } from '../shared/plan-vocab.js';
+import {
+  PHASE_LIFECYCLE_STATES, PHASE_STATUSES, RUNG_OUTCOMES, RUN_LIFECYCLE_STATES, RUN_PENDING_ACTS,
+  RUN_STATUSES, START_DOORS, ULTRA_REVIEW_MODES, WATCH_STATES,
+} from '../shared/run-lifecycle.js';
+import { RUNGS_BY_SITUATION, RUNG_DRIVERS } from '../shared/ladder-model.js';
+import { BOARD_BUCKETS, BOARD_OVERLAY_STATES, BOARD_STATE_UI, PHASE_ACTORS, UI_STATES } from '../shared/status-vocab.js';
+import { TASK_STATUSES } from '../shared/task-model.js';
+import { RUN_PRIORITIES } from '../shared/orchestration-model.js';
+import { SITUATIONS } from '../shared/situation-model.js';
+import { RULING_KINDS } from '../shared/attention-model.js';
+import { DECISION_KEYS } from '../shared/decisions-model.js';
+import { QA_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
 import { transcriptFile } from '../server/runner/transcript.ts';
 import { inboxOutcomeFile } from '../server/runner/outcome.ts';
 import { rulingsFile } from '../server/runner/rulings.ts';
@@ -126,14 +142,37 @@ test('every FA sibling carries the same images as its original', () => {
   }
 });
 
+/** For each Pro region, the `##` section it opens in (0-based, fences stripped) — a shape translation keeps. */
+const proRegionSections = (body: string): number[] => {
+  const out: number[] = [];
+  let section = -1;
+  for (const line of stripFences(body).split('\n')) {
+    if (line.startsWith('## ')) section += 1;
+    if (line.includes('!pro:start')) out.push(section);
+  }
+  return out;
+};
+
+test('every Pro marker region appears in both languages, opening in the same section', () => {
+  for (const [en, fa] of SIBLINGS) {
+    const a = proRegionSections(read(en));
+    const b = proRegionSections(read(fa));
+    // A region one language lacks is a Pro paragraph the other reader never gets — or, unmarked, a Pro
+    // sentence the free tree ships in Persian. viewer/README.fa.md lost `## The autopilot`'s this way.
+    assert.deepEqual(b, a, `${fa} opens Pro regions in sections [${b}], ${en} in [${a}]`);
+  }
+});
+
 /* ------------------------------------------------------------------ *
  * 2. Catalogue row-counts
  * ------------------------------------------------------------------ */
 
 /** Spelled-out counts, both documents' habit. Shared so the two cannot disagree. */
 const CATEGORY_COUNT_WORDS: Record<string, number> = {
+  two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
   nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
-  sixteen: 16, seventeen: 17, eighteen: 18,
+  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
+  'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24,
 };
 
 test('docs/phone.md documents every push category, and the right number of them', () => {
@@ -797,14 +836,8 @@ test('the webhook backoff the docs promise is the backoff the code applies', () 
  * does not exist" is a defect, and only the second is worth a red gate.
  */
 
-/** Flags a shell script implements, read from its `--flag)` / `--a|--b)` case arms. */
-const scriptFlags = (src: string): Set<string> => {
-  const out = new Set<string>();
-  for (const m of src.matchAll(/^[ \t]*((?:--[a-z][a-z0-9-]*\|)*--[a-z][a-z0-9-]*)\)/gm)) {
-    for (const flag of m[1].split('|')) out.add(flag);
-  }
-  return out;
-};
+// The one flag reader, shared with `agent.test.ts` (the wizard's coupling).
+import { scriptFlags } from './script-flags.ts';
 
 /**
  * Flags implemented but deliberately absent from SKILL.md. Every entry is a
@@ -833,6 +866,11 @@ test('SKILL.md never names a flag no script implements', () => {
   // The console's own CLI flags (`--allow-run`, `--port`, …) are implemented in
   // config.ts, not a script, and SKILL.md documents them in the `start` entry.
   for (const m of read('viewer/server/config.ts').matchAll(/arg === '(--[a-z][a-z0-9-]*)'/g)) {
+    universe.add(m[1]);
+  }
+  // …and the `claude` flags the runner itself passes to every session it spawns (`--permission-prompts`,
+  // `--max-budget-usd`, …): SKILL.md tells a supervised session which of them it is running under.
+  for (const m of read('viewer/server/runner/spawn.ts').matchAll(/argv\.push\('(--[a-z][a-z0-9-]*)'/g)) {
     universe.add(m[1]);
   }
 
@@ -887,57 +925,139 @@ test('the UNDOCUMENTED_FLAGS allowance never outlives the flags it excuses', () 
  * ------------------------------------------------------------------ */
 
 /**
- * 226 event kinds are emitted and the five doc surfaces between them named 27
- * (register R36). A journal is only evidence if a reader can tell what a line
- * means, and a list this size is true only for as long as something checks it.
+ * 226 event kinds were emitted when this began and the five doc surfaces
+ * between them named 27 (register R36); the widening below then found 247
+ * more names the console's own LOG writes, none with a row (sep-review LFC-4).
+ * A journal is only evidence if a reader can tell what a line means, and a
+ * list this size is true only for as long as something checks it.
  *
- * The rule is deliberately mechanical: EVERY `'<phase|run|policy>.<name>'`
- * string literal under `viewer/server/` is an event name, and every one must
- * have a row. That covers emitters written in any shape — `this.record(…)`,
- * `.note(…)`, `journal.append(…)`, `deps.journal(slug, id, …)`, a ternary
- * between two names, a `…_EVENT` const — without this test having to know a
- * list of call shapes, which is exactly the kind of list that goes stale.
+ * Three scans, because the names come in two families of different shape:
  *
- * It also covers READERS (`analysis/timeline.ts` keys its bars off these
- * names), and that is a feature: a reader naming an event nothing documents is
- * as much a defect as an emitter that nothing does.
+ *   1. JOURNAL names carry a prefix — EVERY `'<phase|run|policy>.<name>'`
+ *      string literal under `viewer/server/` is one, whatever shape emits it
+ *      (`this.record(…)`, `.note(…)`, `journal.append(…)`, a ternary between
+ *      two names, a `…_EVENT` const) and whatever READS it (`analysis/
+ *      timeline.ts` keys its bars off these names, and a reader naming an
+ *      event nothing documents is as much a defect as an emitter nothing does).
+ *   2. LOG names carry no fixed prefix (`shutdown.begin`, `mcp.probe.failed`,
+ *      `previous-run-crashed`), so they are read off the CALL: the first
+ *      argument of `log.info/warn/error(…)`, and of the sessions registry's
+ *      `onWarn?.(…)` callback, which `service-base.ts` forwards to `log.warn`.
+ *   3. A name that is COMPOSED — a template literal — is one the table can
+ *      never hold, so composition is banned outright rather than parsed:
+ *      `run.park-withdrew` reached the hub's journal that way, undocumented.
+ *
+ * A RETIRED event keeps its row, with `retired <version>` in the emitter
+ * column instead of a file (`run.auto-recover-skipped`: 65 lines in the hub's
+ * journals, no emitter since 3.0.0). The "documented ⇒ emitted" direction
+ * skips such a row; the "emitted ⇒ documented" direction treats one as a
+ * contradiction, so a name that comes back has to be un-retired first.
+ * Deleting the row was the old rule, and it left older logs holding words no
+ * document explained.
  */
 const EVENT_LITERAL = /'((?:phase|run|policy)\.[a-z0-9][a-z0-9.-]*)'/g;
+const LOG_CALL = /\blog\.(?:info|warn|error)\(\s*'([^']+)'/g;
+const ONWARN_CALL = /\bon(?:Warn|Info)\??\.?\(\s*'([^']+)'/g;
+/** A sink call whose first argument opens a template literal — the composed name the rule refuses. */
+const COMPOSED_EVENT = /\b(?:log\.(?:info|warn|error)|this\.(?:record|note)|journal\.append|deps\.journal|on(?:Warn|Info)\??\.?)\(\s*`/g;
 
-function emittedEvents(): Set<string> {
-  const out = new Set<string>();
+function serverSources(): { rel: string; text: string }[] {
+  const out: { rel: string; text: string }[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
       if (!entry.name.endsWith('.ts')) continue;
-      for (const m of readFileSync(full, 'utf8').matchAll(EVENT_LITERAL)) out.add(m[1]);
+      out.push({ rel: full.slice(root.length), text: readFileSync(full, 'utf8') });
     }
   };
   walk(join(root, 'viewer/server'));
+  // The fleet supervisor's own entry point writes the same log (Pro; absent from the free tree).
+  if (existsSync(join(root, 'viewer/fleet'))) walk(join(root, 'viewer/fleet'));
   return out;
 }
 
-function documentedEvents(): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const line of read('docs/journal-events.md').split('\n')) {
-    const row = /^\|\s*`([^`]+)`\s*\|\s*(journal|log|both)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/.exec(line);
-    if (row) out.set(row[1], row[4]);
+function emittedEvents(): Set<string> {
+  const out = new Set<string>();
+  for (const { text } of serverSources()) {
+    for (const re of [EVENT_LITERAL, LOG_CALL, ONWARN_CALL]) {
+      for (const m of text.matchAll(re)) out.add(m[1]);
+    }
   }
   return out;
 }
 
-test('every journal event the server emits has a row in docs/journal-events.md', () => {
-  const undocumented = [...emittedEvents()].filter((ev) => !documentedEvents().has(ev)).sort();
+type EventRow = { sink: string; emitter: string; meaning: string; retired: string | null };
+
+function eventRows(): Map<string, EventRow> {
+  const out = new Map<string, EventRow>();
+  for (const line of read('docs/journal-events.md').split('\n')) {
+    const row = /^\|\s*`([^`]+)`\s*\|\s*(journal|log|both)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|$/.exec(line);
+    if (!row) continue;
+    const retired = /^retired\s+(\d+\.\d+\.\d+)$/.exec(row[3])?.[1] ?? null;
+    out.set(row[1], { sink: row[2], emitter: row[3], meaning: row[4], retired });
+  }
+  return out;
+}
+
+/** The LIVE rows, name → meaning; a retired row is `retiredEvents()`'s answer instead. */
+function documentedEvents(): Map<string, string> {
+  return new Map([...eventRows()].filter(([, row]) => !row.retired).map(([name, row]) => [name, row.meaning]));
+}
+
+/** The retired rows, name → the version that retired the event. */
+function retiredEvents(): Map<string, string> {
+  return new Map([...eventRows()].filter(([, row]) => row.retired).map(([name, row]) => [name, row.retired!]));
+}
+
+test('every event the server writes — journal or log — has a row in docs/journal-events.md', () => {
+  const documented = documentedEvents();
+  const undocumented = [...emittedEvents()].filter((ev) => !documented.has(ev)).sort();
   assert.deepEqual(undocumented, [],
-    'these event kinds are emitted and documented nowhere — add a row to docs/journal-events.md');
+    'these event kinds are written and documented nowhere — add a row to docs/journal-events.md');
 });
 
-test('and every row in docs/journal-events.md names an event that exists', () => {
+test('and every live row in docs/journal-events.md names an event that exists', () => {
   const emitted = emittedEvents();
   const stale = [...documentedEvents().keys()].filter((ev) => !emitted.has(ev)).sort();
   assert.deepEqual(stale, [],
-    'these rows describe events nothing emits any more — delete them');
+    'these rows describe events nothing writes any more — mark each `retired <version>` in the emitter column; never delete a row');
+});
+
+test('a retired event stays retired: nothing under server/ writes it, and its row keeps a version', () => {
+  const retired = retiredEvents();
+  assert.ok(retired.has('run.auto-recover-skipped'),
+    'the one retirement the audit found (65 hub journal lines, no emitter since 3.0.0) must be recorded, not deleted');
+  const emitted = emittedEvents();
+  const back = [...retired.keys()].filter((ev) => emitted.has(ev)).sort();
+  assert.deepEqual(back, [], 'these events are documented as retired and written anyway — un-retire the row');
+  for (const [name, version] of retired) assert.match(version, /^\d+\.\d+\.\d+$/, name);
+});
+
+test('no event name under server/ is composed at runtime', () => {
+  const offenders: string[] = [];
+  for (const { rel, text } of serverSources()) {
+    for (const m of text.matchAll(COMPOSED_EVENT)) {
+      offenders.push(`${rel}:${text.slice(0, m.index).split('\n').length}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    'an event name built from a template literal can never have a row — write the literals out '
+    + '(`runner-control.ts` withdrawQueued did this with `run.${why}-withdrew`, and `registry-file.ts` with `${what}.downgrade`)');
+});
+
+test("the three withdrawal records are reachable from withdrawQueued's own union", () => {
+  const source = read('viewer/server/runner/runner-control.ts');
+  const union = /withdrawQueued\(why:\s*((?:'[a-z]+'\s*\|\s*)+'[a-z]+')\)/.exec(source);
+  assert.ok(union, 'withdrawQueued no longer declares its `why` as a union of literals');
+  const whys = union[1].match(/'([a-z]+)'/g)!.map((w) => w.replace(/'/g, '')).sort();
+  assert.deepEqual(whys, ['halt', 'park', 'pause']);
+  const documented = documentedEvents();
+  for (const why of whys) {
+    const name = `run.${why}-withdrew`;
+    assert.ok(source.includes(`'${name}'`), `${name} is not written as a literal in runner-control.ts`);
+    assert.ok(documented.has(name), `${name} has no row in docs/journal-events.md`);
+  }
 });
 
 test('no row is documented with an empty meaning', () => {
@@ -1053,4 +1173,300 @@ test('the debug guide states the bundle schema the server actually emits', () =>
     body, new RegExp(`^version\\s+${BUNDLE_VERSION}$`, 'm'),
     `docs/debugging.md does not state bundle version ${BUNDLE_VERSION}`,
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * 11. Spelled-out counts, the halt-kind lists, and the axis a word belongs to (LFC-10)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Six sentences in the vocabulary's own prose were untrue when the audit read
+ * them — "seventeen words" over an array of eighteen, "ELEVEN kinds, and for
+ * the other nine" over 11 + 7, `settleRung` given four outcomes of seven, a
+ * fold justified by run files the loader never loads, a status glossed as
+ * signed-off that a person still owes, and a Stop promised to write a word one
+ * axis holds and another folds away. Each was a count or a claim written down
+ * beside the list it described and never read against it again.
+ *
+ * So: a spelled-out count in `shared/*.js` docblocks or in `docs/loop.md` is
+ * either REGISTERED here against the list it describes — and asserted equal —
+ * or named as an anecdote that counts no list. A new number word beside a
+ * vocabulary noun that is neither fails by file and line.
+ */
+type SpelledCount = { file: string; find: RegExp; expect: readonly number[]; what: string };
+
+/** How many vocabularies the "policy words" banner in run-lifecycle.js actually covers — the `export const` between it and the next banner. */
+function policyWordLists(): number {
+  const body = read('viewer/shared/run-lifecycle.js');
+  // The BANNER line, not the header docblock's sentence that uses the same words.
+  const start = body.search(/^ \* The \w+ policy words an operator sets$/m);
+  assert.ok(start >= 0, 'run-lifecycle.js lost its "policy words an operator sets" banner');
+  const next = body.indexOf('/* ----', start);
+  return (body.slice(start, next < 0 ? undefined : next).match(/^export const \w+ = Object\.freeze\(/gm) ?? []).length;
+}
+
+/**
+ * The rows of evidence-model.js's own V-table — the "verification states" its
+ * docblock counts. Two or more spaces after the asterisk is the table's
+ * indentation; the prose below it ("V5 folds into `green`…") has one. The
+ * "six QA ones" in the same sentence are recorded SHAPES with no table and no
+ * list, so only the verification count is pinned.
+ */
+function evidenceShapes(prefix: 'V'): number {
+  return (read('viewer/shared/evidence-model.js').match(new RegExp(`^ \\*\\s{2,}${prefix}\\d\\s`, 'gm')) ?? []).length;
+}
+
+const SPELLED_COUNTS: SpelledCount[] = [
+  { file: 'viewer/shared/decisions-model.js', find: /The (\w+) keys — a closed vocabulary/, expect: [DECISION_KEYS.length], what: 'DECISION_KEYS' },
+  { file: 'viewer/shared/attention-model.js', find: /(\w+) kinds, because the (\w+) need different things/, expect: [RULING_KINDS.length, RULING_KINDS.length], what: 'RULING_KINDS' },
+  { file: 'viewer/shared/attention-model.js', find: /`qa` rows on the (\w+) QA situations/, expect: [SITUATIONS.filter((s) => s.startsWith('qa-')).length], what: 'the qa-* SITUATIONS' },
+  { file: 'viewer/shared/evidence-model.js', find: /distinguish (\w+) verification states and \w+ QA ones/, expect: [evidenceShapes('V')], what: "the V-table rows in the file's own docblock" },
+  { file: 'viewer/shared/evidence-model.js', find: /FIELDS are (\w+) words each/, expect: [VERIFICATION_WORDS.length], what: 'VERIFICATION_WORDS (and QA_WORDS, asserted equal below)' },
+  { file: 'viewer/shared/evidence-model.js', find: /(\w+) words wide and a surface/, expect: [VERIFICATION_WORDS.length], what: 'VERIFICATION_WORDS' },
+  { file: 'viewer/shared/evidence-model.js', find: /The engine's (\w+) bucket words plus `unknown`/, expect: [BOARD_BUCKETS.length], what: 'BOARD_BUCKETS' },
+  { file: 'viewer/shared/evidence-model.js', find: /folded into the (\w+) words\./, expect: [VERIFICATION_WORDS.length], what: 'VERIFICATION_WORDS' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /The (\w+) policy words an operator sets/, expect: [policyWordLists()], what: 'the vocabularies under that banner' },
+  { file: 'viewer/shared/recovery-model.js', find: /retype the ([\w-]+) words/, expect: [HALT_KINDS.length], what: 'HALT_KINDS' },
+  { file: 'viewer/shared/fact-map.js', find: /a ([\w-]+)-word table/, expect: [HALT_KINDS.length], what: 'HALT_KINDS' },
+  { file: 'viewer/shared/fact-map.js', find: /(\w+) words, and `complete` is the one/, expect: [Object.keys(DECLARED_SITUATION).length], what: 'DECLARED_SITUATION' },
+  {
+    file: 'viewer/shared/plan-vocab.js', find: /(\w+) words: (\w+) open, (\w+) terminal/,
+    expect: [PLAN_STATUSES.length, PLAN_STATUSES.length - CLOSED_PLAN_STATUSES.length, CLOSED_PLAN_STATUSES.length],
+    what: 'PLAN_STATUSES / CLOSED_PLAN_STATUSES',
+  },
+  { file: 'viewer/shared/plan-vocab.js', find: /The (\w+) TERMINAL statuses/, expect: [CLOSED_PLAN_STATUSES.length], what: 'CLOSED_PLAN_STATUSES' },
+  { file: 'viewer/shared/plan-vocab.js', find: /agrees on these (\w+) words/, expect: [HANDOFF_STATUSES.length], what: 'HANDOFF_STATUSES' },
+  { file: 'viewer/shared/plan-vocab.js', find: /the (\w+) writable statuses/, expect: [HANDOFF_STATUSES.length], what: 'HANDOFF_STATUSES' },
+  { file: 'viewer/shared/plan-vocab.js', find: /the (\w+) words `qa-record\.sh` will write/, expect: [QA_RESULTS.length], what: 'QA_RESULTS' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /(\w+) words, against `RUN_STATUSES`' (\w+)/, expect: [RUN_LIFECYCLE_STATES.length, RUN_STATUSES.length], what: 'RUN_LIFECYCLE_STATES / RUN_STATUSES' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /(\w+) words against `PHASE_STATUSES`' (\w+)/, expect: [PHASE_LIFECYCLE_STATES.length, PHASE_STATUSES.length], what: 'PHASE_LIFECYCLE_STATES / PHASE_STATUSES' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) transition words, as the/, expect: [RUN_PENDING_ACTS.length], what: 'RUN_PENDING_ACTS' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /for the (\w+) statuses that are one/, expect: [RUN_PENDING_ACTS.length], what: 'RUN_PENDING_ACTS (the three pending statuses)' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) words that are not `off`/, expect: [ULTRA_REVIEW_MODES.length - 1], what: 'ULTRA_REVIEW_MODES minus off' },
+  { file: 'viewer/shared/run-lifecycle.js', find: /(\w+) doors: \w+ are\b/, expect: [START_DOORS.length], what: 'START_DOORS' },
+  // The census's split: nine `startRun` callers lead the list, the rest spawn some other way.
+  { file: 'viewer/shared/run-lifecycle.js', find: /the (\w+) `startRun` doors first, then the (\w+) that are not/, expect: [9, START_DOORS.length - 9], what: 'START_DOORS split' },
+  { file: 'viewer/shared/status-vocab.js', find: /one of (\w+) UI states/i, expect: [UI_STATES.length], what: 'UI_STATES' },
+  { file: 'viewer/shared/status-vocab.js', find: /`RunStatus`, (\w+) words/, expect: [RUN_STATUSES.length], what: 'RUN_STATUSES' },
+  { file: 'viewer/shared/status-vocab.js', find: /`PhaseStatus`, (\w+) words/, expect: [PHASE_STATUSES.length], what: 'PHASE_STATUSES' },
+  { file: 'viewer/shared/status-vocab.js', find: /\* (\w+) words that LOOK like board states/, expect: [BOARD_OVERLAY_STATES.length], what: 'BOARD_OVERLAY_STATES' },
+  { file: 'viewer/shared/status-vocab.js', find: /The (\w+) words the CONSOLE paints as board states/, expect: [BOARD_OVERLAY_STATES.length], what: 'BOARD_OVERLAY_STATES' },
+  { file: 'viewer/shared/status-vocab.js', find: /for the (\w+) PAINT keys/, expect: [Object.keys(BOARD_STATE_UI).length], what: 'BOARD_STATE_UI' },
+  { file: 'viewer/shared/status-vocab.js', find: /over the (\w+) buckets/, expect: [BOARD_BUCKETS.length], what: 'BOARD_BUCKETS' },
+  { file: 'viewer/shared/status-vocab.js', find: /The (\w+) vehicles a live phase/, expect: [PHASE_ACTORS.length], what: 'PHASE_ACTORS' },
+  { file: 'viewer/shared/status-vocab.js', find: /The (\w+) transition words fold/, expect: [RUN_PENDING_ACTS.length], what: 'RUN_PENDING_ACTS' },
+  { file: 'viewer/shared/task-model.js', find: /The (\w+) states a task is in/, expect: [TASK_STATUSES.length], what: 'TASK_STATUSES' },
+  { file: 'viewer/shared/orchestration-model.js', find: /Only the (\w+) words, spelled exactly/, expect: [RUN_PRIORITIES.length], what: 'RUN_PRIORITIES' },
+  { file: 'viewer/shared/ops-vocab.js', find: /(\w+) states, one machine/, expect: [ENTITLEMENT_STATES.length], what: 'ENTITLEMENT_STATES' },
+  { file: 'docs/loop.md', find: /\*\*one\*\* of (\w+) words/, expect: [SITUATIONS.length], what: 'SITUATIONS' },
+  { file: 'docs/loop.md', find: /\*\*(\w+) states, and one of them is not a state/, expect: [WATCH_STATES.length], what: 'WATCH_STATES' },
+];
+
+/**
+ * Number words beside a vocabulary noun that describe NO list: history ("was
+ * spelled out three times"), a pair of code paths, the skill's three modes.
+ * Each is named so the sweep below stays exhaustive over everything else.
+ */
+const COUNT_ANECDOTES: { file: string; find: RegExp }[] = [
+  { file: 'viewer/shared/attention-model.js', find: /holds the two identical, word for word/ },
+  { file: 'viewer/shared/attention-model.js', find: /Two reasons, both measured/ },
+  { file: 'viewer/shared/attention-model.js', find: /two signal\/kind pairs/ },
+  { file: 'viewer/shared/evidence-model.js', find: /which of the two kinds of waiting this is/ },
+  { file: 'viewer/shared/ladder-model.js', find: /two rungs on the same vehicle/ },
+  { file: 'viewer/shared/ladder-model.js', find: /two situations shared a vehicle/ },
+  { file: 'viewer/shared/phase-model.js', find: /the two verbs that START work/ },
+  { file: 'viewer/shared/plan-vocab.js', find: /the two words\?/ },
+  { file: 'viewer/shared/plan-vocab.js', find: /It has two members/ },
+  { file: 'viewer/shared/plan-vocab.js', find: /the two words that definitely mean/ },
+  { file: 'viewer/shared/recovery-model.js', find: /five word-books/ },
+  { file: 'viewer/shared/recovery-model.js', find: /three QA(?:-recovery)? verbs/ },
+  { file: 'viewer/shared/recovery-model.js', find: /The three verbs are offered/ },
+  { file: 'viewer/shared/run-lifecycle.js', find: /drifted to four members/ },
+  { file: 'viewer/shared/run-settings.js', find: /Two doors accept run settings/ },
+  { file: 'viewer/shared/run-settings.js', find: /two-rung cap/ },
+  { file: 'viewer/shared/task-model.js', find: /one of its two doors/ },
+  { file: 'docs/loop.md', find: /[Tt]hree modes/ },
+  { file: 'docs/loop.md', find: /The two QA rungs/ },
+  { file: 'docs/loop.md', find: /evaluates three signals against it/ },
+];
+
+// `(?<![\w-])`, not `\b`, on the left: "thirty-nine keys" must not read as
+// "nine keys" — a hyphenated bigger number is a different number.
+const COUNT_SWEEP = new RegExp(
+  `(?<![\\w-])(${Object.keys(CATEGORY_COUNT_WORDS).sort((a, b) => b.length - a.length).join('|')})\\b(?:-word)?[^.;\\n]{0,14}?\\b`
+  + '(words?|kinds?|members?|statuses|situations?|outcomes?|reasons?|buckets?|verbs?|states?|keys|signals?|vehicles?|rungs?|doors?|modes?|policies|classes)\\b',
+  'gi',
+);
+
+function countSweepFiles(): string[] {
+  return [
+    ...readdirSync(join(root, 'viewer/shared')).filter((f) => f.endsWith('.js')).map((f) => `viewer/shared/${f}`),
+    'docs/loop.md',
+  ];
+}
+
+test('every spelled-out count in shared/*.js and docs/loop.md is asserted against its list, or named as an anecdote', () => {
+  const unregistered: string[] = [];
+  for (const file of countSweepFiles()) {
+    const lines = read(file).split('\n');
+    lines.forEach((line, i) => {
+      if (!line.match(COUNT_SWEEP)) return;
+      const known = [...SPELLED_COUNTS, ...COUNT_ANECDOTES].some((e) => e.file === file && e.find.test(line));
+      if (!known) unregistered.push(`${file}:${i + 1}: ${line.trim().slice(0, 100)}`);
+    });
+  }
+  assert.deepEqual(unregistered, [],
+    'a spelled-out count beside a vocabulary noun must be registered in SPELLED_COUNTS (asserted against its list) '
+    + `or named in COUNT_ANECDOTES:\n  ${unregistered.join('\n  ')}`);
+});
+
+test('and every registered count reads the length of the list it describes', () => {
+  for (const entry of SPELLED_COUNTS) {
+    const body = read(entry.file);
+    const hits = [...body.matchAll(new RegExp(entry.find.source, `gm${entry.find.flags.replace(/[gm]/g, '')}`))];
+    assert.equal(hits.length, 1, `${entry.file}: expected exactly one sentence matching ${entry.find} (${entry.what}), found ${hits.length}`);
+    entry.expect.forEach((expected, i) => {
+      const word = hits[0][i + 1].toLowerCase();
+      assert.equal(CATEGORY_COUNT_WORDS[word], expected,
+        `${entry.file} says "${hits[0][0]}" — ${entry.what} has ${expected}, and "${word}" is ${CATEGORY_COUNT_WORDS[word] ?? 'not a number word this test knows'}`);
+    });
+  }
+  for (const entry of COUNT_ANECDOTES) {
+    assert.ok(entry.find.test(read(entry.file)), `${entry.file}: the anecdote ${entry.find} is gone — drop it from COUNT_ANECDOTES`);
+  }
+  // "five words each" is one number for two lists.
+  assert.equal(QA_WORDS.length, VERIFICATION_WORDS.length, 'evidence-model.js says the two badge fields are the same width');
+});
+
+test('docs/loop.md names every rung outcome where it describes settleRung', () => {
+  const body = read('docs/loop.md');
+  const sentence = /settled\s+when the session ends \(`settleRung`[\s\S]*?remembers it tried\./.exec(body);
+  assert.ok(sentence, 'the settleRung sentence moved — it used to give four outcomes of seven (LFC-10)');
+  for (const outcome of RUNG_OUTCOMES) {
+    assert.ok(sentence[0].includes(`\`${outcome}\``), `docs/loop.md's settleRung sentence omits \`${outcome}\``);
+  }
+});
+
+test('RCV-11: every rung label docs/loop.md prints appears verbatim in shared/ladder-model.js, and every table row has a driver column', () => {
+  // `loop.md:159` called `plan-broken`'s second rung "Repair the plan with a
+  // repair session" against the built "…with a new agent", and the wait row
+  // promised `recheck-watch`, a rung no driver owned. The table is read as
+  // data: every bold label in the ladder table is a label the model carries.
+  const body = read('docs/loop.md');
+  const start = body.indexOf('| situation | rungs, in climb order');
+  assert.ok(start > 0, 'the ladder table moved');
+  const table = body.slice(start, body.indexOf('**Caps**', start));
+  const rows = table.split('\n').filter((line) => line.startsWith('| `'));
+  assert.ok(rows.length >= 20, `the table has ${rows.length} rows`);
+  const labels = new Set(Object.values(RUNGS_BY_SITUATION).flatMap((rungs) => rungs.map((rung) => rung.label)));
+  const printed: string[] = [];
+  for (const row of rows) {
+    const cells = row.split('|').map((cell) => cell.trim());
+    assert.equal(cells.length, 5, `three columns (situation, rungs, driver): ${row.slice(0, 60)}`);
+    for (const m of cells[2].matchAll(/\*\*([^*]+)\*\*/g)) printed.push(m[1]);
+    // The driver column: a `·`-separated list of driver words, or `—` for an empty table.
+    const drivers = cells[3];
+    if (drivers !== '—') {
+      for (const word of drivers.split('·').map((w) => w.trim())) {
+        assert.ok((RUNG_DRIVERS as readonly string[]).includes(word), `${cells[1]}: driver ${word}`);
+      }
+    }
+  }
+  const unknown = printed.filter((label) => !labels.has(label));
+  assert.deepEqual(unknown, [], `labels the model does not carry: ${unknown.join(' · ')}`);
+  assert.ok(printed.includes('Repair the plan with a new agent'));
+  assert.ok(printed.includes('Watched by the clock'));
+  // Every table the model has with rungs prints its rows' labels.
+  for (const [key, rungs] of Object.entries(RUNGS_BY_SITUATION)) {
+    for (const rung of rungs) assert.ok(printed.includes(rung.label), `${key}'s "${rung.label}" is not in docs/loop.md`);
+  }
+});
+
+test('docs/loop.md lists the two halt-kind sides member for member', () => {
+  const body = read('docs/loop.md');
+  const listed = (name: string): string[] => {
+    const m = new RegExp(`\`${name}\` \\(((?:\`[a-z-]+\`(?:\\s*·\\s*)?)+)\\)`).exec(body);
+    assert.ok(m, `docs/loop.md no longer lists ${name} in parentheses`);
+    return m[1].match(/`([a-z-]+)`/g)!.map((w) => w.replace(/`/g, '')).sort();
+  };
+  assert.deepEqual(listed('PHASE_HALT_KINDS'), [...PHASE_HALT_KINDS].sort());
+  assert.deepEqual(listed('RUN_HALT_KINDS'), [...RUN_HALT_KINDS].sort());
+});
+
+test('docs/controls.md names `interrupted` only beside the axis that holds it', () => {
+  // `interrupted` is a STATUS word; the lifecycle STATE folds it to `failed`.
+  // The sentence that promised "never `failed`" was about the other axis, and
+  // a 4.1.0 record reads `lifecycle.state: 'failed'` beside `status:
+  // 'interrupted'` — both true, one promise broken. A doc sentence naming the
+  // word names its axis.
+  const offenders = read('docs/controls.md').split('\n')
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => line.includes('`interrupted`') && !/\bstatus\b/i.test(line));
+  assert.deepEqual(offenders.map((o) => `docs/controls.md:${o.n}`), [],
+    'a sentence naming `interrupted` must say it is the STATUS axis (the lifecycle state folds it to `failed`)');
+});
+
+/* ------------------------------------------------------------------ *
+ * Trust as built (zero-touch-console phase 13): the sentences that promise a
+ * person a tap, and the vocabulary the CLI notifies in
+ * ------------------------------------------------------------------ */
+
+/** One `## ` section of a markdown body, heading to the next heading. */
+const section = (body: string, heading: string): string => {
+  const start = body.indexOf(`\n## ${heading}`);
+  assert.ok(start >= 0, `section "${heading}" exists`);
+  const next = body.indexOf('\n## ', start + 4);
+  return body.slice(start, next < 0 ? undefined : next);
+};
+
+test('ACC-8.7 (LFC-9, TRS-4): the carve-out\'s "one tap" sentences say what the code does — auto-grant never answers either publishing ask, and only a plan exception does', async () => {
+  const { OPEN_PR_ASK, QUESTION_CLASS } = await import('../server/runner/approvals.ts');
+  const { destructiveExceptions } = await import('../shared/policy-model.js');
+  const guide = read('viewer/client/src/content/guide/permissions.md');
+  const commands = OPEN_PR_ASK.map((rule) => /^Bash\((.+):\*\)$/.exec(rule)![1]);
+  for (const name of ['The push carve-out', 'Auto-grant approvals']) {
+    const body = section(guide, name);
+    for (const command of commands) assert.ok(body.includes(`\`${command}\``), `permissions.md §${name} names \`${command}\``);
+    assert.match(body, /[Aa]uto-grant never answers/, `permissions.md §${name} says auto-grant never answers it`);
+    assert.match(body, /permission\.destructive/, `permissions.md §${name} names the one exception`);
+  }
+  // The exception example the guide prints is one the grammar actually reads.
+  const example = /``\s*(deny; allow `[^`]+`)\s*``/.exec(section(guide, 'Auto-grant approvals'))?.[1];
+  assert.ok(example, 'the guide prints an exception example');
+  assert.ok(destructiveExceptions(example!).some((rule) => (OPEN_PR_ASK as readonly string[]).includes(rule)),
+    `the printed example "${example}" grants a publishing rule under destructiveExceptions`);
+  // …and the profile sentences: no profile silences a question.
+  const profiles = section(guide, 'Permission profiles');
+  for (const tool of QUESTION_CLASS) assert.ok(profiles.includes(`\`${tool}\``), `permissions.md names the question class member \`${tool}\``);
+  assert.match(profiles, /No profile silences a question/);
+  // safety-rails.md makes the same promise, and keeps it.
+  const rails = read('docs/safety-rails.md');
+  assert.match(rails, /one human tap — auto-grant never answers either card/);
+});
+
+test('ACC-7.5 (REG-8): every notification_type the CLI documents is mapped, answers a wait, or is ignored on purpose — and the hook-install help says four entries', async () => {
+  const { NOTIFICATION_WAIT_KINDS, NOTIFICATION_ANSWERS, NOTIFICATION_IGNORED } = await import('../server/sessions/registry.ts');
+  const { HOOK_EVENTS } = await import('../server/hooks-install.ts');
+  // The hooks reference's Notification table, 2026-09 (CLI 2.1.272) — contract row 29's families:
+  // permission, idle, auth, elicitation, agent and quota.
+  const documented = [
+    'permission_prompt', 'idle_prompt', 'auth_success', 'elicitation_dialog', 'elicitation_url_dialog',
+    'elicitation_complete', 'elicitation_response', 'agent_needs_input', 'agent_completed',
+    'quota_auto_resume_fired', 'quota_auto_resume_stale', 'quota_auto_resume_disabled',
+  ];
+  for (const type of documented) {
+    const homes = [type in NOTIFICATION_WAIT_KINDS, type in NOTIFICATION_ANSWERS, NOTIFICATION_IGNORED.includes(type)]
+      .filter(Boolean).length;
+    assert.equal(homes, 1, `'${type}' is in exactly one of the wait map, the answers map and the ignored list`);
+  }
+  assert.equal(HOOK_EVENTS.length, 4);
+  // In the free tree `bin/phase-console.mjs` IS the override, and `free/` does not ship.
+  const bins = ['bin/phase-console.mjs'];
+  for (const file of bins) {
+    assert.match(read(file), /`install-hooks` writes four entries \(SessionStart, SessionEnd, Stop, Notification\)/, `${file} says what install-hooks writes`);
+  }
+  const loop = read('docs/loop.md');
+  for (const word of ['`Notification`', '`notification_type`', '`waiting', '`lastWait', '`WAIT_ANSWER_CAP_MS`']) {
+    assert.ok(loop.includes(word), `docs/loop.md's presence section names ${word}`);
+  }
 });

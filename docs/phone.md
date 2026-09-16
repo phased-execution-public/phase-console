@@ -12,11 +12,12 @@ from a phone, on any network, without putting anything on the public internet.
 It takes about ten minutes, and most of it is clicking two switches.
 
 > **The short way.** Settings → *Reach this console from your phone* reads your tailnet live: which
-> devices are on it, whether `serve` points at this console, and whether the console's own
-> `--remote` flags agree with it — that last disagreement is the one that looks fine from your desk
-> and fails from the phone. The card carries a copy-paste prompt that does the whole setup; it is
+> devices are on it, whether `serve` points at this console, and whether the console's own remote
+> settings agree with it — that last disagreement is the one that looks fine from your desk and fails
+> from the phone. The card carries a copy-paste prompt that does the whole setup; it is
 > [Prompt 2 in the README](../README.md). Everything below is the same thing done by hand, plus the
-> parts the card does not cover — push notifications, out-of-band alerts, and what is enforced.
+> parts the card does not cover — the machine profile, push notifications, out-of-band alerts, and
+> what is enforced.
 
 ## The shape of it
 
@@ -45,6 +46,24 @@ the header themselves. This is [Tailscale's own guidance][ts-serve]: *"it's best
 have the service listen on localhost."*
 
 You need a [Tailscale](https://tailscale.com) account. The free tier covers this comfortably.
+
+
+## Once for the machine — not once per repository
+
+Everything the phone path needs belongs to the machine and to you, not to a repository, so it is done
+once:
+
+| Once, for the machine | Where |
+|---|---|
+| Three tailnet switches, and the phone on the tailnet | Steps 1–2 |
+| The machine profile: the tailnet name and the logins allowed through it | Step 3 |
+| One Serve handler, the Home Screen install, one push subscription | Steps 4–6 |
+| A notifier that needs no browser *(optional)* | Step 7 |
+
+A console on its own is one repository's, and the steps publish that console. Once Step 3 is written
+it needs no remote flags to start — `phase-console ~/code/your-repo`, or `./start --root
+~/code/your-repo` from the console's folder — because it reads the profile itself.
+
 
 ## Step 1 · Turn on three things for your tailnet
 
@@ -79,14 +98,48 @@ name. Without it the name simply will not load, and nothing else in this guide w
 
 Check `tailscale status` on your machine; the phone should be listed.
 
-## Step 3 · Tell the console who may arrive
+## Step 3 · Tell the console who may arrive — once, in the machine profile
 
-Two new flags. Neither changes what the server binds to:
+A phone is admitted on two facts: the hostname the proxy serves, and the logins allowed through it.
+Both are the machine's, so write them once in the **machine profile**,
+`~/.config/phase-console/fleet.json`, from the console's folder:
+
+```bash
+node viewer/shared/instances.mjs profile-set remoteHost '"your-machine.your-tailnet.ts.net"'
+node viewer/shared/instances.mjs profile-set remoteUsers '["you@example.com"]'
+node viewer/shared/instances.mjs profile      # the file as every console reads it
+```
+
+Use your real MagicDNS name — `tailscale status --json` prints it as `Self.DNSName` — and the login
+you signed in with. The value is JSON; `null` clears a key, and a value the profile cannot act on is
+refused rather than written.
+
+Every console reads the profile when it starts, field by field. A console started with no `--remote`
+and no `--remote-user` inherits both, so neither belongs on its command line. Remote access is
+inherited only as a usable pair: a host with no login, or logins with no host, is left alone and the
+console boots local-only rather than refusing to start over a half-written file. The profile is read
+at startup — restart a running console to pick up a change.
+
+What the file holds, and what a console does with each field:
+
+| Field | Read as |
+|---|---|
+| `remoteHost` | The hostname the console also answers to behind the proxy — what `--remote` names. |
+| `remoteUsers` | The logins allowed to arrive that way — what `--remote-user` names. |
+| `notifyCommand` | The out-of-band notifier (Step 7), when `PHASE_CONSOLE_NOTIFY` is not set. |
+| `webhooks` | Rows of `{url, name?, categories?}` that every console started with `--allow-webhooks` delivers to. They are the file's: a console lists them and never stores or removes them. |
+| `maxSessions` | The machine's lane ceiling — every console's live lanes summed. `--max-sessions` stays each console's own ceiling. |
+| `hookScript` | An absolute path to the session-presence hook script `install-hooks` and `hooks-status` use, when that file exists. |
+| `categories`, `quietHours` | Recorded, and reported among what a console inherits. What reaches a device is still chosen on that device (Step 6). |
+| `instances` | Per console, by id: `autostart` (`true`, `false` or `once` — whether it starts its work unattended at boot) and `overrides` of `remoteHost`, `remoteUsers`, `notifyCommand`, `webhooks`, `categories` and `quietHours` for that console alone. |
+
+**A flag still wins, for the one console it is passed to.** Neither flag changes what the server binds
+to:
 
 | Flag | Meaning |
 |---|---|
-| `--remote <host>` | The console also answers to this hostname, which is fronted by an authenticating proxy. Repeatable. |
-| `--remote-user <login>` | A login allowed to arrive that way. Repeatable, or `PHASE_CONSOLE_REMOTE_USERS` as a comma-separated list. **Required** by `--remote`. |
+| `--remote <host>` | The console also answers to this hostname, which is fronted by an authenticating proxy. Repeatable. Wins over `remoteHost`. |
+| `--remote-user <login>` | A login allowed to arrive that way. Repeatable, or `PHASE_CONSOLE_REMOTE_USERS` as a comma-separated list. Wins over `remoteUsers`. |
 
 ```bash
 ./start --root ~/code/your-repo --allow-writes --allow-run \
@@ -94,15 +147,15 @@ Two new flags. Neither changes what the server binds to:
         --remote-user you@example.com
 ```
 
-Use your real MagicDNS name — `tailscale status --json` prints it as `Self.DNSName` — and the login
-you signed in with.
-
-`--remote` without `--remote-user` **refuses to start**. Starting with no allowlist would look
-completely correct and quietly admit everyone on your network, so it is an error rather than a
-warning.
+`--remote` with no allowed login at all — none from `--remote-user`, the environment or the profile —
+**refuses to start**. Starting with no allowlist would look completely correct and quietly admit
+everyone on your network, so it is an error rather than a warning.
 
 
 ## Step 4 · Put the proxy in front of it
+
+Settings → *Reach this console from your phone* prints the command for this console's own port. For
+the console on 4123 it is:
 
 ```bash
 tailscale serve --bg --https=443 http://127.0.0.1:4123
@@ -120,7 +173,6 @@ that foreground command, and you will be re-running it by hand forever.
 
 To undo it: `tailscale serve --https=443 http://127.0.0.1:4123 off`, or `tailscale serve reset` to
 clear everything.
-
 
 
 Now open `https://your-machine.your-tailnet.ts.net/` on the phone. Padlock, no warning, no port
@@ -145,6 +197,7 @@ constantly is a channel you learn to ignore.
 Android needs none of this — notifications work in a normal HTTPS tab — but installing it still gives
 you a cleaner window.
 
+
 ## Step 6 · Turn on push, and choose what it sends
 
 **Settings ▸ Notifications** (`#/settings/notifications`) has two switches, and the difference between them is the
@@ -162,6 +215,13 @@ Do it on the laptop too. `http://127.0.0.1` counts as a secure context, so the s
 there with no HTTPS involved, and every browser gets its own subscription and its own choices.
 
 
+**Every notification names its console.** A push carries the console that sent it, and the card's
+title reads `<title> · <console name>` unless the title already says it — one device can hear more
+than one console. A notification's tag, which decides which card replaces which, is namespaced by the
+console's id, so two consoles never overwrite each other's cards. That namespacing changed every tag
+once, at 5.0.0: a card delivered before the upgrade stands beside its successor rather than being
+replaced by it.
+
 **Sixteen categories, per device**, because a phone and a laptop rarely want the same ones. This
 table is the catalogue (`viewer/server/push/catalogue.ts`), and a test holds it to it — if the two
 ever disagree, the catalogue is right:
@@ -169,7 +229,7 @@ ever disagree, the catalogue is right:
 | Category | Default | Fires when |
 |---|---|---|
 | **Permission needed** | on | A session is blocked on a decision only you can make — a command outside its rules, a gate, or a check it cannot make itself. Nothing proceeds until you answer. |
-| **Session waiting on you** | on | A Claude session outside the autopilot — one you ran in a terminal, or an agent session — hit a permission prompt or asked for input. It sits blocked until you answer it there; the console cannot answer for it. |
+| **Session waiting on you** | on | A Claude session is stopped at a permission prompt or a question — a lane of the autopilot, one you ran in a terminal, or an agent session. The body is the question itself, with the plan and phase when the console can tell which, never the directory. A lane whose phase already has a card waiting in the approval queue is not pushed twice. The row is resolved when the wait is answered or the session ends, and a wait still unanswered after an hour is pushed once more. A question a relayed session asks arrives here too, answered by rule when its window closes unless you answer first. |
 | **A phase needs you** | on | A phase did its work and stopped at something no automation may sign off — a check written as prose, a verification only a person can make. It is not failed and not finished; it is waiting, and it will keep waiting. |
 | **Gate needs a person** | on | A phase is held at a gate only a person may clear — a physical act, a third party, a credential no session holds. The board will call the phase ready the moment it is approved and not one second before, so nothing else moves and nothing else will ask. |
 | **QA verdict owed or failed** | on | A finished phase still owes its QA verdict, or QA recorded a fail. Either way the plan gates on it: every dependent phase is held until pass or waived is recorded, and nothing records one by itself. Sent only after the console's own chase (the at-finish dispatcher, then the ladder) left the verdict owed. |
@@ -199,13 +259,28 @@ Payloads are encrypted to a key only your browser holds ([RFC 8291][rfc8291]), s
 relays a notification about your plans without being able to read one. Nothing is installed to make
 that work — the implementation is `node:crypto` and about four hundred lines.
 
+### When nothing would reach you
+
+A console that announces to nobody looks exactly like a console with nothing to say, so it checks.
+An announcement no subscribed device will take is recorded as `no-device` in the delivery ledger (Debug
+shows it); when the reason is that no device is subscribed at all, it is also logged, once per process,
+as `push.no-device`. The console then
+judges its whole channel — a subscribed device, a notifier (`PHASE_CONSOLE_NOTIFY` or the profile's
+`notifyCommand`), or a webhook row — and while none of them reaches anyone it keeps one `push-broken`
+issue, `delivery-channel`, naming the first category that found nobody. Under `--remote` the channel
+also needs Tailscale running and Serve pointing at this console's port. The issue withdraws itself the
+moment a channel appears (`env.delivery-channel` is logged both ways), and quiet hours alone never
+raise it. With nothing to hear it and unread items waiting, the inbox raises its own row about it.
+`phase-console doctor` asks the same probe in its `delivery` row, which reports and does not block.
+
+
 ### Quiet hours on a device
 
 Each subscribed device can carry a daily **quiet window** — *Settings ▸ Notifications ▸ Devices ▸ Quiet
 hours*, off until you switch it on (it opens at 22:00–08:00; edit from there). Inside the window
 nothing is **pushed** to that device. Everything else still happens: the inbox gets the record, an
-open tab gets the event, `PHASE_CONSOLE_NOTIFY` runs, webhooks post — the morning finds the night in
-the bell, and the delivery ledger reads `quiet` for the device rather than reading as a failure.
+open tab gets the event, the notifier runs, webhooks post — the morning finds the night in the bell,
+and the delivery ledger reads `quiet` for the device rather than reading as a failure.
 **Urgent still gets through** by default (an approval held until morning stops the fleet dead until
 morning); untick it on a device that must never buzz at night. Times are on the console's own clock.
 
@@ -239,6 +314,9 @@ Three things this deliberately cannot do, and the reasons are worth knowing befo
   answered` rather than trying again. An expired or already-cleared item opens the console instead,
   which is exactly what every button did before this existed.
 
+A relayed question carries no buttons: a button may allow or deny, never choose one of several
+labels, so its answer is a tap on `#/approve`.
+
 ### `#/approve` — the whole queue, thumb-sized
 
 `https://your-console/#/approve` is a page with nothing on it but what needs you and can be answered
@@ -247,18 +325,21 @@ from any notification.
 
 It shows an item only when this console can actually act on it — a remedy behind a capability you
 did not start the console with is not drawn as a dead button, it is counted in one line at the foot.
-`Session waiting on you` never appears: that session is stopped at its own terminal prompt and the
-console genuinely cannot answer for it.
+A `Session waiting on you` item follows the same rule. A lane of the autopilot that the console can
+place on a plan and phase carries **Answer it**, and your words reach that lane's session as an
+instruction for the rest of the phase (behind `--allow-run`). A session stopped at its own terminal
+prompt has no action here — the console genuinely cannot answer for it — so it is counted at the foot,
+and you answer it where it runs.
 
-Where the console can carry your words — evidence on a gate, a reason on a permission card — the
-card has a text field, and on Chrome and Safari a **microphone button** beside it that dictates into
-it. Firefox has no speech API, so there is no button there rather than a dead one. Dictation fills
-the field; it never presses the button.
+Where the console can carry your words — evidence on a gate, a reason on a permission card, the answer
+to a lane — the card has a text field, and on Chrome and Safari a **microphone button** beside it that
+dictates into it. Firefox has no speech API, so there is no button there rather than a dead one.
+Dictation fills the field; it never presses the button.
 
 ## Step 7 · Alerts with no browser involved at all *(optional)*
 
 Push still needs a browser somewhere, even a closed one. For a machine where that is not true — a
-headless box, a pager, a chat channel — point `PHASE_CONSOLE_NOTIFY` at a script. It is run as
+headless box, a pager, a chat channel — point a notifier at a script. It is run as
 `your-script "<title>" "<body>"` whenever a run needs a person:
 
 ```bash
@@ -267,9 +348,13 @@ headless box, a pager, a chat channel — point `PHASE_CONSOLE_NOTIFY` at a scri
 curl -s -H "Title: $1" -d "$2" https://ntfy.sh/your-private-topic-name >/dev/null
 ```
 
+Set it once for every console in the machine profile, or for one shell with the environment variable,
+which wins over the file:
+
 ```bash
 chmod +x ~/.local/bin/phase-notify
-export PHASE_CONSOLE_NOTIFY=~/.local/bin/phase-notify
+node viewer/shared/instances.mjs profile-set notifyCommand '"/absolute/path/to/phase-notify"'   # every console
+export PHASE_CONSOLE_NOTIFY=~/.local/bin/phase-notify                                            # this shell only
 ```
 
 [ntfy](https://ntfy.sh) is the shortest path — install its app, subscribe to the topic. Pushover,
@@ -277,20 +362,22 @@ Slack or a webhook of your own work the same way.
 
 > **This sends plan names and approval details to whatever service you choose.** Pick a topic name
 > nobody will guess, and if the work is sensitive, [self-host ntfy](https://docs.ntfy.sh/install/) or
-> point the script somewhere you control. The variable is environment-only on purpose — nothing
-> reachable from a web page gets to choose which command runs.
+> point the script somewhere you control. Both places are out of a web page's reach on purpose: the
+> environment, and a file no route writes — so nothing reachable from a browser gets to choose which
+> command runs.
+
 
 ## What is actually enforced
 
-Once you name a hostname, strict `Host` checking turns on and exactly two kinds of request are
-served:
+Once a console has a hostname — `--remote`, or `remoteHost` from the profile — strict `Host` checking
+turns on, and every request is judged by this table:
 
 | Request | Verdict |
 |---|---|
 | Loopback `Host`, no identity header | **Served.** You, at this machine — unchanged from before. |
-| Your `--remote` hostname + an allowlisted login | **Served.** You, through the proxy. |
-| Your `--remote` hostname, no identity header | **403.** Something reached the console without going through the proxy. |
-| Your `--remote` hostname, a login not on the list | **403.** Someone else on your network. |
+| Your remote hostname + an allowlisted login | **Served.** You, through the proxy. |
+| Your remote hostname, no identity header | **403.** Something reached the console without going through the proxy. |
+| Your remote hostname, a login not on the list | **403.** Someone else on your network. |
 | Any other `Host` | **421.** This is what a DNS-rebinding page arrives with. |
 | Loopback `Host` **carrying** an identity header | **421.** See below. |
 
@@ -326,6 +413,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "Host: $H" -H "Tailscale-User-Login:
 
 Use `curl`, not a `fetch()` in a browser console — `Host` is a forbidden header name there, so it is
 dropped silently and every case will look like a pass.
+
 
 ## Locking it down further *(optional)*
 
@@ -364,10 +452,12 @@ console at all.
 | `tailscale serve` prints *"Serve is not enabled on your tailnet"* and never returns | Serve is a tailnet capability that is off until someone approves it. Open the link the command printed — it is specific to that machine — and approve it. The command is waiting for exactly that and will continue on its own; do not kill it. |
 | `tailscale serve` errors about certificates | HTTPS Certificates not enabled. Step 1. |
 | **403** — *"No caller identity"* | You reached the console directly rather than through Serve, or Serve is not running. Check `tailscale serve status`. |
-| **403** — *"… is not allowed to use this console"* | The login is real but not in `--remote-user`. |
-| **421** — *"does not answer to …"* | The hostname you opened is not the one you passed to `--remote`. They must match exactly. |
+| **403** — *"… is not allowed to use this console"* | The login is real but not in `--remote-user` (or, with no flag, the profile's `remoteUsers`). |
+| **421** — *"does not answer to …"* | The hostname you opened is not the one you passed to `--remote` (or, with no flag, the profile's `remoteHost`). They must match exactly. |
 | **421** — *"arrived through a proxy but asks for a local hostname"* | Something rewrote the `Host` header to `localhost`. Serve does not; a proxy in between might. |
-| The console will not start | `--remote` with no `--remote-user`. The error says so. |
+| The console will not start | `--remote` with no allowed login from `--remote-user`, the environment or the profile. The error says so. |
+| The console starts local-only although the profile names a host | Remote access is inherited only as a pair: the profile has `remoteHost` and no `remoteUsers` (or the reverse), and no flag supplies the other half. |
+| A *delivery-channel* issue says announcements are reaching nobody | No subscribed device, no notifier and no webhook — or, under `--remote`, Tailscale stopped or Serve pointing elsewhere. Give the console one channel; the issue withdraws itself. |
 | The notification button does nothing on iOS | Not installed to the Home Screen, or you are on plain HTTP. Both are required. |
 | **Turn on** is missing and a banner explains why | Permission was refused for this site once. A page cannot ask twice — it has to be changed in browser settings. |
 | **Send a test** says it was handed over, and nothing appears | Three separate yeses are involved — the push service, the browser, and the operating system — and only the first answers back. This is almost always the third: macOS *System Settings → Notifications → your browser*, or Windows *Settings → System → Notifications*. A Focus mode does it silently too. |

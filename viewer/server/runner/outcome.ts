@@ -16,8 +16,8 @@
  * crashed attempt must never speak for the next one.
  */
 
-import { readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { runDir } from './state.ts';
 import { OUTCOME_STATUSES } from '../../shared/run-lifecycle.js';
@@ -48,6 +48,20 @@ export type PhaseOutcome = {
   phase: number;
   status: PhaseOutcomeStatus;
   reason?: string;
+  /**
+   * The decision KEY a `blocked` / `needs-human` declaration is missing
+   * (chapter 10 ZTD-3): one of `DECISION_KEYS`, or a blocker class as its short
+   * form (`credential`, `permission`, `gate`, `external`, `lock`). The script
+   * requires it on those two statuses; the reader TOLERATES its absence — a
+   * 4.1.0 session's file must still park the phase during the rollout, and
+   * the classifier then falls back to the prose it always read. Read BEFORE
+   * the prose by `situation.ts`, which is what retires `blocked-declared:unknown`.
+   */
+  needs?: string;
+  /** A permission block, structured: the rule that refused … */
+  rule?: string;
+  /** … and the command it refused. Both optional, both beside `needs`. */
+  command?: string;
   /** ISO time the session suggests re-checking at (waiting-external only). */
   resume_after?: string;
   watch: string[];
@@ -96,6 +110,22 @@ export function inboxOutcomePhase(file: string): number | null {
  * written before this attempt started. Null is always safe — it degrades to
  * the legacy "the session declared nothing" path.
  */
+/**
+ * The structured half of a `blocked`/`needs-human` declaration, ready to
+ * spread into `record.declared` — present only when the session said it, so
+ * a record written from a declaration without `--needs` carries no `needs`
+ * key at all (the classifier reads absence as "fall back to the prose").
+ */
+export function needsOf(outcome: Pick<PhaseOutcome, 'needs' | 'rule' | 'command'>): {
+  needs?: string; rule?: string; command?: string;
+} {
+  return {
+    ...(outcome.needs ? { needs: outcome.needs } : {}),
+    ...(outcome.rule ? { rule: outcome.rule } : {}),
+    ...(outcome.command ? { command: outcome.command } : {}),
+  };
+}
+
 export function readOutcome(
   path: string,
   expect: { slug: string; phase: number; notBefore?: string },
@@ -142,6 +172,13 @@ export function readOutcome(
     phase: parsed.phase,
     status: parsed.status as PhaseOutcomeStatus,
     ...(typeof parsed.reason === 'string' && parsed.reason ? { reason: parsed.reason.slice(0, 500) } : {}),
+    // A word, never a sentence: the same shape the script validates against
+    // decisions.env. Membership is the CLASSIFIER's question (an unknown word
+    // classifies through the prose, exactly like no word), so a key added to
+    // the vocabulary tomorrow is not thrown away by a reader built today.
+    ...(typeof parsed.needs === 'string' && /^[a-z][a-z0-9.-]{0,63}$/.test(parsed.needs) ? { needs: parsed.needs } : {}),
+    ...(typeof parsed.rule === 'string' && parsed.rule ? { rule: parsed.rule.slice(0, 200) } : {}),
+    ...(typeof parsed.command === 'string' && parsed.command ? { command: parsed.command.slice(0, 500) } : {}),
     ...(typeof parsed.resume_after === 'string' && parsed.resume_after
       ? { resume_after: parsed.resume_after }
       : {}),
@@ -153,9 +190,55 @@ export function readOutcome(
   };
 }
 
-/** Remove a consumed (or stale) outcome file. Never throws — best-effort. */
+/** Remove a consumed outcome file. Never throws — best-effort. */
 export function consumeOutcome(path: string): void {
   try {
     rmSync(path, { force: true });
   } catch { /* best-effort */ }
+}
+
+/** Why an inbox declaration was set aside instead of acted on (WAI-7). */
+export const OUTCOME_IGNORE_REASONS = Object.freeze(['stale', 'invalid', 'failed'] as const);
+export type OutcomeIgnoreReason = (typeof OUTCOME_IGNORE_REASONS)[number];
+
+/** The folder under an inbox where set-aside declarations are kept, never deleted. */
+export const OUTCOME_IGNORED_DIR = 'ignored';
+
+/**
+ * Set an inbox declaration aside WITHOUT destroying it: moved into
+ * `<inbox>/ignored/<name>.<reason>` (a `.<n>` suffix when that name already
+ * exists — evidence is never overwritten). Returns the new path, or null when
+ * the move failed (the caller then deletes, as it always did, and says so).
+ *
+ * The inbox used to `consumeOutcome` a file BEFORE deciding whether to believe
+ * it, so an unparseable or day-old declaration — the one channel a hand session
+ * has into the autopilot — vanished with one `console.log` line and nothing on
+ * any run's journal. The 24-hour rule stays; the silence does not.
+ */
+export function ignoreOutcome(path: string, reason: OutcomeIgnoreReason): string | null {
+  try {
+    const dir = join(dirname(path), OUTCOME_IGNORED_DIR);
+    mkdirSync(dir, { recursive: true });
+    const base = join(dir, `${basename(path)}.${reason}`);
+    let target = base;
+    for (let n = 1; existsSync(target); n++) target = `${base}.${n}`;
+    renameSync(path, target);
+    return target;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The `written_at` of a declaration the strict reader rejected, if the bytes
+ * are JSON at all — so `phase.outcome-ignored` can still say when it was
+ * written. Null when nothing can be read.
+ */
+export function peekWrittenAt(path: string): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as { written_at?: unknown };
+    return typeof parsed?.written_at === 'string' ? parsed.written_at : null;
+  } catch {
+    return null;
+  }
 }

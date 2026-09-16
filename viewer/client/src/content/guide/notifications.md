@@ -17,7 +17,7 @@ ignoring the inbox entirely.
 | Category | Tells you | Default |
 |---|---|---|
 | **Permission needed** | A session is blocked on a decision only you can make. Nothing proceeds until you answer. | On, urgent |
-| **Session waiting on you** | A Claude session outside the autopilot — an agent session, or one you ran in a terminal — hit a permission prompt or asked for input. It waits until you answer it there. | On, urgent |
+| **Session waiting on you** | A Claude session hit a permission prompt or asked for input — an agent session, one you ran in a terminal, an autopilot lane with no permission card already up for it, or a question the relay is holding, with the seconds left before the console answers it by rule. Sent once more if an ask waits an hour unanswered. | On, urgent |
 | **A phase needs you** | A phase stopped at a check no automation may sign off. Not failed, not finished — waiting. | On, urgent |
 | **Gate needs a person** | A phase is held at a gate only a person may clear. The board calls it ready the moment you approve it and not before. | On |
 | **QA verdict owed or failed** | A finished phase still owes its QA verdict, or QA recorded a fail — the plan gates on it, so every dependent is held until pass or waived is recorded. Sent only after the console's own chase left the verdict owed. | On, urgent |
@@ -73,11 +73,18 @@ is between two halves of one piece of work, and taking the lane away throws that
 26 park-and-resume cycles at a median of 70 minutes each, every one of them interrupting a machine
 doing exactly what it had been asked to do. So the console tells whose clock it is by reading the
 command, and a local one gets a single nudge — background the job and carry on — with the park only
-after `stallLocalJobMs` (45 minutes). A local park hands the loop's own condition over as a watch ref,
-so the lane comes back when the job is genuinely finished rather than at the end of a guessed window.
+after `stallLocalJobMs` (45 minutes). A park hands the loop's own condition over as a watch ref, but a
+`cmd:` ref the console minted from a command is run only when `watchMintedCmdRefs` is on — off unless
+you turn it on, and only under `--allow-run` — so by default that ref is recorded unrun and the lane
+comes back on the park's own clock rather than the moment the job finishes.
 
-**Urgent** is reserved for *nothing proceeds without you*. Those three may interrupt a focus mode and
-buzz a wrist.
+The console may park a lane by itself at most four times a phase — its own allowance, separate from
+the waits a session declares — and `stallAutomaticPark` (Settings ▸ Automation) switches that off
+altogether: the card still comes and the local job's nudge still goes, but no lane is parked in the
+session's place.
+
+**Urgent** is reserved for *nothing proceeds without you*. The categories marked urgent above may
+interrupt a focus mode and buzz a wrist.
 
 ## Turning off the usage-limit alerts
 
@@ -122,4 +129,8 @@ about — a plan, a run, a phase, a session — so it routes to the thing rather
 
 > If announcements arrive in the inbox and never anywhere else, `PHASE_CONSOLE_NOTIFY` is unset and
 > no device is subscribed — the Notifications page says so at the top rather than leaving you to
-> conclude it.
+> conclude it. Each record says it too: a delivery that found no device reads `no-device` rather than
+> nothing, and a console with no way to reach you at all raises that as a problem with its delivery,
+> naming the category that reached nobody.
+
+Every push carries the name of the console that sent it, after its title.

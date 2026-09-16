@@ -65,6 +65,19 @@ const OUTCOMES: { id: string; means: string; counts: string; tone: 'ok' | 'bad' 
     counts: 'held',
     tone: 'neutral',
   },
+  {
+    id: 'skipped',
+    means:
+      'The console’s own row: nothing could be seen delivered — the process exited first, or there was nowhere to send it.',
+    counts: 'not delivered',
+    tone: 'bad',
+  },
+  {
+    id: 'no-device',
+    means: 'No device was there to take it — none subscribed, or none to this category.',
+    counts: 'not delivered',
+    tone: 'bad',
+  },
 ];
 
 /**
@@ -85,6 +98,8 @@ const TONE_OF: Record<string, 'ok' | 'bad' | 'neutral' | 'wait'> = {
   throttled: 'wait',
   failed: 'bad',
   gone: 'bad',
+  skipped: 'bad',
+  'no-device': 'bad',
 };
 
 const columns: Column<DebugEntry>[] = [

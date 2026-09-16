@@ -26,31 +26,49 @@ memory: project_gatecheck
 
 ### Phase 1 — base
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 2 — future *(GATED)*
 - **Gate-check:** date 2099-01-01
+- **Verification:**
+  - `true`
 
 ### Phase 3 — past *(GATED)*
 - **Gate-check:** date 2000-01-01
+- **Verification:**
+  - `true`
 
 ### Phase 4 — needs-one *(GATED)*
 - **Gate-check:** phase 1
+- **Verification:**
+  - `true`
 
 ### Phase 5 — ops *(GATED)*
 - **Gates (must clear first):** ops signs the launch checklist
 - **Gate-check:** manual ops sign-off before launch
+- **Verification:**
+  - `true`
 
 ### Phase 6 — several *(GATED)*
 - **Gate-check:** phases 1,3
+- **Verification:**
+  - `true`
 
 ### Phase 7 — duesoon *(GATED)*
 - **Gate-check:** deadline 2099-01-01
+- **Verification:**
+  - `true`
 
 ### Phase 8 — overdue *(GATED)*
 - **Gate-check:** deadline 2000-01-01
+- **Verification:**
+  - `true`
 
 ### Phase 9 — factcheck *(GATED)*
 - **Gate-check:** cmd true
+- **Verification:**
+  - `true`
 
 ### Phase 10 — aigate *(GATED)*
 - **Gates (must clear first):**
@@ -63,3 +81,5 @@ memory: project_gatecheck
   7. the seventh condition sits far beyond the old six-line window
 - **Gate-check:** ai verify staging deploy and smoke suite
 - **Size:** S
+- **Verification:**
+  - `true`

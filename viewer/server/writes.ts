@@ -18,10 +18,11 @@ import {
   HANDOFF_STATUSES,
   QA_RESULTS, QA_DIRECTIVES,
 } from '../shared/plan-vocab.js';
+import { DECISION_KEYS } from '../shared/decisions-model.js';
 
 export type WriteAction =
   | 'new-plan' | 'new-handoff' | 'qa-record' | 'gate-approve' | 'lock-claim' | 'lock-release'
-  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode';
+  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote';
 
 export type WriteRequest = {
   action: WriteAction;
@@ -59,6 +60,16 @@ export type WriteRequest = {
    * WRITER's words — what the engine reads back is `QA_MODES`.
    */
   mode?: string;
+  /**
+   * The ruling to promote (`decisions-promote`): its ledger id, the decision
+   * key its row goes under, and the ledger it is read from — passed to the
+   * script as `PE_RULINGS_FILE` so the console and `decisions.sh` read ONE
+   * file (the console resolves the ledger through `instances.mjs`, the script
+   * through `instance.sh`; a sandboxed test redirects only the first).
+   */
+  rulingId?: string;
+  key?: string;
+  ledger?: string;
 };
 
 export type WriteOutcome = {
@@ -124,7 +135,13 @@ function requirePhase(phase?: number): number {
   return phase as number;
 }
 
-export type WritePlan = { script: string; args: string[]; description: string };
+export type WritePlan = {
+  script: string;
+  args: string[];
+  description: string;
+  /** Extra environment for the script, over the process's own. */
+  env?: Record<string, string>;
+};
 
 /** Translate a request into the exact script invocation, or refuse it. */
 export function planWrite(request: WriteRequest, opts: { root: string; docsDir?: string }): WritePlan {
@@ -291,6 +308,32 @@ export function planWrite(request: WriteRequest, opts: { root: string; docsDir?:
       };
     }
 
+    case 'decisions-promote': {
+      // A ruling becomes a standing `## Decisions` row (source `ruling`) in
+      // the plan's twin, `docs/handoffs/<slug>/decisions.md` — the only file
+      // `decisions.sh` writes and the only writer of it. The row is plan-wide:
+      // a ruling is made in one phase, the answer it records is the plan's.
+      const slug = requireSlug(request.slug);
+      const rulingId = (request.rulingId ?? '').trim();
+      if (!/^[0-9a-f]{12}$/.test(rulingId)) throw new WriteError('A ruling id is 12 hex characters — the ledger\'s own.');
+      const key = (request.key ?? '').trim();
+      if (!(DECISION_KEYS as readonly string[]).includes(key)) {
+        throw new WriteError(`The decision key must be one of the manifest's (${DECISION_KEYS.join(', ')}).`);
+      }
+      const by = (request.by ?? '').trim();
+      if (!by || !GATE_BY.test(by)) {
+        throw new WriteError('Who remembered it must be 1-64 characters: letters, digits, spaces, dots, @, + or dashes.');
+      }
+      const ledger = (request.ledger ?? '').trim();
+      if (!isAbsolute(ledger)) throw new WriteError('The ruling ledger must be an absolute path.');
+      return {
+        script: 'decisions.sh',
+        args: [slug, 'promote', '--from-ruling', rulingId, '--key', key, '--by', by],
+        description: `Remember ruling ${rulingId} as the ${slug} answer to ${key}`,
+        env: { PE_RULINGS_FILE: ledger },
+      };
+    }
+
     case 'open-editor':
       throw new WriteError('Editor launches do not go through planWrite.');
 
@@ -314,7 +357,7 @@ export async function runWrite(
         timeout: 20_000,
         maxBuffer: 4 * 1024 * 1024,
         cwd: opts.root,
-        env: { ...process.env, DOCS_ROOT: opts.root, NO_COLOR: '1', TERM: 'dumb' },
+        env: { ...process.env, ...(plan.env ?? {}), DOCS_ROOT: opts.root, NO_COLOR: '1', TERM: 'dumb' },
       },
       (error, stdout, stderr) => {
         const code = error && typeof (error as { code?: unknown }).code === 'number'

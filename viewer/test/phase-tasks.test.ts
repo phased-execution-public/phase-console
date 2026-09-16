@@ -258,7 +258,7 @@ test('a retry starts a fresh list — the fold and its offset are cleared togeth
   record.tasks = [{ id: 'a', content: 'from the last attempt', status: 'completed' }];
   record.tasksAt = 512;
 
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
 
   // Both, or neither. Keeping the offset while deleting the file would leave
   // the tail reading past the end of a shorter one for ever; keeping the list

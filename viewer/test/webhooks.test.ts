@@ -459,3 +459,39 @@ test('the payload carries a per-announcement urgency override, else the catalogu
     [...WEBHOOK_PAYLOAD_FIELDS].sort(),
   );
 });
+
+/* ------------------------------------------------------------------ *
+ * The machine profile's rows (zero-touch phase 17, FLT-3)
+ * ------------------------------------------------------------------ */
+
+test('FLT-3: a machine-profile row is delivered to, listed as the profile\'s, never persisted and never removable here', async () => {
+  const { sent, fetchImpl } = recorder();
+  const base = fresh({ fetch: fetchImpl });
+  assert.equal(base.list().length, 0);
+  const hooks = new Webhooks({
+    enabled: true,
+    instance: 'test-console',
+    link: (url: string) => `http://127.0.0.1:4123${url}`,
+    fetch: fetchImpl,
+    profileHooks: [
+      { url: URL_B, name: 'machine chat', categories: ['halted'] },
+      { url: 'http://127.0.0.1:9/nope' },
+    ],
+  });
+  const rows = hooks.list();
+  assert.equal(rows.length, 1, 'a refused URL from the file is skipped, not registered');
+  assert.equal(rows[0]!.profile, true);
+  assert.equal(rows[0]!.label, 'machine chat');
+  assert.equal(hooks.remove(rows[0]!.id), false, 'the file owns it — removing it here would come back at the next boot');
+
+  hooks.announce('halted', { title: 'A run halted', body: 'b', url: '/', category: 'halted', urgent: true } as never);
+  await settle();
+  assert.equal(sent.length, 1, 'every console delivers to the machine\'s rows');
+
+  // A row this console registers itself is persisted; the profile's is not.
+  const own = hooks.add(URL_A, 'own', null);
+  assert.ok(!('error' in own));
+  const reread = new Webhooks({ enabled: true, instance: 'test-console', link: (url: string) => url });
+  assert.deepEqual(reread.list().map((row) => row.label), ['own'], 'only the console\'s own row reached the file');
+  for (const row of reread.list()) reread.remove(row.id);
+});

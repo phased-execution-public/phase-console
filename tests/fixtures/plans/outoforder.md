@@ -22,3 +22,26 @@ still ready and nothing falsely reports "done".
 | 3 | sib-b   | 1 | 2    | r | x |
 | 4 | mid     | 1 | 2, 3 | r | x |
 | 5 | tip     | 4 | —    | r | x |
+
+## Phases
+
+### Phase 1 — base
+- **Verification:**
+  - `true`
+
+### Phase 2 — sib-a
+- **Verification:**
+  - `true`
+
+### Phase 3 — sib-b
+- **Verification:**
+  - `true`
+
+### Phase 4 — mid
+- **Verification:**
+  - `true`
+
+### Phase 5 — tip
+- **Verification:**
+  - `true`
+

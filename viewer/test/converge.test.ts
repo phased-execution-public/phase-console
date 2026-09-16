@@ -38,9 +38,10 @@ const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const {
   planConvergence, executeConvergence, ConvergeScheduler, stoppedByOperator, runIsDead, evidenceFingerprint,
-  CHANGE_DEBOUNCE_MS, HALT_DELAY_MS, MAX_BOOT_RESUMES, MIN_SWEEP_MS, WAIT_OVERDUE_GRACE_MS,
+  CHANGE_DEBOUNCE_MS, HALT_DELAY_MS, MAX_BOOT_RESUMES, MIN_SWEEP_MS, WAIT_OVERDUE_GRACE_MS, PRESS_ONLY_HALT_KINDS,
 } = await import('../server/converge.ts');
 const { newRun, phaseRecord, saveRun, loadRun, journalFile, consoleStoppedNote } = await import('../server/runner/state.ts');
+const { START_DOORS } = await import('../shared/run-lifecycle.js');
 const { lockPath, readLock } = await import('../server/store.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 type PhaseRecord = import('../server/runner/state.ts').PhaseRecord;
@@ -276,6 +277,46 @@ test('planner: the same evidence is not healed twice — until something changes
   assert.equal(planConvergence(facts({ runs: [halted], lastNoop: fingerprint, trigger: 'button' })).actions[0].kind, 'heal');
 });
 
+test('SLF-7: the noop latch rides the RUN — two passes over identical evidence write one run.converge across a simulated restart', async () => {
+  const halted = run({ status: 'halted', halt: { at: '', reason: 'phase 2 did not verify', phase: 2, kind: 'verify-failed' } }, [{ phase: 2, status: 'failed' }]);
+  // Pass 1, in a process whose scheduler has no memory of this plan: the heal
+  // runs, finds nothing, journals once, and writes the latch onto the run.
+  const firstDeps = stubDeps(halted);
+  const first = await executeConvergence(planConvergence(facts({ runs: [halted], lastNoop: null })), firstDeps);
+  assert.equal(firstDeps.lines.filter((l) => l.event === 'run.converge').length, 1);
+  assert.ok(first.noop, 'the pass reports its fingerprint');
+  assert.equal(halted.converge?.lastNoop, first.noop, 'persisted on the run, where its evidence lives');
+  // Pass 2 after a RESTART: the scheduler's memory is blank (`lastNoop: null`),
+  // the evidence is identical, the run remembers. Nothing healed, nothing written.
+  const secondDeps = stubDeps(halted);
+  const second = await executeConvergence(planConvergence(facts({ runs: [halted], lastNoop: null })), secondDeps);
+  assert.equal(secondDeps.lines.filter((l) => l.event === 'run.converge').length, 0, 'the restart did not heal the same evidence again');
+  assert.equal(second.actions[0].kind, 'skip');
+  // …and a pass that LAUNCHES clears the latch, so the next pass looks again.
+  const healing = stubDeps(halted, { heal: async () => ({ launched: true, phase: 2, situation: 'verify-red', rung: 'fix-verification' }) });
+  const third = await executeConvergence(planConvergence(facts({ runs: [halted], lastNoop: null, trigger: 'button' })), healing);
+  assert.equal(third.launched, true);
+  assert.equal(halted.converge, null, 'a launch clears the latch');
+  assert.equal(healing.lines.filter((l) => l.event === 'run.converge').length, 1);
+});
+
+test('SLF-7: a refused cmd: row with a past nextDueAt does not move the fingerprint — stable across two minutes', () => {
+  const parked = run({ status: 'parked', halt: { at: '', reason: 'phase 2 needs a person', phase: 2, kind: 'needs-human' } }, [{
+    phase: 2, status: 'parked',
+    declared: { status: 'needs-human', reason: 'the token', watch: ['cmd:npm ci'], at: '2026-08-21T09:00:00.000Z' },
+    // A row written before the scheduler dropped a refused row's clock: past
+    // its due, `refused`, and never advanced by anybody.
+    watchState: { at: '2026-08-21T09:30:00.000Z', refs: [{ ref: 'cmd:npm ci', scheme: 'cmd', state: 'refused', checkedAt: '2026-08-21T09:30:00.000Z', nextDueAt: NOW - 3_600_000, runs: 12 }] },
+  } as never]);
+  const board = facts().board!;
+  const at = evidenceFingerprint(parked, board, [], null, null, NOW);
+  const later = evidenceFingerprint(parked, board, [], null, null, NOW + 2 * 60_000);
+  assert.equal(at, later, 'a refused row is not "due" — the term does not tick with the minute');
+  // The same row `pending` IS live evidence, and does move the term.
+  (parked.phases['2'].watchState!.refs[0] as { state: string }).state = 'pending';
+  assert.notEqual(evidenceFingerprint(parked, board, [], null, null, NOW), evidenceFingerprint(parked, board, [], null, null, NOW + 2 * 60_000));
+});
+
 test('planner: clearing a gate is a change — the healer is asked again about a phase a person just unblocked', () => {
   // The shape this was written for, measured on a real run: a manual gate parks
   // the phase, the healer finds nothing to climb (only a person CAN clear it),
@@ -338,7 +379,7 @@ function stubDeps(state: RunState, over: Partial<ConvergeDeps> = {}): ConvergeDe
   };
 }
 
-test('executor: a relaunch bumps bootResumes, journals phase.resume-at-boot + run.converge, and starts the run once', async () => {
+test('executor: a relaunch bumps bootResumes, journals phase.resume-automatic + run.converge, and starts the run once', async () => {
   const state = run({ status: 'interrupted', stoppedBy: 'system', onlyPhases: [2, 3], skills: ['tdd'] }, [
     { phase: 2, status: 'interrupted', note: consoleStoppedNote(2), sessionId: 'sess-2' },
   ]);
@@ -353,8 +394,47 @@ test('executor: a relaunch bumps bootResumes, journals phase.resume-at-boot + ru
   assert.deepEqual(start.onlyPhases, [2, 3], 'a scoped run keeps its scope through the relaunch');
   assert.deepEqual(start.skills, ['tdd'], 'and its skills');
   assert.equal(state.recoveries?.['2']?.bootResumes, 1, 'the resume is counted on the run');
-  assert.ok(deps.lines.some((l) => l.event === 'phase.resume-at-boot' && l.phase === 2 && l.data.count === 1 && l.data.sessionId === 'sess-2'));
+  // Named for what it is, with what woke it (LFC-7): `phase.resume-at-boot`
+  // was true of 15 of its 25 lines.
+  assert.ok(deps.lines.some((l) => l.event === 'phase.resume-automatic' && l.phase === 2 && l.data.count === 1
+    && l.data.sessionId === 'sess-2' && l.data.path === 'killed-lane' && l.data.trigger === 'timer'));
+  assert.ok(!deps.lines.some((l) => l.event === 'phase.resume-at-boot'), 'the retired name is never written');
   assert.ok(deps.lines.some((l) => l.event === 'run.converge' && l.data.action === 'relaunch'));
+  // SLF-1: the start names its door — `run.start` will carry this actor whole —
+  // with the loop's trigger, the planner's reason, the guard and the counter.
+  const actor = (deps.started[0] as { actor: Record<string, unknown> }).actor;
+  assert.equal(actor.door, 'converge-relaunch');
+  assert.ok((START_DOORS as readonly string[]).includes(String(actor.door)));
+  assert.equal(actor.by, 'converge');
+  assert.equal(actor.via, 'timer', 'the sweep is a clock of the console\'s own');
+  assert.equal(actor.origin, 'converge:timer');
+  assert.equal(actor.guard, 'automaticResumeGate');
+  assert.equal(actor.counter, `MAX_BOOT_RESUMES:1/${MAX_BOOT_RESUMES}`);
+  assert.equal(actor.remoteUser, null);
+});
+
+test('SLF-1: the heal action hands the healer the pass — its trigger and evidence fingerprint — and a boot relaunch says boot', async () => {
+  const halted = run({ status: 'halted', stoppedBy: 'system' }, [{ phase: 2, status: 'failed', note: 'phase 2 did not verify' }]);
+  const passes: unknown[] = [];
+  const deps = stubDeps(halted, { heal: async (_slug, pass) => { passes.push(pass); return { launched: false, reason: 'nothing to climb' }; } });
+  const plan = planConvergence(facts({ runs: [halted], board: { 1: 'done', 2: 'in-progress', 3: 'waiting' }, trigger: 'halt' }));
+  assert.deepEqual(kinds(plan), ['heal']);
+  await executeConvergence(plan, deps);
+  assert.equal(passes.length, 1);
+  const pass = passes[0] as { trigger: string; fingerprint: string };
+  assert.equal(pass.trigger, 'halt');
+  assert.equal(typeof pass.fingerprint, 'string');
+  assert.ok(pass.fingerprint.length > 10, 'the planner\'s fingerprint, not a placeholder');
+
+  // A boot-triggered relaunch is `via: boot` with the boot as its origin.
+  const state = run({ status: 'interrupted', stoppedBy: 'system' }, [{ phase: 2, status: 'interrupted', note: consoleStoppedNote(2), sessionId: 'sess-2' }]);
+  const bootDeps = stubDeps(state, { prefs: () => ({ resumeAtBoot: 'auto' }) });
+  const bootPlan = planConvergence(facts({ runs: [state], board: { 1: 'done', 2: 'in-progress', 3: 'waiting' }, trigger: 'boot' }));
+  await executeConvergence(bootPlan, bootDeps);
+  const actor = (bootDeps.started[0] as { actor: Record<string, unknown> }).actor;
+  assert.equal(actor.door, 'converge-relaunch');
+  assert.equal(actor.via, 'boot');
+  assert.equal(actor.origin, 'converge:boot');
 });
 
 test('executor: debris release journals run.lock-debris-released on the DEAD run and pokes the locks', async () => {
@@ -778,7 +858,8 @@ test('service: at boot, lanes a console restart killed resume their own session 
       const disk = loadRun(root, 'alpha', state.id, null)!;
       assert.equal(disk.recoveries?.['2']?.bootResumes, 1);
       const events = journalEvents(root, state.id);
-      assert.ok(events.some((e) => e.event === 'phase.resume-at-boot' && e.phase === 2 && e.data.sessionId === 'sess-2'));
+      assert.ok(events.some((e) => e.event === 'phase.resume-automatic' && e.phase === 2 && e.data.sessionId === 'sess-2'
+        && e.data.trigger === 'boot' && e.data.path === 'killed-lane'));
       assert.ok(events.some((e) => e.event === 'run.converge' && e.data.trigger === 'boot' && e.data.action === 'relaunch'));
       const report = svc.convergeReports().find((r) => r.slug === 'alpha')!;
       assert.equal(report.trigger, 'boot');
@@ -1072,6 +1153,79 @@ test('planner: a parked run whose board has ready work it never boarded is relau
   assert.ok(kinds(plan).includes('relaunch'), `expected a relaunch, got: ${kinds(plan).join(',')}`);
 });
 
+test('RCV-11: a run halt() stopped and relaunched gives a why that never says the console shut down — and a restart-interrupted run naming its own halt says which', () => {
+  // (a) A `halt()`-stopped run — `halted`, never `systemStop` — relaunches
+  // only for the board opening up (or a restart's killed lanes), and the
+  // sentence says that: "shut down" is a claim about the console, and the
+  // console did nothing to this run.
+  const halted = run({ status: 'halted', stoppedBy: 'system', halt: { at: '', reason: 'nothing can proceed — phase 2 holds every dependent', phase: 2, kind: 'plan-deadlocked' } },
+    [{ phase: 1, status: 'done' }]);
+  const plan = planConvergence(facts({ runs: [halted], board: { 1: 'done', 2: 'ready', 3: 'waiting' } }));
+  const relaunch = plan.actions.find((a) => a.kind === 'relaunch');
+  assert.ok(relaunch, `expected a relaunch, got ${kinds(plan).join(',')}`);
+  const why = relaunch.kind === 'relaunch' ? relaunch.why.join(' ') : '';
+  assert.ok(!/shut down/.test(why), why);
+  assert.match(why, /the board has ready work again/);
+  // …and a killed lane on a halted run relaunches for the lane, in the lane's words.
+  const withLane = run({ status: 'halted', stoppedBy: 'system', halt: { at: '', reason: 'phase 2 did not verify', phase: 2, kind: 'verify-failed' } },
+    [{ phase: 2, status: 'interrupted', note: consoleStoppedNote(2) }]);
+  const p2 = planConvergence(facts({ runs: [withLane], board: { 1: 'done', 2: 'in-progress', 3: 'waiting' } }));
+  const r2 = p2.actions.find((a) => a.kind === 'relaunch');
+  assert.ok(r2 && r2.kind === 'relaunch');
+  assert.ok(!/shut down/.test(r2.why.join(' ')), r2.why.join(' '));
+  assert.match(r2.why.join(' '), /a console restart killed/);
+  // (b) The system-stop sentence stays true for the run it was written for —
+  // one the console's own restart interrupted, no halt of its own…
+  const interrupted = run({ status: 'interrupted', stoppedBy: 'system', halt: { at: '', reason: 'nothing has been driving this run since …', phase: 2, kind: 'interrupted-by-restart' } });
+  const p3 = planConvergence(facts({ runs: [interrupted] }));
+  const r3 = p3.actions.find((a) => a.kind === 'relaunch');
+  assert.ok(r3 && r3.kind === 'relaunch', kinds(p3).join(','));
+  assert.match(r3.why.join(' '), /the console shut down while this run was working/);
+  // …and names the run's OWN halt when a stale one rides the restart-interrupted run.
+  const stale = run({ status: 'interrupted', stoppedBy: 'system', halt: { at: '', reason: 'every model is exhausted', phase: 2, kind: 'models-exhausted' } });
+  const p4 = planConvergence(facts({ runs: [stale] }));
+  const r4 = p4.actions.find((a) => a.kind === 'relaunch');
+  assert.ok(r4 && r4.kind === 'relaunch', kinds(p4).join(','));
+  assert.match(r4.why.join(' '), /shut down after this run stopped on its own \(models-exhausted/);
+  assert.ok(!/while this run was working/.test(r4.why.join(' ')));
+});
+
+test('ACC-5.1 (RCV-3): a run halted failure-streak is relaunched by no trigger but button — every automatic trigger falls through to the healer', () => {
+  // The audit's shape: the streak halted the run, phase 2 is ready and never
+  // boarded, killed lanes from a restart sit beside it — three relaunch doors,
+  // each of which used to answer the halt and zero the counter on the way in.
+  const spent = (over: Partial<RunState> = {}) => run({
+    status: 'halted', stoppedBy: 'system', consecutiveFailures: 2, maxConsecutiveFailures: 2,
+    halt: { at: '', reason: '2 phases failed in a row', phase: 1, kind: 'failure-streak' },
+    ...over,
+  }, [{ phase: 1, status: 'failed', halt: { at: '', reason: 'red', phase: 1, kind: 'verify-failed' } }]);
+  for (const trigger of ['timer', 'boot', 'change', 'halt'] as const) {
+    const plan = planConvergence(facts({ runs: [spent()], board: { 1: 'stuck', 2: 'ready', 3: 'waiting' }, trigger }));
+    assert.ok(!kinds(plan).includes('relaunch'), `${trigger}: no relaunch — got ${kinds(plan).join(',')}`);
+    assert.ok(kinds(plan).includes('heal'), `${trigger}: the phases' own ladders still climb — got ${kinds(plan).join(',')}`);
+  }
+  // …a restart's killed lanes included: that was the door the measured reset came through.
+  const killed = spent({ status: 'halted' });
+  Object.assign(phaseRecord(killed, 2), { status: 'interrupted', note: consoleStoppedNote(2), sessionId: 'sess-2', resumeSessionId: 'sess-2' });
+  const afterRestart = planConvergence(facts({ runs: [killed], board: { 1: 'stuck', 2: 'in-progress', 3: 'waiting' }, trigger: 'boot' }));
+  assert.ok(!kinds(afterRestart).includes('relaunch'), `boot after a restart: ${kinds(afterRestart).join(',')}`);
+  // A person's press is the one door left open.
+  const pressed = planConvergence(facts({ runs: [spent()], board: { 1: 'stuck', 2: 'ready', 3: 'waiting' }, trigger: 'button' }));
+  assert.ok(kinds(pressed).includes('relaunch'), `button: ${kinds(pressed).join(',')}`);
+  // The same for a refused credential (RCV-1): the breaker opens only for a
+  // person, so a relaunch by clock would park on the same wall.
+  const refused = run({
+    status: 'halted', stoppedBy: 'system', consecutiveFailures: 1,
+    halt: { at: '', reason: 'organization policy blocks this credential (account: p)', phase: 1, kind: 'credential-refused' },
+  }, [{ phase: 1, status: 'parked', cause: { kind: 'credential-refused', class: 'org-policy', reason: 'organization policy blocks this credential', at: '' } }]);
+  const byClock = planConvergence(facts({ runs: [refused], board: { 1: 'ready', 2: 'ready', 3: 'waiting' } }));
+  assert.ok(!kinds(byClock).includes('relaunch'), `credential-refused by timer: ${kinds(byClock).join(',')}`);
+  assert.ok(kinds(byClock).includes('heal'));
+  const byPress = planConvergence(facts({ runs: [refused], board: { 1: 'ready', 2: 'ready', 3: 'waiting' }, trigger: 'button' }));
+  assert.ok(kinds(byPress).includes('relaunch'), `credential-refused by button: ${kinds(byPress).join(',')}`);
+  assert.deepEqual([...PRESS_ONLY_HALT_KINDS], ['failure-streak', 'credential-refused']);
+});
+
 test('planner: a parked run with nothing ready is NOT relaunched — it would only re-park', () => {
   const parked = run({ status: 'parked', stoppedBy: 'system', halt: { at: '', reason: 'nothing is ready to run', phase: 1 } },
     [{ phase: 1, status: 'done' }]);
@@ -1336,6 +1490,54 @@ test('planner: an answered ask behaves exactly like the mode it answers to', () 
   assert.deepEqual(kinds(off), ['errand'], 'the standing policy still writes one');
 });
 
+test('planner: the RUN\'s own resumeOnRestart decides the boot relaunch — true relaunches, false writes the errand, only a run with neither asks (ZTD-8)', async () => {
+  const killed = (over: Record<string, unknown> = {}) => run({
+    status: 'interrupted', stoppedBy: 'system', ...over,
+    phases: {
+      1: { phase: 1, status: 'done', attempts: 1, costUsd: 0 },
+      2: {
+        phase: 2, status: 'interrupted', attempts: 1, costUsd: 0,
+        note: consoleStoppedNote(2), sessionId: 'sess-2', resumeSessionId: 'sess-2',
+      },
+    },
+  });
+  const board = { 1: 'done', 2: 'in-progress', 3: 'waiting' };
+  // The console says `ask`; the run said `continue` at its door — no question, no errand, a relaunch.
+  const yes = planConvergence(facts({ runs: [killed({ resumeOnRestart: true })], prefs: { resumeAtBoot: 'ask' }, board }));
+  assert.deepEqual(kinds(yes), ['relaunch']);
+  assert.ok(!kinds(yes).includes('await-decision'));
+  // The run said `hold`, and the console's `auto` does not overrule it: the errand names the run's own word.
+  const no = planConvergence(facts({ runs: [killed({ resumeOnRestart: false })], prefs: { resumeAtBoot: 'auto' }, board }));
+  assert.deepEqual(kinds(no), ['errand']);
+  const [errand] = no.actions as [{ kind: string; errand: { need: string; how: string; decisionKey?: string }; why: string }];
+  assert.match(errand.why, /launched with resume-on-restart off/);
+  assert.match(errand.errand.need, /this run was launched with resume-on-restart off/);
+  assert.doesNotMatch(errand.errand.how, /Resume at boot on/, 'the console setting is not the remedy for the run\'s own answer');
+  assert.equal(errand.errand.decisionKey, 'resume.on-restart');
+  // A person's `continue` on the boot card still outranks a stored `false` — the card is answered per boot.
+  const pressed = planConvergence(facts({
+    runs: [killed({ resumeOnRestart: false })], prefs: { resumeAtBoot: 'auto' }, board, resumeDecision: () => 'continue',
+  }));
+  assert.deepEqual(kinds(pressed), ['relaunch']);
+  // A run carrying neither (before the field existed) falls through to the console's word — the ask.
+  const neither = planConvergence(facts({ runs: [killed()], prefs: { resumeAtBoot: 'ask' }, board }));
+  assert.deepEqual(kinds(neither), ['await-decision']);
+  // The same three answers on the wait-clock path (an armed wait whose clock
+  // went by while nothing ran, past the grace).
+  const late = (over: Partial<RunState> = {}) => overdue(WAIT_OVERDUE_GRACE_MS + 10 * 60_000, over);
+  assert.equal(waitClockVerdict(late({ resumeOnRestart: true }), facts({ prefs: { resumeAtBoot: 'ask' } })).verdict, 'resume');
+  const waitOff = waitClockVerdict(late({ resumeOnRestart: false }), facts({ prefs: { resumeAtBoot: 'auto' } }));
+  assert.equal(waitOff.verdict, 'errand');
+  assert.match(waitOff.why, /launched with resume-on-restart off/);
+  assert.equal(waitClockVerdict(late(), facts({ prefs: { resumeAtBoot: 'ask' } })).verdict, 'ask');
+  // And the executor: a run that answered `true` journals its relaunch and never `run.resume-asked`.
+  const state = killed({ resumeOnRestart: true });
+  const deps = stubDeps(state, { prefs: () => ({ resumeAtBoot: 'ask' }) });
+  await executeConvergence(yes, deps as never);
+  assert.equal(deps.started.length, 1, 'relaunched');
+  assert.ok(!deps.lines.some((l) => l.event === 'run.resume-asked'), 'nobody was asked');
+});
+
 test('planner: a stored boolean `true` reads as ask, not as auto', () => {
   // The migration that matters. `true` was the only value that resumed at all,
   // so every console that wanted resuming has it — reading it as `auto` would
@@ -1438,4 +1640,198 @@ test('executor: an errand that already stands is not rewritten, journalled or an
   const third = await executeConvergence(capped, stubDeps(off, { prefs: () => ({ resumeAtBoot: 'auto' }), now: () => NOW + 120_000 }));
   assert.equal(third.errands.length, 1, 'a changed ask is written again');
   assert.match(off.recoveries?.['2']?.errand?.need ?? '', /restarts in a row/);
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 5: one wait predicate, one gate, one counter
+ * ------------------------------------------------------------------ */
+
+const { waitClockVerdict, automaticResumeGate } = await import('../server/converge.ts');
+
+/** A run a restart left sleeping on a wait clock that went by `lateMs` ago. */
+function overdue(lateMs: number, over: Partial<RunState> = {}): RunState {
+  const until = new Date(NOW - lateMs).toISOString();
+  return run({ status: 'paused', stoppedBy: 'system', waitReason: 'external', waitUntil: until, ...over },
+    [{ phase: 2, status: 'waiting', parkedUntil: until, sessionId: 'sess-w', resumeSessionId: 'sess-w' }]);
+}
+
+test('LFC-7: with ask and no decision, an armed wait whose clock has passed registers the question and launches nothing', () => {
+  const late = overdue(WAIT_OVERDUE_GRACE_MS + 10 * 60_000);
+  const asked = planConvergence(facts({ runs: [late], prefs: { resumeAtBoot: 'ask' } }));
+  assert.deepEqual(kinds(asked), ['await-decision']);
+  const ask = asked.actions[0] as { phases: number[]; sessions: string[] };
+  assert.deepEqual(ask.phases, [2]);
+  assert.deepEqual(ask.sessions, ['sess-w']);
+  // Answered: continue relaunches as a RULED wait, and the answer is spent by it.
+  const yes = planConvergence(facts({ runs: [late], prefs: { resumeAtBoot: 'ask' }, resumeDecision: () => 'continue' }));
+  assert.deepEqual(kinds(yes), ['relaunch']);
+  const relaunch = yes.actions[0];
+  assert.ok(relaunch.kind === 'relaunch' && relaunch.wait && relaunch.decided === true);
+  assert.deepEqual(relaunch.kind === 'relaunch' && relaunch.wait?.phases, [2]);
+  assert.match(skipWhy(planConvergence(facts({ runs: [late], prefs: { resumeAtBoot: 'ask' }, resumeDecision: () => 'dismiss' }))), /declined/);
+  assert.deepEqual(kinds(planConvergence(facts({ runs: [late], prefs: { resumeAtBoot: 'off' } }))), ['errand']);
+  // Inside the grace the armed timer still owns it — no question, no launch.
+  assert.deepEqual(kinds(planConvergence(facts({ runs: [overdue(WAIT_OVERDUE_GRACE_MS - 5_000)], prefs: { resumeAtBoot: 'ask' } }))), ['skip']);
+});
+
+test('SLF-6: an operator-stopped run with a past waitUntil is held by ONE predicate — the boot and the loop give the same why', async () => {
+  const stopped = overdue(3 * 60 * 60_000, { stoppedBy: 'operator' });
+  const verdict = waitClockVerdict(stopped, { now: NOW, prefs: { resumeAtBoot: 'auto' } });
+  assert.equal(verdict.verdict, 'hold');
+  const why = verdict.verdict === 'hold' ? verdict.why : '';
+  assert.match(why, /operator stopped it/);
+  assert.equal(skipWhy(planConvergence(facts({ runs: [stopped] }))), why, 'the loop answers in the same words');
+
+  // …and the boot's re-adoption, through the real service: nothing armed, nothing started.
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'paused';
+    state.stoppedBy = 'operator';
+    state.waitReason = 'external';
+    state.waitUntil = new Date(Date.now() - 3 * 60 * 60_000).toISOString();
+    phaseRecord(state, 2).status = 'waiting';
+    saveRun(state);
+    const started: unknown[] = [];
+    const svc = service(root, { converge: false }, (s) => {
+      (s as never as { startRun: (slug: string, o: unknown) => Promise<unknown> }).startRun = async (slug, o) => { started.push({ slug, o }); return null; };
+    });
+    try {
+      await svc.bootSettled;
+      const timers = (svc as unknown as { limitResumeTimers: Map<string, unknown> }).limitResumeTimers;
+      assert.equal(timers.has('alpha'), false, 'the boot no longer arms a clock the operator stopped');
+      assert.deepEqual(started, []);
+      const held = waitClockVerdict(loadRun(root, 'alpha', state.id, null)!, { now: Date.now(), prefs: svc.prefs });
+      assert.equal(held.verdict === 'hold' && held.why, why, 'the boot reads the same predicate, so the same why');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('LFC-7: the one gate — restart-caused resumes answer to resume-at-boot, every path is counted, and the count binds across triggers', () => {
+  assert.equal(automaticResumeGate({ prefs: { resumeAtBoot: 'ask' }, decision: null, restartCaused: true, count: 0 }), 'ask');
+  assert.equal(automaticResumeGate({ prefs: { resumeAtBoot: 'ask' }, decision: null, restartCaused: false, count: 0 }), 'proceed',
+    'a live console\'s own resume is not asked about — that would stop every declared wait for a person');
+  assert.equal(automaticResumeGate({ prefs: { resumeAtBoot: 'auto' }, decision: null, restartCaused: false, count: MAX_BOOT_RESUMES }), 'capped');
+  assert.equal(automaticResumeGate({ prefs: { resumeAtBoot: 'off' }, decision: 'continue', restartCaused: true, count: 0 }), 'proceed');
+
+  // A lock-cap re-arm is counted, and at the bound it is an errand — whatever woke the loop.
+  // The session-cap park's own sentence (the fixture beside D28/P8), so this is
+  // the re-arm path for real and not a fixture the planner ignores.
+  const rearmed = (count: number) => run({
+    status: 'parked', stoppedBy: 'system', halt: { at: '', reason: 'nothing left to run on its own — phase 2 is parked' },
+    recoveries: { 2: { attempts: 0, lastAt: '', bootResumes: count } },
+  }, [{ phase: 2, status: 'parked', note: 'phase 2 is held by 3 of 3 lanes (session cap) and has waited 121 minutes for it', resumeSessionId: 'sess-2' }]);
+  for (const trigger of ['timer', 'change', 'halt'] as const) {
+    const under = planConvergence(facts({ runs: [rearmed(1)], trigger, laneFree: () => true }));
+    const relaunch = under.actions.find((a) => a.kind === 'relaunch');
+    assert.ok(relaunch && relaunch.kind === 'relaunch' && relaunch.rearm.includes(2), `${trigger}: ${kinds(under).join(', ')}`);
+    assert.deepEqual(relaunch.counted?.map((c) => [c.phase, c.path]), [[2, 'rearm']], trigger);
+    const capped = planConvergence(facts({ runs: [rearmed(MAX_BOOT_RESUMES)], trigger, laneFree: () => true }));
+    assert.deepEqual(kinds(capped), ['errand'], `${trigger}: the bound holds on every trigger`);
+  }
+});
+
+test('LFC-7: a shutdown between lanes counts the checkpointed resume, and the executor journals every automatic resume with its trigger and path', async () => {
+  const stopped = run({ status: 'paused', stoppedBy: 'system' }, [
+    { phase: 1, status: 'done' },
+    { phase: 2, status: 'pending', sessionId: 'sess-2', resumeSessionId: 'sess-2' },
+  ]);
+  const plan = planConvergence(facts({ runs: [stopped], trigger: 'boot', board: { 1: 'done', 2: 'ready', 3: 'waiting' } }));
+  const relaunch = plan.actions.find((a) => a.kind === 'relaunch');
+  assert.ok(relaunch && relaunch.kind === 'relaunch');
+  assert.deepEqual(relaunch.counted, [{ phase: 2, path: 'system-stop', sessionId: 'sess-2' }]);
+  const deps = stubDeps(stopped);
+  await executeConvergence(plan, deps);
+  const automatic = deps.lines.filter((l) => l.event === 'phase.resume-automatic');
+  assert.equal(automatic.length, 1);
+  assert.deepEqual([automatic[0].phase, automatic[0].data.path, automatic[0].data.trigger, automatic[0].data.count], [2, 'system-stop', 'boot', 1]);
+  assert.equal(stopped.recoveries?.['2']?.bootResumes, 1);
+  // At the bound it stops being a relaunch.
+  stopped.recoveries!['2'].bootResumes = MAX_BOOT_RESUMES;
+  assert.deepEqual(kinds(planConvergence(facts({ runs: [stopped], trigger: 'timer', board: { 1: 'done', 2: 'ready', 3: 'waiting' } }))), ['errand']);
+});
+
+test('service: an answered continue relaunches end to end — the boot-resume answer reaches the planner, and is spent by the launch', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    handoff(root, 2, 'cart-api', 'in-progress');
+    const state = newRun({ slug: 'alpha', root, autoRecover: true });
+    state.status = 'interrupted';
+    state.stoppedBy = 'system';
+    const two = phaseRecord(state, 2);
+    two.status = 'interrupted';
+    two.note = consoleStoppedNote(2);
+    two.sessionId = 'sess-2';
+    saveRun(state);
+    const started: unknown[] = [];
+    const svc = service(root, {}, (s) => {
+      s.prefs.resumeAtBoot = 'ask';
+      (s as never as { startRun: (slug: string, o: unknown) => Promise<unknown> }).startRun = async (slug, o) => { started.push({ slug, o }); return null; };
+    });
+    try {
+      await settle(svc);
+      assert.deepEqual(started, [], 'asked, nothing launched');
+      assert.ok(svc.resumeAsks.has(state.id));
+      // What POST /api/boot-resume {decision: continue} does: record the answer, then press.
+      svc.resumeDecisions.set(state.id, 'continue');
+      await svc.convergeNow('alpha', 'button');
+      assert.equal(started.length, 1, 'the answer used to be dropped before the planner, and continue launched nothing');
+      assert.equal(svc.resumeDecisions.has(state.id), false, 'spent by the launch it authorised — the next restart asks again');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('WAI-6: an overdue park is announced ONCE — on the inbox row\'s own condition, stamped on the record, silent after a restart', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    const announced: { title: string; phase?: number }[] = [];
+    const capture = (svc: InstanceType<typeof Service>) => {
+      (svc as never as { announce: (c: string, m: { title: string }, ctx: { phase?: number }) => null }).announce =
+        (_category, message, ctx) => { announced.push({ title: message.title, phase: ctx.phase }); return null; };
+    };
+    // A read-only console: `allowRun` off, so nothing will ever fire this clock
+    // — exactly the console whose overdue parks are worth a phone's attention.
+    const svc = service(root, { allowRun: false }, capture);
+    try {
+      await settle(svc);
+      const past = new Date(Date.now() - 15 * 60_000).toISOString();
+      const state = newRun({ slug: 'alpha', root });
+      state.status = 'paused';
+      state.stoppedBy = 'system';
+      state.waitUntil = past;
+      state.waitReason = 'external';
+      const record = phaseRecord(state, 1);
+      record.status = 'waiting';
+      record.parkedUntil = past;
+      record.declared = { status: 'waiting-external', reason: 'the image build', at: past };
+      saveRun(state);
+
+      await svc.convergeNow('alpha', 'timer');
+      await svc.convergeNow('alpha', 'timer');
+      const overdue = announced.filter((m) => /park is overdue/.test(m.title));
+      assert.equal(overdue.length, 1, `announced once, not per pass (${announced.map((m) => m.title).join(', ')})`);
+      assert.equal(overdue[0].phase, 1);
+      const stored = loadRun(root, 'alpha', state.id)!;
+      assert.equal(stored.phases[1].parkOverdueAnnouncedFor, past, 'the stamp rides the record');
+      assert.equal(stored.phases[1].status, 'waiting', 'the console\'s own clock: settlement leaves it standing');
+    } finally {
+      await svc.close();
+    }
+    // A restart reads the stamp and says nothing more.
+    announced.length = 0;
+    const again = service(root, { allowRun: false }, capture);
+    try {
+      await settle(again);
+      await again.convergeNow('alpha', 'timer');
+      assert.equal(announced.filter((m) => /park is overdue/.test(m.title)).length, 0);
+    } finally {
+      await again.close();
+    }
+  } finally {
+    cleanup();
+  }
 });

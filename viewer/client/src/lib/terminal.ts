@@ -59,6 +59,7 @@
  */
 
 import { ApiError, api, type TerminalSession } from './api';
+import { consolePath } from './base';
 
 export type LinkStatus = 'connecting' | 'reconnecting' | 'live' | 'closed' | 'error';
 
@@ -90,7 +91,7 @@ export interface LinkOptions {
 export const RECONNECT_BACKOFF_MS: readonly number[] = [1_000, 2_000, 5_000];
 
 function socketUrl(path: string, token: string): string {
-  const url = new URL(path, window.location.href);
+  const url = new URL(consolePath(path), window.location.href);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('token', token);
   return url.toString();

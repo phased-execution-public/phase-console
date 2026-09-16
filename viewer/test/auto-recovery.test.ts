@@ -33,7 +33,11 @@ process.env.XDG_CONFIG_HOME = join(STATE_HOME, 'config');
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service, autoRecoveryClass } = await import('../server/service.ts');
 const { consumeDeclaration, loadRun, newRun, phaseRecord, runDir, saveRun } = await import('../server/runner/state.ts');
+const { RECOVER_MAX_PER_PHASE } = await import('../server/runner/runner-core.ts');
 const { WatchScheduler } = await import('../server/watch-scheduler.ts');
+const { PhaseClaimedError } = await import('../server/service-core.ts');
+const { WATCH_REDELIVER_SERIES_MS, redeliverAfter } = await import('../server/watch-refs.ts');
+const { recent: recentLog } = await import('../server/log.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
@@ -961,6 +965,10 @@ test('a QA wedge the ladder has spent still leaves exactly one errand', async ()
   try {
     const svc = service(s.root);
     stubMint(svc);
+    // Since phase 11 the shipped answer to `qa.exhausted` is `waive` and the
+    // healer enacts it (the case below); an OWNER word is what keeps the verdict
+    // a person's, and that is the contract this case pins.
+    svc.prefs.policy = { 'qa.exhausted': 'operator' };
     const state = qaWedgedRun(s.root);
     state.phases['1'].sessionId = 'sess-p1';
     // Both rungs already climbed and failed: nothing left to try.
@@ -982,6 +990,52 @@ test('a QA wedge the ladder has spent still leaves exactly one errand', async ()
     assert.ok(errand, 'an exhausted climb must leave the ask behind');
     assert.match(errand!.need, /QA verdict/);
     assert.match(errand!.how, /qa-record\.sh|QA/);
+    assert.equal(errand!.decisionKey, 'qa.exhausted', 'the ask names the manifest row that would answer it');
+    assert.equal(errand!.policy, undefined, 'an owner word is not an automatic answer');
+  } finally { s.cleanup(); }
+});
+
+test('a QA wedge the ladder has spent is WAIVED by policy under the shipped default — the verdict recorded, no errand', async () => {
+  // Phase 11 (ZTD-9): `qa.exhausted` defaults to `waive`. The healer reaches
+  // the same exhaustion as above, journals the ruling under its decision key,
+  // records the waiver through the one QA door with `by: 'policy'`, and asks
+  // nobody — the dependents are released on the next board read.
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const state = qaWedgedRun(s.root);
+    state.phases['1'].sessionId = 'sess-p1';
+    state.recoveries = {
+      1: {
+        attempts: 2, lastAt: new Date().toISOString(),
+        rungs: [
+          { situation: 'qa-failed', rung: 'resume-own-session', at: new Date().toISOString(), outcome: 'failed', params: { mode: 'qa-fix' } },
+          { situation: 'qa-failed', rung: 'fix-agent', at: new Date().toISOString(), outcome: 'failed' },
+        ],
+      },
+    };
+    saveRun(state);
+
+    const result = await svc.maybeAutoRecover('alpha');
+    assert.equal(result.launched, false, 'nothing is launched — the answer is a waiver, not a session');
+    const after = loadRun(s.root, 'alpha', state.id)!;
+    assert.equal(after.errand ?? after.recoveries?.['1']?.errand, undefined, 'a policy answer is not a person\'s ask');
+    assert.deepEqual(
+      { key: after.recoveries?.['1']?.policyAnswered?.decisionKey, answer: after.recoveries?.['1']?.policyAnswered?.answer, source: after.recoveries?.['1']?.policyAnswered?.source },
+      { key: 'qa.exhausted', answer: 'waive', source: 'default' },
+    );
+    const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${state.id}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; data?: Record<string, unknown> });
+    const answered = journal.find((e) => e.event === 'phase.policy-answered');
+    assert.equal(answered?.data?.decisionKey, 'qa.exhausted');
+    assert.equal(answered?.data?.answer, 'waive');
+    const waived = journal.find((e) => e.event === 'phase.qa-waived');
+    assert.equal(waived?.data?.by, 'policy', 'the waiver names the policy, not a person');
+    assert.ok(!journal.some((e) => e.event === 'phase.errand'), 'no errand was written');
+    assert.match(readFileSync(join(s.root, 'docs', 'handoffs', 'alpha', 'test-status.md'), 'utf8'), /\|\s*1\s*\|\s*waived\s*\|/, 'the QA table records the waiver');
+    const board = (await svc.board('alpha')).states;
+    assert.notEqual(board[2], 'waiting', 'the waiver releases the dependent');
   } finally { s.cleanup(); }
 });
 /** `qaWedgedRun` with the verdict still OWED — the P2 incident's shape. */
@@ -1114,6 +1168,9 @@ test('maybeAutoRecover leaves an errand for a stop with no anchor at all', async
   try {
     const svc = service(s.root);
     stubMint(svc);
+    // An owner word keeps the verdict a person's (the shipped `waive` would
+    // record a waiver instead — see the QA-wedge cases above).
+    svc.prefs.policy = { 'qa.exhausted': 'operator' };
     const state = qaWedgedRun(s.root);
     // Every rung spent, so the climb cannot start; the ask is all that is left.
     state.recoveries = {
@@ -1383,6 +1440,56 @@ test('preRecoveryGate: a genuinely finished phase is still superseded', async ()
 
     assert.equal(await gate('alpha', state, 1), 'superseded',
       'finished work is finished — this is what the guard exists for');
+  } finally { s.cleanup(); }
+});
+
+test('ACC-5.1 (RCV-4): preRecoveryGate answers unchanged / capped for the operator\'s verb only — the healer\'s callers never see either', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    const gate = (svc as unknown as {
+      preRecoveryGate: (slug: string, state: RunState, phase: number, opts?: { verb?: boolean }) => Promise<string>;
+      fingerprintFor: (slug: string, state: RunState, board: Record<number, string>) => string;
+    });
+    const state = haltedRun(s.root);
+    const read = await svc.board('alpha');
+    const now = gate.fingerprintFor.call(svc, 'alpha', state, read.states);
+    assert.ok(now.length > 0);
+
+    // No ledger yet: the verb proceeds like anyone else.
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2, { verb: true }), 'proceed');
+    // The last recovery ran under exactly this evidence.
+    state.recoveries = { 2: { attempts: 0, lastAt: new Date().toISOString(), recovers: { count: 1, lastAt: new Date().toISOString(), lastFingerprint: now, lastMode: 'recheck' } } };
+    saveRun(state);
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2, { verb: true }), 'unchanged',
+      'a click over evidence the last recovery already ran under changes nothing');
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2), 'proceed',
+      'the healer is held to its own fingerprint (RCV-9), never to the verb\'s ledger');
+    // Evidence moved: the verb proceeds again.
+    state.recoveries[2]!.recovers!.lastFingerprint = 'something-else';
+    saveRun(state);
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2, { verb: true }), 'proceed');
+    // The cap.
+    state.recoveries[2]!.recovers!.count = RECOVER_MAX_PER_PHASE;
+    saveRun(state);
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2, { verb: true }), 'capped');
+    assert.equal(await gate.preRecoveryGate.call(svc, 'alpha', state, 2), 'proceed');
+
+    // …and `recoverPhase` — the verb — refuses with a sentence naming the last
+    // recovery, journals `run.recover.refused`, and arms nothing.
+    state.recoveries[2]!.recovers = { count: 1, lastAt: '2026-09-14T10:00:00.000Z', lastFingerprint: now, lastMode: 'recheck' };
+    saveRun(state);
+    await assert.rejects(
+      svc.recoverPhase('alpha', 2, 'recheck', { by: 'operator' }),
+      /Nothing has changed since the recheck recovery of phase 2 at 2026-09-14T10:00:00.000Z/,
+    );
+    const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${state.id}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string; data?: Record<string, unknown> });
+    const refused = journal.filter((e) => e.event === 'run.recover.refused');
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].data?.why, 'unchanged');
+    assert.equal(refused[0].data?.by, 'operator');
+    assert.equal(journal.filter((e) => e.event === 'run.recover').length, 0, 'nothing was armed');
   } finally { s.cleanup(); }
 });
 
@@ -1883,6 +1990,168 @@ test('a REJECTING recoverPhase un-charges the delivery, and the landing is offer
   } finally { s.cleanup(); }
 });
 
+/**
+ * SLF-8 / RCV-8 — ten rejections of one landing. The scheduler drives the
+ * landing through the real `onWatchLanded`; `recoverPhase` is a drive that
+ * throws the foreign-lock refusal `assertNotClaimed` throws, with the lock's
+ * lease. What must hold: the re-offer BACKS OFF (the series, or the lease's end
+ * when later), the rejection ledger is bounded at `MAX_BOOT_RESUMES` and then
+ * writes ONE errand (the class RCV-8 found unreachable), `watchResumes` stays
+ * un-charged (the drives launched nothing — that accounting was right), and
+ * `run.watch-resume-failed` is said once per distinct reason per lease.
+ */
+async function rejectedLanding(
+  s: { root: string }, reject: () => Error,
+): Promise<{ live: RunState; scheduler: InstanceType<typeof WatchScheduler>; calls: () => number; tick: () => Promise<void> }> {
+  const state = declaredParkRun(s.root);
+  const svc = service(s.root);
+  let calls = 0;
+  (svc as unknown as Record<string, unknown>).recoverPhase = async () => { calls += 1; throw reject(); };
+  const live = loadRun(s.root, 'alpha', state.id)!;
+  const scheduler = new WatchScheduler({
+    clock: STILL_CLOCK,
+    runs: () => [{ slug: 'alpha', state: live }],
+    probe: async (t: { ref: string }) => ({ ref: t.ref, state: 'landed' as const, detail: 'completed: success' }),
+    onLanded: async (sl: string, st: RunState, ph: number, l: { ref: string; state: string }) =>
+      await (svc as unknown as {
+        onWatchLanded: (sl: string, st: RunState, ph: number, l: unknown) => Promise<'resumed' | 'deferred' | 'done'>;
+      }).onWatchLanded(sl, st, ph, l),
+    resumeInFlight: (sl: string, ph: number) => svc.watchResumeInFlight(sl, ph),
+    save: () => {},
+  });
+  scheduler.open();
+  return {
+    live, scheduler, calls: () => calls,
+    tick: async () => { await scheduler.tick(); await settled(); },
+  };
+}
+
+test('SLF-8/RCV-8: ten rejections back off along the series, charge a bounded ledger, and end in ONE errand — the warning said once', async () => {
+  const s = scratch();
+  try {
+    // A time cutoff, not a ring position: the log ring holds 200 entries, and a
+    // file that has already filled it answers `length === 200` before AND after.
+    const since = Date.now();
+    const h = await rejectedLanding(s, () => new Error('RecoveryBusyError: a recovery of this phase is already running'));
+    try {
+      const rec = () => h.live.phases['2'];
+      const row = () => rec().watchState!.refs[0];
+      const gaps: number[] = [];
+      for (let i = 0; i < 10; i++) {
+        const offered = h.calls();
+        const t0 = Date.now();
+        await h.tick();
+        if (h.calls() === offered) break; // no longer offered: the landing retired into an errand
+        assert.equal(rec().watchResumes, undefined, 'the drive launched nothing: the delivery stays un-charged');
+        // The re-offer clock the rejection left on the row — the series step
+        // for this many rejections, never a flat minute. The CAPPING rejection
+        // leaves none: the landing is an errand now and the row retires.
+        if (row().nextDueAt === undefined) break;
+        gaps.push(row().nextDueAt! - t0);
+        row().nextDueAt = 0; // the test's clock is still; force the next cadence
+      }
+      assert.equal(h.calls(), 3, 'three offers — the ledger is bounded at MAX_BOOT_RESUMES, and the rest were never offered');
+      assert.equal(rec().watchRejections?.count, 3);
+      assert.match(rec().watchRejections?.reason ?? '', /RecoveryBusyError/);
+      // Increasing intervals before the cap: 60 s, then 120 s (± the tick's own ms).
+      assert.equal(gaps.length, 2);
+      for (const [i, gap] of gaps.entries()) {
+        assert.ok(Math.abs(gap - WATCH_REDELIVER_SERIES_MS[i]) < 2_000, `rejection ${i + 1}: re-offered in ${gap} ms, series says ${WATCH_REDELIVER_SERIES_MS[i]}`);
+      }
+      assert.equal(row().nextDueAt, undefined, 'the capping rejection retired the row');
+      // Further ticks offer nothing: the errand stands, the row is terminal.
+      await h.tick();
+      await h.tick();
+      assert.equal(h.calls(), 3);
+      // The errand the class could never reach: written once, and the row retired.
+      assert.equal(rec().watchLandedErrandFor, OUTAGE_REFS[0]);
+      const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${h.live.id}.jsonl`), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line) as { event: string; data?: { need?: string } });
+      const errands = journal.filter((r) => r.event === 'phase.errand');
+      assert.equal(errands.length, 1, 'one errand, not one per rejection');
+      assert.match(errands[0].data?.need ?? '', /3 attempts to resume this phase were refused/);
+      assert.equal(journal.filter((r) => r.event === 'phase.watch-landed').length, 1, 'one landing, one line');
+      // …and said ONCE: the same words, no lease, logged on the first rejection only.
+      const warned = recentLog(500).filter((e) => e.event === 'run.watch-resume-failed' && Date.parse(e.time) >= since);
+      assert.equal(warned.length, 1, `run.watch-resume-failed ×${warned.length}`);
+    } finally { h.scheduler.close(); }
+  } finally { s.cleanup(); }
+});
+
+test('SLF-8/RCV-8: a foreign-lease rejection backs off to the LEASE, not to the minute — and a new lease is news again', async () => {
+  const s = scratch();
+  try {
+    // A time cutoff, not a ring position: the log ring holds 200 entries, and a
+    // file that has already filled it answers `length === 200` before AND after.
+    const since = Date.now();
+    let leaseUntil = Date.now() + 20 * 60_000;
+    const h = await rejectedLanding(s, () => new PhaseClaimedError('alpha', 2, { owner: 'sam@laptop', host: 'laptop', leaseUntil }));
+    try {
+      const rec = () => h.live.phases['2'];
+      const row = () => rec().watchState!.refs[0];
+      await h.tick();
+      assert.equal(h.calls(), 1);
+      assert.ok(Math.abs(row().nextDueAt! - leaseUntil) < 1_000, `re-offered at the lease's end (${row().nextDueAt} vs ${leaseUntil})`);
+      assert.equal(rec().watchRejections?.until, leaseUntil);
+      assert.equal(redeliverAfter(1, Date.now(), leaseUntil), leaseUntil, 'the series step is a floor; a later clock wins');
+      // The same lease, rejected again: no second warning.
+      row().nextDueAt = 0;
+      await h.tick();
+      assert.equal(h.calls(), 2);
+      let warned = recentLog(500).filter((e) => e.event === 'run.watch-resume-failed' && Date.parse(e.time) >= since);
+      assert.equal(warned.length, 1, 'the same reason inside the same lease is not said again');
+      // A NEW lease (the holder renewed) is a distinct fact — said once more.
+      leaseUntil += 60 * 60_000;
+      row().nextDueAt = 0;
+      await h.tick();
+      assert.equal(h.calls(), 3);
+      warned = recentLog(500).filter((e) => e.event === 'run.watch-resume-failed' && Date.parse(e.time) >= since);
+      assert.equal(warned.length, 2, 'a new lease is a new warning');
+      assert.equal(rec().watchRejections?.count, 3, 'and the ledger is at its cap');
+    } finally { h.scheduler.close(); }
+  } finally { s.cleanup(); }
+});
+
+test('RCV-8: two refs landing on one phase journal exactly two phase.watch-landed over ten redeliveries', async () => {
+  const s = scratch();
+  try {
+    const state = declaredParkRun(s.root);
+    // Two refs declared, both landing; the healer's drive keeps resolving
+    // without launching, so the landings are re-offered again and again.
+    const refs = ['gh:acme/app#run/33123610977', 'gh:acme/infra#pr/104'];
+    state.phases['2'].watch = [...refs];
+    state.phases['2'].declared = { status: 'needs-human', reason: OUTAGE, watch: [...refs], at: new Date().toISOString() };
+    saveRun(state);
+    const svc = service(s.root);
+    (svc as unknown as Record<string, unknown>).recoverPhase = async () => null;
+    const live = loadRun(s.root, 'alpha', state.id)!;
+    const scheduler = new WatchScheduler({
+      clock: STILL_CLOCK,
+      runs: () => [{ slug: 'alpha', state: live }],
+      probe: async (t: { ref: string }) => ({ ref: t.ref, state: 'landed' as const, detail: 'completed: success' }),
+      onLanded: async (sl: string, st: RunState, ph: number, l: { ref: string; state: string }) =>
+        await (svc as unknown as {
+          onWatchLanded: (sl: string, st: RunState, ph: number, l: unknown) => Promise<'resumed' | 'deferred' | 'done'>;
+        }).onWatchLanded(sl, st, ph, l),
+      resumeInFlight: (sl: string, ph: number) => svc.watchResumeInFlight(sl, ph),
+      save: () => {},
+    });
+    scheduler.open();
+    try {
+      for (let i = 0; i < 10; i++) {
+        await scheduler.tick();
+        await settled();
+        for (const row of live.phases['2'].watchState?.refs ?? []) if (row.nextDueAt !== undefined) row.nextDueAt = 0;
+      }
+      const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${live.id}.jsonl`), 'utf8')
+        .trim().split('\n').map((line) => JSON.parse(line) as { event: string; data?: { ref?: string } });
+      const landed = journal.filter((r) => r.event === 'phase.watch-landed').map((r) => r.data?.ref).sort();
+      assert.deepEqual(landed, [...refs].sort(), 'two landings, two lines — one string stamp used to flip between them and re-journal both every minute');
+      assert.deepEqual([...(live.phases['2'].watchLandedJournalledFor ?? [])].sort(), [...refs].sort(), 'the stamp is a per-ref set');
+    } finally { scheduler.close(); }
+  } finally { s.cleanup(); }
+});
+
 test('a recoverPhase that RESOLVES without launching does not spend the offer for ever', async () => {
   // QA round 3, H1(a) — the B2 shape: an adopt-orphan refusal, a cancelled
   // admission, a superseded gate and a null retry all RESOLVE having started
@@ -2122,6 +2391,115 @@ test('an errand whose only rung this console cannot drive names the switch — t
   } finally { cleanup(); }
 });
 
+test('ACC-8.12 (TRS-10/LFC-3): on a stopped run the healer offers the widen-rule card for the console\'s own denial — Allow strikes the rule for the plan and resumes the phase\'s own session; Deny settles the rung and the errand names the rule', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const sessions = stubSession(svc);
+    const edits: Array<Record<string, unknown>> = [];
+    (svc as never as Record<string, unknown>).editPolicy = (edit: Record<string, unknown>) => { edits.push(edit); return {}; };
+    const state = haltedRun(s.root);
+    // The session declared itself blocked — only "blocked" — and the console
+    // had refused `git push` under a deny rule: the denial on the record is
+    // what classifies `:permission` (LFC-3), not the prose.
+    const record = phaseRecord(state, 2);
+    record.status = 'parked';
+    record.sessionId = 'sess-p2';
+    record.declared = { status: 'blocked', reason: 'blocked — could not proceed', at: new Date().toISOString() };
+    record.toolDenied = { tool: 'Bash', rule: 'Bash(git push:*)', command: 'git push origin pe/alpha', at: new Date().toISOString() };
+    state.halt = { at: new Date().toISOString(), reason: 'phase 2 declared itself blocked', phase: 2, kind: 'phase-blocked' };
+    saveRun(state);
+    writeFileSync(
+      join(s.root, 'docs', 'handoffs', 'alpha', 'phase-02-service.md'),
+      '---\nplan: docs/plans/alpha.md\nphase: 2\ntitle: service\nstatus: blocked\n---\n# blocked\n\n## Outstanding / blockers\n\nblocked — could not proceed\n',
+      'utf8',
+    );
+
+    const first = await svc.maybeAutoRecover('alpha');
+    assert.equal(first.launched, true, first.reason);
+    assert.equal(first.rung, 'widen-rule');
+    assert.equal(first.vehicle, 'card');
+    assert.equal(sessions.length, 0, 'nothing spent: the card is the rung');
+    const card = svc.approvals.pending().find((a) => a.slug === 'alpha' && a.phase === 2);
+    assert.ok(card, 'a standing card is up');
+    assert.equal(card!.standing, true);
+    assert.equal(card!.kind, 'tool');
+    assert.equal(card!.suggestedRule, 'Bash(git push:*)');
+    assert.match(card!.title, /widen `Bash\(git push:\*\)`/);
+    assert.match(card!.detail, /strikes that ONE rule for this plan/);
+    const climbed = loadRun(s.root, 'alpha', state.id, null)!.recoveries?.['2']?.rungs?.at(-1);
+    assert.equal(climbed?.rung, 'widen-rule');
+    assert.equal(climbed?.outcome, 'running');
+    assert.equal(climbed?.cardId, card!.id);
+    // A second pass while the card is up settles nothing and offers nothing more.
+    const again = await svc.maybeAutoRecover('alpha');
+    assert.equal(again.launched, false, again.reason);
+    assert.equal(loadRun(s.root, 'alpha', state.id, null)!.recoveries?.['2']?.rungs?.at(-1)?.outcome, 'running', 'the rung stays open under its card');
+    assert.equal(svc.approvals.pending().length, 1, 'one card, not two');
+    // …and a loop ending elsewhere does not answer it for the person.
+    svc.approvals.disarm(state.id);
+    assert.equal(svc.approvals.pending().length, 1, 'a standing card survives disarm');
+
+    // A person allows: the deny rule is struck for THIS plan, and the phase's
+    // own session is resumed through the recover verb — no new boarding.
+    assert.equal(svc.decideApproval(card!.id, 'allow', 'operator', undefined).ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(edits.at(-1), { scope: 'plan', slug: 'alpha', remove: { deny: ['Bash(git push:*)'] }, by: 'operator' });
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].phase, 2);
+    assert.equal(sessions[0].mode, 'resume');
+    assert.match(String(sessions[0].opts.instruction), /`Bash\(git push:\*\)` was struck for this plan/);
+    assert.match(String(sessions[0].opts.instruction), /Re-run `git push origin pe\/alpha`/);
+    assert.equal(sessions[0].opts.by, 'operator');
+    const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${state.id}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string; data?: Record<string, unknown> });
+    const decided = journal.find((e) => e.event === 'phase.widen-decided');
+    assert.equal(decided?.data?.decision, 'allow');
+    assert.equal(decided?.data?.rule, 'Bash(git push:*)');
+    assert.ok(journal.some((e) => e.event === 'policy.edited' && (e.data?.removed as string[] | undefined)?.[0] === 'deny Bash(git push:*)'), 'the strike is on this run\'s journal too');
+    assert.ok(journal.some((e) => e.event === 'phase.rung' && e.data?.vehicle === 'card'));
+  } finally { s.cleanup(); }
+});
+
+test('ACC-8.12 (TRS-10): a denied widen card settles the rung failed, and the next pass writes the errand naming the rule and the command', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const sessions = stubSession(svc);
+    const state = haltedRun(s.root);
+    const record = phaseRecord(state, 2);
+    record.status = 'parked';
+    record.declared = { status: 'blocked', reason: 'blocked — could not proceed', at: new Date().toISOString() };
+    record.toolDenied = { tool: 'Bash', rule: 'Bash(git push --force-with-lease=*)', command: 'git push --force-with-lease origin pe/alpha', at: new Date().toISOString() };
+    state.halt = { at: new Date().toISOString(), reason: 'phase 2 declared itself blocked', phase: 2, kind: 'phase-blocked' };
+    saveRun(state);
+    writeFileSync(
+      join(s.root, 'docs', 'handoffs', 'alpha', 'phase-02-service.md'),
+      '---\nplan: docs/plans/alpha.md\nphase: 2\ntitle: service\nstatus: blocked\n---\n# blocked\n\n## Outstanding / blockers\n\nblocked — could not proceed\n',
+      'utf8',
+    );
+    const offered = await svc.maybeAutoRecover('alpha');
+    assert.equal(offered.rung, 'widen-rule');
+    const card = svc.approvals.pending().find((a) => a.slug === 'alpha' && a.phase === 2)!;
+    assert.equal(svc.decideApproval(card.id, 'deny', 'operator', 'do it by hand').ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(sessions.length, 0, 'a denial resumes nothing');
+    const settled = loadRun(s.root, 'alpha', state.id, null)!.recoveries?.['2']?.rungs?.at(-1);
+    assert.equal(settled?.outcome, 'failed');
+    // The next pass: the one-rung table is spent, the errand names the rule and the command.
+    const next = await svc.maybeAutoRecover('alpha');
+    assert.equal(next.launched, false, next.reason);
+    const errand = loadRun(s.root, 'alpha', state.id, null)!.recoveries?.['2']?.errand;
+    assert.ok(errand, next.reason);
+    assert.equal(errand!.situation, 'blocked-declared:permission');
+    assert.match(errand!.need, /`Bash\(git push --force-with-lease=\*\)`/);
+    assert.match(errand!.need, /`git push --force-with-lease origin pe\/alpha`/);
+    assert.deepEqual(errand!.tried, ['widen-rule → failed'], 'what was already tried, so nobody repeats it by hand');
+  } finally { s.cleanup(); }
+});
+
 test('a ladder whose only rung a PREFERENCE switched off names that preference on the errand', async () => {
   // `unblockAttempts` off makes `unblock-session` undrivable, so `nextRung`
   // answers "no rung … is available on this console yet" — a sentence that
@@ -2267,5 +2645,413 @@ test('the sweep refreshes the record from the ledger: a later pass lands its rou
     assert.equal(record.situation, undefined, 'a situation the verdict has answered is not left standing');
     assert.equal(after.recoveries?.['1']?.errand, undefined, 'and the errand dissolved with it');
     assert.equal(after.recoveries?.['1']?.rungs?.[0]?.outcome, 'fixed');
+  } finally { s.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * RCV-9 — who classified, once per evidence, one shell-out per repository
+ * ------------------------------------------------------------------ */
+
+const THREE_ROOTS = `---
+slug: beta
+created: 2026-09-14
+status: active
+phases: 3
+---
+
+# beta
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | one | — | 2, 3 | app | it works |
+| 2 | two | — | 1, 3 | app | it works |
+| 3 | three | — | 1, 2 | app | it works |
+
+## Phases
+
+### Phase 1 — one
+- **Size:** S
+
+### Phase 2 — two
+- **Size:** S
+
+### Phase 3 — three
+- **Size:** S
+`;
+
+/**
+ * A halted run of `beta` with three open records, every one a person's — a
+ * declared `needs-human` park. Three candidates for one heal pass, none of
+ * which the ladder may climb: the pass classifies all three, refuses all
+ * three, launches nothing and changes nothing, so a second pass reads the
+ * SAME evidence — which is the case the re-journal rule is about.
+ */
+function threeCandidates(root: string): RunState {
+  const state = newRun({ slug: 'beta', root, autoRecover: true });
+  state.status = 'halted';
+  state.activePhase = 1;
+  state.halt = { at: new Date().toISOString(), reason: 'phase 1 asked for a person', phase: 1, kind: 'needs-human' };
+  state.finishedReason = state.halt.reason;
+  for (const phase of [1, 2, 3]) {
+    const record = phaseRecord(state, phase);
+    record.status = 'parked';
+    record.note = `phase ${phase} asked for a person`;
+    record.declared = { status: 'needs-human', reason: 'a person must look', at: new Date().toISOString() };
+  }
+  saveRun(state);
+  return state;
+}
+
+function journalOf(root: string, slug: string, runId: string): Array<{ event: string; phase?: number; data: Record<string, unknown> }> {
+  const file = join(runDir(root, slug), `run-${runId}.jsonl`);
+  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; phase?: number; data: Record<string, unknown> });
+}
+
+test('RCV-9: a heal pass signs every phase.situation, a second pass over the same evidence writes none, and one pass asks git once per repository', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    // The plan is on disk BEFORE the console opens the root — the store reads once.
+    writeFileSync(join(root, 'docs', 'plans', 'beta.md'), THREE_ROOTS, 'utf8');
+    const svc = service(root);
+    stubMint(svc);
+    stubSession(svc);
+    // Count the shell-outs the evidence builder makes, through the seam the
+    // builder already has (`EvidenceDeps.git`), answering "clean tree".
+    const gitCalls: string[] = [];
+    const real = (svc as never as { evidenceDeps: (slug: string) => Record<string, unknown> }).evidenceDeps.bind(svc);
+    (svc as never as Record<string, unknown>).evidenceDeps = (slug: string) => ({
+      ...real(slug),
+      git: async (args: string[]) => { gitCalls.push(args.join(' ')); return ''; },
+    });
+    const state = threeCandidates(root);
+
+    const first = await svc.maybeAutoRecover('beta', { trigger: 'timer' });
+    assert.equal(first.launched, false, 'three declared parks: nothing to climb');
+    const situations = journalOf(root, 'beta', state.id).filter((l) => l.event === 'phase.situation');
+    assert.deepEqual(situations.map((l) => l.phase).sort(), [1, 2, 3], 'one situation line per candidate');
+    for (const line of situations) {
+      assert.equal(line.data.by, 'heal', `phase ${line.phase}: signed by the healer`);
+      assert.equal(line.data.trigger, 'timer', 'and with the trigger that woke the pass');
+      assert.equal(typeof line.data.fingerprint, 'string');
+    }
+    // One `git status` for the one scope directory, not one per candidate.
+    const statuses = gitCalls.filter((c) => c.includes('status --porcelain'));
+    assert.equal(statuses.length, 1, `git status once per repository per pass (${gitCalls.join(' | ')})`);
+    // The record carries what the journal said, so the next pass can compare.
+    const disk = loadRun(root, 'beta', state.id, null)!;
+    for (const phase of [1, 2, 3]) {
+      assert.equal(disk.phases[String(phase)].situation?.by, 'heal');
+      assert.equal(typeof disk.phases[String(phase)].situation?.fingerprint, 'string');
+    }
+
+    // The same evidence again: no new situation line for any of the three.
+    gitCalls.length = 0;
+    await svc.maybeAutoRecover('beta', { trigger: 'timer' });
+    const after = journalOf(root, 'beta', state.id).filter((l) => l.event === 'phase.situation');
+    assert.equal(after.length, situations.length, 'an unchanged situation is not re-journalled');
+    assert.equal(gitCalls.filter((c) => c.includes('status --porcelain')).length, 1, 'and the second pass still asks git once');
+  } finally { cleanup(); }
+});
+
+test('RCV-9: the rung the healer climbs is signed with the classifier and the trigger', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const svc = service(root);
+    stubMint(svc);
+    stubSession(svc);
+    const run = haltedRun(root);
+    const out = await svc.maybeAutoRecover('alpha', { trigger: 'halt' });
+    assert.equal(out.launched, true, out.reason);
+    const lines = journalOf(root, 'alpha', run.id);
+    const situation = lines.filter((l) => l.event === 'phase.situation');
+    const rung = lines.filter((l) => l.event === 'phase.rung');
+    assert.equal(situation.length, 1);
+    assert.equal(situation[0].data.by, 'heal');
+    assert.equal(rung.length, 1, 'one rung climbed');
+    assert.equal(rung[0].data.by, 'heal', 'phase.rung carries the classifier');
+    assert.equal(rung[0].data.trigger, 'halt', 'and the trigger that woke the pass');
+  } finally { cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 10: ladder drivability, settlement and the errand's voice
+ * ------------------------------------------------------------------ */
+
+function stubStart(svc: ReturnType<typeof service>): Array<Record<string, unknown>> {
+  const starts: Array<Record<string, unknown>> = [];
+  (svc as never as Record<string, unknown>).startRun = async (_slug: string, opts: Record<string, unknown>) => {
+    starts.push(opts);
+    return null;
+  };
+  return starts;
+}
+
+/** A run halted on its budget, phase 2 the open record it stopped over. */
+function budgetHaltedRun(root: string, over: Partial<RunState> = {}): RunState {
+  return haltedRun(root, {
+    runBudgetUsd: 20, spentUsd: 20,
+    halt: { at: new Date().toISOString(), reason: 'the run budget of $20 is spent', kind: 'budget' },
+    finishedReason: 'the run budget of $20 is spent',
+    ...over,
+  });
+}
+
+test('LFC-2: a budget wall with an UNTRIED raise is climbed — the healer raises once and relaunches; a raise already spent ends in an errand naming why, never a deferral', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const starts = stubStart(svc);
+    svc.prefs.budgetAutoRaisePct = 25;
+    const run = budgetHaltedRun(s.root);
+    const result = await svc.maybeAutoRecover('alpha');
+    assert.equal(result.launched, true, result.reason);
+    assert.equal(result.rung, 'raise-budget');
+    assert.equal(result.vehicle, 'raise-budget');
+    const after = loadRun(s.root, 'alpha', run.id, null)!;
+    assert.equal(after.runBudgetUsd, 25, '$20 raised by 25 %');
+    assert.deepEqual({ from: after.budgetRaise?.from, to: after.budgetRaise?.to, pct: after.budgetRaise?.pct }, { from: 20, to: 25, pct: 25 });
+    assert.equal(after.halt, null, 'the budget halt dissolves with the raise');
+    assert.equal(after.recoveries?.['2']?.rungs?.at(-1)?.rung, 'raise-budget');
+    const events = journalOf(s.root, 'alpha', run.id);
+    assert.ok(events.some((e) => e.event === 'phase.rung' && e.data.rung === 'raise-budget' && e.data.vehicle === 'raise-budget'));
+    const raised = events.find((e) => e.event === 'run.budget-raised')!;
+    assert.deepEqual({ from: raised.data.from, to: raised.data.to, rung: raised.data.rung }, { from: 20, to: 25, rung: 'raise-budget' });
+    assert.equal(starts.length, 1, 'the run relaunches under its raised budget');
+    assert.equal(starts[0].resumeRunId, run.id);
+    assert.ok(!events.some((e) => e.event === 'phase.ladder-deferred'));
+
+    // Already raised once and spent again (the runner's inline try): the rung
+    // is refused with the reason, the table is exhausted, and the errand
+    // names the vehicle and why — the shape LFC-2 was written for.
+    const spent = budgetHaltedRun(s.root, {
+      runBudgetUsd: 25, spentUsd: 25,
+      budgetRaise: { from: 20, to: 25, pct: 25, at: new Date().toISOString() },
+    });
+    const again = await svc.maybeAutoRecover('alpha');
+    assert.equal(again.launched, false);
+    assert.match(again.reason ?? '', /no rung for resource-wall:budget is available on this console yet/);
+    const errand = loadRun(s.root, 'alpha', spent.id, null)?.recoveries?.['2']?.errand;
+    assert.ok(errand, again.reason);
+    assert.equal(errand!.situation, 'resource-wall:budget');
+    assert.match(errand!.how, /\*\*Raise the budget once\*\* \(raise-budget, console\): the budget was already raised once, \$20 → \$25 \(25%\)/);
+    const events2 = journalOf(s.root, 'alpha', spent.id);
+    assert.ok(events2.some((e) => e.event === 'phase.errand' && e.phase === 2));
+    assert.ok(!events2.some((e) => e.event === 'phase.ladder-deferred'), 'an undrivable table escalates, never defers');
+    assert.equal(starts.length, 1, 'nothing relaunched the second time');
+  } finally { s.cleanup(); }
+});
+
+test('RCV-6: a history over perPhaseUsd writes a journalled dollar-cap refusal beside the errand, once', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    stubSession(svc);
+    const at = new Date(Date.now() - 60_000).toISOString();
+    const run = haltedRun(s.root, {
+      recoveries: {
+        '2': {
+          attempts: 1, lastAt: at,
+          rungs: [{ situation: 'verify-red', rung: 'resume-own-session', params: { mode: 'fix-verification' }, at, outcome: 'failed', costUsd: 100 }],
+        },
+      },
+    });
+    const result = await svc.maybeAutoRecover('alpha');
+    assert.equal(result.launched, false);
+    assert.match(result.reason ?? '', /phase's ladder budget is spent \(\$100\.00 of \$100\)/);
+    const events = journalOf(s.root, 'alpha', run.id);
+    const refused = events.filter((e) => e.event === 'phase.ladder-refused');
+    assert.equal(refused.length, 1);
+    assert.deepEqual(
+      { phase: refused[0].phase, cap: refused[0].data.cap, spent: refused[0].data.spent, limit: refused[0].data.limit, situation: refused[0].data.situation, by: refused[0].data.by },
+      { phase: 2, cap: 'phase-usd', spent: 100, limit: 100, situation: 'verify-red', by: 'heal' },
+    );
+    assert.ok(events.some((e) => e.event === 'phase.errand' && e.phase === 2));
+    // A second sweep over the same standing errand writes no second line.
+    await svc.maybeAutoRecover('alpha');
+    assert.equal(journalOf(s.root, 'alpha', run.id).filter((e) => e.event === 'phase.ladder-refused').length, 1);
+  } finally { s.cleanup(); }
+});
+
+test('RCV-6: the settlement sweep journals each rung with its situation and its OWN cost — two consecutive rungs never share a total', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    stubSession(svc);
+    const t0 = new Date(Date.now() - 120_000).toISOString();
+    const t1 = new Date(Date.now() - 60_000).toISOString();
+    // Phase 2 reads done on the record (the sweep's `fixed` arm) with two open
+    // rungs behind it, each charged its own attempt.
+    const run = haltedRun(s.root, {
+      recoveries: {
+        '2': {
+          attempts: 2, lastAt: t1,
+          rungs: [
+            { situation: 'verify-red', rung: 'resume-own-session', params: { mode: 'fix-verification' }, at: t0, outcome: 'running', costUsd: 4 },
+            { situation: 'verify-red', rung: 'fix-agent', params: { escalate: 'model' }, at: t1, outcome: 'running', costUsd: 9 },
+          ],
+        },
+      },
+    });
+    run.phases['2'].status = 'done';
+    saveRun(run);
+    await svc.maybeAutoRecover('alpha');
+    const settled = journalOf(s.root, 'alpha', run.id).filter((e) => e.event === 'phase.rung-settled');
+    assert.equal(settled.length, 1, 'the sweep settles the NEWEST open rung per pass');
+    assert.deepEqual(
+      { rung: settled[0].data.rung, situation: settled[0].data.situation, params: settled[0].data.params, costUsd: settled[0].data.costUsd, outcome: settled[0].data.outcome },
+      { rung: 'fix-agent', situation: 'verify-red', params: { escalate: 'model' }, costUsd: 9, outcome: 'fixed' },
+    );
+    await svc.maybeAutoRecover('alpha');
+    const both = journalOf(s.root, 'alpha', run.id).filter((e) => e.event === 'phase.rung-settled');
+    assert.equal(both.length, 2);
+    assert.equal(both[1].data.rung, 'resume-own-session');
+    assert.equal(both[1].data.costUsd, 4, 'the older rung keeps the cost its own attempt booked');
+    for (const line of both) {
+      assert.equal(typeof line.data.costUsd, 'number');
+      assert.equal(typeof line.data.situation, 'string');
+    }
+  } finally { s.cleanup(); }
+});
+
+test('RCV-10: mcp-unavailable driven end to end — the wait rung is accounted while the clock runs, and the flip settles it and continues', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const starts = stubStart(svc);
+    const parkedAt = new Date().toISOString();
+    const run = haltedRun(s.root, {
+      status: 'parked',
+      halt: { at: parkedAt, reason: 'phase 2 is parked: MCP server gh would not connect', phase: 2, kind: 'mcp-preflight' },
+    });
+    const record = run.phases['2'];
+    record.status = 'parked';
+    record.note = 'parked: MCP policy is require and gh would not connect';
+    record.mcpPark = { at: parkedAt, degraded: [{ id: 'gh', reason: 'needs-auth' }] } as never;
+    saveRun(run);
+
+    const first = await svc.maybeAutoRecover('alpha');
+    assert.equal(first.launched, false);
+    assert.match(first.reason ?? '', /parked on an MCP server — it continues without it at/);
+    let state = loadRun(s.root, 'alpha', run.id, null)!;
+    assert.deepEqual(state.recoveries?.['2']?.rungs?.map((r) => `${r.rung}:${r.outcome}`), ['wait-heal:running'], 'the wait rung is climbed once, by the timer');
+    const events = journalOf(s.root, 'alpha', run.id);
+    const rung = events.find((e) => e.event === 'phase.rung' && e.data.rung === 'wait-heal')!;
+    assert.equal(rung.data.vehicle, 'timer');
+    assert.equal(rung.data.by, 'heal');
+    assert.ok(typeof rung.data.until === 'string');
+    // A second pass while the clock runs accounts nothing more.
+    await svc.maybeAutoRecover('alpha');
+    assert.equal(journalOf(s.root, 'alpha', run.id).filter((e) => e.event === 'phase.rung').length, 1);
+
+    // The clock runs out: the next rung continues without the server.
+    state = loadRun(s.root, 'alpha', run.id, null)!;
+    state.phases['2'].mcpPark!.at = new Date(Date.now() - 31 * 60_000).toISOString();
+    saveRun(state);
+    const second = await svc.maybeAutoRecover('alpha');
+    assert.equal(second.launched, true, second.reason);
+    assert.equal(second.rung, 'mcp-continue');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    state = loadRun(s.root, 'alpha', run.id, null)!;
+    assert.deepEqual(state.recoveries?.['2']?.rungs?.map((r) => `${r.rung}:${r.outcome}`), ['wait-heal:failed', 'mcp-continue:running']);
+    assert.equal(state.phases['2'].status, 'pending');
+    assert.equal(state.phases['2'].boardingHint?.rung, 'mcp-continue');
+    const settled = journalOf(s.root, 'alpha', run.id).find((e) => e.event === 'phase.rung-settled' && e.data.rung === 'wait-heal')!;
+    assert.ok(settled, 'the flip settles the wait rung in place');
+    assert.deepEqual({ outcome: settled.data.outcome, situation: settled.data.situation, costUsd: settled.data.costUsd }, { outcome: 'failed', situation: 'mcp-unavailable', costUsd: 0 });
+    assert.ok(starts.length >= 1, 'the run relaunches to board the phase without gh');
+  } finally { s.cleanup(); }
+});
+
+test('RCV-10/ACC-3.2: resource-wall:auth driven end to end — a retired credential, a spare account with headroom: the run moves and relaunches without a press', async () => {
+  const s = scratch();
+  const svc = service(s.root);
+  let spare: { id: string } | null = null;
+  try {
+    stubMint(svc);
+    const starts = stubStart(svc);
+    const at = new Date().toISOString();
+    const said = 'Your organization has disabled Claude subscription access for Claude Code';
+    // The run and its handoff BEFORE the accounts move: registering an account
+    // wakes the console, which reads (and caches) the board — a handoff written
+    // after that read is invisible until the docs watcher's debounce.
+    const run = haltedRun(s.root, {
+      halt: { at, reason: 'organization policy blocks this credential (account: default)', phase: 2, kind: 'credential-refused' },
+    });
+    const record = run.phases['2'];
+    record.status = 'parked';
+    record.said = said;
+    record.cause = { kind: 'credential-refused', class: 'org-policy', reason: 'organization policy blocks this credential', at } as never;
+    saveRun(run);
+    spare = await svc.accounts.addToken('spare', 'token-spare-cccccccccccccccc');
+    svc.accounts.retire('default', undefined, 'organization policy blocks this credential', 'classifier', 'org-policy');
+
+    const result = await svc.maybeAutoRecover('alpha');
+    assert.equal(result.launched, true, result.reason);
+    assert.equal(result.situation, 'resource-wall:auth');
+    assert.equal(result.rung, 'switch-account');
+    const after = loadRun(s.root, 'alpha', run.id, null)!;
+    assert.equal(after.accountId, spare.id, 'the run moved to the account with headroom');
+    assert.equal(after.recoveries?.['2']?.rungs?.at(-1)?.rung, 'switch-account');
+    const events = journalOf(s.root, 'alpha', run.id);
+    const switched = events.find((e) => e.event === 'run.account-switched')!;
+    assert.deepEqual({ at: switched.data.at, from: switched.data.from, account: switched.data.account, reason: switched.data.reason },
+      { at: 'ladder', from: 'default', account: spare.id, reason: 'resource-wall:auth' });
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].accountId, spare.id, 'the relaunch names the account, so the preflight judges the right login');
+    assert.equal(starts[0].resumeRunId, run.id);
+  } finally {
+    svc.accounts.clearRetired('default');
+    if (spare) await svc.accounts.remove(spare.id);
+    s.cleanup();
+  }
+});
+
+test('RCV-10: a declared blocker on the outside world with no ref parks on the ladder\'s clock — the phase waits, the resume is armed, its own session re-checks', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const run = haltedRun(s.root, {
+      halt: { at: new Date().toISOString(), reason: 'phase 2 declared itself blocked: the deploy window opens tonight', phase: 2, kind: 'phase-blocked' },
+    });
+    const record = run.phases['2'];
+    record.status = 'failed';
+    record.sessionId = 'sess-external';
+    record.note = 'the deploy window opens tonight';
+    // A `--needs external` declaration with no `--watch` ref: the console
+    // stands nothing down (no ref to watch), so the ladder climbs.
+    record.declared = { status: 'blocked', reason: 'the deploy window opens tonight', watch: [], needs: 'external', requested: new Date().toISOString(), by: 'session' } as never;
+    saveRun(run);
+    const before = Date.now();
+    const result = await svc.maybeAutoRecover('alpha');
+    assert.equal(result.launched, true, result.reason);
+    assert.equal(result.situation, 'blocked-declared:external');
+    assert.equal(result.rung, 'timed-park', 'no ref, so poll-park is refused and the timed park is the first drivable rung');
+    assert.equal(result.vehicle, 'timed-park');
+    const after = loadRun(s.root, 'alpha', run.id, null)!;
+    const rec = after.phases['2'];
+    assert.equal(rec.status, 'waiting');
+    const until = Date.parse(rec.parkedUntil ?? '');
+    assert.ok(until >= before + 29 * 60_000 && until <= before + 31 * 60_000, `parked for the ladder's window: ${rec.parkedUntil}`);
+    assert.equal(rec.boardingHint?.rung, 'timed-park');
+    assert.equal(rec.boardingHint?.brief, 'continue');
+    assert.equal(rec.boardingHint?.sessionId, 'sess-external');
+    assert.match(rec.boardingHint?.instruction ?? '', /Re-check that blocker now/);
+    assert.equal(rec.waitHistory?.at(-1)?.by, 'ladder');
+    // `waiting` as written; a run nobody drives reads `paused` off the read
+    // path (`reconcileRun`, the clock intact) — both mean "resume me at the clock".
+    assert.ok(after.status === 'waiting' || after.status === 'paused', after.status);
+    assert.equal(after.waitUntil, rec.parkedUntil);
+    assert.equal(after.stoppedBy, 'system');
+    const events = journalOf(s.root, 'alpha', run.id);
+    const waiting = events.find((e) => e.event === 'phase.waiting')!;
+    assert.deepEqual({ by: waiting.data.by, rung: waiting.data.rung, wait: waiting.data.wait }, { by: 'ladder', rung: 'timed-park', wait: 'external' });
+    assert.ok(events.some((e) => e.event === 'phase.rung' && e.data.rung === 'timed-park' && e.data.vehicle === 'timed-park'));
   } finally { s.cleanup(); }
 });

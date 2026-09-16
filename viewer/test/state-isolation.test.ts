@@ -213,3 +213,74 @@ test('the belt itself: a test that resolves the real state or config dir THROWS'
     assert.ok(stateHome({ XDG_STATE_HOME: joinPath(homedir(), '.local', 'state') }));
   } finally { delete process.env.PHASE_CONSOLE_ALLOW_REAL_STATE; }
 });
+
+/* ------------------------------------------------------------------ *
+ * The fixture roots, and the bats suites (zero-touch-console phase 2)
+ * ------------------------------------------------------------------ */
+
+function filesUnder(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...filesUnder(full));
+    else out.push(full);
+  }
+  return out;
+}
+
+const REPO = join(VIEWER_DIR, '..');
+
+/**
+ * The bash half of the suite. `tests/unit/*.bats` boots scripts, not the
+ * console — but a bats file that DID start one (`server/index.ts`, `viewer/run`,
+ * `phase-console.mjs start`) would do it with the operator's real
+ * `XDG_STATE_HOME`, since `state-sandbox.ts` is a node module. The rule for
+ * such a file is the rule the node suites live by, spelled the bash way: it
+ * exports `XDG_STATE_HOME` into `$BATS_TEST_TMPDIR` before anything runs.
+ */
+test('a bats suite that boots the console does it under a sandboxed XDG_STATE_HOME', () => {
+  const offenders: string[] = [];
+  for (const file of filesUnder(join(REPO, 'tests'))) {
+    if (!/\.(bats|bash|sh)$/.test(file)) continue;
+    const source = readFileSync(file, 'utf8');
+    const boots = /server\/index\.ts|viewer\/run\b|phase-console\.mjs\s+(?:start|serve)/.test(source);
+    if (!boots) continue;
+    // Into a directory of its own — `$BATS_TEST_TMPDIR`, a `mktemp` root — and
+    // never one resolved from `$HOME`.
+    if (!/export XDG_STATE_HOME=["']?\$\{?(?!HOME\b)\w+/.test(source)) offenders.push(file.slice(REPO.length + 1));
+  }
+  assert.deepEqual(offenders, [],
+    `these bats files start a console without exporting XDG_STATE_HOME into a temp root first:\n  ${offenders.join('\n  ')}`);
+});
+
+/**
+ * Fixtures are read by tests and copied by hand; a fixture that points at a
+ * real machine is a fixture a test can follow home. The journal fixture under
+ * `viewer/test/fixtures/journals/` is a slice of the hub console's own runs,
+ * scrubbed by its builder — this is the check that the scrub held, and that
+ * the plan fixtures the bats suites use (`tests/fixtures/plans/`) never grew
+ * a real path either.
+ */
+test('the fixture roots hold nothing that points at a real machine', () => {
+  const FORBIDDEN: [RegExp, string][] = [
+    [/\/Users\//, 'a macOS home path'],
+    // A state directory under a REAL home — `~`, `$HOME`, a macOS account. The
+    // journal fixture's argv name `/home/operator/.local/state/…`, which is the
+    // builder's placeholder home and points at nobody's machine.
+    [/(?:~|\$HOME|\/Users\/[^/\s]+)\/\.local\/state/, "the console's real state directory"],
+    [/XDG_STATE_HOME=\$HOME|XDG_STATE_HOME=~/, 'a state home resolved from $HOME'],
+    [/[A-Za-z0-9._%+-]+@(?!example\.(?:com|org|invalid)\b|x\.com\b)[A-Za-z0-9-]+\.[A-Za-z]{2,}/, 'an email address that is not a placeholder'],
+  ];
+  const offenders: string[] = [];
+  for (const dir of [join(REPO, 'tests', 'fixtures'), join(VIEWER_DIR, 'test', 'fixtures')]) {
+    for (const file of filesUnder(dir)) {
+      const source = readFileSync(file, 'utf8');
+      for (const [re, what] of FORBIDDEN) {
+        const m = re.exec(source);
+        if (m) offenders.push(`${file.slice(REPO.length + 1)}: ${what} (${m[0].slice(0, 40)})`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], `scrub these before they are committed:\n  ${offenders.join('\n  ')}`);
+});

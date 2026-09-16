@@ -33,17 +33,27 @@
  *
  * They are stripped in one place, `sanitize()`, so no future caller can
  * reintroduce them by passing extra arguments.
+ *
+ * One flag is passed on the RUN's behalf rather than stripped: `--permission-prompts
+ * none` rides every session no relay answers (`permissionPrompts`, decided by
+ * `permissionPromptsFor` at the one spawn door), so anything that would prompt
+ * is refused and the session is told nobody can approve. Its opposite rides a
+ * session the relay IS armed for (phase 14): `--permission-prompt-tool` naming
+ * the console's presence-only host (`permissionPromptTool`), which is what makes
+ * the CLI offer `AskUserQuestion` in `-p`. Never both.
  */
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
-import { SPAWN_FIRST_EVENT_MS } from '../../shared/attention-model.js';
+import { SPAWN_FIRST_EVENT_MS, SPAWN_INIT_IDLE_MS } from '../../shared/attention-model.js';
 import { isProductiveEvent } from './liveness.ts';
 import { MAX_TASKS, MAX_TASK_TEXT } from '../../shared/task-model.js';
+import { ENDED_BY, type EndedBy } from '../../shared/run-lifecycle.js';
 import { log } from '../log.ts';
-import { childEnv, type StopSignal } from './errors.ts';
-import { wakeAndTerm } from './signals.ts';
+import { API_RETRY_ERRORS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
+import { DEFAULT_KILL_AFTER_MS, INT_GRACE_MS, forgetInterrupt, groupSignal, interruptOnce, wakeAndTerm } from './signals.ts';
+import { resolveCaps, type SessionCaps } from './session-record.ts';
 import { PERMISSION_MODES, type PERMISSION_PROFILES } from '../../shared/run-settings.js';
 
 type PermissionProfile = (typeof PERMISSION_PROFILES)[number];
@@ -117,6 +127,17 @@ export function isBypassDowngrade(text: string): boolean {
  * than none — it would send `liveWall` after an account switch for a capacity
  * problem another account has too.
  */
+/**
+ * The CLI's own permission refusal, as a tool result: "Claude requested
+ * permissions to use Bash, but you haven't granted it yet", "…to write to
+ * <path>…", "…to edit <path> which is a sensitive file". Anchored at the start
+ * and kept to the CLI's framing on purpose — an INTERRUPTED call's result says
+ * "The user doesn't want to proceed with this tool use. The tool use was
+ * rejected" (measured, `test/fixtures/spikes/sigint.md`), and reading that as a
+ * refusal would file every console stop as a permission wall.
+ */
+const REFUSAL_RE = /^Claude requested permissions to (?:use|write to|edit|read)\b/;
+
 export function inferRetryCategory(detail: string | undefined): string | undefined {
   if (!detail) return undefined;
   const text = detail.toLowerCase();
@@ -185,7 +206,7 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
  * which is what turns "some text somewhere in the phase's output" into an
  * answer the console can attribute to the question that caused it.
  */
-export const OPERATOR_MARK = /\[\[(ask|steer):([0-9a-z]{4,16})\]\]/i;
+export const OPERATOR_MARK = /\[\[(ask|steer|relay):([0-9a-z]{4,16})\]\]/i;
 
 /** The tag in a piece of text, normalised, or null. */
 export function operatorMark(text: string): string | null {
@@ -193,8 +214,12 @@ export function operatorMark(text: string): string | null {
   return found ? `${found[1].toLowerCase()}:${found[2].toLowerCase()}` : null;
 }
 
-/** Build the tag for one operator message. */
-export function markFor(kind: 'ask' | 'steer', id: string): string {
+/**
+ * Build the tag for one operator message. `relay` is the console's own notice
+ * after the relay answered a question nobody did (phase 14) — tagged like the
+ * others so its echo is recognised, never an answer the console waits for.
+ */
+export function markFor(kind: 'ask' | 'steer' | 'relay', id: string): string {
   return `[[${kind}:${id}]]`;
 }
 
@@ -209,7 +234,21 @@ export function markFor(kind: 'ask' | 'steer', id: string): string {
 export type TodoItem = { content: string; status: string; activeForm?: string };
 
 export type StreamEvent =
-  | { kind: 'init'; sessionId: string; model?: string; tools?: number; toolNames?: string[] }
+  | {
+    kind: 'init';
+    sessionId: string;
+    model?: string;
+    tools?: number;
+    toolNames?: string[];
+    /**
+     * `system/init.claude_code_version` — the ONE field the relay's CLI floor is
+     * read from (phase 14; chapter 13 §1.4, DOC-7). Never `capabilities`, which
+     * names nothing about hooks (phase 1 measured three members, none of them).
+     */
+    version?: string;
+    /** `system/init.mcp_servers`, name and status — how a failed connection is known, since `--strict-mcp-config` does not exit on one (DOC-5). */
+    mcpServers?: { name: string; status: string }[];
+  }
   | { kind: 'text'; text: string }
   /** Coalesced `text_delta`s — the same words, arriving as they are written. */
   | { kind: 'partial'; text: string }
@@ -238,8 +277,33 @@ export type StreamEvent =
     agent?: string;
     parent?: string;
   }
-  /** The result of one, paired back by `id`. See above. */
-  | { kind: 'tool-result'; id: string; ok: boolean; ms?: number; detail?: string; parent?: string }
+  /**
+   * The result of one, paired back by `id`. See above.
+   *
+   * `refused` marks a result that is the CLI's permission system saying no —
+   * paired by id to a `system/permission_denied`, or in the CLI's own refusal
+   * sentence (`REFUSAL_RE`) — and `tool` then names the call. The words the
+   * session READ, distinct from the denial the CLI recorded (`permission-denied`).
+   */
+  | { kind: 'tool-result'; id: string; ok: boolean; ms?: number; detail?: string; parent?: string; refused?: boolean; tool?: string; target?: string }
+  /**
+   * A tool call the CLI's permission system denied. `stream` is the CLI's
+   * best-effort `system/permission_denied` message, which carries the reason;
+   * `result` is an entry of the final `result.permission_denials` — the
+   * authoritative record, which carries the input but no reason — emitted only
+   * for a denial the stream never announced, so one denial is one event.
+   */
+  | {
+    kind: 'permission-denied';
+    tool: string;
+    toolUseId?: string;
+    /** What the call was aimed at: its command, path or pattern. */
+    target?: string;
+    reason?: string;
+    /** The CLI's `decision_reason_type` — `hook`, `rule`, `mode`… */
+    reasonType?: string;
+    source: 'stream' | 'result';
+  }
   /** The session's own task list, as `TodoWrite` last wrote it. */
   | { kind: 'todos'; items: TodoItem[] }
   /**
@@ -294,15 +358,45 @@ export type StreamEvent =
    * is written, and this emits it again — same `mark` — when the CLI echoes it
    * back, which is the only evidence it arrived.
    */
-  | { kind: 'injected'; text: string; mark?: string; delivered?: boolean }
+  | { kind: 'injected'; text: string; mark?: string; delivered?: boolean; steer?: boolean; relay?: boolean }
   /** The session's reply to one of those, recognised by the tag it repeats. */
   | { kind: 'answer'; text: string; mark: string }
   /** stdin was closed by the watchdog rather than by the conversation ending. */
   | { kind: 'idle'; afterMs: number; reason: string }
-  /** The account's usage window, as the CLI reports it mid-session. */
-  | { kind: 'limits'; status: string; window?: string; utilization?: number; resetsAt?: number }
-  | { kind: 'retry'; category?: string; /** The category was READ OUT of `detail`, not reported by the CLI. */ inferred?: boolean; attempt?: number; detail?: string }
-  | { kind: 'result'; subtype?: string; costUsd?: number; turns?: number; isError?: boolean }
+  /**
+   * The account's usage window, as the CLI reports it mid-session.
+   *
+   * Two units, both named: `utilization` is the wire's FRACTION (0–1, what
+   * every journal row and client read has always held), `utilizationPct` the
+   * same reading as a PERCENT (0–100, the account meters' unit), which is the
+   * one a threshold is compared against.
+   */
+  | { kind: 'limits'; status: string; window?: string; utilization?: number; utilizationPct?: number; resetsAt?: number }
+  | {
+    kind: 'retry';
+    /** The CLI's `error` — one of `API_RETRY_ERRORS` — or, marked `inferred`, a guess from its text. */
+    category?: string;
+    /** The category was READ OUT of the text, not reported by the CLI in its documented field. */
+    inferred?: boolean;
+    attempt?: number;
+    /** The CLI's own ceiling for this retry sequence (`max_retries`). */
+    maxRetries?: number;
+    /** How long the CLI waits before this attempt (`retry_delay_ms`). */
+    retryDelayMs?: number;
+    /** The HTTP status behind the retry; null when no response arrived at all. */
+    errorStatus?: number | null;
+    detail?: string;
+  }
+  /**
+   * A `control_request` line (TRS-2): the CLI asking its host something over the
+   * stream — the envelope the SDK documents for a permission request. The
+   * console is no SDK host and answers none of them; it records each, so a run
+   * that ever receives one is not a run whose question went nowhere unnoticed.
+   */
+  | { kind: 'control-request'; requestId?: string; subtype?: string; tool?: string }
+  /** The turn ended on a `defer` (phase 14, spike S3): the call kept as `deferred_tool_use`, resumable with `--resume`. */
+  | { kind: 'deferred'; toolUseId?: string; tool?: string }
+  | { kind: 'result'; subtype?: string; costUsd?: number; turns?: number; isError?: boolean; terminalReason?: string }
   | { kind: 'stderr'; text: string };
 
 /**
@@ -333,6 +427,18 @@ export type SpawnHandle = {
    * its stdin on the very next tick, which is the same bug wearing a hat.
    */
   setFrozen(frozen: boolean): void;
+  /**
+   * Say who is about to end this session, before signalling it.
+   *
+   * The spawn can see that its child died, but not who killed it: a lane
+   * checkpointed for an account switch, stopped by an operator or recycled by
+   * the liveness watchdog all arrive as the same signal. The runner names the
+   * ending here first, and the outcome carries it as `endedBy` — the first word
+   * written wins, so a watchdog's own teardown is not re-attributed by a stop
+   * that lands a moment later. Optional in the type because a test's fake
+   * handle need not implement it; every real handle does.
+   */
+  markEnding?(endedBy: EndedBy, reason?: string): void;
 };
 
 export type SpawnRequest = {
@@ -356,6 +462,13 @@ export type SpawnRequest = {
   resume?: string;
   budgetUsd?: number | null;
   maxTurns?: number | null;
+  /**
+   * Both caps with the policy that set each (`session-record.ts`). When
+   * present they are what reaches argv; the two bare numbers above are for a
+   * caller with no source to name, and are recorded as `caller`. With neither,
+   * `spawn.ts` applies its floor (`spawn-default`) — no session goes uncapped.
+   */
+  caps?: SessionCaps;
   /** Models to fail over to in-place, in order, without losing the session. */
   fallbackModels?: string[];
   /** Shown in `/resume` and `claude agents` — worth having on an unattended run. */
@@ -379,6 +492,18 @@ export type SpawnRequest = {
    * two differ in the ask list inside `--settings`, not out here.
    */
   permissionProfile?: PermissionProfile;
+  /**
+   * `none` passes `--permission-prompts none` (CLI 2.1.259+): the floor for a
+   * run no relay answers. Decided per session by `permissionPromptsFor`.
+   */
+  permissionPrompts?: 'none';
+  /**
+   * `--permission-prompt-tool <mcp tool>` — the relay's presence-only host
+   * (phase 14, spike S1): with one attached the CLI offers `AskUserQuestion`
+   * in `-p`. Set only on a session the relay is armed for, never beside
+   * `permissionPrompts`.
+   */
+  permissionPromptTool?: string;
   /** Stream assistant text as it is written rather than per finished block. */
   partialMessages?: boolean;
   /** Forward subagent text, so a phase that delegates is not a silent gap. */
@@ -399,6 +524,20 @@ export type SpawnRequest = {
    * the old unbounded behaviour, or a caller that supervises its own child).
    */
   firstEventMs?: number;
+  /**
+   * How long a session may be silent between its `init` and its first
+   * `result` — the clock over the gap where the phase's work happens.
+   *
+   * The first-event backstop above is cleared by the `init` every session
+   * emits in its first second, and the idle close refuses to arm until the
+   * first `result`, so a session that initialised and then wedged had no clock
+   * inside this file at all (SES-10). Armed at `init`, cleared by the first
+   * `result`, stretched by every productive event. Defaults to
+   * `SPAWN_INIT_IDLE_MS`; 0 switches it off.
+   */
+  initIdleMs?: number;
+  /** How long an aborted child gets to close its turn after SIGINT before SIGTERM. Test seam; defaults to `INT_GRACE_MS`. */
+  interruptGraceMs?: number;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
@@ -419,6 +558,25 @@ export type SpawnOutcome = {
   argv: string[];
   /** Messages the operator injected mid-session, for the record. */
   injected: number;
+  /*
+   * The session ledger (zero-touch-console phase 4). Optional in the type so a
+   * test's fake outcome still runs; `spawnClaude` always sets every one, and
+   * `session-record.ts` reads a missing one as its honest default.
+   */
+  /** Who ended the session — `exit` when nothing in the console did. */
+  endedBy?: EndedBy;
+  /** The ender's own words, when it had some (the spawn watchdogs always do). */
+  endedReason?: string;
+  /** A turn was still open when the process ended: the last `result` does not cover all the work. */
+  midTurn?: boolean;
+  /** Distinct assistant turns of the phase's own conversation the stream showed. */
+  steps?: number;
+  /** Where `turns` came from: the CLI's `num_turns`, or the stream for a turn that never closed. */
+  turnsSource?: 'result' | 'stream';
+  /** Where `costUsd` came from; `none` means no `total_cost_usd` ever arrived. */
+  costSource?: 'result' | 'stream' | 'none';
+  /** The caps that reached argv, with their sources. */
+  caps?: SessionCaps;
 };
 
 export type SpawnFn = (request: SpawnRequest) => Promise<SpawnOutcome>;
@@ -506,6 +664,10 @@ export function buildArgv(request: SpawnRequest): string[] {
     '--verbose',
     '--permission-mode', bypass ? 'bypassPermissions' : (request.permissionMode ?? 'acceptEdits'),
   ];
+  // Who answers a prompt in print mode: nobody, on a run no relay answers —
+  // and the relay's presence-only host on a session it is armed for. Never both.
+  if (request.permissionPrompts === 'none') argv.push('--permission-prompts', 'none');
+  else if (request.permissionPromptTool) argv.push('--permission-prompt-tool', request.permissionPromptTool);
   if (request.resume) argv.push('--resume', request.resume);
   else argv.push('--session-id', request.sessionId ?? randomUUID());
   if (request.model) argv.push('--model', request.model);
@@ -518,8 +680,13 @@ export function buildArgv(request: SpawnRequest): string[] {
   const fallbacks = (request.fallbackModels ?? []).filter(Boolean);
   if (fallbacks.length) argv.push('--fallback-model', fallbacks.join(','));
   if (request.name) argv.push('--name', request.name.slice(0, 80));
-  if (request.budgetUsd && request.budgetUsd > 0) argv.push('--max-budget-usd', String(request.budgetUsd));
-  if (request.maxTurns && request.maxTurns > 0) argv.push('--max-turns', String(request.maxTurns));
+  // Always both, and never a bare absence (SES-8): 0 of 507 lifetime argvs
+  // carried a dollar cap, because both conditions read values that defaulted
+  // to null. The caps come named (`request.caps`), bare (`caller`), or — for a
+  // caller that passed nothing — as the floor, so no session goes uncapped.
+  const caps = resolveCaps(request);
+  argv.push('--max-budget-usd', String(caps.maxBudgetUsd.value));
+  argv.push('--max-turns', String(caps.maxTurns.value));
   if (request.tools?.length) argv.push('--tools', request.tools.join(','));
   // One variadic flag rather than a repeated one: `--add-dir <directories...>`
   // collects until the next option, and a second occurrence would replace the
@@ -593,7 +760,7 @@ export function userMessage(text: string): string {
 export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((resolve) => {
   const started = Date.now();
   if (Buffer.byteLength(request.prompt) > MAX_PROMPT_BYTES) {
-    resolve(fail(`the boot prompt is over ${MAX_PROMPT_BYTES / 1024}KB — the plan is malformed`, started, []));
+    resolve(fail(`the boot prompt is over ${MAX_PROMPT_BYTES / 1024}KB — the plan is malformed`, started, [], resolveCaps(request)));
     return;
   }
 
@@ -635,6 +802,47 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let stderr = '';
   const retryCategories: string[] = [];
   let settled = false;
+
+  /* ---- the session ledger ---- *
+   *
+   * What the stream already says, kept so a session that never reaches its
+   * `result` is still booked (SES-1). The CLI books turns and dollars on the
+   * `result` alone; SIGINT now makes an interrupted turn write one, and these
+   * cover the endings where nothing does.
+   *
+   *   `costSource`       where the last `total_cost_usd` came from, or `none`.
+   *   `reportedTurns`    the CLI's own `num_turns`, the highest seen.
+   *   `turnIds`          distinct `message.id`s of the phase's own assistant
+   *                      messages. One API turn arrives as SEVERAL assistant
+   *                      lines — its thinking and its tool call share one id
+   *                      (measured, `test/fixtures/spikes/sigint.md`) — so a
+   *                      count of lines would over-book it.
+   *   `turnOpen`         a user message went in and no completed `result` has
+   *                      come back for it. A `result` whose `terminal_reason`
+   *                      is `aborted_*` closed the turn without finishing it.
+   *   `ending`           who ended the session, first writer wins.
+   */
+  let costSource: 'result' | 'stream' | 'none' = 'none';
+  let reportedTurns: number | null = null;
+  const turnIds = new Set<string>();
+  let anonymousTurns = 0;
+  let turnOpen = true;                 // the boot prompt is the first open turn
+  let isError = false;
+  let terminalReason: string | undefined;
+  let permissionDenials: PermissionDenial[] = [];
+  /** `tool_use` ids the stream said were denied, so a result entry is not a second event. */
+  const deniedIds = new Set<string>();
+  /** A tool call's name and aim, by id — what a `permission_denied` line does not repeat. Bounded like `toolStartedAt`. */
+  const toolInfo = new Map<string, { name: string; summary: string }>();
+  /** Background tasks the CLI started and has not reported finished (`system/task_started`). */
+  const backgroundTasks = new Map<string, string>();
+  let ending: { endedBy: EndedBy; reason?: string } | null = null;
+  const noteEnding = (endedBy: EndedBy, reason?: string): void => {
+    if (ending) return;
+    ending = { endedBy, ...(reason ? { reason } : {}) };
+  };
+  /** SIGTERM and SIGKILL behind an interrupt, armed once by the teardown. */
+  const escalation: NodeJS.Timeout[] = [];
 
   /* ---- the conversation's own state ---- *
    *
@@ -710,6 +918,11 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     if (settled) return;
     settled = true;
     clearFirstEventTimer();
+    clearInitIdle();
+    for (const timer of escalation) clearTimeout(timer);
+    // The child is over; its pid may be reused by a process that must be
+    // asked afresh (`signals.ts` remembers one interrupt per pid).
+    forgetInterrupt(child.pid);
     if (parseErrors) log.warn('spawn.parse-errors', { pid: child.pid, count: parseErrors });
     resolve(outcome);
   };
@@ -719,6 +932,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   const emit = (event: StreamEvent) => {
     lastEventAt = Date.now();
     sawEvent = true;
+    // The init→result bound measures silence in PRODUCTIVE events, by the same
+    // one definition the backstop below uses.
+    if (isProductiveEvent(event)) lastProductiveAt = lastEventAt;
     // The backstop's question is not "did anything arrive" — it is "did this
     // session ever WORK". Those were the same thing until the CLI started
     // absorbing failures on our behalf: a lane that emits nothing but
@@ -799,6 +1015,17 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let sawProductive = false;
   /** Set by `setFrozen` — see `SpawnHandle.setFrozen` for why the watchdog must not run. */
   let frozen = false;
+  /** When the session last produced a productive event — the init→result bound's clock. */
+  let lastProductiveAt = Date.now();
+  const initIdleAfter = request.initIdleMs ?? SPAWN_INIT_IDLE_MS;
+  let initIdleTimer: NodeJS.Timeout | null = null;
+  /** Between the session's `init` and its first `result`: the stretch that bound watches. */
+  let initWatch = false;
+  const clearInitIdle = (): void => {
+    if (!initIdleTimer) return;
+    clearTimeout(initIdleTimer);
+    initIdleTimer = null;
+  };
 
   /**
    * Armed only once the phase's own turn has produced a result: before that,
@@ -849,6 +1076,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       if (mark) unecho.add(mark);
       else sentSinceLastResult = true;
       injected++;
+      // A message opens a turn; only its completed `result` closes it.
+      turnOpen = true;
       armIdle();
       return true;
     },
@@ -857,13 +1086,17 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       frozen = next;
       if (frozen) {
         if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        clearInitIdle();
         return;
       }
       // The frozen stretch was not silence the session chose. Forgiving it is
       // what makes a thaw at T+12 a resume rather than a delayed idle-close.
       lastEventAt = Date.now();
+      lastProductiveAt = lastEventAt;
       armIdle();
+      armInitIdle();
     },
+    markEnding: (endedBy: EndedBy, reason?: string) => { noteEnding(endedBy, reason); },
   });
 
   /* ---- coalescing the delta firehose ---- */
@@ -885,16 +1118,36 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   };
 
   const onAbort = () => {
-    // Wake first, THEN SIGTERM, so the session's own SessionEnd hooks still
-    // run; the runner escalates to SIGKILL if it has to.
-    //
-    // The wake is the whole point. A frozen lane aborted here — which is
-    // exactly what a console shutdown does — cannot act on SIGTERM: the signal
-    // is queued against a stopped process and its handler never runs. That is
-    // how a phase-9 child outlived its console by three hours in state `T`.
+    // Who asked, when the abort said: `stop()` and `checkpointForShutdown()`
+    // abort the run's controller with their `ENDED_BY` word as the reason.
+    const why = request.signal?.aborted ? request.signal.reason : undefined;
+    if (typeof why === 'string' && (ENDED_BY as readonly string[]).includes(why)) noteEnding(why as EndedBy);
     closeStdin();
-    if (child.pid) wakeAndTerm(child.pid);
-    else { try { child.kill('SIGTERM'); } catch { /* already gone */ } }
+    if (!child.pid) {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      return;
+    }
+    // Ask the turn to close first — SIGINT, once per process (`signals.ts`).
+    // The CLI then writes the `result` that books the session's turns and
+    // dollars, which a SIGTERM never lets it write: measured on 2.1.270, the
+    // `result` 10 ms after the signal and a clean exit half a second later.
+    // The wake rides inside `interruptOnce`, and it is still the point: a
+    // frozen lane aborted here — exactly what a console shutdown does — cannot
+    // act on any signal until it is continued. That is how a phase-9 child
+    // outlived its console by three hours in state `T`.
+    interruptOnce(child.pid);
+    if (escalation.length) return;
+    // …then insist, on this spawn's own clock, so a child with no runner ladder
+    // behind it — a lane-less QA round, a PR session — still has a SIGTERM and
+    // a SIGKILL coming. Both are cleared the moment the child is gone.
+    const grace = request.interruptGraceMs ?? INT_GRACE_MS;
+    const term = setTimeout(() => { if (!settled && child.pid) wakeAndTerm(child.pid); }, grace);
+    const kill = setTimeout(() => {
+      if (!settled && child.pid) groupSignal(child.pid, 'SIGKILL');
+    }, grace + DEFAULT_KILL_AFTER_MS);
+    term.unref?.();
+    kill.unref?.();
+    escalation.push(term, kill);
   };
   request.signal?.addEventListener('abort', onAbort, { once: true });
 
@@ -939,6 +1192,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
           ? 'the session produced nothing but API retries after it started — no turn, no tool call, no result'
           : 'the session produced no output at all after it started';
       log.warn('spawn.no-first-event', { afterMs, reason, parseErrors, sawEvent, pid: child.pid });
+      // Named before the teardown, so the outcome says the spawn's own clock
+      // ended this child (SES-11) — not an external SIGTERM a person must
+      // explain, which is how `classify()` used to read the exit.
+      noteEnding('spawn-watchdog', reason);
       // Emitted BEFORE the teardown, so the journal holds the evidence that
       // produced the kill even though the kill is what ends the stream. Note
       // this sets `sawEvent`; nothing reads it after this point.
@@ -947,6 +1204,41 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     }, Math.min(firstEventAfter, MAX_SPAWN_TIMER_MS));
     firstEventTimer.unref?.();
   }
+
+  /* ---- the init→result bound ---- *
+   *
+   * The clock over the stretch where a phase's work happens (SES-10): after
+   * the session's `init`, before its first `result`. The first-event backstop
+   * above cannot see it — the `init` every session emits in its first second
+   * clears that one — and the idle close refuses to arm until a `result`, so a
+   * session that initialised and then wedged had no clock in this file at all.
+   * Only the runner's nudge-then-recycle bounded it, and that needs a lane, a
+   * liveness ticker and a console still driving: the things absent in exactly
+   * the cases the audit is about.
+   *
+   * It measures silence in productive events and re-arms for the remainder on
+   * each wake, like `armIdle`, rather than rescheduling per event; a frozen
+   * lane suspends it. By construction the last clock (`SPAWN_INIT_IDLE_MS`):
+   * a long local job the runner parks at `STALL_LOCAL_JOB_MS` never reaches it.
+   */
+  const armInitIdle = (delay = initIdleAfter): void => {
+    clearInitIdle();
+    if (!initWatch || settled || frozen || initIdleAfter <= 0) return;
+    initIdleTimer = setTimeout(() => {
+      initIdleTimer = null;
+      if (!initWatch || settled || frozen) return;
+      const quiet = Date.now() - lastProductiveAt;
+      if (quiet < initIdleAfter) { armInitIdle(initIdleAfter - quiet); return; }
+      initWatch = false;
+      const spoken = quiet < 120_000 ? `${Math.round(quiet / 1_000)} s` : `${Math.round(quiet / 60_000)} min`;
+      const reason = `no result after init — the session went silent for ${spoken} after it started and before its first result`;
+      log.warn('spawn.init-idle', { afterMs: quiet, pid: child.pid });
+      noteEnding('spawn-watchdog', reason);
+      emit({ kind: 'idle', afterMs: quiet, reason });
+      onAbort();
+    }, Math.min(Math.max(1, delay), MAX_SPAWN_TIMER_MS));
+    initIdleTimer.unref?.();
+  };
 
   const handleLine = (line: string) => {
     let message: Record<string, unknown>;
@@ -977,7 +1269,29 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     const sub = typeof message.subtype === 'string' ? message.subtype : undefined;
     const parent = typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : undefined;
 
+    // The running total, whichever message carried it, the last one winning
+    // (SES-1). `result` is the documented carrier; reading it wherever it
+    // appears means a session that never reached one is not booked at $0 when
+    // the stream did say what it had cost.
+    if (typeof message.total_cost_usd === 'number') {
+      costUsd = message.total_cost_usd;
+      costSource = type === 'result' ? 'result' : 'stream';
+    }
+
     if (type === 'system' && sub === 'init') {
+      // The init→result bound starts here: from now until the first `result`
+      // is the stretch where the phase's work happens.
+      initWatch = true;
+      lastProductiveAt = Date.now();
+      armInitIdle();
+      const servers = Array.isArray(message.mcp_servers)
+        ? message.mcp_servers.flatMap((entry) => {
+          const server = entry as { name?: unknown; status?: unknown } | null;
+          return typeof server?.name === 'string' && server.name
+            ? [{ name: server.name.slice(0, MAX_TOOL_NAME), status: typeof server.status === 'string' ? server.status.slice(0, 40) : 'unknown' }]
+            : [];
+        }).slice(0, MAX_TOOL_NAMES)
+        : undefined;
       emit({
         kind: 'init',
         sessionId: sessionId ?? '',
@@ -990,7 +1304,69 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
               .slice(0, MAX_TOOL_NAMES)
               .map((name) => name.slice(0, MAX_TOOL_NAME))
           : undefined,
+        // The field and nothing else: `capabilities` is an open set that names
+        // no hook behaviour, and a version parsed out of any other string is a
+        // guess about which binary answered.
+        ...(typeof message.claude_code_version === 'string' && message.claude_code_version
+          ? { version: message.claude_code_version.slice(0, 40) } : {}),
+        ...(servers ? { mcpServers: servers } : {}),
       });
+      return;
+    }
+
+    // The CLI asking its host over the stream (TRS-2). Recorded, never
+    // answered: the console is not an SDK host, passes no stdio prompt tool,
+    // and a `control_response` it invented would be a decision nobody made.
+    if (type === 'control_request') {
+      const request = (message.request ?? {}) as { subtype?: unknown; tool_name?: unknown };
+      emit({
+        kind: 'control-request',
+        ...(typeof message.request_id === 'string' ? { requestId: message.request_id.slice(0, 80) } : {}),
+        ...(typeof request.subtype === 'string' ? { subtype: request.subtype.slice(0, 60) } : {}),
+        ...(typeof request.tool_name === 'string' ? { tool: request.tool_name.slice(0, MAX_TOOL_NAME) } : {}),
+      });
+      return;
+    }
+
+    // A denial as the CLI announces it — best-effort, and the only form that
+    // carries the reason. The `result`'s `permission_denials` is the
+    // authoritative ledger and is read there, for the denials this missed.
+    // Measured shape (CLI 2.1.270, `test/fixtures/spikes/permissionrequest.md`):
+    // `tool_name`, `tool_use_id`, `decision_reason_type`, `decision_reason`,
+    // `message` — and no input, so the aim comes from the call's own `tool_use`.
+    if (type === 'system' && sub === 'permission_denied') {
+      const toolUseId = typeof message.tool_use_id === 'string' && message.tool_use_id ? message.tool_use_id : undefined;
+      const known = toolUseId ? toolInfo.get(toolUseId) : undefined;
+      if (toolUseId) deniedIds.add(toolUseId);
+      const reason = firstString(message, ['decision_reason', 'message']);
+      emit({
+        kind: 'permission-denied',
+        tool: typeof message.tool_name === 'string' && message.tool_name ? message.tool_name : (known?.name ?? 'tool'),
+        ...(toolUseId ? { toolUseId } : {}),
+        ...(known?.summary ? { target: known.summary } : {}),
+        ...(reason ? { reason: reason.slice(0, MAX_RESULT_TEXT) } : {}),
+        ...(typeof message.decision_reason_type === 'string' ? { reasonType: message.decision_reason_type } : {}),
+        source: 'stream',
+      });
+      return;
+    }
+
+    // Background work the CLI is holding open for this session. Whatever is
+    // still open when the process ends is what the CLI's background-task
+    // ceiling terminated (SES-12) — the one list that can name those tasks,
+    // since the CLI's own warning names only the ceiling.
+    if (type === 'system' && (sub === 'task_started' || sub === 'task_notification')) {
+      const taskId = typeof message.task_id === 'string' ? message.task_id : '';
+      if (taskId && sub === 'task_started') {
+        const description = typeof message.description === 'string' ? message.description : '';
+        backgroundTasks.set(taskId, description.slice(0, MAX_RESULT_TEXT));
+        if (backgroundTasks.size > MAX_PENDING_TOOLS) {
+          const oldest = backgroundTasks.keys().next().value;
+          if (oldest !== undefined) backgroundTasks.delete(oldest);
+        }
+      } else if (taskId) {
+        backgroundTasks.delete(taskId);
+      }
       return;
     }
 
@@ -1010,30 +1386,50 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // unattended run that is about to walk into a wall should say so first.
     if (type === 'rate_limit_event') {
       const info = (message.rate_limit_info ?? {}) as Record<string, unknown>;
+      const utilization = typeof info.utilization === 'number' ? info.utilization : undefined;
       emit({
         kind: 'limits',
         status: String(info.status ?? 'unknown'),
         window: typeof info.rateLimitType === 'string' ? info.rateLimitType : undefined,
-        utilization: typeof info.utilization === 'number' ? info.utilization : undefined,
+        utilization,
+        // The same reading in the meters' unit, named, so a threshold is never
+        // compared across units (SES-9): the wire's is a fraction (0.29–0.99 in
+        // the audit's 1 062 rows), the account meters' a percent.
+        ...(utilization === undefined ? {} : { utilizationPct: percentOf(utilization) }),
         resetsAt: typeof info.resetsAt === 'number' ? info.resetsAt : undefined,
       });
       return;
     }
 
     // The retry stream is how the CLI reports what it is absorbing on our
-    // behalf. The field has been spelled several ways; take whichever is there
-    // rather than silently recording no category at all.
+    // behalf. The category is the documented `error` field, one of twelve
+    // values (`API_RETRY_ERRORS`, chapter 09 row 31); it used to be read from
+    // four names the CLI has never sent — `error_category` belongs to a
+    // different message, `tool_progress.subagent_retry` — so every retry was
+    // filed as free text and the one arm that acts on `server_error` could not
+    // be reached (SES-7). Inference survives only for a value outside the
+    // documented set, and says it is a guess.
     if (type === 'system' && sub === 'api_retry') {
-      const detail = firstString(message, ['error', 'message', 'detail']);
-      const said = firstString(message, ['error_category', 'category', 'error_type', 'reason']);
-      // `??=`, so the CLI's own word always wins: this only ever fills a hole.
-      const category = said ?? inferRetryCategory(detail);
+      const error = typeof message.error === 'string' && message.error ? message.error : undefined;
+      const documented = error && (API_RETRY_ERRORS as readonly string[]).includes(error) ? error : undefined;
+      const detail = firstString(message, ['message', 'detail']) ?? error;
+      const category = documented ?? inferRetryCategory(detail);
       if (category) retryCategories.push(category);
+      const count = (key: string): number | undefined =>
+        (typeof message[key] === 'number' ? message[key] as number : undefined);
+      const maxRetries = count('max_retries');
+      const retryDelayMs = count('retry_delay_ms');
       emit({
         kind: 'retry',
         category,
-        ...(said || !category ? {} : { inferred: true }),
-        attempt: typeof message.attempt === 'number' ? message.attempt : undefined,
+        ...(documented || !category ? {} : { inferred: true }),
+        attempt: count('attempt'),
+        ...(maxRetries === undefined ? {} : { maxRetries }),
+        ...(retryDelayMs === undefined ? {} : { retryDelayMs }),
+        // Null, not absent, when the CLI says no response arrived at all.
+        ...('error_status' in message
+          ? { errorStatus: typeof message.error_status === 'number' ? message.error_status : null }
+          : {}),
         detail,
       });
       return;
@@ -1076,6 +1472,14 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
           const id = typeof item.id === 'string' && item.id ? item.id : undefined;
           if (id) noteToolStart(id);
           const input = (item.input ?? {}) as Record<string, unknown>;
+          // Kept by id for a denial that names the call but not its aim.
+          if (id) {
+            toolInfo.set(id, { name: item.name, summary: summarise(item.input) });
+            if (toolInfo.size > MAX_PENDING_TOOLS) {
+              const oldest = toolInfo.keys().next().value;
+              if (oldest !== undefined) toolInfo.delete(oldest);
+            }
+          }
           // A delegation, and which agent it hands to — taken here rather than
           // guessed from its prose, because the console pairs subagent output
           // back to this call by id and "agent" as a label says nothing when
@@ -1113,6 +1517,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       // listener that counts steps and reacts to tools sees them in the order
       // they happened. A subagent's turn is not the phase's — see `step`.
       if (!parent) {
+        // One API turn arrives as several assistant lines sharing a
+        // `message.id` (its thinking, then its tool call), so the ledger
+        // counts ids, not lines. The `step` below stays per line: the liveness
+        // detectors were calibrated on it.
+        const turnId = (message.message as { id?: unknown } | undefined)?.id;
+        if (typeof turnId === 'string' && turnId) turnIds.add(turnId);
+        else anonymousTurns++;
         emit({
           kind: 'step',
           tools: (content?.content ?? []).filter(
@@ -1142,12 +1553,24 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         if (item.type !== 'tool_result' || typeof item.tool_use_id !== 'string' || !item.tool_use_id) continue;
         results++;
         const ms = toolDuration(item.tool_use_id);
+        const detail = resultDetail(item.content);
+        // The words the session READ when the CLI said no: paired to a denial
+        // by id, or in the CLI's own refusal sentence. Never an interrupted
+        // call's "the tool use was rejected" (see `REFUSAL_RE`).
+        const refused = item.is_error === true && (deniedIds.has(item.tool_use_id) || REFUSAL_RE.test(detail));
         emit({
           kind: 'tool-result',
           id: item.tool_use_id,
           ok: item.is_error !== true,
           ...(ms === undefined ? {} : { ms }),
-          detail: resultDetail(item.content),
+          detail,
+          ...(refused ? {
+            refused: true,
+            tool: toolInfo.get(item.tool_use_id)?.name ?? 'tool',
+            // What was refused, so the journal line names a target as the
+            // denial ledger's does (TRS-8) — not only the sentence the session read.
+            ...(toolInfo.get(item.tool_use_id)?.summary ? { target: toolInfo.get(item.tool_use_id)!.summary } : {}),
+          } : {}),
           // A subagent's tool calls are its own; attributing them to the phase
           // is how a delegated `rm -rf` reads as something the phase did.
           ...(parent ? { parent } : {}),
@@ -1175,22 +1598,68 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       flushPartials();
       subtype = sub;
       // `total_cost_usd` is the running total for the whole session, not this
-      // turn's share — so the last one wins and they are never summed.
-      if (typeof message.total_cost_usd === 'number') costUsd = message.total_cost_usd;
+      // turn's share — so the last one wins and they are never summed. It is
+      // taken above, for every message that carries one.
+      //
+      // The CLI's own error bit, and the finer reason for the ending. Both used
+      // to reach the browser and stop there, so `classify()` believed
+      // `subtype: success` for every failure text outside its patterns (SES-5).
+      isError = message.is_error === true;
+      terminalReason = typeof message.terminal_reason === 'string' && message.terminal_reason
+        ? message.terminal_reason : undefined;
       // A result that reports a turn number already seen is a duplicate, not a
       // turn boundary — and telling those apart is the CLI's job, not ours.
       const reported = typeof message.num_turns === 'number' ? message.num_turns : null;
       const newTurn = reported === null || reported > turnsSeen;
       if (reported !== null) turnsSeen = Math.max(turnsSeen, reported);
       if (reported !== null) turns = Math.max(turns, reported);
+      if (reported !== null) reportedTurns = Math.max(reportedTurns ?? 0, reported);
       const text = message.result ?? message.error;
       if (typeof text === 'string') resultText = text;
+      // The authoritative denial ledger. A denial the stream already announced
+      // is not announced twice; one it missed is announced now, with the input
+      // this record carries and the reason it does not.
+      if (Array.isArray(message.permission_denials)) {
+        permissionDenials = message.permission_denials.slice(0, MAX_PENDING_TOOLS).flatMap((entry): PermissionDenial[] => {
+          if (!entry || typeof entry !== 'object') return [];
+          const denial = entry as { tool_name?: unknown; tool_use_id?: unknown; tool_input?: unknown };
+          const toolUseId = typeof denial.tool_use_id === 'string' && denial.tool_use_id ? denial.tool_use_id : undefined;
+          const target = summarise(denial.tool_input);
+          return [{
+            tool: typeof denial.tool_name === 'string' && denial.tool_name ? denial.tool_name : 'tool',
+            ...(toolUseId ? { toolUseId } : {}),
+            ...(target ? { target } : {}),
+          }];
+        });
+        for (const denial of permissionDenials) {
+          if (denial.toolUseId && deniedIds.has(denial.toolUseId)) continue;
+          if (denial.toolUseId) deniedIds.add(denial.toolUseId);
+          emit({ kind: 'permission-denied', ...denial, source: 'result' });
+        }
+      }
+      // A `defer` (phase 14, spike S3): the call is kept on the result for a
+      // `--resume` to run, and the console says so before anything reads the
+      // ending as a turn that simply finished.
+      const deferred = message.deferred_tool_use as { id?: unknown; name?: unknown } | undefined;
+      if (deferred && typeof deferred === 'object') {
+        emit({
+          kind: 'deferred',
+          ...(typeof deferred.id === 'string' ? { toolUseId: deferred.id.slice(0, 80) } : {}),
+          ...(typeof deferred.name === 'string' ? { tool: deferred.name.slice(0, MAX_TOOL_NAME) } : {}),
+        });
+      }
+      // A completed turn is closed; an aborted one (`aborted_streaming`,
+      // `aborted_tools`) only stopped, and the stream's count covers its tail.
+      if (!terminalReason?.startsWith('aborted')) turnOpen = false;
+      // The first result ends the init→result stretch.
+      if (initWatch) { initWatch = false; clearInitIdle(); }
       emit({
         kind: 'result',
         subtype,
         costUsd,
         turns,
-        isError: message.is_error === true,
+        isError,
+        ...(terminalReason ? { terminalReason } : {}),
       });
 
       // One result per TURN. The first belongs to the boot prompt, so the phase
@@ -1237,7 +1706,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     const reason = error.code === 'ENOENT'
       ? 'the `claude` CLI is not on PATH for this process'
       : `could not start claude: ${error.message}`;
-    finish(fail(reason, started, shown));
+    finish(fail(reason, started, shown, resolveCaps(request)));
   });
 
   child.on('close', (code, sig) => {
@@ -1250,36 +1719,72 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // Result text first: it is the CLI's own account of why it stopped. stderr
     // follows because some failures never reach a result message at all.
     const text = [resultText, stderr].filter(Boolean).join('\n');
+    // The ledger (SES-1). A session whose turn closed is booked on the CLI's
+    // own count; one that ended with a turn still open is booked on whatever
+    // is larger — that count, or the assistant turns the stream showed — since
+    // the last `result` (if any) does not cover the work after it.
+    const steps = turnIds.size + anonymousTurns;
+    const midTurn = turnOpen;
+    const bookedTurns = midTurn ? Math.max(reportedTurns ?? 0, steps) : (reportedTurns ?? steps);
+    const turnsSource: 'result' | 'stream' = reportedTurns !== null && bookedTurns === reportedTurns ? 'result' : 'stream';
+    const endedBy: EndedBy = ending?.endedBy ?? 'exit';
+    const openTasks = [...backgroundTasks].map(([id, description]) => ({ id, description }));
     finish({
       signal: {
         subtype,
-        code: code ?? (sig === 'SIGTERM' ? 143 : sig === 'SIGKILL' ? 137 : null),
+        code: code ?? (sig === 'SIGTERM' ? 143 : sig === 'SIGKILL' ? 137 : sig === 'SIGINT' ? 130 : null),
         stopReason,
         text,
         retryCategories,
         model: request.model,
+        isError,
+        permissionDenials,
+        endedBy,
+        ...(ending?.reason ? { endedReason: ending.reason } : {}),
+        ...(terminalReason ? { terminalReason } : {}),
+        ...(openTasks.length ? { backgroundTasks: openTasks } : {}),
       },
       sessionId,
       costUsd,
-      turns,
+      turns: bookedTurns,
       resultText,
       durationMs: Date.now() - started,
       argv: shown,
       injected,
+      endedBy,
+      ...(ending?.reason ? { endedReason: ending.reason } : {}),
+      midTurn,
+      steps,
+      turnsSource,
+      costSource,
+      caps: resolveCaps(request),
     });
   });
 });
 
-function fail(reason: string, started: number, argv: string[]): SpawnOutcome {
+function fail(reason: string, started: number, argv: string[], caps: SessionCaps): SpawnOutcome {
   return {
-    signal: { subtype: 'error_during_execution', code: null, text: reason },
+    signal: { subtype: 'error_during_execution', code: null, text: reason, endedBy: 'exit' },
     costUsd: 0,
     turns: 0,
     resultText: reason,
     durationMs: Date.now() - started,
     argv,
     injected: 0,
+    // A child that never started ended itself, before any turn: nothing open,
+    // nothing reported, nothing seen.
+    endedBy: 'exit',
+    midTurn: false,
+    steps: 0,
+    turnsSource: 'result',
+    costSource: 'none',
+    caps,
   };
+}
+
+/** A usage fraction from the wire (0–1) as the meters' percent (0–100), one decimal. */
+export function percentOf(fraction: number): number {
+  return Math.round(Math.min(1, Math.max(0, fraction)) * 1_000) / 10;
 }
 
 /** The tag is plumbing; it belongs in the correlation, not on the screen. */

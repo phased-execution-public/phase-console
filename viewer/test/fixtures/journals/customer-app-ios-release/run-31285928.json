@@ -1,0 +1,1305 @@
+{
+  "id": "31285928",
+  "slug": "customer-app-ios-release",
+  "root": "/home/operator/work/hub",
+  "status": "parked",
+  "autonomy": "keep-going",
+  "model": "opus[1m]",
+  "effort": "max",
+  "qaModel": "sonnet",
+  "qaEffort": "max",
+  "qaMaxRounds": 5,
+  "phaseBudgetUsd": null,
+  "runBudgetUsd": null,
+  "spentUsd": 385.5616064999998,
+  "maxConsecutiveFailures": 2,
+  "consecutiveFailures": 0,
+  "createdAt": "2026-09-05T16:58:08.455Z",
+  "updatedAt": "2026-09-14T01:47:19.190Z",
+  "activePhase": null,
+  "child": null,
+  "waitUntil": null,
+  "halt": {
+    "at": "2026-09-08T01:32:50.002Z",
+    "reason": "nothing left to run on its own — phase 4 needs you — Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored'  (Clear what it names, then Resume the session with an instruction or Retry; or split the remaining work into a new phase.). a phase parked with an errand takes that errand, then Retry."
+  },
+  "pause": null,
+  "freeze": null,
+  "onLimit": "switch",
+  "phaseOptions": {
+    "3": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "4": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "5": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "6": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "7": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "8": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "9": {
+      "model": "opus[1m]",
+      "effort": "max"
+    }
+  },
+  "skills": [
+    "graph-tool"
+  ],
+  "permissionProfile": "trusted",
+  "autoRecover": {},
+  "phases": {
+    "3": {
+      "phase": 3,
+      "status": "done",
+      "attempts": 1,
+      "costUsd": 0,
+      "lifecycle": {
+        "state": "done"
+      },
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "preflight": [
+        "left for a person on the record: ! grep -q '\"expo\": \"npx expo\"' apps/expo/package.json — `!` is not a recognised command (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "! grep -q '\"expo\": \"npx expo\"' apps/expo/package.json",
+          "message": "left for a person on the record: ! grep -q '\"expo\": \"npx expo\"' apps/expo/package.json — `!` is not a recognised command (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-05T16:58:09.870Z",
+      "attemptStartedAt": "2026-09-06T06:02:04.380Z",
+      "model": "opus[1m]",
+      "effort": "max",
+      "sessionId": "f1c70000-0000-4000-8000-000000000050",
+      "actualModel": "claude-opus-5[1m]",
+      "liveness": {
+        "phase": 3,
+        "lastOutputAt": "2026-09-06T06:02:07.405Z",
+        "turnsSinceLastTool": 0,
+        "commitsSinceStart": 0,
+        "treeDirty": true
+      },
+      "tasks": [
+        {
+          "id": "p3.task1",
+          "content": "p3.task1 — bootstrap: read P2 handoff + findings, graph-tool query customer-app",
+          "status": "completed"
+        },
+        {
+          "id": "p3.task2",
+          "content": "p3.task2 — build/store plumbing: eas.json, app.config.js, package.json, metro.config.js, root app.json/eas.json deletion, docs",
+          "status": "completed"
+        },
+        {
+          "id": "p3.task3",
+          "content": "p3.task3 — expo install --fix + expo-doctor clean",
+          "status": "completed"
+        },
+        {
+          "id": "p3.task4",
+          "content": "p3.task4 — nav + QA bug fixes: legal redirect, connect-channels header, checkout Apple-pay onError, ClearDataRow dev-only",
+          "status": "completed"
+        },
+        {
+          "id": "p3.task5",
+          "content": "p3.task5 — remaining P2/P1 bugs: GoogleSignIn cancel, SafeAreaView deprecation, others",
+          "status": "completed"
+        },
+        {
+          "id": "p3.task6",
+          "content": "p3.task6 — verify: yarn verify:local, expo install --check, prebuild+pod install, dev client boot, Maestro re-run",
+          "status": "in_progress"
+        },
+        {
+          "id": "p3.task7",
+          "content": "p3.task7 — graph-tool update, push branch, update draft PR #114",
+          "status": "pending"
+        },
+        {
+          "id": "p3.task8",
+          "content": "p3.task8 — handoff + QA subagent (sonnet) + qa-record",
+          "status": "pending"
+        }
+      ],
+      "turns": 0,
+      "durationMs": 11206195,
+      "said": "",
+      "note": "closed outside this run (the board reads done)",
+      "resumeSessionId": "f1c70000-0000-4000-8000-000000000050",
+      "endedAt": "2026-09-06T06:03:10.404Z",
+      "costUnknown": true,
+      "situation": {
+        "key": "qa-failed",
+        "at": "2026-09-06T06:02:02.561Z",
+        "why": [
+          "the board reads done",
+          "QA is on and the recorded verdict is fail"
+        ]
+      },
+      "closeout": {
+        "at": "2026-09-06T06:02:07.987Z",
+        "ok": true,
+        "sessionId": "f1c70000-0000-4000-8000-000000000050",
+        "note": "resumed with an operator instruction"
+      },
+      "verification": {
+        "ok": true,
+        "reason": "5 commands green",
+        "ran": [
+          {
+            "command": "yarn verify:local",
+            "ok": true,
+            "code": 0,
+            "ms": 56276,
+            "output": "erator method is not\ncallable\" at PreferencesScreen.tsx:63; in a RELEASE build a render throw is not\na red box, it is a blank screen with no recovery (Phase-2 finding B-10, P0).\n\nRoot cause, traced to the handler rather than guessed: the endpoint answers\n`{ data: { preferences: [...], quiet_hours: {...} } }` (aws\nsrc/endpoints/common/me-notifications/src/handlers/preferences.ts — its\n`successResponse({ data: { preferences, quiet_hours } })` return), but\n`PreferencesResponse` declared `data: PreferenceRow[]` — one level too shallow\nAND under the wrong key. So `(await fetchPreferences()).data` handed the screen\nan OBJECT, `?? []` never fired because the value is non-null, and `for…of`\nthrew.\n\nFixed at the network boundary, not at the `for…of`: `fetchPreferences` now\nreturns `PreferenceRow[]`, extracting the rows from the canonical envelope and\ntolerating two alternates, so a screen never has to know which shape the server\nchose. An unrecognised body yields `[]`, which renders as \"everything enabled\"\n— the backend's own semantics for a missing row — instead of throwing. The type\nnow describes the real wire shape, and the screen keeps one `Array.isArray`\nguard: a non-array there is a blank release screen, never a price worth paying\nfor one predicate.\n\nCo-Authored-By: Claude Opus 5 (1M context) <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: chore(expo): 2.1.0 build + store plumbing for the App Store submission\n\n- eas.json: production sets APS_ENVIRONMENT=production so the store build's\n  aps-environment entitlement binds to the APNs PRODUCTION gateway (it was\n  falling back to `development`, which cannot receive production pushes);\n  staging:device APP_ENV staging (it said `production` while pointing at the\n  preview API — the one profile whose env contradicted its own name).\n- app.config.js: version 2.1.0; expo-image-picker declares\n  cameraPermission/microphonePermission false and android RECORD_AUDIO is\n  dropped — the app only ever picks an existing image, and shipping purpose\n  strings for capabilities the binary does not use invites a 5.1.1 rejection.\n  Rewrote the buildNumber/aps comments to state what is true: appVersionSource\n  \"remote\" + autoIncrement means EAS owns the build number and the literal is\n  informational, and runtimeVersion policy appVersion fences OTA per version.\n- package.json: drop the `\"expo\": \"npx expo\"` script (it shadowed the real CLI\n  in `yarn expo …`); expo:prebuild* call `npx expo prebuild` directly.\n- expo install --fix for expo, expo-constants, expo-file-system,\n  expo-local-authentication, expo-updates.\n- metro.config.js: preserve and de-duplicate the watch folders getDefaultConfig\n  already computed instead of replacing them.\n- Delete the root app.json + eas.json: stale duplicates referenced by nothing,\n  declaring version 2.0.0 and a `preview` profile that does not exist. Docs\n  that described either are corrected in the same commit.\n\nCo-Authored-By: Claude Opus 5 (1M context) <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(expo): register expo-linear-gradient for Tamagui LinearGradient on native\n\nWithout @tamagui/native/setup-expo-linear-gradient every <LinearGradient> on\nnative (ThemeBackground behind every screen, ProductHero, Banner, FeedCard,\nAchievementCard, VendorProfileScreen) logged \"Must call import ... at root\"\nand rendered nothing. expo-linear-gradient 15.0.8 was already installed.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(ui): fence web-only backgroundImage gradients behind $platform-web\n\nTamagui v2 forwards a bare backgroundImage on native to React Native's\nexperimental_backgroundImage; RN cannot parse the web-only var()/color-mix()\nstrings and the empty colour-stop list aborts the app inside RCTLinearGradient\n(SIGABRT on the iOS sign-in screen - GlassSurface carried one in its styled\ndefaults, so no screen could render). 14 sites now use\n$platform-web={{ backgroundImage }} / '$platform-web': { backgroundImage },\nkeeping the flat native fallbacks. A no-restricted-syntax ESLint gate (JSX attr +\nobject key, exempt under $platform-web) and a §Gradients rule section keep it\nthat way. The config package gains its own .eslintrc.js so lint-staged can lint it.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(auth): render the native brand mark from a bundled PNG\n\nAuthBrand passed a web-relative src (/fonts-and-icons/logo/logo.svg) to\nsolito/image on native, which throws at render (\"add the nextJsURL prop\") and\ntook the whole sign-in screen down on iOS. Split into BrandMark.tsx (the web\nmask-image branch, unchanged) and BrandMark.native.tsx (RN Image over the bundled\nlogo-red.png, the LoadingView.native pattern). Also fences the auth-ui gradients\nbehind $platform-web (see the following commit).\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(deps): resolve @react-navigation/native 7.3.18 for drawer 7.13.10\n\nThe 2026-08-26 dependabot sweep (#66) moved @react-navigation/drawer to 7.13.10,\nwhose peer range is native ^7.3.18, but the lock kept expo-router's transitive\nnative at 7.2.5. The app crashed at startup on iOS with\n\"createScreenFactory is not a function\" from (drawer)/_layout.tsx. yarn up -R\non native + core (7.21.13); yarn dedupe --check stays clean.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(ios): patch react-native-iap podspec for the SDK 54 prebuilt React core\n\nEvery EAS iOS build since the SDK 54 upgrade died at Install pods (build 3e4291d3,\n2026-06-08): the generated Podfile enables Expo's precompiled React Native core,\nwhich publishes no RCT-Folly pod, while react-native-iap 12.15.7 still declares\nReact-Codegen + RCT-Folly in its new-arch block. Building RN from source instead\ndoes not compile under Xcode 26 (fmt 11.0.2 consteval errors), so keep the prebuilt\ncore and let install_modules_dependencies() declare the right pods (patch-package,\napplied by the root postinstall). Clean prebuild + pod install now green.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n    ✅ PASS (commitlint / origin/main..HEAD, 3s)\n\n━━━ no-api-base-fallback / negative test\n    $ bash scripts/assert-api-base-required.sh\n── 1/3  the enforcement primitive throws when nothing is set\n  ✅ throws, and throws for the right reason\n── 2/3  a hardcoded value still resolves (so the gate is not just 'always red')\n  ✅ resolves and strips the trailing slash\n── 3/3  next.config.js is WIRED to the primitive (not merely shipping it)\n  ✅ config load aborts with the [api-base] error\n── ordering: the guard runs BEFORE any third-party require\n  ✅ guard at line 8 precedes the first third-party require (line 14)\n── static sweep: no production host left in the resolution path\n  ✅ no '|| https://api.example-org.com' fallback anywhere\n\nno-api-base-fallback: PASS\n    ✅ PASS (no-api-base-fallback / negative test, 2s)\n\n━━━ verify:local summary (required-checks mirror)\n  monorepo-integrity / dedupe --check        PASS    2s\n  monorepo-integrity / constraints           PASS    0s\n  monorepo-integrity / check-deps            PASS    2s\n  monorepo-integrity / check-circular        PASS    2s\n  monorepo-integrity / lint-sherif           PASS    6s\n  quality-gates / typecheck                  PASS    1s\n  quality-gates / contract:notifications     PASS    2s\n  quality-gates / lint                       PASS    2s\n  quality-gates / build:ci                   PASS   34s\n  commitlint / origin/main..HEAD             PASS    3s\n  no-api-base-fallback / negative test       PASS    2s\n  total: 56s\n\nverify:local: all gates passed — matches a green required-checks.\n[notification-contract] sibling aws contract present and byte-identical to the vendored copy\n✅ notification preference contract is current: v2, 17 categories, sha256 7e103c2a2616…"
+          },
+          {
+            "command": "test ! -f app.json && test ! -f eas.json",
+            "ok": true,
+            "code": 0,
+            "ms": 3,
+            "output": ""
+          },
+          {
+            "command": "grep -q \"version: '2.1.0'\" apps/expo/app.config.js",
+            "ok": true,
+            "code": 0,
+            "ms": 3,
+            "output": ""
+          },
+          {
+            "command": "grep -q '\"APS_ENVIRONMENT\": \"production\"' apps/expo/eas.json",
+            "ok": true,
+            "code": 0,
+            "ms": 4,
+            "output": ""
+          },
+          {
+            "command": "cd apps/expo && npx expo install --check",
+            "ok": true,
+            "code": 0,
+            "ms": 4076,
+            "output": "Dependencies are up to date"
+          }
+        ],
+        "notRun": [
+          {
+            "text": "! grep -q '\"expo\": \"npx expo\"' apps/expo/package.json",
+            "reason": "`!` is not a recognised command"
+          }
+        ]
+      },
+      "verifiedIn": "customer-app",
+      "lint": {
+        "ok": true,
+        "summary": "LINT OK: customer-app-ios-release — 9 phases, well-formed and acyclic"
+      }
+    },
+    "4": {
+      "phase": 4,
+      "status": "parked",
+      "attempts": 2,
+      "costUsd": 293.9612549999999,
+      "situation": {
+        "key": "blocked-declared:unknown",
+        "at": "2026-09-14T01:47:17.874Z",
+        "why": [
+          "the session asked for a person",
+          "Outstanding: ### THIS PHASE NEEDS A PERSON — three decisions no unattended session should make 1. **Does this route ship at all in its current form?** It has four known regr",
+          "reason: Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that comm",
+          "sub-kind unknown"
+        ]
+      },
+      "endedAt": "2026-09-06T05:15:30.211Z",
+      "lifecycle": {
+        "state": "parked",
+        "stop": {
+          "kind": "declared",
+          "declared": "needs-human"
+        }
+      },
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "preflight": [
+        "left for a person on the record: curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401 — `curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}'` sends a non-GET request — a person should run this, not an unattended runner (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401",
+          "message": "left for a person on the record: curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401 — `curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}'` sends a non-GET request — a person should run this, not an unattended runner (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-05T16:58:10.072Z",
+      "attemptStartedAt": "2026-09-06T03:46:08.596Z",
+      "model": "opus[1m]",
+      "effort": "max",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "actualModel": "claude-opus-5[1m]",
+      "liveness": {
+        "phase": 4,
+        "lastOutputAt": "2026-09-06T05:15:29.287Z",
+        "lastToolUseAt": "2026-09-06T05:14:19.341Z",
+        "turnsSinceLastTool": 1,
+        "commitsSinceStart": 4,
+        "treeDirty": false
+      },
+      "tasks": [
+        {
+          "id": "p4.task1",
+          "content": "p4.task1 — confirm aws PR #174 green (the P0 fix) and merge it",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task2",
+          "content": "p4.task2 — re-bump aws-pin.sha to #174's squash; fill the register's pending aws_commit",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task3",
+          "content": "p4.task3 — hetzner register-lint + verify:local + pin-delta (ship-gate 2, 9)",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task4",
+          "content": "p4.task4 — decide the three open P1s (OAuth scope, dead isOAuthUser, erasure completeness)",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task5",
+          "content": "p4.task5 — re-run /code-review on the FULL hetzner#104 URL (ship-gate 3)",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task6",
+          "content": "p4.task6 — ship-gate 1,7: PR green + change window; merge or park",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task7",
+          "content": "p4.task7 — graph-tool refresh, handoff, outcome",
+          "status": "completed"
+        }
+      ],
+      "turns": 156,
+      "durationMs": 13797566,
+      "said": "The sweep changed one thing materially, so I acted on it rather than just filing it. ## The one that matters beyond this phase `applyCognitoAttributeChanges` has no `is_anonymized` guard — and I verified that `hetzner/workers/reconcile.ts:162` loads that exact handler in-process **every 5 minutes** for any user whose `UserLastModifiedDate` moved. So an anonymized row gets the real name, email and phone written back over `[erased]` within minutes, and `anonymize_customer`'s `AND is_anonymized = false` guard then makes re-erasure a permanent no-op. **This is not confined to the route I was building.** The pre-existing `admin-customer-erasure` endpoint never deletes the Cognito user at all, so every row it has ever anonymized is exposed to the same reversal *today*, in production. That's a live defect this phase surfaced, and it outranks the deploy question the phase was parked on. ## The one I had to correct in my own shipped text My register entry asserted \"no tokens are minted on this route.\" That's false: `mfa_configuration: OPTIONAL` (verified in `cognito.yaml:7`), so a customer without MFA gets no `ChallengeName` and the route accepts `AuthenticationResult` — a fresh Access + Id",
+      "idleAttempts": 0,
+      "parkedUntil": "2026-09-07T06:00:00.000Z",
+      "parkReason": "TWO blockers. (1) The hetzner merge IS a production deploy and ship-gate condition 7 allows one only 06:00-16:00 UTC Mon-Fri; this ran Saturday 17:00-20:30 UTC, so the next window is Mon 2026-09-07 06:00 UTC. (2) Ship-gate condition 3 FAILED: the required code review red-proved 2 P0s in the already-merged aws code (lane-verdict fall-through to an irreversible DeleteUser; cognito:groups minted by the pre-token trigger rather than proving membership). Both are fixed in aws PR #174, which is open w",
+      "waits": 1,
+      "tasksAt": 4567,
+      "note": "Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored' ",
+      "declared": {
+        "status": "needs-human",
+        "reason": "Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored' ",
+        "at": "2026-09-06T05:15:30.211Z"
+      }
+    },
+    "6": {
+      "phase": 6,
+      "status": "done",
+      "attempts": 1,
+      "costUsd": 34.48637449999998,
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "preflight": [
+        "left for a person on the record: grep -q \"unstable-native-tabs\" \"apps/expo/app/(tabs)/_layout.tsx\" && test ! -d \"apps/expo/app/(drawer)\" && ! grep -q \"storefront\" \"apps/expo/app/(tabs)/_layout.tsx\" — `!` is not a recognised command (asks only if nothing else proves the phase)",
+        "left for a person on the record: xcrun simctl listapps CD75818B-ED2A-49D9-BB70-045874639736 | grep -q com.example-org.customerapp — `xcrun` is not a recognised command (asks only if nothing else proves the phase)",
+        "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-06/flows/tabs.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "grep -q \"unstable-native-tabs\" \"apps/expo/app/(tabs)/_layout.tsx\" && test ! -d \"apps/expo/app/(drawer)\" && ! grep -q \"storefront\" \"apps/expo/app/(tabs)/_layout.tsx\"",
+          "message": "left for a person on the record: grep -q \"unstable-native-tabs\" \"apps/expo/app/(tabs)/_layout.tsx\" && test ! -d \"apps/expo/app/(drawer)\" && ! grep -q \"storefront\" \"apps/expo/app/(tabs)/_layout.tsx\" — `!` is not a recognised command (asks only if nothing else proves the phase)"
+        },
+        {
+          "kind": "human-check",
+          "command": "xcrun simctl listapps CD75818B-ED2A-49D9-BB70-045874639736 | grep -q com.example-org.customerapp",
+          "message": "left for a person on the record: xcrun simctl listapps CD75818B-ED2A-49D9-BB70-045874639736 | grep -q com.example-org.customerapp — `xcrun` is not a recognised command (asks only if nothing else proves the phase)"
+        },
+        {
+          "kind": "human-check",
+          "command": "maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-06/flows/tabs.yaml",
+          "message": "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-06/flows/tabs.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-06T11:21:39.473Z",
+      "attemptStartedAt": "2026-09-06T11:21:39.473Z",
+      "model": "opus[1m]",
+      "effort": "max",
+      "lifecycle": {
+        "state": "done"
+      },
+      "sessionId": "f1c70000-0000-4000-8000-000000000052",
+      "sessionAccountId": "info",
+      "actualModel": "claude-opus-5[1m]",
+      "liveness": {
+        "phase": 6,
+        "lastOutputAt": "2026-09-06T14:11:51.644Z",
+        "lastToolUseAt": "2026-09-06T14:08:55.194Z",
+        "turnsSinceLastTool": 1,
+        "commitsSinceStart": 4,
+        "treeDirty": false
+      },
+      "tasksAt": 7632,
+      "tasks": [
+        {
+          "id": "p6.task1",
+          "content": "p6.task1 — Orient: graph-tool query customer-app + read current shell/glass files",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task2",
+          "content": "p6.task2 — Tests first: vitest bootstrap (if absent) + failing GlassMaterial/NativeScreen tests",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task3",
+          "content": "p6.task3 — Deps: expo-glass-effect/blur/symbols, prebuild+pods, dev-client rebuild in background",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task4",
+          "content": "p6.task4 — GlassMaterial(.native) + useReduceTransparency + GlassSurface/GlassCard/Panel rewire",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task5",
+          "content": "p6.task5 — NativeScreen backdrop + ScrollView.native inset wiring",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task6",
+          "content": "p6.task6 — NativeTabs bar + drawer removal + 5 non-tab roots become stack routes",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task7",
+          "content": "p6.task7 — Glass headers (D7) on RootStack + nested stacks",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task8",
+          "content": "p6.task8 — HeaderBell (D4) glass pill on the four non-profile tab roots",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task9",
+          "content": "p6.task9 — Docs + liquid-glass rule + graph-tool update",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task10",
+          "content": "p6.task10 — Sim proof: Maestro tabs/header flows + screenshots + deep links",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task11",
+          "content": "p6.task11 — Verification green, commit+push, handoff, QA subagent",
+          "status": "completed"
+        },
+        {
+          "id": "p6.task12",
+          "content": "p6.task12 — BLOCKED: authed simulator proof (tabs.yaml + header-glass.yaml + tab-root screenshots) needs a signed-in session",
+          "status": "pending"
+        }
+      ],
+      "turns": 249,
+      "durationMs": 10212655,
+      "said": "Phase 6 is on the board as `in-progress`, both trees clean and pushed, outcome declared. ## Phase 6 — Liquid Glass native shell **Built and pushed** (`customer-app` `8a6484e`, 4 commits on `pe/customer-app-ios-release`; hub `67bf8f12`). **Parked on one credential**, not on unfinished code. **What shipped** - **Native got a real glass material.** Before this, \"glass\" on the simulator was a flat translucent fill — `GlassFrame`'s blur is the web `backdropFilter` prop, which Tamagui drops on native. `GlassMaterial` is the native equivalent: a real `UIVisualEffectView`, upgraded to iOS 26's `UIGlassEffect` for hero surfaces. The ladder is a **pure function**, so the decision that reaches a user's eyes is testable with no simulator. - **The drawer is gone**; `(tabs)` moved up a level, five hidden `href:null` tabs became root stack routes with back chevrons. That also closes B-17's second half — the RootStack's `name=\"notifications\"` named a *directory* whose list screen lived elsewhere. - **`NativeTabs`** (a real `UITabBarController`), transparent glass headers with the inset wiring that makes scroll-under safe, and the header bell. - **The repo has a test runner for the first time** (vi",
+      "idleAttempts": 0,
+      "note": "closed outside this run (the board reads done)",
+      "endedAt": "2026-09-06T14:11:52.494Z",
+      "situation": {
+        "key": "blocked-declared:credential",
+        "at": "2026-09-06T14:12:52.618Z",
+        "why": [
+          "the session asked for a person",
+          "Outstanding: 1. 🧑 **THE ONE BLOCKER — a signed-in simulator.** `AuthProvider.native.tsx:531` replace-routes every route outside `(auth)`/`oauth` to `/sign-in`, so the tab b",
+          "reason: The glass shell is built, pushed (customer-app 8a6484e) and verified everywhere it can be without a login: yarn verify:local 12/12 PASS after the final commit, ",
+          "sub-kind credential"
+        ]
+      }
+    },
+    "7": {
+      "phase": 7,
+      "status": "done",
+      "attempts": 1,
+      "costUsd": 26.896124000000007,
+      "sessionId": "f1c70000-0000-4000-8000-000000000053",
+      "lifecycle": {
+        "state": "done"
+      },
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "preflight": [
+        "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-07/flows/profile-menu.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-07/flows/profile-menu.yaml",
+          "message": "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-07/flows/profile-menu.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-07T21:33:59.643Z",
+      "attemptStartedAt": "2026-09-07T21:33:59.643Z",
+      "model": "opus[1m]",
+      "effort": "max",
+      "actualModel": "claude-opus-5[1m]",
+      "liveness": {
+        "phase": 7,
+        "lastOutputAt": "2026-09-07T22:51:34.936Z",
+        "lastToolUseAt": "2026-09-07T22:50:12.926Z",
+        "turnsSinceLastTool": 1,
+        "commitsSinceStart": 2,
+        "treeDirty": false
+      },
+      "tasksAt": 1947,
+      "tasks": [
+        {
+          "id": "p7.task1",
+          "content": "p7.task1 — push the branch (force-with-lease; subject-case rewrite)",
+          "status": "pending"
+        },
+        {
+          "id": "p7.task2",
+          "content": "p7.task2 — root-cause the scroll-fires-navigation defect",
+          "status": "completed"
+        },
+        {
+          "id": "p7.task3",
+          "content": "p7.task3 — capture the two owed proofs (menu footer + filters sheet)",
+          "status": "completed"
+        },
+        {
+          "id": "p7.task4",
+          "content": "p7.task4 — graph-tool update + verify + handoff complete",
+          "status": "completed"
+        }
+      ],
+      "turns": 66,
+      "durationMs": 4655870,
+      "said": "Phase 7 is complete. ## What this session did It resumed a phase that had been parked owing two on-device proofs — and the interesting outcome is that it **retracted three of the previous session's findings** rather than working around them. **The two owed proofs, obtained.** Both Maestro flows are green (`MAESTRO_EXIT=0`): `profile-menu.yaml` 34/34 steps, `sheet-glass.yaml` 8/8. All four exit criteria are now demonstrated on the device — the grouped-glass Profile menu scrolled to its version footer, the `/settings` tree, and the filters sheet photographed as a real `GlassSheetFrame` with the product grid reading through it. **The retraction.** Session 1 recorded, with reproduction counts, that the tab bar was unaddressable, that `maestro hierarchy` returned ~6 labelled nodes per screen, and that a scroll beginning on a row navigated instead of scrolling. All three were false. Re-measured on the same machine, simulator and commit against a freshly-entered dev client, every row id, the version footer and the five tab items are addressable and the menu scrolls normally. Session 1 had edited `MenuRowBase` to add the RN `Pressable`, relaunched the app, and judged its own fix against a ",
+      "idleAttempts": 0,
+      "verification": {
+        "ok": false,
+        "reason": "`grep -q \"MenuGroup\" packages/app/features/settings/screen.tsx && grep -q \"MenuRow\" packages/app/features/sessions/detail-components/ConfigSection.tsx` exited 1",
+        "ran": [
+          {
+            "command": "test -f packages/ui/src/glass/menu/MenuRow.tsx && test -f packages/ui/src/glass/menu/MenuGroup.tsx && test -f packages/ui/src/glass/menu/MenuRow.test.tsx",
+            "ok": true,
+            "code": 0,
+            "ms": 2,
+            "output": ""
+          },
+          {
+            "command": "test ! -f packages/ui/src/components/SettingItem.tsx && test ! -f packages/ui/src/components/Settings.tsx",
+            "ok": true,
+            "code": 0,
+            "ms": 1,
+            "output": ""
+          },
+          {
+            "command": "test -f packages/app/features/profile/menu-screen.tsx && test ! -d packages/app/features/drawer-menu",
+            "ok": true,
+            "code": 0,
+            "ms": 2,
+            "output": ""
+          },
+          {
+            "command": "grep -q \"menu-screen\" \"apps/expo/app/(tabs)/profile/index.tsx\"",
+            "ok": true,
+            "code": 0,
+            "ms": 3,
+            "output": ""
+          },
+          {
+            "command": "grep -q \"MenuGroup\" packages/app/features/settings/screen.tsx && grep -q \"MenuRow\" packages/app/features/sessions/detail-components/ConfigSection.tsx",
+            "ok": false,
+            "code": 1,
+            "ms": 5,
+            "output": ""
+          },
+          {
+            "command": "grep -q \"MenuGroup\" packages/app/features/settings/screen.tsx && grep -q \"MenuRow\" packages/app/features/sessions/detail-components/ConfigSection.tsx",
+            "ok": false,
+            "code": 1,
+            "ms": 5,
+            "output": "",
+            "retry": true
+          }
+        ],
+        "notRun": [
+          {
+            "text": "maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test ../docs/handoffs/customer-app-ios-release/reports/phase-07/flows/profile-menu.yaml",
+            "reason": "`maestro` is not a recognised command"
+          },
+          {
+            "text": "grep -q \"expo-glass-effect\" packages/eslint-config-custom/index.js",
+            "reason": "skipped after an earlier command failed"
+          },
+          {
+            "text": "yarn test && yarn verify:local",
+            "reason": "skipped after an earlier command failed"
+          },
+          {
+            "text": "ls ../docs/handoffs/customer-app-ios-release/reports/phase-07/screens/*.png | head -1",
+            "reason": "skipped after an earlier command failed"
+          }
+        ]
+      },
+      "verifiedIn": "customer-app",
+      "lint": {
+        "ok": true,
+        "summary": "LINT OK: customer-app-ios-release — 9 phases, well-formed and acyclic"
+      },
+      "endedAt": "2026-09-07T22:51:38.128Z",
+      "note": "§Verification is red (`grep -q \"MenuGroup\" packages/app/features/settings/screen.tsx && grep -q \"MenuRow\" packages/app/features/sessions/detail-components/ConfigSection.tsx` exited 1) but the handoff already reads complete — the board's word stands; the red verdict travels on this record"
+    },
+    "8": {
+      "phase": 8,
+      "status": "done",
+      "attempts": 1,
+      "costUsd": 30.21785299999999,
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "lifecycle": {
+        "state": "done"
+      },
+      "watchState": {
+        "at": "2026-09-07T22:49:14.120Z",
+        "refs": [
+          {
+            "ref": "lock:customer-app-ios-release/7",
+            "scheme": "lock",
+            "state": "landed",
+            "detail": "nothing holds its scope any more",
+            "checkedAt": "2026-09-07T22:49:14.120Z"
+          }
+        ]
+      },
+      "watchChecked": {
+        "at": "2026-09-07T22:49:14.120Z",
+        "ref": "lock:customer-app-ios-release/7",
+        "state": "landed",
+        "detail": "nothing holds its scope any more"
+      },
+      "preflight": [
+        "left for a person on the record: test \"$(grep -c \"| fix |\" docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md | tr -d ' ')\" = 0 — `fix` is not a recognised command (asks only if nothing else proves the phase)",
+        "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test docs/handoffs/customer-app-ios-release/reports/phase-08/flows/login.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "test \"$(grep -c \"| fix |\" docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md | tr -d ' ')\" = 0",
+          "message": "left for a person on the record: test \"$(grep -c \"| fix |\" docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md | tr -d ' ')\" = 0 — `fix` is not a recognised command (asks only if nothing else proves the phase)"
+        },
+        {
+          "kind": "human-check",
+          "command": "maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test docs/handoffs/customer-app-ios-release/reports/phase-08/flows/login.yaml",
+          "message": "left for a person on the record: maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test docs/handoffs/customer-app-ios-release/reports/phase-08/flows/login.yaml — `maestro` is not a recognised command (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-07T22:51:38.707Z",
+      "attemptStartedAt": "2026-09-07T22:51:38.707Z",
+      "model": "opus[1m]",
+      "effort": "max",
+      "sessionId": "f1c70000-0000-4000-8000-000000000054",
+      "sessionAccountId": "info",
+      "actualModel": "claude-opus-5[1m]",
+      "liveness": {
+        "phase": 8,
+        "lastOutputAt": "2026-09-08T01:25:48.326Z",
+        "lastToolUseAt": "2026-09-08T01:25:01.547Z",
+        "turnsSinceLastTool": 1,
+        "commitsSinceStart": 2,
+        "treeDirty": true
+      },
+      "tasksAt": 6030,
+      "tasks": [
+        {
+          "id": "p8.task1",
+          "content": "p8.task1 — bring up sim + fresh dev client; graph-tool query customer-app",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task2",
+          "content": "p8.task2 — write flows/deeplinks.sh regression script over Phase 2's route table",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task3",
+          "content": "p8.task3 — walk every route on the new shell: light+dark screenshots + status rows",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task4",
+          "content": "p8.task4 — exercise Reduce Transparency fallback; record pre-iOS-26 path unverified",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task5",
+          "content": "p8.task5 — scroll perf recordings for /marketplace/all-robots and /sessions",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task6",
+          "content": "p8.task6 — fix every 'fix' row, one commit each with repro",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task7",
+          "content": "p8.task7 — re-run Phase 2's login/logout/open-profile flows on NativeTabs labels",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task8",
+          "content": "p8.task8 — store screenshots on an iPhone 17 Pro Max sim (errand E5)",
+          "status": "completed"
+        },
+        {
+          "id": "p8.task9",
+          "content": "p8.task9 — yarn test + verify:local green, graph-tool update, handoff",
+          "status": "completed"
+        }
+      ],
+      "turns": 209,
+      "durationMs": 9255609,
+      "said": "Phase 8 is complete and the handoff is committed and pushed. ## What I did **Walked all 51 Phase-2 routes on the new shell in both appearances, found and fixed one real shell defect, and proved every exit criterion.** All six §Verification commands exit 0. **The fix — `590dec2`.** `/notifications` stacked two safe areas: the route wraps the screen in `<NativeScreen inset>` (which pads by the header height, already covering the status bar) and `InboxScreen.native.tsx` padded by `insets.top + 12` on top of it — ~90pt of dead space, a full card of content lost. Phase 6 predicted this screen by name and said to check it first; it was right. The other four promoted routes were checked and are correct, so it was one screen, not systemic. **The finding worth your time is a retraction.** At the plan's specified 2-second settle, the sweep produced only **29 distinct frames from 51** — nine consecutive routes sharing one image, with a `REPLACE … not handled by any navigator` toast on screen. That reads exactly like broken deep-link navigation, and I had written it up as one. It was the probe: at a 4-second settle from a fresh launch, **19 of 19 consecutive routes moved with zero navigator er",
+      "idleAttempts": 0,
+      "verification": {
+        "ok": true,
+        "reason": "4 commands green",
+        "ran": [
+          {
+            "command": "test -s docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md",
+            "ok": true,
+            "code": 0,
+            "ms": 2,
+            "output": ""
+          },
+          {
+            "command": "grep -c \"| /\" docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md",
+            "ok": true,
+            "code": 0,
+            "ms": 4,
+            "output": "51"
+          },
+          {
+            "command": "bash docs/handoffs/customer-app-ios-release/reports/phase-08/flows/deeplinks.sh",
+            "ok": true,
+            "code": 0,
+            "ms": 328949,
+            "output": "deeplinks.sh — 2026-09-08 04:25:55\n  udid=CD75818B-ED2A-49D9-BB70-045874639736  settle=4s  appearance=current  relaunch-every=12  out=/home/operator/work/hub/docs/handoffs/customer-app-ios-release/reports/phase-08/screens\n\nok   /sign-in  blur=99\nok   /sign-up  blur=196\nok   /reset-password  blur=199\nok   /verify-email  blur=200\nok   /onboarding  blur=294\nerr  /legal/customer-terms-of-service   (4 console.error)\nok   /legal/customer-agreement  [dup-frame]\nok   /legal/customer-app-privacy-policy\nok   /\nok   /licenses\nok   /marketplace\nok   /sessions  [dup-frame]\nok   /profile\nok   /my-builds  blur=152\nok   /wallet  blur=157\nok   /notifications  blur=159\nok   /orders?tab=orders  blur=160\nok   /orders?tab=payments\nok   /support  blur=161\nok   /profile/detail  blur=111\nok   /profile/apply-vendor  blur=112\nok   /rewards  blur=113\nerr  /wishlist   (1 console.error)  blur=116\nok   /my-activity  blur=117\nok   /about\nok   /settings  blur=102\nok   /settings/general  blur=103\nok   /settings/change-email\nok   /settings/change-password\nok   /settings/notifications  blur=110\nok   /settings/connect-channels  blur=111\nok   /marketplace/all-robots  blur=120\nok   /marketplace/vendors  blur=127\nok   /marketplace/pricing  blur=135\nerr  /marketplace/saved   (1 console.error)  blur=138\nok   /marketplace/robots/gold-scalper-mt5  blur=152\nok   /marketplace/indicators/fractal-timing  blur=112\nok   /marketplace/vendors/sahib-ul-ahsan  blur=116\nok   /marketplace/robots/gold-scalper-mt5/backtests/13\nok   /marketplace/35  blur=130\nok   /wallet/topup  blur=132\nok   /self-use/checkout  blur=133\nok   /support/create  blur=136\nerr  /licenses/1   (1 console.error)\nerr  /activation-guide   (1 console.error)  blur=140\nerr  /sessions/1   (1 console.error)  blur=142\nerr  /support/1   (3 console.error)  blur=143\nerr  /orders/1   (1 console.error)  blur=146\nerr  /payments/1   (1 console.error)  blur=101\nerr  /my-builds/35   (1 console.error)  blur=102\nerr  /notifications/1   (1 console.error)  blur=100\n\n── 51 routes · 0 red box · 16 console.error · 2 dup-frame ──\n   dup-frame (screenshot did not capture that route): auth-legal-agreement tab-sessions\nPASS — no red box on any route"
+          },
+          {
+            "command": "cd customer-app && yarn test && yarn verify:local",
+            "ok": true,
+            "code": 0,
+            "ms": 83126,
+            "output": "nded the screen\nan OBJECT, `?? []` never fired because the value is non-null, and `for…of`\nthrew.\n\nFixed at the network boundary, not at the `for…of`: `fetchPreferences` now\nreturns `PreferenceRow[]`, extracting the rows from the canonical envelope and\ntolerating two alternates, so a screen never has to know which shape the server\nchose. An unrecognised body yields `[]`, which renders as \"everything enabled\"\n— the backend's own semantics for a missing row — instead of throwing. The type\nnow describes the real wire shape, and the screen keeps one `Array.isArray`\nguard: a non-array there is a blank release screen, never a price worth paying\nfor one predicate.\n\nCo-Authored-By: Claude Opus 5 (1M context) <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: chore(expo): 2.1.0 build + store plumbing for the App Store submission\n\n- eas.json: production sets APS_ENVIRONMENT=production so the store build's\n  aps-environment entitlement binds to the APNs PRODUCTION gateway (it was\n  falling back to `development`, which cannot receive production pushes);\n  staging:device APP_ENV staging (it said `production` while pointing at the\n  preview API — the one profile whose env contradicted its own name).\n- app.config.js: version 2.1.0; expo-image-picker declares\n  cameraPermission/microphonePermission false and android RECORD_AUDIO is\n  dropped — the app only ever picks an existing image, and shipping purpose\n  strings for capabilities the binary does not use invites a 5.1.1 rejection.\n  Rewrote the buildNumber/aps comments to state what is true: appVersionSource\n  \"remote\" + autoIncrement means EAS owns the build number and the literal is\n  informational, and runtimeVersion policy appVersion fences OTA per version.\n- package.json: drop the `\"expo\": \"npx expo\"` script (it shadowed the real CLI\n  in `yarn expo …`); expo:prebuild* call `npx expo prebuild` directly.\n- expo install --fix for expo, expo-constants, expo-file-system,\n  expo-local-authentication, expo-updates.\n- metro.config.js: preserve and de-duplicate the watch folders getDefaultConfig\n  already computed instead of replacing them.\n- Delete the root app.json + eas.json: stale duplicates referenced by nothing,\n  declaring version 2.0.0 and a `preview` profile that does not exist. Docs\n  that described either are corrected in the same commit.\n\nCo-Authored-By: Claude Opus 5 (1M context) <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(expo): register expo-linear-gradient for Tamagui LinearGradient on native\n\nWithout @tamagui/native/setup-expo-linear-gradient every <LinearGradient> on\nnative (ThemeBackground behind every screen, ProductHero, Banner, FeedCard,\nAchievementCard, VendorProfileScreen) logged \"Must call import ... at root\"\nand rendered nothing. expo-linear-gradient 15.0.8 was already installed.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(ui): fence web-only backgroundImage gradients behind $platform-web\n\nTamagui v2 forwards a bare backgroundImage on native to React Native's\nexperimental_backgroundImage; RN cannot parse the web-only var()/color-mix()\nstrings and the empty colour-stop list aborts the app inside RCTLinearGradient\n(SIGABRT on the iOS sign-in screen - GlassSurface carried one in its styled\ndefaults, so no screen could render). 14 sites now use\n$platform-web={{ backgroundImage }} / '$platform-web': { backgroundImage },\nkeeping the flat native fallbacks. A no-restricted-syntax ESLint gate (JSX attr +\nobject key, exempt under $platform-web) and a §Gradients rule section keep it\nthat way. The config package gains its own .eslintrc.js so lint-staged can lint it.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(auth): render the native brand mark from a bundled PNG\n\nAuthBrand passed a web-relative src (/fonts-and-icons/logo/logo.svg) to\nsolito/image on native, which throws at render (\"add the nextJsURL prop\") and\ntook the whole sign-in screen down on iOS. Split into BrandMark.tsx (the web\nmask-image branch, unchanged) and BrandMark.native.tsx (RN Image over the bundled\nlogo-red.png, the LoadingView.native pattern). Also fences the auth-ui gradients\nbehind $platform-web (see the following commit).\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(deps): resolve @react-navigation/native 7.3.18 for drawer 7.13.10\n\nThe 2026-08-26 dependabot sweep (#66) moved @react-navigation/drawer to 7.13.10,\nwhose peer range is native ^7.3.18, but the lock kept expo-router's transitive\nnative at 7.2.5. The app crashed at startup on iOS with\n\"createScreenFactory is not a function\" from (drawer)/_layout.tsx. yarn up -R\non native + core (7.21.13); yarn dedupe --check stays clean.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n⧗   input: fix(ios): patch react-native-iap podspec for the SDK 54 prebuilt React core\n\nEvery EAS iOS build since the SDK 54 upgrade died at Install pods (build 3e4291d3,\n2026-06-08): the generated Podfile enables Expo's precompiled React Native core,\nwhich publishes no RCT-Folly pod, while react-native-iap 12.15.7 still declares\nReact-Codegen + RCT-Folly in its new-arch block. Building RN from source instead\ndoes not compile under Xcode 26 (fmt 11.0.2 consteval errors), so keep the prebuilt\ncore and let install_modules_dependencies() declare the right pods (patch-package,\napplied by the root postinstall). Clean prebuild + pod install now green.\n\nCo-Authored-By: Claude Fable 5.1 <bot@example.com>\n✔   found 0 problems, 0 warnings\n    ✅ PASS (commitlint / origin/main..HEAD, 21s)\n\n━━━ LOCAL-ONLY (not in CI) / vitest\n    $ yarn test\n\n RUN  v3.2.7 /home/operator/work/hub/customer-app\n\n ✓ packages/ui/src/glass/menu/MenuRow.test.tsx (12 tests) 25ms\n ✓ packages/ui/src/glass/GlassMaterial.test.tsx (16 tests) 15ms\n ✓ packages/app/features/layout/NativeScreen.test.tsx (5 tests) 13ms\n\n Test Files  3 passed (3)\n      Tests  33 passed (33)\n   Start at  04:32:43\n   Duration  1.29s (transform 443ms, setup 394ms, collect 1.31s, tests 54ms, environment 980ms, prepare 149ms)\n\n    ✅ PASS (LOCAL-ONLY (not in CI) / vitest, 2s)\n\n━━━ no-api-base-fallback / negative test\n    $ bash scripts/assert-api-base-required.sh\n── 1/3  the enforcement primitive throws when nothing is set\n  ✅ throws, and throws for the right reason\n── 2/3  a hardcoded value still resolves (so the gate is not just 'always red')\n  ✅ resolves and strips the trailing slash\n── 3/3  next.config.js is WIRED to the primitive (not merely shipping it)\n  ✅ config load aborts with the [api-base] error\n── ordering: the guard runs BEFORE any third-party require\n  ✅ guard at line 8 precedes the first third-party require (line 14)\n── static sweep: no production host left in the resolution path\n  ✅ no '|| https://api.example-org.com' fallback anywhere\n\nno-api-base-fallback: PASS\n    ✅ PASS (no-api-base-fallback / negative test, 2s)\n\n━━━ verify:local summary (required-checks mirror)\n  monorepo-integrity / dedupe --check        PASS    0s\n  monorepo-integrity / constraints           PASS    1s\n  monorepo-integrity / check-deps            PASS    1s\n  monorepo-integrity / check-circular        PASS    1s\n  monorepo-integrity / lint-sherif           PASS    2s\n  quality-gates / typecheck                  PASS    1s\n  quality-gates / contract:notifications     PASS    1s\n  quality-gates / lint                       PASS    1s\n  quality-gates / build:ci                   PASS   46s\n  commitlint / origin/main..HEAD             PASS   21s\n  LOCAL-ONLY (not in CI) / vitest            PASS    2s\n  no-api-base-fallback / negative test       PASS    2s\n  total: 79s\n\nverify:local: all gates passed — matches a green required-checks.\n[notification-contract] sibling aws contract present and byte-identical to the vendored copy\n✅ notification preference contract is current: v2, 17 categories, sha256 7e103c2a2616…"
+          }
+        ],
+        "notRun": [
+          {
+            "text": "test \"$(grep -c \"| fix |\" docs/handoffs/customer-app-ios-release/reports/phase-08/shell-findings.md | tr -d ' ')\" = 0",
+            "reason": "`fix` is not a recognised command"
+          },
+          {
+            "text": "maestro --udid CD75818B-ED2A-49D9-BB70-045874639736 test docs/handoffs/customer-app-ios-release/reports/phase-08/flows/login.yaml",
+            "reason": "`maestro` is not a recognised command"
+          }
+        ]
+      },
+      "verifiedIn": ".",
+      "lint": {
+        "ok": true,
+        "summary": "LINT OK: customer-app-ios-release — 9 phases, well-formed and acyclic"
+      },
+      "endedAt": "2026-09-08T01:32:49.367Z"
+    }
+  },
+  "checkout": "shared",
+  "lifecycle": {
+    "state": "parked"
+  },
+  "recoveries": {
+    "3": {
+      "attempts": 19,
+      "lastAt": "2026-09-06T06:02:03.604Z",
+      "rungs": [
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:15:42.062Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:18:38.044Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:20:43.460Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:22:47.545Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:24:58.616Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:26:56.169Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:29:40.937Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:33:05.067Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:35:12.094Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:38:26.030Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:40:27.674Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:42:47.863Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:45:00.283Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:48:12.625Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:51:21.664Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:53:41.394Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:56:46.750Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T05:59:00.452Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        },
+        {
+          "situation": "qa-failed",
+          "rung": "resume-own-session",
+          "at": "2026-09-06T06:02:03.604Z",
+          "outcome": "interrupted",
+          "params": {
+            "mode": "qa-fix"
+          },
+          "note": "the session never effectively ran — no turns before it ended",
+          "turns": 0
+        }
+      ],
+      "lastReason": "phase 4 needs a person: Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored' ",
+      "lastOutcome": "interrupted"
+    },
+    "4": {
+      "attempts": 1,
+      "lastAt": "2026-09-05T16:58:08.947Z",
+      "rungs": [
+        {
+          "situation": "work-in-progress",
+          "rung": "reboard-resume-brief",
+          "at": "2026-09-05T16:58:08.947Z",
+          "outcome": "no-defect",
+          "note": "the session declared waiting-external: TWO blockers. (1) The hetzner merge IS a production deploy and ship-gate condition 7 allows one only 06:00-16:00 UTC Mon",
+          "costUsd": 186.86077674999993
+        }
+      ],
+      "lastOutcome": "no-defect",
+      "errand": {
+        "phase": 4,
+        "situation": "blocked-declared:unknown",
+        "at": "2026-09-06T05:15:30.211Z",
+        "tried": [
+          "reboard-resume-brief → no-defect"
+        ],
+        "need": "Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored' ",
+        "how": "Clear what it names, then Resume the session with an instruction or Retry; or split the remaining work into a new phase."
+      }
+    },
+    "6": {
+      "attempts": 0,
+      "lastAt": "2026-09-06T14:11:52.494Z",
+      "errand": {
+        "phase": 6,
+        "situation": "blocked-declared:credential",
+        "at": "2026-09-06T14:11:52.494Z",
+        "tried": [],
+        "need": "The glass shell is built, pushed (customer-app 8a6484e) and verified everywhere it can be without a login: yarn verify:local 12/12 PASS after the final commit, 21/21 unit tests, typecheck clean, 9 of 13 plan verification commands green, and a real Maestro run (MAESTRO_EXIT=0, 19/19) proving the app boots on the new route tree and that exit criterion 2 (transparent glass header, content scrolling under it) holds on public stack routes. What is left needs a SIGNED-IN simulator: AuthProvider.native",
+        "how": "Provide it where the handoff says, then Resume the session with an instruction or Retry."
+      }
+    }
+  },
+  "limits": {
+    "status": "allowed",
+    "window": "five_hour",
+    "resetsAt": 1788834600,
+    "at": "2026-09-08T01:24:08.425Z"
+  },
+  "rulings": [
+    {
+      "id": "e0b88af8109d",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deviation",
+      "what": "Ship-gate condition 3's '/code-review 104 high' resolved the bare PR number against acme-backend PR #104 (pe/ai-builder-v3), not example-org/hetzner#104 — it returned ~14 findings about the AI-builder pipeline, none about this diff. Re-running with the fully-qualified PR URL.",
+      "why": "A bare PR number is ambiguous across a 14-repo monorepo of submodules, and acme-backend happens to have a live PR #104 too. The mis-targeted run cost ~2.4M subagent tokens across 9 angle agents and proves nothing about the change that is about to deploy production.",
+      "costIfWrong": "If the re-run is accepted as the gate without checking WHICH repo it read, the hetzner pin bump merges to production with condition 3 satisfied by a review of an unrelated repo.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-05T17:53:24Z"
+    },
+    {
+      "id": "d2272537e84a",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deviation",
+      "what": "NOT merging hetzner PR #104. Ship-gate condition 3 (code review, no open P0/P1) FAILS: the review red-proved two P0s in the aws half — (1) delete-account.ts:226 treats every lane verdict except 'ignored' as success, so a lane returning 'noop'/'unknown' (or the invoke-emulator's empty {} for a non-local registry policy) still reaches DeleteUser and answers 200 'deleted'; (2) the isCustomer gate reads cognito:groups, which the pre-token-generation trigger MINTS from the requesting app client, an",
+      "why": "Condition 3 is a hard bar and both findings were executed against the real handler, not argued. Merging is a production deploy of a route whose success path is irreversible.",
+      "costIfWrong": "If this merged, the first customer-app 2.1.0 user to tap Delete Account on a groupless identity loses their login permanently with 100% of their PII still in Postgres.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-05T18:52:47Z"
+    },
+    {
+      "id": "183ffb4fd88b",
+      "slug": "customer-app-ios-release",
+      "phase": 3,
+      "kind": "deviation",
+      "what": "Registered notifications/[id] in the RootStack and fixed the inert notification row in NotificationRow.tsx, both inside the area the plan reserved for Phase 6",
+      "why": "The plan says to leave the 'Stack.Screen name=\"notifications\"' MISMATCH to Phase 6 (D5), and I did leave that line untouched. But B-17 is a reproduced P1 the plan's own step 11 tells me to fix, and its root cause turned out to be neither the mismatch nor the route: SwipeableRow.native.tsx's docstring already documents that a Tamagui onPress inside ReanimatedSwipeable loses the gesture to the parent GestureDetector — the fix had been applied to the action panel but not the row content.",
+      "costIfWrong": "Phase 6 moves /notifications into the root stack and will rewrite these files; if it re-derives the row from scratch it must keep the RN Pressable or the rows go inert again.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000050",
+      "at": "2026-09-05T18:54:57Z"
+    },
+    {
+      "id": "e58f71ee095f",
+      "slug": "customer-app-ios-release",
+      "phase": 3,
+      "kind": "deferral",
+      "what": "Left react-native-keyboard-controller at 1.21.3 rather than pinning it to the SDK-54-recommended 1.18.5, and did not add an expo.install.exclude entry",
+      "why": "The plan made this conditional on 'Phase 2 keyboard behaviour was clean', but P2 records keyboard avoidance as NOT EXERCISED, so neither branch's premise held. 1.21.3 is what P1 and P2 booted and swept 51 routes on, and expo-doctor passes 18/18 with it; downgrading a native module three minors on no evidence is the larger risk. expo install --check stays clean because only --fix would rewrite it.",
+      "costIfWrong": "If a keyboard-avoidance defect appears on a form screen, 1.18.5 is the first thing to try; Phase 8's cross-cutting sweep is where P2's unexercised keyboard check should land.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000050",
+      "at": "2026-09-05T18:54:57Z"
+    },
+    {
+      "id": "2aebc7366e75",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deferral",
+      "what": "Refreshed the aws graph (32,771 · 62,907 · 2,015, report 511 KB) and updated hub .claude/rules/graph-tool.md §3, but did NOT update aws/CLAUDE.md §graph-tool in the same commit as the rule requires. Left for Monday's session to fold into the #174 branch before merge.",
+      "why": "aws is detached at the pin, so a commit there would be unreachable; putting it on the #174 branch now cancels and restarts a ~50-minute CI run against a capped, breaker-backed Actions budget, for a 0.1% node-count drift. The rule's own severity note says a stale node count is harmless while a stale committed/local-only flag or report size is not — local-only is unchanged and the size is updated in the hub inventory, which is the file the next agent budgets context from.",
+      "costIfWrong": "aws/CLAUDE.md quotes 32,733 nodes and a 2026-09-03 build until Monday; a session reading it budgets context off a figure 0.1% low and a stale build date.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-05T19:15:21Z"
+    },
+    {
+      "id": "96b3fd708087",
+      "slug": "customer-app-ios-release",
+      "phase": 3,
+      "kind": "deviation",
+      "what": "Re-opened phase 3 in place to clear QA round 1's FAIL rather than deferring criterion 3 to phase 6, and corrected handoff ruling 2 to the opposite of what it said.",
+      "why": "QA F-1 found the handoff records react-native-keyboard-controller as staying at 1.21.3 while the tree ships 1.18.5; the handoff is the artifact phase 6 boots from, so a wrong record is the deliverable defect. The QA report offered to batch the native rebuild into phase 6, but phase 3 owns exit criterion 3 and phase 6 would inherit an unproven base.",
+      "costIfWrong": "If the rebuild had been deferred, phase 6 would start on a dev client built from a stale pod set and attribute any keyboard/native defect to its own glass work.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000055",
+      "at": "2026-09-06T00:31:00Z"
+    },
+    {
+      "id": "dfc9427738dd",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "ambiguity",
+      "what": "P1-a (hosted-UI OAuth scope) is REFUTED for the mobile app and needs no fix. The review claimed getUser 401s for Google/Apple customers because hosted-UI tokens cannot carry aws.cognito.signin.user.admin. Verified against source: both apple-oauth.ts and google-oauth.ts mint the tokens they hand the client via ADMIN_USER_PASSWORD_AUTH (apple-oauth.ts:490,575,769,845; google-oauth.ts:716,811), not the hosted-UI /oauth2/token exchange. Cognito API auth flows issue the admin scope, so getUser works.",
+      "why": "A release blocker that is not real would have stalled 2.1.0 for nothing; the claim was checkable in one grep and the source contradicts it.",
+      "costIfWrong": "If some untraced path DOES return a hosted-UI token to the mobile client, those users 401 on the route and the customer-app client silently refresh-retries the deletion body until it force-logs-out.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-06T03:58:43Z"
+    },
+    {
+      "id": "1ac591bac92f",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deferral",
+      "what": "P1-b (isOAuthUser is dead) is CONFIRMED and is the real Apple 2.1.0 release blocker, and I am NOT fixing it in this phase. Native Apple/Google accounts are created by adminCreateUser with username=email, custom:role set, and a RANDOM permanent password via adminSetUserPassword (apple-oauth.ts:443-468) - they carry no 'identities' attribute, so isOAuthUser is false and the route demands a password the user was never told. They cannot delete their account.",
+      "why": "A correct fix needs a trustworthy signal for 'this account has no user-known password', and the backend has none: user_mgmt.identities has no provider column (cognito_sub, primary_email, timestamps only), commerce.customers has none, and adding a Cognito custom: attribute is forbidden by aws-change-control. The one attribute that correlates - custom:role, set by the OAuth paths and deliberately unset by password signups - attests WHICH ROLE the account is, not whether it has a known password. Inferring the latter from it is the exact error class that produced both P0s in this phase (the URL path, then cognito:groups): using an attribute as evidence for something it does not attest. I will not make it a third time unattended.",
+      "costIfWrong": "2.1.0 ships without a working deletion path for Sign in with Apple users, which is precisely the population guideline 5.1.1(v) is about, and App Review rejects it.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-06T03:58:43Z"
+    },
+    {
+      "id": "a192ab2a7ec4",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deferral",
+      "what": "P1-c (the erasure leaves identities.primary_email, device_tokens, web_push_subscriptions and crm.contacts behind while the response says 'Your account has been deleted') is confirmed and deferred. Not fixed here.",
+      "why": "Completing it is a DB-content change across four schemas plus a decision about what 'deleted' promises, and the safe form is constrained: identities.primary_email must be scrubbed IN PLACE because hetzner/shim/jit/index.ts gates JIT on identities.cognito_sub - deleting the row re-opens JIT and cognito-post-confirmation's upsert writes the PII back. That is a designed change with its own migration rail, not a tail fix on a deploy.",
+      "costIfWrong": "A customer who deletes their account remains re-identifiable by a one-join lookup on an indexed real email, and keeps a live push channel to their handset.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-06T03:58:43Z"
+    },
+    {
+      "id": "eb26205b1d49",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deviation",
+      "what": "STOPPING code changes to delete-account.ts. The independent review of my own #174 fix found FOUR regressions I introduced in that single unattended pass: (1) the INCORRECT_PASSWORD 400 at :199 is thrown inside the catch I added and rewritten to a 500; (2) my sanitizer collapsed lib/cognito.ts's 14 curated 4xx mappings into that same 500, so a RESET_REQUIRED customer can never delete; (3) my double-tap branch matches UserNotFoundException, which the token-authorized DeleteUser does not return (th",
+      "why": "Four defects from one unattended fix to a security-critical route is the signal to stop, not to patch again. The review's own recommended fixes are architectural and far outside this phase: port the intentionality gate into auth-proxy's lib/utils.ts (fixes 17 other routes), make the shim's invoke-emulator noop() set FunctionError (fixes ~40 call sites), and stop the pre-token trigger minting cognito:groups from the requesting client (fixes 27 grant sites, including the admin fleet's only authorization check). Nothing is deployed - the pin is unmerged - so leaving the regressions costs nothing operationally, while a third unattended pass risks a fifth defect.",
+      "costIfWrong": "The aws main branch carries a delete-account route with four known defects until someone fixes them; anyone who merges the pin without reading the handoff ships them to production.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000051",
+      "at": "2026-09-06T04:54:15Z"
+    },
+    {
+      "id": "b2f894c7f623",
+      "slug": "customer-app-ios-release",
+      "phase": 6,
+      "kind": "deviation",
+      "what": "Android tab icons are <VectorIcon family={MaterialIcons}> via androidSrc, not the 15 template PNGs the plan lists under apps/expo/assets/tabs/.",
+      "why": "The SDK 54 Icon type makes sf and src mutually exclusive (src?: never beside sf) — the plan's 'Icon sf={...} src={...png}' does not typecheck. The real companion prop is androidSrc, and it accepts a React element, so @expo/vector-icons (already shipped with Expo, 14.1.0) gives real vector icons with no binary assets to author, review or keep in sync.",
+      "costIfWrong": "If a MaterialIcons name is wrong, that ANDROID tab renders blank. iOS is unaffected (it reads sf=). Phase 8 should open the app once on an Android emulator to confirm the five names.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000052",
+      "at": "2026-09-06T11:59:25Z"
+    },
+    {
+      "id": "6cb970197204",
+      "slug": "customer-app-ios-release",
+      "phase": 6,
+      "kind": "deviation",
+      "what": "The contentInsetAdjustmentBehavior default for lists is set once on the shared AppFlashList.native.tsx wrapper, not on the two FlashList screen roots the plan names.",
+      "why": "Both roots (all-robots-screen, OrdersListScaffold) render AppFlashList, so one default covers both and any future adopter; the spread still lets a nested list opt out with 'never'. Same reasoning as ScrollView.native.tsx, which the plan itself asks for.",
+      "costIfWrong": "A FlashList nested inside another scroller would double-inset until it passes contentInsetAdjustmentBehavior=\"never\"; neither current root is nested.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000052",
+      "at": "2026-09-06T11:59:25Z"
+    },
+    {
+      "id": "7bfc584a8380",
+      "slug": "customer-app-ios-release",
+      "phase": 6,
+      "kind": "deferral",
+      "what": "The .claude/rules/liquid-glass.md § Native glass mirror is NOT applied; the exact patch is staged at customer-app/docs/pending-rule-patches/liquid-glass-native-glass.md for an operator paste.",
+      "why": "Writes under .claude/ are denied to this unattended session. The edit was attempted and refused, not skipped; docs/LIQUID_GLASS_SYSTEM.md §7 carries the same substance in the same commit.",
+      "costIfWrong": "Until applied, a session editing packages/ui/src/glass/** is not told about the native tier by the path-scoped rule that auto-loads — the likeliest concrete harm is someone re-adding a bare expo-blur import on a web path.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000052",
+      "at": "2026-09-06T13:04:44Z"
+    },
+    {
+      "id": "131b1f43d2e8",
+      "slug": "customer-app-ios-release",
+      "phase": 7,
+      "kind": "ambiguity",
+      "what": "ConfigSection.tsx is NOT a SettingItem consumer — its `Settings` import is the LUCIDE ICON. The only consumer of @my/ui's Settings/SettingItem is drawer-menu/index.tsx. No migration is performed there, and the plan's §Verification line `grep -q MenuRow ... ConfigSection.tsx` is amended to assert the real invariant (no SettingItem reference survives).",
+      "why": "Verified by grep across packages+apps: the only files importing Settings from '@my/ui' are drawer-menu; every other 'Settings,' line sits inside a @tamagui/lucide-icons-2 import. Inserting a MenuRow into a robot-config FORM purely to satisfy a grep would be faking a gate.",
+      "costIfWrong": "If ConfigSection really did contain settings rows, they keep the old look until a later phase notices.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000053",
+      "at": "2026-09-07T17:35:48Z"
+    },
+    {
+      "id": "39520a37620c",
+      "slug": "customer-app-ios-release",
+      "phase": 7,
+      "kind": "deviation",
+      "what": "The settings-tree conversion covers settings/screen.tsx (full MenuGroup+MenuRow rewrite), general-screen.tsx (read-only value rows + the App Lock toggle seated in a MenuGroup) and notifications/PreferencesScreen.tsx (one MenuGroup per category, header=label, footer=description, channel switches as rows). connect-channels/screen.tsx keeps its GlassSurface refract panel and is NOT converted.",
+      "why": "MenuRow is a NAVIGATION row: it owns a chevron, a link/button role and a push. connect-channels §01 is two connect BUTTONS and §02 is a channel status list with per-row disconnect actions on a 'refract' hero panel; MenuGroup exposes no refract, so converting it would strip the web edge-lensing and add nothing. Where a screen genuinely groups settings, the GROUP primitive is applied even though the CONTROL stays a switch — that is the shared vocabulary the phase is for.",
+      "costIfWrong": "connect-channels looks slightly different from the rest of the settings tree; Phase 8's sweep can convert it if the screenshots disagree.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000053",
+      "at": "2026-09-07T18:01:48Z"
+    },
+    {
+      "id": "829d5b70c02f",
+      "slug": "customer-app-ios-release",
+      "phase": 7,
+      "kind": "deferral",
+      "what": "Exit criterion 3's filters-sheet screenshot and the Profile menu's lower-half screenshot were NOT obtained; the phase hands off in-progress with those two proofs owed. The 23 modal conversions, the menu tree and the ESLint gate ARE done and verified.",
+      "why": "A scroll or swipe that BEGINS on a MenuRow is delivered as a TAP (measured 5x: 'scroll' x2, 700ms swipe, 900ms swipe), so the menu cannot be scrolled to its footer, and the same class of miss made the open-filters tap land on a product card. Wrapping the native row in an RN Pressable is the right primitive but did not fix it on a re-run after a hard relaunch — claiming it fixed would be a fabricated verification.",
+      "costIfWrong": "If the defect is only a Maestro driver artifact rather than app behaviour, Phase 8 spends an hour proving that and the two screenshots cost a further ten minutes.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000053",
+      "at": "2026-09-07T21:11:49Z"
+    },
+    {
+      "id": "4d74a7ccd225",
+      "slug": "customer-app-ios-release",
+      "phase": 7,
+      "kind": "deviation",
+      "what": "Retracted three findings this phase itself recorded as measured on 2026-09-07 — the tab bar being unaddressable, maestro hierarchy returning ~6 nodes per screen, and a scroll beginning on a MenuRow navigating instead of scrolling. All three re-measured FALSE on 2026-09-08 and the flows, the report, the liquid-glass rule and the memory were rewritten.",
+      "why": "They were artifacts of a stale Metro bundle: session 1 edited MenuRowBase to add the RN Pressable, relaunched the app, and judged its own fix against a bundle that predated the edit. Session 2 re-entered the dev client, waited for a real anchor, and every one of the three reversed. Leaving them on file would have sent Phase 8 hunting a defect that does not exist and would have argued for reverting the Pressable, which is load-bearing twice over.",
+      "costIfWrong": "If some third factor (not the bundle) explains the flip, the traps are merely intermittent rather than false and Phase 8 rediscovers them — the flows already anchor on bell.fill, so it would fail loudly rather than silently.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000053",
+      "at": "2026-09-07T22:41:52Z"
+    },
+    {
+      "id": "11fbd144b9a0",
+      "slug": "customer-app-ios-release",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "deeplinks.sh settles 4s per route, not the 2s the plan's step 1 specifies",
+      "why": "At 2s the screenshot catches the OUTGOING screen: a 51-route sweep produced only 29 distinct frames, with 9 consecutive routes sharing one image. Re-run at 4s, 18/18 consecutive routes moved with zero navigator errors. 2s does not photograph the route it names.",
+      "costIfWrong": "A sweep ~2 min slower; the screenshots are the phase's evidence so a fast-but-wrong frame is worse than a slow one.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000054",
+      "at": "2026-09-07T23:17:49Z"
+    },
+    {
+      "id": "acd07552f5ba",
+      "slug": "customer-app-ios-release",
+      "phase": 8,
+      "kind": "ambiguity",
+      "what": "Treated 'every other deep link is ignored' as a MEASUREMENT ARTIFACT, not an app defect, and did not file it as a fix row",
+      "why": "It reproduced twice and looked like a real navigation stall (identical frames + a REPLACE-not-handled toast). A fresh-stack control at 4s settle landed 18/18 with 0 navigator errors, so the stall was the 2s settle. This is Phase 7's stale-bundle lesson in a new costume: a negative result measured through a too-fast probe.",
+      "costIfWrong": "If deep links DO stall at some depth, Phase 9's Danger-zone deep link could be unreachable; the 4s sweep re-runs it every time, so a real stall resurfaces.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000054",
+      "at": "2026-09-07T23:17:49Z"
+    },
+    {
+      "id": "f76ce30b0eb9",
+      "slug": "customer-app-ios-release",
+      "phase": 8,
+      "kind": "deferral",
+      "what": "Did NOT apply D1's material=solid escape hatch to /sessions or /marketplace/all-robots",
+      "why": "The plan says switch 'if it hitches'. Measured from the Maestro recordings: both lists hold a MEDIAN 15.0ms frame gap (~66fps). /sessions has the worse tail (p95 46.7ms, 72/595 gaps >33ms = 12.1%) vs all-robots (p95 20.0ms, 27/1232 = 2.2%), but neither sustains a stall — the >500ms outliers are the idle periods between swipes. A simulator VFR capture is not a device performance measurement, so degrading the material on this evidence would trade a documented look for an unproven gain.",
+      "costIfWrong": "If the lists DO hitch on real hardware, /sessions is the one to switch first; the recordings + numbers are in reports/phase-08 so the next session need not re-measure.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000054",
+      "at": "2026-09-08T00:11:01Z"
+    },
+    {
+      "id": "45350d71806e",
+      "slug": "customer-app-ios-release",
+      "phase": 8,
+      "kind": "deferral",
+      "what": "Built, layout-verified and then REVERTED the /sign-in keyboard-avoidance fix (removing the nested FormWrapper); left it for a device/working-keyboard pass",
+      "why": "P6 assigned this fix to Phase 8 and the root cause is written down: sign-in-screen.tsx wraps SchemaForm in a FormWrapper and SchemaForm mounts a second one — on native a FormWrapper IS a KeyboardAwareScrollView, so two nest and the inner content-height one has nothing to scroll. The edit typechecked and the screen rendered identically. But the simulator would NOT raise a software keyboard even with ConnectHardwareKeyboard=0 and a full Simulator restart (r2's stated precondition), so the flow passed VACUOUSLY — the exact vacuous-pass trap that report warns about. Shipping an unverified behavioural change to the app's first screen two phases before release is worse than carrying a known, diagnosed defect.",
+      "costIfWrong": "The defect stays: on a real device the password field sits under the keyboard. Mitigated — P7's auth-email/auth-password/auth-submit testIDs mean flows no longer need coordinate taps, and the exact patch is written in the handoff.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000054",
+      "at": "2026-09-08T00:33:52Z"
+    }
+  ],
+  "artefacts": [
+    {
+      "kind": "branch",
+      "name": "pe/ci-cd-hardening",
+      "repo": "aws",
+      "phase": 4,
+      "at": "2026-09-05T19:18:46.816Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/mql-build-lane-hardening",
+      "repo": "aws",
+      "phase": 4,
+      "at": "2026-09-05T19:18:46.816Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/ci-cd-hardening",
+      "repo": "hetzner",
+      "phase": 4,
+      "at": "2026-09-05T19:18:46.816Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/mql-build-lane-hardening",
+      "repo": "hetzner",
+      "phase": 4,
+      "at": "2026-09-05T19:18:46.816Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/ci-cd-hardening",
+      "repo": "customer-app",
+      "phase": 3,
+      "at": "2026-09-05T20:04:56.132Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/mql-build-lane-hardening",
+      "repo": "customer-app",
+      "phase": 3,
+      "at": "2026-09-05T20:04:56.132Z"
+    }
+  ],
+  "waitReason": null,
+  "resolved": null,
+  "reopenedAt": null,
+  "accountId": "info",
+  "stoppedBy": "system",
+  "finishedReason": "nothing left to run on its own — phase 4 needs you — Ship-gate condition 3 failed a SECOND time, and this time on the fix. The independent review of aws#174 returned 15 findings, four of them regressions that commit introduced into delete-account.ts (the INCORRECT_PASSWORD 400 swallowed by its own catch into a 500; the sanitizer collapsing lib/cognito.ts's 14 curated 4xx mappings so a RESET_REQUIRED customer can never delete; the double-tap branch matching UserNotFoundException, which the token-authorized DeleteUser does not return; and 'ignored'  (Clear what it names, then Resume the session with an instruction or Retry; or split the remaining work into a new phase.). a phase parked with an errand takes that errand, then Retry."
+}

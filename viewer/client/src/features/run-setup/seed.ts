@@ -24,7 +24,7 @@ import type { LaunchMemory } from './launch-memory';
 import { REMEMBERED_FIELDS } from './launch-memory';
 import type { RunSetupContext, RunSetupMode } from './modes';
 import { shows } from './modes';
-import { EMPTY, formatPhases, type RunSetupField, type RunSetupValues } from './schema';
+import { EMPTY, formatAccounts, formatPhases, type RunSetupField, type RunSetupValues } from './schema';
 
 /** Where each field's opening value came from, so provenance can say so. */
 export type Origins = Partial<Record<RunSetupField, Source>>;
@@ -204,6 +204,16 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   // for anyway — and the box is right there to narrow again.
   values.onlyPhases = mode === 'phase' || mode === 'continue' ? '' : formatPhases(run?.onlyPhases);
   values.phaseOptions = run?.phaseOptions ?? {};
+  // The prelude's answers (phase 11): an EXISTING run answers for itself (a
+  // resume keeps them; the door re-reads nothing), a fresh start opens on the
+  // shipped words — continue after a restart, no relay — and an EMPTY account
+  // list the Decisions stage fills from the plan's clause once the prelude
+  // answers. A waiver is acknowledged per launch, never carried over.
+  values.resumeOnRestart = run?.resumeOnRestart ?? true;
+  values.relay = run?.relay ?? 'off';
+  values.accounts = run ? formatAccounts(run.accounts) : '';
+  values.acknowledgedWaivers = [];
+  values.manifestOverride = '';
 
   for (const field of RUN_SEEDED) mark(field, run ? 'run' : 'defaults');
 
@@ -272,6 +282,9 @@ export const RUN_SEEDED = [
   'maxConsecutiveFailures',
   'onlyPhases',
   'phaseOptions',
+  'resumeOnRestart',
+  'relay',
+  'accounts',
 ] as const satisfies readonly RunSetupField[];
 
 /**
@@ -280,12 +293,17 @@ export const RUN_SEEDED = [
  * the seed rather than written out, so it cannot drift from what a launch
  * actually opens on.
  */
-export const BASELINE: Readonly<RunSetupValues> = Object.freeze(
-  seedFor('start', {
+export const BASELINE: Readonly<RunSetupValues> = Object.freeze({
+  ...seedFor('start', {
     run: null,
     prefs: automationPrefs(undefined),
     rawPrefs: {},
     context: {},
     defaultSkills: [],
   })[0],
-);
+  // The account list a fresh console launches with once the prelude answers
+  // for a plan naming none: the machine login, no minimum. The seed itself
+  // leaves the field empty until the prelude fills it (`run-setup.tsx`), so the
+  // shipped answer is stated here rather than read out of a fetch.
+  accounts: 'default:0',
+});

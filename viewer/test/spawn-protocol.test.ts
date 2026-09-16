@@ -27,6 +27,10 @@ import { join } from 'node:path';
 process.env.PHASE_CONSOLE_LOG = '';
 
 const { spawnClaude, markFor } = await import('../server/runner/spawn.ts');
+const { SPAWN_DEFAULT_CAPS, permissionPromptsFor, relayArmingFor } = await import('../server/runner/session-record.ts');
+const { PERMISSION_PROMPTS_CLI_FLOOR, RELAY_CLI_FLOOR } = await import('../shared/run-settings.js');
+const { RELAY_HOST_TOOL } = await import('../server/relay-host.ts');
+const { INT_GRACE_MS } = await import('../server/runner/signals.ts');
 import type { SpawnHandle, StreamEvent } from '../server/runner/spawn.ts';
 // The REAL framing, not a copy of it. This file used to build its operator
 // messages by hand, and the hand-copy had already drifted from `frameQuestion`
@@ -53,6 +57,10 @@ if (process.env.PC_STUB_ENV) {
     CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? null,
     // The session id the console tells the child about itself (Phase 5).
     PE_SESSION_ID: process.env.PE_SESSION_ID ?? null,
+    // The CLI-side ceilings the console sets on every child (zero-touch-console
+    // phase 4, SES-12 and DOC-2).
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS ?? null,
+    CLAUDE_CODE_MAX_RETRIES: process.env.CLAUDE_CODE_MAX_RETRIES ?? null,
   }));
 }
 
@@ -88,6 +96,46 @@ if (process.env.PC_STUB_GARBAGE === '1') {
 const say = (o) => process.stdout.write(JSON.stringify(o) + '\\n');
 const sid = '11111111-2222-3333-4444-555555555555';
 
+// Zero-touch-console phase 4 — the session ledger. A session that STARTED WORK
+// and then was ended: its init, one API turn (thinking and a tool call, as TWO
+// assistant lines sharing a message id — measured on CLI 2.1.270), and then
+// nothing, with the Bash call still running. What happens on SIGINT is the knob:
+//   STEP_HANG      no handler — SIGINT's default kills it with nothing written
+//   SIGINT_RESULT  the measured CLI: the interrupted call's result, the
+//                  interrupt line, then a \`result\` (test/fixtures/spikes/sigint.md)
+//   IGNORE_SIGINT  a child that will not go on SIGINT — only SIGTERM ends it
+const hang = process.env.PC_STUB_STEP_HANG === '1' || process.env.PC_STUB_SIGINT_RESULT === '1'
+  || process.env.PC_STUB_IGNORE_SIGINT === '1';
+if (hang) {
+  say({ type: 'system', subtype: 'init', session_id: sid, model: 'stub-1', tools: [] });
+  say({ type: 'assistant', session_id: sid, parent_tool_use_id: null,
+        message: { id: 'msg_turn_1', role: 'assistant', content: [{ type: 'thinking', thinking: 'run it' }] } });
+  say({ type: 'assistant', session_id: sid, parent_tool_use_id: null,
+        message: { id: 'msg_turn_1', role: 'assistant', content: [
+          { type: 'tool_use', id: 'toolu_sleep', name: 'Bash', input: { command: 'sleep 20' } }] } });
+  if (process.env.PC_STUB_SIGINT_RESULT === '1') {
+    process.on('SIGINT', () => {
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [{ type: 'tool_result',
+        tool_use_id: 'toolu_sleep', is_error: true,
+        content: "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file)." }] } });
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [
+        { type: 'text', text: '[Request interrupted by user for tool use]' }] } });
+      process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true,
+        terminal_reason: 'aborted_tools', stop_reason: 'tool_use', num_turns: 3, total_cost_usd: 0.0114327,
+        permission_denials: [], session_id: sid }) + '\\n', () => process.exit(0));
+    });
+  }
+  if (process.env.PC_STUB_IGNORE_SIGINT === '1') process.on('SIGINT', () => {});
+  process.stdin.resume(); setInterval(() => {}, 1000); return;
+}
+// Initialised, said one line on stderr, then wedged before its first result —
+// the stretch the first-event backstop cannot see (SES-10).
+if (process.env.PC_STUB_INIT_STDERR === '1') {
+  say({ type: 'system', subtype: 'init', session_id: sid, model: 'stub-1', tools: [] });
+  process.stderr.write('warming a cache\\n');
+  process.stdin.resume(); setInterval(() => {}, 1000); return;
+}
+
 // Turns whose result is withheld, so the NEXT turn's result covers both — this
 // is the CLI folding two injected messages into one turn, which is what the old
 // counter could not survive.
@@ -106,7 +154,40 @@ const goSilent = process.env.PC_STUB_SILENT === '1';
 const tools = process.env.PC_STUB_TOOLS === '1';
 const tag = (text) => (/\\[\\[(ask|steer):[0-9a-z]{4,16}\\]\\]/i.exec(text) || [])[0];
 
-say({ type: 'system', subtype: 'init', session_id: sid, model: process.env.PC_STUB_MODEL || 'stub-1', tools: [] });
+// The init a real 2.1.270 session prints (phase 1, spike S1): \`AskUserQuestion\`
+// is offered ONLY when a permission host is attached, and the host's own status
+// rides \`mcp_servers\`. The version is \`claude_code_version\`; \`capabilities\` is
+// an open set that names nothing about hooks — a stub can put a lie in it.
+const hosted = argv.includes('--permission-prompt-tool');
+say({
+  type: 'system', subtype: 'init', session_id: sid, model: process.env.PC_STUB_MODEL || 'stub-1',
+  tools: hosted ? ['Bash', 'Read', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] : [],
+  ...(process.env.PC_STUB_CLI_VERSION ? { claude_code_version: process.env.PC_STUB_CLI_VERSION } : {}),
+  capabilities: ['interrupt_receipt_v1', 'interrupt_cancel_queued_v1', 'msg_lifecycle_v1',
+    ...(process.env.PC_STUB_CAPABILITY ? [process.env.PC_STUB_CAPABILITY] : [])],
+  mcp_servers: hosted ? [{ name: 'pcrelay', status: process.env.PC_STUB_HOST_STATUS || 'connected' }] : [],
+});
+// The CLI asking its host over the stream (TRS-2), and a turn ended on \`defer\` (S3).
+if (process.env.PC_STUB_CONTROL_REQUEST === '1') {
+  say({ type: 'control_request', request_id: 'req_1', request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion' } });
+}
+if (process.env.PC_STUB_DEFER === '1') {
+  say({ type: 'result', subtype: 'success', stop_reason: 'tool_deferred', terminal_reason: 'tool_deferred', is_error: false,
+    num_turns: 1, total_cost_usd: 0.004587, permission_denials: [], session_id: sid, result: '',
+    deferred_tool_use: { id: 'toolu_deferred', name: 'AskUserQuestion', input: { questions: [] } } });
+  process.exit(0);
+}
+// The CLI's retry line in its DOCUMENTED shape (chapter 09 rows 31–32): the
+// category is \`error\`, and four numbers ride beside it.
+if (process.env.PC_STUB_DOC_RETRY === '1') {
+  say({ type: 'system', subtype: 'api_retry', attempt: 3, max_retries: 15, retry_delay_ms: 2000,
+        error_status: 500, error: 'server_error', session_id: sid });
+}
+// A usage warning at 99 % of a window, as a fraction on the wire.
+if (process.env.PC_STUB_RATE_LIMIT === '1') {
+  say({ type: 'rate_limit_event', session_id: sid, rate_limit_info: {
+    status: 'allowed_warning', utilization: 0.99, rateLimitType: 'seven_day', resetsAt: 1789956000 } });
+}
 for (let i = 0; i < replayHistory; i++) {
   say({ type: 'user', session_id: sid,
         message: { role: 'user', content: [{ type: 'text', text: 'replayed history ' + i }] } });
@@ -189,6 +270,46 @@ if (process.env.PC_STUB_HEARD) fs.appendFileSync(process.env.PC_STUB_HEARD, text
       say({ type: 'user', session_id: sid, message: { role: 'user', content: [
         { type: 'tool_result', tool_use_id: 'toolu_task', is_error: false, content: 'found 3 callers' },
       ] } });
+    }
+    // A tool call the CLI's permission system refuses. \`stream\`: the measured
+    // CLI 2.1.270 trio (test/fixtures/spikes/permissionrequest.md) — the
+    // announcement, the refused result, the result's authoritative ledger.
+    // \`result\`: no announcement, and the CLI's own refusal sentence.
+    if (process.env.PC_STUB_DENIED && turn === 1) {
+      const streamed = process.env.PC_STUB_DENIED === 'stream';
+      // \`sensitive\`: the audit's Q-08e shape — an Edit of a file the CLI
+      // guards, refused in its own words (43 of the 155 lifetime refusals).
+      const sensitive = process.env.PC_STUB_DENIED === 'sensitive';
+      const call = sensitive
+        ? { type: 'tool_use', id: 'toolu_deny', name: 'Edit',
+            input: { file_path: '/home/someone/.claude/rules/house-rules.md', old_string: 'a', new_string: 'b' } }
+        : { type: 'tool_use', id: 'toolu_deny', name: 'Bash', input: { command: 'touch spike-s2-marker.txt' } };
+      say({ type: 'assistant', session_id: sid, parent_tool_use_id: null, message: { id: 'msg_deny', role: 'assistant',
+        content: [call] } });
+      if (streamed) {
+        say({ type: 'system', subtype: 'permission_denied', tool_name: 'Bash', tool_use_id: 'toolu_deny',
+              decision_reason_type: 'hook', decision_reason: 'spike listener: deny', message: 'spike listener: deny',
+              session_id: sid });
+      }
+      say({ type: 'user', session_id: sid, message: { role: 'user', content: [{ type: 'tool_result',
+        tool_use_id: 'toolu_deny', is_error: true,
+        content: streamed ? 'spike listener: deny'
+          : sensitive ? 'Claude requested permissions to edit /home/someone/.claude/rules/house-rules.md which is a sensitive file.'
+            : "Claude requested permissions to use Bash, but you haven't granted it yet." }] } });
+      say({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, total_cost_usd: 0.0126,
+            permission_denials: [{ tool_name: call.name, tool_use_id: 'toolu_deny', tool_input: call.input }],
+            result: 'DENIED', session_id: sid });
+      continue;
+    }
+    // A backgrounded job the CLI's ceiling killed when the run ended (SES-12):
+    // the task starts, never reports, and the CLI's own sentence lands on stderr.
+    if (process.env.PC_STUB_BG_TASK === '1' && turn === 1) {
+      say({ type: 'system', subtype: 'task_started', task_id: 'bash_7', description: 'npm test -- --run',
+            session_id: sid });
+      process.stderr.write('Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.\\n');
+      say({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, total_cost_usd: 0.5,
+            result: 'all done', session_id: sid });
+      continue;
     }
     const mark = answering ? tag(text) : undefined;
     say({ type: 'assistant', session_id: sid,
@@ -616,6 +737,12 @@ test('a session that never says anything at all is ended by the first-event back
   assert.ok(outcome.durationMs >= 200);
   assert.equal(outcome.turns, 0);
   assert.equal(outcome.costUsd, 0);
+  // …and the outcome says the SPAWN's own clock ended it, with the diagnosis
+  // (SES-11): read as the external SIGTERM it used to arrive as, it halted the
+  // run for a person who had pressed nothing.
+  assert.equal(outcome.endedBy, 'spawn-watchdog');
+  assert.match(outcome.endedReason ?? '', /no output at all/);
+  assert.equal(outcome.signal.endedBy, 'spawn-watchdog');
   b.cleanup();
 });
 
@@ -1034,4 +1161,376 @@ test('PE_SESSION_ID rides into the child\'s environment — the minted --session
     assert.equal(fixed.PE_SESSION_ID, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
     assert.equal(b.argv()[b.argv().indexOf('--session-id') + 1], 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
   } finally { b.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * The session ledger (zero-touch-console phase 4, chapter 03 SES-1…SES-12)
+ * ------------------------------------------------------------------ */
+
+type RetryEvent = Extract<StreamEvent, { kind: 'retry' }>;
+type DeniedEvent = Extract<StreamEvent, { kind: 'permission-denied' }>;
+type ToolResultEvent = Extract<StreamEvent, { kind: 'tool-result' }>;
+
+test('a session aborted after one API turn and no result is still booked — turns from the stream, and who ended it', async () => {
+  // SES-1: `turns` and `costUsd` came from the `result` alone, and every
+  // ending the console caused was a SIGTERM, which writes none — 27 of 88
+  // records read 0 turns / $0 for 18.99 hours. This child has no SIGINT
+  // handler, so it dies writing nothing: the stream is the only witness.
+  const b = bench();
+  try {
+    const controller = new AbortController();
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_STEP_HANG: '1' }, idleCloseMs: 0,
+      signal: controller.signal,
+      onEvent: (event) => { if (event.kind === 'tool') controller.abort('stop'); },
+    });
+    assert.equal(outcome.turns, 1,
+      'one API turn — its thinking and its tool call arrive as two lines sharing a message id, and are one turn');
+    assert.equal(outcome.turnsSource, 'stream');
+    assert.equal(outcome.midTurn, true);
+    assert.equal(outcome.steps, 1);
+    assert.equal(outcome.endedBy, 'stop', 'the abort named its reason, and the outcome carries it');
+    assert.equal(outcome.signal.endedBy, 'stop');
+    assert.equal(outcome.costSource, 'none', 'no total_cost_usd ever arrived: unknown, not a measured zero');
+    assert.equal(outcome.signal.code, 130, 'SIGINT, not SIGTERM, is what the abort sent first');
+  } finally { b.cleanup(); }
+});
+
+test('SIGINT closes the turn: the interrupted session writes its result, and its dollars and turns are booked', async () => {
+  // The measured CLI (test/fixtures/spikes/sigint.md): mid-tool SIGINT → the
+  // interrupted call's result, the interrupt line, a `result` 10 ms later, a
+  // clean exit. That result is the ledger a SIGTERM never let the CLI write.
+  const b = bench();
+  try {
+    const controller = new AbortController();
+    let abortedAt = 0;
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_SIGINT_RESULT: '1' }, idleCloseMs: 0,
+      signal: controller.signal,
+      onEvent: (event) => {
+        if (event.kind === 'tool') { abortedAt = Date.now(); controller.abort('shutdown'); }
+      },
+    });
+    assert.ok(outcome.costUsd > 0, `the interrupted turn's result booked the session's dollars (${outcome.costUsd})`);
+    assert.equal(outcome.costSource, 'result');
+    assert.equal(outcome.turns, 3, 'the CLI\'s own count, which covers more than the stream showed');
+    assert.equal(outcome.turnsSource, 'result');
+    assert.equal(outcome.midTurn, true, 'an aborted turn stopped — it did not finish');
+    assert.equal(outcome.endedBy, 'shutdown');
+    assert.equal(outcome.signal.terminalReason, 'aborted_tools');
+    assert.equal(outcome.signal.isError, true);
+    assert.equal(outcome.signal.code, 0, 'a clean exit: no SIGTERM was ever needed');
+    assert.ok(Date.now() - abortedAt < INT_GRACE_MS, 'it left inside the interrupt\'s grace');
+  } finally { b.cleanup(); }
+});
+
+test('a child that ignores SIGINT is termed after the interrupt grace — the backstop is still there', async () => {
+  const b = bench();
+  try {
+    const controller = new AbortController();
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_IGNORE_SIGINT: '1' }, idleCloseMs: 0,
+      signal: controller.signal, interruptGraceMs: 300,
+      onEvent: (event) => { if (event.kind === 'tool') controller.abort('stop'); },
+    });
+    assert.equal(outcome.signal.code, 143, 'SIGTERM ended it, once SIGINT had not');
+    assert.equal(outcome.endedBy, 'stop', 'and the ending is still the one the abort named');
+    assert.equal(outcome.turns, 1);
+  } finally { b.cleanup(); }
+});
+
+test('system/api_retry is read from its documented field — the category and all four numbers', async () => {
+  // SES-7 / DOC-1: the category was read from four field names the CLI has
+  // never sent, so `server_error` was filed as free text and the retry arm
+  // that acts on it could not be reached.
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_DOC_RETRY: '1' },
+      onEvent: (event) => events.push(event),
+    });
+    const retry = events.find((event) => event.kind === 'retry') as RetryEvent | undefined;
+    assert.ok(retry, 'the retry was parsed');
+    assert.equal(retry.category, 'server_error');
+    assert.equal(retry.inferred, undefined, 'the CLI said it; nothing was guessed');
+    assert.equal(retry.attempt, 3);
+    assert.equal(retry.maxRetries, 15);
+    assert.equal(retry.retryDelayMs, 2000);
+    assert.equal(retry.errorStatus, 500);
+    assert.deepEqual(outcome.signal.retryCategories, ['server_error'], 'and it reaches the classifier');
+  } finally { b.cleanup(); }
+});
+
+test('every spawn carries both caps: the floor when none were named, the named ones otherwise, a bare number as `caller`', async () => {
+  // SES-8: 0 of 507 lifetime argvs carried `--max-budget-usd`.
+  const b = bench();
+  try {
+    const bare = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env });
+    let argv = b.argv();
+    assert.equal(argv[argv.indexOf('--max-budget-usd') + 1], String(SPAWN_DEFAULT_CAPS.maxBudgetUsd.value));
+    assert.equal(argv[argv.indexOf('--max-turns') + 1], String(SPAWN_DEFAULT_CAPS.maxTurns.value));
+    assert.equal(bare.caps?.maxBudgetUsd.source, 'spawn-default');
+    assert.equal(bare.caps?.maxTurns.source, 'spawn-default');
+
+    const named = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: b.env,
+      caps: { maxTurns: { value: 150, source: 'size', basis: 'S' }, maxBudgetUsd: { value: 25, source: 'size', basis: 'S' } },
+    });
+    argv = b.argv();
+    assert.equal(argv[argv.indexOf('--max-budget-usd') + 1], '25');
+    assert.equal(argv[argv.indexOf('--max-turns') + 1], '150');
+    assert.deepEqual(named.caps?.maxTurns, { value: 150, source: 'size', basis: 'S' });
+
+    const numbers = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, budgetUsd: 3, maxTurns: 7 });
+    argv = b.argv();
+    assert.equal(argv[argv.indexOf('--max-budget-usd') + 1], '3');
+    assert.equal(numbers.caps?.maxBudgetUsd.source, 'caller');
+  } finally { b.cleanup(); }
+});
+
+test('a session that initialised and then went silent before its first result is ended by the init→result bound', async () => {
+  // SES-10: the first-event backstop is cleared by the `init` every session
+  // emits at once, and the idle close waits for a result — so this child, a
+  // stderr line and then nothing, had no clock inside spawn.ts at all.
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_INIT_STDERR: '1' }, idleCloseMs: 0,
+      initIdleMs: 400, onEvent: (event) => events.push(event),
+    });
+    const idle = events.filter((event) => event.kind === 'idle') as { reason: string; afterMs: number }[];
+    assert.equal(idle.length, 1, 'the kill is announced');
+    assert.match(idle[0].reason, /no result after init/);
+    assert.ok(idle[0].afterMs >= 350, `measured from the last productive event (${idle[0].afterMs} ms)`);
+    assert.equal(outcome.endedBy, 'spawn-watchdog');
+    assert.match(outcome.endedReason ?? '', /no result after init/);
+  } finally { b.cleanup(); }
+});
+
+test('the init→result bound never touches a session whose result came first', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, initIdleMs: 2_000, onEvent: (event) => events.push(event),
+    });
+    assert.equal(events.filter((event) => event.kind === 'idle').length, 0);
+    assert.equal(outcome.endedBy, 'exit', 'nothing in the console ended it');
+    assert.equal(outcome.midTurn, false);
+    assert.equal(outcome.signal.subtype, 'success');
+  } finally { b.cleanup(); }
+});
+
+test('a denial the CLI announced is ONE event with its reason — the result\'s ledger adds no duplicate — and the refused result is marked', async () => {
+  // The measured CLI 2.1.270 trio (test/fixtures/spikes/permissionrequest.md,
+  // arm s2a-deny): `system/permission_denied`, the refused `tool_result`, and
+  // the result's `permission_denials` naming the same call.
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_DENIED: 'stream' },
+      onEvent: (event) => events.push(event),
+    });
+    const denied = events.filter((event) => event.kind === 'permission-denied') as DeniedEvent[];
+    assert.equal(denied.length, 1, 'one denial, one event');
+    assert.deepEqual(denied[0], {
+      kind: 'permission-denied', tool: 'Bash', toolUseId: 'toolu_deny', target: 'touch spike-s2-marker.txt',
+      reason: 'spike listener: deny', reasonType: 'hook', source: 'stream',
+    });
+    const refused = events.filter((event) => event.kind === 'tool-result' && event.refused) as ToolResultEvent[];
+    assert.equal(refused.length, 1, 'the words the session read are marked as a refusal');
+    assert.equal(refused[0].tool, 'Bash');
+    assert.equal(outcome.signal.permissionDenials?.length, 1, 'and the authoritative ledger reaches the classifier');
+  } finally { b.cleanup(); }
+});
+
+test('a denial only the result\'s ledger records is announced from it, with its aim — and the CLI\'s refusal sentence marks the result', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_DENIED: 'result' },
+      onEvent: (event) => events.push(event),
+    });
+    const denied = events.filter((event) => event.kind === 'permission-denied') as DeniedEvent[];
+    assert.equal(denied.length, 1);
+    assert.equal(denied[0].source, 'result');
+    assert.equal(denied[0].target, 'touch spike-s2-marker.txt');
+    assert.equal(denied[0].reason, undefined, 'the ledger carries no reason, and none is invented');
+    const refused = events.filter((event) => event.kind === 'tool-result' && event.refused);
+    assert.equal(refused.length, 1, '"Claude requested permissions to use Bash…" is the CLI\'s own refusal');
+  } finally { b.cleanup(); }
+});
+
+test('ACC-8.11 (TRS-8): the Q-08e refusal — a sensitive file the CLI will not let the session edit — journals as two DISTINCT events, each naming the target', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_DENIED: 'sensitive' },
+      onEvent: (event) => events.push(event),
+    });
+    const denied = events.filter((event) => event.kind === 'permission-denied') as DeniedEvent[];
+    assert.equal(denied.length, 1, 'the result\'s authoritative ledger');
+    assert.equal(denied[0].tool, 'Edit');
+    assert.equal(denied[0].source, 'result');
+    assert.match(String(denied[0].target), /house-rules\.md$/);
+    const refused = events.filter((event) => event.kind === 'tool-result' && event.refused) as ToolResultEvent[];
+    assert.equal(refused.length, 1, '"…which is a sensitive file." is the CLI\'s own refusal, not a failed command');
+    assert.equal(refused[0].tool, 'Edit');
+    assert.match(String(refused[0].target), /house-rules\.md$/, 'and it names what was refused, as the ledger does');
+    assert.match(String(refused[0].detail), /which is a sensitive file/);
+    assert.notEqual(denied[0].kind, refused[0].kind, 'two events, not one generic tool result');
+  } finally { b.cleanup(); }
+});
+
+test('ACC-8.11 (QRL-9): --permission-prompts none rides a relay-off session and is absent from a relay-on one; a CLI known to predate it is refused the flag', async () => {
+  for (const [prompts, expect] of [['none', true], [undefined, false]] as const) {
+    const b = bench();
+    try {
+      await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, ...(prompts ? { permissionPrompts: prompts } : {}) });
+      const argv = b.argv();
+      assert.equal(argv.includes('--permission-prompts'), expect, `permissionPrompts ${prompts ?? 'absent'}`);
+      if (expect) assert.equal(argv[argv.indexOf('--permission-prompts') + 1], 'none');
+    } finally { b.cleanup(); }
+  }
+  assert.equal(PERMISSION_PROMPTS_CLI_FLOOR, '2.1.259');
+  assert.deepEqual(permissionPromptsFor('off', '2.1.270'), { flag: 'none' }, 'relay off: the floor');
+  assert.deepEqual(permissionPromptsFor(undefined, '2.1.259'), { flag: 'none' }, 'a run with no relay answer is off, and the floor version itself qualifies');
+  assert.deepEqual(permissionPromptsFor('last-resort', '2.1.270'), { flag: null }, 'relay on: the relay answers prompts, so the flag would take them away');
+  assert.deepEqual(permissionPromptsFor('off', undefined), { flag: 'none' }, 'an unknown version still gets the floor — an old CLI then fails loudly');
+  assert.deepEqual(permissionPromptsFor('off', '2.1.258'), {
+    flag: null, refused: { reason: 'below-floor', version: '2.1.258', floor: '2.1.259' },
+  }, 'a known older CLI would reject the flag as an unknown option');
+});
+
+test('an interrupted call\'s "the tool use was rejected" is NOT a refusal — a stop is not a permission wall', async () => {
+  const b = bench();
+  try {
+    const controller = new AbortController();
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_SIGINT_RESULT: '1' }, idleCloseMs: 0,
+      signal: controller.signal,
+      onEvent: (event) => { events.push(event); if (event.kind === 'tool') controller.abort('stop'); },
+    });
+    const results = events.filter((event) => event.kind === 'tool-result') as ToolResultEvent[];
+    assert.equal(results.length, 1, 'the interrupted call\'s result arrived');
+    assert.equal(results[0].ok, false);
+    assert.equal(results[0].refused, undefined);
+    assert.equal(events.filter((event) => event.kind === 'permission-denied').length, 0);
+  } finally { b.cleanup(); }
+});
+
+test('a usage reading carries its unit: the wire\'s fraction and the meters\' percent, side by side', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_RATE_LIMIT: '1' },
+      onEvent: (event) => events.push(event),
+    });
+    const limits = events.find((event) => event.kind === 'limits') as Extract<StreamEvent, { kind: 'limits' }> | undefined;
+    assert.ok(limits);
+    assert.equal(limits.status, 'allowed_warning');
+    assert.equal(limits.utilization, 0.99, 'the fraction every journal row and client read has always held');
+    assert.equal(limits.utilizationPct, 99, 'the percent a threshold is compared against');
+    assert.equal(limits.window, 'seven_day');
+  } finally { b.cleanup(); }
+});
+
+test('the background-task ceiling is set explicitly on the child, and the tasks it killed are named on the signal', async () => {
+  // SES-12: the CLI waits 600 s for background tasks at the end of a -p run
+  // and then kills them; the console set neither the ceiling nor a reader.
+  const b = bench();
+  try {
+    const env = { ...b.env, PC_STUB_BG_TASK: '1' };
+    delete env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+    delete env.CLAUDE_CODE_MAX_RETRIES;
+    const outcome = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env });
+    assert.deepEqual(outcome.signal.backgroundTasks, [{ id: 'bash_7', description: 'npm test -- --run' }]);
+    assert.match(outcome.signal.text ?? '', /Background tasks still running after 600s/);
+    const seen = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as Record<string, string | null>;
+    assert.equal(seen.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, '600000', 'the documented default, set on purpose');
+    assert.equal(seen.CLAUDE_CODE_MAX_RETRIES, '15');
+  } finally { b.cleanup(); }
+});
+
+test('ACC-8.11 (AC-13): the floor and the relay never share an argv — a relay-on session carries the host and no --permission-prompts, a relay-off one the reverse', async () => {
+  for (const [shape, expectHost, expectFloor] of [
+    [{ permissionPromptTool: RELAY_HOST_TOOL }, true, false],
+    [{ permissionPrompts: 'none' as const }, false, true],
+    // A caller that set both gets the floor alone: `none` would take the prompt from the host anyway.
+    [{ permissionPrompts: 'none' as const, permissionPromptTool: RELAY_HOST_TOOL }, false, true],
+  ] as const) {
+    const b = bench();
+    try {
+      await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: b.env, ...shape });
+      const argv = b.argv();
+      assert.equal(argv.includes('--permission-prompt-tool'), expectHost, JSON.stringify(shape));
+      assert.equal(argv.includes('--permission-prompts'), expectFloor, JSON.stringify(shape));
+      if (expectHost) assert.equal(argv[argv.indexOf('--permission-prompt-tool') + 1], 'mcp__pcrelay__hold');
+    } finally { b.cleanup(); }
+  }
+});
+
+test('ACC-8.11 (AC-13, QRL-5): the relay arms only at system/init.claude_code_version >= 2.1.268 — read from that field, never from capabilities, never on a version nobody read', async () => {
+  assert.equal(RELAY_CLI_FLOOR, '2.1.268');
+  assert.deepEqual(relayArmingFor('last-resort', '2.1.270'), { armed: true, version: '2.1.270', floor: '2.1.268' });
+  assert.deepEqual(relayArmingFor('last-resort', '2.1.268'), { armed: true, version: '2.1.268', floor: '2.1.268' }, 'the floor itself arms');
+  assert.deepEqual(relayArmingFor('last-resort', '2.1.267'), { armed: false, version: '2.1.267', floor: '2.1.268', refused: 'below-floor' });
+  assert.deepEqual(relayArmingFor('last-resort', null), { armed: false, version: null, floor: '2.1.268', refused: 'version-unknown' });
+  assert.deepEqual(relayArmingFor('off', '2.1.270'), { armed: false, version: '2.1.270', floor: '2.1.268' }, 'a relay-off run is simply not armed');
+
+  // The reading a spawn hands the arming: `claude_code_version`, even when the
+  // open `capabilities` set carries a member that sounds like permission.
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({
+      prompt: 'BOOT phase 1', cwd: b.dir,
+      env: { ...b.env, PC_STUB_CLI_VERSION: '2.1.260', PC_STUB_CAPABILITY: 'permission_request_print_v1' },
+      onEvent: (event) => events.push(event),
+    });
+    const init = events.find((event) => event.kind === 'init') as Extract<StreamEvent, { kind: 'init' }>;
+    assert.equal(init.version, '2.1.260');
+    assert.equal(relayArmingFor('last-resort', init.version).armed, false, 'a capability that names permission arms nothing');
+  } finally { b.cleanup(); }
+});
+
+test('ACC-8.4 (TRS-2, S1): a -p run with the presence-only host is OFFERED AskUserQuestion in system/init.tools, and one without is not — the host\'s status rides mcp_servers', async () => {
+  for (const [host, offered] of [[true, true], [false, false]] as const) {
+    const b = bench();
+    try {
+      const events: StreamEvent[] = [];
+      await spawnClaude({
+        prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_HOST_STATUS: 'connected' },
+        ...(host ? { permissionPromptTool: RELAY_HOST_TOOL } : { permissionPrompts: 'none' as const }),
+        onEvent: (event) => events.push(event),
+      });
+      const init = events.find((event) => event.kind === 'init') as Extract<StreamEvent, { kind: 'init' }>;
+      assert.equal(init.toolNames?.includes('AskUserQuestion'), offered, host ? 'with the host' : 'host-less');
+      if (host) assert.deepEqual(init.mcpServers, [{ name: 'pcrelay', status: 'connected' }]);
+    } finally { b.cleanup(); }
+  }
+});
+
+test('ACC-8.4 (TRS-2): a control_request line is an event of its own — and a result ended on defer names the call it kept', async () => {
+  const b = bench();
+  try {
+    const events: StreamEvent[] = [];
+    await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env: { ...b.env, PC_STUB_CONTROL_REQUEST: '1' }, onEvent: (event) => events.push(event) });
+    const request = events.find((event) => event.kind === 'control-request');
+    assert.deepEqual(request, { kind: 'control-request', requestId: 'req_1', subtype: 'can_use_tool', tool: 'AskUserQuestion' });
+  } finally { b.cleanup(); }
+  const d = bench();
+  try {
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({ prompt: 'BOOT phase 1', cwd: d.dir, env: { ...d.env, PC_STUB_DEFER: '1' }, onEvent: (event) => events.push(event) });
+    assert.deepEqual(events.find((event) => event.kind === 'deferred'), { kind: 'deferred', toolUseId: 'toolu_deferred', tool: 'AskUserQuestion' });
+    assert.equal(outcome.signal.terminalReason, 'tool_deferred');
+  } finally { d.cleanup(); }
 });

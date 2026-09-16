@@ -64,6 +64,10 @@ const MARK_GLYPH: Record<TimelineMark['kind'], string> = {
   park: '❚',
   wall: '✖',
   outcome: '●',
+  session: '▾',
+  ask: '?',
+  policy: '§',
+  start: '▶',
 };
 
 /**
@@ -247,6 +251,25 @@ export function Gantt({
                     </text>
                   </g>
                 ))}
+
+                {/* Run-level marks — each start of the run, with its door — sit on
+                    the axis itself: they belong to no lane. */}
+                {marks
+                  .filter((mark) => mark.phase === undefined)
+                  .map((mark, i) => (
+                    <text
+                      key={`run-${mark.kind}-${mark.atMs}-${i}`}
+                      x={x(mark.atMs)}
+                      y={AXIS - 2}
+                      fontSize="8"
+                      textAnchor="middle"
+                      className="[--state:var(--ink-muted)]"
+                      fill="var(--state)"
+                    >
+                      {MARK_GLYPH[mark.kind]}
+                      <title>{`${duration(mark.atMs)} · ${mark.kind}: ${mark.label}`}</title>
+                    </text>
+                  ))}
 
                 {lanes.map((lane, row) => {
                   const y = AXIS + row * ROW;

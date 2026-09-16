@@ -1041,6 +1041,8 @@ describe('a table says whether it scrolls', () => {
     'features/plans/handoffs-tab.tsx:status': 'the frozen handoff statuses — shared/plan-vocab.js',
     'features/plans/qa-tab.tsx:verdict':
       'the QA verdicts — shared/plan-vocab.js QA_RESULTS, or the literal word `pending`',
+    'features/plans/source-tab.tsx:state':
+      'the decision states — shared/decisions-model.js DECISION_STATES (anything else renders as breakable text)',
     'features/repo/branches.tsx:name': 'the literal words `checked out` and `trunk`',
     'features/repo/checkouts.tsx:role': 'the checkout roles',
     'features/repo/checkouts.tsx:state': 'the checkout states',

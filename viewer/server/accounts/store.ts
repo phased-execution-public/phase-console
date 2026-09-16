@@ -47,10 +47,12 @@ export type AccountMeta = {
   createdAt: string;
   lastUsed?: string;
   /**
-   * Buckets this account is known to have exhausted, from an actual limit hit
-   * (the runner's classifier) — bucket name → ISO reset time. The usage poller
-   * corroborates when it can; this survives when it cannot (a token account
-   * the usage endpoint refuses still learns its windows the hard way).
+   * LEGACY (read-only since zero-touch-console phase 8). A 4.1.0 registry kept
+   * each account's exhausted windows here — bucket name → ISO reset. They live
+   * in the machine-wide learned store now (`learned.ts`, keyed by credential,
+   * so two consoles share one wall); the facade folds any row still carrying
+   * them into that store on construction and drops the field. Nothing writes
+   * it any more.
    */
   limitedUntil?: Record<string, string>;
 };
@@ -68,9 +70,13 @@ export const ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const ACCOUNTS_DIR = join(INSTANCE_STATE_DIR, 'accounts');
 const REGISTRY_FILE = join(ACCOUNTS_DIR, 'accounts.json');
 
-/** A profile account's whole `~/.claude` world lives here. */
-export function profileConfigDir(id: string): string {
-  return join(ACCOUNTS_DIR, id, 'config');
+/**
+ * A profile account's whole `~/.claude` world lives here. `dir` is another
+ * console's accounts directory when a process reads registrations it does not
+ * own — the fleet supervisor's poller, reading every console's.
+ */
+export function profileConfigDir(id: string, dir: string = ACCOUNTS_DIR): string {
+  return join(dir, id, 'config');
 }
 
 /**
@@ -95,9 +101,14 @@ type RegistryFile = {
 export class AccountStore {
   private accounts: AccountMeta[] = [];
   private machineName: string | undefined;
+  private readonly dir: string;
+  private readonly file: string;
 
-  constructor() {
-    const { accounts, defaultName } = readRegistry();
+  /** `dir` is a test seam — two registries over two instance directories, one machine-wide learned file. */
+  constructor(dir: string = ACCOUNTS_DIR) {
+    this.dir = dir;
+    this.file = join(dir, 'accounts.json');
+    const { accounts, defaultName } = readRegistry(this.file);
     this.accounts = accounts;
     this.machineName = defaultName;
   }
@@ -115,12 +126,13 @@ export class AccountStore {
   /**
    * REGISTERED accounts only — the synthesized default is the facade's business.
    *
-   * The default may nonetheless hold a row in `accounts[]` (see `markLimited`):
-   * a reserved one, carrying its learned windows and nothing else. Filtering it
-   * out here is what keeps that row invisible to everything that means
-   * "accounts the operator added" — `list()` would double-list it beside the
-   * synthesized view, `startPolling()` would poll it twice, and `newId()` would
-   * count it as a collision.
+   * The default may nonetheless hold a row in `accounts[]` — a 4.1.0 registry's
+   * reserved limits carrier, read for the one-time fold into the learned store
+   * (`rowsWithLegacyLimits` / `dropLegacyLimits`). Filtering it out here is
+   * what keeps that row invisible to everything that means "accounts the
+   * operator added" — `list()` would double-list it beside the synthesized
+   * view, `startPolling()` would poll it twice, and `newId()` would count it as
+   * a collision.
    */
   stored(): AccountMeta[] {
     return this.accounts.filter((a) => a.id !== DEFAULT_ACCOUNT_ID).map((a) => ({ ...a }));
@@ -173,35 +185,29 @@ export class AccountStore {
   }
 
   /**
-   * Record an exhausted window. Kept tidy on write: reset times that have
-   * already passed are dropped rather than carried around as stale alarm.
-   *
-   * The default account gets a RESERVED row, minted here on first need. It used
-   * to be the one account whose windows were not written down — the facade held
-   * them in a bare instance field — so the machine login, the account most
-   * consoles actually run on, forgot every wall it had learned the hard way on
-   * every restart, while every registered account remembered. A restart then
-   * spent a fresh session rediscovering a five-hour window that had hours left
-   * on it. The row is filtered out of `stored()`, which is what the original
-   * "a stored row would double-list" objection was really about; it is a
-   * limits carrier, not a registration, and `add()`'s guard still refuses one.
+   * Every row still carrying 4.1.0's per-row walls — including the RESERVED
+   * `default` row the old `markLimited` minted for the machine login. The
+   * facade folds them into the learned store, once, on construction.
    */
-  markLimited(id: string, bucket: string, resetsAt: string, now = new Date()): void {
-    let found = this.accounts.find((a) => a.id === id);
-    if (!found && id === DEFAULT_ACCOUNT_ID) {
-      found = { id: DEFAULT_ACCOUNT_ID, kind: 'default', createdAt: new Date(now).toISOString() };
-      this.accounts.push(found);
+  rowsWithLegacyLimits(): AccountMeta[] {
+    return this.accounts
+      .filter((a) => a.limitedUntil && Object.keys(a.limitedUntil).length)
+      .map((a) => ({ ...a }));
+  }
+
+  /**
+   * Forget the per-row walls: the field goes from every row, and the reserved
+   * `default` row — a limits carrier, never a registration — goes entirely.
+   * Writes only when something changed.
+   */
+  dropLegacyLimits(): void {
+    let changed = false;
+    for (const row of this.accounts) {
+      if (row.limitedUntil) { delete row.limitedUntil; changed = true; }
     }
-    // An account nobody registered is not learned about; there is nowhere to
-    // put the answer and inventing a row would resurrect a deleted account.
-    if (!found) return;
-    const kept: Record<string, string> = {};
-    for (const [name, iso] of Object.entries(found.limitedUntil ?? {})) {
-      if (Date.parse(iso) > now.getTime()) kept[name] = iso;
-    }
-    kept[bucket] = resetsAt;
-    found.limitedUntil = kept;
-    this.persist();
+    const reserved = this.accounts.findIndex((a) => a.id === DEFAULT_ACCOUNT_ID);
+    if (reserved >= 0) { this.accounts.splice(reserved, 1); changed = true; }
+    if (changed) this.persist();
   }
 
   private persist(): void {
@@ -210,23 +216,23 @@ export class AccountStore {
       accounts: this.accounts,
       ...(this.machineName ? { defaultName: this.machineName } : {}),
     };
-    mkdirSync(ACCOUNTS_DIR, { recursive: true, mode: 0o700 });
-    backupIfNewer(REGISTRY_FILE, 'accounts.registry');
-    const tmp = `${REGISTRY_FILE}.tmp`;
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    backupIfNewer(this.file, 'accounts.registry');
+    const tmp = `${this.file}.tmp`;
     writeFileSync(tmp, `${JSON.stringify(body, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-    renameSync(tmp, REGISTRY_FILE);
+    renameSync(tmp, this.file);
   }
 }
 
 /**
  * Narrow a row read from disk — the `default` id in particular.
  *
- * A stored `default` row is legitimate and load-bearing: `markLimited` mints
- * one as a RESERVED limits carrier so the machine login remembers the walls it
- * learned the hard way across a restart, and `stored()` filters it back out of
- * everything that means "accounts the operator added". Dropping it on read —
- * the shape the finding proposed — would undo exactly that and put the machine
- * login back to rediscovering a five-hour window on every boot.
+ * A stored `default` row is a 4.1.0 artefact and still legitimate on the way
+ * in: the old `markLimited` minted one as a RESERVED limits carrier so the
+ * machine login remembered its walls across a restart. It is read here so the
+ * facade can fold those walls into the learned store, after which
+ * `dropLegacyLimits` removes it; `stored()` filters it out of everything that
+ * means "accounts the operator added" meanwhile.
  *
  * What must not survive the read is a `default` row claiming to be a
  * REGISTRATION. `add()` refuses to create one, but nothing stood between a
@@ -248,9 +254,9 @@ function asReadRow(meta: AccountMeta): AccountMeta {
 }
 
 /** An unreadable registry degrades to empty — same posture as the instance registry. */
-function readRegistry(): { accounts: AccountMeta[]; defaultName: string | undefined } {
+function readRegistry(file: string = REGISTRY_FILE): { accounts: AccountMeta[]; defaultName: string | undefined } {
   try {
-    const parsed = JSON.parse(readFileSync(REGISTRY_FILE, 'utf8')) as RegistryFile;
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as RegistryFile;
     // `>=`, not `===`. See `registry-file.ts` for why an exact match here is a
     // data-loss bug with our own next release as its fuse.
     if (versionOk(parsed, REGISTRY_VERSION) && Array.isArray(parsed.accounts)) {

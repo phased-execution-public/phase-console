@@ -27,6 +27,7 @@ type ResumeLost = { lost: string };
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
+import { capsFor, consoleEnded } from './session-record.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
   type PersistedEscalation,
@@ -50,22 +51,28 @@ import {
 } from './ladder.ts';
 import { checkouts } from './worktree.ts';
 import type { RungRecord } from './state.ts';
+import { manifestEcho } from './state.ts';
 import {
   childrenOf, endLockWait, loadRun, newRun, orphanAdvice, phaseRecord, procIdentity, retirePhaseHalt, runDir, saveRun, pidAlive, pidHoldsWork, IN_FLIGHT, SETTLED,
-  setPhaseState,
+  setPhaseState, setRunState,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords,
-  type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
+  type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type EndedBy, type Errand, type HaltKind,
   type McpDegradation, type RunArtefact, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RetryOverride,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary, clearWatchBookkeeping, isSessionGone,
+  chargeDeclaration, consumeDeclaration, prepareReboard, syncWaitClock, DECLARATION_REFUSED_EVENT,
+  type Actor,
 } from './state.ts';
-import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
+import { asActor, stoppedByOf, unattributedActor } from '../actor.ts';
+import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
 import {
-  AdmissionAborted, AdmissionCapped, autopilotOwner, isCappableBlocker,
+  AdmissionAborted, AdmissionCapped, LEARNED_WALL_BUCKET, SCHEDULE_HOLDER, autopilotOwner, isCappableBlocker,
   type Holder, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
+import type { LeaveReason, LeaveResult } from '../accounts/index.ts';
+import type { PortResult } from '../accounts/transcripts.ts';
 import { formatScope } from '../../shared/scope.js';
 import { ISOLATED, SETTLE_PUSHES, settleOf } from '../../shared/worktree-model.js';
 import { Journal } from './journal.ts';
@@ -77,8 +84,9 @@ import {
 } from './approvals.ts';
 import { dropMcpConfigsFor } from '../mcp/config.ts';
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, REPAIR_MAX_TURNS, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, declarationCooldownFor, declaredClock, ladderClassifies, RECOVER_MAX_PER_PHASE, REPAIR_MAX_TURNS, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MAX_OPEN_ASKS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameRelayNotice, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions, type ResumeVerdict, type VettedResume,
 } from './runner-core.ts';
+import { answeredByPhrase, type QuestionAnsweredBy } from '../../shared/relay-model.js';
 import type { Runner } from './runner.ts';
 import { RunnerBase } from './runner-base.ts';
 import type { QueueKind } from '../../shared/run-lifecycle.js';
@@ -158,9 +166,48 @@ export abstract class RunnerControl extends RunnerBase {
       accountId: options.accountId,
       onLimit: options.onLimit,
       autoRecover: options.autoRecover,
+      // The prelude's answers and the manifest it resolved (phase 11) — by
+      // hand, for the reason above.
+      resumeOnRestart: options.resumeOnRestart,
+      relay: options.relay,
+      accounts: options.accounts,
+      acknowledgedWaivers: options.acknowledgedWaivers,
+      manifest: options.manifest,
     });
 
+    // Who is starting this — read here because the two rules below turn on
+    // it (RCV-3): a PRESS is a person back in the loop; a door opened by a
+    // clock, a boot or an observation is the console talking to itself.
+    const actor: Actor = options.actor ?? unattributedActor('Runner.start');
+    const press = stoppedByOf(actor) === 'operator';
+
     if (state) {
+      // A run that stopped on its failure streak is relaunched by nobody but a
+      // person (RCV-3). The convergence loop's own relaunch used to be the
+      // thing that answered a `failure-streak` halt — the one run-level "this
+      // plan is broken, stop" bound — and it zeroed the counter on the way in:
+      // 25 resets against 3 such halts, a plan failing indefinitely two phases
+      // at a time. The planner now never proposes the relaunch (`converge.ts`
+      // `PRESS_ONLY_HALT_KINDS`); this is the belt beneath it, for the door
+      // that carries the loop's own word. Every other door — the healer's
+      // rungs, a watch landing, a recovery's continue — passes, streak intact.
+      const spent = state.halt?.kind === 'failure-streak'
+        || (state.maxConsecutiveFailures > 0 && state.consecutiveFailures >= state.maxConsecutiveFailures);
+      if (spent && !press && actor.door === 'converge-relaunch') {
+        this.journal = new Journal(state.root, state.slug, state.id);
+        this.record('run.relaunch-refused', {
+          reason: 'failure-streak',
+          consecutiveFailures: state.consecutiveFailures, max: state.maxConsecutiveFailures,
+          ...(state.halt ? { halt: state.halt.kind } : {}),
+          ...actor,
+        });
+        log.warn('runner.relaunch-refused', {
+          runId: state.id, slug: state.slug, door: actor.door, consecutiveFailures: state.consecutiveFailures,
+        });
+        this.journal = null;
+        this.state = null;
+        return state;
+      }
       // Resuming: the halt that stopped it has been seen, and anything left
       // mid-flight is reconciled before a new child is started.
       this.state.halt = null;
@@ -216,8 +263,14 @@ export abstract class RunnerControl extends RunnerBase {
       // same signal `park()` treats as clearing the slate. Carried across the
       // resume, a spent failure budget meant the continued run halted on its
       // first stumble, however long ago the failures it inherited were.
-      resumedStreak = this.state.consecutiveFailures;
-      this.state.consecutiveFailures = 0;
+      // ONLY a person's press, though (RCV-3): an automatic relaunch — the
+      // convergence loop, a watch landing, a boot re-adoption — carries the
+      // streak forward, because it is the loop reacting to the very failures
+      // the streak counts, and a reset there let a broken plan fail for ever.
+      if (press) {
+        resumedStreak = this.state.consecutiveFailures;
+        this.state.consecutiveFailures = 0;
+      }
       if (options.model) this.state.model = options.model;
       if (options.effort) this.state.effort = options.effort;
       if (options.autonomy) this.state.autonomy = options.autonomy;
@@ -398,19 +451,34 @@ export abstract class RunnerControl extends RunnerBase {
       : await checkAuth(this.state.root, true);
     let refusal = preflight(this.state.root) ?? (auth.loggedIn ? null : authRefusal(auth.detail));
     let tried: string[] = [];
+    let wall: 'auth' | 'quota' | null = auth.loggedIn ? null : 'auth';
     if (refusal && !auth.loggedIn) {
       // The auth wall's first rung, climbed before anyone is told: a signed-in
       // account that can pay takes the run. Only when none will does this
       // become the park it always was — now with the errand named on it.
-      const climbed = await this.switchAccountAtPreflight(auth.detail);
+      const climbed = await this.switchAccountAtPreflight('auth', auth.detail);
       tried = climbed.tried;
-      if (climbed.switched) refusal = null;
+      if (climbed.switched) { refusal = null; wall = null; }
+    }
+    // The QUOTA door, climbing beside the auth door instead of throwing above
+    // it (ACT-2). The service's verdict reads `liveBuckets`, the machine-wide
+    // walls and the breaker; a refusal walks `rankAccounts` for an account
+    // with headroom that also signs in, and only when none does is the run
+    // parked — a journalled state with ONE errand, never an exception a
+    // `log.warn` swallows on the nine automatic doors.
+    if (!refusal && this.deps.accountHeadroom) {
+      const quota = this.deps.accountHeadroom(this.state.accountId, this.state.model);
+      if (!quota.ok) {
+        const climbed = await this.switchAccountAtPreflight('quota', quota.reason);
+        tried = climbed.tried;
+        if (!climbed.switched) { refusal = quota.reason; wall = 'quota'; }
+      }
     }
     if (refusal) {
       this.state.status = 'parked';
       this.state.stoppedBy = 'system';
       this.state.halt = { at: new Date().toISOString(), reason: refusal, kind: 'run-preflight' };
-      if (!auth.loggedIn) {
+      if (wall === 'auth') {
         // The one ask, with what was already tried so nobody repeats it by
         // hand. `how` is the console's own sign-in sentence when it composed
         // one (it names the account and the exact command); the generic
@@ -424,17 +492,55 @@ export abstract class RunnerControl extends RunnerBase {
         };
         this.state.errand = errand;
         this.record('run.errand', { ...errand, reason: 'no signed-in account could take the run', by: 'runner' });
+      } else if (wall === 'quota') {
+        const paying = this.state.accountId ?? 'the machine login';
+        const base = errandFor('resource-wall:usage', tried, 0);
+        const errand: Errand = {
+          ...base,
+          need: `A Claude account with headroom for this run — it is set to pay as ${paying}: ${refusal}`,
+          how: 'Register or sign in another Claude account under Settings ▸ Accounts and switch the run to it, '
+            + 'clear a retired account there once its organisation allows it again, or wait for the window and Continue.',
+        };
+        this.state.errand = errand;
+        this.record('run.errand', { ...errand, reason: 'no account with headroom could take the run', by: 'runner' });
       }
-      this.record('run.preflight-refused', { reason: refusal, ...(tried.length ? { tried } : {}) });
+      this.record('run.preflight-refused', { reason: refusal, ...(wall ? { wall } : {}), ...(tried.length ? { tried } : {}) });
       this.persist();
       log.warn('runner.preflight', { root: this.state.root, reason: refusal });
       return this.state;
     }
 
+    // A resume past a credential wall re-boards what the wall stopped (RCV-1).
+    // The preflight above just proved the account can pay again — a person
+    // cleared it, or the run was switched to another — and a `parked` record
+    // is SETTLED to the drive loop, so without this Continue would find nothing
+    // to do and park the run on "outstanding". The reset is the console's
+    // (bounds and ledgers carried forward); the cause goes, because it is no
+    // longer true.
+    if (state) {
+      for (const record of Object.values(this.state.phases)) {
+        if (record.status !== 'parked' || record.cause?.kind !== 'credential-refused') continue;
+        const wall = record.cause;
+        resetForRetry(record, { by: 'console', journal: this.declarationSink() });
+        delete record.cause;
+        this.record('phase.retry-requested', {
+          by: 'console',
+          reason: `the credential wall this phase stopped on (${wall.class}: ${wall.reason}) no longer refuses `
+            + `${this.state.accountId ?? 'the machine login'} — re-boarding`,
+        }, record.phase);
+      }
+    }
+
     this.state.status = 'running';
     this.abort = new AbortController();
     this.stopRequested = false;
+    this.stopActor = null;
     this.settingsPath = this.armSettings(this.state.id);
+    // Who opened this start, from where, through which door — the actor as
+    // the site built it, every field (SLF-1: 324 of 326 lines carried no
+    // `by`). `unattributedActor` is the harness fallback and never a door's
+    // word; `test/invariants.test.ts` holds every `startRun(` site to naming
+    // one, so a production line reading `unattributed` is a defect to chase.
     this.record('run.start', {
       runId: this.state.id, slug: this.state.slug, model: this.state.model,
       autonomy: this.state.autonomy, resumed: Boolean(state),
@@ -443,14 +549,31 @@ export abstract class RunnerControl extends RunnerBase {
       account: this.state.accountId ?? 'default',
       ...(this.state.onLimit ? { onLimit: this.state.onLimit } : {}),
       ...(this.state.onlyPhases?.length ? { onlyPhases: this.state.onlyPhases } : {}),
+      // The manifest as the door resolved it (phase 11, ZTD-2/QRL-2): every
+      // row with its state and source, the probes, the accounts clause, the
+      // credentials held and missing, the delivery channel — so the line that
+      // says a run started also says what was answered before it did. Row
+      // values are cut to 200 characters; a row's evidence is the plan's.
+      ...(this.state.manifest ? { manifest: manifestEcho(this.state.manifest) } : {}),
+      ...(typeof this.state.resumeOnRestart === 'boolean' ? { resumeOnRestart: this.state.resumeOnRestart } : {}),
+      ...(this.state.relay ? { relay: this.state.relay } : {}),
+      ...actor,
     });
+    // The one recorded way past a blocking row (ZTD-2): who took it, over
+    // which rows. Written here and not in the Service because the journal did
+    // not exist a line ago.
+    if (!state && options.manifestOverride) {
+      this.record('run.manifest-override', {
+        rows: options.manifestOverride.rows, by: options.manifestOverride.by,
+      });
+    }
     // The journal only exists from a few lines up; `was` keeps the audit
     // trail the counter itself loses.
     if (resumedStreak) this.record('run.failure-streak-reset', { was: resumedStreak });
     this.persist();
 
     const runId = this.state.id;
-    onShutdown(this.shutdownKey(runId), () => this.checkpointForShutdown());
+    onShutdown(this.shutdownKey(runId), (context) => this.checkpointForShutdown(context));
     this.driving = this.drive().finally(() => {
       this.driving = null;
       offShutdown(this.shutdownKey(runId));
@@ -520,13 +643,29 @@ export abstract class RunnerControl extends RunnerBase {
    * board, the verification and `validate.sh` do not all agree about.
    */
   async recover(options: RecoverOptions): Promise<RunState> {
+    // The verb's own ledger (RCV-4): refused over the fingerprint the last
+    // recovery of this phase ran under — it cannot have changed anything — and
+    // bounded per phase. The service asks the same question with a live board
+    // before it reaches here (`preRecoveryGate` answers `unchanged`/`capped`);
+    // this is the belt for a caller that passed a fingerprint and no board.
+    const refusal = this.recoverRefusal(options);
+    if (refusal) return refusal;
+    const ledger = this.recoverLedgerFor(options);
     const armed = this.armRecovery({
       ...options,
       kind: 'run.recover',
-      payload: { mode: options.mode },
+      payload: { mode: options.mode, ...ledger },
     });
     if ('refused' in armed) return armed.refused;
-    const { state, haltedWith } = armed;
+    const { state, haltedWith, was } = armed;
+    // Charged once the recovery is genuinely armed — an orphan refusal above
+    // spends nothing — on the state the loop now holds, so `disarmRecovery`'s
+    // persist writes it.
+    const slot = (state.recoveries ??= {})[String(options.phase)] ??= { attempts: 0, lastAt: new Date().toISOString() };
+    slot.recovers = {
+      count: ledger.recovers, lastAt: new Date().toISOString(), lastFingerprint: ledger.fingerprint, lastMode: options.mode,
+    };
+    this.persist();
 
     // A `.catch` before the `.finally`, because `this.driving` is STORED, never
     // awaited: `recover()` returns `state` synchronously and the promise lives
@@ -534,7 +673,7 @@ export abstract class RunnerControl extends RunnerBase {
     // lock-wait cap being the measured one (R7) — was an unhandled rejection,
     // which node reports on stderr and the console never hears. A recovery that
     // could not run is a settled fact about the phase, so it is recorded as one.
-    this.driving = this.runRecovery({ ...options, haltedWith }).catch((error) => {
+    this.driving = this.runRecovery({ ...options, haltedWith, was }).catch((error) => {
       log.error('runner.recover.unhandled', { error });
       this.halt(
         `the recovery of phase ${options.phase} could not run: ${(error as Error)?.message ?? String(error)}`,
@@ -542,6 +681,34 @@ export abstract class RunnerControl extends RunnerBase {
       );
     }).finally(() => this.disarmRecovery(state));
     return state;
+  }
+
+  /**
+   * The recover verb refused — over unchanged evidence, or past the per-phase
+   * cap — as a journalled state on the stored run, or null to proceed.
+   */
+  private recoverRefusal(options: RecoverOptions): RunState | null {
+    const state = loadRun(options.root, options.slug, options.runId, null);
+    const ledger = state?.recoveries?.[String(options.phase)]?.recovers;
+    if (!state || !ledger) return null;
+    const why = ledger.count >= RECOVER_MAX_PER_PHASE
+      ? 'capped'
+      : options.fingerprint && ledger.lastFingerprint === options.fingerprint ? 'unchanged' : null;
+    if (!why) return null;
+    new Journal(state.root, state.slug, state.id).append('run.recover.refused', {
+      phase: options.phase, why, mode: options.mode, by: options.by ?? 'console',
+      recovers: ledger.count, max: RECOVER_MAX_PER_PHASE, since: ledger.lastAt,
+      ...(options.fingerprint ? { fingerprint: options.fingerprint.slice(0, 200) } : {}),
+    }, options.phase);
+    log.warn('runner.recover.refused', { runId: state.id, slug: state.slug, phase: options.phase, why, recovers: ledger.count });
+    return state;
+  }
+
+  /** The fields `run.recover` carries — this recovery's count against the cap, and the evidence it ran under. */
+  private recoverLedgerFor(options: RecoverOptions): { fingerprint: string | null; recovers: number; max: number } {
+    const state = loadRun(options.root, options.slug, options.runId, null);
+    const count = (state?.recoveries?.[String(options.phase)]?.recovers?.count ?? 0) + 1;
+    return { fingerprint: options.fingerprint ?? null, recovers: count, max: RECOVER_MAX_PER_PHASE };
   }
 
   /**
@@ -565,7 +732,7 @@ export abstract class RunnerControl extends RunnerBase {
     slug: string; root: string; runId: string; phase: number; by?: string;
     /** The journal line this arming writes, and what rides on it. */
     kind: string; payload?: Record<string, unknown>;
-  }): { state: RunState; haltedWith: string | null } | { refused: RunState } {
+  }): { state: RunState; haltedWith: string | null; was: { status: RunState['status']; finishedReason?: string } } | { refused: RunState } {
     if (this.driving) throw new Error('A run is already in progress. Pause or stop it first.');
 
     const state = loadRun(options.root, options.slug, options.runId, null);
@@ -596,6 +763,11 @@ export abstract class RunnerControl extends RunnerBase {
     // Only this phase's own halt explains anything here: a stop recorded
     // against another phase is not this recovery's story.
     const haltedWith = state.halt?.phase === options.phase ? state.halt.reason : null;
+    // What the run READ before this recovery flipped it, so a recheck that
+    // changes nothing can put it back exactly (RCV-4): `park()` writes both
+    // `state.halt` and `parked`, and mapping the return through the halt alone
+    // sent a parked run back as `halted`.
+    const was = { status: state.status, ...(state.finishedReason ? { finishedReason: state.finishedReason } : {}) };
     // The halt is NOT cleared here. It used to be — "a run being worked on
     // must not go on looking stopped" — and the cost was worse than the look:
     // a recovery that crashed re-halted with a generic message and the
@@ -613,6 +785,7 @@ export abstract class RunnerControl extends RunnerBase {
     this.transcript = new Transcript(state.root, state.slug, state.id);
     this.abort = new AbortController();
     this.stopRequested = false;
+    this.stopActor = null;
     this.settingsPath = this.armSettings(state.id);
     this.record(
       options.kind,
@@ -626,9 +799,9 @@ export abstract class RunnerControl extends RunnerBase {
     // for the whole of that. The `finally` emit below still reports the end.
     this.emit('run', { state });
 
-    onShutdown(this.shutdownKey(state.id), () => this.checkpointForShutdown());
+    onShutdown(this.shutdownKey(state.id), (context) => this.checkpointForShutdown(context));
     this.recovering = true;
-    return { state, haltedWith };
+    return { state, haltedWith, was };
   }
 
   /** The other half of `armRecovery` — every caller's `.finally`, said once. */
@@ -642,7 +815,9 @@ export abstract class RunnerControl extends RunnerBase {
     this.emit('run', { state });
   }
 
-  private async runRecovery(options: RecoverOptions & { haltedWith?: string | null }): Promise<void> {
+  private async runRecovery(
+    options: RecoverOptions & { haltedWith?: string | null; was?: { status: RunState['status']; finishedReason?: string } },
+  ): Promise<void> {
     const state = this.state!;
     const record = phaseRecord(state, options.phase);
     const owner = autopilotOwner(state.id);
@@ -752,14 +927,46 @@ export abstract class RunnerControl extends RunnerBase {
         return;
       }
 
-      const ok = await this.confirmed(options.phase);
+      // A recheck re-runs the three checks and spawns nothing, so it is never a
+      // failed ATTEMPT and never a new ENDING when it finds the same one (RCV-4:
+      // 16 of 127 recoveries re-halted within seconds having changed nothing,
+      // each re-writing `phase.halted` with a fresh clock and charging the
+      // streak). While `rechecking` names the phase, `settlePhase`/`halt` keep an
+      // identical standing halt untouched and the paperwork charges skip; the
+      // verdict is one `run.recheck` line.
+      const before = { run: state.halt?.kind ?? null, phase: record.halt?.kind ?? null, at: record.halt?.at ?? state.halt?.at ?? null };
+      if (options.mode === 'recheck') this.rechecking = options.phase;
+      let ok: boolean;
+      try {
+        ok = await this.confirmed(options.phase);
+      } finally {
+        this.rechecking = null;
+      }
+      if (options.mode === 'recheck') {
+        const after = { run: state.halt?.kind ?? null, phase: record.halt?.kind ?? null, at: record.halt?.at ?? state.halt?.at ?? null };
+        const unchanged = !ok && after.run === before.run && after.phase === before.phase && after.at === before.at;
+        const verdict = ok ? (record.status === 'done' ? 'confirmed' : 'changed') : unchanged ? 'unchanged' : 'changed';
+        this.record('run.recheck', {
+          phase: options.phase, verdict,
+          ...(options.fingerprint ? { fingerprint: options.fingerprint.slice(0, 200) } : {}),
+          ...(after.phase || after.run ? { halt: { kind: after.phase ?? after.run, reason: (record.halt?.reason ?? state.halt?.reason ?? '').slice(0, 200) } } : {}),
+        }, options.phase);
+        if (unchanged && options.was) {
+          // Exactly what it read before — the status word included, and the
+          // sentence the card showed.
+          state.status = options.was.status;
+          if (options.was.finishedReason) state.finishedReason = options.was.finishedReason;
+          else delete state.finishedReason;
+          return;
+        }
+      }
       if (!ok) {
         // confirm() halted (or re-halted) and said why — at the PHASE when the
         // ending was phase-level, which writes no run status. `armRecovery`
         // flipped the run to `running`; left there it reads as still driving.
         if (state.status === 'running') {
           state.status = state.halt ? 'halted' : 'parked';
-          state.finishedReason ??= record.halt?.reason ?? `phase ${options.phase} did not confirm`;
+          state.finishedReason ??= record.halt?.reason ?? state.halt?.reason ?? `phase ${options.phase} did not confirm`;
         }
         return;
       }
@@ -770,6 +977,11 @@ export abstract class RunnerControl extends RunnerBase {
       state.halt = null;
       state.resolved = null;
       state.reopenedAt = null;
+      // …and the streak (RCV-3): a phase confirmed done breaks "N in a row" by
+      // definition — the attempt loop resets on the same fact — and it is what
+      // lets `recovery-continue` relaunch a run the healer just mended, now
+      // that an automatic relaunch of a SPENT streak is refused.
+      state.consecutiveFailures = 0;
       // …and the PHASE's own ending, which since the halt-kind split is where a
       // `verify-failed`/`no-handoff`/`phase-blocked` recovery's subject actually
       // lives. Left standing it would out-rank `state.halt` in the classifier
@@ -780,9 +992,8 @@ export abstract class RunnerControl extends RunnerBase {
         // The recovery session declared waiting-external instead of closing —
         // the honest outcome for a phase whose external clock has not landed.
         // The run waits with the phase; the service re-arms the resume.
-        state.status = 'waiting';
         state.waitUntil = record.parkedUntil ?? null;
-        state.waitReason = 'external';
+        setRunState(state, 'waiting', { kind: 'external', until: state.waitUntil });
         state.finishedReason = `phase ${options.phase} is waiting on external work`
           + `${record.parkReason ? ` (${record.parkReason})` : ''}; resumes at ${record.parkedUntil}.`;
         this.record('run.waiting-external', {
@@ -927,7 +1138,6 @@ export abstract class RunnerControl extends RunnerBase {
       // whole of that phase (seen live — phase 4 driving, run reading
       // `queued` because phases 5–6 sat behind its scope). The queued LANE
       // is already honest in `record.status` and the tabs.
-      if (!this.livePhases().length) state.status = 'queued';
       // The HEAD blocker's kind and, when it can be known, when it should end.
       // Two different waits look identical in `phase.queued` without them — a
       // sibling lane pipelining (`grant`, ends when it finishes) and a dead
@@ -935,6 +1145,17 @@ export abstract class RunnerControl extends RunnerBase {
       // opposites. `eta` is the head lock's lease; a grant has no deadline to
       // report yet, and inventing one would be worse than saying nothing.
       const head: Holder | undefined = blockers[0];
+      // Through the named writer, with the reason: `scope` unless the head
+      // holder is the operator's boarding schedule. Both are spelled `queued`
+      // and the recorded reason is the only thing that tells them apart —
+      // `schedule` had no production writer at all (LFC-5).
+      if (!this.livePhases().length) {
+        setRunState(state, 'queued', {
+          kind: head?.slug === SCHEDULE_HOLDER ? 'schedule' : 'scope',
+          until: head?.leaseUntil ? new Date(head.leaseUntil).toISOString() : null,
+          ...(head ? { on: head.phase == null ? head.slug : `${head.slug} phase ${head.phase}` } : {}),
+        });
+      }
       this.record('phase.queued', {
         scope: formatScope(scope),
         ...(head ? { headKind: head.kind } : {}),
@@ -1176,19 +1397,54 @@ export abstract class RunnerControl extends RunnerBase {
     // exhausted on Opus still takes this phase when it runs on Sonnet.
     const next = this.deps.pickAccount?.(from, model ?? record.model ?? state.model);
     if (!next || next === (from ?? 'default')) return false;
-    let ported = false;
+    let port: PortResult | null = null;
     if (record.sessionId) {
-      ported = this.deps.portTranscript?.(record.sessionId, record.sessionAccountId, next) ?? false;
-      if (ported) {
+      port = this.deps.portTranscript?.(record.sessionId, record.sessionAccountId, next) ?? null;
+      if (port?.findable) {
         if (next === 'default') delete record.sessionAccountId;
         else record.sessionAccountId = next;
       }
     }
-    this.record('phase.account-switch', { from: from ?? 'default', to: next, ported, reason }, phase);
+    // `ported` is BYTES MOVED; `findable` is what the resume relies on. A
+    // same-directory switch (the machine login → a token) reads
+    // `ported: false, why: 'nothing to carry'` and still resumes (ACT-12).
+    this.record('phase.account-switch', {
+      from: from ?? 'default', to: next, reason,
+      ported: port?.ported ?? false, findable: port?.findable ?? false, why: port?.why ?? null,
+      cliVersion: port?.cliVersion ?? null,
+    }, phase);
     this.emit('phase', { phase, status: 'running', accountSwitch: { from: from ?? 'default', to: next } });
     if (next === 'default') delete state.accountId;
     else state.accountId = next;
     return true;
+  }
+
+  /**
+   * A run is leaving `accountId` (the run's own account unless named) — the
+   * ONE runner door onto `accounts.leaveAccount` (ACT-5, SES-2): the account
+   * is marked machine-wide BEFORE any switch, the scheduler holds it for what
+   * the answer says, and the departure is journalled as the account's fact
+   * (`run.account-cooling` for a window, `run.account-retired` for a
+   * refusal; a person's switch has `run.account-switch` already). Every
+   * `trySwitchAccount` is paired with a call to this — `test/invariants.test.ts`
+   * holds the pair — because the live wall once switched without marking, and
+   * the picker sent the run straight back.
+   */
+  protected leaveAccount(phase: number | undefined, leaving: LeaveReason, accountId = this.state?.accountId): LeaveResult | null {
+    const result = this.deps.leaveAccount?.(accountId, leaving) ?? null;
+    if (!result) return null;
+    if (result.throttleUntilMs) {
+      this.deps.scheduler?.throttle(result.throttleUntilMs, result.accountId, result.wall?.bucket ?? LEARNED_WALL_BUCKET);
+    }
+    if (leaving.kind !== 'operator') {
+      this.record(leaving.kind === 'credential' ? 'run.account-retired' : 'run.account-cooling', {
+        id: result.accountId, orgId: result.orgIdHash ?? null, reason: leaving.reason, by: leaving.by,
+        state: result.state, until: result.until ?? null, wall: result.wall ?? null,
+        ...(leaving.class ? { class: leaving.class } : {}),
+        ...(leaving.bucket ? { bucket: leaving.bucket } : {}),
+      }, phase);
+    }
+    return result;
   }
 
   /** Is the recorded session's transcript where the CURRENT account will look? */
@@ -1197,26 +1453,81 @@ export abstract class RunnerControl extends RunnerBase {
   }
 
   /**
-   * The session id `--resume` can actually reach under the run's account, or
-   * undefined. The transcript lives in the config dir of the account that
-   * WROTE it; under a different one it is carried over first, and when it
-   * cannot be, a self-contained boot beats a resume that finds nothing.
+   * May THIS session be handed to `--resume`, under the run's account, now?
    *
-   * ONE check for every `--resume` this runner spawns. It lived on the drive
-   * loop's boarding alone, so the healer's `resumeWithInstruction` and the
-   * QA round's resume asked nothing and found nothing: three runs spent a
-   * rung every two minutes on `No conversation found with session ID`.
+   * ONE check for every `--resume` this runner spawns — and since
+   * zero-touch-console phase 5 the only thing that can mint the `VettedResume`
+   * the spawn door takes, so a site that skips it does not compile. It once
+   * lived on the drive loop's boarding alone, so the healer's resume and the QA
+   * round asked nothing (three runs spent a rung every two minutes on `No
+   * conversation found`); then the boarding, the closeout and the PR session
+   * each kept a copy of half of it (SLF-10).
+   *
+   * Three questions, in the order that matters:
+   *  1. Is it stamped gone? A resume the CLI already refused is never offered
+   *     again — journalled `phase.resume-lost` once per session, wherever the
+   *     stamp is met.
+   *  2. Is it still RUNNING? The registry's presence (REG-1): `live` is refused
+   *     and recorded (`phase.resume-refused`, announced once) — resuming it
+   *     would put a second `claude` on its transcript in its working tree.
+   *     `unknown` proceeds: the boarding's own lock claim is the lease rule.
+   *  3. Is its transcript where the paying account looks? Carried over when it
+   *     can be; when it cannot, a self-contained boot beats a resume that finds
+   *     nothing.
    */
-  protected resumableSession(record: PhaseRecord, sessionId: string | undefined): string | undefined {
-    if (!sessionId) return undefined;
-    if (isSessionGone(record, sessionId)) return undefined;
+  protected resumableSession(record: PhaseRecord, sessionId: string | undefined): ResumeVerdict {
+    if (!sessionId) return { ok: false, why: 'none' };
+    if (isSessionGone(record, sessionId)) {
+      this.noteGoneResume(record, sessionId);
+      return { ok: false, why: 'gone', sessionId };
+    }
+    const seen = this.deps.sessionPresence?.(sessionId) ?? { presence: 'unknown' as const };
+    if (seen.presence === 'live') {
+      this.refuseLiveResume(record, sessionId, seen.pid);
+      return { ok: false, why: 'session-live', sessionId, ...(seen.pid ? { pid: seen.pid } : {}) };
+    }
     const state = this.state!;
-    if (this.transcriptFollows(record)) return sessionId;
-    const ported = this.deps.portTranscript?.(sessionId, record.sessionAccountId, state.accountId) ?? false;
-    this.record('phase.transcript-port', {
-      sessionId, from: record.sessionAccountId ?? 'default', to: state.accountId ?? 'default', ported,
+    if (!this.transcriptFollows(record)) {
+      const port = this.deps.portTranscript?.(sessionId, record.sessionAccountId, state.accountId) ?? null;
+      this.record('phase.transcript-port', {
+        sessionId, from: record.sessionAccountId ?? 'default', to: state.accountId ?? 'default',
+        ported: port?.ported ?? false, findable: port?.findable ?? false, why: port?.why ?? null,
+        cliVersion: port?.cliVersion ?? null,
+      }, record.phase);
+      if (!port?.findable) return { ok: false, why: 'unported', sessionId };
+    }
+    if (record.resumeRefused?.sessionId === sessionId) delete record.resumeRefused;
+    return { ok: true, resume: { sessionId, presence: seen.presence } as VettedResume };
+  }
+
+  /** The sessions this runner already journalled `phase.resume-lost` for, by `phase:session`. */
+  private readonly lostJournalled = new Set<string>();
+
+  /**
+   * A resume that met a session already stamped gone: journalled `phase.resume-lost`
+   * once per session, wherever it is met (SLF-10) — the record already says it,
+   * and the journal said nothing when the stamp was met a second time.
+   */
+  protected noteGoneResume(record: PhaseRecord, sessionId: string): void {
+    const key = `${record.phase}:${sessionId}`;
+    if (this.lostJournalled.has(key)) return;
+    this.lostJournalled.add(key);
+    this.record('phase.resume-lost', {
+      sessionId, account: this.state?.accountId ?? 'default',
+      reason: `already marked gone (${record.sessionGone?.reason ?? 'no reason recorded'}) — not offered to --resume again`,
     }, record.phase);
-    return ported ? sessionId : undefined;
+  }
+
+  /**
+   * A resume refused because its session is still running: on the record (the
+   * page shows it), on the journal, and announced — once per session, however
+   * many boardings meet it (REG-1).
+   */
+  private refuseLiveResume(record: PhaseRecord, sessionId: string, pid: number | undefined): void {
+    if (record.resumeRefused?.sessionId === sessionId) return;
+    this.noteResumeRefused(record.phase, {
+      sessionId, why: 'session-live', by: 'runner', ...(pid ? { pid } : {}),
+    });
   }
 
   /**
@@ -1236,11 +1547,7 @@ export abstract class RunnerControl extends RunnerBase {
     this.record('phase.resume-lost', {
       sessionId, account: state.accountId ?? 'default', reason,
     }, record.phase);
-    const slot = state.recoveries?.[String(record.phase)];
-    if (slot) {
-      settleRung(slot, 'failed', undefined,
-        `session ${sessionId} cannot be resumed under this account — ${reason}`);
-    }
+    this.settleOpenRung(record.phase, 'failed', `session ${sessionId} cannot be resumed under this account — ${reason}`);
     this.persist();
   }
 
@@ -1253,7 +1560,7 @@ export abstract class RunnerControl extends RunnerBase {
    * impossible without the account-aware probe (the legacy one answers only
    * for the machine login).
    */
-  private async switchAccountAtPreflight(detail?: string): Promise<{ switched: boolean; tried: string[] }> {
+  private async switchAccountAtPreflight(reason: 'auth' | 'quota', detail?: string): Promise<{ switched: boolean; tried: string[] }> {
     const state = this.state!;
     const tried: string[] = [];
     if (this.deps.autoAccountSwitch?.() === false || !this.deps.checkAuth) return { switched: false, tried };
@@ -1262,10 +1569,27 @@ export abstract class RunnerControl extends RunnerBase {
       ?? [this.deps.pickAccount?.(from, state.model)].filter((id): id is string => Boolean(id));
     for (const next of ranked) {
       if (next === (from ?? 'default')) continue;
+      // Both doors, in the cheap order: the quota verdict is a cache read, the
+      // login probe is a process. A candidate with no headroom is never probed.
+      const quota = this.deps.accountHeadroom?.(next === 'default' ? undefined : next, state.model);
+      if (quota && !quota.ok) { tried.push(`switch-account → ${next}: ${quota.reason}`); continue; }
       const probe = await this.deps.checkAuth(next === 'default' ? undefined : next);
       if (!probe.loggedIn) { tried.push(`switch-account → ${next}: not signed in`); continue; }
+      if (reason === 'quota') {
+        // The wall the run is walking away from, written before the walk —
+        // the same rule as every mid-run mover: a retired account stays
+        // retired, a spent window is a wall until its reset.
+        const verdict = this.deps.accountHeadroom?.(from, state.model);
+        const resetsAt = verdict && !verdict.ok && verdict.resetsAt ? new Date(verdict.resetsAt) : null;
+        if (!(verdict && !verdict.ok && verdict.kind === 'retired')) {
+          this.leaveAccount(undefined, {
+            kind: 'usage', reason: detail ?? 'no headroom at preflight', by: 'preflight',
+            ...(resetsAt ? { bucket: 'five_hour', resetsAt } : {}),
+          }, from);
+        }
+      }
       this.record('run.account-switched', {
-        from: from ?? 'default', to: next, at: 'preflight', reason: 'auth',
+        from: from ?? 'default', to: next, at: 'preflight', reason,
         detail: detail ?? null, tried,
       });
       if (next === 'default') delete state.accountId;
@@ -1320,7 +1644,7 @@ export abstract class RunnerControl extends RunnerBase {
       // this path writes `paused`.
       state.stoppedBy = 'system';
       state.waitUntil = at.toISOString();
-      state.waitReason = 'usage-limit';
+      setRunState(state, 'paused', { kind: 'usage-limit', until: state.waitUntil });
       state.finishedReason = `usage limit — resets ${at.toLocaleString()}. `
         + 'Continue now under another account, or wait for the window.';
       if (opts.errand) {
@@ -1333,9 +1657,8 @@ export abstract class RunnerControl extends RunnerBase {
       return 'stop';
     }
 
-    state.status = 'waiting';
     state.waitUntil = at.toISOString();
-    state.waitReason = 'usage-limit';
+    setRunState(state, 'waiting', { kind: 'usage-limit', until: state.waitUntil });
     if (opts.errand) {
       state.errand = opts.errand;
       this.record('run.errand', { ...opts.errand, reason, by: 'runner' });
@@ -1580,11 +1903,7 @@ export abstract class RunnerControl extends RunnerBase {
       // `interrupted` is exempt), so leaving it open would spend this remedy on
       // the freeze itself and send the thaw's converge to the NEXT, more
       // expensive rung — the opposite of what the comment above promises.
-      const slot = state.recoveries?.[String(phase)];
-      if (slot) {
-        settleRung(slot, 'interrupted', undefined,
-          `the console was frozen${frozen.by ? ` by ${frozen.by}` : ''}, so this rung never ran`);
-      }
+      this.settleOpenRung(phase, 'interrupted', `the console was frozen${frozen.by ? ` by ${frozen.by}` : ''}, so this rung never ran`);
       const why = `the repair of phase ${phase} did not start: the console is frozen`
         + `${frozen.by ? ` by ${frozen.by}` : ''}. It is climbed again after the thaw.`;
       this.record('phase.repair-skipped', { reason: why, frozen: true }, phase);
@@ -1597,7 +1916,6 @@ export abstract class RunnerControl extends RunnerBase {
       return;
     }
 
-    const spawn = this.deps.spawn ?? spawnClaude;
     // The phase IS running again, and nothing else says so — the same gap the
     // resume path had. `startedAt` is left alone when the phase already has
     // one; `attemptStartedAt` moves, because `takeOutcome`'s staleness floor is
@@ -1617,7 +1935,7 @@ export abstract class RunnerControl extends RunnerBase {
     const artefactsBefore = await this.artefactScan(phase);
     let outcome;
     try {
-      outcome = await spawn({
+      outcome = await this.spawnSession(phase, 'repair', {
         prompt: brief,
         // The tree the phase worked in — its lane when it had one, the run's
         // own checkout otherwise. NEVER the console's root.
@@ -1626,11 +1944,6 @@ export abstract class RunnerControl extends RunnerBase {
         model: record.model ?? state.model,
         effort: record.effort ?? state.effort,
         name: `${state.slug} p${phase} repair`,
-        // A repair is a bounded errand: a quarter of the phase budget and its
-        // own turn cap, so a session that misreads the ask and starts building
-        // runs out rather than running on.
-        budgetUsd: state.phaseBudgetUsd === null ? null : Math.max(1, state.phaseBudgetUsd / 4),
-        maxTurns: REPAIR_MAX_TURNS,
         settings: this.settingsPath ?? undefined,
         permissionProfile: this.profile(),
         partialMessages: this.deps.stream?.partialMessages ?? true,
@@ -1653,6 +1966,11 @@ export abstract class RunnerControl extends RunnerBase {
           this.emit('run', { state });
         },
         onEvent: (event) => this.onStream(phase, event),
+      }, {
+        // A repair is a bounded errand: a quarter of the phase's dollars and
+        // its own turn cap, so a session that misreads the ask and starts
+        // building runs out rather than running on.
+        caps: capsFor({ mode: 'repair', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
       // A rung whose session could not START never ran, so it is settled
@@ -1675,17 +1993,8 @@ export abstract class RunnerControl extends RunnerBase {
     // session's sign-off is what explains why the phase stopped, and a repair's
     // "I could not" overwriting it is the same defect the closeout path fixed.
     const said = outcome.resultText ? outcome.resultText.replace(/\s+/g, ' ').slice(0, 1_200) : undefined;
-
-    // The SAME line every other session writes, so the timeline counts this
-    // spend and the spend panels see it without knowing repairs exist —
-    // `mode: 'repair'` is what tells the two apart, and `argv` is the record
-    // that this was a `claude -p` under the run's settings rather than a pty.
-    this.record('phase.session', {
-      mode: 'repair', model: record.model ?? state.model, effort: record.effort ?? state.effort ?? null,
-      costUsd: outcome.costUsd, turns: outcome.turns,
-      subtype: outcome.signal?.subtype, ms: outcome.durationMs, argv: outcome.argv,
-      ...(said ? { said } : {}),
-    }, phase);
+    // The SAME `phase.session` every other session writes — `mode: 'repair'`
+    // tells the two apart — was written by `spawnSession` as the child exited.
 
     const declared = this.takeOutcome(phase);
     this.record('phase.repair-done', {
@@ -1703,19 +2012,17 @@ export abstract class RunnerControl extends RunnerBase {
     // climbed the next, more expensive rung. `attempt()` has asked this since
     // the loop was written; `repairSession` asked on no exit at all.
     if (this.stopRequested || this.abort?.signal.aborted) {
-      const slot = state.recoveries?.[String(phase)];
-      if (slot) {
-        settleRung(slot, 'interrupted', undefined,
-          this.shuttingDown ? 'the console stopped while this rung was running' : 'the operator stopped this rung');
-      }
+      this.settleOpenRung(phase, 'interrupted',
+        this.shuttingDown ? 'the console stopped while this rung was running' : 'the operator stopped this rung');
       record.status = 'interrupted';
       record.endedAt = new Date().toISOString();
       if (this.shuttingDown) {
         record.note = consoleStoppedNote(phase);
         state.stoppedBy = 'system';
       } else {
-        record.note = 'stopped by the operator';
-        state.stoppedBy = 'operator';
+        const stamp = this.stopStamp();
+        record.note = stamp.note;
+        state.stoppedBy = stamp.stoppedBy;
       }
       // 🔴 UNGUARDED, unlike every other ending in this method, and that is the
       // point. `RUN_ALREADY_ENDED` means "somebody with more authority already
@@ -1790,9 +2097,8 @@ export abstract class RunnerControl extends RunnerBase {
       // will later read as deliberate.
       if (RUN_ALREADY_ENDED.includes(state.status)) return;
       if (record.parkedUntil) {
-        state.status = 'waiting';
         state.waitUntil = record.parkedUntil;
-        state.waitReason = 'external';
+        setRunState(state, 'waiting', { kind: 'external', until: state.waitUntil });
         state.finishedReason = `phase ${phase} is waiting on external work`
           + `${record.parkReason ? ` (${record.parkReason})` : ''}; resumes at ${record.parkedUntil}.`;
         this.record('run.waiting-external', {
@@ -1848,8 +2154,7 @@ export abstract class RunnerControl extends RunnerBase {
   private endRepair(phase: number, reason: string, outcome: 'interrupted' | 'failed'): void {
     const state = this.state!;
     const record = phaseRecord(state, phase);
-    const slot = state.recoveries?.[String(phase)];
-    if (slot) settleRung(slot, outcome, undefined, reason);
+    this.settleOpenRung(phase, outcome, reason);
     this.settleRepairRecord(record, 'no-defect');
     // The run's OWN ending first, then the halt. `halt()` emits a `run` frame
     // of its own, and with the status written afterwards that frame carried
@@ -1897,15 +2202,23 @@ export abstract class RunnerControl extends RunnerBase {
       return `phase ${phase} has no session left to resume — retry it instead, or close it by hand`;
     }
     // Before the record is flipped to `running`: can `--resume` reach this
-    // conversation under the account paying? A transcript that cannot be
-    // carried over is a resume that will fail in three seconds, and the
-    // ladder's next rung — a fresh session — is the answer, not a spawn.
-    if (!this.resumableSession(record, sessionId)) {
-      this.markSessionGone(record, sessionId, 'its transcript is not under the account this run pays with');
+    // conversation under the account paying, and is the session not still
+    // running? A transcript that cannot be carried over is a resume that will
+    // fail in three seconds, and the ladder's next rung — a fresh session — is
+    // the answer, not a spawn. A session still RUNNING is a refusal with a
+    // reason, never a lost session: nothing is wrong with it (REG-1).
+    const gate = this.resumableSession(record, sessionId);
+    if (!gate.ok) {
+      if (gate.why === 'session-live') {
+        return `phase ${phase}'s session ${sessionId} is still running${gate.pid ? ` (pid ${gate.pid})` : ''} — `
+          + 'the console will not resume a session on top of itself; this is tried again once it ends';
+      }
+      if (gate.why === 'unported') {
+        this.markSessionGone(record, sessionId, 'its transcript is not under the account this run pays with');
+      }
       return { lost: sessionId };
     }
 
-    const spawn = this.deps.spawn ?? spawnClaude;
     const board = await this.board();
     // The operator's words first — they are the newest fact and the reason this
     // resume exists — then what the phase already knows went wrong, then the
@@ -1937,7 +2250,8 @@ export abstract class RunnerControl extends RunnerBase {
 
     let outcome;
     try {
-      outcome = await spawn({
+      outcome = await this.spawnSession(phase, 'resume', {
+        resumeFrom: gate.resume,
         prompt,
         // The tree the phase worked in — its lane when it had one. Resuming a
         // lane session in the shared root hands it a checkout without its own
@@ -1949,9 +2263,6 @@ export abstract class RunnerControl extends RunnerBase {
         model: record.model ?? state.model,
         effort: record.effort ?? state.effort,
         name: `${state.slug} p${phase} recover`,
-        resume: sessionId,
-        budgetUsd: state.phaseBudgetUsd,
-        maxTurns: CLOSEOUT_MAX_TURNS,
         settings: this.settingsPath ?? undefined,
         permissionProfile: this.profile(),
         partialMessages: this.deps.stream?.partialMessages ?? true,
@@ -1988,6 +2299,10 @@ export abstract class RunnerControl extends RunnerBase {
           this.emit('run', { state });
         },
         onEvent: (event) => this.onStream(phase, event),
+      }, {
+        // The phase's own session carrying on with an instruction: the phase's
+        // whole dollar budget, a closeout's turns — it is finishing, not starting.
+        caps: capsFor({ mode: 'resume', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } finally {
       this.attachPid(phase, null);
@@ -2017,9 +2332,15 @@ export abstract class RunnerControl extends RunnerBase {
     {
       const slot = state.recoveries?.[String(record.phase)];
       const open = slot?.rungs ? [...slot.rungs].reverse().find((r) => r.outcome === 'running' || r.outcome == null) : null;
-      if (open) open.turns = (open.turns ?? 0) + outcome.turns;
-      if (slot && this.abort?.signal.aborted && !outcome.turns) {
-        settleRung(slot, 'interrupted', undefined, 'the console stopped while this rung was climbing');
+      if (open) {
+        open.turns = (open.turns ?? 0) + outcome.turns;
+        if (outcome.endedBy) open.endedBy = outcome.endedBy;
+      }
+      // Cut off by the console — a shutdown, an operator's stop — rather than
+      // ended by its own work. Zero turns used to be the only witness for that;
+      // with interrupted turns booked honestly, the ending itself is.
+      if (slot && this.abort?.signal.aborted && (!outcome.turns || consoleEnded(outcome.endedBy))) {
+        this.settleOpenRung(record.phase, 'interrupted', 'the console stopped while this rung was climbing');
       }
     }
     record.turns = (record.turns ?? 0) + outcome.turns;
@@ -2048,7 +2369,13 @@ export abstract class RunnerControl extends RunnerBase {
       return null;
     }
     try {
-      const token = approvals.arm(runId);
+      // The token this run already holds, when it holds one — adopted at boot
+      // from a child that outlived the last console (TRS-11) — and a fresh one
+      // only when it does not. A re-mint under a surviving child makes its
+      // next hook call unauthorised, and this hook fails open. Asked as an
+      // optional call: a broker shape without `liveToken` (an older harness)
+      // must still arm, never lose the settings file.
+      const token = approvals.liveToken?.(runId) ?? approvals.arm(runId);
       const path = this.writeSettings(runId, token, origin);
       this.record('run.settings', { path, profile: this.profile() });
       return path;
@@ -2071,7 +2398,21 @@ export abstract class RunnerControl extends RunnerBase {
       policy: loadPolicyFor(this.state?.slug ?? null),
       profile: this.profile(),
       openPrCarveOut: this.openPrCarveOut(),
+      // The relay's `PermissionRequest` hook rides only an ARMED run (phase
+      // 14): `--permission-prompts none` does not switch the hook off, so a run
+      // on the floor must simply not register one.
+      relay: this.state?.relayArming?.armed === true,
     }));
+  }
+
+  /**
+   * The relay armed or disarmed for this run (phase 14, `noteRelayArming`): the
+   * settings file rewritten with the same token, so the NEXT child loads the
+   * `PermissionRequest` hook or goes without it. The running one keeps what it
+   * loaded — which is why arming is decided at the spawn door, before it.
+   */
+  protected rearmRelay(_armed: boolean): void {
+    this.rearmSettings();
   }
 
   /**
@@ -2290,14 +2631,23 @@ export abstract class RunnerControl extends RunnerBase {
       phases++;
     }
     if (entries || phases) {
-      this.record(`run.${why}-withdrew`, { entries, phases });
+      // Three literals, never a template: `test/docs-parity.test.ts` reads
+      // event names off the source, and a composed name is one the table can
+      // never hold — `run.park-withdrew` reached the hub's journal undocumented
+      // exactly this way (LFC-4).
+      const event = {
+        pause: 'run.pause-withdrew', halt: 'run.halt-withdrew', park: 'run.park-withdrew',
+      } as const;
+      this.record(event[why], { entries, phases });
       log.info('runner.withdrew-queued', { runId: state.id, slug: state.slug, why, entries, phases });
     }
     return entries + phases;
   }
 
-  pause(by = 'console'): boolean {
+  pause(who: Actor | string = unattributedActor('Runner.pause')): boolean {
     if (!this.state || !this.driving) return false;
+    const actor = asActor(who, 'Runner.pause');
+    const by = actor.by;
     // A recovery is one session, not the phase loop — and `pausing` is a word
     // only the loop reads. Arming it here lit the Pause button, changed the
     // badge to "pausing", and stopped precisely nothing, which is the failure
@@ -2316,7 +2666,7 @@ export abstract class RunnerControl extends RunnerBase {
       afterPhase: this.state.activePhase,
       by,
     };
-    this.record('run.pause-requested', { afterPhase: this.state.pause.afterPhase, by });
+    this.record('run.pause-requested', { afterPhase: this.state.pause.afterPhase, ...actor });
     // Before the persist and the emit, so the state that reaches disk and the
     // state that reaches the browser are the withdrawn one. Armed-then-emitted
     // was the shape that let a reload of a pausing run read the stale queue
@@ -2623,11 +2973,14 @@ export abstract class RunnerControl extends RunnerBase {
 
     lane.checkpointed = true;
     lane.frozen = null;
+    // Named before it is signalled, so the session's record says a freeze
+    // clock checkpointed it rather than an exit nobody explains.
+    lane.handle?.markEnding?.('checkpoint', `frozen past ${Math.round(FREEZE_ESCALATE_MS / 60_000)} minutes`);
     if (pid && pidAlive(pid)) {
-      // Wake, then ask, then insist — all three from `signals.ts`, which is the
+      // Wake, then ask, then insist — all from `signals.ts`, which is the
       // only place in `server/` allowed to signal a child. This lane is
       // BY DEFINITION stopped, so the wake is not a precaution here: without it
-      // the SIGTERM is queued and the escalation escalates nothing.
+      // the interrupt is queued and the escalation escalates nothing.
       void killLadder(pid, { killAfterMs: SIGTERM_GRACE_MS });
     }
 
@@ -2677,26 +3030,35 @@ export abstract class RunnerControl extends RunnerBase {
    * asleep on a usage window holds no process at all; the wake event ends its
    * sleep so it, too, re-attempts now instead of at the old account's reset.
    */
-  switchAccount(accountId: string | undefined, by = 'console'):
+  switchAccount(accountId: string | undefined, who: Actor | string = unattributedActor('Runner.switchAccount')):
     { ok: true; checkpointed: number } | { ok: false; reason: string } {
     const state = this.state;
+    const actor = asActor(who, 'Runner.switchAccount');
+    const by = actor.by;
     if (!state) return { ok: false, reason: 'this console holds no run for that plan' };
     const target = accountId && accountId !== 'default' ? accountId : undefined;
     if ((state.accountId ?? 'default') === (target ?? 'default')) {
       return { ok: false, reason: `the run is already on ${target ?? 'the machine login'}` };
     }
     const from = state.accountId ?? 'default';
+    // Through the one helper like every automatic mover — recorded on the
+    // account as a person's departure, held against nobody (no wall, no
+    // cool-down): the operator may be moving TO a fuller quota, not away from
+    // a wall, and the picker must not learn otherwise.
+    this.leaveAccount(undefined, { kind: 'operator', reason: `account switch by ${by}`, by: 'operator' }, state.accountId);
     if (target) state.accountId = target;
     else delete state.accountId;
 
     let checkpointed = 0;
     for (const lane of this.lanes.values()) {
       if (lane.pid == null || !pidAlive(lane.pid)) continue;
-      this.checkpointLane(lane, `account switch by ${by}`);
+      this.checkpointLane(lane, `account switch by ${by}`, { endedBy: 'account-switch' });
       checkpointed++;
     }
     this.haltSignal.dispatchEvent(new Event('wake'));
-    this.record('run.account-switch', { from, to: target ?? 'default', by, checkpointed });
+    // The actor as derived (ACT-11): 20 of 21 lifetime switches read
+    // `by: "console"` because the route defaulted what the client never sent.
+    this.record('run.account-switch', { from, to: target ?? 'default', checkpointed, ...actor });
     this.persist();
     this.emit('run', { state });
     return { ok: true, checkpointed };
@@ -2711,7 +3073,7 @@ export abstract class RunnerControl extends RunnerBase {
    * checkpoint whose caller has already written what the run is now waiting
    * on (the live wall under `onLimit: 'pause'`).
    */
-  protected checkpointLane(lane: Lane, why: string, opts: { carryOn?: boolean } = {}): void {
+  protected checkpointLane(lane: Lane, why: string, opts: { carryOn?: boolean; endedBy: EndedBy }): void {
     const state = this.state!;
     const record = phaseRecord(state, lane.phase);
     const sessionId = record.sessionId;
@@ -2719,6 +3081,11 @@ export abstract class RunnerControl extends RunnerBase {
     lane.frozen = null;
     lane.checkpointed = true;
     lane.checkpointNote = { carryOn: opts.carryOn ?? true };
+    // WHO is ending it, named on the session before anything signals it: an
+    // account switch, a usage pause and a watchdog recycle all arrive at the
+    // child as the same interrupt, and its record is the one place that can
+    // say which.
+    lane.handle?.markEnding?.(opts.endedBy, why);
     if (lane.pid && pidAlive(lane.pid)) {
       // Same ladder as the freeze escalation, and for the same reason — this
       // lane may be frozen too (an account switch under a freeze).
@@ -2747,9 +3114,20 @@ export abstract class RunnerControl extends RunnerBase {
     return true;
   }
 
-  /** Stop now: the child gets SIGTERM so its own SessionEnd hooks still run. */
-  async stop(): Promise<void> {
+  /**
+   * Stop now: the child gets SIGTERM so its own SessionEnd hooks still run.
+   *
+   * `actor` is who asked (LFC-6, SHD-3): it rides `run.stop-requested` as it
+   * is, and `stoppedBy` is folded from it (`stoppedByOf`) rather than
+   * hardcoded `'operator'` — so a stop the console's own machinery makes is
+   * the system's on the record, and a person's is a person's, with the
+   * transport and origin beside the word. A bare call is a harness's, and is
+   * written as `unattributed` rather than as anybody in particular.
+   */
+  async stop(who: Actor | string = unattributedActor('Runner.stop')): Promise<void> {
     if (!this.state) return;
+    const actor = asActor(who, 'Runner.stop');
+    this.stopActor = actor;
     // Nothing is driving: the loop already ended and left a status behind. A
     // Stop that quietly does nothing here is worse than no Stop at all — the
     // operator presses it, the badge still says `running`, and the console has
@@ -2760,12 +3138,13 @@ export abstract class RunnerControl extends RunnerBase {
         // what was interrupted, and taking it afterwards made it record the
         // word "interrupted" every single time — the one fact it was for.
         const was = this.state.status;
+        const stamp = this.stopStamp();
         this.state.status = 'interrupted';
-        this.state.stoppedBy = 'operator';
+        this.state.stoppedBy = stamp.stoppedBy;
         this.state.child = null;
         this.state.pause = null;
-        this.state.halt ??= { at: new Date().toISOString(), reason: 'stopped by the operator', phase: this.state.activePhase ?? undefined };
-        this.record('run.stopped-while-idle', { was });
+        this.state.halt ??= { at: new Date().toISOString(), kind: 'operator-stop', reason: stamp.note, phase: this.state.activePhase ?? undefined };
+        this.record('run.stopped-while-idle', { was, ...actor });
         this.persist();
         this.emit('run', { state: this.state });
       }
@@ -2785,8 +3164,13 @@ export abstract class RunnerControl extends RunnerBase {
       // stop.
       if (lane.frozen) wasFrozen = true;
       lane.frozen = null;
+      // The stop, named on the session before anything signals it.
+      lane.handle?.markEnding?.('stop', `${actor.by === 'operator' ? 'the operator' : actor.by} stopped the run`);
       if (lane.pid && pidAlive(lane.pid)) wake(lane.pid);
     }
+    // A session with no lane — a QA round, the pull-request session — is
+    // reached only through the abort below; it gets the same word.
+    this.handle?.markEnding?.('stop', `${actor.by === 'operator' ? 'the operator' : actor.by} stopped the run`);
     // The persisted `children[].frozen` flags must clear with the lanes they
     // describe, or the checkpoint says two contradictory things about one pid.
     this.syncMirror();
@@ -2796,14 +3180,17 @@ export abstract class RunnerControl extends RunnerBase {
       pids: lanes.map((lane) => lane.pid).filter((pid): pid is number => pid != null),
       phases: lanes.map((lane) => lane.phase),
       wasFrozen,
+      ...actor,
     });
     this.persist();
     // Aborts the spawns AND every admission still queued — a stopped run must
-    // not leave an entry in the queue that would start a session later.
-    this.abort?.abort();
-    // The backstop, one per lane. `killLadder` re-sends the wake and the term
-    // — harmless on a child the abort above already reached, and the safety net
-    // for one it did not — then kills after the grace.
+    // not leave an entry in the queue that would start a session later. The
+    // reason is the session ledger's word for this ending (`ENDED_BY`).
+    this.abort?.abort('stop');
+    // The backstop, one per lane. `killLadder` re-sends the wake, shares the
+    // interrupt the abort above already sent (one SIGINT per process) and
+    // insists after the grace — the safety net for a child the abort did not
+    // reach — then kills.
     const backstops = lanes
       .map((lane) => lane.pid)
       .filter((pid): pid is number => pid != null)
@@ -2828,9 +3215,11 @@ export abstract class RunnerControl extends RunnerBase {
    * untouched) nor an endorsement; dependents of the stopped phase never
    * become ready, so the run parks at its end naming them honestly.
    */
-  stopPhase(phase: number, by = 'console'): { ok: true } | { ok: false; reason: string } {
+  stopPhase(phase: number, who: Actor | string = unattributedActor('Runner.stopPhase')): { ok: true } | { ok: false; reason: string } {
     const state = this.state;
     if (!state || !this.driving) return { ok: false, reason: 'nothing is driving this run' };
+    const actor = asActor(who, 'Runner.stopPhase');
+    const by = actor.by;
     const record = state.phases[String(phase)];
     const lane = this.lanes.get(phase);
     if (!lane) {
@@ -2841,7 +3230,7 @@ export abstract class RunnerControl extends RunnerBase {
         record.status = 'interrupted';
         record.note = `stopped by ${by} before it started — the rest of the run carries on`;
         record.endedAt = new Date().toISOString();
-        this.record('phase.stopped', { by, before: 'admission' }, phase);
+        this.record('phase.stopped', { ...actor, before: 'admission' }, phase);
         this.persist();
         this.emit('phase', { phase, status: record.status });
         return { ok: true };
@@ -2863,6 +3252,8 @@ export abstract class RunnerControl extends RunnerBase {
       lane.frozen = null;
     }
     lane.stopped = { at: new Date().toISOString(), by };
+    // Named on the session before anything signals it.
+    lane.handle?.markEnding?.('stop', `stopped by ${by}`);
     const pid = lane.pid;
     if (pid && pidAlive(pid)) {
       void killLadder(pid, { killAfterMs: SIGTERM_GRACE_MS }).then((how) => {
@@ -2874,7 +3265,9 @@ export abstract class RunnerControl extends RunnerBase {
     this.syncMirror();
     this.syncFreezeMirror();
     this.syncFrozenStatus();
-    this.record('phase.stop-requested', { pid: pid ?? null, by }, phase);
+    // The same attribution field as the run-level stop (LFC-6): a lane's stop
+    // and a run's carry the one actor shape, whichever verb was pressed.
+    this.record('phase.stop-requested', { pid: pid ?? null, ...actor }, phase);
     this.persist();
     this.emit('run', { state });
     return { ok: true };
@@ -2937,8 +3330,27 @@ export abstract class RunnerControl extends RunnerBase {
    * for the model to answer and, before the close rule was rewritten, a
    * permanent leak in the counter that decided when stdin closed.
    */
+  /**
+   * The relay answered a question nobody else did (phase 14, QRL-6): the session
+   * is told so down its own stdin, one `frameRelayAnswer` sentence per answer —
+   * the answer, the rule that chose it, that it is NOT a change to the phase,
+   * and to declare `blocked --needs ambiguity` rather than ask again. A person's
+   * answer needs no notice: the tool result already says what they chose.
+   */
+  tellRelayAnswer(phase: number, answers: readonly { question: string; label: string; by: string; ruleId?: string }[]): AskResult {
+    if (!answers.length) return { ok: false, reason: 'nothing to tell' };
+    const told = answers.map((answer) => ({
+      question: answer.question.replace(/\s+/g, ' ').slice(0, 300),
+      label: answer.label,
+      rule: answeredByPhrase(answer.by as Exclude<QuestionAnsweredBy, 'human'>, answer.ruleId),
+    }));
+    return this.inject('relay', told.map((answer) => answer.label).join(' · '), 'relay', undefined, phase,
+      (mark) => frameRelayNotice(told, mark, 'ambiguity'));
+  }
+
   private inject(
-    kind: 'ask' | 'steer', body: string, by: string, key?: string, targetPhase?: number | null,
+    kind: 'ask' | 'steer' | 'relay', body: string, by: string, key?: string, targetPhase?: number | null,
+    frame?: (mark: string) => string,
   ): AskResult {
     const text = body.trim();
     if (!text) return { ok: false, reason: kind === 'ask' ? 'nothing to ask' : 'nothing to say' };
@@ -2972,7 +3384,7 @@ export abstract class RunnerControl extends RunnerBase {
 
     const id = randomUUID().replace(/-/g, '').slice(0, 8);
     const mark = markFor(kind, id);
-    const framed = kind === 'ask' ? frameQuestion(text, mark) : frameSteer(text, mark);
+    const framed = frame ? frame(mark) : kind === 'ask' ? frameQuestion(text, mark) : frameSteer(text, mark);
     if (!handle.send(framed)) {
       return { ok: false, reason: 'the session stopped accepting input as the message was sent' };
     }
@@ -2982,19 +3394,63 @@ export abstract class RunnerControl extends RunnerBase {
 
     const phase = lane?.phase ?? this.state?.activePhase ?? undefined;
     // Two event names, on purpose: a journal that records a course correction
-    // as a question cannot later explain why the phase changed direction.
-    this.record(kind === 'ask' ? 'phase.asked' : 'phase.steered', {
-      by, mark: result.mark, [kind === 'ask' ? 'question' : 'instruction']: text.slice(0, 500),
-    }, phase);
+    // as a question cannot later explain why the phase changed direction. The
+    // relay's notice writes neither — its `phase.question-answered` lines are
+    // the record, and a third name for the same fact would be a copy of them.
+    if (kind !== 'relay') {
+      this.record(kind === 'ask' ? 'phase.asked' : 'phase.steered', {
+        by, mark: result.mark, [kind === 'ask' ? 'question' : 'instruction']: text.slice(0, 500),
+      }, phase);
+    }
+    // A question is owed an answer, and the answer is owed a record (TRS-6):
+    // kept by its mark until the session replies with it.
+    if (kind === 'ask' && result.mark) {
+      this.openAsks.set(result.mark, { question: text.slice(0, 500), by, at: Date.now(), ...(phase != null ? { phase } : {}) });
+      while (this.openAsks.size > MAX_OPEN_ASKS) {
+        const oldest = this.openAsks.keys().next().value;
+        if (oldest === undefined) break;
+        this.openAsks.delete(oldest);
+      }
+    }
     // Shown immediately rather than waiting for the CLI's echo: the operator
     // pressed a key and is owed the evidence of it. The echo arrives a moment
     // later carrying the same mark, and the console folds it into this line as
     // a delivery tick rather than printing the message a second time.
-    this.emit('stream', { phase, kind: 'injected', text, mark: result.mark, steer: kind === 'steer' });
+    this.emit('stream', {
+      phase, kind: 'injected', text, mark: result.mark, steer: kind === 'steer', ...(kind === 'relay' ? { relay: true } : {}),
+    });
     return result;
   }
 
   /** Bounded, and oldest-first: an idempotency key is only interesting briefly. */
+  /**
+   * The return leg of an operator's question (TRS-6): the session's reply,
+   * recognised by the mark it was asked to open with, journalled beside the
+   * question as `phase.answered {question, options, chosen, by, ms}` — the
+   * shape a relayed question's answer takes too, so one reader serves both.
+   * An operator's question is free text, so `options` is empty and `chosen` is
+   * the reply itself. Once per question: a mark the session repeats, or one
+   * this console never asked (a restart lost the stdin it went down), writes
+   * nothing. A steer's acknowledgement is not an answer.
+   */
+  protected noteAnswer(phase: number, event: { text: string; mark: string }): void {
+    if (!event.mark.startsWith('ask:')) return;
+    const asked = this.openAsks.get(event.mark);
+    if (!asked) return;
+    this.openAsks.delete(event.mark);
+    const sessionId = this.state?.phases[String(phase)]?.sessionId;
+    this.record('phase.answered', {
+      question: asked.question,
+      options: [],
+      chosen: event.text.replace(/\s+/g, ' ').trim().slice(0, 500),
+      by: 'session',
+      ...(sessionId ? { sessionId } : {}),
+      askedBy: asked.by,
+      mark: event.mark,
+      ms: Math.max(0, Date.now() - asked.at),
+    }, asked.phase ?? phase);
+  }
+
   private remember(key: string, result: AskResult): void {
     this.injected.set(key, result);
     while (this.injected.size > MAX_INJECT_KEYS) {
@@ -3018,14 +3474,15 @@ export abstract class RunnerControl extends RunnerBase {
   /** A park that is draining: the finalizer lands on `parked`, not `halted`. */
   protected parkPending = false;
 
-  park(reason: string, phase: number | null = null, kind?: HaltKind): boolean {
+  park(reason: string, phase: number | null, kind: HaltKind): boolean {
     if (!this.state) return false;
     if (this.state.halt) return false;
     const at = phase ?? this.state.activePhase;
-    // `kind` is the machine-readable class, exactly as `halt()` carries one:
-    // a needs-human park was indistinguishable from any other park at the
-    // halt level, so the situation classifier had to guess from prose.
-    this.state.halt = { at: new Date().toISOString(), reason, ...(at !== null ? { phase: at } : {}), ...(kind ? { kind } : {}) };
+    // `kind` is the machine-readable class, exactly as `halt()` carries one,
+    // and REQUIRED since LFC-1: a needs-human park was indistinguishable from
+    // any other park at the halt level, so the situation classifier had to
+    // guess from prose.
+    this.state.halt = { at: new Date().toISOString(), reason, ...(at !== null ? { phase: at } : {}), kind };
     // With lanes still live the run is DRAINING, not stopped — the same reason
     // `halt()` uses `halting`, and for the same cost when it is got wrong:
     // `parked` is not IN_FLIGHT, so a console that died mid-drain would never
@@ -3133,7 +3590,7 @@ export abstract class RunnerControl extends RunnerBase {
    */
   continueMcpPark(phase: number, by = 'timeout'): McpContinueResult | null {
     if (!this.state) return null;
-    const result = continueMcpParkedRecord(this.state, phase, { by, now: this.now() });
+    const result = continueMcpParkedRecord(this.state, phase, { by, now: this.now(), journal: this.declarationSink() });
     if (!result) return null;
     this.record('phase.mcp-require-timeout', {
       servers: result.servers, waitedMs: result.waitedMs, by,
@@ -3170,7 +3627,90 @@ export abstract class RunnerControl extends RunnerBase {
    * A phase a lane of this run is working, or whose record is done, is left
    * alone — the declaration is journalled as ignored and the file was consumed.
    */
-  declareOutcome(phase: number, declared: PhaseOutcome, by = 'unsupervised'): 'parked' | 'boarding' | 'noted' | 'ignored' | null {
+  /**
+   * A resume the console refused because the session it would resume is still
+   * running (REG-1) — written on this run's journal and on the phase, where the
+   * page shows it. Called by the inbox, which read the presence before it
+   * consumed the declaration; the runner's own `resumableSession` writes the
+   * same record when the refusal happens at boarding.
+   */
+  noteResumeRefused(
+    phase: number,
+    refusal: { sessionId: string; why: 'session-live' | 'session-lease'; pid?: number; lock?: string; [key: string]: unknown },
+  ): void {
+    const state = this.state;
+    if (!state) return;
+    const record = phaseRecord(state, phase);
+    record.resumeRefused = {
+      sessionId: refusal.sessionId, at: this.now().toISOString(), why: refusal.why,
+      ...(refusal.pid ? { pid: refusal.pid } : {}), ...(refusal.lock ? { lock: refusal.lock } : {}),
+    };
+    this.record('phase.resume-refused', refusal, phase);
+    this.emit('phase', { phase, status: record.status, note: record.note ?? null, resumeRefused: record.resumeRefused });
+    this.persist();
+  }
+
+  /** The person cards this run is waiting on — `cardId → {phase, until}` (WAI-10). */
+  private readonly personCards = new Map<string, { phase: number; until: string }>();
+
+  /**
+   * A card is a WAIT (WAI-10). While a verification card or a tool approval
+   * card stands, the run is waiting on a person: `waitReason: 'person'`, the
+   * run's clock at the soonest card's expiry, the status `waiting` — so every
+   * surface, the budget and the boot re-arm treat the commonest human-shaped
+   * wait as a wait. It used to be `running` with no child and no spend for up
+   * to twelve hours, and the park a timeout produced had no kind. Restart-safe
+   * like every wait: `reconcileRun` turns it `paused` with the clock intact,
+   * the boot re-arm fires at the card's expiry and the resume re-raises it.
+   */
+  enterPersonWait(phase: number, card: { id: string; until: string; on: string }): void {
+    const state = this.state;
+    if (!state) return;
+    this.personCards.set(card.id, { phase, until: card.until });
+    const soonest = [...this.personCards.values()].map((c) => c.until).sort()[0];
+    state.waitUntil = soonest;
+    setRunState(state, 'waiting', { kind: 'person', until: soonest, on: card.on });
+    this.record('run.waiting-person', { phase, cardId: card.id, until: card.until, on: card.on, cards: this.personCards.size });
+    this.persist();
+    this.emit('run', { state });
+  }
+
+  /** The card is down — answered, expired or the run ended. The wait ends with the LAST card. */
+  leavePersonWait(cardId: string): void {
+    const state = this.state;
+    if (!this.personCards.delete(cardId) || !state) return;
+    if (this.personCards.size) {
+      state.waitUntil = [...this.personCards.values()].map((c) => c.until).sort()[0];
+      this.persist();
+      return;
+    }
+    state.waitReason = null;
+    state.waitUntil = null;
+    // A phase parked on external work meanwhile keeps its clock on the run.
+    syncWaitClock(state);
+    // Compare-and-set, as the usage wait does: a status another lane wrote
+    // while this one waited is not this lane's to overwrite.
+    if (state.status === 'waiting') setRunState(state, this.resumedStatus());
+    this.persist();
+    this.emit('run', { state });
+  }
+
+  /**
+   * An inbox declaration the console set aside without acting on it (WAI-7) —
+   * stale, unparseable, or one whose act threw — written on THIS run's journal
+   * because the plan's runner is live. The inbox keeps the file under
+   * `outcomes/ignored/`; this is the line that says so.
+   */
+  noteOutcomeIgnored(phase: number, data: Record<string, unknown>): void {
+    this.record('phase.outcome-ignored', data, phase);
+  }
+
+  async declareOutcome(
+    phase: number, declared: PhaseOutcome, by = 'unsupervised',
+  ): Promise<'parked' | 'boarding' | 'noted' | 'ignored' | null> {
+    // The plan's allowance first, while nothing has been written: the park below
+    // is answered by the same `evaluateWait` a lane's own declaration gets.
+    const budget = declared.status === 'waiting-external' ? await this.waitBudgetOf(phase) : undefined;
     const state = this.state;
     if (!state) return null;
     const record = phaseRecord(state, phase);
@@ -3180,11 +3720,37 @@ export abstract class RunnerControl extends RunnerBase {
     };
     if (this.lanes.has(phase)) return ignore('a lane of this run is working the phase');
     if (record.status === 'done') return ignore('the record is already done');
+    // The moment a `blocked`/`needs-human` session named, floored and capped
+    // like every other path's (`declaredClock`, WAI-8) — computed here so the
+    // `phase.outcome` line carries the cap, armed below only if acted on. This
+    // twin used to arm no clock at all, so a hand session's `--until` was
+    // dropped whenever the plan's runner happened to be live.
+    const clock = declared.status === 'blocked' || declared.status === 'needs-human'
+      ? declaredClock(declared.resume_after, { now: this.now().getTime(), floorMs: this.deps.waitFloorMs })
+      : null;
     this.record('phase.outcome', {
       status: declared.status, reason: declared.reason ?? null,
       resumeAfter: declared.resume_after ?? null, watch: declared.watch,
+      ...(clock ? { requested: clock.requested, granted: clock.until, capped: clock.capped } : {}),
       sessionId: declared.session_id ?? null, by,
     }, phase);
+    // The declarations ledger (WAI-8, SLF-4) — the live twin of the stored
+    // arm's, same knobs: every word counted, a repeat inside the cooldown
+    // collapsed into the act that stands, a word past its cap recorded and not
+    // acted on. The record is otherwise untouched.
+    const charge = chargeDeclaration(record, declared.status, { now: this.now().getTime(), cooldownMs: declarationCooldownFor(declared.status) });
+    if (charge.verdict !== 'act') {
+      this.record(DECLARATION_REFUSED_EVENT, {
+        status: charge.status, why: charge.verdict === 'cooled' ? 'cooldown' : 'cap', count: charge.count, max: charge.max,
+        refused: charge.refused, ...(charge.cooldownMs !== undefined ? { cooldownMs: charge.cooldownMs } : {}),
+        reason: declared.reason ?? null, sessionId: declared.session_id ?? null, by,
+      }, phase);
+      this.persist();
+      return 'ignored';
+    }
+    // A NEW declaration supersedes the last one — the `new-outcome` licence,
+    // as the supervised `routeOutcome` spends it (WAI-9).
+    consumeDeclaration(record, 'new-outcome', (event, data, at) => this.record(event, { ...data, next: declared.status, by }, at));
     if (declared.session_id) {
       // The declaring session is the one to resume. A session nobody here
       // spawned lives under the machine's own login — `resumableSession` ports
@@ -3195,12 +3761,18 @@ export abstract class RunnerControl extends RunnerBase {
     let verdict: 'parked' | 'boarding' | 'noted';
     switch (declared.status) {
       case 'waiting-external': {
+        // Presence was read at the inbox, before this file was consumed
+        // (`ServiceRuns.ingestOutcomeFile`): a declaring session that is still
+        // live never reaches here. `resumableSession` reads it again at boarding.
         record.resumeSessionId = declared.session_id ?? record.sessionId;
-        verdict = this.parkWaiting(phase, declared) ? 'parked' : 'noted';
+        verdict = this.parkWaiting(phase, declared, { by: by === 'unsupervised' ? 'unsupervised' : 'session', budget })
+          ? 'parked' : 'noted';
         break;
       }
       case 'partial': {
-        resetForRetry(record);
+        // A re-board of the SAME work, unattended: `prepareReboard`, never
+        // `resetForRetry` — the watchdog's bound and the ledger stay (SLF-4).
+        prepareReboard(record);
         const brief = declared.session_id ? 'continue' : 'resume';
         record.boardingHint = {
           situation: 'work-in-progress', rung: 'resume-own-session', brief,
@@ -3222,10 +3794,15 @@ export abstract class RunnerControl extends RunnerBase {
             status: declared.status,
             ...(declared.reason ? { reason: declared.reason } : {}),
             ...(declared.watch.length ? { watch: declared.watch } : {}),
+            ...needsOf(declared),
             at: new Date().toISOString(),
           };
           if (declared.watch.length) record.watch = declared.watch;
           clearWatchBookkeeping(record);
+          if (clock) {
+            record.parkedUntil = clock.until;
+            this.armParkPoke(phase, clock.until);
+          }
         }
         verdict = 'noted';
     }
@@ -3278,7 +3855,7 @@ export abstract class RunnerControl extends RunnerBase {
     }
 
     const at = new Date().toISOString();
-    resetForRetry(record);
+    resetForRetry(record, { by: 'operator', journal: this.declarationSink() });
     record.boardingHint = {
       situation: FOLLOW_UP_SITUATION,
       rung: FOLLOW_UP_RUNG,
@@ -3302,9 +3879,18 @@ export abstract class RunnerControl extends RunnerBase {
     return { ok: true, boarded: this.state.status === 'running' };
   }
 
-  /** Clear a phase's terminal state so the loop will pick it up again. */
-  retry(phase: number, override?: RetryOverride): void {
+  /**
+   * Clear a phase's terminal state so the loop will pick it up again.
+   *
+   * `press` says whose retry it is (RCV-3, phase 9): a person's clears the
+   * failure streak and the recover ledger — they are back in the loop — while
+   * an automatic retry (the healer's rung, a watch landing) carries both
+   * forward. Absent means a press: every caller that predates the word is a
+   * button or a harness.
+   */
+  retry(phase: number, override?: RetryOverride, opts: { press?: boolean } = {}): void {
     if (!this.state) return;
+    const press = opts.press ?? true;
     const record = phaseRecord(this.state, phase);
     // The ONE reset — `state.ts` `resetForRetry`, shared with the stored-run
     // Retry in the service. The two used to carry their own copies and
@@ -3314,10 +3900,13 @@ export abstract class RunnerControl extends RunnerBase {
     // The override rides the same one reset for the same reason — the live and
     // stored paths must not disagree about what a Retry-with-edits leaves
     // behind, and this is the third time that class of drift has cost a day.
-    resetForRetry(record, override);
+    resetForRetry(record, { by: press ? 'operator' : 'console', override, journal: this.declarationSink() });
     this.ladderSeen.delete(phase);
-    this.state.consecutiveFailures = 0;
+    if (press) this.state.consecutiveFailures = 0;
     this.state.halt = null;
+    // The recover verb's ledger is the operator's to clear, and Retry is how
+    // they say "from the top" (RCV-4).
+    if (press) delete this.state.recoveries?.[String(phase)]?.recovers;
     this.record('phase.retry-requested', {
       ...(override?.addendum ? { addendum: override.addendum } : {}),
       ...(override?.options && Object.keys(override.options).length ? { options: override.options } : {}),

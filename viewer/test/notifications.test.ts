@@ -713,6 +713,55 @@ test('resolveWhere annotates the scoped records, marks them read, and survives a
     'the board moved past the halt');
 });
 
+test('resolveWhere scopes by session too — a session-ask row carries no slug or run, only the session it was about (REG-4)', async () => {
+  const { Notifications } = await import('../server/notifications.ts');
+  const store = new Notifications(mkdtempSync(join(tmpdir(), 'pc-notif-session-')));
+  const mine = store.record({ category: 'session-ask', title: 'waiting', body: 'q1', sessionId: 'sess-a' });
+  const theirs = store.record({ category: 'session-ask', title: 'waiting', body: 'q2', sessionId: 'sess-b' });
+  const changed = store.resolveWhere({ category: 'session-ask', sessionId: 'sess-a' }, 'the session moved on');
+  assert.deepEqual(changed.map((row) => row.id), [mine.id], 'only that session\'s row');
+  assert.equal(store.list({}).items.find((row) => row.id === theirs.id)?.resolved, undefined);
+});
+
+test('ACC-8.9 (REG-4, TRS-6): a session-ask row carries the question, and is marked resolved the moment its wait clears', async () => {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { defaultCategories } = await import('../server/push/catalogue.ts');
+  const service = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  const inner = service as unknown as { prefs: Record<string, unknown>; push: { announce: (...args: unknown[]) => void } };
+  inner.prefs.notify = defaultCategories();
+  const pushed: { category: string; body: string }[] = [];
+  inner.push.announce = (category: unknown, message: unknown) => {
+    pushed.push({ category: category as string, body: (message as { body: string }).body });
+  };
+  // The presence backlog flushes on a microtask after construction.
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    const cwd = mkdtempSync(join(tmpdir(), 'pc-ask-cwd-'));
+    const at = new Date().toISOString();
+    service.ingestSessionEvent({ session_id: 'ask-row', event: 'SessionStart', cwd, at });
+    service.ingestSessionEvent({
+      session_id: 'ask-row', event: 'Notification', notification_type: 'permission_prompt',
+      message: 'Claude needs your permission to use WebFetch', cwd, at,
+    });
+    const row = () => service.notifications.list({}).items.find((item) => item.category === 'session-ask' && item.sessionId === 'ask-row');
+    assert.ok(row(), 'the ask is a notification row');
+    assert.equal(row()?.body, 'Claude needs your permission to use WebFetch', 'the question, not the cwd');
+    assert.equal(pushed.filter((p) => p.category === 'session-ask').length, 1);
+    assert.equal(row()?.resolved, undefined, 'open while the session waits');
+
+    service.ingestSessionEvent({ session_id: 'ask-row', event: 'Stop', cwd, at: new Date(Date.now() + 1_000).toISOString() });
+    assert.ok(row()?.resolved, 'resolved when the wait clears — no urgent card left that nobody can close');
+    assert.match(row()!.resolved!.reason, /answered/);
+    assert.equal(row()?.read, true);
+  } finally {
+    service.close();
+  }
+});
+
 test('a qa hold announces once per verdict, and not for a closed plan', async () => {
   // The pending row holds dependents exactly as a failure does, and until now
   // no push category carried that fact — a needs-you-severity inbox row that
@@ -1042,4 +1091,127 @@ test('a per-announcement urgency override is written to the record', () => {
   assert.equal(escalated.urgent, true, 'the escalation buzzed, and the record says so');
   const quietened = inbox.record(announcement({ category: 'approval', urgent: false }));
   assert.equal(quietened.urgent, false, 'the override works in both directions');
+});
+
+test('ACC-8.16 (AC-5): an unanswerable relayed question is ONE push and one row — per question, never a second for the same ask', async () => {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR, INSTANCE_STATE_DIR } = await import('../server/config.ts');
+  const { defaultCategories } = await import('../server/push/catalogue.ts');
+  const { rmSync } = await import('node:fs');
+  rmSync(join(INSTANCE_STATE_DIR, 'relay'), { recursive: true, force: true });
+  const service = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  const inner = service as unknown as {
+    prefs: Record<string, unknown>;
+    runners: Map<string, unknown>;
+    push: { announce: (...args: unknown[]) => void };
+  };
+  inner.prefs.notify = defaultCategories();
+  const pushed: { category: string; title: string; body: string }[] = [];
+  inner.push.announce = (category: unknown, message: unknown) => {
+    pushed.push({ category: category as string, ...(message as { title: string; body: string }) });
+  };
+  const parks: string[] = [];
+  inner.runners.set('demo', {
+    busy: () => true,
+    current: () => ({
+      id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: 'trusted', phases: {}, status: 'running',
+      relay: 'last-resort', relayArming: { armed: true, version: '2.1.270', floor: '2.1.268', at: new Date().toISOString() },
+    }),
+    note: () => {},
+    park: (reason: string) => { parks.push(reason); return true; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const ask = (question: Record<string, unknown>) => ({
+    tool_name: 'AskUserQuestion', session_id: 'sess-n', tool_use_id: 'toolu_n',
+    tool_input: { questions: [{ header: 'Choice', multiSelect: false, ...question }] },
+  });
+  try {
+    await service.decideToolUse(ask({ question: 'Which checks?', options: [{ label: 'lint' }, { label: 'types' }], multiSelect: true }) as never, 'r1');
+    await service.decideToolUse(ask({ question: 'What now?', options: [{ label: 'Wait' }, { label: 'Publish the release' }] }) as never, 'r1');
+    assert.equal(pushed.length, 2, 'one push per unanswerable question');
+    assert.ok(pushed.every((p) => p.category === 'needs-you'));
+    assert.match(pushed[0].title, /A question needs you — demo phase 2/);
+    assert.match(pushed[0].body, /Which checks\?/, 'the question itself, not a directory');
+    assert.match(pushed[1].body, /destructive/);
+    // This file's store is shared by every case in it, so the rows are the relay's own.
+    const rows = service.notifications.list({}).items
+      .filter((item) => item.category === 'needs-you' && /^A question needs you — demo phase 2/.test(item.title));
+    assert.equal(rows.length, 2, 'and one inbox row each');
+    assert.equal(parks.length, 2, 'each parked for a person');
+  } finally {
+    service.close();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The shutdown announcement outlives the process that sends it (SHD-4)
+ * ------------------------------------------------------------------ */
+
+/**
+ * ACC-6.4, the SHD-4 half. `announce()` wrote the row, handed the push to a
+ * callback that records `delivery` after the request returns — and the process
+ * then exited. Both measured shutdown rows carried `delivery: []`: the one
+ * record meant to reach an operator elsewhere reached nobody, and said nothing
+ * about why. The announcement is now a drain handler: `index.ts` awaits it
+ * before `shutdown.end`, and the row leaves with the reports that landed or the
+ * console's own `skipped` row.
+ */
+test('ACC-6.4 (SHD-4): a shutdown announcement\'s delivery is non-empty before shutdown.end — the reports that landed, or skipped with the why', async () => {
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { onShutdownRequest, runShutdownHandlers, hasShutdownWork } = await import('../server/lifecycle.ts');
+  const { defaultCategories } = await import('../server/push/catalogue.ts');
+  // `index.ts`'s half, reduced to what this asserts: the press went through.
+  const requested: string[] = [];
+  onShutdownRequest((reason) => { requested.push(reason); });
+
+  const make = () => {
+    const service = new Service({
+      port: 0, host: '127.0.0.1', open: false, allowWrites: false,
+      scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+    } as never);
+    (service as unknown as { prefs: Record<string, unknown> }).prefs.notify = defaultCategories();
+    return service;
+  };
+  const shutdownRow = (service: InstanceType<typeof Service>) =>
+    service.inbox({ limit: 20 }).items.find((row) => row.title === 'Phase Console is shutting down')!;
+
+  // A device that answers a moment later — inside the drain, not after the exit.
+  let service = make();
+  service.push.announce = ((_c: unknown, _m: unknown, _n: unknown, onDelivery?: (r: unknown) => void) =>
+    new Promise<void>((resolve) => {
+      setTimeout(() => { onDelivery?.({ device: 'd1', label: 'iPhone · Safari', outcome: 'sent' }); resolve(); }, 40);
+    })) as typeof service.push.announce;
+  assert.equal(service.shutdown('a test', { acknowledge: true }).ok, true);
+  assert.equal(requested.length, 1);
+  const pending = shutdownRow(service);
+  assert.deepEqual(pending.delivery, [], 'at the press nothing has answered yet — the old record stopped here');
+  assert.equal(hasShutdownWork(), true, 'the announcement is a drain handler');
+  await runShutdownHandlers(10_000, { intent: 'shutdown', reason: 'a test' });
+  assert.deepEqual(shutdownRow(service).delivery.map((d) => d.outcome), ['sent'], 'the report landed before the drain ended');
+  service.close();
+
+  // A push service that took the send and reported nothing: skipped, and why.
+  service = make();
+  service.push.announce = (() => Promise.resolve()) as unknown as typeof service.push.announce;
+  assert.equal(service.shutdown('a test', { acknowledge: true }).ok, true);
+  await runShutdownHandlers(10_000, { intent: 'shutdown', reason: 'a test' });
+  const silent = shutdownRow(service).delivery;
+  assert.equal(silent.length, 1);
+  assert.equal(silent[0].outcome, 'skipped');
+  assert.match(String(silent[0].detail), /process exiting/);
+  service.close();
+
+  // Nowhere to send it at all: still not `[]`.
+  service = make();
+  service.push.announce = (() => undefined) as unknown as typeof service.push.announce;
+  assert.equal(service.shutdown('a test', { acknowledge: true }).ok, true);
+  await runShutdownHandlers(10_000, { intent: 'shutdown', reason: 'a test' });
+  const nowhere = shutdownRow(service).delivery;
+  assert.deepEqual(nowhere.map((d) => d.outcome), ['skipped']);
+  assert.match(String(nowhere[0].detail), /no device or webhook/);
+  service.close();
 });

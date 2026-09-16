@@ -1,0 +1,477 @@
+{
+  "id": "a968152f",
+  "slug": "mql-lane-followups",
+  "root": "/home/operator/work/hub",
+  "status": "paused",
+  "autonomy": "keep-going",
+  "model": "opus",
+  "effort": "max",
+  "phaseBudgetUsd": null,
+  "runBudgetUsd": null,
+  "spentUsd": 19.963440000000002,
+  "maxConsecutiveFailures": 2,
+  "consecutiveFailures": 0,
+  "createdAt": "2026-09-12T16:08:27.737Z",
+  "updatedAt": "2026-09-14T03:01:27.462Z",
+  "activePhase": null,
+  "child": null,
+  "waitUntil": "2026-09-14T11:01:27.461Z",
+  "halt": null,
+  "pause": null,
+  "freeze": null,
+  "onlyPhases": [
+    8
+  ],
+  "permissionProfile": "trusted",
+  "autoRecover": {},
+  "phases": {
+    "8": {
+      "phase": 8,
+      "status": "done",
+      "attempts": 2,
+      "costUsd": 19.963440000000002,
+      "sessionId": "f1c70000-0000-4000-8000-000000000095",
+      "lifecycle": {
+        "state": "done"
+      },
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "startedAt": "2026-09-12T16:08:30.600Z",
+      "attemptStartedAt": "2026-09-13T04:07:24.949Z",
+      "model": "opus",
+      "effort": "max",
+      "actualModel": "claude-opus-5",
+      "liveness": {
+        "phase": 8,
+        "lastOutputAt": "2026-09-13T04:11:15.574Z",
+        "lastToolUseAt": "2026-09-13T04:11:15.419Z",
+        "turnsSinceLastTool": 0,
+        "commitsSinceStart": 0,
+        "treeDirty": false,
+        "openTool": {
+          "id": "toolu_01CdcXwzm7j8WKHbXZgw9W77",
+          "name": "Bash",
+          "since": "2026-09-13T04:11:15.419Z",
+          "summary": "cd /home/operator/work/hub/trade/acme-backend || exit gh pr ready 131 2>&1 | tail -1 gh pr merge 131 --squash --delete-branch \\ --subject \"chore(e2e): mirror DI-06 and add the I-ON-R unentitled indicator cell (#131)\" \\ --body 'F-01 (F"
+        }
+      },
+      "turns": 50,
+      "durationMs": 1047847,
+      "said": "",
+      "idleAttempts": 1,
+      "waits": 1,
+      "endedAt": "2026-09-12T16:21:39.681Z",
+      "parkedMs": 42345268,
+      "note": "closed outside this run (the board reads done)"
+    },
+    "11": {
+      "phase": 11,
+      "status": "waiting",
+      "attempts": 0,
+      "costUsd": 0,
+      "sessionId": "f1c70000-0000-4000-8000-000000000096",
+      "parkedUntil": "2026-09-14T11:01:27.461Z",
+      "parkReason": "AWS SES production-access review: Support Center case 178935438200941 (Service limit increase, SES Sending Limits eu-west-1) filed by the owner 2026-09-14 ~02:50Z; gate step 3 needs ProductionAccessEnabled=true. Resume recipe: handoff phase-11 §▶ Resume",
+      "declared": {
+        "status": "waiting-external",
+        "reason": "AWS SES production-access review: Support Center case 178935438200941 (Service limit increase, SES Sending Limits eu-west-1) filed by the owner 2026-09-14 ~02:50Z; gate step 3 needs ProductionAccessEnabled=true. Resume recipe: handoff phase-11 §▶ Resume",
+        "at": "2026-09-14T03:01:27.461Z"
+      },
+      "waits": 1,
+      "endedAt": "2026-09-14T03:01:27.461Z",
+      "resumeSessionId": "f1c70000-0000-4000-8000-000000000096",
+      "lifecycle": {
+        "state": "waiting",
+        "stop": {
+          "kind": "declared",
+          "declared": "waiting-external"
+        }
+      }
+    }
+  },
+  "lifecycle": {
+    "state": "paused"
+  },
+  "waitReason": "external",
+  "resolved": null,
+  "reopenedAt": null,
+  "skills": [],
+  "checkout": "shared",
+  "limits": {
+    "status": "allowed_warning",
+    "window": "seven_day",
+    "utilization": 0.99,
+    "resetsAt": 1789560000,
+    "at": "2026-09-13T04:08:46.218Z"
+  },
+  "rulings": [
+    {
+      "id": "de8e0398b600",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Neither open PR (tb #131, MQL52026 #156) may be merged while the live ring is running. The plan's step order is 1 MQL52026 PR, 2 tb mirror PR, 3 ring, 4 graph PR — I am running the ring BEFORE steps 2 and 4 and holding both merges until it finishes.",
+      "why": "Merging in MQL52026 ships box #3 (no blue-green by design — a ship IS a brief outage), and the ring compiles and verifies against box #3 continuously for ~3 h; a restart mid-ring would kill verifications in flight and produce fabricated reds indistinguishable from real findings. Merging tb #131 deploys box #2, whose api slot rolls and whose worker+beat restart — and beat is the reaper that releases the ring's REAL credit holds on the golden customer's wallet. The ring does not need either merge: it drives the LOCAL tb tree (bind-mounted at /app), which is already on the branch carrying the I-ON-R cell and the mirrored 37-check contract, and box #3 is already live on aa0d12de. Verified before starting: roster 37, DI-06 present, unrostered_demands empty.",
+      "costIfWrong": "Only ordering: both PRs merge immediately after the ring, and the plan's exit criteria are unchanged. If the ring dies for an unrelated reason the merges are simply un-blocked earlier.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000097",
+      "at": "2026-09-12T16:11:06Z"
+    },
+    {
+      "id": "1e843b5a3a8e",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Deleted my own just-written coverage tests from tests/unit/app/clients/test_compile_service_client.py and kept the other session's, then committed d06f0022.",
+      "why": "Two live sessions shared trade/acme-backend. hub-a1 diagnosed the same diff-cover failure (compile_service_client.py:718 uncovered, 50% vs an 80% floor) and committed a5a95520 — which swept in an uncommitted append of mine sitting in the same file, creating a SECOND _arm_verify_http and a _FakeVerifyClient that shadowed the established _VerifyResp/_VerifyClient harness. 14 tests failed on the branch. Theirs are the better pair (they use the real harness and assert both halves of the omitted-unless-set contract), so removing mine rather than theirs was the smaller, correcter change. Not a revert of unowned work: I removed only MY OWN accidental contribution. a5a95520 was never pushed, so the break never left the laptop.",
+      "costIfWrong": "If hub-a1 intended a different harness shape, the two deleted tests are recoverable from this session's transcript; the surviving pair already covers the same wire contract, so coverage is unaffected.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000097",
+      "at": "2026-09-12T16:16:20Z"
+    },
+    {
+      "id": "f0973625c302",
+      "slug": "mql-lane-followups",
+      "phase": 9,
+      "kind": "deviation",
+      "what": "Replaced the '/builds says NOTHING' test with an all-SEEDED-list assertion instead of re-pointing it at the mixed roster",
+      "why": "builds-ux.spec.ts already asserts the mixed branch for real (BL-35, same required lane); re-pointing would duplicate it, while the homogeneous-seeded branch of listSizingDisclosure was asserted nowhere",
+      "costIfWrong": "the mixed branch would be covered once instead of twice — still covered; the seeded list branch would go back to uncovered",
+      "sessionId": "f1c70000-0000-4000-8000-000000000098",
+      "at": "2026-09-12T16:33:50Z"
+    },
+    {
+      "id": "0b063a3be77c",
+      "slug": "mql-lane-followups",
+      "phase": 9,
+      "kind": "ambiguity",
+      "what": "Read 'fix the robot-compiles glob' as the COLLECTION matcher only; left the two detail-route globs as they are",
+      "why": "measured the defect: playwright-core 1.62.1 compiles '**/v1/robot-compiles/?**' to a LITERAL '?', so it matches only the query form and never the bare collection. The detail globs are already end-anchored and correct, and _helpers/compile-fixtures.ts's own header says not to refactor working evidence inside the PR that makes that evidence blocking",
+      "costIfWrong": "a detail route that later gains a query string would miss its stub; robotDetailRe() already exists for that",
+      "sessionId": "f1c70000-0000-4000-8000-000000000098",
+      "at": "2026-09-12T16:33:50Z"
+    },
+    {
+      "id": "fc4d344446be",
+      "slug": "mql-lane-followups",
+      "phase": 9,
+      "kind": "deferral",
+      "what": "Left trade/CLAUDE.md's graph-tool table row for acme-frontend stale",
+      "why": "that row lives in the acme-hub repo, outside this phase's declared scope (trade/acme-frontend); Phase 16's scope is hub+trade and is where it belongs",
+      "costIfWrong": "one of the three copies of the graph row stays stale until P16 — the trap tf/CLAUDE.md itself warns about ('update both or neither')",
+      "sessionId": "f1c70000-0000-4000-8000-000000000098",
+      "at": "2026-09-12T16:33:50Z"
+    },
+    {
+      "id": "9c5572bb4277",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "ambiguity",
+      "what": "Scoped D-01's widening to SELF-USE licences only; marketplace licences stay per-version.",
+      "why": "D-01 asks 'is a SELF-USE entitlement per-version or per-robot-type'. The start-session branch it names is shared with marketplace licences, and widening those would hand every buyer every future version a vendor publishes — options-report §2.1 calls that a pricing question, and nobody answered it.",
+      "costIfWrong": "If the owner meant ALL licences, self-use customers are served but marketplace buyers still re-purchase on a vendor bump — a second, smaller change, not a rollback.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T17:48:07Z"
+    },
+    {
+      "id": "821fae3cc963",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deviation",
+      "what": "Built D-06 entirely in aws; did NOT touch sdk-integrator or any MQL emitter.",
+      "why": "The plan says D-06 is built in the emitted robot shell via sdk-integrator. Measured: sdk-integrator contains no close-positions code at all — the D15 seam is acme-backend's mql_emitter.py, and the emitted on_termination_requested ALREADY closes positions for any heartbeat that says termination_requested. The gap is purely that revocation and force-terminate never send it.",
+      "costIfWrong": "If an emitter change is also needed, it is a acme-backend follow-up; the aws half is a prerequisite either way and P8 owns acme-backend right now.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T17:48:07Z"
+    },
+    {
+      "id": "e8d4572b621b",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deferral",
+      "what": "Prepared the four AWS change-register entries but did NOT merge them: the register lives in hetzner, where any push to main triggers build-and-push then the armed CD.",
+      "why": "Phase 17's Repos scope is 'aws', yet exit criterion 2 says the new routes must be 'registered' — the register file is hetzner/config/aws-change-register.yaml. hetzner's build-and-push.yml triggers on ANY push to main with no paths-ignore, so a register-only merge is a production deploy of box #1. That is the ship phase's deliberate act, not a side effect of an aws phase.",
+      "costIfWrong": "task aws:register-lint reads the hetzner WORKING TREE, so it is green on the prepared branch and red on hetzner main until that PR merges. Every product: commit here is unregistered until then — the ship phase must merge it before the pin bump.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T17:48:20Z"
+    },
+    {
+      "id": "963aba2908fc",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deviation",
+      "what": "Ran task aws:register-lint from hetzner/, not from aws/ as the plan's Verification block says.",
+      "why": "The task does not exist in aws/Taskfile.yml; it is defined at hetzner/Taskfile.yml:811 and runs hetzner/scripts/aws-register-lint.sh. The plan's 'Verify in: aws' applies to task verify:local only.",
+      "costIfWrong": "None to the code; the plan's Verification block should be corrected so a future session does not read a 127 as a green.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T17:48:20Z"
+    },
+    {
+      "id": "40caa77f4790",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deviation",
+      "what": "Committed D-03 with --no-verify, after repairing a corrupted aws submodule git index.",
+      "why": "The three terraform pre-commit hooks run 'task infra:init' = 'terraform init -upgrade' WITH the Terraform Cloud backend, which needs TFC credentials this machine lacks; proved pre-existing by moving my .tf aside and getting the same exit 1 on the workspaces block. CI never runs that (validate-pr.yml is backend-less). Worse, each FAILED pre-commit run left the aws index referencing ~30 blobs that do not exist (fsck: 'invalid sha1 pointer in cache-tree' + 30 'missing blob'), which made git diff, git reset and every later commit fail — so retrying the hook was actively destructive.",
+      "costIfWrong": "If a terraform defect slipped past, CI's validate-terraform catches it on the PR. The hooks that judge the change (fmt, validate, yaml, gitleaks) were run and passed; route-contract and schema-contract were run by hand.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T18:09:05Z"
+    },
+    {
+      "id": "0c77ef7f2d22",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deferral",
+      "what": "Shipped D-06's REVOCATION half; deferred the admin FORCE-TERMINATE half to a follow-up.",
+      "why": "The two are not the same severity, measured rather than assumed. Revocation orphans positions PERMANENTLY: it closes the session row, so the robot dies via the token-refresh 403 -> TMKR-6002 -> bare ExpertRemove(), a path that never reaches on_termination_requested where the close loop lives. Force-terminate is a LATENCY problem, not an orphaning one — it also kills the channel, but the robot then fails 3 heartbeats, raises TMKR-4002, and TMKR-4002 DOES reach the close loop (CSDKContext.mqh:425/480), so positions close after ~3 heartbeat intervals of unmonitored trading. Fixing force-terminate also changes an admin-facing contract (a live session would be signalled and deferred rather than closed now, and force-terminate.test.ts:71-74 explicitly asserts today's behaviour), which is not a c",
+      "costIfWrong": "A force-terminated LIVE session keeps trading unmonitored for ~3 minutes before its positions close. Real but bounded, and strictly better than the revocation case that is now fixed. The follow-up is recorded in the P17 handoff with the exact call sites.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T18:24:08Z"
+    },
+    {
+      "id": "20b092114795",
+      "slug": "mql-lane-followups",
+      "phase": 17,
+      "kind": "deviation",
+      "what": "Completed task verify:local as its four jobs run separately, after the single full run was SIGKILLed by the OS memory killer (exit 143) mid-admin.",
+      "why": "The full run got through robot 6/6, customer 10/10, common 46/46 and 30 of 34 admin endpoints with 98 passing jest summaries and ZERO failures, then died at admin-search: 14 CPUs means jest spawns ~13 ts-jest workers per endpoint, on a 36 GB machine already holding a Docker VM and VS Code cpptools (~7 GB, the user's, not mine to touch) with 12 GB compressed. Re-running the whole ~50-minute fleet would re-prove three categories that already passed and hit the same peak. So: schema-contract, parity-gates and validate-terraform each re-run via 'task verify:local -- <job>' (all success), and test-lambdas completed by running only the unfinished categories (admin in full, vendor, commissioner, public, support-agent) via their official 'task test:<cat>:endpoints' verbs — the exact code path test",
+      "costIfWrong": "Robot/customer/common are proven by the killed run's log rather than a run that exited 0 end-to-end; a defect that only appears when categories run in one process would be missed. CI's test-lambdas on each PR is the authoritative whole-fleet run.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000099",
+      "at": "2026-09-12T18:40:59Z"
+    },
+    {
+      "id": "86493a381fb9",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "ambiguity",
+      "what": "SDK version is v1.4.0; SDK v1.3.3 is never tagged",
+      "why": "owner chose it; wrapper v1.3.3 is already public WITHOUT D-02, so tagging D-02 as 1.3.3 would give one number two contents; release-please derives minor from feat:",
+      "costIfWrong": "a public tag cannot be walked back",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "964152272864",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "deviation",
+      "what": "release fully tonight despite the known cross-lane reds",
+      "why": "owner chose it over staging: MQL52026 required contract-and-sdk-drift reads mql5-sample-lib@main and the 06:17Z pointer bot bumps hub, so both go red until MQL52026 re-vendors SDK v1.4.0 (a box #3 deploy)",
+      "costIfWrong": "Phase 8's #156 merge CD-refuses and ring-fix PRs are blocked until the re-vendor ships",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "84d14059e667",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "deviation",
+      "what": "scope widened to one aws fix: PR (site-4 re-pin + D-02 structural guards, test-only)",
+      "why": "sdk-error-codes.test.ts self-skips in aws CI and pins the SDK define; it drifted twice; a test-only fix: needs no register entry",
+      "costIfWrong": "a product: class would oblige a change-register entry for a commit that changes no handler",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "fc581f928d0a",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "deferral",
+      "what": "P19 does not advance hub's mql5-sample-lib gitlink",
+      "why": "robot-config-parity byte-compares MQL52026's vendored SDK (Phase 8's repo); the pointer bot owns the bump; hub's shared index holds a foreign staged 0e127b05 for that path",
+      "costIfWrong": "hub stays behind by a few commits, which pointer-freshness tolerates up to 100",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "d5a3c411c715",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "deferral",
+      "what": "no dedicated demo-account TMKR code in this phase",
+      "why": "it needs catalog.json + regenerated website artifacts (out of scope) and P17's unmerged #191; the SDK maps TMKR-2006 with context.allowed_trade_modes and shows any unknown code verbatim",
+      "costIfWrong": "demo-on-live refusals keep reading as 'licence not active' until the dedicated code ships",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "a17a0ba14e11",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "ambiguity",
+      "what": "MIN_REQUIRED_SDK_VERSION stays 1.1.1",
+      "why": "D-02 is additive: emitted robots call only on_init, and the refusal alert lives inside the SDK",
+      "costIfWrong": "none unless a later integrator change starts calling the new getters",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "67d454e84e24",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "ambiguity",
+      "what": "keep bool start()/start_session(); add typed getters instead of changing return types",
+      "why": "no signature break for any vendor subclass; the typed reason is still carried end to end",
+      "costIfWrong": "a vendor wanting the reason must call a getter rather than read a return value",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "abef9c6305e6",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "ambiguity",
+      "what": "a bodyless 401/403 (no TMKR code) maps to UNKNOWN, never key-not-recognised",
+      "why": "only the server's own TMKR-2001 may claim a key problem; a Cloudflare/WAF 403 has no problem+json body",
+      "costIfWrong": "a real key refusal from an older gateway without a body would read as unknown (still shows HTTP status)",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "04b429a976cd",
+      "slug": "mql-lane-followups",
+      "phase": 19,
+      "kind": "ambiguity",
+      "what": "publish a GitHub Release for SDK v1.4.0 marked Latest, no backfill",
+      "why": "owner chose it; vendors browsing sdk-mql5-lib saw v1.2.0 as Latest, three versions behind",
+      "costIfWrong": "none beyond an extra public release page",
+      "sessionId": "f1c70000-0000-4000-8000-000000000100",
+      "at": "2026-09-12T20:07:00Z"
+    },
+    {
+      "id": "07d7a213be68",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Ring runs in three passes into ONE artifact: pass 1 = the 16 robot cells now; pass 2 = I-ON-S, I-ON-R, I-ON-V, I-OFF-S, I-FR-S MERGE_INTO after box #2 deploys the trivy fix + #131 and drift:trade is green; pass 3 = I-ON-O + IB-ON-S MERGE_INTO after the 2026-09-13T21:00Z forex open (plus I-ON-R if pass 2 reads it inconclusive for want of ticks).",
+      "why": "live_matrix.compile_subject compiles INDICATORS against production box #2 (_compile_indicator_prod; the DLL /check, heartbeat and kill-file consult box #2) while robots never touch it. tb #131 is merged and box #2 must redeploy, so indicator cells must not straddle that deploy; robots are box-#2-independent and the preflight itself says run them now. merge_reruns appends new cells under reruns with previous_verdict None, so provenance stays honest.",
+      "costIfWrong": "Seven indicator cells read as reruns rather than one pass in the rendered report; if box #2's fix pipeline stalls, pass 2 waits for it.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000101",
+      "at": "2026-09-13T04:24:02Z"
+    },
+    {
+      "id": "d8b485941c6f",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Added a acme-backend fix PR to the phase: libpcre2-8-0 10.42-1 (CVE-2026-86145, CVE-2026-89161, both HIGH, fix available) in the runtime image.",
+      "why": "security-scan / trivy-image failed on tb main's Quality gate for 9ac389fc (the #131 squash), so CD cannot deploy box #2 and exit criterion 2 (box #2 drift-green) is unreachable without it. Same CVE pair and fix class as P5's box #1 ship.",
+      "costIfWrong": "One extra box #2 deploy; the fix is an apt package pin, revertible by revert.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000101",
+      "at": "2026-09-13T04:24:02Z"
+    },
+    {
+      "id": "c7b0d66fc56c",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Realigned the LAPTOP checkouts of mql5-sample-lib (f7f09573 -> 1d08d3c6) and its SDK (763563f2 -> 59274a36) by explicit sha; no commit or change to either repo.",
+      "why": "MQL52026's local gates read the sibling ../mql5-sample-lib working tree as canonical: on the re-vendor branch both contract-and-sdk-drift and compile-service-tests (test_a_partial_skip_still_passes) redded ONLY because that checkout still held the pre-release SDK, and the pre-push hook would refuse the push. CI checks out mql5-sample-lib@main (1d08d3c6). P19's handoff prescribes exactly this realign.",
+      "costIfWrong": "Until hub's mql5-sample-lib gitlink advances (pointer bot), hub shows that path as modified; restore with the reverse detach if needed.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000101",
+      "at": "2026-09-13T04:41:02Z"
+    },
+    {
+      "id": "9b5b287fde16",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "ambiguity",
+      "what": "SDK v1.4.0 re-vendor sequencing = option (a): a dedicated MQL52026 PR (#158, six files byte-identical to sdk-mql5-lib 59274a36) merges FIRST, only after every counted ring cell (incl. the post-open I-ON-O/IB-ON-S pass); its CD pin-bump PR lands next; the graph PR #156 is rebased onto that main and merged one full CI cycle later. Rollback tag for the re-vendor ship: mt-cvs/compile-service:20260912-aa0d12de (running + pinned at ruling time).",
+      "why": "Two separate box #3 deploys are cheaper to attribute and roll back than one merge that carries both a bake-set change (Include/ -> image rebuild) and a graph refresh; #156 is not in the bake set so it costs no rebuild, and spacing merges one CI cycle keeps cvs:drift readable between them. Folding (b) would tie the graph's freshness to the SDK ship and blur a rollback.",
+      "costIfWrong": "One extra CI cycle (~1 h) and one extra pin-bump PR on box #3; no product exposure either way.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000101",
+      "at": "2026-09-13T10:29:24Z"
+    },
+    {
+      "id": "a3b33133dd60",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "ambiguity",
+      "what": "Session 5 (7e95ff7b) took over P8 at 15:50Z with the user's explicit choice; the prior session hub-e5 (9d8b45ec) had already run pass 2, handed off in-progress and RELEASED the lock at 15:41Z, so the claim needed no --force. The #158 re-proof (diff -rq, sync_contract --check, task verify:local: 6/6 gates green on a591fa3) was run BEFORE pass 3 because it is read-only and MQL52026 main (e5847d03) has not moved; the MERGE still waits for pass 3 per the option-(a) ruling. Re-prove again only if MQL",
+      "why": "The boot prompt's 'ONLY after every counted cell' governs the merge (a box #3 rebuild mid-ring), not a local proof; proving early takes ~10 min off the post-21:00Z critical path.",
+      "costIfWrong": "None to the ring; if main moves the proof is stale and must be re-run before the merge.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000095",
+      "at": "2026-09-13T15:52:41Z"
+    },
+    {
+      "id": "dd5ddb2c3813",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "Pin PR #159 squash body left EMPTY (subject only) instead of #157's hand-written body",
+      "why": "The human's pasted merge line wraps at ~80 cols and zsh runs the fragments (the first #158 attempt split at --repo); a body-file flag cannot survive that. Squash uses COMMIT_MESSAGES and the bot commit has no body, so the default is commitlint-safe.",
+      "costIfWrong": "A thinner main-log line for the pin adoption; the PR carries the explanation",
+      "sessionId": "f1c70000-0000-4000-8000-000000000095",
+      "at": "2026-09-14T01:55:20Z"
+    },
+    {
+      "id": "bc61cde52711",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "deviation",
+      "what": "MQL52026 #156 (graph, outside the bake set) merged from the session after the user granted all permissions; tb #134 still handed to the human",
+      "why": "The user granted permissions explicitly; #156 changes no image and the classifier allowed it; the tb main merge was classifier-denied [Production Deploy] so it went to the human as the boot prompt requires.",
+      "costIfWrong": "None to the box: #156's CD was an image no-op and cvs drift stayed green",
+      "sessionId": "f1c70000-0000-4000-8000-000000000095",
+      "at": "2026-09-14T01:55:20Z"
+    },
+    {
+      "id": "7e6a018172f0",
+      "slug": "mql-lane-followups",
+      "phase": 8,
+      "kind": "ambiguity",
+      "what": "Hub's MQL52026 gitlink advanced by hand (temp-index) e5847d03 -> 0136a82b in the closeout commit rather than waiting for the pointer bot",
+      "why": "The boot prompt allowed either; doing it now lets hub's robot-config-parity re-run on the restored input in the same commit that closes the phase.",
+      "costIfWrong": "The bot's daily run finds nothing to move for MQL52026",
+      "sessionId": "f1c70000-0000-4000-8000-000000000095",
+      "at": "2026-09-14T01:55:20Z"
+    },
+    {
+      "id": "7c22fa3ef734",
+      "slug": "mql-lane-followups",
+      "phase": 11,
+      "kind": "deviation",
+      "what": "Gate step 1 was attempted through the API (sesv2 put-account-details) rather than the console reply",
+      "why": "SES returned ConflictException: a DENIED review (case 178070038900653) cannot be re-requested through the API, so the appeal is console-only and stays with the operator; the account still reads DENIED",
+      "costIfWrong": "none: the API call changed nothing",
+      "sessionId": "f1c70000-0000-4000-8000-000000000096",
+      "at": "2026-09-14T02:28:57Z"
+    },
+    {
+      "id": "8bac55b5487a",
+      "slug": "mql-lane-followups",
+      "phase": 11,
+      "kind": "ambiguity",
+      "what": "The three .internal admin recipients are handled three ways: live rail agent-admin-2 -> operator@example.com (Cognito attribute + rail secret username + DB row), old rail agent-admin (id 138) -> Cognito disabled + row soft-deleted, robot-bridge-system admin row -> soft-deleted with its email kept",
+      "why": "the pool signs in by email so a rename must move the secret too; the bridge resolves the sentinel by email (robot-bridge/src/lib/database.ts:56) so renaming it would 500 registrations, while listAllAdmins filters only deleted_at (recipients.ts:199) so a soft-delete removes it from the fan-out",
+      "costIfWrong": "a soft-deleted sentinel could be purged by a future cleanup of deleted admins; filed as a follow-up to make the fan-out honour active instead",
+      "sessionId": "f1c70000-0000-4000-8000-000000000096",
+      "at": "2026-09-14T02:28:57Z"
+    },
+    {
+      "id": "9d35394b4bb7",
+      "slug": "mql-lane-followups",
+      "phase": 24,
+      "kind": "deviation",
+      "what": "D-14's MECHANISM (xdotool/AutoIt GUI automation) is replaced by a launch-argv fix: MT4 takes its startup ini POSITIONALLY as an absolute path (terminal.exe /portable Z:\\job\\tester.ini); tester.py/provision.sh passed the MT5 form /config:config\\tester.ini, which MT4 silently ignores. Measured 2026-09-14 02:53Z in a fresh golden-mt4:20260709 container on box #3: 'Started with configuration file', 'Expert Moving Average EURUSD,H1: loaded successfully', 'Tester: start with configuration file', TestS",
+      "why": "The plan's mechanism rested on the 2026-07-09/2026-08-06 'MT4 ignores the ini' spikes, all of which used the MT5 /config: flag — the repo's own desktop-entrypoint.sh:110 already records that MT4 ignores /config: and takes the path positionally. A one-line argv fix is cheaper, more robust and reproducible than driving Wine GUI with xdotool.",
+      "costIfWrong": "If the positional path had failed on a real SDK subject or an indicator .set, the phase would fall back to xdotool in a new golden-mt4 layer (xdotool is absent from the image) — a golden rebake plus a fragile driver.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000102",
+      "at": "2026-09-14T02:57:55Z"
+    },
+    {
+      "id": "488b3e1aa3bb",
+      "slug": "mql-lane-followups",
+      "phase": 24,
+      "kind": "deviation",
+      "what": "Scope widened from MQL52026-only to MQL52026 + trade/acme-backend (owner-approved 2026-09-14 ~03:05Z): publishing mt4 as tier B,C regenerates verify_checks.json, whose tb byte-mirror hub's drift:pins requires; the tb PR carries the mirror copy + the ring's R-ON-S/mt4 cell tightening only. VERIFY_TIERS (an API-response default, contracts lockstep) is deferred to a tb-scoped follow-up.",
+      "why": "Exit criterion 3 + the boot prompt require task drift green at closeout; drift:pins reads the two working trees byte-for-byte.",
+      "costIfWrong": "A tb merge is a box #2 deploy (~34 min CD); if the owner had preferred MQL52026-only, drift:pins would read RED until a tb session copied the mirror.",
+      "sessionId": "f1c70000-0000-4000-8000-000000000102",
+      "at": "2026-09-14T03:01:14Z"
+    }
+  ],
+  "stoppedBy": "system",
+  "finishedReason": "phase 11 declared itself waiting on external work (AWS SES production-access review: Support Center case 178935438200941 (Service limit increase, SES Sending Limits eu-west-1) filed by the owner 2026-09-14 ~02:50Z; gate step 3 needs ProductionAccessEnabled=true. Resume recipe: handoff phase-11 §▶ Resume); its own session resumes at 2026-09-14T11:01:27.461Z."
+}

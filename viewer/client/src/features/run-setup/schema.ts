@@ -31,7 +31,8 @@
  */
 
 import * as z from 'zod/mini';
-import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions } from '@/lib/api';
+import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions, RelayMode } from '@/lib/api';
+import { RELAY_MODES } from '@shared/run-settings.js';
 import { RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
 import {
   DEFAULT_SETTLE,
@@ -125,6 +126,19 @@ export interface RunSetupValues {
   phaseOptions: Record<string, PhaseOptions>;
   /** A session's first message. Never a run field. */
   prompt: string;
+  /**
+   * The prelude's answers (phase 11, the Decisions stage). `resumeOnRestart`
+   * and `relay` are the run's own words for the `resume.on-restart` and `relay`
+   * rows; `accounts` is the list it may spend as `id:minHeadroom%` pairs
+   * (parsed at the payload boundary, like `onlyPhases`); `acknowledgedWaivers`
+   * names the waived rows the operator has read; `manifestOverride` is the
+   * name a person signs a start past a blocking row with — empty means none.
+   */
+  resumeOnRestart: boolean;
+  relay: RelayMode;
+  accounts: string;
+  acknowledgedWaivers: string[];
+  manifestOverride: string;
 }
 
 export type RunSetupField = keyof RunSetupValues;
@@ -171,6 +185,11 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
   onlyPhases: 'onlyPhases',
   phaseOptions: 'phaseOptions',
   prompt: null,
+  resumeOnRestart: 'resumeOnRestart',
+  relay: 'relay',
+  accounts: 'accounts',
+  acknowledgedWaivers: 'acknowledgedWaivers',
+  manifestOverride: 'manifestOverride',
 });
 
 /**
@@ -242,6 +261,17 @@ export const runSetupSchema = z.object({
   ),
   phaseOptions: z.record(z.string(), z.any()),
   prompt: z.string(),
+  resumeOnRestart: z.boolean(),
+  // From the owner list — `shared/run-settings.js` is the one place the relay's
+  // two words are spelled.
+  relay: z.enum(RELAY_MODES as unknown as [RelayMode, ...RelayMode[]]),
+  accounts: z.string().check(
+    z.refine((text) => text.trim() === '' || parseAccounts(text) !== undefined, {
+      message: 'Accounts look like default:20, work:10 — an id and the minimum headroom percent',
+    }),
+  ),
+  acknowledgedWaivers: z.array(z.string()),
+  manifestOverride: z.string(),
 });
 
 /** `''` is "no ceiling"; anything else must be a non-negative number. */
@@ -321,7 +351,38 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   onlyPhases: '',
   phaseOptions: {},
   prompt: '',
+  // The prelude's four (phase 11): continue after a restart (decision 11's
+  // `resume.on-restart: continue`), no relay (phase 14 arms it), and an EMPTY
+  // account list — the Decisions stage fills it from the plan's clause or the
+  // machine login once the prelude answers, and the door refuses a start that
+  // never named one. No waiver acknowledged, no override signed.
+  resumeOnRestart: true,
+  relay: 'off',
+  accounts: '',
+  acknowledgedWaivers: [],
+  manifestOverride: '',
 });
+
+/** `"default:20, work:10"` → `[{id, minHeadroomPct}]`; empty → `[]`; unreadable → `undefined`. */
+export function parseAccounts(text: string): { id: string; minHeadroomPct: number }[] | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  const out: { id: string; minHeadroomPct: number }[] = [];
+  for (const part of trimmed.split(',')) {
+    const m = /^\s*([A-Za-z0-9][A-Za-z0-9._-]{0,63})(?:\s*:\s*(\d{1,3})\s*%?)?\s*$/.exec(part);
+    if (!m) return undefined;
+    const min = m[2] === undefined ? 0 : Math.min(100, Number(m[2]));
+    if (!out.some((a) => a.id === m[1])) out.push({ id: m[1], minHeadroomPct: min });
+  }
+  return out;
+}
+
+/** The inverse, for seeding the field from a run or the prelude's resolved list. */
+export function formatAccounts(
+  accounts: readonly { id: string; minHeadroomPct: number }[] | null | undefined,
+): string {
+  return accounts?.length ? accounts.map((a) => `${a.id}:${a.minHeadroomPct}`).join(', ') : '';
+}
 
 /** `"1, 3, 5-7"` → `[1, 3, 5, 6, 7]`; empty or unreadable → `undefined`. */
 export function parsePhases(text: string): number[] | undefined {

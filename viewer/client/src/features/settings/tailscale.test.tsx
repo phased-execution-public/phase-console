@@ -17,7 +17,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
-import type { TailscaleStatus } from '@/lib/api';
+import type { ServeOccupant, TailscaleStatus } from '@/lib/api';
 import { TailscaleCard, httpsPortFor, servedPort } from './tailscale';
 
 // `vi.hoisted`, because the mock factory is lifted above every top-level const.
@@ -63,7 +63,46 @@ function running(serve: Serve): TailscaleStatus {
   };
 }
 
-const SERVING_US = { active: true, forOurPort: true, url: 'https://alpha.example.ts.net' };
+/** Serve pointed at this console, as a server that read the whole table reports it. */
+const SERVING_US: Serve = {
+  active: true,
+  forOurPort: true,
+  url: 'https://alpha.example.ts.net',
+  targetPort: 4123,
+  handlers: [{ host: 'alpha.example.ts.net', httpsPort: 443, path: '/', targetPort: 4123, ours: true }],
+  command: null,
+};
+
+/** A sibling console on this machine, named the way the server names a handler's occupant. */
+const DELTA: ServeOccupant = { port: 4130, id: 'aaaaaaaa-delta', name: 'delta', liveness: 'running' };
+
+/** The default console's own command, when nothing live stands in its way. */
+const NATURAL = {
+  httpsPort: 443,
+  text: 'tailscale serve --bg --https=443 http://127.0.0.1:4123',
+  displaces: null,
+};
+
+/** 443 held by `occupant`, as the server reports it to the console on 4123. */
+function heldBy(occupant: ServeOccupant, command: Serve['command']): Serve {
+  return {
+    active: true,
+    forOurPort: false,
+    targetPort: occupant.port,
+    occupant,
+    handlers: [
+      {
+        host: 'alpha.example.ts.net',
+        httpsPort: 443,
+        path: '/',
+        targetPort: occupant.port,
+        ours: false,
+        occupant,
+      },
+    ],
+    command,
+  };
+}
 
 /**
  * The banners, as text.
@@ -149,12 +188,27 @@ describe('the disagreements, each named with its symptom', () => {
     expect(await screen.findByText(/will not resolve/)).toBeTruthy();
   });
 
-  it('serving a different port is not reported as "not serving"', async () => {
+  it('serving another console is not reported as "not serving" — and that console is named', async () => {
     // Distinct states with distinct fixes; collapsing them would tell someone
-    // to re-run a serve command that is already running.
+    // to re-run a serve command that is already running. "Something else" was
+    // the old answer, and it could not say whose phone the fix would take.
+    tailscale.mockResolvedValue(running(heldBy({ ...DELTA, liveness: 'stopped' }, NATURAL)));
+    mount({ remoteHosts: ['alpha.example.ts.net'] });
+    expect(await screen.findByText('delta (port 4130)')).toBeTruthy();
+    expect(screen.queryByText(/something else/)).toBeNull();
+  });
+
+  it('a port no registered console claims is named by its port', async () => {
+    tailscale.mockResolvedValue(running(heldBy({ port: 9999 }, NATURAL)));
+    mount({ remoteHosts: ['alpha.example.ts.net'] });
+    expect(await screen.findByText('port 9999 — a program no console on this machine knows')).toBeTruthy();
+  });
+
+  it('a server too old to name the occupant still never says "something else"', async () => {
     tailscale.mockResolvedValue(running({ active: true, forOurPort: false }));
     mount({ remoteHosts: ['alpha.example.ts.net'] });
-    expect(await screen.findByText(/something else/)).toBeTruthy();
+    expect(await screen.findByText('another port — this server is too old to say which')).toBeTruthy();
+    expect(screen.queryByText(/something else/)).toBeNull();
   });
 
   it('two halves naming different hosts is its own warning', async () => {
@@ -225,6 +279,8 @@ describe('a second console on one machine', () => {
   // one's URL over: the phone then reached whichever ran the command last, and
   // the other refused with a 421.
   it('keeps 443 for the default port and derives a port of its own for every other console', () => {
+    // The fallback copy for a server that sends no `serve.command`: the same
+    // rows `test/tailscale.test.ts` pins on the server's `httpsPortFor`.
     expect(httpsPortFor(4123)).toBe(443);
     expect(httpsPortFor(4130)).toBe(8130);
     expect(httpsPortFor(5000)).toBe(9000);
@@ -261,5 +317,40 @@ describe('a second console on one machine', () => {
     mount({ port: 4130, remoteHosts: ['alpha.example.ts.net'] });
     await screen.findByText('alpha@example.com');
     expect(warnings().join(' ')).toMatch(/nothing is being served on 8130/);
+  });
+
+  it('names the live console holding 443, refuses to print the command that would displace it, and offers the port that leaves it alone', async () => {
+    // The real shape of the finding: a sibling holds 443, and the default
+    // console's natural command is exactly the line that takes its phone.
+    tailscale.mockResolvedValue(
+      running(
+        heldBy(DELTA, {
+          httpsPort: 8123,
+          text: 'tailscale serve --bg --https=8123 http://127.0.0.1:4123',
+          displaces: { httpsPort: 443, occupant: DELTA },
+        }),
+      ),
+    );
+    mount({ port: 4123, remoteHosts: ['alpha.example.ts.net'] });
+    await screen.findByText('alpha@example.com');
+    // The Serving row names the occupying console and its port.
+    expect(screen.getByText('delta (port 4130)')).toBeTruthy();
+    // The server's command is printed as sent; the displacing one is not.
+    expect(commands().getByText(/--https=8123 http:\/\/127\.0\.0\.1:4123/)).toBeTruthy();
+    expect(commands().queryByText(/--https=443 /)).toBeNull();
+    const said = warnings().join(' ');
+    expect(said).toMatch(/443 is held by the live console delta \(port 4130\)/);
+    expect(said).toMatch(/publishes on 8123 instead, which leaves delta alone/);
+    // And the flagged-but-unserved warning names the port that command publishes on.
+    expect(said).toMatch(/nothing is being served on 8123/);
+  });
+
+  it('prints the natural command, with no refusal, when the console holding it is not running', async () => {
+    tailscale.mockResolvedValue(running(heldBy({ ...DELTA, liveness: 'stopped' }, NATURAL)));
+    mount({ port: 4123, remoteHosts: [] });
+    await screen.findByText('alpha@example.com');
+    expect(screen.getByText('delta (port 4130)')).toBeTruthy();
+    expect(commands().getByText(/--https=443 http:\/\/127\.0\.0\.1:4123/)).toBeTruthy();
+    expect(warnings().join(' ')).not.toMatch(/held by the live console/);
   });
 });

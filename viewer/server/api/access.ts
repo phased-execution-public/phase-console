@@ -35,6 +35,7 @@
  * treated exactly as it was before this file existed.
  */
 
+import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 
 import type { Flags } from '../config.ts';
@@ -44,8 +45,18 @@ export const IDENTITY_HEADER = 'tailscale-user-login';
 
 const LOOPBACK = new Set(['', 'localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
 
+/** Is this (port-stripped) hostname one of the console's own? Shared with `actor.ts`, which derives `origin` from it. */
+export function isLoopbackHost(host: string): boolean {
+  return LOOPBACK.has(host);
+}
+
 export type Verdict =
-  | { ok: true; scope: 'local' | 'remote'; login: string | null }
+  /**
+   * `poll` marks a request the fleet supervisor made for itself (its inbox merge,
+   * zero-touch phase 19): served, and not a visit — the ledger does not count it,
+   * so `lastRemoteAt` keeps meaning "a phone reached this console".
+   */
+  | { ok: true; scope: 'local' | 'remote'; login: string | null; poll?: true }
   | { ok: false; status: number; message: string; reason: string };
 
 /**
@@ -61,6 +72,7 @@ export function hostnameOf(header: string | undefined): string {
   if (colons > 1) return raw; // bare IPv6, no port
   return raw.replace(/:\d+$/, '').replace(/\.$/, '');
 }
+
 
 export function classify(req: IncomingMessage, flags: Flags): Verdict {
   const login = headerValue(req.headers[IDENTITY_HEADER]);
@@ -120,8 +132,107 @@ export function classify(req: IncomingMessage, flags: Flags): Verdict {
  * bury the real value behind one of their own, so a duplicated identity is no
  * identity at all.
  */
-function headerValue(value: string | string[] | undefined): string | null {
+export function headerValue(value: string | string[] | undefined): string | null {
   if (Array.isArray(value)) return null;
   const trimmed = (value ?? '').trim().toLowerCase();
   return trimmed || null;
 }
+
+/* ------------------------------------------------------------------ *
+ * The served-request record (zero-touch phase 17, FLT-10)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A login, never in clear: the first 12 hex characters of its sha256 — enough
+ * to tell two identities apart in a log, useless for finding out who they are.
+ */
+export function loginHash(login: string): string {
+  return createHash('sha256').update(login).digest('hex').slice(0, 12);
+}
+
+type RemoteIdentity = { host: string; loginHash: string; first: string; last: string; count: number };
+
+/**
+ * What this console has SERVED, by scope — the ingress record that was missing.
+ *
+ * Only refusals were ever logged, so forty-two days of logs could not say
+ * whether a phone had reached a console once: a failing proxy, an allowlist
+ * that no longer matched the login Serve asserts and a phone nobody picked up
+ * all read as silence. Now every served request counts (`served.local`,
+ * `served.remote`, on `state().access`), each remote identity is logged ONCE
+ * per process (`access.remote`, with a hashed login), and the last remote
+ * request's moment is what the heartbeat writes as `lastRemoteAt`.
+ *
+ * `log` and `onFirstRemote` are injectable so a test can watch both without a
+ * log file; the process-wide ledger below wires the real ones in `index.ts`.
+ */
+export class AccessLedger {
+  readonly served = { local: 0, remote: 0 };
+  private readonly identities = new Map<string, RemoteIdentity>();
+  private last: string | null = null;
+  private log: (event: 'access.remote', detail: RemoteIdentity) => void;
+  private onFirstRemote: (at: string) => void;
+
+  constructor(
+    opts: {
+      log?: (event: 'access.remote', detail: RemoteIdentity) => void;
+      onFirstRemote?: (at: string) => void;
+    } = {},
+  ) {
+    this.log = opts.log ?? (() => {});
+    this.onFirstRemote = opts.onFirstRemote ?? (() => {});
+  }
+
+  /** Wire the real log and the registry write — `index.ts`, once. */
+  wire(opts: {
+    log?: (event: 'access.remote', detail: RemoteIdentity) => void;
+    onFirstRemote?: (at: string) => void;
+  }): void {
+    if (opts.log) this.log = opts.log;
+    if (opts.onFirstRemote) this.onFirstRemote = opts.onFirstRemote;
+  }
+
+  /** One served request. A refused one is not served — `access.refused` already records it. */
+  note(verdict: Verdict, host: string | undefined, now: number = Date.now()): void {
+    if (!verdict.ok) return;
+    // The supervisor asking for itself (its inbox merge) is not somebody reaching this console.
+    if (verdict.poll) return;
+    if (verdict.scope === 'local') {
+      this.served.local++;
+      return;
+    }
+    this.served.remote++;
+    const at = new Date(now).toISOString();
+    const firstRemote = this.last === null;
+    this.last = at;
+    const hash = loginHash(verdict.login ?? '');
+    const seen = this.identities.get(hash);
+    if (seen) {
+      seen.last = at;
+      seen.count++;
+    } else {
+      const identity: RemoteIdentity = { host: hostnameOf(host), loginHash: hash, first: at, last: at, count: 1 };
+      this.identities.set(hash, identity);
+      try { this.log('access.remote', { ...identity }); } catch { /* a log line must never refuse a request */ }
+    }
+    if (firstRemote) {
+      try { this.onFirstRemote(at); } catch { /* the heartbeat writes it again on its next beat */ }
+    }
+  }
+
+  lastRemoteAt(): string | null {
+    return this.last;
+  }
+
+  /** What `state().access` carries: the counters, the identities (hashed) and the last remote moment. */
+  snapshot(): { served: { local: number; remote: number }; lastRemoteAt: string | null; identities: RemoteIdentity[] } {
+    return {
+      served: { ...this.served },
+      lastRemoteAt: this.last,
+      identities: [...this.identities.values()].map((identity) => ({ ...identity })),
+    };
+  }
+}
+
+/** The process's one ledger — `index.ts` notes every served request into it. */
+export const accessLedger = new AccessLedger();

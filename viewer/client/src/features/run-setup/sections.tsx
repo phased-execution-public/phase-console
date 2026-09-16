@@ -33,6 +33,7 @@ import { QA_FIX_STRATEGIES, QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.
 import { ISOLATED, SETTLE_LABELS, SETTLE_PUSHES, SETTLE_STRATEGIES } from '@shared/worktree-model.js';
 import type { UltraReviewMode } from '@shared/run-lifecycle.js';
 import { NumberField, PressField, SelectField, SetupField, ToggleField } from './fields';
+import { DecisionsSection } from './decisions';
 import { permissionModeFor } from './modes';
 import { PerPhase } from './per-phase';
 import type { RunSetupValues } from './schema';
@@ -957,6 +958,7 @@ export function StopsSection() {
 export function FlatForm() {
   return (
     <div className="flex min-w-0 flex-col gap-3">
+      <DecisionsSection />
       <ScopeSection />
       <ModelSection />
       <AccountSection />

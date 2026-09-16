@@ -8,10 +8,12 @@ load ../helpers/test_helper
 
 setup() {
   export XDG_STATE_HOME="$BATS_TEST_TMPDIR/state"
+  # The registry the no-node fallback reads (FLT-8) — never the operator's.
+  export XDG_CONFIG_HOME="$BATS_TEST_TMPDIR/config"
   export STUB="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$STUB"
   # Nothing inherited from the session this suite may itself be running in.
-  unset PE_SESSION_ID PE_OWNER PE_SCOPE PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF CLAUDE_CODE_SESSION_ID
+  unset PE_SESSION_ID PE_OWNER PE_SCOPE PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF PHASE_CONSOLE_PROBE CLAUDE_CODE_SESSION_ID
   # …and the rest of what a console exports into every session it spawns —
   # including the one running THIS suite under an autopilot. The hook honours
   # `$DOCS_ROOT` by design (a lane worktree's cwd is the wrong root), so with
@@ -71,8 +73,8 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
 @test "hook: SessionStart POSTs the record to the owning console and tells the session its id" {
   run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
-  # node was asked about THIS cwd.
-  grep -q -- "shell --cwd $PROJ" "$STUB/node.log"
+  # node was asked which REGISTERED console owns THIS cwd (FLT-8: `owner`, no sole-instance fallback).
+  grep -q -- "owner --cwd $PROJ" "$STUB/node.log"
   # one POST, to the console's /hooks/session
   grep -q "http://127.0.0.1:4999/hooks/session" "$STUB/curl.log"
   body="$(cat "$STUB/curl.body")"
@@ -148,8 +150,33 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   assert_contains "$(cat "$STUB/curl.body")" '"reason":"logout"'
 }
 
-@test "hook: no node answer ⇒ no POST; the inbox is derived by the bash identity rule (default instance = flat state home)" {
+# The registry as instances.mjs writes it (pretty-printed, one row per id), for
+# the no-node fallback, which reads it rather than guessing from disk (FLT-8).
+write_registry() { # <id> <root> <default:true|false>
+  mkdir -p "$XDG_CONFIG_HOME/phase-console"
+  cat > "$XDG_CONFIG_HOME/phase-console/instances.json" <<EOR
+{
+  "version": 1,
+  "instances": {
+    "$1": {
+      "name": "proj",
+      "port": 4999,
+      "default": $3,
+      "root": "$2",
+      "lanes": {
+        "live": 0,
+        "max": 3
+      }
+    }
+  }
+}
+EOR
+}
+
+@test "hook: no node answer, the REGISTRY names the root as default ⇒ no POST; the inbox is the flat state home" {
   rm -f "$NODE_STUB_FILE"
+  id="$(printf '%s' "$PROJ" | shasum -a 256 | cut -c1-8)-proj"
+  write_registry "$id" "$PROJ" true
   run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
   [ ! -f "$STUB/curl.log" ]
@@ -157,13 +184,14 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   [ -n "$f" ]
   assert_contains "$(cat "$f")" '"session_id":"s1"'
   assert_contains "$(cat "$f")" "\"root\":\"$PROJ\""
+  assert_contains "$(cat "$f")" '"owner_kind":"registered"'
   assert_contains "$output" '--session s1'
 }
 
-@test "hook: no node answer, non-default instance ⇒ the inbox under instances/<id> (the dir a console created)" {
+@test "hook: no node answer, a registered NON-default instance ⇒ the inbox under instances/<id>" {
   rm -f "$NODE_STUB_FILE"
   id="$(printf '%s' "$PROJ" | shasum -a 256 | cut -c1-8)-proj"
-  mkdir -p "$XDG_STATE_HOME/phase-console/instances/$id"
+  write_registry "$id" "$PROJ" false
   run bash -c "printf '%s' '$(payload SessionEnd ',"reason":"other"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
   f="$(inbox_files "$XDG_STATE_HOME/phase-console/instances/$id/sessions/inbox")"
@@ -171,13 +199,47 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   [ -z "$(inbox_files "$XDG_STATE_HOME/phase-console/sessions")" ]
 }
 
-@test "hook: a directory no project owns is nobody's business — nothing written, nothing said (no node answer)" {
+@test "hook (FLT-8): no node answer and a project the registry does not hold ⇒ recorded unowned, never guessed onto the default" {
+  rm -f "$NODE_STUB_FILE"
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ -z "$(inbox_files "$XDG_STATE_HOME/phase-console/sessions")" ]
+  f="$(inbox_files "$XDG_STATE_HOME/phase-console/fleet/sessions/inbox")"
+  [ -n "$f" ]
+  assert_contains "$(cat "$f")" '"owner_kind":"unowned"'
+  assert_contains "$(cat "$f")" '"owner_how":"no-node"'
+  assert_contains "$(cat "$f")" "\"root\":\"$PROJ\""
+}
+
+@test "hook (FLT-8): a directory no project owns is recorded unowned in the machine sink — and nothing is said" {
   rm -f "$NODE_STUB_FILE"
   nowhere="$BATS_TEST_TMPDIR/nowhere"; mkdir -p "$nowhere"
   run bash -c "printf '{\"session_id\":\"s9\",\"cwd\":\"%s\",\"hook_event_name\":\"SessionStart\",\"source\":\"startup\"}' '$nowhere' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
-  [ -z "$(inbox_files "$XDG_STATE_HOME")" ]
+  [ -z "$(inbox_files "$XDG_STATE_HOME/phase-console/sessions")" ]
+  f="$(inbox_files "$XDG_STATE_HOME/phase-console/fleet/sessions/inbox")"
+  [ -n "$f" ]
+  assert_contains "$(cat "$f")" '"session_id":"s9"'
+  assert_contains "$(cat "$f")" '"root":""'
+}
+
+@test "hook (FLT-8): node answers unowned ⇒ no POST, no drain, the drop lands in the machine sink" {
+  cat > "$NODE_STUB_FILE" <<EOS
+kind=unowned
+how=candidate
+root=$PROJ
+inbox=$XDG_STATE_HOME/phase-console/fleet/sessions/inbox
+EOS
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ ! -f "$STUB/curl.log" ]
+  f="$(inbox_files "$XDG_STATE_HOME/phase-console/fleet/sessions/inbox")"
+  [ -n "$f" ]
+  assert_contains "$(cat "$f")" '"owner_how":"candidate"'
+  # The node stub records every call: `owner` was asked, and no `sessions ingest` drain followed.
+  assert_contains "$(cat "$STUB/node.log")" 'owner --cwd'
+  ! grep -q 'sessions ingest' "$STUB/node.log"
 }
 
 @test "hook: malformed payloads never fail the session — no session_id, unknown event, garbage, empty" {
@@ -198,6 +260,22 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   body="$(cat "$STUB/curl.body")"
   assert_contains "$body" '"owner":"autopilot/ab12cd34"'
   assert_contains "$body" '"scope":"web-app"'
+}
+
+@test "hook: the console's MCP probe (PE_OWNER=console/mcp-probe, PHASE_CONSOLE_PROBE=1) posts its owner and probe:1; anyone else posts probe:0" {
+  # SLF-2 / REG-6: the probe used to arrive with no owner and was filed
+  # foreign; it names itself now and the hook forwards the flag so the
+  # registry can keep it out of the operator's list.
+  PE_OWNER=console/mcp-probe PHASE_CONSOLE_PROBE=1 run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"owner":"console/mcp-probe"'
+  assert_contains "$body" '"probe":1'
+  rm -f "$STUB/curl.body"
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"probe":0'
 }
 
 @test "hook: PHASE_CONSOLE_URL overrides the resolved console; PHASE_CONSOLE_HOOK_OFF=1 makes it a no-op" {
@@ -293,4 +371,51 @@ inbox_files() { find "$1" -type f -name '*.json' 2>/dev/null | sort; }
   body="$(cat "$STUB/curl.body")"
   assert_contains "$body" '"event":"Notification"'
   assert_contains "$body" '"notification_type":""'
+}
+
+# ---- REG-7: the drop's name, mode and tmp ---------------------------------------
+
+@test "hook (REG-7): the inbox drop is written 0600 and named with a millisecond stamp" {
+  CURL_STUB_EXIT=7 run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  f="$(inbox_files "$BATS_TEST_TMPDIR/sd/sessions/inbox")"
+  [ -n "$f" ]
+  # 0600 like every other record: the drop names the session, its cwd and its transcript.
+  mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+  [ "$mode" = "600" ]
+  # The stamp is milliseconds — 13 digits today, never the 10 of `date +%s`.
+  stamp="$(basename "$f" | cut -d- -f1)"
+  [ "${#stamp}" -ge 13 ]
+  case "$stamp" in *[!0-9]*) echo "not digits: $stamp"; false ;; esac
+  # tmp+mv: no residue, and the trap that would take a killed hook's tmp with it is armed before the write.
+  [ -z "$(ls "$BATS_TEST_TMPDIR/sd/sessions/inbox"/*.tmp.* 2>/dev/null || true)" ]
+  grep -q "trap 'rm -f \"\$tmp\"" "$PE_SCRIPTS/session-hook.sh"
+}
+
+@test "hook (REG-7): two drops in the same instant both survive — the second gets a distinct name, never an overwrite" {
+  # Freeze every clock the name is built from, so both drops ask for one stamp.
+  cat > "$STUB/date" <<'STUB'
+#!/bin/bash
+case "$*" in
+  *%s%3N*) printf '17000000003N\n' ;;   # macOS date prints the letters back — the fallback path
+  *%s*) printf '1700000000\n' ;;
+  *) printf '2026-01-01T00:00:00Z\n' ;;
+esac
+STUB
+  cat > "$STUB/perl" <<'STUB'
+#!/bin/bash
+printf '1700000000123'
+STUB
+  chmod +x "$STUB/date" "$STUB/perl"
+  CURL_STUB_EXIT=7 run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  CURL_STUB_EXIT=7 run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  files="$(inbox_files "$BATS_TEST_TMPDIR/sd/sessions/inbox")"
+  [ "$(printf '%s\n' "$files" | wc -l | tr -d ' ')" = "2" ]
+  names="$(printf '%s\n' "$files" | xargs -n1 basename | tr '\n' ' ')"
+  case "$names" in *"1700000000123-s1-Stop.json"*) : ;; *) echo "no plain name in: $names"; false ;; esac
+  case "$names" in *1700000000123-s1-Stop-[0-9]*.json*) : ;; *) echo "no tie-broken name in: $names"; false ;; esac
+  # Both are complete records of the same event.
+  for f in $files; do assert_contains "$(cat "$f")" '"event":"Stop"'; done
 }

@@ -16,8 +16,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  applyEvent, evaluateStall, livenessOf, newLaneSignals, oldestOpenTool, stallThresholds,
+  applyEvent, evaluateStall, livenessOf, newLaneSignals, noteWaitDenied, oldestOpenTool, stallThresholds,
   type LaneSignals,
+  mintWatchRef, WATCH_ONESHOT_LEADS, waitScope,
 } from '../server/runner/liveness.ts';
 import { VERIFY_ENV_FALLBACK } from '../server/runner/verify-env.ts';
 import { STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS } from '../shared/attention-model.js';
@@ -62,8 +63,14 @@ test('the shipped thresholds are the shared ones, and nonsense falls back to the
   assert.equal(stallThresholds({ stallRetryBurst: 2 }).stallRetryBurst, 2);
   assert.equal(stallThresholds({ stallRetryBurst: 0 }).stallRetryBurst, STALL_DEFAULTS.stallRetryBurst);
   assert.equal(stallThresholds({ stallExternalWaitMs: 90_000 }).stallExternalWaitMs, 90_000);
+  // The one detector threshold where zero IS a setting: "never call a lane
+  // waiting" — what Settings has always promised ("0 never parks a lane for
+  // waiting") while `positive` quietly turned it back into five minutes
+  // (SLF-9, KNOWN-SINCE). Nonsense still falls back.
+  assert.equal(stallThresholds({ stallExternalWaitMs: 0 }).stallExternalWaitMs, 0);
+  assert.equal(stallThresholds({ stallExternalWaitMs: -1 }).stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs);
   assert.equal(
-    stallThresholds({ stallExternalWaitMs: 0 }).stallExternalWaitMs,
+    stallThresholds({ stallExternalWaitMs: Number.NaN }).stallExternalWaitMs,
     STALL_DEFAULTS.stallExternalWaitMs,
   );
 });
@@ -492,4 +499,133 @@ test('the open-tool summary reaches the wire, so a reader sees what a lane is in
   const signals = fold([[bash('a', 'gh run watch 456'), T0]]);
   assert.equal(oldestOpenTool(signals)?.summary, 'gh run watch 456');
   assert.equal(livenessOf(2, signals).openTool?.summary, 'gh run watch 456');
+});
+
+/* ------------------------------------------------------------------ *
+ * A wait the console REFUSED (zero-touch-console phase 5, RCV-5's firing half)
+ * ------------------------------------------------------------------ */
+
+const DENIED_LOCAL = { command: 'until [ -f /tmp/suite.done ]; do sleep 30; done', matched: 'until [^`]+; *do' };
+
+test('a refused local wait, then silence, raises external-wait from the refusal — no call ever opened', () => {
+  const signals = newLaneSignals(T0);
+  noteWaitDenied(signals, DENIED_LOCAL, T0 + MINUTE, STALL_LOCAL_JOB_MS);
+  assert.equal(waited(signals, T0 + 4 * MINUTE), null, 'inside the external-wait threshold: nothing yet');
+  const stall = waited(signals, T0 + 7 * MINUTE);
+  assert.equal(stall?.signal, 'external-wait');
+  assert.equal(stall?.source, 'denied');
+  assert.equal(stall?.scope, 'local', 'read off the refused command, like an open one');
+  assert.equal(stall?.since, new Date(T0 + MINUTE).toISOString(), 'since the refusal, not the tick');
+  assert.match(String(stall?.detail), /refused 1 in-turn wait/);
+  // Outranks `silent` for the same reason an open wait does: the cause is named.
+  assert.equal(waited(signals, T0 + 12 * MINUTE)?.signal, 'external-wait');
+});
+
+test('a session that took the refusal and went on working is left alone; one that keeps asking is not', () => {
+  // Took it: one refusal, then real work every minute — the console asked for exactly this.
+  const working = newLaneSignals(T0);
+  noteWaitDenied(working, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
+  for (let m = 1; m <= 8; m++) applyEvent(working, step(1), T0 + m * MINUTE);
+  assert.equal(waited(working, T0 + 8 * MINUTE + 30_000), null);
+
+  // Pressing: refused again inside the threshold, however busy it looks between.
+  const pressing = newLaneSignals(T0);
+  noteWaitDenied(pressing, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
+  for (let m = 1; m <= 6; m++) applyEvent(pressing, step(1), T0 + m * MINUTE);
+  noteWaitDenied(pressing, { ...DENIED_LOCAL, command: 'while ! test -f /tmp/suite.done; do sleep 20; done' }, T0 + 5 * MINUTE, STALL_LOCAL_JOB_MS);
+  const stall = waited(pressing, T0 + 6 * MINUTE);
+  assert.equal(stall?.source, 'denied');
+  assert.match(String(stall?.detail), /refused 2 in-turn wait/);
+  assert.equal(stall?.since, new Date(T0).toISOString(), 'one episode — `since` holds while refusals keep coming');
+});
+
+test('a commit or a declared outcome ends the refusal\'s episode; an old refusal is over whatever the lane does now', () => {
+  for (const summary of ['git commit -m "wip"', 'bash scripts/phase-outcome.sh demo 3 waiting-external --wait-minutes 30 --watch cmd:"test -f /tmp/x"']) {
+    const signals = newLaneSignals(T0);
+    noteWaitDenied(signals, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
+    applyEvent(signals, bash('t1', summary), T0 + MINUTE);
+    applyEvent(signals, result('t1'), T0 + MINUTE + 1_000);
+    assert.equal(signals.waitDenied, undefined, `${summary.slice(0, 20)}…: durable progress ends it`);
+    assert.equal(waited(signals, T0 + 9 * MINUTE)?.source, undefined);
+  }
+  const stale = newLaneSignals(T0);
+  noteWaitDenied(stale, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
+  const late = T0 + STALL_LOCAL_JOB_MS + STALL_DEFAULTS.stallExternalWaitMs + MINUTE;
+  assert.notEqual(waited(stale, late)?.source, 'denied', 'a refusal from before the local budget plus the threshold is history');
+});
+
+test('a refused `--watch` is a refused wait too: raised from the refusal, on the clock it names', () => {
+  // REC-48's other half: the session's `--watch` was refused before it opened,
+  // exactly like its `until … pgrep` loop, and has to reach the same ladder.
+  const signals = newLaneSignals(T0);
+  noteWaitDenied(signals, { command: 'gh pr checks 12 --watch', matched: '--watch' }, T0, STALL_LOCAL_JOB_MS);
+  noteWaitDenied(signals, { command: 'gh pr checks 12 --watch --interval 30', matched: '--watch' }, T0 + 2 * MINUTE, STALL_LOCAL_JOB_MS);
+  const stall = waited(signals, T0 + 6 * MINUTE);
+  assert.equal(stall?.signal, 'external-wait');
+  assert.equal(stall?.source, 'denied');
+  assert.equal(stall?.scope, 'external', 'gh names somebody else\'s clock — the park keeps the command as prose, no minted cmd: ref');
+});
+
+test('RCV-5: a refused local `--watch` is a LOCAL wait — the runner\'s ladder, not the external park — and its one-shot form is the minted ref', () => {
+  // The commonest refusal in the corpus (`--watch` ×16 of 37): a test runner,
+  // a build, a type-checker re-running on change — a session supervising
+  // something it started. It used to read as `external` (nothing local named)
+  // and park at once on the raw command as its "ref".
+  for (const command of ['vitest --watch', 'node --test --watch viewer/test > /tmp/t.log 2>&1', 'tsc --watch -p tsconfig.json', 'watch -n 5 ls dist']) {
+    assert.equal(waitScope(command), 'local', command);
+  }
+  const signals = newLaneSignals(T0);
+  noteWaitDenied(signals, { command: 'vitest --watch', matched: '--watch' }, T0, STALL_LOCAL_JOB_MS);
+  noteWaitDenied(signals, { command: 'vitest --watch', matched: '--watch' }, T0 + 2 * MINUTE, STALL_LOCAL_JOB_MS);
+  const stall = waited(signals, T0 + 6 * MINUTE);
+  assert.equal(stall?.signal, 'external-wait');
+  assert.equal(stall?.source, 'denied');
+  assert.equal(stall?.scope, 'local', 'the local-job ladder: one nudge, then the park with a minted ref');
+  // …while a `--watch` on somebody else's clock keeps its scope.
+  assert.equal(waitScope('gh pr checks 12 --watch'), 'external');
+  assert.equal(waitScope('kubectl get pods --watch'), 'external');
+});
+
+test('RCV-5/TRS-3: mintWatchRef reads every shape the guard refuses — a poll loop, a --watch runner, a sleep, a gh watch — and answers null for a wait with no honest landing', () => {
+  const at = Date.parse('2026-09-14T12:00:00Z');
+  const cases: [string, string | null][] = [
+    // The poll-loop arm, unchanged (phase 5's `localWatchRef`).
+    ['until [ -f /tmp/suite.done ]; do sleep 30; done', 'cmd:"test -f /tmp/suite.done"'],
+    ['while ! test -f /tmp/x; do sleep 5; done', 'cmd:"test -f /tmp/x"'],
+    // A `--watch` flag names a command whose one-shot form is its own probe;
+    // the flag and the redirections go, the lead must be a runner or a probe.
+    ['vitest --watch', 'cmd:"vitest"'],
+    ['node --test --watch viewer/test > /tmp/t.log 2>&1', 'cmd:"node --test viewer/test"'],
+    ['npm test -- --watch', 'cmd:"npm test"'],
+    ['tsc --watch -p tsconfig.json', 'cmd:"tsc -p tsconfig.json"'],
+    ['rm -rf dist --watch', null],
+    // `watch -n N <cmd>`: the watched command is the probe.
+    ['watch -n 5 ls dist', 'cmd:"ls dist"'],
+    // A sleep is a clock, not a probe.
+    ['sleep 600', 'date:2026-09-14T12:10:00Z'],
+    ['sleep 10m', 'date:2026-09-14T12:10:00Z'],
+    // A gh watch names its run or PR — a real ref when the repo is named, the
+    // one-shot form when it is not.
+    ['gh run watch 12345 -R acme/widgets', 'gh:acme/widgets#run/12345'],
+    ['gh run watch 12345', 'cmd:"gh run view 12345 --exit-status"'],
+    ['gh pr checks 77 --watch --repo acme/widgets', 'gh:acme/widgets#pr/77'],
+    ['gh pr checks 77 --watch', 'cmd:"gh pr checks 77"'],
+    // No honest landing: the card keeps the sentence, nothing is minted.
+    ['tail -f build.log', null],
+    ['docker compose logs -f api', null],
+    ['while true; do sleep 30; done', null],
+  ];
+  for (const [command, expected] of cases) assert.equal(mintWatchRef(command, at), expected, command);
+  // The one-shot leads are runners a person would run by hand, never a verb
+  // of consequence: nothing here deploys, ships or deletes.
+  for (const lead of WATCH_ONESHOT_LEADS) assert.ok(!/deploy|ship|rm|delete|publish/.test(lead), lead);
+});
+
+test('stallExternalWaitMs: 0 is off — no external-wait from an open call or a refusal', () => {
+  const off = stallThresholds({ stallExternalWaitMs: 0 });
+  const open = fold([[bash('a', 'until [ "$(gh run view 1 -q .status)" = completed ]; do sleep 45; done'), T0 + MINUTE]]);
+  assert.notEqual(evaluateStall(open, off, T0 + 9 * MINUTE, { verifyEnv: EXTERNAL_WAIT })?.signal, 'external-wait');
+  const refused = newLaneSignals(T0);
+  noteWaitDenied(refused, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
+  assert.notEqual(evaluateStall(refused, off, T0 + 9 * MINUTE, { verifyEnv: EXTERNAL_WAIT })?.signal, 'external-wait');
 });

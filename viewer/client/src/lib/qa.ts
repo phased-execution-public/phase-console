@@ -10,6 +10,7 @@
 
 import { type QA_RESULT_WORDS } from '../../../shared/plan-vocab.js';
 import { planHref } from '../../../shared/routes.js';
+import { PROFILE_LABELS } from '../../../shared/run-settings.js';
 
 /** What `qa-record.sh` writes, plus the parser's word for a row it could not read. */
 export type QaResult = (typeof QA_RESULT_WORDS)[number];
@@ -65,7 +66,7 @@ export type QaProfile = (typeof QA_PROFILES)[number];
 
 export const QA_PROFILE_LABEL: Record<QaProfile, string> = {
   guarded: 'Guarded — the CLI asks you before it acts',
-  bypass: 'Bypass — the CLI stops asking too',
+  bypass: PROFILE_LABELS.bypass,
 };
 
 /** Which phases are worth reviewing. A phase nobody has finished has no diff to read. */

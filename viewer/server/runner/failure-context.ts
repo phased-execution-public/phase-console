@@ -275,7 +275,9 @@ export function unblockInstruction(facts: BriefFacts): string {
     'If the blocker is genuinely an operator\'s — a credential nobody on this machine holds, a',
     'person\'s approval, a third party, a manual gate — do not improvise around it: declare exactly',
     'what is needed and from whom, then stop:',
-    `    ${outcomeScript(facts)} needs-human --reason "<the exact errand: what, from whom>"`,
+    `    ${outcomeScript(facts)} needs-human --needs <key> --reason "<the exact errand: what, from whom>"`,
+    '(`--needs` names the decision the errand is missing: `credentials`, `gates`, `human-acts`,',
+    '`accounts`, `mcp`, `waits` … or its short form `credential` / `gate` / `permission` / `external`.)',
     'Otherwise carry the phase to its exit criteria, run the plan\'s §Verification, commit the changed',
     'files with explicit paths, and write the handoff `complete`.',
   ].join('\n');

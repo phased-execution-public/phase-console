@@ -19,7 +19,7 @@ import {
   TerminalSquare,
   type LucideIcon,
 } from 'lucide-react';
-import { NAV } from '@/app/shell/nav';
+import { visibleNav } from '@/app/shell/nav';
 import { SECTION_SEARCH_TERMS, SETTINGS_SECTIONS } from '@/features/settings/nav';
 import { repoHref } from '@/features/repo/routes';
 import {
@@ -129,9 +129,8 @@ export function settingsActions(): CommandAction[] {
 /** The eight destinations, plus Help — everywhere the nav can send you. */
 export function navigationActions(context: CommandContext): CommandAction[] {
   const { state } = context;
-  const items = NAV.filter(
-    (item) => !item.requires || item.requires.some((flag) => state?.[flag] === true),
-  ).map<CommandAction>((item) => ({
+  // The nav's own filter, so a destination this console cannot offer is not a command either.
+  const items = visibleNav(state).map<CommandAction>((item) => ({
     id: `go:${item.id}`,
     group: GROUPS.go,
     label: item.label,
@@ -388,7 +387,7 @@ export function verbActions(context: CommandContext): CommandAction[] {
       label: 'Freeze the whole console…',
       hint: 'The board on Runs',
       icon: Snowflake,
-      keywords: 'panic halt stop everything pause fleet thaw',
+      keywords: 'panic halt stop everything pause console thaw',
       run: (ctx) => ctx.go(runsHref('board')),
     });
   }

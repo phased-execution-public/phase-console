@@ -56,13 +56,22 @@ function decode(out: Captured, chunk: unknown): void {
 
 async function call(
   service: unknown, method: string, path: string,
-  { body = {}, header = true, accept = '', ifNoneMatch = '' } = {},
+  { body = {}, header = true, accept = '', ifNoneMatch = '', extraHeaders = {} as Record<string, string> } = {},
 ): Promise<Captured> {
   const { handleApi } = await import('../server/api/routes.ts');
   const out: Captured = { status: 0, body: null, headers: {} };
+  // A fresh start answers the prelude's three required fields (phase 11) —
+  // merged in for every case that is about some OTHER field, so a case that
+  // wants to see the 400 says so by passing `undecided: true` in its body.
+  if (method === 'POST' && /\/start$/.test(path) && !(body as Record<string, unknown>).resumeRunId) {
+    const b = body as Record<string, unknown>;
+    if (b.undecided) delete b.undecided;
+    else body = { ...DECIDED, ...b };
+  }
   const headers: Record<string, string> = header ? { 'x-phase-console': '1' } : {};
   if (accept) headers['accept-encoding'] = accept;
   if (ifNoneMatch) headers['if-none-match'] = ifNoneMatch;
+  Object.assign(headers, extraHeaders);
   const req = {
     method,
     headers,
@@ -90,12 +99,16 @@ async function call(
 }
 
 /** Just enough Service for the run door — no source directory needed. */
+/** The prelude's three required answers, as the launch form sends them. */
+const DECIDED = { resumeOnRestart: true, relay: 'off', accounts: [{ id: 'default', minHeadroomPct: 0 }] };
+
 function fakeService(over: Record<string, unknown> = {}) {
   const started: { slug: string; options: Record<string, unknown> }[] = [];
   const configured: Record<string, unknown>[] = [];
   return {
     flags: { allowWrites: true, allowRun: true, maxSessions: 4 },
     store: { get: () => ({}), list: () => [] },
+    accounts: { has: () => false },
     startRun: async (slug: string, options: Record<string, unknown>) => {
       started.push({ slug, options });
       return { id: 'r1' };
@@ -376,6 +389,107 @@ test('acking takes the cross-site check but NOT --allow-writes', async () => {
   assert.deepEqual(acked, ['errand:demo:4']);
 });
 
+test('an ack is always attributed: the body\'s `by` when offered, else the actor rule (phase 12)', async () => {
+  // 184 ledger acks, 0 with a name (chapter 10 §4). The ruling ledger now
+  // refuses an unattributed ack, so the route derives one for the browser —
+  // a fake req with no user-agent is a `script` — and passes an offered one.
+  const seen: { id: string; by: string }[] = [];
+  const service = fakeService({
+    store: null, unackInbox: () => true,
+    ackInbox: (id: string, by: string) => { seen.push({ id, by }); return true; },
+    ackInboxMany: (ids: string[], by: string) => ids.map((id) => { seen.push({ id, by }); return { id, ok: true }; }),
+  });
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'errand:demo:4' } })).status, 200);
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { id: 'errand:demo:5', by: 'mo' } })).status, 200);
+  assert.equal((await call(service, 'POST', '/api/inbox/ack', { body: { ids: ['a', 'b'] } })).status, 200);
+  assert.deepEqual(seen, [
+    { id: 'errand:demo:4', by: 'script' }, { id: 'errand:demo:5', by: 'mo' }, { id: 'a', by: 'script' }, { id: 'b', by: 'script' },
+  ]);
+});
+
+test('POST /api/run/:slug/rulings/:id/remember — plan behind --allow-writes, global behind the header only, the actor derived', async () => {
+  const calls: unknown[][] = [];
+  const remember = async (...args: unknown[]) => {
+    calls.push(args);
+    return { ok: true, scope: args[2], key: 'waits', value: 'window', ack: true, detail: 'remembered' };
+  };
+  const on = fakeService({ rememberRuling: remember });
+  const off = fakeService({ rememberRuling: remember, flags: { allowWrites: false, allowRun: true, maxSessions: 4 } });
+  const path = '/api/run/demo/rulings/abcdef012345/remember';
+
+  // The scope is the first thing checked — a body without one is a 400, not
+  // a 403 that would hide the real cause behind a capability.
+  const noScope = await call(on, 'POST', path, { body: {} });
+  assert.equal(noScope.status, 400);
+  assert.match(err(noScope), /scope/);
+
+  assert.equal((await call(on, 'POST', path, { body: { scope: 'plan' }, header: false })).status, 403, 'the console header');
+  const frozen = await call(off, 'POST', path, { body: { scope: 'plan' } });
+  assert.equal(frozen.status, 403);
+  assert.match(err(frozen), /--allow-writes/);
+  // …but a console answer is a preference: no capability flag guards it.
+  assert.equal((await call(off, 'POST', path, { body: { scope: 'global' } })).status, 200);
+
+  const ok = await call(on, 'POST', path, { body: { scope: 'plan', by: 'op@mac' } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(ok.body, { ok: true, scope: 'plan', key: 'waits', value: 'window', ack: true, detail: 'remembered' });
+  assert.deepEqual(calls, [
+    ['demo', 'abcdef012345', 'global', 'script'],
+    ['demo', 'abcdef012345', 'plan', 'op@mac'],
+  ]);
+
+  // A refusal carries the service's own status and words.
+  const refusing = fakeService({ rememberRuling: async () => ({ ok: false, status: 404, error: 'No ruling x in the demo ledger.' }) });
+  const gone = await call(refusing, 'POST', path, { body: { scope: 'global' } });
+  assert.equal(gone.status, 404);
+  assert.match(err(gone), /No ruling/);
+  // And it is not a run verb: `--allow-run` off changes nothing here.
+  const noRun = fakeService({ rememberRuling: remember, flags: { allowWrites: true, allowRun: false, maxSessions: 4 } });
+  assert.equal((await call(noRun, 'POST', path, { body: { scope: 'plan' } })).status, 200);
+});
+
+test('POST /api/prefs hands the actor to savePreferences, so a changed policy answer is journalled with a name', async () => {
+  const seen: { patch: Record<string, unknown>; opts: Record<string, unknown> }[] = [];
+  const service = fakeService({
+    store: null,
+    savePreferences: (patch: Record<string, unknown>, opts: Record<string, unknown>) => { seen.push({ patch, opts }); return patch; },
+  });
+  assert.equal((await call(service, 'POST', '/api/prefs', { body: { policy: { gates: 'operator' } } })).status, 200);
+  assert.equal((await call(service, 'POST', '/api/prefs', { body: { policy: {}, by: 'mo' } })).status, 200);
+  assert.deepEqual(seen.map((s) => s.opts), [{ by: 'script' }, { by: 'mo' }]);
+});
+
+test('POST /api/policy answers 400 with the rules named when the editor refuses an inert rule (phase 12)', async () => {
+  const { PolicyRuleError } = await import('../server/runner/approvals.ts');
+  const service = fakeService({
+    store: null,
+    editPolicy: () => { throw new PolicyRuleError([{ raw: 'git(:*)', note: 'git is not a tool Claude Code provides' }]); },
+  });
+  const out = await call(service, 'POST', '/api/policy', { body: { add: { allow: ['git(:*)'] }, scope: 'global' } });
+  assert.equal(out.status, 400);
+  assert.match(err(out), /would never match/);
+  assert.deepEqual((out.body as { rules: unknown }).rules, [{ raw: 'git(:*)', note: 'git is not a tool Claude Code provides' }]);
+});
+
+test('POST /api/policy/advisory/acknowledge — a receipt, behind the header alone; a kind that does not stand is a 404', async () => {
+  const acked: string[] = [];
+  const service = fakeService({
+    store: null,
+    flags: { allowWrites: false, allowRun: false, maxSessions: 4 },
+    acknowledgePolicyAdvisory: (kind: string) => { acked.push(kind); return kind === 'ask-empty'; },
+    policyAdvisories: () => [{ kind: 'ask-empty', rules: [], message: 'm', acknowledged: true, fingerprint: 'f' }],
+  });
+  assert.equal((await call(service, 'POST', '/api/policy/advisory/acknowledge', { body: { kind: 'ask-empty' }, header: false })).status, 403);
+  const bad = await call(service, 'POST', '/api/policy/advisory/acknowledge', { body: { kind: 'nope' } });
+  assert.equal(bad.status, 400);
+  assert.match(err(bad), /ask-empty/);
+  const ok = await call(service, 'POST', '/api/policy/advisory/acknowledge', { body: { kind: 'ask-empty' } });
+  assert.equal(ok.status, 200, 'no --allow-writes needed: nothing about the policy changes');
+  assert.deepEqual((ok.body as { advisory: { acknowledged: boolean }[] }).advisory[0].acknowledged, true);
+  assert.equal((await call(service, 'POST', '/api/policy/advisory/acknowledge', { body: { kind: 'deny-struck' } })).status, 404);
+  assert.deepEqual(acked, ['ask-empty', 'deny-struck']);
+});
+
 test('an ack with no id is a 400, and a DELETE with no id never clears everything', async () => {
   const service = fakeService({ store: null, ackInbox: () => true, unackInbox: () => true });
   const post = await call(service, 'POST', '/api/inbox/ack', { body: {} });
@@ -396,6 +510,114 @@ test('starting a run still needs --allow-run', async () => {
   const out = await call(service, 'POST', '/api/run/demo/start', { body: { model: 'opus' } });
   assert.equal(out.status, 403);
   assert.match(err(out), /--allow-run/);
+});
+
+/* ------------------------------------------------------------------ *
+ * the prelude (phase 11, ZTD-2 / QRL-2, gate ACC-1.2)
+ * ------------------------------------------------------------------ */
+
+test('a fresh start must answer resumeOnRestart, relay and accounts — refused 400 by name, never defaulted', async () => {
+  const service = fakeService();
+  const bare = await call(service, 'POST', '/api/run/demo/start', { body: { model: 'opus', undecided: true } });
+  assert.equal(bare.status, 400);
+  assert.deepEqual((bare.body as { missing: string[] }).missing, ['resumeOnRestart', 'relay', 'accounts']);
+  assert.match(err(bare), /Decisions stage/);
+  assert.equal(service._started.length, 0);
+  // Two of three: the one left out is the one named.
+  const two = await call(service, 'POST', '/api/run/demo/start', {
+    body: { model: 'opus', resumeOnRestart: false, accounts: [{ id: 'default', minHeadroomPct: 20 }], undecided: true },
+  });
+  assert.equal(two.status, 400);
+  assert.deepEqual((two.body as { missing: string[] }).missing, ['relay']);
+  // A relay word outside the vocabulary is "not answered", not a typo let through.
+  const typo = await call(service, 'POST', '/api/run/demo/start', {
+    body: { resumeOnRestart: true, relay: 'sideways', accounts: [{ id: 'default' }], undecided: true },
+  });
+  assert.equal(typo.status, 400);
+  // A resume answered at its own door: nothing required.
+  const resume = await call(service, 'POST', '/api/run/demo/start', { body: { resumeRunId: 'r0' } });
+  assert.equal(resume.status, 200);
+  // All three: the answers reach the service as the run's fields, coerced.
+  const ok = await call(service, 'POST', '/api/run/demo/start', {
+    body: {
+      resumeOnRestart: false, relay: 'last-resort',
+      accounts: [{ id: 'default', minHeadroomPct: 250 }, { id: 'nobody-registered', minHeadroomPct: 5 }, 'default'],
+      acknowledgedWaivers: ['announce', 'not-a-key'],
+      manifestOverride: { rows: ['credentials'], by: '  the operator  ' },
+    },
+  });
+  assert.equal(ok.status, 200);
+  const options = service._started.at(-1)!.options;
+  assert.equal(options.resumeOnRestart, false);
+  assert.equal(options.relay, 'last-resort');
+  assert.deepEqual(options.accounts, [{ id: 'default', minHeadroomPct: 100 }], 'clamped, deduplicated, unknown ids dropped');
+  assert.deepEqual(options.acknowledgedWaivers, ['announce']);
+  assert.deepEqual(options.manifestOverride, { rows: ['credentials'], by: 'the operator' });
+  // An override with no `by` is signed by the request's actor — never
+  // anonymous (a header-less harness call reads as `script`; a browser as
+  // `operator`, `api/actor.ts`).
+  await call(service, 'POST', '/api/run/demo/start', { body: { manifestOverride: { rows: ['accounts'] } } });
+  assert.equal((service._started.at(-1)!.options.manifestOverride as { by: string }).by, 'script');
+});
+
+test('the start door answers 409 with every unanswered row when the prelude refuses', async () => {
+  const { PreludeRefusal } = await import('../server/prelude.ts');
+  const prelude = {
+    slug: 'demo', rows: [], probes: {}, waived: [], acknowledged: [], manifestPresent: true, accounts: [],
+    credentials: { policy: 'require', ids: [], held: [], missing: [] }, delivery: { ok: true, channels: [], acknowledged: false },
+    at: '2026-09-14T00:00:00.000Z',
+    blocking: [
+      { key: 'credentials', why: 'outstanding — owed by operator' },
+      { key: 'accounts', why: 'every declared account is unusable: the machine login — retired' },
+    ],
+  };
+  const service = fakeService({ startRun: async () => { throw new PreludeRefusal(prelude as never); } });
+  const out = await call(service, 'POST', '/api/run/demo/start', { body: { model: 'opus' } });
+  assert.equal(out.status, 409);
+  const body = out.body as { error: string; unanswered: { key: string; why: string }[]; prelude: { blocking: unknown[] } };
+  assert.match(body.error, /2 decisions still open — credentials: outstanding/);
+  assert.match(body.error, /and 1 more/);
+  assert.deepEqual(body.unanswered.map((b) => b.key), ['credentials', 'accounts']);
+  assert.equal(body.prelude.blocking.length, 2, 'the whole prelude rides the refusal so the form can render it');
+});
+
+test('GET /api/run/:slug/prelude serves the draft its answers and the console its probes', async () => {
+  const asked: Record<string, unknown>[] = [];
+  const service = fakeService({
+    prelude: async (_slug: string, options: Record<string, unknown>) => { asked.push(options); return { slug: 'demo', blocking: [], rows: [] }; },
+  });
+  const out = await call(service, 'GET',
+    '/api/run/demo/prelude?accounts=default:20,ghost:5&relay=last-resort&resumeOnRestart=false&ack=announce,credentials&model=opus&profile=trusted');
+  assert.equal(out.status, 200);
+  assert.deepEqual((out.body as { prelude: { slug: string } }).prelude.slug, 'demo');
+  assert.deepEqual(asked[0], {
+    accounts: [{ id: 'default', minHeadroomPct: 20 }], relay: 'last-resort', resumeOnRestart: false,
+    acknowledgedWaivers: ['announce', 'credentials'], model: 'opus', permissionProfile: 'trusted',
+  });
+  // No draft at all: the plan's own answers and the shipped defaults.
+  const bare = await call(service, 'GET', '/api/run/demo/prelude');
+  assert.equal(bare.status, 200);
+  assert.deepEqual(asked[1], {});
+  // A plan the console does not have is a 404, not a 500.
+  const missing = fakeService({ prelude: async () => { throw new Error('No plan named nope.'); } });
+  assert.equal((await call(missing, 'GET', '/api/run/nope/prelude')).status, 404);
+});
+
+test('GET /api/doctor serves the console\'s own report — above the no-root wall, no guard, no flag', async () => {
+  const report = {
+    instance: { id: 'x', name: 'x', root: null, port: 4130, default: false }, mode: 'console',
+    rows: [{ id: 'accounts', label: 'Accounts', status: 'ok', blocking: true, reason: 'fine' }],
+    ok: true, firstFailing: null, cliFloor: '2.1.268', at: '2026-09-14T00:00:00.000Z',
+  };
+  // No source directory open, no `--allow-*` flag at all, no header: the
+  // console that could not open its directory is the one somebody runs doctor
+  // against.
+  const service = fakeService({
+    store: null, flags: { allowWrites: false, allowRun: false, maxSessions: 4 }, doctor: async () => report,
+  });
+  const out = await call(service, 'GET', '/api/doctor', { header: false });
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body, report, 'the body IS the report — the CLI prints exactly this');
 });
 
 /* ------------------------------------------------------------------ *
@@ -1041,7 +1263,8 @@ test('the scalar form still works, and is still one ack', async () => {
   const out = await call(service, 'POST', '/api/inbox/ack', { body: { id: 'just-one' } });
   assert.equal(out.status, 200);
   assert.deepEqual(out.body, { ok: true });
-  assert.deepEqual(service._acked, [{ ids: ['just-one'] }]);
+  // Attributed even when the client sent no name (phase 12): the actor rule.
+  assert.deepEqual(service._acked, [{ ids: ['just-one'], by: 'script' }]);
 });
 
 test('an empty or unusable selection is a 400 naming what to send', async () => {
@@ -1338,4 +1561,308 @@ test('a write verb against the repo surface is refused', async () => {
     const out = await call(repoService(), method, '/api/repo/graph');
     assert.notEqual(out.status, 200, `${method} must not be answered by a read surface`);
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * The actor — derived from the request, never supplied (SHD-3, ACT-11)
+ * ------------------------------------------------------------------ */
+
+test('ACT-11: switch-account with no `by` records an actor derived from the request, never the literal console', async () => {
+  const switched: unknown[][] = [];
+  const service = fakeService({
+    accounts: { has: () => true },
+    switchAccountRun: (...args: unknown[]) => { switched.push(args); return { ok: true, run: { id: 'r1' } }; },
+  });
+  // A browser: Mozilla-shaped User-Agent, loopback Host, nothing in the body.
+  const out = await call(service, 'POST', '/api/run/demo/switch-account', {
+    body: { accountId: 'default' },
+    extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605' },
+  });
+  assert.equal(out.status, 200, err(out));
+  assert.deepEqual(switched[0].slice(0, 3), ['demo', 'default', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }]);
+  // A script — curl, undici, nothing — is told apart from the operator.
+  await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'curl/8.4.0' } });
+  assert.equal((switched[1][2] as { by: string }).by, 'script');
+  // The console's own CLI is the operator, over `cli`.
+  await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'btw/1' } });
+  assert.deepEqual(switched[2][2], { by: 'operator', via: 'cli', origin: 'local', remoteUser: null });
+  // A body may still LABEL `by`; the transport it cannot touch.
+  await call(service, 'POST', '/api/run/demo/switch-account', { body: { accountId: 'default', by: 'a test' }, extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'curl/8.4.0' } });
+  assert.deepEqual(switched[3][2], { by: 'a test', via: 'api', origin: 'local', remoteUser: null });
+  for (const call_ of switched) assert.notEqual((call_[2] as { by: string }).by, 'console');
+});
+
+test('SHD-3: through the --remote proxy the actor carries the login and the hostname the proxy served', async () => {
+  const stopped: unknown[][] = [];
+  const service = fakeService({
+    flags: { allowWrites: true, allowRun: true, maxSessions: 4, remoteHosts: ['mac.tail1234.ts.net'], remoteUsers: ['alice@github'] },
+    stopRun: async (...args: unknown[]) => { stopped.push(args); return { id: 'r1' }; },
+  });
+  const out = await call(service, 'POST', '/api/run/demo/stop', {
+    body: {},
+    extraHeaders: { host: 'mac.tail1234.ts.net', 'tailscale-user-login': 'alice@github', 'user-agent': 'Mozilla/5.0 (iPhone) Safari/605' },
+  });
+  assert.equal(out.status, 200, err(out));
+  assert.deepEqual(stopped[0][2], { by: 'alice@github', via: 'api', origin: 'mac.tail1234.ts.net', remoteUser: 'alice@github' });
+  // The same header on a loopback request vouches for nobody (classify() would have refused it upstream anyway).
+  await call(service, 'POST', '/api/run/demo/stop', {
+    body: {}, extraHeaders: { host: '127.0.0.1:4123', 'tailscale-user-login': 'alice@github', 'user-agent': 'curl/8' },
+  });
+  assert.deepEqual(stopped[1][2], { by: 'script', via: 'api', origin: 'local', remoteUser: null });
+});
+
+test('SHD-3: restart and shutdown derive their actor, and a body with no `by` never reads console', async () => {
+  const seen: unknown[] = [];
+  const service = fakeService({
+    restart: (who: unknown, force: boolean) => { seen.push(['restart', who, force]); return { ok: true }; },
+    shutdown: (who: unknown) => { seen.push(['shutdown', who]); return { ok: true }; },
+    restartReadiness: () => ({ ok: true }),
+    shutdownReadiness: () => ({}),
+  });
+  await call(service, 'POST', '/api/restart', { body: {}, extraHeaders: { host: 'localhost:4123', 'user-agent': 'Mozilla/5.0' } });
+  await call(service, 'POST', '/api/shutdown', { body: { confirm: true }, extraHeaders: { host: 'localhost:4123', 'user-agent': 'Mozilla/5.0' } });
+  assert.deepEqual(seen, [
+    ['restart', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }, false],
+    ['shutdown', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }],
+  ]);
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 8 — the accounts surface: the breaker's clearance
+ * verb, and the view fields the dashboard (phase 15) reads
+ * ------------------------------------------------------------------ */
+
+test('POST /api/accounts/:id/clear-retired: behind --allow-accounts, 404 for an unknown id, and attributed to the request', async () => {
+  const cleared: unknown[][] = [];
+  const view = { id: 'work', kind: 'token', builtIn: false, credential: 'abcd', entitlement: { state: 'unknown', via: 'credential' } };
+  const service = fakeService({
+    flags: { allowWrites: true, allowRun: true, allowAccounts: true, maxSessions: 4 },
+    clearRetiredAccount: async (id: string, actor: unknown) => { cleared.push([id, actor]); return id === 'work' ? view : undefined; },
+  });
+  const out = await call(service, 'POST', '/api/accounts/work/clear-retired', {
+    body: {},
+    extraHeaders: { host: '127.0.0.1:4123', 'user-agent': 'Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605' },
+  });
+  assert.equal(out.status, 200, err(out));
+  assert.deepEqual((out.body as { account: unknown }).account, view);
+  assert.deepEqual(cleared[0], ['work', { by: 'operator', via: 'api', origin: 'local', remoteUser: null }], 'the clearance names who pressed it');
+
+  const missing = await call(service, 'POST', '/api/accounts/ghost/clear-retired', { body: {}, extraHeaders: { host: '127.0.0.1:4123' } });
+  assert.equal(missing.status, 404);
+  const malformed = await call(service, 'POST', '/api/accounts/NOT%20AN%20ID/clear-retired', { body: {}, extraHeaders: { host: '127.0.0.1:4123' } });
+  assert.equal(malformed.status, 400);
+
+  // A console started without --allow-accounts refuses: widening what every
+  // future run may spend is a registration-class act.
+  const readOnly = fakeService({
+    flags: { allowWrites: true, allowRun: true, allowAccounts: false, maxSessions: 4 },
+    clearRetiredAccount: async () => view,
+  });
+  const refused = await call(readOnly, 'POST', '/api/accounts/work/clear-retired', { body: {}, extraHeaders: { host: '127.0.0.1:4123' } });
+  assert.equal(refused.status, 403);
+  assert.match(err(refused), /--allow-accounts/);
+});
+
+test('GET /api/accounts hands the facade\'s views through verbatim — entitlement, the hashed orgId, lastErrorAt and a tombstone included, never a raw id', async () => {
+  const views = [
+    {
+      id: 'default', kind: 'default', builtIn: true, credential: '0123456789abcdef',
+      orgId: 'e462cb3c', entitlement: { state: 'retired', via: 'org', reason: 'organization policy blocks this credential', class: 'org-policy' },
+      authState: 'unusable', lastErrorAt: '2026-09-14T04:07:18.517Z',
+      usage: { buckets: {}, lastErrorAt: '2026-09-14T04:07:18.517Z', error: 'credential was refused' },
+    },
+    { id: 'support', kind: 'token', builtIn: false, credential: 'fedcba9876543210', entitlement: { state: 'unknown', via: 'none' }, tombstone: { name: 'Support Max', retiredAt: '2026-09-01T00:00:00Z' } },
+  ];
+  const tombstones = [{ id: 'support', name: 'Support Max', retiredAt: '2026-09-01T00:00:00Z', credential: 'fedcba9876543210', entitlement: { state: 'unknown', via: 'none' } }];
+  const service = fakeService({
+    flags: { allowWrites: true, allowRun: true, allowAccounts: false, maxSessions: 4 },
+    listAccounts: async () => views,
+    accountTombstones: () => tombstones,
+  });
+  const out = await call(service, 'GET', '/api/accounts');
+  assert.equal(out.status, 200, err(out));
+  const body = out.body as { accounts: typeof views; allowAccounts: boolean; tombstones: typeof tombstones };
+  assert.deepEqual(body.accounts, views);
+  assert.equal(body.allowAccounts, false);
+  assert.deepEqual(body.tombstones, tombstones, 'the removed registrations ride the same read (phase 15)');
+  // A service from before the field still answers the list, with no tombstones.
+  const older = await call(fakeService({ listAccounts: async () => views }), 'GET', '/api/accounts');
+  assert.deepEqual((older.body as { tombstones: unknown[] }).tombstones, []);
+  assert.equal(body.accounts[0].usage.fetchedAt, undefined, 'no successful read, no reading time (ACT-4)');
+  assert.equal(JSON.stringify(body).includes('-'), true);
+  assert.equal(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.test(JSON.stringify(body)), false, 'no UUID-shaped orgId reaches the wire');
+});
+
+test('POST /api/accounts/:id/probe-entitlement (phase 15): behind --allow-accounts, attributed to the request, 400/404/409 — and through a real facade the one-turn check writes the learned store and the log', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { Accounts, ProbeInFlightError } = await import('../server/accounts/index.ts');
+  const { recent } = await import('../server/log.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-probe-route-'));
+  const accounts = new Accounts({
+    platform: 'linux', exec: async () => ({ stdout: '' }),
+    learnedFile: join(dir, 'learned.json'), instanceId: 'route-test',
+    fetchFn: (async () => new Response('nope', { status: 500 })) as typeof fetch,
+  });
+  let hold = false;
+  const spawnFn = (() => {
+    const child = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const held = hold;
+    setImmediate(() => {
+      child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'system', subtype: 'init', claude_code_version: '2.1.271' })}\n`));
+      if (held) return;
+      child.stdout.emit('data', Buffer.from(`${JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'ok', num_turns: 1, total_cost_usd: 0.003 })}\n`));
+      child.emit('close', 0);
+    });
+    return child;
+  }) as unknown as typeof import('node:child_process').spawn;
+  const asked: unknown[] = [];
+  const service = fakeService({
+    flags: { allowWrites: true, allowRun: true, allowAccounts: true, maxSessions: 4 },
+    probeAccountEntitlement: async (id: string, actor: Record<string, unknown>) => {
+      asked.push([id, actor]);
+      if (!accounts.has(id)) return undefined;
+      return accounts.probeEntitlement(id, {
+        actor: { ...(actor as { by: string }), door: 'operator', trigger: 'entitlement-probe' },
+        spawnFn, cwd: dir, ...(hold ? { timeoutMs: 150 } : {}),
+      });
+    },
+  });
+  const browser = { host: '127.0.0.1:4123', 'user-agent': 'Mozilla/5.0 (Macintosh) AppleWebKit/605 Safari/605' };
+  // A token account: its login state is `unknown` by construction, so no
+  // reading of this machine's own credentials can refuse the check under test.
+  const { id } = await accounts.addToken('Route Max', 'sk-ant-oat01-routemax000000000000');
+  const path = `/api/accounts/${id}/probe-entitlement`;
+  try {
+    const out = await call(service, 'POST', path, { body: {}, extraHeaders: browser });
+    assert.equal(out.status, 200, err(out));
+    const body = out.body as { account: { id: string; probe?: { status: string } }; probe: { status: string; count: number; by: string; costUsd?: number }; spent: boolean };
+    assert.equal(body.spent, true);
+    assert.equal(body.probe.status, 'ok');
+    assert.equal(body.probe.by, 'operator');
+    assert.equal(body.probe.costUsd, 0.003);
+    assert.equal(body.account.probe?.status, 'ok', 'the row the dashboard redraws carries the answer');
+    assert.deepEqual(asked[0], [id, { by: 'operator', via: 'api', origin: 'local', remoteUser: null }], 'the request\'s derived actor, never a console literal');
+
+    // Written where every console reads it: the machine-wide learned store…
+    const row = Object.values(accounts.learned.snapshot().credentials).find((c) => c.ids.includes(`route-test/${id}`));
+    assert.equal(row?.probe?.status, 'ok');
+    assert.equal(row?.probe?.count, 1);
+    assert.equal(row?.entitlement.state, 'entitled');
+    assert.equal(row?.entitlement.by, 'probe');
+    // …and on the console's own log, with the actor whole.
+    const ran = recent(200).findLast((line) => line.event === 'accounts.entitlement-probe.ran' && line.data?.account === id);
+    assert.equal(ran?.data?.via, 'api');
+    assert.equal(ran?.data?.door, 'operator');
+    assert.equal(ran?.data?.status, 'ok');
+
+    // One at a time: a press while a check of the same account runs is 409.
+    hold = true;
+    const first = call(service, 'POST', path, { body: {}, extraHeaders: browser });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const busy = await call(service, 'POST', path, { body: {}, extraHeaders: browser });
+    assert.equal(busy.status, 409, err(busy));
+    assert.match(err(busy), /already running/);
+    assert.equal((await first).status, 200);
+    hold = false;
+
+    const missing = await call(service, 'POST', '/api/accounts/ghost/probe-entitlement', { body: {}, extraHeaders: browser });
+    assert.equal(missing.status, 404);
+    const malformed = await call(service, 'POST', '/api/accounts/NOT%20AN%20ID/probe-entitlement', { body: {}, extraHeaders: browser });
+    assert.equal(malformed.status, 400);
+    assert.ok(ProbeInFlightError, 'the refusal the 409 maps is the facade\'s own');
+
+    // Registration-class: without --allow-accounts the check is refused before anything runs.
+    const readOnly = fakeService({
+      flags: { allowWrites: true, allowRun: true, allowAccounts: false, maxSessions: 4 },
+      probeAccountEntitlement: async () => { throw new Error('must not be reached'); },
+    });
+    const refused = await call(readOnly, 'POST', path, { body: {}, extraHeaders: browser });
+    assert.equal(refused.status, 403);
+    assert.match(err(refused), /--allow-accounts/);
+  } finally {
+    await accounts.remove(id);
+    accounts.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The relay's transport and the answer verb (zero-touch-console phase 14)
+ * ------------------------------------------------------------------ */
+
+test('POST /hooks/permission-request authenticates on the per-run token ALONE — no console header, no origin; a bad token is 401, a proxied call 403 before the token is read', async () => {
+  const { Approvals } = await import('../server/runner/approvals.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-permission-hook-'));
+  try {
+    const approvals = new Approvals(() => {}, join(dir, 'pending.json'));
+    const token = approvals.arm('r1');
+    const seen: { body: Record<string, unknown>; runId: unknown }[] = [];
+    const service = fakeService({
+      approvals,
+      decidePermissionRequest: async (body: Record<string, unknown>, runId: unknown) => {
+        seen.push({ body, runId });
+        return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
+      },
+    });
+    // A `claude` child sends neither the console header nor an origin: the token is the credential.
+    const ok = await call(service, 'POST', '/hooks/permission-request', {
+      header: false, body: { hook_event_name: 'PermissionRequest', tool_name: 'Bash' },
+      extraHeaders: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(ok.body, { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].runId, 'r1', 'the token says WHICH run asked');
+    assert.equal(seen[0].body.tool_name, 'Bash');
+
+    const bad = await call(service, 'POST', '/hooks/permission-request', {
+      header: true, extraHeaders: { authorization: `Bearer ${'x'.repeat(43)}` },
+    });
+    assert.equal(bad.status, 401, 'the console header does not stand in for the token');
+    const none = await call(service, 'POST', '/hooks/permission-request', { header: true });
+    assert.equal(none.status, 401);
+    assert.equal((await call(service, 'GET', '/hooks/permission-request', { header: false })).status, 405);
+    assert.equal(seen.length, 1, 'nothing unauthenticated reached the decision');
+
+    // In through the remote proxy — a Serve handler on the wrong console must not expose this POST.
+    const remote = fakeService({
+      approvals,
+      flags: { allowWrites: true, allowRun: true, maxSessions: 4, remoteHosts: ['console.example'], remoteUsers: ['me@example.com'] },
+      decidePermissionRequest: async () => { throw new Error('must not be reached'); },
+    });
+    const proxied = await call(remote, 'POST', '/hooks/permission-request', {
+      header: false,
+      extraHeaders: { authorization: `Bearer ${token}`, host: 'console.example', 'tailscale-user-login': 'me@example.com' },
+    });
+    assert.equal(proxied.status, 403);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('POST /api/run/:slug/answer takes a person\'s pick on a relayed question — behind --allow-run, the actor derived, 409 when the window closed', async () => {
+  const picks: { slug: string; approvalId: string; picks: unknown; by: string }[] = [];
+  const service = fakeService({
+    answerQuestion: (slug: string, approvalId: string, chosen: unknown, by: string) => {
+      picks.push({ slug, approvalId, picks: chosen, by });
+      return approvalId === 'gone'
+        ? { ok: false, status: 404, error: 'no question is waiting under that id' }
+        : { ok: true, answered: ['choice:which-colour'], remaining: 0 };
+    },
+  });
+  const ok = await call(service, 'POST', '/api/run/demo/answer', { body: { approvalId: 'card-1', key: 'choice:which-colour', label: 'Red', by: 'phone' } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(picks[0], { slug: 'demo', approvalId: 'card-1', picks: [{ label: 'Red', key: 'choice:which-colour' }], by: 'phone' });
+  const many = await call(service, 'POST', '/api/run/demo/answer', {
+    body: { approvalId: 'card-1', answers: [{ key: 'a', label: 'x' }, { question: 'Why?', label: 'y' }] },
+  });
+  assert.equal(many.status, 200);
+  assert.deepEqual(picks[1].picks, [{ label: 'x', key: 'a' }, { label: 'y', question: 'Why?' }]);
+  assert.equal((await call(service, 'POST', '/api/run/demo/answer', { body: { approvalId: 'gone', key: 'a', label: 'x' } })).status, 409);
+  assert.equal((await call(service, 'POST', '/api/run/demo/answer', { body: { key: 'a', label: 'x' } })).status, 400, 'no card named');
+  assert.equal((await call(service, 'POST', '/api/run/demo/answer', { body: { approvalId: 'card-1' } })).status, 400, 'no pick');
+  const locked = fakeService({ flags: { allowWrites: true, allowRun: false, maxSessions: 4 }, answerQuestion: () => { throw new Error('must not be reached'); } });
+  assert.equal((await call(locked, 'POST', '/api/run/demo/answer', { body: { approvalId: 'card-1', key: 'a', label: 'x' } })).status, 403);
 });

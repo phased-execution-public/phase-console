@@ -984,7 +984,7 @@ export function BoardToggle({
   ];
   if (VIEWS.length < 2) return null;
   return (
-    <div className="flex items-center gap-1" role="group" aria-label="Fleet view">
+    <div className="flex items-center gap-1" role="group" aria-label="Runs view">
       {VIEWS.map((value) => (
         <button
           key={value}

@@ -39,7 +39,7 @@
 import { ExternalLink, Play, Users } from 'lucide-react';
 import { phaseHref } from '@shared/routes.js';
 import type { ForeignSession } from '@/lib/api';
-import { foreignVehicle } from '@/features/now/model';
+import { endedLabel, foreignVehicle, turnsLabel } from '@/features/now/model';
 import { Button, Chip, ConfirmButton, KeyValue, RelativeTime, StatusBadge, StatusDot } from '@/components/ui';
 
 /** The refusal the server gives for the same request — said here first, verbatim. */
@@ -224,9 +224,33 @@ export function ForeignSessionPage({
                   </a>,
                 ]
               : null,
-            ['turns', session.turns],
+            [
+              'turns',
+              session.turnsSource === 'unknown' ? (
+                <span title="This record moved many times and never saw a Stop hook, so its count of 0 was never counted.">
+                  unknown
+                </span>
+              ) : (
+                turnsLabel(session)
+              ),
+            ],
             ['last seen', <RelativeTime at={session.lastSeen} />],
-            session.endedAt ? ['ended', <RelativeTime at={session.endedAt} />] : null,
+            session.endedAt
+              ? [
+                  endedLabel(session) ?? 'ended',
+                  session.endedBy === 'probe' ? (
+                    <span>
+                      after <RelativeTime at={session.endedAt} /> — its last sign of life; the process was
+                      found gone{' '}
+                      {session.endedDetectedAt ? <RelativeTime at={session.endedDetectedAt} /> : 'later'}
+                    </span>
+                  ) : (
+                    <span>
+                      <RelativeTime at={session.endedAt} /> — reported by the session
+                    </span>
+                  ),
+                ]
+              : null,
             session.pid ? ['pid', <span className="font-mono text-2xs">{session.pid}</span>] : null,
           ]}
         />

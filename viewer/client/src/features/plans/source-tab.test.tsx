@@ -117,3 +117,58 @@ describe('the phase graph table', () => {
     await expectNoAxeViolations(container);
   });
 });
+
+describe('the Decisions card', () => {
+  it('shows each row’s state and source and its evidence, and a per-phase row under its phase', () => {
+    const view = detail([graphRow()]);
+    (view.plan as unknown as { decisions: unknown[] }).decisions = [
+      {
+        key: 'gates',
+        value: 'delegated',
+        owner: 'operator',
+        state: 'answered',
+        blocking: 'no',
+        source: 'plan',
+        evidence: 'phases 22–23',
+        phase: null,
+      },
+      {
+        key: 'waits',
+        value: 'window',
+        owner: 'operator',
+        state: 'outstanding',
+        blocking: 'yes',
+        source: 'ruling',
+        evidence: 'ruling abcdef012345',
+        phase: 4,
+      },
+    ];
+    mount(view);
+    expect(screen.getByRole('columnheader', { name: 'Source' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Evidence' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Phase' })).toBeInTheDocument();
+    expect(screen.getByText('ruling')).toBeInTheDocument();
+    expect(screen.getByText('ruling abcdef012345')).toBeInTheDocument();
+    expect(screen.getByText('p4')).toBeInTheDocument();
+    expect(screen.getByText('outstanding')).toBeInTheDocument();
+  });
+
+  it('asks for no Phase column when every row is plan-wide', () => {
+    const view = detail([graphRow()]);
+    (view.plan as unknown as { decisions: unknown[] }).decisions = [
+      {
+        key: 'gates',
+        value: 'delegated',
+        owner: 'operator',
+        state: 'answered',
+        blocking: 'no',
+        source: 'plan',
+        evidence: '',
+        phase: null,
+      },
+    ];
+    mount(view);
+    expect(screen.queryByRole('columnheader', { name: 'Phase' })).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'Source' })).toBeInTheDocument();
+  });
+});

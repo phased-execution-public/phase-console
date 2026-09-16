@@ -7,12 +7,13 @@ reset.
 The run needs `--allow-run`. Without it the Autopilot tab still shows you everything; it just cannot
 start anything.
 
-### The four stages 🟡
+### The five stages 🟡
 
 A run-shaped launch opens as a **staged overlay**, not one long form:
 
 | Stage | What it settles |
 |---|---|
+| **Decisions** | Every decision this run could ask for, answered before it starts: the manifest, what the probes found, and what the start requires. |
 | **What runs** | The plan, the phases ready now, the sessions they batch into, and where the run picks up. |
 | **How it runs** | The model, the guard rails, the branch it works on, and what every session is given. |
 | **Money and stops** | What it may spend, and every condition that stops it. |
@@ -22,6 +23,18 @@ On a desk it is two panes — the stages on the left, a live **ticket** on the r
 happen — and they merge on the Review stage. On a phone it is a full-screen sheet where only the stage
 scrolls. The stepper carries a per-stage *"2 changed"* note, and the Review stage lists every
 non-default choice **with its provenance** and a Change link back to the stage that owns it.
+
+**Decisions comes first, and a launch with anything to ask opens on it.** It shows the plan's
+`## Decisions` manifest as the console resolves it for this draft — every row with its state and where
+its answer came from — and the four probes a start runs before anything spawns (accounts, MCP servers,
+credentials, delivery) with what each found. Then it asks what the start requires: whether the run
+continues by itself after a console restart, whether the **relay** is armed (*last resort*: a person is
+asked first, and after 60 s the console answers by rule — see **Permissions**), which accounts the run
+may spend and the headroom each must show, and an acknowledgement of every waived row. The answers are
+judged by the server (`GET /api/run/<slug>/prelude`), so the stage shows what the start will decide.
+While a blocking row is outstanding, Launch stays disabled and names it —
+`Decision outstanding: <key> — <why>` — and the one way past is **Start anyway, recorded as**, which
+writes who signed the override on the run (`run.manifest-override`).
 
 The one amber **Launch** button sits on every stage on a desk — the ticket has already said what will
 happen — and on the **Review stage only** on a phone.
@@ -123,7 +136,7 @@ on the Runs page and the session console's own toolbar:
 | Verb | What happens |
 |---|---|
 | **Freeze** (one tab) | `SIGSTOP` for that session alone. The others keep working; the run only reads `frozen` when nothing is left running. |
-| **Stop** (one tab) | Ends that session (woken first, then SIGTERM, then the SIGKILL backstop), records its phase `interrupted` with the session id kept — Retry can resume it — and the run carries on scheduling. On a queued phase it takes it out of the admission line before anything spawns. |
+| **Stop** (one tab) | Ends that session politely — woken first, then asked to close its turn (SIGINT to the CLI itself, with five seconds to leave), then SIGTERM to its process group and the SIGKILL backstop — so the CLI still books the turns and dollars it spent. Records its phase `interrupted` with the session id kept — Retry can resume it — and the run carries on scheduling. On a queued phase it takes it out of the admission line before anything spawns. |
 
 Neither touches the consecutive-failure budget: an operator's stop is neither a failure nor an
 endorsement.
@@ -225,6 +238,28 @@ names the outcome, the model, the duration, the spend, any ladder rung climbed, 
 §Verification command whose result moved — matched by command name, so a §Verification you
 repaired between attempts shows the command appearing rather than two unrelated commands
 "flipping". A number that was never recorded says *not recorded*; it is never rounded to `$0.00`.
+
+## Why it started, and what it cost 🟢
+
+Two cards on the run page answer what a run nobody remembers pressing raises.
+
+**Why this run started** lists every start of the run, not only the first: which door started it,
+what fired that door — a timer, a boot, an event — which guard let it through and which start of that
+door it was, and who asked from where. The words are the journal's own `run.start` lines. Beside them
+is the start door's report: the decisions it resolved and where each answer came from, what its
+probes found, and the override a person signed, if one did.
+
+**What it cost and how long it ran** is one row per session, read from its `phase.session` line: the
+mode, how it ended and whether the console ended it, its turns, what it said it cost, how long it ran,
+and the two caps it ran under with where each came from. A session that never reported a cost reads
+*unknown*, never `$0.00`. Under the table the sessions' own figures are reconciled against the run's
+spend — when they disagree, the gap is shown as a finding rather than averaged away — and below that,
+what each ladder rung settled with: its situation, its cost and who drives that rung. A rung's cost is
+its session's, already in the table, so it is shown beside the total and never added to it.
+
+A session the console started for a run — a repair, a QA round, a ladder rung — shows the same door
+and ending on its own page, read from the same journal, so the two pages cannot disagree about why it
+exists.
 
 ## When the plan runs out 🟢
 

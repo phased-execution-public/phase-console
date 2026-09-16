@@ -22,11 +22,17 @@ Gate-check line for the F12 feature.
 
 ### Phase 1 — Setup
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 2 — Gated thing *(GATED)*
 - **Gates (must clear first):** external vendor approval received
 - **Gate-check:** manual vendor-approval
 - **Size:** M
+- **Verification:**
+  - `true`
 
 ### Phase 3 — After
 - **Size:** L
+- **Verification:**
+  - `true`

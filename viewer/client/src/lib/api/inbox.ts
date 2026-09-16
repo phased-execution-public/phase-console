@@ -23,7 +23,9 @@ export type InboxKind =
   | 'stall'
   | 'ruling'
   | 'session-ask'
-  | 'conflict';
+  | 'conflict'
+  | 'question'
+  | 'policy';
 
 /** How loudly: `urgent` interrupts, `needs-you` waits for a person, `fyi` informs. */
 export type InboxSeverity = 'urgent' | 'needs-you' | 'fyi';
@@ -64,11 +66,19 @@ export type InboxItem = {
   tried?: string[];
   /** ISO 8601 — since when it has been waiting. */
   since: string;
+  /** ISO 8601 — when the ask stops being a person's to answer (a relayed question's window). */
+  expiresAt?: string;
   actions: InboxAction[];
   /** Where in the console it lives. */
   href: string;
   /** Acknowledged — seen, not cleared. */
   ack?: { at: string; by?: string } | null;
+  /**
+   * The console that asked, on a list that merges several — absent on a
+   * console's own inbox, where every row is that console's. `null` names a row
+   * about the machine rather than any one console.
+   */
+  console?: { id: string; name: string } | null;
 };
 
 export type InboxView = {

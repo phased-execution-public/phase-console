@@ -25,6 +25,10 @@ must re-inject those skills into every boot prompt + the QA brief.
 
 ### Phase 1 — a
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 2 — b
 - **Size:** S
+- **Verification:**
+  - `true`

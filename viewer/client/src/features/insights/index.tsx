@@ -61,8 +61,10 @@ import { PortfolioPanel } from './portfolio';
 import { VelocityPanel } from './velocity';
 import { CostVsCapsPanel } from './cost-vs-caps';
 import { PlanCostPanel } from './plan-cost';
+import { LedgerSummaryPanel } from './ledger';
 import { EtaPanel } from './eta';
 import { MixPanel } from './model';
+import { ApprovalsPanel } from './approvals';
 import { qaReportHref, qaReportRound } from '@/lib/qa';
 
 export default function InsightsView({ route }: ViewProps) {
@@ -162,6 +164,12 @@ export default function InsightsView({ route }: ViewProps) {
           <CostVsCapsPanel spend={spend} plan={plan} />
         </Section>
 
+        {/* The sessions' own figures, per plan and per account (phase 19) — the
+            same ledger the run page reconciles, across every open plan. */}
+        <Section title="What each session cost">
+          <LedgerSummaryPanel />
+        </Section>
+
         {/* Scoped only. `/api/spend` above is the console's money against its
             caps; this is ONE plan's money against its own phases, and it comes
             off that plan's run files rather than out of the portfolio
@@ -181,6 +189,12 @@ export default function InsightsView({ route }: ViewProps) {
 
         <Section title="How fast">
           <VelocityPanel stats={stats} />
+        </Section>
+
+        {/* Console-wide, like the cost card: how often this console has put a
+            card in front of a person, and since when (TRS-5). */}
+        <Section title="Who was asked">
+          <ApprovalsPanel counts={state?.approvals} />
         </Section>
 
         <Section title="What shape the work is in">

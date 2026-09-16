@@ -363,6 +363,28 @@ test('a run written by a bare status assignment still lands with a lifecycle', a
     });
     saveRun(back);
     assert.equal(loadRun(root, 'a-plan', back.id)!.lifecycle!.wait!.kind, 'schedule');
+
+    // …and a PERSON's card is a wait the disk keeps (WAI-10, ACC-11.3): the
+    // run parked behind a verification or approval card round-trips with the
+    // kind and the card's clock — `reconcileRun` turns a `waiting` run with a
+    // clock into `paused` with the clock intact, so the boot re-arm fires at
+    // the card's expiry like any other wait.
+    const until = new Date(Date.now() + 3_600_000).toISOString();
+    back.status = 'running';
+    back.waitUntil = until;
+    setRunState(back, 'waiting', { kind: 'person', until, on: 'phase 2 verification card' });
+    assert.deepEqual(back.lifecycle, { state: 'waiting', wait: { kind: 'person', until, on: 'phase 2 verification card' } });
+    saveRun(back);
+    const person = loadRun(root, 'a-plan', back.id)!;
+    // No loop drives this file, so the read path reconciles the wait to
+    // `paused` — with the reason and the clock INTACT, which is what the boot
+    // re-arm reads (`waitClockVerdict` → `waitReasonOf`). The stored lifecycle
+    // is the in-memory one above; the settled one describes the paused run.
+    assert.equal(person.status, 'paused');
+    assert.equal(person.waitReason, 'person');
+    assert.equal(person.waitUntil, until);
+    assert.equal(waitReasonOf(person), 'person');
+    assert.deepEqual(person.lifecycle, runLifecycle(person), 'the axes follow the settled status');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

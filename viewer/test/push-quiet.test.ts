@@ -152,6 +152,27 @@ test('a fan-out where every device slept is not the "reached nobody" alarm', asy
   assert.equal(undelivered, 0, 'quiet is a decision, not an outage');
 });
 
+test('ACC-10.1: quiet hours alone never raise the no-device alarm — a sleeping device is still a device', async () => {
+  const { register, devices } = fresh(['phone']);
+  register.setQuiet(devices[0].id, { ...NIGHT, allowUrgent: false });
+  let nobody = 0;
+  let undelivered = 0;
+  register.onNoDevice = () => { nobody += 1; };
+  register.onUndelivered = () => { undelivered += 1; };
+  const outcomes: string[] = [];
+  const fetch = withFetch(201);
+  try {
+    register.announce('halted', { title: 'A run halted', body: 'b', tag: 'q-nobody', url: '/' }, at('03:00'),
+      (report) => { outcomes.push(report.outcome); });
+    await settle();
+  } finally {
+    fetch.restore();
+  }
+  assert.deepEqual(outcomes, ['quiet'], 'held, and the ledger says quiet — not no-device');
+  assert.equal(nobody, 0, 'a device asleep by its own choice is not a console that can reach nobody');
+  assert.equal(undelivered, 0);
+});
+
 test('urgent breaks through by default, and is held when the device says so', async () => {
   const { register, devices } = fresh(['phone']);
   register.setQuiet(devices[0].id, NIGHT);

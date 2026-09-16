@@ -19,7 +19,13 @@ import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 
 import { RECOVERY_CLASSES } from '../../shared/recovery-model.js';
-import { QA_FIX_STRATEGIES, type QaFixStrategy } from '../../shared/run-settings.js';
+import { NEED_CLASSES } from '../../shared/decisions-model.js';
+import {
+  hoursText, DEFAULT_WAIT_BUDGET_MS as WAIT_BUDGET_DEFAULT, WAIT_MAX_PER_PHASE as WAITS_PER_PHASE,
+  type WaitBudgetSource,
+} from './wait-budget.ts';
+import { QA_FIX_STRATEGIES, type QaFixStrategy, type RelayMode } from '../../shared/run-settings.js';
+import { RELAY_WINDOW_MS } from '../../shared/relay-model.js';
 import { log } from '../log.ts';
 import { onShutdown, offShutdown } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
@@ -29,7 +35,7 @@ import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
+import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -52,7 +58,8 @@ import {
 import {
   accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { RungRecord } from './state.ts';
+import type { Actor, AccountRequirement, ResolvedManifest, RungRecord } from './state.ts';
+import type { PolicyInputs } from '../../shared/policy-model.js';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
@@ -64,7 +71,7 @@ import {
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import {
-  AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant,
+  AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant, type SessionPeerView,
 } from './scheduler.ts';
 import { formatScope } from '../../shared/scope.js';
 import { DEFAULT_PRIORITY, type RunPriority } from '../../shared/orchestration-model.js';
@@ -76,6 +83,11 @@ import {
 import { Journal } from './journal.ts';
 import { Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
+// Type-only, deliberately: the runner holds no runtime import of the accounts
+// facade (zero-touch-console phase 4's cycle rule); these shapes are erased.
+import type { AccountKind, HeadroomVerdict, LeaveReason, LeaveResult } from '../accounts/index.ts';
+import type { McpTransport } from '../../shared/ops-vocab.js';
+import type { PortResult } from '../accounts/transcripts.ts';
 import type { Presence } from '../../shared/run-lifecycle.js';
 import {
   buildSettings, writeSettingsFile, loadPolicyFor,
@@ -255,6 +267,24 @@ export type RunnerDeps = {
    */
   planMcp?: (slug: string, phase: number) => string[];
   /**
+   * The credentials the PLAN says a phase needs — its §Session budget
+   * `**Credentials:**` line unioned with the phase's own bullet (`phase-graph.sh
+   * --credentials N`) — and the plan's policy for a missing one (`require` |
+   * `continue`, the phase's bullet over the §Session budget line; `null` = the
+   * plan has no opinion). Read from the parsed plan like `planMcp` (phase 11,
+   * ZTD-4). Absent = the plan names none.
+   */
+  planCredentials?: (slug: string, phase: number) => { ids: string[]; policy: string | null };
+  /**
+   * Are these credentials held on this machine — by id, never by value
+   * (`credentials-probe.ts`, memoised). Asked before the spawn for every id
+   * the plan names for the phase: under `require` a missing one parks the
+   * phase with its errand and nothing is spent; under `continue` the phase
+   * boards told which are missing. Absent = the preflight is skipped, as a
+   * harness without a registry must.
+   */
+  credentialsHeld?: (ids: readonly string[]) => Promise<{ id: string; status: string; reason: string }[]>;
+  /**
    * What the PLAN says a phase should do when one of its servers is
    * unreachable — its per-phase `**MCP policy:**` bullet, else the
    * §Session budget line. Read from the store for the same reason `planMcp`
@@ -272,6 +302,13 @@ export type RunnerDeps = {
    */
   onMcpDegraded?: (state: RunState, phase: number, degraded: McpDegradation[]) => void;
   /**
+   * A live wall the run could not move around escalated (ACT-6): the phase
+   * waits on the window (`until`) or is parked with an errand (`until: null`).
+   * Told to the service so it announces under `limits` — the runner has no
+   * notification vocabulary of its own.
+   */
+  onLiveWallEscalated?: (state: RunState, phase: number, detail: { action: 'wait' | 'park'; reason: string; until: string | null }) => void;
+  /**
    * Resolve a phase's server set into a `--mcp-config` file, and check it can
    * actually connect before the phase boards.
    *
@@ -287,8 +324,12 @@ export type RunnerDeps = {
       unknown: string[];
       disabled: string[];
       probeError?: string;
+      /** How many `claude` processes the preflight itself started — 0 when the health clock's answer was fresh. */
+      probes?: number;
     }>;
     configFor: (runId: string, phase: number, ids: string[]) => Promise<string | null>;
+    /** A registered server's transport — `stdio` inherits the child's env, a URL does not (ACT-12). */
+    transportOf?: (id: string) => McpTransport | undefined;
   };
   /**
    * The plan's own `**Branch:**` prose from §Session budget, verbatim. Read
@@ -399,15 +440,87 @@ export type RunnerDeps = {
    * mid-phase with nothing worth awaiting.
    */
   pickAccount?: (excluding: string | undefined, forModel?: string) => string | null;
-  /** A limit landed: remember it on the account and tell the operator. */
-  onAccountLimited?: (accountId: string | undefined, window: string, resetsAt: Date | null, detail: string) => void;
+  /**
+   * A run is LEAVING an account — a wall, a refusal, a person's switch (ACT-5,
+   * SES-2). The service's `accounts.leaveAccount`: ONE helper marks the account
+   * machine-wide BEFORE any switch, and answers what to throttle and what was
+   * written so the runner can journal it. Replaces `onAccountLimited`, which
+   * only three of the four movers called and the live wall never did.
+   */
+  leaveAccount?: (accountId: string | undefined, leaving: LeaveReason) => LeaveResult | void;
+  /**
+   * The quota door's verdict for an account (ACT-2) — the service's
+   * `preflightAccount`, which reads `liveBuckets`, the learned walls and the
+   * breaker, and never throws. Absent in harnesses: no quota door.
+   */
+  accountHeadroom?: (accountId: string | undefined, forModel?: string) => HeadroomVerdict;
+  /**
+   * Can the SERVICE drive this rung on a stopped run (zero-touch-console
+   * phase 10, LFC-2)? The drive loop's own vehicles are the few `hintFor`
+   * knows; the healer's `resolveVehicle` knows the rest — the agents, the
+   * script, the resource walls, the parks. `climb()` asks both before it
+   * decides: a rung neither can drive is EXHAUSTION (one errand naming the
+   * vehicle and why), a rung only the healer can drive is a deferral
+   * (`phase.ladder-deferred`, climbed when the run stops). Without this the
+   * loop computed exhaustion from the unfiltered table, answered `false` for
+   * six wholly undrivable tables, and deferred them for ever — 28 records, no
+   * rung, no errand, no push. Absent: nothing beyond the loop's own vehicles.
+   */
+  rungDrivable?: (
+    slug: string, rung: Rung, situation: Situation, record: PhaseRecord, evidence: PhaseEvidence | null, state: RunState,
+  ) => boolean;
+  /**
+   * Why no rung of this situation's table can be driven here, rung by rung —
+   * the healer's `unavailableRungHint`, for the errand the loop writes when
+   * `rungDrivable` answered no for every row (RCV-7). Absent: the errand
+   * carries the table's own sentence.
+   */
+  rungUnavailable?: (
+    slug: string, situation: Situation, record: PhaseRecord, evidence: PhaseEvidence | null, state: RunState,
+  ) => string | null;
+  /**
+   * Strike a deny rule for THIS plan — the `widen-rule` rung's act once a
+   * person approved its card (phase 9, TRS-10). Plan-scoped, recorded and
+   * reversible on the policy page; the service journals `policy.edited` on
+   * every live run. Absent (a harness), the rung offers no card.
+   */
+  widenRule?: (slug: string, rule: string, by: string) => void;
+  /**
+   * Resume the phase's own session through the stopped-run door (the recover
+   * verb) — for a `widen-rule` card answered after the loop that offered it
+   * has ended (phase 9). A live loop re-boards by itself instead.
+   */
+  resumeOwnSession?: (slug: string, phase: number, instruction: string, by: string) => void;
+  /** The registered kind of an account — a `token` scopes what a spawn may attach (ACT-12). */
+  accountKind?: (accountId: string | undefined) => AccountKind | undefined;
   /**
    * Probe the RUN's account before spending a session on it. Absent, the
    * legacy probe runs — which only ever answers for the machine login.
    */
   checkAuth?: (accountId: string | undefined) => Promise<AuthStatus>;
-  /** Copy a session transcript between two accounts' config dirs. See `accounts/transcripts.ts`. */
-  portTranscript?: (sessionId: string, fromAccount: string | undefined, toAccount: string | undefined) => boolean;
+  /**
+   * Carry a session transcript between two accounts' config dirs. See
+   * `accounts/transcripts.ts`: `findable` is what a resume needs, `ported` is
+   * whether bytes moved — the two used to be one boolean, and a same-directory
+   * "port" journalled as carried having copied nothing (ACT-12).
+   */
+  portTranscript?: (sessionId: string, fromAccount: string | undefined, toAccount: string | undefined) => PortResult;
+  /**
+   * The `claude` CLI version this console runs, or undefined when it could not
+   * be read — what `permissionPromptsFor` judges the `--permission-prompts none`
+   * floor against (zero-touch-console phase 13, QRL-9). Absent in a harness,
+   * which reads as unknown.
+   */
+  cliVersion?: () => Promise<string | undefined>;
+  /**
+   * The newest `system/init.claude_code_version` a session on this console
+   * reported, for the binary `cliVersion` answers now (`server/cli-init.ts`) —
+   * the ONE reading the relay's floor is judged against (phase 14, AC-13).
+   * Absent in a harness, which reads as never seen: the relay does not arm.
+   */
+  initVersion?: (binaryNow: string | undefined) => string | null;
+  /** Remember what a session's `system/init` said (`server/cli-init.ts`). */
+  noteCliInit?: (version: string, binary: string | undefined) => void;
   onEvent?: RunnerEvent;
   /**
    * The store's parsed handoff for a phase — its status and its Outstanding
@@ -445,6 +558,19 @@ export type RunnerDeps = {
    */
   dayHistory?: () => readonly RungRecord[];
   /**
+   * The per-instance start ceiling (`start-ceiling.ts`, SLF-1). The runner
+   * CHARGES it with every session's reported dollars as the session ends, and
+   * ASKS it before the two automatic starts that are its own — the reviewer
+   * and the cloud review — refusing the door by name past the ceiling. Absent
+   * in a harness: no ceiling, as before.
+   */
+  startCeiling?: {
+    admit: (actor: Actor) => { ok: true } | { ok: false; ceiling: string; limit: number; count: number; until: string };
+    charge: (actor: Actor, slug?: string | null) => void;
+    spendUsd: (usd: number) => void;
+    shouldAnnounce: (refusal: { until: string }) => boolean;
+  };
+  /**
    * Whether ONE bounded unblock session may be spent on a phase whose handoff
    * declares it blocked (the `unblockAttempts` preference). Absent = yes. Off
    * means the errand is written at once — the operator asked to be asked.
@@ -463,6 +589,34 @@ export type RunnerDeps = {
    * `Prefs.delegateHumanGates`.
    */
   delegateHumanGates?: () => boolean;
+  /**
+   * This console's policy preferences (phase 11, ZTD-10): the `policy.<key>`
+   * overrides and the legacy `delegateHumanGates` switch, as
+   * `shared/policy-model.js` `resolvePolicy` reads them. Absent = no console
+   * override; the plan's row and the shipped defaults still answer.
+   */
+  policyPrefs?: () => NonNullable<PolicyInputs['prefs']>;
+  /**
+   * Record a QA verdict of `waived` for a phase on the console's behalf
+   * (phase 11, ZTD-9): what `qa.exhausted: waive` does when the round budget
+   * is spent — through the same door the operator's "Waive with a reason"
+   * uses, so the report, the round and the reason are written the one way.
+   * Absent = the policy cannot act and the phase parks with the errand it
+   * always had.
+   */
+  qaWaive?: (slug: string, phase: number, opts: { reason: string; by: string }) => Promise<unknown>;
+  /**
+   * The plan's `**QA exhausted:** waive|halt|<owner>` word (phase 11, ZTD-9),
+   * read from the parsed plan like `planMcpPolicy`; absent/undefined = the
+   * plan has no opinion and the console's policy table answers.
+   */
+  planQaExhausted?: (slug: string) => string | undefined;
+  /**
+   * The phase's `- **Person-check:** allow|halt|<owner>` word (phase 11,
+   * ZTD-6), read from the parsed plan; absent/undefined = the plan has no
+   * opinion and the console's policy table answers.
+   */
+  personCheck?: (slug: string, phase: number) => string | undefined;
   /**
    * The dependencies of this phase on which THIS CONSOLE'S operator has
    * requested changes (`review.ts`).
@@ -531,6 +685,22 @@ export type RunnerDeps = {
    */
   lockPresence?: (lock: { slug: string; phase: number; owner: string; session?: string }) => Presence;
   /**
+   * The session registry's presence for one SESSION, with the pid it probed —
+   * what `resumableSession` reads before every `--resume` (REG-1): `live` is a
+   * refusal, because resuming a session still running puts a second `claude`
+   * on its transcript. Absent (tests, a console without a registry): every
+   * session reads `unknown`, and `unknown` proceeds — the boarding's lock claim
+   * is the lease rule.
+   */
+  sessionPresence?: (sessionId: string) => { presence: Presence; pid?: number };
+  /**
+   * The live sessions in this repository that could be about to work `phase`
+   * and hold no lock for it (REG-3) — `ServiceBase.peersInRepository`, minus
+   * the sessions in `excluding` (the phase's own). Boarding's peer belt-check
+   * reads it in the grant→spawn window. Absent: no peer check.
+   */
+  peers?: (slug: string, phase: number, excluding: readonly (string | undefined)[]) => readonly SessionPeerView[];
+  /**
    * Report that a session this runner spawned is alive — and, on a `step`,
    * that it has just finished a turn.
    *
@@ -564,11 +734,29 @@ export type RunnerDeps = {
    * running rather than to the next run. Absent means the shipped defaults.
    */
   stallThresholds?: () => Partial<StallThresholds> | undefined;
+  /**
+   * May the stall watchdog park a lane by itself (`stallAutomaticPark`)? False:
+   * the `external-wait` signal still raises its card and the local job's nudge
+   * still goes, but no lane is checkpointed and parked in the session's place.
+   * Absent reads as true — the shipped behaviour.
+   */
+  stallAutomaticPark?: () => boolean;
 };
 
 export type StartOptions = {
   slug: string;
   root: string;
+  /**
+   * Who is starting this run, from where, through which door — written on
+   * `run.start` as it is, every field (SLF-1). Every `startRun(` site under
+   * `server/` names one: an automatic door builds it with `doorActor(door,
+   * …)`, a press derives it from its request with `pressActor(actorOfRequest(
+   * …))`, and a verb several doors share carries its caller's through.
+   * Required by type — the door is not, because the LINT is what holds a
+   * door to every site (a harness's bare `Runner.start` is recorded as
+   * `unattributedActor`, door-less, which no production path ever writes).
+   */
+  actor: Actor;
   model?: string;
   effort?: string;
   /**
@@ -648,6 +836,20 @@ export type StartOptions = {
   /** What to do at the shared usage window. Absent = `wait`, the old behavior. */
   onLimit?: OnLimitPolicy;
   /**
+   * The prelude's answers (phase 11, ZTD-2): the launch form's four required
+   * fields, and the manifest the Service resolved at the door — echoed whole
+   * onto `run.start`. `manifestOverride` is the one recorded way past a
+   * blocking row; `Runner.start` journals it as `run.manifest-override` right
+   * after `run.start`, because a fresh run has no journal before the runner
+   * mints it. All absent on a resume — the stored run's stand.
+   */
+  resumeOnRestart?: boolean;
+  relay?: RelayMode;
+  accounts?: AccountRequirement[];
+  acknowledgedWaivers?: string[];
+  manifest?: ResolvedManifest;
+  manifestOverride?: { rows: string[]; by: string };
+  /**
    * Consumed by the Service before the runner sees the run — `qa` activates the
    * plan's QA gate at start, `attachDefaultSkills` decides whether the machine's
    * default skills are seeded into `skills`. Carried here so route parsing
@@ -719,15 +921,31 @@ export type RecoverOptions = {
   cls?: RepairClass;
   situation?: string;
   by?: string;
+  /**
+   * The phase's evidence fingerprint as the caller read it (phase 9, RCV-4):
+   * a recovery over the fingerprint the last one ran under is REFUSED — it
+   * cannot have changed anything, and 16 of 127 recoveries re-halted within
+   * seconds having changed nothing, each resetting the halt card's clock.
+   * Absent from a caller that has no board to read (a harness, `qaRecover`);
+   * the service's `recoverPhase` always passes one.
+   */
+  fingerprint?: string;
 };
 
 /**
- * A repair is a bounded errand, not a phase: read the situation, do the one
- * thing, declare an outcome. Longer than a closeout because a `fix-agent` may
- * legitimately have to run a suite; far shorter than a phase, so a session that
- * misreads the ask and starts building runs out rather than running on.
+ * How many times the `recover` verb may run on one phase of one run before it
+ * is refused (phase 9, RCV-4) — twice the shipped per-phase RUNG cap, because
+ * a recovery is cheaper than a rung and a person pressing it is a person
+ * watching. An operator's Retry clears the count; nothing automatic does.
  */
-export const REPAIR_MAX_TURNS = 90;
+export const RECOVER_MAX_PER_PHASE = 6;
+
+/**
+ * The session caps live with the session ledger (`session-record.ts`, a leaf
+ * module `spawn.ts` can import without a cycle through the runner) and are
+ * re-exported here under the names every runner link already imports.
+ */
+export { CLOSEOUT_MAX_TURNS, REPAIR_MAX_TURNS } from './session-record.ts';
 
 /** Per phase: one first try, plus room for a model switch, a resume and a retry. */
 export const MAX_ATTEMPTS = 4;
@@ -779,33 +997,23 @@ export function survivingChildren(state: RunState): Record<string, ChildRef> {
 /**
  * How long a "please check this by hand" card waits. Unlike a tool approval
  * there is no hook holding a socket open, and the honest unit for "open the app
- * and look at the gate stack" is hours, not the ten minutes a permission
- * prompt gets.
+ * and look at the gate stack" is hours — longer than the about an hour a
+ * permission prompt gets before its hook times out (`HOOK_TIMEOUT_SECONDS`).
  */
 export const VERIFY_ANSWER_MS = 12 * 60 * 60 * 1_000;
 
-/**
- * A closeout is paperwork: verify, commit, write the handoff, update the index.
- * Generous enough for a phase whose verification is a full suite, tight enough
- * that a session which misreads the ask and starts coding again runs out.
- */
-export const CLOSEOUT_MAX_TURNS = 60;
+
 
 /* ---- the waiting-external park (console-runtime knobs) ----
  * Runner constants, deliberately NOT in scripts/sizing.env: the F5 single-source
  * rule is for numbers both bash and TS read, and bash never reads these. They
- * are documented in viewer/README.md beside the other runtime knobs. */
-
-/** A waiting-external outcome that names no window: check back in half an hour. */
-export const WAIT_DEFAULT_MS = 30 * 60_000;
-/**
- * How many waiting-external parks one phase may take. A phase that keeps
- * re-filing the same wait is not waiting, it is stuck — the cap turns that
- * into an honest halt instead of an infinite quiet loop.
- */
-export const WAIT_MAX_PER_PHASE = 4;
-/** Total wall-clock one phase may spend parked, across all its waits. */
-export const WAIT_BUDGET_MS = 8 * 60 * 60_000;
+ * are documented in viewer/README.md beside the other runtime knobs. The wait
+ * knobs live in `wait-budget.ts` beside the one function that reads them. */
+export {
+  DECLARATION_COOLDOWN_MS, DECLARATIONS_MAX_PER_PHASE, DECLARED_CLOCK_MAX_MS,
+  DEFAULT_WAIT_BUDGET_MS, RESUME_REFUSED_RECHECK_MS, WAIT_DEFAULT_MS, WAIT_FLOOR_MS, WAIT_MAX_PER_PHASE,
+  WAIT_OVERDUE_ANNOUNCE_MS, WAIT_SETTLE_GRACE_MS, WATCHDOG_PARKS_MAX_PER_PHASE, declarationCooldownFor, declaredClock,
+} from './wait-budget.ts';
 /**
  * How long a phase may queue behind a foreign lock before an honest park
  * naming the holder. Bounds the dead-but-unexpired-lock case.
@@ -1014,7 +1222,10 @@ export function ultracodeOn(
  * turn result and background tasks die seconds later. The exit read `success`;
  * the board read `ready`; the run halted.
  */
-export function unattendedDirective(scriptsDir: string, slug: string, phase: number): string {
+export function unattendedDirective(
+  scriptsDir: string, slug: string, phase: number,
+  wait: { budgetMs: number; source: WaitBudgetSource } = { budgetMs: WAIT_BUDGET_DEFAULT, source: 'default' },
+): string {
   return [
     '',
     '',
@@ -1028,12 +1239,20 @@ export function unattendedDirective(scriptsDir: string, slug: string, phase: num
     '  `status: in-progress` (the durable pause marker), then declare the wait and stop:',
     `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} waiting-external \\`,
     '        --wait-minutes <realistic-window> --reason "<what you are waiting on>" --watch <ref>',
-    '  The supervisor parks the phase and RESUMES THIS SESSION when the window elapses.',
+    '  The supervisor parks the phase and RESUMES THIS SESSION when the window elapses — inside',
+    `  this phase's wait budget: at most ${WAITS_PER_PHASE} waits (WAIT_MAX_PER_PHASE) and ${hoursText(wait.budgetMs)} parked in total`,
+    `  (${WAIT_BUDGET_WORDS[wait.source]}). A window past what is left is REFUSED with a`,
+    '  `waiting-external-timeout` halt, never shortened: name the real end of the wait, and a',
+    '  longer wait needs the plan to say so (`- **Waits on:** <ref> · <max>` on the phase).',
     '- Blocked on a lock or scope conflict? Do not wait for a user reply that cannot come:',
-    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --reason "lock held by <owner>" --watch lock:${slug}/${phase}`,
+    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs lock --reason "lock held by <owner>" --watch lock:${slug}/${phase}`,
     '  then stop; the supervisor queues the retry for when the lock frees.',
     '- Need a person (an MCP sign-in, a manual gate, credentials)? Declare it and stop:',
-    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} needs-human --reason "<what and why>"`,
+    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} needs-human --needs <key> --reason "<what and why>"`,
+    // One line, not a restatement: the engine's boot prompt that leads this
+    // prompt already carries the manifest and the `--needs` duty, and the
+    // script's own refusal names the whole vocabulary.
+    `  (<key>: a ## Decisions key — --decisions ${phase} — or ${NEED_CLASSES.join('|')})`,
     '- Must stop with WORK STILL LEFT (your budget or context is nearly spent)? Commit what is done,',
     '  write the handoff `in-progress`, then declare it so the supervisor RESUMES you instead of',
     '  reading a failed phase:',
@@ -1054,26 +1273,117 @@ export function unattendedDirective(scriptsDir: string, slug: string, phase: num
   ].join('\n');
 }
 
+/* ---- the one resume gate ---- */
+
+declare const VETTED_RESUME: unique symbol;
+
 /**
- * What the runner says when a waiting-external park's window elapses and the
- * board still does not read done. Resumes the SAME session — its context is
- * the whole point — and keeps the escape hatch open: an external process that
- * genuinely needs longer gets a re-filed wait, not a lie.
+ * A session id `resumableSession` cleared for `--resume`: not stamped gone, its
+ * transcript where the paying account will look, and not LIVE (REG-1). Only that
+ * function mints one, and the spawn door takes nothing else — so a `--resume`
+ * that skipped the gate is a compile error rather than a second `claude` on a
+ * running session's transcript, which is what one ungated site made possible.
  */
-export function waitResumePrompt(slug: string, phase: number, reason?: string, watch?: string[]): string {
+export type VettedResume = { readonly sessionId: string; readonly presence: Presence; readonly [VETTED_RESUME]: true };
+
+/** The gate's answer: a vetted resume, or why not. */
+export type ResumeVerdict =
+  | { ok: true; resume: VettedResume }
+  | { ok: false; why: 'none' | 'gone' | 'unported' | 'session-live'; sessionId?: string; pid?: number };
+
+/** What the spawn door accepts: a request whose `--resume` can only be one the gate vetted. */
+export type SessionRequest = Omit<SpawnRequest, 'resume'> & { resumeFrom?: VettedResume };
+
+/** Where a phase's wait budget came from, in the words a session reads. */
+const WAIT_BUDGET_WORDS: Record<WaitBudgetSource, string> = {
+  phase: "this phase's `Waits on:` bullet",
+  plan: "the plan's `Wait budget:` line",
+  default: 'the console default',
+};
+
+/**
+ * Why a parked phase is being resumed — `waitResumePrompt` says only what is
+ * true of the cause:
+ *  - `declared-window` — the window the session itself declared is over.
+ *  - `budget-elapsed` — the console's wait budget ran out before the session's
+ *    own window did (a park from before 5.0.0, or a default window shortened
+ *    to what was left). The session asked for longer and must be told so.
+ *  - `watchdog` — the console parked it by itself; the session declared nothing.
+ */
+export type WaitResumeCause = 'declared-window' | 'budget-elapsed' | 'watchdog';
+
+export type WaitResumeFacts = {
+  scriptsDir: string;
+  slug: string;
+  phase: number;
+  reason?: string;
+  watch?: string[];
+  cause: WaitResumeCause;
+  /** How far the instant the session asked for still lies ahead, or null when it has passed. */
+  externalLeftMs: number | null;
+  budgetMs: number;
+  budgetRemainingMs: number;
+  budgetSource: WaitBudgetSource;
+  /** How long past the armed clock this resume actually came. */
+  lateMs: number;
+};
+
+/** Lateness worth saying out loud: past this, "the world may have moved on" is the likely truth. */
+const RESUME_LATE_WORTH_SAYING_MS = 10 * 60_000;
+
+/**
+ * What the runner says when a parked phase comes back and the board still does
+ * not read done. Resumes the SAME session — its context is the whole point —
+ * and keeps the escape hatch open: an external process that genuinely needs
+ * longer gets a re-filed wait, not a lie.
+ *
+ * It used to open "The wait window you declared … has elapsed" whatever woke
+ * it, including a budget that ran out 51 hours before the session's own window
+ * and a park the console made by itself; one session answered the second false
+ * signal with a ruling nothing acted on (WAI-2). Only `declared-window` says
+ * the declared window elapsed now.
+ */
+export function waitResumePrompt(facts: WaitResumeFacts): string {
+  const { scriptsDir, slug, phase, reason, watch, cause } = facts;
+  const waitingOn = reason ? ` (you were waiting on: ${reason})` : '';
+  const left = hoursText(facts.budgetRemainingMs);
+  const opening: string[] = cause === 'declared-window'
+    ? [`The wait window you declared for phase ${phase} of \`${slug}\` has elapsed${waitingOn}.`]
+    : cause === 'budget-elapsed'
+      ? [
+        `Phase ${phase} of \`${slug}\` is being resumed because this phase's wait BUDGET ran out — NOT because`
+          + ` the window you declared is over${waitingOn}.`,
+        ...(facts.externalLeftMs !== null
+          ? [`The instant you asked for is still ${hoursText(facts.externalLeftMs)} away. The console will not shorten a`
+            + ' declared window in silence, so it is telling you: this phase cannot park again past what is left,'
+            + " and only the plan can allow a longer wait (`- **Waits on:** <ref> · <max>` on this phase — an"
+            + ' operator\'s edit).']
+          : []),
+      ]
+      : [
+        `The CONSOLE parked phase ${phase} of \`${slug}\` by itself — you did not declare this wait${waitingOn}.`,
+        'A Bash call was waiting inside the turn, which holds the phase lock and produces nothing, so the',
+        'watchdog ended that turn and scheduled this resume.',
+      ];
   return [
-    `The wait window you declared for phase ${phase} of \`${slug}\` has elapsed`
-      + `${reason ? ` (you were waiting on: ${reason})` : ''}.`,
+    ...opening,
     ...(watch?.length ? [`You were watching: ${watch.join(', ')}.`] : []),
+    ...(facts.lateMs > RESUME_LATE_WORTH_SAYING_MS
+      ? [`This resume came ${hoursText(facts.lateMs)} after the clock the console armed (it was not running to fire`
+        + ' it on time): assume the world moved on, and re-check before you trust anything you saw.']
+      : []),
     '',
     'Pick up the closeout:',
     '',
     '1. Re-check the external process(es). If they finished, run the plan\'s §Verification',
     '   commands, commit, and write the handoff `complete` (red verification → handoff',
     '   `blocked` with the failure recorded — never `complete` on red).',
-    `2. If they are STILL not finished, re-file the wait with a realistic window —`,
-    `   \`bash scripts/phase-outcome.sh ${slug} ${phase} waiting-external --wait-minutes <M> --reason "…"\` —`,
-    '   and stop. Do not sit in the turn waiting.',
+    `2. If they are STILL not finished, re-file the wait with the real end of it and a watch ref —`,
+    `   \`bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} waiting-external --wait-minutes <M> --reason "…" --watch <ref>\` —`,
+    `   and stop. Do not sit in the turn waiting. This phase may stay parked ${left} more (its wait`,
+    `   budget is ${hoursText(facts.budgetMs)}, ${WAIT_BUDGET_WORDS[facts.budgetSource]}); a window past that is refused`,
+    '   with a `waiting-external-timeout` halt. If that is not enough, write the handoff `in-progress`',
+    `   and declare \`bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs waits --reason "…"\` instead.`,
     '3. If they failed, write the handoff `blocked` recording exactly what failed.',
     '',
     'Do not start new work. Never end the turn without a handoff or a declared outcome.',
@@ -1154,6 +1464,9 @@ export function condenseSaid(said: string): string {
 
 /** How many idempotency keys are worth remembering. Minutes, not hours. */
 export const MAX_INJECT_KEYS = 200;
+
+/** How many operator questions may wait for their answer at once, oldest dropped first. */
+export const MAX_OPEN_ASKS = 50;
 
 /** What a write to a live session answers with. */
 export type AskResult = {
@@ -1292,6 +1605,8 @@ export type Lane = {
   limitHits?: number[];
   /** When the live wall last acted on this lane (ms) — the cooldown's clock. */
   limitActedAt?: number;
+  /** The `action: 'none'` decisions this lane has journalled (ms), newest last — `LIMIT_NONE_MAX`'s evidence. */
+  limitNones?: number[];
   /**
    * What THIS attempt has spent so far, as the CLI's own `result` messages
    * report it — and absent until one arrives.
@@ -1312,6 +1627,8 @@ export type Lane = {
    * costs exactly one extra line.
    */
   localNudgeRefused?: boolean;
+  /** `stallAutomaticPark` is off and this episode's park was declined — logged once, not per tick. */
+  automaticParkDeclined?: boolean;
 };
 
 /** How often the liveness ticker evaluates every live lane. */
@@ -1423,6 +1740,22 @@ export const LIMIT_RETRY_WINDOW_MS = 120_000;
  * a move per retry is a loop.
  */
 export const LIMIT_ACTION_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * How many `action: 'none'` live-wall decisions a lane may take inside
+ * `LIMIT_NONE_WINDOW_MS` before the wall stops being journalled and starts
+ * being acted on (ACT-6: 85 of 102 lifetime walls were `none`, 52 of them
+ * under `switch`, and the child sat in the CLI's retry loop with nobody told).
+ *
+ * Two — so the THIRD burst, twenty minutes into a wall at the cooldown's pace,
+ * waits out the window or parks with the errand and a `limits` announcement.
+ * One would act on a wall that a single cooldown might have outlived; more
+ * would be the measured silence with a bigger number on it.
+ */
+export const LIMIT_NONE_MAX = 2;
+
+/** The window those `none` decisions have to land inside — a five-hour wall is hours; an hour is plenty. */
+export const LIMIT_NONE_WINDOW_MS = 60 * 60_000;
 
 
 /**
@@ -1719,6 +2052,35 @@ export function frameQuestion(question: string, mark: string): string {
     + 'off. Do not alter your plan, your task list, or what you were about to do — unless the '
     + `question itself explicitly asks you to.\n\nBegin your answer with the tag ${mark} so the `
     + `console can show it beside the question.\n\nQuestion: ${question}`;
+}
+
+/**
+ * What a session is told when the relay answered its question and nobody else
+ * did (zero-touch-console phase 14, QRL-6) — the sentence chapter 13 §1.4 wrote
+ * for it, word for word, in `frameQuestion`'s register: the answer, the rule
+ * that chose it, that it does not redirect the phase, and the one declaration
+ * that is right if the answer was wrong. The key is the manifest row a relayed
+ * answer is filed under (`ambiguity`), so the declaration is one `phase-outcome.sh`
+ * accepts. Exact, because a session reads "No operator answered" as the fact it
+ * is only if the words never drift.
+ */
+export function frameRelayAnswer(label: string, rule: string, key: string): string {
+  return `No operator answered within ${Math.round(RELAY_WINDOW_MS / 1000)} s. The console answered \`${label}\` by `
+    + `\`${rule}\`. This is NOT a change to the phase. If that answer is wrong, declare \`blocked --needs ${key}\` `
+    + 'rather than asking again.';
+}
+
+/**
+ * The message the relay's answers go down stdin in: one `frameRelayAnswer`
+ * sentence per question the console answered, each beside the question it
+ * answers, tagged so the CLI's echo is recognised. It asks for no reply.
+ */
+export function frameRelayNotice(
+  answers: readonly { question: string; label: string; rule: string }[], mark: string, key: string,
+): string {
+  const lines = answers.map((answer) => `Question: ${answer.question}\n${frameRelayAnswer(answer.label, answer.rule, key)}`);
+  return `${mark} A notice from the console supervising this run, about a question you asked.\n\n${lines.join('\n\n')}\n\n`
+    + 'Nothing needs saying back: carry on with the phase.';
 }
 
 /**

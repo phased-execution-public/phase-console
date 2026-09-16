@@ -150,9 +150,12 @@ The long version, including push notifications and exactly what is enforced →
 **[📖 Full documentation →](docs/README.md)**
 
 [Overview](docs/overview.md) · [Your first plan](docs/first-plan.md) · [The loop](docs/loop.md) · [The artifacts](docs/artifacts.md) ·
-[What you control](docs/controls.md) · [Session budget](docs/session-budget.md) · [Model handling](docs/model-handling.md) ·
+[What you control](docs/controls.md) · [Session budget](docs/session-budget.md) · [Decisions](docs/decisions.md) · [Model handling](docs/model-handling.md) ·
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
+
+5.0 adds what an unattended run leans on: `phase-console doctor`, the [decisions](docs/decisions.md) a run
+starts with, a relay for a session's mid-run question, and Shut down's **Stay off…** — [docs/controls.md](docs/controls.md).
 
 Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no
 runtime dependencies**. Releases: `vX.Y.Z` tags with a GitHub Release carrying the packed tarball,

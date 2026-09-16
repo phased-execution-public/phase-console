@@ -1,54 +1,68 @@
 #!/usr/bin/env bats
-# F14 — a phase without a runnable §Verification warns at lint time, never gates.
-# The advisory exists because the autopilot parks such a phase at boarding
-# ("nothing would prove the work"), hours after plan time; the author should
-# hear it while the plan is still in front of them. Warning tier by design:
-# exit codes and the LINT OK line never move.
+# F14 — a phase without a runnable §Verification FAILS the lint (a gate since
+# 5.0.0, `verification-empty-open`; it warned before). The autopilot parks such
+# a phase at boarding ("nothing would prove the work") hours after plan time,
+# and the sep-review audit (ZTD-6) found a prose-only verification card asking a
+# person for twelve hours after the phase was paid for — so the author hears it
+# as a red exit while the plan is still in front of them. Done phases and closed
+# plans keep their history unjudged.
 load ../helpers/test_helper
 
-@test "F14: an open phase with no Verification bullet is named, exit stays 0" {
+@test "F14: an open phase with no Verification bullet is named, and the lint FAILS" {
   setup_docs nested-verification nestedv
   run pg nestedv --lint
-  [ "$status" -eq 0 ]
-  assert_contains "$output" "LINT OK"
-  assert_contains "$output" "F14 phase 3"
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "LINT FAIL"
+  assert_contains "$output" "phase 3: verification-empty-open"
 }
 
 @test "F14: nested sub-bullet verification counts as runnable" {
   setup_docs nested-verification nestedv
   run pg nestedv --lint
-  [[ "$output" != *"F14 phase 1"* ]]
-  [[ "$output" != *"F14 phase 2"* ]]
+  [[ "$output" != *"phase 1: verification-empty-open"* ]]
+  [[ "$output" != *"phase 2: verification-empty-open"* ]]
 }
 
-@test "F14: a done phase is not nagged about history" {
+@test "F14: a done phase is not judged about history — the same plan lints OK" {
   setup_docs nested-verification nestedv
   write_handoff nestedv 3 bare complete
   run pg nestedv --lint
   [ "$status" -eq 0 ]
-  [[ "$output" != *"F14"* ]]
+  assert_contains "$output" "LINT OK"
+  [[ "$output" != *"verification-empty-open"* ]]
 }
 
 @test "F14: a plan whose every phase verifies stays silent" {
   setup_docs scoped scoped
   run pg scoped --lint
   [ "$status" -eq 0 ]
-  [[ "$output" != *"F14"* ]]
+  [[ "$output" != *"verification-empty-open"* ]]
 }
 
-@test "F14: validate.sh inherits the advisory without failing" {
+@test "F14: validate.sh fails on it, naming the check" {
   setup_docs nested-verification nestedv
   run pe_validate nestedv
-  [ "$status" -eq 0 ]
-  assert_contains "$output" "F14 phase 3"
-  assert_contains "$output" "VALIDATE OK"
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "phase 3: verification-empty-open"
+  [[ "$output" != *"VALIDATE OK"* ]]
 }
 
-@test "F14: a closed plan is not scanned" {
+@test "F14: a closed plan is noted, not gated" {
   setup_docs closed closedp
   run pg closedp --lint
   [ "$status" -eq 0 ]
-  [[ "$output" != *"F14"* ]]
+  assert_contains "$output" "LINT OK (closed)"
+}
+
+@test "F14: every shape of an empty §Verification is named — numbers only, no bullet, prose only" {
+  setup_docs bad-empty-verification-open bev
+  run pg bev --lint
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "phase 1: verification-empty-open"
+  assert_contains "$output" "phase 2: verification-empty-open"
+  assert_contains "$output" "phase 3: verification-empty-open"
+  [[ "$output" != *"phase 4: verification-empty-open"* ]]
+  assert_contains "$output" "LINT FAIL: bev (3 issue[s])"
 }
 
 # F16 — a §Verification that waits on an external clock warns at lint time,
@@ -77,7 +91,7 @@ load ../helpers/test_helper
 @test "F16: runnable-but-unbounded does not trip F14" {
   setup_docs unbounded-verification unb
   run pg unb --lint
-  [[ "$output" != *"F14"* ]]
+  [[ "$output" != *"verification-empty-open"* ]]
 }
 
 @test "F16: a done phase is not nagged about history" {

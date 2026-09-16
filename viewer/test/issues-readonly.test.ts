@@ -76,6 +76,10 @@ const ALLOWED_GH = [
   // has that pull request left OPEN. Reads, both of them.
   ['run', 'view'],
   ['pr', 'view'],
+  // `credentials-probe.ts` (phase 11): is the operator signed in to GitHub —
+  // the prelude's and `doctor`'s `gh` credential probe. A read of the CLI's
+  // own state, and the exit code is all that is kept.
+  ['auth', 'status'],
 ];
 
 /**
@@ -130,7 +134,7 @@ function tsFiles(dir: string, out: string[] = []): string[] {
  * a reviewer can see the whole set of files that reach GitHub in one place,
  * and so the positive assertion below can prove the list describes real code.
  */
-const GH_CALLERS = ['issues/fetch.ts', 'watch-refs.ts'];
+const GH_CALLERS = ['issues/fetch.ts', 'watch-refs.ts', 'credentials-probe.ts'];
 
 /**
  * A source file with its comments removed.

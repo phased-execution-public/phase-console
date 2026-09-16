@@ -27,9 +27,15 @@ the opus budget (~200K, F6), not the no-model default (~40K).
 
 ### Phase 1 — a
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 2 — b
 - **Size:** S
+- **Verification:**
+  - `true`
 
 ### Phase 3 — c
 - **Size:** S
+- **Verification:**
+  - `true`

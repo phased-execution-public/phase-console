@@ -73,6 +73,12 @@ export type PushMessage = {
    */
   actions?: { action: string; title: string }[];
   callback?: string;
+  /**
+   * Which console spoke (zero-touch phase 17, FLT-4): its instance id and name,
+   * so a notification reaching a device that more than one console announces
+   * to — and, from phase 18, the fleet's one subscription — says whose it is.
+   */
+  console?: { id: string; name: string };
 };
 
 /**

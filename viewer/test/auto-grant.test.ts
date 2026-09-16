@@ -2,10 +2,14 @@
  * Auto-grant: the console answers permission asks itself — the ask still
  * happens, only the answering hand is automated.
  *
- * The operator's chosen shape (2026-08-23): ON by default, fully hands-free —
- * the openPr carve-out's `git push` / `gh pr create` asks auto-grant too. The
- * one thing held back is a wrapper whose hidden payload the deny list would
- * stop: a silent yes there is the wall failing, not supervision relaxing.
+ * The operator's chosen shape (2026-08-23): ON by default. Two things are held
+ * back: a wrapper whose hidden payload the deny list would stop (a silent yes
+ * there is the wall failing, not supervision relaxing), and — since 5.0.0
+ * (zero-touch-console phase 13, TRS-4) — the two publishing asks the openPr
+ * carve-out pins for a person, `git push` and `gh pr create`, which the
+ * 2026-08-23 shape auto-granted 189 times with nobody asked. Those stay a card
+ * unless the plan's `permission.destructive` row names the rule as an
+ * exception, and a grant under one carries `matched` and is announced.
  *
  * Three layers, one file: the scope resolution (`autoApproveFor` — plan file
  * beats global file beats the shipped ON), the file round-trip (`editPolicy`
@@ -206,11 +210,14 @@ test('an ask-listed command auto-grants by default: allow reply, journal entry, 
   assert.equal(card?.status, 'allow');
   assert.equal(card?.decidedBy, 'auto-grant');
   assert.equal(card?.phase, 2, 'stamped with the lane');
-  const journalled = noted.find((n) => n.event === 'phase.tool-auto-granted');
+  const journalled = noted.find((n) => n.event === 'phase.approval-auto-granted');
   assert.ok(journalled, 'the durable audit is the journal');
   assert.equal(journalled?.data.tool, 'Bash');
   assert.equal(journalled?.data.level, 'default');
   assert.equal(journalled?.phase, 2);
+  // Which line of policy asked (LFC-9): the audit's 189 grants carried only the suggestion.
+  assert.equal(journalled?.data.matched, 'Bash(git commit:*)');
+  assert.equal(card?.matched, 'Bash(git commit:*)');
   assert.ok(events.some((e) => e.name === 'approval:resolved'), 'pages learn a decision exists');
   assert.ok(!events.some((e) => e.name === 'approval'), '`approval` is the "get a person" channel');
   service.close();
@@ -253,7 +260,7 @@ test('the phase level outranks everything: false beats a silent-global ON, and t
     const { service, noted } = serviceOn({ phaseOptions: { 2: { autoApprove: true } } });
     const answer = reply(await service.decideToolUse(ASKED, 'r1'));
     assert.equal(answer.permissionDecision, 'allow');
-    assert.equal(noted.find((n) => n.event === 'phase.tool-auto-granted')?.data.level, 'phase');
+    assert.equal(noted.find((n) => n.event === 'phase.approval-auto-granted')?.data.level, 'phase');
     service.close();
   }
   rmSync(POLICY_PATH, { force: true });
@@ -307,17 +314,72 @@ test('a clean wrapper auto-grants — the same benefit of the doubt trusted give
   service.close();
 });
 
-test("the operator's fully-hands-free choice: git push and gh pr create auto-grant on an openPr run", async () => {
-  rmSync(POLICY_PATH, { force: true });
-  const { service, noted } = serviceOn({ gitMode: 'new-branch', openPr: true });
-  for (const command of ['git push origin work', 'gh pr create --fill']) {
-    const answer = reply(await service.decideToolUse(
-      { tool_name: 'Bash', tool_input: { command } }, 'r1',
-    ));
-    assert.equal(answer.permissionDecision, 'allow', `${command} rides the carve-out into auto-grant`);
+test('ACC-8.7 (TRS-4): with auto-grant ON at every level and the carve-out on, git push and gh pr create still raise a card — auto-grant never answers the publishing asks', async () => {
+  mkdirSync(join(POLICY_PATH, '..'), { recursive: true });
+  writeFileSync(POLICY_PATH, `${JSON.stringify({ autoApprove: true })}\n`, 'utf8');
+  write(planPolicyPath('demo'), { autoApprove: true });
+  const { service, noted, events } = serviceOn({
+    gitMode: 'new-branch', openPr: true, phaseOptions: { 2: { autoApprove: true } },
+  });
+  try {
+    for (const [command, rule] of [['git push origin work', 'Bash(git push:*)'], ['gh pr create --fill', 'Bash(gh pr create:*)']] as const) {
+      const pending = Symbol('still asking');
+      const outcome = await Promise.race([
+        service.decideToolUse({ tool_name: 'Bash', tool_input: { command } }, 'r1'),
+        new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+      ]);
+      assert.equal(outcome, pending, `${command} is a person's tap, whatever auto-grant says`);
+      const card = service.approvals.pending().find((approval) => (approval.tool?.input as { command?: string }).command === command);
+      assert.ok(card, `${command} raised a real card`);
+      assert.equal(card?.matched, rule, 'and the card names the rule that asked');
+    }
+    assert.equal(noted.filter((n) => n.event === 'phase.approval-auto-granted').length, 0, 'nothing was granted');
+    assert.equal(
+      events.filter((e) => e.name === 'notification' && (e.data as { category?: string }).category === 'approval').length, 2,
+      'each raised card went out once on the approval channel',
+    );
+  } finally {
+    service.approvals.disarm();
+    service.close();
+    rmSync(POLICY_PATH, { force: true });
+    rmSync(planPolicyPath('demo'), { force: true });
   }
-  assert.equal(noted.filter((n) => n.event === 'phase.tool-auto-granted').length, 2);
-  service.close();
+});
+
+test('ACC-8.7 (TRS-4): a plan whose permission.destructive row allows the rule lets auto-grant answer it — with matched, and exactly one approval notification', async () => {
+  rmSync(POLICY_PATH, { force: true });
+  const manifest = {
+    decisions: [{ key: 'permission.destructive', state: 'answered', source: 'plan', value: 'deny; allow `Bash(gh pr create:*)`' }],
+  };
+  const { service, noted, events } = serviceOn({ gitMode: 'new-branch', openPr: true, manifest });
+  try {
+    const answer = reply(await service.decideToolUse(
+      { tool_name: 'Bash', tool_input: { command: 'gh pr create --fill' } }, 'r1',
+    ));
+    assert.equal(answer.permissionDecision, 'allow');
+    assert.match(answer.permissionDecisionReason, /auto-grant/);
+    const granted = noted.find((n) => n.event === 'phase.approval-auto-granted');
+    assert.equal(granted?.data.matched, 'Bash(gh pr create:*)');
+    assert.deepEqual((granted?.data.exception as { rule: string }).rule, 'Bash(gh pr create:*)');
+    const card = service.approvals.recent().at(-1);
+    assert.equal(card?.matched, 'Bash(gh pr create:*)');
+    assert.match(String(card?.reason), /permission\.destructive exception/);
+    const announced = events.filter((e) => e.name === 'notification' && (e.data as { category?: string }).category === 'approval');
+    assert.equal(announced.length, 1, 'a grant under an exception is announced, once');
+    assert.equal((announced[0].data as { title?: string }).title, 'Published under a plan exception');
+    assert.ok(!events.some((e) => e.name === 'approval'), 'and never queued as a question');
+
+    // The exception names ONE rule: the other publishing ask is still a card.
+    const pending = Symbol('still asking');
+    const outcome = await Promise.race([
+      service.decideToolUse({ tool_name: 'Bash', tool_input: { command: 'git push origin work' } }, 'r1'),
+      new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+    ]);
+    assert.equal(outcome, pending);
+  } finally {
+    service.approvals.disarm();
+    service.close();
+  }
 });
 
 test('a call whose token names no run never auto-grants — an anomaly stays in front of a person', async () => {

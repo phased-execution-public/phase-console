@@ -45,6 +45,8 @@ npm run check:dist            # the build gate — run it after every build
 
 ```bash
 ./start [<repo-with-docs-plans>] [--allow-writes] [--port N] [--no-open]   # run the console
+phase-console doctor [<instance>] [--json]      # the start's probes + the machine checks, no plan needed
+phase-console sessions ingest [<instance>]      # drain the presence inbox while no console is up (the hook runs it)
 ```
 
 
@@ -120,9 +122,22 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
 - `shared/plan-vocab.js` — the plan-file words: plan status + the three terminal ones, the QA
   vocabularies, the FROZEN handoff statuses, gate kinds.
 - `shared/ops-vocab.js` — the console-machinery words: health severity, MCP status/transport,
-  account kind + auth state, delivery outcome, ETA basis.
+  account kind + auth state, the entitlement breaker (`ENTITLEMENT_STATES`,
+  `ENTITLEMENT_TRANSITIONS`), delivery outcome (`no-device` included), ETA basis, and the shutdown
+  words — `SHUTDOWN_MODES` (`exit`, `unload`), `SHUTDOWN_DURABILITIES`, `SHUTDOWN_INTENTS`,
+  `SHUTDOWN_CLOCK_SOURCES` — plus `BOOT_HOLD_KINDS` (`stopped`, `autostart-off`).
 - `shared/run-settings.js` — the run's own settings, including the permission profiles, their
-  labels, and the CLI permission modes.
+  labels, the CLI permission modes, `RELAY_MODES`, the two CLI floors (`RELAY_CLI_FLOOR`,
+  `PERMISSION_PROMPTS_CLI_FLOOR`) and `versionAtLeast`, the one comparison both are read through.
+- `shared/run-lifecycle.js` — every word a run, a phase, a rung, a queue entry or a watch ref can be,
+  plus `START_DOORS` (with `OPERATOR_DOOR`), `SESSION_MODES` and the reviewer policies.
+- `shared/decisions-model.js` — the decision manifest (`DECISION_KEYS`, `DECISION_STATES`,
+  `DECISION_SOURCES`); `shared/policy-model.js` — the policy table over it: each class of
+  intervention, the manifest row that answers it, the shipped default and the journal line.
+- `shared/relay-model.js` — the relay's window and answer clock, the per-phase question budget, the
+  exclusions and unanswerable reasons, who answered, the relay rules, and `pickAnswer`.
+- `shared/cli-tools.js` — `CLI_TOOLS`, the tool names Claude Code provides, which is what a
+  permission rule may name.
 
 Add a state, a rung or a route in the shared file and nowhere else. Three copies that agree today
 are three copies that disagree the day a word is added — which is how a finished run gets painted as
@@ -158,17 +173,27 @@ Adding a sixth bucket means editing `BOARD_BUCKETS` and nothing else.
 
 ### Accounts and the usage window
 
-`server/accounts/` is per-instance, like the push keys and unlike `runs/` — two consoles on one
-machine are usually two projects with two ideas about whose quota they may burn. `store.ts` is the
-registry of three kinds (`default`, the machine's own `claude` login, synthesized on every read and
-never stored or deleted; `profile`, a console-managed `CLAUDE_CONFIG_DIR` the operator signs into;
-`token`, a pasted `claude setup-token`), `credentials.ts` is the only file that touches secrets —
-keychain or a 0600 file for ours, **read-only** for the CLI's own, because a second writer is how two
-processes corrupt one login — `usage.ts` polls the same endpoint the CLI's own `/usage` asks (gently:
-single-flight, adaptive cadence, harder backoff on 429), `transcripts.ts` copies a
-session's `.jsonl` into the target account's config dir so `--resume` finds the conversation, and
-`index.ts` is the facade whose every answer is already redacted, so the boundary is there and not in
-a route. State lives under `INSTANCE_STATE_DIR/accounts`; `accounts.json` never holds a secret.
+`server/accounts/` is two stores with two scopes. The **registrations** are per instance, like the
+push keys and unlike `runs/` — two consoles on one machine are usually two projects with two ideas
+about whose quota they may burn: `store.ts` is the registry of three kinds (`default`, the machine's
+own `claude` login, synthesized on every read and never stored or deleted; `profile`, a
+console-managed `CLAUDE_CONFIG_DIR` the operator signs into; `token`, a pasted `claude
+setup-token`), under `INSTANCE_STATE_DIR/accounts`, and `accounts.json` never holds a secret. What
+the machine has **learned** about a credential is machine-wide: `learned.ts` keeps one
+`<stateHome>/accounts/learned.json`, keyed by the credential's fingerprint — its walls, the
+entitlement breaker (`unknown · entitled · cooling · retired`, moved only along
+`ENTITLEMENT_TRANSITIONS`; a transition outside that table is refused and logged), the meter-read
+clocks, the hashed organisation id (a `retired` organisation excludes every account in it) and the
+tombstone a removed registration is still named by — because a wall one console learned used to be
+invisible to the other. `credentials.ts` is the only file that touches secrets — keychain or a 0600
+file for ours, **read-only** for the CLI's own, because a second writer is how two processes corrupt
+one login — `usage.ts` polls the same endpoint the CLI's own `/usage` asks (gently: single-flight,
+every ~90 s for an account a runner is spending and every ten minutes otherwise, harder backoff on
+429), `transcripts.ts` copies a session's `.jsonl` into the target account's config dir so `--resume`
+finds the conversation, and `index.ts` is the facade whose every answer is already redacted, so the
+boundary is there and not in a route. Its quota door (`headroom`) refuses a start by name on a
+retired credential, until the reset on a learned wall, and at `PREFLIGHT_REFUSE_PCT` (97) on a live
+five-hour meter.
 
 Two rules the code is built around. **Bucket names are data, not schema** (`five_hour`, `seven_day`,
 `seven_day_opus`, whatever tier ships next) — anything with a `utilization` and a `resets_at` is a
@@ -213,8 +238,10 @@ rather than refusing.
   two sessions end up in one working tree.
   **F14** rides the same arm as a WARNING (stderr, exit untouched): an open, not-done phase whose
   §Verification holds nothing runnable — the thing the autopilot would otherwise park on at boarding.
-  **F15** rides it too, same tier and same reasoning: a plan or phase naming an MCP server this
-  machine has not registered. **F16** rides it too: a §Verification command that waits on an
+  **F15** rides it too, same tier and same reasoning: a plan or phase naming an MCP server, an
+  account or a credential this machine has not registered — the console tells bash its registries
+  through `PE_MCP_SERVERS`, `PE_ACCOUNTS` and `PE_CREDENTIALS` (unset disables the check; set but
+  empty is a real answer), and the run-start prelude is the gate that acts on it. **F16** rides it too: a §Verification command that waits on an
   external clock (`gh run watch`, `task deploy`, `--watch`/`wait` flags, long sleeps) — runnable by
   F14's test, unfinishable inside a session's turn; split the phase behind a Gate-check or expect a
   runtime park. **F17** and **F18** complete the family, both born from one measured incident class
@@ -258,6 +285,12 @@ rather than refusing.
   identity check; it deliberately does not widen `--host`. The `Tailscale-User-Login` header is only
   trustworthy because nothing but the proxy can reach the port.
 - **Permission `deny` is identical across all three run profiles.** Profiles move only the ask list.
+  The classifier, `classifyTool` (`runner/approvals.ts`), reads deny FIRST, then answers `hold` for
+  `QUESTION_CLASS` (`AskUserQuestion`) from its own constant — never from the ask list, which a
+  profile, a strike or a written allow rule can empty; a `hold` is answered by the relay on an armed
+  run and by the plan's `ambiguity` row everywhere else. The two publishing asks in `OPEN_PR_ASK`
+  (`git push`, `gh pr create`) are never auto-granted: only a `permission.destructive` row in the
+  plan's manifest lets the console answer one, and that answer is announced.
   The PreToolUse hook fails open and carries workflow, never safety. The **Stop hook** rides the same
   settings file with the same philosophy: it nudges a session ending with neither a handoff nor a
   declared outcome (at most twice), fails open, and the runner's own exit-time outcome check — not
@@ -284,12 +317,15 @@ rather than refusing.
   because two probes disagreeing about one process is how a stopped session read as alive (`ps -o
   comm=` answers `claude`; `ucomm` answers the version string the CLI execs, so it is `comm`).
   **One place acts:** `server/runner/signals.ts` is the only place that signals one — SIGCONT first
-  (a stopped process queues SIGTERM and never runs its handler), address the process GROUP (`-pid`,
-  so the child's bash, MCP servers and subagents go with it), and always leave a SIGKILL backstop,
-  **awaited** rather than armed on a `setTimeout` that dies with the console that set it. The lint
-  allows five other `.kill(` files by name and reason — three console-owned probe children with no
-  group of their own, two ptys — and fails when that set changes in EITHER direction, so a reason
-  cannot rot. **The handle outlives the console that made it:** `syncMirror` MERGES `state.children`
+  (a stopped process queues SIGTERM and never runs its handler); then SIGINT, once, to the CLI leader
+  itself and never its group — SIGINT closes the turn and writes the `result` the CLI books turns and
+  dollars in, SIGTERM does not — with `INT_GRACE_MS` (5 s) to leave; then SIGTERM to the process
+  GROUP (`-pid`, so the child's bash, MCP servers and subagents go with it); and always a SIGKILL
+  backstop, **awaited** rather than armed on a `setTimeout` that dies with the console that set it.
+  The MCP probe takes the same ladder with the interrupt rung off — it has no turn to close — so its
+  ending is SIGTERM to its group, `PROBE_TERM_GRACE_MS` (3 s), then the SIGKILL its `npx` shims
+  need. The lint allows six other `.kill(` files, each by name and reason (`KILL_ALLOWED` in the
+  test), and fails when that set changes in EITHER direction, so a reason cannot rot. **The handle outlives the console that made it:** `syncMirror` MERGES `state.children`
   and never rebuilds it, so a ChildRef for a phase this console holds no lane for survives
   byte-for-byte and only the probe may drop it; identity is the `(pid, procStartedAt)` tuple, never
   `child.startedAt`, which is the PHASE's clock and is hours off on a retry. **And no reader ever
@@ -316,7 +352,14 @@ rather than refusing.
   reviewer itself; what the QA rungs do is resume the PHASE's own session and instruct it to
   dispatch the fresh-context subagent and record the verdict (`qa-verdict`, `qa-fix`), which is
   why both QA situations are actor `machine`. `autoClass: 'ladder*'` in `KIND_PROFILE` is still a
-  word for a surface, never a launch.
+  word for a surface, never a launch. Every rung's vehicle has a driver in `VEHICLE_DRIVERS`
+  (`console` · `writes` · `agent` · `never`, held total by `test/ladder.test.ts`): a rung this
+  console cannot drive is skipped, a table with nothing drivable left is exhausted and its errand
+  names what is in the way (`undrivableSentence`), and nothing waits on a rung nobody owns. A halt
+  only a person's press relaunches is in `PRESS_ONLY_HALT_KINDS` (`converge.ts`) — `failure-streak`,
+  because relaunching by clock was what reset the streak, and `credential-refused`, because a
+  retired credential only meets the same wall — and converge closes just the run-level relaunch to
+  them; the phases' own ladders still climb.
 - **The engine is the authority on gate state, including for the healer.** `collectEvidence` takes
   a `gate` dep and `Service.evidenceDeps` supplies it as a live `--gate-status` read; the
   `record.gate` fallback is only for a read that could not RUN. It once had no dep at all, so the
@@ -339,15 +382,54 @@ rather than refusing.
   confirm on the policy page — it widens what every future run may do, the CLI-side settings
   included), the per-run push carve-out **never resurrects** a struck wall, and profiles still never
   move deny. `approvals.test.ts` pins all three.
+- **One spawn door, and every start names its door.** Every `claude -p` under `runner/` goes through
+  `RunnerBase.spawnSession`, which is also the one writer of `phase.session`, and each
+  `SESSION_MODES` member is exactly one call site — a session spawned beside the door is a session no
+  census can see (`invariants.test.ts` clause 1). Every `startRun(` site names its door from
+  `START_DOORS` (SLF-1) and passes `accountId` or `resumeRunId` (ACT-1). The automatic doors are
+  counted by the per-instance start ceiling (`server/start-ceiling.ts`: 40 starts and $250 of reported
+  session spend per sliding hour, `ceilingStartsPerHour`/`ceilingUsdPerHour`); `OPERATOR_DOOR` never
+  is. The actor is DERIVED rather than defaulted — a route builds it with `actorOfRequest`
+  (`server/api/actor.ts`), an automatic door with `doorActor` — and every `phase.situation` /
+  `phase.rung` line carries `by` (RCV-9). Every `trySwitchAccount(` is preceded by `leaveAccount(`
+  (ACT-5), and an exported setter on `Accounts` needs a production caller (ACT-3).
+- **Halts, parks and waits have kinds.** `halt()` and `park()` take a `HaltKind` from
+  `shared/recovery-model.js` — a writer naming a word the list lacks is a type error, and
+  `waiting-is-a-state.test.ts` holds every written kind to `HALT_KINDS` and to exactly one of
+  `PHASE_HALT_KINDS` / `RUN_HALT_KINDS`. A wait is `setRunState(state, 'waiting', { kind, until })`
+  with a `WAIT_REASONS` kind — a standing verification or approval card is the `person` wait, never a
+  `running` run with no child (`run-lifecycle.test.ts`).
+- **Every journal and log name has a row in `docs/journal-events.md`.** Each
+  `'<phase|run|policy>.<name>'` literal under `viewer/server/` and each `log.info/warn/error` first
+  argument is documented there, checked in both directions; a name is never composed from a template
+  literal, and a retired event keeps its row with `retired <version>` in the emitter column
+  (`docs-parity.test.ts`). A new event is a new row in the same commit.
+- **The relay is one call site, behind two floors.** `server/relay.ts` is the only file that calls
+  `pickAnswer(`, the service enters `relayQuestion(` from one place, and inside it the deny list is
+  read before any window opens (`invariants.test.ts` AC-14). The relay arms only at
+  `RELAY_CLI_FLOOR` (2.1.268), judged from `system/init.claude_code_version` as `server/cli-init.ts`
+  remembers it, never from `capabilities`; every session that is not armed carries
+  `--permission-prompts none` at `PERMISSION_PROMPTS_CLI_FLOOR` (2.1.259) or later, and under a known
+  older CLI the flag is skipped and journalled (`run.permission-prompts-skipped`). `phase-console
+  doctor` compares the installed CLI against the relay floor.
+- **Tests never touch the operator's state.** Every node test file that imports from `server/`
+  imports `./state-sandbox.ts` first (or redirects `XDG_STATE_HOME` inline before that import — static
+  imports evaluate in source order), and a console is spawned only through `test/spawn-console.ts`.
+  `test/state-isolation.test.ts` enforces both, and belongs in every verification batch that runs node
+  tests.
 
 ### MCP servers
 
-`server/mcp/` is per-instance, like `accounts/` and for the same reason. `store.ts` holds no secret
-(`credentials.ts` is the only file that does — keychain, else 0600); `health.ts` is the probe, and
-the probe is a **one-turn `claude -p`** whose `system/init` reports each server's real status before
-any model call, because that is the only place `needs-auth` is knowable; `catalog.ts` degrades to a
-shipped curated list when the official registry is unreachable; `config.ts` writes the per-run
-`--mcp-config`, 0600, `chmod` after the write.
+`server/mcp/` is per-instance, like the account registrations and for the same reason. `store.ts`
+holds no secret (`credentials.ts` is the only file that does — keychain, else 0600); `health.ts` is
+the probe, and the probe is a **one-turn `claude -p`** whose `system/init` reports each server's real
+status before any model call, because that is the only place `needs-auth` is knowable; `catalog.ts`
+degrades to a shipped curated list when the official registry is unreachable; `config.ts` writes the
+per-run `--mcp-config`, 0600, `chmod` after the write. The probe runs as `PE_OWNER=console/mcp-probe`
+with `PHASE_CONSOLE_PROBE=1`, so the session registry keeps its record but leaves it out of every
+operator-facing list; one answer is reused for `HEALTH_TTL_MS` (5 min), which is also the health
+clock's period, and the boarding preflight reads that cache and joins a probe already in flight
+rather than starting its own; and every probe is an automatic start, charged to the start ceiling.
 
 Four rules the code is built around. **`--mcp-config` is always paired with `--strict-mcp-config`**
 — alone it would UNION the machine's own servers into an unattended run, and determinism here is a

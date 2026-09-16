@@ -146,7 +146,7 @@ function frozenRun(root: string, minutesFromNow: number, pid = process.pid): Run
 }
 
 /** A service with the restart stubbed — before `open()`, because the boot pass arms inside it. */
-function service(root: string) {
+function service(root: string, before?: (svc: InstanceType<typeof Service>) => void) {
   const svc = new Service({
     port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: true, allowAgent: false,
     scriptsDir: SCRIPTS, logFile: null,
@@ -164,6 +164,7 @@ function service(root: string) {
     });
     return null;
   };
+  before?.(svc);
   assert.equal(svc.open(root).ok, true);
   OPEN.push(svc);
   return { svc, started, timers: () => s.freezeTimers };
@@ -388,6 +389,90 @@ test('start(): an inherited freeze is RULED on, not erased — the child is ende
 
 /* ---------------- the fourth boot clock ---------------- */
 
+/** A run a restart left parked on a wait whose clock went by `lateMs` ago, parked `parkedForMs` in all. */
+function overdueWait(root: string, lateMs: number, parkedForMs: number): RunState {
+  const state = newRun({ slug: 'alpha', root });
+  state.status = 'paused';
+  state.stoppedBy = 'system';
+  state.waitReason = 'external';
+  const until = new Date(Date.now() - lateMs).toISOString();
+  state.waitUntil = until;
+  const record = phaseRecord(state, 1);
+  record.status = 'waiting';
+  record.sessionId = 'sess-parked';
+  record.resumeSessionId = 'sess-parked';
+  record.parkedUntil = until;
+  record.waits = 1;
+  record.declared = {
+    status: 'waiting-external', reason: 'the image build', watch: ['date:2026-01-01T00:00:00Z'],
+    at: new Date(Date.now() - parkedForMs).toISOString(),
+  };
+  record.waitHistory = [{ parkedFrom: new Date(Date.now() - parkedForMs).toISOString(), parkedUntil: until, by: 'session' }];
+  saveRun(state);
+  return state;
+}
+
+test('boot: a wait already past its clock is RULED ON — lateness journalled, refs checked, resumed once (SHD-6, SLF-5)', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const run = overdueWait(root, 2 * 60 * 60_000, 3 * 60 * 60_000);
+    const { svc, started } = service(root, (s) => { s.prefs.resumeAtBoot = 'auto'; });
+    await svc.bootSettled;
+    const deadline = Date.now() + 5_000;
+    while (!started.length && Date.now() < deadline) await sleep(20);
+    await sleep(80);
+    assert.deepEqual(started.map((s) => s.resumeRunId), [run.id], 'resumed exactly once — never fired bare on the next tick');
+
+    const events = journal(root, run.id);
+    const overdue = events.find((e) => e.event === 'run.wait-overdue');
+    assert.ok(overdue, 'ruled on, and on the RUN journal — it lived only in console.log');
+    assert.ok(Number(overdue!.data.lateByMs) >= 2 * 60 * 60_000 - 10_000, `lateByMs ${overdue!.data.lateByMs}`);
+    assert.deepEqual((overdue!.data.refs as { ref: string; state: string }[]).map((r) => [r.ref, r.state]),
+      [['date:2026-01-01T00:00:00Z', 'landed']], 'the refs were checked before anything resumed');
+    const order = events.map((e) => e.event);
+    assert.ok(order.indexOf('run.wait-overdue') >= 0 && order.indexOf('run.wait-overdue') < order.indexOf('run.limit-resume'),
+      `the ruling precedes the resume: ${order.join(', ')}`);
+    const automatic = events.find((e) => e.event === 'phase.resume-automatic');
+    assert.equal(automatic?.data.path, 'overdue-wait');
+    assert.equal(automatic?.data.trigger, 'boot');
+    assert.equal(automatic?.data.count, 1, 'counted against the one per-phase bound');
+  } finally { cleanup(); }
+});
+
+test('boot: a wait past its clock AND past its budget halts waiting-external-timeout on readoptQueued, and spawns nothing (WAI-4)', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const run = overdueWait(root, 60 * 60_000, 10 * 60 * 60_000);
+    const { svc, started } = service(root, (s) => { s.prefs.resumeAtBoot = 'auto'; });
+    await svc.bootSettled;
+    const deadline = Date.now() + 5_000;
+    while (loadRun(root, 'alpha', run.id, null)?.phases['1']?.status === 'waiting' && Date.now() < deadline) await sleep(20);
+    await sleep(80);
+    assert.deepEqual(started, [], 'nothing boards onto a clock hours stale with the budget spent');
+    const after = loadRun(root, 'alpha', run.id, null)!;
+    assert.equal(after.phases['1'].halt?.kind, 'waiting-external-timeout');
+    assert.match(after.phases['1'].halt?.reason ?? '', /parked 10 h against its 8\.0 h wait budget/);
+    assert.equal(after.phases['1'].status, 'failed');
+    assert.equal(after.waitUntil, null, 'no clock left to fire');
+    assert.ok(journal(root, run.id).some((e) => e.event === 'phase.halted' && e.data.kind === 'waiting-external-timeout'));
+  } finally { cleanup(); }
+});
+
+test('boot: with resume-at-boot on ask, an overdue wait registers the question and launches nothing (LFC-7)', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const run = overdueWait(root, 60 * 60_000, 2 * 60 * 60_000);
+    // Set, not assumed: `open()` remembers the root and writes the prefs, so a
+    // test above that chose `auto` would otherwise leave it on disk for this one.
+    const { svc, started } = service(root, (s) => { s.prefs.resumeAtBoot = 'ask'; });
+    await svc.bootSettled;
+    await sleep(80);
+    assert.deepEqual(started, [], 'the shipped `ask` answers an overdue wait exactly as it answers a killed lane');
+    assert.ok(svc.resumeAsks.has(run.id), 'the question is registered for the app to put on screen');
+    assert.ok(journal(root, run.id).some((e) => e.event === 'run.resume-asked'));
+  } finally { cleanup(); }
+});
+
 test('boot: a freeze already past its deadline escalates on the boot pass, journalled and persisted', async () => {
   const { root, cleanup } = scratch();
   try {
@@ -510,14 +595,156 @@ test('boot: the same run with no marker IS re-adopted — the refusal is the fre
   } finally { cleanup(); }
 });
 
+/**
+ * ACC-6.4, the SHD-5 half, mirroring the freeze cases above. A "stay off" Shut
+ * down leaves a stop marker; the unit is disabled too, but the marker is what
+ * holds a console that comes back anyway — a hand-run `launchctl bootstrap`, a
+ * foreground start — so that "stays off" means the WORK stays off.
+ */
+test('boot: a console that starts under a stop marker re-adopts NOTHING and says why — and the release picks it up once', async () => {
+  const { root, cleanup } = scratch();
+  const { writeStopMarker, clearStopMarker, readStopMarker } = await import('../server/lifecycle.ts');
+  const { recent } = await import('../server/log.ts');
+  try {
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'queued';
+    saveRun(state);
+    writeStopMarker({ by: 'mo', via: 'api', origin: 'local', durability: 'disabled', label: 'com.example.console', resurrect: 'launchctl enable …' });
+    try {
+      const { svc, started } = service(root);
+      await svc.bootSettled;
+      await sleep(50);
+      assert.deepEqual(started, [], 'a queued run re-adopted under a stop marker is "stay off" surviving the boot in name only');
+      const hold = svc.bootHold();
+      assert.equal(hold?.kind, 'stopped');
+      assert.equal(hold?.by, 'mo');
+      assert.match(String(hold?.why), /stopped on purpose by mo/);
+      assert.ok(recent(200).some((entry) => entry.event === 'boot.hold' && entry.data?.kind === 'stopped'), 'the boot says why');
+      assert.ok(recent(200).some((entry) => entry.event === 'run.readopt-held'), 'and the re-adoption says it held');
+      assert.equal(svc.state().bootHold?.kind, 'stopped', 'on /api/state, where Settings reads it');
+
+      const released = await svc.releaseBootHold({ by: 'mo', via: 'api', origin: 'local', remoteUser: null });
+      assert.equal(released.ok, true);
+      assert.equal(released.was, 'stopped');
+      assert.equal(readStopMarker(), null, 'the marker is gone');
+      assert.equal(svc.bootHold(), null);
+      assert.deepEqual(started.map((s) => s.slug), ['alpha'], 'the held re-adoption ran once, at the release');
+    } finally { clearStopMarker(); }
+  } finally { cleanup(); }
+});
+
+/**
+ * The same hold, lifted from OUTSIDE: `phase-console start` removes the marker
+ * and, finding the job already running, starts nothing — so the console has to
+ * notice on its own, or it reports no hold with no re-adoption behind it.
+ */
+test('boot: a stop marker removed from outside under a held console runs the held boot pass once', async () => {
+  const { root, cleanup } = scratch();
+  const { writeStopMarker, clearStopMarker } = await import('../server/lifecycle.ts');
+  const { recent } = await import('../server/log.ts');
+  try {
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'queued';
+    saveRun(state);
+    writeStopMarker({ by: 'mo', via: 'api', origin: 'local', durability: 'disabled', label: 'com.example.console', resurrect: 'launchctl enable …' });
+    try {
+      const { svc, started } = service(root);
+      await svc.bootSettled;
+      await sleep(50);
+      assert.deepEqual(started, [], 'held at boot');
+      assert.equal(svc.bootHold()?.kind, 'stopped');
+
+      clearStopMarker(); // what `agent.sh start` does before it finds the job running
+      assert.equal(svc.bootHold(), null, 'the hold reads lifted');
+      await svc.bootSettled;
+      await sleep(50);
+      assert.deepEqual(started.map((s) => s.slug), ['alpha'], 'and the boot pass it held ran');
+      const released = recent(200).filter((entry) => entry.event === 'boot.hold-released');
+      assert.equal(released.at(-1)?.data?.how, 'marker-removed');
+      assert.equal(released.at(-1)?.data?.heldBy, 'mo');
+
+      assert.equal(svc.bootHold(), null);
+      await svc.bootSettled;
+      await sleep(50);
+      assert.equal(started.length, 1, 'once — a second read runs nothing');
+      svc.close();
+    } finally { clearStopMarker(); }
+  } finally { cleanup(); }
+});
+
+/**
+ * ACC-10.7, the FLT-9 half. Every login started every installed console and
+ * every convergence loop at once, and nothing decided that they should. The
+ * machine profile says, per instance.
+ */
+test('boot: a console whose instance is autostart:false does not converge at boot and says why; `once` is spent and boots', async () => {
+  const { root, cleanup } = scratch();
+  const { INSTANCE } = await import('../server/config.ts');
+  const { fleetProfilePath, readAutostart } = await import('../shared/instances.mjs');
+  const { recent } = await import('../server/log.ts');
+  const profile = fleetProfilePath();
+  const writeProfile = (autostart: unknown) => {
+    mkdirSync(join(profile, '..'), { recursive: true });
+    writeFileSync(profile, `${JSON.stringify({ remoteHost: 'kept.example', instances: { [INSTANCE.id]: { autostart, overrides: { note: 'kept' } } } }, null, 2)}\n`);
+  };
+  try {
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'queued';
+    saveRun(state);
+
+    writeProfile(false);
+    {
+      // With the loop switched ON, so "does not converge" is the hold's doing.
+      const { svc, started } = service(root, (s) => { (s.flags as { converge?: boolean }).converge = true; });
+      await svc.bootSettled;
+      await sleep(50);
+      assert.deepEqual(started, [], 'autostart: false re-adopts nothing');
+      assert.equal(svc.bootHold()?.kind, 'autostart-off');
+      assert.match(String(svc.bootHold()?.why), /autostart: false/);
+      assert.equal((svc as unknown as { convergeAutomatic(): boolean }).convergeAutomatic(), false, 'and the loop does not run on its own');
+      assert.ok(recent(200).some((entry) => entry.event === 'boot.hold' && entry.data?.kind === 'autostart-off'), 'it says why');
+      // The operator's release covers this boot; the profile still says false.
+      const released = await svc.releaseBootHold('mo');
+      assert.equal(released.ok, true);
+      assert.deepEqual(started.map((s) => s.slug), ['alpha']);
+      assert.equal(readAutostart(INSTANCE.id), false, 'the release does not edit the profile');
+      svc.close();
+    }
+
+    writeProfile('once');
+    {
+      const again = newRun({ slug: 'alpha', root });
+      again.status = 'queued';
+      saveRun(again);
+      const { svc, started } = service(root);
+      await svc.bootSettled;
+      await sleep(50);
+      assert.equal(svc.bootHold(), null, '`once` starts this boot');
+      assert.deepEqual(started.map((s) => s.slug), ['alpha']);
+      assert.equal(readAutostart(INSTANCE.id), false, 'and is spent: the next boot holds');
+      const written = JSON.parse(readFileSync(profile, 'utf8'));
+      assert.equal(written.remoteHost, 'kept.example', 'every other key of the profile carried through');
+      assert.deepEqual(written.instances[INSTANCE.id].overrides, { note: 'kept' });
+      svc.close();
+    }
+  } finally {
+    rmSync(profile, { force: true });
+    cleanup();
+  }
+});
+
 test('thaw: a wait whose moment passed during the freeze fires ONCE, at the thaw', async () => {
   const { root, cleanup } = scratch();
   try {
     const state = newRun({ slug: 'alpha', root });
     state.status = 'paused';
+    // Paused by the SYSTEM, as every wait writer leaves it: a `paused` with no
+    // `stoppedBy` is an operator's pause, and an operator's stop pins its clock
+    // (SLF-6) — at a thaw exactly as at boot.
+    state.stoppedBy = 'system';
     // An hour ago: the moment passed while the console was frozen. Nothing
-    // rewinds it — the run keeps `waitUntil` on disk, and the re-arm computes
-    // a negative delay, which `setTimeout` runs on the next tick.
+    // rewinds it — the run keeps `waitUntil` on disk, and the thaw's pass finds
+    // it overdue and RULES on it (lateness, refs, budget) before resuming once.
     state.waitUntil = new Date(Date.now() - 60 * 60_000).toISOString();
     phaseRecord(state, 1).status = 'waiting';
     saveRun(state);

@@ -24,6 +24,20 @@
 #   phase-graph.sh <slug> --size N        # rough working-set size of phase N (S|M|L; default M)
 #   phase-graph.sh <slug> --repos N       # phase N's SCOPE as normalized csv (Repos column; "" → all)
 #   phase-graph.sh <slug> --boot-prompt N # full copy-paste boot prompt for phase N
+#   phase-graph.sh <slug> --mcp [N]       # MCP servers the plan (or phase N: plan ∪ bullet) needs, csv
+#   phase-graph.sh <slug> --mcp-policy [N] # continue | require | "" (the plan's word, phase overriding)
+#   phase-graph.sh <slug> --decisions [N] # the decision manifest: key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value
+#                                         # per row — the plan's `## Decisions` table with docs/handoffs/<slug>/
+#                                         # decisions.md merged over it (and phase N's rows over both)
+#   phase-graph.sh <slug> --credentials [N] # credential ids the plan (or phase N: plan ∪ bullet) needs, csv
+#   phase-graph.sh <slug> --credential-policy [N] # require | continue | "" (like --mcp-policy)
+#   phase-graph.sh <slug> --qa-exhausted         # waive | halt | <owner> | "" (the `**QA exhausted:**` line)
+#   phase-graph.sh <slug> --person-check N       # allow | halt | <owner> | "" (the phase's `- **Person-check:**` bullet)
+#   phase-graph.sh <slug> --accounts      # the `**Accounts:**` line as id<TAB>minHeadroom per line
+#   phase-graph.sh <slug> --wait-budget [N] # minutes<TAB>phase|plan — how long a phase may stay parked on
+#                                         # its declared waits (the phase's `Waits on:` max, else the plan's
+#                                         # `Wait budget:`); nothing when the plan is silent (the console default)
+#   phase-graph.sh <slug> --waits-on N    # the refs phase N's `- **Waits on:**` bullet names, one per line
 #   phase-graph.sh <slug> --session-plan [model|budget]
 #                                         # propose which REMAINING phases to batch into one session,
 #                                         # sized to a model's budget (haiku|sonnet|opus|fable) or a
@@ -33,7 +47,7 @@
 # Run from the repo root that owns docs/, or set DOCS_ROOT.
 set -euo pipefail
 
-slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--boot-prompt N|--session-plan [model|budget]]}"
+slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--waits-on N|--boot-prompt N|--session-plan [model|budget]]}"
 mode="${2:-board}"
 arg="${3:-}"
 
@@ -351,15 +365,32 @@ mcp_directive() {  # mcp_directive <phase>
 # values live in scripts/gates.env — ONE source shared with the console (F5
 # pattern, like sizing.env: viewer/server/analysis/gates.ts reads the same
 # file), so --gate-status, --lint and the UI cannot drift apart. A directive
-# whose type is not on the list is treated as manual (fail-safe), and --lint
-# reports it rather than letting it pass silently: a typo used to demote an
-# automated gate to a human one with no warning. These defaults keep the script
-# alive if the file is ever missing.
+# whose type is not on the list is treated as manual (fail-safe) AND fails
+# --lint (F24) rather than passing silently: a typo used to demote an automated
+# gate to a human one with no warning. A *(GATED)* heading with NO directive
+# reads as GATE_DEFAULT (`ai` since 5.0.0 — the sep-review audit found 15 of
+# 143 gated headings demanding a person by accident of the old `human`
+# fallback) and ALSO fails --lint (F24): the default answers the board, the
+# lint makes the author say it. These defaults keep the script alive if the
+# file is ever missing.
 GATE_TYPES="phase phases plan cmd date deadline by manual ai"
 GATE_TYPES_HUMAN="manual"
 GATE_TYPES_AI="ai"
+GATE_DEFAULT="ai"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/gates.env" ] && . "$SCRIPT_DIR/gates.env"
+
+# The decision manifest's vocabulary (chapter 13 §1.1) — the OWNER is
+# viewer/shared/decisions-model.js and scripts/decisions.env is its bash twin,
+# held equal by viewer/test/decisions-model.test.ts. Read by --decisions, the
+# F25 lint and the boot prompt here; by decisions.sh (the twin writer) and
+# phase-outcome.sh (--needs) beside this script.
+DECISION_KEYS="permission.policy permission.destructive credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
+DECISION_STATES="answered outstanding waived"
+DECISION_SOURCES="plan run default ruling"
+NEED_CLASSES="lock permission credential gate external"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
 
 _gate_type_known() {  # _gate_type_known <type>
   case " $GATE_TYPES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
@@ -367,16 +398,18 @@ _gate_type_known() {  # _gate_type_known <type>
 
 # Which category a phase's gate falls into — drives the boot prompt, the
 # console's Gate card and the runner's park-vs-proceed decision.
-#   human — a person must act (manual gates; a *(GATED)* heading with no
-#           Gate-check line at all; unknown types — fail-safe)
-#   ai    — an AI session may verify/do/clear it (a person may still approve)
+#   human — a person must act (manual gates; unknown types — fail-safe, and a
+#           lint failure)
+#   ai    — an AI session may verify/do/clear it (a person may still approve);
+#           also what a *(GATED)* heading with no Gate-check line reads as
+#           (GATE_DEFAULT, gates.env — the audit's bias, and a lint failure)
 #   auto  — the engine evaluates it by itself
 #   none  — not gated
 gate_kind() {  # gate_kind <phase> → human|ai|auto|none
   local gc gtype
   [ "$(is_gated "$1")" = yes ] || { echo none; return; }
   gc="$(gate_check_directive "$1")"
-  [ -z "$gc" ] && { echo human; return; }
+  [ -z "$gc" ] && gc="$GATE_DEFAULT"
   gtype="${gc%% *}"
   case " $GATE_TYPES_HUMAN " in *" $gtype "*) echo human; return ;; esac
   case " $GATE_TYPES_AI "    in *" $gtype "*) echo ai; return ;; esac
@@ -739,7 +772,12 @@ duplicate_handoff_issues() {
   return 0
 }
 
-# All structural problems, one per line (empty output = clean).
+# All structural problems, one per line (empty output = clean). Every producer
+# here is F1-tier: a line from any of them fails --lint. The four checks that
+# moved up from advisory in 5.0.0 name themselves in the line —
+# `gate-directive-missing`, `gate-type-unknown` (F24), `verification-empty-open`
+# (F14), `decision-outstanding-unowned` (F25) — so a failure can be grepped for
+# and a test can assert the check by name rather than by prose.
 compute_issues() {
   table_shape_issues
   table_cell_issues
@@ -750,18 +788,28 @@ compute_issues() {
   undefined_deps
   if detect_cycle; then printf 'dependency cycle: %s\n' "$CYCLE_PATH"; fi
   gate_issues
+  verification_issues
+  decision_issues
   return 0
 }
 
-# Gate-check grammar. The evaluator falls back to `manual` for anything it does
-# not recognise, which is fail-safe but silent — so `Gate-check: phase-21 …`
-# (hyphen, not space) read as manual and nobody knew the automation was off.
-# Every deviation is reported here instead.
+# F24: Gate-check grammar — GATING. A *(GATED)* heading with no directive at
+# all (`gate-directive-missing`) and a directive whose type is not on the list
+# (`gate-type-unknown`) both fail the lint by name. The evaluator still answers
+# for the board — GATE_DEFAULT for a missing directive, `manual` for an unknown
+# type, fail-safe — but the answer is no longer silent: the sep-review audit
+# found 15 of 143 gated headings demanding a person by accident, and
+# `Gate-check: phase-21 …` (hyphen, not space) reading as manual with nobody
+# knowing the automation was off. Every deviation is reported here.
 gate_issues() {
   local p gc gtype gval q
   for p in "${PHASES[@]}"; do
     gc="$(gate_check_directive "$p")"
-    [ -z "$gc" ] && continue
+    if [ -z "$gc" ]; then
+      [ "${GATED[$p]:-no}" = yes ] && \
+        printf 'phase %s: gate-directive-missing — a *(GATED)* heading needs a "- **Gate-check:** <type> <value>" bullet (it reads as %s until it has one)\n' "$p" "$GATE_DEFAULT"
+      continue
+    fi
 
     if [ "${GATED[$p]:-no}" != yes ]; then
       printf 'phase %s: has a Gate-check but the heading is not marked *(GATED)* — the board will batch it as ungated\n' "$p"
@@ -769,7 +817,7 @@ gate_issues() {
 
     gtype="${gc%% *}"; gval="${gc#"$gtype"}"; gval="${gval# }"
     if ! _gate_type_known "$gtype"; then
-      printf 'phase %s: unknown Gate-check type "%s" (expected one of: %s) — it will be treated as manual\n' \
+      printf 'phase %s: gate-type-unknown — Gate-check type "%s" is not one of: %s (a typo here used to demote an automated gate to a person, silently)\n' \
         "$p" "$gtype" "$GATE_TYPES"
       continue
     fi
@@ -876,7 +924,10 @@ _verification_lead() {  # _verification_lead <candidate>
   return 0
 }
 
-# F14: a phase without a runnable §Verification — ADVISORY, never a gate.
+# F14: a phase without a runnable §Verification — GATING since 5.0.0 (it was
+# advisory: the sep-review audit's ZTD-6 found a prose-only verification card
+# asking a person for twelve hours after the phase was paid for, and a warning
+# nobody reads at plan time is no gate at all). A done phase is still exempt —
 # The autopilot boards a phase only to park it when its Verification bullet
 # yields nothing executable ("nothing would prove the work"), hours after the
 # author could have heard it. Warned per open phase at lint time — validate.sh
@@ -889,7 +940,7 @@ _verification_lead() {  # _verification_lead <candidate>
 # commands, the shape that made a real phase board and park. Nested 2-space
 # sub-bullets count — the console's parser keeps them since the same run that
 # taught it parked on that shape.
-verification_advisories() {
+verification_issues() {
   local p
   for p in "${PHASES[@]}"; do
     _is_done "$p" && continue
@@ -914,8 +965,34 @@ verification_advisories() {
       }
       END { exit (ok ? 0 : 1) }
     ' "$plan_file" || \
-      printf 'F14 phase %s: no runnable §Verification — the autopilot will park it at boarding; add the commands that prove the exit criteria\n' "$p"
+      printf 'phase %s: verification-empty-open — no runnable §Verification on an open phase; the autopilot would park it at boarding, so add the commands that prove the exit criteria (a backticked command or a fence)\n' "$p"
   done
+  return 0
+}
+
+# F25: the decision manifest's rows — GATING. An `outstanding` row with no
+# owner (`decision-outstanding-unowned`) is a decision nobody owes, which is
+# how a run starts with a question that has no answerer; a key outside the
+# closed vocabulary (`decision-key-unknown`) or a state outside
+# `answered|outstanding|waived` (`decision-state-unknown`) is the gate-type
+# defect over again — a typo that reads as a row and answers nothing. Every
+# row of the plan's table AND of the twin is checked, whatever phase it is
+# scoped to; a plan with no `## Decisions` at all has no rows and passes.
+decision_issues() {
+  { plan_decisions; twin_decisions; } | awk -F'\037' -v keys="$DECISION_KEYS" -v states="$DECISION_STATES" -v sources="$DECISION_SOURCES" '
+    BEGIN {
+      n = split(keys, K, " "); for (i = 1; i <= n; i++) known[K[i]] = 1
+      m = split(states, S, " "); for (i = 1; i <= m; i++) okstate[S[i]] = 1
+      q = split(sources, R, " "); for (i = 1; i <= q; i++) oksource[R[i]] = 1
+    }
+    {
+      where = ($1 == "2") ? "decisions.md" : "the plan"
+      if ($9 != "") where = where " (phase " $9 ")"
+      if (!($2 in known)) printf "decision row `%s` in %s: decision-key-unknown — not one of: %s\n", $2, where, keys
+      if (!($5 in okstate)) printf "decision row `%s` in %s: decision-state-unknown — state \"%s\" is not one of: %s\n", $2, where, $5, states
+      if ($7 != "" && !($7 in oksource)) printf "decision row `%s` in %s: decision-source-unknown — source \"%s\" is not one of: %s\n", $2, where, $7, sources
+      if ($5 == "outstanding" && $4 == "") printf "decision row `%s` in %s: decision-outstanding-unowned — an outstanding decision needs an owner (who answers it)\n", $2, where
+    }'
   return 0
 }
 
@@ -1005,6 +1082,51 @@ mcp_advisories() {
       fi
     fi
   done
+  return 0
+}
+
+# F15, the credential and account half (chapter 13 §1.1: "an unregistered
+# account or credential stays advisory"). The console tells bash what it holds
+# through PE_CREDENTIALS and PE_ACCOUNTS (plain space/comma lists of ids), the
+# way PE_MCP_SERVERS carries the MCP registry; unset means no console here and
+# disables the check, set-but-empty is a real answer. Phase 11's prelude is the
+# gate that acts on it; this only says so while the plan is open.
+credential_advisories() {
+  local p named t missing known
+  if [ -n "${PE_CREDENTIALS+set}" ]; then
+    known=" $(printf '%s' "${PE_CREDENTIALS:-}" | tr ',' ' ' | tr -s ' ') "
+    _unknown_cred() {
+      local acc="" one
+      local IFS=,
+      for one in $1; do
+        one="$(printf '%s' "$one" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -z "$one" ] && continue
+        case "$known" in *" $one "*) continue ;; esac
+        acc="${acc:+$acc, }$one"
+      done
+      printf '%s' "$acc"
+    }
+    missing="$(_unknown_cred "$(plan_credentials)")"
+    if [ -n "$missing" ]; then
+      printf 'F15 plan: credential(s) the console does not hold: %s — under **Credential policy:** require every phase is refused at boarding; register them in Phase Console → Settings, or drop them from §Session budget\n' "$missing"
+      known="${known}$(printf '%s' "$missing" | tr ',' ' ' | tr -s ' ') "
+    fi
+    for p in "${PHASES[@]}"; do
+      _is_done "$p" && continue
+      named="$(credentials_directive "$p")"
+      [ -z "$named" ] && continue
+      t="$(_unknown_cred "$named")"
+      [ -n "$t" ] && printf 'F15 phase %s: credential(s) the console does not hold: %s — refused at boarding under "require", run and reported under "continue"\n' "$p" "$t"
+    done
+  fi
+  if [ -n "${PE_ACCOUNTS+set}" ]; then
+    known=" $(printf '%s' "${PE_ACCOUNTS:-}" | tr ',' ' ' | tr -s ' ') "
+    while IFS=$'\t' read -r acct _min; do
+      [ -z "$acct" ] && continue
+      case "$known" in *" $acct "*) continue ;; esac
+      printf 'F15 plan: account `%s` is not registered on this console — the prelude will refuse a run that declares it; register it in Phase Console → Accounts, or drop it from **Accounts:**\n' "$acct"
+    done < <(plan_accounts)
+  fi
   return 0
 }
 
@@ -1163,6 +1285,24 @@ verification_cwd_advisories() {
   return 0
 }
 
+# The body of ONE section of the plan — the heading excluded, up to the next
+# heading of the same or a higher level. `_section 2 "session budget"` is the
+# §Session budget block every directive reader below scans; `_section 3 "qa
+# contract"` the optional H3. Case-insensitive prefix match on the heading
+# text, and an H3 inside an H2 section stays inside it. One awk, every
+# reader — six inlined copies of it used to disagree by a character.
+_section() {  # _section <level> <heading-prefix>
+  local hashes open_re close_re
+  hashes="$(printf '%*s' "$1" '' | tr ' ' '#')"
+  open_re="^${hashes}[[:space:]]+$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+  if [ "$1" -ge 3 ]; then close_re="^#{2,3}[[:space:]]"; else close_re="^##[[:space:]]"; fi
+  awk -v open_re="$open_re" -v close_re="$close_re" '
+    tolower($0) ~ open_re { f = 1; next }
+    f && $0 ~ close_re { f = 0 }
+    f
+  ' "$plan_file"
+}
+
 # F6: model named in the plan's "## Session budget" section (empty if none).
 plan_model() {
   # The alternation is built from models.env rather than spelled here, and the
@@ -1172,7 +1312,7 @@ plan_model() {
   # file exists to stop.
   local alts
   alts="$(printf '%s %s' "$MODEL_ALIASES" "$MODEL_BIG" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' '|' | sed 's/|$//')"
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file" \
+  _section 2 "session budget" \
     | grep -ioE "(claude-)?($alts)(-[0-9a-z.]+)*(\\[1m\\])?" | head -1 | tr '[:upper:]' '[:lower:]'
 }
 
@@ -1186,7 +1326,7 @@ plan_model() {
 plan_skills() {
   # `|| true`: a no-match grep mid-pipe exits 1, which under `set -euo pipefail`
   # would otherwise abort every caller (e.g. --boot-prompt) on a plan with no Skills line.
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file" \
+  _section 2 "session budget" \
     | grep -i 'skills (every session)' | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
 }
 
@@ -1198,8 +1338,32 @@ plan_skills() {
 # same reason plan_skills() is strict: a loose 'mcp' match would swallow backticked
 # tokens out of unrelated budget prose.
 plan_mcp() {
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file" \
+  _section 2 "session budget" \
     | grep -i 'mcp servers (every session)' | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+# Credentials directive (chapter 10 ZTD-4): backtick-quoted credential ids on
+# the canonical "**Credentials:**" line in §Session budget — the credentials
+# EVERY phase needs, resolved by the console against its registry of named
+# credential probes BEFORE a phase boards (phase 11's prelude) and read here by
+# --credentials, F15 and the boot prompt. The `MCP servers` shape exactly:
+# strict phrase, backticked ids, csv out, empty when none.
+plan_credentials() {
+  _section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}credentials\*{0,2}[[:space:]]*:' | head -1 \
+    | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+# Accounts directive (chapter 13 §1.1, `accounts`): backticked `id:minHeadroom`
+# pairs on the canonical "**Accounts:**" line in §Session budget — which Claude
+# accounts a run may spend, in order, each with the minimum five-hour headroom
+# (a percent, 0–100) it must show before a phase boards. Printed one per line
+# as id<TAB>min, min empty when the pair carries none.
+plan_accounts() {
+  _section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}accounts\*{0,2}[[:space:]]*:' | head -1 \
+    | grep -oE '`[^`]+`' | tr -d '`' \
+    | awk -F: '{ id = $1; min = (NF > 1) ? $2 : ""; gsub(/^[[:space:]]+|[[:space:]]+$/, "", id); gsub(/^[[:space:]]+|[[:space:]%]+$/, "", min); if (id != "") print id "\t" min }' || true
 }
 
 # The plan's own review rules, verbatim — the optional "### QA contract" section.
@@ -1221,7 +1385,7 @@ plan_mcp() {
 # plan may demand of its reviewers, only that the demand reaches them. Empty
 # when the plan has no such section, which is the normal case.
 plan_qa_contract() {
-  awk 'tolower($0) ~ /^###[[:space:]]+qa contract/{f=1;next} /^#{2,3}[[:space:]]/{f=0} f' "$plan_file" \
+  _section 3 "qa contract" \
     | sed -e '/^[[:space:]]*$/d' || true
 }
 
@@ -1233,7 +1397,7 @@ plan_qa_contract() {
 # The plan-wide `**Setup (every phase):**` line's TEXT (not a parsed list —
 # the same extractor that runs §Verification reads commands out of prose).
 plan_setup() {
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file" \
+  _section 2 "session budget" \
     | grep -i 'setup (every phase)' | head -1 \
     | sed -E 's/^[[:space:]]*[-*][[:space:]]*//; s/^\*{0,2}[Ss]etup \(every phase\):?\*{0,2}[[:space:]]*//' || true
 }
@@ -1316,7 +1480,7 @@ mcp_for_phase() {  # mcp_for_phase <phase>
 # a typo. So a word that is neither prints nothing and falls through, which is
 # the same fail-safe direction gitMode takes in the console's preferences.
 plan_mcp_policy() {
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file" \
+  _section 2 "session budget" \
     | grep -i 'mcp policy' | head -1 \
     | sed -E 's/.*[Mm][Cc][Pp][[:space:]]*[Pp]olicy[^:]*:[[:space:]]*//; s/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
     | tr '[:upper:]' '[:lower:]' | awk '$1=="require"{print "require"} $1=="continue"{print "continue"}' || true
@@ -1335,6 +1499,224 @@ mcp_policy_for_phase() {  # mcp_policy_for_phase <phase>
   own="$(mcp_policy_directive "$1")"
   [ -n "$own" ] && { printf '%s' "$own"; return 0; }
   printf '%s' "$(plan_mcp_policy)"
+}
+
+# ---- Credentials: the MCP shapes, verbatim (ZTD-4) ---------------------------
+# A phase's own `- **Credentials:** \`x\`` bullet UNIONS with the plan line, as
+# servers do; `**Credential policy:** require|continue` OVERRIDES like MCP
+# policy, with the same three states (silence is the console's to answer).
+credentials_directive() {  # credentials_directive <phase>
+  phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}credentials\*{0,2}[[:space:]]*:' \
+    | head -1 | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+credentials_for_phase() {  # credentials_for_phase <phase>
+  local combined seen out t
+  combined="$(plan_credentials)"
+  t="$(credentials_directive "$1")"
+  [ -n "$t" ] && combined="${combined:+$combined, }$t"
+  [ -z "$combined" ] && return 0
+  seen=" "; out=""
+  local IFS=,
+  for t in $combined; do
+    t="$(printf '%s' "$t" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$t" ] && continue
+    case "$seen" in *" $t "*) continue ;; esac
+    seen="${seen}${t} "
+    out="${out:+$out, }$t"
+  done
+  printf '%s' "$out"
+}
+
+plan_credential_policy() {
+  _section 2 "session budget" \
+    | grep -i 'credential policy' | head -1 \
+    | sed -E 's/.*[Cc]redential[[:space:]]*[Pp]olicy[^:]*:[[:space:]]*//; s/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+    | tr '[:upper:]' '[:lower:]' | awk '$1=="require"{print "require"} $1=="continue"{print "continue"}' || true
+}
+
+credential_policy_directive() {  # credential_policy_directive <phase>
+  phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}credential[[:space:]]+policy\*{0,2}[[:space:]]*:' \
+    | head -1 \
+    | sed -E 's/.*[Cc]redential[[:space:]]*[Pp]olicy\*{0,2}[[:space:]]*:[[:space:]]*//; s/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+    | tr '[:upper:]' '[:lower:]' | awk '$1=="require"{print "require"} $1=="continue"{print "continue"}' || true
+}
+
+credential_policy_for_phase() {  # credential_policy_for_phase <phase>
+  local own
+  own="$(credential_policy_directive "$1")"
+  [ -n "$own" ] && { printf '%s' "$own"; return 0; }
+  printf '%s' "$(plan_credential_policy)"
+}
+
+# ---- Two policy words the console reads at run time (phase 11) --------------
+# `**QA exhausted:** waive|halt|<owner>` in §Session budget answers "and if the
+# QA round budget runs out?" (ZTD-9, the `qa.exhausted` row); a phase's own
+# `- **Person-check:** allow|halt|<owner>` answers what to do with a
+# §Verification fragment written as prose (ZTD-6, `verification.person-check`).
+# One word each, lower-cased, bold and backticks stripped; an owner is any
+# single token that is not one of the closed words. Silence prints nothing —
+# the console's policy table answers then. The JS twins are `qaExhausted` on
+# `SessionBudget` and `personCheckFor` in parse/plan.ts (engine-parity holds them).
+_policy_word() {  # _policy_word — stdin: the line's remainder; prints one word or nothing
+  sed -E 's/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
+    | awk 'NF>0 { w=tolower($1); sub(/[[:punct:]]+$/, "", w); if (w != "") print w; exit }'
+}
+
+plan_qa_exhausted() {
+  _section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}QA[[:space:]]+exhausted\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/.*[Qq][Aa][[:space:]]+[Ee]xhausted\*{0,2}[[:space:]]*:[[:space:]]*//' \
+    | _policy_word || true
+}
+
+person_check_for_phase() {  # person_check_for_phase <phase>
+  phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}person-check\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/.*[Pp]erson-check\*{0,2}[[:space:]]*:[[:space:]]*//' \
+    | _policy_word || true
+}
+
+# ---- The wait budget: how long a phase may stay parked (WAI-1, `waits`) -----
+# `**Wait budget:** 48h` in §Session budget is the total wall-clock ONE phase may
+# spend parked across its declared waits; a phase's own
+# `- **Waits on:** <ref>[, <ref>…] · <max>` names what it waits on and overrides
+# that total for itself — and a `date:` ref named there is the plan
+# countersigning a wait up to that instant (the console reads both through
+# --wait-budget / --waits-on). Minutes, so bash 3.2 never multiplies
+# milliseconds; the console's own default is the console's, so silence prints
+# nothing. The JS twin is `waitBudgetFor`/`waitsOnFor` in parse/plan.ts.
+duration_minutes() {  # duration_minutes <text> → the FIRST duration as minutes, or nothing
+  printf '%s\n' "$1" | tr -d '`*' | awk '{
+    if (!match($0, /[0-9]+[[:space:]]*(minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d)([^A-Za-z0-9_]|$)/)) exit
+    s = substr($0, RSTART, RLENGTH)
+    n = s; sub(/[^0-9].*$/, "", n); n = n + 0
+    u = s; sub(/^[0-9]+[[:space:]]*/, "", u); sub(/[^A-Za-z].*$/, "", u); u = tolower(u)
+    if (n <= 0) exit
+    if (u ~ /^d/) print n * 1440; else if (u ~ /^h/) print n * 60; else print n
+    exit
+  }' || true
+}
+
+plan_wait_budget() {  # plan_wait_budget → minutes, or nothing
+  local body
+  body="$(_section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}wait[[:space:]]+budget\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//')" || true
+  [ -n "$body" ] && duration_minutes "$body"
+  return 0
+}
+
+waits_on_directive() {  # waits_on_directive <phase> → the bullet's body after its label, verbatim
+  phase_block "$1" \
+    | grep -iE '^[[:space:]]*[-*][[:space:]]*\*{0,2}waits[[:space:]]+on\*{0,2}[[:space:]]*:' | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//; s/^\*{1,2}[[:space:]]*//' || true
+}
+
+waits_on_refs() {  # waits_on_refs <phase> → one ref per line: backticked spans, else the comma list
+  local body left
+  body="$(waits_on_directive "$1")"
+  [ -z "$body" ] && return 0
+  left="${body%%·*}"
+  case "$left" in
+    *'`'*) printf '%s\n' "$left" | grep -oE '`[^`]+`' | tr -d '`' || true ;;
+    *) printf '%s\n' "$left" | tr ',' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' || true ;;
+  esac
+  return 0
+}
+
+wait_budget_for_phase() {  # wait_budget_for_phase <phase> → minutes<TAB>phase|plan, or nothing
+  local body m
+  body="$(waits_on_directive "$1")"
+  case "$body" in
+    *·*) m="$(duration_minutes "${body#*·}")" ;;
+    *) m="" ;;
+  esac
+  if [ -n "$m" ]; then printf '%s\tphase\n' "$m"; return 0; fi
+  m="$(plan_wait_budget)"
+  [ -n "$m" ] && printf '%s\tplan\n' "$m"
+  return 0
+}
+
+# ---- The decision manifest (chapter 13 §1.1) --------------------------------
+# `## Decisions` in the plan, and docs/handoffs/<slug>/decisions.md — the
+# mutable twin only scripts/decisions.sh writes — read with ONE awk: the first
+# pipe table under the first `## Decisions` heading, columns located BY NAME
+# (`key value owner state blocking source evidence`, optional `phase`), the
+# `|---|` row skipped, a table inside a fence ignored. Records are US-separated
+# `layer<US>key<US>value<US>owner<US>state<US>blocking<US>source<US>evidence<US>phase`;
+# key/owner/state/blocking/source lose their bold and backticks, value and
+# evidence keep theirs (tabs and newlines can never reach a cell, so the TSV
+# below stays six columns). The JS reader (viewer/shared/decisions-model.js)
+# does exactly this and engine-parity holds the two together.
+_decisions_table() {  # _decisions_table <file> <layer>
+  [ -f "$1" ] || return 0
+  awk -v layer="$2" '
+    function plain(c) { gsub(/[*`]/, "", c); gsub(/^[[:space:]]+|[[:space:]]+$/, "", c); return c }
+    function trim(c)  { gsub(/[\t]/, " ", c); gsub(/^[[:space:]]+|[[:space:]]+$/, "", c); return c }
+    /^[[:space:]]*(```|~~~)/ { fence = !fence; next }
+    fence { next }
+    !armed { if (tolower($0) ~ /^##[[:space:]]+decisions/) armed = 1; next }
+    /^[[:space:]]*\|/ {
+      line = $0; sub(/^[[:space:]]*\|/, "", line); sub(/\|[[:space:]]*$/, "", line)
+      n = split(line, c, "|")
+      if (!header) {
+        header = 1
+        for (i = 1; i <= n; i++) { h = tolower(plain(c[i])); col[h] = i }
+        next
+      }
+      sep = 1; for (i = 1; i <= n; i++) if (trim(c[i]) !~ /^:?-{2,}:?$/) sep = 0
+      if (sep) next
+      if (!("key" in col)) next
+      key = plain(c[col["key"]]); if (key == "") next
+      value = ("value" in col) ? trim(c[col["value"]]) : ""
+      owner = ("owner" in col) ? plain(c[col["owner"]]) : ""
+      state = ("state" in col) ? tolower(plain(c[col["state"]])) : ""
+      blocking = ("blocking" in col) ? tolower(plain(c[col["blocking"]])) : ""
+      blocking = (blocking == "yes" || blocking == "true" || blocking == "y") ? "yes" : "no"
+      source = ("source" in col) ? tolower(plain(c[col["source"]])) : ""
+      evidence = ("evidence" in col) ? trim(c[col["evidence"]]) : ""
+      phase = ("phase" in col) ? plain(c[col["phase"]]) : ""
+      if (phase !~ /^[0-9]+$/) phase = ""; else phase = phase + 0
+      printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n", layer, key, value, owner, state, blocking, source, evidence, phase
+      rows++
+      next
+    }
+    header { exit }
+    /^##[[:space:]]/ { exit }
+  ' "$1"
+}
+
+decisions_twin_file="$DOCS_ROOT/docs/handoffs/${slug}/decisions.md"
+plan_decisions() { _decisions_table "$plan_file" 1; }
+twin_decisions() { _decisions_table "$decisions_twin_file" 2; }
+
+# The rows that hold — for the plan (no argument) or for phase N — as
+# key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value, in DECISION_KEYS
+# order, unknown keys after in first-seen order. Merge order, lowest to
+# highest: plan plan-wide → twin plan-wide → plan phase-N → twin phase-N; a
+# later row replaces the earlier one WHOLE. Rows scoped to another phase, and
+# every scoped row when no phase is asked, are left out.
+decisions_rows() {  # decisions_rows [phase]
+  { plan_decisions; twin_decisions; } | awk -F'\037' -v ph="${1:-}" -v keys="$DECISION_KEYS" '
+    BEGIN { n = split(keys, K, " "); for (i = 1; i <= n; i++) known[K[i]] = 1 }
+    {
+      layer = $1 + 0; key = $2; rowphase = $9
+      if (rowphase == "") rank = layer
+      else if (ph != "" && rowphase == ph) rank = layer + 2
+      else next
+      if (!(key in best) || rank >= best[key]) {
+        best[key] = rank
+        row[key] = $2 "\t" $5 "\t" $4 "\t" $6 "\t" $7 "\t" $3
+        if (!(key in seen)) { seen[key] = ++m; unk[m] = key }
+      }
+    }
+    END {
+      for (i = 1; i <= n; i++) if (K[i] in row) print row[K[i]]
+      for (j = 1; j <= m; j++) { k = unk[j]; if (!(k in known)) print row[k] }
+    }'
 }
 
 # The policy that will ACTUALLY apply — the plan's word if it has one, else the
@@ -1611,7 +1993,7 @@ _is_verified() {  # done + QA-passed (when gating on); honours the assume-done h
 # The canonical grep is line-anchored and bold-EXACT ("**QA gate:** on") so prose
 # like "**QA gate: WAIVED for ALL phases** (user decision…" can never match "on".
 session_budget_block() {
-  awk 'tolower($0) ~ /^##[[:space:]]+session budget/{f=1;next} /^##[[:space:]]/{f=0} f' "$plan_file"
+  _section 2 "session budget"
 }
 qa_mode() {
   local sb; sb="$(session_budget_block)"
@@ -1881,14 +2263,14 @@ case "$mode" in
       issues="${issues}"$'\n'"phase count mismatch: frontmatter says ${declared} but the table parses ${#PHASES[@]} rows"
     fi
     issues="$(printf '%s' "$issues" | sed '/^[[:space:]]*$/d')"
-    # F14–F18 and F22/F23 advisories ride stderr beside the issues but never
+    # F15–F19 and F22/F23 advisories ride stderr beside the issues but never
     # gate the exit — a closed plan is not even scanned (nothing to board there).
     if ! plan_is_closed; then
-      advisories="$(verification_advisories)"
-      [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
       advisories="$(verification_unbounded_advisories)"
       [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
       advisories="$(mcp_advisories)"
+      [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
+      advisories="$(credential_advisories)"
       [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
       advisories="$(verification_lead_advisories)"
       [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
@@ -1954,6 +2336,73 @@ case "$mode" in
     # `continue`, because those two are different facts.
     if [ -n "$arg" ]; then mcp_policy_for_phase "$arg"; else printf '%s' "$(plan_mcp_policy)"; fi
     printf '\n'
+    exit 0
+    ;;
+  --credentials)
+    # Which credential ids a phase needs, as phase 11's prelude probes them.
+    # With no argument: the plan-wide line alone. With one: plan line ∪ the
+    # phase's own bullet. Always a csv, empty when the plan names none.
+    if [ -n "$arg" ]; then credentials_for_phase "$arg"; else printf '%s' "$(plan_credentials)"; fi
+    printf '\n'
+    exit 0
+    ;;
+  --credential-policy)
+    # What the PLAN says when a named credential is not held: `require` (refuse
+    # at boarding) or `continue` (run, report the gap); empty is silence.
+    if [ -n "$arg" ]; then credential_policy_for_phase "$arg"; else printf '%s' "$(plan_credential_policy)"; fi
+    printf '\n'
+    exit 0
+    ;;
+  --accounts)
+    # The `**Accounts:**` line: id<TAB>minHeadroom per line, min empty when the
+    # pair carries none. Nothing when the plan names no accounts.
+    plan_accounts
+    exit 0
+    ;;
+  --qa-exhausted)
+    # The plan's answer once the QA round budget is spent: waive | halt | <owner>;
+    # empty is silence (the console's policy table answers).
+    plan_qa_exhausted
+    printf '\n'
+    exit 0
+    ;;
+  --person-check)
+    # A phase's answer for a §Verification fragment written as prose: allow |
+    # halt | <owner>; empty is silence. Phase-only — there is no plan-wide line.
+    [ -n "$arg" ] || { echo "usage: phase-graph.sh <slug> --person-check N" >&2; exit 2; }
+    person_check_for_phase "$arg"
+    printf '\n'
+    exit 0
+    ;;
+  --wait-budget)
+    # How long a phase may stay parked on its declared waits, and which line said
+    # so: the phase's `Waits on:` max, else the plan's `Wait budget:`. Nothing is
+    # silence — the console's default then applies, and it is the console's to say.
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+      wait_budget_for_phase "$arg"
+    else
+      wb="$(plan_wait_budget)"
+      [ -n "$wb" ] && printf '%s\tplan\n' "$wb"
+    fi
+    exit 0
+    ;;
+  --waits-on)
+    # What phase N's own bullet says it waits on — the refs, one per line. The
+    # console reads a `date:` among them as the plan countersigning that wait.
+    [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --waits-on N\n' >&2; exit 2; }
+    case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    waits_on_refs "$arg"
+    exit 0
+    ;;
+  --decisions)
+    # The decision manifest as it holds — for the plan, or for phase N (its
+    # own rows over the plan-wide ones). One row per line, TSV, rows that
+    # EXIST only: a plan with no `## Decisions` prints nothing.
+    if [ -n "$arg" ]; then
+      case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    fi
+    decisions_rows "${arg:-}"
     exit 0
     ;;
   --ready|--ready-after)
@@ -2126,8 +2575,9 @@ case "$mode" in
       esac
     fi
     if [ -z "$gc" ]; then
-      if [ "$(is_gated "$arg")" = yes ]; then printf 'manual: %s\n' "$(gate_conditions_line "$arg")"; exit 1; fi
-      echo "clear (no gate)"; exit 0
+      # A gated heading with no directive reads as GATE_DEFAULT (`ai`), the
+      # same answer --gate-kind gives; --lint has already named it (F24).
+      if [ "$(is_gated "$arg")" = yes ]; then gc="$GATE_DEFAULT"; else echo "clear (no gate)"; exit 0; fi
     fi
     gtype="${gc%% *}"; gval="${gc#"$gtype"}"; gval="${gval# }"
     case "$gtype" in
@@ -2349,7 +2799,7 @@ case "$mode" in
                 printf -- '- ANY condition you cannot verify from evidence — a visual judgement nobody has made,\n'
                 printf -- '  a credential you lack, a person'"'"'s sign-off, a preview nobody has looked at — STOP.\n'
                 printf -- '  Do not approve it, do not implement past it, and say exactly which condition and why:\n'
-                printf -- '    bash %s/phase-outcome.sh %s %s blocked --reason "<the condition you could not verify>"\n' "$SCRIPT_DIR" "$slug" "$p"
+                printf -- '    bash %s/phase-outcome.sh %s %s blocked --needs gates --reason "<the condition you could not verify>"\n' "$SCRIPT_DIR" "$slug" "$p"
                 printf 'Never record an approval you cannot cite evidence for. A gate approved on a guess is\n'
                 printf 'worse than a gate that stopped the run.\n'
               else
@@ -2392,6 +2842,22 @@ case "$mode" in
     printf 'This is a DAG: other phases may be ready too and lower-numbered phases may still be\n'
     printf 'unfinished — do NOT assume phases below %s are done. Run `scripts/phase-graph.sh %s`\n' "$p" "$slug"
     printf 'for live state.\n'
+    # The decision manifest, resolved for this phase — `outstanding` rows first,
+    # because a row nobody has answered is the one thing the session must not
+    # discover mid-phase (chapter 13 Tier 0). Then the one duty the manifest
+    # puts on a session: a block is declared BY KEY, never asked in prose.
+    dec_rows="$(decisions_rows "$p")"
+    printf '\nThis phase'\''s DECISIONS (the plan'\''s manifest, `scripts/phase-graph.sh %s --decisions %s`):\n' "$slug" "$p"
+    if [ -n "$dec_rows" ]; then
+      printf '%s\n' "$dec_rows" | awk -F'\t' '$2 == "outstanding" { printf "  - [%s] %s — owner %s, blocking %s: %s\n", $2, $1, ($3 == "" ? "nobody" : $3), $4, ($6 == "" ? "(no value yet)" : $6) }'
+      printf '%s\n' "$dec_rows" | awk -F'\t' '$2 != "outstanding" { printf "  - [%s] %s: %s\n", $2, $1, ($6 == "" ? "(no value)" : $6) }'
+    else
+      printf '  (this plan carries no `## Decisions` manifest — the keys are: %s)\n' "$(printf '%s' "$DECISION_KEYS" | sed 's/ /, /g')"
+    fi
+    printf 'If you cannot proceed because a decision is missing or wrong, declare it BY KEY and stop:\n'
+    printf -- '    bash %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$SCRIPT_DIR" "$slug" "$p"
+    printf -- '`--needs` is REQUIRED on `blocked` and `needs-human` (exit 2 without it): a decision key from\n'
+    printf 'the list above, or its short form (%s). Never ask in prose — prose reaches nobody.\n' "$(printf '%s' "$NEED_CLASSES" | sed 's/ /, /g')"
     sc="${REPOS[$p]:-all}"
     printf '\nThis phase'\''s SCOPE (the repos it touches, from the plan'\''s Repos column): %s\n' "$sc"
     printf 'Two sessions may run at once ONLY on disjoint scopes. Before implementing:\n'

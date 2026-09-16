@@ -35,9 +35,14 @@
  * number it is guarding is a second copy of the drift.
  */
 
+// Sandbox first: the directive below is read from the runner itself.
+import './state-sandbox.ts';
+
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
+import { unattendedDirective } from '../server/runner/runner-core.ts';
+import { DEFAULT_WAIT_BUDGET_MS, WAIT_MAX_PER_PHASE } from '../server/runner/wait-budget.ts';
 import { fileURLToPath } from 'node:url';
 
 import { SITUATIONS, EXIT_SUB_KINDS } from '../shared/situation-model.js';
@@ -211,7 +216,10 @@ const consoleVerbs = (): Set<string> => {
     .map((m) => m[1]);
   const trio = [...bin.matchAll(/\[\s*'(install-hooks)'\s*,\s*'(uninstall-hooks)'\s*,\s*'(hooks-status)'\s*\]/g)]
     .flatMap((m) => [m[1], m[2], m[3]]);
-  const verbs = new Set([...early, ...trio]);
+  // A verb with its own dispatch arm (`if (args[0] === 'sessions')` in both trees, two more in Pro) is as
+  // real as a table entry. Reading only the tables sent a phase-20 doc to a spelling around a verb that exists.
+  const dispatched = [...bin.matchAll(/args\[0\] === '([a-z][a-z-]+)'/g)].map((m) => m[1]);
+  const verbs = new Set([...early, ...trio, ...dispatched]);
   return verbs;
 };
 
@@ -526,4 +534,19 @@ test('the lane branch the documents promise is the one the code can actually cre
     /`pe\/<slug>\/p\d`/,
     'SKILL.md shows a slash-separated lane branch as if it were creatable',
   );
+});
+
+test('the unattended contract states the wait ceiling beside the flag it bounds (WAI-2)', () => {
+  // The session was told "the supervisor RESUMES THIS SESSION when the window
+  // elapses" and nothing about a ceiling, which lived only in documents a
+  // session is never given — so a correct 48-hour soak was cut to eight in silence.
+  const shipped = unattendedDirective('/skill/scripts', 'soak', 16);
+  assert.match(shipped, /--wait-minutes <realistic-window>/);
+  assert.match(shipped, new RegExp(`at most ${WAIT_MAX_PER_PHASE} waits \\(WAIT_MAX_PER_PHASE\\)`), 'the per-phase cap, by name and value');
+  assert.match(shipped, new RegExp(`${DEFAULT_WAIT_BUDGET_MS / 3_600_000}\\.0 h parked in total`), 'the budget\'s value');
+  assert.match(shipped, /the console default/, 'and where it came from');
+  assert.match(shipped, /REFUSED with a\s+`waiting-external-timeout` halt, never shortened/, 'and what happens past it');
+  // The phase's own allowance is what the session reads when the plan set one.
+  const planned = unattendedDirective('/skill/scripts', 'soak', 16, { budgetMs: 72 * 3_600_000, source: 'phase' });
+  assert.match(planned, /72 h parked in total\s+\(this phase's `Waits on:` bullet\)/);
 });

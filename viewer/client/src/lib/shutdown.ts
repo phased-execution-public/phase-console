@@ -22,8 +22,8 @@ import { useSyncExternalStore } from 'react';
 export type Stopped = {
   /** How to start it again — from `/api/shutdown`'s `restartHint`. */
   hint: string;
-  /** `launchctl` unloaded the job; `exit` just ended the process. */
-  via: 'launchctl' | 'exit';
+  /** `launchctl`/`systemctl` unloaded AND disabled the unit ("stay off"); `exit` just ended the process. */
+  via: 'launchctl' | 'systemctl' | 'exit';
 };
 
 let stopped: Stopped | null = null;

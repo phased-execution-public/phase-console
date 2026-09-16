@@ -170,10 +170,14 @@ header is trustworthy only because nothing but the proxy can reach the port.
 
 [نمای کلی](docs/overview.md) · [اولین نقشه](docs/first-plan.md) · [حلقه](docs/loop.md) ·
 [آرتیفکت‌ها](docs/artifacts.md) · [کنترل‌ها](docs/controls.md) ·
-[بودجهٔ نشست](docs/session-budget.md) · [انتخاب مدل](docs/model-handling.md) ·
+[بودجهٔ نشست](docs/session-budget.md) · [تصمیم‌ها](docs/decisions.md) · [انتخاب مدل](docs/model-handling.md) ·
 [گیتِ QA](docs/qa-gating.md) · [حفاظ‌های ایمنی](docs/safety-rails.md) ·
 [Phase Console](docs/console.md) · [متریک‌ها](docs/metrics.md) · [نصبِ دستی](docs/install.md) ·
 [نسخه‌بندی و انتشار](docs/releasing.md) · [مرجع](docs/reference.md)
+
+از ۵.۰، اجرایی که بدونِ حضورِ شما پیش می‌رود به این‌ها تکیه دارد: `phase-console doctor`،
+[تصمیم‌هایی](docs/decisions.md) که اجرا با آن‌ها شروع می‌شود، رله‌ای برای پرسشی که نشست وسطِ اجرا می‌پرسد، و
+گزینهٔ **Stay off…** در Shut down — [docs/controls.md](docs/controls.md) (انگلیسی).
 
 به Claude Code و `bash` و `git` نیاز دارد. کنسول علاوه بر آن Node ‏22.18+ (یا ‏23.6+) می‌خواهد و
 **هیچ وابستگیِ اجرایی** ندارد. انتشارها تگِ `vX.Y.Z` هستند با یک GitHub Release که تاربالِ بسته‌بندی‌شده را دارد، و دستی بریده می‌شوند —

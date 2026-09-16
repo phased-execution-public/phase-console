@@ -409,7 +409,23 @@ export function runNotes({
   // is worse than saying nothing: a phase parked on a CI run announced as a
   // usage limit sends them to switch accounts against a wall that is not there.
   const waitReason = run?.waitUntil ? waitReasonOf(run) : null;
-  if (run?.waitUntil && run.status === 'paused') {
+  if (run?.waitUntil && waitReason === 'person') {
+    // A person's card — a verification check only they can make, or a tool
+    // approval — is a wait on THEM, not on a clock or an account (WAI-10). The
+    // card itself is on the Now page; this says why the run reads waiting.
+    notes.push({
+      id: 'waiting-window',
+      severity: 'warn',
+      title: run.status === 'paused' ? 'Stopped while waiting for a person.' : undefined,
+      body: (
+        <>
+          Waiting for a person to answer a card until {at(run.waitUntil)} — a verification check or an
+          approval only you can make. Nothing is spent while it waits and no account is at its limit; answer
+          the card, or the phase parks for you when the card expires.
+        </>
+      ),
+    });
+  } else if (run?.waitUntil && run.status === 'paused') {
     // Stopped ON the clock: the run's own policy said "pause and ask", a
     // console restart preserved the clock and the re-arm has not fired, or
     // someone stopped a run that was parked.

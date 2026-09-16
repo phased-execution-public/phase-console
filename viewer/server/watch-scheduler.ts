@@ -104,6 +104,14 @@ export type WatchSchedulerDeps = {
    * and nothing is held.
    */
   resumeInFlight?: (slug: string, phase: number) => boolean;
+  /**
+   * May a `cmd:` ref the CONSOLE minted run at all (SLF-8)? The watchdog's park
+   * lifts a command out of a Bash tool summary and files it as a watch ref of
+   * its own (`declared.minted`); absent or false, such a ref is written once
+   * as `unknown` and never run — the console's own inference must not execute
+   * a writing command against a repository nobody is watching.
+   */
+  mintedCmdRefsEnabled?: () => boolean;
 };
 
 /**
@@ -232,19 +240,26 @@ export class WatchScheduler {
           // The stored verdict is the world's final answer; re-asking for it
           // would cost a network round trip to be told the same thing.
           const known = record.watchState?.refs.find((r) => r.ref === target.ref);
+          // A `cmd:` ref the console MINTED runs only when the operator said so
+          // (SLF-8): written once as `unknown`, with no clock, never asked again.
+          // `unknown`, not `refused` — the console did not judge the command, it
+          // did not ask; the same word `watchCmdRefs` off gets.
+          const mintedHeld = target.kind === 'cmd' && this.mintedHeld(record, target.ref);
           const verdict: WatchState = known?.state === 'landed'
             ? { ref: known.ref, state: 'landed', ...(known.detail ? { detail: known.detail } : {}) }
-            // A `cmd:` ref RUNS something on every pass, for as long as the
-            // phase is parked. Bounded per phase (see `MAX_CMD_RUNS_PER_PHASE`)
-            // and refused in words when the bound is spent, so an operator sees
-            // a state rather than a silence.
-            : target.kind === 'cmd' && (known?.runs ?? 0) >= MAX_CMD_RUNS_PER_PHASE
-              ? {
-                ref: target.ref, state: 'refused' as const,
-                detail: `run ${MAX_CMD_RUNS_PER_PHASE} times without landing — this console will not run it again`,
-              }
-              : await this.ask(target);
-          if (this.apply(slug, state, record, target, verdict, now)) changed = true;
+            : mintedHeld
+              ? { ref: target.ref, state: 'unknown' as const, detail: 'console-minted cmd ref — not run (watchMintedCmdRefs is off)' }
+              // A `cmd:` ref RUNS something on every pass, for as long as the
+              // phase is parked. Bounded per phase (see `MAX_CMD_RUNS_PER_PHASE`)
+              // and refused in words when the bound is spent, so an operator sees
+              // a state rather than a silence.
+              : target.kind === 'cmd' && (known?.runs ?? 0) >= MAX_CMD_RUNS_PER_PHASE
+                ? {
+                  ref: target.ref, state: 'refused' as const,
+                  detail: `run ${MAX_CMD_RUNS_PER_PHASE} times without landing — this console will not run it again`,
+                }
+                : await this.ask(target);
+          if (this.apply(slug, state, record, target, verdict, now, { terminal: mintedHeld })) changed = true;
           if (verdict.state === 'landed') landings.push({ phase: record.phase, landed: verdict });
         }
       }
@@ -308,7 +323,15 @@ export class WatchScheduler {
       const implied = `lock:${holder.slug}/${holder.phase}`;
       if (!refs.includes(implied)) refs.push(implied);
     }
-    const targets = pollableRefs(refs).slice(0, MAX_WATCH_REFS);
+    // Refs this phase RETIRED — refused by the policy, or run to the cap — are
+    // out of the rotation for good, whatever a new declaration says (SLF-8):
+    // the same command is the same command, and the world's answer was final.
+    // Only an operator's Retry un-retires (`resetForRetry` by `operator`).
+    const retired = new Set(record.watchRetired ?? []);
+    const declaredTargets = pollableRefs(refs).slice(0, MAX_WATCH_REFS);
+    // A retired ref keeps its `refused` row while it is declared — the operator
+    // sees a state, not a silence — but is never a probe target again.
+    const targets = declaredTargets.filter((t) => !retired.has(t.ref));
     const store = record.watchState;
     if (store) {
       // PRUNE to what is actually declared now, before anything reads the cap.
@@ -319,7 +342,7 @@ export class WatchScheduler {
       // executing every sixty seconds instead of every five minutes, for ever
       // (QA F4). A row for a ref nobody is watching any more is not evidence
       // worth keeping; it is the thing that stops the real one being kept.
-      const live = new Set(targets.map((t) => t.ref));
+      const live = new Set(declaredTargets.map((t) => t.ref));
       if (store.refs.some((r) => !live.has(r.ref))) {
         store.refs = store.refs.filter((r) => live.has(r.ref));
         if (sink) sink.changed = true;
@@ -330,6 +353,8 @@ export class WatchScheduler {
       const row = rows.find((r) => r.ref === target.ref);
       if (!row) return true;
       if (row.state === 'refused') return false;
+      // A minted `cmd:` row the operator has not enabled: written once, held.
+      if (target.kind === 'cmd' && row.state === 'unknown' && row.minted && this.mintedHeld(record, target.ref)) return false;
       // A LANDING is re-offered, not re-probed — the world's answer is final,
       // the healer's chance to act on it is not. Three things end the offer:
       //
@@ -438,9 +463,16 @@ export class WatchScheduler {
    * is what decides a save — a pass that learned nothing must not rewrite the
    * run file.
    */
+  /** Is this a console-minted `cmd:` ref the operator has not enabled? */
+  private mintedHeld(record: PhaseRecord, ref: string): boolean {
+    if (!record.declared?.minted?.includes(ref)) return false;
+    return !this.deps.mintedCmdRefsEnabled?.();
+  }
+
   private apply(
     slug: string, state: RunState, record: PhaseRecord,
     target: WatchRefTarget, verdict: WatchState, now: number,
+    opts: { terminal?: boolean } = {},
   ): boolean {
     const at = new Date(now).toISOString();
     const store = (record.watchState ??= { at, refs: [] });
@@ -460,12 +492,22 @@ export class WatchScheduler {
       state: verdict.state,
       ...(verdict.detail ? { detail: verdict.detail } : {}),
       checkedAt: at,
+      ...(record.declared?.minted?.includes(verdict.ref) ? { minted: true as const } : {}),
       ...(before?.runs || ran ? { runs: (before?.runs ?? 0) + ran } : {}),
       ...(() => {
-        const next = nextDueFor(target, verdict.state, now);
+        // A terminal verdict (a held minted ref) gets no clock: nothing will
+        // ever advance it, and a row with a past clock churns the fingerprint.
+        const next = opts.terminal ? null : nextDueFor(target, verdict.state, now);
         return next === null ? {} : { nextDueAt: next };
       })(),
     };
+    // A `cmd:` ref the policy refused, or one run to its cap, is RETIRED on
+    // the record (SLF-8): `clearWatchBookkeeping` forgets the row with the
+    // declaration, so without this the same command came back with twelve
+    // fresh runs on the next declaration.
+    if (verdict.state === 'refused' && target.kind === 'cmd' && !record.watchRetired?.includes(verdict.ref)) {
+      record.watchRetired = [...(record.watchRetired ?? []), verdict.ref];
+    }
     // The cap is enforced here as well as by the prune in `dueFor`, and it is
     // not redundant: the prune bounds rows to the DECLARED set, and a single
     // declaration carrying more than eight pollable refs would otherwise grow

@@ -1,20 +1,25 @@
 /**
  * Creating the desktop launcher — one click instead of a copy-and-edit ritual.
  *
- * because a shipped file must carry nobody's machine layout. What a person
- * actually wants on their Desktop is that file with THEIR root, THEIR port and
- * every capability switch on — which is exactly the substitution a program
- * does better than a human copying a file and hunting for line 58.
+ * because a file on a Desktop must carry nobody's machine layout — no root, no
+ * port, no allowlisted login — or it goes stale the first time one of them
+ * changes, once per copy. What a program still does better than a person
+ * copying a file and hunting for line 58 is the rest: every capability switch
+ * on, and the console copy to start named.
  *
  * Per platform, honestly:
- *   darwin  the shipped `.command`, knobs patched, executable — double-click.
- *   linux   an XDG `.desktop` entry running the start script in a terminal.
- *           Exec lines expand no environment variables, so the paths are baked
- *           absolute; GNOME additionally wants a right-click → Allow Launching
- *           the first time, which the answer says rather than hides.
+ *   darwin  the shipped `.command`, CONSOLE_HOME patched, executable — double-click.
+ *   linux   an XDG `.desktop` entry running the start command for one console
+ *           (`--instance <id>`) in a terminal. Exec lines expand no environment
+ *           variables, so the paths are baked absolute; GNOME additionally wants
+ *           a right-click → Allow Launching the first time, which the answer
+ *           says rather than hides.
  *   win32   not supported natively — the console itself only runs on
  *           darwin/linux (package.json `os`), so Windows means WSL, and a
  *           `.lnk` pointing into a WSL filesystem is a lie waiting to break.
+ *
+ * Remote access is in neither artifact: every console reads the machine
+ * profile (`~/.config/phase-console/fleet.json`) at boot.
  *
  * Everything filesystem-shaped is parameterised (home, platform, source) so
  * the tests never touch a real Desktop.
@@ -24,7 +29,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { DEFAULT_MAX_SESSIONS, SKILL_DIR, VIEWER_DIR } from './config.ts';
+import { SKILL_DIR, VIEWER_DIR } from './config.ts';
 
 /**
  * The capability switches, the full set the launcher turns on — and the list
@@ -49,9 +54,13 @@ export type LauncherPlan = {
 };
 
 export type LauncherOptions = {
-  root: string;
-  port: number;
-  /** Distinguishes a second project's launcher from the default one's. */
+  /**
+   * The console the artifact is written for. The `.command` carries nothing of
+   * it but its file name (rev 12 — the file picks its console when it runs);
+   * the Linux entry starts exactly this one, by id.
+   */
+  instanceId: string;
+  /** Names the file and the entry — `Phase Console — <name>`. */
   instanceName?: string;
   isDefault?: boolean;
   home?: string;
@@ -59,16 +68,6 @@ export type LauncherOptions = {
   /** The shipped template — injectable so tests patch a fixture, not the repo. */
   source?: string;
   skillDir?: string;
-  /**
-   * The console's own settings, baked into the artifact so a double-click
-   * starts the console THIS console is — not a five-switch approximation of
-   * it. Remote access dropped from a launcher was the silent-loss shape rev 7
-   * exists to end.
-   */
-  remoteHosts?: string[];
-  remoteUsers?: string[];
-  maxSessions?: number;
-  defaultSkills?: string[];
   /**
    * The console copy the launcher should start — its package root. Defaults to
    * THIS package, so a launcher written by a hub's own copy starts that copy
@@ -114,34 +113,28 @@ export function launcherPlan(opts: {
   };
 }
 
-/** The shipped template with THIS machine's knobs baked in. Exported for tests. */
-export function renderCommandFile(source: string, opts: {
-  root: string; port: number; home: string;
-  remoteHosts?: string[]; remoteUsers?: string[]; maxSessions?: number; defaultSkills?: string[];
-  consoleHome?: string;
-}): string {
+/**
+ * The shipped template, ready for a Desktop. Exported for tests.
+ *
+ * Only CONSOLE_HOME is patched — the copy to start, `$HOME`-relative, empty when
+ * the caller wants discovery. Nothing about an instance goes in (rev 12): the
+ * file picks its console when it runs, so two consoles rendering it from one
+ * copy write byte-identical files, and no copy carries a root, a port or an
+ * allowlisted login to go stale.
+ */
+export function renderCommandFile(source: string, opts: { home: string; consoleHome?: string }): string {
   if (!/^LAUNCHER_REV=\d+$/m.test(source)) {
     throw new Error('the launcher template has no LAUNCHER_REV — refusing to write a copy that cannot detect staleness');
   }
-  // The rev-7 knobs must exist before they are patched — a template old enough
-  // to lack them would silently drop this console's remote access from the
-  // written copy, which is the exact loss the knobs exist to end.
-  for (const knob of ['REMOTE=', 'REMOTE_USERS=', 'MAX_SESSIONS=', 'DEFAULT_SKILLS=', 'CONSOLE_HOME=']) {
+  // The rev-12 knobs must exist before a copy is written: a template old enough
+  // to lack INSTANCE is a launcher for ONE root and port, and writing it would
+  // bake in exactly what rev 12 took out.
+  for (const knob of ['INSTANCE=', 'MAX_SESSIONS=', 'DEFAULT_SKILLS=', 'CONSOLE_HOME=']) {
     if (!new RegExp(`^${knob}`, 'm').test(source)) {
       throw new Error(`the launcher template is missing its ${knob.slice(0, -1)} knob — update the template first`);
     }
   }
-  let patched = source.replace(/^ROOT=.*$/m, `ROOT="${homeRelative(opts.root, opts.home)}"`);
-  patched = patched.replace(/^PORT=.*$/m, `PORT=${opts.port}`);
-  patched = patched.replace(/^REMOTE=.*$/m, `REMOTE="${(opts.remoteHosts ?? []).join(' ')}"`);
-  patched = patched.replace(/^REMOTE_USERS=.*$/m, `REMOTE_USERS="${(opts.remoteUsers ?? []).join(' ')}"`);
-  // Pin only what the operator pinned: at the default ceiling the knob stays
-  // empty, so the console's own default keeps ruling — including a future one.
-  patched = patched.replace(/^MAX_SESSIONS=.*$/m,
-    `MAX_SESSIONS="${opts.maxSessions != null && opts.maxSessions !== DEFAULT_MAX_SESSIONS ? opts.maxSessions : ''}"`);
-  patched = patched.replace(/^DEFAULT_SKILLS=.*$/m, `DEFAULT_SKILLS="${(opts.defaultSkills ?? []).join(',')}"`);
-  // The copy to start — $HOME-relative like ROOT, empty when the caller wants discovery.
-  patched = patched.replace(/^CONSOLE_HOME=.*$/m,
+  const patched = source.replace(/^CONSOLE_HOME=.*$/m,
     `CONSOLE_HOME="${opts.consoleHome ? homeRelative(opts.consoleHome, opts.home) : ''}"`);
   for (const line of ['WRITES="--allow-writes"', 'RUNS="--allow-run"', 'TERM_FLAG="--allow-terminal"',
     'AGENT="--allow-agent"', 'ACCOUNTS="--allow-accounts"', 'MCP="--allow-mcp"',
@@ -153,22 +146,18 @@ export function renderCommandFile(source: string, opts: {
   return patched;
 }
 
-/** The XDG entry. Exec expands no env vars, so every path is absolute. */
+/**
+ * The XDG entry. Exec expands no env vars, so every path is absolute — and the
+ * console is named by id, never by root or port, so the registry stays the one
+ * place those live (rev 12's rule, on the platform that has no template).
+ */
 export function renderDesktopEntry(opts: {
-  skillDir: string; root: string; port: number;
-  remoteHosts?: string[]; remoteUsers?: string[]; maxSessions?: number; defaultSkills?: string[];
-  instanceName?: string; isDefault?: boolean;
+  skillDir: string; instanceId: string; instanceName?: string;
 }): string {
   const command = [
     `"${opts.skillDir}/start"`,
-    `"${opts.root}"`,
-    `--port ${opts.port}`,
+    `--instance "${opts.instanceId}"`,
     ...FULL_FLAGS,
-    ...(opts.remoteHosts ?? []).flatMap((host) => ['--remote', host]),
-    ...(opts.remoteUsers ?? []).flatMap((user) => ['--remote-user', user]),
-    ...(opts.maxSessions != null && opts.maxSessions !== DEFAULT_MAX_SESSIONS
-      ? ['--max-sessions', String(opts.maxSessions)] : []),
-    ...(opts.defaultSkills?.length ? ['--default-skills', opts.defaultSkills.join(',')] : []),
   ].join(' ');
   // Exec quoting per the spec: the whole argument double-quoted, embedded
   // double quotes and backslashes escaped.
@@ -202,12 +191,6 @@ export function installDesktopLauncher(opts: LauncherOptions): { ok: true; path:
   if (!plan.supported || !plan.path) throw new Error(plan.note);
 
   const skillDir = opts.skillDir ?? SKILL_DIR;
-  const extras = {
-    ...(opts.remoteHosts?.length ? { remoteHosts: opts.remoteHosts } : {}),
-    ...(opts.remoteUsers?.length ? { remoteUsers: opts.remoteUsers } : {}),
-    ...(opts.maxSessions != null ? { maxSessions: opts.maxSessions } : {}),
-    ...(opts.defaultSkills?.length ? { defaultSkills: opts.defaultSkills } : {}),
-  };
   mkdirSync(join(plan.path, '..'), { recursive: true });
   // Executable either way: a `.command` needs it to run, and GNOME will not
   // even OFFER Allow Launching on a .desktop file without the bit.
@@ -217,9 +200,13 @@ export function installDesktopLauncher(opts: LauncherOptions): { ok: true; path:
   // deletes whole LINES: an `if`/`else` marked here would leave the free tree
   // holding an orphaned brace. `launcherPlan` already reports the launcher
   // unsupported on every platform in that tree, so nothing reaches this arm.
+  // The entry starts its console by id. A caller that did not say which one
+  // gets a refusal, not an entry whose Exec reads `--instance undefined`.
+  if (!opts.instanceId) {
+    throw new Error('a desktop entry starts one console by id — no instance id was given');
+  }
   writeFileSync(plan.path, renderDesktopEntry({
-    skillDir, root: opts.root, port: opts.port, ...extras,
-    instanceName: opts.instanceName, isDefault: opts.isDefault,
+    skillDir, instanceId: opts.instanceId, instanceName: opts.instanceName,
   }), 'utf8');
   chmodSync(plan.path, 0o755);
   return { ok: true, path: plan.path, note: plan.note };

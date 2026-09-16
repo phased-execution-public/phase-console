@@ -417,6 +417,30 @@ export function foreignVehicle(session: Pick<ForeignSession, 'kind'>): string {
       : 'Terminal session';
 }
 
+/**
+ * How a foreign session's end reads, when it has ended (REG-9): `ended` for one
+ * it reported itself, `ended · inferred` for one the probe concluded from a
+ * process that was gone — whose `endedAt` is the last evidence of life, not
+ * the moment anybody looked. Null while it has not ended.
+ */
+export function endedLabel(session: Pick<ForeignSession, 'presence' | 'endedBy'>): string | null {
+  if (session.presence !== 'ended') return null;
+  return session.endedBy === 'probe' ? 'ended · inferred' : 'ended';
+}
+
+/**
+ * A foreign session's turn count as a page may print it (REG-9): `unknown` when
+ * the record moved many times and never saw a Stop — a 0 nobody counted — and
+ * the number otherwise, with the stream named when the runner's stream is what
+ * counted it (the run's settings displace the machine's Stop hook).
+ */
+export function turnsLabel(session: Pick<ForeignSession, 'turns' | 'turnsSource'>): string {
+  if (session.turnsSource === 'unknown') return 'unknown';
+  if (session.turnsSource === 'stream')
+    return `${session.turns} (counted by the run's stream — the run's settings displace the Stop hook)`;
+  return String(session.turns);
+}
+
 export function otherSessions(
   sessions: readonly ForeignSession[] | undefined,
   // A `NowLane` satisfies this, and so does a bare `RunState` — `child` is

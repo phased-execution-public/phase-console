@@ -13,10 +13,11 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { CREDENTIAL_CLASSES } from '../shared/ops-vocab.js';
 
 import {
-  classify, lostResume, parseResetTime, childEnv, nextModel, resetWaitUntil,
-  RESET_MARGIN_MS, MAX_AUTO_WAIT_MS, type StopSignal,
+  classify, lostResume, parseResetTime, childEnv, childEnvDecisions, nextModel, resetWaitUntil,
+  API_RETRY_ERRORS, BG_WAIT_CEILING_MS, RESET_MARGIN_MS, MAX_AUTO_WAIT_MS, type StopSignal,
 } from '../server/runner/errors.ts';
 
 const at = (iso: string) => new Date(iso);
@@ -166,21 +167,30 @@ test('429 retries later rather than switching or halting', () => {
   assert.equal(d.kind, 'retry');
 });
 
-test('auth, org policy and billing all stop for a human', () => {
-  for (const text of [
-    'Please run /login · API Error: 401 Invalid authentication credentials',
-    'Login expired · Please run /login',
-    'Your organization has disabled Claude subscription access for Claude Code',
-    'Credit balance is too low',
-  ]) {
-    assert.equal(classify(stop({ text })).kind, 'needs-human', text);
+test('auth, org policy, billing and a bad certificate all stop the RUN on its credential (RCV-1)', () => {
+  for (const [text, cls] of [
+    ['Please run /login · API Error: 401 Invalid authentication credentials', 'auth'],
+    ['Login expired · Please run /login', 'auth'],
+    ['Your organization has disabled Claude subscription access for Claude Code', 'org-policy'],
+    ['Credit balance is too low', 'billing'],
+    // The two zero-cost sessions the audit found classified as nothing (RCV-2):
+    // a TLS interception is a wall no re-board gets past.
+    ['API Error: Unable to connect to API: Self-signed certificate detected.', 'certificate'],
+    ['unable to get local issuer certificate', 'certificate'],
+  ] as const) {
+    const d = classify(stop({ text }));
+    assert.equal(d.kind, 'credential-refused', text);
+    if (d.kind === 'credential-refused') assert.equal(d.class, cls, text);
   }
+  // …and the disposition's kind is the vocabulary's word, exhaustively: every
+  // class the owner names is one the classifier can answer with.
+  for (const cls of CREDENTIAL_CLASSES) assert.ok(typeof cls === 'string' && cls.length > 3);
 });
 
 test('an api_retry category is honoured even with no message text', () => {
-  assert.equal(classify(stop({ retryCategories: ['authentication_failed'] })).kind, 'needs-human');
+  assert.equal(classify(stop({ retryCategories: ['authentication_failed'] })).kind, 'credential-refused');
   assert.equal(classify(stop({ retryCategories: ['overloaded'] })).kind, 'switch-model');
-  assert.equal(classify(stop({ retryCategories: ['billing_error'] })).kind, 'needs-human');
+  assert.equal(classify(stop({ retryCategories: ['billing_error'] })).kind, 'credential-refused');
 });
 
 test('budget and turn caps resume the same session rather than restarting it', () => {
@@ -209,10 +219,23 @@ test('a reset more than 12h away parks with the usage-window discriminant, not a
     assert.equal(d.cause, 'usage-window');
     assert.equal(d.at?.getTime(), epoch * 1000);
   }
-  // An ordinary park carries no discriminant, so nothing can mistake it.
+  // A credential refusal is its OWN kind since zero-touch-console phase 9
+  // (RCV-1): the class the runner retires the account's organisation under
+  // rides on it, and `needs-human` never carries a credential again — so
+  // nothing can mistake a wall the run must stop on for a person's park.
   const auth = classify(stop({ text: 'Failed to authenticate: OAuth session expired' }));
-  assert.equal(auth.kind, 'needs-human');
-  if (auth.kind === 'needs-human') assert.equal(auth.cause, undefined);
+  assert.equal(auth.kind, 'credential-refused');
+  if (auth.kind === 'credential-refused') assert.equal(auth.class, 'auth');
+  const org = classify(stop({ text: 'API Error: 403 organization has been disabled' }));
+  assert.equal(org.kind, 'credential-refused');
+  if (org.kind === 'credential-refused') assert.equal(org.class, 'org-policy');
+  const billing = classify(stop({ text: '', retryCategories: ['account_on_hold'] }));
+  assert.equal(billing.kind, 'credential-refused');
+  if (billing.kind === 'credential-refused') assert.equal(billing.class, 'billing');
+  // …and an ordinary person's park carries none at all.
+  const plain = classify(stop({ code: 143, text: '' }));
+  assert.equal(plain.kind, 'needs-human');
+  if (plain.kind === 'needs-human') assert.equal(plain.cause, undefined);
 });
 
 test('signals distinguish a supervisor kill from an OOM kill', () => {
@@ -262,6 +285,111 @@ test('an explicit retry count from the operator is not overridden', () => {
   assert.equal(childEnv({ CLAUDE_CODE_MAX_RETRIES: '3' }).CLAUDE_CODE_MAX_RETRIES, '3');
 });
 
+test('the background-task ceiling is set explicitly — the documented default, never inherited by accident (SES-12)', () => {
+  const env = childEnv({ PATH: '/usr/bin' });
+  assert.equal(env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, String(BG_WAIT_CEILING_MS));
+  assert.equal(BG_WAIT_CEILING_MS, 600_000, 'chapter 09 row 42: 600 000 ms is the CLI\'s own default');
+  assert.equal(childEnv({ CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0' }).CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, '0',
+    'an operator\'s own value survives');
+});
+
+test('childEnvDecisions names where each ceiling came from — what phase.retry-ceiling journals', () => {
+  assert.deepEqual(childEnvDecisions({ PATH: '/usr/bin' }), {
+    maxRetries: { value: '15', source: 'console' },
+    bgWaitCeilingMs: { value: '600000', source: 'console' },
+  });
+  assert.deepEqual(childEnvDecisions({ CLAUDE_CODE_MAX_RETRIES: '3', CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: '0' }), {
+    maxRetries: { value: '3', source: 'env' },
+    bgWaitCeilingMs: { value: '0', source: 'env' },
+  });
+  // The env childEnv writes and the decisions say the same thing.
+  const env = childEnv({});
+  const said = childEnvDecisions({});
+  assert.equal(env.CLAUDE_CODE_MAX_RETRIES, said.maxRetries.value);
+  assert.equal(env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, said.bgWaitCeilingMs.value);
+});
+
+/* ---------------- the session ledger's signals (zero-touch-console phase 4) ---------------- */
+
+test('API_RETRY_ERRORS is the twelve documented `error` values (chapter 09 row 31)', () => {
+  assert.deepEqual([...API_RETRY_ERRORS].sort(), [
+    'account_on_hold', 'authentication_failed', 'billing_error', 'cloud_credential_error', 'invalid_request',
+    'max_output_tokens', 'model_not_found', 'oauth_org_not_allowed', 'overloaded', 'rate_limit', 'server_error',
+    'unknown',
+  ]);
+  assert.ok(Object.isFrozen(API_RETRY_ERRORS));
+});
+
+test('isError disqualifies success before any text is read — and without it, today\'s behaviour stands (SES-5)', () => {
+  // An error the classifier has no pattern for: the bit alone keeps it from
+  // reading as a completed phase, and the reason quotes what it did not know.
+  const text = 'API Error: Unable to connect to API: the upstream gateway answered 418.';
+  const broken = classify({ subtype: 'success', code: 0, isError: true, text });
+  assert.notEqual(broken.kind, 'ok');
+  assert.equal(broken.kind, 'phase-failed');
+  assert.match(broken.kind === 'phase-failed' ? broken.reason : '', /answered 418/,
+    'the reason quotes the error it did not recognise');
+  assert.equal(classify({ subtype: 'success', code: 0, text }).kind, 'ok',
+    'the same signal without the bit keeps today\'s reading');
+});
+
+test('the TLS-interception sign-off is a credential wall, with or without the isError bit (RCV-2)', () => {
+  // Twice recorded as a completed phase at 4.1.0; phase 4 made the bit stop
+  // that, phase 9 names the wall — credentials are read BEFORE success is
+  // believed, so the bit is not what stands between this text and `ok`.
+  const text = 'API Error: Unable to connect to API: Self-signed certificate detected.';
+  for (const signal of [
+    { subtype: 'success' as const, code: 0, isError: true, text },
+    { subtype: 'success' as const, code: 0, text },
+  ]) {
+    const d = classify(signal);
+    assert.equal(d.kind, 'credential-refused');
+    if (d.kind === 'credential-refused') {
+      assert.equal(d.class, 'certificate');
+      assert.match(d.reason, /certificate/);
+    }
+  }
+});
+
+test('an aborted turn is never ok, whatever its subtype says', () => {
+  assert.notEqual(classify({ subtype: 'success', code: 0, terminalReason: 'aborted_tools' }).kind, 'ok');
+  assert.equal(classify({ subtype: 'success', code: 0, terminalReason: 'completed' }).kind, 'ok');
+});
+
+test('a session the console ended before its turn was done is never ok', () => {
+  assert.notEqual(classify({ subtype: 'success', code: 0, endedBy: 'stop' }).kind, 'ok');
+  assert.equal(classify({ subtype: 'success', code: 0, endedBy: 'exit' }).kind, 'ok');
+});
+
+test('the spawn watchdog\'s kill is a retry quoting its diagnosis — never "session was terminated (SIGTERM)" (SES-11)', () => {
+  const reason = 'no result after init — the session went silent for 55 min after it started and before its first result';
+  const disposition = classify({ code: 143, endedBy: 'spawn-watchdog', endedReason: reason });
+  assert.equal(disposition.kind, 'retry');
+  assert.match(disposition.kind === 'retry' ? disposition.reason : '', /no result after init/);
+  assert.doesNotMatch(disposition.kind === 'retry' ? disposition.reason : '', /SIGTERM/);
+  // An external SIGTERM nobody named is still what it always was.
+  assert.equal(classify({ code: 143 }).kind, 'needs-human');
+});
+
+test('"Background tasks still running after" is never ok, and names the tasks the stream saw start (SES-12)', () => {
+  const text = 'all done\nBackground tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.';
+  const named = classify({
+    subtype: 'success', code: 0, text, backgroundTasks: [{ id: 'bash_7', description: 'npm test -- --run' }],
+  });
+  assert.equal(named.kind, 'phase-failed');
+  assert.match(named.kind === 'phase-failed' ? named.reason : '', /600s/);
+  assert.match(named.kind === 'phase-failed' ? named.reason : '', /bash_7 \(npm test -- --run\)/);
+  const unnamed = classify({ subtype: 'success', code: 0, text });
+  assert.equal(unnamed.kind, 'phase-failed');
+  assert.match(unnamed.kind === 'phase-failed' ? unnamed.reason : '', /named no task/);
+});
+
+test('a server_error retry category reaches its retry arm (SES-7)', () => {
+  const disposition = classify(stop({ subtype: 'error_during_execution', retryCategories: ['server_error'] }));
+  assert.equal(disposition.kind, 'retry');
+  assert.match(disposition.kind === 'retry' ? disposition.reason : '', /server error/);
+});
+
 test('model fallback walks down the ladder and then gives up', () => {
   assert.equal(nextModel('claude-opus-5'), 'sonnet');
   assert.equal(nextModel('sonnet'), 'haiku');
@@ -277,8 +405,8 @@ test('a session that could not authenticate is not a success, whatever it report
     subtype: 'success',
     text: 'Failed to authenticate: OAuth session expired and could not be refreshed',
   }));
-  assert.equal(d.kind, 'needs-human');
-  assert.match(d.kind === 'needs-human' ? d.reason : '', /authentication/);
+  assert.equal(d.kind, 'credential-refused');
+  assert.match(d.kind === 'credential-refused' ? d.reason : '', /authentication/);
 });
 
 test('a genuine success is still a success', () => {

@@ -1,6 +1,6 @@
 # Session budget
 
-The ten decisions a plan records, and where each one is written.
+The eleven decisions a plan records, and where each one is written.
 
 A complete `## Session budget` note looks like this:
 
@@ -45,6 +45,24 @@ Tag a phase and the engine can group phases into sessions for you:
 
 Untagged phases are treated as `M`. A phase whose weight exceeds one session's budget is really two
 phases — split it.
+
+**What a size buys.** On the console the tag is also the cap a phase's session runs under when its
+run sets no per-phase dollar budget (`phaseBudgetUsd`):
+
+| Tag | Dollars | Turns |
+|---|---|---|
+| `S` | $25 | 150 |
+| `M` | $60 | 300 |
+| `L` | $120 | 600 |
+
+That is about three times the most any measured session spent, so it bounds a runaway without
+cutting a long phase (`SESSION_CAPS_BY_SIZE`, `viewer/server/runner/session-record.ts`). Every
+session the spawn door starts carries both, as `--max-budget-usd` and `--max-turns`. A phase attempt
+or a resume gets the whole row (or the whole `phaseBudgetUsd`); a side session — a closeout, a
+repair, a reviewer — gets a quarter of those dollars, never under $1, unless its caller set its own
+(a QA round's `qaRoundBudgetUsd`), and a turn cap of its own: 90 for a repair (`REPAIR_MAX_TURNS`), 60 for paperwork and bounded reviews
+(`CLOSEOUT_MAX_TURNS`). A cap that bites is not a failure: the same session resumes under double
+that cap, and the `phase.session` line names which policy set each cap.
 
 ## 4 · Whether phases share a session
 
@@ -156,6 +174,51 @@ need to:
 ```bash
 DOCS_ROOT=/path/to/repo scripts/phase-graph.sh checkout-rewrite
 ```
+
+## 11 · What a run needs decided before it starts
+
+**Written in `## Decisions`** — the decision manifest, one row per key of a closed vocabulary
+(`permission.policy`, `permission.destructive`, `credentials`, `accounts`, `mcp`, `gates`,
+`verification.person-check`, `qa.exhausted`, `waits`, `human-acts`, `ambiguity`, `budgets`,
+`resume.on-restart`, `plan-health`, `stop`, `relay`, `announce`), each with a value, an owner, a
+state (`answered` · `outstanding` · `waived`), whether it blocks the run, where the answer came from
+and its evidence. Nothing asks a person mid-run: the skill's plan mode asks these once, before
+authoring, and the console refuses to start a run while a blocking row is still `outstanding`.
+
+Some rows resolve from lines in this section — `**Credentials:**` + `**Credential policy:**`,
+`**Accounts:**`, `**Permissions:**`, `**May publish:**`, `**QA exhausted:**`, `**When in doubt:**`,
+`**Wait budget:**` — and from per-phase bullets (`- **Credentials:**`, `- **Waits on:**`,
+`- **Human step:**`, `- **Person-check:**`). Answers that arrive later go to a twin the engine
+merges over the table, written only by `scripts/decisions.sh`.
+
+**The wait budget is a total, and a declared window is never cut.** `**Wait budget:** 48h` is the
+TOTAL wall-clock one phase may spend parked across every wait it declares — not a window per wait;
+with the line absent the console's default is 8 h. A phase's `- **Waits on:** <ref>[, <ref>…] · <max>`
+overrides it for that phase alone, and a `date:` ref among its refs countersigns a wait up to that
+instant. Each declaration is judged against what is left — the budget minus the time the phase has
+already spent parked, read from each park's own stamps — at park and again at resume:
+
+- a window that fits what is left parks;
+- a window past what is left, but inside the plan's countersign, parks;
+- a window past both is **refused**: a `waiting-external-timeout` halt that states the arithmetic and
+  names the two lines that would allow it. The console never shortens a declared window in silence —
+  only a park that named no window at all (the 30-minute default) is shortened to what is left.
+
+One phase may declare at most four waits (`WAIT_MAX_PER_PHASE`); the console's own watchdog parks
+spend a separate allowance and never touch this one.
+
+```bash
+scripts/phase-graph.sh <slug> --decisions        # the rows as they hold: key, state, owner, blocking, source, value
+scripts/phase-graph.sh <slug> --decisions 4      # resolved for phase 4 (its own rows over the plan-wide ones)
+scripts/phase-graph.sh <slug> --wait-budget 4    # minutes⇥phase|plan — nothing means the console default
+scripts/phase-graph.sh <slug> --waits-on 4       # the refs phase 4's Waits on: bullet names, one per line
+scripts/decisions.sh <slug> answer waits --value "gh:acme/x#run/9 · 45m" --by me
+scripts/decisions.sh <slug> --phase 4 waive relay --reason "no relay in the gated phase"
+```
+
+A session that hits a decision the manifest lacks declares it by key — `phase-outcome.sh <slug> <N>
+blocked --needs <key>` — and the console files a defect report rather than an errand. The whole
+story: [Decisions](decisions.md).
 
 ---
 

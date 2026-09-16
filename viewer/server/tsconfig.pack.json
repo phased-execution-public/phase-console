@@ -26,5 +26,5 @@
     "skipLibCheck": true,
     "types": []
   },
-  "include": ["./**/*.ts"]
+  "include": ["./**/*.ts", "../fleet/**/*.ts"]
 }

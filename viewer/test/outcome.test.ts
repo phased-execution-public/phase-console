@@ -11,11 +11,11 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const { consumeOutcome, readOutcome } = await import('../server/runner/outcome.ts');
+const { consumeOutcome, ignoreOutcome, peekWrittenAt, readOutcome, OUTCOME_IGNORE_REASONS } = await import('../server/runner/outcome.ts');
 
 function outcomeFile(over: Record<string, unknown> = {}): string {
   const dir = mkdtempSync(join(tmpdir(), 'pc-outcome-'));
@@ -91,10 +91,60 @@ test('readOutcome: a declaration made in the attempt\'s own second is not stale 
   assert.equal(readOutcome(outcomeFile({ written_at: 'yesterday-ish' }), sameSecond), null);
 });
 
+test('readOutcome: `needs`, `rule` and `command` ride the declaration — and their absence is tolerated', () => {
+  const expect = { slug: 'demo', phase: 4 };
+  const full = readOutcome(outcomeFile({ status: 'blocked', needs: 'credential', rule: 'Bash(ssh *)', command: 'ssh deploy@box' }), expect);
+  assert.equal(full?.needs, 'credential');
+  assert.equal(full?.rule, 'Bash(ssh *)');
+  assert.equal(full?.command, 'ssh deploy@box');
+  // A 4.1.0 session's file: blocked, no key. Still a declaration — the
+  // classifier falls back to the prose; the rollout must not drop the park.
+  const legacy = readOutcome(outcomeFile({ status: 'blocked', reason: 'no SSH key' }), expect);
+  assert.equal(legacy?.status, 'blocked');
+  assert.equal('needs' in (legacy ?? {}), false, 'absent, not an empty string');
+  // A word, never a sentence; a decision key with dots and hyphens is a word.
+  assert.equal(readOutcome(outcomeFile({ status: 'blocked', needs: 'resume.on-restart' }), expect)?.needs, 'resume.on-restart');
+  assert.equal(readOutcome(outcomeFile({ status: 'blocked', needs: 'the SSH key please' }), expect)?.needs, undefined);
+  assert.equal(readOutcome(outcomeFile({ status: 'blocked', needs: 42 }), expect)?.needs, undefined);
+  // Sliced, not refused: a 600-character command is still a declaration.
+  assert.equal(readOutcome(outcomeFile({ status: 'blocked', needs: 'permission', command: 'x'.repeat(600) }), expect)?.command?.length, 500);
+});
+
 test('consumeOutcome removes the file and never throws on one that is not there', () => {
   const path = outcomeFile();
   consumeOutcome(path);
   assert.equal(readOutcome(path, { slug: 'demo', phase: 4 }), null, 'consumed means gone');
   consumeOutcome(path); // again, and on a path that never existed
   consumeOutcome(join(tmpdir(), 'pc-outcome-never', 'nothing.json'));
+});
+
+test('WAI-7: ignoreOutcome sets a declaration aside under ignored/<name>.<reason>, bytes intact, and never overwrites', () => {
+  const path = outcomeFile({ status: 'nonsense' });
+  const bytes = readFileSync(path, 'utf8');
+  assert.equal(readOutcome(path, { slug: 'demo', phase: 4 }), null, 'the reader rejects it');
+  const kept = ignoreOutcome(path, 'invalid');
+  assert.ok(kept);
+  assert.ok(!existsSync(path), 'gone from the inbox');
+  assert.equal(kept, join(path, '..', 'ignored', 'phase-04.json.invalid'));
+  assert.equal(readFileSync(kept!, 'utf8'), bytes, 'the evidence is intact');
+  // The same name again is suffixed, not clobbered.
+  writeFileSync(path, 'second');
+  const again = ignoreOutcome(path, 'invalid');
+  assert.equal(again, `${kept}.1`);
+  writeFileSync(path, 'third');
+  assert.equal(ignoreOutcome(path, 'invalid'), `${kept}.2`);
+  assert.equal(readFileSync(kept!, 'utf8'), bytes, 'the first is untouched');
+  // A missing file cannot be set aside: null, and the caller falls back to consuming.
+  assert.equal(ignoreOutcome(join(tmpdir(), 'pc-outcome-never', 'nothing.json'), 'stale'), null);
+  assert.deepEqual([...OUTCOME_IGNORE_REASONS], ['stale', 'invalid', 'failed']);
+});
+
+test('WAI-7: peekWrittenAt reads the stamp off a declaration the strict reader rejected — or null', () => {
+  const rejected = outcomeFile({ version: 9, written_at: '2026-09-13T15:55:39Z' });
+  assert.equal(readOutcome(rejected, { slug: 'demo', phase: 4 }), null);
+  assert.equal(peekWrittenAt(rejected), '2026-09-13T15:55:39Z');
+  const junk = join(mkdtempSync(join(tmpdir(), 'pc-outcome-')), 'phase-04.json');
+  writeFileSync(junk, 'not json');
+  assert.equal(peekWrittenAt(junk), null);
+  assert.equal(peekWrittenAt(join(tmpdir(), 'pc-outcome-never', 'nothing.json')), null);
 });

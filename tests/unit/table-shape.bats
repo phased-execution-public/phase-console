@@ -57,7 +57,9 @@ load ../helpers/test_helper
 
 @test "F20: a row with fewer columns than the header is named" {
   setup_docs linear ragged
-  printf '| 4 | Delta | 3 | repoA |\n' >> "$DOCS_ROOT/docs/plans/ragged.md"
+  # Inside the table (the fixture carries a `## Phases` section after it now).
+  awk '{ print } /^\| 3 \|/ { print "| 4 | Delta | 3 | repoA |" }' "$DOCS_ROOT/docs/plans/ragged.md" > "$DOCS_ROOT/ragged.tmp"
+  mv "$DOCS_ROOT/ragged.tmp" "$DOCS_ROOT/docs/plans/ragged.md"
   run pg ragged --lint
   [ "$status" -eq 1 ]
   assert_contains "$output" "phase 4: its table row has 4 columns but the header has 6"

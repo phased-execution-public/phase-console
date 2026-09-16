@@ -45,7 +45,7 @@ import {
   type ReviewerFinding, type ReviewerReport, type ReviewerVerdictPolicy,
 } from '../reviewer.ts';
 import { isReviewVerdict, type ReviewVerdict } from '../review.ts';
-import { killLadder } from './signals.ts';
+import { killLadder, type LadderEnding } from './signals.ts';
 
 /** The subcommand, spelled once. */
 export const ULTRAREVIEW_SUBCOMMAND = 'ultrareview';
@@ -106,7 +106,7 @@ export type UltraReviewOptions = {
  */
 export type UltraReviewResult =
   | { state: 'landed'; report: ReviewerReport; ms: number; findings: number }
-  | { state: 'unknown'; reason: string; ms: number; code?: number; how?: 'gone' | 'exited' | 'killed' };
+  | { state: 'unknown'; reason: string; ms: number; code?: number; how?: LadderEnding };
 
 /**
  * The argv, built once so the test and the runner cannot disagree about it.
@@ -498,7 +498,7 @@ type ChildRun = {
   stdout: string;
   stderr: string;
   cut: 'timeout' | 'abort' | null;
-  how?: 'gone' | 'exited' | 'killed';
+  how?: LadderEnding;
   spawnError?: string;
 };
 
@@ -525,7 +525,7 @@ function runChild(
     let err = '';
     let bytes = 0;
     let cut: 'timeout' | 'abort' | null = null;
-    let how: 'gone' | 'exited' | 'killed' | undefined;
+    let how: LadderEnding | undefined;
     let settled = false;
 
     const child = launch('claude', argv, {

@@ -153,6 +153,17 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
     }
     case 'prompt':
       return values.prompt.trim() ? 'set' : 'none';
+    // The Decisions stage's five (phase 11).
+    case 'resumeOnRestart':
+      return values.resumeOnRestart ? 'continue by itself' : 'wait for a person, with one errand';
+    case 'relay':
+      return values.relay === 'last-resort' ? 'last resort — a person, then the rule table' : 'off';
+    case 'accounts':
+      return values.accounts.trim() ? values.accounts.trim() : 'not yet named';
+    case 'acknowledgedWaivers':
+      return values.acknowledgedWaivers.length ? values.acknowledgedWaivers.join(', ') : 'none';
+    case 'manifestOverride':
+      return values.manifestOverride.trim() ? `signed by ${values.manifestOverride.trim()}` : 'none';
     default:
       return String(v);
   }
@@ -217,7 +228,12 @@ export function summaryRows(
       label: FIELD_LABELS[field],
       value: valueText(field, values, names),
       source,
-      baseline: JSON.stringify(values[field]) === JSON.stringify(BASELINE[field]),
+      // An EMPTY account list is the baseline too: it means "the prelude's
+      // resolved clause", which for a plan naming none IS `default:0` — the
+      // form holds it empty until the prelude answers (`run-setup.tsx`).
+      baseline:
+        JSON.stringify(values[field]) === JSON.stringify(BASELINE[field]) ||
+        (field === 'accounts' && values.accounts.trim() === ''),
       live,
     });
   }
@@ -231,7 +247,7 @@ export function notableRows(rows: readonly SummaryRow[]): SummaryRow[] {
 
 /** How many rows the operator changed in THIS dialog, per stage — the stepper's note. */
 export function changedPerStage(rows: readonly SummaryRow[]): Record<ControlStage, number> {
-  const out: Record<ControlStage, number> = { what: 0, how: 0, money: 0 };
+  const out: Record<ControlStage, number> = { decisions: 0, what: 0, how: 0, money: 0 };
   for (const row of rows) if (row.source === 'changed') out[row.stage] += 1;
   return out;
 }

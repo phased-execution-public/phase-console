@@ -330,6 +330,24 @@ export function ultracodeDirective(on: boolean): string {
  * server to the MODEL, and a model that treats it as a hint improvises for an
  * hour and hands back work that used none of what was chosen for it.
  */
+/**
+ * The credentials the plan named for this phase that the console could not
+ * find before the spawn, under `credential policy: continue` (phase 11,
+ * ZTD-4). Told to the session the way a degraded MCP server is: by name, with
+ * the instruction to do what does not need it and record the rest as an
+ * operator errand — never to improvise a credential or ask a person mid-run.
+ */
+export function credentialsDirective(missing: { id: string; reason: string }[]): string {
+  if (!missing.length) return '';
+  const named = missing.map((m) => `\`${m.id}\` (${m.reason})`).join(', ');
+  return `\nThe plan names credential${missing.length === 1 ? '' : 's'} this console could not find before it started you: `
+    + `${named}. The credential policy is \`continue\`, so you were boarded anyway. Do the work that does not need `
+    + `${missing.length === 1 ? 'it' : 'them'}; for the rest, record an operator errand under **Outstanding** in the `
+    + 'handoff naming the credential id, and if the phase genuinely cannot proceed at all declare it — '
+    + `\`phase-outcome.sh <slug> <N> blocked --needs credential --reason "<id> is not held"\` — rather than asking. `
+    + 'Never print a credential\'s value.\n';
+}
+
 export function mcpDirective(servers: string[], degraded: McpDegradation[] = []): string {
   const named = [...new Set(servers.filter(Boolean))];
   const attached = named.length

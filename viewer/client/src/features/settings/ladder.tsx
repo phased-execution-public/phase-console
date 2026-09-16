@@ -252,6 +252,31 @@ export function LadderCard() {
         />
 
         <SectionHeading as="h3" className="mt-1">
+          Start ceiling
+        </SectionHeading>
+        <NumberField
+          pref="ceilingStartsPerHour"
+          id="ladder-ceiling-starts"
+          label="Automatic starts per hour"
+          value={prefs.ceilingStartsPerHour}
+          unit="starts"
+          hint={`Every claude this console starts by itself — a boot re-adoption, a wait clock, a converge relaunch, the MCP probe, the reviewer — counted over a sliding hour; the next automatic start past the number is refused and announced once. Your own Start, Retry and Continue are never counted. 0 turns the ceiling off (shipped: ${LADDER_PREF_DEFAULTS.ceilingStartsPerHour}).`}
+          disabled={busy}
+          onSave={num('ceilingStartsPerHour')}
+        />
+        <NumberField
+          pref="ceilingUsdPerHour"
+          id="ladder-ceiling-usd"
+          label="Session spend per hour"
+          value={prefs.ceilingUsdPerHour}
+          unit="USD"
+          step={10}
+          hint={`What the sessions that ended in the last hour reported costing, across every run; past it the next automatic start is refused until the hour rolls on. 0 turns it off (shipped: $${LADDER_PREF_DEFAULTS.ceilingUsdPerHour}).`}
+          disabled={busy}
+          onSave={num('ceilingUsdPerHour')}
+        />
+
+        <SectionHeading as="h3" className="mt-1">
           Clocks
         </SectionHeading>
         <NumberField
@@ -331,6 +356,21 @@ export function LadderCard() {
           disabled={busy}
           onSave={(v) => save.mutate({ stallExternalWaitMs: v * 60_000 })}
         />
+        {/* The watchdog's own park, on its own switch (the KNOWN-SINCE off
+            switch). The row above says WHEN a lane reads as waiting; this says
+            whether the console may take the turn away from it for that. */}
+        <div className={row}>
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Park a waiting lane by itself</span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              On (shipped): a lane waiting inside its turn — an open poll loop, or a wait the console refused
+              — is checkpointed and parked in the console&apos;s own name, on its own allowance, never the
+              session&apos;s declared waits. Off: the stall card still stands and the local-job nudge still
+              goes, but nothing is parked.
+            </span>
+          </span>
+          {onOff(stored.stallAutomaticPark !== false, 'stallAutomaticPark')}
+        </div>
         {/* The same signal, the other clock. Its own row because the two
             numbers answer different questions and an operator who shortens one
             almost never means the other. */}
@@ -449,12 +489,12 @@ export function LadderCard() {
           <span className="min-w-0">
             <span className="text-sm text-ink">Let a session clear a human gate</span>
             <span className="mt-0.5 block text-2xs text-ink-muted">
-              <strong>Off, and deliberately.</strong> The plan author wrote <code>human</code>, and a gate
-              reading &ldquo;the owner approves the visual result&rdquo; is not something a session can judge.
-              What makes delegation safe is not trust: the brief demands cited evidence for every condition
-              and STOPS with the condition named when it has none. Turn it on for a plan whose human gates are
-              machine-verifiable in practice — <code>gate-status.md</code> records those approvals as{' '}
-              <code>by: ai-session-delegated</code>.
+              <strong>On since 5.0.0</strong> — this console&apos;s word for the manifest&apos;s{' '}
+              <code>gates</code> row (<code>gates: delegated</code>); a plan&apos;s own{' '}
+              <code>## Decisions</code> row outranks it. What makes delegation safe is not trust: the brief
+              demands cited evidence for every condition and STOPS with the condition named when it has none,
+              and a gate whose conditions are not written stays a person&apos;s whatever this says.{' '}
+              <code>gate-status.md</code> records those approvals as <code>by: ai-session-delegated</code>.
             </span>
           </span>
           {onOff(prefs.delegateHumanGates, 'delegateHumanGates')}

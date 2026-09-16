@@ -58,8 +58,10 @@ after_heading() {  # after_heading <file> <phase> <N>
 }
 
 @test "a new §Session budget lands after the graph: above ## Phases when there is one, else at the end" {
-  # diamond has no ## Phases — the section closes the file.
+  # A graph-only plan (diamond with its ## Phases section cut off) — the
+  # section closes the file.
   setup_docs diamond diamond
+  sed -i.bak '/^## Phases/,$d' "$(plan diamond)"
   qa_mode_set diamond on >/dev/null
   [ "$(tail -n 3 "$(plan diamond)")" = "$(printf '## Session budget\n\n**QA gate:** on')" ]
   # A plan with ## Phases: strip the fixture's own section, then the new one sits

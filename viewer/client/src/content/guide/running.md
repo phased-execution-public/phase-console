@@ -50,6 +50,10 @@ can do right now.
 > `./start` for what it is good at: `./start ~/code/your-repo --allow-run`, and stop it with the
 > terminal it is running in.
 
+Before anything runs, `phase-console doctor` says whether this machine is ready — accounts, MCP
+servers, the `claude` login, a delivery channel, the presence hooks, the Claude CLI's version.
+**When stuck** has the rest.
+
 
 ## Talk to a running phase from any terminal
 

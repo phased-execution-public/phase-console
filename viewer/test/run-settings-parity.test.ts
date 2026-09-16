@@ -160,7 +160,7 @@ test('the start-only fields are the four a patch must never carry', () => {
   // `startAfter` joined the three in console-concurrent-plans P17. A chain
   // says where a run BEGINS, and a run already mid-plan cannot un-begin: the
   // settings door reading one would either do nothing or claim to.
-  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'qa', 'resumeRunId', 'startAfter']);
+  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'accounts', 'acknowledgedWaivers', 'manifestOverride', 'qa', 'relay', 'resumeOnRestart', 'resumeRunId', 'startAfter']);
 });
 
 test('PHASE_OPTION_FIELDS matches the route filter that keeps a phase honest', () => {

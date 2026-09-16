@@ -40,11 +40,14 @@ test('the shipped fallback is identical to scripts/gates.env', () => {
   assert.deepEqual([...file.types].sort(), [...GATES_ENV_FALLBACK.types].sort());
   assert.deepEqual([...file.human].sort(), [...GATES_ENV_FALLBACK.human].sort());
   assert.deepEqual([...file.ai].sort(), [...GATES_ENV_FALLBACK.ai].sort());
+  assert.equal(file.default, GATES_ENV_FALLBACK.default);
+  assert.equal(file.default, 'ai', 'operator decision 7 / ZTD-5: an undeclared gate is an AI gate');
+  assert.ok(file.ai.includes(file.default), 'the default must be a type that classifies as ai, or the audit\'s bias is not what ships');
 });
 
 test('every key the reader looks for is actually present in the file', () => {
   const text = readFileSync(join(SCRIPTS, 'gates.env'), 'utf8');
-  for (const key of ['GATE_TYPES', 'GATE_TYPES_HUMAN', 'GATE_TYPES_AI']) {
+  for (const key of ['GATE_TYPES', 'GATE_TYPES_HUMAN', 'GATE_TYPES_AI', 'GATE_DEFAULT']) {
     assert.match(text, new RegExp(`^${key}="`, 'm'), `${key} is missing from gates.env`);
   }
 });
@@ -84,9 +87,9 @@ test('gateKindOf answers the same category the engine\'s gate_kind does', () => 
     ['deadline 2026-01-01', true, 'auto', 'and a deadline'],
     ['by 2026-01-01', true, 'auto', 'and its synonym'],
     ['Date 2026-01-01', true, 'human', 'CASE-SENSITIVE: capital-D Date is an unknown type'],
-    ['review the design', true, 'human', 'an unknown type is a person, fail-safe'],
-    [undefined, true, 'human', 'a GATED phase with no Gate-check line at all is a person'],
-    ['', true, 'human', 'and so is an empty one'],
+    ['review the design', true, 'human', 'an unknown type is a person, fail-safe (and lint F24)'],
+    [undefined, true, 'ai', 'a GATED phase with no Gate-check line at all reads as GATE_DEFAULT — ai since 5.0.0 (ZTD-5; and lint F24)'],
+    ['', true, 'ai', 'and so does an empty one'],
     ['manual the operator flips the flag', false, 'none', 'not gated is not a gate'],
     [undefined, false, 'none', 'and neither is nothing'],
   ];

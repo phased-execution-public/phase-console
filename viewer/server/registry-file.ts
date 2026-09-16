@@ -76,13 +76,16 @@ export function backupIfNewer(file: string, what: string, ours = 1): void {
   try {
     mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
     copyFileSync(file, backup);
-    log.warn(`${what}.downgrade`, {
+    // One literal name with the registry as a field — never `${what}.downgrade`:
+    // a composed name is one `docs/journal-events.md` can never hold (LFC-4).
+    log.warn('registry.downgrade', {
+      registry: what,
       version,
       ours,
       backup,
       note: 'a newer registry is being rewritten by an older console — the original was copied aside',
     });
   } catch (error) {
-    log.warn(`${what}.backup-failed`, { version, error: (error as Error).message });
+    log.warn('registry.backup-failed', { registry: what, version, error: (error as Error).message });
   }
 }

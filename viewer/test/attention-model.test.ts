@@ -79,19 +79,20 @@ test('INBOX_KINDS is the InboxKind union, same words, same order', () => {
     union,
     'shared/attention-model.js and client/src/lib/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
   );
-  assert.equal(union.length, 12, union.join(','));
+  assert.equal(union.length, 14, union.join(','));
   assert.ok(Object.isFrozen(INBOX_KINDS), 'a vocabulary is frozen');
 });
 
-test('conflict was APPENDED — every earlier kind keeps the rank it sorted at', () => {
+test('conflict, question and then policy were APPENDED — every earlier kind keeps the rank it sorted at', () => {
   // The union order is `sortInbox`'s third tie-break, so inserting a kind in
   // the middle silently reorders a list an operator reads top-down. The
   // append-only contract is what makes a new kind free; this is the assertion
-  // that keeps it true.
-  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'conflict');
+  // that keeps it true. `question` (zero-touch phase 14) and `policy` (phase 19)
+  // went on the end, in that order.
+  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'policy');
   assert.deepEqual(
-    INBOX_KINDS.slice(0, 11),
-    ['errand', 'approval', 'gate', 'sign-in', 'mcp-auth', 'qa', 'lock', 'health', 'stall', 'ruling', 'session-ask'],
+    INBOX_KINDS.slice(0, 13),
+    ['errand', 'approval', 'gate', 'sign-in', 'mcp-auth', 'qa', 'lock', 'health', 'stall', 'ruling', 'session-ask', 'conflict', 'question'],
   );
 });
 
@@ -467,6 +468,23 @@ test('the watchdog clocks sit BESIDE the detector map, and fire in the one right
     SPAWN_FIRST_EVENT_MS > STALL_DEFAULTS.stallSilentMs + STALL_NUDGE_GRACE_MS,
     'the backstop must be strictly later than the recycle, never level with it',
   );
+});
+
+test('the init→result bound is the last clock on a quiet session — later than the local-job park it must never race', async () => {
+  const {
+    STALL_LOCAL_JOB_MS, STALL_NUDGE_GRACE_MS, SPAWN_FIRST_EVENT_MS, SPAWN_INIT_IDLE_MS,
+  } = await import('../shared/attention-model.js');
+  // Beside the detector map, like every remedy clock (see the bijection above).
+  assert.ok(!('spawnInitIdleMs' in STALL_DEFAULTS));
+  // Derived, so it cannot drift under the clock it must outlast: a long local
+  // suite the runner parks at STALL_LOCAL_JOB_MS is quiet between tool
+  // results, and a spawn bound that fired first would kill work a person
+  // expects to finish (zero-touch-console phase 4, SES-10).
+  assert.equal(SPAWN_INIT_IDLE_MS, STALL_LOCAL_JOB_MS + 2 * STALL_NUDGE_GRACE_MS);
+  assert.ok(SPAWN_INIT_IDLE_MS > STALL_LOCAL_JOB_MS + STALL_NUDGE_GRACE_MS,
+    'strictly later than the runner\'s park plus its grace, never level with it');
+  assert.ok(SPAWN_INIT_IDLE_MS > SPAWN_FIRST_EVENT_MS,
+    'and later than the first-event backstop, which covers the stretch before init');
 });
 
 test('every ruling kind has a label, and the default is the weakest of them', () => {

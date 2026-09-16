@@ -34,18 +34,19 @@ import {
   shows,
 } from './modes';
 
-const { state, skills, runStart, runSettings, savePrefs, toastMock } = vi.hoisted(() => ({
+const { state, skills, runStart, runSettings, savePrefs, toastMock, runPrelude } = vi.hoisted(() => ({
   state: vi.fn(),
   skills: vi.fn(),
   runStart: vi.fn(),
   runSettings: vi.fn(),
   savePrefs: vi.fn(),
   toastMock: vi.fn(),
+  runPrelude: vi.fn(),
 }));
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, state, skills, runStart, runSettings, savePrefs } };
+  return { ...actual, api: { ...actual.api, state, skills, runStart, runSettings, savePrefs, runPrelude } };
 });
 
 // The one thing the operator actually reads after pressing the button. It used
@@ -73,6 +74,26 @@ const values = (over: Partial<RunSetupValues> = {}): RunSetupValues => ({ ...EMP
 
 async function mount(props: Record<string, unknown>, consoleState: Record<string, unknown> = {}) {
   state.mockResolvedValue({ prefs: {}, defaultSkills: ['graph-tool'], ...consoleState });
+  runPrelude.mockResolvedValue({
+    prelude: {
+      slug: 'alpha',
+      rows: [],
+      blocking: [],
+      waived: [],
+      acknowledged: [],
+      manifestPresent: false,
+      probes: {
+        accounts: { status: 'ok', ok: true, reason: 'the machine login' },
+        mcp: { status: 'skip', ok: true, reason: 'no MCP server named' },
+        credentials: { status: 'skip', ok: true, reason: 'no credential named' },
+        delivery: { status: 'ok', ok: true, reason: '1 subscribed device' },
+      },
+      accounts: [{ id: 'default', minHeadroomPct: 0 }],
+      credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+      delivery: { ok: true, channels: ['1 subscribed device'], acknowledged: false },
+      at: '2026-09-14T00:00:00.000Z',
+    },
+  });
   const client = new QueryClient(queryClientConfig);
   const { RunSetup } = await import('./run-setup');
   const Setup = RunSetup as unknown as (props: Record<string, unknown>) => ReactElement;
@@ -252,6 +273,10 @@ describe('the payloads', () => {
       // Always sent as shown, never omitted: an explicit false on a resume
       // returns the run to the off state rather than to a preference.
       autoRecover: false,
+      // The Decisions stage's two words (phase 11), sent as shown; the account
+      // list is sent only once named — the door refuses a fresh start without it.
+      resumeOnRestart: true,
+      relay: 'off',
       resumeRunId: 'run-1',
       onlyPhases: [3],
     });

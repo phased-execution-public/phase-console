@@ -517,7 +517,7 @@ test('resetForRetry is the single reset: it clears what the last boarding conclu
     verifyingSince: '2026-08-21T09:55:00Z',
     liveness: { phase: 3, lastOutputAt: '2026-08-21T09:40:00Z', turnsSinceLastTool: 4, commitsSinceStart: 0, treeDirty: false },
   });
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
   assert.equal(record.status, 'pending');
   assert.equal(record.note, undefined);
   assert.equal(record.endedAt, undefined);

@@ -56,13 +56,25 @@ answer.
 ## Stop it
 
 **Settings → Shut down** ends the console and everything it owns — a graceful exit that says what
-it is taking with it.
+it is taking with it. With nothing supervising the process, that exit is the stop.
 
-The confirm dialog is an inventory rather than a warning: it lists the run it is about to stop (which
-is checkpointed first and resumes when the console comes back), each live agent session, each
-terminal, and the command that brings it all back. Restart shows the same list — it has always killed
-every pty on the way out and never said so. Shut down is deliberately **not** behind `--allow-run`:
-the one thing every console must be able to do is stop.
+The confirm dialog is an inventory rather than a warning, computed from the work: every live lane, the
+soonest clock the exit breaks (a resume, a freeze escalation, an MCP `require` clock) and the rest
+counted, the runs on disk the next boot picks up, the live Claude sessions it stops watching, the
+pending approval cards, the presence events and declarations not yet read — and the command that
+brings it all back. Confirming acknowledges that list: `POST /api/shutdown` refuses a bare
+`{"confirm":true}` over a non-empty one, naming it, and a "stay off" always needs `"acknowledge": true`.
+Restart shows the terminals' half — it has always killed every pty on the way out and never said so.
+Shut down is deliberately **not** behind `--allow-run`: the one thing every console must be able to do
+is stop.
+
+`GET /api/shutdown` serves that inventory and the plan for each strength before anyone presses, each
+with a `durability` word the dialog turns into its one promise — with nothing supervising the process
+the word is `stays-off`, said as "Nothing brings it back" beside the command that does. The press is
+announced and the announcement is awaited: the drain holds for a delivery report for up to
+`SHUTDOWN_ANNOUNCE_WAIT_MS` (5 s), and a record nothing reported on leaves with the console's own
+`skipped` delivery row saying why (`shutdown.announced`), so the inbox never shows a shutdown that was
+quietly not sent.
 
 ## What it shows
 
@@ -74,14 +86,14 @@ address still means something (`#/ready` → `#/now?focus=next`, `#/plan/x/raw` 
 
 | Destination | Answers |
 |---|---|
-| **Now** | *Does anything need me, and what is running?* Four bands: the needs-you inbox with inline actions (approvals, gates, errands, expired accounts, stalled lanes — every kind acts in place, and the buttons come from the server's own `{endpoint, method, body}`, so a new kind ships working against a console nobody rebuilt); the operations board — one band per plan, its live lanes with heartbeat, cost, ETA, the branch AND checkout each one rides, and under them that plan's admissions still waiting for a scope (who holds it, what collided, when the lease ends); what is next up across every plan; and the plans in flight. |
-| **Plans** | *Where is each plan on its route?* The list with progress, ready phases, locks, QA regime and health, filterable by status, ready, locked or repo. A plan opens on six tabs: **Route** (the transit map — phases are stations, dependencies are track, each suggested session batch is a train — plus the health panel and the verify-preflight prediction of how a phase will halt), **Phases** (state-grouped, with a drawer per phase carrying its goal, files, steps, verification, gate, lock, QA verdict and evidence), **Run**, **QA** (the gate for the plan and for each phase — the regime and where it came from, the verdicts and their rounds, what each verdict holds, the report itself, and the on/off switches), **Handoffs** and **Source**. |
-| **Runs** | *What is this doing, why is it stopped, what did it cost?* The **orchestration board** — four columns, running · queued · waiting · frozen, a card per live run with its branch chip, spend and phase strip, and every verb that changes what happens next inline on it, Freeze all in the header — over the record of every run there has ever been, with settled-today against the day cap. Per run: the status strip, the ways forward (one renderer — there is no second place a remedy can appear), the Git card for a run on its own branch, the lanes and their session panes, the state-grouped phases with evidence, liveness and rulings, the timeline and the journal. |
-| **Sessions** | *What processes exist, and can I get at one?* One list for autopilot lanes, agent sessions, shells and the Claude sessions the presence hook reports — and one pane, the phone-first browser terminal, for the two kinds this console holds a pty for. Agent sessions need `--allow-agent`, shells `--allow-terminal`; the list renders either way and says which flag is missing. |
+| **Now** | *Does anything need me, and what is running?* Four bands: the needs-you inbox with inline actions (approvals, gates, errands, expired accounts, stalled lanes, a session's question with the seconds left before the console answers it by rule, a correlated lane's **Session ask** answered by steering it — every kind acts in place, and the buttons come from the server's own `{endpoint, method, body}`, so a new kind ships working against a console nobody rebuilt; two kinds carry no button because nothing is owed: **Policy answered**, each answer the policy table gave with nobody asked, and the instance's own health as work — notifications nobody was told about, Tailscale stopped, Serve pointing at another console, a registered console down or its directory gone — each naming the command that fixes it); the operations board — one band per plan, its live lanes with heartbeat, cost, ETA, the branch AND checkout each one rides, and under them that plan's admissions still waiting for a scope (who holds it, what collided, when the lease ends); what is next up across every plan; and the plans in flight. |
+| **Plans** | *Where is each plan on its route?* The list with progress, ready phases, locks, QA regime and health, filterable by status, ready, locked or repo. A plan opens on six tabs: **Route** (the transit map — phases are stations, dependencies are track, each suggested session batch is a train — plus the health panel and the verify-preflight prediction of how a phase will halt), **Phases** (state-grouped, with a drawer per phase carrying its goal, files, steps, verification, gate, lock, QA verdict and evidence), **Run**, **QA** (the gate for the plan and for each phase — the regime and where it came from, the verdicts and their rounds, what each verdict holds, the report itself, and the on/off switches), **Handoffs** and **Source** (the plan's own markdown, and its **Decisions** card — each `## Decisions` row's key, state, phase, owner, whether it blocks, source, value and evidence). |
+| **Runs** | *What is this doing, why is it stopped, what did it cost?* The **orchestration board** — four columns, running · queued · waiting · frozen, a card per live run with its branch chip, spend and phase strip, and every verb that changes what happens next inline on it, Freeze all in the header — over the record of every run there has ever been, with settled-today against the day cap. Per run: the status strip, the ways forward (one renderer — there is no second place a remedy can appear), the Git card for a run on its own branch, the lanes and their session panes, the state-grouped phases with evidence, liveness and rulings, **Why this run started** (every start and refusal from the run's ledger, with the decisions it began under), **What it cost and how long it ran** (each session with who ended it, its cost, turns, time and caps, the rung settlements, and one line reconciling the sessions' own costs against the run's spend — red, naming the gap, when they disagree), the timeline (with a mark for each session, ask, policy answer and start) and the journal. |
+| **Sessions** | *What processes exist, and can I get at one?* One list for autopilot lanes, agent sessions, shells and the Claude sessions the presence hook reports — and one pane, the phone-first browser terminal, for the two kinds this console holds a pty for. Agent sessions need `--allow-agent`, shells `--allow-terminal`; the list renders either way and says which flag is missing. A presence the probe saw end reads `ended · inferred`, a run's session shows the door it came through and who ended it at what cost, and the console's own MCP probe sessions are never listed. |
 | **Repo** | *What did the work do to the tree — and which of several trees?* Six sections over the read-only git and issue surfaces: **History** (a commit graph with the run and lane branches decorated), **Branches** (divergence, what claims each one, which working trees hold it), **Working trees** (where the parallel work is, and what no surviving run record claims — the reclaim surface), **Changes** (any range, one file's patch at a time), **Settles** (how each run's work reached the trunk, or why it did not) and **Issues** (every repository's GitHub issues in one table, four filters in the URL, and a multi-select whose one click mints the plan-wizard ticket — freshness per repository is `fresh` · `stale` with its age · `unknown` with the reason, and a probe that cannot answer leaves the last good rows rather than emptying the list). Above them, the glance `/api/state` has always reported: the branch, its tracking counts, and what is uncommitted **under `docs/`** — the only corner that read covers (`repoInfo` scopes its `git status` there), which is why it says so. Every view is addressable and every row opens an inspector carrying the server's record verbatim. |
-| **Insights** | *How long, how much, how fast, on what?* The estimate with the basis under it (`plan`, `portfolio` or `heuristic` — the same "≈ 3 days" means three different things), settled spend against the day cap and each run against its budget, a plan's QA verdicts and report paths, the velocity trend and completions calendar, the state/size mix, the locks and health issues, and the repos, skills and models the work runs on. Portfolio-wide, or one plan with `?plan=`. |
+| **Insights** | *How long, how much, how fast, on what?* The estimate with the basis under it (`plan`, `portfolio` or `heuristic` — the same "≈ 3 days" means three different things), settled spend against the day cap and each run against its budget, **What each session cost** per plan and per account, **Cards raised** (what reached a person, what auto-grant answered, what waits now), a plan's QA verdicts and report paths, the velocity trend and completions calendar, the state/size mix, the locks and health issues, and the repos, skills and models the work runs on. Portfolio-wide, or one plan with `?plan=`. |
 | **Debug** | *What did the console see?* What this process is running with — and every log this console writes, on one time axis: the run journals, the watch scheduler's decisions, the health record and every refused tool call, filterable by time, run and phase, readable here rather than only in a terminal. Plus `GET /api/debug/bundle`: one redacted JSON snapshot sized for a context window, so diagnosing a run means handing over a bundle rather than describing a screen. |
-| **Settings** | *What may this console do, and as whom?* Eight sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the directory, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, terminal renderer), **Automation** (the defaults every launch opens on, the ladder's caps, the stall thresholds, the boarding schedule, and the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts**, **MCP servers** (registry and catalog), **Permissions**, **This instance** (what is running, how it is reached, restart, shut down). The palette indexes all eight by their CONTENTS, so `⌘K quiet hours` finds the page. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
+| **Settings** | *What may this console do, and as whom?* Eight sections at their own `#/settings/<section>`, ordered minimal → advanced: **Essentials** (the directory, what the console is allowed to do, the start command, the engine, the keys), **Appearance** (theme, density, terminal renderer), **Automation** (the defaults every launch opens on, the ladder's caps and the start ceiling, the stall thresholds, the boarding schedule, **Policy answers** with its **Relay rules**, and the posture read-out), **Notifications** (every kind and where it lands — console, this device, each channel — plus per-device quiet hours), **Accounts**, **MCP servers** (registry and catalog), **Permissions**, **This instance** (what is running, how it is reached, restart, shut down, and the banner of a console whose automation is held). The palette indexes all eight by their CONTENTS, so `⌘K quiet hours` finds the page. `general`, `alerts` and `process` are the pre-4.0 ids and still redirect. |
 
 | Overlay | What |
 |---|---|
@@ -108,6 +120,34 @@ the process exits and takes its context with it. A phase advances only when thre
 agree: the plan's own verification commands pass, `validate.sh` still passes, and the board re-read
 **from disk** says done. Nothing asks the session whether it succeeded.
 
+**Before the first spawn, the prelude (since 5.0.0).** A run cannot start with a decision open: the
+start door reads the plan's `## Decisions` rows and runs four probes — the declared accounts' sign-in
+and headroom, the plan's MCP servers, the credentials it names (`gh`, the `claude` login, `env:`,
+`keychain:`, `file:` ids — presence only, never a value) and whether anything could deliver an
+announcement — and answers **409** naming each blocking row or failed probe. The launch form's first
+stage, *Decisions*, shows the same report and asks the three answers every run must give
+(resume-on-restart, relay, accounts); a recorded override starts anyway and journals who overrode
+what. Mid-run, an intervention the policy table can answer — a manual gate with `gates: delegated`,
+QA exhausted with `qa.exhausted: waive`, a console restart with `resumeOnRestart` — is answered and
+journalled as `phase.policy-answered` rather than raised as a card; `blocked-declared:unknown` is
+always a card. `phase-console doctor [instance]` runs the same probes by hand, plus the hooks, the
+CLI version against the relay floor, `gh auth status`, the environment doctor and the console's own
+health, and exits 1 naming the first failing row. The prelude is the run's; a phase asks again at
+boarding. The credentials it names are re-probed (`phase.credential-preflight`): under
+`**Credential policy:** require` a missing one parks the phase with an errand
+(`blocked-declared:credential`), and under `continue` — the default, after the policy table's
+`credentials` row — it boards with the gap on its record.
+
+**Every automatic start names itself.** A start nobody pressed is decided at one of the
+`START_DOORS` — `boot-readopt`, `wait-clock`, `converge-relaunch`, `converge-heal`, `watch-landed`,
+`outcome-inbox`, `auto-reviewer` and the rest — and a person's press is the `operator` door. Every
+start and every refusal is written to the run's ledger (`GET /api/run/:slug/ledger`), which the run
+page's **Why this run started** card reads back one sentence per start. The automatic doors share one
+ceiling per console over a sliding hour — `ceilingStartsPerHour` 40 and `ceilingUsdPerHour` $250
+(Settings ▸ Automation's ladder card; 0 turns either off) — past which a start is refused
+(`run.start-refused`) and one *Start ceiling reached* health announcement goes out per window. A
+press is never counted and never refused.
+
 **The outcome protocol.** A session can declare how it ended instead of leaving the runner to guess
 from a clean exit: `scripts/phase-outcome.sh <slug> <N> <status>` writes one atomic JSON file to the
 path the runner injects as `PE_OUTCOME_FILE`, and the runner reads, journals and consumes it on
@@ -129,8 +169,12 @@ failure, not settled: the lane, its scope grant and its lock are released so sib
 `parkedUntil` the runner **resumes the phase's own session** (`claude -p --resume`, context intact)
 to verify and close out, or re-file the wait. When every startable phase is parked, the run itself
 waits with the soonest clock (`waitUntil`) — restart-safe: a console reboot re-arms it exactly like
-a usage-window sleep. Caps make the wait honest: 4 waits and 8 hours parked per phase, then a
-`waiting-external-timeout` halt naming the watch refs.
+a usage-window sleep. The wait budget keeps the wait honest: at most 4 declared waits and, by default,
+8 hours parked per phase (`**Wait budget:**`, or a phase's `- **Waits on:** <ref> · <max>`, raises it).
+A window past what is left is never shortened — it halts `waiting-external-timeout` at once with the
+arithmetic — and the budget is re-read at resume, so a clock that went by while nothing ran is ruled on
+(`run.wait-overdue`: lateness journalled, refs checked, a declaring session still running refused)
+rather than fired. The watchdog's own automatic park spends an allowance of its own, never the session's.
 
 **Rulings — what a session decided.** The same script's second shape,
 `phase-outcome.sh <slug> <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral]
@@ -140,18 +184,38 @@ does not park a phase, climb the ladder or end a turn — which is what makes it
 judgement call the plan did not make for you. The console ingests the ledger into the run
 (`run.rulings`, journal `phase.ruling`), serves it at `GET /api/run/:slug/rulings`, puts the phase's
 own on its diagnosis, and raises one `fyi` inbox row per recent one; acknowledging appends a further
-line rather than editing a file a live session may still be writing to.
+line rather than editing a file a live session may still be writing to. Since 5.0.0 every line is
+stamped with its id and, with `--needs <key>`, the decision key it answers: a keyed ruling is a row
+of its own with **Remember for this plan** (a `## Decisions` row through `decisions.sh promote`,
+source `ruling`, behind `--allow-writes`) and — when its words are an answer the console can hold
+for the key — **Remember on this console** (`policy.<key>`), both `POST /api/run/:slug/rulings/:id/remember`
+and both acking the ruling by name (`appendAck` refuses an ack with nobody behind it). A session does
+the first as it records with `--remember plan` and asks for the second with `--remember global`.
+The console's answers themselves are Settings ▸ Automation ▸ **Policy answers** — one control per
+row of the policy table, the object written whole, every changed key journalled `policy.changed`
+— and the plan wizard's prompt opens by reading the repository's ledgers (`Service.planFacts`),
+then asks the manifest and every plan field `phase-graph.sh` reads back (`server/plan-fields.ts`,
+held to the script's flag list by `test/agent.test.ts`) one numbered question at a time.
+Settings ▸ Permissions raises an acknowledgeable banner (`policy.advisory`, once per boot; `GET
+/api/policy` → `advisory`) when the merged ask list is empty or a shipped deny rule is struck, and
+`editPolicy` refuses a rule that would never match — an empty prefix, a tool the CLI does not
+provide (`shared/cli-tools.js`, plus the tools this console has seen).
 
 **Liveness — is the lane actually working?** A wedged `Bash` call, a session reasoning in circles and
 a session about to commit all read `running` with a spinner. Every live lane now exposes
 `{lastOutputAt, lastToolUseAt, turnsSinceLastTool, commitsSinceStart, treeDirty, openTool?, stall?}`
-on `GET /api/run/:slug`, and a 60-second ticker raises one of three signals against it: `silent` (no
-output for `stallSilentMs`, naming the call open longest), `spinning` (`stallSpinTurns` turns with no
-tool call) and `stalemate` (`stallStalemateAttempts` attempts that committed nothing and left a clean
-tree). A phase inside its own §Verification is exempt — a build is silent and fine. One episode is
-one card: only transitions are journalled (`phase.stall` / `phase.liveness`) and announced, under the
-**`stalled`** category, on by default and deliberately not urgent. v1 is display, notification and
-manual verbs (nudge, freeze, stop the lane); making it a ladder situation is the v2 path
+on `GET /api/run/:slug`, and a 60-second ticker raises signals against it (`STALL_SIGNALS`, worst
+first): `stalemate` (`stallStalemateAttempts` attempts that committed nothing and left a clean tree),
+`retrying` (`stallRetryBurst` API retries in a row with nothing productive between them),
+`external-wait` (below), `silent` (no output for `stallSilentMs`, naming the call open longest) and
+`spinning` (`stallSpinTurns` turns with no tool call). A phase inside its own §Verification is exempt
+— a build is silent and fine. One episode is one card: only transitions are journalled
+(`phase.stall` / `phase.liveness`) and announced, under the **`stalled`** category (*Nothing is
+happening*), on by default and deliberately not urgent. Most signals are display, notification and
+manual verbs (nudge, freeze, stop the lane); two act by themselves. `external-wait` parks the lane
+(below), and a lane that booted and has said nothing at all is nudged once, recycled once if it is
+still silent `STALL_NUDGE_GRACE_MS` (5 min) later, and then left for a person — at most one of each
+per phase until Retry, and never a session that has already done work
 ([docs/loop.md](../docs/loop.md)).
 
 **The ladder in the loop.** `interrupted` and `failed` records are not terminal any more. At the top
@@ -169,7 +233,14 @@ sub-kind re-queues, `credential`/`gate` park with an **errand** immediately, `un
 session and then the errand. Exhaustion parks the phase with the errand — one named ask, journalled
 `phase.errand` — and the run keeps driving whatever else is ready. Journal vocabulary:
 `phase.situation` → `phase.rung` → `phase.brief` → `phase.start`, `phase.errand`,
-`phase.ladder-deferred` (a rung remains that only the healer's agent can drive). The healer reaches
+`phase.ladder-deferred` (a rung remains that only the healer can drive, on a stopped run; it names that
+rung as `next`). A situation whose table holds no rung this console can drive is spent at once — the
+phase parks with its errand, whose *how* says so — rather than waiting on a rung nothing will climb.
+Each vehicle has a driver (`VEHICLE_DRIVERS`: `console`, `writes` for what needs `--allow-writes`,
+`agent` for a fresh session or pty agent, `never`). A tool call a deny rule refused
+(`blocked-declared:permission`) has one rung, `widen-rule`: a card, *Phase N: widen `<rule>`?*, whose
+**Allow** strikes that deny rule for this plan and resumes the phase's own session, and whose
+**Deny** — or no answer — parks the phase with the errand. The healer reaches
 the same vehicle from outside the loop through `startRun({resumeRunId, reboard: [{phase, situation,
 rung, brief}]})`. Opt-in is the run's own auto-recovery switch; a never-started phase re-boards fresh
 regardless, because that is the run doing its job.
@@ -186,7 +257,9 @@ passed) and journalled `run.lock-debris-released`; a person's claim is never deb
 the console's own restart stopped (`stoppedBy: 'system'`): lanes a restart killed re-board through
 `startRun({resumeRunId, reboard})` hinted to **resume their own session** (`brief: continue`; a session
 that cannot be resumed degrades to a fresh boot with the resume block), bounded by `MAX_BOOT_RESUMES` 3
-per phase and journalled `phase.resume-at-boot` — with Settings ▸ Automation ▸ *Resume at boot* off the
+per phase and journalled `phase.resume-automatic` with its `trigger` and `path` — the same gate and
+counter every automatic resume passes (an overdue wait, a lock-cap re-arm, a shutdown between lanes, a
+hand session's `partial`) — with Settings ▸ Automation ▸ *Resume at boot* off the
 run waits for a person with one errand naming exactly that; a lock-cap park re-arms when the lock it
 waited out is gone (`phase.lock-cap-rearmed`; the live loop does the same at the top of every tick);
 and a shutdown between phases simply continues. Then the **healer** (`maybeAutoRecover`: classify the
@@ -194,7 +267,10 @@ open phases, climb one rung, drive it through the runner) — once per evidence:
 nothing remembers the evidence fingerprint and does not re-read it until something changes. What it
 never touches: a run the **operator** paused or stopped (`stoppedBy: 'operator'` — Pause, Stop, an
 escalated freeze; for records written before the field, any pause), a **resolved** run, a live one, a
-run waiting on its own clock, a `finished` or `queued` one. `--no-converge` keeps the automatic
+run waiting on its own clock, a `finished` or `queued` one — and it never relaunches a run halted
+`failure-streak` or `credential-refused` (`PRESS_ONLY_HALT_KINDS`): only a person's press does, a
+relaunch that reaches the runner with the streak spent is refused (`run.relaunch-refused`), and the
+healer still climbs that run's phases. `--no-converge` keeps the automatic
 triggers off (a bare harness has them off by construction); the operator's press still converges. Every
 pass that acts journals `run.converge` on the run it acted on. `POST /api/run/<slug>/recover` answers
 `outcome: 'errand'` with the `Errand` body — what is needed and how to give it — wherever nothing
@@ -214,7 +290,10 @@ journal all apply; needs only `--allow-run`). The pty agent remains for plan-sha
 unrunnable §Verification, a failing `validate.sh`) under `--allow-agent`, and as the manual
 fallback. A recovery that finds nothing wrong records `no-defect` — the halt stands down without
 inventing `done` — and a recovery finishing under a live loop hands its verdict to the loop instead
-of being skipped.
+of being skipped. A per-phase recovery (`POST /api/run/:slug/recheck`, `closeout` or `resume-phase`)
+is refused with 409 and journalled `run.recover.refused` when the evidence has not moved since the
+last one (`unchanged`) or the phase has had `RECOVER_MAX_PER_PHASE` (6) already (`capped`); a Retry
+clears the count.
 
 **Cross-plan locks.** A foreign unexpired lock — another plan's run, a manual session, another
 machine via the git-synced lock files — queues the phase behind the holder (named on the queue page
@@ -230,21 +309,49 @@ in it, and a lane doing nothing at all told the healer "something changed" every
 
 The park and lock knobs are runner constants, deliberately not in `scripts/sizing.env` (F5
 single-sources numbers both bash and TS read; bash never reads these): `WAIT_DEFAULT_MS` 30 min,
-`WAIT_MAX_PER_PHASE` 4, `WAIT_BUDGET_MS` 8 h, `LOCK_WAIT_CAP_MS` 2 h, `LEASE_REFRESH_MS` 10 min,
-`RUNNER_LEASE_S` 90 min — all defined in `server/runner/runner-core.ts` (re-exported through
-`runner.ts`).
+`WAIT_MAX_PER_PHASE` 4, `DEFAULT_WAIT_BUDGET_MS` 8 h (a default the plan overrides),
+`WATCHDOG_PARKS_MAX_PER_PHASE` 4, `WAIT_SETTLE_GRACE_MS` 10 min (a `waiting` record whose clock
+nothing will fire is settled after it), `DECLARED_CLOCK_MAX_MS` 7 d (the ceiling on a
+`blocked`/`needs-human` `--until`), `DECLARATIONS_MAX_PER_PHASE` 4 per declared word,
+`DECLARATION_COOLDOWN_MS` 5 min (a second unsupervised `partial` inside it collapses into the first),
+`LOCK_WAIT_CAP_MS` 2 h, `LEASE_REFRESH_MS` 10 min, `RUNNER_LEASE_S`
+90 min — the wait knobs beside `evaluateWait` in `server/runner/wait-budget.ts`, the rest in
+`server/runner/runner-core.ts` (all re-exported through `runner.ts`). The watch clock's re-offer
+series after a rejected landing is `WATCH_REDELIVER_SERIES_MS` (1, 2, 5, 15, 30 min) in
+`server/watch-refs.ts`; `watchMintedCmdRefs` (Settings ▸ Automation, off) is the switch that lets a
+console-minted `cmd:` ref run at all.
+
+**Every session is capped and booked, whoever ends it.** Every `claude -p` the runner starts goes
+through one door (`RunnerBase.spawnSession`), carries both `--max-turns` and `--max-budget-usd`,
+and writes one `phase.session` record of one shape. The caps come from the run's `phaseBudgetUsd`
+when it set one, else the phase's `Size:` through `SESSION_CAPS_BY_SIZE` — S $25 / 150 turns,
+M $60 / 300, L $120 / 600; side sessions (closeout, repair, QA, PR, review) take a quarter of the
+dollars and `CLOSEOUT_MAX_TURNS` 60 or `REPAIR_MAX_TURNS` 90 — and a cap the CLI reports spent
+resumes the same session under double it. A deliberate ending asks the turn to close first:
+SIGINT, then `INT_GRACE_MS` 5 s, then SIGTERM, then SIGKILL, so the CLI writes the `result` that
+books the session's turns and dollars. `spawn.ts`'s own clocks are `SPAWN_FIRST_EVENT_MS` (20 min
+with no output) and `SPAWN_INIT_IDLE_MS` (55 min silent between `init` and the first `result`).
+Defined in `server/runner/session-record.ts`, `server/runner/signals.ts` and
+`shared/attention-model.js`. Every child is also started with `CLAUDE_CODE_MAX_RETRIES` 15,
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` 600000 and `CLAUDE_CODE_RETRY_WATCHDOG` 1 (`childEnv` in
+`server/runner/errors.ts`) — an inherited value wins — and `phase.retry-ceiling` journals which
+ceiling it ran under and where that came from.
 
 **A lane waiting on somebody else's clock parks itself.** A `Bash` call matching the shared
 external-clock vocabulary — `EXTERNAL_WAIT` in `scripts/verify.env`, the same list lint F16 warns
 from at plan time — open past `stallExternalWaitMs` (5 min, `STALL_DEFAULTS`) raises the
-`external-wait` stall signal, and that signal is the ONE that acts: the phase parks through the same
+`external-wait` stall signal, and that signal acts rather than only telling: the phase parks through the same
 `parkWaiting` a declared `waiting-external` uses, **its lock is released**, and its own session is
 resumed when the window elapses. The vocabulary is deliberately one string in one file read by two
 languages, so what the lint warns about at plan time is exactly what gets parked at run time
 (`viewer/test/verify-env.test.ts` runs both engines over the same inputs). Measured: a phase held an
 exclusive claim on a whole repository for 35+ minutes inside two poll loops, invisible to every
 surface — no stream event arrives while a Bash call is open, and the keepalive above kept the lock
-looking healthy.
+looking healthy. Whose clock it is decides the remedy: a call waiting on the session's own background
+job — a suite, a build, a log it started — is steered once to background the job and carry on
+(`LOCAL_JOB_NUDGE`), and parks only past the far longer `stallLocalJobMs` (45 min,
+`STALL_LOCAL_JOB_MS`). With Settings ▸ Automation's **Park a waiting lane by itself** off
+(`stallAutomaticPark`, on by default) the watchdog parks nothing and the stall card stays for a person.
 
 **The run drives to plan completion.** The board is re-read after every phase, so work a finishing
 phase unlocks starts itself — the queue only ever shows what can run *now*, and the **Waiting** tab
@@ -252,7 +359,8 @@ beside the session tabs shows the rest: each dependency-waiting phase with exact
 so phases 10 and 11 of an 11-phase plan never look abandoned while 7 and 9 run. The run ends when
 the whole graph is done, or parks naming precisely what still needs a person. Pressing Start or
 Continue also restores the consecutive-failure budget — an operator back in the loop is the same
-signal a phase succeeding is.
+signal a phase succeeding is. Only a press does: an automatic relaunch keeps the count, and the reset
+is journalled `run.failure-streak-reset` with what it was.
 
 **What a phase runs as** is resolved from three places, in this order: what you chose for this run,
 then the plan's own `**Model:**` / `**Effort:**` bullets for that phase, then the run's defaults —
@@ -336,9 +444,13 @@ went nowhere is otherwise indistinguishable from one that worked.
 *In this tab* is the Notification API: free, instant, and gone with the tab. *On this device* is a
 push subscription — a service worker and a VAPID keypair, so the notification arrives with the
 console closed and the phone locked. Both are in **Notifications → Settings**, per device, across
-twelve categories: permission needed, a phase needs you, run halted, run parked or waiting, phase
-finished or failed, plan finished, work became ready, plans changed on disk, a session ended,
-console problems, usage limits, usage climbing. Only the first three are sent urgent.
+sixteen categories: permission needed, a session waiting on you, a phase needs you, a gate needs a
+person, a QA verdict owed or failed, run halted, run parked or waiting, nothing is happening, phase
+finished or failed, plan finished, work became ready, plans changed on disk, a session ended, console
+problems, usage limits, usage climbing. Five are sent urgent: permission needed, a session waiting on
+you, a phase needs you, a QA verdict owed or failed, and run halted. A push names the console it came
+from — its title ends `· <console>` — and a delivery that found no subscribed device, or none taking
+that category, is recorded `no-device` rather than dropped silently.
 A **Send a test** button goes out through the real push service and back, so it proves the chain
 rather than the last hop. An approval notification carries **Allow** and **Deny** as notification
 actions, so answering from a lock screen is one tap.
@@ -389,16 +501,35 @@ with who did it, takes effect at the hook on the *next tool call*, and reaches t
 next phase — the running child cannot reload its own settings, and the console says so rather than
 implying otherwise. A run on anything but Guarded carries a banner for as long as it is in force.
 
+**A question is not an ask, and no profile silences one.** `AskUserQuestion` is its own class
+(`QUESTION_CLASS`), checked right after deny and before the ask list, so emptying the ask list under
+Trusted or Bypass never turns a question into a silent allow. The hook holds it: with a relay armed
+the question becomes a card (*When nobody answers*, below); without one the policy table's
+`ambiguity` row answers — under its default, `ruling`, the session is told to decide from the plan,
+record a ruling and carry on, and under any other answer to declare `needs-human` and stop —
+journalled `phase.policy-answered` with `class: 'question'`. A session the relay does not arm is
+started with `--permission-prompts none`: anything that would prompt is denied with the session told
+nobody can approve, `AskUserQuestion` is removed and elicitations are cancelled. A CLI known to
+predate the flag (`PERMISSION_PROMPTS_CLI_FLOOR`, 2.1.259) gets no flag and the run journals
+`run.permission-prompts-skipped` once; an unknown version still gets it, so an old CLI fails loudly at
+spawn rather than dropping the floor unnoticed.
+
 ### Auto-grant: who answers the ask list
 
 Since 2026-08-23 the console **answers ask-list cards itself by default**: the ask still happens —
 the classifier still says ask, the hook still holds — but the answering hand is the console's. Every
 auto-granted card is recorded in the approvals history (`decided by auto-grant`) and journaled
-(`phase.tool-auto-granted`), so nothing is asked less; it is only waited on less. The deny list is
-untouched, a wrapper hiding something deny would stop still gets a person, and verification
-sign-offs and gates are never auto-granted. Three scopes, most specific wins: per phase (the launch
+(`phase.approval-auto-granted`, with the rule it matched), so nothing is asked less; it is only
+waited on less. The deny list is untouched, a wrapper hiding something deny would stop still gets a
+person, and verification sign-offs and gates are never auto-granted. **Publishing is never
+auto-granted either**: `git push` and `gh pr create` (`OPEN_PR_ASK`) wait for a person unless the
+plan's or the run's `permission.destructive` row names that rule as an exception — a grant under one
+is announced, *Published under a plan exception*, and its journal line carries the exception. Three scopes, most specific wins: per phase (the launch
 dialog's per-phase **More** panel) → per plan → everywhere (Settings ▸ Permissions), default ON.
-Turn it off at any scope and those cards wait for a person exactly as before.
+Turn it off at any scope and those cards wait for a person exactly as before. Insights' **Cards
+raised** panel counts both sides since a date — raised for a person, answered by auto-grant, waiting
+now, last raised — from the same counts `/api/state` serves as `approvals` (`raised`, `autoGranted`,
+`since`, `lastRaisedAt`, `pending`).
 
 ### Writing a rule from the card that interrupted you
 
@@ -451,20 +582,49 @@ The edges are surfaced in the UI because each has cost someone an afternoon:
 
 A tool card waits **an hour**, not ten minutes. At ten, a real overnight run had a commit refused
 because everyone was asleep — the worst outcome available, since the work was done and the session
-was told "no" for a reason that was really "you were away". The hook is still answered before its own
-timeout (silence fails open), but a timeout now **parks the run** instead of letting the session treat
-the refusal as a verdict about the work: `run.parked`, failure counter untouched, phase retryable the
-moment the card is answered.
+was told "no" for a reason that was really "you were away". While a card is open the run reads
+`waiting` on a person (`run.waiting-person`, naming the card and its deadline) rather than running.
+The hook is still answered before its own timeout (silence fails open), but a timeout **parks the
+run** with kind `awaiting-person` instead of letting the session treat the refusal as a verdict about
+the work: `run.parked`, no failure charged, phase retryable the moment the card is answered.
+
+**A card outlives a restart when its session does.** At boot the console adopts a surviving child's
+hook token from its settings file and puts its answerable tool cards back to pending; a card that can
+no longer be answered reads `unanswerable` — the word that replaced `expired` — with its reason:
+`session-gone`, `token-lost`, `asker-gone`, `reoffered` or `hook-closed`. An answer a person gives a
+recovered card is kept, once, and handed over when the session repeats the call.
+
+**A question gets a minute, then a rule.** The launch form's *Decisions* stage asks each run for its
+relay: `off` (the console never answers a question on a person's behalf) or `last-resort` (a person is
+paged first; after 60 s the console answers by rule). Under `last-resort` a phase session on a CLI at
+or past `RELAY_CLI_FLOOR` (2.1.268) is armed (`run.relay-armed`; `run.relay-refused` names
+`below-floor` or `version-unknown`), and a question it asks becomes a **question card** — on the run
+page, as an inbox `question` row counting down, and as a push, *A session asks — answered by rule in
+60 s unless you do* — with one button per option. A person has `RELAY_WINDOW_MS` (60 s); after that the
+console answers by a relay rule, else the sole `(Recommended)` option, else the first
+(`phase.question-answered`), tells the session nobody answered and that this is not a change to the
+phase, and appends a ruling. Relay rules live in Settings ▸ Automation ▸ Policy answers ▸ **Relay
+rules** (`relayRules`; none shipped, at most 50): a glob over the question's key, the tool
+(`AskUserQuestion` unless named), the run profile (`*` for any) and the option to answer, matched
+exactly or as a unique prefix. A question the relay will not answer by rule — `QUESTION_EXCLUSIONS`
+(`deny-list`, `multi-select`, `destructive-option`, `run-stopped`, `repeated-key`), or one past
+`RELAY_QUESTIONS_PER_PHASE` (8) in a phase — parks the phase `needs-human` and pushes *A question
+needs you*.
 
 The runner will also not execute a verification command that reaches outside the working tree unless
 it can be shown read-only — `curl -X POST`, `ssh box 'systemctl restart …'` and `psql -c 'DELETE …'`
 all go to a person with the reason attached, while `docker ps` and `psql -c 'SELECT …'` still run.
 
-Sessions **outside** the autopilot — an agent session, or a `claude` you ran in a terminal — have
-their own channel: the machine-wide session hook now forwards the CLI's `Notification` events, so a
-session stopped at a permission prompt or waiting for input shows up as a **Session ask** in the
-inbox, on the Sessions list, on the top bar's waiting-on-you chip, and as a push
-(**Session waiting on you**). The console cannot answer those for you — the card says where to go.
+Every Claude session the hook reports — an agent session, a `claude` you ran in a terminal, and since
+5.0.0 an autopilot lane — has a second channel: the machine-wide session hook forwards the CLI's
+`Notification` events, so a session stopped at a permission prompt or an elicitation shows up as a
+**Session ask** in the inbox, on the Sessions list, on the top bar's waiting-on-you chip, and as a push
+(**Session waiting on you**); a lane that already has a card pending for its phase is not pushed twice
+(`sessions.ask-suppressed`). A row correlated to a lane this console drives answers in place —
+**Answer it** steers the lane with your words; for any other session the row says to go to the
+terminal it runs in, because the console cannot answer for it. The registry keeps each episode as the
+session's `lastWait` (`answered`, `ended` or `unanswered`) and closes one nobody answered after
+`WAIT_ANSWER_CAP_MS` (60 min).
 
 ### What the healer reads first: the situation
 
@@ -473,8 +633,9 @@ picks a remedy from the halt kind alone. Every open phase is **classified** from
 already exists — the board line, the handoff's status and Outstanding text, the run's record and
 halt, the lock, the working tree of the repos the phase names, the gate, QA, MCP and health — into
 one **situation** (`viewer/shared/situation-model.js`: `never-started`, `work-in-progress`,
-`done-unrecorded`, `verify-red`, `blocked-declared:<lock|credential|gate|external|unknown>`,
-`waiting-external`, `gated-manual`, `plan-broken`, `mcp-unavailable`,
+`done-unrecorded`, `verify-red`, `blocked-declared:<lock|permission|credential|gate|external|unknown>`,
+`waiting-external`, `gated-manual`, `plan-broken` (`lint`, `unreadable`, `verification`, `issue`),
+`mcp-unavailable`,
 `resource-wall:<usage|auth|budget|model>`, `foreign-live`, `foreign-stale`, `qa-pending`,
 `qa-failed`, `superseded`, `unknown`). A **remediation ladder** (`server/runner/ladder.ts`) then
 names the next rung for that situation — never the same rung twice on one phase, bounded per
@@ -535,8 +696,9 @@ Three consequences worth knowing before touching this:
 **Session presence — the hook.** The console also knows about sessions it did not start. A
 user-scope Claude Code hook (`scripts/session-hook.sh`, installed from Settings ▸ Automation ▸ Session presence or
 `phase-console install-hooks` / `uninstall-hooks` / `hooks-status`; it edits `~/.claude/settings.json`
-by merging three entries and never touches another key) reports every Claude session on the machine
-whose working directory a console owns — SessionStart, each finished turn, SessionEnd — to that
+by merging four entries and never touches another key) reports every Claude session on the machine
+whose working directory a console owns — SessionStart, each finished turn, a prompt it stops at
+(Notification), SessionEnd — to that
 console (`POST /hooks/session`, loopback only), or into the instance's inbox when it is down. The
 registry (`GET /api/sessions/registry`, and the Pulse) lists them with a three-valued presence:
 *live*, *ended*, *unknown*. A phase lock that names its session (`phase-lock.sh --session`, or the
@@ -547,6 +709,17 @@ lease; a live session's lock is a queue to wait in; a lock nobody reports keeps 
 `runs/<instance>/<slug>/outcomes/`, where the console picks it up: a `waiting-external` parks the
 phase and resumes that very session at the window, a `partial` boards it again with a resume. Off by
 default — installing the hook is the operator's choice.
+
+A presence is a claim the console settles against the process: an end the hook reported is
+`endedBy: 'hook'`, and one the probe found — the process gone with no `SessionEnd` — is
+`endedBy: 'probe'`, dated at the last evidence of life and shown as `ended · inferred`. The console's
+own MCP health probes run with `PHASE_CONSOLE_PROBE=1`, and the registry keeps them out of every
+session view. When no console is up the hook's events wait in the instance's inbox, and
+`phase-console sessions ingest [instance]` drains them by hand — it does nothing while that instance's
+own console answers, and the hook itself runs it after a POST that did not arrive — applying an event
+older than 10 minutes as history (no push, no lock reaction), refusing one older than 7 days, and
+taking `sessions/inbox.lock` so two drains never race. A session a run started also shows, on its
+vitals, the door it came through and who ended it at what cost.
 
 **And a reported session is a terminal you can open.** The list could once only say a foreign session
 *existed*: the row built no id, so `#/sessions/<id>` resolved to nothing. A foreign row now carries
@@ -597,7 +770,8 @@ phase. **The session records the verdict with `qa-record.sh`; the console only r
 `test-status.md` is re-read on exit and compared with a snapshot taken at launch, so a session that
 ended without recording one is reported as exactly that.
 
-Both ride `POST /api/terminal` behind `--allow-agent`; neither adds a route. `permissionProfile`
+Both ride `POST /api/terminal` behind `--allow-agent`; neither adds a route, and a prompt past
+`MAX_AGENT_PROMPT_BYTES` (32 KB) — typed or composed — is refused with 400. `permissionProfile`
 (`guarded` | `bypass`) is accepted **only** with a review and refused on every other agent session.
 Turning QA on for a plan (`POST /api/plans/:slug/qa-mode`, `--allow-writes`) goes through the
 skill's own `--qa` path, which waives the already-finished phases rather than gating them.
@@ -742,9 +916,10 @@ and every per-model window the usage endpoint reports (Opus, Fable, … — rend
 window that ships tomorrow appears tomorrow), per account, with reset countdowns. The compact bars
 read the **worst window across every account**, naming the account supplying the number — a second
 account walking into its wall must never hide behind a green machine-login meter — and the dialog
-behind them holds the per-account truth. The numbers are the same ones `/usage` shows (polled
-gently, cached, served stale with their age attached when the endpoint is unreachable), and they
-work with no flag at all.
+behind them holds the per-account truth. The numbers are the same ones `/usage` shows — polled
+every 90 s while a run is spending the account and every 10 minutes otherwise (`USAGE_ACTIVE_MS`,
+`USAGE_IDLE_MS`; a 429 backs off harder than other failures), cached, and served stale with their age
+attached when the endpoint is unreachable — and they work with no flag at all.
 
 `--allow-accounts` turns on **registration**, and the account registry is the console's own.
 Sign a second Claude account in (a managed `CLAUDE_CONFIG_DIR` profile — the console opens a
@@ -762,6 +937,33 @@ raises a *Sign in again* notification, badges the account in Settings and the me
 page's sign-in card names the right account with the right command — a run pinned to a profile is
 preflighted **as that profile**, so an expired one refuses before spending a session rather than
 burning one per phase discovering it.
+
+**What the console learns about a login outlives the console that learned it.**
+`accounts/learned.json` under the machine's state home — one file for every console, 0600, written
+atomically under a lock — keys each credential by a fingerprint and remembers its organisation, the
+walls it hit, its entitlement and when it last worked; the browser only ever sees a hashed `orgId`.
+Entitlement is a breaker (`ENTITLEMENT_STATES`: `unknown`, `entitled`, `cooling`, `retired`). A read
+that works promotes `unknown` to `entitled`. A usage wall cools the account until the wall's reset, or
+for `ACCOUNT_COOLDOWN_MS` (30 min) when the reset cannot be read, and a cooling account is out of the
+`auto` rank until then. A credential-class refusal (`org-policy`, `auth`, `billing`, `certificate`)
+**retires** the account and its organisation with it, so every login of that organisation reads
+`unusable`; the run journals `run.account-retired`, announces *Account retired*, and halts
+`credential-refused`, which only a person's press relaunches. A retired account is refused at start by
+name and at every boarding (`run.admission-refused`) until `POST /api/accounts/:id/clear-retired`
+(`--allow-accounts`) clears the organisation and every sibling — a new organisation on the same
+credential reopens it by itself. A removed account leaves a tombstone, so a journal that names it
+still reads `<name> (removed)`; `GET /api/accounts` serves them as `tombstones`, and each account's
+`breaker` says whether it is a rank candidate and, if not, why and until when.
+`POST /api/accounts/:id/probe-entitlement` (`--allow-accounts`) tests an account with one capped
+one-turn session (haiku, `--max-budget-usd 0.05`) that counts toward the start ceiling — a failure
+retires it, a success promotes `unknown` to `entitled`.
+
+**Before a run spends, and at the wall.** The start door ranks accounts by headroom and refuses one
+that is retired, walled in a learned bucket, or at `PREFLIGHT_REFUSE_PCT` (97 %) of its 5-hour window —
+trying the next and, with none left, parking the run with an errand (`run.preflight-refused`). Mid-run
+an account at `WALL_PCT` (99 %) is out of the rank, and a run whose on-limit policy twice finds no move
+inside an hour (`LIMIT_NONE_MAX` in `LIMIT_NONE_WINDOW_MS`) hands the phase to the ladder as
+`resource-wall:usage`: it waits out the window or parks with an errand (`phase.live-wall`).
 
 Every launch surface — the run form, the phase launcher, the recovery and QA dialogs, the agent
 launcher — then offers an **Account** choice (including `auto`, most 5-hour headroom) and, for
@@ -784,6 +986,7 @@ account, so runs paying with a different one keep flowing. Everything is journal
 wall that is actually hit and every login that needs signing in again, and the 80/95% early warning
 is its own off-by-default category, *Usage climbing*.
 
+
 ## MCP servers
 
 Sessions can call tools you attach: a browser, an issue tracker, a documentation server. The
@@ -801,7 +1004,9 @@ Before a phase boards, the console probes the exact set it would run with — a 
 `claude -p --strict-mcp-config --mcp-config <set>` whose `system/init` reports each server's real
 status before any model call. That matters because an unattended session cannot fix a wall itself:
 there is no `/mcp` panel in `-p`, and the CLI reports the missing tools to the *model*, which then
-improvises around them.
+improvises around them. The preflight shares the health clock's cache and single flight
+(`HEALTH_TTL_MS`, 5 min), so a set probed in the last five minutes is not probed again, and the
+probe's own session carries `PHASE_CONSOLE_PROBE=1`, which keeps it out of every session view.
 
 **What it does about a wall is a policy, and the default is to carry on.** The phase boards with the
 servers that answered, its prompt names the ones it did not get and instructs it neither to
@@ -823,6 +1028,10 @@ stopped.
 The spawn always pairs `--mcp-config` with `--strict-mcp-config`, so the resolved set is the whole
 set — without it the CLI would union in whatever `~/.claude.json` and the project's `.mcp.json`
 happen to hold, and the run would be talking to servers nobody chose for it.
+
+A **token** account's `CLAUDE_CODE_OAUTH_TOKEN` is inherited by every stdio server a session starts,
+so a run paying with one keeps only the stdio servers the plan itself declares — remote servers are
+always kept — and journals `run.token-scope` with what it kept and dropped.
 
 Three kinds of credential, and the console holds one. **OAuth** goes through
 `claude mcp login <id> --no-browser` in a terminal, and the token stays in the CLI's own store — a
@@ -908,6 +1117,11 @@ tailscale serve --bg --https=443 http://127.0.0.1:4123
 | `--remote <host>` | Also answer to this hostname, fronted by an authenticating proxy. Repeatable. Turns on strict `Host` checking. |
 | `--remote-user <login>` | A login allowed to arrive that way. Repeatable, or `PHASE_CONSOLE_REMOTE_USERS`. Required by `--remote`; without one the console refuses to start. |
 
+Neither flag is needed when the machine profile says it: `remoteHost` and `remoteUsers` in
+`~/.config/phase-console/fleet.json` are inherited as a pair — per field, a flag or environment
+variable first, then this console's own override in that file, then the machine's value — and so are
+`notifyCommand`, `webhooks`, `categories` and `quietHours`.
+
 Naming a hostname means exactly two kinds of request are served: a loopback `Host` with no identity
 header (you, at this machine) and the named hostname with an allowlisted login (you, through the
 proxy). Everything else is refused — including a proxied request asking for a loopback `Host`, which
@@ -919,11 +1133,21 @@ request is treated exactly as it was before.
 network interface, anyone could send the header themselves. `--remote` deliberately does not widen
 `--host`; the [Tailscale documentation][serve] makes the same point.
 
+A request through the proxy is attributed to its login: the verified `Tailscale-User-Login` becomes
+the actor's `remoteUser`, and its `by` unless the request body names a label of its own — a label is
+only ever that, and `via`, `origin` and `remoteUser` cannot be set from a body — so a press from a
+phone journals as the person who made it.
+
+`tailscale serve --https=443` is the default console's. Any other console's HTTPS port is its own port
+plus 4000 (`httpsPortFor`), and the Serve command the console composes (`serveCommandFor`) never takes
+a port a running console already serves: it names that occupant and offers another port.
+
 **The full setup** — the two admin-console switches, the phone, the Home Screen install that iOS
 notifications require, out-of-band alerts, access rules and a troubleshooting table — is in
 [docs/phone.md](../docs/phone.md).
 
 [serve]: https://tailscale.com/docs/features/tailscale-serve
+
 
 ## What a page costs
 

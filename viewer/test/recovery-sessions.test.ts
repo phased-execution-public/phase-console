@@ -997,6 +997,9 @@ async function driveRepair(opts: {
         // throw on abort — that is the whole trap).
         if (opts.stopDuringSession) {
           (runner as never as Record<string, unknown>).stopRequested = true;
+          // What `stop(actor)` records beside the flag since phase 7: who asked.
+          // Poked with the flag, or the note reads `stopped by unattributed`.
+          (runner as never as Record<string, unknown>).stopActor = { by: 'operator', via: 'api', origin: 'local', remoteUser: null };
           const live = runner.current();
           if (live) live.status = 'stopping';
         }

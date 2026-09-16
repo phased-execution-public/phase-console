@@ -49,6 +49,12 @@ export type FleetHold = {
   at: string;
   /** Who pressed it — an operator name, `console`, or an API caller's `by`. */
   by: string;
+  /**
+   * `machine` on a hold a supervisor wrote for every console of the machine;
+   * absent on this console's own marker. Never written to disk — the file a
+   * record came from is what says which it is.
+   */
+  scope?: 'machine';
 };
 
 /**
@@ -59,9 +65,14 @@ export type FleetHold = {
  * `at` — answers "not frozen".
  */
 export function readFleetHold(): FleetHold | null {
+  return readHoldFile(FLEET_FREEZE_FILE);
+}
+
+/** One marker file, read with the tolerance note 3 describes. */
+function readHoldFile(file: string): FleetHold | null {
   let raw: string;
   try {
-    raw = readFileSync(FLEET_FREEZE_FILE, 'utf8');
+    raw = readFileSync(file, 'utf8');
   } catch {
     return null;
   }
@@ -73,7 +84,7 @@ export function readFleetHold(): FleetHold | null {
     const by = typeof parsed.by === 'string' && parsed.by ? parsed.by : 'console';
     return { at, by };
   } catch {
-    log.warn('fleet.freeze-unreadable', { file: FLEET_FREEZE_FILE });
+    log.warn('fleet.freeze-unreadable', { file });
     return null;
   }
 }
@@ -108,3 +119,4 @@ export function clearFleetHold(): void {
     throw new Error(`the freeze marker could not be removed (${FLEET_FREEZE_FILE}) — the console is still frozen`);
   }
 }
+

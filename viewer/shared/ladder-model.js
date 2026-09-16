@@ -63,12 +63,26 @@ export const RUNG_VEHICLES = Object.freeze(
     'poll-park',
     /** Park for a bounded time, then re-evaluate. */
     'timed-park',
-    /** Re-check the declared watch refs after a wait elapsed. */
-    'recheck-watch',
+    /**
+     * The watch clock — `watch-scheduler.ts` — polling the declared refs on its
+     * own cadence and resuming the phase's own session the moment one lands.
+     * Named as the mechanism it is (zero-touch-console phase 10, RCV-10): the
+     * row used to read `recheck-watch`, a rung no driver owned, while the work
+     * it promised was done out of band — 0 climbs against 222
+     * `phase.watch-checked`. A table must not print a rung nothing owns.
+     */
+    'watch-clock',
     /** Wait a bounded time for an MCP server to heal. */
     'wait-heal',
     /** Set the run's MCP policy to continue and re-board the parked phases (exists). */
     'mcp-continue',
+    /**
+     * Offer the deny rule that refused a tool call as an approval card; an
+     * approval strikes that rule for this plan and resumes the phase's own
+     * session with the command to re-run. Nothing spends until a person
+     * answers (zero-touch-console phase 9, TRS-10/LFC-3).
+     */
+    'widen-rule',
   ]),
 );
 
@@ -93,6 +107,161 @@ export const RUNG_VEHICLES = Object.freeze(
  */
 const R = (vehicle, label, blurb, spends, params) =>
   Object.freeze({ vehicle, label, blurb, spends, ...(params ? { params: Object.freeze(params) } : {}) });
+
+/* ------------------------------------------------------------------ *
+ * Who can drive a vehicle
+ * ------------------------------------------------------------------ */
+
+/**
+ * Who drives a vehicle, in one word — the ladder's drivability column
+ * (zero-touch-console phase 10, LFC-2/RCV-10). The audit found half the
+ * vehicles never climbed and six whole tables undrivable, while every surface
+ * printed them as the ladder; a row now states its driver, so no surface
+ * promises a rung nothing owns:
+ *
+ *   - `console` — the console itself: the runner's own boarding or resume,
+ *     a park on a clock it arms, an account it picks, a card it offers.
+ *     Costs nothing beyond the phase's own session (`--allow-run`).
+ *   - `writes`  — the console, but only started with `--allow-writes`: the
+ *     deterministic repair edits work-state.
+ *   - `agent`   — a fresh briefed session or pty agent (`--allow-run`, else
+ *     `--allow-agent`): the "new agent" rungs and the stale-claim takeover.
+ *   - `never`   — operator-only: no console drives it; the table row is a
+ *     person's instruction, and `VEHICLE_DRIVERS[vehicle].how` says why.
+ */
+export const RUNG_DRIVERS = Object.freeze(/** @type {const} */ (['console', 'writes', 'agent', 'never']));
+
+/** @typedef {(typeof RUNG_DRIVERS)[number]} RungDriver */
+
+/** The driver words as a card prints them. */
+export const RUNG_DRIVER_LABELS = Object.freeze({
+  console: 'the console drives it',
+  writes: 'the console drives it under --allow-writes',
+  agent: 'a fresh session or agent drives it (--allow-run, else --allow-agent)',
+  never: 'operator-only — no console drives it',
+});
+
+/**
+ * Every vehicle's driver and HOW it is driven — one row per `RUNG_VEHICLES`
+ * member, held total by `test/ladder.test.ts`. `how` is the mechanism in a
+ * sentence: what the console actually does when the rung is climbed, or, for
+ * `never`, why only a person can.
+ * @type {Readonly<Record<RungVehicle, Readonly<{ by: RungDriver, how: string }>>>}
+ */
+export const VEHICLE_DRIVERS = Object.freeze({
+  'reboard-fresh': Object.freeze({
+    by: 'console',
+    how: 'the runner resets the record and boards the phase from its boot prompt (`retryPhase`)',
+  }),
+  'resume-own-session': Object.freeze({
+    by: 'console',
+    how: "the runner resumes the phase's own session with an instruction (`claude -p --resume`)",
+  }),
+  'reboard-resume-brief': Object.freeze({
+    by: 'console',
+    how: 'the runner boards fresh with the resume brief appended to the boot prompt',
+  }),
+  'unblock-session': Object.freeze({
+    by: 'console',
+    how: 'the runner resumes (or boards fresh with) an unblock brief — one bounded session, `unblockAttempts` permitting',
+  }),
+  'closeout-own-session': Object.freeze({
+    by: 'console',
+    how: "the runner resumes the phase's own session to verify, commit and write the handoff",
+  }),
+  'closeout-agent': Object.freeze({
+    by: 'agent',
+    how: 'a fresh briefed repair session (or pty agent) writes the handoff the phase never wrote',
+  }),
+  'fix-agent': Object.freeze({
+    by: 'agent',
+    how: 'a fresh briefed repair session (or pty agent) at a stronger model fixes what is red; the QA review rides the QA loop',
+  }),
+  'plan-repair-script': Object.freeze({
+    by: 'writes',
+    how: 'the console runs scripts/repair-artefacts.sh --apply, which edits INDEX.md, handoff frontmatter and lock files',
+  }),
+  'plan-repair-agent': Object.freeze({
+    by: 'agent',
+    how: 'a fresh briefed repair session (or pty agent) edits the plan until validate.sh passes',
+  }),
+  'switch-account': Object.freeze({
+    by: 'console',
+    how: 'the runner continues under the registered account with the most headroom (`pickAccount`); on a stopped run the healer moves the run and relaunches it',
+  }),
+  'switch-model': Object.freeze({
+    by: 'console',
+    how: 'the runner fails over to the next model in the fallback chain at the wall, in the attempt loop (`phase.model-switch`)',
+  }),
+  'wait-window': Object.freeze({
+    by: 'console',
+    how: "the runner parks the phase on the window's reset at the wall; on a stopped run the healer parks the run on the account's recorded reset and re-arms the clock",
+  }),
+  'raise-budget': Object.freeze({
+    by: 'console',
+    how: 'the run budget is raised once by `budgetAutoRaisePct` within the per-run ladder cap — inline at the wall, or by the healer on a halted run',
+  }),
+  'stale-claim-takeover': Object.freeze({
+    by: 'agent',
+    how: 'a fresh briefed repair session (or pty agent) takes the expired claim, `staleClaimTakeover` permitting',
+  }),
+  queue: Object.freeze({
+    by: 'console',
+    how: 'the runner re-boards the phase and the scheduler queues it behind the lock holder',
+  }),
+  'poll-park': Object.freeze({
+    by: 'console',
+    how: 'the healer parks the phase on its machine-checkable refs; the watch clock polls them and resumes the own session when they land',
+  }),
+  'timed-park': Object.freeze({
+    by: 'console',
+    how: "the healer parks the phase on a bounded clock and re-arms the resume; at the clock the phase's own session re-checks its blocker",
+  }),
+  'watch-clock': Object.freeze({
+    by: 'console',
+    how: 'the watch scheduler polls the declared refs on its own cadence and resumes the own session on a landing; a re-check runs one pass now',
+  }),
+  'wait-heal': Object.freeze({
+    by: 'console',
+    how: 'the console holds the `require` park on its clock (`mcpRequireTimeoutMs`) and continues without the server when it runs out',
+  }),
+  'mcp-continue': Object.freeze({
+    by: 'console',
+    how: "the run's MCP policy is set to continue and the parked phases re-board without the server",
+  }),
+  'widen-rule': Object.freeze({
+    by: 'console',
+    how: 'the console offers the deny rule on a standing approval card; Allow strikes it for the plan and resumes the own session',
+  }),
+});
+
+/**
+ * Who drives `vehicle` — `never` for a vehicle the table does not know, so a
+ * rung written by a newer console reads as nobody's rather than as free.
+ * @param {string} vehicle
+ * @returns {RungDriver}
+ */
+export function drivableBy(vehicle) {
+  return VEHICLE_DRIVERS[/** @type {RungVehicle} */ (vehicle)]?.by ?? 'never';
+}
+
+/**
+ * The tables no console drives — every rung `never` — with the reason, for the
+ * ladder card and the errand (RCV-10). Empty today: every table has a driver
+ * since phase 10, and the registry exists so that a future operator-only row
+ * has one place to say why. Held against `VEHICLE_DRIVERS` by
+ * `test/ladder.test.ts`.
+ * @returns {Record<string, string>} situation key → why only a person can
+ */
+export function operatorOnlyTables() {
+  /** @type {Record<string, string>} */
+  const out = {};
+  for (const [key, rungs] of Object.entries(RUNGS_BY_SITUATION)) {
+    if (!rungs.length || !rungs.every((rung) => drivableBy(rung.vehicle) === 'never')) continue;
+    out[key] = rungs.map((rung) => `${rung.label}: ${VEHICLE_DRIVERS[rung.vehicle].how}`).join(' · ');
+  }
+  return out;
+}
 
 /* ------------------------------------------------------------------ *
  * The table
@@ -164,11 +333,16 @@ export const RUNGS_BY_SITUATION = Object.freeze({
       true,
     ),
   ]),
+  // A `wait` actor's table: the clock owns it, and the one row NAMES the clock
+  // rather than promising a rung (RCV-10). The healer never climbs a wait —
+  // `nextRung` is not asked for one — so the row is what a card says about
+  // who is working, in the mechanism's own words.
   'waiting-external': Object.freeze([
     R(
-      'recheck-watch',
-      'Re-check what it waits on',
-      'Reads the declared watch refs again after the wait elapsed; resumes the own session when they have landed. Free.',
+      'watch-clock',
+      'Watched by the clock',
+      "The watch clock polls the declared refs on its own cadence and resumes the phase's own session the moment " +
+        'one lands — a re-check on demand runs one pass now. Not a session; nothing spends. Free.',
       false,
     ),
   ]),
@@ -254,11 +428,25 @@ export const RUNGS_BY_SITUATION = Object.freeze({
     ),
   ]),
   'blocked-declared:credential': Object.freeze([]),
-  // A tool the run's permission policy refused. Empty on purpose: the wall is
-  // the operator's — a policy edit, or the step done by hand — and one unblock
-  // session walking into the same wall is exactly what this sub-kind was
-  // measured on (console-parallel-repaint P12).
-  'blocked-declared:permission': Object.freeze([]),
+  // A tool the run's permission policy refused. ONE rung, and a free one
+  // (zero-touch-console phase 9, TRS-10): the console puts the deny rule and
+  // the command it stopped on an approval card. Approving strikes that rule
+  // for this plan — the explicit confirm a deny-strike takes — and resumes the
+  // phase's own session; denying leaves the errand. It used to be empty, on
+  // the reasoning that the wall is the operator's, and it still is: the rung
+  // spends nothing and asks THEM. What it stops is the shape measured on
+  // console-parallel-repaint P12 and 267 times since — a permission wall read
+  // as `:unknown`, answered with an unblock session into the same wall.
+  'blocked-declared:permission': Object.freeze([
+    R(
+      'widen-rule',
+      'Offer the rule to widen',
+      'Puts the denied rule and the command it stopped on an approval card. Approving strikes that one rule for ' +
+        "this plan and resumes the phase's own session with the command to re-run; denying leaves the errand. " +
+        'Nothing spends until a person answers. Free.',
+      false,
+    ),
+  ]),
   'blocked-declared:gate': Object.freeze([]),
   'blocked-declared:external': Object.freeze([
     R(

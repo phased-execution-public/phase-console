@@ -17,8 +17,10 @@
  * journals nothing; the caller journals in its own voice.
  */
 
-import { errandFor } from './ladder.ts';
-import { mcpReasonText, resetForRetry, type Errand, type PhaseRecord, type RunState } from './state.ts';
+import { errandFor, rungSettledPayload, settleRungRecord } from './ladder.ts';
+import {
+  mcpReasonText, resetForRetry, type DeclarationSink, type Errand, type PhaseRecord, type RunState,
+} from './state.ts';
 
 /** Thirty minutes: long enough for a heal in progress, short enough to matter. */
 export const DEFAULT_MCP_REQUIRE_TIMEOUT_MS = 30 * 60 * 1000;
@@ -62,7 +64,7 @@ export type McpContinueResult = {
  * to do".
  */
 export function continueMcpParkedRecord(
-  state: RunState, phase: number, opts: { by: string; now?: Date },
+  state: RunState, phase: number, opts: { by: string; now?: Date; journal: DeclarationSink },
 ): McpContinueResult | null {
   const record = state.phases[String(phase)];
   if (!record || record.status !== 'parked' || !record.mcpPark) return null;
@@ -77,15 +79,27 @@ export function continueMcpParkedRecord(
 
   const key = String(phase);
   (state.phaseOptions ??= {})[key] = { ...(state.phaseOptions?.[key] ?? {}), mcpPolicy: 'continue' };
-  resetForRetry(record);
+  // A person's "Continue without it" is an operator's reset; the `require`
+  // timeout is the console's, and carries the watchdog's bound forward.
+  resetForRetry(record, { by: opts.by === 'operator' ? 'operator' : 'console', journal: opts.journal });
   record.boardingHint = { situation: 'mcp-unavailable', rung: 'mcp-continue', brief: 'fresh', at: nowIso, by: opts.by };
 
   const slot = ((state.recoveries ??= {})[key] ??= { attempts: 0, lastAt: nowIso });
+  // The wait rung was accounted while the clock ran when the healer visited
+  // the park (`driveWaitHeal`, phase 10) — settle THAT one in place; a park
+  // the runner's own timer flipped with no healer pass writes it here,
+  // retroactively, as before. Either way the ledger reads one `wait-heal`
+  // per park, settled `failed` (the server did not heal in time).
+  const waited = (slot.rungs ?? []).find((r) =>
+    r.rung === 'wait-heal' && r.situation === 'mcp-unavailable' && r.at >= park.at && (r.outcome === 'running' || r.outcome == null));
+  const waitNote = `waited ${minutes} min for ${servers.join(', ')}`;
+  if (waited) {
+    settleRungRecord(slot, waited, 'failed', undefined, waitNote);
+    opts.journal('phase.rung-settled', rungSettledPayload(waited), phase);
+  } else {
+    (slot.rungs ??= []).push({ situation: 'mcp-unavailable', rung: 'wait-heal', at: park.at, outcome: 'failed', note: waitNote });
+  }
   (slot.rungs ??= []).push(
-    {
-      situation: 'mcp-unavailable', rung: 'wait-heal', at: park.at, outcome: 'failed',
-      note: `waited ${minutes} min for ${servers.join(', ')}`,
-    },
     { situation: 'mcp-unavailable', rung: 'mcp-continue', at: nowIso, outcome: 'running', note: 'Continue without it' },
   );
   slot.lastAt = nowIso;

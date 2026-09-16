@@ -16,7 +16,9 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { groupSignal, killLadder, stopWhereItStands, wake, wakeAndTerm } from '../server/runner/signals.ts';
+import {
+  INT_GRACE_MS, groupSignal, interruptOnce, interruptedAt, killLadder, stopWhereItStands, wake, wakeAndTerm,
+} from '../server/runner/signals.ts';
 
 const SERVER = new URL('../server/', import.meta.url);
 const read = (rel: string): string => readFileSync(new URL(rel, SERVER), 'utf8');
@@ -29,27 +31,117 @@ function recorder() {
 
 const noSleep = async (): Promise<void> => {};
 
-test('killLadder: wake, ask, then insist — and the wake comes first', async () => {
+test('killLadder: wake, ask the turn to close, ask, then insist — and the wake comes first', async () => {
   const r = recorder();
-  // Alive throughout: the child ignores SIGTERM, so the ladder must escalate.
+  // Alive throughout: the child ignores SIGINT and SIGTERM, so the ladder must escalate.
   const how = await killLadder(99, { signal: r.signal, alive: () => true, sleep: noSleep });
 
-  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM', 'SIGKILL']);
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGINT', 'SIGTERM', 'SIGKILL'],
+    'SIGINT before SIGTERM: the CLI closes its turn (and writes the `result` that books its '
+    + 'turns and dollars) on SIGINT, and leaves it unfinished on SIGTERM — chapter 09 row 57');
   assert.equal(r.sent[0].signal, 'SIGCONT',
     'the wake is FIRST — a stopped process cannot act on anything else');
   assert.equal(how, 'killed');
 });
 
-test('killLadder: a child that goes on SIGTERM is never killed', async () => {
+test('killLadder: a child that closes its turn on SIGINT is never termed', async () => {
   const r = recorder();
   let alive = true;
-  const how = await killLadder(99, {
+  const how = await killLadder(98, {
     signal: r.signal,
     alive: () => alive,
-    sleep: async () => { alive = false; },   // it exits during the grace
+    sleep: async () => { alive = false; },   // it exits during the interrupt's grace
   });
-  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM']);
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGINT']);
+  assert.equal(how, 'interrupted');
+});
+
+test('killLadder: a child that ignores SIGINT but goes on SIGTERM is never killed', async () => {
+  const r = recorder();
+  let alive = true;
+  const how = await killLadder(97, {
+    signal: r.signal,
+    alive: () => alive,
+    // Stays through the whole interrupt grace, leaves in the SIGTERM grace.
+    sleep: async () => { if (r.sent.some((s) => s.signal === 'SIGTERM')) alive = false; },
+    interruptAfterMs: 300,
+  });
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGINT', 'SIGTERM']);
   assert.equal(how, 'exited');
+});
+
+test('killLadder: the SIGKILL backstop is awaited — the promise settles after the kill, not before', async () => {
+  const order: string[] = [];
+  const how = killLadder(96, {
+    signal: (_pid, signal) => { order.push(`sent ${signal}`); },
+    alive: () => true,
+    sleep: async () => { order.push('slept'); },
+    interruptAfterMs: 100,
+    killAfterMs: 100,
+  });
+  order.push('called');
+  assert.equal(await how, 'killed');
+  order.push('settled');
+  assert.equal(order.at(-2), 'sent SIGKILL', 'the kill is the last thing the ladder does before it settles');
+  assert.equal(order.at(-1), 'settled');
+});
+
+test('killLadder: both graces are polled — a child that leaves early releases the caller early', async () => {
+  const r = recorder();
+  let sleeps = 0;
+  let alive = true;
+  const how = await killLadder(95, {
+    signal: r.signal,
+    alive: () => alive,
+    sleep: async () => { sleeps += 1; if (sleeps === 3) alive = false; },
+    interruptAfterMs: 5_000,
+  });
+  assert.equal(how, 'interrupted');
+  assert.equal(sleeps, 3, 'the wait asked every 100 ms and stopped at the first answer, not after the grace');
+});
+
+test('killLadder: interrupt:false keeps the old ladder for a child with no turn to close', async () => {
+  const r = recorder();
+  const how = await killLadder(94, { signal: r.signal, alive: () => true, sleep: noSleep, interrupt: false });
+  assert.deepEqual(r.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM', 'SIGKILL']);
+  assert.equal(how, 'killed');
+});
+
+test('interruptOnce: one SIGINT per process, and a later ladder shares the first grace instead of asking again', async () => {
+  const first = recorder();
+  let clock = 1_000_000;
+  assert.equal(interruptOnce(93, { signal: first.signal, now: () => clock }), true);
+  assert.deepEqual(first.sent.map((s) => s.signal), ['SIGCONT', 'SIGINT']);
+  assert.equal(interruptedAt(93, clock), clock);
+
+  // The spawn's abort asked 4 s ago; a runner's ladder arrives now.
+  clock += 4_000;
+  const second = recorder();
+  assert.equal(interruptOnce(93, { signal: second.signal, now: () => clock }), false,
+    'asked already — a second interrupt is insistence, not a question');
+  let slept = 0;
+  const how = await killLadder(93, {
+    signal: second.signal, alive: () => true, now: () => clock, killAfterMs: 0,
+    sleep: async (ms) => { slept += ms; },
+  });
+  assert.equal(how, 'killed');
+  assert.deepEqual(second.sent.map((s) => s.signal), ['SIGCONT', 'SIGTERM', 'SIGKILL'],
+    'no second SIGINT from the ladder');
+  assert.ok(slept >= 1_000 && slept <= 1_100, `the ladder waited out only the first grace's remainder (${slept} ms)`);
+  assert.equal(interruptedAt(93, clock), undefined, 'a settled ladder forgets the pid — it may be reused');
+});
+
+test('killLadder: when only `signal` is given, the interrupt goes through it too — a test seam never reaches a real pid', async () => {
+  const r = recorder();
+  const realKill = process.kill.bind(process);
+  let reached = false;
+  // @ts-expect-error — deliberately swapping the platform call for one test
+  process.kill = () => { reached = true; };
+  try {
+    await killLadder(92, { signal: r.signal, alive: () => true, sleep: noSleep });
+  } finally { process.kill = realKill; }
+  assert.equal(reached, false, 'the seam carried every signal, the interrupt included');
+  assert.ok(r.sent.some((s) => s.signal === 'SIGINT'));
 });
 
 test('killLadder: a pid already gone is signalled not at all', async () => {
@@ -136,8 +228,11 @@ test('every teardown path was actually rewired, not just the ones with tests', (
   const spawnSrc = read('runner/spawn.ts');
   const terminal = read('terminal.ts');
 
-  // The two that shipped without a wake.
-  assert.match(spawnSrc, /wakeAndTerm\(child\.pid\)/, 'the abort handler must wake before it terms');
+  // The two that shipped without a wake. The abort handler now asks the turn
+  // to close first (`interruptOnce` wakes, then interrupts), and escalates to
+  // the wake-and-term on its own clock when the child does not go.
+  assert.match(spawnSrc, /interruptOnce\(child\.pid/, 'the abort handler must wake and interrupt before it terms');
+  assert.match(spawnSrc, /wakeAndTerm\(child\.pid\)/, 'the abort handler must still wake before it terms');
   assert.match(runner, /const ladders = \[\.\.\.this\.lanes\.values\(\)\]/,
     'checkpointForShutdown must run the ladder itself — a setTimeout backstop dies with the process that set it');
 
@@ -161,6 +256,22 @@ test('the shutdown ladder is awaited, and inside the console\'s drain budget', (
   // adjacency assertion above still reads `runner`.
   const budget = /SHUTDOWN_LADDER_MS = ([\d_]+)/.exec(read('runner/runner-core.ts'));
   assert.ok(budget, 'the shutdown grace must be a named constant');
-  assert.ok(Number(budget[1].replace(/_/g, '')) <= 120_000,
+  // The ladder asks the turn to close first, so the whole wait is the
+  // interrupt's grace plus the SIGTERM grace — both have to fit.
+  assert.ok(INT_GRACE_MS + Number(budget[1].replace(/_/g, '')) <= 120_000,
     'it has to fit inside index.ts\'s 120s shutdown budget, with room for the rest of the drain');
+
+  // SHD-8: the record a killed child leaves says WHICH phase and session, the
+  // grace it was given, why it went and the tool call that was open — `{pid,
+  // how}` alone could not say which side of a `gh pr merge` it fell on. And
+  // the checkpoint is handed the drain's intent rather than guessing it.
+  assert.match(runner, /protected async checkpointForShutdown\(context\?: ShutdownContext\)/,
+    'the checkpoint takes the drain\'s context');
+  const child = /this\.record\('run\.shutdown-child', \{([\s\S]*?)\}, lane\.phase\)/.exec(runner);
+  assert.ok(child, 'run.shutdown-child is recorded against the lane\'s phase');
+  for (const field of ['pid', 'phase: lane.phase', 'sessionId', 'how', 'graceMs', 'interruptGraceMs', 'why', 'intent', 'reason', 'openTool']) {
+    assert.ok(child[1].includes(field), `run.shutdown-child carries ${field}`);
+  }
+  assert.match(read('runner/runner-control.ts'), /onShutdown\(this\.shutdownKey\(runId\), \(context\) => this\.checkpointForShutdown\(context\)\)/,
+    'the drive loop\'s handler forwards the context');
 });

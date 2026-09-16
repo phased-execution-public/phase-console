@@ -16,6 +16,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { debugIndexPath, type DebugEntry, type DebugIndexParams } from '@/lib/api';
+import { consolePath } from '@/lib/base';
 
 /**
  * How many followed rows are kept.
@@ -77,7 +78,7 @@ export function useDebugTail(params: DebugIndexParams, enabled: boolean): TailSt
 
     let stream: EventSource;
     try {
-      stream = new EventSource(path);
+      stream = new EventSource(consolePath(path));
     } catch {
       setStatus('error');
       return undefined;

@@ -2,7 +2,7 @@
 
 Contents: What a supervised session is · The convergence loop · The watch clock ·
 The Stop hook · Permission profiles and the deny wall · Never wait inside a turn ·
-Run settings ·
+Questions · Run settings ·
 The remediation ladder · Freeze and thaw · Talking to a running phase ·
 Session terminals · Reading the console's API · Where the state lives
 
@@ -37,6 +37,18 @@ Two consequences the contract in SKILL.md's boot prompt spells out and that are 
 here: **the process exits when your turn ends** (no `ScheduleWakeup`, no background watcher survives
 it), and **your deliverable is the handoff** — a clean exit with no handoff and no declared outcome
 reads as a failed phase, not as a quiet success.
+
+Two more facts about the process itself. **It runs under two caps it did not choose.** Every session
+the console spawns carries `--max-budget-usd` and `--max-turns`, set per session by `capsFor`
+(`viewer/server/runner/session-record.ts`): a phase session gets the run's `phaseBudgetUsd`, or — when
+the run set none — its size row (`SESSION_CAPS_BY_SIZE`: S $25 / 150 turns · M $60 / 300 · L $120 /
+600; `references/sizing.md`); a closeout, QA round, PR session or reviewer gets a quarter of those
+dollars and 60 turns, a repair 90. A cap that bites resumes the same session with that cap doubled, so
+meeting one is not the end of the phase. **And a stop asks your turn to close before it asks the
+process to leave.** When the console stops a session it wakes the process (SIGCONT), sends the CLI one
+SIGINT and gives it `INT_GRACE_MS` (5 s) — long enough for the CLI to close the turn and write its
+`result`, so what the session spent reaches the record — and only then SIGTERMs the process group, with
+a SIGKILL backstop (`viewer/server/runner/signals.ts`).
 
 ## The convergence loop — converge, classify, climb
 
@@ -77,8 +89,11 @@ next visits your plan. Five schemes:
 record and `declared.landed` beside it, and an instruction that names what actually happened. A run
 that ended `cancelled` gets "decide whether to re-run it", not "re-check it" — so read the
 instruction rather than assuming the thing you waited for succeeded. Three resumes per landing; after
-that it becomes an operator errand. Once your session produces work the declaration is spent and the
-watch stops — so if you are still waiting on something else, declare it again.
+that it becomes an operator errand. **A declaration is spent only by the session speaking to it** — a
+`git commit` or a `phase-outcome.sh` call in the resumed session (`isDurableProgress`; a turn or a
+`git status` is not enough) — or by a newer declaration, the board closing the phase, or an operator's
+Retry (`DECLARATION_CONSUMERS`). Once it is spent the watch stops, so if you are still waiting on
+something else, declare it again.
 
 **`cmd:` runs your command, repeatedly.** Through the same policy a plan's §Verification gets — a
 denylist of mutating verbs, an inverted allowlist for verbs that reach off this machine, 60 seconds,
@@ -95,6 +110,31 @@ can also switch the whole scheme off (`watchCmdRefs`), in which case such a ref 
 `waiting-external`. A person is still asked; the clock only says when the console next brings the
 phase up. If you know both — a person must look, *and* not before the release lands at 09:00 — say
 both.
+
+**What a declaration may ask for is bounded, and past a bound it is refused, never cut.** A
+`waiting-external` spends this phase's wait budget: at most 4 waits (`WAIT_MAX_PER_PHASE`) and 8 h
+parked in total (`DEFAULT_WAIT_BUDGET_MS`) unless the plan's `**Wait budget:**` line or the phase's
+`- **Waits on:** <ref> · <max>` bullet says otherwise — a `date:` ref there countersigns a wait up to
+that instant. Your boot prompt's contract states the ceiling and where it came from, and a window past
+what is left is REFUSED with a `waiting-external-timeout` halt carrying the arithmetic — never shortened,
+so name the real end of the wait. Each of the other statuses is acted on at most 4 times for one phase
+(`DECLARATIONS_MAX_PER_PHASE`): a fifth is recorded, not acted on, and parks the phase `needs-human` on
+the `unknown:declaration-cap` errand until an operator's Retry clears the count. A `blocked` or
+`needs-human` clock is capped at 7 days (`DECLARED_CLOCK_MAX_MS`, the cap journalled), and on the
+unsupervised paths two `partial` declarations inside 5 minutes are one act (`DECLARATION_COOLDOWN_MS`).
+
+**A resume is refused while the session that declared is still live.** The console never resumes a
+session on top of itself: a declaration whose session is still running — or still holding the phase
+lock on its lease — is journalled `phase.resume-refused`, announced once, and acted on when that session
+ends; the console looks again every 5 minutes (`RESUME_REFUSED_RECHECK_MS`). Declare, then stop.
+
+**`blocked` and `needs-human` name their decision key — `--needs <key>` is required** (since 5.0.0;
+exit 2 without it). The key is a row of the plan's `## Decisions` manifest (`credentials`, `gates`,
+`accounts`, `mcp`, `waits`, `human-acts`, …) or a blocker class as its short form (`credential`,
+`permission`, `gate`, `external`, `lock`); the boot prompt prints the phase's rows. The runner reads
+it BEFORE your prose: `--needs credential` classifies `blocked-declared:credential` whatever the
+`--reason` says, and a `blocked-declared:unknown` is now a key the manifest lacks — a defect report.
+`--rule`/`--command` structure a permission block beside it.
 
 ## The Stop hook — the closeout contract, enforced
 
@@ -115,7 +155,8 @@ Three properties, all deliberate:
   the console is not supervising.
 
 If your turn "will not end", you have not hit a bug: you have hit the closeout contract. Write the
-handoff, or declare `waiting-external` / `blocked` / `needs-human` / `partial` / `no-defect`.
+handoff, or declare `waiting-external` / `blocked` / `needs-human` / `partial` / `no-defect`
+(`blocked` and `needs-human` with their `--needs <key>`).
 
 ## Permission profiles and the deny wall
 
@@ -146,7 +187,15 @@ allowed to depend on it alone.
 reason, not as an unexplained failure — read it. It is not a bug and not something to route around:
 do the part of the work that does not need the denied tool, and record what you could not do under
 **Outstanding** in the handoff as an operator errand. Never try to defeat the wall; a person runs
-those commands themselves, deliberately.
+those commands themselves, deliberately — or widens the wall for this plan, which the console offers
+them. A deny-list denial is stamped on your phase record (`toolDenied`: the tool, the rule, the
+command), a phase stopped on it reads `blocked-declared:permission`, and that situation's one rung is
+`widen-rule`: a standing approval card naming the rule, whose Allow strikes it for this plan and
+resumes your own session. If the phase cannot proceed without the tool, declare it by key with the
+rule and the command as fields —
+`phase-outcome.sh <slug> <N> blocked --needs permission --rule "<the rule>" --command "<the command>"`
+— and stop. The card is driven only from the console's own recorded denial: a wall described in prose,
+a denial that names no rule, and the wait guard's `in-turn-wait` offer nothing to widen.
 
 ## Never wait inside a turn
 
@@ -191,18 +240,69 @@ And if a wait is already open when the console looks — the guard catches the c
 make, not one you made before it existed, or one spelled in a way the vocabulary does not know — the
 same split decides what happens to you, read off the command (`liveness.ts` `waitScope`):
 
-- **External** (`gh`, `aws`, `kubectl`, `ssh`, a URL): after `stallExternalWaitMs` (5 min) the phase
-  is **parked** and its lock released, exactly as if you had declared the wait yourself. Nothing is
-  lost — you are resumed on your own session id.
+- **External** (`gh`, `aws`, `kubectl`, `ssh`, a URL): after `stallExternalWaitMs` (5 min) the console
+  **parks** the phase and releases its lock — in its own name (`by: 'watchdog'`), on its own allowance
+  of 4 parks per phase (`WATCHDOG_PARKS_MAX_PER_PHASE`), never your declared waits or your wait budget.
+  Nothing is lost — you are resumed on your own session id.
 - **Local** (a `/tmp` log, a `tasks/*.output`, a `pgrep`, a `[ -f … ]`): you get **one nudge** into
-  your stdin saying what to do instead, and the park only after `stallLocalJobMs` (45 min). A local
-  park carries your own loop's condition as a `cmd:` watch ref — `until test -f /tmp/done; do …`
-  becomes `cmd:"test -f /tmp/done"` — so you come back when the job is genuinely finished rather than
-  at the end of a guessed window. The gap exists because parking a session 40 minutes into its own
-  suite does not release anything useful; it throws the suite away and runs it again.
+  your stdin saying what to do instead, and the park only after `stallLocalJobMs` (45 min). The gap
+  exists because parking a session 40 minutes into its own suite does not release anything useful; it
+  throws the suite away and runs it again.
+
+Either park mints a watch ref from the command it caught — a poll loop's condition becomes a `cmd:`
+ref, `until test -f /tmp/done; do …` → `cmd:"test -f /tmp/done"` — and a minted `cmd:` ref is **NOT
+run** unless the operator turned `watchMintedCmdRefs` on (it ships off): until then it reads `unknown`,
+and you come back on the park's own clock rather than the moment the job lands. With
+`stallAutomaticPark` off the console parks nothing by itself — the stall card still stands and the
+nudge still goes.
+
+**A wait declared with no ref after that refusal is adopted or refused, never left blind.** Declare
+`waiting-external` without `--watch` after the guard refused an in-turn wait in this attempt, and the
+console mints the ref from the command it refused and adopts it; failing that it takes the phase's
+`- **Waits on:**` refs from the plan; failing both it REFUSES the declaration and parks the phase
+`needs-human` with a `blocked-declared:external` errand naming the command and the plan line that
+would have allowed it — each step journalled `phase.watch-missing`. Name the ref yourself.
 
 A §Verification command is exempt from all of it: while the lane is verifying the plan is entitled to
 a slow command, and that path has its own 30-minute bound and its own signal.
+
+## Questions — held, relayed, or answered by the plan
+
+`AskUserQuestion` is never treated as a permission. Every call to it is **held** (`QUESTION_CLASS` in
+`viewer/server/runner/approvals.ts`, checked right after the deny list and before anything a profile or
+an operator's allow list can reach), and the console answers it one of two ways.
+
+**The relay is armed** — the run answered `relay: last-resort`, the CLI read at or above
+`RELAY_CLI_FLOOR` (2.1.268, from `system/init`), and this is the phase's own session: its boarding or
+the resume of its own conversation. A QA round, a repair, a resume with an instruction, a closeout, the
+PR session and the reviewer never carry it. The question meets the deny list first, then the
+exclusions (`QUESTION_EXCLUSIONS`: `deny-list`, `multi-select`, `destructive-option`, `run-stopped`,
+`repeated-key`) and the phase's budget of 8 (`RELAY_QUESTIONS_PER_PHASE`). **An excluded question is
+not answered by rule at all**: the whole call comes back unanswerable, the phase parks `needs-human`,
+one push goes out, and the tool result tells you to hand off `in-progress`, declare
+`needs-human --needs ambiguity --reason "<the question>"`, and stop. Anything else goes on a card for
+60 s (`RELAY_WINDOW_MS`): a person inside the window wins; otherwise, at 55 s, the console answers by the
+operator's relay rules, else the sole `(Recommended)` option, else the first. **One question per lane is
+open at a time** — a second call waits for the first. Every answer is filed as a ruling
+(`references/conventions.md` §Rulings), and when the console answered rather than a person, a notice
+arrives down your stdin with one sentence per question, exactly these words (`frameRelayAnswer`,
+`viewer/server/runner/runner-core.ts`):
+
+> No operator answered within 60 s. The console answered `<label>` by `<rule>`. This is NOT a change to
+> the phase. If that answer is wrong, declare `blocked --needs ambiguity` rather than asking again.
+
+Nothing needs saying back: carry on with the phase.
+
+**The relay is not armed** — `relay: off`, a CLI below the floor, or no version read yet. The plan's
+`ambiguity` row answers (`phase.policy-answered`; the shipped answer is `ruling`), and the hook is told
+`deny` with that answer as its reason, which is not a refusal of your work: under `ruling`, decide from
+the plan, record the call (`phase-outcome.sh <slug> <N> ruling --kind ambiguity …`) and carry on; under
+`ask` or `halt`, hand off `in-progress`, declare `needs-human --needs ambiguity`, and stop. Usually the
+tool is not offered at all: **every session the relay is not armed for is spawned with
+`--permission-prompts none`** (`PERMISSION_PROMPTS_CLI_FLOOR`, 2.1.259) — anything that would prompt is
+denied, the session is told nobody can approve it and not to retry, `AskUserQuestion` is removed and
+elicitations are cancelled. A CLI known to predate the flag runs without it, and the run says so once
+(`run.permission-prompts-skipped`).
 
 ## Run settings — what an operator can change under you
 
@@ -213,7 +313,27 @@ and run budgets, `skills`, `mcpServers`, `mcpPolicy`, `permissionProfile`, `gitM
 `maxConsecutiveFailures`, `onlyPhases`, `phaseOptions`, `isolation` (a drop lands, a raise 409s),
 `settle`, `priority`, `attachDefaultSkills`, and the five that belong to the Fix & re-QA loop —
 `qaMaxRounds`, `qaModel`, `qaEffort`, `qaFixStrategy`, `qaRoundBudgetUsd`. A handful
-are start-only — `resumeRunId`, `startAfter`, `qa`, `accountId`.
+are start-only — `resumeRunId`, `startAfter`, `qa`, `accountId`, and since 5.0.0 the run's own
+answers to the decision manifest: `resumeOnRestart`, `relay`, `accounts` (`[{id, minHeadroomPct}]`),
+`acknowledgedWaivers` and `manifestOverride`.
+
+**The start door refuses before it spawns (since 5.0.0).** A fresh `POST /api/run/:slug/start` that
+omits `resumeOnRestart`, `relay` or `accounts` is answered **400** naming the missing field — the
+launch form's Decisions stage is where they are answered, and a scripted start has to answer them
+too. With them given, the **prelude** (`viewer/server/prelude.ts`) runs the plan's `## Decisions`
+rows and four probes — accounts, MCP, credentials, delivery — and a blocking row still `outstanding`,
+a `waived` row nobody acknowledged, or a failed blocking probe answers **409** `{unanswered: [{key,
+why}], prelude}`. `manifestOverride: {by}` starts anyway and journals `run.manifest-override`; a
+channel-less start is admitted only with `acknowledgedWaivers: ['announce']`. A resume
+(`resumeRunId`) skips the prelude — the run already answered. `GET /api/run/:slug/prelude` is the
+same report for display, and `phase-console doctor` runs the same probes with no plan in front of
+them. What it means for a session: the credentials the plan named were probed before you boarded
+(`phase.credential-preflight`) — under credential policy `require` a missing one parks the phase at
+boarding, before anything is spent, with a `blocked-declared:credential` errand; under `continue` (the
+default) you are boarded anyway and your boot prompt names each missing credential by id, telling you
+to do the work that does not need it, record the rest as an operator errand, and declare
+`blocked --needs credential` only if the phase cannot proceed at all. And a policy answer the console
+gave in your place is on the journal as `phase.policy-answered` rather than on a card.
 
 One phase can override a smaller set for itself (`PHASE_OPTION_FIELDS`): `model`, `effort`, `tools`,
 `permissionMode`, `skills` / `skillsOff`, `mcpServers` / `mcpOff`, `mcpPolicy`, `autoApprove`,
@@ -260,10 +380,10 @@ preferences in Settings ▸ Automation.
 Three things about the ladder from the posture sweep (console-parallel-repaint P12) that a session
 may notice. An errand written for a person **stands**: the sweep re-reads it every five minutes and
 writes nothing new unless the ask changed, so the clock on the card is when it was first asked. A
-declared blocker whose reason names the console's own permission wall — a tool that was denied, a
-path that was "not granted" — reads `blocked-declared:permission` and climbs no rung; the wall is the
-operator's, so record what you could not do under **Outstanding** and stop, rather than spending an
-unblock session on it. And two operator opt-ins, both off by default, widen what runs without a
+declared blocker on the console's own permission wall reads `blocked-declared:permission` and climbs
+exactly one rung, `widen-rule` — the standing card described under §Permission profiles, offered only
+when the console recorded the denial itself; the wall is the operator's to widen, so record what you
+could not do under **Outstanding** and stop, rather than spending an unblock session on it. And two operator opt-ins, both off by default, widen what runs without a
 person: `allowUnverifiedPhases` boards a phase whose plan states no §Verification and passes it on
 the handoff alone (`phase.verify-waived` on the record), and `ladderExtendOnProgress` grants one more
 rung, once, when the newest settled rung landed commits (`phase.ladder-extended`). Neither moves the
@@ -276,7 +396,8 @@ For a session, the practical consequences are:
   in the tree is the previous attempt's — read `git status` before doing anything, and never
   `git stash` / `git checkout --` / `git reset` it away.
 - **A declared outcome short-circuits the guessing.** `blocked` and `needs-human` route to the rungs
-  that fetch a person; `partial` routes to the ones that resume you; `waiting-external` parks the
+  that fetch a person — and their `--needs <key>` decides WHICH rung, before any prose is read;
+  `partial` routes to the ones that resume you; `waiting-external` parks the
   phase and comes back. Prose routes to nothing.
 - **A remediation that reaches you is a SESSION under this run, not a TUI.** The four "a fresh
   briefed agent" rungs — `fix-agent`, `closeout-agent`, `plan-repair-agent`, `stale-claim-takeover` —
@@ -351,6 +472,17 @@ that outranks the plan for the rest of the phase — then record the departure w
 `scripts/phase-outcome.sh <slug> <N> ruling --kind deviation`, because the next session reads the
 handoff, not the console's chat.
 
+Two more ways words reach you. **A lane's own ask is answerable from the inbox**: when the presence
+hook reports your session stopped on a prompt, the inbox's `session-ask` row for your lane carries
+**Answer it**, and a person's words arrive as a *steer* — an instruction for the rest of the phase. (A
+lane with a pending approval card for the same phase gets the card instead of the row.) And **every
+verb says who sent it**: a route derives the actor from the request (`actorOfRequest`,
+`viewer/server/api/actor.ts`) — `via` is `cli` for `phase-console` and `btw` and `api` otherwise,
+`origin` is `local` or the calling host, `remoteUser` is the proxy's login and is read only under
+`--remote`, and `by` is the request body's label (at most 64 characters), else that login, else
+`operator` for a browser or the CLI and `script` for anything else. A message a script sent is
+recorded as the script's, never as the operator's.
+
 ## Session terminals — other sessions on this machine
 
 Every Claude session on the machine reports presence through `scripts/session-hook.sh`
@@ -363,7 +495,18 @@ into the operator's `~/.claude/settings.json` and never clobbers it.
 On SessionStart the hook prints your own session id back to you along with the
 `phase-lock.sh --session <id>` instruction — which is why a hand-driven session can claim its lock as
 *itself*, and why the console can release that lock the moment the session ends instead of at the end
-of its lease.
+of its lease. The same context names the **other live Claude sessions** the registry shows in this
+repository — each with its id, pid, where it stands and the plan phase it works when that is known —
+and ends by telling you to check `phase-lock.sh <slug> conflicts <N>` before claiming, because one of
+them may be about to work it. When the hook's POST finds no console, it drops the event into the
+instance's inbox and — with node present and the connection refused, not merely slow — drains that
+inbox itself with `phase-console sessions ingest`, which then supplies the peers line too; `PHASE_CONSOLE_HOOK_INGEST=0` leaves the inbox for the console.
+
+A phase the scheduler queues says what it waits behind, in words worth recognising: a lock's owner;
+`session <id> (pid N)` — a live session in the same scope that has not claimed a lock yet, the one
+window a lock cannot guard; `session cap` (`N of N lanes`) — this console is full; or `machine cap`
+(`the machine is full — N of M lanes: …`) — every console on this machine together is. None of them
+is a fault in your phase.
 
 Those sessions are **openable**: the console can attach a terminal to another session and resume it.
 The one thing a session must know about that machinery is where a pty lives — a terminal is a child

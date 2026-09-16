@@ -45,6 +45,7 @@ import {
   useJournal,
   useQueue,
   useTimeline,
+  useLedger,
   useRulings,
   useRun,
   useRunScopes,
@@ -54,7 +55,7 @@ import { keys } from '@/lib/queries';
 import { useQueryClient } from '@tanstack/react-query';
 import { planHref } from '@/app/routes';
 import { isLive } from './defaults';
-import { ApprovalQueue, type Decide } from './approvals';
+import { ApprovalQueue, type Answer, type Decide } from './approvals';
 import { Controls } from './lane-setup';
 import { LiveConsole } from './console';
 import { RunHeader, RunTiles } from './tiles';
@@ -69,6 +70,8 @@ import { Timeline } from './timeline';
 import { Gantt } from './gantt';
 import { AttemptCompare } from './attempt-compare';
 import { Journal } from './journal';
+import { LedgerCard } from './ledger';
+import { WhyStarted } from './why-started';
 import { RecoveryActions } from '@/components/recovery-actions';
 
 export function RunView({ detail }: { detail: PlanDetail }) {
@@ -107,6 +110,9 @@ export function RunView({ detail }: { detail: PlanDetail }) {
   // exists — which is every plan somebody is driving by hand.
   const { data: journal } = useJournal(slug, undefined, 500, enabled && Boolean(run));
   const { data: timeline } = useTimeline(slug, undefined, enabled && Boolean(run));
+  // Why each start happened and what every session cost (phase 19) — the run's
+  // ledger, read from the same journal the timeline projects.
+  const { data: runLedger } = useLedger(slug, undefined, enabled && Boolean(run));
   // Which phase's attempts are open in the drawer. `null` is closed; the Gantt
   // is the only thing that opens it, and only for a phase with two boardings.
   const [comparePhase, setComparePhase] = useState<number | null>(null);
@@ -182,6 +188,21 @@ export function RunView({ detail }: { detail: PlanDetail }) {
     [act],
   );
 
+  const answerQuestion: Answer = useCallback(
+    (approval, key, label) => {
+      void act('answer', async () => {
+        const result = await api.answerQuestion(approval.slug, approval.id, [{ key, label }]);
+        if (!result?.ok) toast(result?.error ?? 'the question could not be answered', 'warn');
+        else
+          toast(
+            result.remaining ? `Answered “${label}” · ${result.remaining} left` : `Answered “${label}”`,
+            'ok',
+          );
+      });
+    },
+    [act],
+  );
+
   if (stale) return <StaleServerNote />;
   if (isPending && !detailRun) return <Spinner label="Reading run state" />;
 
@@ -196,7 +217,7 @@ export function RunView({ detail }: { detail: PlanDetail }) {
 
       {/* First, always: a session parked with its hand up is the only thing on
           this page that is waiting on a person. */}
-      <ApprovalQueue approvals={approvals} allowRun={allowRun} onDecide={decide} />
+      <ApprovalQueue approvals={approvals} allowRun={allowRun} onDecide={decide} onAnswer={answerQuestion} />
 
       {authFailure && (
         <AuthCard
@@ -273,6 +294,12 @@ export function RunView({ detail }: { detail: PlanDetail }) {
       />
 
       {run && <RunTiles run={run} phases={phases} total={detail.phases.length} />}
+
+      {/* Why this run started, and what it cost and ran session by session
+          (phase 19) — under the tiles that give the totals: the two questions
+          an unattended run is most often opened to answer. */}
+      {run && <WhyStarted ledger={runLedger} manifest={run.manifest ?? null} />}
+      {run && <LedgerCard ledger={runLedger} />}
 
       {/* Where the work IS, under the tiles that say how it is going. Only for
           a run with a checkout story — an isolated one, or one that asked and

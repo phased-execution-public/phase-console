@@ -85,7 +85,7 @@ import { STALL_SIGNAL_KIND, factsFor, splitSituation } from './fact-map.js';
 
 /**
  * @typedef {'errand'|'approval'|'gate'|'sign-in'|'mcp-auth'|'qa'|'lock'
- *   |'health'|'stall'|'ruling'|'session-ask'|'conflict'} InboxKind
+ *   |'health'|'stall'|'ruling'|'session-ask'|'conflict'|'question'|'policy'} InboxKind
  */
 
 /**
@@ -94,12 +94,14 @@ import { STALL_SIGNAL_KIND, factsFor, splitSituation } from './fact-map.js';
  * third tie-break, so the list has a total order that does not depend on the
  * order the server happened to gather its facts in.
  *
- * `stall` and `ruling` are DECLARED HERE AND PRODUCED BY NOBODY YET: Phase 5
- * fills them (see the stall vocabulary at the foot of this file, and
- * `Approvals`' `remember: 'plan'|'global'` for a ruling — a decision that
- * should outlive the card that asked for it). They are in the list from the
- * first day so that the wire type, the labels, the filter chips and the ack
- * file never need a migration when the producer lands.
+ * `stall` and `ruling` were declared here before anything produced them (the
+ * stall vocabulary is at the foot of this file). A ruling that names its
+ * decision key now carries `remember: 'plan'|'global'` as its two actions —
+ * a decision that should outlive the session that made it, written as a
+ * `## Decisions` row or as this console's own policy answer (zero-touch
+ * phase 12). They were in the list from the first day so that the wire type,
+ * the labels, the filter chips and the ack file never needed a migration
+ * when the producers landed.
  *
  * @type {readonly InboxKind[]}
  */
@@ -123,7 +125,7 @@ export const INBOX_KINDS = Object.freeze(
     'health',
     /** Phase 5. Something nominally in flight that has not moved. */
     'stall',
-    /** Phase 5. A decision worth remembering — a rule, not an answer. */
+    /** A decision worth remembering — keyed, it offers to be. */
     'ruling',
     /**
      * A Claude session outside the autopilot — an agent, or someone's own CLI
@@ -140,6 +142,22 @@ export const INBOX_KINDS = Object.freeze(
      * tie-break.
      */
     'conflict',
+    /**
+     * A question a session raised on a run whose relay is armed (zero-touch
+     * phase 14): one row per question, one action per option, and a window —
+     * a person who picks inside it wins, and the console answers by rule when
+     * it closes. Appended at the end for `session-ask`'s reason.
+     */
+    'question',
+    /**
+     * What the console decided BY ITSELF (zero-touch phase 19): a
+     * `phase.policy-answered` line — a situation a person would once have been
+     * asked about, answered by the policy table (phase 11) instead. `fyi`, with
+     * the decision key, the answer, where it came from and the shipped default,
+     * so the operator can see the console acting in their name and change the
+     * answer. Appended at the end for `session-ask`'s reason.
+     */
+    'policy',
   ]),
 );
 
@@ -162,18 +180,21 @@ export const INBOX_KIND_LABELS = Object.freeze({
   ruling: 'Ruling',
   'session-ask': 'Session ask',
   conflict: 'Conflict',
+  question: 'Question',
+  policy: 'Policy answered',
 });
 
 /**
  * The kinds that are somebody ASKING right now — a session stopped dead until
- * a person answers: a permission card (`approval`), or a non-autopilot session
- * blocked at its own prompt (`session-ask`). What the top bar's "waiting on
+ * a person answers: a permission card (`approval`), a session blocked at its
+ * own prompt (`session-ask`), or a relayed question inside its window
+ * (`question`, phase 14). What the top bar's "waiting on
  * you" indicator counts, and what the drawer's own section gathers. A subset
  * of `INBOX_KINDS` by identity — a test pins that.
  *
  * @type {readonly InboxKind[]}
  */
-export const ASK_KINDS = Object.freeze(/** @type {const} */ (['approval', 'session-ask']));
+export const ASK_KINDS = Object.freeze(/** @type {const} */ (['approval', 'session-ask', 'question']));
 
 /**
  * How many of `items` are live asks — the indicator's number. Unknown kinds
@@ -837,6 +858,27 @@ export const STALL_NUDGE_GRACE_MS = 5 * MINUTE;
  * away from the only layer that can keep the session.
  */
 export const SPAWN_FIRST_EVENT_MS = STALL_DEFAULTS.stallSilentMs + 2 * STALL_NUDGE_GRACE_MS;
+
+/**
+ * How long a session may be silent between its `init` and its first `result`
+ * — `spawn.ts`'s second bound of its own, over the stretch where a phase's
+ * work actually happens (the sep-review audit's SES-10).
+ *
+ * The backstop above is cleared by the `init` every session emits in its first
+ * second, and the idle close waits for a `result`, so a session that
+ * initialised and then wedged had nothing inside `spawn.ts` bounding it — only
+ * the runner's nudge-then-recycle, which needs a lane, a liveness ticker and a
+ * console still driving, the very things absent when a session outlives its
+ * supervisor.
+ *
+ * The local-job clock plus TWO nudge graces, for the reason the backstop is
+ * the silent threshold plus two: by construction it is the last clock on a
+ * session that is quiet between tool results. A long local suite the runner
+ * parks at `STALL_LOCAL_JOB_MS` never reaches it; only a session with no runner
+ * behind it does, and one that initialised and wedged stops holding its lock
+ * inside the hour.
+ */
+export const SPAWN_INIT_IDLE_MS = STALL_LOCAL_JOB_MS + 2 * STALL_NUDGE_GRACE_MS;
 
 /**
  * How long a retry storm is parked when the CLI reported no reset window.

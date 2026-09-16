@@ -18,7 +18,19 @@ import {
   type Section,
 } from './markdown.ts';
 import { wantsDefaultCheckout } from '../../shared/worktree-model.js';
+import { parseDecisionsTable } from '../../shared/decisions-model.js';
+import type { DecisionRow } from '../../shared/decisions-model.js';
 import type { McpPolicy } from '../runner/state.ts';
+
+/**
+ * `**Credential policy:**` — the SAME vocabulary as `McpPolicy`
+ * (`MCP_POLICIES`, `shared/run-lifecycle.js`) and the same three states;
+ * silence is the console's to answer. An alias, never a second spelling.
+ */
+export type CredentialPolicy = McpPolicy;
+
+/** One `id:minHeadroom` pair off the `**Accounts:**` line; `minHeadroom` absent when unstated. */
+export type AccountClause = { id: string; minHeadroom?: number };
 
 export type PhaseRow = {
   phase: number;
@@ -123,6 +135,29 @@ export type PhaseDetail = {
    * `require` parks — see `mcpPolicyOf`.
    */
   mcpPolicy?: McpPolicy;
+  /**
+   * `- **Credentials:** \`x\`` — credential ids this phase needs beyond the
+   * plan's line; UNIONED like `mcpServers` (`credentialsFor`). Absent when
+   * the bullet is missing or names nothing.
+   */
+  credentials?: string[];
+  /** `- **Credential policy:** require|continue` — overrides the plan's, like `mcpPolicy`. */
+  credentialPolicy?: CredentialPolicy;
+  /**
+   * `- **Waits on:** <ref>[, <ref>…] · <max>` — what this phase waits on and,
+   * after the `·`, how long it may stay parked in total; the max overrides the
+   * plan's `**Wait budget:**` for this phase (`waitBudgetFor`), and a `date:`
+   * ref is the plan countersigning a wait up to that instant. Absent when the
+   * bullet is missing.
+   */
+  waitsOn?: { refs: string[]; maxMinutes?: number };
+  /**
+   * `- **Person-check:** allow|halt|<owner>` — what to do with a §Verification
+   * fragment written as prose (`person_check_for_phase()`; chapter 10 ZTD-6,
+   * the `verification.person-check` row). One lower-cased word; absent is
+   * silence and the console's policy table answers (`personCheckFor`).
+   */
+  personCheck?: string;
   handoffMustRecord?: string;
   /** Every labelled bullet, so nothing in an unusual plan is dropped. */
   bullets: { label: string; body: string }[];
@@ -154,6 +189,33 @@ export type SessionBudget = {
    * when the plan is silent, and lets the plan win when it is not.
    */
   mcpPolicy?: McpPolicy;
+  /**
+   * `**Credentials:**` — backticked credential ids every phase needs, probed
+   * by the console's registry of named credential probes before a phase
+   * boards (chapter 10 ZTD-4; the `MCP servers` shape). Empty when none.
+   */
+  credentials: string[];
+  /** `**Credential policy:**` — `require` refuses at boarding, `continue` runs and reports; absent is silence. */
+  credentialPolicy?: CredentialPolicy;
+  /**
+   * `**Accounts:**` — which Claude accounts a run may spend, in order, each
+   * with the minimum five-hour headroom (percent) it must show before a phase
+   * boards (chapter 13 §1.1 `accounts`). Empty when none.
+   */
+  accounts: AccountClause[];
+  /**
+   * `**Wait budget:**` — the total wall-clock ONE phase may spend parked across
+   * its declared waits, in minutes (`plan_wait_budget()`). Absent is silence:
+   * the console's own default applies (`DEFAULT_WAIT_BUDGET_MS`).
+   */
+  waitBudgetMinutes?: number;
+  /**
+   * `**QA exhausted:** waive|halt|<owner>` — the plan's answer once the QA
+   * round budget is spent (`plan_qa_exhausted()`; chapter 10 ZTD-9, the
+   * `qa.exhausted` row). One lower-cased word; absent is silence and the
+   * console's policy table answers.
+   */
+  qaExhausted?: string;
   /** Literal plan directive, if present: `on` | `off`. */
   qaGate?: 'on' | 'off';
   /**
@@ -190,6 +252,14 @@ export type Plan = {
   architecture?: string;
   endToEnd?: string;
   sessionBudget: SessionBudget;
+  /**
+   * The `## Decisions` manifest (chapter 13 §1.1): one row per decision key,
+   * as written in the PLAN. The mutable twin (`docs/handoffs/<slug>/
+   * decisions.md`) is read by the store and merged over these rows with
+   * `mergeDecisions`; the engine's `--decisions` prints that merge, and
+   * `engine-parity` holds the two together. Empty when the plan has none.
+   */
+  decisions: DecisionRow[];
   graph: PhaseRow[];
   /** Blocking / Independent callout lines under the graph table. */
   callouts: string[];
@@ -436,6 +506,23 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // everything through the first colon — so bold is optional here too.
   const mcpPolicy = mcpPolicyOf(/(?:\*\*)?MCP policy(?:\*\*)?[^:\n]*:\s*(.+)/i.exec(flat)?.[1]);
 
+  // `plan_credentials()` / `plan_accounts()`: the label at the START of a line
+  // (the engine greps `^[[:space:]>]*\*{0,2}credentials\*{0,2}[[:space:]]*:`),
+  // so a sentence that merely mentions credentials cannot become a list; then
+  // the same backtick harvest as MCP servers. `plan_credential_policy()` is
+  // the loose `grep -i 'credential policy'` of its MCP twin.
+  const credentialsLine = /^\*{0,2}Credentials\*{0,2}\s*:\s*(.+)/im.exec(flat)?.[1] ?? '';
+  const credentials = [...new Set([...credentialsLine.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim()).filter(Boolean))];
+  const credentialPolicy = credentialPolicyOf(/(?:\*\*)?Credential policy(?:\*\*)?[^:\n]*:\s*(.+)/i.exec(flat)?.[1]);
+  const accountsLine = /^\*{0,2}Accounts\*{0,2}\s*:\s*(.+)/im.exec(flat)?.[1] ?? '';
+  const accounts = [...accountsLine.matchAll(/`([^`]+)`/g)].map((m) => accountClauseOf(m[1])).filter((a): a is AccountClause => a !== undefined);
+  // `plan_wait_budget()`: the label at the start of a line, then the FIRST
+  // duration after the colon.
+  const waitBudgetMinutes = durationMinutes(/^\*{0,2}Wait[ \t]+budget\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
+  // `plan_qa_exhausted()`: the label at the start of a line (after the quote
+  // marks), then the FIRST word after the colon.
+  const qaExhausted = policyWord(/^\*{0,2}QA[ \t]+exhausted\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
+
   // Ported verbatim from `qa_mode()`, whose own regex carries a comment naming
   // the bug it fixed: the optional `- `/`* ` bullet prefix, because
   // `- **QA gate:** off` — a perfectly ordinary way to write it — missed BOTH
@@ -460,9 +547,49 @@ function parseSessionBudget(section?: Section): SessionBudget {
   }
 
   return {
-    raw, targetModel: model, budget, branch, skills, mcpServers, mcpPolicy, qaGate, worktrees,
+    raw, targetModel: model, budget, branch, skills, mcpServers, mcpPolicy, credentials, credentialPolicy, accounts, qaGate, worktrees,
     ...(setupLine ? { setup: setupLine } : {}),
+    ...(waitBudgetMinutes !== undefined ? { waitBudgetMinutes } : {}),
+    ...(qaExhausted !== undefined ? { qaExhausted } : {}),
   };
+}
+
+/**
+ * `duration_minutes()` in phase-graph.sh: the FIRST `<n><unit>` in the text as
+ * minutes (`45m`, `~45m`, `8h`, `2 days`, `90 min`), or undefined. Longest unit
+ * first so the ordered alternation picks what awk's leftmost-longest does.
+ */
+export function durationMinutes(text: string | undefined): number | undefined {
+  if (!text) return undefined;
+  const m = /([0-9]+)[ \t\r\n\f\v]*(minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d)(?:[^A-Za-z0-9_]|$)/i
+    .exec(text.replace(/[`*]/g, ''));
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  if (!Number.isSafeInteger(n) || n <= 0) return undefined;
+  const unit = m[2].toLowerCase();
+  if (unit.startsWith('d')) return n * 1440;
+  if (unit.startsWith('h')) return n * 60;
+  return n;
+}
+
+/** `plan_credential_policy()`'s word filter — the MCP policy filter, because it is the MCP policy vocabulary. */
+function credentialPolicyOf(value?: string): CredentialPolicy | undefined {
+  return mcpPolicyOf(value);
+}
+
+/**
+ * One backticked `id:min` token → a clause. `plan_accounts()` splits on the
+ * first colon, trims, strips a trailing `%` off the minimum and prints the id
+ * with an EMPTY minimum when the pair carries none — read as `undefined` here.
+ */
+function accountClauseOf(token: string): AccountClause | undefined {
+  const [rawId, ...rest] = token.split(':');
+  const id = rawId.trim();
+  if (!id) return undefined;
+  const min = rest.join(':').trim().replace(/[\s%]+$/, '');
+  if (!min) return { id };
+  const n = Number(min);
+  return Number.isFinite(n) ? { id, minHeadroom: n } : { id };
 }
 
 /**
@@ -501,6 +628,25 @@ function mcpPolicyOf(value?: string): McpPolicy | undefined {
  */
 const MCP_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}MCP\*{0,2}[ \t]*:(.*)$/i;
 const MCP_POLICY_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}MCP[ \t]+policy\*{0,2}[ \t]*:(.*)$/i;
+/** `credentials_directive()` / `credential_policy_directive()` — the same shapes. */
+const CREDENTIALS_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Credentials\*{0,2}[ \t]*:(.*)$/i;
+const CREDENTIAL_POLICY_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Credential[ \t]+policy\*{0,2}[ \t]*:(.*)$/i;
+/** `waits_on_directive()` — the label, then everything after its first colon. */
+const WAITS_ON_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Waits[ \t]+on\*{0,2}[ \t]*:(.*)$/i;
+/** `person_check_for_phase()` — the same shape. */
+const PERSON_CHECK_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Person-check\*{0,2}[ \t]*:(.*)$/i;
+
+/**
+ * `_policy_word()`: bold and backticks stripped, the FIRST token lower-cased
+ * with trailing punctuation dropped — `Halt.` reads `halt`, `**dev-lead** —
+ * they know the UI` reads `dev-lead`. Undefined when the remainder is empty.
+ */
+function policyWord(remainder: string | undefined): string | undefined {
+  if (remainder === undefined) return undefined;
+  const first = remainder.replace(/[*`]/g, '').trim().split(/\s+/)[0] ?? '';
+  const word = first.toLowerCase().replace(/[!-/:-@[-`{-~]+$/, '');
+  return word || undefined;
+}
 
 /**
  * The plan-wide Setup line and the phase's own bullet, joined — or undefined.
@@ -543,6 +689,44 @@ function mcpPolicyBullet(block: string): McpPolicy | undefined {
   return mcpPolicyOf(firstMatch(block, MCP_POLICY_BULLET_RE));
 }
 
+/** The phase's `- **Credentials:** \`a\`, \`b\`` ids, or undefined when it names none — `mcpBullet`'s twin. */
+function credentialsBullet(block: string): string[] | undefined {
+  const body = firstMatch(block, CREDENTIALS_BULLET_RE);
+  if (body === undefined) return undefined;
+  const ids = [...body.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim()).filter(Boolean);
+  return ids.length ? [...new Set(ids)] : undefined;
+}
+
+/** The phase's `- **Credential policy:** require|continue`, or undefined for silence. */
+function credentialPolicyBullet(block: string): CredentialPolicy | undefined {
+  return credentialPolicyOf(firstMatch(block, CREDENTIAL_POLICY_BULLET_RE));
+}
+
+/** The phase's `- **Person-check:** allow|halt|<owner>`, or undefined for silence. */
+function personCheckBullet(block: string): string | undefined {
+  return policyWord(firstMatch(block, PERSON_CHECK_BULLET_RE));
+}
+
+/**
+ * The phase's `- **Waits on:** …` — `waits_on_refs()` and `wait_budget_for_phase()`.
+ * Refs are the backticked spans left of the `·` when there are any, else that
+ * side split on commas; the max is the first duration right of the `·`.
+ */
+function waitsOnBullet(block: string): { refs: string[]; maxMinutes?: number } | undefined {
+  const line = firstMatch(block, WAITS_ON_BULLET_RE);
+  if (line === undefined) return undefined;
+  // The engine strips through the FIRST colon of the whole line and then a
+  // leading `**`: the label's own closing bold, when the colon sat inside it.
+  const body = line.replace(/^[ \t]*/, '').replace(/^\*{1,2}[ \t]*/, '');
+  const dot = body.indexOf('·');
+  const left = dot === -1 ? body : body.slice(0, dot);
+  const refs = left.includes('`')
+    ? [...left.matchAll(/`([^`]+)`/g)].map((m) => m[1])
+    : left.split(',').map((ref) => ref.replace(/^[ \t\r\n\f\v]+|[ \t\r\n\f\v]+$/g, '')).filter(Boolean);
+  const maxMinutes = dot === -1 ? undefined : durationMinutes(body.slice(dot + 1));
+  return { refs, ...(maxMinutes !== undefined ? { maxMinutes } : {}) };
+}
+
 /**
  * The phase's `- **QA:** on|off`, or undefined for silence.
  *
@@ -583,6 +767,55 @@ export function mcpServersFor(plan: Plan | undefined, phase: number): string[] {
     ...(plan.sessionBudget.mcpServers ?? []),
     ...(plan.phases[phase]?.mcpServers ?? []),
   ])];
+}
+
+/**
+ * Every credential id a phase needs: the plan-wide line UNIONED with the
+ * phase's own bullet, deduped, first-seen order — `credentials_for_phase()`
+ * in phase-graph.sh, which `--credentials N` prints and engine-parity pins.
+ */
+export function credentialsFor(plan: Plan | undefined, phase: number): string[] {
+  if (!plan) return [];
+  return [...new Set([
+    ...(plan.sessionBudget.credentials ?? []),
+    ...(plan.phases[phase]?.credentials ?? []),
+  ])];
+}
+
+/**
+ * The credential policy that applies to a phase: its own bullet, else the
+ * plan's line, else undefined (silence — the run's setting decides), exactly
+ * `credential_policy_for_phase()`.
+ */
+export function credentialPolicyFor(plan: Plan | undefined, phase: number): CredentialPolicy | undefined {
+  if (!plan) return undefined;
+  return plan.phases[phase]?.credentialPolicy ?? plan.sessionBudget.credentialPolicy;
+}
+
+/** The phase's `- **Person-check:**` word — `person_check_for_phase()`; phase-only, no plan-wide line. */
+export function personCheckFor(plan: Plan | undefined, phase: number): string | undefined {
+  return plan?.phases[phase]?.personCheck;
+}
+
+/**
+ * How long a phase may stay parked on its declared waits, and which line said
+ * so — `wait_budget_for_phase()`: the phase's `Waits on:` max, else the plan's
+ * `Wait budget:`, else undefined (the console's default applies). With no
+ * phase, the plan line alone.
+ */
+export function waitBudgetFor(
+  plan: Plan | undefined, phase?: number,
+): { minutes: number; source: 'phase' | 'plan' } | undefined {
+  if (!plan) return undefined;
+  const own = phase === undefined ? undefined : plan.phases[phase]?.waitsOn?.maxMinutes;
+  if (own !== undefined) return { minutes: own, source: 'phase' };
+  const planWide = plan.sessionBudget.waitBudgetMinutes;
+  return planWide !== undefined ? { minutes: planWide, source: 'plan' } : undefined;
+}
+
+/** The refs a phase's `- **Waits on:**` bullet names — `waits_on_refs()`. */
+export function waitsOnFor(plan: Plan | undefined, phase: number): string[] {
+  return plan?.phases[phase]?.waitsOn?.refs ?? [];
 }
 
 /**
@@ -658,6 +891,14 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       mcpServers: mcpBullet(block.raw),
       // Same regex as `mcp_policy_directive()`, same optional asterisks.
       mcpPolicy: mcpPolicyBullet(block.raw),
+      // The credential twins of the two above (`credentials_directive()`,
+      // `credential_policy_directive()`).
+      credentials: credentialsBullet(block.raw),
+      credentialPolicy: credentialPolicyBullet(block.raw),
+      personCheck: personCheckBullet(block.raw),
+      // What the phase waits on and its own parked-time allowance
+      // (`waits_on_refs()` / `wait_budget_for_phase()`).
+      waitsOn: waitsOnBullet(block.raw),
       // Whether this phase states its own QA regime — see PhaseDetail.qa.
       qa: qaBullet(block.raw),
       handoffMustRecord: bullet(bullets, 'Handoff must record'),
@@ -693,6 +934,10 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     architecture: findSection(secs, 'Architecture')?.body,
     endToEnd: findSection(secs, 'End-to-end')?.body,
     sessionBudget,
+    // The first pipe table of the `## Decisions` section — `_decisions_table()`
+    // in phase-graph.sh reads the same table the same way (columns by name,
+    // the separator row skipped, a fenced example ignored).
+    decisions: parseDecisionsTable(findSection(secs, 'Decisions')?.body ?? ''),
     graph,
     callouts: calloutLines(body),
     phases,

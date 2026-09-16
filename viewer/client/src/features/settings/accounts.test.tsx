@@ -20,7 +20,9 @@ vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
   return { ...actual, api: { ...actual.api, accounts: accountsMock, state: vi.fn(async () => ({})) } };
 });
-vi.mock('@/app/router', () => ({ navigate: vi.fn() }));
+// `useNavigate` too: the Pro tree draws the dashboard card under this one, and
+// its table reaches for it.
+vi.mock('@/app/router', () => ({ navigate: vi.fn(), useNavigate: () => vi.fn() }));
 
 import { AccountsCard } from './accounts';
 
@@ -56,12 +58,13 @@ describe('the accounts card', () => {
   it('meters the machine login and explains the disabled registration', async () => {
     accountsMock.mockResolvedValue(STATE);
     mount();
-    expect(await screen.findByText('me@example.com')).toBeTruthy();
+    // At least once: the Pro tree's dashboard names the login again, on its own row.
+    expect((await screen.findAllByText('me@example.com')).length).toBeGreaterThanOrEqual(1);
     // Bucket keys render by NAME, so a window that ships tomorrow appears
     // tomorrow — including a per-model one nobody hard-coded.
     expect(screen.getByText('5-hour session')).toBeTruthy();
     expect(screen.getByText('Weekly (Fable)')).toBeTruthy();
-    expect(screen.getByText(/--allow-accounts/)).toBeTruthy();
+    expect(screen.getAllByText(/--allow-accounts/).length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByRole('button', { name: 'Sign in…' })).toBeNull();
   });
 

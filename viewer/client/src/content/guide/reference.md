@@ -44,6 +44,8 @@ All seven capability switches are off unless named. Flags are read once, at star
 | `phase-console <repo>` | Run the console for that repository. A bare first argument is a **root**, not a verb. |
 | `phase-console install-skill` | Put the skill files where Claude Code reads them. For a packaged copy — a plugin or a clone never needs it. `uninstall-skill` takes them out again. |
 | `phase-console install-hooks` | Add the session-presence hook to `~/.claude/settings.json`, so the console knows which sessions are live. `uninstall-hooks` removes it; `hooks-status` says whether it is there. |
+| `phase-console doctor [instance] [--json]` | Whether this machine is ready to run: the checks a run's start makes, with no plan — accounts, MCP servers, the `claude` login, a delivery channel, the presence hooks, the CLI version against the relay floor, `gh auth status`. Exit 1 names the first blocking row that fails. |
+| `phase-console sessions ingest [instance]` | Apply the presence hook's queued drops while no console is running — the hook runs it itself when its POST finds nobody. It does nothing while the console answers, because that console drains its own inbox. |
 
 `./start` is the clone's equivalent, and it takes a **repository, not a verb**: its first bare
 argument becomes `--root`.
@@ -67,8 +69,8 @@ themselves.
 
 **Approving** — the phase page's Gate card, or `scripts/gate-approve.sh <slug> <N> --by <who>` —
 clears a gate of **any** kind: the row lands in `docs/handoffs/<slug>/gate-status.md`, and revoking
-it restores the gate. A `*(GATED)*` heading with no Gate-check at all reads as a human gate, the safe
-default.
+it restores the gate. A `*(GATED)*` heading with no Gate-check at all reads as an **ai** gate (the
+default since 5.0.0) — and fails the plan's lint until the author says which it is.
 
 ## Review holds
 
@@ -154,7 +156,9 @@ below it — that one splits each phase's own clock, this one says *when* each p
 | `frozen` | stopped by the operator (a SIGSTOP: no spend, real wall-clock) |
 
 A **hatched** bar is still open. Ticks along a lane mark `board`, `verify`, `rung`, `park`,
-`wall` and `outcome`. The **critical path** highlighted here is the longest dependency chain
+`wall`, `outcome`, `session` (a session ended — its mode, how it ended, what it cost), `ask` (a
+question or a card was raised or answered) and `policy` (the console answered something by itself);
+`start` ticks sit on the axis itself, one per start of the run, naming its door. The **critical path** highlighted here is the longest dependency chain
 weighted by what each lane MEASURED — not the plan page's estimate, which answers what is left
 rather than what happened.
 
@@ -197,6 +201,10 @@ the card says how much.
 | `docs/handoffs/` | Per-phase handoffs and locks. Yours, in git. |
 | `~/.local/state/phase-console/` | Run checkpoints, journals, the log. Never inside your repository, so `git status` stays clean. |
 | `~/.config/phase-console/` | Preferences — notification categories, push devices — and your autopilot policy, plus `instances.json`, which records this console's root, port and name. |
+| `~/.config/phase-console/fleet.json` | The machine profile a console inherits and may override: the remote host and logins, the notify command, webhooks, categories, quiet hours, the machine's lane ceiling. |
+| `~/.local/state/phase-console/accounts/learned.json` | What the machine has learned about each Claude credential — its walls, the entitlement breaker, when its meters were last read, its organisation (hashed), and the tombstone of a removed registration. Every console on the machine reads the same file; the registrations themselves stay per console. |
+| `~/.local/state/phase-console/cli-init.json` | The newest Claude CLI version a session on this console reported — what the relay's floor is judged against. |
+| `~/.local/state/phase-console/relay/state.json` | The relay's memory across a restart: the questions each run has asked, and the answers kept for a session that resumes. |
 | `.phase-console.json` | Optional, committed at a repository root: `{"name": …, "port": …}` names that project's console for everyone who clones it. |
 
 ## The engine, if you would rather drive it yourself
@@ -290,7 +298,7 @@ available, so closing is a cheap, reversible call.
 | `running` | Running | The autopilot is driving: sessions spawn, verify and hand off by themselves. | Nothing — watch the phase tabs. Pause, Freeze and Stop all apply. |
 | `pausing` | Waiting | A pause is armed: whatever is running finishes, and nothing new boards. | Wait for the boundary, or Cancel pause to keep going. |
 | `paused` | Waiting | Stopped between phases at your request; nothing is running. | Press Continue when ready — it picks up exactly where it left off. |
-| `waiting` | Waiting | Sleeping until the account's usage window reopens, then resumes itself. | Nothing. |
+| `waiting` | Waiting | Asleep on a clock: an account's usage window reopening, an external wait a session declared, or — while a verification or permission card stands — a person, with the run's clock at the soonest card's expiry. A card that runs out its clock unanswered parks its phase as `awaiting-person`. | Nothing, unless it is waiting on you: then answer the card. |
 | `frozen` | Waiting | Every session is stopped where it stands (mid-token), warm and losing nothing. A freeze on ONE session of several is recorded on that session's tab instead, and the run stays `running`. | Continue the frozen session to resume instantly, or Stop it. |
 | `parked` | Needs you | Every remaining phase needs a person first — a gate, an approval, a decision. | Read "Why this is stopped": each blocker is named with its remedy. |
 | `queued` | Queued | In line behind another plan holding the same repos; starts itself when the scope frees. | Nothing — the holder is named on the queued chip. |
@@ -322,6 +330,37 @@ disk.
 
 A `failed` record under a phase the **board** calls done means: this run's attempt stopped, and the
 work was finished and verified outside it. The row says "nothing to fix — done elsewhere".
+
+## Why a phase or a run stopped
+
+A halt carries a **kind**, and the kind says what it is about. A phase-level kind settles that one
+phase, and the phases already queued or in flight keep their places. A run-level kind stops the run.
+
+| Kind | Level | What happened |
+|---|---|---|
+| `verify-failed` | phase | §Verification ran and came back red. |
+| `no-handoff` | phase | The session ended without writing its handoff. |
+| `phase-blocked` | phase | The session declared itself blocked. |
+| `waiting-external-timeout` | phase | A declared external wait was not resumed. |
+| `needs-human` | phase | An errand only a person can settle. |
+| `awaiting-person` | phase | A person was asked — a verification or permission card — and its clock ran out unanswered. |
+| `phase-crashed` | phase | The phase failed inside the runner. |
+| `verification-preflight` | phase | The phase's §Verification gave the runner nothing it could run. |
+| `mcp-preflight` | phase | An MCP server the phase requires would not connect. |
+| `recovery-failed` | phase | A recovery crashed, or said why it could not finish. |
+| `orphaned-session` | phase | A live session from an earlier console was found still working. |
+| `worktree-merge` | phase | A lane's commits would not merge into the run branch; every commit survives on its lane branch. |
+| `budget` | run | The run's budget is spent. |
+| `plan-unreadable` · `plan-lint` | run | The plan could not be read, or stopped linting. |
+| `failure-streak` | run | Too many phases failed in a row. Only a person's press relaunches it. |
+| `models-exhausted` | run | Every model is exhausted or at capacity. |
+| `run-preflight` | run | The start was refused: the auth or configuration preflight failed. |
+| `runner-crashed` | run | The drive loop itself threw. |
+| `plan-deadlocked` | run | A QA verdict holds every phase that is left; nothing is ready and nothing is in flight. |
+| `nothing-ready` | run | Phases remain, each behind a gate, an errand, a Retry or another plan's lock. |
+| `interrupted-by-restart` | run | The run was found in flight with no live session after the console driving it went away. |
+| `operator-stop` | run | Stop was pressed on a run this console was not driving. |
+| `credential-refused` | run | The API refused the credential the run spends, and the account is retired for its organisation. Only a person's press relaunches it. |
 
 ## Board state
 

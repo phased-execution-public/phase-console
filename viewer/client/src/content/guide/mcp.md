@@ -44,6 +44,12 @@ That matters because an unattended session cannot fix it. There is no `/mcp` pan
 and what the CLI does instead is tell the *model* that the tools are unavailable — so the session
 improvises around the missing server and hands back work that used none of what you chose it for.
 
+The probe is the console talking to itself, so it never appears on **Sessions**, and one answer lasts
+five minutes: the health clock probes on that period, and a phase boarding inside it reuses the answer
+— or joins a probe already running — instead of starting one of its own. Each probe is still an
+automatic start, so it counts against the console's start ceiling (see **Autopilot**); a console past
+the ceiling lets health go stale rather than probing.
+
 **By default the phase still runs.** It boards without the servers that would not answer, its prompt
 names them and tells it to do the work that does not depend on them and to record the rest under
 **Outstanding** as an errand for you, and you get one notification per run per server. Change that

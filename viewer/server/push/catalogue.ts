@@ -42,9 +42,9 @@ export const CATEGORIES: readonly Category[] = [
   {
     id: 'session-ask',
     label: 'Session waiting on you',
-    detail: 'A Claude session outside the autopilot — one you ran in a terminal, or an agent '
-      + 'session — hit a permission prompt or asked for input. It sits blocked until you answer '
-      + 'it there; the console cannot answer for it.',
+    detail: 'A Claude session hit a permission prompt or asked for input — an autopilot lane, or one '
+      + 'you ran in a terminal or as an agent session. It sits blocked until it is answered: a lane '
+      + 'from the inbox, any other session only where it runs.',
     byDefault: true,
     urgent: true,
   },

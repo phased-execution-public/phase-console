@@ -342,13 +342,13 @@ export function healthIssues(ctx: PlanContext): HealthIssue[] {
     for (const dep of row.dependsOn) {
       if (!known.has(dep)) add('error', 'undefined-dep', `Phase ${row.phase} depends on ${dep}, which is not in the table`, row.phase);
     }
-    // A nudge, never bash lint: an uncategorized gate defaults to human (the
-    // safe read), so it fails nothing — but naming the category is what lets
-    // the autopilot clear ai gates instead of parking on them.
+    // Since 5.0.0 the bash lint FAILS this (F24 `gate-directive-missing`) and
+    // the board reads the gate as `ai` (gates.env GATE_DEFAULT) until the
+    // author says which it is; this row is the console's own word for it.
     const detail = plan.phases[row.phase];
     if (detail?.gated && !detail.gateCheck) {
-      add('info', 'gate-uncategorized',
-        `Phase ${row.phase} is GATED with no Gate-check — add \`ai <check>\` (a session clears it) `
+      add('error', 'gate-uncategorized',
+        `Phase ${row.phase} is GATED with no Gate-check (it reads as ai until it has one; validate.sh fails it) — add \`ai <check>\` (a session clears it) `
         + 'or `manual <who>` (the Gate card clears it)', row.phase);
     }
     // A phase whose §Verification yields nothing runnable boards the autopilot

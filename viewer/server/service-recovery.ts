@@ -25,7 +25,8 @@ import {
 import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type HooksWrite } from './hooks-install.ts';
 import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
-  ConvergeScheduler, convergePlan, HALT_DELAY_MS, MAX_BOOT_RESUMES, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
+  ConvergeScheduler, convergePlan, evidenceFingerprint, HALT_DELAY_MS, MAX_BOOT_RESUMES, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
+import { RECOVER_MAX_PER_PHASE } from './runner/runner-core.ts';
 import { planWrite, runWrite } from './writes.ts';
 import {
   run, invalidate, readMemoryBlock, readQaMode, readSessionPlan, readLint, readGateStatus,
@@ -73,16 +74,28 @@ import {
   continueMcpParkedRecord, mcpParkDueAt, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult,
 } from './runner/mcp-park.ts';
 import {
-  classifySituation, collectEvidence, gitIn, summariseEvidence, workEvidence,
+  classifySituation, collectEvidence, gitIn, newEvidenceCache, summariseEvidence, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './runner/situation.ts';
 import {
-  accountRung, errandFor, ladderCaps, lastSettledRung, nextRung, parseSituationKey, progressExtension, rungsFor,
-  sameErrand, settleRung, situationLabel, type Rung,
+  accountRung, capRefusal, errandFor, errandSaid, ladderCaps, lastSettledRung, nextRung, parseSituationKey, progressExtension,
+  policyAnsweredPayload,
+  rungSettledPayload, rungsFor, sameErrand, settleRung, situationLabel, undrivableSentence, type Rung, widenCard, widenInstruction,
 } from './runner/ladder.ts';
-import { pollableRefs, type WatchState } from './watch-refs.ts';
+import { policyForSituation, policyPrefsOf } from './runner/policy.ts';
+import { pollableRefs, redeliverAfter, type WatchState } from './watch-refs.ts';
+
+/**
+ * How many times a landing's drive may REJECT before the landing becomes an
+ * errand (RCV-8) — the same three as `MAX_BOOT_RESUMES`, because a rejection
+ * and a void resume are two ways of the same landing buying nothing.
+ */
+const MAX_WATCH_REJECTIONS = MAX_BOOT_RESUMES;
 import type { WatchLandingOutcome } from './watch-scheduler.ts';
-import type { McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import type { ClassifiedBy, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import { doorActor, viaOfTrigger, type StartActor } from './actor.ts';
+import { ceilingSentence } from './start-ceiling.ts';
+import { consoleEnded } from './runner/session-record.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
@@ -97,10 +110,11 @@ import type { LaneLiveness } from './runner/liveness.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, retirePhaseHalt,
-  reconcileRecordsAgainstBoard, resetForRetry, resolveRunsAgainst, saveRun,
+  reconcileRecordsAgainstBoard, resetForRetry, resolveRunsAgainst, saveRun, setRunState, syncWaitClock,
   slugsNeedingBoard, runDir, waitReasonOf, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText,
   type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary, mergeQaHistory,
 } from './runner/state.ts';
+import { openWaitEntry } from './runner/wait-budget.ts';
 import {
   consumeOutcome, inboxOutcomePhase, outcomeFileFor, outcomeInboxDir, readOutcome, type PhaseOutcome,
 } from './runner/outcome.ts';
@@ -408,7 +422,16 @@ export abstract class ServiceRecovery extends ServiceRuns {
    */
   protected async preRecoveryGate(
     slug: string, state: RunState, phase: number,
-  ): Promise<'proceed' | 'superseded' | 'resolved'> {
+    /**
+     * `verb: true` is the operator's `recover` (`recoverPhase`), which is also
+     * held to its own ledger (RCV-4): `unchanged` when the phase's evidence
+     * fingerprint is the one the last recovery ran under, `capped` past
+     * `RECOVER_MAX_PER_PHASE`. The healer's two calls never ask — its dedup is
+     * the situation fingerprint (RCV-9), and an `interrupted` rung must stay
+     * re-climbable once over evidence a restart did not move.
+     */
+    opts: { verb?: boolean } = {},
+  ): Promise<'proceed' | 'superseded' | 'resolved' | 'unchanged' | 'capped'> {
     // `if (board)` used to be dead code: `boardStates` caught internally and
     // always returned an object, so this branch ran against an EMPTY board and
     // reconciled records against a read that had never happened. `board.error`
@@ -463,7 +486,25 @@ export abstract class ServiceRecovery extends ServiceRuns {
       }
     }
     if (state.resolved) return 'resolved';
+    if (opts.verb) {
+      const ledger = state.recoveries?.[String(phase)]?.recovers;
+      if (ledger && ledger.count >= RECOVER_MAX_PER_PHASE) return 'capped';
+      if (ledger?.lastFingerprint && board) {
+        const now = this.fingerprintFor(slug, state, board, read?.qa);
+        if (now === ledger.lastFingerprint) return 'unchanged';
+      }
+    }
     return 'proceed';
+  }
+
+  /**
+   * The evidence fingerprint over THIS console's facts — the converge pass's
+   * function over the same inputs (`allLocks`, the gate stamp, the board's
+   * QA), so a direct caller (the Recover press, the healer without a pass, a
+   * test) answers "unchanged" exactly as the loop would.
+   */
+  protected fingerprintFor(slug: string, state: RunState, board: Record<number, string>, qa?: Parameters<typeof evidenceFingerprint>[4]): string {
+    return evidenceFingerprint(state, board, this.allLocks().filter((lock) => lock.slug === slug), this.gateStampFor(slug), qa);
   }
 
   /**
@@ -773,28 +814,89 @@ export abstract class ServiceRecovery extends ServiceRuns {
   }
 
   /**
-   * The switch that would have made the ladder's only rung drivable on THIS
-   * console — named on the errand, because `nextRung`'s "no rung … is
-   * available on this console yet" reached the journal and never the person
-   * who could flip it (measured: four `plan-broken` stand-downs and two
-   * `foreign-stale`, each with a card that read as if no rung existed).
+   * Why the ladder's rungs cannot be driven on THIS console — named on the
+   * errand, because `nextRung`'s "no rung … is available on this console yet"
+   * reached the journal and never the person who could act (measured: four
+   * `plan-broken` stand-downs and two `foreign-stale`, each with a card that
+   * read as if no rung existed). It used to answer for three situations by
+   * name; since phase 10 (RCV-7) it answers for EVERY table `resolveVehicle`
+   * refuses, rung by rung, from the refusal reasons themselves — the flag, the
+   * preference, the clock, the account, the missing ref. Null only when some
+   * rung is drivable, because then the ladder climbs and no sentence is owed.
+   * The drive loop reads the same answer through `RunnerDeps.rungUnavailable`.
    */
-  private unavailableRungHint(situation: Situation, slug: string): string | null {
-    if (situation.id === 'plan-broken' && !this.flags.allowWrites) {
-      return `The free deterministic rung (scripts/repair-artefacts.sh ${slug} --apply) needs a console started with --allow-writes: run it by hand, or restart with the flag and Retry.`;
-    }
-    if (situation.id === 'foreign-stale' && this.prefs.staleClaimTakeover === false) {
-      return 'Take over stale claims is off in Settings ▸ Automation: turn it on and Retry, or release the claim from the phase page.';
-    }
-    if (situation.id === 'blocked-declared' && situation.sub === 'unknown' && this.prefs.unblockAttempts === false) {
-      return 'Unblock attempts are off in Settings ▸ Automation: turn them on and Retry to spend one bounded session on it.';
-    }
-    return null;
+  protected unavailableRungHint(
+    situation: Situation, record: RunPhaseRecord | undefined, evidence: PhaseEvidence | null,
+    slug: string, state: RunState | null,
+  ): string | null {
+    return undrivableSentence(situation.key, this.rungRefusals(situation, record, evidence, slug, state));
   }
 
-  async maybeAutoRecover(slug: string): Promise<AutoRecoverResult> {
+  /**
+   * The `wait-heal` rung, driven (phase 10): a `require` MCP park still on
+   * its clock. The timer is re-armed — a restart may have lost it — and the
+   * rung is accounted ONCE per park, so the ladder card says who is working
+   * and the flip (`continueMcpParkedRecord`) settles it when the clock fires.
+   * Written through `slot.rungs` directly rather than `accountRung`, like the
+   * flip: nothing launched, so the legacy launch counter must not move.
+   */
+  private driveWaitHeal(
+    slug: string, state: RunState, phase: number, situation: Situation,
+    vehicle: { kind: 'wait-heal'; until: string }, journal: Journal, signed: { by: string; trigger: string },
+  ): void {
+    const record = state.phases[String(phase)];
+    const parkedAt = record?.mcpPark?.at ?? '';
+    const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: new Date().toISOString() });
+    const held = (slot.rungs ?? []).some((r) => r.rung === 'wait-heal' && r.situation === situation.key && r.at >= parkedAt);
+    if (!held) {
+      const at = new Date().toISOString();
+      (slot.rungs ??= []).push({ situation: situation.key, rung: 'wait-heal', at, outcome: 'running', note: `waits until ${vehicle.until}` });
+      slot.lastAt = at;
+      journal.append('phase.rung', {
+        situation: situation.key, rung: 'wait-heal', params: null, vehicle: 'timer', attempt: slot.attempts,
+        by: signed.by, trigger: signed.trigger, until: vehicle.until,
+      }, phase);
+      try { saveRun(state); } catch { /* the timer matters more than the write */ }
+    }
+    this.armMcpRequireTimer(slug, phase, Date.parse(vehicle.until));
+  }
+
+  /**
+   * The service's ONE settlement door (phase 10, RCV-6): settle the phase's
+   * newest open rung and write `phase.rung-settled` with the whole payload —
+   * situation, params, cost, note. Every `settleRung` under `service*.ts`
+   * goes through here (`test/invariants.test.ts` holds it), so the journal
+   * can never again carry a settlement that says only `{outcome, rung}`.
+   * Answers the settled record, or null when nothing was open.
+   */
+  protected settleRungOn(
+    state: RunState, phase: number, outcome: NonNullable<RungRecord['outcome']>, note?: string, costUsd?: number,
+  ): RungRecord | null {
+    const slot = state.recoveries?.[String(phase)];
+    if (!slot) return null;
+    const settled = settleRung(slot, outcome, costUsd, note);
+    if (settled && this.root?.ok) {
+      new Journal(this.root.path, state.slug, state.id).append('phase.rung-settled', rungSettledPayload(settled), phase);
+    }
+    return settled;
+  }
+
+  async maybeAutoRecover(
+    slug: string,
+    pass: { trigger?: string; fingerprint?: string } = {},
+  ): Promise<AutoRecoverResult> {
     const no = (reason: string, extra: Partial<AutoRecoverResult> = {}): AutoRecoverResult =>
       ({ launched: false, reason, ...extra });
+    // Who is classifying (RCV-9): the healer, on whichever trigger woke the
+    // convergence loop — every `phase.situation` and `phase.rung` this pass
+    // writes carries the word, the runner's own climb writes `drive`.
+    const by: ClassifiedBy = 'heal';
+    const trigger = pass.trigger ?? 'direct';
+    const healActor = (situation: string, rung: string, attempt: number, perPhase: number): StartActor =>
+      doorActor('converge-heal', {
+        by, via: viaOfTrigger(trigger), origin: `converge:${trigger}`,
+        trigger: situation, guard: `ladder:${rung}`, counter: `ladderPerPhaseRungs:${attempt}/${perPhase}`,
+      });
     if (!this.root?.ok) return no('no source directory is open');
     if (this.liveRunner(slug)) return no('the run is live again');
 
@@ -823,7 +925,24 @@ export abstract class ServiceRecovery extends ServiceRuns {
         const sitId = String(open.situation ?? '').split(':')[0];
         let outcome: 'fixed' | 'no-defect' | 'failed' | 'interrupted';
         let note: string;
-        if (sitId === 'qa-pending' || sitId === 'qa-failed') {
+        // A standing `widen-rule` card is a rung still running (phase 9): the
+        // record is `parked` with a declaration behind it, which the `no-defect`
+        // arm below would otherwise score on the very next pass — exhausting
+        // the one-rung table while the card was still up. Its answer settles
+        // it (`widenDecided`, the healer's `decided`); a card that is GONE with
+        // the rung still open is a console restart, and reads `interrupted`.
+        if (open.rung === 'widen-rule') {
+          if (open.cardId && this.approvals.isPending(open.cardId)) continue;
+          outcome = 'interrupted';
+          note = 'the widen card is gone — the console restarted under it, or it was answered before the rung could settle';
+        } else if (open.rung === 'wait-heal' && record?.mcpPark) {
+          // A `require` park's wait rung is the timer's (phase 10): the flip
+          // settles it when the clock fires — or the healer's own next pass,
+          // past the clock, climbs `mcp-continue` and flips. Scoring it here
+          // ("the record reads parked") settled it `failed` before the flip,
+          // which then wrote a second `wait-heal` retroactively.
+          continue;
+        } else if (sitId === 'qa-pending' || sitId === 'qa-failed') {
           const verdict = await this.qaVerdict(slug, phaseNo);
           const met = sitId === 'qa-pending'
             ? verdict !== 'pending' && verdict !== 'none'
@@ -839,9 +958,14 @@ export abstract class ServiceRecovery extends ServiceRuns {
           }
           if (met) { outcome = 'fixed'; note = `a QA verdict is recorded (${verdict})`; }
           else if (!open.turns) { outcome = 'interrupted'; note = 'the session never effectively ran — no turns before it ended'; }
+          else if (consoleEnded(open.endedBy)) { outcome = 'interrupted'; note = `the console ended the session (${open.endedBy}) before its turn was done`; }
           else { outcome = 'failed'; note = `the verdict is still ${verdict}`; }
         } else if (open.rung === 'resume-own-session' && !open.turns && record?.status !== 'done') {
           outcome = 'interrupted'; note = 'the session never effectively ran — no turns before it ended';
+        } else if (open.rung === 'resume-own-session' && consoleEnded(open.endedBy) && record?.status !== 'done') {
+          // Interrupted turns are booked honestly now, so zero turns is no
+          // longer the only witness to a session the console cut short.
+          outcome = 'interrupted'; note = `the console ended the session (${open.endedBy}) before its turn was done`;
         } else if (record?.status === 'done') {
           outcome = 'fixed'; note = 'the record reads done';
         } else if ((record?.status === 'parked' || record?.status === 'waiting') && record?.declared) {
@@ -855,13 +979,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         } else {
           outcome = 'failed'; note = `the record reads ${record?.status ?? 'absent'}`;
         }
-        const settled = settleRung(slot, outcome, undefined, note);
-        if (settled) {
-          touched = true;
-          new Journal(this.root.path, slug, state.id).append(
-            'phase.rung-settled', { rung: settled.rung, outcome: settled.outcome }, phaseNo,
-          );
-        }
+        if (this.settleRungOn(state, phaseNo, outcome, note)) touched = true;
       }
       // A standing qa errand whose ask is now ANSWERED dissolves with the
       // same sweep — the verdict is the rung's goal, and a satisfied ask left
@@ -921,7 +1039,15 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const read = await this.board(slug);
     if (read.error) return no(`the console could not read the board: ${read.error}`);
     const board = read.states;
-    const candidates = await this.classifyOpenPhases(slug, state, board);
+    // ONE cache for the whole pass (RCV-9): `git status` per scope directory,
+    // the plan's health and each gate read are asked once, however many
+    // candidates there are. The fingerprint is the converge pass's when it
+    // handed one over, else the same function over the same facts — so a
+    // direct caller (the Recover press, a test) gets the same "unchanged"
+    // answer the loop would.
+    const cache = newEvidenceCache();
+    const fingerprint = pass.fingerprint ?? this.fingerprintFor(slug, state, board, read.qa);
+    const candidates = await this.classifyOpenPhases(slug, state, board, cache);
     if (!candidates.length) {
       // No candidate does NOT mean nothing is wrong. The candidate list is
       // deliberately record-shaped — a phase the board reads done is closed by
@@ -937,10 +1063,11 @@ export abstract class ServiceRecovery extends ServiceRuns {
       const anchor = state.halt?.phase;
       if (anchor == null) return no('no open phase of this run has a record to act on');
       try {
-        const { situation } = await this.classifyPhase(slug, anchor, state, board);
+        const { situation } = await this.classifyPhase(slug, anchor, state, board, cache);
         if (situation.actor === 'person' || situation.actor === 'machine') {
           const journal = new Journal(this.root.path, slug, state.id);
-          const errand = errandFor(situation.key, [], anchor);
+          const errand = errandFor(situation.key, [], anchor, undefined,
+            errandSaid(situation, state.phases[String(anchor)]?.said));
           // A standing errand is not rewritten: this arm runs on every sweep,
           // and each rewrite re-pushed the same ask with a fresh clock.
           const standing = state.recoveries?.[String(anchor)]?.errand;
@@ -986,12 +1113,26 @@ export abstract class ServiceRecovery extends ServiceRuns {
       firstRefusal ??= { launched: false, reason, phase: c.phase, situation: c.situation.key, label: c.situation.label };
     };
 
+    let reJournalled = 0;
+    let unchanged = 0;
     for (const c of candidates) {
       const key = String(c.phase);
       const record = state.phases[key];
       const slot = recoveries[key];
-      journal.append('phase.situation', { situation: c.situation.key, sub: c.situation.sub ?? null, why: c.situation.why }, c.phase);
-      if (record) record.situation = { key: c.situation.key, at: c.evidence.at, why: c.situation.why };
+      // Signed, and written ONCE per evidence (RCV-9): the same key from the
+      // same fingerprint is what the record already says, and every pass
+      // used to write it again — 1 332 lines, 1 249 of them unsigned, most
+      // of them "still parked". The candidate is still walked and may still
+      // climb; only the journal line is spared.
+      const same = record?.situation?.key === c.situation.key && record?.situation?.fingerprint === fingerprint;
+      if (same) unchanged += 1; else {
+        reJournalled += 1;
+        journal.append('phase.situation', {
+          situation: c.situation.key, sub: c.situation.sub ?? null, label: c.situation.label, why: c.situation.why,
+          by, trigger, fingerprint: fingerprint.slice(0, 200),
+        }, c.phase);
+      }
+      if (record) record.situation = { key: c.situation.key, at: c.evidence.at, why: c.situation.why, fingerprint, by };
 
       /* A DECLARED park is the session's own testimony — a person was asked
        * (needs-human), or the world is being waited on. The ladder does not
@@ -1047,17 +1188,21 @@ export abstract class ServiceRecovery extends ServiceRuns {
         refuse(`phase ${c.phase} reads ${c.situation.label} — nothing to climb`, c);
         continue;
       }
-      // A `require` MCP park still on its clock is nobody's to climb: the
-      // timer continues the phase without its servers when the clock runs
-      // out (re-armed here in case the console that parked it is gone), and
-      // `healMcpParks` requeues it sooner if the server heals. Not an errand —
-      // that is written when the clock fires, not while it is running.
+      // A `require` MCP park still on its clock is the `wait-heal` rung being
+      // climbed — by the timer, which continues the phase without its servers
+      // when the clock runs out (re-armed here in case the console that parked
+      // it is gone), while `healMcpParks` requeues it sooner if the server
+      // heals. The rung is accounted ONCE per park (phase 10, RCV-10: the row
+      // was refused by name and never climbed, 0 against 104 `phase.mcp`), so
+      // the ladder card and the journal say who is working; the flip settles
+      // it when the clock fires. Not an errand — that is written when the
+      // clock fires, not while it is running.
       if (c.situation.id === 'mcp-unavailable') {
-        const due = mcpParkDueAt(record, this.mcpRequireTimeoutMs());
-        if (due !== null && due > Date.now()) {
-          this.armMcpRequireTimer(slug, c.phase, due);
+        const held = this.resolveVehicle(rungsFor(c.situation.key)[0], c.situation, record, c.evidence, slug, state);
+        if ('vehicle' in held && held.vehicle.kind === 'wait-heal') {
+          this.driveWaitHeal(slug, state, c.phase, c.situation, held.vehicle, journal, { by, trigger });
           refuse(`phase ${c.phase} is parked on an MCP server — it continues without it at `
-            + `${new Date(due).toISOString()} unless the server heals first`, c);
+            + `${held.vehicle.until} unless the server heals first`, c);
           continue;
         }
       }
@@ -1074,7 +1219,8 @@ export abstract class ServiceRecovery extends ServiceRuns {
         const key2 = String(c2.phase);
         const slot2 = (recoveries[key2] ??= { attempts: 0, lastAt: new Date().toISOString() });
         if (slot2.errand) return;
-        const errand = errandFor(c2.situation.key, slot2.rungs ?? [], c2.phase);
+        const errand = errandFor(c2.situation.key, slot2.rungs ?? [], c2.phase, undefined,
+          errandSaid(c2.situation, state.phases[key2]?.said));
         slot2.errand = errand;
         journal.append('phase.errand', { ...errand }, c2.phase);
         this.announceErrand({ slug, runId: state.id, phase: c2.phase, errand });
@@ -1125,7 +1271,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         // The same day budget the runner's own climb counts against, so the
         // loop's rungs and the healer's cannot each spend it in full.
         situation: c.situation.key, history, runHistory, caps, dayHistory: this.dayRungs(),
-        available: (rung: Rung) => this.vehicleForRung(rung, c.situation, record, c.evidence, slug) !== null,
+        available: (rung: Rung) => this.vehicleForRung(rung, c.situation, record, c.evidence, slug, state) !== null,
       };
       let next = nextRung(climbInput);
       // One more rung when the newest settled rung landed commits
@@ -1157,7 +1303,11 @@ export abstract class ServiceRecovery extends ServiceRuns {
             ? c.evidence?.health?.find((i) => i.phase == null || i.phase === c.phase)
             : null;
           const errand = errandFor(
-            c.situation.key, slot?.rungs ?? [], c.phase, undefined, null,
+            c.situation.key, slot?.rungs ?? [], c.phase, undefined,
+            // The session's own words when they ARE the evidence — the one
+            // rule for both paths (RCV-7, `errandSaid`): a refusal, a skill
+            // that would not load, the organisation that said no.
+            errandSaid(c.situation, record?.said),
             c.situation.id === 'plan-broken'
               ? {
                 kind: planIssue?.kind ?? c.situation.sub,
@@ -1168,20 +1318,81 @@ export abstract class ServiceRecovery extends ServiceRuns {
                 ...(c.situation.sub === 'lint' ? { validateOk: false } : {}),
               }
               : null,
+            null,
+            // The console's own denial, so a permission errand names the rule
+            // and the command rather than "a tool" (LFC-3).
+            record?.toolDenied && record.toolDenied.rule !== 'in-turn-wait' ? record.toolDenied : null,
+            // The answer in force for this situation's manifest row (phase 11,
+            // ZTD-10): the run's manifest, this console's `policy.<key>`, the
+            // shipped default — the same reading the drive loop makes.
+            policyForSituation(c.situation.key, state, policyPrefsOf(this.prefs)),
           );
-          // The ladder's only rung was there and THIS console could not drive
-          // it: name the switch, or the card reads as if no rung existed.
-          const hint = /^no rung for /.test(next.reason) ? this.unavailableRungHint(c.situation, slug) : null;
+          // A class whose row answered AUTOMATICALLY is not a person's: the
+          // ruling is journalled under its decision key, once per answer per
+          // phase, and acted on where the console can act — never an errand,
+          // never a push. `blocked-declared:unknown` is pinned and never lands here.
+          if (errand.policy) {
+            const answered = recoveries[key]?.policyAnswered;
+            if (answered && answered.decisionKey === errand.decisionKey && answered.answer === errand.policy.answer) {
+              refuse(`phase ${c.phase} reads ${c.situation.label} — answered by policy (${errand.decisionKey} = ${errand.policy.answer}, since ${answered.at})`, c);
+              continue;
+            }
+            (recoveries[key] ??= { attempts: 0, lastAt: errand.at }).policyAnswered = {
+              decisionKey: errand.decisionKey!, answer: errand.policy.answer, source: errand.policy.source, at: errand.at,
+            };
+            journal.append('phase.policy-answered', {
+              ...policyAnsweredPayload({ ...errand, decisionKey: errand.decisionKey! }),
+              label: c.situation.label, reason: next.reason, by, trigger,
+            }, c.phase);
+            if (errand.decisionKey === 'qa.exhausted' && errand.policy.answer === 'waive') {
+              const rounds = (record?.qa ?? []).filter((entry) => entry.verdict === 'fail').length;
+              const result = await this.qaWaive(slug, c.phase, {
+                reason: `QA exhausted after ${rounds} failed round${rounds === 1 ? '' : 's'} — waived by policy `
+                  + `(qa.exhausted: waive, from the ${errand.policy.source})`,
+                by: 'policy',
+              }).catch((error: unknown) => ({ ok: false, detail: String((error as Error)?.message ?? error) }));
+              if (result.ok) {
+                journal.append('phase.qa-waived', {
+                  by: 'policy', decisionKey: errand.decisionKey, source: errand.policy.source, rounds,
+                }, c.phase);
+              } else {
+                // The policy could not act: the person's ask stands after all.
+                const { policy: _policy, ...asked } = errand;
+                recoveries[key]!.policyAnswered = undefined;
+                recoveries[key]!.errand = asked;
+                journal.append('phase.errand', {
+                  ...asked, reason: `qa.exhausted: waive could not record the verdict — ${result.detail}`, by,
+                }, c.phase);
+                this.announceErrand({ slug, runId: state.id, phase: c.phase, errand: asked });
+              }
+            }
+            refuse(`phase ${c.phase} reads ${c.situation.label} — answered by policy (${errand.decisionKey} = ${errand.policy.answer}, from the ${errand.policy.source})`, c);
+            continue;
+          }
+          // The ladder's rungs were there and THIS console could not drive
+          // them: name each and why, or the card reads as if no rung existed.
+          const hint = /^no rung for /.test(next.reason)
+            ? this.unavailableRungHint(c.situation, record, c.evidence, slug, state)
+            : null;
           if (hint) errand.how = `${errand.how} ${hint}`;
           // A standing errand is not rewritten: this path runs on every sweep
           // for every person's situation, and each rewrite re-pushed the same
           // ask with a fresh clock (51 times in a day for one manual gate).
-          const standing = recoveries[key]?.errand;
-          if (sameErrand(standing, errand)) {
+          // The RUN's own errand counts as standing too (phase 9): a credential
+          // wall writes its errand at the halt, run-level, and a phase-level
+          // twin here would be one wall asked about twice.
+          const standing = recoveries[key]?.errand
+            ?? (state.errand && state.errand.situation === c.situation.key ? state.errand : undefined);
+          if (sameErrand(standing, errand) || (standing && standing === state.errand)) {
             refuse(`phase ${c.phase} reads ${c.situation.label} — ${next.reason} (the errand has stood since ${standing!.at})`, c);
             continue;
           }
           (recoveries[key] ??= { attempts: 0, lastAt: errand.at }).errand = errand;
+          // A cap refusal is a journal line, not only a sentence (RCV-6):
+          // written beside the errand it produced, once — the errand's own
+          // dedupe above is what keeps a sweep from repeating it.
+          const cap = capRefusal(next);
+          if (cap) journal.append('phase.ladder-refused', { situation: c.situation.key, ...cap, by, trigger }, c.phase);
           journal.append('phase.errand', { ...errand }, c.phase);
           // The healer's errands push on the same channel and through the same
           // dedupe as the runner's. Which of the two exhausted the ladder is an
@@ -1191,13 +1402,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
         refuse(`phase ${c.phase} reads ${c.situation.label} — ${next.reason}`, c);
         continue;
       }
-      const vehicle = this.vehicleForRung(next.rung, c.situation, record, c.evidence, slug);
+      const vehicle = this.vehicleForRung(next.rung, c.situation, record, c.evidence, slug, state);
       if (!vehicle) { refuse(`phase ${c.phase} reads ${c.situation.label} — ${next.rung.label} cannot be driven here`, c); continue; }
       chosen = { ...c, rung: next.rung, vehicle };
       break;
     }
     try { saveRun(state); } catch { /* the verdict matters more than the write */ }
     this.emit('run:state', { state });
+    log.info('run.heal-pass', {
+      slug, runId: state.id, trigger, candidates: candidates.length, journalled: reJournalled, unchanged,
+      shellOutsSaved: cache.hits, chose: chosen ? chosen.phase : null,
+    });
     if (!chosen) return firstRefusal ?? no('nothing the autopilot can climb');
 
     const { phase, situation, rung, vehicle } = chosen;
@@ -1237,7 +1452,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       if (state.halt?.reason) slot.lastReason = state.halt.reason;
       saveRun(state);
       this.emit('run:state', { state });
-      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: vehicle.kind, attempt: slot.attempts }, phase);
+      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: vehicle.kind, attempt: slot.attempts, by, trigger }, phase);
       log.info('run.auto-recovery', { slug, runId: state.id, phase, situation: situation.key, rung: rung.vehicle, vehicle: vehicle.kind, attempt: slot.attempts });
       // Plan progress about a phase, not a session ending — on `session` the
       // deep link landed on the terminal list and the card read "A session
@@ -1255,13 +1470,62 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (vehicle.kind === 'retry') {
       if (!this.flags.allowRun) return no('the runner re-board needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       climb();
-      void this.retryPhase(slug, phase)
+      void this.retryPhase(slug, phase, undefined, healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs))
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
-          settleRung(slot, 'failed', undefined, (error as Error)?.message ?? String(error));
+          this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
           try { saveRun(state); } catch { /* best effort */ }
         });
       return answer();
+    }
+
+    /* The `widen-rule` card on a STOPPED run (phase 9, TRS-10): a standing
+     * approval card for the deny rule the console's own hook refused. Free —
+     * the rung is recorded as climbed with the card's id, nothing spends until
+     * a person answers, and `disarm()` never answers it for them. Allow strikes
+     * the rule for this plan and resumes the phase's OWN session through the
+     * recover verb; Deny or the card's clock settles the rung `failed`, and the
+     * next pass writes the errand. (A LIVE run drives the same rung itself —
+     * `Runner.offerWidenRule` — so the two never race for one phase.) */
+    if (vehicle.kind === 'card') {
+      const { approval, decided } = this.approvals.offer(widenCard({ runId: state.id, slug, phase, denied: vehicle.denied }));
+      const climbed = accountRung(slot, { situation: situation.key, rung: rung.vehicle, params: rung.params, at: now, note: rung.label });
+      climbed.cardId = approval.id;
+      if (state.halt?.reason) slot.lastReason = state.halt.reason;
+      const record = state.phases[key];
+      if (record) {
+        record.note = `${situation.label} — a person is asked to widen \`${vehicle.denied.rule}\` (approval card ${approval.id}); nothing spends until they answer`;
+      }
+      saveRun(state);
+      this.emit('run:state', { state });
+      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: 'card', cardId: approval.id, attempt: slot.attempts, by, trigger }, phase);
+      log.info('run.auto-recovery', { slug, runId: state.id, phase, situation: situation.key, rung: rung.vehicle, vehicle: 'card', attempt: slot.attempts });
+      const denied = vehicle.denied;
+      void decided.then((outcome) => {
+        const fresh = loadRun(this.root!.path, slug, state.id, null);
+        const freshSlot = fresh?.recoveries?.[key];
+        const open = freshSlot?.rungs?.find((r) => r.cardId === approval.id && r.outcome === 'running');
+        const line = new Journal(this.root!.path, slug, state.id);
+        line.append('phase.widen-decided', {
+          decision: outcome.decision, by: outcome.by, rule: denied.rule, cardId: approval.id,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+        }, phase);
+        if (outcome.decision === 'allow') {
+          this.editPolicy({ scope: 'plan', slug, remove: { deny: [denied.rule] }, by: outcome.by });
+          // `journalPolicy` notes live runners only; this run is stopped.
+          line.append('policy.edited', { scope: 'plan', by: outcome.by, removed: [`deny ${denied.rule}`] });
+          void this.recoverPhase(slug, phase, 'resume', { instruction: widenInstruction(denied), by: outcome.by })
+            .catch((error) => log.warn('run.auto-recovery-failed', { slug, phase, error }));
+          return;
+        }
+        if (fresh && freshSlot && open) {
+          this.settleRungOn(fresh, phase, 'failed', `the widen card was ${outcome.by === 'timeout' ? 'not answered' : `denied by ${outcome.by}`}`);
+          try { saveRun(fresh); } catch { /* best effort */ }
+          this.emit('run:state', { state: fresh });
+        }
+        this.scheduleAutoRecover(slug);
+      }).catch((error) => log.warn('run.auto-recovery-failed', { slug, phase, error }));
+      return answer({ vehicle: 'card' });
     }
 
     /* A `require` MCP park past its clock: continue without the servers. No
@@ -1269,9 +1533,136 @@ export abstract class ServiceRecovery extends ServiceRuns {
      * journal line below is the healer's own voice. */
     if (vehicle.kind === 'mcp-continue') {
       if (!this.flags.allowRun) return no('continuing without the MCP server needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
-      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: null, vehicle: 'mcp-continue', attempt: slot.attempts }, phase);
+      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: null, vehicle: 'mcp-continue', attempt: slot.attempts, by, trigger }, phase);
       void this.continueMcpParkedPhase(slug, phase, 'auto-recovery')
         .catch((error) => { log.warn('run.auto-recovery-failed', { slug, phase, error }); });
+      return answer();
+    }
+
+    /* A `require` MCP park still on its clock (phase 10): the same act the
+     * candidate walk makes before any climb — the timer re-armed, the rung
+     * accounted once — reachable here only for a caller that climbs the
+     * table directly. Nothing launches: the clock is the vehicle. */
+    if (vehicle.kind === 'wait-heal') {
+      this.driveWaitHeal(slug, state, phase, situation, vehicle, journal, { by, trigger });
+      return no(`phase ${phase} is parked on an MCP server — it continues without it at ${vehicle.until} unless the server heals first`,
+        { phase, situation: situation.key, label: situation.label, rung: rung.vehicle, vehicle: 'wait-heal' });
+    }
+
+    /* The watch clock, one pass now (phase 10): the `waiting-external` row's
+     * one act, for a caller that climbs a wait's table directly — the healer's
+     * own walk stands down before it. Nothing is accounted: a pass of the
+     * clock is not a remedy for a failure. */
+    if (vehicle.kind === 'watch-clock') {
+      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: null, vehicle: 'watch-clock', attempt: slot.attempts, by, trigger }, phase);
+      void this.watchClock.tick().catch((error: unknown) => log.warn('run.auto-recovery-failed', { slug, phase, error }));
+      return no(`phase ${phase} waits on its refs — the watch clock ran a pass`,
+        { phase, situation: situation.key, label: situation.label, rung: rung.vehicle, vehicle: 'watch-clock' });
+    }
+
+    /* The resource walls and the parks on a STOPPED run (phase 10, LFC-2):
+     * each moves the run's own record — the account, the budget, the clock —
+     * and then relaunches (or arms the resume) through the run's ordinary
+     * door. The rung is accounted first, like every rung, so a console that
+     * dies between the edit and the launch still remembers it climbed. */
+    if (vehicle.kind === 'switch-account') {
+      if (!this.flags.allowRun) return no('the account switch relaunches the run, which needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+      climb();
+      const moved = this.switchAccountRun(slug, vehicle.accountId,
+        doorActor('converge-heal', { by, via: viaOfTrigger(trigger), origin: `converge:${trigger}`, trigger: situation.key, guard: `ladder:${rung.vehicle}` }));
+      if (!moved.ok) {
+        this.settleRungOn(state, phase, 'failed', moved.reason ?? 'the account switch was refused');
+        try { saveRun(state); } catch { /* best effort */ }
+        return no(`phase ${phase} reads ${situation.label} — the switch to ${vehicle.accountId} was refused: ${moved.reason ?? 'unknown'}`,
+          { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+      }
+      journal.append('run.account-switched', { at: 'ladder', reason: situation.key, from: vehicle.from, account: vehicle.accountId, by, phase });
+      void this.startRun(slug, {
+        actor: healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs),
+        resumeRunId: state.id,
+        accountId: vehicle.accountId,
+        ...(state.onlyPhases?.length ? { onlyPhases: state.onlyPhases } : {}),
+        skills: state.skills ?? [],
+      }).catch((error) => {
+        log.warn('run.auto-recovery-failed', { slug, phase, error });
+        this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
+        try { saveRun(state); } catch { /* best effort */ }
+      });
+      return answer();
+    }
+
+    if (vehicle.kind === 'raise-budget') {
+      if (!this.flags.allowRun) return no('the budget raise relaunches the run, which needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+      climb();
+      const raised = this.editStoredRunById(slug, state.id, (stored) => {
+        stored.budgetRaise = { from: vehicle.from, to: vehicle.to, pct: vehicle.pct, at: now };
+        stored.runBudgetUsd = vehicle.to;
+        // The halt this rung answers dissolves with the raise: the run has
+        // budget again, and a standing `budget` halt would refuse the relaunch.
+        if (stored.halt?.kind === 'budget') { stored.halt = null; stored.status = 'parked'; }
+        if (stored.errand?.situation === 'resource-wall:budget') delete stored.errand;
+      });
+      if (!raised) {
+        this.settleRungOn(state, phase, 'failed', 'the stored run could not be edited');
+        try { saveRun(state); } catch { /* best effort */ }
+        return no('the run could not be edited for the raise', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+      }
+      journal.append('run.budget-raised', { from: vehicle.from, to: vehicle.to, pct: vehicle.pct, cap: vehicle.cap, spentUsd: state.spentUsd, by, rung: rung.vehicle });
+      void this.startRun(slug, {
+        actor: healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs),
+        resumeRunId: state.id,
+        ...(state.onlyPhases?.length ? { onlyPhases: state.onlyPhases } : {}),
+        skills: state.skills ?? [],
+      }).catch((error) => {
+        log.warn('run.auto-recovery-failed', { slug, phase, error });
+        this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
+        try { saveRun(state); } catch { /* best effort */ }
+      });
+      return answer();
+    }
+
+    if (vehicle.kind === 'timed-park') {
+      climb();
+      const parked = this.editStoredRunById(slug, state.id, (stored) => {
+        const rec = stored.phases[key];
+        if (!rec) return;
+        const sessionId = rec.resumeSessionId ?? rec.sessionId;
+        rec.status = 'waiting';
+        rec.parkedUntil = vehicle.until;
+        rec.parkedFrom = now;
+        rec.parkReason = vehicle.why;
+        rec.note = vehicle.why;
+        if (vehicle.refs?.length) rec.watch = vehicle.refs;
+        // The console's own park, stamped like the watchdog's: shown on the
+        // record, never charged to the session's declared budget (WAI-5).
+        openWaitEntry(rec, { parkedFrom: now, parkedUntil: vehicle.until, by: 'ladder' }, Date.now());
+        // The clock's resume boards the phase's own session with the
+        // instruction to re-check — the ladder's hint, read at boarding.
+        rec.boardingHint = {
+          situation: situation.key, rung: rung.vehicle, brief: sessionId ? 'continue' : 'resume',
+          ...(sessionId ? { sessionId } : {}),
+          instruction: vehicle.wait === 'usage-limit'
+            ? 'The usage window you were parked on has reopened. Continue the phase from where it stopped.'
+            : 'The console parked this phase for a while because you declared it blocked on something outside the '
+              + 'session. Re-check that blocker now: if it has landed, continue the phase to its exit criteria; if it has '
+              + 'not, declare `waiting-external` with a machine-checkable `--watch` ref (a gh run or PR, a date, a lock, '
+              + 'a cmd) so the console can watch it instead of you.',
+          at: now, by: 'auto-recovery',
+        };
+        if (stored.halt?.phase === phase) stored.halt = null;
+        setRunState(stored, 'waiting', { kind: vehicle.wait, until: vehicle.until });
+        syncWaitClock(stored);
+      });
+      if (!parked) {
+        this.settleRungOn(state, phase, 'failed', 'the stored run could not be edited');
+        try { saveRun(state); } catch { /* best effort */ }
+        return no('the run could not be edited for the park', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+      }
+      journal.append('phase.waiting', {
+        reason: vehicle.why, until: vehicle.until, watch: vehicle.refs ?? [], by: 'ladder', rung: rung.vehicle, wait: vehicle.wait,
+      }, phase);
+      this.emit('run:state', { state: parked });
+      this.armLimitResume(slug, parked);
       return answer();
     }
 
@@ -1283,6 +1674,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       climb();
       const record = state.phases[key];
       void this.startRun(slug, {
+        actor: healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs),
         resumeRunId: state.id,
         reboard: [{
           phase, situation: situation.key, rung: rung.vehicle, brief: vehicle.brief,
@@ -1294,7 +1686,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         skills: state.skills ?? [],
       }).catch((error) => {
         log.warn('run.auto-recovery-failed', { slug, phase, error });
-        settleRung(slot, 'failed', undefined, (error as Error)?.message ?? String(error));
+        this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
         try { saveRun(state); } catch { /* best effort */ }
       });
       return answer();
@@ -1343,7 +1735,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
             // that honestly reported `no-defect` as one that fixed something.
             // `settleRung` answers null when nothing is open; first writer
             // wins, and the first writer is the session that was there.
-            const settled = settleRung(afterSlot, 'fixed', undefined, 'the board reads fixed');
+            const settled = this.settleRungOn(after, phase, 'fixed', 'the board reads fixed');
             if (settled) {
               afterSlot.fixed = true;
               afterSlot.lastOutcome = 'fixed';
@@ -1364,6 +1756,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
             } else if (this.prefs.autoContinueRecovery !== false && this.flags.allowRun && !this.liveRunner(slug)) {
               log.info('run.recovery-continue', { slug, runId: after.id });
               await this.startRun(slug, {
+                // The recovery session's exit is an observation: the run goes
+                // on because the board reads fixed after the rung it climbed.
+                actor: doorActor('recovery-continue', {
+                  by: 'console', via: 'event', origin: `recovery:${vehicle.mode}`,
+                  trigger: `${situation.key}:fixed`, guard: 'autoContinueRecovery,allowRun,!liveRunner,!fleetHold',
+                  counter: `ladderPerPhaseRungs:${afterSlot.attempts}/${caps.perPhaseRungs}`,
+                }),
                 resumeRunId: after.id,
                 ...(after.onlyPhases?.length ? { onlyPhases: after.onlyPhases } : {}),
                 skills: after.skills ?? [],
@@ -1372,7 +1771,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
           } else if (after.status === 'waiting' && after.waitUntil) {
             // The honest middle: the session declared the external clock has
             // still not landed. The park machinery owns it from here.
-            settleRung(afterSlot, 'no-defect', undefined, 'the session declared an external wait');
+            this.settleRungOn(after, phase, 'no-defect', 'the session declared an external wait');
             saveRun(after);
             this.armLimitResume(slug, after);
           } else if (IN_FLIGHT.includes(after.status) || this.liveRunner(slug)) {
@@ -1397,17 +1796,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
             // failing at it — `failed` here is what escalated a production
             // outage up the model ladder. The declared errand stands.
             const d = after.phases[key]!.declared!;
-            settleRung(afterSlot, 'no-defect', undefined,
+            this.settleRungOn(after, phase, 'no-defect',
               `the session declared ${d.status}${d.reason ? `: ${d.reason.replace(/\s+/g, ' ').slice(0, 120)}` : ''}`);
             saveRun(after);
           } else {
-            settleRung(afterSlot, 'failed', undefined, `the run reads ${after.status}${after.halt ? ` — ${after.halt.reason.slice(0, 120)}` : ''}`);
+            this.settleRungOn(after, phase, 'failed', `the run reads ${after.status}${after.halt ? ` — ${after.halt.reason.slice(0, 120)}` : ''}`);
             saveRun(after);
           }
         })
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
-          settleRung(slot, 'failed', undefined, (error as Error)?.message ?? String(error));
+          this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
           try { saveRun(state); } catch { /* best effort */ }
         });
       return answer();
@@ -1448,7 +1847,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       void this.runRepairScript(slug, phase, state)
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
-          settleRung(slot, 'failed', undefined, (error as Error)?.message ?? String(error));
+          this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
           try { saveRun(state); } catch { /* best effort */ }
         });
       return answer();
@@ -1464,7 +1863,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (vehicle.kind === 'qa-rerun') {
       if (!this.flags.allowRun) return no('a fresh QA review needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       climb();
-      void this.qaRecover(slug, phase, { verb: 'qa-rerun', strategy: 'fresh', qaMaxRounds: 1, by: 'auto-recovery', settled: true })
+      void this.qaRecover(slug, phase, {
+        verb: 'qa-rerun', strategy: 'fresh', qaMaxRounds: 1, by: 'auto-recovery', settled: true,
+        actor: healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs),
+      })
         .then(async () => {
           const after = this.runners.get(slug)?.current()
             ?? (this.root ? loadRun(this.root.path, slug, state.id, this.liveRunIds()) : null);
@@ -1473,8 +1875,8 @@ export abstract class ServiceRecovery extends ServiceRuns {
           const verdict = await this.qaVerdict(slug, phase);
           const met = verdict !== 'pending' && verdict !== 'none';
           const settled = met
-            ? settleRung(afterSlot, 'fixed', undefined, `a QA verdict is recorded (${verdict})`)
-            : settleRung(afterSlot, 'failed', undefined, 'the review recorded no verdict');
+            ? this.settleRungOn(after, phase, 'fixed', `a QA verdict is recorded (${verdict})`)
+            : this.settleRungOn(after, phase, 'failed', 'the review recorded no verdict');
           if (settled && met) {
             afterSlot.fixed = true;
             afterSlot.lastOutcome = 'fixed';
@@ -1485,7 +1887,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         })
         .catch((error) => {
           log.warn('run.auto-recovery-failed', { slug, phase, error });
-          settleRung(slot, 'failed', undefined, (error as Error)?.message ?? String(error));
+          this.settleRungOn(state, phase, 'failed', (error as Error)?.message ?? String(error));
           try { saveRun(state); } catch { /* best effort */ }
         });
       return answer();
@@ -1552,11 +1954,22 @@ export abstract class ServiceRecovery extends ServiceRuns {
     );
     if (!built.ok) return no(built.error, { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
 
+    // One of the fourteen automatic starts (SLF-1): the pty agent names its
+    // door and asks the ceiling before a rung is charged for it.
+    const agentActor = doorActor('ladder-pty-agent', {
+      by, via: viaOfTrigger(trigger), origin: `converge:${trigger}`,
+      trigger: situation.key, guard: `ladder:${rung.vehicle},allowAgent,pty`, counter: `ladderPerPhaseRungs:${slot.attempts + 1}/${caps.perPhaseRungs}`,
+    });
+    const admitted = this.admitStart(agentActor, slug, state.id);
+    if (!admitted.ok) return no(ceilingSentence(admitted), { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
+    this.startCeiling.charge(agentActor, slug);
+    journal.append('phase.session-start', { ...agentActor, mode: 'pty-agent' }, phase);
+
     // Bumped before the session exists — see `climb`.
     climb();
     const minted = await this.terminals.mint(undefined, undefined, built.launch);
     if (!minted.ok) {
-      settleRung(slot, 'failed', undefined, minted.error);
+      this.settleRungOn(state, phase, 'failed', minted.error);
       try { saveRun(state); } catch { /* best effort */ }
       return no(minted.error, { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
     }
@@ -1672,7 +2085,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       const out = await run(this.engineOpts(), 'repair-artefacts.sh', args);
       summary = out.stdout.trim();
     } catch (error) {
-      settleRung(slot, 'failed', undefined, `the repair script could not run: ${(error as Error)?.message ?? String(error)}`);
+      this.settleRungOn(state, phase, 'failed', `the repair script could not run: ${(error as Error)?.message ?? String(error)}`);
       try { saveRun(state); } catch { /* best effort */ }
       journal?.append('phase.repair-script', { ok: false, error: String(error) }, phase);
       return;
@@ -1698,7 +2111,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       declined = typeof parsed.declined === 'number' && Number.isFinite(parsed.declined) ? parsed.declined : 0;
     } catch { changed = null; }
     if (changed === null) {
-      settleRung(slot, 'failed', undefined,
+      this.settleRungOn(state, phase, 'failed',
         'the deterministic repair ran but its summary could not be read — what it changed is unknown');
       try { saveRun(state); } catch { /* best effort */ }
       journal?.append('phase.repair-script', { ok: false, reason: 'unreadable summary', summary: summary.slice(0, 2_000) }, phase);
@@ -1710,7 +2123,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       ? 'no-defect' as const
       : lint?.ok ? 'fixed' as const : 'failed' as const;
     const declinedNote = declined ? ` (${declined} further disagreement(s) reported and NOT repaired — a person's)` : '';
-    settleRung(slot, outcome, undefined,
+    this.settleRungOn(state, phase, outcome,
       (changed === 0
         ? 'the deterministic repair found nothing mechanical to fix'
         : lint?.ok
@@ -1768,6 +2181,63 @@ export abstract class ServiceRecovery extends ServiceRuns {
     }
     const row = record.watchState?.refs.find((r) => r.ref === ref);
     if (row) delete row.deliveredAt;
+  }
+
+  /**
+   * A landing's drive REJECTED (SLF-8, RCV-8): charge the rejection ledger,
+   * back the re-offer off, and say so once per distinct reason per lease.
+   *
+   * `voidWatchDelivery` un-charges `watchResumes` — correctly, the drive
+   * launched nothing — which is exactly why the over-cap errand could never be
+   * reached for this class: a foreign lease outside the phase rejected every
+   * minute for the whole lease, un-charged every time, 134 warnings in 108
+   * minutes and no errand. `watchRejections` is the counter that CAN reach it,
+   * and the row's `nextDueAt` is moved to `redeliverAfter` — the series step,
+   * or the rejection's own clock (a lock's `lease_until`) when that is later —
+   * so the scheduler's next offer waits for the thing to change. Returns
+   * whether the cap was hit, so the caller writes the errand.
+   */
+  private chargeWatchRejection(
+    record: RunPhaseRecord, ref: string, error: unknown, now = Date.now(),
+  ): { count: number; capped: boolean; until: number | null; reason: string; repeated: boolean } {
+    const reason = ((error as Error)?.message ?? String(error)).slice(0, 300);
+    const until = error instanceof PhaseClaimedError && typeof error.lock.leaseUntil === 'number' && Number.isFinite(error.lock.leaseUntil)
+      ? error.lock.leaseUntil : null;
+    const previous = record.watchRejections;
+    const count = (previous?.count ?? 0) + 1;
+    // Repeated: the same words inside the same lease (or, clockless, the same
+    // words again) — logged once, however many minutes the lease has left.
+    const repeated = previous !== undefined && previous.reason === reason && (previous.until ?? null) === until;
+    record.watchRejections = { count, lastAt: new Date(now).toISOString(), reason, ...(until !== null ? { until } : {}) };
+    const row = record.watchState?.refs.find((r) => r.ref === ref);
+    if (row && row.state === 'landed') row.nextDueAt = redeliverAfter(count, now, until);
+    return { count, capped: count >= MAX_WATCH_REJECTIONS, until, reason, repeated };
+  }
+
+  /**
+   * The errand a landing becomes when its resumes are spent — over the delivery
+   * cap, or over the rejection cap (RCV-8, where it was unreachable). Written
+   * ONCE per landing (`watchLandedErrandFor` is the stamp) and the row retires.
+   */
+  private landingErrand(
+    slug: string, state: RunState, record: RunPhaseRecord, c: { phase: number; situation: { id: string; key: string } },
+    landed: WatchState, need: string, journal: Journal,
+  ): boolean {
+    if (record.watchLandedErrandFor === landed.ref) return false;
+    record.watchLandedErrandFor = landed.ref;
+    const errand: Errand = {
+      phase: c.phase,
+      situation: c.situation.id === 'blocked-declared' ? c.situation.key : 'blocked-declared:external',
+      at: new Date().toISOString(),
+      tried: [],
+      need,
+      how: 'Open the phase, settle what its Outstanding section names, then Retry — or resume the session with an instruction.',
+    };
+    ((state.recoveries ??= {})[String(c.phase)] ??= { attempts: 0, lastAt: errand.at }).errand = errand;
+    journal.append('phase.errand', { ...errand }, c.phase);
+    this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
+    try { saveRun(state); } catch { /* the errand matters more than the write */ }
+    return true;
   }
 
   /**
@@ -1843,9 +2313,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // four times for one event — three of them saying the world had landed
     // again when nothing had changed but the console's own willingness to act
     // (QA round 2, G6). `watchLandedJournalledFor` is the stamp, and it is
-    // cleared with the rest of the watch bookkeeping.
-    if (record.watchLandedJournalledFor !== landed.ref) {
-      record.watchLandedJournalledFor = landed.ref;
+    // cleared with the rest of the watch bookkeeping. A SET, per ref (RCV-8):
+    // as one string, two refs landing on one phase overwrote each other's stamp
+    // on alternate deliveries and both re-journalled every minute — 56 lines
+    // for two landings.
+    const journalled = record.watchLandedJournalledFor ?? [];
+    if (!journalled.includes(landed.ref)) {
+      record.watchLandedJournalledFor = [...journalled, landed.ref];
       journal.append('phase.watch-landed', { ref: landed.ref, detail: landed.detail ?? null }, c.phase);
     }
     const sessionId = record.sessionId ?? record.resumeSessionId;
@@ -1868,24 +2342,28 @@ export abstract class ServiceRecovery extends ServiceRuns {
       // on every converge pass — an errand that never ages and a push that
       // never stops. `watchResumes` alone could not carry it: it is already
       // over the cap on the pass that writes the errand.
-      if (record.watchLandedErrandFor === landed.ref) return null;
-      record.watchLandedErrandFor = landed.ref;
-      const errand: Errand = {
-        phase: c.phase,
-        situation: c.situation.id === 'blocked-declared' ? c.situation.key : 'blocked-declared:external',
-        at: new Date().toISOString(),
-        tried: [],
-        need: `${landed.ref} landed${landed.detail ? ` (${landed.detail})` : ''}, and ${MAX_BOOT_RESUMES} `
-          + 'resumes of this phase produced nothing. Read what it is really waiting for.',
-        how: 'Open the phase, settle what its Outstanding section names, then Retry — or resume the session with an instruction.',
-      };
-      ((state.recoveries ??= {})[String(c.phase)] ??= { attempts: 0, lastAt: errand.at }).errand = errand;
-      journal.append('phase.errand', { ...errand }, c.phase);
-      this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
-      try { saveRun(state); } catch { /* the errand matters more than the write */ }
+      this.landingErrand(slug, state, record, c, landed,
+        `${landed.ref} landed${landed.detail ? ` (${landed.detail})` : ''}, and ${MAX_BOOT_RESUMES} `
+          + 'resumes of this phase produced nothing. Read what it is really waiting for.', journal);
+      return null;
+    }
+    // The other cap: the drive has REJECTED this landing `MAX_WATCH_REJECTIONS`
+    // times (a foreign lease, a recovery already in flight) — see
+    // `chargeWatchRejection`. An errand a person can read, instead of a
+    // re-offer every minute for the whole lease.
+    if ((record.watchRejections?.count ?? 0) >= MAX_WATCH_REJECTIONS) {
+      this.landingErrand(slug, state, record, c, landed,
+        `${landed.ref} landed${landed.detail ? ` (${landed.detail})` : ''}, and ${record.watchRejections!.count} attempts to resume `
+          + `this phase were refused — last: ${record.watchRejections!.reason}. Settle that, then Retry.`, journal);
       return null;
     }
     record.watchResumes = resumes;
+    // One of the six automatic resumes, journalled in the one shape with what
+    // woke it (LFC-7). Its bound is its own — a landing's deliveries, which
+    // retire with the declaration they answer — so it is counted there.
+    journal.append('phase.resume-automatic', {
+      trigger: 'watch', path: 'watch-landed', count: resumes, sessionId: sessionId ?? null, ref: landed.ref, by: 'watch',
+    }, c.phase);
     // The delivery stamp — written HERE, beside the charge, where the
     // settlement below can still reach it, and never by the scheduler. Round
     // 3's H1: the scheduler stamped it after `onLanded` returned, so a fast
@@ -1898,9 +2376,9 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const stampRow = record.watchState?.refs.find((r) => r.ref === landed.ref);
     if (stampRow) stampRow.deliveredAt = offerAt;
     // What the record's own bookkeeping said BEFORE the drive: `endedAt` is
-    // written by every attempt teardown (the park included) and unset only by
-    // `resetForRetry`, so it moving past this point is the drive's proof that
-    // a session really ran.
+    // written by every attempt teardown and unset only by `resetForRetry` — a
+    // park writes `parkedFrom` since 5.0.0, never `endedAt` — so it moving past
+    // this point is the drive's proof that a session really ran.
     const endedBefore = record.endedAt ? Date.parse(record.endedAt) : null;
     // The landing goes ON the declaration, not beside it.
     //
@@ -1929,9 +2407,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // recovery, not from the state it had while the recovery was still being
     // admitted. `recover()` answers synchronously, so this `.then` used to run
     // against `status: running` and do nothing at all (R7).
+    const watchActor = doorActor('watch-landed', {
+      by: 'watch', via: 'timer', origin: 'watch-scheduler', trigger: landed.ref,
+      guard: 'autoContinueRecovery,allowRun,!liveRunner,!fleetHold', counter: `watchResumes:${resumes}`,
+    });
     const drive = sessionId
       ? this.recoverPhase(slug, c.phase, 'resume', { by: 'watch', instruction, settled: true })
-      : this.retryPhase(slug, c.phase);
+      : this.retryPhase(slug, c.phase, undefined, watchActor);
     // The drive is registered BEFORE anything can observe it and released by
     // whichever settlement handler runs — the scheduler holds the landed offer
     // back exactly as long as this entry lives (`watchResumeInFlight`).
@@ -1980,21 +2462,36 @@ export abstract class ServiceRecovery extends ServiceRuns {
         if (after.status !== 'parked' || after.halt) return;
         if (this.fleetHold() || this.prefs.autoContinueRecovery === false || !this.flags.allowRun || this.liveRunner(slug)) return;
         await this.startRun(slug, {
+          actor: watchActor,
           resumeRunId: after.id,
           ...(after.onlyPhases?.length ? { onlyPhases: after.onlyPhases } : {}),
           skills: after.skills ?? [],
         });
       }, (error) => {
         this.watchDrives.delete(driveKey);
-        log.warn('run.watch-resume-failed', { slug, phase: c.phase, ref: landed.ref, error: (error as Error)?.message ?? String(error) });
         // ROLL THE RESUME BACK. The drive REJECTED — a recovery already in
-        // flight, a spawn that could not start — so nothing was resumed, and
-        // leaving the charge standing is how three offers were spent in three
-        // minutes on a phase where no session had started at all (QA round 2,
-        // G1). The stamp is written above, in this same function, which is the
-        // only reason this delete reaches it: when the scheduler wrote it, it
-        // wrote AFTER this handler had already run (QA round 3, H1(b)).
+        // flight, a spawn that could not start, a foreign lease — so nothing was
+        // resumed, and leaving the charge standing is how three offers were
+        // spent in three minutes on a phase where no session had started at all
+        // (QA round 2, G1). The stamp is written above, in this same function,
+        // which is the only reason this delete reaches it: when the scheduler
+        // wrote it, it wrote AFTER this handler had already run (QA round 3,
+        // H1(b)). The REJECTION is charged on its own ledger, the re-offer
+        // backed off, and the warning said once per reason per lease (SLF-8,
+        // RCV-8) — the un-charged offer used to come back every minute.
         this.voidWatchDelivery(record, landed.ref, resumes);
+        const rejection = this.chargeWatchRejection(record, landed.ref, error);
+        if (!rejection.repeated) {
+          log.warn('run.watch-resume-failed', {
+            slug, phase: c.phase, ref: landed.ref, error: rejection.reason, rejections: rejection.count,
+            ...(rejection.until !== null ? { until: new Date(rejection.until).toISOString() } : {}),
+          });
+        }
+        if (rejection.capped) {
+          this.landingErrand(slug, state, record, c, landed,
+            `${landed.ref} landed${landed.detail ? ` (${landed.detail})` : ''}, and ${rejection.count} attempts to resume `
+              + `this phase were refused — last: ${rejection.reason}. Settle that, then Retry.`, journal);
+        }
         try { saveRun(state); } catch { /* the next pass re-derives it anyway */ }
       })
       .catch((error) => {

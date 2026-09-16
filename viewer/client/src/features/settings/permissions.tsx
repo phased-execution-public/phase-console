@@ -22,6 +22,7 @@ import { useMemo, useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { X } from 'lucide-react';
 import { api, type PolicyLists } from '@/lib/api';
+import type { PolicyAdvisoryKind } from '@shared/ops-vocab.js';
 import { cn } from '@/lib/cn';
 import { keys, toastError, useConsoleState, usePlans, usePolicy } from '@/lib/queries';
 import { SettingsSectionFrame, sectionFor } from './nav';
@@ -206,6 +207,17 @@ export function PolicyCard({ allowWrites }: { allowWrites: boolean }) {
               : 'Removed',
         'ok',
       );
+    },
+    onError: toastError,
+  });
+
+  // The advisory's receipt: recorded against the rules it named, so it stands
+  // again the day one more default is struck.
+  const acknowledge = useMutation({
+    mutationFn: (kind: PolicyAdvisoryKind) => api.acknowledgePolicyAdvisory(kind),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: ['policy'] });
+      toast('Acknowledged — it comes back if the rules change', 'ok');
     },
     onError: toastError,
   });
@@ -450,6 +462,35 @@ export function PolicyCard({ allowWrites }: { allowWrites: boolean }) {
             </p>
           </AlertDialogContent>
         </AlertDialog>
+
+        {(policy.advisory ?? [])
+          .filter((a) => !a.acknowledged)
+          .map((advisory) => (
+            <Banner key={advisory.kind} severity="warn" data-policy-advisory={advisory.kind}>
+              <strong>
+                {advisory.kind === 'ask-empty' ? 'Nothing here asks.' : 'The deny wall is struck.'}
+              </strong>{' '}
+              {advisory.message}
+              {advisory.rules.length ? (
+                <ul className="mt-1.5 list-disc pl-5">
+                  {advisory.rules.map((r) => (
+                    <li key={r}>
+                      <code>{r}</code>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              <div className="mt-2">
+                <Button
+                  size="sm"
+                  disabled={acknowledge.isPending}
+                  onClick={() => acknowledge.mutate(advisory.kind)}
+                >
+                  I have read this
+                </Button>
+              </div>
+            </Banner>
+          ))}
 
         {policy.inert?.length ? (
           <Banner severity="warn">

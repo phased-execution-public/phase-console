@@ -4,8 +4,9 @@
  * It sits next to *This process* because that is where the question arrives:
  * the Restart button refuses when nothing is supervising this console, and the
  * refusal explains the cause without giving you a way to fix it. The Create
- * button answers it directly: the server writes the launcher itself, with this
- * console's root and port baked in and every capability switch on. The paste-
+ * button answers it directly: the server writes the launcher itself — one file,
+ * named for this console, that starts any console registered on this machine,
+ * with every capability switch on and no root, port or login baked in. The paste-
  * into-Claude walkthrough for the same act lives in the guide and the README
  * (`shared/setup-prompts.js`), not here — a page with a working button does
  * not also need the manual procedure beside it.
@@ -52,20 +53,18 @@ export function LauncherCard({ supervised }: { supervised?: boolean }) {
         <CardTitle>{setup.title}</CardTitle>
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
-        {/* The server writes the launcher itself — this console's root and
-            port baked in, all seven switches on. */}
+        {/* The server writes the launcher itself — named for this console,
+            all seven switches on, no root, port or login baked in. */}
         {plan?.supported ? (
           <div className="flex flex-col gap-2 rounded border border-rule bg-ground-deep p-3">
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 variant="action"
-                disabled={creating || !plan.rootOpen || state?.allowWrites !== true}
+                disabled={creating || state?.allowWrites !== true}
                 title={
                   state?.allowWrites !== true
                     ? 'Restart with --allow-writes — writing an executable to the Desktop is a write.'
-                    : plan.rootOpen
-                      ? `Writes ${shownPath ?? 'the launcher'} with this console's source directory, port, every capability switch, and its remote/session/skills settings.`
-                      : 'Open a source directory first — the launcher bakes it in as its ROOT.'
+                    : `Writes ${shownPath ?? 'the launcher'}: one launcher, named for this console, that starts any registered console with every capability switch.`
                 }
                 onClick={create}
               >
@@ -76,13 +75,15 @@ export function LauncherCard({ supervised }: { supervised?: boolean }) {
             <p className="m-0 text-2xs text-ink-faint">
               {plan.platform === 'darwin' ? (
                 <>
-                  macOS: a double-clickable .command with ROOT, PORT,{' '}
+                  macOS: one double-clickable .command, named for this console, that starts any console
+                  registered on this machine with{' '}
                   {(plan.fullFlags ?? []).map((flag) => (
                     <code key={flag} className="mr-1">
                       {flag}
                     </code>
                   ))}
-                  and this console&rsquo;s remote/session/skills settings baked in.
+                  on — no root, port or login baked in: each console&rsquo;s root and port come from the
+                  registry, and remote access from the machine profile.
                 </>
               ) : (
                 'Linux: an XDG .desktop entry that runs the start command — full flag set — in a terminal.'

@@ -19,6 +19,8 @@ import { describe, expect, it } from 'vitest';
 import type { ForeignSession, TerminalSession } from '@/lib/api';
 import type { NowLane } from '@/features/now/model';
 import { SessionList, sessionRows } from './list';
+import { ForeignSessionPage } from './foreign';
+import { endedLabel, turnsLabel } from '@/features/now/model';
 
 const NOW = Date.parse('2026-08-22T12:00:00Z');
 const at = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString();
@@ -305,5 +307,65 @@ describe('status, attention and time on the rows', () => {
     });
     render(<SessionList rows={rows} empty="none" />);
     expect(screen.getByText('needs permission')).toBeTruthy();
+  });
+});
+
+/**
+ * ACC-7.7 (REG-9). A probe-detected death used to be stamped with the moment
+ * somebody LOOKED — one record claimed 17.3 hours it never lived — and `turns
+ * 0` described a twelve-hour session in the same words as a five-second probe.
+ * The registry now writes an inferred end as one, and says where a turn count
+ * came from; the pages draw both differently from what a session reported.
+ */
+describe('inferred ends and unknown turns (REG-9)', () => {
+  const reported = foreign({
+    sessionId: 'f-reported',
+    presence: 'ended',
+    endedAt: at(5),
+    endedBy: 'hook',
+    turns: 12,
+    turnsSource: 'hook',
+  });
+  const inferred = foreign({
+    sessionId: 'f-inferred',
+    presence: 'ended',
+    lastSeen: at(50),
+    endedAt: at(50),
+    endedBy: 'probe',
+    endedDetectedAt: at(2),
+    turns: 0,
+    turnsSource: 'unknown',
+  });
+
+  it('labels an inferred end differently from a reported one, and an unknown count as unknown', () => {
+    expect(endedLabel(reported)).toBe('ended');
+    expect(endedLabel(inferred)).toBe('ended · inferred');
+    expect(endedLabel(foreign({ sessionId: 'f-live' }))).toBeNull();
+    expect(turnsLabel(reported)).toBe('12');
+    expect(turnsLabel(inferred)).toBe('unknown');
+    expect(turnsLabel(foreign({ sessionId: 'f-lane', turns: 139, turnsSource: 'stream' }))).toMatch(
+      /139 \(counted by the run's stream/,
+    );
+  });
+
+  it('draws the two ends differently on the list rows', () => {
+    const rows = sessionRows({ foreign: [reported, inferred], now: NOW });
+    expect(rows.find((row) => row.sessionId === 'f-reported')?.note).toBe('ended');
+    expect(rows.find((row) => row.sessionId === 'f-inferred')?.note).toBe('ended · inferred');
+    render(<SessionList rows={rows} empty="none" />);
+    expect(screen.getByText('ended · inferred')).toBeTruthy();
+    expect(screen.getByText('ended')).toBeTruthy();
+  });
+
+  it("the session's own page says an inferred end is an inference, and never prints an uncounted 0", () => {
+    const { unmount } = render(<ForeignSessionPage session={inferred} allowAgent onResume={() => {}} />);
+    expect(screen.getByText('unknown')).toBeTruthy();
+    expect(screen.getByText(/its last sign of life; the process was found gone/)).toBeTruthy();
+    expect(screen.getByText('ended · inferred')).toBeTruthy();
+    unmount();
+    render(<ForeignSessionPage session={reported} allowAgent onResume={() => {}} />);
+    expect(screen.getByText('12')).toBeTruthy();
+    expect(screen.getByText(/reported by the session/)).toBeTruthy();
+    expect(screen.queryByText(/found gone/)).toBeNull();
   });
 });

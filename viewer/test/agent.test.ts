@@ -14,13 +14,21 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { homedir, hostname, userInfo } from 'node:os';
+import { fileURLToPath } from 'node:url';
 
 import {
   buildAgentLaunch, phasedExecutionSkillId, planPrompt, resumedLabel,
-  MAX_AGENT_PROMPT_BYTES, MAX_BRIEF_BYTES,
+  MAX_AGENT_PROMPT_BYTES, MAX_BRIEF_BYTES, type PlanFacts,
 } from '../server/agent.ts';
+import { MANIFEST_QUESTIONS, PLAN_FIELDS, STATE_FLAGS, accountedFlags } from '../server/plan-fields.ts';
+import { DECISION_KEYS } from '../shared/decisions-model.js';
+import { POLICY_DEFAULTS } from '../shared/policy-model.js';
 import type { SkillInfo } from '../server/skills.ts';
+import { scriptFlags } from './script-flags.ts';
+
+const PHASE_GRAPH = fileURLToPath(new URL('../../scripts/phase-graph.sh', import.meta.url));
 
 const CTX = {
   skills: (): SkillInfo[] => [],
@@ -187,6 +195,105 @@ test('the composed plan prompt walks Mode 1 end to end and carries the brief', (
     text.indexOf('After the operator approves') < text.indexOf('new-plan.sh'),
     'the scaffold step is on the far side of the approval',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * The wizard's questions ↔ the engine's plan fields (zero-touch phase 12,
+ * chapter 10 ZTD-11): the console's own front door once asked about none of
+ * the fields the skill's Mode 1 elicits. The coupling is the same one
+ * `skill-sync.test.ts` holds on the capability flags — read the script's
+ * flag list, and hold the prompt to it.
+ * ------------------------------------------------------------------ */
+
+test('every phase-graph.sh flag is a plan field the wizard asks, or a state flag with a reason — and nothing stale', () => {
+  const flags = scriptFlags(readFileSync(PHASE_GRAPH, 'utf8'));
+  assert.ok(flags.size >= 30, `the flag reader found ${flags.size} flags`);
+  const accounted = accountedFlags();
+  const unaccounted = [...flags].filter((flag) => !accounted.has(flag));
+  assert.deepEqual(unaccounted, [],
+    'these flags read something back that the wizard never asks — add a PLAN_FIELDS entry, or a STATE_FLAGS reason');
+  const stale = [...accounted].filter((flag) => !flags.has(flag));
+  assert.deepEqual(stale, [], 'these entries name a flag phase-graph.sh no longer implements');
+  // A flag is one or the other, never both.
+  for (const field of PLAN_FIELDS) {
+    for (const flag of field.flags) assert.ok(!(flag in STATE_FLAGS), `${flag} is listed as both a field and state`);
+  }
+});
+
+test('planPrompt asks every manifest key and every machine-read plan field, numbered, one at a time, defaults first', () => {
+  const text = planPrompt('a brief', 'phased-execution', CTX.scriptsDir);
+  assert.match(text, /ONE QUESTION AT A TIME/);
+  assert.match(text, /wait for the answer before the next/);
+  // Q1…Qn, contiguous, in the manifest's order followed by the fields'.
+  const numbers = [...text.matchAll(/^\s+Q(\d+)\. /gm)].map((m) => Number(m[1]));
+  assert.equal(numbers.length, DECISION_KEYS.length + PLAN_FIELDS.length);
+  assert.deepEqual(numbers, numbers.map((_, i) => i + 1), 'numbered without a gap');
+  DECISION_KEYS.forEach((key, i) => {
+    assert.ok(text.includes(`Q${i + 1}. \`${key}\` — ${MANIFEST_QUESTIONS[key]}`), `manifest key ${key} is question ${i + 1}`);
+    const fallback = POLICY_DEFAULTS[key as keyof typeof POLICY_DEFAULTS];
+    if (fallback) assert.ok(text.includes(`\`${key}\` — ${MANIFEST_QUESTIONS[key]} (default ${fallback})`), `${key} names its default`);
+  });
+  PLAN_FIELDS.forEach((field, i) => {
+    assert.ok(text.includes(`Q${DECISION_KEYS.length + i + 1}. ${field.field} — `), `plan field ${field.field} is asked`);
+    assert.ok(text.includes(field.home), `${field.field} says where it is written`);
+  });
+  // The manifest is presented FILLED IN before anything is written, and the
+  // questions come before the approval, which comes before the scaffold.
+  assert.match(text, /"## Decisions" table with EVERY\s+row answered, waived or owned/);
+  assert.ok(text.indexOf('Q1. ') < text.indexOf('After the operator approves'), 'asked before approval');
+  assert.ok(text.indexOf('EVERY') < text.indexOf('After the operator approves'), 'shown before approval');
+  assert.ok(text.indexOf('After the operator approves') < text.indexOf('new-plan.sh'), 'written after');
+  assert.match(text, /phase-graph\.sh <slug> --decisions/, 'and read back');
+});
+
+test('planPrompt opens by reading the repository\'s ledgers — outstanding keys, keyed rulings, promoted answers', () => {
+  const facts: PlanFacts = {
+    plans: 3,
+    outstanding: [
+      { key: 'credentials', plans: ['shop', 'site', 'hub', 'fleet'] },
+      { key: 'human-acts', plans: ['shop'] },
+    ],
+    rulings: [
+      { slug: 'shop', phase: 4, key: 'waits', what: 'the window is the cap', at: '2026-09-14T00:00:00Z' },
+      { slug: 'site', phase: 2, key: 'qa.exhausted', what: 'x'.repeat(300), at: '2026-09-13T00:00:00Z' },
+    ],
+    promoted: 2,
+  };
+  const text = planPrompt('a brief', 'phased-execution', CTX.scriptsDir, '', facts);
+  assert.match(text, /Open by reading this repository's ledgers/);
+  assert.match(text, /3 open plans, 2 answers promoted from rulings/);
+  assert.match(text, /`credentials` \(4 plans: shop, site, hub, …\)/, 'the plans are named, bounded');
+  assert.match(text, /`human-acts` \(1 plan: shop\)/);
+  assert.match(text, /ask these first/);
+  assert.match(text, /shop phase 4 · `waits`: the window is the cap/);
+  assert.ok(!text.includes('x'.repeat(120)), 'a long ruling is cut, never the prompt');
+  assert.ok(text.indexOf('Open by reading') < text.indexOf('Q1. '), 'the ledgers come before the questions');
+  // The digest is bounded: forty outstanding keys and a hundred rulings add a
+  // few hundred bytes, not a kilobyte per row.
+  const flood: PlanFacts = {
+    plans: 200,
+    outstanding: DECISION_KEYS.map((key) => ({ key, plans: Array.from({ length: 50 }, (_, i) => `plan-${i}`) })),
+    rulings: Array.from({ length: 100 }, (_, i) => ({ slug: `p${i}`, phase: 1, key: 'waits', what: 'w'.repeat(500), at: '2026-09-14T00:00:00Z' })),
+    promoted: 9,
+  };
+  const wide = planPrompt('a brief', 'phased-execution', CTX.scriptsDir, '', flood);
+  assert.ok(Buffer.byteLength(wide) - Buffer.byteLength(text) < 1_500, `the digest grew by ${Buffer.byteLength(wide) - Buffer.byteLength(text)} bytes`);
+  assert.match(wide, /and \d+ more/);
+
+  // No root open: the prompt says nothing was read rather than pretending.
+  const blind = planPrompt('a brief', 'phased-execution', CTX.scriptsDir);
+  assert.match(blind, /nothing could be read for you/);
+  assert.match(blind, /docs\/handoffs\/<slug>\/decisions\.md/);
+});
+
+test('the wizard prompt fits an 8 KB brief with room for issues at the cap', () => {
+  // The cap moved 16 → 32 KB in phase 12 for exactly this arithmetic: the
+  // questions and the digest are ~6 KB of fixed text, and the brief is the
+  // operator's. `issues.test.ts` pins the twenty-issue case; this pins the
+  // template's own size so a future question does not eat the brief.
+  const template = Buffer.byteLength(planPrompt('', 'phased-execution', CTX.scriptsDir));
+  assert.ok(template < 10 * 1024, `the template is ${template} bytes`);
+  assert.ok(template + MAX_BRIEF_BYTES + 4 * 1024 < MAX_AGENT_PROMPT_BYTES, 'template + brief + issues fit');
 });
 
 test('a plan session starts in plan mode without anyone asking for it', () => {

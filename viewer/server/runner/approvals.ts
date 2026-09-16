@@ -29,15 +29,18 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { log } from '../log.ts';
-import { INSTANCE, INSTANCE_STATE_DIR } from '../config.ts';
+import { toolStanding } from '../../shared/cli-tools.js';
+import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
+import { INSTANCE, INSTANCE_STATE_DIR, notifyCommand } from '../config.ts';
 import {
   DEFAULT_PERMISSION_PROFILE, PERMISSION_PROFILES, PROFILE_LABELS,
 } from '../../shared/run-settings.js';
+import type { QuestionAnsweredBy, RelayMechanism } from '../../shared/relay-model.js';
 
 /* ------------------------------------------------------------------ *
  * The two lists
@@ -145,7 +148,7 @@ export type AutopilotPolicy = {
  * by the CLI's own permission engine and this console never sees it, which is
  * a distinction the editor has to be able to show.
  */
-export const HOOK_TOOLS = ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch'];
+export const HOOK_TOOLS = ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'AskUserQuestion'];
 
 /** Tools whose *path* rules Claude Code does not consult at all. */
 const PATH_RULES_IGNORED = ['Write', 'NotebookEdit', 'Glob'];
@@ -245,7 +248,7 @@ const PARAM = /^([A-Za-z_][\w]*):(.*)$/s;
  * does nothing" — and the last category is the one that silently costs people
  * an afternoon.
  */
-export function parseRule(raw: string): ParsedRule | null {
+export function parseRule(raw: string, known?: ReadonlySet<string>): ParsedRule | null {
   const rule = raw.trim();
   if (!rule || rule.length > 200) return null;
 
@@ -263,6 +266,17 @@ export function parseRule(raw: string): ParsedRule | null {
   const hooked = HOOK_TOOLS.includes(tool);
   const at = (form: RuleForm, support: ParsedRule['support'], note?: string): ParsedRule =>
     ({ raw: rule, tool, spec, form, support, note });
+
+  // Two shapes the syntax accepts that can never match (TRS-12): a tool the
+  // CLI does not provide — `git(:*)` is a COMMAND written where a tool goes —
+  // and, below, a prefix rule whose prefix is empty. Both parse, both were
+  // shown as enforced, and the same blind spot would void a deny rule.
+  const standing = toolStanding(tool, known);
+  if (standing === 'none') {
+    return at(spec === undefined ? 'bare' : spec.endsWith(':*') ? 'prefix' : 'literal', 'ignored',
+      `${tool} is not a tool Claude Code provides — a rule names a tool (Bash, Edit, WebFetch, mcp__<server>…), never a command`);
+  }
+  const unseen = standing === 'unseen' ? ` — no session on this console has offered a tool named ${tool}` : '';
 
   if (spec === undefined || spec === '*') {
     if (isMcp) return at('mcp', 'cli-only', 'MCP calls do not reach this console’s hook');
@@ -283,10 +297,15 @@ export function parseRule(raw: string): ParsedRule | null {
   if ((tool === 'WebFetch' || tool === 'WebSearch') && spec.startsWith('domain:')) {
     return at('domain', 'hook');
   }
-  // `:*` is a command prefix and is only meaningful at the end.
+  // `:*` is a command prefix and is only meaningful at the end — and only
+  // with a prefix: `Bash(:*)` tests `subject === '' || subject.startsWith(' ')`,
+  // which no real command satisfies.
+  if (spec === ':*') {
+    return at('prefix', 'ignored', `${tool}(:*) has an empty prefix and matches nothing — write ${tool}(<prefix>:*)`);
+  }
   if (spec.endsWith(':*') && !isMcp) {
     return at('prefix', hooked ? 'hook' : 'cli-only',
-      hooked ? undefined : `${tool} calls do not reach this console’s hook`);
+      hooked ? undefined : `${tool} calls do not reach this console’s hook${unseen}`);
   }
   if (tool === 'Read' || tool === 'Edit') {
     return at('path', tool === 'Edit' ? 'hook' : 'cli-only',
@@ -355,18 +374,71 @@ export function ruleMatches(
   return subject === spec || subject.startsWith(`${spec} `);
 }
 
-/** Rules that parse but do nothing, so startup can say so once. */
-export function inertRules(policy: AutopilotPolicy): ParsedRule[] {
+/**
+ * Rules that parse but do nothing, so the policy page can say so — including
+ * (since phase 12) an empty-prefix rule and one naming a tool the CLI does
+ * not provide. `known` is the set of tool names this console has seen a
+ * session offer, so a tool newer than the shipped list is never called inert.
+ */
+export function inertRules(policy: AutopilotPolicy, known?: ReadonlySet<string>): ParsedRule[] {
   const seen = new Set<string>();
   const out: ParsedRule[] = [];
   for (const rule of [...policy.deny, ...policy.ask, ...policy.allow, ...(policy.always ?? [])]) {
     if (seen.has(rule)) continue;
     seen.add(rule);
-    const parsed = parseRule(rule);
+    const parsed = parseRule(rule, known);
     if (!parsed) out.push({ raw: rule, tool: '', form: 'literal', support: 'ignored', note: 'not a rule this syntax accepts' });
     else if (parsed.support === 'ignored') out.push(parsed);
   }
   return out;
+}
+
+/** What the policy page and the boot log say about a policy that cannot do its job. */
+export type PolicyAdvisoryKind = (typeof POLICY_ADVISORY_KINDS)[number];
+export type PolicyAdvisory = {
+  kind: PolicyAdvisoryKind;
+  /** `ask-empty`: the struck ask rules; `deny-struck`: the struck deny rules. */
+  rules: string[];
+  /** One sentence for a banner or a log line. */
+  message: string;
+};
+
+/**
+ * The two states TRS-9 found live and unannounced: a merged ask list with
+ * nothing on it (the profile picker then offers three postures that are one),
+ * and a shipped deny rule struck out of the wall that holds with the console
+ * dead. Pure over the merge and the strikes; the service emits it once per
+ * boot and `GET /api/policy` carries it until acknowledged.
+ */
+export function policyAdvisory(policy: AutopilotPolicy, struck: PolicyRemovals): PolicyAdvisory[] {
+  const out: PolicyAdvisory[] = [];
+  if (policy.ask.length === 0) {
+    out.push({
+      kind: 'ask-empty',
+      rules: [...struck.ask],
+      message: struck.ask.length
+        ? `The effective ask list is empty — every shipped ask rule is struck (${struck.ask.length}), so no run on any profile asks about anything; Guarded and Trusted are the same posture here.`
+        : 'The effective ask list is empty, so no run on any profile asks about anything; Guarded and Trusted are the same posture here.',
+    });
+  }
+  if (struck.deny.length) {
+    out.push({
+      kind: 'deny-struck',
+      rules: [...struck.deny],
+      message: `${struck.deny.length} shipped deny rule${struck.deny.length === 1 ? ' is' : 's are'} struck out of the wall that holds with the console dead: ${struck.deny.join(', ')}.`,
+    });
+  }
+  return out;
+}
+
+/** The editor's refusal: rules that would parse and never match. */
+export class PolicyRuleError extends Error {
+  readonly rules: { raw: string; note: string }[];
+  constructor(rules: { raw: string; note: string }[]) {
+    super(`${rules.length === 1 ? 'A rule' : `${rules.length} rules`} would never match: ${rules.map((r) => `${r.raw} (${r.note})`).join('; ')}`);
+    this.name = 'PolicyRuleError';
+    this.rules = rules;
+  }
 }
 
 /**
@@ -493,6 +565,79 @@ export function wrappedPayloads(command: string): string[] {
 }
 
 /**
+ * The QUESTION CLASS (zero-touch-console phase 13, TRS-1): calls that are a
+ * question for a person rather than a request for permission.
+ *
+ * The audit's first finding was that no profile could ask anything: `trusted`
+ * and `bypass` empty the ask list by construction, so the classifier could
+ * answer only allow or deny and "needs a decision" and "is denied" became one
+ * event. A profile cuts the VOLUME of permission cards; it must never remove
+ * the capability to ask, so this list is consulted right after the deny wall
+ * from its own constant — never carried in `ask`, where a profile, a strike or
+ * a written allow rule could empty it. What answers a `hold` is the relay
+ * (`server/relay.ts`, phase 14) on a run whose relay is armed, and the policy
+ * table everywhere else (the `ambiguity` row — `Service.holdQuestion`). Rules
+ * in the ordinary grammar, so a later question-shaped tool is one entry.
+ */
+export const QUESTION_CLASS = ['AskUserQuestion'];
+
+/**
+ * What the classifier answers: the three words the hook has always used, and
+ * `hold` for the question class. `hold` never reaches the wire — see
+ * `Decision`.
+ */
+export type ToolVerdict = Decision | 'ask';
+
+/** Everything a rule may match about one call: the input, and each command a shell line would run. */
+function callSubjects(toolName: string, input: unknown): unknown[] {
+  const subjects: unknown[] = [input];
+  const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
+  if (typeof command === 'string') {
+    for (const segment of commandSegments(command)) subjects.push({ command: segment });
+  }
+  return subjects;
+}
+
+/** The first of `rules` that matches this call, or null. */
+function firstMatch(rules: readonly string[], toolName: string, input: unknown): string | null {
+  const subjects = callSubjects(toolName, input);
+  return rules.find((rule) => subjects.some((subject) => ruleMatches(rule, toolName, subject))) ?? null;
+}
+
+/** The `QUESTION_CLASS` rule this call matches, or null. */
+export function questionRule(toolName: string, input: unknown): string | null {
+  return firstMatch(QUESTION_CLASS, toolName, input);
+}
+
+/** One question as the journal records it. */
+export type QuestionRecord = { question: string; options: string[]; multiSelect: boolean };
+
+/**
+ * The questions an `AskUserQuestion` call carries, bounded for the journal —
+ * the question text, its option labels, and whether several may be chosen.
+ * A call carries one to four; anything that is not that shape reads as none.
+ * The audit's one real question left no console record at all (TRS-6).
+ */
+export function questionsOf(input: unknown): QuestionRecord[] {
+  const list = (input as { questions?: unknown } | null)?.questions;
+  if (!Array.isArray(list)) return [];
+  const out: QuestionRecord[] = [];
+  for (const entry of list.slice(0, 4)) {
+    const q = entry as { question?: unknown; options?: unknown; multiSelect?: unknown } | null;
+    if (typeof q?.question !== 'string') continue;
+    const options = Array.isArray(q.options)
+      ? q.options
+        .map((option) => (typeof option === 'string' ? option : (option as { label?: unknown } | null)?.label))
+        .filter((label): label is string => typeof label === 'string')
+        .slice(0, 8)
+        .map((label) => label.slice(0, 80))
+      : [];
+    out.push({ question: q.question.slice(0, 300), options, multiSelect: q.multiSelect === true });
+  }
+  return out;
+}
+
+/**
  * What to do with one tool call, before any human is involved.
  *
  * The filter the first real run proved was missing. The PreToolUse hook fires
@@ -504,18 +649,19 @@ export function wrappedPayloads(command: string): string[] {
 export function classifyTool(
   toolName: string, input: unknown, policy: AutopilotPolicy,
   profile: PermissionProfile = 'guarded',
-): 'deny' | 'ask' | 'allow' {
-  const subjects: unknown[] = [input];
+): ToolVerdict {
+  const subjects = callSubjects(toolName, input);
   const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
-  if (typeof command === 'string') {
-    for (const segment of commandSegments(command)) subjects.push({ command: segment });
-  }
-  const hits = (rules: string[]) =>
+  const hits = (rules: readonly string[]) =>
     rules.some((rule) => subjects.some((subject) => ruleMatches(rule, toolName, subject)));
 
   // The wall first, and nothing gets past it — not an operator's own rule, not
   // a profile, not a tap on a phone.
   if (hits(policy.deny)) return 'deny';
+  // Then a question — on EVERY profile, before anything a profile or an
+  // operator's own allow list can reach (TRS-1). A question is not a
+  // permission, so no permission word answers it.
+  if (hits(QUESTION_CLASS)) return 'hold';
   // Then what this operator deliberately allowed, which is the only thing that
   // can outrank the built-in ask list. See `AutopilotPolicy.always`.
   if (hits(policy.always ?? [])) return 'allow';
@@ -634,6 +780,23 @@ export const PUSH_DENY_CARVED = [
 
 /** The asks that survive every profile while the carve-out is on. */
 export const OPEN_PR_ASK = ['Bash(git push:*)', 'Bash(gh pr create:*)'];
+
+/**
+ * The publishing ask a call matches — one of the two the carve-out pins for a
+ * person — or null (zero-touch-console phase 13, TRS-4).
+ *
+ * The carve-out's whole deal is one human tap to publish, and auto-grant (ON
+ * by default) answered it 189 times with nobody asked and nothing announced.
+ * `Service.decideToolUse` asks this before auto-grant is allowed to answer:
+ * a match raises a real card unless the plan's `permission.destructive` row
+ * names the rule as an exception (`destructiveExceptions`), and a grant under
+ * such an exception is announced. Beside `neverAutoApproves` rather than
+ * inside it: that predicate is about what a wrapper HIDES, and the classifier
+ * consults it for its wrapper fallback; a publishing verb hides nothing.
+ */
+export function publishingRule(toolName: string, input: unknown): string | null {
+  return firstMatch(OPEN_PR_ASK, toolName, input);
+}
 
 /**
  * The effective policy for one run, carve-out and profile applied together.
@@ -911,6 +1074,8 @@ const validRules = (list: string[]) => list
 export function editPolicy(
   edit: {
     add?: { deny?: string[]; ask?: string[]; allow?: string[] };
+    /** Tool names this console has seen sessions offer — a rule naming one is never inert. */
+    known?: ReadonlySet<string>;
     remove?: { deny?: string[]; ask?: string[]; allow?: string[] };
     /**
      * Return these parts to stock: the operator's own rules come out AND their
@@ -936,6 +1101,19 @@ export function editPolicy(
   file = POLICY_FILE,
 ): AutopilotPolicy {
   const current = policyExtras(file);
+  // Refused before anything is read or written (phase 12, TRS-12): a rule
+  // the editor accepted and the hook never matched is a widening the
+  // operator believes is in force. Junk the syntax rejects is still dropped
+  // — it was never a rule — but a rule that PARSES and matches nothing is a
+  // rule somebody meant, and the answer is a refusal naming why.
+  const inert: { raw: string; note: string }[] = [];
+  for (const list of ['deny', 'ask', 'allow'] as const) {
+    for (const rule of strings(edit.add?.[list])) {
+      const parsed = parseRule(rule, edit.known);
+      if (parsed?.support === 'ignored') inert.push({ raw: parsed.raw, note: parsed.note ?? 'matches nothing' });
+    }
+  }
+  if (inert.length) throw new PolicyRuleError(inert);
   const resets = new Set(strings(edit.reset));
   const drop = (list: string[], removals: string[]) => {
     const gone = new Set(removals.map((rule) => rule.trim()));
@@ -1047,6 +1225,19 @@ export function addPolicyRules(
 }
 
 /**
+ * The ask rule that actually matched a call, or null when none did — an ask
+ * reached through a wrapper shape rather than a rule, or a rule edited out from
+ * under a live card.
+ *
+ * What a card and a grant record as `matched` (zero-touch-console phase 13,
+ * LFC-9): the audit's 189 auto-grants carried only the SUGGESTED rule, so "which
+ * line of policy asked" was unanswerable afterwards for every one of them.
+ */
+export function matchedAskRule(toolName: string, input: unknown, policy: AutopilotPolicy): string | null {
+  return firstMatch(policy.ask, toolName, input);
+}
+
+/**
  * The rule a card should offer to write.
  *
  * Derived from the ask rule that actually stopped the call, so accepting it
@@ -1056,14 +1247,9 @@ export function addPolicyRules(
  * first two words of the command, which is the narrowest honest guess.
  */
 export function suggestedRule(toolName: string, input: unknown, policy: AutopilotPolicy): string {
-  const subjects: unknown[] = [input];
+  const matched = matchedAskRule(toolName, input, policy);
+  if (matched) return matched;
   const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
-  if (typeof command === 'string') {
-    for (const segment of commandSegments(command)) subjects.push({ command: segment });
-  }
-  for (const rule of policy.ask) {
-    if (subjects.some((subject) => ruleMatches(rule, toolName, subject))) return rule;
-  }
   if (typeof command === 'string') {
     const head = commandSegments(command)[0] ?? command;
     const words = head.trim().split(/\s+/).slice(0, 2).join(' ');
@@ -1077,15 +1263,111 @@ export function suggestedRule(toolName: string, input: unknown, policy: Autopilo
  * ------------------------------------------------------------------ */
 
 /**
- * Only two, on purpose. The docs also describe `defer`, but this hook fails
- * open, and an unrecognised decision is indistinguishable from no answer at
- * all — the difference between "wait for me" and "go ahead unsupervised" would
- * come down to a spelling. `deny` is the behaviour actually measured against a
- * live session, so a timeout denies and says it timed out.
+ * What settles a CARD: only two, on purpose. A card is a permission question,
+ * and these are the two words the PreToolUse hook honours. The docs also
+ * describe `defer`, but this hook fails open, and an unrecognised decision is
+ * indistinguishable from no answer at all — the difference between "wait for
+ * me" and "go ahead unsupervised" would come down to a spelling. `deny` is the
+ * behaviour actually measured against a live session, so a timeout denies and
+ * says it timed out.
  */
-export type Decision = 'allow' | 'deny';
+export type CardDecision = 'allow' | 'deny';
+
+/**
+ * What the console decides about one tool call: a card's two words, `hold`
+ * and `defer`.
+ *
+ * `hold` — the question class (`QUESTION_CLASS`, TRS-1), a call that is a
+ * question for a person rather than a permission. A decision the CONSOLE makes
+ * and never a word the CLI receives: on a run whose relay is armed the relay
+ * answers it (`server/relay.ts`, zero-touch-console phase 14); otherwise the
+ * policy table does, and the hook is told `deny` with that answer as its reason
+ * (`Service.holdQuestion`).
+ *
+ * `defer` — phase 1's spike S3 measured it honoured on CLI 2.1.270: a
+ * `PreToolUse` `defer` ends the session with `stop_reason: tool_deferred` and
+ * the call kept as `deferred_tool_use`, and `claude -p --resume` fires the same
+ * hook again for the same `tool_use_id`, where `allow` + `updatedInput` runs it.
+ * The relay says it for exactly one thing — a question whose window is still
+ * open when the console is going away (`Relay.deferOpen`) — so the question
+ * outlives the process instead of dying with its socket. Never a card's word:
+ * the card's own vocabulary stays `CardDecision`.
+ */
+export type Decision = CardDecision | 'hold' | 'defer';
+
+/**
+ * Why a card recovered after a restart cannot be answered (TRS-11) — the
+ * machine-readable half of what used to be one word, `expired`, which said
+ * nothing about whether anything was left to receive an answer.
+ *
+ *   session-gone — no session of the asking run survived the restart.
+ *   token-lost   — one survived, but its hook token could not be read back
+ *                  from the run's settings file, so its later calls arrive
+ *                  unauthorised (and this hook fails open).
+ *   asker-gone   — a verification or gate card: the runner that raised it
+ *                  stopped with the console, and the phase raises it again
+ *                  when the run resumes.
+ *   reoffered    — a standing offer (the ladder's `widen-rule`): the healer
+ *                  offers it again on its next pass.
+ *   hook-closed  — a relayed QUESTION (phase 14) whose window was open when the
+ *                  console died without deferring it: the hook call that asked
+ *                  closed with the console. The console's answer is still
+ *                  recorded at boot — the substitute — and it answers the
+ *                  session if the session asks the same question again.
+ */
+export const UNANSWERABLE_REASONS = Object.freeze(
+  ['session-gone', 'token-lost', 'asker-gone', 'reoffered', 'hook-closed'] as const,
+);
+export type UnanswerableReason = (typeof UNANSWERABLE_REASONS)[number];
+
+/** What a recovered card says about each reason, in a person's words. */
+const UNANSWERABLE_DETAIL: Readonly<Record<UnanswerableReason, string>> = Object.freeze({
+  'session-gone': 'the console restarted before this was answered, and no session of that run survived it '
+    + '— nothing is left to receive an answer',
+  'token-lost': 'a session of that run survived the restart, but its hook token could not be read back '
+    + 'from the run’s settings file — its later calls reach this console unauthorised, and the hook fails open',
+  'asker-gone': 'the console restarted before this was answered; the runner that raised it stopped with '
+    + 'the console, and the phase raises it again when the run resumes',
+  reoffered: 'a standing offer the console restarted under; the healer offers it again on its next pass',
+  'hook-closed': 'the console stopped while this question was open and could not defer it, so the hook call that '
+    + 'asked closed with it — the console answered it at boot, and that answer is given if the session asks again',
+});
 
 export type Evidence = { label: string; body: string };
+
+/** One question of a relayed call, as the relay reads it (`server/relay.ts`). */
+export type QuestionItem = {
+  /** `shared/relay-model.js` `questionKey` — what rules match and the repeated-key rule compares. */
+  key: string;
+  /** The question's text exactly as the CLI sent it: the `answers` map is keyed by it. */
+  question: string;
+  header?: string;
+  options: { label: string; description?: string }[];
+  multiSelect: boolean;
+};
+
+/** One answer on a question card: the option label, who chose it and, for a rule, which one. */
+export type QuestionAnswer = { label: string; by: QuestionAnsweredBy; at: string; ruleId?: string; who?: string };
+
+/**
+ * The relay's part of a `question` card (zero-touch-console phase 14): how the
+ * question arrived, the questions it carries (a call carries 1 to 4), the
+ * answers so far — a person may answer some inside the window and the console
+ * the rest — and, when the console went away with the window open, the deferral
+ * that keeps the call answerable across the restart.
+ */
+export type ApprovalQuestion = {
+  mechanism: RelayMechanism;
+  tool: string;
+  /** Carried by a `PreToolUse` body only — and what a `defer` names. */
+  toolUseId?: string;
+  sessionId?: string;
+  /** The run's profile when it asked — what a relay rule is matched against, at raise and at boot. */
+  profile?: PermissionProfile;
+  items: QuestionItem[];
+  answers: Record<string, QuestionAnswer>;
+  deferred?: { toolUseId: string; at: string; why: string };
+};
 
 export type Approval = {
   id: string;
@@ -1097,7 +1379,15 @@ export type Approval = {
    * the runner could not make itself — a browser step, a look at a dashboard —
    * so no hook is blocked on the far end and it can afford to wait far longer.
    */
-  kind: 'gate' | 'tool' | 'verify';
+  kind: 'gate' | 'tool' | 'verify' | 'question';
+  /**
+   * A card no session is holding a hook open for — the ladder's `widen-rule`
+   * offer (phase 9, TRS-10): the phase is PARKED behind it, the run may be
+   * stopped, and `disarm(runId)` — which answers a run's cards `deny` when its
+   * loop ends — leaves it standing. Settled by the same `settle()` a click
+   * reaches; the offering side holds the promise.
+   */
+  standing?: true;
   title: string;
   detail: string;
   evidence: Evidence[];
@@ -1108,20 +1398,61 @@ export type Approval = {
    * file grows rules nobody can account for.
    */
   suggestedRule?: string;
+  /**
+   * The ask rule that actually matched the call (`matchedAskRule`), or null when
+   * none did — a wrapper shape. The audit's 189 grants carried only the
+   * SUGGESTED rule, so which line of policy asked was unknowable (LFC-9).
+   * Absent on a card from before 5.0.0.
+   */
+  matched?: string | null;
   createdAt: string;
   expiresAt: string;
-  status: 'pending' | Decision | 'expired';
+  /**
+   * `unanswerable` replaced `expired` in 5.0.0 (TRS-11): a card recovered after
+   * a restart is either answerable again (`pending`, with `recovered`) or says
+   * WHY it is not (`unanswerable`).
+   */
+  status: 'pending' | CardDecision | 'unanswerable';
   decidedAt?: string;
   decidedBy?: string;
   reason?: string;
+  /** Set on a card the console restarted under and kept answerable: when it was restored, and when it was first raised. */
+  recovered?: { at: string; from: string };
+  /** Set on a recovered card nothing can answer any more: the reason, and the words for it. */
+  unanswerable?: { reason: UnanswerableReason; detail: string };
+  /**
+   * `kind: 'question'` only — a question a session raised on a run whose relay
+   * is armed (phase 14): the questions, the answers, the deferral. The window is
+   * the card's own `expiresAt`; the relay answers 5 s before it.
+   */
+  question?: ApprovalQuestion;
 };
 
-type Waiting = { approval: Approval; settle: (decision: Decision, by: string, reason?: string) => void; timer: NodeJS.Timeout };
+type Settled = { decision: CardDecision; by: string; reason?: string };
+
+type Waiting = { approval: Approval; settle: (decision: CardDecision, by: string, reason?: string) => void; timer: NodeJS.Timeout };
+
+/**
+ * How long a standing `widen-rule` card waits for a person before it reads as
+ * denied and the phase's errand stands instead (phase 9, TRS-10). Twelve
+ * hours: the phase is parked either way, nothing spends, and an offer a person
+ * finds the next morning is still an offer.
+ */
+export const WIDEN_ANSWER_BY_MS = 12 * 60 * 60 * 1000;
 
 /**
  * The hook's own timeout governs how long the session waits. Answer a little
  * before it, so the decision is ours and reads as a decision — not as the
  * silence that fails open.
+ *
+ * **It is NOT a gate** (chapter 09 DOC-3, row 19; the belief deleted in phase
+ * 14). A hook that times out, errors, answers non-2xx or closes with the
+ * console does not block anything: the call continues through the CLI's normal
+ * permission flow, and under `bypassPermissions` that means it runs. So an
+ * answer that arrives late is advisory at best, and anything that must not run
+ * is a DENY RULE, which the CLI enforces with this console unreachable — never
+ * this number. The relay's question window (60 s, answered at 55 s) sits far
+ * inside it for the same reason: the answer has to be a decision, early.
  *
  * **An hour, not ten minutes.** At ten, a real overnight run put up ten `git
  * commit` cards and one of them was refused because nobody was awake — and a
@@ -1139,9 +1470,13 @@ type Waiting = { approval: Approval; settle: (decision: Decision, by: string, re
 export const HOOK_TIMEOUT_SECONDS = 3600;
 const ANSWER_BY_MS = (HOOK_TIMEOUT_SECONDS - 20) * 1000;
 
-/** Said to the session, and to the person, when a card ran out of time. */
+/**
+ * Said to the session, and to the person, when a card ran out of time. It no
+ * longer says "answer the card": a card that timed out is settled, and the
+ * sentence promised a button that no longer existed.
+ */
 export const TIMEOUT_REASON = 'nobody answered in time — the phase is parked, not failed; '
-  + 'answer the card and retry the phase';
+  + 'retry the phase to be asked again';
 
 /* ------------------------------------------------------------------ *
  * Telling someone, when nobody is looking at the tab
@@ -1162,7 +1497,9 @@ export const TIMEOUT_REASON = 'nobody answered in time — the phase is parked, 
  * a broken notifier must not be able to stop a run.
  */
 export function notifyOutOfBand(title: string, body: string, env = process.env): void {
-  const command = env.PHASE_CONSOLE_NOTIFY;
+  // The environment first, then the machine profile's `notifyCommand` (FLT-3):
+  // a file only a shell writes, so the rule above still holds.
+  const command = notifyCommand(env);
   if (!command) return;
   try {
     execFile(command, [title, body], { timeout: 10_000 }, (error) => {
@@ -1187,12 +1524,14 @@ const PENDING_FILE = join(INSTANCE_STATE_DIR, 'approvals', 'pending.json');
  * gathered for it — the phase came back as `interrupted` and what it had been
  * asking was simply gone.
  *
- * What is restored is deliberately NOT answerable. The promise a decision
- * would have resolved died with the process, and so did the hook socket on the
- * far end; a card offering Allow and Deny to something nobody is listening to
- * would be the same lie as a Pause button that changes nothing. They come back
- * as what they are: questions that were never answered, with their evidence,
- * marked expired.
+ * What is restored is answerable only where an answer can still land
+ * (`Approvals.recover`, TRS-11): the promise a decision would have resolved
+ * died with the process, and so did the hook socket on the far end — a card
+ * offering Allow and Deny to something nobody is listening to would be the same
+ * lie as a Pause button that changes nothing. So a recovered card comes back
+ * either answerable, because a session of its run survived with its token
+ * adopted and may ask the same thing again, or `unanswerable` with a reason
+ * from `UNANSWERABLE_REASONS` — never the old `expired`, which said neither.
  */
 function writePending(pending: Approval[], file: string): void {
   try {
@@ -1229,7 +1568,76 @@ export function readPending(file = PENDING_FILE): Approval[] {
 export type ApprovalHooks = {
   notify?: (approval: Approval) => void;
   resolved?: (approval: Approval) => void;
+  /**
+   * The run journal's half of the story (zero-touch-console phase 13, TRS-7):
+   * a card RAISED, every ending — a person, `disarm()`, the timeout — and a
+   * grant, each told once, so the service can write the `phase.approval-*`
+   * twin onto the run that asked. The log carries `approval.*`; a raise used
+   * to be on no run at all.
+   */
+  record?: (event: ApprovalEvent, approval: Approval) => void;
+  /**
+   * A `question` card the broker is about to end on its own — the run ending
+   * under it (`disarm`) — handed to the relay instead (phase 14), which defers
+   * the call when it can and answers it by rule when it cannot. Return true
+   * when the relay took it; false (or no hook) settles it the old way.
+   */
+  questionEnding?: (approval: Approval, why: string) => boolean;
 };
+
+/** The three moments a card has on the run's journal. */
+export type ApprovalEvent = 'raised' | 'decided' | 'auto-granted';
+
+/**
+ * How many cards this console has raised, and since when (TRS-5).
+ *
+ * The audit found the "Permission needed" channel had carried 0 of 602
+ * notifications, and nothing could say whether that meant "nobody needed
+ * asking" or "nothing could ask". A count with its start date turns "0 cards
+ * in N days" into something visible. Per instance, beside `pending.json`.
+ */
+export type ApprovalCounts = {
+  /** Cards put in front of a person — tool, gate and verification cards, standing offers included. */
+  raised: number;
+  /** Asks the console answered itself under a standing auto-grant setting. */
+  autoGranted: number;
+  /** When this console started counting. */
+  since: string;
+  /** The most recent raise, or null when there has never been one. */
+  lastRaisedAt: string | null;
+};
+
+/**
+ * What `recover` is told about one card: answerable, or the reason it is not.
+ *
+ * `settle` is the relay's (phase 14): a question card it answered AT BOOT —
+ * deferred, so the answer still lands when the session resumes — is answerable
+ * and already decided, so it is filed settled rather than put back in the queue
+ * for a person who was never going to see a 60 s window that closed hours ago.
+ */
+export type RecoveryVerdict =
+  | { answerable: true; settle?: { decision: CardDecision; by: string; reason?: string } }
+  | { unanswerable: UnanswerableReason; detail?: string };
+
+/**
+ * Appended to a card kept answerable across a restart, because the truth about
+ * the call that raised it is not what a person would assume: the hook request
+ * closed with the console, and a closed hook connection is a non-blocking
+ * error to the CLI — the call has already gone ahead or been refused.
+ */
+export const RECOVERED_NOTE = 'Recovered after the console restarted: the hook call that raised this card '
+  + 'closed with the console, so that call has already gone ahead or been refused by the CLI. Your answer '
+  + 'is recorded, and it answers the session if it asks the same thing again.';
+
+/** The key a recovered answer is kept under — one run, one phase, one exact call. */
+function answerKey(runId: string, phase: number | null, toolName: string, input: unknown): string {
+  let body: string;
+  try { body = JSON.stringify(input) ?? ''; } catch { body = String(input); }
+  return JSON.stringify([runId, phase ?? null, toolName, body]);
+}
+
+/** A per-run token as `arm` mints it: 32 random bytes, base64url. */
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
 export class Approvals {
   private waiting = new Map<string, Waiting>();
@@ -1248,36 +1656,99 @@ export class Approvals {
   private counter = 0;
   private notify: (approval: Approval) => void;
   private resolved: (approval: Approval) => void;
+  private recordHook: (event: ApprovalEvent, approval: Approval) => void;
+  /** Late-bound: the relay is built after the broker. See `ApprovalHooks.questionEnding`. */
+  questionEnding: ((approval: Approval, why: string) => boolean) | null;
   private file: string;
+  private countsFile: string;
+  private tally: ApprovalCounts;
+  /** Cards an earlier console left outstanding, filed at construction and judged by `recover`. */
+  private recoveredAtBoot: Approval[] = [];
+  /** A person's answer on a recovered card, kept for the one call it was about. See `takeRecoveredAnswer`. */
+  private recoveredAnswers = new Map<string, Settled & { at: string }>();
 
   /**
    * The bare-function form is the original contract and still means "notify on
    * creation", so every existing caller and test reads unchanged.
    */
   constructor(hooks: ((approval: Approval) => void) | ApprovalHooks = {}, file = PENDING_FILE) {
-    const resolved = typeof hooks === 'function' ? {} : hooks;
+    const named = typeof hooks === 'function' ? {} : hooks;
     this.notify = (typeof hooks === 'function' ? hooks : hooks.notify) ?? (() => {});
-    this.resolved = resolved.resolved ?? (() => {});
+    this.resolved = named.resolved ?? (() => {});
+    this.recordHook = named.record ?? (() => {});
+    this.questionEnding = named.questionEnding ?? null;
     this.file = file;
-    // Anything an earlier console was still asking about, recovered as record.
+    this.countsFile = join(dirname(file), 'counter.json');
+    this.tally = this.readCounts();
+    // Anything an earlier console was still asking about, filed as record with
+    // the reason that holds when nothing else is known: the session is gone.
+    // `recover()` — which the service calls once it can read which sessions
+    // survived — may put a card back in the queue or name a truer reason.
     for (const approval of readPending(file)) {
-      this.history.push({
+      const filed: Approval = {
         ...approval,
-        status: 'expired',
-        reason: approval.reason
-          ?? 'the console restarted before this was answered — the session it was asking for is gone',
-      });
+        status: 'unanswerable',
+        unanswerable: { reason: 'session-gone', detail: UNANSWERABLE_DETAIL['session-gone'] },
+        reason: approval.reason ?? UNANSWERABLE_DETAIL['session-gone'],
+      };
+      this.history.push(filed);
+      this.recoveredAtBoot.push(filed);
     }
-    if (this.history.length) {
-      log.info('approvals.recovered', { count: this.history.length });
-      writePending([], file);
-    }
+    if (this.recoveredAtBoot.length) writePending([], file);
   }
 
   /** Keep the on-disk copy in step with what is genuinely outstanding. */
   private flush(): void {
     writePending([...this.waiting.values()].map((w) => w.approval), this.file);
   }
+
+  /** Tell the journal side, never at the cost of the decision. */
+  private fire(event: ApprovalEvent, approval: Approval): void {
+    try { this.recordHook(event, approval); } catch { /* a journal listener must never block a decision */ }
+  }
+
+  /* ---- the counter ---- */
+
+  private readCounts(): ApprovalCounts {
+    try {
+      const parsed = JSON.parse(readFileSync(this.countsFile, 'utf8')) as Partial<ApprovalCounts>;
+      if (typeof parsed.since === 'string' && Number.isFinite(Date.parse(parsed.since))) {
+        const whole = (value: unknown) => (Number.isInteger(value) && (value as number) >= 0 ? value as number : 0);
+        return {
+          raised: whole(parsed.raised),
+          autoGranted: whole(parsed.autoGranted),
+          since: parsed.since,
+          lastRaisedAt: typeof parsed.lastRaisedAt === 'string' ? parsed.lastRaisedAt : null,
+        };
+      }
+    } catch { /* never counted yet, or unreadable: start now */ }
+    const fresh: ApprovalCounts = { raised: 0, autoGranted: 0, since: new Date().toISOString(), lastRaisedAt: null };
+    this.writeCounts(fresh);
+    return fresh;
+  }
+
+  private writeCounts(counts: ApprovalCounts): void {
+    try {
+      mkdirSync(dirname(this.countsFile), { recursive: true });
+      const tmp = `${this.countsFile}.tmp.${process.pid}`;
+      writeFileSync(tmp, `${JSON.stringify(counts, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this.countsFile);
+    } catch (error) {
+      log.warn('approvals.persist', { file: this.countsFile, error });
+    }
+  }
+
+  private count(what: 'raised' | 'autoGranted', at: string): void {
+    this.tally = {
+      ...this.tally,
+      [what]: this.tally[what] + 1,
+      ...(what === 'raised' ? { lastRaisedAt: at } : {}),
+    };
+    this.writeCounts(this.tally);
+  }
+
+  /** How many cards this console has raised and auto-granted, and since when. */
+  counts(): ApprovalCounts { return { ...this.tally }; }
 
   /* ---- the per-run token ---- */
 
@@ -1290,6 +1761,25 @@ export class Approvals {
     const token = randomBytes(32).toString('base64url');
     this.tokens.set(runId, { bytes: Buffer.from(token), text: token });
     return token;
+  }
+
+  /**
+   * Re-arm a run's EXISTING token without minting one (TRS-11).
+   *
+   * A child that outlives its console loaded its `Authorization` header at
+   * startup and cannot reload it; a console that comes back and mints afresh
+   * leaves every later hook call from that child unauthorised — and an
+   * unauthorised hook call is a failed hook call, and this hook fails open. So
+   * a restart reads the token back out of the settings file the child is
+   * holding (`tokenFromSettingsFile`) and adopts it. Refuses a malformed token,
+   * and refuses to replace a DIFFERENT token already armed for the run.
+   */
+  adoptToken(runId: string, token: string): boolean {
+    if (!TOKEN_RE.test(token)) return false;
+    const armed = this.tokens.get(runId);
+    if (armed) return armed.text === token;
+    this.tokens.set(runId, { bytes: Buffer.from(token), text: token });
+    return true;
   }
 
   /**
@@ -1325,6 +1815,18 @@ export class Approvals {
     // settling them would deny a live session's work on its neighbour's behalf.
     for (const [id, entry] of [...this.waiting]) {
       if (runId && entry.approval.runId !== runId) continue;
+      // A standing offer is not a session's question: the phase is parked
+      // behind it and the run may already be stopped, so a loop ending is not
+      // "nobody will ever answer". It lives on its own clock (phase 9).
+      if (entry.approval.standing) continue;
+      // A relayed question is the relay's to end (phase 14): it defers the call
+      // when the hook can carry that, and answers it by rule when it cannot — a
+      // `deny` here would be the silence the relay exists to replace.
+      if (entry.approval.kind === 'question') {
+        let taken = false;
+        try { taken = this.questionEnding?.(entry.approval, 'run ended') ?? false; } catch { taken = false; }
+        if (taken) continue;
+      }
       this.settle(id, 'deny', 'run ended', 'the run ended before this was decided');
     }
   }
@@ -1365,6 +1867,55 @@ export class Approvals {
   /* ---- the queue ---- */
 
   /**
+   * Put one card in the queue, with the ONE settle closure every ending passes
+   * through — a click, a tap on another device, `disarm()` when a run ends with
+   * cards still up, and the timeout.
+   *
+   * The decision record lives inside the closure for exactly that reason
+   * (TRS-7): it used to hang off the public `settle()`, which the timeout never
+   * called, so the six cards that expired unanswered were the six with no
+   * decision record — the endings nobody was watching carried the least
+   * evidence. Shared by `request`, `offer` and `recover`, so a restored card
+   * ends the same way a fresh one does.
+   */
+  private enqueue(approval: Approval, after?: (settled: Settled) => void): void {
+    const settle = (decision: CardDecision, by: string, reason?: string) => {
+      const entry = this.waiting.get(approval.id);
+      if (!entry) return;
+      clearTimeout(entry.timer);
+      this.waiting.delete(approval.id);
+      approval.status = decision;
+      approval.decidedAt = new Date().toISOString();
+      approval.decidedBy = by;
+      approval.reason = reason;
+      this.remember(approval);
+      this.flush();
+      log.info('approval.decided', {
+        id: approval.id, decision, by, runId: approval.runId, phase: approval.phase, kind: approval.kind,
+        waitedMs: Math.max(0, Date.parse(approval.decidedAt) - Date.parse(approval.createdAt)),
+        ...(approval.recovered ? { recovered: true } : {}),
+      });
+      this.fire('decided', approval);
+      try { this.resolved(approval); } catch { /* a listener must never block a decision */ }
+      after?.({ decision, by, reason });
+    };
+    // Unreferenced: the listening socket is what keeps this process alive, and
+    // a pending approval must never be the reason it cannot exit.
+    //
+    // It still answers `deny`, and it has to: the hook fails open, so saying
+    // nothing is saying yes, unsupervised, to the one call nobody watched.
+    // What changes is what happens next — `by: 'timeout'` parks the run
+    // instead of letting the session treat a refusal as a verdict and work
+    // around it. See `Service.decideToolUse`.
+    const timer = setTimeout(
+      () => settle('deny', 'timeout', TIMEOUT_REASON),
+      Math.max(0, Date.parse(approval.expiresAt) - Date.now()),
+    ).unref();
+    this.waiting.set(approval.id, { approval, settle, timer });
+    this.flush();
+  }
+
+  /**
    * Park until somebody decides, or until we are nearly out of the hook's
    * patience. Answering just before the hook's own timeout matters: our answer
    * is a decision, its timeout is silence, and silence lets the call through.
@@ -1372,7 +1923,7 @@ export class Approvals {
   request(
     request: Omit<Approval, 'id' | 'createdAt' | 'expiresAt' | 'status'>,
     answerByMs = ANSWER_BY_MS,
-  ): { approval: Approval; decided: Promise<{ decision: Decision; by: string; reason?: string }> } {
+  ): { approval: Approval; decided: Promise<Settled> } {
     const id = `${Date.now().toString(36)}-${++this.counter}`;
     const approval: Approval = {
       ...request,
@@ -1381,55 +1932,50 @@ export class Approvals {
       expiresAt: new Date(Date.now() + answerByMs).toISOString(),
       status: 'pending',
     };
-
-    const decided = new Promise<{ decision: Decision; by: string; reason?: string }>((resolve) => {
-      const settle = (decision: Decision, by: string, reason?: string) => {
-        const entry = this.waiting.get(id);
-        if (!entry) return;
-        clearTimeout(entry.timer);
-        this.waiting.delete(id);
-        approval.status = decision;
-        approval.decidedAt = new Date().toISOString();
-        approval.decidedBy = by;
-        approval.reason = reason;
-        this.remember(approval);
-        this.flush();
-        // Inside the settle closure on purpose: this is the ONE place every
-        // ending passes through — a click, a tap on another device, the
-        // timeout, and `disarm()` when a run ends with cards still up. Hanging
-        // it off `settle(id, …)` instead would silently miss the last two,
-        // which are precisely the endings nobody is watching for.
-        try { this.resolved(approval); } catch { /* a listener must never block a decision */ }
-        resolve({ decision, by, reason });
-      };
-      // Unreferenced: the listening socket is what keeps this process alive, and
-      // a pending approval must never be the reason it cannot exit.
-      //
-      // It still answers `deny`, and it has to: the hook fails open, so saying
-      // nothing is saying yes, unsupervised, to the one call nobody watched.
-      // What changes is what happens next — `by: 'timeout'` parks the run
-      // instead of letting the session treat a refusal as a verdict and work
-      // around it. See `Service.decideToolUse`.
-      const timer = setTimeout(
-        () => settle('deny', 'timeout', TIMEOUT_REASON),
-        answerByMs,
-      ).unref();
-      this.waiting.set(id, { approval, settle, timer });
-      this.flush();
-    });
-
+    const decided = new Promise<Settled>((resolve) => { this.enqueue(approval, resolve); });
+    this.count('raised', approval.createdAt);
     log.info('approval.requested', { id, runId: approval.runId, phase: approval.phase, title: approval.title });
+    this.fire('raised', approval);
     try { this.notify(approval); } catch { /* a notifier must never block a decision */ }
     return { approval, decided };
   }
 
-  settle(id: string, decision: Decision, by: string, reason?: string): boolean {
+  settle(id: string, decision: CardDecision, by: string, reason?: string): boolean {
     const entry = this.waiting.get(id);
     if (!entry) return false;
-    log.info('approval.decided', { id, decision, by });
     entry.settle(decision, by, reason);
     return true;
   }
+
+  /**
+   * Change a card that is still up and write the queue to disk — the relay's
+   * partial answers and its deferral (phase 14), which have to survive a restart
+   * exactly as the card itself does. False when the card is not pending.
+   */
+  update(id: string, mutate: (approval: Approval) => void): boolean {
+    const entry = this.waiting.get(id);
+    if (!entry) return false;
+    mutate(entry.approval);
+    this.flush();
+    return true;
+  }
+
+  /**
+   * Offer a STANDING card — `request()` with `standing: true`, for an ask no
+   * session is holding a hook open for (the ladder's `widen-rule` rung, phase
+   * 9): the phase is parked behind it, the run may be stopped, and the loop
+   * ending must not answer it `deny`. Settled by the same `settle()` a click
+   * or a tap reaches; the offering side holds `decided` and acts on it.
+   */
+  offer(
+    request: Omit<Approval, 'id' | 'createdAt' | 'expiresAt' | 'status' | 'standing'>,
+    answerByMs = WIDEN_ANSWER_BY_MS,
+  ): { approval: Approval; decided: Promise<Settled> } {
+    return this.request({ ...request, standing: true }, answerByMs);
+  }
+
+  /** Is this card still up? The settlement sweep asks before scoring a `widen-rule` rung. */
+  isPending(id: string): boolean { return this.waiting.has(id); }
 
   /**
    * Mint an already-settled card: the audit trail without the pipe.
@@ -1437,16 +1983,18 @@ export class Approvals {
    * Auto-grant's vehicle. The ask still HAPPENED — the classifier said ask and
    * the hook is holding — but the console's standing setting answers it, so
    * the card is born decided: no pending entry, no pending-file write, no
-   * timer, and no `notify` (that hook is the "get a person" channel — the push
-   * and the `approval` SSE both ride it). Only `resolved` fires, which is what
-   * tells every open page a decision now exists. History caps at 200 like any
-   * settled card; the durable audit is the run journal's
-   * `phase.tool-auto-granted` entry.
+   * timer. `notify` fires only when the caller says so — a grant under a
+   * plan's publishing exception is announced (TRS-4), every other grant is
+   * not, because that hook is the "get a person" channel. `resolved` always
+   * fires, which is what tells every open page a decision now exists. History
+   * caps at 200 like any settled card; the durable audit is the run journal's
+   * `phase.approval-auto-granted` entry.
    */
   grant(
     request: Omit<Approval, 'id' | 'createdAt' | 'expiresAt' | 'status'>,
     by: string,
     reason: string,
+    opts: { notify?: boolean } = {},
   ): Approval {
     const id = `${Date.now().toString(36)}-${++this.counter}`;
     const now = new Date().toISOString();
@@ -1461,11 +2009,104 @@ export class Approvals {
       reason,
     };
     this.remember(approval);
+    this.count('autoGranted', now);
     log.info('approval.auto-granted', {
-      id, runId: approval.runId, phase: approval.phase, title: approval.title,
+      id, runId: approval.runId, phase: approval.phase, title: approval.title, matched: approval.matched ?? null,
     });
+    this.fire('auto-granted', approval);
     try { this.resolved(approval); } catch { /* a listener must never block a decision */ }
+    if (opts.notify) {
+      try { this.notify(approval); } catch { /* a notifier must never block a decision */ }
+    }
     return approval;
+  }
+
+  /* ---- surviving a restart ---- */
+
+  /**
+   * Judge the cards an earlier console left outstanding (TRS-11).
+   *
+   * Called once the caller can tell which sessions survived — the service does
+   * it on `open`, after adopting the surviving runs' tokens. An ANSWERABLE card
+   * goes back into the queue with a fresh answer window and `recovered`
+   * stamped, and its detail says plainly what became of the call that raised it
+   * (`RECOVERED_NOTE`); a person's answer is recorded like any decision and kept
+   * for the one call it was about (`takeRecoveredAnswer`). Every other card
+   * stays on the record, `unanswerable` with the reason the verdict names —
+   * never `expired`. Idempotent: a card is judged once.
+   */
+  recover(verdictOf: (card: Approval) => RecoveryVerdict): { answerable: number; unanswerable: Partial<Record<UnanswerableReason, number>> } {
+    const cards = this.recoveredAtBoot.splice(0);
+    const outcome: { answerable: number; unanswerable: Partial<Record<UnanswerableReason, number>> } = { answerable: 0, unanswerable: {} };
+    for (const card of cards) {
+      let verdict: RecoveryVerdict;
+      try { verdict = verdictOf(card); } catch { verdict = { unanswerable: 'session-gone' }; }
+      if ('answerable' in verdict && verdict.settle) {
+        // Answered at boot and still deliverable (a deferred question, phase
+        // 14): on the record as decided, never back in a queue whose window a
+        // person could not have seen. `approval.decided` is written like any
+        // ending, with `recovered`, so the journal twin names the boot answer.
+        const now = new Date().toISOString();
+        card.status = verdict.settle.decision;
+        card.decidedAt = now;
+        card.decidedBy = verdict.settle.by;
+        card.reason = verdict.settle.reason;
+        card.recovered = { at: now, from: card.createdAt };
+        delete card.unanswerable;
+        log.info('approval.decided', {
+          id: card.id, decision: card.status, by: card.decidedBy, runId: card.runId, phase: card.phase, kind: card.kind,
+          waitedMs: Math.max(0, Date.parse(now) - Date.parse(card.createdAt)), recovered: true,
+        });
+        this.fire('decided', card);
+        outcome.answerable += 1;
+        continue;
+      }
+      if ('answerable' in verdict) {
+        const index = this.history.indexOf(card);
+        if (index >= 0) this.history.splice(index, 1);
+        const now = Date.now();
+        const restored: Approval = {
+          ...card,
+          status: 'pending',
+          expiresAt: new Date(Math.max(Date.parse(card.expiresAt) || 0, now + ANSWER_BY_MS)).toISOString(),
+          recovered: { at: new Date(now).toISOString(), from: card.createdAt },
+          detail: card.detail.includes(RECOVERED_NOTE) ? card.detail : `${card.detail} ${RECOVERED_NOTE}`.trim(),
+        };
+        delete restored.unanswerable;
+        delete restored.reason;
+        delete restored.decidedAt;
+        delete restored.decidedBy;
+        this.enqueue(restored, (settled) => {
+          // A person's answer is kept for the call it was about; the window
+          // running out again answers nothing a session could ask.
+          if (settled.by === 'timeout' || restored.kind !== 'tool' || !restored.tool) return;
+          this.recoveredAnswers.set(
+            answerKey(restored.runId, restored.phase, restored.tool.name, restored.tool.input),
+            { ...settled, at: new Date().toISOString() },
+          );
+        });
+        outcome.answerable += 1;
+        continue;
+      }
+      const reason = verdict.unanswerable;
+      card.unanswerable = { reason, detail: verdict.detail ?? UNANSWERABLE_DETAIL[reason] };
+      card.reason = card.unanswerable.detail;
+      outcome.unanswerable[reason] = (outcome.unanswerable[reason] ?? 0) + 1;
+    }
+    if (cards.length) log.info('approvals.recovered', { count: cards.length, ...outcome });
+    return outcome;
+  }
+
+  /**
+   * A person's answer on a recovered card, for the exact call it was about —
+   * one run, one phase, one tool, one input — or null. One-shot: taking it
+   * spends it, so an answer cannot quietly become a standing rule.
+   */
+  takeRecoveredAnswer(runId: string, phase: number | null, toolName: string, input: unknown): (Settled & { at: string }) | null {
+    const key = answerKey(runId, phase, toolName, input);
+    const found = this.recoveredAnswers.get(key) ?? null;
+    if (found) this.recoveredAnswers.delete(key);
+    return found;
   }
 
   pending(): Approval[] { return [...this.waiting.values()].map((w) => w.approval); }
@@ -1476,6 +2117,31 @@ export class Approvals {
     this.history.push(approval);
     if (this.history.length > 200) this.history.shift();
   }
+}
+
+/**
+ * The run token a settings file carries — what its child loaded at startup —
+ * or null when there is no file, or no hook in it that names one (TRS-11).
+ * Reads the hooks `buildSettings` writes; PreToolUse and Stop carry the same
+ * token.
+ */
+export function tokenFromSettingsFile(runId: string, dir = join(INSTANCE_STATE_DIR, 'settings')): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, `run-${runId}.json`), 'utf8')) as {
+      hooks?: Record<string, { hooks?: { headers?: Record<string, unknown> }[] }[]>;
+    };
+    for (const event of ['PreToolUse', 'Stop', 'PermissionRequest']) {
+      for (const group of parsed.hooks?.[event] ?? []) {
+        for (const hook of group.hooks ?? []) {
+          const header = hook.headers?.Authorization;
+          if (typeof header !== 'string') continue;
+          const token = header.replace(/^Bearer\s+/i, '').trim();
+          if (TOKEN_RE.test(token)) return token;
+        }
+      }
+    }
+  } catch { /* no file, or not one this console wrote */ }
+  return null;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1492,7 +2158,23 @@ export type SettingsOptions = {
   profile?: PermissionProfile;
   /** New-branch runs that will open a PR: bare `git push` moves deny → ask. */
   openPrCarveOut?: boolean;
+  /**
+   * The relay is armed for this run (phase 14): a `PermissionRequest` `http`
+   * hook rides beside `PreToolUse`. Only ever true on a `relay: last-resort`
+   * run whose CLI read at or above `RELAY_CLI_FLOOR` from `system/init` — a
+   * relay-off run registers none, because `--permission-prompts none` does NOT
+   * switch the hook off (phase 1, spike S2).
+   */
+  relay?: boolean;
 };
+
+/**
+ * The tools the `PreToolUse` hook is asked about. `AskUserQuestion` since
+ * phase 14: on a run with a permission host the tool is offered, and the hook
+ * is where the relay answers it (`allow` + `updatedInput`, spike S1). A run
+ * without a host is never offered the tool, so the entry costs it nothing.
+ */
+export const PRE_TOOL_USE_MATCHER = HOOK_TOOLS.join('|');
 
 export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
   const policy = carvedPolicy(
@@ -1521,7 +2203,7 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
           // Only the tools that can reach outside this repo are worth a round
           // trip; matching everything would put a network hop in front of every
           // Read and turn a phase into a slideshow.
-          matcher: 'Bash|Write|Edit|NotebookEdit|WebFetch|WebSearch',
+          matcher: PRE_TOOL_USE_MATCHER,
           hooks: [
             {
               type: 'http',
@@ -1532,6 +2214,27 @@ export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
           ],
         },
       ],
+      // The relay's transport (phase 14, spike S2): with a permission host
+      // attached, every call that reaches the permission step is put to the
+      // host AND to this hook at once, and the first decision wins. The host is
+      // presence-only and never answers first, so this hook must answer every
+      // call — hence every tool, not a list. Same token, same hour: the relay
+      // answers a question at 55 s and anything else at once.
+      ...(opts.relay ? {
+        PermissionRequest: [
+          {
+            matcher: '*',
+            hooks: [
+              {
+                type: 'http',
+                url: `${opts.origin}/hooks/permission-request`,
+                headers: { Authorization: `Bearer ${opts.token}` },
+                timeout: HOOK_TIMEOUT_SECONDS,
+              },
+            ],
+          },
+        ],
+      } : {}),
       // The closeout contract, enforced at the one moment it can still be
       // acted on: a session about to end its turn with neither a handoff on
       // the board nor a declared outcome is told exactly what to do instead

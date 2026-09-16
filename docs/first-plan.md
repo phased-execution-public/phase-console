@@ -16,11 +16,15 @@ webhook ingest, cart API, refunds, the UI, receipts, and a ship step.
 
 You can also just describe big work — the skill announces itself when it fits.
 
-## Step 2 — Answer one question about the model
+## Step 2 — Answer the questions a run would otherwise ask you later
 
 Claude asks which model will *execute* the phases, because that decides how big each session may be.
 If you do not care, say so and it uses a sensible default. See
-[Model handling](model-handling.md) for what changes.
+[Model handling](model-handling.md) for what changes. Then it asks, one question at a time, for the
+decisions a run could otherwise interrupt you with — which credentials and accounts it may use, what
+it may publish, who clears a gate, what to do when a wait runs long or the plan is ambiguous — and
+writes each answer into the plan's `## Decisions` table, the recommended default first. Answer
+them now and nothing asks you mid-run; see [Decisions](decisions.md).
 
 ## Step 3 — Claude writes the plan
 

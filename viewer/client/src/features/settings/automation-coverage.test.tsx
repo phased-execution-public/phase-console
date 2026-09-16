@@ -100,9 +100,18 @@ async function renderedPrefs(prefs: Record<string, unknown>): Promise<string[]> 
   const found = [...container.querySelectorAll('[data-pref]')].map(
     (el) => el.getAttribute('data-pref') ?? '',
   );
+  // The policy editor's rows: one control per row of the policy table,
+  // counted the same way the preferences are (phase 12).
+  policyControls.length = 0;
+  for (const el of container.querySelectorAll('[data-policy-control]')) {
+    policyControls.push(el.getAttribute('data-policy-control') ?? '');
+  }
   unmount();
   return found;
 }
+
+/** The `data-policy-control` markers of the LAST mount `renderedPrefs` made. */
+const policyControls: string[] = [];
 
 /**
  * Both reachable shapes of the section, unioned.
@@ -160,6 +169,23 @@ describe('automation preference coverage', () => {
 
     expect(missing, 'these preferences load and save but no control reaches them').toEqual([]);
     expect(duplicated, 'two controls for one preference disagree the day their fallbacks do').toEqual([]);
+  });
+
+  it('every policy row has exactly one control (phase 12)', async () => {
+    const { POLICY_TABLE } = await import('@shared/policy-model.js');
+    expect(POLICY_TABLE.length).toBeGreaterThan(10);
+    await renderedPrefs({});
+    const counts = new Map<string, number>();
+    for (const cls of policyControls) counts.set(cls, (counts.get(cls) ?? 0) + 1);
+    const missing = POLICY_TABLE.map((row) => row.class).filter((cls) => !counts.has(cls));
+    const duplicated = [...counts].filter(([, n]) => n > 1).map(([cls, n]) => `${cls} (${n})`);
+    const unknown = [...counts.keys()].filter((cls) => !POLICY_TABLE.some((row) => row.class === cls));
+    expect(missing, 'these policy rows render with no control').toEqual([]);
+    expect(duplicated, 'two controls on one row').toEqual([]);
+    expect(unknown, 'a control for a row the table does not have').toEqual([]);
+    // And the object preference they all write is one control to the coverage
+    // rule above — the card, not eighteen rows.
+    expect((await renderedPrefs({})).filter((k) => k === 'policy')).toHaveLength(1);
   });
 
   it('every exemption names a preference that still exists', async () => {

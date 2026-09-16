@@ -133,12 +133,13 @@ export function stopReason(run: RunState): string {
       ? `paused${where} by ${run.pause.by}`
       : `pausing${where}, asked by ${run.pause.by}`;
   }
-  // Which wait — the clock alone never said, and this line called both of them
-  // a usage window. See `WAIT_REASONS`.
+  // Which wait — the clock alone never said, and this line called all of them
+  // a usage window. See `WAIT_REASONS`: a person's card is a wait too (WAI-10).
   if (run.waitUntil) {
-    return waitReasonOf(run) === 'external'
-      ? `waiting on external work until ${run.waitUntil}`
-      : `waiting for the usage window until ${run.waitUntil}`;
+    const reason = waitReasonOf(run);
+    if (reason === 'external') return `waiting on external work until ${run.waitUntil}`;
+    if (reason === 'person') return `waiting for a person to answer a card, until ${run.waitUntil}`;
+    return `waiting for the usage window until ${run.waitUntil}`;
   }
 
   switch (run.status) {

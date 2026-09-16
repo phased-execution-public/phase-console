@@ -313,9 +313,9 @@ export function App() {
                     <strong>
                       {sse === 'live' ? 'This console is shutting down.' : 'This console is off.'}
                     </strong>{' '}
-                    {stopped.via === 'launchctl'
-                      ? 'Its launchd job was unloaded, so nothing will bring it back.'
-                      : 'The process has ended.'}{' '}
+                    {stopped.via === 'exit'
+                      ? 'The process has ended.'
+                      : 'Its unit was unloaded and disabled, and a stop marker holds its work — not even a login brings it back.'}{' '}
                     Start it again with <code className="font-mono text-2xs">{stopped.hint}</code>.
                   </div>
                 </Banner>

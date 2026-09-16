@@ -60,6 +60,9 @@ const STATE = {
   port: 4123,
   unread: 2,
   prefs: {},
+  // A supervisor beats on this machine, so the machine-wide destination renders
+  // its content rather than its "none answers" state.
+  fleet: { frozen: false, at: null, by: null, reachable: true, hold: null },
 };
 
 const PLANS = [

@@ -34,9 +34,13 @@ import {
 } from '../shared/recovery-model.js';
 import { SITUATIONS } from '../shared/situation-model.js';
 import { AdmissionAborted, AdmissionCapped, isCappableBlocker } from '../server/runner/scheduler.ts';
+import { loadRun, runFile } from '../server/runner/state.ts';
+import { haltKindLiterals } from './halt-kind-scan.ts';
+import { fixtureRuns } from './journal-fixture.ts';
 import {
   consumeDeclaration, endLockWait, newRun, phaseRecord, reconcileRecordsAgainstBoard, resetForRetry,
-  latestEnding, resolveRunsAgainst, retirePhaseHalt, saveRun,
+  latestEnding, resolveRunsAgainst, retirePhaseHalt, saveRun, journalFile,
+  DECLARATION_CONSUMERS, DECLARATION_CONSUMED_EVENT,
   type PhaseRecord, type RungRecord,
 } from '../server/runner/state.ts';
 import { classifySituation, type PhaseEvidence } from '../server/runner/situation.ts';
@@ -93,10 +97,31 @@ test('endLockWait clears the wait so the next admission measures from zero', () 
  * 3. The halt split
  * ------------------------------------------------------------------ */
 
+/**
+ * The walk runs over every halt-kind literal a WRITER under `server/` names —
+ * `test/halt-kind-scan.ts` — unioned with `HALT_KINDS`, not over `HALT_KINDS`
+ * alone. Iterating the list proves the list agrees with itself; the drive loop
+ * wrote `plan-deadlocked` for weeks while this test was green, because the
+ * word was in no list for it to iterate (sep-review LFC-1, gate ACC-11.1).
+ */
+const writtenKinds = (): Set<string> => new Set([...HALT_KINDS, ...haltKindLiterals().keys()]);
+
+test('every halt kind a writer names is in HALT_KINDS — no word escapes the vocabulary', () => {
+  const literals = haltKindLiterals();
+  assert.ok(literals.size >= 15, `the scan found only ${literals.size} kinds written under server/ — it is not reading the writers`);
+  const unlisted = [...literals].filter(([kind]) => !(HALT_KINDS as readonly string[]).includes(kind))
+    .map(([kind, sites]) => `${kind} at ${sites.map((s) => `${s.file}:${s.line}`).join(', ')}`);
+  assert.deepEqual(unlisted, [], 'a writer names a halt kind HALT_KINDS does not hold — add it to the list, a side and KIND_PROFILE');
+  // The four the census found: written, and now listed.
+  for (const kind of ['plan-deadlocked', 'nothing-ready', 'interrupted-by-restart', 'operator-stop']) {
+    assert.ok(literals.has(kind), `${kind} has no writer under server/ any more`);
+  }
+});
+
 test('every halt kind is phase-level or run-level, and never both', () => {
   const phase = new Set<string>(PHASE_HALT_KINDS);
   const run = new Set<string>(RUN_HALT_KINDS);
-  for (const kind of HALT_KINDS) {
+  for (const kind of writtenKinds()) {
     assert.equal(phase.has(kind) !== run.has(kind), true, `${kind} must be in exactly one list`);
   }
   assert.equal(phase.size + run.size, HALT_KINDS.length, 'no kind may be listed twice');
@@ -185,7 +210,7 @@ test('a retired ending is retired on the PHASE too — a stale record.halt canno
   record.status = 'failed';
   record.halt = { at: '2026-08-30T10:00:00.000Z', reason: 'red', phase: 1, kind: 'verify-failed' };
 
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
   assert.equal(record.halt, undefined,
     'a Retry is a fresh attempt; the reason the last one stopped describes nothing');
 
@@ -352,6 +377,89 @@ test('consumeDeclaration is the only way a declaration is spent, and it says why
 
   // Nothing to consume: the caller gets null and journals nothing.
   assert.equal(consumeDeclaration(record, 'board-closed'), null);
+});
+
+/**
+ * WAI-9 — every licence journals, through its real caller. Two of the four
+ * (`new-outcome`, `session-productive`) journalled; `board-closed` and `retry`
+ * spent testimony in silence — and `board-closed` is the commonest ending a
+ * declaration has (19 of the audit's 22 never-resumed waits). The four
+ * callers, and where each is held to exactly one line:
+ *   - `board-closed` → `reconcileRecordsAgainstBoard` (here, both sinks);
+ *   - `retry`        → `resetForRetry` (here, with `by`);
+ *   - `new-outcome`  → `routeOutcome` / `declareOutcome` / the stored twin
+ *     (`runner.test.ts` "WAI-9: a new declaration spends the old one once",
+ *     `sessions-presence.test.ts` "WAI-8 / SLF-4 … stallRemedy survives");
+ *   - `session-productive` → `onStream` on a durable-progress event
+ *     (`runner.test.ts` "WAI-4: a resumed wait that only LOOKS keeps its declaration").
+ */
+test('WAI-9: board-closed journals exactly one phase.declaration-consumed — through the run\'s own journal when nobody passes one', () => {
+  assert.deepEqual([...DECLARATION_CONSUMERS], ['new-outcome', 'session-productive', 'board-closed', 'retry']);
+  const root = mkdtempSync(join(tmpdir(), 'pc-wai9-'));
+  try {
+    const state = newRun({ slug: 'alpha', root, model: 'opus' });
+    state.status = 'parked';
+    const record = phaseRecord(state, 3);
+    record.status = 'waiting';
+    record.waits = 2;
+    record.parkedUntil = '2026-08-29T12:00:00.000Z';
+    record.declared = { status: 'waiting-external', reason: 'the image build', watch: ['gh:o/r#run/1'], at: '2026-08-29T00:00:00.000Z' };
+    saveRun(state);
+    // No sink passed: the run's own journal takes the line (a read path's shape).
+    const result = reconcileRecordsAgainstBoard(state, { 3: 'done' });
+    assert.deepEqual(result, { changed: true, closed: [3] });
+    assert.equal(record.status, 'done');
+    assert.equal(record.declared, undefined);
+    const lines = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l) as { event: string; phase?: number; data: Record<string, unknown> });
+    const spent = lines.filter((l) => l.event === DECLARATION_CONSUMED_EVENT);
+    assert.equal(spent.length, 1, 'exactly one line');
+    assert.equal(spent[0].phase, 3);
+    assert.equal(spent[0].data.why, 'board-closed');
+    assert.equal(spent[0].data.status, 'waiting-external');
+    assert.equal(spent[0].data.waits, 2);
+    assert.equal(typeof spent[0].data.parkedMs, 'number');
+    assert.equal(typeof spent[0].data.spentAt, 'string');
+    assert.deepEqual(spent[0].data.watch, ['gh:o/r#run/1']);
+    // A second reconcile spends nothing and writes nothing.
+    reconcileRecordsAgainstBoard(state, { 3: 'done' });
+    const again = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').filter(Boolean);
+    assert.equal(again.length, lines.length);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+  // …and a live runner's sink takes it instead — never a second Journal over one file.
+  const live = newRun({ slug: 'alpha', root: '/tmp/x' });
+  live.status = 'parked';
+  const rec = phaseRecord(live, 1);
+  rec.status = 'parked';
+  rec.declared = { status: 'needs-human', reason: 'the token', at: '2026-08-29T00:00:00.000Z' };
+  const seen: { event: string; data: Record<string, unknown>; phase?: number }[] = [];
+  reconcileRecordsAgainstBoard(live, { 1: 'done' }, undefined, (event, data, phase) => { seen.push({ event, data, phase }); });
+  assert.deepEqual(seen.map((l) => [l.event, l.data.why, l.phase]), [[DECLARATION_CONSUMED_EVENT, 'board-closed', 1]]);
+});
+
+test('WAI-9: retry journals exactly one phase.declaration-consumed, naming who asked', () => {
+  const record: PhaseRecord = phaseRecord(newRun({ slug: 'alpha', root: '/tmp/x' }), 2);
+  record.status = 'parked';
+  record.waits = 1;
+  record.declared = { status: 'blocked', reason: 'a foreign lock', watch: ['lock:beta/3'], at: '2026-08-29T00:00:00.000Z' };
+  const seen: { event: string; data: Record<string, unknown>; phase?: number }[] = [];
+  const spent = resetForRetry(record, { by: 'operator', journal: (event, data, phase) => { seen.push({ event, data, phase }); } });
+  assert.ok(spent);
+  assert.equal(spent.why, 'retry');
+  assert.equal(seen.length, 1, 'exactly one line');
+  assert.equal(seen[0].event, DECLARATION_CONSUMED_EVENT);
+  assert.equal(seen[0].phase, 2);
+  assert.equal(seen[0].data.why, 'retry');
+  assert.equal(seen[0].data.by, 'operator');
+  assert.equal(seen[0].data.status, 'blocked');
+  assert.equal(record.declared, undefined);
+  // Nothing to spend: nothing journalled, and the reset still happens.
+  record.status = 'failed';
+  assert.equal(resetForRetry(record, { by: 'console', journal: (event, data, phase) => { seen.push({ event, data, phase }); } }), null);
+  assert.equal(seen.length, 1);
+  assert.equal(record.status, 'pending');
 });
 
 /* ------------------------------------------------------------------ *
@@ -684,4 +792,66 @@ test('the board does not close a phase whose FROZEN child is still on the machin
   const after = reconcileRecordsAgainstBoard(run, { 1: 'done' });
   assert.deepEqual(after.closed, [1], 'no surviving child, so the board overtakes it');
   assert.equal(record.status, 'done');
+});
+
+/* ------------------------------------------------------------------ *
+ * 3b. The kind reaches disk — and legacy files answer with one (LFC-1)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Of the hub's 53 run files, four carried a `halt` and none carried a `kind`
+ * — all four from the drive loop's park, whose kind was conditional on three
+ * predicates and `{}` otherwise. The fixture holds two of them, verbatim. A
+ * reader that keys on the kind (`classifyRun`, `situationOfHalt`) must get one
+ * from every file the loader accepts, so `settle()` names a legacy halt from
+ * its sentence (`healLegacyHalt`) and this walks every fixture run through the
+ * real loader to prove it.
+ */
+test('no run file under the journal fixture produces a halt without a kind from HALT_KINDS', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-fixture-runs-'));
+  try {
+    const runs = fixtureRuns();
+    assert.ok(runs.length >= 9, `the fixture holds ${runs.length} run files; expected the six plans' nine`);
+    let legacy = 0;
+    for (const { slug, runId, state } of runs) {
+      const halt = state.halt as { kind?: string } | null | undefined;
+      if (halt && !halt.kind) legacy++;
+      const target = runFile(root, slug, runId);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, JSON.stringify(state));
+      const loaded = loadRun(root, slug, runId);
+      assert.ok(loaded, `${slug}/${runId} did not load`);
+      if (!loaded.halt) continue;
+      assert.ok((HALT_KINDS as readonly string[]).includes(loaded.halt.kind as string),
+        `${slug}/${runId}: loaded with halt.kind ${JSON.stringify(loaded.halt.kind)} — reason "${loaded.halt.reason.slice(0, 60)}"`);
+    }
+    // The fixture is the evidence: at least the two kindless parks the audit
+    // counted are still in it raw, and the loader healed them above.
+    assert.ok(legacy >= 2, `the fixture no longer holds the raw kindless halts (found ${legacy}) — was it rebuilt from a healed corpus?`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('no phase.waiting payload lacks `requested` — every park says what was asked beside what was granted (WAI-1)', () => {
+  // The clamp recorded only the instant it granted, so a window cut from 48 h to
+  // eight was indistinguishable from one asked for eight. Every writer of the
+  // event, in both twins, now carries the ask, the grant and whether it was capped.
+  const serverDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'server');
+  const files = ['runner/runner-attempt.ts', 'service-runs.ts'];
+  let writers = 0;
+  for (const rel of files) {
+    const lines = readFileSync(join(serverDir, rel), 'utf8').split('\n');
+    lines.forEach((line, i) => {
+      if (!/(?:record|append)\('phase\.waiting', \{/.test(line)) return;
+      writers += 1;
+      const payload = lines.slice(i, i + 14).join('\n');
+      const end = payload.indexOf('}, phase)');
+      const body = end >= 0 ? payload.slice(0, end) : payload;
+      for (const key of ['requested:', 'granted:', 'capped:', 'budgetRemainingMs:', 'by']) {
+        assert.ok(body.includes(key), `${rel}:${i + 1} writes phase.waiting without \`${key.replace(':', '')}\``);
+      }
+    });
+  }
+  assert.equal(writers, 2, 'the two parks — the runner\'s and the unsupervised twin');
 });

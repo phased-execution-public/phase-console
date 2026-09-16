@@ -13,13 +13,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { SITUATIONS, SITUATION_ACTOR, SUB_KINDS, situationKey } from '../shared/situation-model.js';
-import { MAX_RUNG_INTERRUPTIONS, countedRungs, triedRungKeys, untriedRungs } from '../shared/ladder-model.js';
 import {
-  DEFAULT_LADDER_CAPS, RUNGS_BY_SITUATION, RUNG_VEHICLES,
-  accountRung, errandFor, ladderCaps, lastSettledRung, nextRung, progressExtension, rungKey, rungsFor, sameErrand, settleRung,
+  MAX_RUNG_INTERRUPTIONS, RUNG_DRIVERS, RUNG_DRIVER_LABELS, VEHICLE_DRIVERS, countedRungs, drivableBy, operatorOnlyTables,
+  triedRungKeys, untriedRungs,
+} from '../shared/ladder-model.js';
+import {
+  DEFAULT_LADDER_CAPS, LADDER_TIMED_PARK_MS, RUNGS_BY_SITUATION, RUNG_VEHICLES,
+  accountRung, capRefusal, chargeRung, errandFor, errandSaid, ladderCaps, lastSettledRung, nextRung, progressExtension, rungKey,
+  rungSettledPayload, rungsFor, sameErrand, settleRung, settleRungRecord, undrivableSentence,
   type RecoverySlot,
 } from '../server/runner/ladder.ts';
 import type { RungRecord } from '../server/runner/state.ts';
+import { keyedAsks } from '../server/runner/ladder.ts';
+import { DECISION_KEYS } from '../shared/decisions-model.js';
+import { POLICY_DEFAULTS, decisionKeyOfSituation, isAutomaticAnswer, policyAnsweredPayload } from '../shared/policy-model.js';
 
 const at = '2026-08-21T00:00:00.000Z';
 const climbed = (situation: string, rung: string, costUsd = 0, params?: RungRecord['params']): RungRecord =>
@@ -141,9 +148,22 @@ test('a person\'s situation and a wait are refused without being "exhausted"; no
   assert.match(!wait.ok ? wait.reason : '', /settles itself/);
   const none = nextRung({ situation: 'superseded', history: [] });
   assert.match(!none.ok ? none.reason : '', /nothing is wrong/);
-  // A machine's situation with an empty sub-table IS exhausted (credential/gate blockers go straight to the errand).
-  const cred = nextRung({ situation: 'blocked-declared:credential', history: [] });
-  assert.equal(!cred.ok && cred.exhausted, true);
+  // The four empty sub-tables are a PERSON's since phase 9 (LFC-3): the parent
+  // climbs, the sub-kind does not, and `nextRung` says so in the same words
+  // the classifier's actor and `loop.md` use — not "exhausted", which read as
+  // a machine that ran out of ideas about a credential nobody had asked it for.
+  for (const key of ['blocked-declared:credential', 'blocked-declared:gate', 'never-started:refusal', 'never-started:skill-missing']) {
+    const sub = nextRung({ situation: key, history: [] });
+    assert.equal(sub.ok, false, key);
+    assert.equal(!sub.ok && sub.exhausted, false, key);
+    assert.match(!sub.ok ? sub.reason : '', /person's to settle/, key);
+  }
+  // …while a machine's sub-kind that HAS a table climbs it, and one whose
+  // table is merely undrivable on this console is exhausted.
+  const widen = nextRung({ situation: 'blocked-declared:permission', history: [] });
+  assert.equal(widen.ok && widen.rung.vehicle, 'widen-rule');
+  const undrivable = nextRung({ situation: 'blocked-declared:permission', history: [], available: () => false });
+  assert.equal(!undrivable.ok && undrivable.exhausted, true);
 });
 
 /* ------------------------------------------------------------------ *
@@ -195,6 +215,47 @@ test('accountRung records BEFORE the climb and keeps the legacy counters in step
  * Errands
  * ------------------------------------------------------------------ */
 
+test('ACC-3.2: resource-wall:auth climbs nothing under the same account — its one rung unavailable, the ladder is exhausted and the errand carries the sign-off', () => {
+  // `rankAccounts` excludes the retired account, so `switch-account` is the
+  // only rung that could ever spawn — and with no other account registered
+  // the healer refuses it (phase 10 made it drivable when one IS), so nothing
+  // paid happens: one exhausted ladder, one errand.
+  const table = rungsFor('resource-wall:auth');
+  assert.deepEqual(table.map((r) => r.vehicle), ['switch-account']);
+  assert.ok(table.every((r) => r.spends === false), 'no rung on this table spends');
+  const next = nextRung({ situation: 'resource-wall:auth', history: [], available: () => false });
+  assert.equal(next.ok, false);
+  assert.equal(!next.ok && next.exhausted, true);
+  const said = 'Your organization has disabled Claude subscription access for Claude Code';
+  const errand = errandFor('resource-wall:auth', [], 7, at, said);
+  assert.equal(errand.situation, 'resource-wall:auth');
+  assert.equal(errand.said, said, 'the organisation that said no, in its own words');
+  assert.deepEqual(errand.tried, []);
+});
+
+test('ACC-8.12: blocked-declared:permission climbs widen-rule — free — and its errand names the rule and the command the console refused', () => {
+  const next = nextRung({ situation: 'blocked-declared:permission', history: [] });
+  assert.ok(next.ok);
+  assert.equal(next.ok && next.rung.vehicle, 'widen-rule');
+  assert.equal(next.ok && next.rung.spends, false, 'nothing spends until a person answers the card');
+  // Climbed once and denied: the same-rung-once rule holds and the table is exhausted.
+  const after = nextRung({
+    situation: 'blocked-declared:permission',
+    history: [{ situation: 'blocked-declared:permission', rung: 'widen-rule', at, outcome: 'failed' }],
+  });
+  assert.equal(after.ok, false);
+  assert.equal(!after.ok && after.exhausted, true);
+  const errand = errandFor('blocked-declared:permission', [], 8, at, null, null, null, {
+    tool: 'Bash', rule: 'Bash(git push --force-with-lease=*)', command: 'git push --force-with-lease origin pe/demo',
+  });
+  assert.match(errand.need, /`Bash\(git push --force-with-lease=\*\)`/, 'the rule, verbatim');
+  assert.match(errand.need, /`git push --force-with-lease origin pe\/demo`/, 'the command, verbatim');
+  assert.match(errand.how, /widen/);
+  // Without the console's own denial the table's sentence stands, unchanged.
+  const bare = errandFor('blocked-declared:permission', [], 8, at);
+  assert.match(bare.need, /the session named the act/);
+});
+
 test('errandFor yields {situation, tried, need, how} with non-empty need/how for EVERY situation and sub-kind', () => {
   for (const id of SITUATIONS) {
     const keys = [id, ...((SUB_KINDS[id] ?? []).map((sub) => situationKey(id, sub)))];
@@ -216,6 +277,82 @@ test('errandFor yields {situation, tried, need, how} with non-empty need/how for
   assert.deepEqual(errand.tried, ['resume-own-session (continue) → failed', 'reboard-resume-brief']);
   // An unknown key reads as unknown — never throws.
   assert.equal(errandFor('whatever').situation, 'unknown');
+});
+
+/* ------------------------------------------------------------------ *
+ * The policy table (phase 11, ZTD-10 / QRL-3, gate ACC-1.10)
+ * ------------------------------------------------------------------ */
+
+test('every RUNGS_BY_SITUATION key and every ask carries a decisionKey from the manifest vocabulary', () => {
+  const keys = new Set<string>([...Object.keys(RUNGS_BY_SITUATION), ...Object.keys(keyedAsks())]);
+  for (const id of SITUATIONS) {
+    keys.add(id);
+    for (const sub of SUB_KINDS[id] ?? []) keys.add(situationKey(id, sub));
+  }
+  assert.ok(keys.size >= 28, `expected the whole situation vocabulary, saw ${keys.size}`);
+  for (const key of keys) {
+    const errand = errandFor(key, [], 4, at);
+    assert.ok(errand.decisionKey, `${key} carries no decisionKey`);
+    assert.ok((DECISION_KEYS as readonly string[]).includes(errand.decisionKey), `${key} → ${errand.decisionKey} is not a manifest key`);
+    assert.equal(errand.decisionKey, decisionKeyOfSituation(key), `${key} disagrees with the policy table`);
+    // No policy given: the errand is a person's, exactly as before.
+    assert.equal(errand.policy, undefined, `${key} answered by policy with no policy given`);
+  }
+  // Every ask names its row and the shipped word for it (or null for a free-text row).
+  for (const [key, ask] of Object.entries(keyedAsks())) {
+    assert.ok((DECISION_KEYS as readonly string[]).includes(ask.decisionKey), `${key} ask`);
+    assert.equal(ask.defaultAnswer, POLICY_DEFAULTS[ask.decisionKey as keyof typeof POLICY_DEFAULTS] ?? null);
+  }
+  // The keys the audit named, by name.
+  assert.equal(decisionKeyOfSituation('blocked-declared:credential'), 'credentials');
+  assert.equal(decisionKeyOfSituation('blocked-declared:permission'), 'permission.policy');
+  assert.equal(decisionKeyOfSituation('gated-manual'), 'gates');
+  assert.equal(decisionKeyOfSituation('qa-failed'), 'qa.exhausted');
+  assert.equal(decisionKeyOfSituation('resource-wall:budget'), 'budgets');
+  assert.equal(decisionKeyOfSituation('resource-wall:usage'), 'accounts');
+  assert.equal(decisionKeyOfSituation('waiting-external'), 'waits');
+  assert.equal(decisionKeyOfSituation('mcp-unavailable'), 'mcp');
+  assert.equal(decisionKeyOfSituation('blocked-declared:unknown'), 'ambiguity');
+});
+
+test('a configured automatic answer suppresses the errand; a pinned class never is', () => {
+  // `qa.exhausted: waive` — the shipped default — answers a spent QA budget
+  // without a person: the errand carries the answer and its source, and the
+  // caller journals `phase.policy-answered` in place of `phase.errand`.
+  const waived = errandFor('qa-failed', [], 4, at, null, null, { rounds: 3, max: 3, report: 'r.md' }, null,
+    { decisionKey: 'qa.exhausted', answer: 'waive', source: 'default' });
+  assert.deepEqual(waived.policy, { answer: 'waive', source: 'default' });
+  assert.deepEqual(policyAnsweredPayload({ ...waived, decisionKey: waived.decisionKey! }),
+    { phase: 4, situation: 'qa-failed', decisionKey: 'qa.exhausted', answer: 'waive', source: 'default' });
+  // The plan said `halt`: the errand is a person's.
+  const halted = errandFor('qa-failed', [], 4, at, null, null, null, null,
+    { decisionKey: 'qa.exhausted', answer: 'halt', source: 'plan' });
+  assert.equal(halted.policy, undefined);
+  assert.equal(halted.decisionKey, 'qa.exhausted');
+  // An answer for a DIFFERENT row never leaks onto this situation.
+  const wrongRow = errandFor('qa-failed', [], 4, at, null, null, null, null,
+    { decisionKey: 'gates', answer: 'delegated', source: 'default' });
+  assert.equal(wrongRow.policy, undefined);
+  // A peer holding the scope under `waits: window` is nobody's errand — the
+  // scheduler queues; the ruling is recorded and no card is raised.
+  const queued = errandFor('foreign-live', [], 4, at, null, null, null, null,
+    { decisionKey: 'waits', answer: 'window', source: 'default' });
+  assert.deepEqual(queued.policy, { answer: 'window', source: 'default' });
+  // …but an EXTERNAL clock that ran out is a person's under the same word.
+  const external = errandFor('blocked-declared:external', [], 4, at, null, null, null, null,
+    { decisionKey: 'waits', answer: 'window', source: 'default' });
+  assert.equal(external.policy, undefined);
+  // The pinned class: a block whose key the manifest lacks is a defect report,
+  // whatever any row says.
+  for (const answer of ['ruling', 'ask', 'halt']) {
+    const unknown = errandFor('blocked-declared:unknown', [], 4, at, null, null, null, null,
+      { decisionKey: 'ambiguity', answer, source: 'plan' });
+    assert.equal(unknown.policy, undefined, `unknown-block answered by ${answer}`);
+    assert.equal(unknown.decisionKey, 'ambiguity');
+  }
+  assert.equal(isAutomaticAnswer('blocked-declared:unknown', 'ruling'), false);
+  assert.equal(isAutomaticAnswer('qa-pending', 'waive'), true);
+  assert.equal(isAutomaticAnswer('gated-manual', 'delegated'), false, 'a delegated gate that still stopped is a person\'s');
 });
 
 /* ------------------------------------------------------------------ *
@@ -550,4 +687,136 @@ test('qa-pending has a second rung — a fresh review — for a phase whose own 
     history: [climbed('qa-pending', 'resume-own-session', 0, { mode: 'qa-verdict' })],
   });
   assert.ok(next.ok && next.rung.vehicle === 'fix-agent' && next.rung.params?.mode === 'qa-review', JSON.stringify(next));
+});
+
+/* ------------------------------------------------------------------ *
+ * Drivability, settlement and the errand's voice (zero-touch-console phase 10)
+ * ------------------------------------------------------------------ */
+
+test('LFC-2/RCV-10: every vehicle states its driver, every table is drivable or exhausted or operator-only with a reason, and the wait row names the clock', () => {
+  // The column is total over the vocabulary, in both directions: a vehicle
+  // with no driver row is a rung no surface can describe, and a driver row for
+  // a vehicle that is not one is a promise about nothing.
+  assert.deepEqual([...Object.keys(VEHICLE_DRIVERS)].sort(), [...RUNG_VEHICLES].sort());
+  for (const [vehicle, row] of Object.entries(VEHICLE_DRIVERS)) {
+    assert.ok((RUNG_DRIVERS as readonly string[]).includes(row.by), `${vehicle}: ${row.by}`);
+    assert.ok(row.how.length > 20, `${vehicle} says how it is driven`);
+    assert.equal(drivableBy(vehicle), row.by);
+  }
+  assert.deepEqual([...RUNG_DRIVERS], ['console', 'writes', 'agent', 'never']);
+  for (const word of RUNG_DRIVERS) assert.ok(RUNG_DRIVER_LABELS[word].length > 5, word);
+  assert.equal(drivableBy('no-such-vehicle'), 'never', 'a rung written by a newer console is nobody\'s, never free');
+  // The exit criterion, key by key: some rung drivable (a driver other than
+  // `never`), or the available-filtered walk is EXHAUSTED (so it escalates,
+  // never defers), or the key is operator-only with its reason on record.
+  const operatorOnly = operatorOnlyTables();
+  for (const [key, rungs] of Object.entries(RUNGS_BY_SITUATION)) {
+    if (!rungs.length) continue;
+    const drivable = rungs.some((rung) => drivableBy(rung.vehicle) !== 'never');
+    const undrivable = nextRung({ situation: key, history: [], available: () => false });
+    const exhausted = !undrivable.ok && undrivable.exhausted;
+    const listed = typeof operatorOnly[key] === 'string' && operatorOnly[key].length > 10;
+    assert.ok(drivable || exhausted || listed, `${key}: no driver, not exhausted when undrivable, not listed operator-only`);
+    if (!drivable) assert.ok(listed, `${key} is nobody's and says nothing about why`);
+  }
+  // The six tables the audit found wholly undrivable each have a console-driven row now.
+  for (const key of ['resource-wall:usage', 'resource-wall:auth', 'resource-wall:budget', 'resource-wall:model', 'waiting-external', 'blocked-declared:external']) {
+    assert.ok(rungsFor(key).some((rung) => drivableBy(rung.vehicle) === 'console'), `${key} has a console-driven rung`);
+  }
+  // …and nothing is operator-only today: the registry exists for the day one is.
+  assert.deepEqual(operatorOnly, {});
+  // The wait row names the mechanism that does the work — the watch clock —
+  // not a rung nothing owned (0 `recheck-watch` climbs against 222 checks).
+  assert.deepEqual(rungsFor('waiting-external').map((rung) => rung.vehicle), ['watch-clock']);
+  assert.ok(!(RUNG_VEHICLES as readonly string[]).includes('recheck-watch'));
+  assert.equal(SITUATION_ACTOR['waiting-external'], 'wait', 'still a wait: the healer climbs nothing for it');
+  assert.equal(LADDER_TIMED_PARK_MS, 30 * 60 * 1000);
+});
+
+test('RCV-6: a settlement journals situation, params and a numeric cost; two consecutive rungs never share a total; an older open rung settles by name', () => {
+  const slot: RecoverySlot = { attempts: 0, lastAt: 'old' };
+  // Rung A climbs, its attempt spends $4, it settles: the payload is the whole row.
+  const a = accountRung(slot, { situation: 'work-in-progress', rung: 'resume-own-session', params: { mode: 'continue' }, at: '2026-09-14T10:00:00.000Z' });
+  assert.equal(chargeRung(slot, 4), a);
+  const settledA = settleRung(slot, 'failed', undefined, 'the record reads failed');
+  assert.equal(settledA, a);
+  assert.deepEqual(rungSettledPayload(a), {
+    rung: 'resume-own-session', outcome: 'failed', situation: 'work-in-progress', params: { mode: 'continue' }, costUsd: 4,
+    note: 'the record reads failed',
+  });
+  // Rung B climbs; ITS attempt's $9 is booked on B alone — A stays $4 (the
+  // audit's 21 open rungs absorbed every later charge).
+  const b = accountRung(slot, { situation: 'work-in-progress', rung: 'reboard-resume-brief', at: '2026-09-14T11:00:00.000Z' });
+  assert.equal(chargeRung(slot, 9), b);
+  assert.equal(a.costUsd, 4);
+  assert.equal(b.costUsd, 9);
+  settleRung(slot, 'fixed', undefined, 'the record reads done');
+  assert.equal(rungSettledPayload(b).costUsd, 9);
+  assert.notEqual(rungSettledPayload(a).costUsd, rungSettledPayload(b).costUsd);
+  // A cost never booked is a numeric zero on the line, not an absent field.
+  const c = accountRung(slot, { situation: 'never-started', rung: 'reboard-fresh', at: '2026-09-14T12:00:00.000Z' });
+  assert.equal(rungSettledPayload(c).costUsd, 0);
+  assert.equal(rungSettledPayload(c).params, null);
+  assert.equal(rungSettledPayload(c).outcome, 'running');
+  // Two open rungs: `settleRung` takes the NEWEST; `settleRungRecord` settles
+  // the older one by name and leaves the younger open — what the runner's
+  // attempt-end backstop needs.
+  const d = accountRung(slot, { situation: 'never-started', rung: 'resume-own-session', params: { mode: 'continue' }, at: '2026-09-14T13:00:00.000Z' });
+  assert.equal(settleRungRecord(slot, c, 'interrupted', undefined, 'a later climb overtook it'), c);
+  assert.equal(c.outcome, 'interrupted');
+  assert.equal(d.outcome, 'running', 'the younger rung is still open');
+  assert.equal(slot.lastOutcome, 'interrupted');
+  assert.equal(settleRung(slot, 'fixed'), d);
+});
+
+test('RCV-6: a cap refusal carries its numbers for the journal line; an exhausted table does not', () => {
+  const rungs = nextRung({ situation: 'never-started', history: [climbed('a', 'x'), climbed('b', 'y'), climbed('c', 'z')] });
+  assert.deepEqual(capRefusal(rungs), {
+    cap: 'phase-rungs', spent: 3, limit: 3, reason: "the phase's ladder budget is spent (3 of 3 rungs)",
+  });
+  const usd = nextRung({ situation: 'never-started', history: [climbed('a', 'x', 100)] });
+  assert.deepEqual(capRefusal(usd), {
+    cap: 'phase-usd', spent: 100, limit: 100, reason: "the phase's ladder budget is spent ($100.00 of $100)",
+  });
+  const day = nextRung({ situation: 'never-started', history: [], dayHistory: [climbed('a', 'x', 650)] });
+  assert.equal(capRefusal(day)?.cap, 'day-usd');
+  assert.equal(capRefusal(day)?.spent, 650);
+  assert.equal(capRefusal(day)?.limit, 600);
+  // Not a cap: a table walked to its end, a person's situation, an open climb.
+  assert.equal(capRefusal(nextRung({ situation: 'blocked-declared:unknown', history: [climbed('blocked-declared:unknown', 'unblock-session')] })), null);
+  assert.equal(capRefusal(nextRung({ situation: 'gated-manual', history: [] })), null);
+  assert.equal(capRefusal(nextRung({ situation: 'never-started', history: [] })), null);
+});
+
+test('RCV-7: `said` rides the errand exactly when the situation was decided from it — one rule for both paths', () => {
+  const said = 'Your organization has disabled Claude subscription access for Claude Code';
+  // The classifier's own flag decides.
+  assert.equal(errandSaid({ id: 'blocked-declared', sub: 'unknown', key: 'blocked-declared:unknown', fromSaid: true }, said), said);
+  assert.equal(errandSaid({ id: 'work-in-progress', key: 'work-in-progress' }, said), undefined, 'a sign-off that decided nothing is not evidence');
+  // The two keys the flag was written for still answer without it — a
+  // `Situation` built by hand, or a record classified by an older build.
+  assert.equal(errandSaid({ id: 'never-started', sub: 'refusal', key: 'never-started:refusal' }, said), said);
+  assert.equal(errandSaid({ id: 'never-started', key: 'never-started' }, said), undefined, 'the bare situation read nothing off the words');
+  assert.equal(errandSaid({ id: 'resource-wall', sub: 'auth', key: 'resource-wall:auth' }, said), said);
+  assert.equal(errandSaid({ id: 'resource-wall', sub: 'auth', key: 'resource-wall:auth' }, '   '), undefined);
+  assert.equal(errandSaid({ id: 'resource-wall', sub: 'auth', key: 'resource-wall:auth' }, null), undefined);
+  // …and the errand quotes it verbatim.
+  const errand = errandFor('never-started:refusal', [], 3, at, errandSaid({ id: 'never-started', sub: 'refusal', key: 'never-started:refusal', fromSaid: true }, said));
+  assert.equal(errand.said, said);
+});
+
+test('RCV-7: the undrivable sentence names each rung, its driver and what is in the way — null when nothing was refused', () => {
+  const table = rungsFor('resource-wall:budget');
+  const sentence = undrivableSentence('resource-wall:budget', [
+    { rung: table[0], why: 'the budget was already raised once, $20 → $25 (25%), and spent again' },
+  ]);
+  assert.ok(sentence);
+  assert.match(sentence!, /No rung of resource-wall:budget's ladder can be driven here/);
+  assert.match(sentence!, /\*\*Raise the budget once\*\* \(raise-budget, console\): the budget was already raised once/);
+  const two = undrivableSentence('blocked-declared:external', [
+    { rung: rungsFor('blocked-declared:external')[0], why: 'the session named no machine-checkable watch ref' },
+    { rung: rungsFor('blocked-declared:external')[1], why: 'the run is not to hand' },
+  ]);
+  assert.match(two!, /Park and poll the refs.*; \*\*Park for a while\*\*/);
+  assert.equal(undrivableSentence('never-started', []), null);
 });

@@ -8,6 +8,7 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
+import { doorActor } from '../actor.ts';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -21,13 +22,16 @@ import {
   DEFAULT_REVIEWER_POLICY, parseReviewerReport, reviewerLabel, reviewerPrompt,
   type ReviewerVerdictPolicy,
 } from '../reviewer.ts';
-import { mcpDirective, skillDirective, ultracodeDirective } from '../skills.ts';
+import { credentialsDirective, mcpDirective, skillDirective, ultracodeDirective } from '../skills.ts';
+import { policyForKey } from './policy.ts';
 import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
+import { capsFor, CLOSEOUT_MAX_TURNS as SESSION_CLOSEOUT_TURNS, type Cap } from './session-record.ts';
+import { closeWaitEntry, evaluateWait, parkedMsOf } from './wait-budget.ts';
 import {
   lastFinishedPhase, ultraReviewJob, ULTRAREVIEW_EVENTS,
 } from './ultrareview.ts';
@@ -63,16 +67,17 @@ import {
 import type { RungRecord } from './state.ts';
 import {
   childrenOf, latestEnding, loadRun, newRun, phaseRecord, procIdentity, retirePhaseHalt, saveRun, pidAlive, pidHoldsWork, processState, IN_FLIGHT, SETTLED,
-  setPhaseState,
+  setPhaseState, consumeDeclaration, DECLARATION_CONSUMED_EVENT, endLockWait, isSessionGone,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords, consoleRunsDir, type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary,
+  syncWaitClock,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import {
-  AdmissionAborted, AdmissionCapped, autopilotOwner, type Scheduler, type ScopeGrant,
+  AdmissionAborted, AdmissionCapped, autopilotOwner, type Scheduler, type ScopeGrant, type SessionPeerView,
 } from './scheduler.ts';
 import { formatScope } from '../../shared/scope.js';
 import {
@@ -87,10 +92,16 @@ import {
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, mergeQueuePrompt, prBlockText, preflight, reasonOf, retryAddendumBlock, survivingChildren, ultracodeOn, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, mergeQueuePrompt, prBlockText, preflight, reasonOf, retryAddendumBlock, survivingChildren, ultracodeOn, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
 import { RunnerControl } from './runner-control.ts';
+
+/** A wait-resume's turn cap: a continuation, capped like a closeout. */
+const WAIT_RESUME_TURNS: Cap = { value: SESSION_CLOSEOUT_TURNS, source: 'closeout', basis: 'a wait-resume' };
+
+/** A closeout brief's turn cap, as the brief composed it. */
+const closeoutBriefTurns = (value: number): Cap => ({ value, source: 'closeout', basis: 'a closeout brief' });
 
 /**
  * "Something asked this run to stop admitting" — as a function, and the
@@ -1018,8 +1029,9 @@ export abstract class RunnerLoop extends RunnerControl {
             state.stoppedBy = 'system';
             state.finishedReason ??= 'the console shut down while this run was working — it continues by itself once the console is back';
           } else {
-            state.stoppedBy = 'operator';
-            state.finishedReason ??= 'stopped by the operator';
+            const stamp = this.stopStamp();
+            state.stoppedBy = stamp.stoppedBy;
+            state.finishedReason ??= stamp.note;
           }
           break;
         }
@@ -1473,7 +1485,13 @@ export abstract class RunnerLoop extends RunnerControl {
                   ? { kind: 'verification-preflight', phase: verificationParked[0].p }
                   : allMcp
                     ? { kind: 'mcp-preflight', phase: mcpParked[0].p }
-                    : {}),
+                    // The rest — gates, errands, failed phases awaiting Retry,
+                    // blocked handoffs, lock-cap parks, in any mixture — used
+                    // to park with NO kind at all, which is how 4 of the hub's
+                    // 53 run files came to carry a halt nothing could classify
+                    // (LFC-1). `held` above names every holder; the kind names
+                    // the shape.
+                    : { kind: 'nothing-ready' }),
             };
             state.finishedReason = state.halt.reason;
           }
@@ -1610,6 +1628,80 @@ export abstract class RunnerLoop extends RunnerControl {
     );
   }
 
+  /**
+   * The `gates` row's answer for this run (phase 11): `delegated` — a manual
+   * gate is briefed to the phase's own session to evidence and clear — or
+   * `operator`. The plan's row, else this console's word, else the shipped
+   * `delegated`; the legacy `delegateHumanGates` dep is the console's word for
+   * a harness that supplies nothing else.
+   */
+  private gatesPolicy(): { answer: string; source: string } {
+    const prefs = this.deps.policyPrefs?.()
+      ?? (this.deps.delegateHumanGates ? { delegateHumanGates: this.deps.delegateHumanGates() } : null);
+    const resolved = policyForKey('gates', this.state, prefs);
+    return resolved ? { answer: resolved.answer, source: resolved.source } : { answer: 'operator', source: 'default' };
+  }
+
+  /**
+   * The credential preflight (phase 11, ZTD-4): the ids the plan names for
+   * this phase, asked of the registry by id. Answers `null` when nothing is
+   * named or the harness has no registry; `{ park }` under `require` with a
+   * missing id (the phase is parked with the class's errand, nothing spent);
+   * otherwise records the missing ones on the record under `continue` and
+   * updates the run's manifest row in place.
+   */
+  private async preflightCredentials(phase: number): Promise<{ park: string | null } | null> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    delete record.credentialsMissing;
+    const named = this.deps.planCredentials?.(state.slug, phase);
+    if (!named?.ids.length || !this.deps.credentialsHeld) return null;
+    const policy = named.policy
+      ?? policyForKey('credentials', state, this.deps.policyPrefs?.() ?? null)?.answer
+      ?? 'continue';
+    let verdicts: { id: string; status: string; reason: string }[];
+    try {
+      verdicts = await this.deps.credentialsHeld(named.ids);
+    } catch (error) {
+      // A registry that could not answer refuses nothing — the MCP preflight's
+      // rule: "I could not check" and "it is missing" are different facts.
+      this.record('phase.credential-preflight', {
+        ids: named.ids, held: [], missing: [], policy, skipped: String((error as Error)?.message ?? error),
+      }, phase);
+      return null;
+    }
+    const held = verdicts.filter((v) => v.status === 'ok').map((v) => v.id);
+    const missing = verdicts.filter((v) => v.status === 'fail').map((v) => ({ id: v.id, reason: v.reason }));
+    this.record('phase.credential-preflight', {
+      ids: named.ids, held, missing: missing.map((m) => m.id), policy,
+      ...(verdicts.some((v) => v.status === 'skip') ? { unprobed: verdicts.filter((v) => v.status === 'skip').map((v) => v.id) } : {}),
+    }, phase);
+    if (!missing.length) return null;
+    const manifestRow = state.manifest?.decisions.find((row) => row.key === 'credentials');
+    if (manifestRow) {
+      manifestRow.state = 'outstanding';
+      manifestRow.value = `${missing.map((m) => `\`${m.id}\``).join(', ')} not held on this console (phase ${phase}); policy ${policy}`;
+    }
+    if (policy === 'require') {
+      const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: new Date().toISOString() });
+      const situation: Situation = {
+        id: 'blocked-declared', sub: 'credential', key: 'blocked-declared:credential',
+        label: 'Declared blocked · credential', blurb: '', actor: 'person',
+        why: missing.map((m) => `${m.id}: ${m.reason}`),
+      };
+      const errand = errandFor(situation.key, slot.rungs ?? [], phase, undefined, null, null, null, null,
+        this.policyFor(situation.key));
+      errand.need = `The credential${missing.length === 1 ? '' : 's'} the plan names for phase ${phase} and this console does not hold: `
+        + `${missing.map((m) => `\`${m.id}\` (${m.reason})`).join('; ')}.`;
+      slot.errand = errand;
+      record.endedAt ??= errand.at;
+      this.record('phase.errand', { ...errand, label: situation.label, reason: 'credential policy is require', by: 'preflight' }, phase);
+      return { park: `credential policy is require and ${missing.map((m) => m.id).join(', ')} ${missing.length === 1 ? 'is' : 'are'} not held — ${errand.how}` };
+    }
+    record.credentialsMissing = missing;
+    return { park: null };
+  }
+
   /** Returns false when the run must stop. */
   private async runPhase(phase: number, board: Board): Promise<boolean> {
     const state = this.state!;
@@ -1665,9 +1757,22 @@ export abstract class RunnerLoop extends RunnerControl {
     // detail sniff stays for a gate read by an older engine on the same box.
     const humanFamily = /^(manual|human|OVERDUE)$/i.test(gate.kind)
       && !/\bnot executed\b/i.test(gate.detail ?? '');
-    const delegated = humanFamily && this.deps.delegateHumanGates?.() === true;
+    // The `gates` row's answer (phase 11, ZTD-5): the plan's `## Decisions`
+    // row, else this console's `policy.gates` (the legacy `delegateHumanGates`
+    // switch folds in), else the shipped `delegated` — operator decision 11.
+    const gatesPolicy = this.gatesPolicy();
+    const delegated = humanFamily && gatesPolicy.answer === 'delegated';
+    // A delegated gate the session cannot EVIDENCE stops here, before the
+    // spend: a `manual` gate whose conditions are not written cannot be
+    // verified against anything a session could cite, and boarding it buys a
+    // session whose first task is impossible.
+    // (`readGateStatus` echoes the whole verdict as `detail` when nothing
+    // follows the colon, so a bare `manual:` reads as no conditions too.)
+    const detail = (gate.detail ?? '').trim();
+    const conditions = detail === gate.kind || detail === `${gate.kind}:` ? '' : detail;
+    const unevidenceable = delegated && !conditions;
     if (!gate.clear) {
-      if (gate.kind === 'ai' || delegated) {
+      if (gate.kind === 'ai' || (delegated && !unevidenceable)) {
         // An ai-clearable gate is the session's FIRST task, not a wall: the
         // engine's own boot prompt orders it to verify each condition, do the
         // work to make failing ones true, and record the clearance before
@@ -1676,14 +1781,19 @@ export abstract class RunnerLoop extends RunnerControl {
         // because "a person's gate a session was asked to verify" is a
         // different fact from "a gate the plan marked ai-clearable" and an
         // audit has to be able to tell them apart.
-        this.record(delegated ? 'phase.gate-delegated' : 'phase.gate-ai', { gate }, phase);
+        this.record(delegated ? 'phase.gate-delegated' : 'phase.gate-ai', {
+          gate, ...(delegated ? { decisionKey: 'gates', source: gatesPolicy.source } : {}),
+        }, phase);
       } else {
         // human or auto: nothing this run can do — a person must approve (the
         // phase page's Gate card), or the world must change. `gated`, not
         // `parked`: the reader's next move is different, and so is the label.
+        const why = unevidenceable
+          ? 'delegated, but the gate states no condition a session could evidence — a person approves it'
+          : null;
         record.status = 'gated';
-        record.note = `gate not clear: ${gate.kind}${gate.detail ? ` — ${gate.detail}` : ''}`;
-        this.record('phase.gated', { gate }, phase);
+        record.note = `gate not clear: ${gate.kind}${gate.detail ? ` — ${gate.detail}` : ''}${why ? ` (${why})` : ''}`;
+        this.record('phase.gated', { gate, ...(why ? { why, decisionKey: 'gates', source: gatesPolicy.source } : {}) }, phase);
         this.emit('phase', { phase, status: record.status, gate });
         // Other ready phases may still be runnable, so this is not a halt.
         return true;
@@ -1728,7 +1838,10 @@ export abstract class RunnerLoop extends RunnerControl {
 
     // The lane exists from here on, so every control can find this phase even
     // before its child has a pid — and so the `finally` below has exactly one
-    // place to undo all of it.
+    // place to undo all of it. Its start instant is what the ladder's
+    // attempt-end settlement measures from: a rung climbed BEFORE it is this
+    // lane's to settle; one climbed inside it on the way out is the next's.
+    const laneStartedAt = new Date().toISOString();
     const lane: Lane = {
       phase, pid: null, handle: null, grant, frozen: null, freezeTimer: null, stopped: null, checkpointed: false, checkpointNote: null, leaseTimer: null,
       // The stalemate counter is the phase's, not the lane's: three attempts
@@ -1758,6 +1871,11 @@ export abstract class RunnerLoop extends RunnerControl {
       this.deps.scheduler?.release(lane.grant);
       this.clearFreezeTimer(lane);
       this.lanes.delete(phase);
+      // No rung stays `running` past its attempt (RCV-6): whatever the
+      // outcome-driven settles above left open is settled here from the
+      // record the attempt left, so `chargeRung` can never book the NEXT
+      // attempt's spend onto this one's rung.
+      this.settleRungsAfterAttempt(phase, laneStartedAt);
       this.syncMirror();
       this.persist();
     }
@@ -1980,8 +2098,15 @@ export abstract class RunnerLoop extends RunnerControl {
     const record = phaseRecord(state, phase);
     // A waiting-external phase whose window elapsed boards as a RESUME of its
     // own session, never a fresh boot — its context is the whole point.
-    // Decided here, before anything rewrites the status.
-    const resuming = record.status === 'waiting';
+    // Decided here, before anything rewrites the status, and from the
+    // DECLARATION and the clock rather than the status word alone (SLF-5): a
+    // console's retry-storm park is `waiting` with nothing declared and boots
+    // with the engine's own text, and a declaration a licence already spent
+    // says nothing about a wait any more.
+    const wasWaiting = record.status === 'waiting';
+    const resuming = wasWaiting
+      && record.declared?.status === 'waiting-external'
+      && (!record.parkedUntil || Date.parse(record.parkedUntil) <= Date.now());
     // The ladder's instruction for this boarding, if it left one. Read here for
     // the same reason, and consumed (deleted) only when the session actually
     // spawns, so a boarding abandoned at the gate, the queue or a preflight
@@ -2010,6 +2135,35 @@ export abstract class RunnerLoop extends RunnerControl {
       this.record('phase.not-started', {
         reason: `this phase was settled (${record.status}) while it waited for its scope`,
       }, phase);
+      return true;
+    }
+
+    /* ---- a park that is ending: is it still inside its allowance? ----
+     * The budget is evaluated at RESUME too, through the same `evaluateWait`
+     * the park used (WAI-4). A declared park whose parked time ran past the
+     * budget — a console outage counts, it is time the phase spent parked —
+     * halts here, before the lock and the prompt, instead of boarding a session
+     * onto a clock hours stale: the measured case resumed 9.7 h late with
+     * 11.76 h of an 8 h budget spent, and produced nothing. */
+    const budget = await this.waitBudgetOf(phase);
+    const resumeAt = Date.now();
+    const parked = resuming
+      ? evaluateWait({
+        purpose: 'resume', now: resumeAt, parkedMs: parkedMsOf(record, resumeAt), waits: record.waits ?? 0, budget,
+        ledger: record.declared?.by === 'watchdog' ? 'watchdog' : 'session',
+      })
+      : null;
+    if (parked?.verdict === 'timeout') {
+      record.status = 'failed';
+      record.note = record.parkReason ?? record.note;
+      record.parkedUntil = undefined;
+      syncWaitClock(state);
+      this.clearParkPoke(phase);
+      const timedOut = consumeDeclaration(record, 'new-outcome');
+      if (timedOut) this.record(DECLARATION_CONSUMED_EVENT, { ...timedOut, next: 'waiting-external-timeout' }, phase);
+      endLockWait(record);
+      state.consecutiveFailures++;
+      this.halt(`phase ${phase} was not resumed — ${parked.reason}`, phase, 'waiting-external-timeout');
       return true;
     }
 
@@ -2155,6 +2309,36 @@ export abstract class RunnerLoop extends RunnerControl {
         return true;
       }
     }
+    /* ---- the peer belt-check (REG-3) ----
+     * The lock answers "has somebody claimed this phase". A session that has
+     * started and not claimed yet — the first minute of every hand session,
+     * exactly when two sessions collide — holds no lock, and admission read the
+     * registry for it a moment ago; this asks again for the grant→spawn window.
+     * A peer queues the phase, NAMED (session, pid, cwd), with the lock race's
+     * backoff: it never parks it, never force-releases anything, and the
+     * scheduler owns the wait. */
+    if (this.deps.scheduler && this.deps.peers) {
+      let peers: readonly SessionPeerView[] = [];
+      // This run's own sessions are already left out by their `autopilot/<runId>`
+      // owner; a session of this phase started by anyone else — a hand
+      // `claude --resume` of the same id included — is exactly a peer.
+      try { peers = this.deps.peers(state.slug, phase, [record.sessionId]); } catch { peers = []; }
+      const peer = peers.find((p) => p.presence === 'live') ?? peers[0];
+      if (peer) {
+        record.status = 'queued';
+        record.note = `queued behind a Claude session in this repository that holds no lock — `
+          + `${peer.sessionId.slice(0, 8)}${peer.pid ? ` (pid ${peer.pid})` : ''} in ${peer.cwd}`;
+        const backoffMs = Math.min(LOCK_BACKOFF_MAX_MS, (record.lockBackoffMs ?? 0) * 2 || 1_000);
+        record.lockBackoffMs = backoffMs;
+        this.record('phase.peer-race', {
+          session: peer.sessionId, pid: peer.pid, cwd: peer.cwd, owner: peer.owner, presence: peer.presence,
+          scope: formatScope([...peer.scope]), backoffMs,
+        }, phase);
+        this.emit('phase', { phase, status: 'queued', note: record.note });
+        await this.sleep(backoffMs);
+        return true;
+      }
+    }
     record.lockWaitSince = undefined;
     delete record.lockBackoffMs;
     // The child holds the lock; the supervisor keeps its lease alive. A live
@@ -2217,6 +2401,22 @@ export abstract class RunnerLoop extends RunnerControl {
       delete record.mcpDegraded;
     }
 
+    /* ---- credential preflight ----
+     * Same place, same reasoning (phase 11, ZTD-4): the credentials the plan
+     * names for this phase are asked about by id before the spawn — the
+     * operator's own plan spent three phases discovering, one at a time, that
+     * three service accounts did not exist. `require` parks here with the
+     * class's errand and spends nothing; `continue` boards and tells the
+     * session which are missing, and the run's manifest row reads
+     * `outstanding` so the run page says so too. Never a value, only a name. */
+    const missingCredentials = await this.preflightCredentials(phase);
+    if (missingCredentials?.park) {
+      record.status = 'parked';
+      record.note = missingCredentials.park;
+      this.emit('phase', { phase, status: 'parked', note: missingCredentials.park });
+      return true;
+    }
+
     /* ---- prompt ---- */
     // `PE_GATE_DELEGATE` swaps the human-gate block for the delegated brief:
     // verify each condition against evidence you can cite, record the clearance,
@@ -2225,7 +2425,7 @@ export abstract class RunnerLoop extends RunnerControl {
     // the gate, because by default one must.
     const engineText = readText(await this.engine(
       ['--boot-prompt', String(phase)],
-      this.deps.delegateHumanGates?.() === true ? { PE_GATE_DELEGATE: '1' } : undefined,
+      this.gatesPolicy().answer === 'delegated' ? { PE_GATE_DELEGATE: '1' } : undefined,
     ));
     if (!engineText.trim()) {
       await this.release(phase, owner);
@@ -2281,8 +2481,21 @@ export abstract class RunnerLoop extends RunnerControl {
     // it, `continue`/`closeout` resume the phase's own session and carry no
     // engine text — the session has it — unless that session cannot be
     // resumed, in which case they degrade to the self-contained `resume`.
-    let base = resuming
-      ? waitResumePrompt(state.slug, phase, record.parkReason, record.watch)
+    const requestedAt = record.declared?.requested ? Date.parse(record.declared.requested) : NaN;
+    const clockAt = record.parkedUntil ? Date.parse(record.parkedUntil) : NaN;
+    const waitCause = record.declared?.by === 'watchdog'
+      ? 'watchdog' as const
+      : Number.isFinite(requestedAt) && Number.isFinite(clockAt) && requestedAt > clockAt
+        ? 'budget-elapsed' as const
+        : 'declared-window' as const;
+    const lateMs = Number.isFinite(clockAt) ? Math.max(0, resumeAt - clockAt) : 0;
+    let base = resuming && parked
+      ? waitResumePrompt({
+        scriptsDir: this.deps.scriptsDir, slug: state.slug, phase, reason: record.parkReason, watch: record.watch,
+        cause: waitCause, lateMs,
+        externalLeftMs: Number.isFinite(requestedAt) && requestedAt > resumeAt ? requestedAt - resumeAt : null,
+        budgetMs: parked.budgetMs, budgetRemainingMs: parked.budgetRemainingMs, budgetSource: parked.budgetSource,
+      })
       : engineText;
     let failureInsert = context;
     let resumeId: string | undefined;
@@ -2319,8 +2532,9 @@ export abstract class RunnerLoop extends RunnerControl {
     const prompt = base + (failureInsert ? `\n\n${failureInsert}\n` : '')
       + (addendum ? `\n\n${retryAddendumBlock(addendum)}\n` : '') + git
       + skillDirective(extraSkills) + mcpDirective(ownMcp, mcp.degraded)
+      + credentialsDirective(record.credentialsMissing ?? [])
       + ultracodeDirective(ultracodeOn(state, own))
-      + unattendedDirective(this.deps.scriptsDir, state.slug, phase);
+      + unattendedDirective(this.deps.scriptsDir, state.slug, phase, { budgetMs: budget.budgetMs, source: budget.source });
     if (failureInsert) this.record('phase.retry-context', { bytes: Buffer.byteLength(failureInsert) }, phase);
     if (extraSkills.length) this.record('phase.skills', { skills: [...new Set(extraSkills)] }, phase);
 
@@ -2343,19 +2557,70 @@ export abstract class RunnerLoop extends RunnerControl {
 
     /* ---- what this phase runs as ---- */
     const chosen = this.optionsFor(phase);
-    if (resuming) {
-      // The park is over: accrue the time actually spent parked (the console
-      // may have been down past `parkedUntil`, so this is measured, not
-      // planned), hand the session id to the resume machinery, and clear the
-      // clock so a crash mid-resume re-parks cleanly rather than double-firing.
-      const parkedFrom = record.endedAt ?? record.parkedUntil;
-      record.parkedMs = (record.parkedMs ?? 0)
-        + (parkedFrom ? Math.max(0, Date.now() - Date.parse(parkedFrom)) : 0);
-      record.resumeSessionId ??= record.sessionId;
+
+    /* ---- the account door, asked at every boarding (RCV-1's admission half) ----
+     * The breaker is machine-wide and moves between boardings: a credential
+     * refused under another run of this console — or under another console —
+     * is retired for its organisation, and a phase this run had queued before
+     * the refusal must not board on it. The run's own preflight asked once, at
+     * start; this asks at the door, and reads ONE word. `retired` IS the
+     * credential wall, so the run halts on it exactly as the classifier's arm
+     * would have, without a session spent finding out. Every other verdict (a
+     * spent window, a wall) stays the preflight's and the live wall's. */
+    const door = this.deps.accountHeadroom?.(state.accountId, record.model ?? chosen.model);
+    if (door && !door.ok && door.kind === 'retired') {
+      await this.release(phase, owner);
+      const paying = state.accountId ?? 'the machine login';
+      this.record('run.admission-refused', {
+        phase, reason: 'account-retired', account: paying, detail: door.reason,
+      }, phase);
+      record.status = 'parked';
+      record.note = `${door.reason} (account: ${paying})`;
+      // The cause on the record, as the classifier's arm stamps it: the wall
+      // is the same, and a Continue past it re-boards this phase by the cause.
+      record.cause = {
+        kind: 'credential-refused', reason: door.reason, at: new Date().toISOString(),
+        ...(state.accountId ? { account: state.accountId } : {}),
+      };
+      this.halt(record.note, phase, 'credential-refused');
+      return true;
+    }
+    if (wasWaiting) {
+      // The park is over: close it on its own stamps (so `parkedMsOf` measures
+      // the time it actually held — the console may have been down past
+      // `parkedUntil`), and clear the clock so a crash mid-resume re-parks
+      // cleanly rather than double-firing. The session to resume was named at
+      // park time; a record that named none gets its own session — but never
+      // one already stamped gone, which `??=` used to re-arm (SLF-10). A park
+      // with NO declaration (the console's retry-storm park, a record from
+      // before declarations) still resumes its session; only the prompt, the
+      // budget and the turn cap belong to a declared wait.
+      const endedAt = new Date().toISOString();
+      closeWaitEntry(record, endedAt);
+      record.parkedMs = parkedMsOf(record, Date.parse(endedAt));
+      if (!record.resumeSessionId && record.sessionId) {
+        if (isSessionGone(record, record.sessionId)) this.noteGoneResume(record, record.sessionId);
+        else record.resumeSessionId = record.sessionId;
+      }
       record.parkedUntil = undefined;
+      // The run's clock follows the waiters that remain (WAI-6).
+      syncWaitClock(state);
       this.clearParkPoke(phase);
+      const declarer = record.sessionId ? this.deps.sessionPresence?.(record.sessionId) : undefined;
       this.record('phase.wait-resume', {
-        waits: record.waits ?? 0, parkedMs: record.parkedMs, sessionId: record.sessionId ?? null,
+        waits: record.waits ?? 0, parkedMs: record.parkedMs, lateMs,
+        cause: resuming ? waitCause : 'console-park',
+        ...(resuming && parked ? {
+          budgetMs: parked.budgetMs, budgetSource: parked.budgetSource, budgetRemainingMs: parked.budgetRemainingMs,
+          capSource: WAIT_RESUME_TURNS.source,
+          ...(parked.extendedBy ? { extendedBy: parked.extendedBy } : {}),
+        } : {}),
+        ...(record.declared?.by === 'watchdog' ? { watchdogParks: record.watchdogParks ?? 0 } : {}),
+        sessionId: record.sessionId ?? null,
+        // Whose declaration this resume answers, and whether that session is
+        // still around — an ended author is recorded, never silently resumed
+        // over (SHD-6).
+        declaredBy: { by: record.declared?.by ?? (resuming ? 'session' : null), presence: declarer?.presence ?? 'unknown' },
       }, phase);
     }
     record.status = 'running';
@@ -2365,6 +2630,12 @@ export abstract class RunnerLoop extends RunnerControl {
     // again. (`resetForRetry` covers the operator's Retry; this covers every
     // re-board the ladder makes without one.)
     retirePhaseHalt(record);
+    // …and so are the wall and the denial it last stopped on: the door above
+    // just proved the account can board, and a denial belongs to the attempt
+    // it happened in (phase 9). `prepareReboard` deliberately keeps both, so a
+    // console re-board that never reaches a spawn carries them forward.
+    delete record.cause;
+    delete record.toolDenied;
     // The last declaration is NOT deleted here. It used to be — "a new attempt
     // consumes it" — and the delete ran before the spawn, so a boarding that
     // queued, capped or failed to start threw away the session's own testimony
@@ -2419,7 +2690,7 @@ export abstract class RunnerLoop extends RunnerControl {
       ...(chosen.permissionMode ? { permissionMode: chosen.permissionMode } : {}),
       title: board.states[phase],
       ...(hint ? { brief: hint.brief, situation: hint.situation, rung: hint.rung } : {}),
-      ...(resuming ? { waitResume: true } : {}),
+      ...(resuming ? { waitResume: true, waitCause } : {}),
     }, phase);
     this.emit('phase', { phase, status: 'running', model: record.model, effort: record.effort });
 
@@ -2429,7 +2700,7 @@ export abstract class RunnerLoop extends RunnerControl {
       // so a session that misreads the ask and starts new work runs out. A
       // `closeout` brief is capped the same way, for the same reason; a
       // `continue` is the phase itself and is not.
-      ...(resuming ? { maxTurns: CLOSEOUT_MAX_TURNS } : cappedTurns ? { maxTurns: cappedTurns } : {}),
+      ...(resuming ? { maxTurns: WAIT_RESUME_TURNS } : cappedTurns ? { maxTurns: closeoutBriefTurns(cappedTurns) } : {}),
       mcp,
     });
     if (!settled.carryOn) { await this.release(phase, owner); return false; }
@@ -2745,7 +3016,7 @@ export abstract class RunnerLoop extends RunnerControl {
     const candidates = [...new Set([this.lastDonePhase, ...done])].filter((p): p is number => p != null);
     const phase = candidates.find((p) => {
       const r = state.phases[String(p)];
-      return Boolean(r?.sessionId) && this.transcriptFollows(r);
+      return Boolean(r?.sessionId) && this.transcriptFollows(r) && !isSessionGone(r, r.sessionId);
     });
     if (phase == null) return null;
     // …and not under a fleet freeze. A PR session is a `claude` that never
@@ -2767,7 +3038,17 @@ export abstract class RunnerLoop extends RunnerControl {
       return null;
     }
     const record = phaseRecord(state, phase);
-    const spawn = this.deps.spawn ?? spawnClaude;
+    // The one gate every `--resume` takes. This site only asked whether the
+    // transcript followed; a session still running, or one the CLI already
+    // refused, was resumed for the pull request anyway (SLF-10).
+    const gate = this.resumableSession(record, record.sessionId);
+    if (!gate.ok) {
+      this.record('run.pr-session-skipped', {
+        reason: `the last phase's session ${record.sessionId} cannot be resumed (${gate.why}) — the ${what} did not run`,
+        errand: `settle ${branch} by hand, or Continue this run once that session has ended`,
+      }, phase);
+      return null;
+    }
     // The tree that phase worked in. Its lane is gone from `this.lanes` by now
     // — every phase has settled, that is what makes this the last leaf — so the
     // question has to be put to git (D7). In a worktree run the shared root is
@@ -2779,18 +3060,14 @@ export abstract class RunnerLoop extends RunnerControl {
 
     let outcome;
     try {
-      outcome = await spawn({
+      outcome = await this.spawnSession(phase, 'pr', {
         prompt,
         cwd: prCwd,
         addDirs: resolve(prCwd) === resolve(state.root) ? undefined : [state.root],
         model: record.model ?? state.model,
         effort: record.effort ?? state.effort,
         name: `${state.slug} p${phase} ${what}`,
-        resume: record.sessionId,
-        // Paperwork, like a closeout: capped so a confused session cannot
-        // re-open the work it was asked only to publish.
-        budgetUsd: state.phaseBudgetUsd === null ? null : Math.max(1, state.phaseBudgetUsd / 4),
-        maxTurns: CLOSEOUT_MAX_TURNS,
+        resumeFrom: gate.resume,
         settings: this.settingsPath ?? undefined,
         permissionProfile: this.profile(),
         partialMessages: this.deps.stream?.partialMessages ?? true,
@@ -2814,6 +3091,11 @@ export abstract class RunnerLoop extends RunnerControl {
           this.emit('run', { state });
         },
         onEvent: (event) => this.onStream(phase, event),
+      }, {
+        // Paperwork, like a closeout: a quarter of the phase's dollars and a
+        // closeout's turns, so a confused session cannot re-open the work it
+        // was asked only to publish.
+        caps: capsFor({ mode: 'pr', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
       this.record('phase.pr-session-failed', { error: (error as Error)?.message ?? String(error) }, phase);
@@ -2904,7 +3186,21 @@ export abstract class RunnerLoop extends RunnerControl {
       return;
     }
 
-    const spawn = this.deps.spawn ?? spawnClaude;
+    // One of the fourteen automatic starts (SLF-1): the reviewer names its
+    // door, asks the instance's ceiling, and is skipped by name past it —
+    // advisory paperwork is the first thing a ceiling should cost.
+    const actor = doorActor('auto-reviewer', {
+      by: 'runner', via: 'event', origin: 'phase-finish',
+      trigger: `reviewEachPhase:${policy}`, guard: 'non-empty diff,!fleetFrozen', counter: 'one per phase',
+    });
+    const admitted = this.deps.startCeiling?.admit(actor) ?? { ok: true as const };
+    if (!admitted.ok) {
+      this.record('run.start-refused', { ...actor, ceiling: admitted.ceiling, limit: admitted.limit, count: admitted.count, until: admitted.until }, phase);
+      this.record('phase.review-session-skipped', { reason: `the start ceiling refused the reviewer (${admitted.ceiling}) until ${admitted.until}` }, phase);
+      return;
+    }
+    this.deps.startCeiling?.charge(actor, state.slug);
+    this.record('phase.session-start', { ...actor, mode: 'review' }, phase);
     this.record('phase.review-session', {
       policy, files: facts.diff.files.length,
       additions: facts.diff.additions, deletions: facts.diff.deletions,
@@ -2913,7 +3209,7 @@ export abstract class RunnerLoop extends RunnerControl {
 
     let outcome;
     try {
-      outcome = await spawn({
+      outcome = await this.spawnSession(phase, 'review', {
         prompt: reviewerPrompt(facts),
         cwd: state.root,
         model: record.model ?? state.model,
@@ -2923,11 +3219,6 @@ export abstract class RunnerLoop extends RunnerControl {
         // phase is not a review — it is the author agreeing with themselves,
         // which is the entire failure this feature exists to avoid. Same rule
         // the QA intent in `agent.ts` states for the same reason.
-        // Reading, like paperwork: a quarter of the phase budget and the
-        // closeout's turn cap, so a confused reviewer cannot spend a phase's
-        // worth of money re-deriving the work.
-        budgetUsd: state.phaseBudgetUsd === null ? null : Math.max(1, state.phaseBudgetUsd / 4),
-        maxTurns: CLOSEOUT_MAX_TURNS,
         tools: [...RunnerLoop.REVIEWER_TOOLS],
         settings: this.settingsPath ?? undefined,
         permissionProfile: this.profile(),
@@ -2948,6 +3239,11 @@ export abstract class RunnerLoop extends RunnerControl {
         },
         env: await this.sessionEnv({}),
         signal: this.abort?.signal,
+      }, {
+        // Reading, like paperwork: a quarter of the phase's dollars and the
+        // closeout's turn cap, so a confused reviewer cannot spend a phase's
+        // worth of money re-deriving the work.
+        caps: capsFor({ mode: 'review', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
       this.record('phase.review-session-failed', { error: (error as Error)?.message ?? String(error) }, phase);
@@ -3032,6 +3328,22 @@ export abstract class RunnerLoop extends RunnerControl {
       return;
     }
 
+    // One of the fourteen automatic starts (SLF-1): billed cloud work, so it
+    // names its door and asks the ceiling before a dollar is spent.
+    const actor = doorActor('ultrareview', {
+      by: 'runner', via: 'event', origin: occasion === 'each-phase' ? 'phase-finish' : 'run-settle',
+      trigger: `ultraReview:${occasion}`, guard: '!fleetFrozen', counter: 'one per phase',
+    });
+    const admitted = this.deps.startCeiling?.admit(actor) ?? { ok: true as const };
+    if (!admitted.ok) {
+      this.record('run.start-refused', { ...actor, ceiling: admitted.ceiling, limit: admitted.limit, count: admitted.count, until: admitted.until }, phase);
+      this.record(ULTRAREVIEW_EVENTS.skipped, {
+        occasion, reason: `the start ceiling refused the cloud review (${admitted.ceiling}) until ${admitted.until}`,
+      }, phase);
+      return;
+    }
+    this.deps.startCeiling?.charge(actor, state.slug);
+    this.record('phase.session-start', { ...actor, mode: 'ultrareview' }, phase);
     await ultraReviewJob({
       occasion, slug: state.slug, phase,
       cwd: occasion === 'each-phase' ? this.laneRoot(phase) : state.root,

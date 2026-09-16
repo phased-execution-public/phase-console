@@ -14,8 +14,8 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import type { SessionInventory } from '@/lib/api';
-import { StopInventory, keepList, stopList } from './shutdown';
+import type { SessionInventory, ShutdownInventory, StopPlanView } from '@/lib/api';
+import { StopInventory, durabilitySentence, inventoryItems, keepList, stopList } from './shutdown';
 
 const inventory = (over: Partial<SessionInventory> = {}): SessionInventory => ({
   live: 3,
@@ -77,5 +77,98 @@ describe('what a restart or a shutdown claims', () => {
   it('still says so when there genuinely is nothing', () => {
     render(<StopInventory items={[]} keeps={[]} />);
     expect(screen.getByText(/Nothing is running/)).toBeInTheDocument();
+  });
+});
+
+/**
+ * ACC-6.1 / ACC-6.4 (SHD-1, SHD-5). The dialog said "Nothing is running — no
+ * session, no run" over a lane 36.8 minutes from its resume, and "The launchd
+ * job is unloaded, so it stays off" over a bootout the next login undid. The
+ * list is now the server's inventory, and each strength's sentence is what that
+ * strength achieves.
+ */
+describe('the Shut down dialog is the inventory, and each strength says what it achieves', () => {
+  const empty = (): ShutdownInventory => ({
+    lanes: [],
+    clocks: [],
+    runs: [],
+    liveSessions: [],
+    pendingApprovals: [],
+    inboxDepth: { sessions: 0, outcomes: 0 },
+  });
+
+  it('names every lane, the soonest WORK clock, the runs on disk, the live sessions, the cards and the unread inboxes', () => {
+    const inventory: ShutdownInventory = {
+      ...empty(),
+      lanes: [{ slug: 'demo', runId: 'r1', phase: 3, pid: 4242, sessionId: 's1' }],
+      clocks: [
+        { source: 'session-inbox', at: '2026-09-15T10:00:00.100Z' },
+        { source: 'wait-resume', at: '2026-09-15T10:36:48.000Z', slug: 'hub-plan' },
+      ],
+      runs: [
+        {
+          slug: 'hub-plan',
+          id: 'r2',
+          status: 'paused',
+          waitUntil: '2026-09-15T10:36:48.000Z',
+          live: false,
+          clock: null,
+        },
+      ],
+      liveSessions: [
+        { sessionId: '9d8b45ec-aaaa', kind: 'foreign', pid: 66601, cwd: '/work/hub', plan: null },
+      ],
+      pendingApprovals: [
+        { id: 'a1', slug: 'demo', phase: 3, kind: 'tool', expiresAt: '2026-09-15T11:00:00.000Z' },
+      ],
+      inboxDepth: { sessions: 3, outcomes: 1 },
+    };
+    const items = inventoryItems(inventory);
+    expect(items[0]).toMatch(/^demo phase 3 \(pid 4242\)/);
+    expect(items[1]).toMatch(/^the wait-resume clock for hub-plan due/);
+    expect(items[1]).toMatch(/and 1 more clock/);
+    expect(items.some((item) => /the hub-plan run \(paused, until/.test(item))).toBe(true);
+    expect(
+      items.some((item) => /1 live Claude session this console is watching \(9d8b45ec\)/.test(item)),
+    ).toBe(true);
+    expect(items.some((item) => /1 pending approval/.test(item))).toBe(true);
+    expect(items.some((item) => /3 presence events and 1 declaration not yet read/.test(item))).toBe(true);
+    expect(inventoryItems(empty())).toEqual([]);
+  });
+
+  it('says "nothing" only when the measured inventory is empty, and says what confirming acknowledges otherwise', () => {
+    const { unmount } = render(<StopInventory items={[]} keeps={[]} acknowledging />);
+    expect(screen.getByText(/Nothing is running, armed, waiting or unread/)).toBeInTheDocument();
+    unmount();
+    render(<StopInventory items={['demo phase 3 (pid 4242)']} acknowledging />);
+    expect(screen.getByText(/confirming stops all of it/)).toBeInTheDocument();
+  });
+
+  it("makes each strength's promise the one it keeps", () => {
+    const plan = (over: Partial<StopPlanView>): StopPlanView => ({
+      via: 'exit',
+      mode: 'exit',
+      durability: 'stays-off',
+      detail: '',
+      ...over,
+    });
+    expect(durabilitySentence(plan({ durability: 'returns' }))).toMatch(/starts it again within seconds/);
+    expect(durabilitySentence(plan({ durability: 'until-login' }))).toMatch(
+      /next login starts the unit again/,
+    );
+    expect(durabilitySentence(plan({ durability: 'stays-off' }), 'bash start')).toBe(
+      'Nothing brings it back. To start it again: bash start',
+    );
+    const off = durabilitySentence(
+      plan({
+        via: 'launchctl',
+        mode: 'unload',
+        durability: 'disabled',
+        resurrect: 'launchctl enable gui/$(id -u)/com.example',
+      }),
+    );
+    expect(off).toMatch(/unloaded and disabled and a stop marker holds its automation/);
+    expect(off).toMatch(/a login does not bring it back/);
+    expect(off).toMatch(/To start it again: launchctl enable/);
   });
 });

@@ -13,11 +13,14 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 
-const { editPolicy } = vi.hoisted(() => ({ editPolicy: vi.fn() }));
+const { editPolicy, acknowledgePolicyAdvisory } = vi.hoisted(() => ({
+  editPolicy: vi.fn(),
+  acknowledgePolicyAdvisory: vi.fn(),
+}));
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, editPolicy } };
+  return { ...actual, api: { ...actual.api, editPolicy, acknowledgePolicyAdvisory } };
 });
 
 const POLICY = {
@@ -49,11 +52,14 @@ const POLICY = {
   seen: [],
 };
 
+/** What `usePolicy` answers; a test may swap in a view with advisories. */
+let policyView: Record<string, unknown> = POLICY;
+
 vi.mock('@/lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/queries')>();
   return {
     ...actual,
-    usePolicy: () => ({ data: POLICY }),
+    usePolicy: () => ({ data: policyView }),
     usePlans: () => ({ data: [] }),
   };
 });
@@ -70,7 +76,61 @@ async function mount() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  policyView = POLICY;
   editPolicy.mockResolvedValue(POLICY);
+  acknowledgePolicyAdvisory.mockResolvedValue({ ok: true, kind: 'ask-empty', advisory: [] });
+});
+
+describe('the policy advisory (phase 12)', () => {
+  it('shows nothing on a server without advisories, or with every one acknowledged', async () => {
+    await mount();
+    expect(document.querySelector('[data-policy-advisory]')).toBeNull();
+    policyView = {
+      ...POLICY,
+      advisory: [
+        {
+          kind: 'deny-struck',
+          rules: ['Bash(sudo:*)'],
+          message: 'struck',
+          acknowledged: true,
+          fingerprint: 'f',
+        },
+      ],
+    };
+    await mount();
+    expect(document.querySelector('[data-policy-advisory]')).toBeNull();
+  });
+
+  it('an unacknowledged advisory is a banner naming its rules, and one tap records the receipt', async () => {
+    policyView = {
+      ...POLICY,
+      advisory: [
+        {
+          kind: 'ask-empty',
+          rules: ['Bash(git commit:*)'],
+          message: 'The effective ask list is empty.',
+          acknowledged: false,
+          fingerprint: 'a',
+        },
+        {
+          kind: 'deny-struck',
+          rules: ['Bash(sudo:*)'],
+          message: '1 shipped deny rule is struck.',
+          acknowledged: true,
+          fingerprint: 'b',
+        },
+      ],
+    };
+    await mount();
+    const banners = document.querySelectorAll('[data-policy-advisory]');
+    expect(banners).toHaveLength(1);
+    expect(banners[0].getAttribute('data-policy-advisory')).toBe('ask-empty');
+    expect(banners[0].textContent).toContain('Nothing here asks.');
+    expect(banners[0].textContent).toContain('The effective ask list is empty.');
+    expect(banners[0].textContent).toContain('Bash(git commit:*)');
+    fireEvent.click(screen.getByRole('button', { name: 'I have read this' }));
+    await waitFor(() => expect(acknowledgePolicyAdvisory).toHaveBeenCalledWith('ask-empty'));
+  });
 });
 
 describe('deny parity in the editor', () => {

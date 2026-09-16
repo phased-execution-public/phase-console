@@ -29,7 +29,14 @@
 
 import type { PhaseOptions, RunState } from '@/lib/api';
 import { RECOVERY_LABELS, type RecoveryClass } from '@/lib/recovery';
-import { EMPTY, parsePhases, type PermissionChoice, type RunSetupField, type RunSetupValues } from './schema';
+import {
+  EMPTY,
+  parseAccounts,
+  parsePhases,
+  type PermissionChoice,
+  type RunSetupField,
+  type RunSetupValues,
+} from './schema';
 import { PERMISSION_MODES, PERMISSION_PROFILES, PROFILE_LABELS } from '@shared/run-settings.js';
 
 export type RunSetupMode =
@@ -78,6 +85,12 @@ interface ModeSpec {
  * how a one-phase launch turns into a re-read of the run's whole configuration.
  */
 const RUN_FIELDS = [
+  // The Decisions stage (phase 11): the prelude's required answers, first.
+  'resumeOnRestart',
+  'relay',
+  'accounts',
+  'acknowledgedWaivers',
+  'manifestOverride',
   'model',
   'effort',
   'autonomy',
@@ -122,12 +135,35 @@ const RUN_FIELDS = [
  * BEGINS, and a run already mid-plan cannot un-begin — offering the control on
  * a live run would show a value the settings door does not read.
  */
+/**
+ * The prelude's five (phase 11) — START-only every one: they are the run's
+ * answers to the decision manifest, and a settings patch cannot re-answer what
+ * the door was refused on. A narrow `phase` launch carries the three the door
+ * REQUIRES too, because a phase launch on a finished run is a fresh start.
+ */
+const PRELUDE_FIELDS = [
+  'resumeOnRestart',
+  'relay',
+  'accounts',
+  'acknowledgedWaivers',
+  'manifestOverride',
+] as const;
+
 const LIVE_FIELDS = RUN_FIELDS.filter(
-  (field) => field !== 'qa' && field !== 'accountId' && field !== 'startAfter',
+  (field) =>
+    field !== 'qa' &&
+    field !== 'accountId' &&
+    field !== 'startAfter' &&
+    !PRELUDE_FIELDS.includes(field as (typeof PRELUDE_FIELDS)[number]),
 ) as readonly RunSetupField[];
 
 /** The dialog's narrow launch, unchanged: choices, not configuration. */
 const PHASE_FIELDS = [
+  'resumeOnRestart',
+  'relay',
+  'accounts',
+  'acknowledgedWaivers',
+  'manifestOverride',
   'model',
   'effort',
   'accountId',
@@ -404,6 +440,24 @@ export function buildRunPayload(
   if (on('phaseOptions') && Object.keys(values.phaseOptions).length) {
     payload.phaseOptions = values.phaseOptions;
   }
+  // The prelude's answers (phase 11). The three the door REQUIRES are sent
+  // whenever their control is shown — `false` and `off` are answers, and an
+  // empty account list is deliberately NOT invented here: the door refuses it
+  // by name, which is the point. The waivers ride only when acknowledged, and
+  // the override only when a person signed it — its rows are the server's own
+  // blocking list, never the client's.
+  if (on('resumeOnRestart')) payload.resumeOnRestart = values.resumeOnRestart;
+  if (on('relay')) payload.relay = values.relay;
+  if (on('accounts')) {
+    const accounts = parseAccounts(values.accounts);
+    if (accounts?.length) payload.accounts = accounts;
+  }
+  if (on('acknowledgedWaivers') && values.acknowledgedWaivers.length) {
+    payload.acknowledgedWaivers = [...values.acknowledgedWaivers];
+  }
+  if (on('manifestOverride') && values.manifestOverride.trim()) {
+    payload.manifestOverride = { by: values.manifestOverride.trim() };
+  }
 
   // Scope. A `phase` launch says it outright; every other mode sends whatever
   // the operator typed, and an empty box means the whole plan — which is why a
@@ -602,7 +656,7 @@ export const PHASE_PERMISSION_MODES: readonly (typeof PERMISSION_MODES)[number][
 
 /** What each CLI mode is called on screen — the profile words, where they map. */
 export const PERMISSION_MODE_LABELS: Readonly<Record<string, string>> = Object.freeze({
-  acceptEdits: 'Trusted — only the deny list stops it',
+  acceptEdits: PROFILE_LABELS.trusted,
   plan: 'Plan only (read-only) — until a plan is approved',
   auto: 'Auto — the CLI decides what needs asking',
   dontAsk: 'Don’t ask — refuse rather than prompt',

@@ -336,8 +336,10 @@ for (const mechanism of MECHANISMS) {
 const START_SITES: { file: string; count: number; note: string }[] = [
   {
     file: 'server/service-base.ts',
-    count: 3,
-    note: 'recovery-outcome continue · boot re-adoption · limit resume — all three gated in place',
+    count: 4,
+    note: 'recovery-outcome continue · boot re-adoption · limit resume · the overdue-wait ruling '
+      + '(`resumeOverdueWait`, zero-touch-console phase 5) — all four gated in place; the last two read '
+      + 'the same `run.limit-resume-frozen` hold',
   },
   {
     file: 'server/service-runs.ts',
@@ -349,8 +351,10 @@ const START_SITES: { file: string; count: number; note: string }[] = [
   },
   {
     file: 'server/service-recovery.ts',
-    count: 3,
-    note: "maybeAutoRecover (gated at the loop; the operator's press is deliberate) · "
+    count: 5,
+    note: "maybeAutoRecover's three relaunch vehicles — the reboard, and since phase 10 the "
+      + 'switch-account and raise-budget rungs, each a stopped-run relaunch inside the same '
+      + "healer (gated at the loop; the operator's press is deliberate) · "
       + 'recovery-continue (gated in place) · watch-landed continue (gated in place: '
       + '`resumeOnWatchLanded` checks fleetHold before the resume and again before the continue)',
   },
@@ -389,6 +393,17 @@ const RUNNER_SPAWN_SITES: { file: string; count: number; note: string }[] = [
       + "let it through would be the console starting work the instant the operator stopped it.",
   },
 ];
+
+/**
+ * The door those sites go through (zero-touch-console phase 4, SES-6).
+ *
+ * Every runner session is spawned by `RunnerBase.spawnSession`, which writes
+ * the session's `phase.session` record — so the raw spawn lives in exactly one
+ * place, and the sites above are counted as callers of the door. The gates
+ * stay where they were: each site still asks `fleetFrozen()` (or is gated at
+ * `admit`) BEFORE it calls the door, which gates nothing itself.
+ */
+const SPAWN_DOOR = { file: 'server/runner/runner-base.ts', note: 'spawnSession — the one raw spawn under the runner' };
 
 /**
  * …and there are no OTHER `spawnClaude` users anywhere in `server/`.
@@ -448,8 +463,9 @@ test('census: the runner is the only thing in server/ that spawns a bare claude'
       const rel = `${dir}/${entry}`;
       if (statSync(join(VIEWER, rel)).isDirectory()) { walk(rel); continue; }
       if (!entry.endsWith('.ts') || entry.endsWith('.test.ts')) continue;
-      // `spawn.ts` DEFINES it; a definition is not a call site.
-      if (rel === 'server/runner/spawn.ts' || files.has(rel)) continue;
+      // `spawn.ts` DEFINES it; a definition is not a call site. The door is
+      // pinned to its one call by the census below.
+      if (rel === 'server/runner/spawn.ts' || rel === SPAWN_DOOR.file || files.has(rel)) continue;
       // A USE, not a mention. Both shapes: the `deps.spawn ?? spawnClaude`
       // fallback every site here takes, and a bare call. Naming it in an import
       // list or a type is not spawning anything.
@@ -478,8 +494,14 @@ test('census: every place a RUN can be started is accounted for', () => {
 });
 
 test('census: every place the RUNNER spawns a bare session is accounted for', () => {
+  // The door holds the one raw spawn…
+  const raw = source(SPAWN_DOOR.file).match(/this\.deps\.spawn \?\? spawnClaude/g)?.length ?? 0;
+  assert.equal(raw, 1, `${SPAWN_DOOR.file} must hold exactly one raw spawn (${SPAWN_DOOR.note}); found ${raw}`);
+  // …and no site bypasses it: every site below goes through the door.
   for (const site of RUNNER_SPAWN_SITES) {
-    const found = source(site.file).match(/this\.deps\.spawn \?\? spawnClaude/g)?.length ?? 0;
+    assert.equal(source(site.file).match(/this\.deps\.spawn \?\? spawnClaude/g)?.length ?? 0, 0,
+      `${site.file} spawns a raw session instead of going through ${SPAWN_DOOR.note}`);
+    const found = source(site.file).match(/this\.spawnSession\(/g)?.length ?? 0;
     assert.equal(
       found, site.count,
       `${site.file} has ${found} runner spawn sites, this census expects ${site.count}.\n`
@@ -846,3 +868,4 @@ test('standing: the run-control freeze writes the standing form when asked, and 
     + 'halves of the same promise, and half a promise is the orphan this whole area exists to prevent',
   );
 });
+

@@ -846,7 +846,75 @@ test('L-B — the level vocabulary is checked against ALL 242 kinds', () => {
   // (`phase.qa-recover`, `qa-round`, `qa-recovered`, `qa-exhausted`, `qa-waived`),
   // console-parallel-repaint P14's three `run.ultrareview*` lines and P12's
   // `phase.ladder-extended` and `phase.verify-waived`.
-  assert.equal(kinds.length, 244, `the catalogue has ${kinds.length} kinds; the parser found a different number`);
+  // 248 since zero-touch-console phase 2 (LFC-4): the three withdrawal records
+  // `run.{pause,halt,park}-withdrew` that a template literal used to compose,
+  // and the RETIRED `run.auto-recover-skipped`, kept with a version note so the
+  // hub's older journals stay readable — a retired row still names a kind.
+  // 252 since zero-touch-console phase 4 (the session ledger): the CLI's own
+  // denials and the words a session read for one (`phase.permission-denied`,
+  // `phase.tool-refused`), the CLI-side ceilings a session ran under
+  // (`phase.retry-ceiling`), and the decision a usage warning now gets
+  // (`run.usage-decision`).
+  // 259 since zero-touch-console phase 5 (the wait budget and the resume gate):
+  // the automatic resume named for what it is (`phase.resume-automatic`, with
+  // `phase.resume-at-boot` kept retired), a resume refused over a live session
+  // (`phase.resume-refused`, `run.resume-refused`), a watch ref nothing can poll
+  // (`phase.watch-unpollable`), an overdue clock ruled on (`run.wait-overdue`),
+  // and the two pins a wait clock now logs (`run.limit-resume-held`,
+  // `run.readopt-wait-held`). 262 since phase 6 (settlement, the inbox, the
+  // ledgers): a dead clock settled (`phase.wait-settled`), a declared word
+  // refused (`phase.declaration-refused`) and a person's card as a wait
+  // (`run.waiting-person`) — the phase's three log-family rows
+  // (`outcome-inbox.declaration-refused`, `sessions.inbox-orphan`,
+  // `hook.person-wait-failed`) are outside this count by construction. 265
+  // since phase 7 (every automatic start names itself): a start the ceiling
+  // refused (`run.start-refused`), a session opened by one of the doors that
+  // does not go through `startRun` (`phase.session-start`) and the healer's
+  // pass on the console log (`run.heal-pass`, a `run.` name and so counted
+  // here) — `session.start`, `mcp.probe.*` and `start-ceiling.refused` are
+  // log-family names outside the three prefixes. 268 since phase 8 (accounts):
+  // the account a run left over a window (`run.account-cooling`), the
+  // credential refusal that retired one (`run.account-retired`), and a token
+  // account's MCP set scoped to what the plan declares (`run.token-scope`) —
+  // the `accounts.learned.*`, `accounts.retired.*`, `accounts.token-scope` and
+  // `accounts.transcript-layout` rows are log-family names outside the count.
+  // 273 since phase 9 (the wall and the ladder's breaker): a boarding refused
+  // on a retired account (`run.admission-refused`), an automatic relaunch of a
+  // spent streak refused (`run.relaunch-refused`), a recheck's verdict
+  // (`run.recheck`), a ref-less wait after a guard denial
+  // (`phase.watch-missing`) and a widen card answered (`phase.widen-decided`)
+  // — `runner.recover.refused`, `runner.relaunch-refused` and the two
+  // `runner.widen-rule.*` rows are log-family names outside the count.
+  // 274 since phase 10 (ladder drivability, settlement and the errand's
+  // voice): a ladder cap's refusal as a journal line (`phase.ladder-refused`).
+  // 277 since phase 11 (the prelude and the policy table): a class answered by
+  // policy instead of a person (`phase.policy-answered`), the start door
+  // passed on a blocking row (`run.manifest-override`), and a phase's
+  // credentials checked before the spawn (`phase.credential-preflight`).
+  // 281 since phase 12 (ruling memory and the policy editor): a console
+  // policy answer moved (`policy.changed`), the once-per-boot policy advisory
+  // and its receipt (`policy.advisory`, `policy.advisory-acknowledged`) and
+  // the boot read that could not judge one (`policy.advisory-unread`).
+  // 286 since phase 13 (trust as built): a card's raise and its ending on the
+  // run (`phase.approval-raised`, `phase.approval-decided`), the grant's twin
+  // under its new family name (`phase.approval-auto-granted`; the old
+  // `phase.tool-auto-granted` row stays as retired), the return leg of an
+  // operator's question (`phase.answered`), and a CLI too old for the floor
+  // flag (`run.permission-prompts-skipped`).
+  // 296 since phase 14 (the relay): a question raised, answered, refused to
+  // the console and deferred (`phase.question-raised`, `-answered`,
+  // `-unanswerable`, `-deferred`), the transport's own arrival
+  // (`phase.permission-request`), a `control_request` and a `defer` read off the
+  // stream (`phase.control-request`, `phase.tool-deferred`), and the relay's
+  // arming as it changes (`run.relay-armed`, `run.relay-degraded`,
+  // `run.relay-refused`) — the `relay.*`, `cli-init.*` and
+  // `runner.relay-arming-failed` rows are log-family names outside the count.
+  // 298 since phase 16 (shutdown, boot and presence): a boarding queued behind
+  // a live session in the repository that holds no lock (`phase.peer-race`)
+  // and a re-adoption held by a stop marker or `autostart: false`
+  // (`run.readopt-held`) — the `boot.*`, `shutdown.*` and new `sessions.*` rows
+  // are log-family names outside the count.
+  assert.equal(kinds.length, 298, `the catalogue has ${kinds.length} kinds; the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -859,7 +927,18 @@ test('L-B — the level vocabulary is checked against ALL 242 kinds', () => {
   const tally = { info: 0, warn: 0, error: 0 };
   for (const kind of kinds) tally[journalLevel(kind)] += 1;
   assert.equal(tally.info + tally.warn + tally.error, kinds.length);
-  assert.ok(tally.error > 0 && tally.error < 40, `${tally.error} kinds read as error — check the vocabulary`);
+  // 45 since zero-touch-console phase 5: `phase.resume-refused` and
+  // `run.resume-refused` read as error through the shared `refused` word, like
+  // every refusal before them — a resume refused over a running session is the
+  // console declining a harm, and the page drawing it loud is the point.
+  // 46 since phase 10: `phase.ladder-refused` — a ladder cap declining a
+  // climb — reads as error through the same word, and rightly loud: it is the
+  // moment a phase stops being the machine's and becomes a person's.
+  // 47 since phase 14: `run.relay-refused` — a run that asked for the relay
+  // and was refused it on its CLI's version — reads as error through the same
+  // word, and loud is right: the operator asked for a last resort and the run
+  // is going without one.
+  assert.ok(tally.error > 0 && tally.error < 47, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 

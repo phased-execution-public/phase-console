@@ -110,10 +110,10 @@ A round is a real thing now:
 > an older copy, but not *writable* by one: the pre-rounds upsert deletes every row whose first cell
 > is the phase number, and the ledger's rows begin with exactly that — so a verdict recorded through
 > a stale copy silently takes that phase's history with it, and appends its own row inside the
-> ledger's table. This tree installs in several places at once (each console's own clone, the
-> stamped skill under `~/.claude/skills`, npm, brew, the plugin), so "backward compatible" here
-> means *readable by*, never *writable by*. `phase-console install-skill --force` after each console
-> update is the step that keeps them in step.
+> ledger's table. This tree installs in several places at once (each console's own clone, a stamped
+> copy under `~/.claude/skills`, the plugin), so "backward compatible" here means *readable by*,
+> never *writable by*. Update them together: `git pull` in each clone, `phase-console install-skill
+> --force` for a stamped copy, `/plugin update phased-execution` for the plugin.
 
 ```bash
 scripts/phase-graph.sh <slug> --qa-result N     # the current verdict — the one that gates
@@ -127,10 +127,18 @@ There was no QA failure budget. `maxConsecutiveFailures` counts phase *attempt* 
 phase's own session is neither. So a phase could fail QA indefinitely without anything noticing.
 
 **`qaMaxRounds` on the run** — default 3 — is the bound: *QA may fail N rounds on a phase, then stop.* At
-the budget the `qa-failed` ladder refuses to climb, the phase parks, and the operator gets ONE errand that
-names how many rounds went by and **which report describes the code as it stands** — the newest round's,
-not the plain `phase-NN-qa.md` the old ask pointed nowhere near. Raise the budget from the run's settings
-if you want the autopilot to keep trying.
+the budget the `qa-failed` ladder refuses to climb, and what happens next is the plan's answer to
+**`qa.exhausted`** — the `**QA exhausted:** waive|halt|<owner>` line in §Session budget or its
+`## Decisions` row, else this console's Settings ▸ Automation ▸ Policy answers, else the shipped
+`waive`:
+
+| Answer | What happens at the spent budget |
+|---|---|
+| `waive` *(shipped)* | The console records `waived` itself, through the same `qa-record.sh` door as **Waive with a reason**, the reason naming the policy (`QA exhausted after N failed rounds — waived by policy (qa.exhausted: waive, from the plan)`). It journals `phase.policy-answered` and `phase.qa-waived {by: policy}`, raises no errand and pushes nothing, and the dependents release on the next board read; inside **Fix & re-QA** the run then parks, ready to Continue. The waiver is a write: on a console without `--allow-writes` it cannot be recorded, and the errand below stands with the reason. |
+| `halt` | No waiver. The phase parks with ONE errand that names how many rounds went by and **which report describes the code as it stands** — the newest round's, not the plain `phase-NN-qa.md` the old ask pointed nowhere near. Inside **Fix & re-QA** the whole run halts `plan-deadlocked`, because a fail nobody may waive holds the dependents exactly as a deadlock does. |
+| `<owner>` | No waiver. The phase parks with the same errand, and **Fix & re-QA** addresses it to that person (`The plan hands this verdict to <owner>`). |
+
+Raise the budget from the run's settings if you want the autopilot to keep trying.
 
 Three is the smallest number that lets the normal shape happen — QA fails, the builder fixes it, QA passes
 — with one round of slack for a fix that misses. Above that the evidence is that nobody is converging.
@@ -163,7 +171,7 @@ identically:
 
 | Verb | What runs | Flag |
 |---|---|---|
-| **Fix & re-QA** (`POST /api/run/<slug>/qa-recover`) | The loop with settings of its own: a fix session carrying the last report's findings verbatim, which dispatches the reviewer itself and records round N+1 — repeating while rounds remain. `pass`/`waived` releases every dependent on the next board read; a spent round budget parks the phase with ONE errand naming the LAST report. Offered only on a `fail`: a pending verdict names no findings for a fix session to read. | `--allow-run` |
+| **Fix & re-QA** (`POST /api/run/<slug>/qa-recover`) | The loop with settings of its own: a fix session carrying the last report's findings verbatim, which dispatches the reviewer itself and records round N+1 — repeating while rounds remain. `pass`/`waived` releases every dependent on the next board read; a spent round budget is answered by `qa.exhausted` (§ How many rounds QA may fail) — `waive` records the waiver, `halt` halts the run, an owner parks the phase with ONE errand naming the LAST report. Offered only on a `fail`: a pending verdict names no findings for a fix session to read. | `--allow-run` |
 | **Re-run QA** (`POST /api/run/<slug>/qa-rerun`) | The review alone — no fix session. For a verdict that failed on the ENVIRONMENT rather than the work. | `--allow-run` |
 | **Waive with a reason** (`POST /api/plans/<slug>/qa-waive`) | `waived` with the operator's words, through `qa-record.sh --reason`, into the `## QA waivers` section. Starts nothing, so it is write-class: a console that may write but may not run can still release a gate. | `--allow-writes` |
 
@@ -182,7 +190,7 @@ bash scripts/phase-graph.sh <slug> --qa-prompt <N>     # the reviewer's brief
 ```
 
 The loop journals `phase.qa-recover` → `phase.qa-round` (once per round) → `phase.qa-recovered` or
-`phase.qa-exhausted`; a waiver journals `phase.qa-waived`. Its two settings are the run's, changeable
+`phase.qa-exhausted` (carrying the `policy` and its `policySource`); a waiver journals `phase.qa-waived`. Its two settings are the run's, changeable
 mid-run: `qaFixStrategy` (`resume` — the phase's own session, which already holds the context the
 report is about — or `fresh`, boarded from the phase's boot prompt with the findings appended; the
 loop falls back to `fresh` by itself when no session id survives) and `qaRoundBudgetUsd`, a hard stop
@@ -248,6 +256,7 @@ One behaviour worth knowing before ticking it on a big plan: activation is plan-
 session to dispatch the fresh-context QA subagent and record the verdict; a failed row resumes it with
 the report to fix what QA named, then re-record, and escalates to a fresh agent at a stronger model if
 that does not clear it. **Each of those costs a session**, and they draw on the same ladder caps as
-every other rung. The verdict becomes a person's only when the rungs are exhausted — then you get an
-errand. You can still record one yourself at any time, from the console's QA dialog or by hand with
-`qa-record.sh`.
+every other rung. When the rungs are exhausted the plan's `qa.exhausted` answer decides: under the
+shipped `waive` the console records the waiver itself and says so in the inbox's **Policy answered**
+row; under `halt` or an owner's name the verdict is a person's, and you get an errand. You can still
+record one yourself at any time, from the console's QA dialog or by hand with `qa-record.sh`.

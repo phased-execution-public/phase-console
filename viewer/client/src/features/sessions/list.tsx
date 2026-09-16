@@ -60,7 +60,7 @@ import {
   TabsTrigger,
   asUiState,
 } from '@/components/ui';
-import { foreignVehicle, otherSessions, type NowLane } from '@/features/now/model';
+import { endedLabel, foreignVehicle, otherSessions, type NowLane } from '@/features/now/model';
 import type { ForeignSession, PhaseTask, TerminalSession } from '@/lib/api';
 import { TaskLine } from '@/features/runs/task-summary';
 import { sessionsHref } from '@/app/routes';
@@ -305,8 +305,12 @@ export function sessionRows(input: {
         : (session.owner ?? foreignVehicle(session)),
       detail: session.cwd,
       // A live waiting session's own words beat the silence of a bare row;
-      // a dead or unvouched-for one still prints its presence.
-      note: session.presence === 'live' ? (session.waiting?.note ?? null) : session.presence,
+      // a dead or unvouched-for one still prints its presence — and an end the
+      // probe INFERRED reads differently from one the session reported (REG-9).
+      note:
+        session.presence === 'live'
+          ? (session.waiting?.note ?? null)
+          : (endedLabel(session) ?? session.presence),
       // The PHASE, not the plan's run tab. A correlated session is a session
       // working one phase, and the row that said `plan: null` in the incident
       // pointed at the page the operator was already on; sending them to the

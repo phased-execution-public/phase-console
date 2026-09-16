@@ -141,14 +141,17 @@ and stall everything downstream of them.
 ## The off switch
 
 **Settings ▸ This instance ▸ Shut down** ends the console and everything it owns, as a graceful
-exit that says what it is taking with it.
+exit that says what it is taking with it — and what the exit achieves, in the dialog's own sentence.
 
-- **The dialog is an inventory, not a warning.** It lists what will happen: the run is checkpointed
-  first and resumes when the console comes back, and the sessions are listed under *this keeps
-  running* — since the pty broker they outlive the console, and a dialog that claimed to stop them
-  would be the old silence with the sign flipped. It also gives the command that starts it all again.
-  *Are you sure?* is not a question anybody can answer; *this stops the demo run and keeps 2 agent
-  sessions running* is.
+- **The dialog is an inventory, not a warning.** It lists what the console is holding — the lanes in
+  flight, the clocks armed, the runs on disk, the live sessions, the cards still waiting for an
+  answer, and the session and outcome drops nobody has read yet — and confirming it is acknowledging
+  it: the server refuses a bare press over a non-empty inventory, or over one it could not read, so a
+  stray request cannot end work nobody was shown. The runs are checkpointed first and resume when the
+  console comes back, and the sessions are listed under *this keeps running* — since the pty broker
+  they outlive the console, and a dialog that claimed to stop them would be the old silence with the
+  sign flipped. It also gives the command that starts it all again. *Are you sure?* is not a question
+  anybody can answer; *this stops the demo run and keeps 2 agent sessions running* is.
 - **It is not behind `--allow-run`**, unlike Restart. A read-only console is the common case, and the
   one thing every console must be able to do is stop.
 

@@ -55,6 +55,7 @@ import { DEFAULT_MAX_SESSIONS } from '../config.ts';
 import { log } from '../log.ts';
 import type { Presence } from '../../shared/run-lifecycle.js';
 import type { HolderKind, QueueKind } from '../../shared/run-lifecycle.js';
+import type { MachineLane, SchedulerMachine } from '../fleet.ts';
 
 /** How many later intersecting entries may be admitted past a blocked one. */
 export const MAX_BYPASS = 4;
@@ -154,6 +155,17 @@ export type HolderEta = {
   label?: string;
 };
 
+/** A peer session as the scheduler reads it — the Service's `SessionPeer`, structurally. */
+export type SessionPeerView = {
+  sessionId: string;
+  pid: number | null;
+  cwd: string;
+  presence: 'live' | 'unknown';
+  owner: string;
+  scope: readonly string[];
+  plan: { slug: string; phase: number } | null;
+};
+
 /** What is standing in an entry's way, in the words the queue page shows. */
 export type Holder = {
   kind: HolderKind;
@@ -190,8 +202,18 @@ export type Holder = {
    * hear otherwise.
    */
   leaseUntil?: number;
-  /** The holding session's id (`session=`), when the lock names one. */
+  /** The holding session's id (`session=`), when the lock names one — or the peer session itself (`kind: 'session'`). */
   session?: string;
+  /** A `session` holder's process, when the hook recorded one. */
+  pid?: number;
+  /** A `session` holder's working directory — where the peer is standing. */
+  cwd?: string;
+  /**
+   * The CONSOLE holding the machine's last lane, on a `machine cap` holder
+   * (zero-touch phase 17, FLT-7) — another instance on this machine, named, so
+   * "the machine is full" reads differently from "this console is full".
+   */
+  instance?: { id: string; name?: string };
   /**
    * What the session registry says about that session: `live` — a person (or
    * another console) is in it right now, so this is a queue to wait in, not a
@@ -346,6 +368,13 @@ export type AccountWalls = {
 export const LEARNED_WALL_BUCKET = 'learned_window';
 
 /**
+ * The `slug` of the synthesised boarding-window holder — named, because the
+ * runner reads it back: a run queued behind THIS holder records its wait as
+ * `schedule`, every other queue as `scope` (`WAIT_REASONS`; LFC-5).
+ */
+export const SCHEDULE_HOLDER = 'boarding window';
+
+/**
  * The walls when nobody wired a registry in — a Scheduler constructed bare, as
  * every unit test does. Not a second copy of anything: with no registry there
  * is nothing else holding these, so this IS the store, and it is the only
@@ -445,6 +474,17 @@ export type SchedulerDeps = {
    */
   guard?: () => boolean;
   /**
+   * The live Claude sessions in this repository that hold no lock for the
+   * entry's phase (zero-touch phase 16, REG-3) — the Service's
+   * `peersInRepository`. Each becomes a `session` holder: named with its id,
+   * pid and cwd on the queue page, queued behind, never capped into a park
+   * (`isCappableBlocker` caps only locks) and never released by anything here.
+   * Asked for PHASE admissions only; synchronous like every other answer an
+   * admission reads. Absent: presence alone blocks nothing, the behaviour
+   * before this existed.
+   */
+  peers?: (entry: { slug: string; phase: number; runId: string; scope: readonly string[] }) => readonly SessionPeerView[];
+  /**
    * Presence of the session a lock names (Phase 5). `ended` — the session
    * registry saw its SessionEnd (or its process is gone): the lock is debris
    * and stops blocking NOW, lease or no lease, exactly as a lapsed lease does;
@@ -506,7 +546,19 @@ export type SchedulerDeps = {
    * existed and the right answer for a harness not exercising it.
    */
   fleetHold?: () => { at: string; by?: string } | null | undefined;
+  /**
+   * The MACHINE lane ceiling (zero-touch phase 17, FLT-7): `fleet.json`
+   * `maxSessions`, held across every console on this machine through one lane
+   * token per live lane (`server/fleet.ts MachineLanes`). Acquired at the grant
+   * and given back at release, so a lane is counted by every console the moment
+   * it starts. Absent: only this console's own `max` holds — the behaviour
+   * before this existed.
+   */
+  machine?: SchedulerMachine;
 };
+
+/** The pseudo-holder slug for "the machine is full" — beside `session cap`, which is this console's. */
+export const MACHINE_HOLDER = 'machine cap';
 
 export type SchedulerSnapshot = {
   max: number;
@@ -523,6 +575,8 @@ export type SchedulerSnapshot = {
   entries: QueueEntry[];
   /** Whether cross-run scope conflicts currently block admission. */
   guard: boolean;
+  /** Live lanes on the whole machine and its ceiling, or null when no machine ledger is wired. */
+  machine: { live: number; max: number | null } | null;
   /**
    * The boarding schedule's answer at snapshot time, or null when no policy is
    * set. Reported even when OPEN: a console with a schedule and nothing queued
@@ -680,10 +734,20 @@ export class Scheduler {
   private bumpSeq = 0;
   private closed = false;
 
+  /** Stops watching the machine's lane tokens. */
+  private unwatchMachine: (() => void) | null = null;
+  /** Who held the machine's lanes at the last refused acquisition — the `machine cap` holder's names. */
+  private machineHolders: MachineLane[] = [];
+
   constructor(deps: SchedulerDeps = {}) {
     this.deps = deps;
     this.walls = deps.accountWalls ?? new MemoryWalls();
     this.armIdleTimer();
+    // A sibling console giving a lane back is an event this process can hear
+    // only through the token directory, so a release there wakes the scan
+    // here — the idle poll stays the backstop for a deaf watcher.
+    try { this.unwatchMachine = deps.machine?.watch?.(() => { if (!this.closed) this.poll(); }) ?? null; }
+    catch { this.unwatchMachine = null; }
   }
 
   private now(): number { return this.deps.now?.() ?? Date.now(); }
@@ -774,7 +838,7 @@ export class Scheduler {
     const state = this.scheduleNow();
     if (!state || state.open) return null;
     return {
-      kind: 'reserved', slug: 'boarding window', phase: null, clock: true,
+      kind: 'reserved', slug: SCHEDULE_HOLDER, phase: null, clock: true,
       owner: state.reason ?? 'outside the boarding schedule',
       scope: ['all'], overlaps: ['all'],
     };
@@ -827,6 +891,35 @@ export class Scheduler {
   private maxLive(): number {
     const max = typeof this.deps.max === 'function' ? this.deps.max() : this.deps.max;
     return Math.max(1, max ?? DEFAULT_MAX_SESSIONS);
+  }
+
+  /**
+   * The holder that says "the MACHINE is full", or null (FLT-7).
+   *
+   * Distinct from the `session cap`, which is this console's own ceiling: here
+   * the lanes belong to every console on the machine, and the holder names the
+   * console holding one — another instance where there is one, since "wait for
+   * pe-hub's phase 4" is the sentence an operator can act on and "wait for
+   * yourself" is not. Not a clock (it ends when a lane is given back, which is
+   * nobody's known moment) and, like the session cap, never capped into a park.
+   *
+   * `holders` is what the last refused acquisition saw; a read-only probe
+   * (`wouldBlock`) passes the live list instead.
+   */
+  private machineHolder(holders: readonly MachineLane[]): Holder | null {
+    const machine = this.deps.machine;
+    if (!machine) return null;
+    let max: number | null;
+    try { max = machine.max(); } catch { return null; }
+    if (max === null || holders.length < max) return null;
+    const foreign = holders.find((lane) => lane.instance !== machine.instanceId) ?? holders[0];
+    const names = [...new Set(holders.map((lane) => `${lane.name ?? lane.instance}${lane.phase != null ? ` (${lane.slug} P${lane.phase})` : ` (${lane.slug})`}`))];
+    return {
+      kind: 'reserved', slug: MACHINE_HOLDER, phase: null,
+      owner: `the machine is full — ${holders.length} of ${max} lane${max === 1 ? '' : 's'}: ${names.join(', ')}`,
+      scope: ['all'], overlaps: ['all'],
+      ...(foreign ? { instance: { id: foreign.instance, ...(foreign.name ? { name: foreign.name } : {}) } } : {}),
+    };
   }
 
   /* ---------------------------------------------------------------- *
@@ -959,7 +1052,10 @@ export class Scheduler {
       resolve: () => {}, reject: () => {}, detach: () => {}, settled: false,
     };
     const holders = this.blocking(probe, this.queue.filter((entry) => entry.reserving));
-    return cap ? [cap, ...holders] : holders;
+    let lanes: MachineLane[] = [];
+    try { lanes = this.deps.machine?.lanes() ?? []; } catch { lanes = []; }
+    const machine = this.machineHolder(lanes);
+    return [...(cap ? [cap] : []), ...(machine ? [machine] : []), ...holders];
   }
 
   /**
@@ -1008,7 +1104,31 @@ export class Scheduler {
   release(grant: ScopeGrant | null | undefined): void {
     if (!grant) return;
     if (!this.grants.delete(grant.id)) return;
+    this.releaseMachine(grant);
     this.poll();
+  }
+
+  /** Take this entry's lane on the machine; true when there is no machine ledger at all. */
+  private acquireMachine(entry: Waiting): boolean {
+    const machine = this.deps.machine;
+    if (!machine) return true;
+    try {
+      const result = machine.acquire({ id: entry.id, slug: entry.slug, phase: entry.phase, runId: entry.runId });
+      this.machineHolders = result.ok ? [] : result.holders;
+      if (!result.ok) {
+        log.info('scheduler.machine-full', {
+          slug: entry.slug, phase: entry.phase, runId: entry.runId,
+          holders: result.holders.map((lane) => ({ instance: lane.instance, slug: lane.slug, phase: lane.phase })),
+        });
+      }
+      return result.ok;
+    } catch {
+      return true;
+    }
+  }
+
+  private releaseMachine(grant: ScopeGrant): void {
+    try { this.deps.machine?.release(grant); } catch { /* the token dies with this process's pid */ }
   }
 
   /**
@@ -1023,6 +1143,7 @@ export class Scheduler {
     for (const [id, grant] of [...this.grants]) {
       if (grant.runId !== runId) continue;
       this.grants.delete(id);
+      this.releaseMachine(grant);
     }
     for (const entry of [...this.queue]) {
       if (entry.runId !== runId) continue;
@@ -1207,6 +1328,19 @@ export class Scheduler {
         if (claimsDisjoint(earlier, entry)) continue;
         earlier.bypassed++;
       }
+      // The MACHINE ceiling, taken at the moment of the grant and not before:
+      // the token is the lane, so acquiring it for an entry that then did not
+      // start would hold a lane against every other console. A refusal labels
+      // the entry with who holds the machine's lanes and moves on — every
+      // later grantable entry meets the same wall and says so too.
+      if (!this.acquireMachine(entry)) {
+        const machine = this.machineHolder(this.machineHolders);
+        if (machine) {
+          if (!entry.waitingOn.some((holder) => holder.slug === MACHINE_HOLDER)) changed = true;
+          entry.waitingOn = [machine];
+        }
+        continue;
+      }
       this.grant(entry);
       changed = true;
     }
@@ -1313,6 +1447,7 @@ export class Scheduler {
       max: this.maxLive(),
       guard: this.deps.guard?.() ?? true,
       schedule: this.scheduleNow(),
+      machine: this.machineSnapshot(),
       live: this.grants.size,
       queued: this.queue.filter((entry) => !entry.settled).length,
       throttledUntil: throttledAccounts[0]?.until ?? null,
@@ -1320,6 +1455,12 @@ export class Scheduler {
       grants: [...this.grants.values()],
       entries: this.queue.filter((entry) => !entry.settled).map((entry) => this.entryView(entry)),
     };
+  }
+
+  private machineSnapshot(): { live: number; max: number | null } | null {
+    const machine = this.deps.machine;
+    if (!machine) return null;
+    try { return { live: machine.lanes().length, max: machine.max() }; } catch { return null; }
   }
 
   /** One queue entry as the page sees it. See `snapshot`. */
@@ -1385,7 +1526,10 @@ export class Scheduler {
     this.lockTimer = null;
     this.scheduleTimer = null;
     for (const entry of [...this.queue]) this.cancel(entry, false);
+    for (const grant of this.grants.values()) this.releaseMachine(grant);
     this.grants.clear();
+    this.unwatchMachine?.();
+    this.unwatchMachine = null;
   }
 
   /* ---------------------------------------------------------------- *
@@ -1497,6 +1641,32 @@ export class Scheduler {
         ...(lock.session ? { session: lock.session } : {}),
         ...(presence === 'live' ? { presence } : {}),
       });
+    }
+
+    // A live session in this repository with no claim yet (REG-3): the
+    // collision the lock exists to prevent, in the one window where no lock
+    // exists — every hand session's first minute. No carve-out: a peer
+    // declared neither a branch nor a tree, so nothing makes it disjoint.
+    if (entry.phase != null && this.deps.peers) {
+      let peers: readonly SessionPeerView[] = [];
+      try {
+        peers = this.deps.peers({ slug: entry.slug, phase: entry.phase, runId: entry.runId, scope: entry.scope });
+      } catch { peers = []; }
+      for (const peer of peers) {
+        if (!scopesIntersect([...peer.scope], entry.scope)) continue;
+        holders.push({
+          kind: 'session',
+          slug: peer.plan?.slug ?? entry.slug,
+          phase: peer.plan?.phase ?? null,
+          owner: `session ${peer.sessionId.slice(0, 8)}${peer.pid ? ` (pid ${peer.pid})` : ''}`,
+          scope: [...peer.scope],
+          overlaps: intersectingTokens([...peer.scope], entry.scope),
+          session: peer.sessionId,
+          ...(peer.pid ? { pid: peer.pid } : {}),
+          cwd: peer.cwd,
+          ...(peer.presence === 'live' ? { presence: 'live' as const } : {}),
+        });
+      }
     }
 
     for (const ahead of reserved) {

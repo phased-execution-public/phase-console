@@ -12,6 +12,7 @@
  */
 
 import { RETRY_STORM_PARK_MS } from '../shared/attention-model.js';
+import { HALT_KINDS } from '../shared/recovery-model.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawn as spawnProcess } from 'node:child_process';
@@ -36,11 +37,13 @@ const {
 } = await import('../server/runner/state.ts');
 const { Journal } = await import('../server/runner/journal.ts');
 const { Scheduler } = await import('../server/runner/scheduler.ts');
-const { LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
+const { LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
 const { freezeVerdict } = await import('../server/runner/freeze.ts');
+const { doorActor, pressActor } = await import('../server/actor.ts');
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
-import type { PhaseRecord } from '../server/runner/state.ts';
+import type { PhaseRecord, RunState } from '../server/runner/state.ts';
 import type { LockView } from '../server/runner/scheduler.ts';
+import type { LeaveReason, LeaveResult } from '../server/accounts/index.ts';
 
 /* ------------------------------------------------------------------ *
  * A repo with stub scripts
@@ -85,10 +88,37 @@ type Repo = {
   setSlowBoard: (yes: boolean) => void;
   /** Same, for the gate subprocess — the first await of boarding a phase. */
   setSlowGate: (yes: boolean) => void;
+  /** The phase's `Size:` the engine reports — what its session caps are derived from. */
+  setSize: (phase: number, size: 'S' | 'M' | 'L') => void;
   cleanup: () => void;
 };
 
 const PHASES = [1, 2, 3];
+
+/**
+ * What the accounts facade answers a `leaveAccount` with — the harness's
+ * stand-in (zero-touch-console phase 8). Mirrors `Accounts.leaveAccount`:
+ * a window with a reset walls until it, one without cools for the fixed
+ * cool-down, a credential retires, an operator's switch holds nothing.
+ */
+function leaveStub(accountId: string | undefined, leaving: LeaveReason): LeaveResult {
+  const id = accountId ?? 'default';
+  const now = Date.now();
+  if (leaving.kind === 'operator') return { accountId: id, credential: 'stub', state: 'entitled', throttleUntilMs: null };
+  if (leaving.kind === 'credential') {
+    return { accountId: id, credential: 'stub', state: 'retired', throttleUntilMs: now + 30 * 60_000 };
+  }
+  // The reset as given — the facade compares it with ITS injected clock, and
+  // a harness on a fake clock must not have a real `Date.now()` second-guess it.
+  const resets = leaving.resetsAt ?? null;
+  const until = leaving.perModel ? undefined : (resets ?? new Date(now + 30 * 60_000)).toISOString();
+  return {
+    accountId: id, credential: 'stub', state: leaving.perModel ? 'entitled' : 'cooling',
+    ...(until ? { until } : {}),
+    ...(leaving.bucket && resets ? { wall: { bucket: leaving.bucket, resetsAt: resets.toISOString() } } : {}),
+    throttleUntilMs: leaving.perModel ? null : Date.parse(until!),
+  };
+}
 
 function repo(): Repo {
   const root = mkdtempSync(join(tmpdir(), 'pc-runner-'));
@@ -162,6 +192,9 @@ case "$mode" in
     [ -f "$S/qa-history" ] && cat "$S/qa-history"
     exit 0 ;;
   --boot-prompt) echo "BOOT phase $arg of $slug" ;;
+  # A phase's Size, which its session caps are derived from. M — the engine's
+  # own default — unless a test set one.
+  --size) if [ -f "$S/size-$arg" ]; then cat "$S/size-$arg"; else echo M; fi ;;
   *) echo "unsupported stub mode: $mode" >&2; exit 2 ;;
 esac
 `);
@@ -228,6 +261,7 @@ echo "VALIDATE OK"
     setLintFail: (yes) => yes ? writeFileSync(join(state, 'lint-fail'), '') : rmSync(join(state, 'lint-fail'), { force: true }),
     setSlowBoard: (yes) => yes ? writeFileSync(join(state, 'slow-board'), '') : rmSync(join(state, 'slow-board'), { force: true }),
     setSlowGate: (yes) => yes ? writeFileSync(join(state, 'slow-gate'), '') : rmSync(join(state, 'slow-gate'), { force: true }),
+    setSize: (phase, size) => writeFileSync(join(state, `size-${phase}`), `${size}\n`),
     cleanup: () => rmSync(root, { recursive: true, force: true }),
   };
 }
@@ -704,13 +738,14 @@ test('an unanswered approval parks the run rather than failing it', async () => 
 
   // What the timeout path does: the hook was told no — silence would fail open
   // — and the run is parked so the phase is not treated as having gone wrong.
-  const parked = instance.park('an approval went unanswered: Bash — git commit -m x', 2);
+  const parked = instance.park('an approval went unanswered: Bash — git commit -m x', 2, 'awaiting-person');
   assert.equal(parked, true);
 
   const state = instance.current()!;
   assert.equal(state.status, 'parked');
   assert.match(state.halt!.reason, /unanswered/);
   assert.equal(state.halt!.phase, 2);
+  assert.equal(state.halt!.kind, 'awaiting-person', 'a person was asked and did not answer (WAI-10)');
   assert.equal(state.consecutiveFailures, 0, 'nobody being awake is not the work failing');
 
   const journal = new Journal(r.root, 'demo', state.id).read(200);
@@ -1008,7 +1043,10 @@ test('a plan left failing validate.sh halts even when the phase verified', async
 test('a closed human gate holds that phase as gated and stops rather than forcing it', async () => {
   const r = repo();
   r.setGate(1, 'manual: the operator must approve the deploy');
-  const { instance } = runner(r, workingSession(r));
+  // The console's word for the `gates` row is `operator` here — the shipped
+  // default is `delegated` since 5.0.0 (phase 11), and this case is about the
+  // person's path.
+  const { instance } = runner(r, workingSession(r), '`true`', undefined, { delegateHumanGates: () => false });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
 
@@ -1038,7 +1076,7 @@ test('an ai-clearable gate does not park — the session is booted to clear it',
 test('the runner opts into cmd-gate execution (PHASE_EXEC_GATES=1)', async () => {
   const r = repo();
   writeFileSync(join(r.state, 'gate-echo-env'), '');
-  const { instance } = runner(r, workingSession(r));
+  const { instance } = runner(r, workingSession(r), '`true`', undefined, { delegateHumanGates: () => false });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
 
@@ -1103,9 +1141,17 @@ test('an expired login stops the run instead of failing every phase the same way
   await instance.wait();
 
   const state = instance.current()!;
-  assert.equal(state.status, 'parked');
-  assert.match(state.phases['1'].halt!.reason, /authentication/);
+  // RUN-level since phase 9 (RCV-1): the wall is the run's credential, and a
+  // phase-level park handed the loop its next candidate into the same wall.
+  assert.equal(state.status, 'halted');
+  assert.equal(state.halt?.kind, 'credential-refused');
+  assert.match(state.halt!.reason, /authentication/);
+  assert.equal(state.phases['1'].status, 'parked');
+  assert.equal(state.phases['1'].cause?.kind, 'credential-refused');
+  assert.equal(state.phases['1'].cause?.class, 'auth');
   assert.equal(state.phases['1'].attempts, 1, 'no point retrying a wall');
+  assert.equal(state.consecutiveFailures, 1, 'the wall counts toward the streak (RCV-1)');
+  assert.equal(state.errand?.situation, 'resource-wall:auth', 'the one errand is the run\'s');
   r.cleanup();
 });
 
@@ -1155,8 +1201,11 @@ test('policy `switch`: a plan limit moves to the other account and continues WIT
   const { instance } = runner(r, limited, '`true`', undefined, {
     accountEnv: async (accountId) => (accountId === 'spare' ? { CLAUDE_CODE_OAUTH_TOKEN: 'tok-spare' } : null),
     pickAccount: () => 'spare',
-    portTranscript: () => true,
-    onAccountLimited: (accountId, window) => { marked.push({ ...(accountId ? { accountId } : {}), window }); },
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
+    leaveAccount: (accountId, leaving) => {
+      marked.push({ ...(accountId ? { accountId } : {}), window: leaving.bucket ?? 'none' });
+      return leaveStub(accountId, leaving);
+    },
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
 
@@ -1193,7 +1242,7 @@ test('policy `switch` without a transcript port starts fresh instead of resuming
   };
   const { instance } = runner(r, limited, '`true`', undefined, {
     pickAccount: () => 'spare',
-    portTranscript: () => false,
+    portTranscript: () => ({ findable: false, ported: false, why: 'not found' as const }),
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
   const outcome = await Promise.race([
@@ -1265,7 +1314,7 @@ test('policy `switch` fires from the STREAM, on a child that has not exited', as
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
     now: clock.now,
     pickAccount: () => 'spare',
-    portTranscript: () => true,
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
   await held.inSession;
@@ -1302,7 +1351,7 @@ test('one real event between retries resets the debounce — the burst has to be
   const held = streamingSession(r);
   const clock = fakeClock();
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
-    now: clock.now, pickAccount: () => 'spare', portTranscript: () => true,
+    now: clock.now, pickAccount: () => 'spare', portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
   await held.inSession;
@@ -1362,7 +1411,7 @@ test('a warning heartbeat is not a wall — an account at 97% is still working',
   const held = streamingSession(r);
   const clock = fakeClock();
   const { instance } = runner(r, held.spawn, '`true`', undefined, {
-    now: clock.now, pickAccount: () => 'spare', portTranscript: () => true,
+    now: clock.now, pickAccount: () => 'spare', portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
   await held.inSession;
@@ -1805,6 +1854,216 @@ test('a question reaches the session that is running, framed so it cannot redire
 
   release();
   await instance.wait();
+  r.cleanup();
+});
+
+test('ACC-8.9 (TRS-6): an operator\'s question and the session\'s reply are a pair on the journal — phase.asked, then phase.answered {question, options, chosen, by, ms}, once', async () => {
+  const r = repo();
+  let onEvent: ((event: StreamEvent) => void) | undefined;
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  const inSession = new Promise<void>((resolve) => { entered = resolve; });
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+    if (phase === 1) {
+      onEvent = request.onEvent;
+      request.onHandle?.({ pid: 1, open: () => true, send: () => true, setFrozen: () => {} });
+      entered();
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    r.markDone(phase);
+    return ok();
+  };
+  const { instance } = runner(r, spawn);
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await inSession;
+  const runId = instance.current()!.id;
+
+  const asked = instance.ask('why did you skip the cache?', 'someone@desk');
+  assert.equal(asked.ok, true);
+  // The session replies, opening with the tag it was asked to — twice, as a
+  // session re-quoting its own answer would.
+  onEvent?.({ kind: 'answer', text: 'because the cache was cold', mark: asked.mark! });
+  onEvent?.({ kind: 'answer', text: 'because the cache was cold (again)', mark: asked.mark! });
+  // A steer's acknowledgement is not an answer, and a mark nobody asked pairs with nothing.
+  onEvent?.({ kind: 'answer', text: 'ack', mark: 'steer:0badc0de' });
+  onEvent?.({ kind: 'answer', text: 'stray', mark: 'ask:0badc0de' });
+
+  release();
+  await instance.wait();
+  const lines = new Journal(r.root, 'demo', runId).read();
+  const answered = lines.filter((line) => line.event === 'phase.answered');
+  assert.equal(answered.length, 1, 'one answer per question');
+  const data = answered[0].data as Record<string, unknown>;
+  assert.equal(data.question, 'why did you skip the cache?');
+  assert.deepEqual(data.options, [], 'a free-text question offers no options');
+  assert.equal(data.chosen, 'because the cache was cold');
+  assert.equal(data.by, 'session');
+  assert.equal(data.askedBy, 'someone@desk');
+  assert.equal(data.mark, asked.mark);
+  assert.equal(typeof data.ms, 'number');
+  assert.equal(answered[0].phase, 1);
+  const order = lines.map((line) => line.event).filter((event) => event === 'phase.asked' || event === 'phase.answered');
+  assert.deepEqual(order, ['phase.asked', 'phase.answered']);
+  r.cleanup();
+});
+
+test('ACC-8.11 (QRL-9): the spawn door gives every session of a relay-off run --permission-prompts none, an ARMED relay-on run none of it, and a known-old CLI a warning line instead', async () => {
+  for (const [relay, version, flagged, refused] of [
+    [undefined, undefined, true, false],
+    ['off', '2.1.271', true, false],
+    ['last-resort', '2.1.271', false, false],
+    ['off', '2.1.200', false, true],
+  ] as const) {
+    const r = repo();
+    const seen: (string | undefined)[] = [];
+    const spawn: SpawnFn = async (request) => {
+      seen.push(request.permissionPrompts);
+      r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+      return ok();
+    };
+    // A relay-on run is armed only on an init version the console has READ
+    // (phase 14) — so the relay-on row states one.
+    const { instance } = runner(r, spawn, '`true`', undefined, {
+      ...(version ? { cliVersion: async () => version } : {}),
+      ...(relay === 'last-resort' ? { initVersion: () => version ?? null } : {}),
+    });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', ...(relay ? { relay } : {}) } as never);
+    await instance.wait();
+    const label = `relay ${relay ?? 'absent'} on ${version ?? 'an unknown CLI'}`;
+    assert.ok(seen.length >= 1, `${label}: sessions spawned`);
+    assert.ok(seen.every((value) => value === (flagged ? 'none' : undefined)), `${label}: ${JSON.stringify(seen)}`);
+    const lines = new Journal(r.root, 'demo', instance.current()!.id).read()
+      .filter((line) => line.event === 'run.permission-prompts-skipped');
+    assert.equal(lines.length, refused ? 1 : 0, `${label}: said once per run, or not at all`);
+    if (refused) assert.deepEqual(lines[0].data, { version: '2.1.200', floor: '2.1.259', relay: 'off' });
+    r.cleanup();
+  }
+});
+
+test('ACC-8.11 (AC-13, QRL-5): the relay arms at the spawn door only on an init version read at or above the floor — the host and no floor flag when armed, the floor and run.relay-refused when not, and a session\'s own init arms the next', async () => {
+  const { RELAY_HOST_TOOL } = await import('../server/relay-host.ts');
+  const r = repo();
+  const seen: { phase: number; prompts?: string; tool?: string; doc?: { mcpServers: Record<string, { type: string; args: string[] }> } }[] = [];
+  const noted: string[] = [];
+  let reported: string | null = null;
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+    // Read while the session lives: the run sweeps its MCP documents when its loop ends.
+    seen.push({
+      phase, prompts: request.permissionPrompts, tool: request.permissionPromptTool,
+      ...(request.mcpConfig ? { doc: JSON.parse(readFileSync(request.mcpConfig, 'utf8')) } : {}),
+    });
+    // Every session prints its init; the first one teaches the console its CLI.
+    request.onEvent?.({
+      kind: 'init', sessionId: `s${phase}`, version: '2.1.270',
+      toolNames: request.permissionPromptTool ? ['Bash', 'AskUserQuestion'] : ['Bash'],
+      mcpServers: request.permissionPromptTool ? [{ name: 'pcrelay', status: 'connected' }] : [],
+    });
+    r.markDone(phase);
+    return ok();
+  };
+  const { instance } = runner(r, spawn, '`true`', undefined, {
+    cliVersion: async () => '2.1.270',
+    initVersion: () => reported,
+    noteCliInit: (version: string) => { noted.push(version); reported = version; },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', relay: 'last-resort' } as never);
+  await instance.wait();
+  assert.ok(seen.length >= 2, JSON.stringify(seen));
+  assert.deepEqual({ prompts: seen[0].prompts, tool: seen[0].tool }, { prompts: 'none', tool: undefined },
+    'the first session: no version read yet — the floor, never the host');
+  assert.deepEqual({ prompts: seen[1].prompts, tool: seen[1].tool }, { prompts: undefined, tool: RELAY_HOST_TOOL },
+    'the next: armed by what the first session\'s init said');
+  const doc = seen[1].doc!;
+  assert.equal(seen[0].doc, undefined, 'a session on the floor gets no document it did not ask for');
+  assert.equal(doc.mcpServers.pcrelay.type, 'stdio', 'the presence-only host rides the session\'s MCP set');
+  assert.match(doc.mcpServers.pcrelay.args[0], /relay-host\.(ts|js)$/);
+  assert.deepEqual(noted.slice(0, 1), ['2.1.270']);
+  const lines = new Journal(r.root, 'demo', instance.current()!.id).read();
+  const refused = lines.filter((line) => line.event === 'run.relay-refused');
+  assert.equal(refused.length, 1);
+  assert.deepEqual(refused[0].data, { version: null, floor: '2.1.268', reason: 'version-unknown' });
+  const armed = lines.filter((line) => line.event === 'run.relay-armed');
+  assert.equal(armed.length, 1, 'once per change, not once per session');
+  assert.deepEqual(armed[0].data, { version: '2.1.270', floor: '2.1.268' });
+  assert.equal(instance.current()!.relayArming?.armed, true);
+  assert.ok(!lines.some((line) => line.event === 'run.relay-degraded'), 'the host was connected and the tool offered');
+  r.cleanup();
+});
+
+test('ACC-8.4 (TRS-2): an armed session\'s own init is read at the door — below the floor refuses the relay, a missing AskUserQuestion or a host not connected is journalled — and a control_request and a defer go on the journal', async () => {
+  const r = repo();
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+    if (phase === 1) {
+      request.onEvent?.({ kind: 'init', sessionId: 's1', version: '2.1.271', toolNames: ['Bash'], mcpServers: [{ name: 'pcrelay', status: 'failed' }] });
+      request.onEvent?.({ kind: 'control-request', requestId: 'req_9', subtype: 'can_use_tool', tool: 'AskUserQuestion' });
+      request.onEvent?.({ kind: 'deferred', toolUseId: 'toolu_kept', tool: 'AskUserQuestion' });
+    }
+    if (phase === 2) request.onEvent?.({ kind: 'init', sessionId: 's2', version: '2.1.260', toolNames: ['Bash', 'AskUserQuestion'] });
+    r.markDone(phase);
+    return ok();
+  };
+  let version = '2.1.271';
+  const { instance } = runner(r, spawn, '`true`', undefined, {
+    initVersion: () => version,
+    noteCliInit: (read: string) => { version = read; },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', relay: 'last-resort' } as never);
+  await instance.wait();
+  const lines = new Journal(r.root, 'demo', instance.current()!.id).read();
+  const degraded = lines.filter((line) => line.event === 'run.relay-degraded');
+  assert.deepEqual(degraded.map((line) => line.data?.reason).sort(), ['host-not-connected', 'tool-absent']);
+  assert.equal(degraded.find((line) => line.data?.reason === 'host-not-connected')?.data?.status, 'failed', 'read from mcp_servers, not the exit code');
+  const refused = lines.filter((line) => line.event === 'run.relay-refused');
+  assert.equal(refused.length, 1, 'phase 2\'s own init said 2.1.260');
+  assert.deepEqual(refused[0].data, { version: '2.1.260', floor: '2.1.268', reason: 'below-floor' });
+  assert.equal(instance.current()!.relayArming?.armed, false);
+  const control = lines.find((line) => line.event === 'phase.control-request');
+  assert.deepEqual(control?.data, { requestId: 'req_9', subtype: 'can_use_tool', tool: 'AskUserQuestion' });
+  assert.equal(control?.phase, 1);
+  assert.deepEqual(lines.find((line) => line.event === 'phase.tool-deferred')?.data, { toolUseId: 'toolu_kept', tool: 'AskUserQuestion' });
+  r.cleanup();
+});
+
+test('ACC-8.16 (QRL-6): the session is told the relay\'s answer down its own stdin, in the plan\'s exact sentence, tagged — and it writes no phase.asked', async () => {
+  const { frameRelayAnswer } = await import('../server/runner/runner-core.ts');
+  const r = repo();
+  const sent: string[] = [];
+  let release: () => void = () => {};
+  let entered: () => void = () => {};
+  const inSession = new Promise<void>((resolve) => { entered = resolve; });
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+    if (phase === 1) {
+      request.onHandle?.({ pid: 1, open: () => true, send: (text: string) => { sent.push(text); return true; }, setFrozen: () => {} });
+      entered();
+      await new Promise<void>((resolve) => { release = resolve; });
+    }
+    r.markDone(phase);
+    return ok();
+  };
+  const { instance } = runner(r, spawn);
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await inSession;
+  const told = instance.tellRelayAnswer(1, [
+    { question: 'Which colour should the banner be?', label: 'Blue (Recommended)', by: 'recommended' },
+    { question: 'Which port?', label: '8080', by: 'rule', ruleId: 'ports' },
+  ]);
+  assert.equal(told.ok, true);
+  assert.equal(sent.length, 1, 'one message for the call');
+  assert.match(sent[0], /^\[\[relay:[0-9a-z]{8}\]\] /, 'tagged, so its echo is recognised');
+  const sentence = frameRelayAnswer('Blue (Recommended)', 'its (Recommended) option', 'ambiguity');
+  assert.equal(sentence, 'No operator answered within 60 s. The console answered `Blue (Recommended)` by `its (Recommended) option`. '
+    + 'This is NOT a change to the phase. If that answer is wrong, declare `blocked --needs ambiguity` rather than asking again.');
+  assert.ok(sent[0].includes(sentence), 'the exact framing sentence');
+  assert.ok(sent[0].includes(frameRelayAnswer('8080', 'relay rule ports', 'ambiguity')));
+  assert.match(sent[0], /Question: Which colour should the banner be\?/);
+  release();
+  await instance.wait();
+  const lines = new Journal(r.root, 'demo', instance.current()!.id).read();
+  assert.ok(!lines.some((line) => line.event === 'phase.asked'), 'a notice is not an operator\'s question');
   r.cleanup();
 });
 
@@ -3140,6 +3399,12 @@ test('a lane that wedges again with BOTH rungs spent parks with one errand, and 
   assert.equal(settled.phases['3'].status, 'done');
   const journal = readFileSync(journalFile(r.root, 'demo', state.id), 'utf8');
   assert.match(journal, /"phase\.stall-parked"/);
+  // The whole silent ladder, one record per rung and in order — production has
+  // never exercised it (SLF-9 iv), so this is the only evidence the rungs climb.
+  const rungs = journal.trim().split('\n').map((line) => (JSON.parse(line) as { event: string; phase?: number }))
+    .filter((line) => line.phase === 1 && ['phase.auto-nudged', 'phase.auto-recycled', 'phase.stall-parked'].includes(line.event))
+    .map((line) => line.event);
+  assert.deepEqual(rungs, ['phase.auto-nudged', 'phase.auto-recycled', 'phase.stall-parked']);
   r.cleanup();
 });
 
@@ -3253,7 +3518,7 @@ test('an operator Retry clears the watchdog ledger — and nothing else does', (
     phase: 1, status: 'failed', attempts: 2, costUsd: 0,
     stallRemedy: { nudges: 1, recycles: 1, nudgedAt: 'x', recycledAt: 'y' },
   } as unknown as Parameters<typeof resetForRetry>[0];
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
   assert.equal(record.stallRemedy, undefined);
 });
 
@@ -4011,6 +4276,7 @@ function call(
   const service = {
     flags: { allowWrites: false, allowRun: opts.allowRun ?? false, scriptsDir: '/x' },
     store: { get: () => ({}), list: () => [] },
+    accounts: { has: () => false },
     // If a route reaches for the runner directly it gets a method that fails
     // the test rather than one that quietly does nothing — which is precisely
     // how Pause came to answer 200 and change nothing for so long.
@@ -4070,7 +4336,14 @@ function call(
     on() { return this; },
     writableEnded: false, destroyed: false,
   };
-  const chunks = opts.body === undefined ? [] : [Buffer.from(JSON.stringify(opts.body))];
+  // A fresh start answers the prelude's three required fields (phase 11) —
+  // merged in for every case about some OTHER field; a case that wants the
+  // 400 sends `resumeRunId`-less bodies through `routes.test.ts` instead.
+  const body = opts.body && typeof opts.body === 'object' && /\/start$/.test(path) && opts.method === 'POST'
+    && !(opts.body as Record<string, unknown>).resumeRunId
+    ? { resumeOnRestart: true, relay: 'off', accounts: [{ id: 'default', minHeadroomPct: 0 }], ...(opts.body as Record<string, unknown>) }
+    : opts.body;
+  const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))];
   const req = {
     method: opts.method ?? 'GET',
     headers: { host: '127.0.0.1:4123', ...(opts.headers ?? {}) },
@@ -4736,6 +5009,88 @@ test('retry on a stopped run resets the phase and starts the run again', async (
 });
 
 /* ------------------------------------------------------------------ *
+ * Credential preflight (phase 11, ZTD-4 / ACC-1.4): a named credential nobody
+ * holds is found before the spawn, never after the spend
+ * ------------------------------------------------------------------ */
+
+test('under `credential policy: require` a phase naming an unheld credential never spawns and journals phase.credential-preflight', async () => {
+  const r = repo();
+  const seen: number[] = [];
+  const asked: string[][] = [];
+  const { instance, events } = runner(r, workingSession(r, seen), '`true`', undefined, {
+    planCredentials: () => ({ ids: ['gh', 'env:DEPLOY_KEY'], policy: 'require' }),
+    credentialsHeld: async (ids) => {
+      asked.push([...ids]);
+      return ids.map((id) => id === 'gh'
+        ? { id, status: 'ok', reason: 'gh auth status: signed in' }
+        : { id, status: 'fail', reason: '$DEPLOY_KEY is not set in the console\'s environment' });
+    },
+  });
+  await instance.start({
+    slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1],
+    manifest: {
+      decisions: [{ key: 'credentials', value: '`gh`, `env:DEPLOY_KEY`', owner: 'operator', state: 'answered', source: 'plan', blocking: 'yes', origin: 'plan' }],
+      accounts: [], credentials: { policy: 'require', ids: ['gh', 'env:DEPLOY_KEY'], held: ['gh'], missing: [] },
+      delivery: { ok: true, channels: [], acknowledged: false }, probes: {}, at: '2026-09-14T00:00:00.000Z',
+    },
+  });
+  await instance.wait();
+  const state = instance.current()!;
+  assert.deepEqual(seen, [], 'no session was spawned for a phase whose credential is not held');
+  assert.deepEqual(asked, [['gh', 'env:DEPLOY_KEY']]);
+  assert.equal(state.phases['1'].status, 'parked');
+  assert.match(state.phases['1'].note ?? '', /credential policy is require and env:DEPLOY_KEY is not held/);
+  const [preflight] = journalled(events, 'phase.credential-preflight');
+  assert.deepEqual(preflight, { ids: ['gh', 'env:DEPLOY_KEY'], held: ['gh'], missing: ['env:DEPLOY_KEY'], policy: 'require' });
+  // The class's errand, with the id and the reason — and the run's manifest row now reads outstanding.
+  const errand = state.recoveries?.['1']?.errand;
+  assert.equal(errand?.situation, 'blocked-declared:credential');
+  assert.equal(errand?.decisionKey, 'credentials');
+  assert.match(errand?.need ?? '', /`env:DEPLOY_KEY` \(\$DEPLOY_KEY is not set/);
+  assert.equal(state.manifest?.decisions[0].state, 'outstanding');
+  assert.match(state.manifest?.decisions[0].value ?? '', /not held on this console \(phase 1\); policy require/);
+  assert.ok(!journalled(events, 'phase.session').length, 'nothing was spent');
+  r.cleanup();
+});
+
+test('under `credential policy: continue` the phase boards, is told which credentials are missing, and the record says so', async () => {
+  const r = repo();
+  const prompts: string[] = [];
+  const spawn: SpawnFn = async (request) => {
+    prompts.push(request.prompt);
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1] ?? 0);
+    r.markDone(phase);
+    return ok();
+  };
+  const { instance, events } = runner(r, spawn, '`true`', undefined, {
+    planCredentials: () => ({ ids: ['env:DEPLOY_KEY'], policy: 'continue' }),
+    credentialsHeld: async (ids) => ids.map((id) => ({ id, status: 'fail', reason: '$DEPLOY_KEY is not set' })),
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  const state = instance.current()!;
+  assert.equal(state.phases['1'].status, 'done');
+  assert.deepEqual(state.phases['1'].credentialsMissing, [{ id: 'env:DEPLOY_KEY', reason: '$DEPLOY_KEY is not set' }]);
+  assert.match(prompts[0], /credential this console could not find before it started you: `env:DEPLOY_KEY` \(\$DEPLOY_KEY is not set\)/);
+  assert.match(prompts[0], /blocked --needs credential/);
+  const [preflight] = journalled(events, 'phase.credential-preflight');
+  assert.deepEqual(preflight, { ids: ['env:DEPLOY_KEY'], held: [], missing: ['env:DEPLOY_KEY'], policy: 'continue' });
+  // A registry that cannot answer refuses nothing.
+  const r2 = repo();
+  const seen: number[] = [];
+  const { instance: i2, events: e2 } = runner(r2, workingSession(r2, seen), '`true`', undefined, {
+    planCredentials: () => ({ ids: ['gh'], policy: 'require' }),
+    credentialsHeld: async () => { throw new Error('no registry here'); },
+  });
+  await i2.start({ slug: 'demo', root: r2.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await i2.wait();
+  assert.deepEqual(seen, [1], 'the phase ran');
+  assert.equal(journalled(e2, 'phase.credential-preflight')[0].skipped, 'no registry here');
+  r.cleanup();
+  r2.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
  * Verification preflight: read the plan before paying for a session
  * ------------------------------------------------------------------ */
 
@@ -4894,7 +5249,7 @@ test('an all-verification park halts with a machine-readable kind and an anchor 
 test('a parked run names a gated phase with the gate note, and says what to do', async () => {
   const r = repo();
   r.setGate(1, 'manual: confirm the rollout window');
-  const { instance } = runner(r, workingSession(r));
+  const { instance } = runner(r, workingSession(r), '`true`', undefined, { delegateHumanGates: () => false });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
 
@@ -4905,7 +5260,9 @@ test('a parked run names a gated phase with the gate note, and says what to do',
   assert.match(state.halt?.reason ?? '', /Gates need your confirmation/);
   assert.doesNotMatch(state.halt?.reason ?? '', /Repair with AI/,
     'no blocked handoff and no verification park — the tail names only doors that exist');
-  assert.equal(state.halt?.kind, undefined, 'a gate needs a person, never auto-recovery');
+  // `nothing-ready` since LFC-1: the kind names the SHAPE (nothing to run,
+  // phases behind a person's door), and its profile offers no auto-recovery.
+  assert.equal(state.halt?.kind, 'nothing-ready', 'a gate needs a person, never auto-recovery');
   r.cleanup();
 });
 
@@ -4922,7 +5279,7 @@ test('a stuck phase is named as blocked-by-its-handoff, never "waiting on a gate
   assert.match(state.halt?.reason ?? '', /Repair with AI/);
   assert.doesNotMatch(state.halt?.reason ?? '', /Gates need your confirmation/,
     'nothing here is gated — the tail names only doors that exist');
-  assert.equal(state.halt?.kind, undefined, 'a blocked handoff is not the verification kind');
+  assert.equal(state.halt?.kind, 'nothing-ready', 'a blocked handoff is not the verification kind');
   r.cleanup();
 });
 
@@ -4950,6 +5307,83 @@ test('continuing a run resets the failure streak, and says so in the journal', a
   const journal = readFileSync(journalFile(r.root, 'demo', stored.id), 'utf8');
   assert.match(journal, /run\.failure-streak-reset/);
   assert.match(journal, /"was":2/, 'the audit trail keeps what the counter loses');
+  r.cleanup();
+});
+
+test('ACC-5.1 (RCV-3): an automatic relaunch carries the streak forward — no reset, no run.failure-streak-reset — and a person\'s press is what clears it', async () => {
+  const r = repo();
+  const held = streamingSession(r);
+  const { instance, events } = runner(r, held.spawn);
+  const stored = newRun({ slug: 'demo', root: r.root });
+  stored.status = 'interrupted';
+  stored.stoppedBy = 'system';
+  stored.consecutiveFailures = 1;
+  saveRun(stored);
+
+  // The convergence loop's own relaunch: a door opened by a clock, no person in it.
+  await instance.start({
+    slug: 'demo', root: r.root, resumeRunId: stored.id, autonomy: 'keep-going',
+    actor: doorActor('converge-relaunch', { by: 'converge', via: 'timer', origin: 'converge:timer', trigger: 'test', guard: 'automaticResumeGate', counter: 'MAX_BOOT_RESUMES:1/3' }),
+  });
+  await held.inSession;
+  assert.equal(instance.current()!.consecutiveFailures, 1, 'the streak is carried, not zeroed');
+  assert.equal(journalled(events, 'run.failure-streak-reset').length, 0, 'and nothing claims it was reset');
+  const start = journalled(events, 'run.start');
+  assert.equal(start.length, 1);
+  assert.equal(start[0].door, 'converge-relaunch');
+  held.release();
+  await instance.wait();
+  r.cleanup();
+});
+
+test('ACC-5.1 (RCV-3): a run whose streak is spent is refused an automatic relaunch with a named state — run.relaunch-refused, status untouched, no run.start', async () => {
+  const r = repo();
+  const spawns: SpawnRequest[] = [];
+  const { instance, events } = runner(r, async (request) => {
+    spawns.push(request);
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    return ok();
+  });
+  const stored = newRun({ slug: 'demo', root: r.root });
+  stored.status = 'halted';
+  stored.stoppedBy = 'system';
+  stored.consecutiveFailures = 2;
+  stored.halt = { at: new Date().toISOString(), reason: '2 phases failed in a row', phase: 1, kind: 'failure-streak' };
+  saveRun(stored);
+
+  const refused = await instance.start({
+    slug: 'demo', root: r.root, resumeRunId: stored.id, autonomy: 'keep-going',
+    actor: doorActor('converge-relaunch', { by: 'converge', via: 'timer', origin: 'converge:timer', trigger: 'test', guard: 'automaticResumeGate', counter: 'MAX_BOOT_RESUMES:1/3' }),
+  });
+  await instance.wait();
+  assert.equal(refused.status, 'halted', 'the state comes back untouched');
+  assert.equal(refused.halt?.kind, 'failure-streak');
+  assert.equal(refused.consecutiveFailures, 2);
+  assert.equal(spawns.length, 0, 'nothing boarded');
+  assert.equal(instance.current(), null, 'the runner holds no run it is not driving');
+  const journal = readFileSync(journalFile(r.root, 'demo', stored.id), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const line = journal.find((l) => l.event === 'run.relaunch-refused');
+  assert.ok(line, 'the refusal is a journalled state, not a silent no-op');
+  assert.equal(line.data.reason, 'failure-streak');
+  assert.equal(line.data.consecutiveFailures, 2);
+  assert.equal(line.data.max, 2);
+  assert.equal(line.data.door, 'converge-relaunch');
+  assert.equal(line.data.via, 'timer');
+  assert.ok(!journal.some((l) => l.event === 'run.start'), 'no run.start was written');
+  assert.equal(journalled(events, 'run.start').length, 0);
+
+  // …and the healer's own reboard door is NOT refused: the ladder is bounded
+  // by its own caps, and the streak rides along to stop the next failure.
+  const healed = await instance.start({
+    slug: 'demo', root: r.root, resumeRunId: stored.id, autonomy: 'keep-going',
+    actor: doorActor('converge-heal', { by: 'heal', via: 'timer', origin: 'converge:timer', trigger: 'verify-red', guard: 'ladder:reboard-fresh', counter: 'ladderPerPhaseRungs:1/3' }),
+  });
+  await instance.wait();
+  assert.ok(spawns.length >= 1, 'the healer\'s door opens and the phase boards');
+  assert.equal(journalled(events, 'run.start').length, 1, 'one run.start, the healer\'s');
+  assert.equal(journalled(events, 'run.failure-streak-reset').length, 0, 'but it resets nothing on the way in');
+  assert.equal(healed.status, 'finished', 'the streak carried in and was broken by a phase that succeeded');
+  assert.equal(instance.current()?.consecutiveFailures, 0);
   r.cleanup();
 });
 
@@ -4983,12 +5417,17 @@ test('a frozen lane can be stopped: woken first, credited, session id kept, stre
   r.cleanup();
 });
 
-test('a per-phase stop carries phase and by through the service, and a refusal answers 409', async () => {
+test('a per-phase stop carries phase and the DERIVED actor through the service, and a refusal answers 409', async () => {
   const { status, calls } = await call('/api/run/demo/stop', {
     method: 'POST', allowRun: true, headers: { 'x-phase-console': '1' }, body: { phase: 9, by: 'tester' },
   });
   assert.equal(status, 200);
-  assert.deepEqual(calls, [{ method: 'stopRun', args: ['demo', 9, 'tester'] }]);
+  // The body's label is kept as `by`; the transport is read off the request
+  // (SHD-3): a loopback Host with no User-Agent is a `script` over the `api`
+  // from `local`, and no proxy vouched for anyone.
+  assert.deepEqual(calls, [{
+    method: 'stopRun', args: ['demo', 9, { by: 'tester', via: 'api', origin: 'local', remoteUser: null }],
+  }]);
 
   const refused = await callWith(
     { stopRun: async () => { throw new Error('phase 9 is not one of the ones running — phases 1, 2 are'); } },
@@ -5015,7 +5454,10 @@ test('a per-model limit files its wall against the account, and the run continue
   const { instance } = runner(r, limited, '`true`', undefined, {
     // Pinned before 3:45pm for the same reason the pause-policy test pins it.
     now: () => new Date('2026-01-01T13:00:00'),
-    onAccountLimited: (accountId, window) => { marked.push({ ...(accountId ? { accountId } : {}), window }); },
+    leaveAccount: (accountId, leaving) => {
+      marked.push({ ...(accountId ? { accountId } : {}), window: leaving.bucket ?? 'none' });
+      return leaveStub(accountId, leaving);
+    },
   });
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', model: 'opus' });
   await instance.wait();
@@ -5164,7 +5606,9 @@ test('the wait budget is finite: a phase that keeps re-filing the same wait halt
 
     assert.equal(state.status, 'parked', 'the fourth re-file spends the budget');
     assert.equal(state.phases['1'].halt?.kind, 'waiting-external-timeout');
-    assert.match(state.phases['1'].halt?.reason ?? '', /wait budget is spent/);
+    // The sentence names WHICH ledger ran out — the declared waits, here, not
+    // the hours (WAI-5: the halt must say which allowance was spent).
+    assert.match(state.phases['1'].halt?.reason ?? '', /already declared 4 wait\(s\) — the most one phase may \(4\)/);
     assert.equal(state.phases['1'].status, 'failed');
   } finally { r.cleanup(); }
 });
@@ -5866,7 +6310,7 @@ test('ladder: a stuck board with an unknown blocker gets ONE unblock brief; the 
     assert.equal(unblocks[0].brief, 'BOOT', 'the engine prompt leads, the brief follows');
     assert.match(unblocks[0].prompt, /UNBLOCK phase 1/);
     assert.match(unblocks[0].prompt, /nobody decided/, 'the Outstanding text is in the brief');
-    assert.match(unblocks[0].prompt, /needs-human --reason/, 'the errand escape hatch is named');
+    assert.match(unblocks[0].prompt, /needs-human --needs <key> --reason/, 'the errand escape hatch is named, by key');
     assert.doesNotMatch(unblocks[0].prompt, /do not start new work/i);
     const rungs = journalled(events, 'phase.rung').filter((entry) => entry.rung === 'unblock-session');
     assert.equal(rungs.length, 1);
@@ -6007,6 +6451,9 @@ test('defects: an expired wait on a stuck board is no livelock — the run does 
     stale.phases['1'] = {
       phase: 1, status: 'waiting', attempts: 1, costUsd: 1, sessionId: 'sess-w',
       parkedUntil: new Date(Date.now() - 60_000).toISOString(), parkReason: 'the image build', waits: 1,
+      // What every park writes: the declaration a wait-resume answers. Without
+      // one the boarding still resumes the session, but not as a declared wait.
+      declared: { status: 'waiting-external', reason: 'the image build', at: new Date(Date.now() - 120_000).toISOString() },
     };
     saveRun(stale);
 
@@ -6034,8 +6481,18 @@ test('defects: a verification card that goes unanswered parks the phase and the 
   try {
     const { Approvals } = await import('../server/runner/approvals.ts');
     const notRun = { ok: false, reason: 'nothing runnable (1 fragment left for a human)', ran: [], notRun: [{ text: 'look at the dashboard', reason: 'prose' }] };
+    const approvals = new Approvals();
+    // A snapshot of the run WHILE the card stands: the card lives 60 ms, so a
+    // read 15 ms after it is raised sees the wait the card put the run in.
+    let underCard: RunState | null = null;
+    const request = approvals.request.bind(approvals);
+    approvals.request = ((...args: Parameters<typeof approvals.request>) => {
+      const card = request(...args);
+      setTimeout(() => { underCard = JSON.parse(JSON.stringify(instance.current())) as RunState; }, 15);
+      return card;
+    }) as typeof approvals.request;
     const { instance, events } = runner(r, workingSession(r), undefined, undefined, {
-      approvals: new Approvals(), verify: async () => notRun, verifyAnswerMs: 60, origin: 'http://127.0.0.1:4123',
+      approvals, verify: async () => notRun, verifyAnswerMs: 60, origin: 'http://127.0.0.1:4123',
     });
     // The card's timer is unref'd (a pending approval must never keep the
     // console alive); in a test nothing else holds the loop open, so hold it.
@@ -6051,8 +6508,28 @@ test('defects: a verification card that goes unanswered parks the phase and the 
     assert.equal(state.consecutiveFailures, 0, 'nobody answering is not the phase failing');
     assert.equal(state.status, 'parked');
     assert.match(state.halt?.reason ?? '', /verification card went unanswered/);
+    // WAI-10 (ACC-4.8): the park a timeout produces carries a kind from HALT_KINDS —
+    // `awaiting-person`, a person was asked and did not answer.
+    assert.equal(state.halt?.kind, 'awaiting-person');
+    assert.ok((HALT_KINDS as readonly string[]).includes(state.halt?.kind ?? ''));
     assert.equal(journalled(events, 'phase.verify-unanswered').length, 1);
     assert.equal(journalled(events, 'run.halt').filter((h) => h.kind === 'needs-human').length, 0, 'no needs-human halt, no streak');
+    // …and while the card stood, the run WAITED on a person: `waiting`,
+    // `waitReason: person`, the clock at the card's expiry (WAI-10).
+    const waited = journalled(events, 'run.waiting-person');
+    assert.equal(waited.length, 1);
+    assert.equal(waited[0].phase, 1);
+    assert.match(String(waited[0].on), /verification card/);
+    const waiting = underCard!;
+    assert.ok(waiting, 'the run was read while the card stood');
+    assert.equal(waiting.status, 'waiting', 'the run read `waiting` under the card');
+    assert.equal(waiting.waitReason, 'person');
+    assert.equal(waiting.waitUntil, waited[0].until, 'the clock is the card\'s expiry');
+    assert.equal(waiting.lifecycle?.wait?.kind, 'person');
+    assert.equal(waiting.lifecycle?.wait?.until, waited[0].until);
+    // The card down, the wait is over: the final state carries no person clock.
+    assert.equal(state.waitReason ?? null, null);
+    assert.equal(state.waitUntil, null);
   } finally { r.cleanup(); }
 });
 
@@ -6340,13 +6817,157 @@ test('a console shutdown stamps the run as the system\'s stop and writes the kil
     const second = runner(r, hang);
     await second.instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
     await new Promise((resolve) => setTimeout(resolve, 150));
-    await second.instance.stop();
+    // The operator's stop, as the route derives it from a browser's request.
+    await second.instance.stop({ by: 'operator', via: 'api', origin: 'local', remoteUser: null });
     await second.instance.wait();
     const stopped = second.instance.current()!;
     assert.equal(stopped.status, 'paused');
     assert.equal(stopped.stoppedBy, 'operator');
     assert.equal(stopped.phases['1'].note, 'stopped by the operator');
+
+    // LFC-6 / SHD-3: the two stops are told apart by the record itself — the
+    // shutdown's `run.stop-requested` is absent (a checkpoint, not a stop),
+    // and the operator's carries the derived actor whole, matching `stoppedBy`.
+    const { journalFile } = await import('../server/runner/state.ts');
+    const lines = readFileSync(journalFile(r.root, 'demo', stopped.id), 'utf8').trim().split('\n')
+      .map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
+    const requested = lines.filter((l) => l.event === 'run.stop-requested');
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0].data.by, 'operator');
+    assert.equal(requested[0].data.via, 'api');
+    assert.equal(requested[0].data.origin, 'local');
+    assert.equal(requested[0].data.remoteUser, null);
+    // …and a bare `stop()` — a harness's — is `unattributed`, never anybody's.
+    const third = runner(r, hang);
+    await third.instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await third.instance.stop();
+    await third.instance.wait();
+    const bare = third.instance.current()!;
+    assert.equal(bare.stoppedBy, 'operator', 'a stop nobody attributed is still a person\'s — the console never stops a run unsaid');
+    assert.equal(bare.phases['1'].note, 'stopped by unattributed');
   } finally { r.cleanup(); }
+});
+
+/**
+ * SHD-8. `run.shutdown-child` was `{pid, how}` — 30 records across the hub's
+ * journals, none of which could say which phase a killed pid was, why it died,
+ * or what its half-finished tool call had been doing. A `gh pr merge` cut at
+ * 28 s is exactly where "which side of the merge" is the only question left.
+ */
+test('SHD-8: a shutdown checkpoint names each killed child\'s phase, session, grace, why and open tool — and says its intent even with no live lane', async () => {
+  const r = repo();
+  // The ladder's waits are unref'd (a console exiting must not be held up by
+  // them), so something has to hold this test's event loop open around them.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    let childPid = 0;
+    const spawn: SpawnFn = async (request) => {
+      const child = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore', detached: true });
+      childPid = child.pid!;
+      request.onPid?.(child.pid!);
+      request.onHandle?.({ pid: child.pid!, open: () => true, send: () => true, setFrozen: () => {} });
+      request.onEvent?.({ kind: 'init', sessionId: 'sess-shutdown-0001', model: 'stub-1', tools: 0 });
+      request.onEvent?.({ kind: 'tool', id: 'toolu_merge', name: 'Bash', summary: 'gh pr merge 131 --squash --delete-branch' });
+      await new Promise<void>((resolve) => { child.on('exit', () => resolve()); });
+      return ok({ sessionId: 'sess-shutdown-0001', signal: { subtype: 'error_during_execution', code: 143, text: 'terminated' } });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    for (let i = 0; i < 200 && !childPid; i++) await sleepMs(10);
+    await sleepMs(150);
+    const checkpoint = instance as never as { checkpointForShutdown: (context: unknown) => Promise<void> };
+    await checkpoint.checkpointForShutdown({ intent: 'shutdown', reason: 'shutdown (a test via api from local)', mode: 'exit' });
+    await instance.wait();
+
+    const [shutdown] = journalled(events, 'run.console-shutdown');
+    assert.equal(shutdown.intent, 'shutdown');
+    assert.equal(shutdown.reason, 'shutdown (a test via api from local)');
+    assert.equal(shutdown.mode, 'exit');
+    assert.equal(shutdown.live, true);
+    assert.deepEqual(shutdown.lanes, [{ phase: 1, pid: childPid, sessionId: 'sess-shutdown-0001' }]);
+
+    const children = journalled(events, 'run.shutdown-child');
+    assert.equal(children.length, 1);
+    const [child] = children;
+    assert.equal(child.pid, childPid);
+    assert.equal(child.phase, 1);
+    assert.equal(child.sessionId, 'sess-shutdown-0001');
+    assert.ok(['interrupted', 'exited', 'killed'].includes(String(child.how)), String(child.how));
+    assert.equal(typeof child.graceMs, 'number');
+    assert.equal(typeof child.interruptGraceMs, 'number');
+    assert.equal(child.why, 'console-shutdown');
+    assert.equal(child.intent, 'shutdown');
+    assert.equal(child.reason, 'shutdown (a test via api from local)');
+    assert.deepEqual(
+      { name: (child.openTool as { name: string }).name, summary: (child.openTool as { summary: string }).summary },
+      { name: 'Bash', summary: 'gh pr merge 131 --squash --delete-branch' },
+      'the tool call that was open when the signal went',
+    );
+
+    // A restart's checkpoint over a run with nothing live still writes its row —
+    // saying so, with no lane and the intent that ended it.
+    await checkpoint.checkpointForShutdown({ intent: 'restart', reason: 'restart (a test)' });
+    const rows = journalled(events, 'run.console-shutdown');
+    const idle = rows[rows.length - 1];
+    assert.equal(idle.intent, 'restart');
+    assert.deepEqual(idle.lanes, []);
+    assert.deepEqual(idle.phases, []);
+  } finally { clearInterval(keepAlive); r.cleanup(); }
+});
+
+/**
+ * REG-3, boarding's half. The lock belt-check answers "has somebody claimed
+ * this phase"; a session in its first minute has not. The runner asks the peer
+ * predicate in the grant→spawn window and queues — named, with the lock
+ * race's backoff — never parks and never releases anything.
+ */
+test('REG-3: boarding finds a live session in the repository holding no lock — the phase queues behind it, named, and boards once it is gone', async () => {
+  const r = repo();
+  const scheduler = new Scheduler({ locks: () => [] });
+  // The boarding backoff sleeps on an unref'd timer; hold the loop open.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    let peerAlive = true;
+    const asked: (string | undefined)[][] = [];
+    const spawned: number[] = [];
+    const spawn: SpawnFn = async (request) => {
+      const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+      spawned.push(phase);
+      r.markDone(phase);
+      return ok();
+    };
+    const { instance, events } = runner(r, spawn, '`true`', undefined, {
+      scheduler,
+      peers: (_slug, _phase, excluding) => {
+        asked.push([...excluding]);
+        return peerAlive
+          ? [{ sessionId: 's-hand-peer-0001', pid: 4242, cwd: r.root, presence: 'live', owner: 'sam@laptop', scope: ['all'], plan: null }]
+          : [];
+      },
+    });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await sleepMs(300);
+    assert.deepEqual(spawned, [], 'nothing boards beside a live peer');
+    const [race] = journalled(events, 'phase.peer-race');
+    assert.ok(race, 'the queue is journalled');
+    assert.equal(race.session, 's-hand-peer-0001');
+    assert.equal(race.pid, 4242);
+    assert.equal(race.cwd, r.root);
+    assert.equal(race.presence, 'live');
+    assert.equal(typeof race.backoffMs, 'number');
+    assert.match(String(instance.current()!.phases['1'].note), /queued behind a Claude session in this repository that holds no lock — s-hand-p/);
+    assert.notEqual(instance.current()!.phases['1'].status, 'parked', 'queued, never parked');
+
+    peerAlive = false;
+    await instance.wait();
+    assert.ok(spawned.includes(1), 'the peer gone, the phase boards');
+    assert.ok(asked.length > 0);
+  } finally {
+    clearInterval(keepAlive);
+    scheduler.close();
+    r.cleanup();
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -6459,7 +7080,7 @@ test('usage wall past the 12h ceiling: under `wait`, the run moves to an account
   const { instance, events } = runner(r, limited, '`true`', undefined, {
     accountEnv: async (accountId) => (accountId === 'spare' ? { CLAUDE_CODE_OAUTH_TOKEN: 'tok-spare' } : null),
     pickAccount: () => 'spare',
-    portTranscript: () => true,
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
   });
   // No onLimit: the default `wait`, which cannot wait 20h — the preference
   // (on by default) upgrades it to a switch rather than a needs-human halt.
@@ -7024,13 +7645,65 @@ test('a human gate stops the run — unless the operator delegated it', async ()
   const r = repo();
   r.setGate(1, 'manual: the owner approves the copy');
   const seen: number[] = [];
-  const { instance } = runner(r, workingSession(r, seen));
+  const { instance } = runner(r, workingSession(r, seen), '`true`', undefined, { delegateHumanGates: () => false });
   try {
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
     await instance.wait();
-    assert.equal(instance.current()!.phases['1'].status, 'gated', "a human gate is a person's by default");
+    assert.equal(instance.current()!.phases['1'].status, 'gated', "a human gate is a person's when the console says operator");
     assert.deepEqual(seen, [], 'and nothing was booted past it');
   } finally { r.cleanup(); }
+
+  // The SHIPPED default since 5.0.0 (phase 11, operator decision 11: `gates:
+  // delegated`): a harness that says nothing boards the phase to evidence the
+  // gate, and the journal names the row and the source.
+  const r0 = repo();
+  r0.setGate(1, 'manual: the owner approves the copy');
+  const seen0: number[] = [];
+  const { instance: shipped, events: events0 } = runner(r0, workingSession(r0, seen0));
+  try {
+    await shipped.start({ slug: 'demo', root: r0.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await shipped.wait();
+    assert.deepEqual(seen0, [1], 'delegated by default');
+    const [line] = journalled(events0, 'phase.gate-delegated');
+    assert.equal(line.decisionKey, 'gates');
+    assert.equal(line.source, 'default');
+  } finally { r0.cleanup(); }
+
+  // A plan row outranks the console: `gates: operator` in the manifest holds
+  // the phase even on a console that delegates.
+  const r1 = repo();
+  r1.setGate(1, 'manual: the owner approves the copy');
+  const seen1: number[] = [];
+  const { instance: byPlan } = runner(r1, workingSession(r1, seen1), '`true`', undefined, { delegateHumanGates: () => true });
+  try {
+    await byPlan.start({
+      slug: 'demo', root: r1.root, autonomy: 'keep-going', onlyPhases: [1],
+      manifest: {
+        decisions: [{ key: 'gates', value: 'operator', owner: 'operator', state: 'answered', source: 'plan', blocking: 'no', origin: 'plan' }],
+        accounts: [], credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+        delivery: { ok: true, channels: [], acknowledged: false }, probes: {}, at: '2026-09-14T00:00:00.000Z',
+      },
+    });
+    await byPlan.wait();
+    assert.equal(byPlan.current()!.phases['1'].status, 'gated', "the plan's row wins");
+    assert.deepEqual(seen1, []);
+  } finally { r1.cleanup(); }
+
+  // A delegated gate that states NO condition cannot be evidenced: it stops at
+  // boarding, before the spend, and the journal says why.
+  const r3 = repo();
+  r3.setGate(1, 'manual:');
+  const seen3: number[] = [];
+  const { instance: bare, events: events3 } = runner(r3, workingSession(r3, seen3));
+  try {
+    await bare.start({ slug: 'demo', root: r3.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await bare.wait();
+    assert.equal(bare.current()!.phases['1'].status, 'gated');
+    assert.deepEqual(seen3, [], 'nothing was spent on a gate nobody could evidence');
+    const [gated] = journalled(events3, 'phase.gated');
+    assert.match(String(gated.why), /states no condition a session could evidence/);
+    assert.match(bare.current()!.phases['1'].note ?? '', /no condition a session could evidence/);
+  } finally { r3.cleanup(); }
 
   // Delegated: the same gate boots the phase, and the journal says which kind of
   // clearance this was — a delegated human gate is not an ai-clearable one, and
@@ -7234,11 +7907,15 @@ test('a retry with an addendum and a model override boards ONCE with both, journ
   const planBefore = readFileSync(planFile, 'utf8');
 
   const state = stoppedOnFailure(r);
-  resetForRetry(phaseRecord(state, 1), retryOverrideFrom({
-    addendum: ADDENDUM,
-    options: { model: 'claude-opus-5' },
-    by: 'console',
-  }));
+  resetForRetry(phaseRecord(state, 1), {
+    by: 'operator',
+    override: retryOverrideFrom({
+      addendum: ADDENDUM,
+      options: { model: 'claude-opus-5' },
+      by: 'console',
+    }),
+    journal: () => {},
+  });
   saveRun(state);
 
   const seen: { phase: number; model?: string; prompt: string }[] = [];
@@ -7279,7 +7956,7 @@ test('a retry with an addendum and a model override boards ONCE with both, journ
 test('an addendum-only retry changes nothing else — the model is still the one the phase had', async () => {
   const r = repo();
   const state = stoppedOnFailure(r);
-  resetForRetry(phaseRecord(state, 1), retryOverrideFrom({ addendum: ADDENDUM }));
+  resetForRetry(phaseRecord(state, 1), { by: 'operator', override: retryOverrideFrom({ addendum: ADDENDUM }), journal: () => {} });
   saveRun(state);
   // The record's sticky model survives, because the override named none.
   assert.equal(phaseRecord(state, 1).model, 'claude-sonnet-5');
@@ -7300,12 +7977,12 @@ test('a plain Retry after one with edits is a plain retry — an unspent overrid
   const state = stoppedOnFailure(r);
   const record = phaseRecord(state, 1);
 
-  resetForRetry(record, retryOverrideFrom({ addendum: ADDENDUM, options: { model: 'claude-opus-5' } }));
+  resetForRetry(record, { by: 'operator', override: retryOverrideFrom({ addendum: ADDENDUM, options: { model: 'claude-opus-5' } }), journal: () => {} });
   assert.equal(record.retryOverride!.addendum, ADDENDUM);
   assert.equal(record.model, undefined, 'a model override clears the sticky one, or it would be ignored');
 
   record.status = 'failed';
-  resetForRetry(record);
+  resetForRetry(record, { by: 'operator', journal: () => {} });
   assert.equal(record.retryOverride, undefined, 'pressing Retry means "again, as the plan says"');
   r.cleanup();
 });
@@ -7330,7 +8007,7 @@ test('the attempt override outranks the run`s own per-phase choice, which outran
     // What the operator chose for this RUN, for every phase.
     phaseOptions: { 1: { model: 'claude-haiku-4-5-20251001' }, 2: { model: 'claude-haiku-4-5-20251001' } },
   });
-  resetForRetry(phaseRecord(state, 1), retryOverrideFrom({ options: { model: 'claude-opus-5' } }));
+  resetForRetry(phaseRecord(state, 1), { by: 'operator', override: retryOverrideFrom({ options: { model: 'claude-opus-5' } }), journal: () => {} });
   saveRun(state);
 
   const seen: { phase: number; model?: string; prompt: string }[] = [];
@@ -7356,7 +8033,7 @@ test('an attempt override REPLACES the run`s list-valued choices rather than mer
   });
   // Narrowing this attempt to two tools has to MEAN two tools — a union with
   // the run's list would quietly hand back the one being taken away.
-  resetForRetry(phaseRecord(state, 1), retryOverrideFrom({ options: { tools: ['Read', 'Grep'] } }));
+  resetForRetry(phaseRecord(state, 1), { by: 'operator', override: retryOverrideFrom({ options: { tools: ['Read', 'Grep'] } }), journal: () => {} });
   saveRun(state);
 
   const seen: { phase: number; model?: string; effort?: string; tools?: string[] }[] = [];
@@ -8018,4 +8695,1278 @@ test('an operator stop under a standing run-level halt keeps the run halted, pin
   assert.equal(state.stoppedBy, 'operator', 'pinned as the operator\'s stop, so nothing relaunches it');
   assert.equal(state.phases['1'].status, 'interrupted');
   r.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * The session ledger (zero-touch-console phase 4, chapter 03)
+ * ------------------------------------------------------------------ */
+
+const { CAP_SOURCES } = await import('../shared/run-lifecycle.js');
+type LedgerCap = { value: number; source: string; basis?: string };
+
+test('a run started with no budget still caps every session it spawns, each cap with the policy that set it (SES-8)', async () => {
+  // 0 of 507 lifetime argvs carried a dollar cap: both conditions read values
+  // that defaulted to null and only the launch form ever set them.
+  const r = repo();
+  r.setSize(1, 'L');
+  const requests: SpawnRequest[] = [];
+  const work = workingSession(r);
+  const spawn: SpawnFn = async (request) => { requests.push(request); return work(request); };
+  const { instance, events } = runner(r, spawn);
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+    assert.equal(requests.length, 3, 'three phases, three sessions');
+    for (const request of requests) {
+      assert.ok((request.maxTurns ?? 0) > 0 && (request.budgetUsd ?? 0) > 0, 'both caps reach every spawn');
+    }
+    const sessions = journalled(events, 'phase.session');
+    assert.equal(sessions.length, requests.length, 'one record per session, from the one door');
+    for (const session of sessions) {
+      for (const cap of [session.maxTurns, session.maxBudgetUsd] as LedgerCap[]) {
+        assert.ok((CAP_SOURCES as readonly string[]).includes(cap.source), `a named source (${cap.source})`);
+        assert.ok(cap.source !== 'caller' && cap.source !== 'spawn-default', 'no runner spawn leaves a cap unattributed');
+      }
+      assert.equal(session.mode, 'phase');
+      assert.equal(session.endedBy, 'exit', 'a session that ended itself says so, rather than leaving a blank');
+    }
+    assert.deepEqual(sessions[0].maxBudgetUsd, { value: 120, source: 'size', basis: 'L' });
+    assert.deepEqual(sessions[0].maxTurns, { value: 600, source: 'size', basis: 'L' });
+    assert.deepEqual(sessions[1].maxBudgetUsd, { value: 60, source: 'size', basis: 'M' }, 'an unsized phase is M');
+    // …and the CLI-side ceilings each child ran under, once per spawn.
+    const ceilings = journalled(events, 'phase.retry-ceiling');
+    assert.equal(ceilings.length, requests.length);
+    assert.equal(ceilings[0].mode, 'phase');
+    assert.ok(ceilings[0].source === 'console' || ceilings[0].source === 'env');
+    assert.equal(typeof ceilings[0].bgWaitCeilingMs, 'number');
+  } finally { r.cleanup(); }
+});
+
+test('a run budget is the dollar cap, and a spent cap resumes under double it — attributed as a raise', async () => {
+  const r = repo();
+  const requests: SpawnRequest[] = [];
+  const capped: SpawnFn = async (request) => {
+    requests.push(request);
+    if (requests.length === 1) {
+      return ok({ signal: { subtype: 'error_max_budget_usd', code: 1, text: '' }, sessionId: 'sess-abc' });
+    }
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    return ok({ sessionId: 'sess-abc' });
+  };
+  const { instance, events } = runner(r, capped);
+  try {
+    await instance.start({ slug: 'demo', root: r.root, phaseBudgetUsd: 2, autonomy: 'keep-going' });
+    await instance.wait();
+    const sessions = journalled(events, 'phase.session');
+    assert.deepEqual(sessions[0].maxBudgetUsd, { value: 2, source: 'run' });
+    const raised = sessions[1].maxBudgetUsd as LedgerCap;
+    assert.equal(raised.value, 4, 'double the cap the CLI enforced');
+    assert.equal(raised.source, 'raise');
+    assert.equal(requests[1].budgetUsd, 4, 'and double is what the resume was spawned with');
+    const resume = journalled(events, 'phase.resume')[0];
+    assert.equal(resume.budget, 4);
+    assert.equal(resume.budgetSource, 'raise');
+  } finally { r.cleanup(); }
+});
+
+test('a resume with an instruction is in the census — the same session record as every other session (SES-6)', async () => {
+  // 50 of 138 sessions wrote `phase.resume-done {costUsd, turns, said}` and
+  // nothing else: no subtype, no argv, no duration.
+  const r = repo();
+  let calls = 0;
+  const spawn: SpawnFn = async () => {
+    calls += 1;
+    if (calls === 1) return ok({ sessionId: 'sess-login', signal: { subtype: 'success', code: 0, text: 'Please run /login' } });
+    r.markDone(1);
+    return ok({ sessionId: 'sess-login', durationMs: 42, argv: ['--print', '--resume', 'sess-login'] });
+  };
+  const { instance, events } = runner(r, spawn);
+  try {
+    const started = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+    assert.ok(['halted', 'parked'].includes(instance.current()!.status), 'the first session stopped the run for recovery');
+    await instance.recover({
+      slug: 'demo', root: r.root, runId: started.id, phase: 1, mode: 'resume', instruction: 'finish it', by: 'operator',
+    });
+    await instance.wait();
+    const resumes = journalled(events, 'phase.session').filter((session) => session.mode === 'resume');
+    assert.equal(resumes.length, 1, 'the resume wrote a session record');
+    assert.deepEqual(resumes[0].argv, ['--print', '--resume', 'sess-login']);
+    assert.equal(resumes[0].ms, 42);
+    assert.equal((resumes[0].maxTurns as LedgerCap).source, 'closeout');
+    assert.equal(journalled(events, 'phase.resume-done').length, 1, 'beside the resume\'s own done line, not instead of it');
+  } finally { r.cleanup(); }
+});
+
+test('a usage warning past the alert threshold is decided once per window — not only journalled (SES-9)', async () => {
+  // 3 150 `run.usage-window` lines, every one `allowed_warning`, up to 0.99,
+  // and nothing acted on any of them.
+  const r = repo();
+  const held = streamingSession(r);
+  const { instance, events } = runner(r, held.spawn);
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'pause' });
+    await held.inSession;
+    const warning: StreamEvent = {
+      kind: 'limits', status: 'allowed_warning', window: 'seven_day', utilization: 0.99, utilizationPct: 99, resetsAt: 1789956000,
+    };
+    held.say(warning);
+    held.say(warning);
+    held.say({ kind: 'limits', status: 'allowed_warning', window: 'seven_day', utilization: 0.5, utilizationPct: 50, resetsAt: 1789956000 });
+    held.release();
+    await instance.wait();
+    const windows = journalled(events, 'run.usage-window');
+    assert.equal(windows[0].utilizationPct, 99, 'the reading rides in both units');
+    assert.equal(windows[0].utilization, 0.99);
+    const decisions = journalled(events, 'run.usage-decision');
+    assert.equal(decisions.length, 1, 'one decision per window and reset, however often the warning repeats');
+    assert.deepEqual(decisions[0], {
+      action: 'park', thresholdPct: 95, utilizationPct: 99, window: 'seven_day', resetsAt: 1789956000,
+      policy: 'pause', enacted: false,
+    });
+    assert.equal(instance.current()!.limits?.utilizationPct, 50, 'the run keeps the latest reading');
+  } finally { r.cleanup(); }
+});
+
+test('whoever ends a live session names the ending on its handle first, and the session record carries it (SES-1)', async () => {
+  const r = repo();
+  const endings: string[] = [];
+  let entered!: () => void;
+  const inSession = new Promise<void>((resolve) => { entered = resolve; });
+  let release!: () => void;
+  let first = true;
+  const spawn: SpawnFn = async (request) => {
+    if (!first) { r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1])); return ok(); }
+    first = false;
+    let ended: SpawnOutcome['endedBy'];
+    request.onHandle?.({
+      pid: undefined, send: () => false, open: () => true, setFrozen: () => {},
+      markEnding: (endedBy) => { endings.push(endedBy); ended ??= endedBy; },
+    });
+    entered();
+    await new Promise<void>((resolve) => { release = resolve; });
+    return ok({ endedBy: ended, turns: 2, costUsd: 0 });
+  };
+  const { instance, events } = runner(r, spawn);
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await inSession;
+    assert.deepEqual(instance.stopPhase(1, 'tester'), { ok: true });
+    release();
+    await instance.wait();
+    assert.deepEqual(endings, ['stop'], 'the stop named itself on the session before anything signalled it');
+    assert.equal(journalled(events, 'phase.session')[0].endedBy, 'stop');
+  } finally { r.cleanup(); }
+});
+
+test('a denial the CLI recorded and the refusal the session read are two distinct journal lines', async () => {
+  const r = repo();
+  const held = streamingSession(r);
+  const { instance, events } = runner(r, held.spawn);
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await held.inSession;
+    held.say({
+      kind: 'permission-denied', tool: 'Bash', toolUseId: 'toolu_deny', target: 'touch spike-s2-marker.txt',
+      reason: 'spike listener: deny', reasonType: 'hook', source: 'stream',
+    });
+    held.say({ kind: 'tool-result', id: 'toolu_deny', ok: false, detail: 'spike listener: deny', refused: true, tool: 'Bash' });
+    // An interrupted call's failure is not a refusal, and journals neither line.
+    held.say({ kind: 'tool-result', id: 'toolu_stop', ok: false, detail: 'The user doesn\'t want to proceed with this tool use.' });
+    held.release();
+    await instance.wait();
+    assert.deepEqual(journalled(events, 'phase.permission-denied'), [{
+      tool: 'Bash', source: 'stream', toolUseId: 'toolu_deny', target: 'touch spike-s2-marker.txt',
+      reason: 'spike listener: deny', reasonType: 'hook',
+    }]);
+    assert.deepEqual(journalled(events, 'phase.tool-refused'), [{ tool: 'Bash', toolUseId: 'toolu_deny', detail: 'spike listener: deny' }]);
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 5: the wait budget told, re-read at resume,
+ * and the resume that checks presence
+ * ------------------------------------------------------------------ */
+
+const P5_HOUR = 60 * 60_000;
+
+/** A stored run whose phase 1 is parked on a wait whose clock has passed. */
+function expiredWait(r: Repo, record: Partial<PhaseRecord>): RunState {
+  const stale = newRun({ slug: 'demo', root: r.root });
+  stale.status = 'paused';
+  stale.stoppedBy = 'system';
+  stale.onlyPhases = [1];
+  stale.phases['1'] = {
+    phase: 1, status: 'waiting', attempts: 1, costUsd: 0, waits: 1,
+    parkedUntil: new Date(Date.now() - 60_000).toISOString(),
+    parkReason: 'the image build',
+    declared: { status: 'waiting-external', reason: 'the image build', at: new Date(Date.now() - 2 * P5_HOUR).toISOString() },
+    ...record,
+  } as PhaseRecord;
+  saveRun(stale);
+  return stale;
+}
+
+test('SLF-10: a wait never resumes onto a session already marked gone — no --resume, and phase.resume-lost once', async () => {
+  const r = repo();
+  try {
+    const gone = { sessionId: 'sess-gone', at: new Date(Date.now() - P5_HOUR).toISOString(), reason: 'No conversation found' };
+    // Both shapes the old code re-armed: the id named at park, and none named (the `??=`).
+    for (const named of [true, false]) {
+      const stale = expiredWait(r, { sessionId: 'sess-gone', sessionGone: gone, ...(named ? { resumeSessionId: 'sess-gone' } : {}) });
+      const spawns: (string | undefined)[] = [];
+      const spawn: SpawnFn = async (request) => {
+        spawns.push(request.resume);
+        r.markDone(1);
+        return ok({ sessionId: 'sess-new' });
+      };
+      const { instance, events } = runner(r, spawn);
+      await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+      await instance.wait();
+      assert.equal(spawns[0], undefined, `${named ? 'named' : 'unnamed'}: boarded without the gone id`);
+      assert.equal(spawns.length, 1, `${named ? 'named' : 'unnamed'}: one fresh boarding`);
+      assert.equal(instance.current()!.phases['1'].status, 'done');
+      assert.equal(journalled(events, 'phase.resume-lost').length, 1, 'the lost resume is journalled where it is met, once');
+      writeFileSync(join(r.state, 'done'), '');
+    }
+  } finally { r.cleanup(); }
+});
+
+test('REG-1: a resume onto a session still RUNNING is refused and recorded — nothing spawns, the wait and its session are kept', async () => {
+  const r = repo();
+  try {
+    const stale = expiredWait(r, { sessionId: 'sess-live', resumeSessionId: 'sess-live' });
+    let spawned = 0;
+    const spawn: SpawnFn = async () => { spawned += 1; r.markDone(1); return ok(); };
+    const { instance, events } = runner(r, spawn, '`true`', undefined, {
+      sessionPresence: (id: string) => ({ presence: id === 'sess-live' ? 'live' as const : 'unknown' as const, pid: 4242 }),
+    });
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+    assert.equal(spawned, 0, 'a second claude on a running session transcript is the one act nothing undoes');
+    const refused = journalled(events, 'phase.resume-refused');
+    assert.equal(refused.length, 1, 'recorded once');
+    assert.equal(refused[0].sessionId, 'sess-live');
+    assert.equal(refused[0].pid, 4242);
+    assert.equal(refused[0].why, 'session-live');
+    const rec = instance.current()!.phases['1'];
+    assert.equal(rec.status, 'waiting', 'still waiting — a refusal, not a halt');
+    assert.equal(rec.resumeSessionId, 'sess-live', 'the session to resume is kept for when it ends');
+    assert.ok(rec.declared, 'and the declaration it answers');
+    assert.equal(rec.resumeRefused?.sessionId, 'sess-live');
+    assert.ok(rec.parkedUntil && Date.parse(rec.parkedUntil) > Date.now(), 'on a short re-check clock');
+    assert.equal(rec.halt, undefined);
+    assert.equal(instance.current()!.status, 'waiting');
+  } finally { r.cleanup(); }
+});
+
+test('SLF-5: a park with no declaration is not a declared wait — its own session resumes on the engine prompt, and nothing says the window elapsed', async () => {
+  const r = repo();
+  try {
+    // A declaration some licence already spent, or a console park that never had one.
+    const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w', declared: undefined });
+    const seen: { prompt: string; resume?: string }[] = [];
+    const spawn: SpawnFn = async (request) => {
+      seen.push({ prompt: request.prompt, resume: request.resume });
+      r.markDone(1);
+      return ok({ sessionId: 'sess-w' });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+    assert.equal(seen[0].resume, 'sess-w', 'still its own session');
+    assert.match(seen[0].prompt, /BOOT phase 1/, 'the engine prompt, not a wait-resume');
+    assert.doesNotMatch(seen[0].prompt, /wait window you declared/);
+    const start = journalled(events, 'phase.start')[0];
+    assert.equal(start.waitResume, undefined, 'a boarding on a consumed declaration never says resuming');
+    assert.equal(journalled(events, 'phase.wait-resume')[0].cause, 'console-park');
+  } finally { r.cleanup(); }
+});
+
+test('WAI-4: a resumed wait that only LOOKS keeps its declaration — a commit or an outcome spends it, a git status does not', async () => {
+  for (const [summary, spends] of [['git status', false], ['git commit -m "wip: the build landed"', true]] as const) {
+    const r = repo();
+    try {
+      const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w' });
+      let calls = 0;
+      const spawn: SpawnFn = async (request) => {
+        calls += 1;
+        if (calls === 1) {
+          request.onEvent?.({ kind: 'init', sessionId: 'sess-w', model: 'stub-1', tools: 0 });
+          request.onEvent?.({ kind: 'tool', id: 'toolu_look', name: 'Bash', summary });
+        }
+        r.markDone(1);
+        return ok({ sessionId: 'sess-w' });
+      };
+      const { instance, events } = runner(r, spawn);
+      await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+      await instance.wait();
+      const productive = journalled(events, 'phase.declaration-consumed').filter((d) => d.why === 'session-productive');
+      assert.equal(productive.length, spends ? 1 : 0, `${summary}: ${spends ? 'spends' : 'keeps'} the declaration`);
+    } finally { r.cleanup(); }
+  }
+});
+
+test('WAI-9: a new declaration spends the old one once — new-outcome journals exactly one line, naming what came next', async () => {
+  const r = repo();
+  try {
+    // A phase parked on a declared wait, resumed; the session now declares a
+    // different word. The old testimony is spent under `new-outcome`, once.
+    const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w' });
+    const spawn: SpawnFn = async (request) => {
+      fileOutcome(request, { phase: 1, status: 'needs-human', needs: 'credential', reason: 'the deploy token expired' });
+      return ok({ sessionId: 'sess-w' });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+    const spent = journalled(events, 'phase.declaration-consumed');
+    assert.equal(spent.length, 1, `exactly one spend (${spent.map((d) => d.why).join(', ')})`);
+    assert.equal(spent[0].why, 'new-outcome');
+    assert.equal(spent[0].next, 'needs-human');
+    assert.equal(spent[0].status, 'waiting-external');
+    assert.equal(typeof spent[0].parkedMs, 'number');
+    assert.equal(instance.current()!.phases['1'].declared?.status, 'needs-human', 'the new word stands');
+  } finally { r.cleanup(); }
+});
+
+test('WAI-9: a declaration a resumed session left standing is spent under board-closed when the board reads done — not left on a done record', async () => {
+  const r = repo();
+  try {
+    const stale = expiredWait(r, { sessionId: 'sess-w', resumeSessionId: 'sess-w' });
+    const spawn: SpawnFn = async () => { r.markDone(1); return ok({ sessionId: 'sess-w' }); };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+    const spent = journalled(events, 'phase.declaration-consumed');
+    assert.deepEqual(spent.map((d) => d.why), ['board-closed']);
+    assert.equal(instance.current()!.phases['1'].status, 'done');
+    assert.equal(instance.current()!.phases['1'].declared, undefined, 'no testimony outlives the record it was about');
+  } finally { r.cleanup(); }
+});
+
+test('WAI-1/WAI-11: a declared park says what it granted against what it asked, and names a ref nothing can poll', async () => {
+  const r = repo();
+  try {
+    const spawn: SpawnFn = async (request) => {
+      fileOutcome(request, {
+        phase: 1, status: 'waiting-external', reason: 'the image build',
+        resume_after: new Date(Date.now() + 45 * 60_000).toISOString(),
+        watch: ['gh:acme/app#run/1234', 'config/fleet-pin.yaml:app-prod'],
+      });
+      return ok({ resultText: 'holding pattern' });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+    const waiting = journalled(events, 'phase.waiting')[0];
+    assert.ok(waiting.requested, 'no phase.waiting payload lacks `requested`');
+    assert.equal(waiting.requestedSource, 'declared');
+    assert.equal(waiting.capped, false);
+    assert.equal(waiting.by, 'session');
+    assert.equal(waiting.budgetMs, 8 * P5_HOUR);
+    assert.equal(waiting.budgetSource, 'default');
+    assert.ok(Math.abs(Number(waiting.granted) - 45 * 60_000) < 5_000);
+    assert.deepEqual(waiting.unpollable, ['config/fleet-pin.yaml:app-prod']);
+    const unpollable = journalled(events, 'phase.watch-unpollable');
+    assert.equal(unpollable.length, 1);
+    assert.equal(unpollable[0].ref, 'config/fleet-pin.yaml:app-prod');
+    const rec = instance.current()!.phases['1'];
+    assert.deepEqual(rec.watchUnpollable?.map((u) => u.ref), ['config/fleet-pin.yaml:app-prod']);
+    assert.equal(rec.declared?.by, 'session');
+    assert.ok(rec.parkedFrom, 'the park began on its own field');
+    assert.equal(rec.waitHistory?.length, 1);
+  } finally { r.cleanup(); }
+});
+
+test('WAI-1: a declared window past the budget halts at park with the arithmetic — never parked for a cut-down eight hours', async () => {
+  const r = repo();
+  try {
+    const spawn: SpawnFn = async (request) => {
+      fileOutcome(request, {
+        phase: 1, status: 'waiting-external', reason: 'a 48 h soak',
+        resume_after: new Date(Date.now() + 48 * P5_HOUR).toISOString(),
+      });
+      return ok();
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+    const rec = instance.current()!.phases['1'];
+    assert.notEqual(rec.status, 'waiting');
+    assert.equal(rec.halt?.kind, 'waiting-external-timeout');
+    assert.match(rec.halt?.reason ?? '', /asked to wait until .* \(48 h from now\)/);
+    assert.match(rec.halt?.reason ?? '', /does not cut a declared window short/);
+    assert.equal(journalled(events, 'phase.waiting').length, 0);
+  } finally { r.cleanup(); }
+});
+
+test('WAI-4: phase.wait-resume carries the lateness, the cause and the turn cap\'s source', async () => {
+  const r = repo();
+  try {
+    const stale = expiredWait(r, {
+      sessionId: 'sess-w', resumeSessionId: 'sess-w',
+      parkedUntil: new Date(Date.now() - 20 * 60_000).toISOString(),
+    });
+    const spawn: SpawnFn = async (request) => { r.markDone(1); void request; return ok({ sessionId: 'sess-w' }); };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+    const resumed = journalled(events, 'phase.wait-resume')[0];
+    assert.equal(resumed.cause, 'declared-window');
+    assert.ok(Number(resumed.lateMs) >= 20 * 60_000 - 5_000, `lateMs ${resumed.lateMs}`);
+    assert.equal(resumed.capSource, 'closeout');
+    assert.equal(resumed.budgetSource, 'default');
+    assert.ok(resumed.declaredBy, 'whose declaration this resume answers');
+  } finally { r.cleanup(); }
+});
+
+test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own ledger, the lifted cmd: ref marked minted', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    s.say({ kind: 'tool', id: 'toolu_local', name: 'Bash', summary: 'until [ -f /tmp/suite.done ]; do sleep 30; done' });
+    clock.wind(6 * 60_000);
+    await instance.tickLiveness();
+    clock.wind(45 * 60_000);
+    await instance.tickLiveness();
+    const parked = instance.current()!.phases['1'];
+    assert.equal(parked.status, 'waiting');
+    assert.equal(parked.declared?.by, 'watchdog', 'the console\'s inference, never the session\'s testimony');
+    assert.deepEqual(parked.declared?.minted, ['cmd:"test -f /tmp/suite.done"']);
+    assert.equal(parked.watchdogParks, 1);
+    assert.equal(parked.waits ?? 0, 0, 'the session\'s declared waits are untouched');
+    const waiting = journalled(events, 'phase.waiting')[0];
+    assert.equal(waiting.by, 'watchdog');
+    assert.equal(waiting.watchdogParks, 1);
+    assert.equal(journalled(events, 'phase.external-wait')[0].source, 'open');
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('SLF-9: with stallAutomaticPark off, the watchdog parks nothing — the stall is still named', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now, stallAutomaticPark: () => false });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    s.say({ kind: 'tool', id: 'toolu_wait', name: 'Bash', summary: 'until [ "$(gh run view 42 -q .status)" = completed ]; do sleep 45; done' });
+    clock.wind(6 * 60_000);
+    await instance.tickLiveness();
+    const rec = instance.current()!.phases['1'];
+    assert.equal(rec.stall?.signal, 'external-wait', 'the card still stands');
+    assert.equal(rec.status, 'running', 'and the lane is not taken away');
+    assert.equal(journalled(events, 'phase.waiting').length, 0);
+    assert.equal(journalled(events, 'phase.external-wait').length, 0);
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches the local-job ladder — nudged, then parked with a minted cmd: ref', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    // No call opens: the guard refused it. The only evidence is the refusal.
+    instance.noteWaitDenied(1, { command: 'until [ -f /tmp/ring.done ]; do sleep 30; done', matched: 'until [^`]+; *do' });
+    clock.wind(6 * 60_000);
+    await instance.tickLiveness();
+    const nudged = instance.current()!.phases['1'];
+    assert.equal(nudged.stall?.signal, 'external-wait');
+    assert.equal(nudged.stall?.source, 'denied');
+    assert.equal(nudged.stall?.scope, 'local');
+    assert.equal(s.sent.length, 1, 'rung 1: the nudge');
+    clock.wind(40 * 60_000);
+    await instance.tickLiveness();
+    const parked = instance.current()!.phases['1'];
+    assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
+    assert.equal(parked.watch?.[0], 'cmd:"test -f /tmp/ring.done"', 'with the landing condition the console minted');
+    assert.deepEqual(parked.declared?.minted, ['cmd:"test -f /tmp/ring.done"']);
+    assert.equal(journalled(events, 'phase.external-wait')[0].source, 'denied');
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder — nudged, then parked with the one-shot form as the minted cmd: ref', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance, events } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    // The commonest refusal in the corpus, `--watch` ×16 of 37 — and the one
+    // that used to read as somebody else's clock and park on the raw command.
+    instance.noteWaitDenied(1, { command: 'node --test --watch viewer/test > /tmp/t.log 2>&1', matched: '--watch' });
+    const denied = instance.current()!.phases['1'].toolDenied;
+    assert.equal(denied?.rule, 'in-turn-wait', 'the denial is on the RECORD, where a restart cannot lose it');
+    assert.equal(denied?.command, 'node --test --watch viewer/test > /tmp/t.log 2>&1');
+    clock.wind(6 * 60_000);
+    await instance.tickLiveness();
+    const nudged = instance.current()!.phases['1'];
+    assert.equal(nudged.stall?.signal, 'external-wait');
+    assert.equal(nudged.stall?.source, 'denied');
+    assert.equal(nudged.stall?.scope, 'local', 'a --watch runner is the session\'s own job');
+    assert.equal(s.sent.length, 1, 'rung 1: the nudge');
+    clock.wind(40 * 60_000);
+    await instance.tickLiveness();
+    const parked = instance.current()!.phases['1'];
+    assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
+    assert.deepEqual(parked.watch, ['cmd:"node --test viewer/test"'], 'the one-shot form, redirections dropped');
+    assert.deepEqual(parked.declared?.minted, ['cmd:"node --test viewer/test"']);
+    assert.equal(parked.declared?.by, 'watchdog');
+    const wait = journalled(events, 'phase.external-wait')[0];
+    assert.equal(wait.source, 'denied');
+    assert.equal(wait.watch, 'cmd:"node --test viewer/test"');
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('TRS-3 (phase 9): a waiting-external declared with NO ref after the guard refused the session\'s wait is adopted — the ref minted from the refused command, marked minted', async () => {
+  const r = repo();
+  try {
+    const declaring: SpawnFn = async (request) => {
+      // The measured shape: refused `until … sleep` at 16:11, refused `--watch`
+      // at 16:21, then `waiting-external` 37 s later with `watch: []`.
+      instance.noteWaitDenied(1, { command: 'until [ -f /tmp/ring.done ]; do sleep 30; done', matched: 'until [^`]+; *do' });
+      fileOutcome(request, { phase: 1, status: 'waiting-external', reason: 'the ring job is still running', resume_after: new Date(Date.now() + 30 * 60_000).toISOString() });
+      return ok({ resultText: 'parked on the ring job' });
+    };
+    const { instance, events } = runner(r, declaring, '`true`');
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.status, 'waiting', 'the wait stands — adopted, not refused');
+    assert.deepEqual(record.watch, ['cmd:"test -f /tmp/ring.done"'], 'the console followed its own recipe');
+    assert.deepEqual(record.declared?.watch, ['cmd:"test -f /tmp/ring.done"']);
+    assert.deepEqual(record.declared?.minted, ['cmd:"test -f /tmp/ring.done"'], 'marked minted — it runs only under watchMintedCmdRefs');
+    assert.equal(record.declared?.by, 'session', 'the session\'s own declaration, with the console\'s ref on it');
+    const missing = journalled(events, 'phase.watch-missing');
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0].source, 'declaration');
+    assert.equal(missing[0].from, 'denial');
+    assert.deepEqual(missing[0].adopted, ['cmd:"test -f /tmp/ring.done"']);
+    assert.equal(missing[0].command, 'until [ -f /tmp/ring.done ]; do sleep 30; done');
+    assert.deepEqual(journalled(events, 'phase.waiting')[0].watch, ['cmd:"test -f /tmp/ring.done"']);
+  } finally { r.cleanup(); }
+});
+
+test('TRS-3 (phase 9): a ref-less wait after a refusal the console can neither mint nor read off the plan is REFUSED — parked for a person with the errand naming the command', async () => {
+  const r = repo();
+  try {
+    const declaring: SpawnFn = async (request) => {
+      // `tail -f` has no landing the console can name, and the plan has no
+      // `Waits on:` line for this phase.
+      instance.noteWaitDenied(1, { command: 'tail -f build.log', matched: 'tail -f' });
+      fileOutcome(request, { phase: 1, status: 'waiting-external', reason: 'watching the build log' });
+      return ok({ resultText: 'watching' });
+    };
+    const { instance, events } = runner(r, declaring, '`true`');
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.status, 'parked', 'a wait nobody can watch is a person\'s');
+    assert.equal(instance.current()!.halt?.kind, 'needs-human');
+    assert.match(record.note ?? '', /no --watch ref after the console refused `tail -f build\.log`/);
+    const missing = journalled(events, 'phase.watch-missing');
+    assert.equal(missing.length, 1);
+    assert.equal(missing[0].adopted, null);
+    const refused = journalled(events, 'phase.declaration-refused');
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].status, 'waiting-external');
+    assert.equal(refused[0].why, 'watch-missing');
+    const errand = journalled(events, 'phase.errand')[0];
+    assert.equal(errand.situation, 'blocked-declared:external');
+    assert.match(String(errand.need), /`tail -f build\.log`/);
+    assert.match(String(errand.how), /Waits on:/);
+    assert.equal(journalled(events, 'phase.waiting').length, 0, 'nothing parked on a blind clock');
+  } finally { r.cleanup(); }
+});
+
+test('ACC-8.12 (TRS-10, in the loop): a session blocked on the console\'s own deny rule parks behind a standing widen card — no streak, no session — and Allow strikes the rule and resumes its own session', async () => {
+  const r = repo();
+  try {
+    const { Approvals } = await import('../server/runner/approvals.ts');
+    const approvals = new Approvals();
+    const widened: { slug: string; rule: string; by: string }[] = [];
+    const resumed: { slug: string; phase: number; instruction: string; by: string }[] = [];
+    const blocked: SpawnFn = async (request) => {
+      // The hook refused `git push` under the deny list (stamped on the
+      // record), and the session declared exactly what the recipe says.
+      instance.noteToolDenied(1, { tool: 'Bash', rule: 'Bash(git push:*)', command: 'git push origin pe/demo' });
+      fileOutcome(request, { phase: 1, status: 'blocked', needs: 'permission', reason: 'blocked — could not proceed' });
+      return ok({ sessionId: 'sess-blocked', resultText: 'declared blocked on the push' });
+    };
+    const { instance, events } = runner(r, blocked, '`true`', undefined, {
+      approvals,
+      widenRule: (slug: string, rule: string, by: string) => { widened.push({ slug, rule, by }); },
+      resumeOwnSession: (slug: string, phase: number, instruction: string, by: string) => { resumed.push({ slug, phase, instruction, by }); },
+    });
+    // The ladder climbs only on an auto-recovering run; with it off the old
+    // shape stands (a `phase-blocked` halt for a person).
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', autoRecover: true });
+    await instance.wait();
+    const state = instance.current()!;
+    const record = state.phases['1'];
+    assert.equal(record.status, 'parked', 'parked behind the card, not failed');
+    assert.equal(state.consecutiveFailures, 0, 'a permission wall is not a failed attempt (the deferred-rung regression)');
+    assert.equal(record.halt, undefined, 'no phase-blocked halt was written');
+    const situation = journalled(events, 'phase.situation')[0];
+    assert.equal(situation.situation, 'blocked-declared:permission', 'from the console\'s own denial, not the prose');
+    const rung = journalled(events, 'phase.rung')[0];
+    assert.equal(rung.rung, 'widen-rule');
+    assert.equal(rung.vehicle, 'card');
+    const card = approvals.pending().find((a) => a.phase === 1)!;
+    assert.ok(card, 'the card is up');
+    assert.equal(card.standing, true);
+    assert.equal(card.suggestedRule, 'Bash(git push:*)');
+    assert.equal(rung.cardId, card.id);
+    assert.equal(state.recoveries?.['1']?.rungs?.at(-1)?.cardId, card.id);
+    assert.match(record.note ?? '', /widen `Bash\(git push:\*\)`/);
+    assert.equal(journalled(events, 'phase.errand').length, 0, 'no errand while the card is up');
+    // The run parked around it (nothing else to drive) and its loop ended —
+    // the loop-ending disarm leaves a standing card alone.
+    assert.equal(approvals.pending().length, 1);
+
+    // A person allows: the rule is struck for this plan, and — the loop having
+    // ended — the phase's own session is resumed through the stopped-run door.
+    approvals.settle(card.id, 'allow', 'operator');
+    await sleep(20);
+    assert.deepEqual(widened, [{ slug: 'demo', rule: 'Bash(git push:*)', by: 'operator' }]);
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].phase, 1);
+    assert.match(resumed[0].instruction, /`Bash\(git push:\*\)` was struck for this plan/);
+    assert.match(resumed[0].instruction, /Re-run `git push origin pe\/demo`/);
+    const decided = journalled(events, 'phase.widen-decided')[0];
+    assert.equal(decided.decision, 'allow');
+    assert.equal(decided.by, 'operator');
+  } finally { r.cleanup(); }
+});
+
+test('ACC-8.12 (TRS-10, in the loop): a denied widen card settles the rung failed and parks the phase with the errand naming the rule and the command', async () => {
+  const r = repo();
+  try {
+    const { Approvals } = await import('../server/runner/approvals.ts');
+    const approvals = new Approvals();
+    const blocked: SpawnFn = async (request) => {
+      instance.noteToolDenied(1, { tool: 'Bash', rule: 'Bash(git push --force-with-lease=*)', command: 'git push --force-with-lease origin pe/demo' });
+      fileOutcome(request, { phase: 1, status: 'blocked', needs: 'permission', reason: 'blocked — could not proceed' });
+      return ok({ sessionId: 'sess-blocked', resultText: 'declared blocked on the push' });
+    };
+    const { instance, events } = runner(r, blocked, '`true`', undefined, {
+      approvals, widenRule: () => {}, resumeOwnSession: () => {},
+    });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', autoRecover: true });
+    await instance.wait();
+    const card = approvals.pending().find((a) => a.phase === 1)!;
+    approvals.settle(card.id, 'deny', 'operator', 'do it by hand');
+    await sleep(20);
+    const state = instance.current()!;
+    assert.equal(state.recoveries?.['1']?.rungs?.at(-1)?.outcome, 'failed');
+    assert.equal(journalled(events, 'phase.widen-decided')[0].decision, 'deny');
+    const errand = journalled(events, 'phase.errand')[0];
+    assert.ok(errand, 'the errand stands once the card is denied');
+    assert.equal(errand.situation, 'blocked-declared:permission');
+    assert.match(String(errand.need), /`Bash\(git push --force-with-lease=\*\)`/);
+    assert.match(String(errand.need), /`git push --force-with-lease origin pe\/demo`/);
+    assert.equal(state.phases['1'].status, 'parked');
+    assert.equal(state.consecutiveFailures, 0);
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 8 — accounts: the quota door climbs, every
+ * mover marks the account it leaves, the wall escalates, the credential
+ * refusal retires, the poller's probe is wired, a token's reach is scoped
+ * ------------------------------------------------------------------ */
+
+/** A `HeadroomVerdict` stub keyed by account: `spent` accounts refuse with a reset, the rest pass. */
+function headroomStub(spent: Record<string, string | null>) {
+  return (accountId: string | undefined, _model?: string) => {
+    const id = accountId ?? 'default';
+    if (id in spent) {
+      const resetsAt = spent[id];
+      return {
+        ok: false as const, accountId: id, kind: 'spent' as const,
+        reason: `${id} has 0% of its 5-hour window left${resetsAt ? ` (resets ${resetsAt})` : ''}.`,
+        ...(resetsAt ? { resetsAt } : {}),
+      };
+    }
+    return { ok: true as const, accountId: id, fiveHourPct: 10 };
+  };
+}
+
+test('ACT-2: a start whose account is at 100 % with a second at 10 % starts under the second and journals run.account-switched {at: preflight, reason: quota}', async () => {
+  const r = repo();
+  const envs: (NodeJS.ProcessEnv | undefined)[] = [];
+  const asked: (string | undefined)[] = [];
+  const left: { accountId?: string; leaving: LeaveReason }[] = [];
+  const resets = new Date(Date.now() + 3_600_000).toISOString();
+  const watching: SpawnFn = async (request) => {
+    envs.push(request.env);
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    return ok();
+  };
+  const { instance, events } = runner(r, watching, '`true`', undefined, {
+    accountEnv: async (accountId) => (accountId === 'spare' ? { CLAUDE_CODE_OAUTH_TOKEN: 'tok-spare' } : null),
+    checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
+    accountHeadroom: (accountId, model) => { asked.push(accountId); return headroomStub({ work: resets })(accountId, model); },
+    rankAccounts: (excluding) => ['work', 'spare'].filter((id) => id !== excluding),
+    leaveAccount: (accountId, leaving) => { left.push({ ...(accountId ? { accountId } : {}), leaving }); return leaveStub(accountId, leaving); },
+  });
+  const started = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'work' });
+  assert.equal(started.status, 'running', 'the door climbed instead of throwing');
+  await instance.wait();
+
+  const state = instance.current()!;
+  assert.equal(state.status, 'finished');
+  assert.equal(state.accountId, 'spare', 'the run now pays as the account with headroom');
+  assert.ok(envs.every((env) => env?.CLAUDE_CODE_OAUTH_TOKEN === 'tok-spare'), 'every spawn runs as it');
+  assert.deepEqual(asked.slice(0, 2), ['work', 'spare'], 'the run\'s account first, then the candidate — from cache, before any probe');
+  const switched = ladderJournal(events, 'run.account-switched');
+  assert.equal(switched.length, 1);
+  assert.equal(switched[0].at, 'preflight');
+  assert.equal(switched[0].reason, 'quota');
+  assert.equal(switched[0].from, 'work');
+  assert.equal(switched[0].to, 'spare');
+  // The wall the run walked away from was written BEFORE the walk.
+  assert.equal(left.length, 1);
+  assert.equal(left[0].accountId, 'work');
+  assert.equal(left[0].leaving.kind, 'usage');
+  assert.equal(left[0].leaving.by, 'preflight');
+  assert.equal(left[0].leaving.resetsAt?.toISOString(), resets);
+  assert.equal(ladderJournal(events, 'run.account-cooling').length, 1, 'and journalled as the account\'s fact');
+  assert.equal(ladderJournal(events, 'run.preflight-refused').length, 0);
+  assert.equal(state.errand, undefined, 'nobody is asked');
+  r.cleanup();
+});
+
+test('ACT-2: with no second account the run PARKS carrying run.errand and run.preflight-refused {wall: quota} — and throws nothing', async () => {
+  const r = repo();
+  const seen: number[] = [];
+  const { instance, events } = runner(r, workingSession(r, seen), '`true`', undefined, {
+    checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
+    accountHeadroom: headroomStub({ work: new Date(Date.now() + 3_600_000).toISOString(), spare: null }),
+    rankAccounts: (excluding) => ['spare'].filter((id) => id !== excluding),
+  });
+  let threw: unknown = null;
+  let parked: RunState | null = null;
+  try {
+    parked = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'work' });
+  } catch (error) { threw = error; }
+  assert.equal(threw, null, 'the quota door is a journalled state, never an exception a log.warn swallows');
+  assert.equal(parked!.status, 'parked');
+  assert.equal(parked!.halt?.kind, 'run-preflight');
+  assert.match(parked!.halt?.reason ?? '', /work has 0% of its 5-hour window left/);
+  assert.equal(seen.length, 0, 'nothing spawned behind the refusal');
+  assert.equal(parked!.errand?.situation, 'resource-wall:usage');
+  assert.match(parked!.errand?.need ?? '', /pay as work/);
+  assert.match(parked!.errand?.how ?? '', /Settings ▸ Accounts/);
+  assert.deepEqual(parked!.errand?.tried, ['switch-account → spare: spare has 0% of its 5-hour window left.']);
+  const refused = ladderJournal(events, 'run.preflight-refused');
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0].wall, 'quota');
+  assert.equal(ladderJournal(events, 'run.errand').length, 1);
+  r.cleanup();
+});
+
+test('ACT-1: a stored run with accountId p, resumed with no account named, preflights p — the auth door and the quota door alike', async () => {
+  const r = repo();
+  const probed: (string | undefined)[] = [];
+  const asked: (string | undefined)[] = [];
+  const stored = newRun({ slug: 'demo', root: r.root, accountId: 'p' });
+  stored.status = 'paused';
+  saveRun(stored);
+  const { instance } = runner(r, workingSession(r), '`true`', undefined, {
+    checkAuth: async (accountId) => { probed.push(accountId); return { loggedIn: true, checkedAt: '' }; },
+    accountHeadroom: (accountId) => { asked.push(accountId); return { ok: true as const, accountId: accountId ?? 'default' }; },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', resumeRunId: stored.id });
+  await instance.wait();
+  assert.deepEqual(probed, ['p'], 'the login probed is the run\'s own account, never the machine login');
+  // Asked at the preflight AND at every boarding since phase 9 (the admission
+  // door, RCV-1) — always about the run's own account, never the machine login.
+  assert.ok(asked.length >= 1, 'the window is measured');
+  assert.deepEqual([...new Set(asked)], ['p'], 'and so is the window measured');
+  assert.equal(instance.current()!.accountId, 'p');
+  r.cleanup();
+});
+
+test('ACT-5: a live burst that switches A→B records a wall against A BEFORE the switch, and a second burst on B does not return the run to A', async () => {
+  const r = repo();
+  const held = streamingSession(r);
+  const clock = fakeClock();
+  const cooling = new Set<string>();
+  const left: { accountId: string; leaving: LeaveReason }[] = [];
+  const order: string[] = [];
+  const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
+    now: clock.now,
+    // The picker refuses an account the helper has marked — the facade's rule,
+    // stubbed: `leaveAccount` FIRST, `pickAccount` after.
+    pickAccount: (excluding) => {
+      order.push('pick');
+      return ['default', 'spare'].find((id) => id !== (excluding ?? 'default') && !cooling.has(id)) ?? null;
+    },
+    leaveAccount: (accountId, leaving) => {
+      order.push('leave');
+      cooling.add(accountId ?? 'default');
+      left.push({ accountId: accountId ?? 'default', leaving });
+      return leaveStub(accountId, leaving);
+    },
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
+  await held.inSession;
+  held.say({ kind: 'init', sessionId: 'sess-ab', model: 'stub-1', tools: 0 });
+  // The CLI names the window and its reset; the wall carries both.
+  const resets = Math.floor((clock.now().getTime() + 3_600_000) / 1000);
+  held.say({ kind: 'limits', status: 'allowed_warning', window: 'five_hour', utilization: 0.97, resetsAt: resets });
+  for (let i = 1; i <= 3; i++) { held.say(rateLimited(i)); clock.wind(20_000); }
+
+  const state = instance.current()!;
+  assert.equal(state.accountId, 'spare', 'moved to B');
+  assert.deepEqual(order, ['leave', 'pick'], 'the account is marked BEFORE the picker is asked');
+  assert.equal(left[0].accountId, 'default');
+  assert.equal(left[0].leaving.kind, 'usage');
+  assert.equal(left[0].leaving.by, 'live-wall');
+  assert.equal(left[0].leaving.bucket, 'five_hour', 'under the window\'s own name');
+  assert.equal(left[0].leaving.resetsAt?.getTime(), resets * 1000, 'with the reset the CLI reported');
+  const cooled = ladderJournal(events, 'run.account-cooling');
+  assert.equal(cooled.length, 1);
+  assert.equal(cooled[0].id, 'default');
+  assert.deepEqual(cooled[0].wall, { bucket: 'five_hour', resetsAt: new Date(resets * 1000).toISOString() });
+
+  held.release();
+  await instance.wait();
+  // A second burst on B, in the next attempt: A is cooling, so nothing to
+  // switch to — the picker answers null and the run does NOT ping-pong back.
+  assert.equal(cooling.has('default'), true);
+  const nextPick = ['default', 'spare'].find((id) => id !== 'spare' && !cooling.has(id)) ?? null;
+  assert.equal(nextPick, null, 'B → A is refused: A\'s wall is a fact the picker reads');
+  r.cleanup();
+});
+
+test('ACT-6: a rate-limit burst on a single-account console produces — inside the bound — a phase.errand, a limits announcement and a parked phase, not a third phase.live-wall {action: none}', async () => {
+  const r = repo();
+  const held = streamingSession(r, false);
+  const clock = fakeClock();
+  const escalated: { action: string; until: string | null }[] = [];
+  const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
+    now: clock.now,
+    pickAccount: () => null,   // nowhere to go
+    // A wall with NO reset anywhere: the helper cools the account for the
+    // fixed cool-down but the CLI reported no window, so the escalation parks.
+    leaveAccount: (accountId, leaving) => ({ ...leaveStub(accountId, leaving), until: undefined }),
+    onLiveWallEscalated: (_state, _phase, detail) => { escalated.push({ action: detail.action, until: detail.until }); },
+  });
+  const started = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
+  await held.inSession;
+  held.say({ kind: 'init', sessionId: 'sess-none', model: 'stub-1', tools: 0 });
+  // Three bursts, each past the ten-minute action cooldown of the last.
+  for (let burst = 0; burst < 3; burst++) {
+    for (let i = 1; i <= 3; i++) { held.say(rateLimited(i)); clock.wind(20_000); }
+    clock.wind(LIMIT_ACTION_COOLDOWN_MS + 1_000);
+  }
+  const walls = ladderJournal(events, 'phase.live-wall');
+  assert.deepEqual(walls.map((w) => w.action), ['none', 'none', 'park'], 'two nones, then the escalation — never a third none');
+  const record = instance.current()!.phases['1'];
+  assert.equal(record.status, 'parked');
+  assert.match(record.note ?? '', /Resource wall/);
+  assert.equal(ladderJournal(events, 'phase.errand').length, 1, 'the one ask');
+  assert.equal(ladderJournal(events, 'phase.errand')[0].situation, 'resource-wall:usage');
+  assert.deepEqual(escalated, [{ action: 'park', until: null }], 'announced under limits, through the service seam');
+  // The climb is in the ladder's words, so the card exists for it.
+  const situations = ladderJournal(events, 'phase.situation');
+  assert.equal(situations.at(-1)?.situation, 'resource-wall:usage');
+  assert.equal(situations.at(-1)?.by, 'drive');
+  const slot = instance.current()!.recoveries?.['1'];
+  assert.deepEqual(slot?.rungs?.map((rung) => rung.rung), ['switch-account']);
+  assert.equal(slot?.rungs?.[0].outcome, 'failed');
+
+  held.release();
+  await instance.wait();
+  const journal = readFileSync(journalFile(r.root, 'demo', started.id), 'utf8');
+  assert.equal((journal.match(/"action":"none"/g) ?? []).length, 2);
+  r.cleanup();
+});
+
+test('ACT-6: with a reset known, the third wall WAITS on the window — the phase parked on the clock, the wait-window rung recorded, the poke armed', async () => {
+  const r = repo();
+  const held = streamingSession(r, false);
+  const clock = fakeClock();
+  const escalated: { action: string; until: string | null }[] = [];
+  const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
+    now: clock.now,
+    pickAccount: () => null,
+    leaveAccount: (accountId, leaving) => leaveStub(accountId, leaving),
+    onLiveWallEscalated: (_state, _phase, detail) => { escalated.push({ action: detail.action, until: detail.until }); },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
+  await held.inSession;
+  held.say({ kind: 'init', sessionId: 'sess-wait', model: 'stub-1', tools: 0 });
+  const resets = Math.floor((clock.now().getTime() + 4 * 3_600_000) / 1000);
+  held.say({ kind: 'limits', status: 'allowed_warning', window: 'five_hour', utilization: 0.98, resetsAt: resets });
+  for (let burst = 0; burst < 3; burst++) {
+    for (let i = 1; i <= 3; i++) { held.say(rateLimited(i)); clock.wind(20_000); }
+    clock.wind(LIMIT_ACTION_COOLDOWN_MS + 1_000);
+  }
+  const until = new Date(resets * 1000).toISOString();
+  assert.deepEqual(ladderJournal(events, 'phase.live-wall').map((w) => w.action), ['none', 'none', 'wait']);
+  const state = instance.current()!;
+  const record = state.phases['1'];
+  assert.equal(record.status, 'waiting');
+  assert.equal(record.parkedUntil, until, 'parked on the window\'s own reset');
+  assert.match(record.note ?? '', /window resets/, 'the note the classifier reads as a usage wall');
+  assert.equal(state.waitUntil, until, 'the run clock is synced for the boot re-arm');
+  const rungs = ladderJournal(events, 'phase.rung');
+  assert.equal(rungs.at(-1)?.rung, 'wait-window');
+  assert.equal(rungs.at(-1)?.inline, true);
+  assert.deepEqual(escalated, [{ action: 'wait', until }]);
+  assert.equal(ladderJournal(events, 'phase.errand').length, 0, 'a wait that ends by itself asks nobody');
+  held.release();
+  await instance.stop();
+  r.cleanup();
+});
+
+test('ACT-7: a rate_limit_event at WALL_PCT counts as a wall hit whatever its status word — 0.99 allowed_warning ×3 moves the run', async () => {
+  const r = repo();
+  const held = streamingSession(r);
+  const clock = fakeClock();
+  const { instance, events } = runner(r, held.spawn, '`true`', undefined, {
+    now: clock.now, pickAccount: () => 'spare',
+    leaveAccount: (accountId, leaving) => leaveStub(accountId, leaving),
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch' });
+  await held.inSession;
+  held.say({ kind: 'init', sessionId: 'sess-99', model: 'stub-1', tools: 0 });
+  for (let i = 0; i < 3; i++) {
+    held.say({ kind: 'limits', status: 'allowed_warning', window: 'five_hour', utilization: 0.99, utilizationPct: 99 });
+    clock.wind(10_000);
+  }
+  assert.equal(instance.current()!.accountId, 'spare', 'the meter itself says the window is spent; the word `rejected` never arrives');
+  const wall = ladderJournal(events, 'phase.live-wall')[0];
+  assert.equal(wall.action, 'switch');
+  assert.match(String(wall.detail), /allowed_warning at 99 %/, 'the detail names the word AND the number, in percent');
+  held.release();
+  await instance.wait();
+  r.cleanup();
+});
+
+test('RCV-1 + SES-2: an org-policy refusal halts the RUN on credential-refused — one session, one run-level halt, the account retired, the errand quoting the sign-off, no second phase.start; a second start on the retired account spawns nothing', async () => {
+  const r = repo();
+  // Two more phases are READY beside phase 1 — the shape the audit measured:
+  // the old phase-level park handed the loop its next candidate into the same
+  // wall, ten boardings inside 157 s. `maxParallel: 1` queues them behind the
+  // first lane, so a second `phase.start` is exactly what the run-level halt
+  // must prevent.
+  r.setParallel(true);
+  const spawns: SpawnRequest[] = [];
+  const left: { accountId?: string; leaving: LeaveReason }[] = [];
+  const retiredIds = new Set<string>();
+  const signOff = 'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access';
+  const refusing: SpawnFn = async (request) => {
+    spawns.push(request);
+    return ok({
+      signal: { subtype: 'success', code: 0, text: 'API Error: 403 {"type":"error","error":{"type":"permission_error","message":"Organization has been disabled"}}' },
+      resultText: signOff,
+    });
+  };
+  const { instance, events } = runner(r, refusing, '`true`', undefined, {
+    accountEnv: async () => ({ CLAUDE_CONFIG_DIR: '/tmp/p' }),
+    checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
+    // The breaker, stubbed: a credential leave retires the id, and the quota
+    // door answers `retired` for it from then on (phase 8's contract).
+    accountHeadroom: (accountId) => retiredIds.has(accountId ?? 'default')
+      ? { ok: false as const, accountId: accountId ?? 'default', kind: 'retired' as const, reason: `${accountId} is retired: its organisation refused the credential` }
+      : { ok: true as const, accountId: accountId ?? 'default' },
+    leaveAccount: (accountId, leaving) => {
+      left.push({ ...(accountId ? { accountId } : {}), leaving });
+      if (leaving.kind === 'credential') retiredIds.add(accountId ?? 'default');
+      return leaveStub(accountId, leaving);
+    },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'p', maxParallel: 1 });
+  await instance.wait();
+  const state = instance.current()!;
+
+  // One session, one run-level halt — RUN-level, so the loop boards nothing.
+  assert.equal(spawns.length, 1, 'one session, one refusal');
+  assert.equal(journalled(events, 'phase.session').length, 1, 'one phase.session');
+  assert.equal(journalled(events, 'phase.start').length, 1, 'no second phase.start — the run stopped');
+  assert.equal(state.status, 'halted');
+  assert.equal(state.halt?.kind, 'credential-refused');
+  assert.equal(state.halt?.phase, 1);
+  assert.match(state.halt?.reason ?? '', /organization policy blocks this credential \(account: p\)/);
+  assert.equal(journalled(events, 'run.halt')[0]?.kind, 'credential-refused');
+  // The phase carries the cause — what the classifier reads before any prose.
+  assert.equal(state.phases['1'].status, 'parked');
+  assert.equal(state.phases['1'].cause?.kind, 'credential-refused');
+  assert.equal(state.phases['1'].cause?.class, 'org-policy');
+  assert.equal(state.phases['1'].cause?.account, 'p');
+  assert.match(state.phases['1'].note ?? '', /organization policy blocks this credential \(account: p\)/);
+  // The wall counts toward the streak (the branch used to return before it).
+  assert.equal(state.consecutiveFailures, 1);
+  // The account is retired through the one helper, class named, journalled.
+  assert.equal(left.length, 1);
+  assert.equal(left[0].accountId, 'p');
+  assert.equal(left[0].leaving.kind, 'credential');
+  assert.equal(left[0].leaving.class, 'org-policy');
+  assert.equal(left[0].leaving.by, 'classifier');
+  const retired = ladderJournal(events, 'run.account-retired');
+  assert.equal(retired.length, 1);
+  assert.equal(retired[0].id, 'p');
+  assert.equal(retired[0].class, 'org-policy');
+  assert.equal(retired[0].state, 'retired');
+  // ONE errand, the run's, quoting the session's own sign-off (RCV-7).
+  const errands = journalled(events, 'run.errand');
+  assert.equal(errands.length, 1);
+  assert.equal(errands[0].situation, 'resource-wall:auth');
+  assert.equal(errands[0].phase, 1);
+  assert.match(String(errands[0].need), /refused p's credential \(org-policy\)/);
+  assert.match(String(errands[0].said), /disabled Claude subscription access/);
+  assert.equal(state.errand?.situation, 'resource-wall:auth');
+  assert.equal(journalled(events, 'phase.errand').length, 0, 'one wall, one errand — not a phase-level twin');
+  // …and it was pushed: the errand rides the phase event `announceErrand` reads.
+  assert.ok(events.some((e) => e.event === 'run:phase' && (e.data.errand as { situation?: string } | undefined)?.situation === 'resource-wall:auth'));
+
+  // The same reason twice never spawns a third time: a resume on the retired
+  // account is refused at the quota door — parked `run-preflight` with the
+  // errand, no session (phase 8's door, asked again here).
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', resumeRunId: state.id });
+  await instance.wait();
+  const again = instance.current()!;
+  assert.equal(spawns.length, 1, 'no third spawn on the retired account');
+  assert.equal(again.status, 'parked');
+  assert.equal(again.halt?.kind, 'run-preflight');
+  const refusedAt = journalled(events, 'run.preflight-refused');
+  assert.equal(refusedAt.length, 1);
+  assert.equal(refusedAt[0].wall, 'quota');
+  r.cleanup();
+});
+
+test('RCV-1 (admission): a phase boarding under an account the breaker has retired since the run started is refused at the door — no spawn, the run halts credential-refused', async () => {
+  const r = repo();
+  r.setParallel(true);
+  const spawns: SpawnRequest[] = [];
+  let retired = false;
+  const { instance, events } = runner(r, async (request) => {
+    spawns.push(request);
+    // The first phase completes; by the time the loop admits the next one,
+    // ANOTHER run of this console (or another console) has retired the
+    // credential — the machine-wide breaker moved between boardings.
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    retired = true;
+    return ok();
+  }, '`true`', undefined, {
+    accountEnv: async () => ({ CLAUDE_CONFIG_DIR: '/tmp/p' }),
+    checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
+    accountHeadroom: (accountId) => retired
+      ? { ok: false as const, accountId: accountId ?? 'default', kind: 'retired' as const, reason: 'p is retired: its organisation refused the credential' }
+      : { ok: true as const, accountId: accountId ?? 'default' },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'p', maxParallel: 1 });
+  await instance.wait();
+  const state = instance.current()!;
+  assert.equal(spawns.length, 1, 'the second phase never spawned');
+  assert.equal(state.status, 'halted');
+  assert.equal(state.halt?.kind, 'credential-refused');
+  const refused = journalled(events, 'run.admission-refused');
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0].reason, 'account-retired');
+  assert.equal(refused[0].account, 'p');
+  assert.equal(refused[0].phase, 2);
+  assert.equal(state.phases['2']?.status, 'parked');
+  assert.equal(state.phases['2']?.cause?.kind, 'credential-refused', 'the cause is on the record, as the classifier\'s arm stamps it');
+  assert.equal(state.phases['2']?.cause?.class, undefined, 'the breaker names no class');
+  assert.equal(journalled(events, 'phase.start').length, 1, 'phase 2 wrote no phase.start');
+  r.cleanup();
+});
+
+test('RCV-1 (the wall clears): a Continue whose preflight passes re-boards the phase the credential wall parked, and the cause goes with it', async () => {
+  const r = repo();
+  const spawns: SpawnRequest[] = [];
+  let refuse = true;
+  const { instance, events } = runner(r, async (request) => {
+    spawns.push(request);
+    if (refuse) {
+      return ok({ signal: { subtype: 'success', code: 0, text: 'Please run /login' }, resultText: 'Login expired · Please run /login' });
+    }
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    return ok();
+  }, '`true`', undefined, {
+    accountEnv: async () => ({ CLAUDE_CONFIG_DIR: '/tmp/p' }),
+    checkAuth: async () => ({ loggedIn: true, checkedAt: '' }),
+    accountHeadroom: (accountId) => ({ ok: true as const, accountId: accountId ?? 'default' }),
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'p' });
+  await instance.wait();
+  const halted = instance.current()!;
+  assert.equal(halted.halt?.kind, 'credential-refused');
+  assert.equal(halted.phases['1'].status, 'parked');
+  assert.equal(halted.phases['1'].cause?.class, 'auth');
+
+  // A person signed the account in and pressed Continue: the preflight passes,
+  // and the parked phase — SETTLED to the loop — is re-boarded rather than
+  // left as "outstanding".
+  refuse = false;
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', resumeRunId: halted.id });
+  await instance.wait();
+  const done = instance.current()!;
+  assert.ok(spawns.length >= 2, 'the phase boarded again');
+  assert.match(spawns[1].prompt, /BOOT phase 1\b/, 'phase 1 first — the one the wall parked');
+  assert.equal(done.phases['1'].status, 'done');
+  assert.equal(done.status, 'finished', 'and the linear plan ran on to the end');
+  assert.equal(done.phases['1'].cause, undefined, 'the cause is no longer true');
+  const reboarded = journalled(events, 'phase.retry-requested').filter((e) => e.by === 'console');
+  assert.equal(reboarded.length, 1);
+  assert.match(String(reboarded[0].reason), /no longer refuses/);
+  r.cleanup();
+});
+
+test('ACT-3: isSpending answers true for the run\'s account only while a child is live — the poller\'s active probe', async () => {
+  const r = repo();
+  const held = streamingSession(r);
+  const { instance } = runner(r, held.spawn, '`true`', undefined, {
+    accountEnv: async () => ({ CLAUDE_CONFIG_DIR: '/tmp/p' }),
+  });
+  assert.equal(instance.isSpending('p'), false, 'nothing is driving');
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'p' });
+  await held.inSession;
+  // The stub spawn reports no pid; a lane with a child is what the probe reads.
+  const lanes = (instance as unknown as { lanes: Map<number, { pid?: number | null }> }).lanes;
+  for (const lane of lanes.values()) lane.pid = process.pid;
+  assert.equal(instance.isSpending('p'), true, 'a live child on p is p being spent');
+  assert.equal(instance.isSpending('default'), false, 'and only p');
+  held.release();
+  await instance.wait();
+  assert.equal(instance.isSpending('p'), false, 'settled: nothing spends');
+  r.cleanup();
+});
+
+test('ACT-12: a token account\'s run attaches only the stdio servers the plan declares — the rest are dropped and run.token-scope says so', async () => {
+  const r = repo();
+  const configured: string[][] = [];
+  const { instance, events } = runner(r, workingSession(r), '`true`', undefined, {
+    accountEnv: async () => ({ CLAUDE_CODE_OAUTH_TOKEN: 'tok' }),
+    accountKind: (accountId) => (accountId === 'tok' ? 'token' : 'default'),
+    planMcp: () => ['plan-stdio'],
+    mcp: {
+      preflight: async (ids) => { return { ok: true, blocking: [], unknown: [], disabled: [], probes: 0, ids } as never; },
+      configFor: async (_runId, _phase, ids) => { configured.push([...ids]); return null; },
+      transportOf: (id) => (id === 'remote-http' ? 'http' : 'stdio'),
+    },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', accountId: 'tok', mcpServers: ['run-stdio', 'remote-http'] });
+  await instance.wait();
+  const scoped = ladderJournal(events, 'run.token-scope');
+  assert.ok(scoped.length >= 1);
+  assert.deepEqual(scoped[0].kept, ['plan-stdio', 'remote-http'], 'the plan\'s stdio server and the remote one stay');
+  assert.deepEqual(scoped[0].dropped, ['run-stdio'], 'the run\'s own stdio pick is dropped — it would inherit the token');
+  assert.equal(scoped[0].reach, 'child-tree');
+  assert.deepEqual(configured[0], ['plan-stdio', 'remote-http'], 'and that is the set the --mcp-config carries');
+  r.cleanup();
+});
+
+/* ------------------------------------------------------------------ *
+ * zero-touch-console phase 10: the one exhaustion predicate, and no rung left running
+ * ------------------------------------------------------------------ */
+
+test('LFC-2: a table this loop cannot drive is EXHAUSTED when the healer cannot drive it either — one errand naming the rungs and why, never a deferral', async () => {
+  // The audit's specimen: a session declares itself blocked on the outside
+  // world with no watch ref. `blocked-declared:external`'s two rungs are the
+  // healer's (a park on the clock), not the loop's, and the loop used to
+  // compute exhaustion from the unfiltered table — `false` — and write
+  // `phase.ladder-deferred` for a table nothing would ever climb (28 records,
+  // 0 errands). With no healer answering, the loop is exhausted and asks.
+  const r = repo();
+  try {
+    const blocked: SpawnFn = async (request) => {
+      fileOutcome(request, { phase: 1, status: 'blocked', needs: 'external', reason: 'the deploy window opens tonight' });
+      return ok({ sessionId: 'sess-ext', resultText: 'declared blocked on the deploy window' });
+    };
+    const { instance, events } = runner(r, blocked, '`true`', undefined, {
+      rungUnavailable: () => 'No rung of blocked-declared:external\'s ladder can be driven here — **Park and poll the refs** (poll-park, console): the session named no machine-checkable watch ref; **Park for a while** (timed-park, console): the run is not to hand.',
+    });
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autonomy: 'keep-going', autoRecover: true });
+    await instance.wait();
+    const state = instance.current()!;
+    const record = state.phases['1'];
+    assert.equal(record.status, 'parked');
+    assert.equal(journalled(events, 'phase.ladder-deferred').length, 0, 'an undrivable table escalates, never defers');
+    const errand = journalled(events, 'phase.errand')[0];
+    assert.ok(errand, 'one errand');
+    assert.equal(errand.situation, 'blocked-declared:external');
+    assert.match(String(errand.reason), /no rung for blocked-declared:external is available on this console yet/);
+    assert.match(String(errand.how), /\*\*Park and poll the refs\*\* \(poll-park, console\): the session named no machine-checkable watch ref/);
+    assert.equal(state.recoveries?.['1']?.errand?.situation, 'blocked-declared:external');
+  } finally { r.cleanup(); }
+
+  // …and when the HEALER can drive a rung the loop cannot, the loop defers to
+  // it — `phase.ladder-deferred` naming what remains and what comes next.
+  const r2 = repo();
+  try {
+    const blocked: SpawnFn = async (request) => {
+      fileOutcome(request, { phase: 1, status: 'blocked', needs: 'external', reason: 'the deploy window opens tonight' });
+      return ok({ sessionId: 'sess-ext', resultText: 'declared blocked on the deploy window' });
+    };
+    const { instance, events } = runner(r2, blocked, '`true`', undefined, {
+      rungDrivable: (_slug: string, rung: { vehicle: string }) => rung.vehicle === 'timed-park',
+    });
+    await instance.start({ slug: 'demo', root: r2.root, onlyPhases: [1], autonomy: 'keep-going', autoRecover: true });
+    await instance.wait();
+    const deferred = journalled(events, 'phase.ladder-deferred')[0];
+    assert.ok(deferred, 'deferred to the healer');
+    assert.equal(deferred.situation, 'blocked-declared:external');
+    assert.equal(deferred.next, 'timed-park', 'the rung the healer will climb');
+    assert.deepEqual(deferred.remaining, ['poll-park', 'timed-park']);
+    assert.equal(journalled(events, 'phase.errand').length, 0, 'no errand while a driver remains');
+  } finally { r2.cleanup(); }
+});
+
+test('RCV-6: a rung the attempt left open is settled at the lane\'s end — situation and cost on the line — so the next attempt never books onto it', async () => {
+  const r = repo();
+  try {
+    let calls = 0;
+    const spawn: SpawnFn = async () => {
+      calls++;
+      // Attempt 1 exits clean with no handoff and no declaration — the loop
+      // reads `done-unrecorded` and climbs `closeout-own-session` (a rung);
+      // the closeout session writes the handoff. Neither declares an outcome,
+      // so nothing but the lane-end backstop can settle the rung.
+      if (calls === 1) return ok({ costUsd: 3, resultText: 'nothing happened' });
+      r.markDone(1);
+      return ok({ costUsd: 7 });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autonomy: 'keep-going', autoRecover: true });
+    await instance.wait();
+    const state = instance.current()!;
+    assert.equal(state.phases['1'].status, 'done');
+    const rungs = state.recoveries?.['1']?.rungs ?? [];
+    assert.equal(rungs.length, 1, `one rung climbed: ${JSON.stringify(rungs)}`);
+    assert.equal(rungs[0].rung, 'closeout-own-session');
+    assert.notEqual(rungs[0].outcome, 'running', 'no rung stays running past its attempt');
+    assert.equal(rungs[0].outcome, 'fixed');
+    assert.equal(rungs[0].costUsd, 7, 'the rung is charged its OWN attempt, not the first one\'s');
+    const settled = journalled(events, 'phase.rung-settled');
+    assert.equal(settled.length, 1);
+    assert.deepEqual(
+      { rung: settled[0].rung, outcome: settled[0].outcome, situation: settled[0].situation, costUsd: settled[0].costUsd, by: settled[0].by },
+      { rung: 'closeout-own-session', outcome: 'fixed', situation: 'done-unrecorded', costUsd: 7, by: 'attempt-end' },
+    );
+  } finally { r.cleanup(); }
 });

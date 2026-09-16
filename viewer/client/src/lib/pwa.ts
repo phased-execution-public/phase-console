@@ -35,6 +35,7 @@
 
 import { useEffect, useSyncExternalStore } from 'react';
 import { dismissToast, toast } from '@/components/ui';
+import { MOUNTED } from './base';
 
 /**
  * ⚠️ Both halves of this pair are a contract with every device already
@@ -57,6 +58,10 @@ let pending: Promise<ServiceWorkerRegistration | null> | null = null;
 export function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
   pending ??= (async () => {
     if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+    // Under a mount (`lib/base.ts`) the root belongs to the proxy's own worker —
+    // the one its subscription is bound to — and a console page registering
+    // `/sw.js` there would take it. No worker at all is the honest answer.
+    if (MOUNTED) return null;
     // There is no worker in dev: it is emitted by the build, and the dev server
     // deliberately does not proxy `/sw.js` to the console — registering the
     // production worker against :5173 would precache asset URLs that only exist

@@ -78,11 +78,94 @@ ledger_file() { # <slug>
   assert_contains "$(cat "$PE_OUTCOME_FILE")" '"watch": ["a", "b", "c d"],'
 }
 
+@test "outcome: a --watch ref no scheme can poll is warned about at write time, and still recorded (WAI-11)" {
+  run pe_outcome demo 8 waiting-external --reason "soak" --watch "gh:acme/app#run/42" \
+    --watch "config/fleet-pin.yaml:app-prod" --watch "date:soon" --wait-minutes 30
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'warning: --watch "config/fleet-pin.yaml:app-prod" will never be checked: no watch scheme'
+  assert_contains "$output" 'warning: --watch "date:soon" will never be checked: not an ISO8601 instant'
+  [[ "$output" != *'warning: --watch "gh:acme/app#run/42"'* ]]
+  grep -q '"watch": \["gh:acme/app#run/42", "config/fleet-pin.yaml:app-prod", "date:soon"\]' "$PE_OUTCOME_FILE"
+}
+
 @test "outcome: reason newlines and quotes are sanitised for JSON" {
   reason="$(printf 'line one\nline "two"')"
-  run pe_outcome demo 8 blocked --reason "$reason"
+  run pe_outcome demo 8 blocked --needs credential --reason "$reason"
   [ "$status" -eq 0 ]
   assert_contains "$(cat "$PE_OUTCOME_FILE")" '"reason": "line one line \"two\"",'
+}
+
+# --needs (zero-touch-console P3, chapter 10 ZTD-3): the decision key a blocked
+# or needs-human declaration is missing — required there, refused elsewhere,
+# validated against scripts/decisions.env, and carried on the wire as "needs"
+# so the runner reads it BEFORE the prose.
+@test "outcome: blocked without --needs exits 2 and writes nothing" {
+  run pe_outcome demo 8 blocked --reason "the deploy needs the SSH key"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "--needs <key> is required on blocked"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  run pe_outcome demo 8 needs-human --reason "a person must sign"
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: --needs credential rides the JSON as needs, with the optional rule and command" {
+  run pe_outcome demo 8 blocked --needs credential --reason "no SSH key" --rule 'Bash(ssh *)' --command "ssh deploy@box"
+  [ "$status" -eq 0 ]
+  expected='{
+  "version": 1,
+  "slug": "demo",
+  "phase": 8,
+  "status": "blocked",
+  "reason": "no SSH key",
+  "needs": "credential",
+  "rule": "Bash(ssh *)",
+  "command": "ssh deploy@box",
+  "watch": [],
+  "written_at": "2026-08-10T21:10:03Z"
+}'
+  [ "$(cat "$PE_OUTCOME_FILE")" = "$expected" ]
+}
+
+@test "outcome: --needs takes a decision key or a blocker class; anything else is exit 2" {
+  for word in credentials permission.policy gates waits lock permission gate external; do
+    run pe_outcome demo 8 blocked --needs "$word" --reason x
+    [ "$status" -eq 0 ] || { echo "$word refused: $output"; return 1; }
+    grep -q "\"needs\": \"$word\"" "$PE_OUTCOME_FILE"
+    rm -f "$PE_OUTCOME_FILE"
+  done
+  run pe_outcome demo 8 blocked --needs unknown --reason x
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "unknown --needs word: unknown"
+  run pe_outcome demo 8 blocked --needs Credential --reason x
+  [ "$status" -eq 2 ]
+}
+
+@test "outcome: --needs/--rule/--command are refused on a status that does not ask, and on a ruling" {
+  run pe_outcome demo 8 complete --needs gates
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "only make sense with blocked or needs-human"
+  run pe_outcome demo 8 waiting-external --rule "x" --until 2026-08-10T21:40:00Z
+  [ "$status" -eq 2 ]
+  # A ruling takes a decision KEY (stamped as decisionKey) — never a blocker
+  # short form, and never --rule/--command.
+  run pe_outcome demo 8 ruling --what "chose A" --needs gates
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_RULINGS_FILE")" '"decisionKey":"gates"'
+  run pe_outcome demo 8 ruling --what "chose A" --needs lock
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "unknown --needs key on a ruling: lock"
+  run pe_outcome demo 8 ruling --what "chose A" --rule "Bash(git push:*)"
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: the --needs vocabulary is the one scripts/decisions.env carries" {
+  # shellcheck source=/dev/null
+  . "$PE_SCRIPTS/decisions.env"
+  [ "$(printf '%s' "$DECISION_KEYS" | wc -w | tr -d ' ')" = "17" ]
+  run pe_outcome demo 8 blocked --needs "${DECISION_KEYS##* }" --reason x
+  [ "$status" -eq 0 ]
 }
 
 @test "outcome: without PE_OUTCOME_FILE the JSON goes to the console's inbox for this root AND to stdout, exit stays 0" {
@@ -123,7 +206,7 @@ ledger_file() { # <slug>
 @test "outcome: an unwritable state home still prints the JSON and exits 0" {
   unset PE_OUTCOME_FILE
   export XDG_STATE_HOME="/dev/null/nowhere"
-  run pe_outcome demo 8 blocked --reason "x"
+  run pe_outcome demo 8 blocked --needs credential --reason "x"
   [ "$status" -eq 0 ]
   assert_contains "$output" '"status": "blocked",'
   assert_contains "$output" 'could not be'
@@ -166,12 +249,12 @@ ledger_file() { # <slug>
   # clock — the one fact that could have moved the phase without anybody — was
   # discarded at the parser. The ask still stands; the clock only decides when
   # the console next brings the phase up.
-  run pe_outcome demo 8 needs-human --reason "a person must sign the release" --until 2026-09-01T09:00:00Z
+  run pe_outcome demo 8 needs-human --needs human-acts --reason "a person must sign the release" --until 2026-09-01T09:00:00Z
   [ "$status" -eq 0 ]
   grep -q '"resume_after": "2026-09-01T09:00:00Z"' "$PE_OUTCOME_FILE"
   grep -q '"status": "needs-human"' "$PE_OUTCOME_FILE"
 
-  run pe_outcome demo 8 blocked --reason "waiting on the lock" --wait-minutes 90
+  run pe_outcome demo 8 blocked --needs lock --reason "waiting on the lock" --wait-minutes 90
   [ "$status" -eq 0 ]
   grep -q '"resume_after": "20[0-9][0-9]-' "$PE_OUTCOME_FILE"
 }
@@ -279,7 +362,9 @@ ledger_file() { # <slug>
     --why "a reader predating it still exists" --cost-if-wrong "one dead branch"
   [ "$status" -eq 0 ]
   assert_contains "$output" "ruling recorded: demo phase 5 (deviation)"
-  expected='{"version":1,"type":"ruling","slug":"demo","phase":5,"kind":"deviation","what":"kept the old field","why":"a reader predating it still exists","cost_if_wrong":"one dead branch","at":"2026-08-10T21:10:03Z"}'
+  # The id is sha256("<slug> <phase> <at> <what>") cut to 12 — the digest
+  # viewer/server/runner/rulings.ts derives, stamped so acks and promote name it.
+  expected='{"version":1,"type":"ruling","id":"87b9eff77673","slug":"demo","phase":5,"kind":"deviation","what":"kept the old field","why":"a reader predating it still exists","cost_if_wrong":"one dead branch","at":"2026-08-10T21:10:03Z"}'
   [ "$(cat "$PE_RULINGS_FILE")" = "$expected" ]
 
   PE_NOW="2026-08-10T22:00:00Z" run pe_outcome demo 6 ruling --what "left the sub-case to phase 9"
@@ -287,7 +372,7 @@ ledger_file() { # <slug>
   # Appended, not replaced: two lines, the first untouched.
   [ "$(wc -l < "$PE_RULINGS_FILE" | tr -d ' ')" = "2" ]
   [ "$(head -1 "$PE_RULINGS_FILE")" = "$expected" ]
-  second='{"version":1,"type":"ruling","slug":"demo","phase":6,"kind":"ambiguity","what":"left the sub-case to phase 9","at":"2026-08-10T22:00:00Z"}'
+  second='{"version":1,"type":"ruling","id":"7edead64f86b","slug":"demo","phase":6,"kind":"ambiguity","what":"left the sub-case to phase 9","at":"2026-08-10T22:00:00Z"}'
   [ "$(tail -1 "$PE_RULINGS_FILE")" = "$second" ]
 }
 
@@ -360,6 +445,52 @@ ledger_file() { # <slug>
   assert_contains "$output" 'could not be written'
 }
 
+# ---- rulings: --remember, the feedback loop (chapter 10 ZTD-7) ---------------
+
+@test "ruling --remember plan: writes the ## Decisions row (source ruling) and acks the ruling with --by" {
+  setup_docs decisions decisions
+  # setup_docs scrubs the PE_* environment, the ledger path included.
+  export PE_RULINGS_FILE="$BATS_TEST_TMPDIR/rulings.ndjson" PE_NOW="2026-08-10T21:10:03Z" PE_TODAY=2026-09-14
+  run pe_outcome decisions 2 ruling --what "the window is the cap" --why "the plan says so" \
+    --needs waits --remember plan --by op
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "remembered for plan decisions: waits"
+  id="$(sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p' "$PE_RULINGS_FILE" | head -1)"
+  [ "${#id}" -eq 12 ]
+  # The twin row: value = --what, source ruling, evidence the id, plan-wide.
+  grep -q "| \`waits\` | the window is the cap | op | answered | yes | ruling | ruling $id | — |" \
+    "$DOCS_ROOT/docs/handoffs/decisions/decisions.md"
+  # The ledger: the ruling line, then ONE ack naming it and its author.
+  [ "$(wc -l < "$PE_RULINGS_FILE" | tr -d ' ')" = "2" ]
+  [ "$(tail -1 "$PE_RULINGS_FILE")" = "{\"version\":1,\"type\":\"ack\",\"id\":\"$id\",\"at\":\"2026-08-10T21:10:03Z\",\"by\":\"op\"}" ]
+  # And the engine reads the promoted row back.
+  run pg decisions --decisions
+  assert_contains "$output" "$(printf 'waits\tanswered\top\tyes\truling\tthe window is the cap')"
+}
+
+@test "ruling --remember: needs a key, plan|global only, refused on an outcome status" {
+  run pe_outcome demo 5 ruling --what x --remember plan
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "--remember plan needs --needs <key>"
+  run pe_outcome demo 5 ruling --what x --needs gates --remember always
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "invalid --remember: always"
+  run pe_outcome demo 5 complete --remember plan
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "only make sense with ruling"
+  [ ! -f "$PE_RULINGS_FILE" ]
+}
+
+@test "ruling --remember global: with no console answering, the ruling is still recorded and the exit names the fallback" {
+  PHASE_CONSOLE_URL="http://127.0.0.1:1" run pe_outcome demo 5 ruling --what waive --needs qa.exhausted --remember global
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "no console answers at http://127.0.0.1:1"
+  assert_contains "$output" "Settings"
+  # Recorded first — the request failing is not the ruling failing.
+  assert_contains "$(cat "$PE_RULINGS_FILE")" '"decisionKey":"qa.exhausted"'
+  [ "$(wc -l < "$PE_RULINGS_FILE" | tr -d ' ')" = "1" ]
+}
+
 # --- engine-3 / engine-16: the two ways a declaration used to disappear -------
 
 @test "outcome: a zero-padded phase writes a phase the runner can parse" {
@@ -393,7 +524,7 @@ ledger_file() { # <slug>
   # session died with exit 1 and nothing on either stream — the one failure mode
   # a channel built to replace prose must not have.
   run env PE_OUTCOME_FILE="/proc/nonexistent-root/x/outcome.json" \
-    "$SYS_BASH" "$PE_SCRIPTS/phase-outcome.sh" myslug 3 blocked --reason "lock held"
+    "$SYS_BASH" "$PE_SCRIPTS/phase-outcome.sh" myslug 3 blocked --needs lock --reason "lock held"
   [ "$status" -eq 0 ]
   assert_contains "$output" '"status": "blocked"'
   assert_contains "$output" "could not be written"

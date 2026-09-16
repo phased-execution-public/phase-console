@@ -1,6 +1,6 @@
 # Plan format
 
-Contents: Frontmatter · Sections in order (Title · Context · Architecture · Session budget ·
+Contents: Frontmatter · Sections in order (Title · Context · Architecture · Session budget · Decisions ·
 Phase graph · Phases · End-to-end verification) · Notes
 
 A plan is the durable blueprint for a multi-phase task. It lives at `docs/plans/<slug>.md`, is committed,
@@ -155,6 +155,32 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    `references/conventions.md` §Branches for the branch policy. (The console may override the
    `**Branch:**` line per run with its own work branch — its sessions are told about the mismatch
    and record it in their handoffs; the line here stays authoritative for hand-driven sessions.)
+   **The lines the decision manifest resolves from** (§Decisions below) live here too, each
+   optional, each written plain like the MCP servers line, and each read by the engine or the
+   console rather than by a person: **`Credentials:`** — backticked credential ids EVERY phase needs
+   (`` **Credentials:** `gh`, `npm-token` ``), probed by the console's registry of named credential
+   probes before a phase boards, never a value; `phase-graph.sh <slug> --credentials [N]` prints the
+   plan line unioned with a phase's own `- **Credentials:**` bullet. **`Credential policy:`** —
+   `require` (a phase naming a credential the console does not hold is refused at boarding) or
+   `continue` (it runs, and the gap is reported); silence lets the run's setting decide, and a phase's
+   `- **Credential policy:**` bullet overrides, exactly as MCP policy does
+   (`--credential-policy [N]`). **`Accounts:`** — which Claude accounts a run may spend, in order,
+   as backticked `id:minHeadroom` pairs (`` **Accounts:** `default:20`, `work:10` ``), the minimum
+   five-hour headroom a percent (`--accounts` prints `id<TAB>min` per line). A credential or account
+   the console has not registered is advisory (**F15**), like an unregistered MCP server.
+   **`QA exhausted:`** `waive|halt|<owner>` (once the QA round budget is spent — `qa.exhausted`,
+   `--qa-exhausted`) and **`Wait budget:`** (`48h`, `2d`, `90 min` — the TOTAL wall-clock one phase
+   may spend parked across its declared waits, `waits`; the console's default is 8 h) are the
+   console's to read at run start. The wizard also describes **`Permissions:`** (`permission.policy`),
+   **`May publish:`** (`permission.destructive`) and **`When in doubt:`** (`ambiguity`) lines, but no
+   engine or console code reads them — only the `## Decisions` row answers those keys, so write the
+   row. Per phase, `- **Waits on:** <ref>[, <ref>…] · <max>`,
+   `- **Human step:** <who, what, proof ref>` and `- **Person-check:** allow|halt|<owner>` refine
+   the `waits`, `human-acts` and `verification.person-check` rows for that phase alone. `Waits on:`
+   names what the phase waits on and, after the `·`, overrides the budget for that phase; a `date:` ref
+   there countersigns a wait up to that instant. The console never shortens a declared window: one past
+   what is left halts `waiting-external-timeout` with the arithmetic, which names these two lines as
+   the way to allow it (`phase-graph.sh <slug> --wait-budget N` / `--waits-on N` print what it reads).
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
    (`claude-opus-5`), or either carrying the `[1m]` window suffix (`opus[1m]`, `claude-opus-5[1m]`) — all
    parse the same. The suffix, not the alias, is what claims the ~200K budget (`references/sizing.md`;
@@ -163,7 +189,72 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    > **Target model:** `claude-opus-5` (1M window) · **Budget:** ~200K weight/session (≈60% of the window) · **Branch:** current branch (no new branch).
    > **Skills (every session):** `design-system`, `some-plugin:test-first`
    > Hard-reasoning phases → Opus/Fable; mechanical phases → Haiku if run in their own sessions.
-5. **`## Phase graph`** — a table that makes blocking vs parallel obvious. **This table is machine-read:**
+5. **`## Decisions`** — the **decision manifest**: every decision a run can need, answered BEFORE the
+   run starts, so nothing has to ask a person mid-run (the sep-review audit measured 494 mid-run asks
+   and found every one had an answer before the money was spent). **Machine-read by both engines** —
+   `scripts/phase-graph.sh <slug> --decisions [N]` and the console — one row per key of a closed
+   vocabulary owned once (`viewer/shared/decisions-model.js`; `scripts/decisions.env` is its bash
+   twin), in this shape:
+
+   | key | value | owner | state | blocking | source | evidence |
+   |---|---|---|---|---|---|---|
+   | `credentials` | `gh` and the machine `claude` login | operator | answered | yes | plan | errand E7 |
+   | `waits` | | dev-lead | outstanding | yes | plan | to be bounded before phase 6 |
+   | `qa.exhausted` | QA is off on this plan | operator | waived | no | plan | decision 4 |
+
+   Columns are located **by name**, never by position (like the Phase graph's); `key`, `owner`,
+   `state`, `blocking` and `source` are read with bold and backticks stripped, `value` and `evidence`
+   as written. **The seventeen keys:** `permission.policy` (this plan's ask/deny/allow overlay,
+   `autoApprove`) · `permission.destructive` (publishing and destructive verbs — `deny`, with named
+   exceptions: a clause beginning `allow` naming backticked rules, the only thing that lets
+   auto-grant answer `git push` / `gh pr create`) · `credentials` (backticked ids + the credential policy) · `accounts` (accounts in
+   order, minimum headroom each, `onLimit`) · `mcp` (the servers and the MCP policy) · `gates`
+   (`Gate-check` on every gated heading; `delegated` or `operator`) · `verification.person-check`
+   (allow, halt or an owner when a §Verification fragment is prose) · `qa.exhausted` (waive, halt or
+   an owner once the round budget is spent) · `waits` (each expected wait: what, whose clock, the
+   `--watch` ref, the maximum) · `human-acts` (steps denied to an agent, each with the ref that
+   proves it landed) · `ambiguity` (ruling, ask or halt when the plan did not decide; it also answers a question a
+   session asks mid-run while no relay is armed) · `budgets`
+   (run, phase and turn ceilings) · `resume.on-restart` (continue, hold or ask — the RUN's answer) ·
+   `plan-health` (whether the advisory lints gate this plan) · `stop` (`autonomy`, who is told on a
+   halt) · `relay` (`off` or `last-resort` — whether a question a session asks mid-run is put in front
+   of a person for 60 s and then answered by rule; it arms only on a CLI at or above
+   `RELAY_CLI_FLOOR`, 2.1.268, and below it, or under `off`, the `ambiguity` row answers) · `announce` (which
+   categories push, to whom). **`state`** is `answered`, `outstanding` (somebody still owes it —
+   `owner` says who; an outstanding row with NO owner fails `validate.sh`, **F25**
+   `decision-outstanding-unowned`, as do a key outside the vocabulary, `decision-key-unknown`, a state
+   outside those three, `decision-state-unknown`, and a `source` outside the four below,
+   `decision-source-unknown`) or `waived` (deliberately left open, the
+   reason as its value). **`blocking: yes`** means a run must not start while the row is
+   `outstanding` — the console's start door refuses it. **`source`** is `plan` (this table), `run`
+   (answered at run time), `default` (the shipped policy answered it) or `ruling` (promoted from a
+   session's ruling). Mode 1 elicits the rows one question at a time; the template carries the
+   skeleton with the shipped defaults (`gates: delegated` · `qa.exhausted: waive` ·
+   `resume.on-restart: continue` · `ambiguity: ruling`) already `answered`. Those four are the
+   operator's; the console's policy table (`POLICY_DEFAULTS`, `viewer/shared/policy-model.js`) ships
+   five more for a key neither the plan nor this console's own `policy.<key>` answers —
+   `verification.person-check: operator` · `credentials: continue` · `mcp: continue` · `relay: off` ·
+   `waits: window` — and a row the start door synthesises from one of them reads `source: default`.
+   (For `resume.on-restart`, `relay` and `accounts` the RUN's own answer from the launch form outranks
+   all of these.)
+
+   **Answers that arrive later never edit this table.** They go to the mutable twin
+   `docs/handoffs/<slug>/decisions.md`, written only by `scripts/decisions.sh <slug> [--phase N]
+   answer <key> --value … | waive <key> --reason … | promote --from-ruling <id> --key <key> | list`
+   in exactly the shape the readers parse (the `qa-mode.sh` rule). `--decisions` merges the twin OVER
+   the plan's rows — a twin row replaces the plan's whole row for its key, and a row written with
+   `--phase N` replaces both, for that phase — and prints one
+   `key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value` line per row that exists, in
+   vocabulary order (a plan with no manifest prints nothing and lints clean). The boot prompt hands
+   every phase its rows, `outstanding` first, together with the one duty the manifest puts on a
+   session: a block is declared **by key** — `phase-outcome.sh <slug> <N> blocked --needs <key>` —
+   never asked in prose (`references/conventions.md` §Rulings). The other direction exists too: a
+   ruling that names its key (`… ruling --needs <key> --remember plan`) becomes a twin row with
+   `source: ruling` the moment it is recorded, and the console's inbox offers the same for any
+   keyed ruling — which is how what one plan's sessions decided seeds the next plan's manifest
+   (the console's plan wizard opens by reading these ledgers).
+
+6. **`## Phase graph`** — a table that makes blocking vs parallel obvious. **This table is machine-read:**
    `scripts/phase-graph.sh` parses the `Depends on` column to compute live readiness, so keep it exact.
 
    | Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
@@ -207,8 +298,12 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      | `plan <slug>:<phases>` | auto | those phases of ANOTHER plan reaching done |
      | `cmd <read-only command>` | auto | the command exiting 0 (executed only under `PHASE_EXEC_GATES=1` — the autopilot sets it; page views never do, and answer `unevaluated:` instead) |
 
-     A `*(GATED)*` heading with **no** Gate-check reads as **human** (the safe default) — the console
-     nudges you to categorize it. `scripts/phase-graph.sh <slug> --gate-status N` evaluates any of them
+     **The directive is required.** A `*(GATED)*` heading with **no** Gate-check reads as **ai** (the
+     default `scripts/gates.env` names — `GATE_DEFAULT`; it read as human until 5.0.0, and the
+     sep-review audit found 15 of 143 gated headings demanding a person by that accident alone) —
+     and `validate.sh` **fails** it (**F24** `gate-directive-missing`), as it fails a directive whose
+     type is not on the list (`gate-type-unknown`): the default answers the board, the lint makes the
+     author say it. `scripts/phase-graph.sh <slug> --gate-status N` evaluates any of them
      (exit 0 = clear; 1 = every other verdict, and the WORD says which: `blocked:` not met yet,
      `manual:` a person must act, `ai:` a session must verify and record, `OVERDUE:` a deadline passed,
      `unevaluated:` a `cmd` gate this caller did not run — the one that means nobody has to do anything,
@@ -225,7 +320,7 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      budget (GATED phases and QA boundaries always cut), and the board prints `SUGGESTED BATCHES:`.
      Absent any `Size:` tags every phase is treated as `M`. See `references/sizing.md`.
 
-6. **`## Phases`** — one subsection per phase, each self-contained:
+7. **`## Phases`** — one subsection per phase, each self-contained:
 
    ```
    ### Phase N — <title>
@@ -302,9 +397,12 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
        - `pytest tests/unit -q`
      ~~~
 
-     `validate.sh` warns (F14) on any open phase whose §Verification would extract nothing runnable
-     — heed it at plan time; at run time the same defect parks the phase at boarding (and, under
-     keep-going autonomy, dispatches a plan-repair agent to author the bullet from the exit criteria).
+     `validate.sh` **fails** (**F14** `verification-empty-open`) on any open, not-done phase whose
+     §Verification would extract nothing runnable — a gate since 5.0.0, where it used to warn: at run
+     time the same defect parks the phase at boarding after the phase was paid for (and, under
+     keep-going autonomy, dispatches a plan-repair agent to author the bullet from the exit criteria),
+     and the audit found a prose-only verification card asking a person for twelve hours. A done
+     phase is not judged about history, and a closed plan's issues are noted, not gating.
      Backticked numbers alone (`1`, an exit-code table) do not count as runnable.
      It warns (**F17**) when a command's lead binary is **not installed on this machine** — write the
      check with what exists (`grep -R` not `rg`, `python3` not `python`): the autopilot SKIPS such a
@@ -394,7 +492,7 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    - **Handoff must record:** what Phase N+1 needs to start cold.
    ```
 
-7. **`## End-to-end verification`** — how to test the whole feature once all phases land (run it, MCP
+8. **`## End-to-end verification`** — how to test the whole feature once all phases land (run it, MCP
    checks, tests).
 
 ## Notes

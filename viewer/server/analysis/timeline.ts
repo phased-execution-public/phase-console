@@ -84,7 +84,20 @@ export type TimelineBar = {
 };
 
 /** A moment worth a tick on the axis, as opposed to a span. */
-export type MarkKind = 'board' | 'verify' | 'rung' | 'park' | 'wall' | 'outcome';
+export type MarkKind =
+  | 'board'
+  | 'verify'
+  | 'rung'
+  | 'park'
+  | 'wall'
+  | 'outcome'
+  // Zero-touch phase 19: the ledgers on the axis — a session ending with what it
+  // cost, a question or card raised or answered, an answer the policy table gave
+  // by itself, and (run-level, no lane) each start of the run with its door.
+  | 'session'
+  | 'ask'
+  | 'policy'
+  | 'start';
 
 /**
  * The mark vocabulary, as a value.
@@ -93,7 +106,25 @@ export type MarkKind = 'board' | 'verify' | 'rung' | 'park' | 'wall' | 'outcome'
  * names, and a doc that lists five of six glyphs is worse than one that lists
  * none. `docs-parity.test.ts` holds the two to each other.
  */
-export const MARK_KINDS: readonly MarkKind[] = ['board', 'verify', 'rung', 'park', 'wall', 'outcome'];
+export const MARK_KINDS: readonly MarkKind[] = [
+  'board', 'verify', 'rung', 'park', 'wall', 'outcome', 'session', 'ask', 'policy', 'start',
+];
+
+/** A session's ending — its one `phase.session` line (zero-touch phase 4's shape). */
+const SESSION_END = 'phase.session';
+
+/** Somebody was asked, or answered: a question, a card, a relayed window (phases 13 and 14). */
+const ASK = new Set([
+  'phase.asked', 'phase.answered',
+  'phase.question-raised', 'phase.question-answered', 'phase.question-deferred', 'phase.question-unanswerable',
+  'phase.approval-raised', 'phase.approval-decided', 'phase.approval-auto-granted',
+]);
+
+/** An answer the policy table gave by itself (phase 11). */
+const POLICY_ANSWERED = 'phase.policy-answered';
+
+/** A start of the run — run-level, so it is drawn on the axis rather than in a lane (phase 7's actor). */
+const RUN_START = 'run.start';
 
 export type TimelineMark = {
   kind: MarkKind;
@@ -289,6 +320,14 @@ export function projectTimeline(
       // exists for — a PHASE event the projection did not understand — under
       // `run.settings`, `run.paused` and every other structurally lane-less
       // line, and a number that always looks alarming is not read.
+      if (entry.event === RUN_START) {
+        // A start of the run belongs to no lane, so it ticks the axis itself —
+        // with its door, which is the answer to "why did this start".
+        const data = entry.data ?? {};
+        const door = typeof data.door === 'string' && data.door ? data.door : 'start';
+        const by = typeof data.by === 'string' && data.by ? ` · ${data.by}` : '';
+        marks.push({ kind: 'start', atMs, label: `${door}${data.resumed === true ? ' (resumed)' : ''}${by}` });
+      }
       continue;
     }
 
@@ -354,6 +393,34 @@ export function projectTimeline(
 
     if (WALL.has(entry.event)) {
       marks.push({ kind: 'wall', atMs, phase, label: labelOf(entry, 'usage wall') });
+      continue;
+    }
+
+    if (entry.event === SESSION_END) {
+      // The session ledger on the axis (phase 19): where each session ended,
+      // how, and what it said it cost — `unknown` rather than $0 when it never said.
+      const data = entry.data ?? {};
+      const cost = data.costSource !== 'none' && typeof data.costUsd === 'number'
+        ? ` · $${data.costUsd.toFixed(2)}`
+        : ' · cost unknown';
+      marks.push({
+        kind: 'session', atMs, phase, ok: data.isError !== true,
+        label: `${String(data.mode ?? 'session')} · ended by ${String(data.endedBy ?? 'exit')}${cost}`,
+      });
+      continue;
+    }
+
+    if (ASK.has(entry.event)) {
+      marks.push({ kind: 'ask', atMs, phase, label: labelOf(entry, entry.event.replace(/^phase\./, '')) });
+      continue;
+    }
+
+    if (entry.event === POLICY_ANSWERED) {
+      const data = entry.data ?? {};
+      marks.push({
+        kind: 'policy', atMs, phase,
+        label: `${String(data.decisionKey ?? 'policy')} → ${String(data.answer ?? '?')} (${String(data.source ?? 'default')})`,
+      });
       continue;
     }
 

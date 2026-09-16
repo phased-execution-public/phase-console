@@ -22,3 +22,30 @@ em-dash range (2—4), a "(+N)" combo, and a markdown-bold phase cell (**5**).
 | 4 | Four  | 1, 2, 3  | — | r | x |
 | **5** | Five | 2—4    | — | r | x |
 | 6 | Six   | 1–2 (+4) | — | r | x |
+
+## Phases
+
+### Phase 1 — One
+- **Verification:**
+  - `true`
+
+### Phase 2 — Two
+- **Verification:**
+  - `true`
+
+### Phase 3 — Three
+- **Verification:**
+  - `true`
+
+### Phase 4 — Four
+- **Verification:**
+  - `true`
+
+### Phase 5 — Five
+- **Verification:**
+  - `true`
+
+### Phase 6 — Six
+- **Verification:**
+  - `true`
+

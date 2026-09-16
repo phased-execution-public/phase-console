@@ -25,6 +25,8 @@
 
 import { realExec, type Exec } from '../accounts/credentials.ts';
 import { log } from '../log.ts';
+import { doorActor } from '../actor.ts';
+import type { Actor, StartDoor } from '../runner/state.ts';
 import { buildMcpConfig, redactConfig, writeMcpConfigFile, type McpConfigDoc } from './config.ts';
 import { McpCredentials, refKey } from './credentials.ts';
 import { blocksBoarding, probeMcp, type McpHealth, type McpProbe, type McpStatus } from './health.ts';
@@ -107,6 +109,15 @@ export type McpOptions = {
   now?: () => number;
   /** Injected in tests so no suite ever spawns a real CLI. */
   probeFn?: typeof probeMcp;
+  /**
+   * The instance's start ceiling (`start-ceiling.ts`): the probe is one of
+   * the fourteen automatic `claude` starts, so it asks before it spawns and
+   * charges after. Absent (a harness): no ceiling.
+   */
+  ceiling?: {
+    admit: (actor: Actor) => { ok: true } | { ok: false; ceiling: string; until: string };
+    charge: (actor: Actor) => void;
+  };
 };
 
 /**
@@ -130,7 +141,9 @@ export class Mcp {
   private announced = new Map<string, McpStatus>();
   /** id → the change we found but have not yet had acknowledged. */
   private drift = new Map<string, { added: string[]; removed: string[]; seenAt: string }>();
-  private inFlight: Promise<void> | null = null;
+  private inFlight: Promise<{ probed: boolean }> | null = null;
+  /** What the last probe answered about ITSELF — for a preflight reading a cache the probe could not fill. */
+  private lastProbe: { at: number; error?: string } | null = null;
 
   constructor(opts: McpOptions = {}) {
     this.opts = opts;
@@ -352,13 +365,15 @@ export class Mcp {
    * Single-flight: concurrent callers share one probe. A caller that needs the
    * truth right now (the operator pressed Refresh) passes `force`.
    */
-  async refresh(opts: { force?: boolean; cwd?: string } = {}): Promise<void> {
-    if (this.inFlight) return this.inFlight;
+  async refresh(opts: { force?: boolean; cwd?: string; door?: StartDoor } = {}): Promise<{ probed: boolean }> {
+    // A probe already in flight is shared, and it is the OTHER caller's start:
+    // this one waits for the answer and spawned nothing.
+    if (this.inFlight) return this.inFlight.then(() => ({ probed: false }));
     const ids = this.store.enabledIds();
-    if (!ids.length) return;
-    if (!opts.force && ids.every((id) => this.fresh(id))) return;
+    if (!ids.length) return { probed: false };
+    if (!opts.force && ids.every((id) => this.fresh(id))) return { probed: false };
 
-    this.inFlight = this.runProbe(ids, opts.cwd).finally(() => { this.inFlight = null; });
+    this.inFlight = this.runProbe(ids, opts.cwd, opts.door ?? 'mcp-health-probe').finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
 
@@ -377,6 +392,8 @@ export class Mcp {
     disabled: string[];
     unconfigured: { id: string; missing: string[] }[];
     probeError?: string;
+    /** How many `claude` processes THIS preflight started: 0 when the clock's answer was fresh, else 1. */
+    probes: number;
   }> {
     const { servers, unknown, disabled, unconfigured } = this.resolve(ids);
     // The resolvable ones are probed even when some ids did not resolve. This
@@ -386,19 +403,24 @@ export class Mcp {
     // answer, naming everything wrong with the set.
     const settled = !unknown.length && !disabled.length && !unconfigured.length;
     if (!servers.length) {
-      return { ok: settled, rows: [], blocking: [], unknown, disabled, unconfigured };
+      return { ok: settled, rows: [], blocking: [], unknown, disabled, unconfigured, probes: 0 };
     }
 
-    const doc = await buildMcpConfig(servers, this.creds);
-    const probe = await this.probe(doc, opts.cwd ? { cwd: opts.cwd } : {});
-    // Awaited. `absorb` is async — it awaits `this.view(meta)` to raise the
-    // rug-pull and status-change announcements — so firing it and walking away
-    // meant the preflight could return, the phase could board, and the "this
-    // server's tools changed under you" announcement would land AFTER the
-    // session it was supposed to warn. Worse, a throw inside it was an
-    // unhandled rejection rather than a probe failure.
-    await this.absorb(probe);
-    if (probe.probeError) {
+    // The clock's cache, its TTL and its single flight — not a probe of this
+    // preflight's own (SLF-3). `preflight` used to call `this.probe` bare, so
+    // a phase naming a resolvable server started a full server tree at every
+    // boarding attempt on top of the five-minute clock, with no cap per phase,
+    // run or day; `refresh` answers from a fresh row and shares an in-flight
+    // probe, so two boardings inside one TTL cost one `claude`. The whole
+    // enabled set is what the clock probes, and this phase's servers are a
+    // subset of it (`resolve` keeps disabled ones out).
+    let probes = 0;
+    if (!servers.every((meta) => this.fresh(meta.id))) {
+      const { probed } = await this.refresh({ cwd: opts.cwd, door: 'mcp-boarding-preflight' });
+      if (probed) probes = 1;
+    }
+    const rows = servers.map((meta) => this.health.get(meta.id)?.row).filter((row): row is McpHealth => Boolean(row));
+    if (rows.length < servers.length) {
       // Could not check ≠ they are down. Boarding proceeds: the run's own
       // failure handling is still there, and refusing to start a phase because
       // a probe timed out would turn a flaky check into a stopped plan. The
@@ -406,16 +428,18 @@ export class Mcp {
       // probe and is not in doubt.
       return {
         ok: settled,
-        rows: [], blocking: [], unknown, disabled, unconfigured, probeError: probe.probeError,
+        rows: [], blocking: [], unknown, disabled, unconfigured,
+        probeError: this.lastProbe?.error ?? 'the probe answered for none of these servers',
+        probes,
       };
     }
     // No `unconfigured` rescue here any more: `resolve` now keeps such a server
     // out of the probed set entirely, so a row that blocks did so on its own
     // merits and the CLI's reason for it is the true one.
-    const blocking = probe.servers.filter((row) => blocksBoarding(row.status));
+    const blocking = rows.filter((row) => blocksBoarding(row.status));
     return {
       ok: blocking.length === 0 && settled,
-      rows: probe.servers, blocking, unknown, disabled, unconfigured,
+      rows, blocking, unknown, disabled, unconfigured, probes,
     };
   }
 
@@ -448,17 +472,38 @@ export class Mcp {
     return Boolean(held && this.now() - held.at < HEALTH_TTL_MS);
   }
 
-  private async runProbe(ids: string[], cwd?: string): Promise<void> {
+  private async runProbe(ids: string[], cwd: string | undefined, door: StartDoor): Promise<{ probed: boolean }> {
     const { servers } = this.resolve(ids);
-    if (!servers.length) return;
+    if (!servers.length) return { probed: false };
+    // One of the fourteen automatic starts: it names its door, asks the
+    // ceiling, and its cadence is on the record (SLF-2 ii) — `session.start`
+    // before, `mcp.probe.ran` with the milliseconds after.
+    const actor = doorActor(door, {
+      by: 'console', via: door === 'mcp-health-probe' ? 'timer' : 'event', origin: 'mcp',
+      trigger: servers.map((meta) => meta.id).join(','), guard: 'fresh,!inFlight', counter: `HEALTH_TTL_MS:${HEALTH_TTL_MS}`,
+    });
+    const verdict = this.opts.ceiling?.admit(actor) ?? { ok: true };
+    if (!verdict.ok) {
+      log.warn('mcp.probe.refused', { door, ceiling: verdict.ceiling, until: verdict.until, servers: servers.length });
+      return { probed: false };   // the cache goes stale, which is what it does overnight anyway
+    }
+    this.opts.ceiling?.charge(actor);
+    log.info('session.start', { ...actor, servers: servers.length });
     const doc = await buildMcpConfig(servers, this.creds);
+    const started = this.now();
     const probe = await this.probe(doc, cwd ? { cwd } : {});
+    log.info('mcp.probe.ran', {
+      door, ms: Math.max(0, this.now() - started), servers: servers.length,
+      ...(probe.probeError ? { error: probe.probeError } : {}),
+    });
+    this.lastProbe = { at: this.now(), ...(probe.probeError ? { error: probe.probeError } : {}) };
     if (probe.probeError) {
       log.warn('mcp.probe.failed', { error: probe.probeError });
-      return;   // keep the last known answer, with its age
+      return { probed: true };   // keep the last known answer, with its age
     }
     await this.absorb(probe);
     this.changed();
+    return { probed: true };
   }
 
   /** Fold a probe into the cache, raising the two alarms it can raise. */

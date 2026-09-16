@@ -10,6 +10,10 @@
  * Registration is gated by `--allow-accounts`; READING is not. On a console
  * without the flag the card still meters the machine login and says what the
  * flag would add — a capability that hides when disabled looks like a bug.
+ *
+ * Pro draws one more card under this one: every account's breaker, the rank's
+ * verdict, the meters' age and the per-run quota plan. This file is its one
+ * import site, and the free tree keeps this card exactly as it is.
  */
 
 import { useState } from 'react';
@@ -36,7 +40,16 @@ import {
 import { LimitsOverview } from '@/components/limits-widget';
 import { navigate } from '@/app/router';
 
+/** The Accounts section's cards: the registry card, and (Pro) the dashboard under it. */
 export function AccountsCard() {
+  return (
+    <>
+      <RegistryCard />
+    </>
+  );
+}
+
+function RegistryCard() {
   const client = useQueryClient();
   const { data, isPending } = useAccounts();
   const { data: state } = useConsoleState();

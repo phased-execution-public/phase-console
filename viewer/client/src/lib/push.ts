@@ -26,6 +26,7 @@
 
 import { api, type PushDevice, type PushState } from './api';
 import { registerServiceWorker } from './pwa';
+import { MOUNTED } from './base';
 
 const SUPPORTED =
   typeof navigator !== 'undefined' &&
@@ -61,6 +62,12 @@ export function iosNeedsInstall(): boolean {
 /** Why this browser cannot subscribe, or `null` if it can. */
 export function blocker(): string | null {
   if (!SUPPORTED) return 'This browser does not support push notifications.';
+  if (MOUNTED) {
+    return (
+      'This console is open through the fleet page, which carries every console’s notifications — ' +
+      'turn them on there, once, for this device.'
+    );
+  }
   if (iosNeedsInstall()) {
     return (
       'On iOS, notifications only work once this is added to the Home Screen: Share → Add to ' +

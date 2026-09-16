@@ -52,7 +52,7 @@ _to_mjs() {
 # console: the same defect the header describes for `stop`, in three verbs that
 # nobody had typed yet.
 case "${1:-}" in
-  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status)
+  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|sessions)
     _to_mjs "$@" ;;
 esac
 

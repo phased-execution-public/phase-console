@@ -32,10 +32,18 @@ import {
 const FIELDS = Object.keys(EMPTY) as RunSetupField[];
 const MODE_NAMES = Object.keys(MODES) as RunSetupMode[];
 
-describe('the four stages', () => {
-  it('are What runs, How it runs, Money and stops, Review — in that order', () => {
-    expect(STAGES.map((s) => s.id)).toEqual(['what', 'how', 'money', 'review']);
-    expect(STAGES.map((s) => s.label)).toEqual(['What runs', 'How it runs', 'Money and stops', 'Review']);
+describe('the five stages', () => {
+  it('are Decisions, What runs, How it runs, Money and stops, Review — in that order', () => {
+    // Decisions first since 5.0.0 (phase 11): the prelude's questions are
+    // answered before anything about the run's shape is.
+    expect(STAGES.map((s) => s.id)).toEqual(['decisions', 'what', 'how', 'money', 'review']);
+    expect(STAGES.map((s) => s.label)).toEqual([
+      'Decisions',
+      'What runs',
+      'How it runs',
+      'Money and stops',
+      'Review',
+    ]);
     // The phone reads a shorter word, and each one is a word a quarter of 360px can hold.
     for (const stage of STAGES) expect(stage.short.length).toBeLessThanOrEqual(8);
   });
@@ -44,7 +52,7 @@ describe('the four stages', () => {
 describe('every field has a stage', () => {
   it('maps every member of the value shape onto a control stage', () => {
     expect(Object.keys(STAGE_OF).sort()).toEqual(FIELDS.sort());
-    for (const field of FIELDS) expect(['what', 'how', 'money']).toContain(STAGE_OF[field]);
+    for (const field of FIELDS) expect(['decisions', 'what', 'how', 'money']).toContain(STAGE_OF[field]);
   });
 
   it('and a label, spelled once for the control and the review', () => {
@@ -61,13 +69,23 @@ describe('every field has a stage', () => {
       // `openPr` is owned by `settle` (reachability.test.tsx OWNED_BY); it is
       // on a stage all the same, because the stage is the settle control's.
       const onSomeStage = staged.some((mode) =>
-        (['what', 'how', 'money'] as const).some((stage) => fieldsOnStage(mode, stage).includes(field!)),
+        (['decisions', 'what', 'how', 'money'] as const).some((stage) =>
+          fieldsOnStage(mode, stage).includes(field!),
+        ),
       );
       expect(onSomeStage, `${field} is on no stage of any staged mode`).toBe(true);
     }
   });
 
   it('puts the scope on What runs, the money and the stops on Money and stops, the rest on How', () => {
+    // The prelude's five on Decisions (phase 11) — the three the door
+    // requires, the waivers a person acknowledges, and the recorded override.
+    expect([...fieldsOnStage('start', 'decisions')].sort()).toEqual(
+      ['accounts', 'acknowledgedWaivers', 'manifestOverride', 'relay', 'resumeOnRestart'].sort(),
+    );
+    // A phase launch asks them too: on a finished run it is a fresh start.
+    expect(stageHasControls('phase', 'decisions')).toBe(true);
+    expect(stageHasControls('live', 'decisions')).toBe(false);
     expect([...fieldsOnStage('start', 'what')].sort()).toEqual(['onlyPhases', 'startAfter']);
     expect(fieldsOnStage('start', 'money').sort()).toEqual(
       [
@@ -125,7 +143,7 @@ describe('every mode says how it is shown', () => {
     // A field shown by a mode is on exactly one of that mode's stages.
     for (const mode of MODE_NAMES) {
       const seen = new Map<RunSetupField, number>();
-      for (const stage of ['what', 'how', 'money'] as const) {
+      for (const stage of ['decisions', 'what', 'how', 'money'] as const) {
         for (const field of fieldsOnStage(mode, stage)) seen.set(field, (seen.get(field) ?? 0) + 1);
       }
       for (const field of FIELDS) {

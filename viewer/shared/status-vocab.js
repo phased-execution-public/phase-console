@@ -487,10 +487,19 @@ export function uiLabel(state) {
  * live — and `schedule`, a run held outside its boarding window. Both used to
  * paint as a stop; both are pipelining, and `run.lifecycle.wait.kind` is where
  * they say so.
- * @type {readonly ('usage-limit'|'external'|'scope'|'schedule')[]}
+ *
+ * 5.0.0 adds `person`: a run whose loop is holding a card open for somebody —
+ * a verification check only a person can make, a relay question — was the one
+ * wait with no word, because its status stayed `running` while the loop
+ * awaited the answer. The reason is recorded when the card goes up and cleared
+ * when it is answered (`runner.ts`, the human-verify path); zero-touch-console
+ * phase 6 moves the status with it (ACC-4.8). Every member has a production
+ * writer under `server/` and `test/vocab-owners.test.ts` keeps it so — two of
+ * the four above had none for a release (LFC-5).
+ * @type {readonly ('usage-limit'|'external'|'scope'|'schedule'|'person')[]}
  */
 export const WAIT_REASONS = Object.freeze(
-  /** @type {const} */ (['usage-limit', 'external', 'scope', 'schedule']),
+  /** @type {const} */ (['usage-limit', 'external', 'scope', 'schedule', 'person']),
 );
 
 /** @typedef {(typeof WAIT_REASONS)[number]} WaitReason */

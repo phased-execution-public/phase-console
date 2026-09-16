@@ -20,6 +20,7 @@
  */
 
 import { ArrowRight, Footprints, Hand, Loader2 } from 'lucide-react';
+import { RUNG_DRIVER_LABELS, drivableBy } from '@shared/ladder-model.js';
 import { Chip, RelativeTime } from '@/components/ui';
 import { money, relativeTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
@@ -55,17 +56,21 @@ function TriedChip({ rung }: { rung: TriedRung }) {
         : rung.outcome === 'failed'
           ? 'bad'
           : 'neutral';
+  // The ladder table's drivability column (phase 10): who can drive this rung's
+  // vehicle — the console, a write, an agent, or nobody.
+  const driver = drivableBy(rung.rung);
   const title = [
     rung.label,
     rung.outcomeLabel ? `— ${rung.outcomeLabel}` : undefined,
     when(rung.at) ? `(${when(rung.at)})` : undefined,
     typeof rung.costUsd === 'number' ? `· ${money(rung.costUsd)}` : undefined,
     rung.note ? `· ${rung.note}` : undefined,
+    `· driven by ${RUNG_DRIVER_LABELS[driver] ?? driver}`,
   ]
     .filter(Boolean)
     .join(' ');
   return (
-    <Chip tone={tone} title={title} data-testid="ladder-tried">
+    <Chip tone={tone} title={title} data-testid="ladder-tried" data-driver={driver}>
       {rung.label}
       {rung.outcomeLabel && <span className="text-ink-faint"> → {rung.outcomeLabel}</span>}
     </Chip>

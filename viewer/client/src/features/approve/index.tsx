@@ -36,6 +36,7 @@
 
 import { useMemo, useState } from 'react';
 import { CheckCheck } from 'lucide-react';
+import { useWindowLeft } from '@/lib/clock';
 import { INBOX_KIND_LABELS, SEVERITY_UI } from '@shared/attention-model.js';
 import { Button, Empty, RelativeTime, Skeleton, StatusBadge } from '@/components/ui';
 import { useAttentionInbox } from '@/lib/queries';
@@ -160,6 +161,7 @@ export function ApproveCard({
   // take `reason`, and two boxes asking the same question is a card nobody
   // reads. The first action that takes words decides the label.
   const says = actions.find((action) => action.says)?.says;
+  const windowLeft = useWindowLeft(item.expiresAt);
 
   return (
     <li
@@ -170,7 +172,13 @@ export function ApproveCard({
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <StatusBadge state={ui} label={INBOX_KIND_LABELS[item.kind] ?? item.kind} />
         {where && <span className="text-2xs text-ink-muted">{where}</span>}
-        <RelativeTime at={item.since} className="ml-auto text-2xs text-ink-muted" />
+        {windowLeft === null ? (
+          <RelativeTime at={item.since} className="ml-auto text-2xs text-ink-muted" />
+        ) : (
+          <span className="ml-auto text-2xs text-ink-muted" aria-live="polite" data-testid="approve-window">
+            {windowLeft > 0 ? `${windowLeft} s to answer` : 'answering by rule'}
+          </span>
+        )}
       </div>
 
       <p className="text-sm font-medium text-ink">{item.title}</p>

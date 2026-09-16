@@ -26,7 +26,7 @@ import {
   buildMcpConfig, dropMcpConfigsFor, pruneMcpConfigs, redactConfig, writeMcpConfigFile,
 } from '../server/mcp/config.ts';
 import { McpCredentials, mcpKeychainService } from '../server/mcp/credentials.ts';
-import { blocksBoarding, probeMcp } from '../server/mcp/health.ts';
+import { blocksBoarding, probeMcp, PROBE_FLAG, PROBE_OWNER } from '../server/mcp/health.ts';
 import { Mcp } from '../server/mcp/index.ts';
 import { CURATED, searchCatalog, searchCurated } from '../server/mcp/catalog.ts';
 import { McpStore, MCP_DIR, normaliseTransport } from '../server/mcp/store.ts';
@@ -661,41 +661,133 @@ test('the probe passes its config as a PATH, never as argv — and deletes it af
   assert.ok(argv.includes('--strict-mcp-config'));
 });
 
-test('the probe is group-killed, so the servers it started go with it', async () => {
+test('the probe ends through the ladder: SIGCONT, SIGTERM to the GROUP, then SIGKILL only if it stays', async () => {
   // The probe's whole job is to make the CLI start MCP servers, so it is the
   // one console child guaranteed to have descendants worth killing: each stdio
   // entry becomes an `npx`, and `npx -y …@latest` is a shim that spawns the
   // real server under itself. Killing the CLI alone left those behind with no
   // parent to notice — one leaked tree per server, on a five-minute clock, for
-  // the life of the console.
-  const killed: number[] = [];
-  const realKill = process.kill.bind(process);
-  const spy = ((pid: number, signal?: string | number) => {
-    // Record the group kills this probe makes; never actually signal anything.
-    if (pid < 0) { killed.push(pid); return true; }
-    return realKill(pid, signal as NodeJS.Signals);
-  }) as typeof process.kill;
+  // the life of the console. It used to be SIGKILL directly; since phase 7 it
+  // is signals.ts's ladder with the interrupt rung off (SLF-2 iii): the TERM
+  // lets the CLI run its SessionEnd hook so the registry hears the end, and
+  // the KILL that follows is what the shims need.
+  const withPid = (spawnFn: typeof import('node:child_process').spawn, seen: { spawnOpts?: unknown }[]) =>
+    ((file: string, argv: string[], opts: Record<string, unknown>) => {
+      const child = (spawnFn as unknown as (f: string, a: string[], o: unknown) => Record<string, unknown>)(file, argv, opts);
+      child.pid = 4242;
+      seen[seen.length - 1].spawnOpts = opts;
+      return child;
+    }) as unknown as typeof spawnFn;
 
-  const { spawnFn, seen } = fakeSpawn([INIT]);
-  const withPid = ((file: string, argv: string[], opts: Record<string, unknown>) => {
-    const child = (spawnFn as unknown as (f: string, a: string[], o: unknown) => Record<string, unknown>)(file, argv, opts);
-    child.pid = 4242;
-    seen[seen.length - 1].spawnOpts = opts;
-    return child;
-  }) as unknown as typeof spawnFn;
-
-  process.kill = spy;
-  try {
-    await probeMcp({ mcpServers: { a: { type: 'http', url: 'https://e.com/mcp' } } }, { spawnFn: withPid });
-  } finally {
-    process.kill = realKill;
+  // A child that leaves on the TERM: no SIGKILL follows.
+  {
+    const signals: [number, string][] = [];
+    let alive = true;
+    const { spawnFn, seen } = fakeSpawn([INIT]);
+    const ended = new Promise<string>((resolve) => {
+      void probeMcp({ mcpServers: { a: { type: 'http', url: 'https://e.com/mcp' } } }, {
+        spawnFn: withPid(spawnFn, seen as never),
+        ladder: {
+          signal: (pid, signal) => { signals.push([pid, signal]); if (signal === 'SIGTERM') alive = false; },
+          alive: () => alive,
+          sleep: async () => {},
+        },
+        onEnded: resolve,
+      });
+    });
+    assert.equal(await ended, 'exited', 'the CLI left on SIGTERM, inside the grace');
+    assert.deepEqual(signals.map(([, s]) => s), ['SIGCONT', 'SIGTERM'], 'woken, then asked politely — no SIGKILL for a child that left');
+    assert.ok(signals.every(([pid]) => pid === 4242), 'the ladder is handed the pid; groupSignal addresses the group from it');
+    assert.equal((seen[0] as { spawnOpts?: Record<string, unknown> }).spawnOpts?.detached, true,
+      'and it is spawned detached, or there would be no group to address');
   }
 
-  assert.deepEqual(killed, [-4242], 'the GROUP, not the pid — `-pid` is what reaches the npx shims');
-  assert.equal(
-    (seen[0].spawnOpts as Record<string, unknown>)?.detached, true,
-    'and it is spawned detached, or there would be no group to address',
-  );
+  // A child that ignores the TERM (an npx shim): the backstop kills the group.
+  {
+    const signals: string[] = [];
+    const { spawnFn, seen } = fakeSpawn([INIT]);
+    const ended = new Promise<string>((resolve) => {
+      void probeMcp({ mcpServers: { a: { type: 'http', url: 'https://e.com/mcp' } } }, {
+        spawnFn: withPid(spawnFn, seen as never),
+        ladder: { signal: (_pid, signal) => { signals.push(signal); }, alive: () => true, sleep: async () => {}, killAfterMs: 10 },
+        onEnded: resolve,
+      });
+    });
+    assert.equal(await ended, 'killed');
+    assert.deepEqual(signals, ['SIGCONT', 'SIGTERM', 'SIGKILL'], 'the grace ran out, so the group was killed');
+  }
+});
+
+test('SLF-2: the probe names itself — PE_OWNER console/mcp-probe and PHASE_CONSOLE_PROBE=1 in its environment', async () => {
+  // Spawned with the console's environment unmodified, the probe had no
+  // owner, the presence hook filed it `foreign`, and 82 % of the session
+  // registry was the console talking to itself in the operator's name (SLF-2,
+  // REG-6). `kindOf('console/…')` is `agent`; the flag lets the registry keep
+  // the record out of every operator-facing total.
+  const seenEnv: NodeJS.ProcessEnv[] = [];
+  const { spawnFn } = fakeSpawn([INIT]);
+  const spy = ((file: string, argv: string[], opts: { env: NodeJS.ProcessEnv }) => {
+    seenEnv.push(opts.env);
+    return (spawnFn as unknown as (f: string, a: string[], o: unknown) => unknown)(file, argv, opts);
+  }) as unknown as typeof spawnFn;
+  await probeMcp({ mcpServers: { a: { type: 'http', url: 'https://e.com/mcp' } } }, { spawnFn: spy, env: { PATH: '/bin', PE_OWNER: 'autopilot/should-not-leak' } });
+  assert.equal(seenEnv.length, 1);
+  assert.equal(seenEnv[0].PE_OWNER, PROBE_OWNER, 'the probe\'s own owner, whatever the console\'s environment carried');
+  assert.equal(seenEnv[0][PROBE_FLAG], '1');
+  assert.equal(seenEnv[0].PATH, '/bin', 'the rest of the environment passes through');
+  assert.equal(PROBE_OWNER, 'console/mcp-probe');
+});
+
+test('SLF-3: two boardings inside one TTL naming the same server set spawn the probe once, and preflight says how many it started', async () => {
+  const mcp = facade();
+  await mcp.add({ label: 'ctx7', id: 'ctx7', transport: 'http', url: 'https://mcp.context7.com/mcp' });
+  const probes = (mcp as never as { opts: { probeFn: unknown } });
+  let spawned = 0;
+  const real = (probes.opts as { probeFn: (...a: unknown[]) => unknown }).probeFn;
+  (mcp as never as { probe: (...a: unknown[]) => unknown }).probe = (...args: unknown[]) => { spawned += 1; return real(...args); };
+
+  const first = await mcp.preflight(['ctx7']);
+  assert.equal(first.ok, true, JSON.stringify(first));
+  assert.equal(first.probes, 1, 'the cache was empty: this boarding started the probe');
+  assert.equal(spawned, 1);
+
+  const second = await mcp.preflight(['ctx7']);
+  assert.equal(second.ok, true);
+  assert.equal(second.probes, 0, 'inside the TTL the clock\'s answer stands: no second claude');
+  assert.equal(spawned, 1, 'one probe for two boardings');
+  assert.deepEqual(second.rows.map((row) => row.id), ['ctx7'], 'and the rows come from the cache');
+
+  // The clock's own refresh inside the TTL spawns nothing either — one cache.
+  assert.deepEqual(await mcp.refresh(), { probed: false });
+  assert.equal(spawned, 1);
+  await mcp.remove('ctx7');
+});
+
+test('SLF-1: the probe asks the start ceiling before it spawns, charges it after, and is skipped by name past it', async () => {
+  const asked: string[] = [];
+  const charged: string[] = [];
+  let refuse = false;
+  const { exec } = keychainExec();
+  const { spawnFn } = fakeSpawn([INIT]);
+  const mcp = new Mcp({
+    exec, platform: 'darwin',
+    probeFn: (doc, opts) => probeMcp(doc, { ...opts, spawnFn }),
+    ceiling: {
+      admit: (actor) => { asked.push(String(actor.door)); return refuse ? { ok: false, ceiling: 'startsPerHour', until: '2026-09-14T15:00:00.000Z' } : { ok: true }; },
+      charge: (actor) => { charged.push(String(actor.door)); },
+    },
+  });
+  await mcp.add({ label: 'ctx7', id: 'ctx7', transport: 'http', url: 'https://mcp.context7.com/mcp' });
+  const first = await mcp.preflight(['ctx7']);
+  assert.equal(first.probes, 1);
+  assert.deepEqual(asked, ['mcp-boarding-preflight'], 'a boarding\'s probe names the boarding door');
+  assert.deepEqual(charged, ['mcp-boarding-preflight']);
+
+  refuse = true;
+  assert.deepEqual(await mcp.refresh({ force: true }), { probed: false }, 'refused: nothing spawned');
+  assert.deepEqual(asked, ['mcp-boarding-preflight', 'mcp-health-probe'], 'the clock\'s probe names the clock door');
+  assert.deepEqual(charged, ['mcp-boarding-preflight'], 'a refused start is not charged');
+  await mcp.remove('ctx7');
 });
 
 test('an init with no mcp_servers list is "could not answer", not "all of them failed"', async () => {

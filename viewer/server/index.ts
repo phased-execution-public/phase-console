@@ -11,12 +11,13 @@
  * reason (`log.ts`), and shutdown waits for registered work to checkpoint.
  */
 
+import { signalActor } from './actor.ts';
 import { createServer } from 'node:http';
 import { existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
-import { execFile, spawn as spawnChild } from 'node:child_process';
+import { execFile, spawn as spawnChild, spawnSync } from 'node:child_process';
 
-import { instanceForPort, instanceUrl } from '../shared/instances.mjs';
+import { instanceForPort, instanceUrl, updateInstance } from '../shared/instances.mjs';
 import {
   INSTANCE, INSTANCE_STATE_DIR, claimInstance, electInstance, flagsRefusal, flagsWarning, parseFlags,
   probeConsole, resolvePort,
@@ -27,12 +28,12 @@ import {
 } from './log.ts';
 import {
   bootout, markDegraded, onRestartRequest, onShutdownRequest, reexec, runShutdownHandlers,
-  selfRestartPlan, stopPlan, supervisor, type SelfRestartPlan,
+  selfRestartPlan, stopPlan, supervisor, unload, type SelfRestartPlan, type ShutdownContext,
 } from './lifecycle.ts';
 import { openerCandidates } from './platform.ts';
 import { Service } from './service.ts';
 import { handleApi } from './api/routes.ts';
-import { classify } from './api/access.ts';
+import { accessLedger, classify } from './api/access.ts';
 import { sendFile } from './http/static.ts';
 import { refuse } from './terminal.ts';
 import { HOOK_TIMEOUT_SECONDS } from './runner/approvals.ts';
@@ -135,7 +136,9 @@ const server = createServer(async (req, res) => {
   // request. Handling is mandatory, logging the routine ones is not.
   const noteStreamError = (where: string) => (error: unknown) => {
     if (isClientDisconnect(error)) return;
-    log.warn(where, { url: req.url, error });
+    // A literal name, with WHICH stream as a field: an event name that arrives
+    // in a variable is one no document can list (LFC-4).
+    log.warn('http.stream-error', { where, url: req.url, error });
   };
   res.on('error', noteStreamError('response.error'));
   req.on('error', noteStreamError('request.error'));
@@ -162,6 +165,8 @@ const server = createServer(async (req, res) => {
     res.end(`${verdict.message}\n`);
     return;
   }
+  // Served — counted by scope, and a remote identity recorded once (FLT-10).
+  accessLedger.note(verdict, req.headers.host);
 
   try {
     if (await handleApi({ service }, req, res, url)) return;
@@ -220,6 +225,7 @@ server.on('upgrade', (req, socket, head) => {
     refuse(socket, verdict.status === 421 ? 400 : verdict.status, verdict.message);
     return;
   }
+  accessLedger.note(verdict, req.headers.host);
 
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
   service.terminals.handleUpgrade(req, socket, head, url).then((handled) => {
@@ -434,8 +440,20 @@ server.on('error', (error: NodeJS.ErrnoException) => {
 const boundPort = await resolvePort(flags.port, flags.host, INSTANCE, portWasNamed);
 flags.port = boundPort;
 
+// Every served remote identity is logged once per process, the login hashed;
+// the first remote request of a process lands on the registry row at once
+// rather than at the next beat (FLT-10).
+accessLedger.wire({
+  log: (_event, detail) => log.info('access.remote', detail),
+  onFirstRemote: (at) => { updateInstance(INSTANCE.id, { lastRemoteAt: at }); },
+});
+
 server.listen(flags.port, flags.host, () => {
   claimInstance(flags.port);
+  // The beat starts with the bind: from here the registry row says `running`
+  // to every reader, and a clean exit below says `stopped` (FLT-5).
+  service.heartbeat.start();
+  void service.checkDeliveryReachable();
   const address = `http://${flags.host}:${flags.port}`;
   process.stdout.write(`\n  Phase Console  ${address}\n`);
   process.stdout.write(`  instance      ${INSTANCE.name}${INSTANCE.default ? ' (default)' : ''}  ${INSTANCE.id}\n`);
@@ -484,24 +502,59 @@ const SHUTDOWN_BUDGET_MS = 120_000;
 
 let shuttingDown = false;
 
-async function shutdown(reason: string, successor: SelfRestartPlan | null = null): Promise<void> {
+/**
+ * What the process is going away FOR, beside what signal carried it (SHD-8).
+ *
+ * A press is known before its signal arrives — `onShutdownRequest` hands the
+ * stop to launchd, and launchd's SIGTERM is what actually starts the drain — so
+ * the press records its intent here and the signal handler reads it. Without
+ * it both `shutdown.begin` and `exit` read `reason: "SIGTERM"` for a deliberate
+ * Shut down, indistinguishable from a logout or a `kill`.
+ */
+type Ending = { intent: ShutdownContext['intent']; via: string; mode?: ShutdownContext['mode'] };
+let requested: (Ending & { reason: string }) | null = null;
+
+async function shutdown(reason: string, successor: SelfRestartPlan | null = null, ending?: Ending, signal?: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  noteExit(reason);
-  log.info('shutdown.begin', { reason, successor: successor?.command ?? null });
+  const why: Ending = ending ?? { intent: 'signal', via: 'signal' };
+  const context: ShutdownContext = {
+    intent: why.intent,
+    reason: requested?.reason ?? reason,
+    ...(why.mode ? { mode: why.mode } : {}),
+  };
+  noteExit(reason, {
+    intent: why.intent, via: why.via,
+    ...(why.mode ? { mode: why.mode } : {}),
+    ...(signal ? { signal } : {}),
+    ...(requested && requested.reason !== reason ? { requestedAs: requested.reason } : {}),
+  });
+  log.info('shutdown.begin', {
+    reason, intent: why.intent, via: why.via,
+    ...(why.mode ? { mode: why.mode } : {}),
+    ...(signal ? { signal } : {}),
+    successor: successor?.command ?? null,
+  });
+
+  // Every run this exit abandons, on its own journal, before anything closes —
+  // on every path, a press, a restart and a signal alike (SHD-8).
+  try { service.noteShutdown(context); } catch (error) { log.warn('shutdown.journal-failed', { error: String(error) }); }
 
   // Stop taking new work first, so nothing starts while handlers are draining.
   server.close();
   service.close();
 
-  await runShutdownHandlers(SHUTDOWN_BUDGET_MS);
+  await runShutdownHandlers(SHUTDOWN_BUDGET_MS, context);
 
   // A self-restart: the listener is closed and the drain is done, so the
   // successor can bind the port the moment it boots. Spawned last so a drain
   // that overran its budget never leaves two consoles contending for it.
   if (successor) reexec(successor, spawnChild as never);
 
-  log.info('shutdown.end', { reason });
+  log.info('shutdown.end', { reason, intent: why.intent });
+  // A clean exit, said by the console itself — liveness reads it as `stopped`
+  // at once, where a crash would take three missed beats to read (FLT-5).
+  service.heartbeat.stopped();
   process.exit(0);
 }
 
@@ -517,16 +570,27 @@ async function shutdown(reason: string, successor: SelfRestartPlan | null = null
  * before the socket it arrived on is closed, or the page sees a network error
  * for a restart that is working exactly as asked.
  */
+/**
+ * Whether the API already asked for this exit. The signal handlers below read
+ * it: a SIGTERM that arrives because `launchctl bootout` is carrying out a
+ * Shut-down press is the same request, already on the record with its
+ * derived actor, and must not be written a second time as an unattributed
+ * signal.
+ */
+let askedThroughApi = false;
+
 onRestartRequest((reason) => {
+  askedThroughApi = true;
+  requested = { reason, intent: 'restart', via: 'exit' };
   // Under launchd or systemd the supervisor brings the console back; where
   // nothing does, the process starts its own successor with the arguments it
   // was started with — every capability included — right before it exits.
   const successor = supervisor().kind === 'none' ? selfRestartPlan() : null;
-  setTimeout(() => void shutdown(reason, successor), 250).unref();
+  setTimeout(() => void shutdown(reason, successor, { intent: 'restart', via: 'exit' }), 250).unref();
 });
 
 /**
- * How long to wait for `launchctl bootout` to land before stopping anyway.
+ * How long to wait for the supervisor's stop to land before stopping anyway.
  *
  * Bootout ends the job by sending this process SIGTERM, which the handler below
  * turns into the ordinary graceful shutdown — so on the happy path this timer
@@ -538,30 +602,52 @@ onRestartRequest((reason) => {
 const BOOTOUT_GRACE_MS = 8_000;
 
 /**
- * The Shut-down button's other half — stop, and stay stopped.
+ * The Shut-down button's other half — at the strength the press chose.
  *
- * The asymmetry with Restart is the whole point. Under launchd `KeepAlive` an
- * exit is a *restart*, so a console that stopped by exiting would be back
- * within seconds; the job has to be unloaded instead. Where nothing is
- * supervising, exiting IS stopping and the same drain applies — the runner
- * checkpoints, the pty broker is let go of rather than killed
- * (`service.close()` → `Terminals.close()`, since Phase 7: the ptys are the
- * broker's children, so the terminals are still there when a console comes
- * back), and the process ends 0.
+ * `exit` (the default): the drain and a clean exit. Under launchd `KeepAlive`
+ * that is a comeback within seconds, which is exactly what `exit` promises
+ * there — the work checkpoints and resumes, the console returns; with nothing
+ * supervising it is a stop.
+ *
+ * `unload` ("stay off"): the Service has already written the stop marker, so
+ * the unit is disabled and unloaded here — `launchctl disable` synchronously,
+ * then `bootout` detached, whose SIGTERM starts the drain (or
+ * `systemctl --user disable --now`). The pty broker is let go of rather than
+ * killed either way (`service.close()` → `Terminals.close()`, since Phase 7).
  */
-onShutdownRequest((reason) => {
+onShutdownRequest((reason, request) => {
+  askedThroughApi = true;
   setTimeout(() => {
-    const plan = stopPlan();
-    if (plan.via === 'exit' || !bootout(plan, spawnChild as never)) {
-      void shutdown(reason);
-      return;
+    if (request.mode === 'unload') {
+      const plan = stopPlan(supervisor(), process.env, process.getuid?.() ?? null, 'unload');
+      if (plan) {
+        requested = { reason, intent: 'shutdown', via: plan.via, mode: 'unload' };
+        const carried = unload(plan, spawnChild as never, (file, args, options) => spawnSync(file, args, options));
+        if (carried.spawned) {
+          setTimeout(() => void shutdown(`${reason} (the unload did not land)`, null, requested ?? undefined), BOOTOUT_GRACE_MS).unref();
+          return;
+        }
+      }
     }
-    setTimeout(() => void shutdown(`${reason} (bootout did not land)`), BOOTOUT_GRACE_MS).unref();
+    requested = { reason, intent: 'shutdown', via: 'exit', mode: request.mode };
+    void shutdown(reason, null, requested);
   }, 250).unref();
 });
 
-process.on('SIGINT', () => void shutdown('SIGINT'));
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
+/**
+ * The third transport (SHD-3): a stop that arrived as a signal — `kill`, a
+ * terminal's Ctrl-C, a launchd unload nobody pressed from the console — gets
+ * the same `shutdown.requested` record the API path writes, with `via:
+ * 'signal'` and the signal's name as its origin. Who sent it the console
+ * cannot know, and the record says so rather than guessing. A signal that IS
+ * a press's own stop landing (`requested`) carries that press's intent.
+ */
+function signalled(signal: 'SIGINT' | 'SIGTERM'): void {
+  if (!askedThroughApi && !shuttingDown) log.warn('shutdown.requested', { ...signalActor(signal), supervisor: supervisor().kind });
+  void shutdown(signal, null, requested ?? { intent: 'signal', via: 'signal' }, signal);
+}
+process.on('SIGINT', () => signalled('SIGINT'));
+process.on('SIGTERM', () => signalled('SIGTERM'));
 
 // Closing the terminal must not kill a run in progress. Under launchd the
 // process is detached and never sees this; in the foreground it now survives,

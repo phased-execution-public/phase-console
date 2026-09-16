@@ -15,13 +15,15 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { join } from 'node:path';
 import { request } from 'node:http';
 import type { IncomingMessage } from 'node:http';
 
 import { VIEWER_DIR, flagsRefusal, flagsWarning, parseFlags } from '../server/config.ts';
-import { classify, hostnameOf } from '../server/api/access.ts';
-import { spawnConsole } from './spawn-console.ts';
+import { AccessLedger, classify, hostnameOf, loginHash } from '../server/api/access.ts';
+import { sandbox, spawnConsole } from './spawn-console.ts';
 
 const HOST = 'console.example.ts.net';
 const USER = 'operator@example.com';
@@ -360,3 +362,64 @@ async function waitFor(port: number, tries = 100): Promise<boolean> {
   }
   return false;
 }
+
+/* ------------------------------------------------------------------ *
+ * The served-request record (zero-touch phase 17, FLT-10 / ACC-10.10)
+ * ------------------------------------------------------------------ */
+
+test('ACC-10.10: the ledger counts what was SERVED by scope, and logs each remote identity once — hashed', () => {
+  const lines: { event: string; detail: Record<string, unknown> }[] = [];
+  let firstRemote: string | null = null;
+  const ledger = new AccessLedger({
+    log: (event, detail) => { lines.push({ event, detail }); },
+    onFirstRemote: (at) => { firstRemote = at; },
+  });
+  const two = parseFlags(['--remote', HOST, '--remote-user', USER, '--remote-user', 'second@example.com']);
+
+  ledger.note(classify(req({ host: '127.0.0.1:4123' }), two), '127.0.0.1:4123', 500);
+  ledger.note(classify(req({ host: HOST, 'tailscale-user-login': USER }), two), HOST, 1_000);
+  ledger.note(classify(req({ host: HOST, 'tailscale-user-login': USER }), two), HOST, 2_000);
+  ledger.note(classify(req({ host: HOST, 'tailscale-user-login': 'second@example.com' }), two), HOST, 3_000);
+  // A refusal is not a served request — `access.refused` already records it.
+  ledger.note(classify(req({ host: 'attacker.example' }), two), 'attacker.example', 4_000);
+
+  assert.deepEqual(ledger.served, { local: 1, remote: 3 });
+  const remoteLines = lines.filter((line) => line.event === 'access.remote');
+  assert.equal(remoteLines.length, 2, 'exactly one line per identity per process');
+  assert.deepEqual(remoteLines[0]!.detail, {
+    host: HOST, loginHash: loginHash(USER), first: new Date(1_000).toISOString(),
+    last: new Date(1_000).toISOString(), count: 1,
+  });
+  assert.ok(!JSON.stringify(lines).includes(USER), 'the login is never logged in clear');
+  assert.ok(!JSON.stringify(ledger.snapshot()).includes(USER), 'nor carried on state()');
+  assert.equal(firstRemote, new Date(1_000).toISOString(), 'the first remote request lands on the registry at once');
+  assert.equal(ledger.lastRemoteAt(), new Date(3_000).toISOString());
+  assert.equal(ledger.snapshot().identities.find((i) => i.loginHash === loginHash(USER))?.count, 2);
+});
+
+test('ACC-10.10: a real console counts a remote request on state().access and logs its identity exactly once', async (t) => {
+  const port = await freePort();
+  const box = sandbox('access-ledger');
+  const log = join(box.stateHome, 'access-ledger.log');
+  const { child } = spawnConsole(VIEWER_DIR, port, ['--remote', HOST, '--remote-user', USER, '--log-file', log], { sandbox: box });
+  t.after(() => { child.kill('SIGKILL'); box.cleanup(); });
+  if (!await waitFor(port)) assert.fail('the console did not come up');
+
+  const allowed = { Host: HOST, 'Tailscale-User-Login': USER };
+  assert.equal((await http(port, '/api/state', { headers: allowed })).status, 200);
+  assert.equal((await http(port, '/api/state', { headers: allowed })).status, 200);
+
+  const state = JSON.parse((await http(port, '/api/state', { read: true })).body) as {
+    access?: { served: { local: number; remote: number }; lastRemoteAt: string | null };
+  };
+  assert.equal(state.access?.served.remote, 2, 'both proxied requests were counted as remote');
+  assert.ok((state.access?.served.local ?? 0) >= 1, 'and the local read as local');
+  assert.ok(state.access?.lastRemoteAt, 'lastRemoteAt is on the record');
+
+  for (let i = 0; i < 40 && !existsSync(log); i++) await new Promise((r) => setTimeout(r, 50));
+  const text = readFileSync(log, 'utf8');
+  const remote = text.split('\n').filter((line) => line.includes('"access.remote"'));
+  assert.equal(remote.length, 1, 'one access.remote line for one identity, however many requests');
+  assert.ok(!text.includes(USER), 'no raw login anywhere in the log');
+});
+

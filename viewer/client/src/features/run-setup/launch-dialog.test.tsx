@@ -23,17 +23,38 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 import type { RunState } from '@/lib/api';
 
-const { state, skills, runStart, agentTicket } = vi.hoisted(() => ({
+const { state, skills, runStart, agentTicket, runPrelude } = vi.hoisted(() => ({
   state: vi.fn(),
   skills: vi.fn(),
   runStart: vi.fn(),
   agentTicket: vi.fn(),
+  runPrelude: vi.fn(),
 }));
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, state, skills, runStart, agentTicket } };
+  return { ...actual, api: { ...actual.api, state, skills, runStart, agentTicket, runPrelude } };
 });
+
+/** A prelude with nothing open — the Decisions stage answers, and Launch is not held. */
+const EMPTY_PRELUDE = {
+  slug: 'alpha',
+  rows: [],
+  blocking: [],
+  waived: [],
+  acknowledged: [],
+  manifestPresent: false,
+  probes: {
+    accounts: { status: 'ok', ok: true, reason: '1 of 1 declared account usable: the machine login' },
+    mcp: { status: 'skip', ok: true, reason: 'no MCP server named' },
+    credentials: { status: 'skip', ok: true, reason: 'no credential named' },
+    delivery: { status: 'ok', ok: true, reason: '1 subscribed device' },
+  },
+  accounts: [{ id: 'default', minHeadroomPct: 0 }],
+  credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+  delivery: { ok: true, channels: ['1 subscribed device'], acknowledged: false },
+  at: '2026-09-14T00:00:00.000Z',
+};
 
 const RUN = {
   id: 'run-1',
@@ -55,6 +76,7 @@ async function mount(
   extra: Record<string, unknown> = {},
 ) {
   state.mockResolvedValue({ prefs, defaultSkills: ['graph-tool'], ...extra });
+  runPrelude.mockResolvedValue({ prelude: EMPTY_PRELUDE });
   const client = new QueryClient(queryClientConfig);
   const { LaunchDialog } = await import('./launch-dialog');
   return render(
@@ -90,15 +112,16 @@ describe('the field matrix', () => {
 
   it('a phase launch is staged, and carries the git section on "How it runs"', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null });
-    // Four stages, the first selected.
+    // Five stages since 5.0.0 (phase 11), Decisions first and selected.
     const tabs = await screen.findAllByRole('tab');
     expect(tabs.map((t) => t.textContent)).toEqual([
+      'DecideDecisions',
       'WhatWhat runs',
       'HowHow it runs',
       'MoneyMoney and stops',
       'ReviewReview',
     ]);
-    expect(screen.getByRole('tab', { name: /What runs/ }).getAttribute('aria-selected')).toBe('true');
+    expect(screen.getByRole('tab', { name: /Decisions/ }).getAttribute('aria-selected')).toBe('true');
 
     await stage(/How it runs/);
     await screen.findByLabelText('Branch');
@@ -166,6 +189,9 @@ describe('the field matrix', () => {
 describe('the submits', () => {
   it('a phase launch sends exactly what the dialog shows, scoped to its phase', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: RUN, qaMode: 'off', allowWrites: true });
+    // The Decisions stage fills the account list from the prelude's resolved
+    // clause once it answers; wait for it so the payload below is the whole form.
+    await screen.findByDisplayValue('default:0');
     await stage(/How it runs/);
     await screen.findByLabelText('Branch');
     fireEvent.click(screen.getByRole('button', { name: 'Off' })); // attach defaults on
@@ -197,6 +223,12 @@ describe('the submits', () => {
         // `off` could turn billed cloud reviews on and never take them back.
         ultraReview: 'off',
         autoRecover: false,
+        // The Decisions stage's answers (phase 11): the run's own words for
+        // the manifest's rows, sent as shown — a resume ignores them and a
+        // fresh start is refused without them.
+        resumeOnRestart: true,
+        relay: 'off',
+        accounts: [{ id: 'default', minHeadroomPct: 0 }],
         resumeRunId: 'run-1',
         onlyPhases: [3],
       }),

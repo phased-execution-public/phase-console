@@ -24,6 +24,7 @@ import {
 } from '@shared/worktree-model.js';
 import type { McpPolicy } from './runs';
 import type { GitMode, HolderKind, ReviewerPolicy } from '@shared/run-lifecycle.js';
+import type { BootHoldKind } from '@shared/ops-vocab.js';
 
 /* ---------------- shapes ----------------
  * Only what the shell reads in this phase is typed. Views type their own as
@@ -89,6 +90,10 @@ export interface Concurrency {
    * schedule thinks without a phase having to fail to start first.
    */
   schedule?: { open: boolean; opensAt: number | null; reason: string | null } | null;
+  /** This console's own ceiling — `max`/`live` above, named (zero-touch phase 17, FLT-7). */
+  console?: { live: number; max: number };
+  /** Every console's live lanes on this machine against `fleet.json` `maxSessions`; null when not wired. */
+  machine?: { live: number; max: number | null } | null;
 }
 
 /**
@@ -103,6 +108,26 @@ export interface FleetState {
   frozen: boolean;
   at: string | null;
   by: string | null;
+  /** The machine's supervisor, when this build knows of one: its loopback URL. Absent on a build without it. */
+  url?: string | null;
+  /** Does a supervisor beat on this machine right now? What offers the machine-wide destination. */
+  reachable?: boolean;
+  /** A hold on every console of the machine, beside this console's own freeze. */
+  hold?: { at: string; by: string } | null;
+}
+
+/**
+ * Why this console boots holding its automation (SHD-5, FLT-9): `stopped` — a
+ * Shut down with "stay off" left its marker; `autostart-off` — the machine
+ * profile says this console does not start its work unattended. Nothing is
+ * re-adopted or converged until it is released. Null when nothing holds.
+ */
+export interface BootHold {
+  kind: BootHoldKind;
+  at: string;
+  by: string;
+  why: string;
+  marker?: { resurrect?: string; label?: string; durability?: string };
 }
 
 /** Who is holding a scope an entry is waiting on, and which tokens collided. */
@@ -158,6 +183,10 @@ export interface QueueHolder {
    * offers a takeover for the first and patience for the second.
    */
   presence?: 'live' | 'unknown';
+  /** A `session` holder's process (REG-3) — a peer in the repository that holds no lock yet. */
+  pid?: number;
+  /** A `session` holder's working directory: where the peer is standing. */
+  cwd?: string;
   /**
    * This holder is a CLOCK, not another actor (`Holder.clock`): the operator's
    * boarding window, the live-session cap, an account's usage wall, a fleet
@@ -244,6 +273,18 @@ export interface InstanceInfo {
   pinned: boolean;
 }
 
+/**
+ * How many cards a console has put in front of a person, and since when
+ * (`server/runner/approvals.ts` `ApprovalCounts`, plus the cards up right now).
+ */
+export interface ApprovalCounts {
+  raised: number;
+  autoGranted: number;
+  since: string;
+  lastRaisedAt: string | null;
+  pending: number;
+}
+
 export interface ConsoleState {
   generation?: number;
   root?: RootInfo;
@@ -285,6 +326,8 @@ export interface ConsoleState {
   distRev?: string | null;
   supervisor?: SupervisorInfo;
   unread?: number;
+  /** Cards raised and auto-granted since the console started counting (TRS-5). Absent on a build before 5.0.0. */
+  approvals?: ApprovalCounts;
   scriptsDir?: string;
   /**
    * Skills a NEW run would start with (`--default-skills` /
@@ -308,6 +351,34 @@ export interface ConsoleState {
    */
   remoteHosts?: string[];
   remoteUsers?: string[];
+  /**
+   * Where the settings the machine profile can supply came from — a flag, the
+   * environment, this console's own override in `fleet.json`, or the machine
+   * profile (zero-touch phase 17, FLT-3). Null or absent from an older server.
+   */
+  profile?: {
+    path: string;
+    present: boolean;
+    sources: Partial<
+      Record<
+        | 'remoteHosts'
+        | 'remoteUsers'
+        | 'notifyCommand'
+        | 'webhooks'
+        | 'categories'
+        | 'quietHours'
+        | 'maxSessions',
+        string
+      >
+    >;
+    overridden: string[];
+  } | null;
+  /** What this console has served, by scope, and when a phone last reached it (FLT-10). Logins are hashed. */
+  access?: {
+    served: { local: number; remote: number };
+    lastRemoteAt: string | null;
+    identities: { host: string; loginHash: string; first: string; last: string; count: number }[];
+  };
   /** The port this console is served on — setup commands embed it. */
   port?: number;
   /** Which OS the SERVER runs on — the setup commands differ per platform. */
@@ -348,6 +419,8 @@ export interface ConsoleState {
    */
   resumeAsk?: { slug: string; runId: string; phases: number[]; sessions: string[]; at: string }[];
   fleet?: FleetState;
+  /** See `BootHold`. Absent from a server before 5.0.0, which never held. */
+  bootHold?: BootHold | null;
   /**
    * Server-side preferences. `notify` is the global per-category switch the
    * console consults before it announces anything at all — it is server truth
@@ -396,6 +469,7 @@ export interface ConsoleState {
     autoRecoverByDefault?: boolean;
     autoContinueRecovery?: boolean;
     watchCmdRefs?: boolean;
+    watchMintedCmdRefs?: boolean;
     mcpPolicy?: McpPolicy;
     /** The remediation ladder's caps and toggles (server `Prefs`; Settings ▸ Automation renders them). */
     ladderPerPhaseRungs?: number;
@@ -403,6 +477,9 @@ export interface ConsoleState {
     ladderPerRunRungs?: number;
     ladderPerRunUsd?: number;
     ladderPerDayUsd?: number;
+    /** The per-instance start ceiling (server `start-ceiling.ts`): automatic starts and session dollars per sliding hour; 0 = off. */
+    ceilingStartsPerHour?: number;
+    ceilingUsdPerHour?: number;
     unblockAttempts?: boolean;
     staleClaimTakeover?: boolean;
     /**
@@ -412,8 +489,15 @@ export interface ConsoleState {
      */
     resumeAtBoot?: ResumeAtBootMode | boolean;
     autoAccountSwitch?: boolean;
-    /** A `human` gate is briefed to the phase's own session to verify and clear. Off by default — see `server/config.ts`. */
+    /** A `human` gate is briefed to the phase's own session to verify and clear. ON by default since 5.0.0 (`gates: delegated`) — see `server/config.ts`. */
     delegateHumanGates?: boolean;
+    /**
+     * This console's answers to the decision manifest's rows, keyed by decision
+     * key (`shared/policy-model.js` `DECISION_ANSWERS`). Read below a plan's
+     * `## Decisions` row and above the shipped defaults. Phase 12's policy
+     * editor writes it.
+     */
+    policy?: Partial<Record<string, string>>;
     /** A phase whose plan states no §Verification boards and passes on its handoff alone. Off by default. */
     allowUnverifiedPhases?: boolean;
     /** One more rung, once per phase, when the newest settled rung landed commits. Off by default. */
@@ -438,6 +522,8 @@ export interface ConsoleState {
     stallExternalWaitMs?: number;
     /** The same call when it waits on a job this session started itself. */
     stallLocalJobMs?: number;
+    /** May the stall watchdog park a lane by itself? Absent reads as on — see `server/config.ts`. */
+    stallAutomaticPark?: boolean;
     /**
      * The clock on the ANNOUNCEMENT rather than on a detector: how long before
      * a stall the operator has not acted on is said again.
@@ -456,6 +542,8 @@ export interface ConsoleState {
      * operator asks for.
      */
     boardingSchedule?: SchedulePolicy;
+    /** The relay's rule table (phase 14) — `shared/relay-model.js` `RelayRule`, coerced on read. */
+    relayRules?: unknown[];
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -486,6 +574,7 @@ export function automationPrefs(state: ConsoleState | undefined): {
   autoRecoverByDefault: boolean;
   autoContinueRecovery: boolean;
   watchCmdRefs: boolean;
+  watchMintedCmdRefs: boolean;
   mcpPolicy: McpPolicy;
 } {
   const prefs = state?.prefs ?? {};
@@ -525,6 +614,7 @@ export function automationPrefs(state: ConsoleState | undefined): {
     // On, like the server. An older console has never written the key, and a
     // `cmd:` ref cannot exist on a run that server never watched.
     watchCmdRefs: prefs.watchCmdRefs ?? true,
+    watchMintedCmdRefs: prefs.watchMintedCmdRefs ?? false,
     // Only the exact word may stop a plan, matching the server's own coercion.
     // A console running an older server has never written the key, and reads
     // as the shipped default rather than as the behaviour it used to have.
@@ -543,10 +633,12 @@ export const LADDER_PREF_DEFAULTS = {
   ladderPerRunRungs: 10,
   ladderPerRunUsd: 400,
   ladderPerDayUsd: 600,
+  ceilingStartsPerHour: 40,
+  ceilingUsdPerHour: 250,
   unblockAttempts: true,
   staleClaimTakeover: true,
   autoAccountSwitch: true,
-  delegateHumanGates: false,
+  delegateHumanGates: true,
   allowUnverifiedPhases: false,
   ladderExtendOnProgress: false,
   convergeEveryMs: 300_000,
@@ -560,6 +652,8 @@ export type LadderPrefs = {
   ladderPerRunRungs: number;
   ladderPerRunUsd: number;
   ladderPerDayUsd: number;
+  ceilingStartsPerHour: number;
+  ceilingUsdPerHour: number;
   unblockAttempts: boolean;
   staleClaimTakeover: boolean;
   autoAccountSwitch: boolean;
@@ -569,12 +663,14 @@ export type LadderPrefs = {
   convergeEveryMs: number;
   budgetAutoRaisePct: number;
   mcpRequireTimeoutMs: number;
+  /** The console's `policy.<key>` overrides as stored — empty means none. */
+  policy: Partial<Record<string, string>>;
 };
 
 /**
  * The ladder's preferences with the server's own defaults applied — the same
- * one-place `?? default` rule as `automationPrefs`, for the thirteen knobs the
- * ladder card renders. The server sanitises on load and save (a finite number
+ * one-place `?? default` rule as `automationPrefs`, for the knobs the ladder
+ * card renders. The server sanitises on load and save (a finite number
  * ≥ 0, a real boolean), so these fallbacks only matter against an older server
  * that has never written the keys.
  */
@@ -591,6 +687,8 @@ export function ladderPrefs(state: ConsoleState | undefined): LadderPrefs {
     ladderPerRunRungs: num(prefs.ladderPerRunRungs, d.ladderPerRunRungs),
     ladderPerRunUsd: num(prefs.ladderPerRunUsd, d.ladderPerRunUsd),
     ladderPerDayUsd: num(prefs.ladderPerDayUsd, d.ladderPerDayUsd),
+    ceilingStartsPerHour: num(prefs.ceilingStartsPerHour, d.ceilingStartsPerHour),
+    ceilingUsdPerHour: num(prefs.ceilingUsdPerHour, d.ceilingUsdPerHour),
     unblockAttempts: bool(prefs.unblockAttempts, d.unblockAttempts),
     staleClaimTakeover: bool(prefs.staleClaimTakeover, d.staleClaimTakeover),
     autoAccountSwitch: bool(prefs.autoAccountSwitch, d.autoAccountSwitch),
@@ -600,6 +698,7 @@ export function ladderPrefs(state: ConsoleState | undefined): LadderPrefs {
     convergeEveryMs: num(prefs.convergeEveryMs, d.convergeEveryMs),
     budgetAutoRaisePct: num(prefs.budgetAutoRaisePct, d.budgetAutoRaisePct),
     mcpRequireTimeoutMs: num(prefs.mcpRequireTimeoutMs, d.mcpRequireTimeoutMs),
+    policy: prefs.policy && typeof prefs.policy === 'object' ? { ...prefs.policy } : {},
   };
 }
 
@@ -630,6 +729,10 @@ export const stateApi = {
   fleetFreeze: (by?: string) =>
     post<{ fleet: FleetState; runs: number }>('/api/fleet/freeze', by ? { by } : {}),
   fleetThaw: (by?: string) => post<{ fleet: FleetState; runs: number }>('/api/fleet/thaw', by ? { by } : {}),
+  /* The boot hold's release (SHD-5, FLT-9): the marker cleared, and the held
+   * re-adoption and convergence run now. Run-class, like the thaw. */
+  releaseBootHold: () =>
+    post<{ ok: boolean; was?: BootHoldKind; bootHold: BootHold | null }>('/api/automation/hold/release', {}),
   /** Each phase's scope and what it would collide with if started right now. */
   runScopes: (slug: string) =>
     request<{ scopes: PhaseScope[] }>(`/api/run/${encodeURIComponent(slug)}/scopes`),

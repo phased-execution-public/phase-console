@@ -1,0 +1,413 @@
+{
+  "id": "977825da",
+  "slug": "customer-app-ios-release",
+  "root": "/home/operator/work/hub",
+  "status": "paused",
+  "autonomy": "keep-going",
+  "model": "opus[1m]",
+  "effort": "max",
+  "qaModel": "sonnet",
+  "qaEffort": "max",
+  "phaseBudgetUsd": null,
+  "runBudgetUsd": null,
+  "spentUsd": 29.019288700000008,
+  "maxConsecutiveFailures": 2,
+  "consecutiveFailures": 0,
+  "createdAt": "2026-09-05T11:11:45.683Z",
+  "updatedAt": "2026-09-05T19:07:11.800Z",
+  "activePhase": null,
+  "child": null,
+  "waitUntil": null,
+  "halt": null,
+  "pause": null,
+  "freeze": null,
+  "onLimit": "switch",
+  "skills": [
+    "graph-tool"
+  ],
+  "permissionProfile": "trusted",
+  "gitMode": "new-branch",
+  "settle": "pr",
+  "openPr": true,
+  "autoRecover": {},
+  "phases": {
+    "2": {
+      "phase": 2,
+      "status": "done",
+      "attempts": 2,
+      "costUsd": 0,
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "startedAt": "2026-09-05T11:11:47.137Z",
+      "attemptStartedAt": "2026-09-05T12:43:29.289Z",
+      "model": "opus",
+      "effort": "max",
+      "lifecycle": {
+        "state": "done"
+      },
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "actualModel": "claude-opus-5",
+      "liveness": {
+        "phase": 2,
+        "lastOutputAt": "2026-09-05T15:19:45.305Z",
+        "lastToolUseAt": "2026-09-05T15:19:38.650Z",
+        "turnsSinceLastTool": 0,
+        "commitsSinceStart": 0,
+        "treeDirty": false
+      },
+      "note": "closed outside this run (the board reads done)",
+      "situation": {
+        "key": "never-started",
+        "at": "2026-09-05T12:43:07.556Z",
+        "why": [
+          "no handoff exists",
+          "customer-app: clean tree, 0 commits since the phase started",
+          "the session was interrupted (the console stopped while phase 2 was running)"
+        ]
+      },
+      "tasksAt": 2123,
+      "tasks": [],
+      "turns": 0,
+      "durationMs": 9425006,
+      "said": "",
+      "endedAt": "2026-09-05T15:20:34.869Z",
+      "costUnknown": true
+    },
+    "3": {
+      "phase": 3,
+      "status": "done",
+      "attempts": 0,
+      "costUsd": 0,
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "lifecycle": {
+        "state": "done"
+      },
+      "watchState": {
+        "at": "2026-09-05T15:19:46.409Z",
+        "refs": [
+          {
+            "ref": "lock:customer-app-ios-release/2",
+            "scheme": "lock",
+            "state": "landed",
+            "detail": "nothing holds its scope any more",
+            "checkedAt": "2026-09-05T15:19:46.409Z"
+          }
+        ]
+      },
+      "watchChecked": {
+        "at": "2026-09-05T15:19:46.409Z",
+        "ref": "lock:customer-app-ios-release/2",
+        "state": "landed",
+        "detail": "nothing holds its scope any more"
+      },
+      "note": "closed outside this run (the board reads done)",
+      "endedAt": "2026-09-05T19:07:11.800Z"
+    },
+    "4": {
+      "phase": 4,
+      "status": "waiting",
+      "attempts": 1,
+      "costUsd": 29.019288700000008,
+      "gate": {
+        "clear": true,
+        "kind": "clear",
+        "detail": "no gate"
+      },
+      "preflight": [
+        "left for a person on the record: curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401 — `curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}'` sends a non-GET request — a person should run this, not an unattended runner (asks only if nothing else proves the phase)"
+      ],
+      "preflightDetail": [
+        {
+          "kind": "human-check",
+          "command": "curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401",
+          "message": "left for a person on the record: curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}' | grep -q 401 — `curl -s -o /dev/null -w \"%{http_code}\" -X POST https://api.example-org.com/customer/auth/delete-account -H 'Content-Type: application/json' -d '{\"reason\":\"other\"}'` sends a non-GET request — a person should run this, not an unattended runner (asks only if nothing else proves the phase)"
+        }
+      ],
+      "startedAt": "2026-09-05T11:11:47.136Z",
+      "attemptStartedAt": "2026-09-05T11:11:47.136Z",
+      "model": "opus",
+      "effort": "max",
+      "lifecycle": {
+        "state": "waiting",
+        "stop": {
+          "kind": "declared",
+          "declared": "waiting-external"
+        }
+      },
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "actualModel": "claude-opus-5",
+      "liveness": {
+        "phase": 4,
+        "lastOutputAt": "2026-09-05T12:05:11.770Z",
+        "lastToolUseAt": "2026-09-05T12:04:53.905Z",
+        "turnsSinceLastTool": 1,
+        "commitsSinceStart": 3,
+        "treeDirty": false
+      },
+      "tasksAt": 5795,
+      "tasks": [
+        {
+          "id": "p4.task1",
+          "content": "p4.task1 — orient: graph-tool query aws+hetzner, read auth-proxy + cognito-post-attributes-update",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task2",
+          "content": "p4.task2 — aws: cognito.deleteUser + trigger.invokeAccountDeletion + routes/delete-account.ts + handler case",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task3",
+          "content": "p4.task3 — aws: cognito-post-attributes-update accountDeletion lane + anonymizeCustomer",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task4",
+          "content": "p4.task4 — aws: OpenAPI contracts (add op, deprecate /customer/account) + validate",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task5",
+          "content": "p4.task5 — aws: unit tests (delete-account 8 cases + lane ok/ignored); task verify:local",
+          "status": "completed"
+        },
+        {
+          "id": "p4.task6",
+          "content": "p4.task6 — aws: commit, push, PR, wait for validate-pr, squash-merge",
+          "status": "in_progress"
+        },
+        {
+          "id": "p4.task7",
+          "content": "p4.task7 — hetzner: register entry + aws-pin.sha bump; parity + register-lint + verify:local",
+          "status": "in_progress"
+        },
+        {
+          "id": "p4.task8",
+          "content": "p4.task8 — hetzner: PR, run the 9-condition ship gate, merge (production deploy), watch CD",
+          "status": "pending"
+        },
+        {
+          "id": "p4.task9",
+          "content": "p4.task9 — verify live route (401 curl), drift:backend, graph-tool update",
+          "status": "pending"
+        },
+        {
+          "id": "p4.task10",
+          "content": "p4.task10 — handoff + QA subagent (sonnet) + qa-record",
+          "status": "pending"
+        }
+      ],
+      "turns": 151,
+      "durationMs": 3211666,
+      "said": "The pre-merge review came back **FAIL**, and it was right. That changed the session materially. ## What the review caught **1. Authorization (critical).** `handler.ts` derives `role` from the **URL path**, which proves nothing about the caller. All roles share one Cognito pool, `/customer/auth/{proxy+}` has no gateway authoriser, and `GetUser` succeeds for any valid token — so reaching `case 'delete-account'` under a `/customer/…` URL only meant the caller *typed* \"customer\". A vendor or commissioner could have irreversibly deleted their own Cognito login, and because the anonymize lane finds no `customers` row for them it returned `ignored` and my code **deleted the login while erasing nothing**, orphaning their real record. Federated accounts were worse: they skip the password block, so a valid bearer alone sufficed. I verified this myself before acting. The decisive evidence is `register.ts:163-166` — *\"Authorization uses Cognito group membership\"* — which my handler never consulted. Fixed by resolving the role from the token and failing closed; decoding is sound because `getUser` already made Cognito vouch for that exact string. **2. Stack-trace leak (high).** `aws/CLAUDE.md` p",
+      "idleAttempts": 0,
+      "parkedUntil": "2026-09-05T20:05:19.999Z",
+      "parkReason": "BLOCKED ON THE CHANGE WINDOW: the hetzner merge IS a production deploy and ship-gate condition 7 allows one only 06:00-16:00 UTC Mon-Fri; this session ran Saturday 2026-09-05. Code is complete and reviewed: aws PR #173 head d4966b0e (a fresh-context pre-merge review returned FAIL on two real defects - a URL-path role check letting any role self-delete, and a stack-trace leak - both fixed, tests 22->34, 144/144, both gates red-proved). aws verify:local green on the pre-fix tree and re-running on ",
+      "declared": {
+        "status": "waiting-external",
+        "reason": "BLOCKED ON THE CHANGE WINDOW: the hetzner merge IS a production deploy and ship-gate condition 7 allows one only 06:00-16:00 UTC Mon-Fri; this session ran Saturday 2026-09-05. Code is complete and reviewed: aws PR #173 head d4966b0e (a fresh-context pre-merge review returned FAIL on two real defects - a URL-path role check letting any role self-delete, and a stack-trace leak - both fixed, tests 22->34, 144/144, both gates red-proved). aws verify:local green on the pre-fix tree and re-running on ",
+        "at": "2026-09-05T12:05:19.999Z"
+      },
+      "waits": 1,
+      "endedAt": "2026-09-05T12:05:19.999Z",
+      "resumeSessionId": "f1c70000-0000-4000-8000-000000000057"
+    }
+  },
+  "lifecycle": {
+    "state": "paused"
+  },
+  "checkout": "shared",
+  "limits": {
+    "status": "allowed",
+    "window": "five_hour",
+    "resetsAt": 1788630000,
+    "at": "2026-09-05T15:00:24.997Z"
+  },
+  "rulings": [
+    {
+      "id": "605cdb179c63",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deviation",
+      "what": "aws work rides pe/customer-app-ios-release, not the plan's product/customer-account-deletion",
+      "why": "the console run's git strategy explicitly overrides Session-budget branch names for every scoped repo; and hetzner/config/aws-pin.sha (56491a3c) == aws origin/main HEAD, so 'off the pin' and 'off the default branch' are the SAME base commit — the pin-delta ship-gate condition is unaffected",
+      "costIfWrong": "a reviewer looking for product/customer-account-deletion finds nothing; the PR is on pe/customer-app-ios-release in example-org/aws",
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "at": "2026-09-05T11:14:46Z"
+    },
+    {
+      "id": "83bebf8228d1",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "ambiguity",
+      "what": "ran 'task validate:openapi:redocly:customer' + spectral instead of the plan's 'task validate:openapi:public'",
+      "why": "no such task exists in aws/contracts/Taskfile.yml — the verbs are role-scoped (redocly|spectral):(admin|customer|...); 'customer' is the role this change touches, 'public' would not have linted it at all",
+      "costIfWrong": "none for this change; the plan's Phase-4 step 5 command name is stale and should be corrected if reused",
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "at": "2026-09-05T11:20:13Z"
+    },
+    {
+      "id": "2697864be04b",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deferral",
+      "what": "refreshed BOTH graphs but recorded only hetzner's new counts in docs; left aws's CLAUDE.md + the hub rule's aws row at the 2026-09-03 numbers",
+      "why": "aws's graph is local-only/gitignored so the counts describe a machine-local artifact, the hub rule says outright that a stale node count is harmless, and the only way to land the update was a docs-only push that would have restarted a validate-pr run mid-flight on an org whose Actions budget breaker kills the whole fleet's CI. hetzner's refresh DID land because its rule prescribes folding a doc refresh into a change that ships anyway - and the pin-bump PR is exactly that",
+      "costIfWrong": "aws/CLAUDE.md and hub .claude/rules/graph-tool.md under-report aws by 33 nodes / 90 edges until the next rebuild; nothing reads these numbers except a human budgeting context",
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "at": "2026-09-05T11:29:17Z"
+    },
+    {
+      "id": "0a3dcc78cd5b",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deferral",
+      "what": "parked the phase on the change window with the aws PR still unmerged, rather than merging aws today and parking after",
+      "why": "aws PR #173's test-lambdas check and the independent pre-merge review were both still running when the session's useful work ran out; merging before reading the review would defeat the point of dispatching it, and the hetzner deploy is blocked until Monday either way so nothing is gained by rushing the aws merge",
+      "costIfWrong": "Monday's resume does the aws merge as well as the deploy - one extra step in an already-scripted resume; the handoff lists it as step 3",
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "at": "2026-09-05T11:48:04Z"
+    },
+    {
+      "id": "faf1ebfc9e9c",
+      "slug": "customer-app-ios-release",
+      "phase": 4,
+      "kind": "deviation",
+      "what": "dispatched an independent pre-merge REVIEW mid-build (unrecorded), separate from the plan's formal QA gate, and acted on its findings before merging",
+      "why": "the plan's QA step runs at phase-finish, which for this phase is after a production deploy; a review that lands after the merge cannot stop a bad merge. It returned FAIL on two real defects - a URL-path role check that let any role self-delete, and a stack-trace leak - both of which would otherwise have shipped",
+      "costIfWrong": "none to the gate: no QA verdict was recorded, the formal sonnet QA subagent is still owed at the true finish and must read the MERGED diff, since this review saw cac6fe38 only and not the d4966b0e fixes",
+      "sessionId": "f1c70000-0000-4000-8000-000000000057",
+      "at": "2026-09-05T12:04:43Z"
+    },
+    {
+      "id": "9046d0933ac0",
+      "slug": "customer-app-ios-release",
+      "phase": 2,
+      "kind": "deviation",
+      "what": "Used the graph-tool CLI (graph-tool update . + graph-tool query) instead of loading the /graph-tool skill the boot prompt named",
+      "why": "hub CLAUDE.md and .claude/rules/graph-tool.md forbid loading the ~12k-token SKILL.md to ask a question; the CLI does both jobs the prompt asked for (query at start, refresh before handoff)",
+      "costIfWrong": "none measurable — the graph was refreshed and queried either way",
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "at": "2026-09-05T14:50:14Z"
+    },
+    {
+      "id": "5527488adfc7",
+      "slug": "customer-app-ios-release",
+      "phase": 2,
+      "kind": "ambiguity",
+      "what": "Swept the authenticated route groups first and the public Auth group second, inverting the plan's table order",
+      "why": "the Auth screens require being signed out; sweeping them first would have cost a re-login before every other group. They were swept during an unplanned logged-out window instead",
+      "costIfWrong": "none — all 8 auth routes were covered",
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "at": "2026-09-05T14:50:14Z"
+    },
+    {
+      "id": "87b680116e36",
+      "slug": "customer-app-ios-release",
+      "phase": 2,
+      "kind": "deferral",
+      "what": "Left four cross-cutting checks unexercised: reduced motion, keyboard avoidance on forms, pull-to-refresh, and an explicit logout run",
+      "why": "each needs OS-settings or gesture work that did not fit the session; recording them as not-done beats reporting them as passed",
+      "costIfWrong": "Phase 3/8 inherit four unchecked behaviours; §3 of the findings report names them explicitly",
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "at": "2026-09-05T14:50:14Z"
+    },
+    {
+      "id": "3f913c3fa1d8",
+      "slug": "customer-app-ios-release",
+      "phase": 2,
+      "kind": "deferral",
+      "what": "Documented B-17 (inert rows on /my-builds and /notifications) without root-causing it",
+      "why": "Phase 2's contract is to find and reproduce; Phase 3 owns fixes. The report carries the measured scope, the cited candidate cause for notifications, and the recipe that separates a real inert row from the Maestro openLink+tapOn false positive",
+      "costIfWrong": "Phase 3 spends the diagnosis time instead",
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "at": "2026-09-05T14:50:14Z"
+    },
+    {
+      "id": "44dd438928aa",
+      "slug": "customer-app-ios-release",
+      "phase": 2,
+      "kind": "deviation",
+      "what": "Rewrote the findings route-table cells from backticked `/route` to plain /route",
+      "why": "the plan's §Verification is grep -c '| /' — the backticks made a correct report read as zero routes. Changed the report to match the gate's intent rather than weakening the gate",
+      "costIfWrong": "cosmetic only",
+      "sessionId": "f1c70000-0000-4000-8000-000000000056",
+      "at": "2026-09-05T14:50:14Z"
+    }
+  ],
+  "artefacts": [
+    {
+      "kind": "branch",
+      "name": "pe/customer-app-ios-release",
+      "repo": "aws",
+      "phase": 4,
+      "at": "2026-09-05T12:05:19.538Z"
+    },
+    {
+      "kind": "branch",
+      "name": "pe/customer-app-ios-release",
+      "repo": "hetzner",
+      "phase": 4,
+      "at": "2026-09-05T12:05:19.538Z"
+    }
+  ],
+  "accountId": "account",
+  "waitReason": null,
+  "resolved": null,
+  "reopenedAt": null,
+  "recoveries": {
+    "2": {
+      "attempts": 1,
+      "lastAt": "2026-09-05T12:43:07.556Z",
+      "rungs": [
+        {
+          "situation": "never-started",
+          "rung": "reboard-fresh",
+          "at": "2026-09-05T12:43:07.556Z",
+          "outcome": "running",
+          "note": "Re-board fresh"
+        }
+      ]
+    }
+  },
+  "stoppedBy": "operator",
+  "finishedReason": "stopped by the operator",
+  "qaMaxRounds": 5,
+  "phaseOptions": {
+    "3": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "4": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "5": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "6": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "7": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "8": {
+      "model": "opus[1m]",
+      "effort": "max"
+    },
+    "9": {
+      "model": "opus[1m]",
+      "effort": "max"
+    }
+  }
+}

@@ -15,6 +15,8 @@ import { safeList, type RootCheck } from './config.ts';
 import { parsePlan, type Plan } from './parse/plan.ts';
 import { parseHandoff, parseHandoffFilename, type Handoff } from './parse/handoff.ts';
 import { parseIndex, parseTestStatus, parseLock, type IndexRow, type QaRow, type Lock } from './parse/folder.ts';
+import { parseDecisionsTable } from '../shared/decisions-model.js';
+import type { DecisionRow } from '../shared/decisions-model.js';
 
 export type PlanRecord = {
   slug: string;
@@ -27,6 +29,14 @@ export type PlanRecord = {
   handoffs: Handoff[];
   index: IndexRow[];
   qa: QaRow[];
+  /**
+   * `docs/handoffs/<slug>/decisions.md` — the decision manifest's mutable
+   * twin, written only by `scripts/decisions.sh`, merged OVER the plan's
+   * `## Decisions` rows (`mergeDecisions`) wherever the console answers what
+   * holds. Empty when the file is absent. Read here beside `test-status.md`
+   * because this is where a handoff-folder artefact bumps the revision.
+   */
+  decisionsTwin: DecisionRow[];
   locks: Lock[];
   /** Newest mtime across the plan and every handoff artefact — the sort key. */
   activity: number;
@@ -132,7 +142,7 @@ export class Store {
 
   private emptyRecord(slug: string, kind: PlanRecord['kind']): PlanRecord {
     return {
-      slug, kind, planMtime: 0, handoffs: [], index: [], qa: [], locks: [],
+      slug, kind, planMtime: 0, handoffs: [], index: [], qa: [], decisionsTwin: [], locks: [],
       activity: 0, bytes: 0, revision: ++this.revisionSeed,
     };
   }
@@ -159,6 +169,7 @@ export class Store {
     record.handoffs = [];
     record.index = [];
     record.qa = [];
+    record.decisionsTwin = [];
     record.locks = [];
 
     for (const file of safeList(dir)) {
@@ -169,6 +180,11 @@ export class Store {
           record.activity = Math.max(record.activity, statSync(full).mtimeMs);
         } else if (file === 'test-status.md') {
           record.qa = parseTestStatus(readFileSync(full, 'utf8'));
+          record.activity = Math.max(record.activity, statSync(full).mtimeMs);
+        } else if (file === 'decisions.md') {
+          // The first pipe table under `## Decisions` — `twin_decisions()` in
+          // phase-graph.sh reads the same file the same way.
+          record.decisionsTwin = parseDecisionsTable(readFileSync(full, 'utf8'), { after: /^##\s+decisions/i });
           record.activity = Math.max(record.activity, statSync(full).mtimeMs);
         } else if (file === '.locks') {
           for (const lockFile of safeList(full)) {

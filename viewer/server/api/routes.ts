@@ -11,7 +11,15 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
 import { HookPayloadError, HookRateError, PhaseClaimedError, RecoveryBusyError, type Service } from '../service.ts';
+import { PreludeRefusal } from '../prelude.ts';
+import { RELAY_MODES, type RelayMode } from '../../shared/run-settings.js';
+import { DECISION_KEYS } from '../../shared/decisions-model.js';
+import type { AccountRequirement } from '../runner/state.ts';
 import { classify as classifyAccess } from './access.ts';
+import { actorOfRequest } from './actor.ts';
+import { PolicyRuleError } from '../runner/approvals.ts';
+import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
+import { pressActor } from '../actor.ts';
 import { agentEnabled, checkRoot, gitDoorRefusal, listDirs } from '../config.ts';
 import { fromAutomation } from '../../shared/automation-model.js';
 import { buildAgentLaunch, type ResumeTarget } from '../agent.ts';
@@ -29,7 +37,7 @@ import { isKnownModel } from '../runner/models.ts';
 import { planWrite, runWrite, openInEditor, WriteError, type WriteRequest } from '../writes.ts';
 import { TERMINAL_PATH, type LaunchSpec } from '../terminal.ts';
 import { tailscaleStatus } from '../tailscale.ts';
-import { ACCOUNT_ID_RE, DEFAULT_ACCOUNT_ID } from '../accounts/index.ts';
+import { ACCOUNT_ID_RE, DEFAULT_ACCOUNT_ID, ProbeInFlightError } from '../accounts/index.ts';
 import { searchCatalog } from '../mcp/index.ts';
 import { MCP_ID_RE } from '../mcp/store.ts';
 import { isMcpPolicy, isOnLimitPolicy, type PhaseOptions } from '../runner/state.ts';
@@ -294,6 +302,26 @@ const SCOPE_KEYS = ['slug', 'category', 'runId', 'sessionId', 'phase'] as const;
  * process's environment: a known id, the literal `auto` (the service resolves
  * it against the cached meters), or nothing — never an arbitrary string.
  */
+/**
+ * The accounts a start may name, checked against the instance's own registry
+ * (phase 11): the machine login always, a registered id, `auto` never (the
+ * prelude wants a LIST to judge, not a choice to make). A minimum outside
+ * 0–100 is clamped; an unknown id is dropped rather than passed to the run.
+ */
+function accountRequirements(value: unknown, service: Service): AccountRequirement[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: AccountRequirement[] = [];
+  for (const entry of value) {
+    const id = typeof entry === 'string' ? entry : (entry as { id?: unknown })?.id;
+    if (typeof id !== 'string' || !id) continue;
+    if (id !== DEFAULT_ACCOUNT_ID && !(ACCOUNT_ID_RE.test(id) && service.accounts.has(id))) continue;
+    const raw = typeof entry === 'string' ? 0 : Number((entry as { minHeadroomPct?: unknown })?.minHeadroomPct ?? 0);
+    const min = Number.isFinite(raw) ? Math.max(0, Math.min(100, Math.round(raw))) : 0;
+    if (!out.some((a) => a.id === id)) out.push({ id, minHeadroomPct: min });
+  }
+  return out;
+}
+
 function accountChoice(value: unknown, service: Service): string | undefined {
   if (typeof value !== 'string' || !value) return undefined;
   if (value === 'auto') return 'auto';
@@ -568,6 +596,39 @@ export async function handleApi(
     return true;
   }
 
+  /* ---------------- the relay's transport (PermissionRequest) ---------------- */
+  if (path === '/hooks/permission-request') {
+    // Phase 14 (spike S2): the event a relay-armed child posts for every call
+    // that reached the permission step. The approval hook's trust model — the
+    // caller is a `claude` child with neither the console header nor an origin,
+    // so `guardWrite` does not apply and the per-run bearer token, compared in
+    // constant time, is the whole credential — plus the session hook's rule:
+    // only from this machine. A request that arrived through the `--remote`
+    // proxy is refused before the token is looked at, because a Serve handler
+    // pointed at the wrong console must not expose a permission-deciding POST.
+    if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
+    const remote = req.socket?.remoteAddress ?? '';
+    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === '';
+    // A harness's flags may carry no remote hosts at all, which is a local-only
+    // console — the same reading `classify` gives an empty list.
+    const access = Array.isArray(service.flags.remoteHosts)
+      ? classifyAccess(req, service.flags)
+      : { ok: true as const, scope: 'local' as const };
+    if (!loopback || !access.ok || access.scope !== 'local') {
+      log.warn('hook.rejected', { reason: !loopback ? 'not loopback' : 'not local', hook: 'permission-request' });
+      json(res, 403, { error: 'the permission hook is accepted from this machine only' });
+      return true;
+    }
+    if (!service.approvals.verify(req.headers.authorization)) {
+      log.warn('hook.rejected', { reason: service.approvals.armed() ? 'bad token' : 'no run is armed' });
+      json(res, 401, { error: 'bad or expired run token' });
+      return true;
+    }
+    const permissionRunId = service.approvals.runIdFor(req.headers.authorization);
+    json(res, 200, await service.decidePermissionRequest(await readBody(req), permissionRunId));
+    return true;
+  }
+
   /* ---------------- the closeout (Stop) hook ---------------- */
   if (path === '/hooks/stop') {
     // Same trust model as the approval hook above: the caller is a `claude`
@@ -605,7 +666,14 @@ export async function handleApi(
     }
     try {
       const record = service.ingestSessionEvent(await readBody(req));
-      json(res, 200, { ok: true, session: { sessionId: record.sessionId, presence: service.sessions.presence(record.sessionId) } });
+      // A starting session is told who else is in its repository (REG-3 iv):
+      // the hook copies `peers` into the session's additionalContext.
+      const peers = record.lastEvent?.event === 'SessionStart' ? service.sessionPeersSentence(record) : null;
+      json(res, 200, {
+        ok: true,
+        session: { sessionId: record.sessionId, presence: service.sessions.presence(record.sessionId) },
+        ...(peers ? { peers } : {}),
+      });
     } catch (error) {
       if (error instanceof HookPayloadError) json(res, 400, { error: error.message });
       else if (error instanceof HookRateError) json(res, 429, { error: error.message });
@@ -934,7 +1002,9 @@ export async function handleApi(
         const bad = gitDoorRefusal(shape as { isolation?: string; gitMode?: string });
         if (bad) { json(res, 400, { error: bad }); return true; }
       }
-      json(res, 200, service.savePreferences(body));
+      // Attributed (phase 12): a changed policy answer is journalled with who
+      // changed it — the actor rule, as every other mutating door records.
+      json(res, 200, service.savePreferences(body, { by: actorOfRequest(req, service.flags, body).by }));
       return true;
     }
 
@@ -1065,7 +1135,9 @@ export async function handleApi(
             return true;
           }
 
-          const outcome = await service.performInboxAction(grant.item, verb);
+          const outcome = await service.performInboxAction(
+            grant.item, verb, 'notification', actorOfRequest(req, service.flags, { by: 'notification' }),
+          );
           if (outcome.ok) { json(res, 200, outcome); return true; }
           json(res, outcome.status, { error: outcome.error });
           return true;
@@ -1189,8 +1261,10 @@ export async function handleApi(
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
-        const by = typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console';
-        const outcome = service.restart(by, body.force === true);
+        // Derived, not supplied (SHD-3): the client used to send the literal
+        // `'console'`, so a click, a script and a tailnet caller were one
+        // record. The body may still offer a LABEL; the transport is read.
+        const outcome = service.restart(actorOfRequest(req, service.flags, body), body.force === true);
         json(res, outcome.ok ? 200 : 409, outcome);
         return true;
       }
@@ -1214,9 +1288,14 @@ export async function handleApi(
           json(res, 400, { error: 'pass {"confirm":true} — shutting the console down is not a default.' });
           return true;
         }
-        const by = typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console';
-        const outcome = service.shutdown(by);
-        json(res, outcome.ok ? 200 : 409, outcome);
+        // …and the strength, and the acknowledgement (SHD-1, SHD-2): `mode` is
+        // `exit` (the default) or `unload` ("stay off"); `acknowledge: true`
+        // is what a press over a non-empty inventory — and every `unload` —
+        // must add. A refusal answers with the inventory it is about.
+        const outcome = service.shutdown(actorOfRequest(req, service.flags, body), {
+          mode: body.mode, acknowledge: body.acknowledge,
+        });
+        json(res, outcome.ok ? 200 : (outcome.status ?? 409), outcome);
         return true;
       }
     }
@@ -1236,7 +1315,7 @@ export async function handleApi(
         const refusal = guardAnySession(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
-        const by = typeof body.by === 'string' ? body.by.slice(0, 80) : 'console';
+        const by = actorOfRequest(req, service.flags, body).by;
         const outcome = rest[1] === 'freeze' ? service.terminals.freeze(rest[0], by)
           : rest[1] === 'thaw' ? service.terminals.thaw(rest[0])
           : service.terminals.stop(rest[0], by);
@@ -1385,6 +1464,9 @@ export async function handleApi(
             ...(issues ? { issues } : {}),
             ...(account ? { account } : {}),
             ...(resumeTarget ? { resumeTarget } : {}),
+            // The plan wizard opens by reading this repository's ledgers — the
+            // manifests, their twins and the rulings — digested by the service.
+            ...(body.intent === 'plan' && service.store ? { plan: service.planFacts() } : {}),
           });
           if (!built.ok) { json(res, built.status, { error: built.error }); return true; }
           launch = built.launch;
@@ -1429,6 +1511,28 @@ export async function handleApi(
      * can take a moment; Settings polls it only while it is open. */
     if (head === 'tailscale' && req.method === 'GET') {
       json(res, 200, await tailscaleStatus(service.flags.port));
+      return true;
+    }
+
+    /* ---------------- the consoles of this machine (zero-touch phase 17) ----------------
+     * The census (FLT-5, FLT-6): every console the registry, the state
+     * directories, the prefs files, the units and the launchers know of, one row
+     * each, with the liveness word `phase-console list --json` prints for the
+     * same row — both are `census()` itself. Above the source-directory guard:
+     * an instance fact, read on Settings before any root is open. Behind the
+     * access gate like every read; it names roots, never a secret. */
+    if (head === 'instances' && req.method === 'GET' && rest.length === 0) {
+      json(res, 200, service.instancesView());
+      return true;
+    }
+
+    /* The machine profile (`~/.config/phase-console/fleet.json`, FLT-3), and
+     * what THIS console takes from it — each field's source named, so an
+     * override is visible rather than a surprise. Read-only here; it is written
+     * by `instances.mjs profile-set` / `phase-console profile set`. */
+
+    if (head === 'fleet' && rest[0] === 'profile' && rest.length === 1 && req.method === 'GET') {
+      json(res, 200, service.fleetProfileView());
       return true;
     }
 
@@ -1547,6 +1651,9 @@ export async function handleApi(
         json(res, 200, {
           accounts: await service.listAccounts(),
           allowAccounts: service.flags.allowAccounts,
+          // The removed registrations the learned store still answers for
+          // (phase 15). Read defensively: an older service has no such method.
+          tombstones: typeof service.accountTombstones === 'function' ? service.accountTombstones() : [],
         });
         return true;
       }
@@ -1586,6 +1693,46 @@ export async function handleApi(
         const view = await service.refreshAccount(id);
         if (!view) { json(res, 404, { error: 'No such account.' }); return true; }
         json(res, 200, { account: view });
+        return true;
+      }
+      // The operator's clearance of a RETIRED account (zero-touch-console
+      // phase 8): the one transition out of the breaker's `retired`, for the
+      // credential and every account in its organisation. Registration-class,
+      // like add/remove — it widens what every future run may spend — and
+      // attributed to the request, never to the console.
+      if (req.method === 'POST' && rest.length === 2 && rest[1] === 'clear-retired') {
+        const refusal = guardAccounts(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const id = rest[0] ?? '';
+        if (!ACCOUNT_ID_RE.test(id)) { json(res, 400, { error: 'Not an account id.' }); return true; }
+        const body = await readBody(req);
+        try {
+          const view = await service.clearRetiredAccount(id, actorOfRequest(req, service.flags, body));
+          if (!view) { json(res, 404, { error: 'No such account.' }); return true; }
+          json(res, 200, { account: view });
+        } catch (error) {
+          json(res, 400, { error: (error as Error).message });
+        }
+        return true;
+      }
+      // Does the API take this account's work? One declared one-turn session
+      // under the account (zero-touch-console phase 15): the same gate as the
+      // clearance, because its answer can retire an organisation, and the
+      // same derived actor, because a person asked. Held open for the answer —
+      // at most the session's own clock — and 409 while one is running.
+      if (req.method === 'POST' && rest.length === 2 && rest[1] === 'probe-entitlement') {
+        const refusal = guardAccounts(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const id = rest[0] ?? '';
+        if (!ACCOUNT_ID_RE.test(id)) { json(res, 400, { error: 'Not an account id.' }); return true; }
+        const body = await readBody(req);
+        try {
+          const out = await service.probeAccountEntitlement(id, actorOfRequest(req, service.flags, body));
+          if (!out) { json(res, 404, { error: 'No such account.' }); return true; }
+          json(res, 200, out);
+        } catch (error) {
+          json(res, error instanceof ProbeInFlightError ? 409 : 400, { error: (error as Error).message });
+        }
         return true;
       }
       if (req.method === 'POST' && rest.length === 0) {
@@ -1639,9 +1786,9 @@ export async function handleApi(
 
     /* ---------------- the desktop launcher ----------------
      * Above the wall like tailscale and accounts: Settings is where this
-     * renders, and the PLAN (where would it land, is this platform supported)
-     * is answerable with no root open. Only creating one needs a root, and
-     * that refusal names what to do. */
+     * renders, and neither the PLAN (where would it land, is this platform
+     * supported) nor the file itself needs a root open — since LAUNCHER_REV 12
+     * the launcher carries no root and picks its console when it runs. */
     if (head === 'launcher') {
       if (req.method === 'GET') {
         json(res, 200, service.launcherPlan());
@@ -1657,10 +1804,8 @@ export async function handleApi(
         try {
           json(res, 200, service.createDesktopLauncher());
         } catch (error) {
-          // 409 when a root is simply not open (well-formed ask, nothing to
-          // bake); 400 for an unsupported platform or a template problem.
-          const message = (error as Error).message;
-          json(res, /source directory/i.test(message) ? 409 : 400, { error: message });
+          // 400 for an unsupported platform or a template problem.
+          json(res, 400, { error: (error as Error).message });
         }
         return true;
       }
@@ -1676,6 +1821,24 @@ export async function handleApi(
     if (head === 'policy') {
       if (req.method === 'GET') {
         json(res, 200, service.policy(url.searchParams.get('slug')));
+        return true;
+      }
+      // `POST /api/policy/advisory/acknowledge {kind}` — the operator has read
+      // a standing advisory (phase 12). A receipt, not a policy edit: it needs
+      // the mutation guard and no capability flag, and it changes no rule.
+      if (req.method === 'POST' && rest[0] === 'advisory' && rest[1] === 'acknowledge') {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = await readBody(req);
+        const kind = typeof body.kind === 'string' ? body.kind : '';
+        if (!(POLICY_ADVISORY_KINDS as readonly string[]).includes(kind)) {
+          json(res, 400, { error: `pass {"kind": "${POLICY_ADVISORY_KINDS.join('" | "')}"}` });
+          return true;
+        }
+        const acknowledged = service.acknowledgePolicyAdvisory(kind);
+        json(res, acknowledged ? 200 : 404, acknowledged
+          ? { ok: true, kind, advisory: service.policyAdvisories() }
+          : { error: `no ${kind} advisory stands right now` });
         return true;
       }
       if (req.method === 'POST') {
@@ -1724,16 +1887,26 @@ export async function handleApi(
               set = { autoApprove: part.autoApprove as boolean | null };
             }
           }
-          json(res, 200, service.editPolicy({
-            scope,
-            slug,
-            add: lists(body.add),
-            remove: lists(body.remove),
-            ...(resets.length ? { reset: resets } : {}),
-            ...(restore.deny.length || restore.ask.length || restore.allow.length ? { restore } : {}),
-            ...(set ? { set } : {}),
-            by: typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
-          }));
+          try {
+            json(res, 200, service.editPolicy({
+              scope,
+              slug,
+              add: lists(body.add),
+              remove: lists(body.remove),
+              ...(resets.length ? { reset: resets } : {}),
+              ...(restore.deny.length || restore.ask.length || restore.allow.length ? { restore } : {}),
+              ...(set ? { set } : {}),
+              by: actorOfRequest(req, service.flags, body).by,
+            }));
+          } catch (error) {
+            // A rule that would parse and never match is refused with the
+            // rules named (phase 12, TRS-12), not written and shown as enforced.
+            if (error instanceof PolicyRuleError) {
+              json(res, 400, { error: error.message, rules: error.rules });
+              return true;
+            }
+            throw error;
+          }
           return true;
         }
 
@@ -1760,6 +1933,14 @@ export async function handleApi(
     // in a header widget that is meant to be quietly correct.
     if (head === 'spend' && req.method === 'GET') { json(res, 200, service.spend()); return true; }
 
+    // Every open plan's newest runs, their ledgers per plan and per account
+    // (phase 19) — Insights. Above the wall for `spend`'s reason: no plan
+    // directory is an empty summary, not an error.
+    if (head === 'ledger' && req.method === 'GET' && rest.length === 0) {
+      json(res, 200, service.ledgerSummary());
+      return true;
+    }
+
     // The scrape endpoint. Above the wall for the same reason as `spend`: a
     // console with no plan directory open still has a version, an instance and
     // a day's spend, and a 409 in a scrape loop is an alert about nothing.
@@ -1778,6 +1959,17 @@ export async function handleApi(
         'content-type': METRICS_CONTENT_TYPE,
         'cache-control': 'no-store',
       });
+      return true;
+    }
+
+    /* ---------------- doctor: the prelude's probes with no plan, and the machine ---------------- */
+    //
+    // Above the "no source directory" wall for the same reason `debug` is: a
+    // console that could not open its directory is exactly the one somebody
+    // runs `phase-console doctor` against, and the CLI prefers this answer to
+    // its own off-line reading whenever a console is up. A read; no guard.
+    if (head === 'doctor' && req.method === 'GET') {
+      json(res, 200, await service.doctor());
       return true;
     }
 
@@ -1979,7 +2171,11 @@ export async function handleApi(
         const refusal = guardCsrf(req);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
-        const by = typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : undefined;
+        // Always attributed: a ruling's ledger ack is refused without a name
+        // (phase 12), and the browser never sends one — the actor rule
+        // (`operator` for a browser or the CLI, `script` otherwise, the
+        // offered `by` when there is one) is what every other door records.
+        const by = actorOfRequest(req, service.flags, body).by.slice(0, 64);
 
         // `{ids}` is the bulk form. It answers per item, the way
         // `/api/locks/release {expired:true}` does — seventeen acknowledgements
@@ -2273,6 +2469,7 @@ export async function handleApi(
             by: typeof body.by === 'string' ? body.by : undefined,
             note: typeof body.note === 'string' ? body.note : undefined,
             continueRun: body.continueRun === true,
+            actor: actorOfRequest(req, service.flags, body),
           });
           // On refusal, `error` carries the detail so ApiError.message says
           // WHY rather than "Request failed (409)".
@@ -2342,7 +2539,7 @@ export async function handleApi(
         }
         const outcome = await service.qaWaive(slug, phase, {
           reason: typeof body.reason === 'string' ? body.reason.slice(0, 280) : '',
-          by: typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
+          by: actorOfRequest(req, service.flags, body).by,
         });
         json(res, outcome.ok ? 200 : 409, outcome);
         return true;
@@ -2402,6 +2599,23 @@ export async function handleApi(
      * 200: pressing Freeze on an already-frozen console must not read as
      * having just frozen it, because the `at` an operator then quotes would be
      * the wrong moment. */
+    /* ---------------- the boot hold (SHD-5, FLT-9) ----------------
+     * Run-class, like the thaw it mirrors: releasing the hold re-adopts and
+     * converges, and both end in spawned sessions. */
+    if (head === 'automation' && rest[0] === 'hold') {
+      if (req.method === 'GET') { json(res, 200, { bootHold: service.bootHold() }); return true; }
+      if (req.method === 'POST' && rest[1] === 'release') {
+        const refusal = guardRun(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = await readBody(req);
+        const outcome = await service.releaseBootHold(actorOfRequest(req, service.flags, body));
+        json(res, outcome.ok ? 200 : 409, outcome.ok ? { ...outcome, bootHold: service.bootHold() } : { error: outcome.reason, bootHold: service.bootHold() });
+        return true;
+      }
+      json(res, 405, { error: 'method not allowed' });
+      return true;
+    }
+
     if (head === 'fleet') {
       if (req.method === 'GET' && rest.length === 0) {
         json(res, 200, { fleet: service.fleetState(), allowRun: service.flags.allowRun });
@@ -2411,7 +2625,7 @@ export async function handleApi(
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
-        const by = typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console';
+        const by = actorOfRequest(req, service.flags, body).by;
         const outcome = rest[0] === 'freeze'
           ? service.freezeFleet(by)
           : await service.thawFleet(by);
@@ -2490,7 +2704,7 @@ export async function handleApi(
           : body.remember === 'global' ? 'global' : null;
         const answered = service.decideApproval(
           rest[0], decision,
-          typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
+          actorOfRequest(req, service.flags, body).by,
           typeof body.reason === 'string' ? body.reason.slice(0, 500) : undefined,
           scope && typeof body.rule === 'string' && body.rule
             ? { scope, rule: body.rule.slice(0, 200) } : undefined,
@@ -2525,6 +2739,12 @@ export async function handleApi(
           json(res, 200, service.phaseAttempts(slug, phase, url.searchParams.get('run') ?? undefined));
           return true;
         }
+        // Why each start happened, what every session cost and ran, what each
+        // rung spent — the journal's ledger, held to the run's spend (phase 19).
+        if (verb === 'ledger') {
+          json(res, 200, service.runLedger(slug, rest[2]));
+          return true;
+        }
         if (verb === 'transcript') {
           json(res, 200, service.runTranscript(slug, rest[2], Number(url.searchParams.get('limit') ?? 400)));
           return true;
@@ -2552,6 +2772,38 @@ export async function handleApi(
         // ledger file rather than from a run, so it answers for a plan nobody
         // has ever started a run on — which is every plan somebody is driving
         // by hand.
+        // The run-start prelude for the launch form's DRAFT (phase 11): the
+        // manifest rendered and the four probes run over the console's own
+        // facts, before Launch is pressed — the same computation the start
+        // door makes, so what the form shows is what the door will judge.
+        // The draft's answers ride in the query.
+        if (verb === 'prelude') {
+          const q = url.searchParams;
+          const accounts = q.get('accounts')
+            ? accountRequirements(q.get('accounts')!.split(',').map((pair) => {
+              const [id, min] = pair.split(':');
+              return { id: id?.trim(), minHeadroomPct: min === undefined || min === '' ? 0 : Number(min) };
+            }), service)
+            : undefined;
+          const relay = (RELAY_MODES as readonly string[]).includes(q.get('relay') ?? '') ? q.get('relay')! : undefined;
+          const resume = q.get('resumeOnRestart');
+          const ack = (q.get('ack') ?? '').split(',').map((k) => k.trim()).filter(Boolean);
+          try {
+            const prelude = await service.prelude(slug, {
+              ...(accounts?.length ? { accounts } : {}),
+              ...(relay ? { relay } : {}),
+              ...(resume === 'true' || resume === 'false' ? { resumeOnRestart: resume === 'true' } : {}),
+              ...(ack.length ? { acknowledgedWaivers: ack } : {}),
+              ...(q.get('model') ? { model: q.get('model')! } : {}),
+              ...(q.get('profile') ? { permissionProfile: q.get('profile')! } : {}),
+              ...(q.get('mcpPolicy') ? { mcpPolicy: q.get('mcpPolicy')! } : {}),
+            });
+            json(res, 200, { prelude });
+          } catch (error) {
+            json(res, 404, { error: String((error as Error)?.message ?? error) });
+          }
+          return true;
+        }
         if (verb === 'rulings') {
           json(res, 200, { rulings: service.runRulings(slug) });
           return true;
@@ -2579,6 +2831,26 @@ export async function handleApi(
           // endpoint that mostly 404s teaches a client to stop asking.
           git: service.runGit(slug),
         });
+        return true;
+      }
+
+      // `POST /api/run/:slug/rulings/:id/remember {scope: plan|global}` — a
+      // ruling becomes a standing answer (phase 12). Before the run-verb block
+      // because it is not a run verb: `plan` edits a versioned docs file and
+      // sits behind `--allow-writes`; `global` writes a console preference and
+      // sits behind nothing but the mutation guard, like `/api/prefs`. The
+      // inbox's two actions and `phase-outcome.sh … --remember` all arrive here.
+      if (req.method === 'POST' && verb === 'rulings' && rest[3] === 'remember') {
+        const body = await readBody(req);
+        const scope = body.scope === 'plan' ? 'plan' : body.scope === 'global' ? 'global' : body.scope === 'rule' ? 'rule' : null;
+        if (!scope) { json(res, 400, { error: 'pass {"scope": "plan"}, {"scope": "global"} or {"scope": "rule"}' }); return true; }
+        // `rule` (phase 14) writes a console preference, like `global`.
+        const refusal = scope === 'plan' ? guardWrite(req, service) : guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const id = String(rest[2] ?? '').slice(0, 64);
+        const outcome = await service.rememberRuling(slug, id, scope, actorOfRequest(req, service.flags, body).by);
+        if (!outcome.ok) { json(res, outcome.status, { error: outcome.error }); return true; }
+        json(res, 200, outcome);
         return true;
       }
 
@@ -2611,6 +2883,27 @@ export async function handleApi(
               ?? phaseOptionsProblem(body.phaseOptions);
             if (problem) { json(res, 400, { error: problem }); return true; }
 
+            // The prelude's required answers (phase 11, ZTD-2/QRL-2): a FRESH
+            // start says how it resumes after a restart, whether the relay is
+            // armed, and which accounts it may spend. A resume answered these
+            // at its own door. Refused here, by name, rather than defaulted:
+            // a default silently answering `resume.on-restart` is exactly the
+            // unrecorded decision the audit filed 17 times.
+            if (typeof body.resumeRunId !== 'string' || !body.resumeRunId) {
+              const missing: string[] = [];
+              if (typeof body.resumeOnRestart !== 'boolean') missing.push('resumeOnRestart');
+              if (!(RELAY_MODES as readonly string[]).includes(body.relay as string)) missing.push('relay');
+              if (!Array.isArray(body.accounts) || !body.accounts.length) missing.push('accounts');
+              if (missing.length) {
+                json(res, 400, {
+                  error: `${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required to start a run — `
+                    + 'the Decisions stage answers them (resumeOnRestart: true or false; relay: off, or last-resort; accounts: [{id, minHeadroomPct}]).',
+                  missing,
+                });
+                return true;
+              }
+            }
+
             // The git door. Asked of the RESOLVED pair, because `undefined` on
             // this door means "you did not say" and the stored preference then
             // decides — so the combination that would actually run is the one
@@ -2627,6 +2920,9 @@ export async function handleApi(
             if (gitBad) { json(res, 400, { error: gitBad }); return true; }
 
             const state = await service.startRun(slug, {
+              // The one door a person opens: the request's derived actor,
+              // through `OPERATOR_DOOR`. Never counted by the start ceiling.
+              actor: pressActor(actorOfRequest(req, service.flags, body)),
               model: typeof body.model === 'string' && body.model ? body.model : undefined,
               // Checked above rather than passed through: the CLI only *warns*
               // on an unknown effort and carries on at its own default, so a
@@ -2743,6 +3039,30 @@ export async function handleApi(
               // A boolean or nothing: absent lets the stored preference (fresh
               // run) or the run's own sticky choice (resume) decide.
               autoRecover: typeof body.autoRecover === 'boolean' ? body.autoRecover : undefined,
+              // The prelude's answers (phase 11). Checked above for a fresh
+              // start; coerced here so a typo never reaches the run as an
+              // answer: an unknown account id is dropped (the prelude then
+              // judges what is left), a minimum outside 0–100 is clamped, a
+              // waiver key outside the vocabulary is ignored.
+              resumeOnRestart: typeof body.resumeOnRestart === 'boolean' ? body.resumeOnRestart : undefined,
+              relay: (RELAY_MODES as readonly string[]).includes(body.relay as string) ? (body.relay as RelayMode) : undefined,
+              accounts: accountRequirements(body.accounts, service),
+              acknowledgedWaivers: Array.isArray(body.acknowledgedWaivers)
+                ? body.acknowledgedWaivers.filter((k): k is string => typeof k === 'string' && (DECISION_KEYS as readonly string[]).includes(k))
+                : undefined,
+              // The one recorded way past a blocking row: `{rows?, by?}`; the
+              // rows are the prelude's own list, `by` is the request's actor
+              // unless the body names a person.
+              manifestOverride: body.manifestOverride && typeof body.manifestOverride === 'object'
+                ? {
+                  rows: Array.isArray((body.manifestOverride as { rows?: unknown }).rows)
+                    ? ((body.manifestOverride as { rows: unknown[] }).rows).filter((k): k is string => typeof k === 'string').slice(0, 32)
+                    : [],
+                  by: typeof (body.manifestOverride as { by?: unknown }).by === 'string' && (body.manifestOverride as { by: string }).by.trim()
+                    ? (body.manifestOverride as { by: string }).by.trim().slice(0, 64)
+                    : actorOfRequest(req, service.flags, body).by,
+                }
+                : undefined,
             });
             // Advisory, best-effort: which phases will park at boarding for an
             // unrunnable §Verification, and which are claimed by a live holder
@@ -2775,7 +3095,7 @@ export async function handleApi(
             // 409 rather than 400: the request is well formed, there is simply
             // nothing listening — and the difference is what tells the console
             // to say "no session is running" instead of "bad request".
-            const by = typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console';
+            const by = actorOfRequest(req, service.flags, body).by;
             const key = idempotencyKey(req, body);
             const sent = verb === 'ask'
               ? service.askRun(slug, String(body.question ?? ''), by, key, targetPhase(body))
@@ -2785,7 +3105,29 @@ export async function handleApi(
             json(res, sent.ok ? 200 : 409, sent);
             return true;
           }
-          case 'pause': json(res, 200, { run: service.pauseRun(slug) }); return true;
+          // A person's answer to a relayed question (phase 14): `{approvalId,
+          // answers: [{key|question, label}]}`, or one `{approvalId, key, label}`.
+          // Behind `--allow-run` like the permission card beside it: it answers a
+          // session that is holding a hook open. 409 when the window has closed.
+          case 'answer': {
+            const approvalId = typeof body.approvalId === 'string' ? body.approvalId.slice(0, 80) : '';
+            if (!approvalId) { json(res, 400, { error: 'an approvalId is required' }); return true; }
+            const raw = Array.isArray(body.answers) ? body.answers : [body];
+            const picks = raw.flatMap((entry) => {
+              const pick = entry as { key?: unknown; question?: unknown; label?: unknown } | null;
+              if (typeof pick?.label !== 'string' || !pick.label.trim()) return [];
+              return [{
+                label: pick.label.slice(0, 200),
+                ...(typeof pick.key === 'string' ? { key: pick.key.slice(0, 200) } : {}),
+                ...(typeof pick.question === 'string' ? { question: pick.question } : {}),
+              }];
+            }).slice(0, 4);
+            if (!picks.length) { json(res, 400, { error: 'pass at least one {key, label}' }); return true; }
+            const answered = service.answerQuestion(slug, approvalId, picks, actorOfRequest(req, service.flags, body).by);
+            json(res, answered.ok ? 200 : answered.status === 404 ? 409 : answered.status, answered);
+            return true;
+          }
+          case 'pause': json(res, 200, { run: service.pauseRun(slug, actorOfRequest(req, service.flags, body)) }); return true;
           case 'resume': json(res, 200, { run: service.resumePause(slug) }); return true;
           // Their own verbs and NOT `settings` fields, for the reason
           // `switch-account` is one: a hold is an act with a moment and an
@@ -2795,8 +3137,7 @@ export async function handleApi(
           // ADMISSION and lets the running phases finish.
           case 'hold': {
             json(res, 200, {
-              run: service.holdRun(slug, typeof body.by === 'string' && body.by
-                ? body.by.slice(0, 64) : 'console'),
+              run: service.holdRun(slug, actorOfRequest(req, service.flags, body).by),
             });
             return true;
           }
@@ -2806,9 +3147,10 @@ export async function handleApi(
           // phase re-attempted under the other account without waiting.
           case 'switch-account': {
             const choice = accountChoice(body.accountId, service) ?? DEFAULT_ACCOUNT_ID;
-            const outcome = service.switchAccountRun(
-              slug, choice, typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
-            );
+            // ACT-11: the client never sent `by`, and the default was the
+            // literal `'console'` — twenty of twenty-one lifetime switches
+            // read as the console's own. The actor is the request's now.
+            const outcome = service.switchAccountRun(slug, choice, actorOfRequest(req, service.flags, body));
             json(res, outcome.ok ? 200 : 409, outcome);
             return true;
           }
@@ -2816,11 +3158,7 @@ export async function handleApi(
           // on-disk fallback: a null run here means this console is not the one
           // driving, which the client reports rather than papering over.
           case 'freeze': {
-            const done = service.freezeRun(
-              slug,
-              typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
-              targetPhase(body),
-            );
+            const done = service.freezeRun(slug, actorOfRequest(req, service.flags, body).by, targetPhase(body));
             // `?.ok === false` rather than `!done.ok`: a refusal now carries the
             // reason the operator needs, and the optional chain keeps a service
             // that answers nothing at all reading as "it happened" exactly as
@@ -2842,11 +3180,7 @@ export async function handleApi(
             // carries on. Same 409-with-a-reason shape the recovery verbs use.
             try {
               json(res, 200, {
-                run: await service.stopRun(
-                  slug,
-                  targetPhase(body),
-                  typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
-                ),
+                run: await service.stopRun(slug, targetPhase(body), actorOfRequest(req, service.flags, body)),
               });
             } catch (error) {
               json(res, 409, { error: (error as Error)?.message ?? 'the run could not be stopped' });
@@ -2864,7 +3198,7 @@ export async function handleApi(
             const run = verb === 'resolve'
               ? service.resolveRun(slug, runId, {
                 note: typeof body.note === 'string' ? body.note.slice(0, 500) : undefined,
-                by: typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
+                by: actorOfRequest(req, service.flags, body).by,
               })
               : service.unresolveRun(slug, runId);
             json(res, run ? 200 : 404, run ? { run } : { error: `no run ${runId} of ${slug}` });
@@ -2886,12 +3220,13 @@ export async function handleApi(
               : phaseOptionsProblem({ [String(body.phase)]: body.options });
             if (problem) { json(res, 400, { error: problem }); return true; }
             const addendum = typeof body.addendum === 'string' ? body.addendum.slice(0, ADDENDUM_MAX) : undefined;
+            const actor = actorOfRequest(req, service.flags, body);
             json(res, 200, {
               run: await service.retryPhase(slug, Number(body.phase), {
                 ...(addendum ? { addendum } : {}),
                 options: onePhaseOptions(body.options, service),
-                by: 'console',
-              }),
+                by: actor.by,
+              }, pressActor(actor)),
             });
             return true;
           }
@@ -2904,7 +3239,7 @@ export async function handleApi(
           // Service.recoverPlan for why this cannot corrupt the orchestration.
           case 'recover': {
             try {
-              json(res, 200, await service.recoverPlan(slug));
+              json(res, 200, await service.recoverPlan(slug, pressActor(actorOfRequest(req, service.flags, body))));
             } catch (error) {
               json(res, 409, { error: (error as Error)?.message ?? 'the plan could not be recovered' });
             }
@@ -2922,7 +3257,7 @@ export async function handleApi(
           }
           case 'mcp-continue': {
             try {
-              json(res, 200, { run: await service.continueWithoutMcp(slug) });
+              json(res, 200, { run: await service.continueWithoutMcp(slug, pressActor(actorOfRequest(req, service.flags, body))) });
             } catch (error) {
               json(res, 409, { error: (error as Error)?.message ?? 'the run could not be continued' });
             }
@@ -2981,7 +3316,8 @@ export async function handleApi(
                   ...(isPermissionProfile(body.permissionProfile)
                     ? { permissionProfile: body.permissionProfile } : {}),
                 },
-                by: typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
+                by: actorOfRequest(req, service.flags, body).by,
+                actor: actorOfRequest(req, service.flags, body),
               });
               json(res, 200, { run });
             } catch (error) {
@@ -3017,7 +3353,7 @@ export async function handleApi(
             try {
               const run = await service.recoverPhase(slug, Number(body.phase), mode, {
                 instruction: typeof body.instruction === 'string' ? body.instruction.slice(0, 8_000) : undefined,
-                by: typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console',
+                by: actorOfRequest(req, service.flags, body).by,
               });
               json(res, 200, { run });
             } catch (error) {
@@ -3166,7 +3502,7 @@ export async function handleApi(
               ...(body.qaRoundBudgetUsd === undefined
                 ? {} : { qaRoundBudgetUsd: numberOrNull(body.qaRoundBudgetUsd) }),
               ...(isOnLimitPolicy(body.onLimit) ? { onLimit: body.onLimit } : {}),
-            }, typeof body.by === 'string' && body.by ? body.by.slice(0, 64) : 'console');
+            }, actorOfRequest(req, service.flags, body).by);
             json(res, 200, { run });
             return true;
           }
@@ -3209,13 +3545,19 @@ export async function handleApi(
     // 409 for a claimed phase: the request is well formed and the caller did
     // nothing wrong — somebody else is simply working that phase. 500 would
     // read as a console fault and send the operator looking for the wrong bug.
-    const status = error instanceof PhaseClaimedError || error instanceof RecoveryBusyError ? 409
+    const status = error instanceof PhaseClaimedError || error instanceof RecoveryBusyError || error instanceof PreludeRefusal ? 409
       : error instanceof WriteError ? 400
         : 500;
     json(res, status, {
       error: message,
       ...(error instanceof PhaseClaimedError
         ? { claimed: { slug: error.slug, phase: error.phase, ...error.lock } }
+        : {}),
+      // 409 for the prelude too (phase 11): the request is well formed and the
+      // console is fine — the manifest still owes an answer. The body lists
+      // every unanswered row so the form can name them all, not the first.
+      ...(error instanceof PreludeRefusal
+        ? { unanswered: error.unanswered, prelude: error.prelude }
         : {}),
       // The same 409-with-sessionId shape `resolveRecovery` refusals use, so
       // the client navigates to the live session instead of erroring.

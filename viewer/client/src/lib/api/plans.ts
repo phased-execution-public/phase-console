@@ -285,6 +285,29 @@ export interface SessionBudgetView {
   /** `**MCP servers (every session):**` — attached to every phase of this plan. */
   mcpServers: string[];
   qaGate?: 'on' | 'off';
+  /**
+   * `**Accounts:**` — the accounts a run of this plan may spend, in order, each
+   * with the minimum five-hour headroom (percent) it must show. Absent on a
+   * server from before 5.0.0; empty when the plan names none.
+   */
+  accounts?: { id: string; minHeadroom?: number }[];
+}
+
+/**
+ * One row of the plan's `## Decisions` manifest as it HOLDS — the plan's row
+ * with the `decisions.md` twin merged over it (`shared/decisions-model.js`
+ * `DecisionRow`; the server's `mergeDecisions`). `blocking` is the normalised
+ * `yes`/`no`; `phase` is `null` for a plan-wide row.
+ */
+export interface DecisionRowView {
+  key: string;
+  value: string;
+  owner: string;
+  state: string;
+  blocking: 'yes' | 'no';
+  source: string;
+  evidence: string;
+  phase: number | null;
 }
 
 export interface PlanFile {
@@ -299,6 +322,8 @@ export interface PlanFile {
   graph?: PhaseRow[];
   /** `?include=document` — Source-tab only. */
   callouts?: string[];
+  /** `?include=document` — the decision manifest, Source-tab only. */
+  decisions?: DecisionRowView[];
   /** `?include=document` — the whole plan re-shipped; no client surface reads it. */
   sections?: { title: string; body: string }[];
   path?: string;

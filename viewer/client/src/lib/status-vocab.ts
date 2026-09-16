@@ -148,8 +148,9 @@ export const RUN_STATUS_HELP: Record<RunStatus, StatusHelp> = {
     then: 'Press Continue when ready — it picks up exactly where it left off.',
   },
   waiting: {
-    means: "Sleeping until the account's usage window reopens, then resumes itself.",
-    then: 'Nothing to do.',
+    means:
+      'Parked on a clock — a usage window reopening, an external wait, a scope or the schedule freeing up, or a person answering a card — and resumes itself when it lands.',
+    then: 'Nothing to do, unless it waits on a person: then the card is yours to answer.',
   },
   frozen: {
     means: 'The session is stopped where it stands (mid-token), warm and losing nothing.',

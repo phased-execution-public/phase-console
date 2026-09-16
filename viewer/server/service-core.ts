@@ -12,6 +12,7 @@
  */
 
 import { basename, join } from 'node:path';
+import type { DecisionRow } from '../shared/decisions-model.js';
 import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
@@ -331,6 +332,8 @@ export type PlanDetail = {
     slug: string; title: string; provenance?: string; context?: string; architecture?: string;
     endToEnd?: string; sessionBudget: unknown; graph?: PhaseRow[]; callouts?: string[];
     sections?: { title: string; body: string }[];
+    /** The `## Decisions` manifest as it holds (plan ⊕ twin); `?include=document`. */
+    decisions?: DecisionRow[];
     path?: string;
   } | null;
   phases: PhaseView[];
@@ -410,12 +413,22 @@ export class HookRateError extends Error {}
 /** Session events accepted per minute — a person's sessions produce a few; a runaway loop must not write a storm. */
 export const HOOK_EVENTS_PER_MINUTE = 300;
 /**
- * Presence moves parked during service construction before the oldest is
- * dropped — see `ServiceBase.presenceBacklog`. A poisoned session inbox is
- * exactly what mints a lot of these at once, so the park is bounded: a boot
- * that cannot drain its own backlog is a second way to fall over at boot.
+ * Presence moves parked during service construction before the bound bites —
+ * see `ServiceBase.presenceBacklog`. A poisoned session inbox is exactly what
+ * mints a lot of these at once, so the park is bounded: a boot that cannot
+ * drain its own backlog is a second way to fall over at boot. What the bound
+ * bites is chosen by KIND (SHD-7): the oldest droppable move (`prune`,
+ * `heartbeat`) is evicted to make room, and a real move that still cannot be
+ * parked is deferred to the next poll — a `SessionEnd` is never dropped.
  */
 export const PRESENCE_BACKLOG_MAX = 500;
+/**
+ * How long the drain waits for the shutdown announcement's delivery reports
+ * (SHD-4). Push sends answer in well under a second when they answer at all;
+ * five seconds is room for a slow network and a small slice of the 120 s drain,
+ * and past it the record says `skipped` rather than staying `[]`.
+ */
+export const SHUTDOWN_ANNOUNCE_WAIT_MS = 5_000;
 /** Per-file debounce for the unsupervised-outcome inbox watcher. */
 export const OUTCOME_INBOX_DEBOUNCE_MS = 250;
 /**
@@ -1059,11 +1072,38 @@ export type DriveVehicle =
   /** A `require` MCP park past its clock: continue without the servers, errand recorded. */
   | { kind: 'mcp-continue' }
   /**
+   * A standing approval card (phase 9, TRS-10): the `widen-rule` offer for the
+   * deny rule the console's own hook refused — free, answered by a person.
+   */
+  | { kind: 'card'; offer: 'widen-rule'; denied: { tool: string; rule: string; command?: string; at: string } }
+  /**
    * A fresh QA review through the QA recovery loop (`qaRecover`, verb
    * `qa-rerun`, strategy `fresh`) — `qa-pending`'s second rung, for a phase
    * whose own session cannot be resumed.
    */
-  | { kind: 'qa-rerun' };
+  | { kind: 'qa-rerun' }
+  /*
+   * The resource walls and the parks, drivable on a STOPPED run since
+   * zero-touch-console phase 10 (LFC-2/RCV-10). Each names what the healer
+   * will actually do, resolved from the console's own facts before the rung
+   * is accounted: the account it will move the run to, the budget it will
+   * raise to, the clock it will park on. None spawns anything itself — the
+   * relaunch at the end of each is the run's ordinary door.
+   */
+  /** Move the run to a registered account with headroom (`pickAccount`) and relaunch it. */
+  | { kind: 'switch-account'; accountId: string; from: string }
+  /** Raise the run's budget once, by `budgetAutoRaisePct` within the per-run ladder cap, and relaunch it. */
+  | { kind: 'raise-budget'; from: number; to: number; pct: number; cap: number }
+  /**
+   * Park the phase on a clock — the account's recorded reset (`wait-window`),
+   * the refs it declared (`poll-park`) or a bounded window (`timed-park`) —
+   * and re-arm the resume; at the clock the phase's own session re-boards.
+   */
+  | { kind: 'timed-park'; until: string; why: string; wait: 'external' | 'usage-limit'; refs?: string[] }
+  /** Hold a `require` MCP park on its clock — the timer re-armed, the rung accounted once. */
+  | { kind: 'wait-heal'; until: string }
+  /** One watch pass now, outside the cadence — the `waiting-external` row's one act. */
+  | { kind: 'watch-clock' };
 
 /** What `maybeAutoRecover` answers — launched or not, and what it read. */
 export type AutoRecoverResult = {
@@ -1074,7 +1114,7 @@ export type AutoRecoverResult = {
   situation?: string;
   label?: string;
   rung?: string;
-  vehicle?: 'retry' | 'session' | 'agent' | 'reboard' | 'mcp-continue' | 'script' | 'qa-rerun';
+  vehicle?: DriveVehicle['kind'];
 };
 
 /**
@@ -1085,12 +1125,25 @@ export function situationOfHalt(halt: RunState['halt']): string {
   switch (halt?.kind) {
     case 'plan-lint': case 'plan-unreadable': case 'verification-preflight': return 'plan-broken';
     case 'run-preflight': return 'resource-wall:auth';
+    // The run's own credential refused mid-run (RCV-1): the same wall, hit later.
+    case 'credential-refused': return 'resource-wall:auth';
     case 'budget': return 'resource-wall:budget';
     case 'models-exhausted': return 'resource-wall:model';
     case 'mcp-preflight': return 'mcp-unavailable';
-    case 'needs-human': case 'phase-blocked': return 'blocked-declared';
+    case 'needs-human': case 'awaiting-person': case 'phase-blocked': return 'blocked-declared';
     case 'verify-failed': return 'verify-red';
     case 'no-handoff': return 'done-unrecorded';
+    // The run-level parks LFC-1 named. `plan-deadlocked`'s holder is a phase
+    // the board reads done whose verdict is `pending` or `fail`; the per-phase
+    // classifier tells those apart, this reading names the family.
+    case 'plan-deadlocked': return 'qa-pending';
+    // Every remaining phase is behind a person's door — a gate most often, an
+    // errand or a Retry otherwise; the halt reason names each.
+    case 'nothing-ready': return 'gated-manual';
+    // The operator's own stop is the answer: `superseded` raises nothing.
+    case 'operator-stop': return 'superseded';
+    // `interrupted-by-restart` is crash-shaped and falls through to `unknown`
+    // with the other four, deliberately — `shared/fact-map.js` says why.
     default: return 'unknown';
   }
 }

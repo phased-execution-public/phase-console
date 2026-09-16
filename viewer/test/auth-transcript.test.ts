@@ -49,6 +49,32 @@ test('a signed-in answer is read in full', () => {
   assert.equal(status.detail, undefined, 'a clean answer needs no caveat');
 });
 
+test('the organisation id and the config directory are kept, not dropped (phase 8, ACT-8)', () => {
+  // `claude auth status` at 2.1.270 answers exactly these ten keys. `orgId` is
+  // the one stable key an entitlement breaker can hang on; `configDirectory`
+  // is proof the probe ran under the account it was asked about. Both were
+  // read off the wire and thrown away.
+  const status = parseAuth(JSON.stringify({
+    analyticsDisabled: false,
+    apiProvider: 'firstParty',
+    authMethod: 'claude.ai',
+    configDirectory: '/home/someone/.claude',
+    email: 'you@example.com',
+    loggedIn: true,
+    orgId: '0f4a2c1e-1111-2222-3333-444455556666',
+    orgName: "you@example.com's Organization",
+    projectsDirectory: '/home/someone/.claude/projects',
+    subscriptionType: 'max',
+  }), '', AT);
+  assert.equal(status.orgId, '0f4a2c1e-1111-2222-3333-444455556666');
+  assert.equal(status.configDirectory, '/home/someone/.claude');
+  assert.equal(status.organisation, "you@example.com's Organization", 'the name still rides beside the id');
+  // Absent on the wire means absent on the answer — never an empty string.
+  const bare = parseAuth(JSON.stringify({ loggedIn: true }), '', AT);
+  assert.equal(bare.orgId, undefined);
+  assert.equal(bare.configDirectory, undefined);
+});
+
 test('a signed-out answer is believed', () => {
   const status = parseAuth(JSON.stringify({ loggedIn: false }), '', AT);
   assert.equal(status.loggedIn, false);

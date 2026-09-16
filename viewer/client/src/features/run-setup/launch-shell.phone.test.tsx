@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   runStart: vi.fn(),
   plan: vi.fn(),
   verifyPreflight: vi.fn(),
+  runPrelude: vi.fn(),
 }));
 
 vi.mock('@/lib/api', async (importOriginal) => {
@@ -38,8 +39,29 @@ window.matchMedia = vi.fn().mockImplementation((query: string) => ({
   dispatchEvent: vi.fn(),
 }));
 
+/** A prelude with nothing open: every row answered, every probe ok. */
+const EMPTY_PRELUDE = {
+  slug: 'alpha',
+  rows: [],
+  blocking: [],
+  waived: [],
+  acknowledged: [],
+  manifestPresent: false,
+  probes: {
+    accounts: { status: 'ok', ok: true, reason: 'the machine login' },
+    mcp: { status: 'skip', ok: true, reason: 'no MCP server named' },
+    credentials: { status: 'skip', ok: true, reason: 'no credential named' },
+    delivery: { status: 'ok', ok: true, reason: '1 subscribed device' },
+  },
+  accounts: [{ id: 'default', minHeadroomPct: 0 }],
+  credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+  delivery: { ok: true, channels: ['1 subscribed device'], acknowledged: false },
+  at: '2026-09-14T00:00:00.000Z',
+};
+
 async function mount() {
   mocks.state.mockResolvedValue({ prefs: {}, defaultSkills: [], allowRun: true });
+  mocks.runPrelude.mockResolvedValue({ prelude: EMPTY_PRELUDE });
   const client = new QueryClient(queryClientConfig);
   const { RunSetup } = await import('./run-setup');
   render(
@@ -80,6 +102,9 @@ describe('the phone layout', () => {
     await mount();
     expect(screen.queryByRole('button', { name: 'Start' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
+    // Opens on Decisions (phase 11); one Next reaches What runs, two reach How.
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByRole('tab', { name: /What/ }).getAttribute('aria-selected')).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByRole('tab', { name: /How/ }).getAttribute('aria-selected')).toBe('true');
     expect(screen.getByRole('button', { name: 'Back' })).toBeTruthy();
@@ -93,7 +118,7 @@ describe('the phone layout', () => {
   it('reads the short stage names, and every stage is one tap away', async () => {
     await mount();
     const tabs = screen.getAllByRole('tab');
-    expect(tabs).toHaveLength(4);
+    expect(tabs).toHaveLength(5);
     fireEvent.click(screen.getByRole('tab', { name: /Money/ }));
     expect(screen.getByRole('tab', { name: /Money/ }).getAttribute('aria-selected')).toBe('true');
     // Every tab is thumb-high on a coarse pointer, by class.

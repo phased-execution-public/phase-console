@@ -21,6 +21,7 @@ import assert from 'node:assert/strict';
 
 import {
   SITUATIONS, SITUATION_ACTOR, SITUATION_BLURBS, SITUATION_LABELS, SUB_KINDS,
+  SITUATION_SUB_ACTOR, REFUSAL_CAUSES, actorFor, classifyExitSaid, refusalCauseOf,
   parseSituationKey, situationKey, situationLabel,
 } from '../shared/situation-model.js';
 import {
@@ -255,6 +256,27 @@ test('superseded when the board reads done — and the QA verdicts outrank it wh
  * Precedence and the rest of the vocabulary
  * ------------------------------------------------------------------ */
 
+test('ACC-7.3 (REG-3): with NO lock, a live session in the repository is foreign-live from presence alone — the ladder waits, never boards beside it', () => {
+  // The first minute of a hand session: started, not claimed. Every other
+  // registry reading was reached through a lock, so this phase used to read
+  // `never-started` and the healer would climb into the person's tree.
+  const peer = {
+    ...P12_NEVER_STARTED, lock: null,
+    registry: { live: true, peer: true as const, sessionId: 's-hand-peer-0001', owner: 'sam@laptop', pid: 4242, cwd: '/work/hub' },
+  };
+  const s = classifySituation(peer);
+  assert.equal(s.id, 'foreign-live');
+  assert.match(s.why.join(' '), /no lock is held, but the session registry shows a live Claude session in this repository \(s-hand-p, pid 4242, in \/work\/hub\)/);
+  // A peer the registry can no longer vouch for is not one.
+  assert.notEqual(classifySituation({ ...peer, registry: { ...peer.registry, live: false } }).id, 'foreign-live');
+  // Only the lock-free witness speaks this way: a registry hit without `peer` (the lock's session) needs its lock.
+  assert.notEqual(classifySituation({ ...peer, registry: { live: true, sessionId: 's-x' } }).id, 'foreign-live');
+  // The summary names the witness for what it is.
+  assert.ok(summariseEvidence(peer).some((line) => /registry: a live session in the repository, holding no lock/.test(line)));
+  // A board that reads done still wins: the work is recorded, whoever is in the tree.
+  assert.equal(classifySituation({ ...peer, board: 'done' }).id, 'superseded');
+});
+
 test('a foreign live lock outranks everything that would spend; an expired one over work is stale; over nothing it is debris', () => {
   const live = { ...P2_WORK_IN_PROGRESS, lock: { holder: 'someone@host', ours: false, expired: false } };
   assert.equal(classifySituation(live).id, 'foreign-live');
@@ -365,6 +387,71 @@ test('MCP and resource walls, by sub-kind', () => {
   assert.equal(wall({ reason: 'usage limit reached — resets at 15:00' }).key, 'resource-wall:usage');
 });
 
+test('ACT-6: a live wall the runner escalated classifies resource-wall:usage from the phase record alone — the wait shape and the park shape', () => {
+  // Both shapes `runner.ts`'s `escalateLiveWall` writes: the phase parked on
+  // the window (the retry-storm park's own shape) and the phase parked with
+  // the errand when no reset was known. Neither fabricates a run-level
+  // `limits.status`; the note carries the wall's words.
+  const reason = 'rate limited mid-session (rate_limit) — 3 rate-limit events in 40s with no work between them';
+  const waiting = classifySituation({
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'waiting', waitUntil: '2026-08-13T15:00:00.000Z', halt: null },
+    record: {
+      ...P2_WORK_IN_PROGRESS.record!, status: 'waiting',
+      note: `${reason}. Waiting until 2026-08-13T15:00:00.000Z, when the window resets.`,
+    },
+  });
+  assert.equal(waiting.key, 'resource-wall:usage');
+  const parked = classifySituation({
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'parked', halt: null, waitUntil: null },
+    record: {
+      ...P2_WORK_IN_PROGRESS.record!, status: 'parked',
+      note: `Resource wall — ${reason}. An account whose usage window has room, or the current window to reopen.`,
+    },
+  });
+  assert.equal(parked.key, 'resource-wall:usage');
+  assert.equal(parked.actor, 'machine', 'the ladder\'s to climb — switch-account, wait-window — never a person\'s first');
+});
+
+test('only a run budget is a budget wall — the ladder\'s and the wait\'s "budget is spent" are not (LFC-8)', () => {
+  // All ten `resource-wall:budget` classifications the audit found were the
+  // LADDER's exhaustion sentence, carried into a kindless park's reason and
+  // re-read by a regex as a spent RUN budget — whose one remedy the console
+  // refuses. The kind is the evidence now; the prose is not read at all.
+  const halted = (halt: { kind: string; reason: string; phase?: number }) =>
+    classifySituation({ ...P2_WORK_IN_PROGRESS, run: { status: 'parked', halt } });
+  const ladder = halted({
+    kind: 'nothing-ready',
+    reason: 'nothing is ready to run: phase 2 needs you — the phase\'s ladder budget is spent (3 of 3 rungs) (see the errand)',
+  });
+  assert.notEqual(ladder.key, 'resource-wall:budget', 'the ladder\'s cap is not the run\'s budget');
+  assert.equal(halted({ kind: 'budget', reason: 'the run budget of $5 is spent' }).key, 'resource-wall:budget',
+    'a run budget halt still is one — by its kind');
+  // The wait budget's full sentence, which the old regex also matched.
+  const wait = classifySituation({
+    ...P7_BLOCKED_DECLARED,
+    handoff: { exists: true, status: 'blocked', outstanding: 'blocked' },
+    run: { status: 'halted', halt: { kind: 'waiting-external-timeout', phase: 7,
+      reason: 'phase 7 is still waiting on external work after 3 wait(s) and 480 minutes parked (the CI image build; watching gh:run/123) — the wait budget is spent. Retry when the external work lands, or split the phase behind a Gate-check.' } },
+  });
+  assert.equal(wait.key, 'blocked-declared:external');
+});
+
+test('a usage window the CLI reports `rejected` is a usage wall — `limited` was never a word the CLI sends (SES-9)', () => {
+  const rejected = classifySituation({
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'running', halt: null, limits: { status: 'rejected', utilization: 1, resetsAt: 1789956000 } },
+  });
+  assert.equal(rejected.key, 'resource-wall:usage');
+  assert.ok(rejected.why.some((line) => /rejected at 100 %/.test(line)), `the evidence says what the CLI said (${rejected.why.join(' | ')})`);
+  const warned = classifySituation({
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'running', halt: null, limits: { status: 'allowed_warning', utilization: 0.99 } },
+  });
+  assert.notEqual(warned.key, 'resource-wall:usage', 'a warning is not a wall');
+});
+
 test('declared blockers branch by what the session actually said it is blocked on', () => {
   const blocked = (over: Partial<PhaseEvidence>, handoffOutstanding = 'blocked') =>
     classifySituation({ ...P7_BLOCKED_DECLARED, handoff: { exists: true, status: 'blocked', outstanding: handoffOutstanding }, ...over });
@@ -381,6 +468,27 @@ test('declared blockers branch by what the session actually said it is blocked o
     declared: { status: 'needs-human', reason: 'Exit criterion 4 unfinished (BE-15 pagination). Verification is 13/13 GREEN and nothing is broken — but three closeout-only passes have now looped, each forbidden from doing the remaining implementation work. Needs authorization for ONE normal working session scoped to aws; it then closes the phase complete.', watch: [] },
   });
   assert.equal(needsHuman.key, 'blocked-declared:unknown');
+
+  // `--needs <key>` (zero-touch-console P3, ZTD-3): the session's own word is
+  // read BEFORE the prose. The same lock-shaped sentence and lock ref that
+  // classified `lock` above classifies `credential` when the declaration says
+  // so; a decision key answers through its blocker class; a key no class
+  // points at leaves the prose cascade to decide, as it always did.
+  const lockProse = { reason: 'phase 3 is held by someone@host', watch: ['lock:alpha/3'] };
+  assert.equal(blocked({ declared: { status: 'blocked', needs: 'credential', ...lockProse } }).key, 'blocked-declared:credential');
+  assert.equal(blocked({ declared: { status: 'blocked', needs: 'credentials', ...lockProse } }).key, 'blocked-declared:credential');
+  assert.equal(blocked({ declared: { status: 'blocked', needs: 'permission.destructive', ...lockProse } }).key, 'blocked-declared:permission');
+  assert.equal(blocked({ declared: { status: 'needs-human', needs: 'gates', reason: 'no gate in sight', watch: [] } }).key, 'blocked-declared:gate');
+  assert.equal(blocked({ declared: { status: 'blocked', needs: 'waits', reason: 'nothing external here', watch: [] } }).key, 'blocked-declared:external');
+  assert.equal(blocked({ declared: { status: 'blocked', needs: 'budgets', ...lockProse } }).key, 'blocked-declared:lock', 'no class points at budgets — the prose decides');
+  // And the persisted RECORD copy speaks after a restart, with the same precedence.
+  const fromRecord = classifySituation({
+    ...P7_BLOCKED_DECLARED,
+    handoff: { exists: true, status: 'blocked', outstanding: 'blocked' },
+    declared: null,
+    record: { ...P7_BLOCKED_DECLARED.record!, declared: { status: 'blocked', needs: 'credential', ...lockProse, at: '2026-09-14T00:00:00Z' } },
+  });
+  assert.equal(fromRecord.key, 'blocked-declared:credential');
 });
 
 test('the blocker statement is the first block of Outstanding; ledger nouns below it do not decide', () => {
@@ -935,10 +1043,148 @@ test('blockerSubKind: a tool the permission policy refused is `permission`, read
     'external', 'lowercase prose about writing beside "blocked" is not a tool wall',
   );
   assert.equal(SUB_KINDS['blocked-declared'].includes('permission'), true);
-  assert.equal(rungsFor('blocked-declared:permission').length, 0, 'a wall is the operator\'s — no rung');
+  // One rung since phase 9 (TRS-10): the console offers the denied rule as an
+  // approval card; nothing spends until a person answers it.
+  assert.equal(rungsFor('blocked-declared:permission').length, 1);
+  assert.equal(rungsFor('blocked-declared:permission')[0].vehicle, 'widen-rule');
+  assert.equal(rungsFor('blocked-declared:permission')[0].spends, false);
   const ask = errandFor('blocked-declared:permission', [], 8);
   assert.match(ask.how, /Settings ▸ Permissions/);
   assert.match(ask.how, /Never strike a deny rule/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 9 — the wall read from the console's own evidence (RCV-2, SES-3, LFC-3)
+ * ------------------------------------------------------------------ */
+
+test('RCV-2/SES-3: a credential-refused halt classifies resource-wall:auth for every class, from the kind alone — never blocked-declared', () => {
+  const REASONS = {
+    'org-policy': 'organization policy blocks this credential (account: account)',
+    auth: 'authentication failed — the session\'s Claude login is expired or signed out; sign that account in again, then continue the run (account: p)',
+    billing: 'billing or credit balance needs attention (account: p)',
+    certificate: 'the API refused the connection: a certificate this machine does not trust (a self-signed or intercepting certificate) — fix the trust store or the proxy, then continue the run',
+  } as const;
+  for (const [cls, reason] of Object.entries(REASONS)) {
+    // The run's halt, kind alone — the reason is prose the regexes never read.
+    const s = classifySituation({
+      ...P2_WORK_IN_PROGRESS,
+      run: { status: 'halted', halt: { kind: 'credential-refused', reason, phase: 2 } },
+    });
+    assert.equal(s.key, 'resource-wall:auth', `${cls} from halt.kind`);
+    assert.notEqual(s.id, 'blocked-declared');
+    assert.ok(s.why.some((w) => /refused the run's credential/.test(w)), s.why.join(' | '));
+    // …and the CAUSE on the record alone, with the run's halt long gone (a
+    // relaunch cleared it; a later rung's result rewrote the record) — the
+    // wall still answers, whatever the attempt looked like.
+    const carried = classifySituation({
+      ...P2_WORK_IN_PROGRESS,
+      run: { status: 'parked', halt: null },
+      record: {
+        ...P2_WORK_IN_PROGRESS.record!, status: 'interrupted', turns: 0, costUsd: 0,
+        cause: { kind: 'credential-refused', class: cls, reason, at: '2026-09-06T03:44:46.532Z', account: 'account' },
+      },
+    });
+    assert.equal(carried.key, 'resource-wall:auth', `${cls} from record.cause`);
+    assert.ok(carried.why.some((w) => new RegExp(`\\(${cls}\\)`).test(w)), carried.why.join(' | '));
+    assert.ok(carried.why.some((w) => /stamped on the record/.test(w)));
+    // Decided from the session's own sign-off (RCV-7, phase 10): the errand quotes it.
+    assert.equal(s.fromSaid, true);
+    assert.equal(carried.fromSaid, true);
+  }
+  // The runner's own halt sentence never reached `AUTH_RE` (the measured
+  // miss): under the OLD kind it still reads as a declared blocker, which is
+  // exactly why the kind — not the prose — now carries the class.
+  const old = classifySituation({
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'halted', halt: { kind: 'needs-human', reason: 'organization policy blocks this credential (account: account)', phase: 2 } },
+  });
+  assert.equal(old.id, 'blocked-declared', 'a 4.1.0 record keeps its old reading — the fix is the kind, not a regex');
+});
+
+test('RCV-2: the three sign-offs the reader was blind to classify never-started:refusal with an empty table, the cause named', () => {
+  const cases: [string, string][] = [
+    ['Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access', 'org-subscription'],
+    ['API Error: Unable to connect to API: Self-signed certificate detected.', 'certificate'],
+    ['organization policy blocks this credential (account: account)', 'org-policy'],
+    ['I can\'t help with that. [reasoning_extraction]', 'aup'],
+  ];
+  for (const [said, cause] of cases) {
+    assert.equal(classifyExitSaid(said), 'refusal', said);
+    assert.equal(refusalCauseOf(said), cause, said);
+    const s = classifySituation(exited(said));
+    assert.equal(s.key, 'never-started:refusal', said);
+    assert.equal(s.actor, 'person', 'a refusal is a person\'s — the sub-actor, not the parent\'s machine');
+    assert.equal(s.fromSaid, true, 'the sub-kind was read off the words, so the errand quotes them (RCV-7)');
+    assert.deepEqual([...rungsFor(s.key)], [], 're-boarding is spending to learn nothing');
+    assert.ok(s.why.some((w) => w === `refusal cause ${cause}`), s.why.join(' | '));
+    const errand = errandFor(s.key, [], 12, '2026-09-06T00:00:00.000Z', said);
+    assert.equal(errand.said, said, 'the errand quotes the sign-off verbatim');
+  }
+  assert.deepEqual([...REFUSAL_CAUSES], ['aup', 'org-policy', 'org-subscription', 'certificate']);
+  assert.equal(refusalCauseOf('tests for the organization chart module passed'), undefined, 'a session that merely mentioned an organisation was not refused by one');
+  assert.equal(classifyExitSaid('Refactored the login-expired path and its tests'), undefined);
+  // A bare `never-started` read nothing off the words: no flag, nothing quoted.
+  const bare = classifySituation(exited('Refactored the login-expired path and its tests'));
+  assert.equal(bare.key, 'never-started');
+  assert.equal(bare.fromSaid, undefined);
+});
+
+test('LFC-3: the console\'s own tool-denied record classifies blocked-declared:permission above the prose; the wait guard\'s denial is not a permission block', () => {
+  const blocked = (over: Partial<PhaseEvidence>) => classifySituation({
+    ...P7_BLOCKED_DECLARED,
+    handoff: { exists: true, status: 'blocked', outstanding: 'blocked — could not proceed' },
+    ...over,
+  });
+  // A declaration that says only "blocked" used to read `:unknown` and spend
+  // an unblock session walking into the wall the console had recorded.
+  const denied = blocked({
+    declared: { status: 'blocked', reason: 'blocked — could not proceed', watch: [] },
+    record: {
+      ...P7_BLOCKED_DECLARED.record!,
+      toolDenied: { tool: 'Bash', rule: 'Bash(git push:*)', command: 'git push origin pe/demo', at: '2026-09-06T00:00:00.000Z' },
+    },
+  });
+  assert.equal(denied.key, 'blocked-declared:permission');
+  assert.equal(denied.actor, 'machine', 'it has a rung (widen-rule) — the machine\'s until a person answers the card');
+  assert.ok(denied.why.some((w) => /refused Bash `git push origin pe\/demo` under rule Bash\(git push:\*\)/.test(w)), denied.why.join(' | '));
+  // The session's own `--needs` word still outranks the console's denial.
+  const declaredKey = blocked({
+    declared: { status: 'blocked', reason: 'blocked — could not proceed', watch: [], needs: 'gate' },
+    record: {
+      ...P7_BLOCKED_DECLARED.record!,
+      toolDenied: { tool: 'Bash', rule: 'Bash(git push:*)', command: 'git push', at: '2026-09-06T00:00:00.000Z' },
+    },
+  });
+  assert.equal(declaredKey.key, 'blocked-declared:gate');
+  // The in-turn-wait guard refusing `until … sleep` is not a permission wall:
+  // the session was told what to do instead, and a person has nothing to widen.
+  const waited = blocked({
+    declared: { status: 'blocked', reason: 'blocked — could not proceed', watch: [] },
+    record: {
+      ...P7_BLOCKED_DECLARED.record!,
+      toolDenied: { tool: 'Bash', rule: 'in-turn-wait', command: 'until test -f /tmp/x; do sleep 30; done', matched: 'until [^`]+; *do', at: '2026-09-06T00:00:00.000Z' },
+    },
+  });
+  assert.equal(waited.key, 'blocked-declared:unknown');
+});
+
+test('LFC-3: the four empty sub-tables are a person\'s — one table, read by the classifier, the ladder and the client alike', () => {
+  assert.deepEqual(SITUATION_SUB_ACTOR, {
+    'blocked-declared:credential': 'person',
+    'blocked-declared:gate': 'person',
+    'never-started:refusal': 'person',
+    'never-started:skill-missing': 'person',
+  });
+  for (const key of Object.keys(SITUATION_SUB_ACTOR)) {
+    assert.deepEqual([...rungsFor(key)], [], `${key} has no rung — that is why it is a person's`);
+    const { id, sub } = parseSituationKey(key);
+    assert.equal(actorFor(id, sub), 'person');
+    assert.equal(SITUATION_ACTOR[id], 'machine', 'the parent climbs; only the sub-kind is a person\'s');
+  }
+  assert.equal(actorFor('blocked-declared', 'permission'), 'machine', 'the one sub-kind with a rung stays the machine\'s');
+  assert.equal(actorFor('blocked-declared', 'unknown'), 'machine');
+  assert.equal(actorFor('gated-manual'), 'person');
+  assert.equal(actorFor('no-such-situation'), 'person', 'a word from a newer build reaches a person, never a crash');
 });
 
 test('blockerSubKind: every scheme the watch clock polls reads as an external wait, not only the GitHub ones', () => {

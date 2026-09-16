@@ -18,7 +18,8 @@
  */
 
 import { useState } from 'react';
-import { useConsoleState } from '@/lib/queries';
+import { api } from '@/lib/api';
+import { keys, useApiMutation, useConsoleState } from '@/lib/queries';
 import { applyUpdateNow } from '@/lib/pwa';
 import {
   Banner,
@@ -58,6 +59,7 @@ export function InstanceSection() {
           The server files on disk are newer than this process. Restart it below to run them.
         </Banner>
       )}
+      {state.bootHold && <BootHoldBanner hold={state.bootHold} allowRun={state.allowRun === true} />}
 
       <Card>
         <CardHeader>
@@ -195,3 +197,49 @@ function UpdateInterfaceButton() {
     </Button>
   );
 }
+
+/**
+ * A console holding its automation says so where its off switch lives, with
+ * the one press that lifts it (SHD-5, FLT-9). The hold is the console's own
+ * decision about what it starts by itself — a "stay off" that came back, or a
+ * profile saying it does not start its work unattended — so releasing it runs
+ * the boot pass that was held: the re-adoption and the convergence loop.
+ */
+function BootHoldBanner({ hold, allowRun }: { hold: NonNullable<ConsoleStateBootHold>; allowRun: boolean }) {
+  const release = useApiMutation({
+    fn: () => api.releaseBootHold(),
+    say: 'Released — this console re-adopts and converges its runs now.',
+    invalidates: [keys.state(), keys.shutdown()],
+  });
+  return (
+    <Banner severity="warn" data-testid="boot-hold">
+      <span className="flex flex-col gap-2">
+        <span>
+          <strong className="text-ink">
+            {hold.kind === 'stopped'
+              ? 'Stopped on purpose — automation is held.'
+              : 'Automation is held at boot.'}
+          </strong>{' '}
+          {hold.why}
+        </span>
+        {allowRun ? (
+          <Button
+            size="sm"
+            variant="action"
+            className="self-start"
+            disabled={release.isPending}
+            onClick={() => release.mutate()}
+          >
+            {hold.kind === 'stopped' ? 'Clear the stop and resume' : 'Release it for this boot'}
+          </Button>
+        ) : (
+          <span className="text-2xs text-ink-muted">
+            Releasing it starts work, which needs <code>--allow-run</code>.
+          </span>
+        )}
+      </span>
+    </Banner>
+  );
+}
+
+type ConsoleStateBootHold = NonNullable<ReturnType<typeof useConsoleState>['data']>['bootHold'];

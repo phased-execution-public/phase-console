@@ -25,6 +25,7 @@ const {
   actionRequest,
   answeredNotification,
   clickTarget,
+  consoleName,
   decisionOf,
   decisionRequest,
   notificationActions,
@@ -81,7 +82,37 @@ test('a real payload is carried through to the notification', () => {
     // pair and there is nothing for a callback to answer.
     actions: [{ action: 'allow', title: 'Allow' }, { action: 'deny', title: 'Deny' }],
     callback: null,
+    // A payload from before consoles named themselves names nobody.
+    console: null,
   });
+});
+
+/* ---------------- whose notification it is (zero-touch phase 17, FLT-4) ---------------- */
+
+test('ACC-10.1: a fanned-in payload names its originating console — on the title and on the notification', () => {
+  const data = parsePayload(JSON.stringify({
+    title: 'Permission needed',
+    body: 'Bash(git push:*)',
+    tag: 'approval-7',
+    url: '/#/inbox',
+    category: 'approval',
+    console: { id: 'f922d743-pe-hub', name: 'pe-hub' },
+  }));
+  assert.equal(consoleName(data), 'pe-hub');
+  assert.equal(notificationTitle(data), 'Permission needed · pe-hub', 'the lock screen says whose card it is');
+  assert.equal((notificationOptions(data).data as { console?: string }).console, 'pe-hub');
+  // Two consoles, one device: the same announcement from each reads apart.
+  const other = parsePayload(JSON.stringify({ title: 'Permission needed', console: { id: '4557c636-hub', name: 'hub' } }));
+  assert.notEqual(notificationTitle(other), notificationTitle(data));
+});
+
+test('a console name is never doubled, and a malformed one names nobody', () => {
+  assert.equal(notificationTitle({ title: 'pe-hub halted', console: { name: 'pe-hub' } }), 'pe-hub halted');
+  for (const console of [null, 'pe-hub', { name: '' }, { name: 42 }, { id: 'x' }]) {
+    const data = { title: 'A', console } as unknown as Parameters<typeof notificationTitle>[0];
+    assert.equal(consoleName(data), null);
+    assert.equal(notificationTitle(data), 'A');
+  }
 });
 
 test('the same tag replaces rather than stacks, and never re-alerts', () => {

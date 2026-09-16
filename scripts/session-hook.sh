@@ -19,20 +19,32 @@
 #     (both the field names this CLI sends and the documented ones are read),
 #     plus `message` and `notification_type` — Notification only, so a Stop payload's quoted transcript
 #     can never bleed in through first-occurrence extraction;
-#   - resolves the owning console like bin/btw does:
-#       node <skill>/viewer/shared/instances.mjs shell --cwd "<cwd>"
-#     (node looked for on PATH, then in Homebrew / /usr/local / volta / nvm);
+#   - resolves the REGISTERED console that owns the directory:
+#       node <skill>/viewer/shared/instances.mjs owner --cwd "<cwd>"
+#     (node looked for on PATH, then in Homebrew / /usr/local / volta / nvm) —
+#     with no sole-instance fallback: "the only console" is not evidence a
+#     directory belongs to it. A directory no registered console claims is
+#     recorded `unowned`, with the project root it would have been and how the
+#     answer was reached, in the machine's sink
+#       <state home>/fleet/sessions/inbox/
+#     rather than dropped or filed against the wrong console (FLT-8);
 #   - POSTs {"version":1,"session_id",…} to <url>/hooks/session with a 2 s
 #     timeout; when no console answers (or there is no node to ask), drops the
 #     same record into the instance's inbox —
 #       <instance state dir>/sessions/inbox/<at>-<session_id>-<event>.json
-#     which the console ingests when it is next up;
+#     and, when node is there and the console refused the connection (not a
+#     console that is up and slow), drains that inbox itself with
+#     `phase-console sessions ingest` (REG-2) — in the background, except at
+#     SessionStart, where it waits for the one line it needs;
 #   - on SessionStart prints additionalContext naming the session id and the
 #     `phase-lock.sh --session <id>` instruction, so a hand-driven session can
-#     claim its lock as itself;
+#     claim its lock as itself — and the other live sessions the registry
+#     shows in the same repository (REG-3 iv), from the console's answer or the
+#     drain's;
 #   - ALWAYS exits 0. A hook that could stop a session would be a session
 #     killed by a console's absence. Nothing here is load-bearing for safety.
-# Set PHASE_CONSOLE_HOOK_OFF=1 to make it a no-op.
+# Set PHASE_CONSOLE_HOOK_OFF=1 to make it a no-op, PHASE_CONSOLE_HOOK_INGEST=0 to
+# leave the inbox for the console.
 
 # No `set -e`: every step is best effort and the exit is decided here.
 set -u
@@ -52,9 +64,11 @@ input="$(head -c 65536 2>/dev/null || true)"
 # First occurrence matters: `last_assistant_message` (Stop) may quote a whole
 # payload, and the fields this reads all precede it in the CLI's own output.
 # BSD sed: no `\|`, so "non-specials, then (escape + non-specials)*".
-_jget() {
-  local rest="${input#*\"$1\"}"
-  [ "$rest" != "$input" ] || { printf ''; return 0; }
+_jget() { _jget_in "$input" "$1"; }
+# _jget_in <json> <key> — the same, over any string (the console's answer).
+_jget_in() {
+  local rest="${1#*\"$2\"}"
+  [ "$rest" != "$1" ] || { printf ''; return 0; }
   printf '%s' "$rest" \
     | sed -n 's/^[[:space:]]*:[[:space:]]*"\([^"\\]*\(\\.[^"\\]*\)*\)".*/\1/p' \
     | head -1 \
@@ -89,19 +103,7 @@ case "$cwd" in /*) : ;; *) cwd="$(pwd)" ;; esac
 # ---- the owning console ------------------------------------------------------
 # The same search viewer/run makes: PATH first, then the usual homes. No version
 # floor here — instances.mjs is plain ESM and any node this decade runs it.
-_find_node() {
-  if command -v node >/dev/null 2>&1; then command -v node; return 0; fi
-  local candidates="/opt/homebrew/bin /usr/local/bin $HOME/.volta/bin" v c
-  if [ -d "$HOME/.nvm/versions/node" ]; then
-    for v in $(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -r); do
-      candidates="$candidates $HOME/.nvm/versions/node/$v/bin"
-    done
-  fi
-  for c in $candidates; do
-    if [ -x "$c/node" ]; then printf '%s' "$c/node"; return 0; fi
-  done
-  return 1
-}
+_find_node() { pe_find_node; }
 
 # The console that minted this session says where its work-state lives, in
 # `$DOCS_ROOT`. Asking the cwd instead is wrong for exactly the sessions that
@@ -114,35 +116,59 @@ _find_node() {
 docs_root=""
 case "${DOCS_ROOT:-}" in /*) [ -d "$DOCS_ROOT" ] && docs_root="$DOCS_ROOT" ;; esac
 
-url=""; state_dir=""; root=""
+url=""; state_dir=""; root=""; owner_kind=""; owner_how=""
 node_bin="$(_find_node 2>/dev/null || true)"
 if [ -n "$node_bin" ] && [ -f "$SKILL_DIR/viewer/shared/instances.mjs" ]; then
   if [ -n "$docs_root" ]; then
-    shell_out="$("$node_bin" "$SKILL_DIR/viewer/shared/instances.mjs" shell --root "$docs_root" 2>/dev/null || true)"
+    shell_out="$("$node_bin" "$SKILL_DIR/viewer/shared/instances.mjs" owner --root "$docs_root" 2>/dev/null || true)"
   else
-    shell_out="$("$node_bin" "$SKILL_DIR/viewer/shared/instances.mjs" shell --cwd "$cwd" 2>/dev/null || true)"
+    shell_out="$("$node_bin" "$SKILL_DIR/viewer/shared/instances.mjs" owner --cwd "$cwd" 2>/dev/null || true)"
   fi
+  owner_kind="$(printf '%s\n' "$shell_out" | sed -n 's/^kind=//p' | head -1)"
+  owner_how="$(printf '%s\n' "$shell_out" | sed -n 's/^how=//p' | head -1)"
   root="$(printf '%s\n' "$shell_out" | sed -n 's/^root=//p' | head -1)"
-  url="$(printf '%s\n' "$shell_out" | sed -n 's/^url=//p' | head -1)"
-  state_dir="$(printf '%s\n' "$shell_out" | sed -n 's/^state_dir=//p' | head -1)"
+  if [ "$owner_kind" = registered ]; then
+    url="$(printf '%s\n' "$shell_out" | sed -n 's/^url=//p' | head -1)"
+    state_dir="$(printf '%s\n' "$shell_out" | sed -n 's/^state_dir=//p' | head -1)"
+  elif [ "$owner_kind" = unowned ]; then
+    state_dir="$(printf '%s\n' "$shell_out" | sed -n 's/^inbox=//p' | head -1)"
+    state_dir="${state_dir%/sessions/inbox}"
+  fi
 fi
-if [ -z "$state_dir" ]; then
-  # No node, or it could not answer (which is also what a directory no console
-  # owns looks like): the bash half of the same identity rule — and a directory
-  # with no project above it has no presence to record. `$DOCS_ROOT` is taken
-  # as the root itself rather than searched upward from, because the console
-  # named it; the cwd walk stays as the answer for a session nobody minted.
+if [ -z "$owner_kind" ]; then
+  # No node, or it could not answer: the bash half of the same rule, read from
+  # the REGISTRY rather than guessed from what exists on disk. `$DOCS_ROOT` is
+  # taken as the root itself rather than searched upward from, because the
+  # console named it; the cwd walk stays as the answer for a session nobody
+  # minted. A root the registry does not hold — and a directory with no
+  # project above it at all — is recorded in the machine's unowned sink.
   root="$docs_root"
   [ -n "$root" ] || root="$(pe_project_root_for "$cwd" 2>/dev/null || true)"
-  [ -n "$root" ] || exit 0
-  state_dir="$(pe_instance_state_dir "$root")"
+  if [ -n "$root" ] && state_dir="$(pe_registered_state_dir "$root")"; then
+    owner_kind=registered; owner_how=no-node
+  else
+    owner_kind=unowned; owner_how=no-node
+    unowned_inbox="$(pe_unowned_inbox)"
+    state_dir="${unowned_inbox%/sessions/inbox}"
+  fi
 fi
-[ -n "${PHASE_CONSOLE_URL:-}" ] && url="$PHASE_CONSOLE_URL"
+[ -n "${PHASE_CONSOLE_URL:-}" ] && [ "$owner_kind" = registered ] && url="$PHASE_CONSOLE_URL"
 
 # ---- the record --------------------------------------------------------------
 _js() { printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-epoch="$(date +%s)"
+# The drop's name carries MILLISECONDS (REG-7): two events of one kind for one
+# session inside a second used to collide on a `date +%s` name. GNU date gives
+# `%3N`; macOS date prints the letters back, and bash 3.2 has no EPOCHREALTIME,
+# so the fallbacks are perl's clock, else seconds ×1000 with the pid as the
+# tie-break — distinct names either way, and the registry never parses them.
+epoch_ms="$(date +%s%3N 2>/dev/null)"
+case "$epoch_ms" in
+  *[!0-9]*|'') epoch_ms="$(perl -MTime::HiRes -e 'printf "%d", Time::HiRes::time()*1000' 2>/dev/null || printf '')" ;;
+esac
+case "$epoch_ms" in
+  *[!0-9]*|'') epoch_ms="$(( $(date +%s) * 1000 ))" ;;
+esac
 user_="$(id -un 2>/dev/null || printf '')"
 host_="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf '')"
 # The claude process: Claude Code exports CLAUDE_PID to its hooks; the hook's
@@ -151,24 +177,73 @@ host_="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf '')"
 # gone has ended even when no SessionEnd ever arrived (a crash, a kill -9).
 pid="${CLAUDE_PID:-${PPID:-0}}"
 case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
-body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"at\":\"$at\"}"
+# The console's own MCP health probe sets PHASE_CONSOLE_PROBE=1 beside its
+# PE_OWNER (console/mcp-probe): forwarded as a flag so the registry keeps the
+# record, files it as the console's, and leaves it out of the operator's list.
+probe_=0
+[ "${PHASE_CONSOLE_PROBE:-}" = 1 ] && probe_=1
+body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"probe\":$probe_,\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
 
 # ---- deliver: POST to the console, else the inbox ------------------------------
 delivered=0
+curl_rc=""
+answer=""
 if [ -n "$url" ] && command -v curl >/dev/null 2>&1; then
   # A failed transfer is not delivery whatever it printed: curl's own exit
-  # status is read first, then the HTTP code.
-  if code="$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 1 --max-time 2 \
+  # status is read first, then the HTTP code on the answer's last line. The
+  # answer's body is kept: at SessionStart it names the other live sessions in
+  # this repository (`peers`).
+  nl='
+'
+  response="$(curl -sS -w "${nl}%{http_code}" --connect-timeout 1 --max-time 2 \
       -X POST "$url/hooks/session" -H 'content-type: application/json' -H 'x-phase-console: 1' \
-      --data-binary "$body" 2>/dev/null)"; then
+      --data-binary "$body" 2>/dev/null)"
+  curl_rc=$?
+  code="${response##*"$nl"}"
+  answer="${response%"$nl"*}"
+  if [ "$curl_rc" = 0 ]; then
     case "$code" in 2[0-9][0-9]) delivered=1 ;; esac
   fi
 fi
 if [ "$delivered" = 0 ] && [ -n "$state_dir" ]; then
   inbox="$state_dir/sessions/inbox"
   if mkdir -p "$inbox" 2>/dev/null; then
-    f="$inbox/$epoch-$session_id-$event.json"
-    if printf '%s\n' "$body" > "$f.tmp.$$" 2>/dev/null; then mv "$f.tmp.$$" "$f" 2>/dev/null || rm -f "$f.tmp.$$" 2>/dev/null; fi
+    # 0600 like every other record (REG-7): the drop names the session, its
+    # cwd and its transcript path.
+    umask 077
+    f="$inbox/$epoch_ms-$session_id-$event.json"
+    # The same second, the same session, the same event: a distinct name, never
+    # a silent overwrite — the pid is the tie-break.
+    [ -e "$f" ] && f="$inbox/$epoch_ms-$session_id-$event-$$.json"
+    tmp="$f.tmp.$$"
+    # A hook killed between the write and the rename left a complete payload
+    # matching no glob (REG-7): the trap takes the tmp with it, and the registry
+    # reclaims any tmp whose pid is gone regardless.
+    trap 'rm -f "$tmp" 2>/dev/null' EXIT
+    if printf '%s\n' "$body" > "$tmp" 2>/dev/null; then mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null; fi
+    trap - EXIT
+  fi
+fi
+
+# ---- nobody drained it: drain it here (REG-2) ------------------------------------
+# The inbox's only reader used to be a running console, so for the whole of an
+# outage every drop waited — and a boot replayed hours of them as news. When the
+# console REFUSED the connection (curl 7, or nothing to POST to) and node is
+# here, the verb drains it now, through the registry's own code, and stops at
+# once if the instance's console turns out to be up. A console that timed out
+# (curl 28) is up and slow, and drains its own. At SessionStart the drain is
+# waited for, because the new session's context wants the one line it prints;
+# every other event leaves it running in the background and returns.
+peers=""
+if [ "$delivered" = 1 ] && [ "$event" = SessionStart ]; then
+  peers="$(_jget_in "$answer" peers)"
+elif [ "$delivered" = 0 ] && [ "$owner_kind" = registered ] && [ "$curl_rc" != 28 ] && [ -n "$node_bin" ] && [ -n "$root" ] \
+    && [ "${PHASE_CONSOLE_HOOK_INGEST:-1}" != 0 ] && [ -f "$SKILL_DIR/bin/phase-console.mjs" ]; then
+  if [ "$event" = SessionStart ]; then
+    peers="$("$node_bin" "$SKILL_DIR/bin/phase-console.mjs" sessions ingest --root "$root" --quiet --peers-of "$session_id" 2>/dev/null \
+      | sed -n 's/^peers=//p' | head -1)"
+  else
+    ( "$node_bin" "$SKILL_DIR/bin/phase-console.mjs" sessions ingest --root "$root" --quiet >/dev/null 2>&1 </dev/null & ) 2>/dev/null
   fi
 fi
 
@@ -182,6 +257,7 @@ if [ "$event" = SessionStart ] && [ -n "$root" ]; then
     how="When you claim a phase lock by hand, pass it: scripts/phase-lock.sh <slug> claim <N> ... --session $session_id (or export PE_SESSION_ID=$session_id)."
   fi
   ctx="Phase Console session presence: this Claude session's id is $session_id. $how That lets the console show this session on the Pulse, queue autopilot lanes behind it while it lives, and release its lock the moment it ends."
+  [ -n "$peers" ] && ctx="$ctx $(printf '%s' "$peers" | cut -c1-1200)"
   printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$(_js "$ctx")"
 fi
 exit 0

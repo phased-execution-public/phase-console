@@ -39,7 +39,7 @@
  * `HALT_KIND_SITUATION` is total over `HALT_KINDS` because a halt kind with no
  * situation is a stop nothing can classify, and the classifier's fallback for
  * one is `unknown` — which reads to a person as "the console has no idea",
- * from a console that has an eighteen-word table saying exactly what happened.
+ * from a console that has a twenty-four-word table saying exactly what happened.
  *
  * `inboxKind: null` is a real answer and means **raise nothing**: `superseded`
  * and `work-in-progress` are the board and a live session doing their jobs.
@@ -239,6 +239,8 @@ export const HALT_KIND_SITUATION = Object.freeze({
   'waiting-external-timeout': 'waiting-external',
   /** A declared ask for a person is a declared block — the sub-kind carries the flavour. */
   'needs-human': 'blocked-declared',
+  /** A card a person did not answer is the same block, standing longer: the question is the ask. */
+  'awaiting-person': 'blocked-declared',
   'plan-lint': 'plan-broken',
   'plan-unreadable': 'plan-broken',
   'verification-preflight': 'plan-broken',
@@ -250,7 +252,7 @@ export const HALT_KIND_SITUATION = Object.freeze({
   /** `adopt()` found a live session from an earlier console: somebody else holds it. */
   'orphaned-session': 'foreign-stale',
   /**
-   * The four crash-shaped kinds. `unknown` is the honest answer and the
+   * The crash-shaped kinds. `unknown` is the honest answer and the
    * classifier's own: a process that died has told us nothing about the phase,
    * and dressing that up as `verify-red` or `plan-broken` would send the ladder
    * to fix something that is not broken.
@@ -259,7 +261,18 @@ export const HALT_KIND_SITUATION = Object.freeze({
   'failure-streak': 'unknown',
   'recovery-failed': 'unknown',
   'runner-crashed': 'unknown',
+  /** A dead console, its children dead too — crash-shaped, so the same honest word. */
+  'interrupted-by-restart': 'unknown',
+  /** Not a crash: two lanes' edits collided, and no situation the ladder knows is "a person must pick a side". */
   'worktree-merge': 'unknown',
+  /** The holding phase's verdict is `pending` or `fail`; the per-phase classifier tells them apart, this names the family. */
+  'plan-deadlocked': 'qa-pending',
+  /** Every remaining phase waits on a person's door; the reason names each, and a gate is the door the corpus shows most. */
+  'nothing-ready': 'gated-manual',
+  /** The operator's stop IS the answer, and `superseded` is the one situation that raises nothing. */
+  'operator-stop': 'superseded',
+  /** The run's own credential refused — a wall, and the classifier's `auth` sub-kind names it. */
+  'credential-refused': 'resource-wall',
 });
 
 /**
@@ -335,4 +348,9 @@ export const INBOX_KIND_SOURCE = Object.freeze({
   'mcp-auth': 'independent',
   lock: 'independent',
   conflict: 'independent',
+  // A relayed question (zero-touch phase 14) is read straight off its card — no situation raises it.
+  question: 'independent',
+  // What the policy table answered (phase 19) is a run's own record of a
+  // situation it met — the park owners write it, the inbox only reads it back.
+  policy: 'derived',
 });

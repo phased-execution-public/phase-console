@@ -20,6 +20,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef } from 'react';
+import type { PreludeDraft } from '@/lib/api';
 import {
   QueryClient,
   keepPreviousData,
@@ -87,6 +88,8 @@ export const keys = {
   },
   planRaw: (slug: string) => ['plan', slug, 'raw'] as const,
   verifyPreflight: (slug: string) => ['plan', slug, 'verify-preflight'] as const,
+  /** The run-start prelude for one draft — keyed by the draft's answers, so a changed account list re-probes. */
+  prelude: (slug: string, draft: string) => ['plan', slug, 'prelude', draft] as const,
   isolationPreflight: (slug: string) => ['plan', slug, 'isolation-preflight'] as const,
   handoff: (slug: string, phase: number | string) => ['plan', slug, 'handoff', String(phase)] as const,
   prompt: (slug: string, phase: number | string) => ['plan', slug, 'prompt', String(phase)] as const,
@@ -199,6 +202,11 @@ export const keys = {
   timelineAll: () => ['timeline'] as const,
   timeline: (slug: string, id?: string) => ['timeline', slug, String(id ?? 'latest')] as const,
   attemptsAll: () => ['attempts'] as const,
+  /** The run's ledger (phase 19) — moved by the same phase transitions as the timeline, so invalidated by prefix too. */
+  ledgerAll: () => ['ledger'] as const,
+  ledger: (slug: string, id?: string) => ['ledger', slug, String(id ?? 'latest')] as const,
+  /** Every open plan's ledgers, per plan and per account — Insights. */
+  ledgerSummary: () => ['ledger-summary'] as const,
   attempts: (slug: string, phase: number | string, id?: string) =>
     ['attempts', slug, String(phase), String(id ?? 'latest')] as const,
   /** Money, instance-wide: today against the day cap, per run, and the 7-day series. */
@@ -571,9 +579,20 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
      A run starting, finishing, or having a phase land changes the board too:
      `plans` carries each plan's ready-set, and that is what a finished phase
      moves. */
-  'run:run': { invalidate: [keys.runs(), keys.plans(), keys.spend()], slugScoped: 'both' },
+  'run:run': {
+    // A start writes `run.start` — the ledger's why-started — as well as moving the board.
+    invalidate: [keys.runs(), keys.plans(), keys.spend(), keys.ledgerAll(), keys.ledgerSummary()],
+    slugScoped: 'both',
+  },
   'run:phase': {
-    invalidate: [keys.runs(), keys.spend(), keys.timelineAll(), keys.attemptsAll()],
+    invalidate: [
+      keys.runs(),
+      keys.spend(),
+      keys.timelineAll(),
+      keys.attemptsAll(),
+      keys.ledgerAll(),
+      keys.ledgerSummary(),
+    ],
     slugScoped: 'both',
   },
   'run:verify': { slugScoped: 'run' },
@@ -1045,6 +1064,32 @@ export function usePlanRaw(slug: string | undefined, enabled = true) {
  * predates the endpoint 404s, and the health panel's honest answer to that is
  * to say nothing rather than to claim the plan is clean.
  */
+/**
+ * The run-start prelude (phase 11) for the launch form's draft: the manifest
+ * with every row's state and the four probes' verdicts, recomputed when the
+ * draft's answers change. Kept while a new draft loads, so the table never
+ * blanks between keystrokes.
+ */
+export function usePrelude(slug: string | undefined, draft: PreludeDraft, enabled = true) {
+  const key = JSON.stringify([
+    draft.accounts ?? [],
+    draft.relay ?? '',
+    draft.resumeOnRestart ?? null,
+    draft.acknowledgedWaivers ?? [],
+    draft.model ?? '',
+    draft.profile ?? '',
+    draft.mcpPolicy ?? '',
+  ]);
+  return useQuery({
+    queryKey: keys.prelude(slug ?? '', key),
+    queryFn: () => api.runPrelude(slug!, draft),
+    enabled: Boolean(slug) && enabled,
+    retry: false,
+    placeholderData: keepPreviousData,
+    select: (data) => data.prelude,
+  });
+}
+
 export function useVerifyPreflight(slug: string | undefined, enabled = true) {
   return useQuery({
     queryKey: keys.verifyPreflight(slug ?? ''),
@@ -1261,6 +1306,32 @@ export function useTimeline(slug: string | undefined, id?: string, enabled = tru
     queryKey: keys.timeline(slug ?? '', id),
     queryFn: () => api.runTimeline(slug!, id),
     enabled: Boolean(slug) && enabled,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+/**
+ * The run's ledger (zero-touch phase 19): why each start happened, what every
+ * session cost and ran, held to the run's spend. `keepPreviousData` for the
+ * timeline's reason — it is re-projected whenever a phase lands.
+ */
+export function useLedger(slug: string | undefined, id?: string, enabled = true) {
+  return useQuery({
+    queryKey: keys.ledger(slug ?? '', id),
+    queryFn: () => api.runLedger(slug!, id),
+    enabled: Boolean(slug) && enabled,
+    placeholderData: keepPreviousData,
+    retry: false,
+  });
+}
+
+/** Every open plan's ledgers, per plan and per account — Insights. */
+export function useLedgerSummary(enabled = true) {
+  return useQuery({
+    queryKey: keys.ledgerSummary(),
+    queryFn: () => api.ledgerSummary(),
+    enabled,
     placeholderData: keepPreviousData,
     retry: false,
   });

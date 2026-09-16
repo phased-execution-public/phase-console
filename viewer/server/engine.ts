@@ -22,6 +22,8 @@ import { join } from 'node:path';
 import { BOARD_BUCKETS } from '../shared/status-vocab.js';
 import { QA_MODES } from '../shared/plan-vocab.js';
 import type { McpPolicy } from '../shared/run-lifecycle.js';
+import { parseDecisionsTsv } from '../shared/decisions-model.js';
+import type { DecisionRow } from '../shared/decisions-model.js';
 
 export type EngineResult = {
   code: number;
@@ -77,6 +79,19 @@ export type EngineOptions = {
    * the answer.
    */
   mcpPolicy?: McpPolicy;
+  /**
+   * The credential ids this console currently HOLDS and the account ids it has
+   * REGISTERED, for the F15 family's other two advisories (phase 11, ZTD-4 /
+   * ACT-9): a plan naming a credential nobody holds, or an account nobody
+   * registered, is told so at plan time and still lints `OK`. The same "told,
+   * not asked" arrangement as `mcpServers` — bash cannot probe `gh` on every
+   * lint and must not read the registry — and the same absent/empty rule:
+   * absent turns the check off (`validate.sh` by hand), set-but-empty is a
+   * real answer (a console holding nothing warns on everything named). Both
+   * join the cache key: they change the answer.
+   */
+  credentials?: string[];
+  accounts?: string[];
 };
 
 // validate.sh walks every phase of a plan, which is 13 s on a 31-phase graph;
@@ -147,6 +162,10 @@ export function scriptEnv(
   // to be started with, which is what makes an assignment here mean "this
   // console said so" rather than "something upstream did".
   if (opts.mcpPolicy) env.PE_MCP_POLICY = opts.mcpPolicy;
+  // The credentials held and the accounts registered — the F15 family's other
+  // two inputs, stated the same way (phase 11).
+  if (opts.credentials) env.PE_CREDENTIALS = opts.credentials.join(' ');
+  if (opts.accounts) env.PE_ACCOUNTS = opts.accounts.join(' ');
   return { ...env, ...(extra?.env ?? {}) };
 }
 
@@ -266,6 +285,8 @@ export async function run(
     ? `${script}\u0000${cacheKey.slug}\u0000${cacheKey.revision}\u0000${args.join(' ')}`
       + (opts.mcpServers ? `\u0000mcp:${[...opts.mcpServers].sort().join(',')}` : '')
       + (opts.mcpPolicy ? `\u0000mcppolicy:${opts.mcpPolicy}` : '')
+      + (opts.credentials ? `\u0000cred:${[...opts.credentials].sort().join(',')}` : '')
+      + (opts.accounts ? `\u0000acct:${[...opts.accounts].sort().join(',')}` : '')
       // The ROOT joins the key for the same reason the registry does: it changes the
       // answer. `<slug>` at `<revision>` under one source directory is a different plan
       // from the same name under another, and `invalidate(slug)` cannot help — nothing
@@ -486,6 +507,48 @@ export function readQaMode(result: EngineResult): QaMode {
   // answers this mode with one of three words and no others.
   if (!m) return { mode: 'unknown', error: line ? `unrecognised QA regime: ${line}` : 'the engine said nothing' };
   return { mode: m[1] as QaMode['mode'], reason: m[2] };
+}
+
+/**
+ * `--decisions [N]` — one TSV row per decision that holds, in `DECISION_KEYS`
+ * order (see `shared/decisions-model.js` for the merge the engine performs).
+ * A failed or timed-out read is an EMPTY manifest with an `error`, never a
+ * silent `[]`: phase 11's prelude must not read "nothing outstanding" out of
+ * an engine that could not answer.
+ */
+export type Decisions = { rows: DecisionRow[]; error?: string };
+
+export function readDecisions(result: EngineResult, phase: number | null = null): Decisions {
+  if (result.timedOut) return { rows: [], error: 'the engine timed out reading this plan’s decisions' };
+  if (result.code !== 0) {
+    const why = (result.stderr.split('\n')[0] || 'engine error').replace(/^ERROR:\s*/, '');
+    return { rows: [], error: why };
+  }
+  return { rows: parseDecisionsTsv(result.stdout, phase) };
+}
+
+/**
+ * `--wait-budget [N]` — `minutes<TAB>phase|plan`, or undefined for silence (the
+ * console's own default then applies) and for an engine that could not answer.
+ */
+export function readWaitBudget(result: EngineResult): { minutes: number; source: 'phase' | 'plan' } | undefined {
+  if (result.timedOut || result.code !== 0) return undefined;
+  const [minutesText, source] = result.stdout.trim().split('\t');
+  const minutes = Number(minutesText);
+  if (!Number.isSafeInteger(minutes) || minutes <= 0) return undefined;
+  return source === 'phase' || source === 'plan' ? { minutes, source } : undefined;
+}
+
+/** `--waits-on N` — the refs the phase's `Waits on:` bullet names, one per line; empty when none. */
+export function readWaitsOn(result: EngineResult): string[] {
+  if (result.timedOut || result.code !== 0) return [];
+  return result.stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+}
+
+/** `--credentials [N]` — the csv the engine prints, as ids; empty when it names none. */
+export function readCredentials(result: EngineResult): string[] {
+  if (result.timedOut || result.code !== 0) return [];
+  return result.stdout.trim().split(',').map((s) => s.trim()).filter(Boolean);
 }
 
 export type SessionGroup = {

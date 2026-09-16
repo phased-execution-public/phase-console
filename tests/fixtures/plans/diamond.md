@@ -20,3 +20,22 @@ are both ready (concurrency); 4 waits on 2 and 3.
 | 2 | Left  | 1    | 3   | r | builds |
 | 3 | Right | 1    | 2   | r | builds |
 | 4 | Merge | 2, 3 | —   | r | builds |
+
+## Phases
+
+### Phase 1 — Root
+- **Verification:**
+  - `true`
+
+### Phase 2 — Left
+- **Verification:**
+  - `true`
+
+### Phase 3 — Right
+- **Verification:**
+  - `true`
+
+### Phase 4 — Merge
+- **Verification:**
+  - `true`
+

@@ -78,6 +78,8 @@ import { deriveEvidence } from '../shared/evidence-model.js';
 import {
   DOCUMENT_PLAN_FIELDS, HANDOFF_PROSE_FIELDS, PROSE_PHASE_FIELDS, omit, summarizeRun, wants,
 } from '../shared/projection.js';
+import { mergeDecisions } from '../shared/decisions-model.js';
+import { heldIdsCached } from './credentials-probe.ts';
 import {
   planStats, portfolio, etaSamples, etaFrom, rateFor, phaseEtaFor, healthIssues, isClosedStatus, splitRepos,
   dutyCycle, forecastFrom,
@@ -101,7 +103,8 @@ import {
 import {
   accountRung, errandFor, ladderCaps, nextRung, rungsFor, settleRung, type Rung,
 } from './runner/ladder.ts';
-import type { McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import { asActor, pressActor } from './actor.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
@@ -113,6 +116,8 @@ import {
   FREEZE_ESCALATE_MS, escalatePersistedFreeze, freezeVerdict, type PersistedEscalation,
 } from './runner/freeze.ts';
 import type { LaneLiveness } from './runner/liveness.ts';
+import { DEFAULT_WAIT_BUDGET, waitBudgetFrom, type WaitBudget } from './runner/wait-budget.ts';
+import { dateOfRef } from './watch-refs.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive,
@@ -131,6 +136,7 @@ import { Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir, type AccountView } from
 import { Mcp, type McpServerView } from './mcp/index.ts';
 import { portTranscript } from './accounts/transcripts.ts';
 import { FULL_FLAGS, installDesktopLauncher, launcherPlan } from './launcher.ts';
+import { accessLedger } from './api/access.ts';
 import {
   RECOVERY_TITLES, recoveryKey,
   type RecoveryClass, type RecoveryFacts, type RecoveryRequest,
@@ -1158,6 +1164,12 @@ export abstract class ServiceLive extends ServiceBase {
       // …and the run-level policy behind it, so F15 names the consequence this
       // console would actually produce rather than the default one.
       mcpPolicy: this.prefs.mcpPolicy ?? 'continue',
+      // …and the F15 family's other two inputs (phase 11): the credential ids
+      // whose probes answered `ok` inside their cache window, and every account
+      // this instance has registered. Always passed, for the same reason as
+      // `mcpServers` — empty is a real answer, absent is a bare install.
+      credentials: heldIdsCached(),
+      accounts: [DEFAULT_ACCOUNT_ID, ...this.accounts.accountIds()],
     };
   }
 
@@ -1378,6 +1390,27 @@ export abstract class ServiceLive extends ServiceBase {
     ));
   }
 
+  /**
+   * A phase's wait budget, through the engine — the service's twin of
+   * `RunnerBase.waitBudgetOf`, for the paths no runner drives: the unsupervised
+   * inbox and the boot's overdue ruling. An engine that cannot answer reads as
+   * the console default with nothing countersigned.
+   */
+  async waitBudget(slug: string, phase: number): Promise<WaitBudget> {
+    const record = this.store?.get(slug);
+    if (!record) return DEFAULT_WAIT_BUDGET;
+    try {
+      const [line, refs] = await Promise.all([
+        run(this.engineOpts(), 'phase-graph.sh', [slug, '--wait-budget', String(phase)], { slug, revision: record.revision }),
+        run(this.engineOpts(), 'phase-graph.sh', [slug, '--waits-on', String(phase)], { slug, revision: record.revision }),
+      ]);
+      const text = (result: typeof line): string => (result.code === 0 && !result.timedOut ? result.stdout : '');
+      return waitBudgetFrom(text(line), text(refs), dateOfRef);
+    } catch {
+      return DEFAULT_WAIT_BUDGET;
+    }
+  }
+
   async gateStatus(slug: string, phase: number) {
     const record = this.store?.get(slug);
     if (!record) return null;
@@ -1399,7 +1432,7 @@ export abstract class ServiceLive extends ServiceBase {
   async approveGate(
     slug: string,
     phase: number,
-    opts: { approve: boolean; by?: string; note?: string; continueRun?: boolean },
+    opts: { approve: boolean; by?: string; note?: string; continueRun?: boolean; actor?: Actor },
   ): Promise<{ ok: boolean; gate: GateStatus | null; detail: string; resumed?: boolean }> {
     if (!this.flags.allowWrites) {
       return { ok: false, gate: null, detail: 'Writes are disabled. Restart with --allow-writes to enable them.' };
@@ -1429,7 +1462,9 @@ export abstract class ServiceLive extends ServiceBase {
     let resumed = false;
     if (ok && opts.approve && opts.continueRun) {
       try {
-        resumed = Boolean(await this.retryPhase(slug, phase));
+        // "Approve and continue" is a person's press on the gate — the
+        // request's own actor, through the operator's door.
+        resumed = Boolean(await this.retryPhase(slug, phase, undefined, pressActor(opts.actor ?? asActor(opts.by, 'Service.approveGate'))));
       } catch (error) {
         return {
           ok, gate, detail: `Gate approved, but the run did not continue: ${(error as Error).message}`,
@@ -2258,6 +2293,21 @@ export abstract class ServiceLive extends ServiceBase {
         architecture: plan.architecture, endToEnd: plan.endToEnd, sessionBudget: plan.sessionBudget,
         graph: plan.graph, callouts: plan.callouts,
         sections: plan.sections.map((s) => ({ title: s.title, body: s.body })),
+        // The manifest as it HOLDS — the plan's rows with the twin merged over
+        // them, the same answer `phase-graph.sh --decisions` prints — then each
+        // phase's OWN rows merged the same way (`--decisions N`, zero-touch
+        // phase 19), so a per-phase answer is shown rather than dropped.
+        decisions: [
+          ...mergeDecisions(plan.decisions, record.decisionsTwin),
+          ...[...new Set(
+            [...plan.decisions, ...(record.decisionsTwin ?? [])]
+              .map((row) => row.phase)
+              .filter((phase): phase is number => typeof phase === 'number'),
+          )]
+            .sort((a, b) => a - b)
+            .flatMap((phase) =>
+              mergeDecisions(plan.decisions, record.decisionsTwin, phase).filter((row) => row.phase === phase)),
+        ],
         path: record.planPath,
       }, wantDocument ? [] : DOCUMENT_PLAN_FIELDS) : null,
       // The handoff REFERENCE stays on every phase — a `handoff <status>` chip
@@ -2404,13 +2454,18 @@ export abstract class ServiceLive extends ServiceBase {
       file: POLICY_PATH,
       profiles: PERMISSION_PROFILES.map((id) => ({ id, label: PROFILE_LABELS[id] })),
       // What the syntax accepts but nothing honours, named rather than left to
-      // be discovered at 3am.
-      inert: inertRules(loadPolicyFor(slug ?? null)),
+      // be discovered at 3am — judged against the tools this console has seen
+      // sessions offer, so a tool newer than the shipped list is never inert.
+      inert: inertRules(loadPolicyFor(slug ?? null), this.toolsSeen),
+      // What the policy in force cannot do (phase 12, TRS-9): an empty ask
+      // list, a struck deny wall — each with whether it was acknowledged
+      // against exactly these rules. Non-empty until a person has read it.
+      advisory: this.policyAdvisories(slug ?? null),
       // Which of these this console can enforce itself, and which are the CLI's
       // job — the distinction that decides whether a rule you just wrote will
       // hold at the hook.
       support: [...new Set(rules)]
-        .map((rule) => parseRule(rule))
+        .map((rule) => parseRule(rule, this.toolsSeen))
         .filter((parsed): parsed is NonNullable<typeof parsed> => parsed !== null)
         .map(({ raw, tool, form, support, note }) => ({ raw, tool, form, support, note })),
       hookTools: HOOK_TOOLS,
@@ -2449,6 +2504,8 @@ export abstract class ServiceLive extends ServiceBase {
       add: edit.add, remove: edit.remove, reset: edit.reset, restore: edit.restore,
       ...(edit.set ? { set: edit.set } : {}),
       by: edit.by ?? 'console',
+      // A rule naming a tool this console has seen is never refused as inert.
+      known: this.toolsSeen,
     }, file);
     this.journalPolicy(scope, edit);
     return this.policy(edit.slug ?? null);
@@ -2589,6 +2646,9 @@ export abstract class ServiceLive extends ServiceBase {
       // restart it, and a button that ends the console is not a Restart button.
       supervisor: supervisor(),
       unread: this.notifications.unread(),
+      // How many cards this console has put in front of a person, and since when
+      // (TRS-5): "0 cards in N days" visible rather than assumed benign.
+      approvals: { ...this.approvals.counts(), pending: this.approvals.pending().length },
       allowRun: this.flags.allowRun,
       // The shell gate, so the nav can offer a Terminal only where there is one
       // to offer. `/api/terminal` carries the richer answer (whether node-pty
@@ -2630,6 +2690,9 @@ export abstract class ServiceLive extends ServiceBase {
         .filter((ask) => !this.resumeDecisions.has(ask.runId))
         .map((ask) => ({ ...ask, phases: [...ask.phases] })),
       fleet: this.fleetState(),
+      // Why this console holds its automation, when it does (SHD-5, FLT-9) —
+      // the banner and Settings' release read it.
+      bootHold: this.bootHold(),
       scriptsDir: this.flags.scriptsDir,
       // Which hostnames this console answers to besides localhost, and who may
       // arrive through them. Both are on the state rather than only on
@@ -2641,6 +2704,15 @@ export abstract class ServiceLive extends ServiceBase {
       // needs both halves to say which one it is.
       remoteHosts: this.flags.remoteHosts,
       remoteUsers: this.flags.remoteUsers,
+      // Where those settings — and the notifier, the webhook rows, the device
+      // defaults and the machine ceiling — came from: a flag, the environment,
+      // this console's own override in `fleet.json`, or the machine profile
+      // every console reads (FLT-3). An inherited setting is visible, not a surprise.
+      profile: this.flags.profile ?? null,
+      // What this console has SERVED, by scope, and when a phone last reached it
+      // (FLT-10) — the counters that make "has the phone path ever worked?"
+      // answerable. Logins are hashed; none is ever carried in clear.
+      access: accessLedger.snapshot(),
       // The port this console is actually on, because the setup commands the
       // Settings card prints embed it. A card that hard-codes 4123 tells
       // somebody on `--port 5000` to publish a port nothing is listening on,

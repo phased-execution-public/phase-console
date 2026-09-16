@@ -60,9 +60,11 @@ both sides agree there is nothing to run.
 - `npm run lint`
 
 ### Phase 3 — Bare
-- **Goal:** ship it — deliberately no verification bullet (F14's specimen).
+- **Goal:** ship it — the plainest bullet shape, one command (the F14 specimen lives in bad-empty-verification-open.md since F14 became a gate).
 - **Size:** S
 - **Exit criteria:** 1. shipped
+- **Verification:**
+  - `true`
 
 ## End-to-end verification
 

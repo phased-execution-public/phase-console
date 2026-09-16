@@ -33,9 +33,33 @@ import { spawn } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 
 import { log } from '../log.ts';
-import { groupSignal } from '../runner/signals.ts';
+import { killLadder, type LadderOptions } from '../runner/signals.ts';
 import { writeProbeConfigFile, type McpConfigDoc } from './config.ts';
 import { MCP_STATUSES } from '../../shared/ops-vocab.js';
+
+/**
+ * The probe's own name, in the vocabulary the locks and the session registry
+ * already read (`kindOf`: `console/…` → `agent`). Until zero-touch-console
+ * phase 7 the probe was spawned with the console's environment unmodified, so
+ * `PE_OWNER` was empty, the presence hook filed it `foreign`, and 82 % of the
+ * registry was the console talking to itself in the operator's name (SLF-2,
+ * REG-6). `PHASE_CONSOLE_PROBE=1` rides beside it so the hook can say WHICH
+ * console child this is: the registry keeps the record, flags it, keeps it
+ * out of every operator-facing total and never weakly correlates it.
+ */
+export const PROBE_OWNER = 'console/mcp-probe';
+export const PROBE_FLAG = 'PHASE_CONSOLE_PROBE';
+
+/**
+ * How long the probe gets to leave on SIGTERM before the group is SIGKILLed.
+ *
+ * The CLI runs its SessionEnd hook on SIGTERM — that is why the runner's own
+ * ladder uses it — and the probe has no transcript to flush and one hook to
+ * run, so three seconds is generous. The SIGKILL that follows is still
+ * needed: an `npx -y …@latest` stdio shim swallows the TERM, and the leak
+ * this used to be was exactly those shims outliving the CLI.
+ */
+export const PROBE_TERM_GRACE_MS = 3_000;
 
 /** Statuses the CLI reports in `system/init`. Unknown values pass through. */
 export type McpStatus = (typeof MCP_STATUSES)[number];
@@ -66,6 +90,10 @@ export type ProbeOptions = {
   now?: () => Date;
   /** Injected in tests so no suite ever spawns a real CLI. */
   spawnFn?: typeof spawn;
+  /** The ending's seams (`signals.ts` `LadderOptions`), for a test that proves the TERM-then-KILL order. */
+  ladder?: Pick<LadderOptions, 'signal' | 'alive' | 'sleep' | 'killAfterMs'>;
+  /** Called once the ending is done, with how it ended — a test's wait handle. */
+  onEnded?: (how: string) => void;
 };
 
 /**
@@ -114,7 +142,7 @@ export async function probeMcp(doc: McpConfigDoc, opts: ProbeOptions = {}): Prom
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      killProbeTree(child);
+      killProbeTree(child, opts);
       // The CLI has read it by the time it reports `system/init`, and every
       // exit from this function passes through here, so the window in which a
       // resolved config exists on disk is the probe's own lifetime.
@@ -131,7 +159,11 @@ export async function probeMcp(doc: McpConfigDoc, opts: ProbeOptions = {}): Prom
     try {
       child = spawnFn('claude', argv, {
         cwd: opts.cwd,
-        env: opts.env ?? process.env,
+        // The probe names itself (SLF-2, REG-6): `PE_OWNER` is what the
+        // presence hook posts as the session's owner, and the flag is what
+        // tells the registry this is the console's own probe rather than one
+        // of its agent sessions.
+        env: { ...(opts.env ?? process.env), PE_OWNER: PROBE_OWNER, [PROBE_FLAG]: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
         // The probe's whole job is to make the CLI start MCP servers, so it is
         // the one console child guaranteed to have descendants worth killing:
@@ -190,27 +222,38 @@ export async function probeMcp(doc: McpConfigDoc, opts: ProbeOptions = {}): Prom
 }
 
 /**
- * End the probe and everything it started.
+ * End the probe and everything it started — through `signals.ts`, like every
+ * other console child.
  *
- * The full `killLadder` is for a PHASE SESSION: it wakes a stopped process,
- * waits out a SIGTERM grace so the transcript flushes, then backstops. A probe
- * has no transcript and nothing to flush — it has already told us the one thing
- * we asked — and a TERM an `npx` shim swallows is how the leak looked in the
- * first place. So it is SIGKILL directly.
+ * It used to be SIGKILL directly, on the reasoning that a probe has no
+ * transcript to flush. True, but a SIGKILLed CLI runs no SessionEnd hook
+ * either, so the registry learned of every probe's death by pid probe and
+ * 168 records a day sat `ended: process-gone` (SLF-2 iii). The ladder here is
+ * the runner's with the interrupt rung off — there is no turn to close —
+ * SIGCONT, then SIGTERM to the GROUP (`detached: true` made one: the CLI, its
+ * `npx` shims and the servers under them), a short grace for the hook, then
+ * the SIGKILL the shims need. Never awaited: the probe's answer is already
+ * in hand, and the ending is bookkeeping.
  *
- * What it does NOT do is roll its own sender. `groupSignal` is the one place
- * that knows `-pid` addresses the group `detached: true` created (the CLI, its
- * `npx` shims and the servers under them, together), that a bare pid is the
- * fallback when there is no group — every test's fake spawn, for one — and that
- * pid 0 and 1 must never be signalled. That knowledge living in two places is
- * exactly what `test/invariants.test.ts` exists to prevent.
+ * The no-group fallback (a spawn seam that gave us no pid) is the one
+ * `.kill(` this file keeps, and `test/invariants.test.ts` names it.
  */
-function killProbeTree(child: ReturnType<typeof spawn>): void {
+function killProbeTree(child: ReturnType<typeof spawn>, opts: ProbeOptions): void {
   if (typeof child.pid === 'number' && child.pid > 1) {
-    groupSignal(child.pid, 'SIGKILL');
+    void killLadder(child.pid, {
+      interrupt: false,
+      killAfterMs: opts.ladder?.killAfterMs ?? PROBE_TERM_GRACE_MS,
+      ...(opts.ladder?.signal ? { signal: opts.ladder.signal } : {}),
+      ...(opts.ladder?.alive ? { alive: opts.ladder.alive } : {}),
+      ...(opts.ladder?.sleep ? { sleep: opts.ladder.sleep } : {}),
+    }).then((how) => {
+      if (how === 'killed') log.warn('mcp.probe.sigkill', { pid: child.pid, note: 'the probe ignored SIGTERM — an npx shim, most likely' });
+      opts.onEnded?.(how);
+    }, () => opts.onEnded?.('failed'));
     return;
   }
   try { child.kill('SIGKILL'); } catch { /* already gone */ }
+  opts.onEnded?.('no-pid');
 }
 
 type InitEvent = {

@@ -67,6 +67,7 @@ test('the groups are the ones the plan named, and nothing is stranded', () => {
     'defaults',
     'git',
     'mcp',
+    'policy',
     'recover',
     'schedule',
     'stall',

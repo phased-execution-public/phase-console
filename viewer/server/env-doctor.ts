@@ -25,7 +25,35 @@ export type EnvIssue = {
   detail: string;
   /** The errand, named — what a person does about it. */
   fix: string;
+  /**
+   * A stable id for an issue the console re-evaluates and may withdraw — the
+   * delivery-channel row below. Absent on the issues computed once and kept.
+   */
+  id?: string;
 };
+
+/** The id of the boot doctor's channel row (zero-touch phase 17, FLT-1 ii). */
+export const DELIVERY_ISSUE_ID = 'delivery-channel';
+
+/**
+ * The boot doctor's channel row: a console must reach a person — one subscribed
+ * device, the operator's notifier, or one webhook row; with `--remote`, Tailscale
+ * running and serving this port. `verdict` is the prelude's own
+ * `probeDelivery` (phase 11), so the run-start row and this one cannot
+ * disagree. `category` names the first announcement that found nobody.
+ */
+export function deliveryIssue(verdict: { ok: boolean; reason: string }, category?: string | null): EnvIssue | null {
+  if (verdict.ok) return null;
+  return {
+    kind: 'push-broken',
+    id: DELIVERY_ISSUE_ID,
+    detail: `${verdict.reason}${category ? ` — "${category}" announcements are reaching nobody` : ''}`,
+    fix:
+      'Give this console one way to reach you: subscribe a device (Settings → Notifications, from the phone), '
+      + 'set a notifier (`notifyCommand` in ~/.config/phase-console/fleet.json, or PHASE_CONSOLE_NOTIFY), or register '
+      + 'a webhook. With --remote, start Tailscale and point Serve at this console’s port.',
+  };
+}
 
 /**
  * The Pro tree can bake a cleaned PATH into the unit when the agent is

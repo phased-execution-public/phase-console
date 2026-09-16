@@ -28,12 +28,12 @@ load ../helpers/test_helper
   [[ "$output" != *"F17 phase 3"* ]]
 }
 
-@test "F17: backticked numbers alone are not runnable — F14 names that phase" {
-  setup_docs missing-lead ml
-  run pg ml --lint
-  assert_contains "$output" "F14 phase 3"
-  [[ "$output" != *"F14 phase 2"* ]]
-  [[ "$output" != *"F14 phase 1"* ]]
+@test "F17: backticked numbers alone are not runnable — F14 names that phase (a gate since 5.0.0)" {
+  setup_docs bad-empty-verification-open bev
+  run pg bev --lint
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "phase 1: verification-empty-open"
+  [[ "$output" != *"phase 4: verification-empty-open"* ]]
 }
 
 @test "F17: a done phase is not nagged about history" {

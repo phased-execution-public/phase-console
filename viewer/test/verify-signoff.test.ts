@@ -661,6 +661,54 @@ test('saying the manual check failed halts, and says who said so', async () => {
   } finally { h.cleanup(); }
 });
 
+test('ZTD-6: `Person-check: allow` records the prose checks waived by policy and raises no card; an owner is named on the card; a card\'s `by` is the answerer, never console', async () => {
+  const allowed = harness();
+  try {
+    const lines: { event: string; data: Record<string, unknown> }[] = [];
+    const runner = new Runner({
+      scriptsDir: allowed.scriptsDir, spawn: happySpawn, verify: async () => NOTHING_RAN,
+      verificationText: () => 'run those commands.', approvals: watchedApprovals().approvals,
+      origin: 'http://127.0.0.1:4123', personCheck: () => 'allow',
+      onEvent: (event, data) => { if (event === 'run:journal') lines.push(data as { event: string; data: Record<string, unknown> }); },
+    });
+    const events = lines;
+    await runner.start({ slug: 'demo', root: allowed.root, autonomy: 'keep-going' });
+    await runner.wait();
+    const state = runner.current()!;
+    assert.equal(state.phases['1'].status, 'done');
+    assert.match(state.phases['1'].verification?.reason ?? '', /1 manual check\(s\) waived by policy \(Person-check: allow, from the plan\)/);
+    const waived = events.find((e) => e.event === 'phase.verify-waived')!;
+    assert.deepEqual([waived.data.stage, waived.data.by, waived.data.decisionKey, waived.data.source], ['verify', 'policy', 'verification.person-check', 'plan']);
+    assert.ok(!events.some((e) => e.event === 'phase.awaiting-verification'), 'no card was raised');
+    assert.equal(events.find((e) => e.event === 'phase.policy-answered')?.data.answer, 'allow');
+  } finally { allowed.cleanup(); }
+
+  const owned = harness();
+  const { approvals, first } = watchedApprovals();
+  try {
+    const lines: { event: string; data: Record<string, unknown> }[] = [];
+    const runner = new Runner({
+      scriptsDir: owned.scriptsDir, spawn: happySpawn, verify: async () => NOTHING_RAN,
+      verificationText: () => 'run those commands.', approvals, origin: 'http://127.0.0.1:4123',
+      personCheck: () => 'dev-lead',
+      onEvent: (event, data) => { if (event === 'run:journal') lines.push(data as { event: string; data: Record<string, unknown> }); },
+    });
+    const events = lines;
+    void runner.start({ slug: 'demo', root: owned.root, autonomy: 'keep-going' });
+    await first;
+    const [card] = approvals.pending();
+    assert.match(card.title, /only you can make \(Person-check: dev-lead\)/);
+    // The answerer's own word rides the decision — the route hands the broker the
+    // request's actor (`operator`, a login, a name), and `console` never.
+    approvals.settle(card.id, 'allow', 'dev-lead', 'looked at it');
+    await runner.wait();
+    const verified = events.find((e) => e.event === 'phase.human-verified')!;
+    assert.equal(verified.data.by, 'dev-lead');
+    assert.notEqual(verified.data.by, 'console');
+    assert.match(runner.current()!.phases['1'].verification?.reason ?? '', /confirmed by dev-lead/);
+  } finally { owned.cleanup(); }
+});
+
 test('with no way to ask, it halts saying exactly that', async () => {
   const h = harness();
   try {

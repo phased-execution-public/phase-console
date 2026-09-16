@@ -261,7 +261,9 @@ async function drive(
   r: Repo,
   options: Record<string, unknown>,
   record: (round: number) => string | null,
-): Promise<{ prompts: SpawnRequest[]; journal: string }> {
+  /** Extra runner deps — the policy table's two (phase 11): `planQaExhausted`, `qaWaive`. */
+  deps: Record<string, unknown> = {},
+): Promise<{ prompts: SpawnRequest[]; journal: string; state: () => Record<string, unknown> | null }> {
   const prompts: SpawnRequest[] = [];
   let round = 0;
   const spawn: SpawnFn = async (request: SpawnRequest) => {
@@ -290,7 +292,7 @@ async function drive(
   };
   const runId = seedRun(r, options.seed as Record<string, unknown> ?? {});
   const runner = new Runner({
-    scriptsDir: r.scripts, spawn, verificationText: () => '`true`',
+    scriptsDir: r.scripts, spawn, verificationText: () => '`true`', ...deps,
   } as never);
   await runner.qaRecover({
     slug: 'demo', root: r.root, runId, phase: 1,
@@ -298,10 +300,11 @@ async function drive(
     ...options,
   } as never);
   await runner.wait();
+  const state = () => (runner as unknown as { current: () => Record<string, unknown> | null }).current();
   const journalPath = journalFile(r.root, 'demo', runId);
   let journal = '';
   try { journal = readFileSync(journalPath, 'utf8'); } catch { journal = ''; }
-  return { prompts, journal };
+  return { prompts, journal , state };
 }
 
 test.after(() => rmSync(STATE_HOME, { recursive: true, force: true }));
@@ -342,6 +345,75 @@ test('EC2: three failed rounds journal phase.qa-exhausted with ONE errand naming
     // Exactly one errand for three rounds — the rule the whole ladder keeps.
     assert.equal(journal.split('\n').filter((l) => l.includes('"phase.qa-exhausted"')).length, 1);
   } finally { r.cleanup(); }
+});
+
+test('ZTD-9: with `QA exhausted: waive` a spent round budget records `waived` naming the policy, releases the dependents and writes no errand', async () => {
+  const r = repo('fail');
+  try {
+    const waived: { slug: string; phase: number; opts: { reason: string; by: string } }[] = [];
+    const { prompts, journal, state } = await drive(r, { maxRounds: 2 }, () => 'fail', {
+      planQaExhausted: () => 'waive',
+      qaWaive: async (slug: string, phase: number, opts: { reason: string; by: string }) => {
+        waived.push({ slug, phase, opts });
+        return { ok: true, verdict: 'waived', round: 3, report: 'reports/phase-01-qa-round3.md', detail: 'recorded' };
+      },
+    });
+    assert.equal(prompts.length, 2, 'the budget, spent');
+    assert.equal(waived.length, 1, 'the waiver went through the operator\'s own door, once');
+    assert.equal(waived[0].opts.by, 'policy');
+    assert.match(waived[0].opts.reason, /QA exhausted after 2 failed rounds — waived by policy \(qa.exhausted: waive, from the plan\)/);
+    const lines = journal.split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
+    const exhausted = lines.find((l) => l.event === 'phase.qa-exhausted')!;
+    assert.equal(exhausted.data.policy, 'waive');
+    assert.equal(exhausted.data.policySource, 'plan');
+    const answered = lines.find((l) => l.event === 'phase.policy-answered')!;
+    assert.deepEqual([answered.data.decisionKey, answered.data.answer, answered.data.source], ['qa.exhausted', 'waive', 'plan']);
+    const record = lines.find((l) => l.event === 'phase.qa-waived')!;
+    assert.deepEqual([record.data.by, record.data.decisionKey, record.data.rounds], ['policy', 'qa.exhausted', 2]);
+    assert.ok(!lines.some((l) => l.event === 'phase.errand'), 'no errand — nobody is asked');
+    const run = state()!;
+    assert.equal(run.status, 'parked');
+    assert.equal(run.halt, null, 'the halt this recovery was asked about is retired, the success path\'s way');
+    assert.match(String(run.finishedReason), /waived by policy after 2 failed rounds/);
+    const phase = (run.phases as Record<string, { status: string; note?: string }>)['1'];
+    assert.doesNotMatch(phase.note ?? '', /needs a person/);
+    assert.match(phase.note ?? '', /waived by policy/);
+    assert.equal((run.recoveries as Record<string, { errand?: unknown }>)?.['1']?.errand, undefined);
+  } finally { r.cleanup(); }
+});
+
+test('ZTD-9: `QA exhausted: halt` halts the run with the errand; an owner\'s name parks with the errand addressed to them; a waiver the door refuses falls back to the errand', async () => {
+  const halted = repo('fail');
+  try {
+    const { journal, state } = await drive(halted, { maxRounds: 1 }, () => 'fail', { planQaExhausted: () => 'halt' });
+    const lines = journal.split('\n').filter(Boolean).map((l) => JSON.parse(l) as { event: string; data: Record<string, unknown> });
+    assert.equal(lines.find((l) => l.event === 'phase.qa-exhausted')!.data.policy, 'halt');
+    assert.ok(!lines.some((l) => l.event === 'phase.qa-waived'));
+    const run = state()!;
+    assert.equal(run.status, 'halted');
+    assert.match(String((run.halt as { reason: string }).reason), /the plan says halt \(QA exhausted: halt\)/);
+    assert.ok((run.recoveries as Record<string, { errand?: { need: string } }>)['1'].errand, 'the errand stands beside the halt');
+  } finally { halted.cleanup(); }
+  const owned = repo('fail');
+  try {
+    const { state } = await drive(owned, { maxRounds: 1 }, () => 'fail', { planQaExhausted: () => 'dev-lead' });
+    const run = state()!;
+    assert.equal(run.status, 'parked');
+    const errand = (run.recoveries as Record<string, { errand: { need: string } }>)['1'].errand;
+    assert.match(errand.need, /The plan hands this verdict to dev-lead \(QA exhausted: dev-lead\)/);
+  } finally { owned.cleanup(); }
+  const refused = repo('fail');
+  try {
+    const { journal, state } = await drive(refused, { maxRounds: 1 }, () => 'fail', {
+      planQaExhausted: () => 'waive',
+      qaWaive: async () => ({ ok: false, verdict: 'fail', detail: 'Writes are disabled. Restart the console with --allow-writes.' }),
+    });
+    assert.ok(!journal.includes('"phase.qa-waived"'), 'nothing was recorded');
+    const run = state()!;
+    assert.equal(run.status, 'parked');
+    const errand = (run.recoveries as Record<string, { errand: { how: string } }>)['1'].errand;
+    assert.match(errand.how, /the waiver could not be recorded: Writes are disabled/);
+  } finally { refused.cleanup(); }
 });
 
 test('EC3: a pass recorded in round k stops the loop and journals the recovery', async () => {

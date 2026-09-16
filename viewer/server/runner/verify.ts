@@ -87,7 +87,7 @@ import { log } from '../log.ts';
 // No `killAfterMs` — the ladder's own 15s default is the same grace the runner
 // uses, and importing the constant from `runner-core.ts` would be a cycle
 // (it imports this file).
-import { killLadder } from './signals.ts';
+import { killLadder, type LadderEnding } from './signals.ts';
 import type { VerifyRun, VerifySkip, VerifySummary } from './state.ts';
 
 /**
@@ -1326,7 +1326,7 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     let err = '';
     let bytes = 0;
     let cut: 'timeout' | 'abort' | null = null;
-    let how: 'gone' | 'exited' | 'killed' | undefined;
+    let how: LadderEnding | undefined;
     let settled = false;
 
     const child = spawn('bash', ['-c', command], {
@@ -1365,8 +1365,9 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
       if (settled || cut) return;
       cut = reason;
       if (child.pid == null) return;
-      // The group, not the pid.
-      ending = killLadder(child.pid, { killAfterMs: KILL_GRACE_MS }).then((verdict) => {
+      // The group, not the pid. And no interrupt first: a `bash -c` has no
+      // turn to close, so SIGINT would buy the command nothing but a delay.
+      ending = killLadder(child.pid, { killAfterMs: KILL_GRACE_MS, interrupt: false }).then((verdict) => {
         how = verdict;
       }, () => { /* the process vanished mid-ladder; `how` stays unset */ });
     };

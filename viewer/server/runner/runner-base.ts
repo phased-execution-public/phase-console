@@ -9,20 +9,27 @@
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
 import { execFile } from 'node:child_process';
+import type { ResolvedPolicy } from '../../shared/policy-model.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
-import { onShutdown, offShutdown } from '../lifecycle.ts';
+import { onShutdown, offShutdown, type ShutdownContext } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
 import { detachedRef, worktreeRootOf, WORKTREE_ROOTS, type WorktreeRoot} from '../../shared/worktree-model.js';
 import {
-  classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
+  childEnvDecisions, classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
+import {
+  markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
+} from './spawn.ts';
+import { permissionPromptsFor, relayArmingFor, sessionRecordOf, type Cap, type SessionCaps } from './session-record.ts';
+import { writeMcpConfigFile, type McpConfigDoc } from '../mcp/config.ts';
+import { RELAY_HOST_SERVER, RELAY_HOST_TOOL, relayHostConfig } from '../relay-host.ts';
+import type { PhaseSize } from '../parse/plan.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -52,18 +59,20 @@ import {
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
-  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
+  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, rungSettledPayload, settleRung, settleRungRecord,
+  DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { RungRecord } from './state.ts';
+import type { RungRecord, Actor } from './state.ts';
+import { stoppedByOf } from '../actor.ts';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords, runDir,
-  type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
+  type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind, type SessionMode,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary,
-  consoleRunsDir,
+  consoleRunsDir, type DeclarationSink,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import {
@@ -78,9 +87,12 @@ import {
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
+import { DEFAULT_WAIT_BUDGET, waitBudgetFrom, type WaitBudget } from './wait-budget.ts';
+import type { ResumeVerdict, SessionRequest } from './runner-core.ts';
+import { dateOfRef } from '../watch-refs.ts';
 
 export abstract class RunnerBase {
   /** Set while `ensureRunCheckout` is between the cap check and the finished tree. */
@@ -94,10 +106,10 @@ export abstract class RunnerBase {
     verification: VerifySummary,
     askable?: VerifySummary['notRun'],
   ): Promise<boolean>;
-  protected abstract attempt(phase: number, prompt: string, model: string, owner: string, lane: Lane, chosen?: PhaseOptions, opts?: { maxTurns?: number; mcp?: McpResolution; }): Promise<{ carryOn: boolean; completed: boolean; }>;
+  protected abstract attempt(phase: number, prompt: string, model: string, owner: string, lane: Lane, chosen?: PhaseOptions, opts?: { maxTurns?: Cap; mcp?: McpResolution; }): Promise<{ carryOn: boolean; completed: boolean; }>;
   protected abstract board(): Promise<Board>;
   protected abstract boardingBlocked(): 'stopped' | 'halted' | 'pause' | 'frozen' | null;
-  protected abstract checkpointForShutdown(): Promise<void>;
+  protected abstract checkpointForShutdown(context?: ShutdownContext): Promise<void>;
   protected abstract clearLeaseTimer(lane: Lane): void;
   protected abstract clearParkPoke(phase: number): void;
   protected abstract climb(record: PhaseRecord, board: Board, by: string, preset?: { situation?: Situation; declared?: PhaseEvidence['declared']; sessionId?: string; }): Promise<boolean>;
@@ -114,7 +126,7 @@ export abstract class RunnerBase {
   protected abstract enterRunWaiting(nowIso: string, asked?: Set<number> | null): boolean;
   protected abstract evaluateLane(lane: Lane, thresholds: StallThresholds, now: number): Promise<boolean>;
   protected abstract gitOrNull(args: string[]): Promise<string | null>;
-  protected abstract halt(reason: string, phase?: number, kind?: HaltKind): void;
+  protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind): void;
   protected abstract now(): Date;
   protected abstract onStream(phase: number, event: StreamEvent): void;
   protected abstract armOutcomeFile(phase: number): string;
@@ -122,14 +134,92 @@ export abstract class RunnerBase {
   protected abstract armTasksFile(phase: number): string;
   protected abstract tasksPath(phase: number): string;
   protected abstract drainTasks(phase: number): boolean;
-  protected abstract parkWaiting(phase: number, declared: PhaseOutcome): boolean;
+  protected abstract parkWaiting(
+    phase: number, declared: PhaseOutcome,
+    opts?: { by?: import('./wait-budget.ts').WaitAuthor; budget?: WaitBudget; minted?: string[] },
+  ): boolean;
   protected abstract persist(): void;
   /** `persist()` without the debounce — for the moments that must reach disk now. */
   protected abstract persistNow(): void;
   protected abstract preflightVerification(phase: number): Promise<string | null>;
+  /** The policy answer in force for a situation's manifest row (phase 11; `runner.ts`). */
+  protected abstract policyFor(situationKey: string): ResolvedPolicy | null;
+  /** The phase's `Person-check:` word and its source (phase 11; `runner.ts`). */
+  protected abstract personCheckFor(phase: number): { answer: string | null; source: string };
   protected abstract rearmLockCapParks(board: Board): Promise<void>;
+  /** Rewrite this run's settings with the relay armed or not, keeping the token (phase 14; `runner-control.ts`). */
+  protected abstract rearmRelay(armed: boolean): void;
   protected abstract reboardWith(record: PhaseRecord, hint: BoardingHint): void;
   protected abstract record(event: string, data?: Record<string, unknown>, phase?: number): void;
+  /**
+   * This run's journal as a `DeclarationSink` — what the state helpers that
+   * spend testimony (`resetForRetry`, `reconcileRecordsAgainstBoard`) write
+   * through. A LIVE runner always passes its own: a second `Journal` over the
+   * same file would diverge the sequence numbers.
+   */
+  protected declarationSink(): DeclarationSink {
+    return (event, data, phase) => this.record(event, data, phase);
+  }
+
+  /**
+   * The runner's ONE settlement door (zero-touch-console phase 10, RCV-6):
+   * settle the phase's newest open rung and write `phase.rung-settled` with
+   * the whole payload — situation, params, cost, note. Every `settleRung`
+   * under `runner/` goes through here (`test/invariants.test.ts` holds it; the
+   * service has its own door, `settleRungOn`), which is what makes the
+   * journal's settlement one shape: all 132 the audit read said only
+   * `{outcome, rung}`. A no-op, answering null, when nothing is open.
+   */
+  protected settleOpenRung(
+    phase: number, outcome: NonNullable<RungRecord['outcome']>, note?: string, costUsd?: number,
+  ): RungRecord | null {
+    const slot = this.state?.recoveries?.[String(phase)];
+    if (!slot) return null;
+    const settled = settleRung(slot, outcome, costUsd, note);
+    if (settled) this.record('phase.rung-settled', rungSettledPayload(settled), phase);
+    return settled;
+  }
+
+  /**
+   * Settle whatever this phase's ladder still holds OPEN once its attempt has
+   * ended — the backstop behind the outcome-driven settles, so no rung stays
+   * `running` past its attempt (RCV-6: 21 of 168 records did, and
+   * `chargeRung` went on booking every later attempt's spend onto them). The
+   * verdict is read off the record the attempt left, the healer's sweep's own
+   * table: done → `fixed`; a declared park → `no-defect`; an interruption →
+   * `interrupted`; anything else `failed`, naming the status. Only rungs
+   * climbed BEFORE `since` are settled: a rung the attempt itself climbed on
+   * its way out — a re-board hint for the next lane — is that lane's to
+   * settle, not this one's.
+   */
+  protected settleRungsAfterAttempt(phase: number, since: string): void {
+    const state = this.state;
+    const slot = state?.recoveries?.[String(phase)];
+    if (!state || !slot?.rungs?.some((r) => (r.outcome === 'running' || r.outcome == null) && r.at < since)) return;
+    const record = state.phases[String(phase)];
+    // Only when an attempt actually RAN in this lane. A lane that ended at the
+    // gate, the queue or a preflight park spawned nothing: its re-board hint
+    // is kept for the next tick, and the rung behind that hint has not been
+    // tried yet — settling it here would spend the remedy on a boarding that
+    // never happened and lose its cost from the ledger.
+    if (!record?.attemptStartedAt || record.attemptStartedAt < since) return;
+    const status = record?.status ?? 'absent';
+    const verdict: { outcome: NonNullable<RungRecord['outcome']>; note: string } =
+      status === 'done' ? { outcome: 'fixed', note: 'the record reads done' }
+        : (status === 'parked' || status === 'waiting') && record?.declared
+          ? { outcome: 'no-defect', note: `the session declared ${record.declared.status}` }
+          : status === 'interrupted'
+            ? { outcome: 'interrupted', note: record?.note ? `the attempt was interrupted — ${record.note.slice(0, 120)}` : 'the attempt was interrupted' }
+            : status === 'pending' && record?.boardingHint
+              ? { outcome: 'interrupted', note: `the ladder re-boarded the phase (${record.boardingHint.rung}) before this rung settled` }
+              : { outcome: 'failed', note: `the record reads ${status}` };
+    // Oldest first, every open rung older than the attempt — a phase that
+    // climbed twice without settling holds two, and both are past.
+    for (const open of slot.rungs.filter((r) => (r.outcome === 'running' || r.outcome == null) && r.at < since)) {
+      settleRungRecord(slot, open, verdict.outcome, undefined, verdict.note);
+      this.record('phase.rung-settled', { ...rungSettledPayload(open), by: 'attempt-end' }, phase);
+    }
+  }
   protected abstract release(phase: number, owner: string): Promise<void>;
   protected abstract resolveMcp(phase: number, chosen: PhaseOptions): Promise<McpResolution>;
   protected abstract resumedStatus(): RunStatus;
@@ -409,8 +499,14 @@ export abstract class RunnerBase {
   protected childPid: number | null = null;
   /** The live session, while there is one — what `/btw` talks to. */
   protected handle: SpawnHandle | null = null;
-  /** Set when the operator stopped us, so exit 143 is not read as a mystery. */
+  /** Set when somebody stopped us, so exit 143 is not read as a mystery. */
   protected stopRequested = false;
+  /**
+   * WHO asked for the stop (LFC-6, SHD-3) — the actor `stop()` was handed,
+   * kept until the loop settles so every arm that stamps `stoppedBy` and
+   * writes the "stopped by …" note reads the same answer. Null between stops.
+   */
+  protected stopActor: Actor | null = null;
   /**
    * Fired by `halt()` so lanes sleeping on a retry backoff or a usage window
    * wake and re-check, instead of spawning another attempt on a stopped run.
@@ -418,10 +514,28 @@ export abstract class RunnerBase {
   protected haltSignal = new EventTarget();
   /** Path to the 0600 settings file carrying this run's deny rules and hook. */
   protected settingsPath: string | null = null;
+  /** The run whose `run.permission-prompts-skipped` line is already written — once per run. */
+  private promptsSkippedFor: string | null = null;
+  /** `run.relay-degraded` once per run per reason (phase 14). */
+  private relayDegradedFor = new Set<string>();
   /** Idempotency keys of operator messages already written, newest last. */
   protected injected = new Map<string, AskResult>();
+  /**
+   * The questions an operator asked a live session that are still waiting for
+   * their answer, by mark (`ask:<id>`) — what pairs a `phase.asked` with its
+   * `phase.answered` (TRS-6). Bounded; in memory, because the stdin a question
+   * went down dies with the console that wrote to it.
+   */
+  protected openAsks = new Map<string, { question: string; by: string; at: number; phase?: number }>();
   /** Set while `recover` drives a single session rather than the phase loop. */
   protected recovering = false;
+  /**
+   * The phase a `recheck` recovery is re-checking right now, or null. While
+   * set, `settlePhase`/`halt` leave an IDENTICAL standing ending untouched and
+   * the paperwork charges to the failure streak skip (phase 9, RCV-4): a
+   * recheck spawns nothing, so it is neither a failed attempt nor a new stop.
+   */
+  protected rechecking: number | null = null;
   /**
    * The docs watcher's poke. The FLAG is the truth; the promise only ends the
    * drive loop's sleep — a wake that lands between the race settling and the
@@ -456,6 +570,24 @@ export abstract class RunnerBase {
     this.deps = deps;
   }
 
+  /**
+   * The two facts every stop arm writes, from one source: `stoppedBy` folded
+   * from the actor (`stoppedByOf`), and the note's wording. A shutdown is the
+   * system's whatever actor pressed it — the run must resume at boot — and a
+   * stop nobody attributed is still a person's, because the console never
+   * stops a run without saying so.
+   */
+  protected stopStamp(): { stoppedBy: 'operator' | 'system'; by: string; note: string } {
+    if (this.shuttingDown) return { stoppedBy: 'system', by: 'console', note: 'the console shut down' };
+    const actor = this.stopActor;
+    const by = actor?.by ?? 'unattributed';
+    return {
+      stoppedBy: actor ? stoppedByOf(actor) : 'operator',
+      by,
+      note: `stopped by ${by === 'operator' ? 'the operator' : by}`,
+    };
+  }
+
   current(): RunState | null { return this.state; }
 
   /**
@@ -471,6 +603,23 @@ export abstract class RunnerBase {
     return this.reservingCheckout || this.state?.checkout === 'worktree';
   }
   busy(): boolean { return this.driving !== null; }
+
+  /**
+   * Is a `claude` process of this run spending `accountId` RIGHT NOW? The
+   * usage poller's active probe (ACT-3): a lane holding a live child is the
+   * one account whose meters are moving, and it is polled at the active
+   * cadence; everything else waits the idle ten minutes. A queued or waiting
+   * lane holds no child and spends nothing.
+   */
+  isSpending(accountId: string): boolean {
+    const state = this.state;
+    if (!state || !this.driving) return false;
+    if ((state.accountId ?? 'default') !== accountId) return false;
+    for (const lane of this.lanes.values()) {
+      if (lane.pid != null && !lane.checkpointed && !lane.stopped) return true;
+    }
+    return false;
+  }
 
   /**
    * The docs watcher saw the plan or a handoff (or a lock) change. Wakes the
@@ -501,7 +650,7 @@ export abstract class RunnerBase {
   reconcileAgainstBoard(board: Record<number, string>): { changed: boolean; closed: number[] } {
     const state = this.state;
     if (!state) return { changed: false, closed: [] };
-    const result = reconcileRecordsAgainstBoard(state, board);
+    const result = reconcileRecordsAgainstBoard(state, board, undefined, this.declarationSink());
     if (result.changed) {
       for (const phase of result.closed) {
         this.clearParkPoke(phase);
@@ -714,6 +863,249 @@ export abstract class RunnerBase {
     const lane = this.lanes.get(phase);
     if (lane) { lane.handle = handle; this.syncMirror(); return; }
     this.handle = handle;
+  }
+
+  /** The phase sizes this runner has read, so a retry does not ask the engine again. */
+  protected phaseSizes = new Map<number, PhaseSize>();
+
+  /**
+   * A phase's `Size:` from the plan, through the engine (`--size N`) — the
+   * input to its session caps. Read once per phase; an engine that cannot
+   * answer reads as `M`, the engine's own default for a phase with no size.
+   */
+  protected async sizeOf(phase: number): Promise<PhaseSize> {
+    const known = this.phaseSizes.get(phase);
+    if (known) return known;
+    let size: PhaseSize = 'M';
+    try {
+      const said = (await this.engine(['--size', String(phase)])).stdout.trim();
+      if (said === 'S' || said === 'M' || said === 'L') size = said;
+    } catch { /* unreadable: the engine's own default stands */ }
+    this.phaseSizes.set(phase, size);
+    return size;
+  }
+
+  /** The wait budgets this runner has read — one pair of engine reads per phase. */
+  protected waitBudgets = new Map<number, WaitBudget>();
+
+  /**
+   * A phase's wait budget from the plan, through the engine: `--wait-budget N`
+   * (the phase's own `Waits on:` max, else the plan's `Wait budget:`) and
+   * `--waits-on N`, whose `date:` refs countersign a longer wait. Read once per
+   * phase; an engine that cannot answer reads as the console default with
+   * nothing countersigned — the degradation `sizeOf` makes, for the same reason.
+   */
+  protected async waitBudgetOf(phase: number): Promise<WaitBudget> {
+    const known = this.waitBudgets.get(phase);
+    if (known) return known;
+    let budget: WaitBudget = DEFAULT_WAIT_BUDGET;
+    try {
+      const [line, refs] = await Promise.all([
+        this.engine(['--wait-budget', String(phase)]),
+        this.engine(['--waits-on', String(phase)]),
+      ]);
+      budget = waitBudgetFrom(line.code === 0 ? line.stdout : '', refs.code === 0 ? refs.stdout : '', dateOfRef);
+    } catch { /* unreadable: the console default stands */ }
+    this.waitBudgets.set(phase, budget);
+    return budget;
+  }
+
+  /** The budget already read for a phase — for a synchronous path (a watchdog tick) that cannot ask. */
+  protected knownWaitBudget(phase: number): WaitBudget {
+    return this.waitBudgets.get(phase) ?? DEFAULT_WAIT_BUDGET;
+  }
+
+  /**
+   * THE door every `claude -p` session under the runner goes through.
+   *
+   * Seven sites spawn a session — a phase attempt, a resume with an
+   * instruction, a repair, a QA round, a closeout, the pull-request session and
+   * the reviewer — and until zero-touch-console phase 4 two of them wrote a
+   * `phase.session`, one wrote three fields under another name, and four wrote
+   * nothing: 50 of the 138 sessions the audit's six plans spawned were
+   * invisible to every census built on the record (SES-6). A door that writes
+   * the record cannot be forgotten by a site that does not know it exists, and
+   * `test/invariants.test.ts` holds every spawn to this one call.
+   *
+   * It also puts both caps on every session with the policy that set them
+   * (SES-8), and journals the two CLI-side ceilings the child runs under
+   * (`phase.retry-ceiling`, DOC-2 and SES-12) before it starts.
+   */
+  protected async spawnSession(
+    phase: number, mode: SessionMode, request: SessionRequest, ctx: { caps: SessionCaps; attempt?: number },
+  ): Promise<SpawnOutcome> {
+    // `--resume` only ever arrives vetted (`resumableSession`, REG-1/SLF-10):
+    // the type admits nothing else, and this is the one line that unwraps it.
+    const { resumeFrom, ...rest } = request;
+    // The floor for a run nobody can answer (QRL-9): every session of a
+    // `relay: off` run carries `--permission-prompts none`, unless the CLI is
+    // known to predate the flag — which is said once, on the run.
+    let version: string | undefined;
+    // Asked only when there is someone to ask, so a harness spawns in the same
+    // tick it always did.
+    if (this.deps.cliVersion) {
+      try { version = await this.deps.cliVersion(); } catch { version = undefined; }
+    }
+    // The relay (phase 14): armed only for the phase's own attempts — a boarding
+    // and the `--resume` of its own session, both `mode: 'phase'` — on a `relay:
+    // last-resort` run whose CLI read at or above the floor from `system/init`.
+    // Every other session of any run (a QA round, a repair, a resume with an
+    // instruction, a closeout, the PR and the reviewer), and every session of a
+    // run the relay refused, keeps the floor below and its own MCP set.
+    let relay: McpConfigDoc | null = null;
+    if (this.state?.relay === 'last-resort' && mode === 'phase') {
+      let initVersion: string | null = null;
+      try { initVersion = this.deps.initVersion?.(version) ?? null; } catch { initVersion = null; }
+      const arming = relayArmingFor(this.state.relay, initVersion);
+      this.noteRelayArming(arming);
+      if (arming.armed) relay = this.relayMcpDoc(rest.mcpConfig);
+    }
+    const armedPath = relay && this.state ? this.writeRelayConfig(phase, relay) : null;
+    const prompts = permissionPromptsFor(armedPath ? 'last-resort' : 'off', version);
+    if (prompts.refused && this.state && this.promptsSkippedFor !== this.state.id) {
+      this.promptsSkippedFor = this.state.id;
+      this.record('run.permission-prompts-skipped', {
+        version: prompts.refused.version, floor: prompts.refused.floor, relay: this.state.relay ?? 'off',
+      });
+    }
+    const armed = Boolean(armedPath);
+    const onEvent = rest.onEvent;
+    const sent: SpawnRequest = {
+      ...rest,
+      ...(resumeFrom ? { resume: resumeFrom.sessionId } : {}),
+      ...(prompts.flag ? { permissionPrompts: prompts.flag } : {}),
+      ...(armedPath ? { permissionPromptTool: RELAY_HOST_TOOL, mcpConfig: armedPath } : {}),
+      caps: ctx.caps,
+      maxTurns: ctx.caps.maxTurns.value,
+      budgetUsd: ctx.caps.maxBudgetUsd.value,
+      // What the session's own `system/init` says is read here, at the door:
+      // the version every later arming is judged on, and — on an armed session —
+      // whether the relay actually has a tool to answer and a host to hold it.
+      onEvent: (event) => {
+        try { this.noteSessionEvent(phase, event, armed, version); } catch { /* bookkeeping never costs the stream */ }
+        onEvent?.(event);
+      },
+    };
+    const ceilings = childEnvDecisions(sent.env ?? process.env);
+    this.record('phase.retry-ceiling', {
+      mode,
+      ceiling: Number(ceilings.maxRetries.value),
+      source: ceilings.maxRetries.source,
+      bgWaitCeilingMs: Number(ceilings.bgWaitCeilingMs.value),
+      bgWaitSource: ceilings.bgWaitCeilingMs.source,
+    }, phase);
+    const outcome = await (this.deps.spawn ?? spawnClaude)(sent);
+    this.record('phase.session', sessionRecordOf({ mode, request: sent, outcome, attempt: ctx.attempt }), phase);
+    // What this session REPORTED costing goes to the instance's start ceiling
+    // — its dollars-per-hour half reads the last hour's session spend. A cost
+    // that never arrived charges nothing (`costSource: 'none'`).
+    if (outcome.costUsd > 0) this.deps.startCeiling?.spendUsd(outcome.costUsd);
+    return outcome;
+  }
+
+  /**
+   * The relay's arming for this run, recorded when it CHANGES (phase 14): the
+   * run's `relayArming`, one `run.relay-refused {version, floor, reason}` for a
+   * refusal and one `run.relay-armed {version, floor}` when it arms, and the
+   * settings file rewritten so the next child loads — or no longer loads — the
+   * `PermissionRequest` hook.
+   */
+  protected noteRelayArming(arming: { armed: boolean; version: string | null; floor: string; refused?: 'below-floor' | 'version-unknown' }): void {
+    const state = this.state;
+    if (!state) return;
+    const before = state.relayArming;
+    if (before && before.armed === arming.armed && before.reason === arming.refused) return;
+    state.relayArming = {
+      armed: arming.armed, version: arming.version, floor: arming.floor,
+      ...(arming.refused ? { reason: arming.refused } : {}), at: this.now().toISOString(),
+    };
+    if (arming.refused) {
+      this.record('run.relay-refused', { version: arming.version, floor: arming.floor, reason: arming.refused });
+    } else if (arming.armed) {
+      this.record('run.relay-armed', { version: arming.version, floor: arming.floor });
+    }
+    if (!before || before.armed !== arming.armed) {
+      try { this.rearmRelay(arming.armed); } catch (error) { log.warn('runner.relay-arming-failed', { what: 'settings', error: String(error) }); }
+    }
+    this.persist();
+  }
+
+  /**
+   * The phase's MCP document with the relay's presence-only host added — the
+   * servers this phase already resolved (read back from the file `armMcp` just
+   * wrote) and `pcrelay` beside them. A relay-armed session therefore always
+   * runs `--strict-mcp-config`: the host has to be IN the set, and the flag is
+   * what makes the resolved set the whole set.
+   */
+  private relayMcpDoc(existing: string | undefined): McpConfigDoc {
+    let doc: McpConfigDoc = { mcpServers: {} };
+    if (existing) {
+      try {
+        const parsed = JSON.parse(readFileSync(existing, 'utf8')) as Partial<McpConfigDoc>;
+        if (parsed.mcpServers && typeof parsed.mcpServers === 'object') doc = { mcpServers: { ...parsed.mcpServers } };
+      } catch { /* an unreadable phase document: the host alone, and the phase's servers are named in its prompt */ }
+    }
+    doc.mcpServers[RELAY_HOST_SERVER] = relayHostConfig();
+    return doc;
+  }
+
+  /** Write the relay-armed document, or null — a session that cannot have its host runs on the floor. */
+  private writeRelayConfig(phase: number, doc: McpConfigDoc): string | null {
+    try {
+      return writeMcpConfigFile(this.state!.id, phase, doc);
+    } catch (error) {
+      log.warn('runner.relay-arming-failed', { what: 'mcp-config', error: String(error) });
+      return null;
+    }
+  }
+
+  /**
+   * One stream event, read at the door for the ledgers that belong to no lane:
+   * the CLI version a session's `system/init` reports (every later arming is
+   * judged on it), the relay's two degradations on an armed session — no
+   * `AskUserQuestion` in `system/init.tools`, or its host not `connected` in
+   * `system/init.mcp_servers` (the exit code never says, DOC-5) — a
+   * `control_request` the CLI sent, and a turn that ended on a `defer`.
+   */
+  private noteSessionEvent(phase: number, event: StreamEvent, armed: boolean, binary: string | undefined): void {
+    const state = this.state;
+    if (!state) return;
+    if (event.kind === 'init') {
+      if (event.version) this.deps.noteCliInit?.(event.version, binary);
+      if (!armed) return;
+      if (event.version) {
+        const read = relayArmingFor(state.relay, event.version);
+        if (!read.armed) this.noteRelayArming(read);
+      }
+      const degraded = (reason: string, data: Record<string, unknown>) => {
+        const key = `${state.id}:${reason}`;
+        if (this.relayDegradedFor.has(key)) return;
+        this.relayDegradedFor.add(key);
+        this.record('run.relay-degraded', { reason, ...data }, phase);
+      };
+      if (event.toolNames && !event.toolNames.includes('AskUserQuestion')) {
+        degraded('tool-absent', { tools: event.toolNames.length });
+      }
+      const host = event.mcpServers?.find((server) => server.name === RELAY_HOST_SERVER);
+      if (event.mcpServers && host?.status !== 'connected') {
+        degraded('host-not-connected', { status: host?.status ?? 'absent' });
+      }
+      return;
+    }
+    if (event.kind === 'control-request') {
+      this.record('phase.control-request', {
+        ...(event.requestId ? { requestId: event.requestId } : {}),
+        ...(event.subtype ? { subtype: event.subtype } : {}),
+        ...(event.tool ? { tool: event.tool } : {}),
+      }, phase);
+      return;
+    }
+    if (event.kind === 'deferred') {
+      this.record('phase.tool-deferred', {
+        ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
+        ...(event.tool ? { tool: event.tool } : {}),
+      }, phase);
+    }
   }
 
   /**

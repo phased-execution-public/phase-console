@@ -23,12 +23,21 @@
 
 import type { Errand, RungRecord } from './state.ts';
 import {
-  SITUATIONS, SITUATION_ACTOR, situationKey, situationLabel, parseSituationKey,
+  SITUATIONS, SITUATION_ACTOR, actorFor, situationKey, situationLabel, parseSituationKey,
 } from '../../shared/situation-model.js';
+import {
+  decisionKeyOfSituation, isAutomaticAnswer, policyRowOf, policyAnsweredPayload, POLICY_DEFAULTS,
+  type ResolvedPolicy,
+} from '../../shared/policy-model.js';
 import {
   RUNG_VEHICLES as SHARED_RUNG_VEHICLES,
   RUNGS_BY_SITUATION as SHARED_RUNGS_BY_SITUATION,
   DEFAULT_LADDER_CAPS as SHARED_DEFAULT_LADDER_CAPS,
+  RUNG_DRIVERS,
+  RUNG_DRIVER_LABELS,
+  VEHICLE_DRIVERS,
+  drivableBy,
+  operatorOnlyTables,
   rungsFor as sharedRungsFor,
   rungKey as sharedRungKey,
   countedRungs,
@@ -40,9 +49,11 @@ import {
  * The bound on interruptions and the two readings of it — the shared file's,
  * re-exported so a server caller never grows a private copy of the rule that
  * let one rung climb nineteen times (`shared/ladder-model.js`
- * `MAX_RUNG_INTERRUPTIONS`).
+ * `MAX_RUNG_INTERRUPTIONS`). Beside them the drivability column (phase 10,
+ * LFC-2/RCV-10): who drives each vehicle, and the tables nobody does.
  */
-export { countedRungs, triedRungKeys, untriedRungs };
+export { countedRungs, triedRungKeys, untriedRungs, RUNG_DRIVERS, RUNG_DRIVER_LABELS, VEHICLE_DRIVERS, drivableBy, operatorOnlyTables };
+export type RungDriver = (typeof RUNG_DRIVERS)[number];
 import type { SettledRungOutcome } from '../../shared/run-lifecycle.js';
 
 export type SituationId = (typeof SITUATIONS)[number];
@@ -146,9 +157,37 @@ export type NextRungInput = {
   available?: (rung: Rung) => boolean;
 };
 
+/**
+ * Which of the ladder's OWN caps refused a climb — the structured word beside
+ * the sentence.
+ *
+ * The sentences say "ladder budget is spent", and a run's dollar budget is
+ * spent too; for as long as the only record was the prose, a situation regex
+ * read every spent LADDER cap as a spent RUN budget and sent it to a remedy the
+ * console refuses (LFC-8). A refusal now names itself — `refusal:
+ * 'ladder-budget-spent'` and which `cap` — so nothing has to read the sentence
+ * to know which budget it was. The sentences stay as written: journals,
+ * fixtures and errands already carry them.
+ */
+export type LadderCap = 'phase-rungs' | 'phase-usd' | 'run-rungs' | 'run-usd' | 'day-usd';
+
 export type NextRung =
   | { ok: true; rung: Rung; index: number; key: string }
-  | { ok: false; exhausted: boolean; reason: string; key: string };
+  | {
+    ok: false; exhausted: boolean; reason: string; key: string;
+    /** Set when one of the ladder's own caps refused — never for a run budget. */
+    refusal?: 'ladder-budget-spent';
+    cap?: LadderCap;
+    /**
+     * The two numbers the cap sentence is made of (phase 10, RCV-6): what
+     * the ladder had spent and what the cap allows, in the cap's own unit
+     * (rungs, or dollars). The journal line a cap refusal now writes —
+     * `phase.ladder-refused {cap, spent, limit}` — is built from these, never
+     * parsed back out of the sentence.
+     */
+    spent?: number;
+    limit?: number;
+  };
 
 const usd = (records: readonly RungRecord[]): number =>
   records.reduce((sum, r) => sum + (typeof r.costUsd === 'number' && Number.isFinite(r.costUsd) ? r.costUsd : 0), 0);
@@ -166,7 +205,7 @@ export function rungKey(situation: string, rung: Pick<Rung, 'vehicle' | 'params'
 export function nextRung(input: NextRungInput): NextRung {
   const caps = { ...DEFAULT_LADDER_CAPS, ...(input.caps ?? {}) };
   const key = input.situation;
-  const { id } = parseSituationKey(key);
+  const { id, sub } = parseSituationKey(key);
   // QA's budget first, so the refusal names QA rather than a generic ladder
   // total. It is checked ONLY for `qa-failed`: `qa-pending` is a verdict that
   // was never given, and refusing to ask for one because earlier rounds failed
@@ -197,27 +236,29 @@ export function nextRung(input: NextRungInput): NextRung {
   const phaseRungs = countedRungs(input.history).length;
   const runRungs = countedRungs(input.runHistory ?? input.history).length;
   if (phaseRungs >= caps.perPhaseRungs) {
-    return { ok: false, exhausted: true, key, reason: `the phase's ladder budget is spent (${phaseRungs} of ${caps.perPhaseRungs} rungs)` };
+    return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'phase-rungs', spent: phaseRungs, limit: caps.perPhaseRungs, reason: `the phase's ladder budget is spent (${phaseRungs} of ${caps.perPhaseRungs} rungs)` };
   }
   const phaseUsd = usd(input.history);
   if (phaseUsd >= caps.perPhaseUsd) {
-    return { ok: false, exhausted: true, key, reason: `the phase's ladder budget is spent ($${phaseUsd.toFixed(2)} of $${caps.perPhaseUsd})` };
+    return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'phase-usd', spent: phaseUsd, limit: caps.perPhaseUsd, reason: `the phase's ladder budget is spent ($${phaseUsd.toFixed(2)} of $${caps.perPhaseUsd})` };
   }
   if (runRungs >= caps.perRunRungs) {
-    return { ok: false, exhausted: true, key, reason: `the run's ladder budget is spent (${runRungs} of ${caps.perRunRungs} rungs)` };
+    return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'run-rungs', spent: runRungs, limit: caps.perRunRungs, reason: `the run's ladder budget is spent (${runRungs} of ${caps.perRunRungs} rungs)` };
   }
   const runUsd = usd(input.runHistory ?? input.history);
   if (runUsd >= caps.perRunUsd) {
-    return { ok: false, exhausted: true, key, reason: `the run's ladder budget is spent ($${runUsd.toFixed(2)} of $${caps.perRunUsd})` };
+    return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'run-usd', spent: runUsd, limit: caps.perRunUsd, reason: `the run's ladder budget is spent ($${runUsd.toFixed(2)} of $${caps.perRunUsd})` };
   }
   if (input.dayHistory) {
     const dayUsd = usd(input.dayHistory);
     if (dayUsd >= caps.perDayUsd) {
-      return { ok: false, exhausted: true, key, reason: `today's ladder budget is spent ($${dayUsd.toFixed(2)} of $${caps.perDayUsd})` };
+      return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'day-usd', spent: dayUsd, limit: caps.perDayUsd, reason: `today's ladder budget is spent ($${dayUsd.toFixed(2)} of $${caps.perDayUsd})` };
     }
   }
 
-  const actor = SITUATION_ACTOR[id];
+  // Sub-kind applied (LFC-3): an empty sub-table that is a person's says so
+  // here, in `loop.md` and on the classifier's `Situation.actor` alike.
+  const actor = actorFor(id, sub);
   const table = rungsFor(key);
   if (!table.length) {
     return {
@@ -323,6 +364,23 @@ export function settleRung(
 ): RungRecord | null {
   const open = [...(slot.rungs ?? [])].reverse().find((r) => r.outcome === 'running' || r.outcome == null) ?? null;
   if (!open) return null;
+  return settleRungRecord(slot, open, outcome, costUsd, note);
+}
+
+/**
+ * Settle ONE named rung of the slot — the write `settleRung` makes on the
+ * newest open one, for the caller that must settle an OLDER open rung while
+ * a younger one legitimately stays open (`Runner.settleRungsAfterAttempt`,
+ * phase 10). The one writer of `outcome` and the slot's `fixed`/`lastOutcome`
+ * bookkeeping, so the two readings cannot disagree.
+ */
+export function settleRungRecord(
+  slot: RecoverySlot,
+  open: RungRecord,
+  outcome: NonNullable<RungRecord['outcome']>,
+  costUsd?: number,
+  note?: string,
+): RungRecord {
   open.outcome = outcome;
   if (typeof costUsd === 'number' && Number.isFinite(costUsd)) open.costUsd = (open.costUsd ?? 0) + costUsd;
   if (note) open.note = note;
@@ -335,11 +393,119 @@ export function settleRung(
   return open;
 }
 
+/**
+ * The journal line a settlement writes — ONE shape for every writer
+ * (zero-touch-console phase 10, RCV-6). All 132 `phase.rung-settled` payloads
+ * the audit read were exactly `{outcome, rung}`: no situation, no cost, no
+ * params — so the journal could not say which rung of which situation spent
+ * what, and the dollar caps were spent from a ledger nobody could audit.
+ *
+ * `costUsd` is always a number (0 when nothing was booked): a reader summing
+ * the column must never have to ask whether an absent field means free or
+ * unknown. `chargeRung` books the attempt's spend onto the open rung the
+ * moment its attempt ends, so by the time anything settles it the figure is
+ * the rung's own. The two doors that write this line — `Runner.settleOpenRung`
+ * and `Service.settleRungOn` — are the ONLY callers of `settleRung` outside
+ * this file (`test/invariants.test.ts` holds that), which is what makes the
+ * shape one shape.
+ */
+export function rungSettledPayload(record: RungRecord): {
+  rung: string; outcome: string; situation: string; params: Rung['params'] | null; costUsd: number;
+  note?: string; turns?: number; endedBy?: string; cardId?: string;
+} {
+  return {
+    rung: record.rung,
+    outcome: record.outcome ?? 'running',
+    situation: record.situation,
+    params: record.params ?? null,
+    costUsd: typeof record.costUsd === 'number' && Number.isFinite(record.costUsd) ? record.costUsd : 0,
+    ...(record.note ? { note: record.note } : {}),
+    ...(typeof record.turns === 'number' ? { turns: record.turns } : {}),
+    ...(record.endedBy ? { endedBy: record.endedBy } : {}),
+    ...(record.cardId ? { cardId: record.cardId } : {}),
+  };
+}
+
+/**
+ * A cap refusal, as the journal records it (RCV-6): which of the ladder's own
+ * caps refused, what was spent and what the cap allows — or null when the
+ * refusal was not a cap's (a table exhausted, a person's situation, nothing
+ * available). Written as `phase.ladder-refused` by both climbers, ONCE per
+ * errand rather than per sweep: the healer passes every few minutes and a
+ * refusal re-journalled on each would be the RCV-9 noise again.
+ */
+export function capRefusal(next: NextRung): { cap: LadderCap; spent: number; limit: number; reason: string } | null {
+  if (next.ok || next.refusal !== 'ladder-budget-spent' || !next.cap) return null;
+  return { cap: next.cap, spent: next.spent ?? 0, limit: next.limit ?? 0, reason: next.reason };
+}
+
+/**
+ * How long a `timed-park` rung parks a phase before its own session is asked
+ * to re-check the blocker (phase 10): half an hour — long enough for a deploy
+ * window or a colleague's merge, short enough that a phase parked on a
+ * blocker that landed in five minutes is not lost for the afternoon. Bounded
+ * by the same-rung-once rule (ONE timed park per situation per phase) and
+ * counted against the rung caps like any rung; `parkedMsOf` reads it through
+ * `waitHistory` so the wait budget sees the time.
+ */
+export const LADDER_TIMED_PARK_MS = 30 * 60 * 1000;
+
+/**
+ * The session's own last words, when the situation was DECIDED from them
+ * (RCV-7) — the one rule for both errand paths, the runner's `parkWithErrand`
+ * and the healer's exhausted arm, which used to each carry a copy of the key
+ * list and passed `said` on neither for two audits running (373 errands, 0
+ * quoted). A classifier arm that read `record.said` or the runner's stamped
+ * `cause` flags its answer `fromSaid`; the two keys named here are the arms'
+ * answers for a `Situation` built without the flag (a preset, a record
+ * classified by an older build). Anything else quotes nothing: `said` on an
+ * errand is evidence, and a sign-off that decided nothing is not evidence.
+ */
+export function errandSaid(
+  situation: { id: string; sub?: string; key: string; fromSaid?: boolean },
+  said: string | null | undefined,
+): string | undefined {
+  if (!said?.trim()) return undefined;
+  const decided = situation.fromSaid === true
+    || (situation.id === 'never-started' && Boolean(situation.sub))
+    || situation.key === 'resource-wall:auth';
+  return decided ? said : undefined;
+}
+
+/**
+ * Why a table could not be climbed on THIS console, rung by rung — the
+ * sentence the errand's `how` gains when `nextRung` answered "no rung … is
+ * available on this console yet" (RCV-7, phase 10). It used to answer for
+ * three situations by name and the other refusals reached the journal and
+ * never the person who could act: 33 of 41 such errands carried the table's
+ * generic sentence. Every refusal now carries its reason
+ * (`Service.rungRefusals`), so the sentence names the vehicle and what is in
+ * the way — a flag, a preference, a clock, an account, a missing ref.
+ */
+export function undrivableSentence(
+  situationKeyOrId: string,
+  refusals: readonly { rung: Rung; why: string }[],
+): string | null {
+  if (!refusals.length) return null;
+  const parts = refusals.map(({ rung, why }) => `**${rung.label}** (${rung.vehicle}, ${drivableBy(rung.vehicle)}): ${why}`);
+  return `No rung of ${situationKeyOrId}'s ladder can be driven here — ${parts.join('; ')}.`;
+}
+
 /* ------------------------------------------------------------------ *
  * Errands
  * ------------------------------------------------------------------ */
 
 type Ask = { need: string; how: string };
+
+/**
+ * An ask with its place in the decision manifest (phase 11, ZTD-10): the row
+ * that answers its class and the answer the console ships for that row —
+ * `null` where the row has no shipped word (a free-text row: budgets, a
+ * permission overlay). `keyedAsks()` derives both from the policy table at
+ * load, so the table and the asks cannot drift, and `test/ladder.test.ts`
+ * asserts every entry carries a key in the vocabulary.
+ */
+export type KeyedAsk = Ask & { decisionKey: string; defaultAnswer: string | null };
 
 /** What a person is asked for, per situation — the one card, in words a stranger can act on. */
 const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
@@ -491,6 +657,23 @@ export type QaContext = { rounds?: number; max?: number; report?: string };
 const rungLabel = (t: RungRecord | string): string =>
   (typeof t === 'string' ? t : `${t.rung}${t.params?.mode ? ` (${t.params.mode})` : ''}${t.outcome ? ` → ${t.outcome}` : ''}`);
 
+/**
+ * Every ask with its decision key and shipped answer — the table `ASKS` keeps
+ * private, read through the policy table (one source for "which row answers
+ * this situation"). Exported for the tests and the editor; the runner reads
+ * `errandFor`.
+ */
+export function keyedAsks(): Readonly<Record<string, KeyedAsk>> {
+  const out: Record<string, KeyedAsk> = {};
+  for (const [key, ask] of Object.entries(ASKS)) {
+    const decisionKey = decisionKeyOfSituation(key);
+    out[key] = { ...ask, decisionKey, defaultAnswer: POLICY_DEFAULTS[decisionKey] ?? null };
+  }
+  return Object.freeze(out);
+}
+
+export { policyAnsweredPayload, policyRowOf };
+
 export function errandFor(
   situationKeyOrId: string,
   tried: readonly (RungRecord | string)[] = [],
@@ -499,10 +682,29 @@ export function errandFor(
   said?: string | null,
   issue?: PlanIssue | null,
   qa?: QaContext | null,
+  /**
+   * The console's own denial for a permission wall (`PhaseRecord.toolDenied`,
+   * phase 9): the errand names the RULE and the COMMAND verbatim, because the
+   * table's fixed sentence cannot say which line stopped which call (LFC-3).
+   */
+  denied?: { tool: string; rule: string; command?: string } | null,
+  /**
+   * The answer in force for this situation's decision key
+   * (`shared/policy-model.js` `resolvePolicy`), when the caller resolved one.
+   * An AUTOMATIC answer for the class (`isAutomaticAnswer`) marks the errand
+   * `policy` — the caller then journals `phase.policy-answered` and raises no
+   * card. A pinned class (`blocked-declared:unknown`) ignores it. Absent, the
+   * errand is a person's, as it always was.
+   */
+  policy?: ResolvedPolicy | null,
 ): Errand {
   const { id, sub } = parseSituationKey(situationKeyOrId);
   const key = situationKey(id, sub);
   const ask = ASKS[key] ?? ASKS[id] ?? ASKS.unknown;
+  const decisionKey = decisionKeyOfSituation(key);
+  const answered = policy && policy.decisionKey === decisionKey && isAutomaticAnswer(key, policy.answer)
+    ? { answer: policy.answer, source: policy.source }
+    : null;
   // This situation's rungs, and everything else this phase climbed for some
   // OTHER situation (R11). A string entry names no situation — it comes from a
   // caller that already flattened its history — so it stays where it was.
@@ -549,10 +751,24 @@ export function errandFor(
           + 'By hand: `bash scripts/qa-record.sh <slug> <phase> <pass|fail|waived> --report <path> '
           + '--round <n>`.',
       }
-      : ask;
+      // A permission wall the console itself recorded quotes the rule and the
+      // command — what a person widens or does by hand is THAT line, not "a
+      // tool".
+      : key === 'blocked-declared:permission' && denied?.rule
+        ? {
+          need: `The run's permission policy refused ${denied.tool}`
+            + (denied.command ? ` \`${denied.command.replace(/\s+/g, ' ').slice(0, 200)}\`` : '')
+            + ` under the rule \`${denied.rule}\`.`,
+          how: `Approve the "widen" card to strike \`${denied.rule}\` for this plan and resume the session `
+            + '(Settings ▸ Permissions shows and reverses the strike), or do that step by hand and Resume the '
+            + 'session with an instruction. A deny rule struck here is struck for every future run of this plan.',
+        }
+        : ask;
   return {
     phase,
     situation: key,
+    decisionKey,
+    ...(answered ? { policy: answered } : {}),
     tried: mine,
     ...(earlier.length ? { earlier } : {}),
     need: composed.need,
@@ -563,6 +779,50 @@ export function errandFor(
     // said, not a paraphrase of it.
     ...(said?.trim() ? { said: said.replace(/\s+/g, ' ').slice(0, 600) } : {}),
   };
+}
+
+/**
+ * The approval card the `widen-rule` rung offers (phase 9, TRS-10/LFC-3) —
+ * one shape for both drivers (the runner's in-loop climb and the healer on a
+ * stopped run). `kind: 'tool'` on purpose: the card the client already
+ * renders shows the command, seeds the rule field from `suggestedRule`, and
+ * answers through the same route; what differs is the SENTENCE, which says
+ * what approving does and what denying leaves.
+ */
+export function widenCard(input: {
+  runId: string; slug: string; phase: number;
+  denied: { tool: string; rule: string; command?: string; at: string };
+}): {
+  runId: string; slug: string; phase: number; kind: 'tool'; title: string; detail: string;
+  evidence: { label: string; body: string }[]; tool: { name: string; input: unknown }; suggestedRule: string;
+} {
+  const { denied } = input;
+  return {
+    runId: input.runId,
+    slug: input.slug,
+    phase: input.phase,
+    kind: 'tool',
+    title: `Phase ${input.phase}: widen \`${denied.rule}\`?`,
+    detail: `The run's permission policy refused ${denied.tool}${denied.command ? ` \`${denied.command.slice(0, 160)}\`` : ''} `
+      + `under the deny rule \`${denied.rule}\`, and the session declared itself blocked on it. `
+      + `Approving strikes that ONE rule for this plan (recorded under Settings ▸ Permissions, reversible there) and `
+      + 'resumes the phase\'s own session with the command to re-run. Denying leaves the phase parked with an errand — '
+      + 'do the step by hand, then resume the session. Nothing spends until you answer.',
+    evidence: [
+      { label: 'The rule', body: denied.rule },
+      ...(denied.command ? [{ label: 'The command it stopped', body: denied.command }] : []),
+      { label: 'Refused at', body: denied.at },
+    ],
+    tool: { name: denied.tool, input: denied.command ? { command: denied.command } : {} },
+    suggestedRule: denied.rule,
+  };
+}
+
+/** The instruction the resumed session reads once its rule was widened. */
+export function widenInstruction(denied: { rule: string; command?: string }): string {
+  return `The deny rule \`${denied.rule}\` was struck for this plan by a person, so the call it refused is allowed now. `
+    + `${denied.command ? `Re-run \`${denied.command.slice(0, 200)}\` and continue the phase` : 'Retry the refused call and continue the phase'} `
+    + 'from where it stopped; do not declare blocked on that rule again.';
 }
 
 /* ------------------------------------------------------------------ *
@@ -626,7 +886,8 @@ export function progressExtension(
   enabled: boolean,
 ): Partial<LadderCaps> | null {
   if (!enabled || !progressed || next.ok || !next.exhausted || slot?.extended) return null;
-  if (!/^the phase's ladder budget is spent \(\d+ of \d+ rungs\)$/.test(next.reason)) return null;
+  // The structured cap, not the sentence: only the per-phase RUNG count widens.
+  if (next.cap !== 'phase-rungs') return null;
   return { perPhaseRungs: caps.perPhaseRungs + 1 };
 }
 

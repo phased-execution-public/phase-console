@@ -41,6 +41,7 @@ import { defineSorts } from '@/lib/list-model';
 import { duration, money, plural } from '@/lib/format';
 import { phaseHref, planHref } from '@shared/routes.js';
 import type { Forecast, PlanCost } from '@/lib/api';
+import { consolePath } from '@/lib/base';
 
 /** One phase's money, as the cost report carries it. */
 type CostRow = PlanCost['phases'][number];
@@ -245,7 +246,7 @@ export function PlanCostPanel({
           )}
           <p className="mt-2 text-2xs text-ink-faint">
             Every number on this page is also on{' '}
-            <a href="/api/metrics" className="text-action underline">
+            <a href={consolePath('/api/metrics')} className="text-action underline">
               <code>/api/metrics</code>
             </a>{' '}
             in Prometheus text, for a scraper.

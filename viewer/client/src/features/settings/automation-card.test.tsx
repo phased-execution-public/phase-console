@@ -68,8 +68,10 @@ describe('the automation defaults card', () => {
     // The counts cover the WHOLE card, including the rows `<RunSetup>` renders
     // (skills, QA, the per-phase reviewer, auto-recovery) — those are the same
     // controls the launch form shows, so they carry no `data-pref` of their own.
+    // The fourth Off is `watchMintedCmdRefs` (zero-touch-console phase 6,
+    // SLF-8): a `cmd:` ref the console minted itself is never run by default.
     const off = await screen.findAllByRole('button', { name: 'Off' });
-    expect(off.length).toBe(3);
+    expect(off.length).toBe(4);
     expect(screen.getAllByRole('button', { name: 'On' }).length).toBe(5);
     // …and the card's OWN toggles are named, so the next addition says which.
     const toggles = Object.fromEntries(
@@ -82,6 +84,7 @@ describe('the automation defaults card', () => {
       repoGuard: 'On',
       autoContinueRecovery: 'On',
       watchCmdRefs: 'On',
+      watchMintedCmdRefs: 'Off',
       deleteMergedRunBranches: 'On',
       // The sixth row is the worktree root, added with the project-local lane
       // folder: a config from before the key reads as the project.

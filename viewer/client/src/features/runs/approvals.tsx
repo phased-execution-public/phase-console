@@ -24,6 +24,7 @@
 
 import { useState } from 'react';
 import { Button, Card, CardBody, CardHeader, CardTitle, field } from '@/components/ui';
+import { useWindowLeft } from '@/lib/clock';
 import { cn } from '@/lib/cn';
 import { askToNotify, notifyState, type NotifyState } from '@/lib/notify';
 import type { Approval } from '@/lib/api';
@@ -36,14 +37,20 @@ export type Decide = (
   rule?: string,
 ) => void;
 
+/** A pick on a relayed question (phase 14): which card, which question, which option. */
+export type Answer = (approval: Approval, key: string, label: string) => void;
+
 export function ApprovalQueue({
   approvals,
   allowRun,
   onDecide,
+  onAnswer,
 }: {
   approvals: Approval[];
   allowRun: boolean;
   onDecide: Decide;
+  /** Absent: a question card shows its options and cannot be answered from here. */
+  onAnswer?: Answer;
 }) {
   if (!approvals.length) return null;
   return (
@@ -58,9 +65,13 @@ export function ApprovalQueue({
         <NotifyToggle />
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
-        {approvals.map((a) => (
-          <ApprovalCard key={a.id} approval={a} allowRun={allowRun} onDecide={onDecide} />
-        ))}
+        {approvals.map((a) =>
+          a.kind === 'question' && a.question ? (
+            <QuestionCard key={a.id} approval={a} allowRun={allowRun} onAnswer={onAnswer} />
+          ) : (
+            <ApprovalCard key={a.id} approval={a} allowRun={allowRun} onDecide={onDecide} />
+          ),
+        )}
       </CardBody>
     </Card>
   );
@@ -89,6 +100,81 @@ function NotifyToggle() {
     <Button size="sm" onClick={async () => setState(await askToNotify())}>
       Notify me next time
     </Button>
+  );
+}
+
+/**
+ * A question a session asked (phase 14). Not Allow/Deny: a question is answered
+ * by choosing, so each option is a button, and the card says what silence will
+ * choose and when — the console answers by its relay rules as the window
+ * closes. An option already chosen (by a person on another device) is shown as
+ * chosen; a question left open is still the console's to answer.
+ */
+function QuestionCard({
+  approval,
+  allowRun,
+  onAnswer,
+}: {
+  approval: Approval;
+  allowRun: boolean;
+  onAnswer?: Answer;
+}) {
+  const left = useWindowLeft(approval.expiresAt) ?? 0;
+  const question = approval.question!;
+  const deferred = Boolean(question.deferred);
+
+  return (
+    <article className="rounded-lg border border-rule bg-surface-raised p-3" data-kind="question">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
+        <strong className="text-sm">A session asks</strong>
+        <span className="text-2xs text-ink-faint" aria-live="polite">
+          {approval.phase != null ? `phase ${approval.phase} · ` : ''}
+          {deferred
+            ? 'deferred — answered when its session resumes'
+            : left > 0
+              ? `${left} s to answer`
+              : 'answering by rule'}
+        </span>
+      </div>
+      <p className="mt-1 max-w-prose text-sm text-ink-muted">{approval.detail}</p>
+
+      {question.items.map((item) => {
+        const chosen = question.answers[item.key];
+        return (
+          <section key={item.key} className="mt-3 flex flex-col gap-2">
+            <p className="text-sm font-medium text-ink">
+              {item.header && <span className="mr-2 text-2xs uppercase text-ink-faint">{item.header}</span>}
+              {item.question}
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {item.options.map((option) => (
+                <Button
+                  key={option.label}
+                  size="sm"
+                  variant={chosen?.label === option.label ? 'action' : undefined}
+                  disabled={!allowRun || !onAnswer || Boolean(chosen) || deferred || left === 0}
+                  title={option.description}
+                  onClick={() => onAnswer?.(approval, item.key, option.label)}
+                >
+                  {option.label}
+                </Button>
+              ))}
+            </div>
+            {chosen && (
+              <p className="text-2xs text-ink-faint">
+                Answered “{chosen.label}” by {chosen.by === 'human' ? (chosen.who ?? 'a person') : chosen.by}.
+              </p>
+            )}
+          </section>
+        );
+      })}
+
+      {!allowRun && (
+        <p className="mt-2 text-2xs text-ink-faint">
+          This console cannot answer — it was started without <code className="font-mono">--allow-run</code>.
+        </p>
+      )}
+    </article>
   );
 }
 

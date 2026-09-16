@@ -11,8 +11,12 @@ import {
   type VERIFICATION_WORDS,
 } from '../../../../shared/evidence-model.js';
 import { type QA_DISPLAY_WORDS } from '../../../../shared/plan-vocab.js';
-import { type ETA_BASES } from '../../../../shared/ops-vocab.js';
-import { type PERMISSION_PROFILES, type QA_FIX_STRATEGIES } from '../../../../shared/run-settings.js';
+import { type ETA_BASES, type PROBE_STATUSES } from '../../../../shared/ops-vocab.js';
+import {
+  type PERMISSION_PROFILES,
+  type QA_FIX_STRATEGIES,
+  type RELAY_MODES,
+} from '../../../../shared/run-settings.js';
 import { type BLOCKED_ON } from '../../../../shared/plan-vocab.js';
 import { type RunPriority } from '../../../../shared/orchestration-model.js';
 import {
@@ -46,6 +50,9 @@ export type PhaseStatus = PhaseStatusWord;
 
 export type Autonomy = AutonomyMode;
 export type PermissionProfile = (typeof PERMISSION_PROFILES)[number];
+/** The relay's two modes and the probe verdict words — the shared owners' members, by type. */
+export type RelayMode = (typeof RELAY_MODES)[number];
+export type ProbeStatus = (typeof PROBE_STATUSES)[number];
 /** How a QA recovery boards its fix session — the shared vocabulary's two words. */
 export type QaFixStrategy = (typeof QA_FIX_STRATEGIES)[number];
 
@@ -76,6 +83,7 @@ export interface VerifySummary {
  * would have said which one was right on the day they disagreed.
  */
 import type { HaltKind } from '@shared/recovery-model.js';
+import type { WaitReason as WaitReasonWord } from '@shared/status-vocab.js';
 
 export type { HaltKind };
 
@@ -209,7 +217,8 @@ export interface TimelineBar {
   note?: string;
 }
 
-export type MarkKind = 'board' | 'verify' | 'rung' | 'park' | 'wall' | 'outcome';
+export type MarkKind =
+  'board' | 'verify' | 'rung' | 'park' | 'wall' | 'outcome' | 'session' | 'ask' | 'policy' | 'start';
 
 export interface TimelineMark {
   kind: MarkKind;
@@ -247,6 +256,106 @@ export interface RunTimeline {
   criticalMs: number;
   truncated: boolean;
   unmapped: number;
+}
+
+/* ---- the ledger (`server/analysis/ledger.ts`, zero-touch phase 19) ---- */
+
+/** One start of a run, a refused one, or a session started beside it — with the actor's words. */
+export interface LedgerStart {
+  at: string;
+  event: 'run.start' | 'run.start-refused' | 'phase.session-start';
+  phase: number | null;
+  resumed: boolean;
+  door: string | null;
+  trigger: string | null;
+  guard: string | null;
+  counter: string | number | null;
+  by: string | null;
+  via: string | null;
+  origin: string | null;
+  remoteUser: string | null;
+  account: string | null;
+  mode: string | null;
+  /** The actor as one sentence. */
+  said: string;
+  reason: string | null;
+}
+
+export type LedgerCap = { value: number; source: string; basis?: string } | null;
+
+/** One `phase.session` line — how a session ended, what it cost, how long it ran, under which caps. */
+export interface LedgerSession {
+  at: string;
+  phase: number | null;
+  mode: string;
+  attempt: number | null;
+  model: string | null;
+  sessionId: string | null;
+  resumed: boolean;
+  endedBy: string | null;
+  /** The console ended it, rather than the session finishing its turn. */
+  consoleEnded: boolean;
+  isError: boolean;
+  turns: number | null;
+  turnsSource: string | null;
+  /** `null` when the session never reported a cost — unknown, never $0. */
+  costUsd: number | null;
+  costSource: string | null;
+  ms: number | null;
+  maxTurns: LedgerCap;
+  maxBudgetUsd: LedgerCap;
+  account: string | null;
+}
+
+/** One rung settlement, with the driver word the ladder table gives its vehicle. */
+export interface LedgerRung {
+  at: string;
+  phase: number | null;
+  rung: string;
+  driver: string | null;
+  outcome: string;
+  situation: string;
+  costUsd: number;
+  note: string | null;
+  by: string | null;
+}
+
+export interface LedgerTotals {
+  sessions: number;
+  sessionsUsd: number;
+  unknownCost: number;
+  turns: number;
+  ms: number;
+  rungsUsd: number;
+  spentUsd: number | null;
+  gapUsd: number | null;
+  /** Within a cent with every cost known; `null` when there is no run to hold it to. */
+  reconciled: boolean | null;
+  truncated: boolean;
+}
+
+export interface RunLedger {
+  runId: string | null;
+  starts: LedgerStart[];
+  sessions: LedgerSession[];
+  rungs: LedgerRung[];
+  totals: LedgerTotals;
+}
+
+export interface LedgerSummaryRow {
+  key: string;
+  runs: number;
+  sessions: number;
+  costUsd: number;
+  unknownCost: number;
+  turns: number;
+  ms: number;
+}
+
+export interface LedgerSummary {
+  plans: LedgerSummaryRow[];
+  accounts: LedgerSummaryRow[];
+  truncatedRuns: number;
 }
 
 export interface AttemptVerification {
@@ -444,8 +553,16 @@ export interface PhaseRecord {
   parkReason?: string;
   /** Refs for the external things being waited on (`gh:…#run/N`, `lock:slug/N`). */
   watch?: string[];
-  /** How many waiting-external parks this phase has taken (capped by the runner). */
+  /** How many waiting-external parks this phase has DECLARED (capped by the runner). */
   waits?: number;
+  /** How many times the console parked this phase by itself — its own allowance, never `waits`. */
+  watchdogParks?: number;
+  /** Declared refs no watch scheme can poll, each with why — named on the park, never dropped. */
+  watchUnpollable?: { ref: string; reason: string }[];
+  /** Who parked it: the session, a hand session through the inbox, or the console's watchdog. */
+  declared?: { status: string; by?: string; requested?: string; reason?: string };
+  /** A resume the console refused because the session it would resume is still running. */
+  resumeRefused?: { sessionId: string; at: string; why: string; pid?: number; lock?: string };
   /** When this phase started queueing behind a foreign lock. */
   lockWaitSince?: string;
   /**
@@ -717,6 +834,16 @@ export interface RunState {
   accountId?: string;
   /** What the run does at the shared usage window. Absent = `wait`. */
   onLimit?: OnLimitPolicy;
+  /**
+   * The run's answers to the decision manifest (phase 11): the launch form's
+   * required fields and the manifest as the door resolved it. Absent on a run
+   * from before 5.0.0.
+   */
+  resumeOnRestart?: boolean;
+  relay?: RelayMode;
+  accounts?: AccountRequirement[];
+  acknowledgedWaivers?: string[];
+  manifest?: ResolvedManifest;
   /**
    * The run's git strategy, echoed off the state file. Absent means
    * default-branch — including on servers from before the feature — so render
@@ -1066,8 +1193,8 @@ export interface Approval {
   runId: string;
   slug: string;
   phase: number | null;
-  /** `verify` is a question for a person, not a permission question. */
-  kind: 'gate' | 'tool' | 'verify';
+  /** `verify` is a question for a person, not a permission question; `question` is a relayed one (phase 14). */
+  kind: 'gate' | 'tool' | 'verify' | 'question';
   title: string;
   detail: string;
   evidence: Evidence[];
@@ -1077,12 +1204,45 @@ export interface Approval {
     cwd?: string;
   };
   suggestedRule?: string;
+  /** The ask rule that matched the call, or null when none did. Absent before 5.0.0. */
+  matched?: string | null;
   createdAt: string;
   expiresAt: string;
+  /** `pending`, `allow`, `deny`, or — for a card a restart left — `unanswerable`. */
   status: string;
   decidedAt?: string;
   decidedBy?: string;
   reason?: string;
+  /** A card the console restarted under and kept answerable. */
+  recovered?: { at: string; from: string };
+  /** Why a recovered card can no longer be answered. */
+  unanswerable?: { reason: string; detail: string };
+  /**
+   * A relayed question's part (phase 14): the questions the call carries, the
+   * answers so far and who gave them, and — when the console went away with the
+   * window open — the deferral that keeps the call for its session's resume.
+   */
+  question?: {
+    mechanism: string;
+    tool: string;
+    items: {
+      key: string;
+      question: string;
+      header?: string;
+      options: { label: string; description?: string }[];
+      multiSelect: boolean;
+    }[];
+    answers: Record<string, { label: string; by: string; at: string; ruleId?: string; who?: string }>;
+    deferred?: { toolUseId: string; at: string; why: string };
+  };
+}
+
+/** What answering a relayed question reports (`POST /api/run/:slug/answer`). */
+export interface AnswerResult {
+  ok: boolean;
+  answered?: string[];
+  remaining?: number;
+  error?: string;
 }
 
 export interface DecideResult {
@@ -1170,6 +1330,71 @@ export interface TranscriptEntry {
 }
 
 /** What a start or a settings change sends. Every field is checked server-side. */
+/** One account a run may spend, and the five-hour headroom (percent) it must show first. */
+export interface AccountRequirement {
+  id: string;
+  minHeadroomPct: number;
+}
+
+/** One manifest row as the door resolved it (`server/prelude.ts`). */
+export interface PreludeRow {
+  key: string;
+  value: string;
+  owner: string;
+  state: string;
+  blocking: 'yes' | 'no';
+  source: string;
+  /** Where the prelude got the row: the plan (or its twin), the launch form, or a shipped default. */
+  origin: string;
+  /** Which probe judged it, for the four probed rows. */
+  probe?: 'accounts' | 'mcp' | 'credentials' | 'delivery';
+}
+
+/** One probe's answer — the word, the reason, the warnings when some but not all failed. */
+export interface ProbeVerdict {
+  status: ProbeStatus;
+  ok: boolean;
+  reason: string;
+  warnings?: string[];
+}
+
+/** The run-start prelude (`GET /api/run/:slug/prelude`, and the body of a 409 at the start door). */
+export interface Prelude {
+  slug: string;
+  rows: PreludeRow[];
+  probes: Record<'accounts' | 'mcp' | 'credentials' | 'delivery', ProbeVerdict>;
+  blocking: { key: string; why: string }[];
+  waived: string[];
+  acknowledged: string[];
+  manifestPresent: boolean;
+  accounts: AccountRequirement[];
+  credentials: { policy: string; ids: string[]; held: string[]; missing: string[] };
+  delivery: { ok: boolean; channels: string[]; acknowledged: boolean };
+  at: string;
+}
+
+/** The manifest as `run.start` echoed it and the run stores it. */
+export interface ResolvedManifest {
+  decisions: Omit<PreludeRow, 'probe'>[];
+  accounts: AccountRequirement[];
+  credentials: Prelude['credentials'];
+  delivery: Prelude['delivery'];
+  probes: Record<string, { status: string; reason: string }>;
+  overridden?: { rows: string[]; by: string; at: string };
+  at: string;
+}
+
+/** What the launch form's draft sends the prelude. */
+export interface PreludeDraft {
+  accounts?: AccountRequirement[];
+  relay?: RelayMode;
+  resumeOnRestart?: boolean;
+  acknowledgedWaivers?: string[];
+  model?: string;
+  profile?: string;
+  mcpPolicy?: string;
+}
+
 export interface RunSettings {
   model?: string;
   effort?: string;
@@ -1213,6 +1438,17 @@ export interface RunSettings {
   onLimit?: OnLimitPolicy;
   /** Heal auto-recoverable halts by launching the fix agent. Sticky on resume. */
   autoRecover?: boolean;
+  /**
+   * The prelude's required answers (phase 11, START only): how the run resumes
+   * after a console restart, whether the relay is armed, the accounts it may
+   * spend with their minimum headroom, the waived rows it acknowledges, and
+   * the one recorded way past a blocking row.
+   */
+  resumeOnRestart?: boolean;
+  relay?: RelayMode;
+  accounts?: AccountRequirement[];
+  acknowledgedWaivers?: string[];
+  manifestOverride?: { rows?: string[]; by?: string };
   /** The reviewer's own tier and failure budget — see `shared/run-settings.js`. */
   qaModel?: string;
   qaEffort?: string;
@@ -1255,7 +1491,8 @@ export type QaRecoverSettings = Pick<
 
 /** The on-limit policies a run can carry. `wait` is the pre-accounts behavior. */
 export type OnLimitPolicy = OnLimit;
-export type WaitReason = 'usage-limit' | 'external';
+/** The wait axis's reason — `shared/status-vocab.js` owns the words; this copy once held two of the four (LFC-5). */
+export type WaitReason = WaitReasonWord;
 
 /** `{ run }` — every mutating run endpoint answers in this envelope. */
 export interface RunEnvelope {
@@ -1294,11 +1531,36 @@ export const runsApi = {
   /** One phase's boardings, with each consecutive pair already diffed. */
   runAttempts: (slug: string, phase: number, id?: string) =>
     request<PhaseAttempts>(`/api/run/${q(slug)}/attempts/${phase}${id ? `?run=${q(id)}` : ''}`),
+  /** Why each start happened and what every session cost, held to the run's spend (`server/analysis/ledger.ts`). */
+  runLedger: (slug: string, id?: string) =>
+    request<RunLedger>(`/api/run/${q(slug)}/ledger${id ? `/${q(id)}` : ''}`),
+  /** Every open plan's newest runs, their ledgers per plan and per account — what Insights draws. */
+  ledgerSummary: () => request<LedgerSummary>('/api/ledger'),
   runTranscript: (slug: string, id?: string, limit?: number) =>
     request<TranscriptEntry[]>(
       `/api/run/${q(slug)}/transcript${id ? `/${id}` : ''}${limit ? `?limit=${limit}` : ''}`,
     ),
   runStart: (slug: string, options?: RunSettings) => post<RunEnvelope>(`/api/run/${q(slug)}/start`, options),
+  /**
+   * The run-start prelude for the launch form's DRAFT (phase 11): the manifest
+   * rendered and the four probes run over the console's own facts, before
+   * Launch is pressed. The draft's answers ride in the query so the form shows
+   * exactly what the door will judge.
+   */
+  runPrelude: (slug: string, draft: PreludeDraft = {}) => {
+    const params = new URLSearchParams();
+    if (draft.accounts?.length)
+      params.set('accounts', draft.accounts.map((a) => `${a.id}:${a.minHeadroomPct}`).join(','));
+    if (draft.relay) params.set('relay', draft.relay);
+    if (typeof draft.resumeOnRestart === 'boolean')
+      params.set('resumeOnRestart', String(draft.resumeOnRestart));
+    if (draft.acknowledgedWaivers?.length) params.set('ack', draft.acknowledgedWaivers.join(','));
+    if (draft.model) params.set('model', draft.model);
+    if (draft.profile) params.set('profile', draft.profile);
+    if (draft.mcpPolicy) params.set('mcpPolicy', draft.mcpPolicy);
+    const query = params.toString();
+    return request<{ prelude: Prelude }>(`/api/run/${q(slug)}/prelude${query ? `?${query}` : ''}`);
+  },
   runPause: (slug: string) => post<RunEnvelope>(`/api/run/${q(slug)}/pause`),
   runResume: (slug: string) => post<RunEnvelope>(`/api/run/${q(slug)}/resume`),
   /**
@@ -1398,11 +1660,13 @@ export const runsApi = {
     }),
 
   approvals: () => request<Approval[]>('/api/approvals'),
+  // A person's pick on a relayed question, inside its window (phase 14).
+  answerQuestion: (slug: string, approvalId: string, answers: { key: string; label: string }[]) =>
+    post<AnswerResult>(`/api/run/${q(slug)}/answer`, { approvalId, answers }),
   decide: (id: string, decision: string, reason?: string, remember?: string, rule?: string) =>
     post<DecideResult>(`/api/approvals/${q(id)}`, {
       decision,
       reason,
-      by: 'console',
       ...(remember ? { remember, rule } : {}),
     }),
 

@@ -11,7 +11,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,8 +25,10 @@ process.env.PHASE_CONSOLE_LOG = '';
 
 const {
   Approvals, buildSettings, writeSettingsFile, loadPolicy, classifyTool, ruleMatches,
-  DEFAULT_DENY, DEFAULT_ASK, HOOK_TIMEOUT_SECONDS,
+  DEFAULT_DENY, DEFAULT_ASK, HOOK_TIMEOUT_SECONDS, RECOVERED_NOTE, TIMEOUT_REASON, UNANSWERABLE_REASONS,
+  tokenFromSettingsFile,
 } = await import('../server/runner/approvals.ts');
+const { recent: recentLog } = await import('../server/log.ts');
 
 /* ------------------------------------------------------------------ *
  * The two layers
@@ -279,8 +281,9 @@ test('the answer deadline lands before the hook gives up, not after', () => {
  * Surviving a restart
  * ------------------------------------------------------------------ */
 
-test('a question nobody answered survives the console that was asking it', () => {
-  const file = join(STATE_HOME, 'pending-a.json');
+test('a question nobody answered survives the console that was asking it — unanswerable with a reason, never expired (TRS-11)', () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'pending-a-'));
+  const file = join(dir, 'pending.json');
 
   const first = new Approvals(() => {}, file);
   first.arm('run-1');
@@ -293,16 +296,156 @@ test('a question nobody answered survives the console that was asking it', () =>
   assert.equal(recovered.length, 1, 'the question and its evidence are still here');
   assert.ok(recovered[0].evidence.length, 'including what a person would have needed to answer it');
 
-  // Recovered as a record, NOT as something answerable. The promise a decision
-  // would have resolved died with the process, and so did the hook socket on
-  // the far end — an Allow button here would be answering into a void.
-  assert.equal(recovered[0].status, 'expired');
-  assert.match(recovered[0].reason, /console restarted/);
+  // Filed as a record until somebody can say which sessions survived: the
+  // promise a decision would have resolved died with the process, and so did
+  // the hook socket on the far end — an Allow button here would answer a void.
+  assert.equal(recovered[0].status, 'unanswerable');
+  assert.notEqual(recovered[0].status, 'expired');
+  assert.equal(recovered[0].unanswerable?.reason, 'session-gone');
+  assert.ok((UNANSWERABLE_REASONS as readonly string[]).includes(recovered[0].unanswerable!.reason), 'a machine-readable reason');
+  assert.match(recovered[0].reason!, /console restarted/);
   assert.equal(second.pending().length, 0);
   assert.equal(second.settle(recovered[0].id, 'allow', 'me'), false);
 
+  // A verdict names the truer reason; nothing it says makes the card answerable by accident.
+  const tally = second.recover((cardSeen) => ({ unanswerable: cardSeen.kind === 'tool' ? 'token-lost' : 'asker-gone' }));
+  assert.deepEqual(tally, { answerable: 0, unanswerable: { 'token-lost': 1 } });
+  assert.equal(second.all()[0].unanswerable?.reason, 'token-lost');
+  assert.equal(second.recover(() => ({ answerable: true })).answerable, 0, 'a card is judged once');
+
   // And it is not recovered a second time, forever.
   assert.equal(new Approvals(() => {}, file).all().length, 0);
+});
+
+test('ACC-8.10 (TRS-11): a recovered card whose run kept its token is answerable again — and the answer lands on the session\'s next identical call, once', async () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'pending-r-'));
+  const file = join(dir, 'pending.json');
+  const first = new Approvals(() => {}, file);
+  first.arm('run-1');
+  const { approval: original } = ask(first);
+
+  const decided: { event: string; status: string; by?: string; recovered?: boolean }[] = [];
+  const second = new Approvals({
+    record: (event, approval) => decided.push({ event, status: approval.status, by: approval.decidedBy, recovered: Boolean(approval.recovered) }),
+  }, file);
+  const token = 'A'.repeat(43);
+  assert.equal(second.adoptToken('run-1', 'not a token'), false, 'a malformed token is never armed');
+  assert.equal(second.adoptToken('run-1', token), true);
+  assert.equal(second.liveToken('run-1'), token, 'adopted, not minted');
+  assert.equal(second.adoptToken('run-1', 'B'.repeat(43)), false, 'a different token never replaces one already armed');
+
+  const tally = second.recover((cardSeen) => (second.liveToken(cardSeen.runId) ? { answerable: true } : { unanswerable: 'session-gone' }));
+  assert.deepEqual(tally, { answerable: 1, unanswerable: {} });
+  const restored = second.pending()[0];
+  assert.equal(restored?.id, original.id);
+  assert.equal(restored?.status, 'pending');
+  assert.equal(restored?.recovered?.from, original.createdAt);
+  assert.ok(restored?.detail.includes(RECOVERED_NOTE), 'it says what became of the call that raised it');
+  assert.ok(Date.parse(restored!.expiresAt) > Date.now(), 'with a fresh answer window');
+
+  assert.equal(second.settle(restored!.id, 'allow', 'phone'), true);
+  assert.deepEqual(decided, [{ event: 'decided', status: 'allow', by: 'phone', recovered: true }], 'the ending is recorded like any other');
+  const kept = second.takeRecoveredAnswer('run-1', 2, 'Bash', { command: 'git commit -m wip' });
+  assert.equal(kept?.decision, 'allow');
+  assert.equal(kept?.by, 'phone');
+  assert.equal(second.takeRecoveredAnswer('run-1', 2, 'Bash', { command: 'git commit -m wip' }), null, 'one-shot — never a standing rule');
+  assert.equal(second.takeRecoveredAnswer('run-1', 2, 'Bash', { command: 'git commit -m other' }), null, 'only for the exact call');
+});
+
+test('ACC-8.10 (TRS-7): a card that times out writes the SAME decision record a clicked one does — by timeout', async () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'pending-t-'));
+  const file = join(dir, 'pending.json');
+  const events: { event: string; id: string; status: string; by?: string }[] = [];
+  const approvals = new Approvals({
+    record: (event, approval) => events.push({ event, id: approval.id, status: approval.status, by: approval.decidedBy }),
+  }, file);
+  approvals.arm('run-1');
+  const request = {
+    runId: 'run-1', slug: 'demo', phase: 2, kind: 'tool' as const, title: 'Bash: psql', detail: 'd', evidence: [],
+    tool: { name: 'Bash', input: { command: 'psql -c "select 1"' } },
+  };
+  // Each decision line is read the moment it is written: the log ring is shared
+  // with every other test in this process, and an async neighbour can push an
+  // older line out of it.
+  // The NEWEST match: card ids are `<ms>-<counter>` per broker, and this file
+  // builds many brokers, so an older test's card can share an id.
+  const decisionLine = (id: string) =>
+    recentLog(50).filter((entry) => entry.event === 'approval.decided' && entry.data?.id === id).at(-1);
+  const clicked = approvals.request(request);
+  approvals.settle(clicked.approval.id, 'deny', 'someone@desk', 'not now');
+  const clickedLine = decisionLine(clicked.approval.id);
+  assert.equal(clickedLine?.data?.by, 'someone@desk');
+  const expired = approvals.request(request, 20);
+  const outcome = await expired.decided;
+  const expiredLine = decisionLine(expired.approval.id);
+  assert.equal(outcome.by, 'timeout');
+  assert.equal(outcome.reason, TIMEOUT_REASON);
+  assert.doesNotMatch(TIMEOUT_REASON, /answer the card/, 'a settled card has no button left to press');
+
+  assert.equal(expiredLine?.data?.by, 'timeout', 'the timeout writes its decision (it used to write nothing)');
+  assert.equal(expiredLine?.data?.decision, 'deny');
+  assert.deepEqual(Object.keys(expiredLine?.data ?? {}).sort(), Object.keys(clickedLine?.data ?? {}).sort(), 'one record shape for every ending');
+  assert.deepEqual(
+    events.map((e) => `${e.event}:${e.id === clicked.approval.id ? 'clicked' : 'expired'}:${e.status}:${e.by ?? ''}`),
+    ['raised:clicked:pending:', 'decided:clicked:deny:someone@desk', 'raised:expired:pending:', 'decided:expired:deny:timeout'],
+  );
+});
+
+test('ACC-8.7 (TRS-5): cards raised and auto-granted are counted per instance, since a date, across a restart', () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'counter-'));
+  const file = join(dir, 'pending.json');
+  const first = new Approvals(() => {}, file);
+  const start = first.counts();
+  assert.deepEqual({ raised: start.raised, autoGranted: start.autoGranted, lastRaisedAt: start.lastRaisedAt }, { raised: 0, autoGranted: 0, lastRaisedAt: null });
+  first.arm('run-1');
+  const { approval } = ask(first);
+  first.settle(approval.id, 'allow', 'me');
+  first.grant({ runId: 'run-1', slug: 'demo', phase: 2, kind: 'tool', title: 't', detail: 'd', evidence: [] }, 'auto-grant', 'auto-granted');
+  const after = new Approvals(() => {}, file).counts();
+  assert.equal(after.raised, 1);
+  assert.equal(after.autoGranted, 1);
+  assert.equal(after.since, start.since, 'the start date is kept, so "0 cards in N days" means N days');
+  assert.equal(after.lastRaisedAt, approval.createdAt);
+  assert.equal((statSync(join(dir, 'counter.json')).mode & 0o777).toString(8), '600');
+});
+
+test('TRS-11: the run token a settings file carries reads back exactly — what a restart adopts instead of minting', () => {
+  const approvals = new Approvals();
+  const token = approvals.arm('run-tok');
+  const dir = mkdtempSync(join(STATE_HOME, 'settings-'));
+  const path = join(dir, 'run-run-tok.json');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path, JSON.stringify(buildSettings({ runId: 'run-tok', token, origin: 'http://127.0.0.1:1' })));
+  assert.equal(tokenFromSettingsFile('run-tok', dir), token);
+  assert.equal(tokenFromSettingsFile('no-such-run', dir), null);
+  writeFileSync(join(dir, 'run-junk.json'), '{"hooks":{"PreToolUse":[{"hooks":[{"headers":{"Authorization":"Bearer short"}}]}]}}');
+  assert.equal(tokenFromSettingsFile('junk', dir), null, 'only a token this console could have minted');
+});
+
+test('ACC-8.7 (TRS-5): through Service.announce, a raised tool card produces exactly ONE approval notification carrying Allow and Deny', async () => {
+  const svc = await service();
+  const notes: { category?: string }[] = [];
+  svc.onEvent((name: string, data: unknown) => {
+    if (name === 'notification') notes.push(data as { category?: string });
+  });
+  // The push itself, where the answer rides: `approvalId`, and the Allow/Deny
+  // buttons with the token that makes them spendable.
+  const pushed: { category: string; message: { approvalId?: string; actions?: { action: string }[]; callback?: unknown } }[] = [];
+  (svc as unknown as { push: { announce: (...args: unknown[]) => void } }).push.announce = (category: unknown, message: unknown) => {
+    pushed.push({ category: category as string, message: message as { approvalId?: string; actions?: { action: string }[] } });
+  };
+  const approval = card(svc, 'counted');
+  assert.equal(notes.filter((note) => note.category === 'approval').length, 1, 'one raise, one notification record');
+  const approvalPushes = pushed.filter((p) => p.category === 'approval');
+  assert.equal(approvalPushes.length, 1, 'and one push');
+  assert.equal(approvalPushes[0].message.approvalId, approval.id, 'the notification is the card\'s');
+  assert.equal(approvalPushes[0].message.actions?.length, 2, 'Allow and Deny ride the notification itself');
+  assert.ok(approvalPushes[0].message.callback, 'with the token that makes them spendable');
+  assert.equal(svc.state().approvals?.raised, svc.approvals.counts().raised, '/api/state carries the counter');
+  assert.equal(svc.state().approvals?.pending, 1);
+  svc.approvals.settle(approval.id, 'deny', 'test');
+  assert.equal(notes.filter((note) => note.category === 'approval').length, 1, 'answering it announces nothing more');
+  svc.close();
 });
 
 test('an answered question leaves nothing outstanding on disk', () => {
@@ -460,6 +603,77 @@ test('a rule about a tool the hook never sees is labelled, not pretended about',
   for (const rule of ['Read', 'Agent(Explore)', 'Cd(~/code/**)', 'mcp__server']) {
     assert.equal(parseRule(rule)?.support, 'cli-only', rule);
   }
+});
+
+test('TRS-12: an empty prefix and a tool the CLI does not provide are inert, and the editor refuses them', async () => {
+  const { parseRule, inertRules, editPolicy, PolicyRuleError, loadPolicyFor, ruleMatches: matches } =
+    await import('../server/runner/approvals.ts');
+  // `Bash(:*)` tests `subject === '' || subject.startsWith(' ')` — no real
+  // command satisfies it — and `git(:*)` names a COMMAND where a tool goes.
+  // Both parsed as `hook`/`cli-only` and the live policy showed `inert: []`
+  // with both under `always`.
+  assert.equal(parseRule('Bash(:*)')?.support, 'ignored');
+  assert.match(parseRule('Bash(:*)')?.note ?? '', /empty prefix/);
+  assert.equal(parseRule('git(:*)')?.support, 'ignored');
+  assert.match(parseRule('git(:*)')?.note ?? '', /not a tool Claude Code provides/);
+  assert.equal(parseRule('npm')?.support, 'ignored', 'a bare command name is not a tool either');
+  assert.equal(matches('Bash(:*)', 'Bash', { command: 'git status' }), false);
+  const inert = inertRules({ deny: [], ask: [], allow: ['Bash(:*)', 'git(:*)'] });
+  assert.deepEqual(inert.map((r) => r.raw), ['Bash(:*)', 'git(:*)']);
+
+  // A tool this console has SEEN a session offer is real whatever the shipped
+  // list says; an unseen Pascal-case name is the CLI's to judge, marked as
+  // unseen rather than refused — a newer CLI must not be un-rulable.
+  assert.equal(parseRule('Frobnicate(run:*)')?.support, 'cli-only');
+  assert.match(parseRule('Frobnicate(run:*)')?.note ?? '', /no session on this console has offered/);
+  assert.doesNotMatch(parseRule('Frobnicate(run:*)', new Set(['Frobnicate']))?.note ?? '', /no session/);
+  assert.deepEqual(inertRules({ deny: ['Frobnicate(run:*)'], ask: [], allow: [] }), []);
+
+  // The editor refuses what would never match, naming each; nothing is written.
+  const dir = mkdtempSync(join(tmpdir(), 'pc-inert-edit-'));
+  const globalFile = join(dir, 'autopilot.json');
+  assert.throws(
+    () => editPolicy({ add: { allow: ['Bash(:*)', 'git(:*)'] }, by: 'tester' }, globalFile),
+    (error: unknown) => error instanceof PolicyRuleError
+      && error.rules.map((r) => r.raw).join(',') === 'Bash(:*),git(:*)'
+      && /would never match/.test(error.message),
+  );
+  assert.ok(!loadPolicyFor(null, globalFile, dir).allow.includes('Bash(:*)'));
+  // …while junk the syntax rejects is still dropped, as the earlier case pins.
+  editPolicy({ add: { deny: ['Bash(git push:*)', 'not a rule ('] }, by: 'tester' }, globalFile);
+  assert.ok(loadPolicyFor(null, globalFile, dir).deny.includes('Bash(git push:*)'));
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('TRS-9: an empty ask list and a struck deny rule each raise a named advisory over the merge', async () => {
+  const { editPolicy, loadPolicyFor, struckFor, policyAdvisory, DEFAULT_ASK: ASK, DEFAULT_DENY: DENY } =
+    await import('../server/runner/approvals.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-advisory-'));
+  const globalFile = join(dir, 'autopilot.json');
+
+  // Stock: nothing to say.
+  assert.deepEqual(policyAdvisory(loadPolicyFor(null, globalFile, dir), struckFor(null, globalFile, dir)), []);
+
+  // Every shipped ask rule struck: the merged ask list is empty, and no
+  // profile asks about anything — the live state on 4130 the audit measured.
+  editPolicy({ remove: { ask: [...ASK] }, by: 'tester' }, globalFile);
+  let advisory = policyAdvisory(loadPolicyFor(null, globalFile, dir), struckFor(null, globalFile, dir));
+  assert.deepEqual(advisory.map((a) => a.kind), ['ask-empty']);
+  assert.deepEqual(advisory[0].rules, [...ASK]);
+  assert.match(advisory[0].message, /Guarded and Trusted are the same posture/);
+
+  // One shipped deny rule struck: the wall that holds with the console dead moved.
+  editPolicy({ remove: { deny: [DENY[0]] }, by: 'tester' }, globalFile);
+  advisory = policyAdvisory(loadPolicyFor(null, globalFile, dir), struckFor(null, globalFile, dir));
+  assert.deepEqual(advisory.map((a) => a.kind), ['ask-empty', 'deny-struck']);
+  assert.deepEqual(advisory[1].rules, [DENY[0]]);
+  assert.ok(advisory[1].message.includes(DENY[0]));
+
+  // An operator's own ask rule refills the list; the struck deny still stands.
+  editPolicy({ add: { ask: ['Bash(terraform plan:*)'] }, by: 'tester' }, globalFile);
+  advisory = policyAdvisory(loadPolicyFor(null, globalFile, dir), struckFor(null, globalFile, dir));
+  assert.deepEqual(advisory.map((a) => a.kind), ['deny-struck']);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test('a wrapped command is still the command it wraps', async () => {
@@ -1103,4 +1317,390 @@ test('the Stop hook rides beside PreToolUse — same origin, same token, and pro
     JSON.stringify(buildSettings({ runId: 'r1', token: 't', origin: 'http://x', profile }).hooks));
   assert.equal(byProfile[0], byProfile[1]);
   assert.equal(byProfile[1], byProfile[2]);
+});
+
+/* ------------------------------------------------------------------ *
+ * A restart, end to end (TRS-11)
+ * ------------------------------------------------------------------ */
+
+test('ACC-8.10 (TRS-11): a console that boots over a surviving child ADOPTS its token, keeps its card answerable, keeps its settings file — and files every other card unanswerable with its reason', async () => {
+  const { spawn } = await import('node:child_process');
+  const { INSTANCE_STATE_DIR } = await import('../server/config.ts');
+  const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+  const { Service } = await import('../server/service.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+
+  const root = mkdtempSync(join(STATE_HOME, 'restart-root-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  mkdirSync(join(root, 'docs', 'handoffs', 'alpha'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'alpha.md'), [
+    '---', 'slug: alpha', 'status: active', '---', '', '# alpha', '', '## Phase graph', '',
+    '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |',
+    '|------:|-------|-----------|--------------------|-------|---------------|',
+    '| 1 | one | — | — | app | done |', '| 2 | two | 1 | — | app | done |', '',
+    '## Phases', '', '### Phase 1 — one', '- **Size:** S', '', '### Phase 2 — two', '- **Size:** S', '',
+  ].join('\n'), 'utf8');
+
+  // A child that outlived its console: a real process, so the probe answers the truth.
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
+  try {
+    const surviving = newRun({ slug: 'alpha', root } as never);
+    surviving.status = 'running';
+    const record = phaseRecord(surviving, 2);
+    record.status = 'running';
+    record.sessionId = 'sess-alive';
+    surviving.children = { 2: { pid: child.pid!, phase: 2, sessionId: 'sess-alive', startedAt: new Date().toISOString() } } as never;
+    saveRun(surviving);
+    const token = new Approvals().arm(surviving.id);
+    writeSettingsFile(surviving.id, buildSettings({ runId: surviving.id, token, origin: 'http://127.0.0.1:1' }));
+
+    const at = new Date().toISOString();
+    const until = new Date(Date.now() + 3_000_000).toISOString();
+    const base = { slug: 'alpha', phase: 2, detail: 'wants to run it', evidence: [], createdAt: at, expiresAt: until, status: 'pending' };
+    const pendingFile = join(INSTANCE_STATE_DIR, 'approvals', 'pending.json');
+    mkdirSync(join(INSTANCE_STATE_DIR, 'approvals'), { recursive: true });
+    writeFileSync(pendingFile, JSON.stringify([
+      { ...base, id: 'live-card', runId: surviving.id, kind: 'tool', title: 'Bash: psql', tool: { name: 'Bash', input: { command: 'psql -c "select 1"' } } },
+      { ...base, id: 'gone-card', runId: 'deadbeef', kind: 'tool', title: 'Bash: psql', tool: { name: 'Bash', input: { command: 'psql' } } },
+      { ...base, id: 'verify-card', runId: surviving.id, kind: 'verify', title: 'A check only you can make' },
+      { ...base, id: 'offer-card', runId: surviving.id, kind: 'tool', title: 'Widen a rule', standing: true },
+    ]), 'utf8');
+
+    const svc = new Service({
+      port: 0, host: '127.0.0.1', open: false, allowWrites: true, converge: false,
+      scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null, remoteHosts: [], remoteUsers: [],
+    } as never);
+    try {
+      assert.equal(svc.open(root).ok, true);
+      assert.equal(svc.approvals.liveToken(surviving.id), token, 'the surviving child\'s own token — never a fresh one');
+      assert.ok(recentLog(200).some((entry) => entry.event === 'approvals.token-adopted' && entry.data?.runId === surviving.id));
+      assert.ok(statSync(join(INSTANCE_STATE_DIR, 'settings', `run-${surviving.id}.json`)).isFile(),
+        'the secrets sweep kept the file a surviving child is holding');
+
+      const byId = new Map(svc.approvals.all().map((approval) => [approval.id, approval]));
+      assert.equal(byId.get('live-card')?.status, 'pending', 'answerable: its session survived with its token');
+      assert.ok(byId.get('live-card')?.recovered);
+      assert.equal(byId.get('gone-card')?.unanswerable?.reason, 'session-gone');
+      assert.equal(byId.get('verify-card')?.unanswerable?.reason, 'asker-gone');
+      assert.equal(byId.get('offer-card')?.unanswerable?.reason, 'reoffered');
+      for (const approval of svc.approvals.all()) assert.notEqual(approval.status, 'expired', `${approval.id} never reads expired`);
+
+      // A person answers it; the answer is kept for that session's identical call (the hook half is `hook-decisions.test.ts`).
+      assert.equal(svc.approvals.settle('live-card', 'deny', 'phone'), true);
+      assert.equal(svc.approvals.takeRecoveredAnswer(surviving.id, 2, 'Bash', { command: 'psql -c "select 1"' })?.decision, 'deny');
+    } finally {
+      svc.approvals.disarm();
+      svc.close();
+    }
+  } finally {
+    child.kill();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * The relay (zero-touch-console phase 14) — the 60-second window
+ * ------------------------------------------------------------------ */
+
+type RelayNote = { event: string; data: Record<string, unknown>; phase?: number };
+
+/**
+ * A relay over a real broker and a sandboxed state file, with a runner that
+ * records what it was told. The answer clock is the test's (`answerMs`); the
+ * window the card shows stays the shipped 60 s, so `waitedMs` is what the
+ * relay really waited.
+ */
+async function relayBench(opts: { answerMs?: number; rules?: import('../shared/relay-model.js').RelayRule[]; dir?: string } = {}) {
+  const { Relay } = await import('../server/relay.ts');
+  const dir = opts.dir ?? mkdtempSync(join(STATE_HOME, 'relay-'));
+  const notes: RelayNote[] = [];
+  const journalled: RelayNote[] = [];
+  const parks: { reason: string; phase: number | null; kind: string }[] = [];
+  const pushes: { category: string; title: string; body: string }[] = [];
+  const rulings: { slug: string; what: string; by: string; relay: Record<string, unknown> }[] = [];
+  const told: { phase: number; answers: readonly Record<string, unknown>[] }[] = [];
+  const approvals = new Approvals(() => {}, join(dir, 'pending.json'));
+  const runner = {
+    note: (event: string, data: Record<string, unknown> = {}, phase?: number) => { notes.push({ event, data, phase }); },
+    park: (reason: string, phase: number | null, kind: string) => { parks.push({ reason, phase, kind }); return true; },
+    tellRelayAnswer: (phase: number, answers: readonly Record<string, unknown>[]) => { told.push({ phase, answers }); return { ok: true }; },
+  };
+  const relay = new Relay({
+    approvals,
+    runner: () => runner as never,
+    journal: (_slug, _runId, event, data, phase) => { journalled.push({ event, data, phase }); },
+    announce: (category, message) => { pushes.push({ category, title: message.title, body: message.body }); },
+    tagFor: (...parts) => parts.join(':'),
+    appendRuling: (slug, ruling) => { rulings.push({ slug, what: ruling.what, by: ruling.by, relay: ruling.relay as never }); },
+    rules: () => opts.rules ?? [],
+    scriptsDir: '/skill/scripts',
+    answerMs: opts.answerMs ?? 30,
+    stateFile: join(dir, 'relay-state.json'),
+  });
+  return { dir, relay, approvals, notes, journalled, parks, pushes, rulings, told };
+}
+
+const relayRun = (over: Record<string, unknown> = {}) => ({
+  id: 'r1', slug: 'demo', status: 'running', phases: {}, relay: 'last-resort',
+  relayArming: { armed: true, version: '2.1.270', floor: '2.1.268', at: new Date().toISOString() },
+  ...over,
+}) as never;
+
+const question = (text: string, labels: string[], extra: Record<string, unknown> = {}) => ({
+  question: text, header: 'Choice', multiSelect: false,
+  options: labels.map((label) => ({ label, description: `${label} it is` })),
+  ...extra,
+});
+
+const envelope = (questions: unknown[], extra: Record<string, unknown> = {}) => ({
+  mechanism: 'pre-tool-use' as const,
+  tool: 'AskUserQuestion',
+  input: { questions },
+  toolUseId: 'toolu_relay_1',
+  sessionId: 'sess-relay',
+  policy: loadPolicy('/nonexistent'),
+  profile: 'guarded' as const,
+  ...extra,
+});
+
+test('ACC-8.16 (AC-4): a relayed question is raised, then answered by rule, by its (Recommended) option, else by the first — one entry per question over a call carrying 4, within the window, with a ruling each', async () => {
+  const { frameRelayAnswer } = await import('../server/runner/runner-core.ts');
+  const { questionKey, RELAY_ANSWER_MS, RELAY_WINDOW_MS } = await import('../shared/relay-model.js');
+  assert.equal(RELAY_WINDOW_MS, 60_000);
+  assert.equal(RELAY_ANSWER_MS, 55_000, 'answered 5 s before the window closes');
+  const q1 = question('Which colour should the banner be?', ['Red', 'Blue']);
+  const q2 = question('Which region should the bucket live in?', ['us-east', 'eu-west (Recommended)']);
+  const q3 = question('Which log level for the worker?', ['info', 'debug']);
+  const q4 = question('Which queue backend?', ['sqs (Recommended)', 'redis (Recommended)']);
+  const bench = await relayBench({
+    rules: [{ id: 'banner-red', tool: 'AskUserQuestion', key: `${questionKey(q1)}`, profile: '*', answer: 'red' }],
+  });
+  const before = Date.now();
+  const reply = await bench.relay.relayQuestion(relayRun(), 2, envelope([q1, q2, q3, q4]));
+  assert.equal(reply.kind, 'answered', 'every question answered — an allow, never a denial');
+  if (reply.kind !== 'answered') return;
+  // The shape spike S1 measured honoured: `questions` echoed, `answers` keyed by question TEXT.
+  assert.deepEqual(reply.updatedInput.questions, [q1, q2, q3, q4]);
+  assert.deepEqual(reply.updatedInput.answers, {
+    'Which colour should the banner be?': 'Red',
+    'Which region should the bucket live in?': 'eu-west (Recommended)',
+    'Which log level for the worker?': 'info',
+    'Which queue backend?': 'sqs (Recommended)',
+  });
+
+  const raised = bench.notes.filter((n) => n.event === 'phase.question-raised');
+  assert.equal(raised.length, 1, 'one raise for the call');
+  assert.equal(raised[0].phase, 2);
+  assert.equal(raised[0].data.tool, 'AskUserQuestion');
+  assert.equal(raised[0].data.mechanism, 'pre-tool-use');
+  assert.equal(raised[0].data.source, 'run');
+  assert.equal(raised[0].data.key, questionKey(q1));
+  assert.deepEqual((raised[0].data.questions as { key: string; options: string[]; multiSelect: boolean }[]).map((entry) => entry.key),
+    [q1, q2, q3, q4].map((q) => questionKey(q)), 'one entry per question');
+  assert.deepEqual((raised[0].data.questions as { options: string[] }[])[1].options, ['us-east', 'eu-west (Recommended)']);
+
+  const answered = bench.notes.filter((n) => n.event === 'phase.question-answered');
+  assert.deepEqual(answered.map((n) => n.data.by), ['rule', 'recommended', 'first-option', 'first-option'],
+    'the order: a rule, the sole (Recommended), else the first — two recommendations recommend nothing');
+  assert.equal(answered[0].data.ruleId, 'banner-red');
+  for (const line of answered) {
+    assert.ok(typeof line.data.waitedMs === 'number' && line.data.waitedMs <= 61_000, `waited ${line.data.waitedMs} ms`);
+    assert.ok((line.data.waitedMs as number) <= Date.now() - before + 5);
+  }
+  assert.equal(bench.rulings.length, 4, 'a ruling row per answer');
+  assert.deepEqual(bench.rulings.map((r) => r.relay.answeredBy), ['rule', 'recommended', 'first-option', 'first-option']);
+  assert.ok(bench.rulings.every((r) => r.by === 'relay' && r.slug === 'demo'));
+  assert.equal(bench.approvals.pending().length, 0, 'the card came down');
+  assert.equal(bench.pushes.length, 0, 'the relay itself pushes nothing for a raise — the broker\'s notify does (the service\'s session-ask)');
+
+  // The session is told, in the words the plan fixed, once the reply is on its way.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bench.told.length, 1);
+  assert.equal(bench.told[0].answers.length, 4, 'every machine answer, none of them a person\'s');
+  assert.equal(
+    frameRelayAnswer('Red', 'relay rule banner-red', 'ambiguity'),
+    'No operator answered within 60 s. The console answered `Red` by `relay rule banner-red`. This is NOT a change '
+      + 'to the phase. If that answer is wrong, declare `blocked --needs ambiguity` rather than asking again.',
+  );
+});
+
+test('ACC-8.16 (AC-4): a person answering inside the window wins — by human, and the console answers nothing', async () => {
+  const bench = await relayBench({ answerMs: 5_000 });
+  const q = question('Should the migration run now?', ['Now', 'Tonight (Recommended)']);
+  const pending = bench.relay.relayQuestion(relayRun(), 2, envelope([q]));
+  await new Promise((resolve) => setImmediate(resolve));
+  const card = bench.approvals.pending()[0];
+  assert.equal(card?.kind, 'question');
+  assert.equal(Date.parse(card!.expiresAt) - Date.parse(card!.createdAt), 60_000, 'the card shows the 60 s window');
+  assert.deepEqual(bench.relay.answer(card!.id, [{ key: card!.question!.items[0].key, label: 'nope' }], 'phone'),
+    { ok: false, status: 400, error: '"nope" is not one of that question\'s options' });
+  const taken = bench.relay.answer(card!.id, [{ key: card!.question!.items[0].key, label: 'now' }], 'phone@me');
+  assert.deepEqual(taken, { ok: true, answered: [card!.question!.items[0].key], remaining: 0 });
+  const reply = await pending;
+  assert.equal(reply.kind, 'answered');
+  if (reply.kind !== 'answered') return;
+  assert.deepEqual(reply.updatedInput.answers, { 'Should the migration run now?': 'Now' }, 'the person, not the recommendation');
+  const answered = bench.notes.filter((n) => n.event === 'phase.question-answered');
+  assert.equal(answered.length, 1);
+  assert.equal(answered[0].data.by, 'human');
+  assert.equal(answered[0].data.who, 'phone@me');
+  assert.ok((answered[0].data.waitedMs as number) < 60_000);
+  assert.equal(bench.rulings[0].by, 'phone@me');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bench.told.length, 0, 'a person\'s answer needs no notice');
+});
+
+test('ACC-8.16 (AC-14): the deny list is consulted FIRST — a denied tool or a denied command in an option never opens a window', async () => {
+  const bench = await relayBench({ answerMs: 5_000 });
+  const raisedBefore = bench.approvals.counts().raised;
+  const pushOption = question('How should the branch land?', ['Rebase and merge', 'Run `git push --force origin main`']);
+  const reply = await bench.relay.relayQuestion(relayRun(), 2, envelope([pushOption]));
+  assert.equal(reply.kind, 'unanswerable');
+  if (reply.kind !== 'unanswerable') return;
+  assert.equal(reply.reason, 'deny-list');
+  assert.equal(reply.rule, 'Bash(git push:*)', 'the wall names the line');
+  const walled = { ...loadPolicy('/nonexistent'), deny: [...DEFAULT_DENY, 'AskUserQuestion'] };
+  const second = await bench.relay.relayQuestion(relayRun(), 3, envelope([question('Anything?', ['Yes', 'No'])], { policy: walled }));
+  assert.equal(second.kind, 'unanswerable');
+  assert.equal(bench.approvals.counts().raised, raisedBefore, 'no card was raised — no window was ever started');
+  assert.equal(bench.approvals.pending().length, 0);
+  assert.equal((bench.relay as unknown as { held: Map<string, unknown> }).held.size, 0, 'and no timer is holding anything');
+  assert.ok(!bench.notes.some((n) => n.event === 'phase.question-raised'));
+  assert.equal(bench.notes.filter((n) => n.event === 'phase.question-unanswerable').length, 2);
+});
+
+test('ACC-8.10 (AC-6, S3): a question open across a console death is answered at BOOT by rule, waitedMs spanning the outage — deferred, it is answerable and meets the resume; not deferred, it is hook-closed — and no card reads expired', async () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'relay-restart-'));
+  const first = await relayBench({ answerMs: 600_000, dir });
+  const deferredQ = question('Which colour should the banner be?', ['Red', 'Blue (Recommended)']);
+  const closedQ = question('Which port should the worker take?', ['8080', '9090']);
+  // Run r1 asks through PreToolUse (it carries a tool_use_id and can defer); run r2 through PermissionRequest.
+  const deferredReply = first.relay.relayQuestion(relayRun(), 2, envelope([deferredQ]));
+  const closedReply = first.relay.relayQuestion(relayRun({ id: 'r2' }), 4, envelope([closedQ], {
+    mechanism: 'permission-request', toolUseId: undefined,
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(first.approvals.pending().length, 2);
+  // The console goes away gracefully for r1 only: its question is deferred…
+  assert.equal(first.relay.deferOpen('r1', 'shutdown'), 1);
+  const deferred = await deferredReply;
+  assert.equal(deferred.kind, 'deferred', 'the PreToolUse hook is told defer');
+  assert.ok(first.notes.some((n) => n.event === 'phase.question-deferred' && n.data.toolUseId === 'toolu_relay_1'));
+  // …and then it dies with r2's question still open. Both cards are on disk.
+  const pendingFile = join(dir, 'pending.json');
+  const onDisk = JSON.parse(readFileSync(pendingFile, 'utf8')) as Record<string, unknown>[];
+  assert.equal(onDisk.length, 2);
+  // Ninety minutes of outage, in the record's own clock.
+  const outageMs = 90 * 60_000;
+  for (const card of onDisk) card.createdAt = new Date(Date.parse(card.createdAt as string) - outageMs).toISOString();
+  writeFileSync(pendingFile, JSON.stringify(onDisk), 'utf8');
+  void closedReply;
+
+  const second = await relayBench({ dir });
+  const tally = second.approvals.recover((card) => second.relay.recoverCard(card));
+  assert.deepEqual(tally, { answerable: 1, unanswerable: { 'hook-closed': 1 } });
+  const cards = second.approvals.all();
+  for (const card of cards) assert.notEqual(card.status, 'expired', `${card.id} never reads expired`);
+  const kept = cards.find((card) => card.runId === 'r1')!;
+  assert.equal(kept.status, 'allow', 'deferred: answered at boot, and still answerable');
+  assert.equal(kept.decidedBy, 'relay');
+  assert.ok(kept.recovered);
+  const closed = cards.find((card) => card.runId === 'r2')!;
+  assert.equal(closed.status, 'unanswerable');
+  assert.equal(closed.unanswerable?.reason, 'hook-closed');
+  assert.equal(closed.question?.answers[closed.question.items[0].key]?.label, '8080', 'the rule answer is recorded as the substitute');
+
+  const boot = second.journalled.filter((n) => n.event === 'phase.question-answered');
+  assert.equal(boot.length, 2, 'both answered at boot, on the runs\' journals');
+  for (const line of boot) {
+    assert.equal(line.data.recovered, true);
+    assert.ok((line.data.waitedMs as number) >= outageMs, `waitedMs ${line.data.waitedMs} spans the outage`);
+  }
+  assert.equal(boot.find((n) => n.data.approvalId === kept.id)?.data.by, 'recommended');
+
+  // The resume: the session's PreToolUse fires again for the same tool_use_id — answered at once, no second card.
+  const resumed = await second.relay.relayQuestion(relayRun(), 2, envelope([deferredQ]));
+  assert.equal(resumed.kind, 'answered');
+  if (resumed.kind === 'answered') assert.deepEqual(resumed.updatedInput.answers, { 'Which colour should the banner be?': 'Blue (Recommended)' });
+  assert.equal(second.approvals.pending().length, 0);
+  // The hook-closed question asked again gets the substitute — not a repeated-key refusal.
+  const again = await second.relay.relayQuestion(relayRun({ id: 'r2' }), 4, envelope([closedQ], { mechanism: 'permission-request', toolUseId: undefined }));
+  assert.equal(again.kind, 'answered');
+  // One-shot: the same question once more is a repeated key.
+  const thrice = await second.relay.relayQuestion(relayRun({ id: 'r2' }), 4, envelope([closedQ], { mechanism: 'permission-request', toolUseId: undefined }));
+  assert.equal(thrice.kind, 'unanswerable');
+  if (thrice.kind === 'unanswerable') assert.equal(thrice.reason, 'repeated-key');
+});
+
+test('the relay host never answers first: presence only, a deny after the hook\'s hour, and a notification that cancels it', async () => {
+  const { RELAY_HOST_BACKSTOP_MS, RELAY_HOST_TOOL, answerMessage, relayHostConfig } = await import('../server/relay-host.ts');
+  assert.ok(RELAY_HOST_BACKSTOP_MS > HOOK_TIMEOUT_SECONDS * 1000, 'the host outwaits the hook it must never beat');
+  assert.equal(RELAY_HOST_TOOL, 'mcp__pcrelay__hold');
+  assert.match(relayHostConfig('/node').args[0], /relay-host\.(ts|js)$/);
+  const held: unknown[] = [];
+  const init = answerMessage({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } }, () => {}) as { result: { capabilities: unknown } };
+  assert.deepEqual(init.result.capabilities, { tools: {} });
+  const list = answerMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, () => {}) as { result: { tools: { name: string }[] } };
+  assert.deepEqual(list.result.tools.map((tool) => tool.name), ['hold']);
+  const call = answerMessage({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'hold', arguments: {} } }, (id, later) => held.push({ id, later }));
+  assert.equal(call, null, 'a tools/call is never answered on arrival');
+  assert.equal(held.length, 1);
+  const late = (held[0] as { later: () => { result: { content: { text: string }[] } } }).later();
+  assert.equal(JSON.parse(late.result.content[0].text).behavior, 'deny', 'and only ever denies, late');
+});
+
+test('ACC-8.11 (S2): an ARMED run\'s settings register the PermissionRequest hook beside PreToolUse — same origin, same token, every tool — and a run on the floor registers none, because --permission-prompts none does not switch it off', () => {
+  const armed = buildSettings({ runId: 'r1', token: 'tok', origin: 'http://127.0.0.1:4130', relay: true }) as {
+    hooks: Record<string, { matcher?: string; hooks: { type: string; url: string; headers: Record<string, string>; timeout: number }[] }[]>;
+  };
+  const request = armed.hooks.PermissionRequest;
+  assert.equal(request.length, 1);
+  assert.equal(request[0].matcher, '*', 'the host never answers, so this hook must answer every call that reaches the permission step');
+  assert.equal(request[0].hooks[0].type, 'http');
+  assert.equal(request[0].hooks[0].url, 'http://127.0.0.1:4130/hooks/permission-request');
+  assert.equal(request[0].hooks[0].headers.Authorization, 'Bearer tok');
+  assert.equal(request[0].hooks[0].timeout, HOOK_TIMEOUT_SECONDS, 'the socket outlives the 60 s window');
+  // The question class reaches the PreToolUse hook too — where the relay answers it.
+  assert.match(armed.hooks.PreToolUse[0].matcher!, /(^|\|)AskUserQuestion(\||$)/);
+
+  for (const settings of [
+    buildSettings({ runId: 'r1', token: 'tok', origin: 'http://127.0.0.1:4130' }),
+    buildSettings({ runId: 'r1', token: 'tok', origin: 'http://127.0.0.1:4130', relay: false }),
+  ] as { hooks: Record<string, unknown> }[]) {
+    assert.equal(settings.hooks.PermissionRequest, undefined, 'a relay-off run registers no PermissionRequest hook');
+  }
+
+  // The token a restart adopts reads back from any of the hooks that carry it.
+  const token = 'C'.repeat(43);
+  writeSettingsFile('relay-run', buildSettings({ runId: 'relay-run', token, origin: 'http://127.0.0.1:1', relay: true }));
+  assert.equal(tokenFromSettingsFile('relay-run'), token);
+});
+
+test('the streaming-mode smoke replays: the resumed session\'s hook re-fires for the SAME tool_use_id, and the relay answers it in the shape the CLI honoured', async () => {
+  const text = readFileSync(new URL('./fixtures/spikes/relay-stream.md', import.meta.url), 'utf8');
+  assert.match(text, /^verdict: honoured$/m);
+  const block = /### The hook listener \(both calls, verbatim\)\n```jsonl\n([\s\S]*?)\n```/.exec(text)?.[1] ?? '';
+  const calls = block.split('\n').filter(Boolean).map((line) => JSON.parse(line) as {
+    tool_use_id: string; reply: { hookSpecificOutput: { permissionDecision: string; updatedInput?: { questions: { question: string }[]; answers: Record<string, string> } } };
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].tool_use_id, calls[1].tool_use_id, 'the resume re-fired the hook for the deferred call itself');
+  assert.equal(calls[0].reply.hookSpecificOutput.permissionDecision, 'defer');
+  const honoured = calls[1].reply.hookSpecificOutput.updatedInput!;
+
+  // The relay, over the same call: deferred as the console goes away, answered at boot, delivered on the re-fire.
+  const dir = mkdtempSync(join(STATE_HOME, 'relay-replay-'));
+  const first = await relayBench({ answerMs: 600_000, dir });
+  const input = { questions: honoured.questions };
+  const pending = first.relay.relayQuestion(relayRun(), 2, envelope(honoured.questions, { input, toolUseId: calls[0].tool_use_id }));
+  await new Promise((resolve) => setImmediate(resolve));
+  first.relay.deferOpen(null, 'shutdown');
+  assert.equal((await pending).kind, 'deferred');
+  const second = await relayBench({ dir });
+  second.approvals.recover((card) => second.relay.recoverCard(card));
+  const resumed = await second.relay.relayQuestion(relayRun(), 2, envelope(honoured.questions, { input, toolUseId: calls[1].tool_use_id }));
+  assert.equal(resumed.kind, 'answered');
+  if (resumed.kind !== 'answered') return;
+  assert.deepEqual(Object.keys(resumed.updatedInput).sort(), Object.keys(honoured).sort(), 'questions and answers, as honoured');
+  assert.deepEqual(resumed.updatedInput.questions, honoured.questions);
+  assert.deepEqual(Object.keys(resumed.updatedInput.answers as object), Object.keys(honoured.answers), 'answers keyed by question text');
 });

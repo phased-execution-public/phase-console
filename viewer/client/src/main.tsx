@@ -1,4 +1,8 @@
-import { StrictMode } from 'react';
+import {
+  StrictMode,
+  Suspense,
+  type ComponentType,
+} from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client';
@@ -25,6 +29,13 @@ installErrorReporting();
 const root = document.getElementById('root');
 if (!root) throw new Error('#root missing from index.html');
 
+/** What this document boots — the console's App, unless the page says otherwise. */
+function rootComponent(): ComponentType {
+  return App;
+}
+
+const Root = rootComponent();
+
 const queryClient = createQueryClient();
 
 // The cache from the last time this browser had the console open, if there is
@@ -44,11 +55,15 @@ createRoot(root).render(
         persistOptions={persistence}
         onSuccess={() => revalidateRestored(queryClient)}
       >
-        <App />
+        <Suspense fallback={null}>
+          <Root />
+        </Suspense>
       </PersistQueryClientProvider>
     ) : (
       <QueryClientProvider client={queryClient}>
-        <App />
+        <Suspense fallback={null}>
+          <Root />
+        </Suspense>
       </QueryClientProvider>
     )}
   </StrictMode>,

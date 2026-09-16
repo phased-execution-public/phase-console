@@ -223,7 +223,7 @@ export function Controls(props: ControlsProps) {
       }
       activeCount={activeCount(props.filters)}
       trailing={<LayoutToggle />}
-      sheetTitle="Sort and filter the fleet"
+      sheetTitle="Sort and filter the runs"
       note={
         [
           props.hidden > 0 ? `${props.hidden} hidden by filters` : null,

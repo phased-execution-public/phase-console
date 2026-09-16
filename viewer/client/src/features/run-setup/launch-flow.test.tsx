@@ -26,7 +26,28 @@ const mocks = vi.hoisted(() => ({
   accounts: vi.fn(),
   mcp: vi.fn(),
   isolationPreflight: vi.fn(),
+  runPrelude: vi.fn(),
 }));
+
+/** A prelude with nothing open — the Decisions stage answers, and Launch is not held. */
+const EMPTY_PRELUDE = {
+  slug: 'alpha',
+  rows: [],
+  blocking: [],
+  waived: [],
+  acknowledged: [],
+  manifestPresent: false,
+  probes: {
+    accounts: { status: 'ok', ok: true, reason: '1 of 1 declared account usable: the machine login' },
+    mcp: { status: 'skip', ok: true, reason: 'no MCP server named' },
+    credentials: { status: 'skip', ok: true, reason: 'no credential named' },
+    delivery: { status: 'ok', ok: true, reason: '1 subscribed device' },
+  },
+  accounts: [{ id: 'default', minHeadroomPct: 0 }],
+  credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+  delivery: { ok: true, channels: ['1 subscribed device'], acknowledged: false },
+  at: '2026-09-14T00:00:00.000Z',
+};
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
@@ -193,17 +214,22 @@ beforeEach(() => {
   });
   mocks.mcp.mockResolvedValue({ servers: [], allowMcp: false });
   mocks.isolationPreflight.mockResolvedValue({ available: true, kind: 'checkout', multiRepo: false });
+  mocks.runPrelude.mockResolvedValue({ prelude: EMPTY_PRELUDE });
 });
 
-describe('the four stages', () => {
-  it('open on What runs: the plan, the phases ready now, the sessions, and what will hold', async () => {
+describe('the five stages', () => {
+  it('open on Decisions, then What runs: the plan, the phases ready now, the sessions, and what will hold', async () => {
     await mount();
+    // Decisions first (phase 11): the prelude's questions before the run's shape.
     expect(screen.getAllByRole('tab').map((t) => t.getAttribute('aria-selected'))).toEqual([
       'true',
       'false',
       'false',
       'false',
+      'false',
     ]);
+    expect(within(panel()).getByText('What the door requires')).toBeTruthy();
+    await stage(/What runs/);
     const what = panel();
     expect(await within(what).findByText('Alpha plan')).toBeTruthy();
     expect(within(what).getByText(/4 phases · 1 done · 2 phases ready now/)).toBeTruthy();
@@ -378,13 +404,19 @@ describe('the honest states', () => {
 describe('the contract', () => {
   it('posts, for the default fixture, byte for byte what the old dialog posted', async () => {
     await mount();
+    // The account list is filled from the prelude once it answers; wait for it
+    // so the bytes below are the whole form, not a race.
+    await screen.findByDisplayValue('default:0');
     fireEvent.click(screen.getByRole('button', { name: 'Start' }));
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
     expect(mocks.runStart.mock.calls[0]![0]).toBe('alpha');
     // Captured from the pre-Phase-8 dialog with the same fixture. `modes.ts`
     // is untouched, so this is the redesign's promise stated as bytes.
+    // …plus, since 5.0.0 (phase 11), the Decisions stage's three required
+    // answers at the end: the run's own words for `resume.on-restart` and
+    // `relay`, and the account list the prelude resolved for it.
     expect(JSON.stringify(mocks.runStart.mock.calls[0]![1])).toBe(
-      '{"model":"opus","effort":"max","onLimit":"switch","autonomy":"keep-going","phaseBudgetUsd":null,"runBudgetUsd":null,"permissionProfile":"trusted","skills":[],"mcpPolicy":"continue","gitMode":"default-branch","ultraReview":"off","priority":"normal","startAfter":"","autoRecover":true}',
+      '{"model":"opus","effort":"max","onLimit":"switch","autonomy":"keep-going","phaseBudgetUsd":null,"runBudgetUsd":null,"permissionProfile":"trusted","skills":[],"mcpPolicy":"continue","gitMode":"default-branch","ultraReview":"off","priority":"normal","startAfter":"","autoRecover":true,"resumeOnRestart":true,"relay":"off","accounts":[{"id":"default","minHeadroomPct":0}]}',
     );
   });
 
@@ -435,14 +467,14 @@ describe('the contract', () => {
     await stage(/How it runs/);
     await stage(/Review/);
     const visited = screen.getAllByRole('tab').map((t) => t.hasAttribute('data-visited'));
-    expect(visited).toEqual([true, true, false, true]);
+    expect(visited).toEqual([true, false, true, false, true]);
   });
 });
 
 describe('accessibility', () => {
-  it('axe finds nothing on any of the four stages', async () => {
+  it('axe finds nothing on any of the five stages', async () => {
     await mount();
-    for (const name of [/What runs/, /How it runs/, /Money and stops/, /Review/]) {
+    for (const name of [/Decisions/, /What runs/, /How it runs/, /Money and stops/, /Review/]) {
       await stage(name);
       await screen.findByRole('tabpanel');
       await expectNoAxeViolations(document.body);

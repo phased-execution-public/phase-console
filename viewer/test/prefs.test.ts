@@ -140,9 +140,20 @@ test('sanitiseAutomation is the single coercion table', () => {
     // On, and gated a second time by `--allow-run`: a console that may not spawn
     // a session must not run a session's recorded command either.
     watchCmdRefs: true,
+    // OFF: a `cmd:` ref the console MINTED (the watchdog's park) is never run
+    // unless an operator says so — the console's own inference must not
+    // execute a writing command against a repository nobody is watching (SLF-8).
+    watchMintedCmdRefs: false,
     mcpPolicy: 'continue',
     ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
-    unblockAttempts: true, delegateHumanGates: false, staleClaimTakeover: true,
+    // The start ceiling (phase 7): forty automatic starts and $250 per sliding hour.
+    ceilingStartsPerHour: 40, ceilingUsdPerHour: 250,
+    // `delegateHumanGates` is ON since 5.0.0 (phase 11, operator decision 11:
+    // `gates: delegated`) — this console's word for the manifest's `gates` row.
+    unblockAttempts: true, delegateHumanGates: true, staleClaimTakeover: true,
+    // The policy table's console half (phase 11): empty means "the plan's row,
+    // else the shipped default, answers every key".
+    policy: {},
     // The posture sweep's two opt-ins (P12) ship OFF: one lowers the proof bar
     // to the handoff, the other spends one more session's money.
     allowUnverifiedPhases: false, ladderExtendOnProgress: false,
@@ -161,15 +172,27 @@ test('sanitiseAutomation is the single coercion table', () => {
     // `STALL_DEFAULTS` rather than in it, because that object is a bijection
     // with the signals and this is a second clock on one of them.
     stallLocalJobMs: 2_700_000,
+    // Whether the watchdog may park a lane by itself — SLF-9's off switch.
+    // ON, which is what the console did before the switch existed.
+    stallAutomaticPark: true,
     // The clock on the ANNOUNCEMENT rather than on a detector — 45 minutes,
-    // and the one stall number that takes `cap`: see below.
+    // and one of the two stall numbers that take `cap`: see below.
     stallEscalateMs: 2_700_000,
     // The boarding schedule is the one OBJECT here, coerced by its own
     // `sanitiseSchedule` beside the rules it has to agree with. Off, with
     // nothing in it: a console that has never set one boards at every hour,
     // which is what this console has always done.
     boardingSchedule: { enabled: false, windows: [], quiet: [], cron: [], cronMinutes: 60 },
+    // The relay's rule table (phase 14): a LIST, coerced by `sanitiseRelayRules`
+    // beside the matcher that reads it. Empty: no rule ships, so a console that
+    // has never written one answers a question by its recommendation.
+    relayRules: [],
   });
+  // …and a rule missing its key or its answer is dropped, never repaired.
+  assert.deepEqual(
+    sanitiseAutomation({ relayRules: [{ key: 'colour:*' }, { key: 'colour:*', answer: 'Blue' }] } as never).relayRules,
+    [{ id: 'AskUserQuestion:colour:*:*', tool: 'AskUserQuestion', key: 'colour:*', profile: '*', answer: 'Blue' }],
+  );
   // …and it is not a toggle: `enabled` needs the exact boolean, and a policy
   // that cannot be read is DROPPED rather than defaulted open.
   assert.equal(sanitiseAutomation({ boardingSchedule: { enabled: 'yes' } } as never).boardingSchedule.enabled, false);
@@ -210,12 +233,12 @@ test('sanitiseAutomation is the single coercion table', () => {
   assert.equal(sanitiseAutomation({ watchCmdRefs: 'no' } as never).watchCmdRefs, true,
     'the one pref that governs an execution surface still cannot be turned ON by a typo — '
     + 'it defaults on, so a garbage value must read as the default, not as off');
-  // The five stall thresholds take `positive`, not `cap`: unlike a ladder cap
+  // The stall thresholds take `positive`, not `cap`: unlike a ladder cap
   // there is no meaning to give a zero here — it would flag every lane on its
   // first tick — so zero and every other unusable value take the shipped one.
   assert.equal(sanitiseAutomation({ stallSilentMs: 90_000 }).stallSilentMs, 90_000);
   assert.equal(sanitiseAutomation({ stallSilentMs: 0 }).stallSilentMs, 600_000, 'zero is not "off", it is nonsense');
-  // …with exactly one exception, and it is not a detector. A zero escalation
+  // …with two exceptions. The first is not a detector: a zero escalation
   // clock means "never say a stall twice", which is what this console did
   // before the escalation existed and is a setting an operator can want — so
   // this one takes `cap`, and nonsense still takes the shipped 45 minutes.
@@ -228,7 +251,19 @@ test('sanitiseAutomation is the single coercion table', () => {
   assert.equal(sanitiseAutomation({ stallRetryBurst: 2 }).stallRetryBurst, 2);
   assert.equal(sanitiseAutomation({ stallRetryBurst: 0 }).stallRetryBurst, 5);
   assert.equal(sanitiseAutomation({ stallExternalWaitMs: 120_000 }).stallExternalWaitMs, 120_000);
-  assert.equal(sanitiseAutomation({ stallExternalWaitMs: 0 }).stallExternalWaitMs, 300_000);
+  // The second is: a zero external-wait threshold means "never call a lane
+  // waiting", which Settings always promised ("0 never parks a lane for
+  // waiting") while `positive` quietly turned it back into five minutes (SLF-9).
+  assert.equal(sanitiseAutomation({ stallExternalWaitMs: 0 }).stallExternalWaitMs, 0, 'zero IS "never call it waiting"');
+  assert.equal(sanitiseAutomation({ stallExternalWaitMs: -1 }).stallExternalWaitMs, 300_000);
+  assert.equal(sanitiseAutomation({ stallAutomaticPark: false }).stallAutomaticPark, false);
+  // The minted-ref switch ships OFF and only an explicit true turns it on (SLF-8).
+  assert.equal(sanitiseAutomation({}).watchMintedCmdRefs, false);
+  assert.equal(sanitiseAutomation({ watchMintedCmdRefs: true }).watchMintedCmdRefs, true);
+  assert.equal(sanitiseAutomation({ watchMintedCmdRefs: 'yes' } as never).watchMintedCmdRefs, false,
+    'a typo cannot switch the minted refs on');
+  assert.equal(sanitiseAutomation({ stallAutomaticPark: 'no' } as never).stallAutomaticPark, true,
+    'a typo cannot switch the automatic park off');
   // ...and the shipped numbers are the shared ones, not a second copy.
   assert.deepEqual(
     {
@@ -363,6 +398,11 @@ test('every automation preference the loader accepts can also be SET', () => {
       enabled: true, windows: [{ days: [1], from: '09:00', to: '18:00' }],
       quiet: [], cron: [], cronMinutes: 60,
     },
+    // In the vocabulary's order (`DECISION_KEYS`), which is the order the
+    // coercer writes them back in — the comparison below is by JSON text.
+    // `stop` is a free-text key: one line, kept since phase 12's editor.
+    policy: { gates: 'operator', 'qa.exhausted': 'halt', stop: 'keep-going; page me' },
+    relayRules: [{ id: 'AskUserQuestion:colour:*:*', tool: 'AskUserQuestion', key: 'colour:*', profile: '*', answer: 'Blue' }],
   };
   // 🔴 **A string used to flip to ITSELF**, so `same(flipped[key], after[key])`
   // was trivially true for every word-valued key and this test proved nothing

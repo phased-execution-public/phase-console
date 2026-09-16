@@ -70,17 +70,23 @@ TSC="viewer/node_modules/.bin/tsc"
 # tarball, anything with no `.git` of its own or ignored by the one above it —
 # every file read as untracked and the cleanup deleted the source file with the
 # emitted ones. A snapshot needs no repository and answers the same question.
+#
+# The emit writes wherever the pack tsconfig includes a `.ts`, so the snapshot
+# and the sweep cover every such directory, not just the first one.
+EMIT_DIRS="viewer/server"
 pre_emit="$(mktemp)"
-find viewer/server -name '*.js' -type f 2>/dev/null | LC_ALL=C sort > "$pre_emit"
+# shellcheck disable=SC2086 # EMIT_DIRS is a word list by construction
+find $EMIT_DIRS -name '*.js' -type f 2>/dev/null | LC_ALL=C sort > "$pre_emit"
 
 emitted=""
 cleanup() {
   # Precisely: it was not there before the emit, and it has a .ts sibling.
+  # shellcheck disable=SC2086 # EMIT_DIRS is a word list by construction
   while IFS= read -r js; do
     [ -f "${js%.js}.ts" ] || continue
     grep -qxF "$js" "$pre_emit" && continue
     rm -f "$js"
-  done < <(find viewer/server -name '*.js' -type f 2>/dev/null)
+  done < <(find $EMIT_DIRS -name '*.js' -type f 2>/dev/null)
   rm -f "$pre_emit"
   if [ "$KEEP" -eq 0 ] && [ -n "$emitted" ]; then rm -f "$emitted"; fi
 }

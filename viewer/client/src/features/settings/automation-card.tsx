@@ -111,6 +111,22 @@ export function AutomationCard() {
 
         <div className={row}>
           <span className="min-w-0">
+            <span className="text-sm text-ink">
+              Run <code>cmd:</code> refs the console minted
+            </span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              When the watchdog parks a lane that was polling inside its turn, it files the command it was
+              polling with as a watch ref of its own. Off (shipped): such a ref is recorded and never run —
+              the console&apos;s own inference does not execute a writing command against a repository nobody
+              is watching; the park still resumes on its clock. On: minted refs run exactly as declared ones
+              do.
+            </span>
+          </span>
+          {onOff(prefs.watchMintedCmdRefs, 'watchMintedCmdRefs')}
+        </div>
+
+        <div className={row}>
+          <span className="min-w-0">
             <span className="text-sm text-ink">Repository guard</span>
             <span className="mt-0.5 block text-2xs text-ink-muted">
               Queue runs whose repositories overlap. Off: overlapping runs may start at once, and a

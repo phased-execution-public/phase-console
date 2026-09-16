@@ -32,8 +32,9 @@ import { execFile } from 'node:child_process';
 
 import {
   SITUATIONS, SITUATION_ACTOR, SITUATION_BLURBS, SITUATION_LABELS, SUB_KINDS,
-  classifyExitSaid, isSituation, parseSituationKey, situationKey, situationLabel,
+  actorFor, classifyExitSaid, isSituation, parseSituationKey, refusalCauseOf, situationKey, situationLabel,
 } from '../../shared/situation-model.js';
+import { subKindOfNeed } from '../../shared/decisions-model.js';
 import type { PhaseRecord, RunState } from './state.ts';
 
 export {
@@ -54,6 +55,14 @@ export type Situation = {
   actor: SituationActor;
   /** The evidence that decided it, as short sentences in the order it was weighed. */
   why: string[];
+  /**
+   * The arm read the session's own words — `record.said`, or the cause the
+   * runner stamped from them — to decide (phase 10, RCV-7). The errand then
+   * quotes `said` verbatim (`errandSaid`); a situation decided from the board,
+   * the handoff or a halt kind quotes nothing, because a sign-off that decided
+   * nothing is not evidence of anything.
+   */
+  fromSaid?: boolean;
 };
 
 /* ------------------------------------------------------------------ *
@@ -109,7 +118,7 @@ export type PhaseEvidence = {
     watch?: string[];
     waits?: number;
     /** The outcome the session declared, as the record persists it (`PhaseRecord.declared`). */
-    declared?: { status: string; reason?: string; watch?: string[]; at?: string } | null;
+    declared?: { status: string; reason?: string; watch?: string[]; needs?: string; at?: string } | null;
     costUsd?: number;
     turns?: number;
     /** A lane of THIS console is driving the phase right now. */
@@ -123,6 +132,18 @@ export type PhaseEvidence = {
      * classifier most needs to read.
      */
     halt?: { kind?: string; reason?: string; phase?: number } | null;
+    /**
+     * The wall the runner's own classifier stamped on the record when it
+     * halted (`PhaseRecord.cause`, phase 9) — read BEFORE any prose, and
+     * carried across re-boards so the result of a later rung cannot mask it.
+     */
+    cause?: { kind: string; class?: string; reason?: string; at?: string; account?: string } | null;
+    /**
+     * The last tool call THIS console refused for the phase
+     * (`PhaseRecord.toolDenied`, phase 9): `rule` is the deny-list line, or
+     * `in-turn-wait` for the wait guard — which is not a permission block.
+     */
+    toolDenied?: { tool: string; rule: string; command?: string; matched?: string; at: string } | null;
   } | null;
   run: {
     status?: string;
@@ -134,8 +155,12 @@ export type PhaseEvidence = {
   } | null;
   lock: LockEvidence | null;
   work: WorkEvidence;
-  /** The outcome the session declared (`phase-outcome.sh`), when one is known. */
-  declared: { status: string; reason?: string; watch?: string[]; writtenAt?: string } | null;
+  /**
+   * The outcome the session declared (`phase-outcome.sh`), when one is known.
+   * `needs` is the decision key a `blocked`/`needs-human` named with
+   * `--needs` — read BEFORE the prose by `blockerSubKind`'s caller (ZTD-3).
+   */
+  declared: { status: string; reason?: string; watch?: string[]; needs?: string; writtenAt?: string } | null;
   /** The gate as the engine answers it (`--gate-status`): kind `clear|manual|ai|blocked|OVERDUE|…`. */
   gate: { clear: boolean; kind: string; detail?: string } | null;
   /**
@@ -153,8 +178,13 @@ export type PhaseEvidence = {
   gateDelegated?: boolean;
   mcp: { unreachable: string[]; policy?: string } | null;
   health: Array<{ kind: string; severity: string; phase?: number; detail?: string }>;
-  /** A live-session registry hit for this phase (Phase 5); null until then. */
-  registry: { live: boolean; sessionId?: string; owner?: string } | null;
+  /**
+   * A registry hit for this phase: the session the phase's lock names (Phase
+   * 5), or — with NO lock at all — a live session in the repository that could
+   * be about to work it (`peer: true`, REG-3), so `foreign-live` is reachable
+   * from presence alone. Null when the registry knows nothing either way.
+   */
+  registry: { live: boolean; sessionId?: string; owner?: string; peer?: true; pid?: number; cwd?: string } | null;
   qa: { mode: string; result?: string } | null;
   auth: { signedIn: boolean | null; note?: string } | null;
   /** When the evidence was gathered (ISO). */
@@ -183,7 +213,8 @@ export type EvidenceDeps = {
    * never printed — a field declared, documented and dead.
    */
   mcpPolicy?: (slug: string, phase: number) => string | undefined;
-  registry?: (slug: string, phase: number) => PhaseEvidence['registry'];
+  /** Handed the run too, so the phase's OWN sessions are never read as its peers. */
+  registry?: (slug: string, phase: number, run?: RunState | null) => PhaseEvidence['registry'];
   auth?: () => Promise<PhaseEvidence['auth']> | PhaseEvidence['auth'];
   declared?: (slug: string, phase: number) => PhaseEvidence['declared'];
   /**
@@ -290,8 +321,30 @@ export function parseLockStatus(stdout: string, ownerIsOurs: (owner: string) => 
 }
 
 /**
+ * What one PASS over several phases shares (RCV-9): the shell-outs whose
+ * answer does not depend on the phase. `git status` per scope directory and
+ * the plan's health issues are the same question for every candidate; a gate
+ * read is per phase but a pass may ask it twice (the candidate walk, then the
+ * anchor). Keyed by the exact question, holding the promise so concurrent
+ * askers share one answer. A caller that passes none gets the old behaviour —
+ * every call shells out for itself.
+ */
+export type EvidenceCache = {
+  git: Map<string, Promise<string | null>>;
+  gate: Map<string, Promise<PhaseEvidence['gate']>>;
+  health: Map<string, Promise<PhaseEvidence['health']>>;
+  /** How many times the cache answered instead of the shell — for the pass's own record. */
+  hits: number;
+};
+
+export function newEvidenceCache(): EvidenceCache {
+  return { git: new Map(), gate: new Map(), health: new Map(), hits: 0 };
+}
+
+/**
  * Gather the facts for one phase. Shells and reads only what exists; a
- * dependency that is absent leaves its field null.
+ * dependency that is absent leaves its field null. With `cache`, the
+ * phase-independent shell-outs are asked once per pass.
  */
 export async function collectEvidence(
   deps: EvidenceDeps,
@@ -299,17 +352,36 @@ export async function collectEvidence(
   phase: number,
   run: RunState | null,
   board: Record<number, string>,
+  cache?: EvidenceCache,
 ): Promise<PhaseEvidence> {
   const now = deps.now?.() ?? new Date();
   const record = run?.phases[String(phase)] ?? null;
   const handoff = deps.handoff?.(slug, phase) ?? null;
-  const git = deps.git ?? gitIn(deps.root);
+  const rawGit = deps.git ?? gitIn(deps.root);
+  const git = cache
+    ? (args: string[]): Promise<string | null> => {
+      const key = args.join('\u0000');
+      const held = cache.git.get(key);
+      if (held) { cache.hits += 1; return held; }
+      const asked = rawGit(args);
+      cache.git.set(key, asked);
+      return asked;
+    }
+    : rawGit;
+  const memo = <T>(store: Map<string, Promise<T>> | undefined, key: string, ask: () => Promise<T>): Promise<T> => {
+    if (!store) return ask();
+    const held = store.get(key);
+    if (held) { cache!.hits += 1; return held; }
+    const asked = ask();
+    store.set(key, asked);
+    return asked;
+  };
   const dirs = await Promise.resolve(deps.repos?.(slug, phase) ?? []).catch((): string[] => []);
   const [lock, qa, health, gate, auth, work] = await Promise.all([
     Promise.resolve(deps.lock?.(slug, phase) ?? null).catch(() => null),
     Promise.resolve(deps.qa?.(slug, phase) ?? null).catch(() => null),
-    Promise.resolve(deps.health?.(slug) ?? []).catch(() => []),
-    Promise.resolve(deps.gate?.(slug, phase) ?? null).catch(() => null),
+    memo(cache?.health, slug, () => Promise.resolve(deps.health?.(slug) ?? []).catch(() => [])),
+    memo(cache?.gate, `${slug}:${phase}`, () => Promise.resolve(deps.gate?.(slug, phase) ?? null).catch(() => null)),
     Promise.resolve(deps.auth?.() ?? null).catch(() => null),
     workEvidence(git, record?.startedAt ?? null, dirs).catch((): WorkEvidence => ({ did: null, why: 'the working tree could not be read' })),
   ]);
@@ -345,6 +417,7 @@ export async function collectEvidence(
           status: record.declared.status,
           ...(record.declared.reason ? { reason: record.declared.reason } : {}),
           ...(record.declared.watch?.length ? { watch: record.declared.watch } : {}),
+          ...(record.declared.needs ? { needs: record.declared.needs } : {}),
           ...(record.declared.at ? { writtenAt: record.declared.at } : {}),
         }
         : null),
@@ -357,7 +430,7 @@ export async function collectEvidence(
       }
       : null,
     health,
-    registry: deps.registry?.(slug, phase) ?? null,
+    registry: deps.registry?.(slug, phase, run) ?? null,
     qa,
     auth,
     at: now.toISOString(),
@@ -391,6 +464,8 @@ export function recordEvidence(record: PhaseRecord): NonNullable<PhaseEvidence['
     ...(record.waits != null ? { waits: record.waits } : {}),
     ...(record.declared ? { declared: record.declared } : {}),
     ...(record.halt ? { halt: record.halt } : {}),
+    ...(record.cause ? { cause: record.cause } : {}),
+    ...(record.toolDenied ? { toolDenied: record.toolDenied } : {}),
     costUsd: record.costUsd,
     ...(record.turns != null ? { turns: record.turns } : {}),
     ...(record.mcpDegraded?.length ? { mcpDegraded: record.mcpDegraded.map((d) => d.id) } : {}),
@@ -407,7 +482,13 @@ export const MCP_PARK_RE = /MCP server/;
 
 const AUTH_RE = /auth-expired|signed out|not signed in|sign(ed)? in|log ?in required|authentication|invalid api key|OAuth token|credentials? (expired|missing|refused)/i;
 const USAGE_RE = /usage limit|rate limit|too many requests|window (reopens|resets)|limit reached|resets at/i;
-const BUDGET_RE = /budget (of \$|is spent|spent)|spent the .*budget|\bbudget\b.*\bspent\b/i;
+// No budget pattern. A spent RUN budget is a halt of kind `budget`, written by
+// exactly one site (`haltOnBudget`), and the word is the evidence. The regex
+// that used to stand beside it matched the LADDER's own exhaustion sentence
+// ("the phase's ladder budget is spent (3 of 3 rungs)") and the wait budget's
+// ("the wait budget is spent"), so every `resource-wall:budget` the audit found
+// was a different budget re-read as the run's — whose one remedy the console
+// refuses (LFC-8).
 
 /*
  * Sub-kind detection reads the BLOCKER STATEMENT — the declared reason, the
@@ -473,13 +554,14 @@ export function situation(id: SituationId, why: string[], sub?: string): Situati
     key: situationKey(id, sub),
     label: situationLabel(id, sub),
     blurb: SITUATION_BLURBS[id],
-    actor: SITUATION_ACTOR[id],
+    // Sub-kind applied: the four empty sub-tables are a person's (LFC-3).
+    actor: actorFor(id, sub),
     why,
   };
 }
 
 /** The sub-kind of a declared blocker, from what the session wrote and what it watches. */
-export type BlockerSubKind = 'lock' | 'permission' | 'credential' | 'gate' | 'external' | 'unknown';
+export type BlockerSubKind = (typeof SUB_KINDS)['blocked-declared'][number];
 
 export function blockerSubKind(text: string, refs: string[] = []): BlockerSubKind {
   const lower = text ?? '';
@@ -517,7 +599,7 @@ export function classifySituation(e: PhaseEvidence): Situation {
   // (`e.declared`, a session the console did not spawn), then the RECORD's
   // persisted copy — the only witness after a restart. Park-shaped statuses
   // only; a stale `complete`/`partial` in the map says nothing about a park.
-  const parkShaped = (d: { status: string; reason?: string; watch?: string[] } | null | undefined) =>
+  const parkShaped = (d: { status: string; reason?: string; watch?: string[]; needs?: string } | null | undefined) =>
     (d && ['waiting-external', 'blocked', 'needs-human'].includes(d.status) ? d : null);
   const declaredNow = parkShaped(e.declared) ?? parkShaped(rec?.declared);
 
@@ -564,6 +646,19 @@ export function classifySituation(e: PhaseEvidence): Situation {
       ]);
     }
     // Debris over nothing: the lock is not the story; fall through.
+  }
+
+  /* 4b. Nobody has claimed it, and somebody is in the repository (REG-3): a live
+   * session the registry shows here, holding no lock, uncorrelated or working
+   * this very phase. The first minute of every hand session looks exactly like
+   * this, and the ladder must not climb into a tree a person is standing in —
+   * `foreign-live` has no rung, which is the point: wait, never fight. */
+  if (!e.lock && e.registry?.peer && e.registry.live) {
+    return situation('foreign-live', [
+      `no lock is held, but the session registry shows a live Claude session in this repository`
+        + ` (${e.registry.sessionId?.slice(0, 8) ?? 'unnamed'}${e.registry.pid ? `, pid ${e.registry.pid}` : ''}${e.registry.cwd ? `, in ${e.registry.cwd}` : ''})`,
+      'it may be about to claim this phase — a lane boarded beside it would share its working tree',
+    ]);
   }
 
   /* 5. A DECLARED external wait — the park machinery owns it. A wait whose
@@ -707,11 +802,32 @@ export function classifySituation(e: PhaseEvidence): Situation {
   }
 
   /* 9. Resource walls: money, windows, sign-in, models. */
-  if (haltKind === 'budget' || BUDGET_RE.test(haltReason)) {
+  if (haltKind === 'budget') {
     return situation('resource-wall', [`the run stopped on its budget: ${haltReason.slice(0, 160)}`], 'budget');
   }
   if (haltKind === 'models-exhausted') {
     return situation('resource-wall', [`every model fell back: ${haltReason.slice(0, 160)}`], 'model');
+  }
+  // The console's OWN word first (RCV-2, SES-3): the runner's classifier read
+  // the API's refusal, retired the account and halted the run on
+  // `credential-refused`, and it stamped the cause on the record so that a
+  // later rung's result — a `no-handoff`, a reset record — cannot re-open the
+  // question. No prose is consulted for it: `AUTH_RE` never matched the
+  // runner's own "organization policy blocks this credential", which is how
+  // one wall came to be answered with five paid remedies.
+  const wall = rec?.cause?.kind === 'credential-refused'
+    ? rec.cause
+    : haltKind === 'credential-refused' ? { class: undefined, reason: haltReason } : null;
+  if (wall) {
+    return {
+      ...situation('resource-wall', [
+        `the API refused the run's credential${wall.class ? ` (${wall.class})` : ''}: ${(wall.reason ?? haltReason).slice(0, 160)}`,
+        rec?.cause ? 'stamped on the record by the runner when it halted' : 'the run halted with kind credential-refused',
+      ], 'auth'),
+      // The cause was classified from the session's sign-off, and that
+      // sign-off is what a person reads to know which organisation said no.
+      fromSaid: true,
+    };
   }
   if (e.auth?.signedIn === false || (haltKind === 'run-preflight' && AUTH_RE.test(haltReason))
     || AUTH_RE.test(note) || (haltKind === 'needs-human' && AUTH_RE.test(haltReason))) {
@@ -719,10 +835,18 @@ export function classifySituation(e: PhaseEvidence): Situation {
       e.auth?.signedIn === false ? 'the CLI is signed out' : `a sign-in is needed: ${(AUTH_RE.test(note) ? note : haltReason).slice(0, 160)}`,
     ], 'auth');
   }
-  if ((e.run?.status === 'waiting' && e.run.waitUntil) || USAGE_RE.test(haltReason) || USAGE_RE.test(note)
-    || e.run?.limits?.status === 'limited') {
+  // `rejected` is the CLI's own word for a window that refuses requests — one
+  // of the three `rate_limit_event` statuses it documents (`allowed`,
+  // `allowed_warning`, `rejected`; chapter 09 row 34). This arm used to test
+  // `limited`, which the CLI never sends and nothing here writes (SES-9).
+  const rejected = e.run?.limits?.status === 'rejected';
+  if ((e.run?.status === 'waiting' && e.run.waitUntil) || USAGE_RE.test(haltReason) || USAGE_RE.test(note) || rejected) {
     return situation('resource-wall', [
-      e.run?.waitUntil ? `the run is waiting on the usage window until ${e.run.waitUntil}` : `a usage limit: ${(USAGE_RE.test(note) ? note : haltReason).slice(0, 160)}`,
+      e.run?.waitUntil
+        ? `the run is waiting on the usage window until ${e.run.waitUntil}`
+        : USAGE_RE.test(note) || USAGE_RE.test(haltReason)
+          ? `a usage limit: ${(USAGE_RE.test(note) ? note : haltReason).slice(0, 160)}`
+          : `the CLI reported the usage window rejected${typeof e.run?.limits?.utilization === 'number' ? ` at ${Math.round(e.run.limits.utilization * 100)} %` : ''}`,
     ], 'usage');
   }
 
@@ -731,7 +855,17 @@ export function classifySituation(e: PhaseEvidence): Situation {
   if (declaredBlocked) {
     const text = [declaredNow?.reason ?? '', haltReason, note, blockerStatement(e.handoff.outstanding)].filter(Boolean).join('\n');
     const refs = [...(declaredNow?.watch ?? []), ...(rec?.watch ?? [])];
-    const sub = haltKind === 'waiting-external-timeout' ? 'external' : blockerSubKind(text, refs);
+    // The session's own word first (`--needs <key>`, chapter 10 ZTD-3): a
+    // declaration that names its decision key classifies by it whatever the
+    // prose says. The regex cascade is what remains for a declaration that
+    // named none — a 4.1.0 session's, or a key no blocker class points at.
+    // …then the console's OWN denial (LFC-3): a `phase.tool-denied` the hook
+    // wrote for this phase — a deny-list rule, never the wait guard — is the
+    // permission wall itself, read above the prose that used to decide it
+    // (`:unknown` 267 times, each an unblock session into the same wall).
+    const denied = rec?.toolDenied && rec.toolDenied.rule !== 'in-turn-wait' ? rec.toolDenied : null;
+    const sub = haltKind === 'waiting-external-timeout' ? 'external'
+      : (subKindOfNeed(declaredNow?.needs) ?? (denied ? 'permission' : blockerSubKind(text, refs)));
     const why = [
       hstatus === 'blocked' ? 'the handoff reads blocked'
         : e.board === 'stuck' ? 'the board reads stuck (a handoff that is not complete)'
@@ -742,6 +876,9 @@ export function classifySituation(e: PhaseEvidence): Situation {
       ...(e.handoff.outstanding ? [`Outstanding: ${e.handoff.outstanding.replace(/\s+/g, ' ').slice(0, 160)}`] : []),
       ...(declaredNow?.reason ? [`reason: ${declaredNow.reason.slice(0, 160)}`] : []),
       ...(refs.length ? [`watching ${refs.join(', ')}`] : []),
+      ...(denied && sub === 'permission'
+        ? [`the console refused ${denied.tool}${denied.command ? ` \`${denied.command.slice(0, 120)}\`` : ''} under rule ${denied.rule}`]
+        : []),
       `sub-kind ${sub}`,
     ];
     return situation('blocked-declared', why, sub);
@@ -790,14 +927,25 @@ export function classifySituation(e: PhaseEvidence): Situation {
    * situation and today's path exactly. */
   if (!e.handoff.exists && (e.work.did === false || !rec || rec.status === 'pending' || rec.status === 'queued')) {
     const exit = classifyExitSaid(rec?.said);
+    const refusal = exit === 'refusal' ? refusalCauseOf(rec?.said) : undefined;
     const said = rec?.said ? rec.said.replace(/\s+/g, ' ').slice(0, 160) : null;
-    return situation('never-started', [
-      'no handoff exists',
-      e.work.did === false ? e.work.why : `the record reads ${rec?.status ?? 'absent'} and nothing shows work`,
-      ...(rec?.status === 'interrupted' ? [`the session was interrupted${note ? ` (${note.slice(0, 100)})` : ''}`] : []),
-      ...(rec?.closeout?.note ? [`closeout: ${rec.closeout.note.slice(0, 120)}`] : []),
-      ...(exit && said ? [`the session exited without a turn and said: "${said}"`, `sub-kind ${exit}`] : []),
-    ], exit);
+    return {
+      ...situation('never-started', [
+        'no handoff exists',
+        e.work.did === false ? e.work.why : `the record reads ${rec?.status ?? 'absent'} and nothing shows work`,
+        ...(rec?.status === 'interrupted' ? [`the session was interrupted${note ? ` (${note.slice(0, 100)})` : ''}`] : []),
+        ...(rec?.closeout?.note ? [`closeout: ${rec.closeout.note.slice(0, 120)}`] : []),
+        ...(exit && said ? [`the session exited without a turn and said: "${said}"`, `sub-kind ${exit}`] : []),
+        // Which refusal (RCV-2): a policy, an organisation's subscription, an
+        // organisation's policy, a certificate — the errand's `said` quotes the
+        // words, this names the class a person acts on.
+        ...(refusal ? [`refusal cause ${refusal}`] : []),
+      ], exit),
+      // A sub-kind is read from the exit's own words and nothing else: the
+      // errand quotes them (RCV-7). A bare `never-started` read them and found
+      // nothing, so it carries nothing.
+      ...(exit ? { fromSaid: true } : {}),
+    };
   }
   /* An interrupted session over a tree we could not read: resume it rather than guess. */
   if (rec?.status === 'interrupted' && e.work.did === null) {
@@ -844,7 +992,9 @@ export function summariseEvidence(e: PhaseEvidence): string[] {
   if (e.gate && !e.gate.clear) out.push(`gate: ${e.gate.kind}${e.gate.detail ? ` — ${e.gate.detail}` : ''}`);
   if (e.mcp?.unreachable.length) out.push(`mcp: unreachable ${e.mcp.unreachable.join(', ')}${e.mcp.policy ? ` (policy ${e.mcp.policy})` : ''}`);
   if (e.health.length) out.push(`health: ${e.health.map((i) => `${i.severity} ${i.kind}`).join(', ')}`);
-  if (e.registry) out.push(`registry: ${e.registry.live ? 'a live session' : 'no live session'}${e.registry.owner ? ` (${e.registry.owner})` : ''}`);
+  if (e.registry) {
+    out.push(`registry: ${e.registry.live ? 'a live session' : 'no live session'}${e.registry.peer ? ' in the repository, holding no lock' : ''}${e.registry.owner ? ` (${e.registry.owner})` : ''}`);
+  }
   if (e.qa && e.qa.mode !== 'off') out.push(`qa: ${e.qa.mode}${e.qa.result ? ` — ${e.qa.result}` : ' — no verdict'}`);
   if (e.auth && e.auth.signedIn === false) out.push(`auth: signed out${e.auth.note ? ` (${e.auth.note})` : ''}`);
   return out;

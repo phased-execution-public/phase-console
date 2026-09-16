@@ -54,6 +54,13 @@ verb that matches what is actually missing.
 | **Retry with edits…** | The same retry, carrying an instruction and settings for **that attempt only**. |
 | **Skip** | Mark it not-to-be-run. Deliberate, and recorded as such. |
 
+**Recheck**, **Closeout** and **Resume phase** are recoveries, and a phase's recoveries are held to a
+ledger. Pressed again over the evidence the last one already ran under — the board, the handoff, the
+locks and the gate reading exactly as they did — a recovery is refused as *nothing has changed*,
+because running it again would only rewrite the same halt; and a phase recovered six times in one run
+is refused until **Retry** starts it over, which clears the count. Both refusals are journalled
+(`run.recover.refused`).
+
 ### Retrying with edits
 
 Plain Retry boards the phase again with byte-identical settings, which is right when the attempt was
@@ -93,6 +100,12 @@ than asking you to retype it.
 | Unread notifications | **Mark all read**. |
 | A plan that will not parse | The actual issues, each a link to the line, and **Repair the plan with a new agent**. |
 
+The inbox also shows what the console did **without** asking. A **Policy answered** row has nothing to
+press: it says what the console answered by itself, where that answer came from and what the shipped
+default is, and where to answer differently — Settings ▸ Automation ▸ Policy answers, or the plan's
+`## Decisions` table. And a question a session raised on a run whose relay is armed is a row with one
+button per option and its window ticking down — *N s to answer*, then *answering by rule*.
+
 ## A resolved run is annotated, never deleted
 
 It keeps its status, its halt reason and its place on the Runs page — you can see what happened and
@@ -128,6 +141,31 @@ of a stale claim. The ladder is bounded in **rungs and dollars** — per phase, 
 and every cap is a knob on Settings ▸ Automation's ladder card. Every **Ways forward** shows the
 situation, the rungs tried with how each ended, and the rung it tries next, so what you press is
 never something the machine already tried.
+
+**Every rung names who drives it**: the console itself, the console only under `--allow-writes`, a
+fresh session or agent (`--allow-run`, else `--allow-agent`), or nobody — an operator-only rung is a
+person's instruction. A rung this console cannot drive is skipped rather than waited on, and a
+situation none of whose untried rungs can be driven here counts as exhausted: its errand says, rung by
+rung, what is in the way — a flag, a preference, a clock, an account.
+
+**One rung offers instead of acting.** A phase stopped by a rule of the permission policy gets
+**Offer the rule to widen**: the denied rule and the command it stopped on go on an approval card, and
+approving strikes that one rule for this plan and resumes the phase's own session. Nothing spends
+until a person answers; a card nobody answers in twelve hours reads as denied, and the errand stands.
+
+**A refused credential stops the run, not the phase.** When the API refuses the credential the run
+spends — an organisation policy, an expired or signed-out login, a billing hold, a certificate it will
+not trust — the run halts as `credential-refused`, the account is retired for its organisation on this
+machine, so no run picks it again until a person clears it, and the errand names the account and what
+to sign in. That halt and `failure-streak` are the two the convergence loop never relaunches by
+itself: relaunching by clock was exactly what reset the failure streak, and a retired credential would
+only meet the same wall. The phases' own ladders still climb; only your press starts the run again.
+
+**Above every ladder sits the start ceiling.** A console makes at most 40 automatic `claude` starts
+and $250 of session spend in any sliding hour — the two knobs under *Start ceiling* on the same card,
+where `0` switches one off. Past either, nothing automatic starts until the hour frees; the refusal is
+journalled on the run it would have started (`run.start-refused`) and announced once an hour. A
+person's Start, Retry or Continue is never refused by it.
 
 When every rung is spent, or the situation was yours from the start, the phase is parked with
 **one errand**: what is needed, how to give it, what was already tried. That card is the only thing

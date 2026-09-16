@@ -15,6 +15,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
+import { INSTANCE } from '../config.ts';
 import { log } from '../log.ts';
 import {
   CATEGORIES, categoryOf, defaultCategories, routeFor, sanitiseCategories, type CategoryId,
@@ -91,8 +92,26 @@ export type Device = {
 
 export type PublicDevice = Omit<Device, 'endpoint' | 'keys'> & { service: string };
 
+/**
+ * Where a register keeps its key and its devices, and who it speaks as. The
+ * defaults are this console's own. A supervisor in front of several consoles
+ * builds one over a directory of its own — a second VAPID pair, because a
+ * subscription belongs to the key that made it — and each announcement it
+ * carries names the console that spoke (`message.console`), not the register.
+ */
+export type PushOptions = {
+  dir?: string;
+  console?: { id: string; name: string };
+  /** The push services' transport — a test seam, like `deliver`'s own. */
+  fetchImpl?: typeof fetch;
+};
+
 export class Push {
   private devices: Device[] = [];
+  private readonly dir: string;
+  private readonly file: string;
+  private readonly speaker: { id: string; name: string };
+  private readonly fetchImpl: typeof fetch | undefined;
   private vapid: Vapid | null = null;
   /**
    * Why push is off, when it is. A key file that could not be READ never mints
@@ -127,11 +146,25 @@ export class Push {
     category: CategoryId; tag: string; title: string;
     devices: { label: string; outcome: string; detail?: string }[];
   }) => void;
+  /**
+   * Fired when an announcement found NO device to send to (FLT-1): the register
+   * holds none, or none takes the category. Before this the fan-out returned
+   * before a report existed, and `onUndelivered` — guarded on attempts — never
+   * ran, so a console with no device was not "undelivered", it was silent.
+   * `subscribed` is how many devices the register holds at all.
+   */
+  onNoDevice?: (info: { category: CategoryId; tag: string; title: string; subscribed: number }) => void;
+  /** Fired after the register gains or loses a device — what the delivery-channel check re-reads. */
+  onDevicesChanged?: () => void;
   /** Same notification, same device, twice in a row: send it once. */
   private recent = new Map<string, number>();
 
-  constructor(remoteUsers: string[] = []) {
-    const loaded = loadVapid(vapidSubject(remoteUsers));
+  constructor(remoteUsers: string[] = [], opts: PushOptions = {}) {
+    this.dir = opts.dir ?? PUSH_DIR;
+    this.file = join(this.dir, 'subscriptions.json');
+    this.speaker = opts.console ?? CONSOLE;
+    this.fetchImpl = opts.fetchImpl;
+    const loaded = loadVapid(vapidSubject(remoteUsers), this.dir);
     if ('error' in loaded) {
       this.keyFailure = loaded;
     } else {
@@ -141,7 +174,7 @@ export class Push {
     // The register is loaded either way. Devices are NOT dropped because the
     // key is unreadable: the key may come back, and the subscriptions are still
     // theirs. (`read()` here is the DEVICE register, not vapid.ts's.)
-    this.devices = read();
+    this.devices = read(this.file);
   }
 
   /** `''` when there is no key — which the client already reads as "push is off". */
@@ -192,6 +225,7 @@ export class Push {
     this.devices.push(device);
     this.persist();
     log.info('push.subscribed', { id: device.id, label: device.label, service: origin(device.endpoint) });
+    this.devicesChanged();
     return this.publicOf(device);
   }
 
@@ -202,7 +236,14 @@ export class Push {
     if (this.devices.length === before) return false;
     this.persist();
     log.info('push.unsubscribed', { key: key.slice(0, 40) });
+    this.devicesChanged();
     return true;
+  }
+
+  private devicesChanged(): void {
+    try {
+      this.onDevicesChanged?.();
+    } catch { /* a health re-check must never affect the register */ }
   }
 
   setCategories(id: unknown, categories: unknown): PublicDevice | null {
@@ -259,13 +300,34 @@ export class Push {
        * `replace` says "same tag, different message: send it anyway". */
       replace?: boolean;
     },
-  ): void {
+  ): Promise<void> | null {
     // No key, no sends — and deliberately no per-device failure either: a
     // missing key must not burn the 15-strike budget that drops a subscription
     // for good. The environment issue is where this is said, once.
-    if (!this.vapid) return;
+    if (!this.vapid) return null;
     const targets = this.devices.filter((d) => d.categories[category]);
-    if (!targets.length) return;
+    if (!targets.length) {
+      // Nobody to send to is a REPORT, not silence (FLT-1): the record says so,
+      // and the service decides whether a console with no channel is broken.
+      const subscribed = this.devices.length;
+      const report: DeliveryReport = {
+        device: '',
+        label: subscribed ? 'no device takes this category' : 'no device',
+        outcome: 'no-device',
+        detail: subscribed
+          ? `${subscribed} device${subscribed === 1 ? '' : 's'} subscribed, none to ${category}`
+          : 'no device is subscribed to this console',
+      };
+      if (onDelivery) {
+        try {
+          onDelivery(report);
+        } catch { /* annotating a record must never affect a run */ }
+      }
+      try {
+        this.onNoDevice?.({ category, tag: message.tag, title: message.title, subscribed });
+      } catch { /* a health report must never affect delivery */ }
+      return null;
+    }
 
     const urgent = opts?.urgent ?? categoryOf(category).urgent;
     // One entry per device this fan-out actually TRIED, so that "it reached
@@ -297,7 +359,10 @@ export class Push {
       if (!opts?.replace && last && now - last < 5_000) continue;
       this.recent.set(key, now);
 
-      attempts.push(this.sendOne(device, { ...message, category }, urgent).then((result) => {
+      // The console that SPOKE: a register in front of several consoles carries
+      // each one's name through, so the card says which console it is about.
+      const speaker = message.console ?? this.speaker;
+      attempts.push(this.sendOne(device, { ...message, category, console: speaker }, urgent).then((result) => {
         const report: DeliveryReport = {
           device: device.id,
           label: device.label,
@@ -332,6 +397,12 @@ export class Push {
       });
     }
     this.prune(now);
+    // Returned for the one caller that must wait — the shutdown announcement,
+    // whose process exits next (SHD-4). Every attempt resolves (failures are
+    // reports, not rejections), so awaiting this can never throw. Null when
+    // nothing was attempted (every device asleep or just told), which is a
+    // different fact from a send still in flight.
+    return attempts.length ? Promise.all(attempts).then(() => undefined) : null;
   }
 
   /** The Settings button: prove the whole chain, on one device, on demand. */
@@ -347,6 +418,7 @@ export class Push {
       tag: 'push-test',
       url: routeFor('health'),
       category: 'approval',
+      console: this.speaker,
     }, false);
     return result.kind === 'sent'
       ? { ok: true, detail: `accepted by ${origin(device.endpoint)} (${result.status})` }
@@ -360,7 +432,10 @@ export class Push {
     if (!this.vapid) {
       return { kind: 'failed' as const, status: 0, detail: this.keyFailure?.error ?? 'no VAPID key' };
     }
-    const result = await deliver(this.vapid, device, message, { urgent });
+    const result = await deliver(this.vapid, device, message, {
+      urgent,
+      ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
+    });
     const service = origin(device.endpoint);
     switch (result.kind) {
       case 'sent':
@@ -438,18 +513,18 @@ export class Push {
 
   private persist(): void {
     try {
-      mkdirSync(PUSH_DIR, { recursive: true, mode: 0o700 });
+      mkdirSync(this.dir, { recursive: true, mode: 0o700 });
       // These keys let anyone holding them send this device a notification.
-      writeFileSync(FILE, `${JSON.stringify(this.devices, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      writeFileSync(this.file, `${JSON.stringify(this.devices, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     } catch (error) {
       log.warn('push.persist-failed', { error });
     }
   }
 }
 
-function read(): Device[] {
+function read(file: string = FILE): Device[] {
   try {
-    const parsed = JSON.parse(readFileSync(FILE, 'utf8')) as Device[];
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as Device[];
     if (!Array.isArray(parsed)) return [];
     return parsed
       .filter((d) => d?.endpoint && d?.keys?.p256dh && d?.keys?.auth)
@@ -595,7 +670,28 @@ function parseSubscription(input: unknown): (Subscription & { endpoint: string }
   return { endpoint, keys: { p256dh, auth } };
 }
 
-/** A stable tag for a thing, so repeats about it collapse rather than stack. */
+/** This console, as a payload names it. */
+const CONSOLE = { id: INSTANCE.id, name: INSTANCE.name };
+
+/**
+ * A stable tag for a thing, so repeats about it collapse rather than stack —
+ * namespaced by THIS console's instance id before hashing (FLT-4).
+ *
+ * Without the instance the tag was a function of the parts alone, so
+ * `tagFor('health', 'env-doctor')` was byte-identical on every console and
+ * `tagFor('needs-you', slug, phase, …)` collided whenever two consoles ran one
+ * plan slug: on one device (and on the fleet's one subscription) a card from
+ * one console would silently replace another's. `topicFor` hashes the tag, so
+ * the topic is namespaced by the same stroke.
+ */
 export function tagFor(...parts: (string | number | null | undefined)[]): string {
-  return createHash('sha256').update(parts.filter((p) => p != null).join(':')).digest('hex').slice(0, 16);
+  return tagForInstance(INSTANCE.id, ...parts);
+}
+
+/** `tagFor` for a named console — what a test, and a fan-in, compares two consoles with. */
+export function tagForInstance(instance: string, ...parts: (string | number | null | undefined)[]): string {
+  return createHash('sha256')
+    .update([instance, ...parts.filter((p) => p != null)].join(':'))
+    .digest('hex')
+    .slice(0, 16);
 }

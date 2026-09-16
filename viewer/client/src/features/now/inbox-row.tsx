@@ -36,6 +36,7 @@ import { keys, useApiMutation } from '@/lib/queries';
 import { cn } from '@/lib/cn';
 import { Badge, Button, Checkbox, RelativeTime, StatusBadge, toast } from '@/components/ui';
 import { toHash } from '@/app/routes';
+import { useWindowLeft } from '@/lib/clock';
 import { flagReason, splitActions } from './model';
 
 /* ------------------------------------------------------------------ *
@@ -240,6 +241,13 @@ export interface InboxRowProps {
   /** Drop the plan/phase line — the drawer already groups by nothing else. */
   compact?: boolean;
   onOpen?: (href: string) => void;
+  /**
+   * Where the title links, when the row does not live on this console — a list
+   * merged across consoles links each row under its console's mount
+   * (`/c/<id>/#/…`), which `toHash` would fold into a hash of THIS page.
+   * Default: `toHash(item.href)`.
+   */
+  hrefFor?: (item: InboxItem) => string;
 }
 
 export function InboxRow({
@@ -253,12 +261,20 @@ export function InboxRow({
   onCheck,
   compact = false,
   onOpen,
+  hrefFor,
 }: InboxRowProps) {
   const [open, setOpen] = useState(false);
   const { primary, rest } = splitActions(item);
   const ui = SEVERITY_UI[item.severity] ?? 'queued';
   const since = Date.parse(item.since);
-  const where = [item.slug, item.phase != null ? `phase ${item.phase}` : null].filter(Boolean).join(' · ');
+  // A relayed question's window (phase 14): the console answers by rule when it closes.
+  const windowLeft = useWindowLeft(item.expiresAt);
+  const href = hrefFor ? hrefFor(item) : toHash(item.href);
+  // On a list merged across consoles the console comes first — "which console"
+  // is the question before "which plan".
+  const where = [item.console?.name, item.slug, item.phase != null ? `phase ${item.phase}` : null]
+    .filter(Boolean)
+    .join(' · ');
 
   return (
     <li
@@ -296,12 +312,12 @@ export function InboxRow({
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
             <StatusBadge state={ui} label={INBOX_KIND_LABELS[item.kind] ?? item.kind} />
             <a
-              href={toHash(item.href)}
+              href={href}
               onClick={(event) => {
                 if (!onOpen) return;
                 if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
                 event.preventDefault();
-                onOpen(toHash(item.href));
+                onOpen(href);
               }}
               /*
                * `min-w-48` is the title saying what it is worth, and it is the
@@ -328,6 +344,14 @@ export function InboxRow({
                 the honest rendering — see `InboxItem.since`. */}
             {Number.isFinite(since) && (
               <RelativeTime at={since} className="shrink-0 text-2xs text-ink-faint" />
+            )}
+            {/* A window is a clock that ends in somebody else's answer, so it
+                is shown ticking — "55 s" that never moved would read as time
+                in hand after the console had already answered by rule. */}
+            {windowLeft !== null && (
+              <span data-testid="inbox-window" className="shrink-0 font-mono text-2xs text-ink-muted">
+                {windowLeft > 0 ? `${windowLeft} s to answer` : 'answering by rule'}
+              </span>
             )}
           </div>
 
@@ -383,12 +407,12 @@ export function InboxRow({
         ))}
         <Button size="sm" variant="ghost" asChild>
           <a
-            href={toHash(item.href)}
+            href={href}
             onClick={(event) => {
               if (!onOpen) return;
               if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
               event.preventDefault();
-              onOpen(toHash(item.href));
+              onOpen(href);
             }}
           >
             <ExternalLink size={12} aria-hidden />

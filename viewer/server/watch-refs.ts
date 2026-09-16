@@ -111,8 +111,44 @@ export const WATCH_POLL_MS: Readonly<Record<WatchScheme, number>> = Object.freez
 export const WATCH_INELIGIBLE_STATUSES: ReadonlySet<string> =
   new Set(['done', 'skipped', 'running', 'verifying', 'gated']);
 
-/** How often an undelivered LANDING is re-offered to the healer. See `nextDueFor`. */
+/**
+ * Row STATES the scheduler never advances — the row-level twin of
+ * `WATCH_INELIGIBLE_STATUSES`, which lists phase statuses (SLF-7). A `refused`
+ * row is terminal: the policy, the operator's switch or the run cap said this
+ * console will never probe it again, so nothing moves its `nextDueAt`. Left in
+ * the evidence fingerprint's `soonest` scan, a refused `cmd:` row past its due
+ * read as "due" on every pass and moved the term every minute for ever — on a
+ * still-parked phase the healer converged once a minute indefinitely.
+ */
+export const WATCH_INELIGIBLE_ROW_STATES: ReadonlySet<string> = new Set(['refused']);
+
+/**
+ * How soon a fresh LANDING is re-offered to the healer — the first step of
+ * `WATCH_REDELIVER_SERIES_MS`. See `nextDueFor` and `redeliverAfter`.
+ */
 export const WATCH_REDELIVER_MS = 60_000;
+
+/**
+ * The re-offer clock after the healer's drive REJECTED a landing (SLF-8, RCV-8):
+ * one minute, two, five, fifteen, thirty — indexed by how many times this
+ * landing's drive has rejected. A flat minute retried a foreign-lock rejection
+ * sixty times an hour for the whole lease (134 warnings in 108 minutes); the
+ * series is the floor, and a rejection that names its own clock (a lease's end)
+ * waits for that instead when it is later — `redeliverAfter`.
+ */
+export const WATCH_REDELIVER_SERIES_MS: readonly number[] = Object.freeze([60_000, 120_000, 300_000, 900_000, 1_800_000]);
+
+/**
+ * When a rejected landing is next offered: the series step for this many
+ * rejections (the last step repeats), or the rejection's own clock when that is
+ * later — a foreign lock's `lease_until` is the moment the rejection stops
+ * being true, and a minute before it is a minute wasted.
+ */
+export function redeliverAfter(rejections: number, now: number, until?: number | null): number {
+  const step = WATCH_REDELIVER_SERIES_MS[Math.min(Math.max(rejections, 1), WATCH_REDELIVER_SERIES_MS.length) - 1];
+  const due = now + step;
+  return typeof until === 'number' && Number.isFinite(until) && until > due ? until : due;
+}
 
 /** The floor the scheduler's own timer never goes below, however near a ref is due. */
 export const WATCH_FLOOR_MS = 60_000;
@@ -223,6 +259,47 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
     return command ? { kind: 'cmd', command, ref } : null;
   }
   return null;
+}
+
+/** The five shapes, in words — what a person needs beside a ref nothing can poll. */
+export const WATCH_REF_SHAPES =
+  'gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · cmd:"<command>"';
+
+/**
+ * Why `parseWatchRef` would not poll this ref, or null when it would.
+ *
+ * `parseWatchRef` answers null for every refusal and its readers need nothing
+ * more; the park needs the REASON, because a declared ref that nothing will ever
+ * probe used to be dropped without a word (WAI-11) — a session that said exactly
+ * how to know its wait was over got silence and a clock instead.
+ */
+export function watchRefProblem(ref: string): string | null {
+  if (typeof ref !== 'string' || !ref.trim()) return 'an empty ref';
+  if (parseWatchRef(ref)) return null;
+  if (ref.startsWith('gh:')) return 'a gh: ref is gh:<owner/repo>#run/<id> or gh:<owner/repo>#pr/<n>';
+  if (ref.startsWith('date:') || ref.startsWith('until:')) return 'not a real ISO8601 instant (date:2026-09-20T06:00:00Z)';
+  if (ref.startsWith('lock:')) return 'a lock: ref is lock:<slug>/<phase>';
+  if (ref.startsWith('cmd:')) return 'a cmd: ref names no command';
+  return `no watch scheme — the console polls ${WATCH_REF_SHAPES}`;
+}
+
+/** The declared refs nothing will poll, each with why — in declaration order, deduped. */
+export function unpollableRefs(refs: readonly string[] | undefined | null): { ref: string; reason: string }[] {
+  const seen = new Set<string>();
+  const out: { ref: string; reason: string }[] = [];
+  for (const ref of refs ?? []) {
+    const reason = watchRefProblem(ref);
+    if (!reason || seen.has(ref)) continue;
+    seen.add(ref);
+    out.push({ ref, reason });
+  }
+  return out;
+}
+
+/** A `date:`/`until:` ref's instant, or null for any other ref — what a countersign reads. */
+export function dateOfRef(ref: string): number | null {
+  const target = parseWatchRef(ref);
+  return target?.kind === 'date' ? target.at : null;
 }
 
 /** The pollable subset of a declared watch list, in declaration order, deduped. */

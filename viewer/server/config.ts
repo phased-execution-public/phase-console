@@ -6,6 +6,7 @@
  * skill repo, which stays free of machine-local state.
  */
 
+import { DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR } from './start-ceiling.ts';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { homedir } from 'node:os';
@@ -16,7 +17,7 @@ import {
   DEFAULT_PORT, PORT_RANGE_SIZE, PORT_RANGE_START,
   configDir, defaultInstance, getInstance, instanceId, instancePrefsPath,
   instanceStateDir as sharedStateDir, isDefaultRoot,
-  listInstances, preferredPort, readProjectFile, registerInstance, reservedPorts,
+  listInstances, preferredPort, profileFor, readProjectFile, registerInstance, reservedPorts,
   stateHome, unitName,
 } from '../shared/instances.mjs';
 import { STALL_DEFAULTS, STALL_ESCALATE_MS, STALL_LOCAL_JOB_MS } from '../shared/attention-model.js';
@@ -24,6 +25,9 @@ import {
   AUTOMATION_MAP, AUTOMATION_KEYS, toAutomation, fromAutomation, resumeAtBootMode,
   type ResumeAtBootMode,
 } from '../shared/automation-model.js';
+import { sanitisePolicyPrefs } from '../shared/policy-model.js';
+import { sanitiseRelayRules, type RelayRule } from '../shared/relay-model.js';
+import type { DecisionKey } from '../shared/decisions-model.js';
 import { sanitiseSchedule, type SchedulePolicy } from '../shared/schedule-policy.js';
 import {
   DEFAULT_SETTLE, isolationMode, settleOf, WORKTREE_DEFAULTS, reclaimModeOf,
@@ -138,14 +142,19 @@ export type Flags = {
   remoteUsers: string[];
   scriptsDir: string;
   /**
-   * How many phase sessions may be live across the whole console at once.
+   * How many phase sessions may be live across THIS console at once.
    *
-   * A ceiling on the machine, not on the scheduler's judgement: scope decides
-   * whether two phases *may* overlap, and this decides how many the laptop
-   * running them can actually stand. Three is a deliberate default — each lane
-   * is a full `claude` process with its own context, and the account's usage
-   * window is shared between them, so the fourth lane usually buys throttling
-   * rather than throughput. `--max-sessions`, or `PHASE_CONSOLE_MAX_SESSIONS`.
+   * A ceiling on the console, not on the scheduler's judgement: scope decides
+   * whether two phases *may* overlap, and this decides how many this console
+   * starts. Three is a deliberate default — each lane is a full `claude`
+   * process with its own context, and the account's usage window is shared
+   * between them, so the fourth lane usually buys throttling rather than
+   * throughput. `--max-sessions`, or `PHASE_CONSOLE_MAX_SESSIONS`.
+   *
+   * It is per console, and it used to be documented as a ceiling on the
+   * machine (FLT-7) — two consoles each admitted up to their own. The MACHINE
+   * ceiling is `fleet.json` `maxSessions`, held across every console through
+   * one lane token per live lane (`server/fleet.ts MachineLanes`).
    */
   maxSessions: number;
   /**
@@ -164,7 +173,43 @@ export type Flags = {
   defaultSkills: string[];
   /** Where the structured log goes. `null` disables file logging entirely. */
   logFile: string | null;
+  /**
+   * What this console took from the machine profile (`fleet.json`, zero-touch
+   * phase 17, FLT-3) and where each setting it runs with came from — a flag or
+   * the environment beats this console's own `overrides`, which beat the
+   * machine-wide value. On `state().profile`, so an inherited or overridden
+   * setting is visible rather than a surprise. Absent on a hand-built `Flags`.
+   */
+  profile?: ProfileInheritance;
 };
+
+/** Where one setting a console runs with came from. */
+export type ProfileSource = 'flag' | 'env' | 'override' | 'profile';
+
+export type ProfileInheritance = {
+  /** The profile file read at boot, and whether it exists. */
+  path: string;
+  present: boolean;
+  /** Each setting the profile could supply, with the source of the value in force. */
+  sources: Partial<Record<'remoteHosts' | 'remoteUsers' | 'notifyCommand' | 'webhooks' | 'categories' | 'quietHours' | 'maxSessions', ProfileSource>>;
+  /** Profile fields this console overrides for itself (`instances.<id>.overrides`). */
+  overridden: string[];
+};
+
+/**
+ * The operator's out-of-band notifier: `PHASE_CONSOLE_NOTIFY`, else the machine
+ * profile's `notifyCommand` (this console's override first). Still never a
+ * browser-settable preference — it runs a command on this machine, and the
+ * profile is a file only a shell writes.
+ */
+export function notifyCommand(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (env.PHASE_CONSOLE_NOTIFY) return env.PHASE_CONSOLE_NOTIFY;
+  try {
+    return profileFor(INSTANCE.id, env).notifyCommand ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Machine-local state that is neither preference nor repo content: the log,
@@ -419,6 +464,7 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
   // operator said 4123" are different answers: the first defers to the project
   // file and the registry, the second beats both.
   let explicitPort: number | undefined;
+  let usersFromFlag = false;
   const flags: Flags = {
     port: 0,
     host: '127.0.0.1',
@@ -461,7 +507,7 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     else if (arg === '--allow-mcp') flags.allowMcp = true;
     else if (arg === '--allow-webhooks') flags.allowWebhooks = true;
     else if (arg === '--remote') flags.remoteHosts.push(...splitList(next()));
-    else if (arg === '--remote-user') flags.remoteUsers.push(...splitList(next()));
+    else if (arg === '--remote-user') { usersFromFlag = true; flags.remoteUsers.push(...splitList(next())); }
     else if (arg === '--scripts') flags.scriptsDir = resolve(expandHome(next() ?? ''));
     else if (arg === '--max-sessions') flags.maxSessions = positive(next()) ?? flags.maxSessions;
     // Repeatable and additive to the environment, like --remote: an operator
@@ -471,6 +517,7 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     else if (arg === '--no-log-file') flags.logFile = null;
     else if (arg === '--help' || arg === '-h') { printHelp(); process.exit(0); }
   }
+  flags.profile = inheritProfile(flags, instance, usersFromFlag);
   // Hostnames and logins are compared, never displayed, so they are folded once
   // here rather than at every comparison site.
   flags.remoteHosts = unique(flags.remoteHosts.map((h) => h.toLowerCase().replace(/\.$/, '')));
@@ -486,6 +533,44 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     isDefault: instance.default,
   });
   return flags;
+}
+
+/**
+ * Fill what the operator did not say from the machine profile (FLT-3).
+ *
+ * Per field, flags and the environment first — an operator who types
+ * `--remote` wins an argument with a file — then this console's `overrides`,
+ * then the machine-wide value. Remote access is inherited as a PAIR where it
+ * has to be: a profile host with no login anywhere, or logins with no host,
+ * would make `flagsRefusal` stop a console from booting over a half-written
+ * file, so a half is left alone and the console boots local-only.
+ */
+function inheritProfile(flags: Flags, instance: Instance, usersFromFlag: boolean): ProfileInheritance {
+  let inherited: ReturnType<typeof profileFor>;
+  try {
+    inherited = profileFor(instance.id);
+  } catch {
+    return { path: '', present: false, sources: {}, overridden: [] };
+  }
+  const sources: ProfileInheritance['sources'] = {};
+  if (flags.remoteHosts.length) sources.remoteHosts = 'flag';
+  if (flags.remoteUsers.length) sources.remoteUsers = usersFromFlag ? 'flag' : 'env';
+  const profileUsers: string[] = inherited.remoteUsers ?? [];
+  if (!flags.remoteHosts.length && inherited.remoteHost && (flags.remoteUsers.length || profileUsers.length)) {
+    flags.remoteHosts = [inherited.remoteHost];
+    sources.remoteHosts = inherited.sources.remoteHost;
+  }
+  if (flags.remoteHosts.length && !flags.remoteUsers.length && profileUsers.length) {
+    flags.remoteUsers = [...profileUsers];
+    sources.remoteUsers = inherited.sources.remoteUsers;
+  }
+  if (process.env.PHASE_CONSOLE_NOTIFY) sources.notifyCommand = 'env';
+  else if (inherited.notifyCommand) sources.notifyCommand = inherited.sources.notifyCommand;
+  for (const key of ['webhooks', 'categories', 'quietHours'] as const) {
+    if (inherited[key] !== undefined) sources[key] = inherited.sources[key];
+  }
+  if (inherited.maxSessions != null) sources.maxSessions = 'profile';
+  return { path: inherited.path, present: inherited.present, sources, overridden: inherited.overridden };
 }
 
 /**
@@ -982,6 +1067,16 @@ export type Prefs = {
    * simply did not ask.
    */
   watchCmdRefs?: boolean;
+  /**
+   * May the watch clock RUN a `cmd:` ref the CONSOLE minted — the watchdog's
+   * automatic park lifts the command a session was polling with out of a Bash
+   * tool summary and files it as a watch ref (`declared.minted`). Off (shipped):
+   * a minted ref is written once as `unknown` and never run, because the
+   * console's own inference must not execute a writing command against a
+   * repository nobody is watching (SLF-8); the park still resumes on its clock.
+   * On: minted refs run under exactly the policy `watchCmdRefs` gives declared ones.
+   */
+  watchMintedCmdRefs?: boolean;
   mcpPolicy?: McpPolicy;
   /**
    * The remediation ladder (`runner/ladder.ts`) — what the autopilot may try
@@ -1002,13 +1097,20 @@ export type Prefs = {
    *   account with headroom instead of halting.
    * - `delegateHumanGates`: a `human` gate is briefed to the phase's own
    *   session to VERIFY and clear, instead of stopping the run for a person.
-   *   **Off by default, and deliberately so** — the plan author wrote `human`,
-   *   and a gate that says "the owner approves the visual result" is not a
-   *   thing a session can judge. What makes delegation safe is not trust: the
-   *   brief requires cited evidence per condition and STOPS with the condition
-   *   named when it has none (`phase-outcome.sh … blocked`). Turn it on for a
-   *   plan whose gates are machine-verifiable in practice; `gate-status.md`
-   *   already records such approvals as `by: ai-session-delegated`.
+   *   **On by default since 5.0.0** (phase 11 of zero-touch-console, operator
+   *   decision 11: `gates: delegated`) — it is this console's word for the
+   *   manifest's `gates` row, below a plan's own `## Decisions` row and
+   *   `policy.gates`, and a gate whose conditions are not written stays a
+   *   person's whatever the switch says. What makes delegation safe is not
+   *   trust: the brief requires cited evidence per condition and STOPS with
+   *   the condition named when it has none (`phase-outcome.sh … blocked`);
+   *   `gate-status.md` records such approvals as `by: ai-session-delegated`.
+   * - `policy`: this console's answers to the decision manifest's rows
+   *   (`shared/policy-model.js` `DECISION_ANSWERS`), keyed by decision key —
+   *   `{ "qa.exhausted": "halt", "ambiguity": "ask" }`. Read below a plan's
+   *   `## Decisions` row and above the shipped defaults; an unknown key or word
+   *   is dropped. Phase 12's policy editor writes it; until then a hand edit of
+   *   `config.json` or `POST /api/prefs`.
    * - `convergeEveryMs`: how often the convergence loop re-reads every open
    *   plan even when nothing happened (default 5 min). 0 disables the timer;
    *   boot, change and post-halt passes still run.
@@ -1018,9 +1120,18 @@ export type Prefs = {
   ladderPerRunRungs?: number;
   ladderPerRunUsd?: number;
   ladderPerDayUsd?: number;
+  /**
+   * The start ceiling (`start-ceiling.ts`, SLF-1): how many AUTOMATIC
+   * `claude` starts this instance may make per sliding hour, and how many
+   * session dollars the last hour may hold before the next automatic start is
+   * refused. A person's press is never counted. 0 switches a limit off.
+   */
+  ceilingStartsPerHour?: number;
+  ceilingUsdPerHour?: number;
   unblockAttempts?: boolean;
   staleClaimTakeover?: boolean;
   delegateHumanGates?: boolean;
+  policy?: Partial<Record<DecisionKey, string>>;
   /**
    * Two opt-ins from the automation posture sweep (console-parallel-repaint
    * P12), both off by default:
@@ -1074,6 +1185,14 @@ export type Prefs = {
    */
   boardingSchedule?: SchedulePolicy;
   /**
+   * This console's relay rules (zero-touch-console phase 14): for a question
+   * whose key matches, the option the console answers when nobody else did —
+   * ahead of the `(Recommended)` option and the first. A small list, coerced by
+   * `sanitiseRelayRules` beside the matcher that reads it, replaced wholesale on
+   * every write like `boardingSchedule`, and edited in the policy card.
+   */
+  relayRules?: RelayRule[];
+  /**
    * When a lane that is still alive stops being work (`runner/liveness.ts`).
    *
    * - `stallSilentMs`: no PRODUCTIVE output for this long is `silent` (default
@@ -1115,6 +1234,14 @@ export type Prefs = {
   stallExternalWaitMs?: number;
   stallLocalJobMs?: number;
   /**
+   * Whether the stall watchdog may PARK a lane by itself — the automatic park
+   * `external-wait` makes (default on). The KNOWN-SINCE off switch (SLF-9): the
+   * signal still raises its card and the local job's nudge still goes, but no
+   * lane is checkpointed and parked in the session's place. `stallExternalWaitMs:
+   * 0` is the stronger word — no `external-wait` signal at all.
+   */
+  stallAutomaticPark?: boolean;
+  /**
    * How long an unresolved stall waits before it is said once more, urgently.
    *
    * Not a detector threshold and so not a member of `STALL_DEFAULTS` (which is
@@ -1151,14 +1278,16 @@ const DEFAULT_PREFS: Prefs = {
   isolation: 'queue', settle: DEFAULT_SETTLE, ...WORKTREE_DEFAULTS,
   isolationReclaim: 'clean-only', deleteMergedRunBranches: true,
   reviewEachPhaseByDefault: false, reviewerPolicy: 'comment-only',
-  autoRecoverByDefault: true, autoContinueRecovery: true, watchCmdRefs: true, mcpPolicy: 'continue',
+  autoRecoverByDefault: true, autoContinueRecovery: true, watchCmdRefs: true, watchMintedCmdRefs: false, mcpPolicy: 'continue',
   ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
+  ceilingStartsPerHour: DEFAULT_STARTS_PER_HOUR, ceilingUsdPerHour: DEFAULT_USD_PER_HOUR,
   unblockAttempts: true, staleClaimTakeover: true, resumeAtBoot: 'ask', autoAccountSwitch: true,
-  delegateHumanGates: false, allowUnverifiedPhases: false, ladderExtendOnProgress: false,
+  delegateHumanGates: true, policy: {}, allowUnverifiedPhases: false, ladderExtendOnProgress: false,
   convergeEveryMs: 300_000,
   budgetAutoRaisePct: 25, mcpRequireTimeoutMs: 1_800_000,
   boardingSchedule: sanitiseSchedule(undefined),
-  ...STALL_DEFAULTS, stallEscalateMs: STALL_ESCALATE_MS,
+  relayRules: [],
+  ...STALL_DEFAULTS, stallEscalateMs: STALL_ESCALATE_MS, stallAutomaticPark: true,
   notify: sanitiseCategories(undefined),
 };
 
@@ -1261,13 +1390,14 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   | 'isolation' | 'settle' | 'worktreeMaxConcurrent' | 'worktreeSetup' | 'worktreeCopyEnv' | 'worktreeRoot'
   | 'isolationReclaim' | 'deleteMergedRunBranches'
   | 'reviewEachPhaseByDefault' | 'reviewerPolicy'
-  | 'autoRecoverByDefault' | 'autoContinueRecovery' | 'watchCmdRefs' | 'mcpPolicy'
+  | 'autoRecoverByDefault' | 'autoContinueRecovery' | 'watchCmdRefs' | 'watchMintedCmdRefs' | 'mcpPolicy'
   | 'ladderPerPhaseRungs' | 'ladderPerPhaseUsd' | 'ladderPerRunRungs' | 'ladderPerRunUsd' | 'ladderPerDayUsd'
+  | 'ceilingStartsPerHour' | 'ceilingUsdPerHour'
   | 'unblockAttempts' | 'staleClaimTakeover' | 'resumeAtBoot' | 'autoAccountSwitch'
-  | 'delegateHumanGates' | 'allowUnverifiedPhases' | 'ladderExtendOnProgress' | 'convergeEveryMs'
-  | 'budgetAutoRaisePct' | 'mcpRequireTimeoutMs' | 'boardingSchedule'
+  | 'delegateHumanGates' | 'policy' | 'allowUnverifiedPhases' | 'ladderExtendOnProgress' | 'convergeEveryMs'
+  | 'budgetAutoRaisePct' | 'mcpRequireTimeoutMs' | 'boardingSchedule' | 'relayRules'
   | 'stallSilentMs' | 'stallSpinTurns' | 'stallStalemateAttempts' | 'stallRetryBurst'
-  | 'stallExternalWaitMs' | 'stallLocalJobMs' | 'stallEscalateMs'> {
+  | 'stallExternalWaitMs' | 'stallLocalJobMs' | 'stallEscalateMs' | 'stallAutomaticPark'> {
   const bool = (value: unknown, fallback: boolean): boolean => (typeof value === 'boolean' ? value : fallback);
   // A cap is a finite, non-negative number or it is the default — a string,
   // a negative or NaN in config.json must never turn the ladder unbounded
@@ -1320,14 +1450,18 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     autoRecoverByDefault: bool(parsed.autoRecoverByDefault, true),
     autoContinueRecovery: bool(parsed.autoContinueRecovery, true),
     watchCmdRefs: bool(parsed.watchCmdRefs, true),
+    watchMintedCmdRefs: bool(parsed.watchMintedCmdRefs, false),
     mcpPolicy: parsed.mcpPolicy === 'require' ? 'require' : 'continue',
     ladderPerPhaseRungs: cap(parsed.ladderPerPhaseRungs, 3),
     ladderPerPhaseUsd: cap(parsed.ladderPerPhaseUsd, 100),
     ladderPerRunRungs: cap(parsed.ladderPerRunRungs, 10),
     ladderPerRunUsd: cap(parsed.ladderPerRunUsd, 400),
     ladderPerDayUsd: cap(parsed.ladderPerDayUsd, 600),
+    ceilingStartsPerHour: cap(parsed.ceilingStartsPerHour, DEFAULT_STARTS_PER_HOUR),
+    ceilingUsdPerHour: cap(parsed.ceilingUsdPerHour, DEFAULT_USD_PER_HOUR),
     unblockAttempts: bool(parsed.unblockAttempts, true),
-    delegateHumanGates: bool(parsed.delegateHumanGates, false),
+    delegateHumanGates: bool(parsed.delegateHumanGates, true),
+    policy: sanitisePolicyPrefs(parsed.policy),
     allowUnverifiedPhases: bool(parsed.allowUnverifiedPhases, false),
     ladderExtendOnProgress: bool(parsed.ladderExtendOnProgress, false),
     staleClaimTakeover: bool(parsed.staleClaimTakeover, true),
@@ -1341,6 +1475,9 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     // because the failure direction that costs money is a malformed schedule
     // silently reading as "board at any hour".
     boardingSchedule: sanitiseSchedule(parsed.boardingSchedule),
+    // The relay's rules: a rule missing its key or its answer is DROPPED, never
+    // repaired — a repaired rule answers a question nobody wrote it for.
+    relayRules: sanitiseRelayRules(parsed.relayRules),
     // A stall threshold of zero would fire on every lane on its first tick, so
     // these take `positive` rather than `cap`: unlike a ladder cap, there is no
     // meaning to give a zero here, and the shipped number is the honest answer
@@ -1349,10 +1486,15 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     stallSpinTurns: positive(parsed.stallSpinTurns, STALL_DEFAULTS.stallSpinTurns),
     stallStalemateAttempts: positive(parsed.stallStalemateAttempts, STALL_DEFAULTS.stallStalemateAttempts),
     stallRetryBurst: positive(parsed.stallRetryBurst, STALL_DEFAULTS.stallRetryBurst),
-    stallExternalWaitMs: positive(parsed.stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs),
+    // The exception to the rule above, and the reason it is spelled out: a zero
+    // here does have a meaning — "never call a lane waiting" — and Settings has
+    // promised it ("0 never parks a lane for waiting") while `positive` quietly
+    // turned it back into five minutes (SLF-9, KNOWN-SINCE).
+    stallExternalWaitMs: cap(parsed.stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs),
     stallLocalJobMs: positive(parsed.stallLocalJobMs, STALL_LOCAL_JOB_MS),
-    // `cap`, not `positive`, and it is the one stall number where that is
-    // right: a zero detector threshold would flag every lane on its first tick
+    stallAutomaticPark: bool(parsed.stallAutomaticPark, true),
+    // `cap`, not `positive`, for the same reason as the external-wait clock
+    // above: a zero detector threshold would flag every lane on its first tick
     // (nonsense), but a zero HERE means "never say it twice" — exactly what
     // this console did before the escalation existed, and a setting an
     // operator can genuinely want.

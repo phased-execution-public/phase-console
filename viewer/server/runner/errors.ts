@@ -8,16 +8,17 @@
  * only ever acts on the disposition.
  *
  * The division of labour matters: Claude Code already retries 429/529,
- * timeouts and dropped connections up to `CLAUDE_CODE_MAX_RETRIES` (10) with
- * exponential backoff, and `CLAUDE_CODE_RETRY_WATCHDOG=1` — documented for
- * exactly this case, "CI/unattended sessions" — makes it retry 429/529
- * indefinitely and raises other transient retries to ~3 hours. We set that on
- * the child and do NOT reimplement backoff here. What reaches this module is
+ * timeouts and dropped connections with exponential backoff, and
+ * `CLAUDE_CODE_RETRY_WATCHDOG=1` — documented for exactly this case,
+ * "CI/unattended sessions" — makes it retry 429/529 indefinitely. We set that
+ * on the child and do NOT reimplement backoff here. What reaches this module is
  * what the CLI gave up on, plus the things it cannot decide: whether to wait
  * out a plan limit, drop to a cheaper model, resume with a bigger budget, or
  * stop and fetch a human.
  */
 
+import type { EndedBy } from '../../shared/run-lifecycle.js';
+import type { CredentialClass } from '../../shared/ops-vocab.js';
 import { MODELS_ENV_FALLBACK, modelFamily } from './models.ts';
 
 export type Disposition =
@@ -43,11 +44,34 @@ export type Disposition =
    * account can act on the discriminant instead of string-matching the
    * reason. `at` rides along as the reset time it named.
    */
-  | { kind: 'needs-human'; reason: string; cause?: 'usage-window'; at?: Date }
+  | {
+    kind: 'needs-human'; reason: string;
+    /**
+     * `usage-window`: a reset too far away to sleep on — the one park that IS
+     * fixable without a person, so a runner holding another account can act on
+     * the discriminant instead of string-matching the reason.
+     */
+    cause?: 'usage-window';
+    at?: Date;
+  }
+  /**
+   * The API refused the run's OWN credential: an organisation policy, an
+   * expired or signed-out login, a billing hold, a certificate it would not
+   * accept. Its own kind since zero-touch-console phase 9 (RCV-1, SES-2): it
+   * used to ride `needs-human` as `cause: 'credential'`, and `needs-human` is
+   * a PHASE-level halt — so one blocked credential settled the phase and the
+   * loop boarded the next, ten times in 157 s. The runner retires the
+   * account's organisation (`leaveAccount`) and halts the RUN on it; `class`
+   * is the owner's word (`shared/ops-vocab.js` `CREDENTIAL_CLASSES`).
+   */
+  | { kind: 'credential-refused'; reason: string; class: CredentialClass }
   /** The phase itself failed. Runner decides retry-vs-halt by its own counters. */
   | { kind: 'phase-failed'; reason: string }
   /** Finished normally. */
   | { kind: 'ok' };
+
+/** One tool call the CLI's permission system denied, from `result.permission_denials`. */
+export type PermissionDenial = { tool: string; toolUseId?: string; target?: string };
 
 export type StopSignal = {
   /** `subtype` from the result message, when one arrived. */
@@ -62,7 +86,35 @@ export type StopSignal = {
   retryCategories?: string[];
   /** The model the run used, so a switch can be proposed sensibly. */
   model?: string;
+  /**
+   * The result message's own error bit. It disqualifies `success` before any
+   * text is read (SES-5): a TLS-interception error the patterns below do not
+   * know was twice recorded as a completed phase.
+   */
+  isError?: boolean;
+  /** The result's `permission_denials` — the CLI's authoritative record of what it refused. */
+  permissionDenials?: PermissionDenial[];
+  /** Who ended the session. Anything but `exit` means the console did, before the turn was done. */
+  endedBy?: EndedBy;
+  /** The ender's own words — the spawn watchdogs' diagnosis. */
+  endedReason?: string;
+  /** The result's `terminal_reason`: `completed`, `aborted_tools`, `max_turns`, `tool_deferred`… */
+  terminalReason?: string;
+  /** Background tasks the CLI started and never reported finished. */
+  backgroundTasks?: { id: string; description: string }[];
 };
+
+/**
+ * The CLI's `system/api_retry` `error` values — the closed set the docs give
+ * (chapter 09 row 31, CLI 2.1.270). The category is this field and nothing
+ * else; `error_category` is a different message's (`tool_progress
+ * .subagent_retry`), over a narrower set.
+ */
+export const API_RETRY_ERRORS = Object.freeze([
+  'authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'billing_error',
+  'rate_limit', 'overloaded', 'invalid_request', 'model_not_found', 'server_error',
+  'max_output_tokens', 'cloud_credential_error', 'unknown',
+] as const);
 
 /** Past this, sitting and waiting is worse than telling someone. */
 export const MAX_AUTO_WAIT_MS = 12 * 60 * 60 * 1000;
@@ -279,8 +331,19 @@ const RE = {
   auth: /please run \/login|not logged in|invalid api key|invalid x-api-key|oauth (token|session) (expired|revoked|invalid)|failed to authenticate|could not be refreshed|(^|[·|\n]\s*)login expired|authentication_error|could not resolve authentication|api error:?\s*401|401 unauthorized/i,
   billing: /credit balance is too low|insufficient credits|usage credits required|billing (error|issue|problem)|spend limit (reached|exceeded)|payment (required|method)/i,
   orgPolicy: /organization has (been )?disabled|oauth_org_not_allowed|disabled api key authentication|disabled claude subscription/i,
+  // A TLS interception (a corporate proxy, an MITM appliance) between this
+  // machine and the API. Measured twice in the audit's zero-cost sessions as
+  // "API Error: Unable to connect to API: Self-signed certificate detected."
+  // and classified as nothing — so the phase re-boarded into the same wall.
+  // Node's own error codes ride beside the sentence for the day the CLI
+  // prints the code rather than the prose.
+  certificate: /self.signed certificate|certificate (verify|verification|validation) failed|unable to (get local issuer|verify the first) certificate|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID/i,
   serverError: /api error:?\s*5\d\d|internal server error/i,
   timeout: /request timed out/i,
+  // The CLI's own sentence when its background-task ceiling ends a `-p` run:
+  // "Background tasks still running after 600s; terminating." The work those
+  // tasks were doing was killed with the process group (SES-12).
+  bgTasks: /Background tasks still running after (\d+)\s*s\b/i,
 };
 
 /**
@@ -298,21 +361,69 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
   // value goes on to verify work that was never attempted, on every remaining
   // phase, until something else stops it. What the output says outranks what
   // the exit status claims.
-  const brokenCredentials = RE.orgPolicy.test(text) || cats.includes('oauth_org_not_allowed')
-    ? 'organization policy blocks this credential'
-    : RE.auth.test(text) || cats.includes('authentication_failed')
-      // Deliberately account-agnostic: this classifier cannot see which login
-      // the session ran as, and "run /login in this workspace" was flatly
-      // wrong advice for a profile or token account. The runner appends the
-      // account id; the service composes the exact command.
-      ? 'authentication failed — the session\'s Claude login is expired or signed out; '
-        + 'sign that account in again, then continue the run'
-      : RE.billing.test(text) || cats.includes('billing_error')
-        ? 'billing or credit balance needs attention'
-        : null;
-  if (brokenCredentials) return { kind: 'needs-human', reason: brokenCredentials };
+  const brokenCredentials: { reason: string; class: CredentialClass } | null =
+    RE.orgPolicy.test(text) || cats.includes('oauth_org_not_allowed')
+      ? { reason: 'organization policy blocks this credential', class: 'org-policy' }
+      : RE.auth.test(text) || cats.includes('authentication_failed')
+        // Deliberately account-agnostic: this classifier cannot see which login
+        // the session ran as, and "run /login in this workspace" was flatly
+        // wrong advice for a profile or token account. The runner appends the
+        // account id; the service composes the exact command.
+        ? {
+          reason: 'authentication failed — the session\'s Claude login is expired or signed out; '
+            + 'sign that account in again, then continue the run',
+          class: 'auth',
+        }
+        : RE.billing.test(text) || cats.includes('billing_error') || cats.includes('account_on_hold')
+          ? { reason: 'billing or credit balance needs attention', class: 'billing' }
+          : RE.certificate.test(text)
+            // Not the credential's fault and not the phase's: the connection
+            // itself is intercepted. Filed as a credential class all the same,
+            // because the remedy is identical — nothing this run can spend
+            // gets through, and a person has to change the machine or the account.
+            ? {
+              reason: 'the API refused the connection: a certificate this machine does not trust '
+                + '(a self-signed or intercepting certificate) — fix the trust store or the proxy, then continue the run',
+              class: 'certificate',
+            }
+            : null;
+  if (brokenCredentials) return { kind: 'credential-refused', ...brokenCredentials };
 
-  if (signal.subtype === 'success') return { kind: 'ok' };
+  // The spawn's own clock ended this child — the first-event backstop or the
+  // init→result bound (SES-10, SES-11). Its diagnosis is precise and its remedy
+  // is mechanical, so it is a retry quoting the diagnosis; read as the SIGTERM
+  // it arrived as, it used to halt the run for a person who had pressed nothing.
+  if (signal.endedBy === 'spawn-watchdog') {
+    return {
+      kind: 'retry',
+      afterMs: 60_000,
+      reason: `the spawn watchdog ended the session: ${signal.endedReason ?? 'it stopped making progress'}`,
+    };
+  }
+
+  // The CLI's background-task ceiling killed work that was still running when
+  // a session reported success (SES-12): the phase's own suite or build,
+  // backgrounded to satisfy the in-turn-wait guard, died with the process
+  // group. Never `ok` — and named, from the tasks the stream saw start.
+  const ceiling = RE.bgTasks.exec(text);
+  if (ceiling && (signal.subtype === 'success' || !signal.subtype)) {
+    const tasks = signal.backgroundTasks ?? [];
+    const named = tasks.length
+      ? `: ${tasks.map((task) => (task.description ? `${task.id} (${task.description.slice(0, 80)})` : task.id)).join(', ')}`
+      : ' (the stream named no task)';
+    return {
+      kind: 'phase-failed',
+      reason: `the CLI's background-task ceiling (${ceiling[1]}s) terminated work still running when the session ended${named}`,
+    };
+  }
+
+  // `success` is believed only when nothing else contradicts it (SES-5): not
+  // the CLI's own error bit, not a turn the CLI says was aborted, and not a
+  // session the console ended before its turn was done. The patterns below
+  // then choose WHICH non-ok disposition applies.
+  const aborted = Boolean(signal.terminalReason?.startsWith('aborted'));
+  const endedByConsole = Boolean(signal.endedBy) && signal.endedBy !== 'exit';
+  if (signal.subtype === 'success' && !signal.isError && !aborted && !endedByConsole) return { kind: 'ok' };
 
   // Killed by a supervisor or the OS — not the model's doing.
   if (signal.code === 143) return { kind: 'needs-human', reason: 'session was terminated (SIGTERM)' };
@@ -399,8 +510,19 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
 
   return {
     kind: 'phase-failed',
-    reason: signal.subtype ? `session ended: ${signal.subtype}` : `session exited with code ${signal.code ?? '?'}`,
+    reason: signal.subtype === 'success' && signal.isError
+      ? `the session reported an error the console does not recognise: ${firstLine(text) || 'no text'}`
+      : signal.subtype === 'success' && aborted
+        ? `the session's turn was aborted (${signal.terminalReason})`
+        : signal.subtype === 'success' && endedByConsole
+          ? `the console ended the session (${signal.endedBy}) before its turn was done`
+          : signal.subtype ? `session ended: ${signal.subtype}` : `session exited with code ${signal.code ?? '?'}`,
   };
+}
+
+/** The first non-blank line of a text, bounded — enough to name an error, never a log. */
+function firstLine(text: string): string {
+  return (text.split('\n').find((line) => line.trim()) ?? '').trim().slice(0, 200);
 }
 
 /**
@@ -422,21 +544,72 @@ export function lostResume(signal: StopSignal): boolean {
 }
 
 /**
+ * The console's `CLAUDE_CODE_MAX_RETRIES` for a child, kept on purpose.
+ *
+ * The docs (chapter 09 row 40, DOC-2): with `CLAUDE_CODE_RETRY_WATCHDOG` set,
+ * an UNSET variable defaults to 300 attempts — roughly three hours of backoff
+ * for non-capacity transient errors — while an explicit value is honoured as
+ * written. So this `15` keeps fifteen, and that is the choice: a CLI retrying a
+ * server outage for three hours inside one session holds its lock and produces
+ * nothing, where fifteen hands the failure back within minutes to the layers
+ * that can act on it — the liveness ladder, the retry-storm park, the account
+ * and model switches. It used to be described as raising retries to three
+ * hours, which it never did; `phase.retry-ceiling` now journals which ceiling
+ * each child ran under.
+ */
+export const CONSOLE_MAX_RETRIES = '15';
+
+/**
+ * The background-task ceiling set on every child: the CLI's documented default
+ * (600 000 ms, chapter 09 row 42), set explicitly rather than inherited by
+ * accident (SES-12). At the end of a `-p` run the CLI waits this long for the
+ * session's background tasks and then terminates them. Longer would hold a
+ * finished session's process — and its lock — for work the model can no longer
+ * read; `0` would hold it for ever. The warning it prints is now recognised
+ * (`RE.bgTasks`), so the kill is no longer silent.
+ */
+export const BG_WAIT_CEILING_MS = 600_000;
+
+/**
  * Environment for a child session.
  *
  * `CLAUDE_CODE_RETRY_WATCHDOG=1` is documented for "CI/unattended sessions":
- * it retries 429 and 529 indefinitely and raises other transient retries to
- * ~3 hours. That is strictly better than anything this runner could do from
- * outside the process, because the CLI can resume mid-turn where we would have
- * to restart the phase. So the child absorbs the transient failures and only
- * the decisions above reach us.
+ * it retries 429 and 529 indefinitely. That is strictly better than anything
+ * this runner could do from outside the process, because the CLI can resume
+ * mid-turn where we would have to restart the phase. So the child absorbs the
+ * transient failures and only the decisions above reach us — within the retry
+ * ceiling `CONSOLE_MAX_RETRIES` explains.
  */
 export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const decided = childEnvDecisions(base);
   return {
     ...base,
     CLAUDE_CODE_RETRY_WATCHDOG: '1',
     // The watchdog governs 429/529; this covers everything else it does not.
-    CLAUDE_CODE_MAX_RETRIES: base.CLAUDE_CODE_MAX_RETRIES ?? '15',
+    CLAUDE_CODE_MAX_RETRIES: decided.maxRetries.value,
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: decided.bgWaitCeilingMs.value,
+  };
+}
+
+/** One environment ceiling a child runs under, and whether the console set it or inherited it. */
+export type ChildEnvDecision = { value: string; source: 'env' | 'console' };
+
+/**
+ * The two CLI-side ceilings `childEnv` puts on a child, with where each came
+ * from — what `phase.retry-ceiling` journals once per spawn, so an exhausted
+ * retry budget or a killed background task can be read against the ceiling
+ * that was actually in force.
+ */
+export function childEnvDecisions(base: NodeJS.ProcessEnv = process.env): {
+  maxRetries: ChildEnvDecision; bgWaitCeilingMs: ChildEnvDecision;
+} {
+  return {
+    maxRetries: base.CLAUDE_CODE_MAX_RETRIES !== undefined
+      ? { value: base.CLAUDE_CODE_MAX_RETRIES, source: 'env' }
+      : { value: CONSOLE_MAX_RETRIES, source: 'console' },
+    bgWaitCeilingMs: base.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS !== undefined
+      ? { value: base.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, source: 'env' }
+      : { value: String(BG_WAIT_CEILING_MS), source: 'console' },
   };
 }
 

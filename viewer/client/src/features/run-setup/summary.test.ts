@@ -53,7 +53,7 @@ describe('the rows', () => {
     const rows = summaryRows('start', seed, seed, origins, names);
     expect(rows.length).toBeGreaterThan(20);
     expect(notableRows(rows)).toEqual([]);
-    expect(changedPerStage(rows)).toEqual({ what: 0, how: 0, money: 0 });
+    expect(changedPerStage(rows)).toEqual({ decisions: 0, what: 0, how: 0, money: 0 });
   });
 
   it('lists a value the operator changed here, with its stage and its source', () => {
@@ -65,7 +65,7 @@ describe('the rows', () => {
       ['model', 'how', 'changed', 'sonnet'],
       ['runBudgetUsd', 'money', 'changed', '$40.00'],
     ]);
-    expect(changedPerStage(rows)).toEqual({ what: 0, how: 1, money: 1 });
+    expect(changedPerStage(rows)).toEqual({ decisions: 0, what: 0, how: 1, money: 1 });
   });
 
   it('lists a preference that changed the shipped default, and says it came from Settings', () => {

@@ -149,17 +149,64 @@ pe_project_root_for() {
   return 1
 }
 
-# pe_sha256_prefix <text> → the first 8 hex chars of sha256(text)
-pe_sha256_prefix() {
+# pe_find_node → a node binary on stdout, or exit 1. PATH first, then the
+# places a Desktop-launched shell does not have on its PATH (Homebrew,
+# /usr/local, volta, the newest nvm) — the same order viewer/run looks in.
+# Shared by session-hook.sh and phase-outcome.sh, whose --remember global
+# has to find the console the way the hook does.
+pe_find_node() {
+  if command -v node >/dev/null 2>&1; then command -v node; return 0; fi
+  local candidates="/opt/homebrew/bin /usr/local/bin $HOME/.volta/bin" v c
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    for v in $(ls -1 "$HOME/.nvm/versions/node" 2>/dev/null | sort -r); do
+      candidates="$candidates $HOME/.nvm/versions/node/$v/bin"
+    done
+  fi
+  for c in $candidates; do
+    if [ -x "$c/node" ]; then printf '%s' "$c/node"; return 0; fi
+  done
+  return 1
+}
+
+# pe_console_url [docs-root] → the URL of the console that owns this root, on
+# stdout (empty when nothing can say). $PHASE_CONSOLE_URL wins; else the
+# registry is asked through viewer/shared/instances.mjs `shell`, which needs
+# node — no node, no answer, and the caller says what it does without one.
+pe_console_url() {
+  if [ -n "${PHASE_CONSOLE_URL:-}" ]; then printf '%s' "$PHASE_CONSOLE_URL"; return 0; fi
+  local root="${1:-}" node_bin shell_out skill_dir
+  skill_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  node_bin="$(pe_find_node 2>/dev/null || true)"
+  [ -n "$node_bin" ] && [ -f "$skill_dir/viewer/shared/instances.mjs" ] || return 0
+  if [ -n "$root" ]; then
+    shell_out="$("$node_bin" "$skill_dir/viewer/shared/instances.mjs" shell --root "$root" 2>/dev/null || true)"
+  else
+    shell_out="$("$node_bin" "$skill_dir/viewer/shared/instances.mjs" shell --cwd "$(pwd)" 2>/dev/null || true)"
+  fi
+  printf '%s
+' "$shell_out" | sed -n 's/^url=//p' | head -1 | tr -d '
+'
+}
+
+# pe_sha256_hex <text> → sha256(text) as 64 lowercase hex chars (empty when no
+# digest tool is installed). One routine, so every id derived from a digest —
+# the instance id below, the ruling id phase-outcome.sh stamps — is the same
+# bytes the console's `createHash('sha256')` produces over the same UTF-8.
+pe_sha256_hex() {
   local hex=""
   if command -v shasum >/dev/null 2>&1; then
-    hex="$(printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-8)"
+    hex="$(printf '%s' "$1" | shasum -a 256 2>/dev/null | cut -c1-64)"
   elif command -v sha256sum >/dev/null 2>&1; then
-    hex="$(printf '%s' "$1" | sha256sum 2>/dev/null | cut -c1-8)"
+    hex="$(printf '%s' "$1" | sha256sum 2>/dev/null | cut -c1-64)"
   elif command -v openssl >/dev/null 2>&1; then
-    hex="$(printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | sed 's/^.*= *//' | cut -c1-8)"
+    hex="$(printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | sed 's/^.*= *//' | cut -c1-64)"
   fi
   printf '%s' "$hex"
+}
+
+# pe_sha256_prefix <text> → the first 8 hex chars of sha256(text)
+pe_sha256_prefix() {
+  printf '%s' "$(pe_sha256_hex "$1" | cut -c1-8)"
 }
 
 # pe_instance_id <root> → "<sha8>-<basename>" (basename `root` for "/")
@@ -174,6 +221,34 @@ pe_instance_id() {
 # pe_runs_dir <root> <slug> → where the console keeps this plan's runs
 pe_runs_dir() {
   printf '%s/runs/%s/%s' "$(pe_state_home)" "$(pe_instance_id "$1")" "$2"
+}
+
+# pe_registered_state_dir <root> → the state directory of the console the
+# REGISTRY holds for exactly this root, read with no node at all; prints nothing
+# (exit 1) when no registered console has this root. The registry is the
+# pretty-printed JSON `instances.mjs` writes — each row an object opened at
+# four spaces of indent and closed by a lone `}` at four — so the row is cut
+# out by its id and asked whether it says `"default": true`. It replaces the
+# guess `pe_instance_state_dir` makes from what exists on disk, which filed a
+# directory no console owns against the default one (FLT-8).
+pe_registered_state_dir() {
+  local id registry block
+  id="$(pe_instance_id "$1")"
+  registry="${XDG_CONFIG_HOME:-$HOME/.config}/phase-console/instances.json"
+  [ -f "$registry" ] || return 1
+  block="$(sed -n "/^    \"$id\": {/,/^    },\{0,1\}\$/p" "$registry" 2>/dev/null)"
+  [ -n "$block" ] || return 1
+  if printf '%s' "$block" | grep -q '"default": true'; then
+    pe_state_home
+  else
+    printf '%s/instances/%s' "$(pe_state_home)" "$id"
+  fi
+}
+
+# pe_unowned_inbox → where a presence event no registered console claims is
+# recorded, machine-wide: <state home>/fleet/sessions/inbox (FLT-8).
+pe_unowned_inbox() {
+  printf '%s/fleet/sessions/inbox' "$(pe_state_home)"
 }
 
 # pe_instance_state_dir <root> → this root's per-instance state directory.

@@ -22,6 +22,7 @@ import { Timer } from 'lucide-react';
 import { Chip } from '@/components/ui';
 import { usePlan } from '@/lib/queries';
 import { useNow } from '@/lib/clock';
+import { SessionLedger } from './session-ledger';
 import { elapsed } from '@/lib/format';
 import { planHref } from '@shared/routes.js';
 import type { TerminalSession } from '@/lib/api';
@@ -82,6 +83,8 @@ export function SessionVitals({ session }: { session: TerminalSession }) {
           {over ? ' estimate' : ' est'}
         </span>
       )}
+      {/* Which door started it and how it ended, off the run's ledger (phase 19). */}
+      <SessionLedger session={session} />
     </div>
   );
 }

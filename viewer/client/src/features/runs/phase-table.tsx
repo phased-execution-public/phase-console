@@ -865,9 +865,23 @@ function PhaseRows({
                 // resumes the phase's own session, and which round of waiting
                 // this is (the runner caps them).
                 <div className="text-2xs text-ink-faint">
-                  Waiting on external work{r.parkReason ? `: ${r.parkReason}` : ''}
+                  {/* Whose park it is, first: the console's own inference is never
+                      drawn as the session's testimony. */}
+                  {r.declared?.by === 'watchdog'
+                    ? 'Parked by the console — it was waiting inside its turn'
+                    : 'Waiting on external work'}
+                  {r.parkReason ? `: ${r.parkReason}` : ''}
                   {r.parkedUntil ? ` — resumes ${new Date(r.parkedUntil).toLocaleTimeString()}` : ''}
-                  {r.waits ? ` (wait ${r.waits})` : ''}
+                  {r.declared?.by === 'watchdog'
+                    ? r.watchdogParks
+                      ? ` (automatic park ${r.watchdogParks})`
+                      : ''
+                    : r.waits
+                      ? ` (wait ${r.waits})`
+                      : ''}
+                  {r.resumeRefused
+                    ? ` · resume held: session ${r.resumeRefused.sessionId.slice(0, 8)} is still running`
+                    : ''}
                   {r.watch?.length ? (
                     <>
                       {' '}
@@ -880,6 +894,20 @@ function PhaseRows({
                         title={r.watch.join(', ')}
                       >
                         {r.watch.join(', ')}
+                      </code>
+                    </>
+                  ) : null}
+                  {/* A ref nothing will ever probe is named beside the ones that
+                      will be, never dropped in silence (WAI-11). */}
+                  {r.watchUnpollable?.length ? (
+                    <>
+                      {' '}
+                      · not watchable{' '}
+                      <code
+                        className="inline-block max-w-full truncate align-bottom font-mono"
+                        title={r.watchUnpollable.map((u) => `${u.ref} — ${u.reason}`).join('\n')}
+                      >
+                        {r.watchUnpollable.map((u) => u.ref).join(', ')}
                       </code>
                     </>
                   ) : null}

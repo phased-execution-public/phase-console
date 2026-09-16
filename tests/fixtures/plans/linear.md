@@ -18,3 +18,18 @@ A simple 1 → 2 → 3 chain. No gates, no size tags.
 | 1 | Alpha | — | — | repoA | package builds |
 | 2 | Beta  | 1 | — | repoA | unit tests pass |
 | 3 | Gamma | 2 | — | repoA | deploy succeeds |
+
+## Phases
+
+### Phase 1 — Alpha
+- **Verification:**
+  - `true`
+
+### Phase 2 — Beta
+- **Verification:**
+  - `true`
+
+### Phase 3 — Gamma
+- **Verification:**
+  - `true`
+

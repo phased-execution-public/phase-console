@@ -7,6 +7,12 @@ console's own switches rather than describing a console in general.
 The fix is a restart with the flag: **Launch ▸ The seven switches** has the command, and Settings ▸
 Start with every capability composes it for you.
 
+**Is the machine ready at all?** `phase-console doctor` runs the checks a run's start would, with no
+plan in front of it — accounts, MCP servers, the machine's `claude` login, a delivery channel, the
+session-presence hooks, the Claude CLI's version against the relay's floor, `gh auth status` — and
+exits 1 naming the first blocking row that fails. It asks the running console when one answers on its
+port, and reads the machine itself when none does; `--json` prints the whole report.
+
 ## When a run stops
 
 Four ways a run comes to rest. **Only one of them is a problem.**
@@ -23,7 +29,7 @@ Four ways a run comes to rest. **Only one of them is a problem.**
 *Something the runner will not decide on its own.*
 
 Verification failed · the plan stopped linting · the board did not flip to done · two phases failed in
-a row · the budget ran out · a person is needed.
+a row · the budget ran out · the API refused the run's own credential · a person is needed.
 
 Read the halt reason on the Autopilot tab, fix the cause, then Retry that phase and start again. If
 the phase actually did its work and only failed to close itself out, **Closeout** is the verb rather
@@ -50,7 +56,17 @@ account with headroom rather than waiting at all — and it does so *while the w
 the session's own stream, rather than waiting for the session to exit. That matters because a session
 that hits the wall mid-turn often never exits: the CLI absorbs the 429 and retries every thirty
 seconds indefinitely. A lane in that state reads **Retrying** on its row, and if no account had
-headroom to move it to, the Now inbox raises it after a quarter of an hour.
+headroom to move it to, the Now inbox raises it after a quarter of an hour. The run does not sit there
+silently either: the third such wall inside an hour with nowhere to move stops being merely noted —
+the phase waits out the window when its reset is known, or parks with an errand — and it announces
+under **Usage limits** either way.
+
+**A registered account is not always one a run may spend.** What the machine has learned about each
+credential is shared by every console on it: `cooling` after a wall, until the wall resets (half an
+hour when it named no reset), and `retired` once the API refused the credential for its organisation
+— out of every run until a person clears it. A run is also refused before it starts when its
+account's five-hour window already reads 97 % or more, with the time it resets, rather than finding
+the wall the expensive way.
 
 ## Interrupted
 

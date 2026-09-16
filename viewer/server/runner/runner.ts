@@ -32,7 +32,9 @@ import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
 import { isPhaseHalt } from '../../shared/recovery-model.js';
 import { DEFAULT_QA_MAX_ROUNDS } from '../../shared/run-settings.js';
-import { onShutdown, offShutdown } from '../lifecycle.ts';
+import { policyAnsweredPayload, type ResolvedPolicy } from '../../shared/policy-model.js';
+import { policyForKey, policyForSituation } from './policy.ts';
+import { onShutdown, offShutdown, type ShutdownContext } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
 import {
@@ -40,19 +42,19 @@ import {
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
-import { killLadder, stopWhereItStands, wake } from './signals.ts';
+import { INT_GRACE_MS, killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
   type PersistedEscalation,
 } from './freeze.ts';
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './verify.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
-import { localWatchRef } from './liveness.ts';
+import { mintWatchRef } from './liveness.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
 import {
-  applyEvent, evaluateStall, isProductiveEvent, livenessOf, newLaneSignals, stallThresholds,
+  applyEvent, evaluateStall, isDurableProgress, isProductiveEvent, livenessOf, newLaneSignals, noteWaitDenied, stallThresholds,
   type LaneLiveness, type LaneSignals, type StallState, type StallThresholds,
 } from './liveness.ts';
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
@@ -61,23 +63,26 @@ import {
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
-  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, untriedRungs, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
+  accountRung, capRefusal, chargeRung, errandFor, errandSaid, widenCard, widenInstruction, nextRung, rungKey, rungsFor, untriedRungs, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
 import { qaRungInstruction } from './qa-recover.ts';
-import type { RungRecord } from './state.ts';
+import type { RungRecord, UsageDecisionAction } from './state.ts';
+import { ALERT_PCT, WALL_PCT } from '../../shared/ops-vocab.js';
 import {
-  childrenOf, consumeDeclaration, DECLARATION_CONSUMED_EVENT, loadRun, newRun, phaseRecord, procIdentity, saveRun, saveRunSoon, pidAlive, processState, IN_FLIGHT, SETTLED,
+  childrenOf, consumeDeclaration, DECLARATION_CONSUMED_EVENT, loadRun, newRun, phaseRecord, procIdentity, saveRun, saveRunSoon, pidAlive, processState, IN_FLIGHT, SETTLED, setRunState, waitClockOf,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords, type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary, isSessionGone, mergeQaHistory,
+  syncWaitClock,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import { consumeTasks, foldTasks, readTaskEvents, tasksFileFor } from './tasks.ts';
 import {
-  AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant,
+  AdmissionAborted, autopilotOwner, LEARNED_WALL_BUCKET, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
+import type { LeaveResult } from '../accounts/index.ts';
 import { RETRY_STORM_PARK_MS, STALL_NUDGE_GRACE_MS } from '../../shared/attention-model.js';
 import { formatScope } from '../../shared/scope.js';
 import { TASK_TOOLS, adoptTaskId, foldTaskEvent, tasksFromList, taskSummary } from '../../shared/task-model.js';
@@ -90,7 +95,7 @@ import {
 } from './approvals.ts';
 
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, GIT_FIRST_PROBE_MS, GIT_PROBE_MS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, RUNNER_LEASE_S, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, LOCAL_JOB_NUDGE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, SILENT_NUDGE, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, GIT_FIRST_PROBE_MS, GIT_PROBE_MS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_NONE_MAX, LIMIT_NONE_WINDOW_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, RUNNER_LEASE_S, lockStatusHolder, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, LOCAL_JOB_NUDGE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, SILENT_NUDGE, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import { RunnerAttempt } from './runner-attempt.ts';
 import {
@@ -108,13 +113,15 @@ export {
   MCP_AUTH_PARK_NOTE,
   MCP_PARK_NOTE,
   VERIFICATION_PARK_NOTE,
-  WAIT_BUDGET_MS,
+  DEFAULT_WAIT_BUDGET_MS,
   WAIT_DEFAULT_MS,
   WAIT_MAX_PER_PHASE,
   applySettings,
   briefForRung,
   escalateModel,
   frameQuestion,
+  frameRelayAnswer,
+  frameRelayNotice,
   frameSteer,
   preflight,
 } from './runner-core.ts';
@@ -177,6 +184,7 @@ export class Runner extends RunnerAttempt {
     if (declared) {
       this.record('phase.outcome', {
         status: declared.status, reason: declared.reason ?? null,
+        needs: declared.needs ?? null,
         resumeAfter: declared.resume_after ?? null, watch: declared.watch,
       }, phase);
     }
@@ -300,7 +308,7 @@ export class Runner extends RunnerAttempt {
       this.record('phase.reconciled', { by: resolution.by, outcome: resolution.outcome }, resolution.phase);
       touched = true;
     }
-    const { changed, closed } = reconcileRecordsAgainstBoard(state, board.states);
+    const { changed, closed } = reconcileRecordsAgainstBoard(state, board.states, undefined, this.declarationSink());
     if (changed) {
       for (const phase of closed) {
         this.clearParkPoke(phase);
@@ -384,7 +392,7 @@ export class Runner extends RunnerAttempt {
       }
       if (!free) continue;
       const was = record.note;
-      resetForRetry(record);
+      resetForRetry(record, { by: 'console', journal: this.declarationSink() });
       this.record('phase.lock-cap-rearmed', {
         was,
         note: byCap
@@ -573,6 +581,34 @@ export class Runner extends RunnerAttempt {
     const { approvals } = this.deps;
     const suppressed = verification.notRun.length - askable.length;
 
+    // The plan's answer for a check written as prose (phase 11, ZTD-6): the
+    // phase's `- **Person-check:**` bullet, else this console's policy, else the
+    // shipped `operator` (today's card). `allow` waives the checks by policy —
+    // recorded as such, no card, no wait; `halt` was answered at boarding
+    // (`preflightVerification`), so a phase reaching here under it is one whose
+    // prose arrived through a refused command rather than the plan text, and
+    // it is treated as the owner's; any other word names who is asked.
+    const personCheck = this.personCheckFor(phase);
+    if (personCheck.answer === 'allow') {
+      const redStands = !verification.ok && verification.ran.length > 0;
+      const waived = `${askable.length} manual check(s) waived by policy (Person-check: allow, from the ${personCheck.source})`;
+      record.verification = {
+        ...verification,
+        ok: !redStands,
+        reason: redStands ? `${verification.reason}; ${waived}` : waived,
+      };
+      this.record('phase.verify-waived', {
+        stage: 'verify', by: 'policy', decisionKey: 'verification.person-check', source: personCheck.source,
+        notRun: askable, ...(suppressed ? { suppressed } : {}),
+      }, phase);
+      this.record('phase.policy-answered', {
+        situation: 'verify-red', decisionKey: 'verification.person-check', answer: 'allow', source: personCheck.source,
+        label: 'Verification prose', reason: `${askable.length} check(s) written as prose`, by: 'verify',
+      }, phase);
+      this.persist();
+      return true;
+    }
+
     record.status = 'awaiting-verification';
     this.record('phase.awaiting-verification', { notRun: askable, ...(suppressed ? { suppressed } : {}) }, phase);
     this.emit('phase', { phase, status: 'awaiting-verification', notRun: askable.length });
@@ -585,12 +621,13 @@ export class Runner extends RunnerAttempt {
       return false;
     }
 
-    const { decided } = approvals.request({
+    const { approval, decided } = approvals.request({
       runId: state.id,
       slug: state.slug,
       phase,
       kind: 'verify',
-      title: `Phase ${phase}: ${askable.length} check${askable.length === 1 ? '' : 's'} only you can make`,
+      title: `Phase ${phase}: ${askable.length} check${askable.length === 1 ? '' : 's'} only you can make`
+        + (personCheck.answer && !['halt', 'operator'].includes(personCheck.answer) ? ` (Person-check: ${personCheck.answer})` : ''),
       detail: verification.ran.length
         ? `${verification.ran.length} command(s) ran and passed. The rest is written as prose in the plan, so the runner will not execute it.`
         : 'Nothing in this phase\'s verification is a command the runner can execute, so nothing has been proven either way.',
@@ -605,8 +642,17 @@ export class Runner extends RunnerAttempt {
         }] : []),
       ],
     }, this.deps.verifyAnswerMs ?? VERIFY_ANSWER_MS);
+    // The run is waiting on a PERSON from here until the card is decided — a
+    // wait like any other (WAI-10): `waitReason: 'person'` (`WAIT_REASONS`'
+    // fifth word, and this is its production writer, LFC-5), `waitUntil` at
+    // the card's expiry, the status `waiting`. It used to keep `running` with
+    // no child and no spend for up to twelve hours.
+    this.enterPersonWait(phase, { id: approval.id, until: approval.expiresAt, on: `phase ${phase} verification card` });
 
     const outcome = await decided;
+    // The card is down: whatever happens next, the run is no longer waiting on
+    // a person's answer to it.
+    this.leavePersonWait(approval.id);
     this.record('phase.human-verified', { decision: outcome.decision, by: outcome.by, reason: outcome.reason }, phase);
 
     // Nobody answered, or the run ended under the card. Neither is a person
@@ -625,8 +671,11 @@ export class Runner extends RunnerAttempt {
       record.endedAt = new Date().toISOString();
       this.record('phase.verify-unanswered', { by: outcome.by, notRun: askable.length }, phase);
       this.emit('phase', { phase, status: 'parked', note: record.note });
+      // `awaiting-person`, not `needs-human`: a person was ASKED and did not
+      // answer, which is a different situation from an errand nobody has been
+      // asked about yet (WAI-10).
       this.park(`phase ${phase}'s verification card went unanswered: ${askable.length} `
-        + 'check(s) only a person can make', phase);
+        + 'check(s) only a person can make', phase, 'awaiting-person');
       return false;
     }
 
@@ -822,6 +871,13 @@ export class Runner extends RunnerAttempt {
     const climb = { situation: situation.key, history, runHistory, dayHistory, caps, qaRounds, qaMaxRounds };
     const any = nextRung(climb);
     const mine = nextRung({ ...climb, available: (rung) => hintOf(rung) !== null });
+    // …and the THIRD question (LFC-2, phase 10): is there a rung ANY driver
+    // can climb — this loop's own vehicles, or the healer's on a stopped run.
+    // The same `nextRung(available)` the healer asks, over the union of the
+    // two availability predicates; its exhaustion is the loop's exhaustion.
+    const drivable = (rung: Rung) => hintOf(rung) !== null
+      || this.deps.rungDrivable?.(state.slug, rung, situation, record, evidence, state) === true;
+    const theirs = nextRung({ ...climb, available: drivable });
 
     if (mine.ok) {
       const hint = hintOf(mine.rung)!;
@@ -842,39 +898,159 @@ export class Runner extends RunnerAttempt {
       return true;
     }
 
+    // A rung this loop drives without a boarding: the `widen-rule` card
+    // (phase 9, TRS-10). Offered here rather than deferred to the healer,
+    // because a deferred rung made `closedBlocked` settle the phase `failed`
+    // and charge the streak — a permission wall read as two failures.
+    if (any.ok && any.rung.vehicle === 'widen-rule' && this.offerWidenRule(record, situation, slot, any.rung, by, now)) {
+      return true;
+    }
+
     // The THIRD reader of the same-rung-once rule, and it read no filter at
     // all — so its "every rung tried" could disagree with the `nextRung` it
     // had just called. One helper now (`shared/ladder-model.js`).
     const untried = untriedRungs(situation.key, history);
     const switchedOff = (rung: Rung) => rung.vehicle === 'unblock-session' && !unblockOk;
-    const exhausted = !any.ok || situation.actor === 'person' || (untried.length > 0 && untried.every(switchedOff));
+    // Exhaustion is computed WITH the availability predicate — the same
+    // `nextRung(available)` the healer uses — so an empty available table
+    // escalates exactly as a spent one does (LFC-2): one `phase.errand`
+    // naming the vehicle and why it is unavailable, never a bare
+    // `phase.ladder-deferred` for a table nothing will ever climb.
+    const exhausted = !theirs.ok || situation.actor === 'person' || (untried.length > 0 && untried.every(switchedOff));
     if (exhausted) {
       const reason = !any.ok ? any.reason
         : situation.actor === 'person' ? `${situation.label} is a person's to settle`
-          : 'the unblock session is switched off on this console';
-      this.parkWithErrand(record, situation, slot, reason, by);
+          : !theirs.ok ? theirs.reason
+            : 'the unblock session is switched off on this console';
+      // A cap refusal is a journal line, not only a sentence (RCV-6) — written
+      // once here; `climbLadder`'s fingerprint keeps the pass from repeating it.
+      const cap = capRefusal(any);
+      if (cap) this.record('phase.ladder-refused', { situation: situation.key, ...cap, by }, phase);
+      // The rungs were there and no driver could climb them: the errand names
+      // each and why (RCV-7), or the card reads as if no rung existed.
+      const hint = any.ok && !theirs.ok && /^no rung for /.test(theirs.reason)
+        ? this.deps.rungUnavailable?.(state.slug, situation, record, evidence, state) ?? null
+        : null;
+      this.parkWithErrand(record, situation, slot, reason, by, hint);
       return false;
     }
-    // Deferred: a rung remains for a vehicle this loop does not have (a fresh
-    // briefed agent, a repair script). The record stands as it is; the
-    // service's healer climbs it when the run stops.
+    // Deferred: a rung remains for a vehicle this loop does not have but the
+    // service does (a fresh briefed agent, a repair script, a resource wall on
+    // a stopped run). The record stands as it is; the service's healer climbs
+    // it when the run stops.
     this.record('phase.ladder-deferred', {
       situation: situation.key, reason: mine.reason, remaining: untried.map((rung) => rung.vehicle),
+      next: theirs.ok ? theirs.rung.vehicle : null,
     }, phase);
     return false;
   }
 
   /** Park a phase with the ONE ask for a person the ladder leaves behind. */
+  /**
+   * The `widen-rule` rung, driven by this loop (phase 9, TRS-10): the deny
+   * rule the console's own hook refused goes on a standing approval card, the
+   * phase parks behind it — spending nothing — and the run drives its other
+   * candidates. A person's Allow strikes the rule for this plan
+   * (`deps.widenRule`) and re-boards the phase into its OWN session with the
+   * command to re-run; Deny, or the card's clock, settles the rung `failed`
+   * and leaves the errand. False when nothing can be offered: no broker, no
+   * denial on the record, or a denial by the wait guard (not a permission
+   * wall) — the caller then takes the exhausted path.
+   */
+  private offerWidenRule(
+    record: PhaseRecord, situation: Situation,
+    slot: NonNullable<RunState['recoveries']>[string], rung: Rung, by: string, now: string,
+  ): boolean {
+    const state = this.state;
+    const approvals = this.deps.approvals;
+    const denied = record.toolDenied;
+    if (!state || !approvals || !this.deps.widenRule || !denied?.rule || denied.rule === 'in-turn-wait') return false;
+    const { approval, decided } = approvals.offer(widenCard({ runId: state.id, slug: state.slug, phase: record.phase, denied }));
+    const climbed = accountRung(slot, {
+      situation: situation.key, rung: rung.vehicle, params: rung.params, at: now, note: rung.label,
+    });
+    climbed.cardId = approval.id;
+    record.status = 'parked';
+    record.note = `${situation.label} — a person is asked to widen \`${denied.rule}\` (approval card ${approval.id}); nothing spends until they answer`;
+    record.endedAt ??= now;
+    this.record('phase.rung', {
+      situation: situation.key, rung: rung.vehicle, params: rung.params ?? null,
+      vehicle: 'card', cardId: approval.id, attempt: slot.attempts, by,
+    }, record.phase);
+    this.emit('phase', { phase: record.phase, status: 'parked', note: record.note, situation: situation.key, rung: rung.vehicle });
+    this.persist();
+    const phase = record.phase;
+    const rule = denied.rule;
+    const command = denied.command;
+    void decided.then((outcome) => {
+      try { this.widenDecided(phase, approval.id, { rule, command }, outcome); }
+      catch (error) { log.warn('runner.widen-rule.failed', { runId: state.id, phase, error }); }
+    });
+    return true;
+  }
+
+  /** The card's answer: strike and re-board, or settle the rung and leave the errand. */
+  private widenDecided(
+    phase: number, cardId: string, denied: { rule: string; command?: string },
+    outcome: { decision: 'allow' | 'deny'; by: string; reason?: string },
+  ): void {
+    const state = this.state;
+    if (!state || !state.phases[String(phase)]) return;
+    const record = phaseRecord(state, phase);
+    const slot = state.recoveries?.[String(phase)];
+    const open = slot?.rungs?.find((r) => r.cardId === cardId && r.outcome === 'running');
+    if (!slot || !open) return;
+    this.record('phase.widen-decided', {
+      decision: outcome.decision, by: outcome.by, rule: denied.rule, cardId,
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+    }, phase);
+    if (outcome.decision === 'allow') {
+      this.deps.widenRule?.(state.slug, denied.rule, outcome.by);
+      // The loop that offered the card has ended (the run parked or halted
+      // meanwhile): the stopped-run door — the recover verb — resumes the
+      // phase's own session, which is the door a person's Resume takes too.
+      if (!this.driving) {
+        this.persist();
+        this.deps.resumeOwnSession?.(state.slug, phase, widenInstruction(denied), outcome.by);
+        return;
+      }
+      // Back into its own session, with the command to re-run: the rung
+      // settles when that attempt does, as every rung does.
+      const sessionId = record.resumeSessionId ?? record.sessionId;
+      this.reboardWith(record, {
+        situation: 'blocked-declared:permission', rung: 'widen-rule',
+        brief: sessionId ? 'continue' : 'resume',
+        ...(sessionId ? { sessionId } : {}),
+        instruction: widenInstruction(denied),
+        at: new Date(this.now().getTime()).toISOString(), by: 'console',
+      });
+      this.persist();
+      this.emit('phase', { phase, status: record.status, note: record.note });
+      this.wake.resolve();
+      return;
+    }
+    this.settleOpenRung(phase, 'failed', `the widen card was ${outcome.by === 'timeout' ? 'not answered' : `denied by ${outcome.by}`}`);
+    const situation: Situation = {
+      id: 'blocked-declared', sub: 'permission', key: 'blocked-declared:permission',
+      label: 'Declared blocked · permission', blurb: '', actor: 'machine', why: [],
+    };
+    this.parkWithErrand(record, situation, slot, `the widen card was ${outcome.by === 'timeout' ? 'not answered' : 'denied'}`, 'drive');
+  }
+
   private parkWithErrand(
     record: PhaseRecord, situation: Situation,
     slot: NonNullable<RunState['recoveries']>[string], reason: string, by: string,
+    /** Why no rung could be driven, rung by rung, when that is the reason (RCV-7). */
+    hint: string | null = null,
   ): void {
     // The session's own words go with the errand when they ARE the evidence —
     // a refusal or an "Unknown command" is unactionable without them (D26).
     const rounds = record.qa ?? [];
     const errand: Errand = errandFor(
       situation.key, slot.rungs ?? [], record.phase, undefined,
-      situation.id === 'never-started' && situation.sub ? record.said : undefined,
+      // …the one rule for both paths (RCV-7, `errandSaid`): a refusal, a
+      // skill that would not load, the organisation that said no.
+      errandSaid(situation, record.said),
       null,
       // Which report describes the code as it stands — the newest round's. An
       // errand that says "fix what the QA report names" after three rounds has
@@ -890,7 +1066,31 @@ export class Runner extends RunnerAttempt {
           ...(rounds[rounds.length - 1].reportPath ? { report: rounds[rounds.length - 1].reportPath } : {}),
         }
         : null,
+      // The console's own denial, so a permission errand names the rule and
+      // the command rather than "a tool" (LFC-3).
+      record.toolDenied && record.toolDenied.rule !== 'in-turn-wait' ? record.toolDenied : null,
+      // The answer in force for this situation's manifest row (phase 11,
+      // ZTD-10): the run's manifest (the plan's `## Decisions` as resolved at
+      // the door), this console's `policy.<key>`, the shipped default.
+      this.policyFor(situation.key),
     );
+    // A class whose row answered AUTOMATICALLY is not a person's: the ruling
+    // is journalled under its decision key, no card is raised, and the answer
+    // is acted on where the console can act (a spent QA budget under
+    // `qa.exhausted: waive` records the waiver through the operator's own
+    // door). `blocked-declared:unknown` never takes this branch — its row is
+    // pinned, because a block whose key the manifest lacks IS the ask.
+    // …provided this loop can ACT on the word: a waiver needs the service's
+    // door (`deps.qaWaive`); a harness without one, or a console that cannot
+    // write, leaves the ask standing rather than journalling an answer nobody
+    // carried out.
+    const actable = !(errand.decisionKey === 'qa.exhausted' && !this.deps.qaWaive);
+    if (errand.policy && actable) {
+      this.answerByPolicy(record, situation, slot, errand, reason, by);
+      return;
+    }
+    if (errand.policy) delete errand.policy;
+    if (hint) errand.how = `${errand.how} ${hint}`;
     slot.errand = errand;
     record.status = 'parked';
     record.note = `${situation.label} — ${errand.need}`;
@@ -899,6 +1099,93 @@ export class Runner extends RunnerAttempt {
     // not a phase that failed twice.
     this.record('phase.errand', { ...errand, label: situation.label, reason, by }, record.phase);
     this.emit('phase', { phase: record.phase, status: 'parked', note: record.note, errand });
+    this.persist();
+  }
+
+  /**
+   * The phase's `Person-check:` word and where it came from (phase 11,
+   * ZTD-6): the plan's bullet, else the policy table's answer for
+   * `verification.person-check` (this console's override, then the shipped
+   * `operator`).
+   */
+  protected personCheckFor(phase: number): { answer: string | null; source: string } {
+    const state = this.state;
+    const fromPlan = state ? this.deps.personCheck?.(state.slug, phase) : undefined;
+    if (fromPlan) return { answer: fromPlan, source: 'plan' };
+    const resolved = policyForKey('verification.person-check', state, this.deps.policyPrefs?.() ?? null);
+    return resolved ? { answer: resolved.answer, source: resolved.source } : { answer: null, source: 'default' };
+  }
+
+  /**
+   * The policy answer for a situation's decision key — the run's manifest
+   * first (what the door resolved from the plan and the twin), then this
+   * console's preferences, then the shipped default. A run from before the
+   * manifest existed resolves from the console and the defaults alone.
+   */
+  protected policyFor(situationKey: string): ResolvedPolicy | null {
+    return policyForSituation(situationKey, this.state, this.deps.policyPrefs?.() ?? null);
+  }
+
+  /**
+   * The ladder's answer when the class resolved to an automatic policy word
+   * (phase 11, ZTD-10/QRL-3): one `phase.policy-answered` line naming the
+   * decision key, the answer and its source — never `phase.errand`, never a
+   * card — and the act the word asks for. Written once per answer per phase:
+   * `slot.policyAnswered` is the fingerprint, so a re-classification on the
+   * next tick does not repeat the line.
+   */
+  private answerByPolicy(
+    record: PhaseRecord, situation: Situation,
+    slot: NonNullable<RunState['recoveries']>[string], errand: Errand, reason: string, by: string,
+  ): void {
+    const state = this.state!;
+    const answer = errand.policy!;
+    const already = slot.policyAnswered;
+    if (already && already.decisionKey === errand.decisionKey && already.answer === answer.answer) return;
+    slot.policyAnswered = { decisionKey: errand.decisionKey!, answer: answer.answer, source: answer.source, at: errand.at };
+    record.note = `${situation.label} — answered by policy: ${errand.decisionKey} = ${answer.answer} (${answer.source})`;
+    this.record('phase.policy-answered', {
+      ...policyAnsweredPayload({ ...errand, decisionKey: errand.decisionKey! }), label: situation.label, reason, by,
+    }, record.phase);
+    // The act. `qa.exhausted: waive` records the waiver through the operator's
+    // own door, so the report, the round and the reason are written the one
+    // way and the next board read releases the dependents. `waits: window`
+    // (a peer holding the scope) needs nothing more: the scheduler already
+    // queues behind the holder. Anything else the word names is acted on
+    // where it lives (a resume in `converge.ts`, a ruling by the session).
+    if (errand.decisionKey === 'qa.exhausted' && answer.answer === 'waive' && this.deps.qaWaive) {
+      const rounds = (record.qa ?? []).filter((entry) => entry.verdict === 'fail').length;
+      const declined = (detail: string) => {
+        // The policy could not act, so the ask stands after all — the person's
+        // errand, with the reason the console could not take it for them.
+        const { policy: _policy, ...asked } = errand;
+        slot.errand = asked;
+        slot.policyAnswered = undefined;
+        record.status = 'parked';
+        record.note = `${situation.label} — ${asked.need}`;
+        record.endedAt ??= asked.at;
+        this.record('phase.errand', {
+          ...asked, label: situation.label, by,
+          reason: `qa.exhausted: waive could not record the verdict — ${detail}`,
+        }, record.phase);
+        this.emit('phase', { phase: record.phase, status: 'parked', note: record.note, errand: asked });
+        this.persist();
+      };
+      void this.deps.qaWaive(state.slug, record.phase, {
+        reason: `QA exhausted after ${rounds} failed round${rounds === 1 ? '' : 's'} — waived by policy `
+          + `(qa.exhausted: waive, from the ${answer.source})`,
+        by: 'policy',
+      }).then((result) => {
+        if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+          declined(String((result as { detail?: unknown }).detail ?? 'the waiver was refused'));
+          return;
+        }
+        this.record('phase.qa-waived', {
+          by: 'policy', decisionKey: errand.decisionKey, source: answer.source, rounds,
+        }, record.phase);
+      }, (error: unknown) => declined(String((error as Error)?.message ?? error)));
+    }
+    this.emit('phase', { phase: record.phase, status: record.status, note: record.note });
     this.persist();
   }
 
@@ -946,7 +1233,7 @@ export class Runner extends RunnerAttempt {
 
   /** Reset a record for the boarding the ladder chose, and leave the hint on it. */
   protected reboardWith(record: PhaseRecord, hint: BoardingHint): void {
-    resetForRetry(record);
+    resetForRetry(record, { by: 'console', journal: this.declarationSink() });
     record.boardingHint = hint;
     // The queue rung is a lock wait: the two-hour cap measures from here.
     if (hint.rung === 'queue') record.lockWaitSince ??= hint.at;
@@ -1086,7 +1373,11 @@ export class Runner extends RunnerAttempt {
     const record = phaseRecord(state, phase);
     const facts = await this.briefFacts(phase, board);
     const wantsSession = hint.brief === 'continue' || hint.brief === 'closeout' || (hint.brief === 'unblock' && Boolean(hint.sessionId));
-    const resume = wantsSession ? this.resumableSession(record, hint.sessionId) : undefined;
+    const gate = wantsSession ? this.resumableSession(record, hint.sessionId) : null;
+    // A session still RUNNING is not degraded to a fresh boot — that would put a
+    // second session in its working tree. The brief keeps asking for it, and the
+    // boarding's own gate (`attemptSession`) holds the phase until it ends.
+    const resume = gate?.ok ? gate.resume.sessionId : gate?.why === 'session-live' ? hint.sessionId : undefined;
     let brief = hint.brief;
     let degraded: string | undefined;
     if ((hint.brief === 'continue' || hint.brief === 'closeout') && !resume) {
@@ -1461,6 +1752,7 @@ export class Runner extends RunnerAttempt {
       // — it said "per episode" and was per LANE, which meant a lane whose wait
       // cleared and returned got no second line however long the gap.
       delete lane.localNudgeRefused;
+      delete lane.automaticParkDeclined;
       this.record('phase.liveness', {
         cleared: before?.signal ?? null,
         turnsSinceLastTool: lane.signals.turnsSinceLastTool,
@@ -1641,7 +1933,7 @@ export class Runner extends RunnerAttempt {
       nudgedAt: remedy.nudgedAt ?? null, graceMs: STALL_NUDGE_GRACE_MS,
       sessionId: record.sessionId ?? null,
     }, phase);
-    this.checkpointLane(lane, 'silent before its first tool call, and a nudge did not wake it');
+    this.checkpointLane(lane, 'silent before its first tool call, and a nudge did not wake it', { endedBy: 'watchdog' });
     // The card was about a session that no longer exists. Cleared here rather
     // than left for a liveness tick that will never come — the ticker stops
     // with the lane — which is how a stall card came to outlive its subject.
@@ -1734,7 +2026,7 @@ export class Runner extends RunnerAttempt {
         detail: stall.detail, since: stall.since, attempt, category: category ?? null,
         sessionId: record.sessionId ?? null,
       }, phase);
-      this.checkpointLane(lane, `nothing but API retries before its first tool call${category ? ` (${category})` : ''}`);
+      this.checkpointLane(lane, `nothing but API retries before its first tool call${category ? ` (${category})` : ''}`, { endedBy: 'watchdog' });
       // The card was about a session that no longer exists — cleared here for
       // the same reason the silent recycle clears it: the liveness ticker stops
       // with the lane, so nothing else ever will.
@@ -1788,12 +2080,17 @@ export class Runner extends RunnerAttempt {
     // on the wall it is hitting" asserts the record's WORD and not just its
     // clock. `carryOn: false` because a phase parked on a window must not be
     // re-boarded by the drive loop — the park poke is what brings it back.
-    this.checkpointLane(lane, why, { carryOn: false });
+    this.checkpointLane(lane, why, { carryOn: false, endedBy: 'watchdog' });
     record.status = 'waiting';
     record.parkedUntil = until;
+    syncWaitClock(this.state!);
     record.parkReason = `${why}. Waiting until ${until}, when the window resets.`;
     record.note = record.parkReason;
-    record.endedAt = new Date(now).toISOString();
+    // When this park began, on its own field — not `endedAt`, which meant three
+    // things (WAI-4). It is the console's park, not a declared wait: it writes
+    // no declaration, spends nothing from the wait budget, and boards again with
+    // the engine's own prompt rather than "the wait window you declared".
+    record.parkedFrom = new Date(now).toISOString();
     delete record.stall;
     this.record('phase.retry-storm-parked', {
       until, detail: stall.detail, since: stall.since, attempt, category: category ?? null,
@@ -1873,9 +2170,18 @@ export class Runner extends RunnerAttempt {
       );
     }
     tried.push(`it went silent again before its first tool call on attempt ${record.attempts ?? 0}`);
+    // A `SITUATIONS` member (RCV-11, phase 10): the classifier's own answer
+    // for this record — no handoff, no work, a session that produced nothing —
+    // is `never-started` (arm 14), and the errand files under the same word,
+    // so every reader parses it. It used to say `silent-session:unfixable`, a
+    // key in no vocabulary, which `parseSituationKey` read as `unknown`; a
+    // `stalled` situation of its own is the deliberately untaken v2 path
+    // (`docs/loop.md` §Liveness), so the park keeps its own journal line
+    // (`phase.stall-parked`) for what the watchdog knows and the situation
+    // vocabulary says what the phase IS.
     const errand: Errand = {
       phase,
-      situation: 'silent-session:unfixable',
+      situation: 'never-started',
       tried,
       need: 'a person to look at why this phase boots and then says nothing',
       how: 'Open the phase, read the journal from `phase.boarded` onwards, and check the '
@@ -1892,7 +2198,7 @@ export class Runner extends RunnerAttempt {
     // run must keep driving its OTHER lanes — the settle reads the note, and a
     // `parked` record is not boardable, so the loop moves on rather than
     // re-boarding this one.
-    this.checkpointLane(lane, 'silent twice before its first tool call — parked for a person');
+    this.checkpointLane(lane, 'silent twice before its first tool call — parked for a person', { endedBy: 'watchdog' });
     record.status = 'parked';
     record.note = errand.need;
     record.endedAt ??= at;
@@ -2050,6 +2356,46 @@ export class Runner extends RunnerAttempt {
     this.persist();
   }
 
+  /**
+   * The console's in-turn-wait guard refused a Bash call on this phase's lane
+   * (`Service.decideToolUse`). Fed to the lane's signals so the local-job ladder
+   * can reach the one wait it could never see — a call denied before it opened
+   * (RCV-5's firing half; the situation and its rung are phase 9's).
+   */
+  noteWaitDenied(phase: number, denial: { command: string; matched: string }): void {
+    const lane = this.lanes.get(phase);
+    if (!lane) return;
+    const thresholds = stallThresholds(this.deps.stallThresholds?.());
+    noteWaitDenied(lane.signals, denial, this.now().getTime(), thresholds.stallLocalJobMs);
+    // …and on the RECORD, where a restart cannot lose it and the declaration
+    // path can read it: `applyEvent` deletes the lane's episode on the very
+    // `phase-outcome.sh` call that declares the wait, so the persisted stamp
+    // is the only witness a ref-less `waiting-external` is judged against
+    // (TRS-3). Not a permission block — `rule` says which guard.
+    this.noteToolDenied(phase, { tool: 'Bash', rule: 'in-turn-wait', command: denial.command, matched: denial.matched });
+  }
+
+  /**
+   * A tool call THIS console refused for the phase — the hook's decision
+   * (`Service.decideToolUse`), stamped on the record as first-class evidence
+   * (LFC-3): the situation classifier reads a deny-list denial as
+   * `blocked-declared:permission` above any prose, and the errand quotes the
+   * rule and the command from here rather than from what the session made of
+   * them. Only the newest denial is kept; a boarding clears it.
+   */
+  noteToolDenied(phase: number, denial: { tool: string; rule: string; command?: string; matched?: string }): void {
+    const state = this.state;
+    if (!state) return;
+    const record = state.phases[String(phase)];
+    if (!record) return;
+    record.toolDenied = {
+      tool: denial.tool, rule: denial.rule, at: this.now().toISOString(),
+      ...(denial.command ? { command: denial.command.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+      ...(denial.matched ? { matched: denial.matched } : {}),
+    };
+    this.persist();
+  }
+
   private externalWaitPark(lane: Lane, stall: StallState, thresholds: StallThresholds): void {
     const state = this.state;
     if (!state) return;
@@ -2058,6 +2404,16 @@ export class Runner extends RunnerAttempt {
     if (lane.checkpointed || lane.stopped || lane.frozen) return;
     if (this.stopRequested || this.abort?.signal.aborted || state.halt) return;
     if (state.status === 'pausing' || state.status === 'halting' || state.status === 'stopping') return;
+    // The off switch (SLF-9, KNOWN-SINCE): the stall card still stands, and the
+    // local job's nudge still went, but the console does not take the turn away
+    // from the session by itself. Said once per episode, not once per tick.
+    if (this.deps.stallAutomaticPark && !this.deps.stallAutomaticPark()) {
+      if (!lane.automaticParkDeclined) {
+        lane.automaticParkDeclined = true;
+        log.info('runner.automatic-park-off', { slug: state.slug, phase: lane.phase, detail: stall.detail });
+      }
+      return;
+    }
 
     const phase = lane.phase;
     // Whose clock, in the sentence a person reads on the park card. The same
@@ -2069,21 +2425,25 @@ export class Runner extends RunnerAttempt {
     // The tool's own text is the best `watch` reference available: it is
     // literally the command whose completion the phase is waiting for, and it
     // is what a person reading the park card needs in order to check it.
-    const watching = lane.signals.openTools.find((tool) => tool.name === 'Bash' && tool.summary);
-    // For a LOCAL job the command carries its own landing condition, and a
-    // `cmd:` ref makes the console able to act on it: the lane comes back when
-    // the job is actually done rather than at the end of a guessed window. For
-    // an external wait the summary stays exactly as it was — `gh run watch 12`
-    // is the sentence a person reads on the card, and re-running it as a
-    // command would block the scheduler for the same reason it blocked the
-    // session.
-    const cmdRef = stall.scope === 'local' && watching?.summary
-      ? localWatchRef(watching.summary)
-      : null;
+    // A DENIED wait opened no call: its command is the one the guard refused.
+    const denied = stall.source === 'denied' ? lane.signals.waitDenied : undefined;
+    const watching = denied
+      ? { name: 'Bash', summary: denied.command }
+      : lane.signals.openTools.find((tool) => tool.name === 'Bash' && tool.summary);
+    // The command carries its own landing condition, and a ref makes the
+    // console able to act on it: the lane comes back when the job is actually
+    // done rather than at the end of a guessed window. `mintWatchRef` reads
+    // every shape the guard refuses (phase 9, RCV-5) — a poll loop's condition,
+    // a `--watch` runner's one-shot form, a `sleep`'s clock, a `gh` watch's
+    // run or PR — and answers null for a command with no honest landing
+    // (`tail -f`), whose summary then stays on the card as the sentence a
+    // person reads.
+    const cmdRef = watching?.summary ? mintWatchRef(watching.summary, this.now().getTime()) : null;
     this.record('phase.external-wait', {
       detail: stall.detail,
       since: stall.since,
       scope: stall.scope ?? 'external',
+      source: stall.source ?? 'open',
       command: watching?.summary ?? null,
       watch: cmdRef,
       thresholdMs: stall.scope === 'local'
@@ -2091,10 +2451,16 @@ export class Runner extends RunnerAttempt {
         : thresholds.stallExternalWaitMs,
     }, phase);
 
-    this.checkpointLane(lane, reason, { carryOn: false });
+    this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'watchdog' });
     // No `resume_after`: the session never named a window, so `parkWaiting`'s
     // own default (WAIT_DEFAULT_MS) applies — inventing a shorter one here
     // would be the console guessing at somebody else's build time.
+    //
+    // `by: 'watchdog'` (SLF-9, WAI-5): this is the CONSOLE's park, in the
+    // console's name — its own ledger, never the session's declared waits or
+    // its budget — and the `cmd:` ref it lifted out of the loop is marked as
+    // minted, so nothing reads it as the session's instruction.
+    delete lane.signals.waitDenied;
     this.parkWaiting(phase, {
       version: 1,
       slug: state.slug,
@@ -2104,7 +2470,7 @@ export class Runner extends RunnerAttempt {
       watch: cmdRef ? [cmdRef] : (watching?.summary ? [watching.summary] : []),
       written_at: new Date(this.now().getTime()).toISOString(),
       ...(phaseRecord(state, phase).sessionId ? { session_id: phaseRecord(state, phase).sessionId } : {}),
-    });
+    }, { by: 'watchdog', budget: this.knownWaitBudget(phase), ...(cmdRef ? { minted: [cmdRef] } : {}) });
     // The run, not only the record. `carryOn: false` breaks the loop before
     // any ending branch runs, so unless this says what the run is doing the
     // checkpoint reads `running` with nothing driving it.
@@ -2143,10 +2509,11 @@ export class Runner extends RunnerAttempt {
     if (!waiting.length) return false;
     const soonest = [...waiting].map((r) => r.parkedUntil!).sort()[0];
     const names = waiting.map((r) => r.phase).sort((a, b) => a - b).join(', ');
-    state.status = 'waiting';
     state.stoppedBy = 'system';
+    // The same clock `syncWaitClock` keeps on every park — restated here because
+    // this is the transition that makes it the RUN's wait.
     state.waitUntil = soonest;
-    state.waitReason = 'external';
+    setRunState(state, 'waiting', { kind: 'external', until: soonest });
     state.finishedReason = `waiting on external work — phase${waiting.length === 1 ? '' : 's'} `
       + `${names} parked (${waiting.map((r) => r.parkReason).filter(Boolean).join('; ') || 'declared waits'}); `
       + `resumes at ${soonest}.`;
@@ -2216,9 +2583,15 @@ export class Runner extends RunnerAttempt {
         // resume that queued, capped or failed to spawn lost the testimony for
         // good: the watch-landed resume's whole point is to hand the session
         // back its own declared wait, and the console threw it away one line
-        // before finding out whether the session existed. A turn, a tool call
-        // or a result is proof it does.
-        if (this.state) {
+        // before finding out whether the session existed.
+        //
+        // And not by ANY productive event either (WAI-4): a turn or a `git
+        // status` proves the session exists, not that it said anything about
+        // the wait — the measured resume spent its declaration 0.8 s in and
+        // then produced nothing, leaving a record that could no longer say what
+        // it had been waiting for. A commit or a declared outcome is the
+        // session speaking to it (`isDurableProgress`).
+        if (this.state && isDurableProgress(event)) {
           const record = phaseRecord(this.state, phase);
           const spent = consumeDeclaration(record, 'session-productive');
           if (spent) {
@@ -2242,6 +2615,32 @@ export class Runner extends RunnerAttempt {
     }
 
     if (event.kind === 'retry') this.record('phase.api-retry', { ...event }, phase);
+
+    // What the CLI's own permission system refused, one line per denial
+    // (SES-5; chapter 09 row 2): the stream's announcement when it made one —
+    // the only form that carries a reason — else the result's authoritative
+    // ledger; `spawn.ts` never emits one denial twice. Distinct from
+    // `phase.tool-denied` (the console's OWN hook said no) and from
+    // `phase.tool-refused` (the words the session read when the CLI did).
+    // The session's reply to an operator's question, beside the question (TRS-6).
+    if (event.kind === 'answer') this.noteAnswer(phase, event);
+    if (event.kind === 'permission-denied') {
+      this.record('phase.permission-denied', {
+        tool: event.tool,
+        source: event.source,
+        ...(event.toolUseId ? { toolUseId: event.toolUseId } : {}),
+        ...(event.target ? { target: event.target } : {}),
+        ...(event.reason ? { reason: event.reason } : {}),
+        ...(event.reasonType ? { reasonType: event.reasonType } : {}),
+      }, phase);
+    }
+    if (event.kind === 'tool-result' && event.refused) {
+      this.record('phase.tool-refused', {
+        tool: event.tool ?? 'tool', toolUseId: event.id,
+        ...(event.target ? { target: event.target } : {}),
+        detail: event.detail ?? '',
+      }, phase);
+    }
 
     // The task channel, tailed on the events that mean a tool call finished or
     // a turn ended — which is exactly when `phase-tasks.sh` has just run. No
@@ -2350,12 +2749,14 @@ export class Runner extends RunnerAttempt {
         status: event.status,
         window: event.window,
         utilization: event.utilization,
+        ...(event.utilizationPct !== undefined ? { utilizationPct: event.utilizationPct } : {}),
         resetsAt: event.resetsAt,
         at: new Date().toISOString(),
       };
       // Worth a journal line only when the account is being warned, not on
       // every routine "you are fine" heartbeat.
       if (event.status !== 'allowed') this.record('run.usage-window', { ...event });
+      this.decideOnUsageWarning(event);
       this.persist();
     }
 
@@ -2369,23 +2770,75 @@ export class Runner extends RunnerAttempt {
     // this wall.
     if (lane && (event.kind === 'retry' || event.kind === 'limits')) {
       const walled = event.kind === 'limits'
-        // The CLI's own structured verdict on the account's window.
-        // `allowed_warning` is excluded deliberately: it means "you are high
-        // and your requests are still going through", which is a heads-up
-        // (already journalled as `run.usage-window`) and not a reason to end
-        // a session that is working.
-        ? event.status !== 'allowed' && event.status !== 'allowed_warning'
+        // The CLI's own structured verdict on the account's window — by the
+        // WORD, and by the NUMBER (ACT-7). `rejected`, the one word this arm
+        // used to act on, arrived zero times in 7 326 lifetime events; what
+        // arrives is `allowed_warning` with a utilization. So a warning is a
+        // heads-up (journalled as `run.usage-window`, decided at `ALERT_PCT`)
+        // right up to `WALL_PCT`, where the meter itself says the window is
+        // spent and a request going through is the exception, not the rule.
+        // Compared in PERCENT (`utilizationPct`), never the wire's fraction.
+        ? (event.status !== 'allowed' && event.status !== 'allowed_warning')
+          || (typeof event.utilizationPct === 'number' && event.utilizationPct >= WALL_PCT)
         // A retry the CLI categorised as a rate limit. `overloaded` is
         // capacity rather than quota and another ACCOUNT does not fix it —
         // that one stays the model ladder's business, on exit, as it was.
         : event.category === 'rate_limit' || event.category === 'rate_limit_error';
       if (walled) {
         this.liveWall(lane, phase, event.kind,
-          event.kind === 'limits' ? event.status : event.category);
+          event.kind === 'limits'
+            ? `${event.status}${typeof event.utilizationPct === 'number' ? ` at ${Math.round(event.utilizationPct)} %` : ''}`
+            : event.category);
       }
     }
 
     this.emit('stream', { phase, ...event });
+  }
+
+  /** The `run:window:reset` warnings this runner has already decided about. */
+  private usageDecided = new Set<string>();
+
+  /**
+   * An in-session usage warning past the alert threshold, DECIDED rather than
+   * merely recorded (SES-9).
+   *
+   * The CLI's `rate_limit_event` says `allowed_warning`, with the window's
+   * utilization, long before it says `rejected` — and in the audit's six plans
+   * 3 150 such lines were journalled, every one of them `allowed_warning`, up
+   * to 0.99, and acted on by nothing: the live wall excludes the status by
+   * design and no threshold existed. The run's `onLimit` decides here what the
+   * warning calls for, once per window and reset, against `ALERT_PCT` — the
+   * percent the account meters announce at, compared in their unit
+   * (`utilizationPct`), never the wire's fraction.
+   *
+   * Journalled `enacted: false`: carrying the action out — the switch, the
+   * throttle, the park — is zero-touch-console phase 8's account helper. The
+   * decision is recorded now so the warning stops being a line nothing reads.
+   */
+  private decideOnUsageWarning(event: Extract<StreamEvent, { kind: 'limits' }>): void {
+    const state = this.state;
+    if (!state || event.status !== 'allowed_warning') return;
+    const pct = event.utilizationPct;
+    if (typeof pct !== 'number' || pct < ALERT_PCT) return;
+    const key = `${state.id}:${event.window ?? 'window'}:${event.resetsAt ?? 'unknown'}`;
+    if (this.usageDecided.has(key)) return;
+    this.usageDecided.add(key);
+    const policy = state.onLimit ?? 'wait';
+    // The same reading `liveWall` gives the policy: `switch` always moves, and
+    // `wait` moves too unless automatic switching is off, when all it can do
+    // is hold new work for the window.
+    const action: UsageDecisionAction = policy === 'pause'
+      ? 'park'
+      : policy === 'switch' || this.deps.autoAccountSwitch?.() !== false ? 'switch' : 'throttle';
+    this.record('run.usage-decision', {
+      action,
+      thresholdPct: ALERT_PCT,
+      utilizationPct: pct,
+      ...(event.window ? { window: event.window } : {}),
+      ...(event.resetsAt !== undefined ? { resetsAt: event.resetsAt } : {}),
+      policy,
+      enacted: false,
+    });
   }
 
   /**
@@ -2445,13 +2898,26 @@ export class Runner extends RunnerAttempt {
     const wantSwitch = policy === 'switch'
       || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
 
+    // The wall is the ACCOUNT's fact before it is this run's move (ACT-5):
+    // marked machine-wide under the window's own name, with the reset the CLI
+    // reported when it did, BEFORE any switch — so `pickAccount` on the next
+    // burst, here or in another console, never sends the run straight back.
+    // The live wall used to be the one mover that skipped this, and 16 of 17
+    // lifetime switches were a reciprocal A→B→A pair.
+    const resetsAt = typeof state.limits?.resetsAt === 'number' && Number.isFinite(state.limits.resetsAt)
+      && state.limits.resetsAt * 1000 > now
+      ? new Date(state.limits.resetsAt * 1000) : null;
+    const left = this.leaveAccount(phase, {
+      kind: 'usage', bucket: state.limits?.window ?? LEARNED_WALL_BUCKET, resetsAt, reason, by: 'live-wall',
+    });
+
     if (wantSwitch && this.trySwitchAccount(phase, record, reason, record.model ?? state.model)) {
       lane.limitActedAt = now;
       hits.length = 0;
       this.record('phase.live-wall', { action: 'switch', source, detail: detail ?? null, policy, reason }, phase);
       // `carryOn: true` — the next attempt spawns under the account that can
       // pay, resuming the same session when its transcript came along.
-      this.checkpointLane(lane, reason);
+      this.checkpointLane(lane, reason, { endedBy: 'account-switch' });
       // The lane may be asleep on a queue or a window rather than in `spawn`;
       // the same wake the operator's switch verb uses ends that sleep.
       this.haltSignal.dispatchEvent(new Event('wake'));
@@ -2467,12 +2933,11 @@ export class Runner extends RunnerAttempt {
       // lives inside the attempt loop and this runs on the stream callback:
       // the phase goes back to `pending` with a session to resume, and the run
       // stops for a person with the reset time on it when the CLI told us one.
-      this.checkpointLane(lane, reason, { carryOn: false });
+      this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'checkpoint' });
       const resetsAt = state.limits?.resetsAt;
       const at = typeof resetsAt === 'number' && Number.isFinite(resetsAt) ? new Date(resetsAt * 1000) : null;
-      state.status = 'paused';
       state.waitUntil = at ? at.toISOString() : null;
-      state.waitReason = 'usage-limit';
+      setRunState(state, 'paused', { kind: 'usage-limit', until: state.waitUntil });
       state.finishedReason = at
         ? `usage limit hit mid-session — resets ${at.toLocaleString()}. `
           + 'Continue now under another account, or wait for the window.'
@@ -2490,9 +2955,108 @@ export class Runner extends RunnerAttempt {
     // once per cooldown so the run's own record says the console SAW the wall
     // and had no move — the difference between a policy that did not fire and
     // one that fired and found the door shut.
+    //
+    // …but not for ever (ACT-6: 85 of 102 lifetime walls ended here, 52 under
+    // `switch`, and nothing escalated — the child sat in the CLI's retry loop
+    // and nobody was told). After `LIMIT_NONE_MAX` such decisions inside
+    // `LIMIT_NONE_WINDOW_MS`, the wall is real and the account has no move, so
+    // the run does one of three things instead of a third `none`: waits out
+    // the window when a reset is known (the retry-storm park's own shape, the
+    // phase `waiting` on the clock and the park poke bringing it back), or
+    // parks with the one errand — and announces under `limits` either way.
+    // The climb is recorded in the `phase.situation`/`phase.rung` vocabulary
+    // so the ladder card exists for it.
     lane.limitActedAt = now;
     hits.length = 0;
-    this.record('phase.live-wall', { action: 'none', source, detail: detail ?? null, policy, reason }, phase);
+    const nones = (lane.limitNones ??= []);
+    nones.push(now);
+    while (nones.length && now - nones[0] > LIMIT_NONE_WINDOW_MS) nones.shift();
+    if (nones.length <= LIMIT_NONE_MAX) {
+      this.record('phase.live-wall', { action: 'none', source, detail: detail ?? null, policy, reason, nones: nones.length }, phase);
+      return;
+    }
+    this.escalateLiveWall(lane, record, source, detail, policy, reason, left, now);
+  }
+
+  /**
+   * The third `none` (ACT-6). The account has been left (`leaveAccount` ran
+   * above), so the earliest reset is what it answered — the wall's own clock
+   * when the CLI reported one, the cool-down when it did not — and the run:
+   *
+   *  - WAITS on it (`wait-window`): the phase is checkpointed and parked on the
+   *    window exactly as the retry-storm watchdog parks one — `waiting`,
+   *    `parkedUntil`, the run clock synced, the poke armed — so a restart
+   *    resumes it and the classifier reads `resource-wall:usage` off the
+   *    phase's own note; or
+   *  - PARKS with the one errand when there is no clock at all.
+   *
+   * Announced under `limits` either way, and written in the ladder's words
+   * (`phase.situation` → `phase.rung` / `phase.errand`, `by: 'drive'`) so the
+   * `switch-account` and `wait-window` rungs the card advertises are rungs
+   * that have been climbed rather than words.
+   */
+  private escalateLiveWall(
+    lane: Lane, record: PhaseRecord, source: 'retry' | 'limits', detail: string | undefined,
+    policy: string, reason: string, left: LeaveResult | null, now: number,
+  ): void {
+    const state = this.state!;
+    const phase = lane.phase;
+    const key = 'resource-wall:usage';
+    const why = [
+      `${LIMIT_NONE_MAX + 1} live walls inside ${Math.round(LIMIT_NONE_WINDOW_MS / 60_000)} minutes with no account to move to`,
+      reason,
+    ];
+    record.situation = { key, at: new Date(now).toISOString(), why, by: 'drive' };
+    this.record('phase.situation', { situation: key, sub: 'usage', label: 'Resource wall', why, by: 'drive' }, phase);
+    const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: new Date(now).toISOString() });
+    // `switch-account` was climbed by `trySwitchAccount` and found nothing;
+    // recorded as tried so the errand can say so, then the wait rung.
+    accountRung(slot, { situation: key, rung: 'switch-account', at: new Date(now).toISOString(), note: 'no other account had headroom' });
+    this.record('phase.rung', {
+      situation: key, rung: 'switch-account', params: null, vehicle: 'runner', attempt: slot.attempts, by: 'drive', inline: true,
+    }, phase);
+    this.settleOpenRung(phase, 'failed', 'no other account had headroom');
+    const until = left?.until ?? null;
+    if (until && Date.parse(until) > now) {
+      accountRung(slot, { situation: key, rung: 'wait-window', at: new Date(now).toISOString(), note: `waits until ${until}` });
+      this.record('phase.rung', {
+        situation: key, rung: 'wait-window', params: null, vehicle: 'runner', attempt: slot.attempts, by: 'drive',
+        inline: true, until,
+      }, phase);
+      this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'checkpoint' });
+      record.status = 'waiting';
+      record.parkedUntil = until;
+      syncWaitClock(state);
+      record.parkReason = `${reason}. Waiting until ${until}, when the window resets.`;
+      record.note = record.parkReason;
+      record.parkedFrom = new Date(now).toISOString();
+      delete record.stall;
+      this.record('phase.live-wall', { action: 'wait', source, detail: detail ?? null, policy, reason, until }, phase);
+      this.deps.onLiveWallEscalated?.(state, phase, { action: 'wait', reason, until });
+      this.emit('phase', { phase, status: 'waiting', note: record.parkReason, parkedUntil: until });
+      this.armParkPoke(phase, until);
+      this.persist();
+      return;
+    }
+    // No clock anywhere: the ladder is exhausted, and the one ask stands.
+    const errand: Errand = {
+      ...errandFor(key, slot.rungs ?? [], phase),
+      how: 'Register or sign in another Claude account under Settings ▸ Accounts and switch the run to it; '
+        + 'the wall reported no reset time, so nothing here can wait it out.',
+    };
+    slot.errand = errand;
+    this.checkpointLane(lane, reason, { carryOn: false, endedBy: 'checkpoint' });
+    record.status = 'parked';
+    // The wall's own words lead the note — `USAGE_RE` (`situation.ts`) reads
+    // "rate limited" off it, so the classifier answers `resource-wall:usage`
+    // from the record alone.
+    record.note = `Resource wall — ${reason}. ${errand.need}`;
+    record.endedAt ??= errand.at;
+    this.record('phase.live-wall', { action: 'park', source, detail: detail ?? null, policy, reason }, phase);
+    this.record('phase.errand', { ...errand, label: 'Resource wall', reason, by: 'drive' }, phase);
+    this.deps.onLiveWallEscalated?.(state, phase, { action: 'park', reason, until: null });
+    this.emit('phase', { phase, status: 'parked', note: record.note, errand });
+    this.persist();
   }
 
   /**
@@ -2575,6 +3139,12 @@ export class Runner extends RunnerAttempt {
   protected settlePhase(phase: number, reason: string, kind: HaltKind): void {
     const state = this.state!;
     const record = phaseRecord(state, phase);
+    // A recheck that met the SAME ending is not a new fact (RCV-4): the halt
+    // keeps its clock, no second `phase.halted` is written, and the streak is
+    // not asked — a recovery that spawned nothing failed no attempt. The reason
+    // is prose that legitimately varies (the closeout note rides in it), so
+    // the KIND is the identity. `runRecovery` reports the verdict.
+    if (this.rechecking === phase && record.halt?.kind === kind) return;
     record.halt = { at: new Date().toISOString(), reason, phase, kind };
     // The card's sentence, when the caller did not already write a better one.
     record.note ??= reason;
@@ -2599,14 +3169,17 @@ export class Runner extends RunnerAttempt {
     log.warn('runner.phase-halted', { slug: state.slug, runId: state.id, reason, phase, kind });
   }
 
-  protected halt(reason: string, phase?: number, kind?: HaltKind): void {
+  protected halt(reason: string, phase: number | undefined, kind: HaltKind): void {
     const state = this.state!;
     // A phase-level kind settles the phase and returns the run to its other
     // candidates. Every existing call site keeps its shape: what changed is
     // where the ending is WRITTEN, which is what stopped it from draining the
-    // siblings. A kindless halt is by definition unclassified and stays
-    // run-level — the conservative side of an ambiguity.
-    if (phase != null && kind && isPhaseHalt(kind)) { this.settlePhase(phase, reason, kind); return; }
+    // siblings. The kind is REQUIRED since LFC-1 — a kindless halt used to
+    // "stay run-level, the conservative side of an ambiguity", and the
+    // ambiguity was that nothing could classify it afterwards.
+    if (phase != null && isPhaseHalt(kind)) { this.settlePhase(phase, reason, kind); return; }
+    // The run-level twin of `settlePhase`'s recheck rule (RCV-4).
+    if (phase != null && this.rechecking === phase && state.halt?.kind === kind) return;
     // With lanes still live the run is DRAINING, not stopped: `halting` keeps
     // it in IN_FLIGHT (a dead console mid-drain must still pid-check those
     // children) and the drive loop flips it to `halted` when the last lane
@@ -2617,8 +3190,9 @@ export class Runner extends RunnerAttempt {
     state.status = this.lanes.size ? 'halting' : 'halted';
     state.stoppedBy = 'system';
     // `kind` is the machine-readable class the auto-recovery classifier reads;
-    // the sentence stays for people, and old records simply never have one.
-    state.halt = { at: new Date().toISOString(), reason, phase, ...(kind ? { kind } : {}) };
+    // the sentence stays for people. Old records without one are given a word
+    // on load (`healLegacyHalt`).
+    state.halt = { at: new Date().toISOString(), reason, phase, kind };
     // Wake any lane sleeping on a retry backoff or a usage window: each
     // re-checks `state.halt` on waking and stands down instead of spawning
     // another attempt hours later on a run that has already stopped.
@@ -2631,7 +3205,7 @@ export class Runner extends RunnerAttempt {
     // One field the console can always read for "why did this stop", whichever
     // of the several endings it was.
     state.finishedReason = reason;
-    this.record('run.halt', { reason, phase, ...(kind ? { kind } : {}) });
+    this.record('run.halt', { reason, phase, kind });
     // A halt drains the siblings, so its queue is cancelled with it. Issue #6
     // asked this of `halting` in the same breath as `pausing`, and for the same
     // reason: the sibling lanes are already refused, only the queue and the
@@ -2716,12 +3290,35 @@ export class Runner extends RunnerAttempt {
    * Shutdown: write the checkpoint and let the child settle. The console's
    * shutdown budget is generous for exactly this reason — a phase killed
    * halfway through leaves a repo nobody can reason about.
+   *
+   * Both records say WHY now (SHD-8): `run.console-shutdown` carries the intent
+   * (a Shut down press, a Restart, a signal nobody explained), every lane and
+   * the run's wait clock it discards; each `run.shutdown-child` names the phase,
+   * the session, the grace the ladder gave it and the tool call that was open
+   * when it went — a `gh pr merge` cut at 28 s is where "which side of the
+   * merge" is the only question that matters, and the record used to be
+   * `{pid, how}`.
    */
-  protected async checkpointForShutdown(): Promise<void> {
+  protected async checkpointForShutdown(context?: ShutdownContext): Promise<void> {
     if (!this.state) return;
+    const intent = context?.intent ?? 'signal';
+    const why = intent === 'restart' ? 'restart' : 'console-shutdown';
+    const lanes = this.livePhases().map((phase) => {
+      const lane = this.lanes.get(phase);
+      return { phase, pid: lane?.pid ?? null, sessionId: this.state?.phases[String(phase)]?.sessionId ?? null };
+    });
+    const clock = waitClockOf(this.state) ?? null;
     this.record('run.console-shutdown', {
-      pids: this.livePhases().map((phase) => this.lanes.get(phase)?.pid).filter(Boolean),
+      pids: lanes.map((lane) => lane.pid).filter(Boolean),
       phases: this.livePhases(),
+      intent,
+      ...(context?.reason ? { reason: context.reason } : {}),
+      ...(context?.mode ? { mode: context.mode } : {}),
+      live: true,
+      status: this.state.status,
+      lanes,
+      waitUntil: clock,
+      discards: clock ? `the wait clock due ${clock}` : null,
     });
     this.persist();
     if (!this.livePhases().length && !this.childPid) return;
@@ -2740,14 +3337,37 @@ export class Runner extends RunnerAttempt {
     // a timer, because a `setTimeout` backstop dies with the process that set
     // it — which is precisely the process that is exiting.
     const grace = Math.min(SIGTERM_GRACE_MS, SHUTDOWN_LADDER_MS);
+    // Named on every live session before anything signals it, so each record
+    // says the console's shutdown ended it — not an exit nobody explains.
+    for (const lane of this.lanes.values()) lane.handle?.markEnding?.('shutdown', 'the console shut down');
+    this.handle?.markEnding?.('shutdown', 'the console shut down');
     const ladders = [...this.lanes.values()]
-      .map((lane) => lane.pid)
-      .filter((pid): pid is number => pid != null)
-      .map((pid) => killLadder(pid, { killAfterMs: grace }).then((how) => {
-        this.record('run.shutdown-child', { pid, how });
-        return how;
-      }));
-    this.abort?.abort();
+      .filter((lane) => lane.pid != null)
+      .map((lane) => {
+        const pid = lane.pid as number;
+        const record = this.state?.phases[String(lane.phase)];
+        // The tool call open when the signal went — read BEFORE the ladder, whose
+        // ending closes nothing the stream would report.
+        const openTool = livenessOf(lane.phase, lane.signals).openTool ?? null;
+        const started = Date.now();
+        return killLadder(pid, { killAfterMs: grace }).then((how) => {
+          this.record('run.shutdown-child', {
+            pid,
+            phase: lane.phase,
+            sessionId: record?.sessionId ?? null,
+            how,
+            graceMs: grace,
+            interruptGraceMs: INT_GRACE_MS,
+            ms: Date.now() - started,
+            why,
+            intent,
+            ...(context?.reason ? { reason: context.reason } : {}),
+            openTool: openTool ? { name: openTool.name, since: openTool.since, ...(openTool.summary ? { summary: openTool.summary } : {}) } : null,
+          }, lane.phase);
+          return how;
+        });
+      });
+    this.abort?.abort('shutdown');
     await Promise.allSettled(ladders);
     await this.driving;
     this.persist();

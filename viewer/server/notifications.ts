@@ -293,12 +293,15 @@ export class Notifications {
    * it changed so the caller can decide about a corrective push.
    */
   resolveWhere(scope: {
-    slug?: string; category?: string; runId?: string; phase?: number;
+    slug?: string; category?: string; runId?: string; phase?: number; sessionId?: string;
   }, reason: string): NotificationRecord[] {
     const tests: ((item: NotificationRecord) => boolean)[] = [];
     if (scope.slug) tests.push((item) => item.slug === scope.slug);
     if (scope.category) tests.push((item) => item.category === scope.category);
     if (scope.runId) tests.push((item) => item.runId === scope.runId);
+    // A session's own rows — a `session-ask` carries no slug or run, only the
+    // session it was about, so this is the one key that resolves its row alone.
+    if (scope.sessionId) tests.push((item) => item.sessionId === scope.sessionId);
     if (typeof scope.phase === 'number') tests.push((item) => item.phase === scope.phase);
     if (!tests.length) return [];
 

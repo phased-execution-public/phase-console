@@ -76,6 +76,12 @@ export interface NavItem {
    * both kinds of process: either flag is enough to make it worth a slot.
    */
   requires?: readonly ('allowTerminal' | 'allowAgent')[];
+  /**
+   * Offered only while this console can reach a machine-wide supervisor
+   * (`state.fleet.reachable`) — the same "no permanent dead link" rule as
+   * `requires`, over a fact that arrives with `/api/state` and moves with a beat.
+   */
+  requiresReach?: true;
 }
 
 export const NAV: readonly NavItem[] = [
@@ -104,7 +110,7 @@ export const NAV: readonly NavItem[] = [
     label: 'Runs',
     icon: Play,
     band: 'work',
-    note: 'The fleet and the money — every run, its status and its cost',
+    note: 'Every run on this console — its status and its cost',
     // Deliberately unbadged. The approvals count is exactly what `needsYou`
     // counts, and painting one number on two entries is the "same state on
     // four surfaces" this redesign exists to end. Runs answers *what is
@@ -174,7 +180,11 @@ if (NAV.map((item) => item.id).join() !== (DESTINATIONS as readonly string[]).jo
  * and can change on a restart.
  */
 export function visibleNav(state: ConsoleState | undefined): NavItem[] {
-  return NAV.filter((item) => !item.requires || item.requires.some((flag) => state?.[flag] === true));
+  return NAV.filter(
+    (item) =>
+      (!item.requires || item.requires.some((flag) => state?.[flag] === true)) &&
+      (!item.requiresReach || state?.fleet?.reachable === true),
+  );
 }
 
 /**

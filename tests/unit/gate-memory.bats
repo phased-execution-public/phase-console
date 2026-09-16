@@ -175,11 +175,11 @@ EOF
 
 @test "gate-status: a multi-line prose gate is reported whole, not truncated at six lines" {
   setup_docs gatecheck fulltext
-  # strip phase 10's Gate-check so the manual fallback surfaces the prose
+  # strip phase 10's Gate-check so the default (`ai` since 5.0.0) surfaces the prose
   sed -i.bak '/ai verify staging deploy/d' "$DOCS_ROOT/docs/plans/fulltext.md"
   run pg fulltext --gate-status 10
   [ "$status" -ne 0 ]
-  assert_contains "$output" "manual"
+  [[ "$output" == ai:* ]]
   assert_contains "$output" "seventh condition"
 }
 
@@ -194,7 +194,7 @@ EOF
   sed -i.bak 's/manual ops sign-off before launch/manuel ops sign-off/' "$DOCS_ROOT/docs/plans/typo.md"
   run pg typo --lint
   [ "$status" -ne 0 ]
-  assert_contains "$output" 'unknown Gate-check type "manuel"'
+  assert_contains "$output" 'gate-type-unknown — Gate-check type "manuel"'
 }
 
 @test "memory-block: emits done / ready / waiting sets in canonical form" {
@@ -245,8 +245,8 @@ EOF
   assert_contains "$output" "verify it against evidence you can actually read"
   assert_contains "$output" "Never record an approval you cannot cite evidence for"
   assert_contains "$output" "cannot verify from evidence"
-  # And the stop is a declared outcome the supervisor reads, not prose.
-  assert_contains "$output" "blocked --reason"
+  # And the stop is a declared outcome the supervisor reads, not prose — by key.
+  assert_contains "$output" "blocked --needs gates --reason"
 }
 
 @test "boot-prompt: delegation does not touch an ai gate's own wording" {

@@ -41,7 +41,7 @@ Verify in (silent); phase 6 cd-prefixes the command (silent).
 ### Phase 3 — Table
 
 - **Verification:**
-  - the exit codes seen in the wild were `1` and `128 112 3 12 124`
+  - `bash -c 'exit 0'` — the exit codes seen in the wild were `1` and `128 112 3 12 124`
 
 ### Phase 4 — Root
 

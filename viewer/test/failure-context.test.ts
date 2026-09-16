@@ -220,7 +220,7 @@ test('the UNBLOCK brief leads with the Outstanding text, allows the work, names 
   assert.match(text, /^UNBLOCK phase 3/);
   assert.match(text, /explicitly allowed — asked — to do the work/);
   assert.match(text, /The column rename is undecided/);
-  assert.match(text, /phase-outcome\.sh demo 3 needs-human --reason/);
+  assert.match(text, /phase-outcome\.sh demo 3 needs-human --needs <key> --reason/);
   assert.match(text, /Working tree: clean/);
   assert.doesNotMatch(text, /do not start new work/i);
   // The Outstanding block is load-bearing and appears once, not once in the

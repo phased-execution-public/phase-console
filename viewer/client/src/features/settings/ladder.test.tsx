@@ -47,15 +47,17 @@ describe('<LadderCard>', () => {
     expect(field('Sweep every').value).toBe('5');
     expect(field('Park on a required MCP server for').value).toBe('30');
     expect(field('Raise a spent run budget once by').value).toBe('25');
-    // Three toggles default on. Three default OFF, each deliberately:
-    // `delegateHumanGates` (the plan author wrote `human`, and "the owner
-    // approves the visual result" is not a thing a session can judge),
-    // `allowUnverifiedPhases` (it lowers the proof bar to the handoff) and
-    // `ladderExtendOnProgress` (one more rung is one more session's money) —
-    // server/config.ts. `resumeAtBoot` is no longer a toggle at all — it is
-    // three-valued since 3.5.0 and opens on Ask.
-    expect(screen.getAllByRole('button', { name: 'On' })).toHaveLength(3);
-    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(3);
+    // Five toggles default on — the fourth is `stallAutomaticPark`, the
+    // watchdog's own park, which ships on because that is what the console did
+    // before the switch existed (SLF-9), and the fifth is `delegateHumanGates`,
+    // on since 5.0.0 (phase 11, operator decision 11: `gates: delegated` — the
+    // console's word for the manifest's `gates` row). Two default OFF, each
+    // deliberately: `allowUnverifiedPhases` (it lowers the proof bar to the
+    // handoff) and `ladderExtendOnProgress` (one more rung is one more
+    // session's money) — server/config.ts. `resumeAtBoot` is no longer a toggle
+    // at all — it is three-valued since 3.5.0 and opens on Ask.
+    expect(screen.getAllByRole('button', { name: 'On' })).toHaveLength(5);
+    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'Ask' })).toBeTruthy();
   });
 
@@ -77,21 +79,34 @@ describe('<LadderCard>', () => {
     }
   });
 
-  it('offers a control for delegateHumanGates, and it can be turned on', async () => {
+  it('offers the automatic park on, and turning it off saves exactly its own key', async () => {
+    // SLF-9's off switch: the watchdog's park ships on (what the console did
+    // before the switch existed), and the row reads its CURRENT state, so
+    // "On" is itself the assertion. Off saves `stallAutomaticPark: false` and
+    // nothing else — the stall card and the nudge are not this key's business.
+    await mount({});
+    const row = screen.getByText('Park a waiting lane by itself').closest('div')!;
+    const toggle = within(row).getByRole('button', { name: 'On' });
+    expect(toggle.getAttribute('data-pref')).toBe('stallAutomaticPark');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(toggle);
+    await waitFor(() => expect(savePrefs).toHaveBeenCalledWith({ stallAutomaticPark: false }));
+  });
+
+  it('offers a control for delegateHumanGates, on by default, and it can be turned off', async () => {
     // It was a fully-plumbed server preference — honoured by the runner,
     // patchable over the API — with no control anywhere, so the only way to
     // use it was to hand-edit config.json and restart the console, which is
-    // the exact thing the console exists to remove.
+    // the exact thing the console exists to remove. Since 5.0.0 it ships ON
+    // (`gates: delegated`), so the row reads "On" and a click turns it off.
     await mount({});
     const label = screen.getByText('Let a session clear a human gate');
     const row = label.closest('div')!;
-    // The button carries the CURRENT state, so the delegation row reads "Off"
-    // — which is itself the assertion that it ships off.
-    const toggle = within(row).getByRole('button', { name: 'Off' });
-    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    const toggle = within(row).getByRole('button', { name: 'On' });
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
     fireEvent.click(toggle);
     await waitFor(() =>
-      expect(savePrefs).toHaveBeenCalledWith(expect.objectContaining({ delegateHumanGates: true })),
+      expect(savePrefs).toHaveBeenCalledWith(expect.objectContaining({ delegateHumanGates: false })),
     );
   });
 
@@ -100,9 +115,9 @@ describe('<LadderCard>', () => {
     expect(field('Spend per day').value).toBe('900');
     expect(field('Sweep every').value).toBe('0');
     expect(field('Park on a required MCP server for').value).toBe('0');
-    // The three opt-ins stay Off; `resumeAtBoot: false` renders as its own
-    // three-valued control reading Never.
-    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(3);
+    // The two opt-ins stay Off (delegation ships on since 5.0.0);
+    // `resumeAtBoot: false` renders as its own three-valued control reading Never.
+    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'Never' })).toBeTruthy();
   });
 

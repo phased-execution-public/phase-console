@@ -82,3 +82,12 @@ load ../helpers/test_helper
   [ "$status" -eq 0 ]
   [[ "$output" != *"is not one of"* ]]
 }
+
+# --- The four checks that moved to F1 tier in 5.0.0 (zero-touch-console P3) ---
+@test "validate: names each of the four promoted checks, and passes a plan carrying a full manifest" {
+  setup_docs bad-gated-no-check g1;            run pe_validate g1;  [ "$status" -ne 0 ]; assert_contains "$output" "gate-directive-missing"
+  setup_docs bad-gate-type-unknown g2;         run pe_validate g2;  [ "$status" -ne 0 ]; assert_contains "$output" "gate-type-unknown"
+  setup_docs bad-empty-verification-open g3;   run pe_validate g3;  [ "$status" -ne 0 ]; assert_contains "$output" "verification-empty-open"
+  setup_docs bad-decision-unowned g4;          run pe_validate g4;  [ "$status" -ne 0 ]; assert_contains "$output" "decision-outstanding-unowned"
+  setup_docs credentials ok;                   run pe_validate ok;  [ "$status" -eq 0 ]
+}

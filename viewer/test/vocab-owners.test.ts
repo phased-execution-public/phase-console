@@ -29,7 +29,7 @@
 import './state-sandbox.ts';
 
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
@@ -60,12 +60,23 @@ import {
 import {
   ACCOUNT_KINDS,
   AUTH_STATES,
+  CREDENTIAL_CLASSES,
   DELIVERY_OUTCOMES,
+  ENTITLEMENT_STATES,
   ETA_BASES,
   HEALTH_SEVERITIES,
+  LEAVE_KINDS,
   MCP_STATUSES,
   MCP_TRANSPORTS,
 } from '../shared/ops-vocab.js';
+import {
+  CENSUS_DISCREPANCIES,
+  CENSUS_PROVENANCES,
+  FLEET_TIERS,
+  INSTANCE_HEALTH_KINDS,
+  LIVENESS,
+  UNOWNED_HOWS,
+} from '../shared/fleet-model.js';
 import {
   ORCHESTRATION_VERBS,
   PRIORITY_LABELS,
@@ -74,10 +85,17 @@ import {
   runPriority,
 } from '../shared/orchestration-model.js';
 import {
+  ACTOR_FIELDS,
+  ACTOR_VIAS,
+  CLASSIFIED_BY,
+  OPERATOR_DOOR,
   AUTONOMY_MODES,
   BOARDING_BRIEFS,
+  CAP_SOURCES,
   CONVERGE_TRIGGERS,
+  DECLARATION_CONSUMERS,
   DISPOSITION_KINDS,
+  ENDED_BY,
   GIT_MODES,
   HOLDER_KINDS,
   MCP_POLICIES,
@@ -87,6 +105,7 @@ import {
   PHASE_STATUSES,
   PHASE_STOP_KINDS,
   PRESENCE,
+  PRESENCE_END_SOURCES,
   QUEUE_KINDS,
   REVIEWER_POLICIES,
   ULTRA_REVIEW_MODES,
@@ -94,9 +113,23 @@ import {
   RUN_LIFECYCLE_STATES,
   RUN_PENDING_ACTS,
   RUN_STATUSES,
+  SESSION_MODES,
+  START_DOORS,
+  USAGE_DECISION_ACTIONS,
   WATCH_STATES,
 } from '../shared/run-lifecycle.js';
 import { RESUME_AT_BOOT_MODES } from '../shared/automation-model.js';
+import { DECISION_KEYS, DECISION_STATES, DECISION_SOURCES, NEED_CLASSES } from '../shared/decisions-model.js';
+import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situation-model.js';
+import { RUNG_DRIVERS, RUNG_VEHICLES } from '../shared/ladder-model.js';
+import { POLICY_CLASSES, POLICY_SOURCES } from '../shared/policy-model.js';
+import { RELAY_MODES } from '../shared/run-settings.js';
+import {
+  QUESTION_ANSWERED_BY, QUESTION_EXCLUSIONS, QUESTION_UNANSWERABLE_REASONS, RELAY_MECHANISMS,
+} from '../shared/relay-model.js';
+import {
+  BOOT_HOLD_KINDS, PROBE_STATUSES, SHUTDOWN_CLOCK_SOURCES, SHUTDOWN_DURABILITIES, SHUTDOWN_INTENTS, SHUTDOWN_MODES,
+} from '../shared/ops-vocab.js';
 import {
   CHECKOUT_STATES,
   ISOLATED,
@@ -116,8 +149,8 @@ import {
   SETTLED,
   SETTLED_RUNG_OUTCOMES,
 } from '../shared/run-lifecycle.js';
-import { LIVE_RUN_STATUSES, PHASE_STATUS_UI, RUN_STATUS_UI } from '../shared/status-vocab.js';
-import { BOARDING_BRIEFS as SERVER_BOARDING_BRIEFS, IN_FLIGHT, MCP_POLICIES as SERVER_MCP_POLICIES, ON_LIMIT_POLICIES as SERVER_ON_LIMIT_POLICIES, PHASE_IN_FLIGHT as SERVER_PHASE_IN_FLIGHT, SETTLED as SERVER_SETTLED } from '../server/runner/state.ts';
+import { LIVE_RUN_STATUSES, PHASE_STATUS_UI, RUN_STATUS_UI, WAIT_REASONS } from '../shared/status-vocab.js';
+import { BOARDING_BRIEFS as SERVER_BOARDING_BRIEFS, DECLARATION_CONSUMERS as SERVER_DECLARATION_CONSUMERS, IN_FLIGHT, MCP_POLICIES as SERVER_MCP_POLICIES, ON_LIMIT_POLICIES as SERVER_ON_LIMIT_POLICIES, PHASE_IN_FLIGHT as SERVER_PHASE_IN_FLIGHT, SETTLED as SERVER_SETTLED } from '../server/runner/state.ts';
 import { REVIEWER_VERDICT_POLICIES } from '../server/reviewer.ts';
 import { CLOSED_STATUSES } from '../server/analysis/stats.ts';
 import { QA_RESULTS as SERVER_QA_RESULTS } from '../server/qa-session.ts';
@@ -220,7 +253,10 @@ test('the permission profiles are labelled in ONE place', () => {
   // "ask about", both client tables said "ask me about", so the same profile
   // read two ways depending on the surface. P23 reconciled them deliberately.
   assert.deepEqual(sorted(Object.keys(PROFILE_LABELS)), sorted(PERMISSION_PROFILES));
-  assert.equal(PROFILE_LABELS.guarded, 'Guarded — ask me about the irreversible');
+  // Since phase 12 every label says what the profile silences and that deny
+  // still refuses — the one difference a picker may claim.
+  assert.equal(PROFILE_LABELS.guarded, 'Guarded — asks about everything on the ask list; deny still refuses');
+  for (const label of Object.values(PROFILE_LABELS)) assert.match(label, /deny still refuses$/);
   assert.equal(SERVER_PROFILE_LABELS, PROFILE_LABELS, 'approvals.ts serves the owner table');
 
 });
@@ -383,6 +419,7 @@ test('the server re-exports the lifecycle OWNER objects, not copies', () => {
   assert.equal(SERVER_BOARDING_BRIEFS, BOARDING_BRIEFS, 'state.ts BOARDING_BRIEFS');
   assert.equal(SERVER_MCP_POLICIES, MCP_POLICIES, 'state.ts MCP_POLICIES');
   assert.equal(SERVER_ON_LIMIT_POLICIES, ON_LIMIT_POLICIES, 'state.ts ON_LIMIT_POLICIES');
+  assert.equal(SERVER_DECLARATION_CONSUMERS, DECLARATION_CONSUMERS, 'state.ts DECLARATION_CONSUMERS');
   assert.equal(REVIEWER_VERDICT_POLICIES, REVIEWER_POLICIES, 'reviewer.ts REVIEWER_VERDICT_POLICIES');
   // `IN_FLIGHT` is the one that is a copy BY VALUE — it is typed
   // `readonly RunStatus[]` for its consumers — so membership is what is held.
@@ -500,6 +537,9 @@ const VOCABULARIES: {
   { name: 'MCP transports', members: MCP_TRANSPORTS, owner: 'shared/ops-vocab.js' },
   { name: 'account kinds', members: ACCOUNT_KINDS, owner: 'shared/ops-vocab.js' },
   { name: 'auth states', members: AUTH_STATES, owner: 'shared/ops-vocab.js' },
+  { name: 'entitlement states', members: ENTITLEMENT_STATES, owner: 'shared/ops-vocab.js' },
+  { name: 'leave kinds', members: LEAVE_KINDS, owner: 'shared/ops-vocab.js' },
+  { name: 'credential classes', members: CREDENTIAL_CLASSES, owner: 'shared/ops-vocab.js' },
   { name: 'delivery outcomes', members: DELIVERY_OUTCOMES, owner: 'shared/ops-vocab.js' },
   { name: 'ETA bases', members: ETA_BASES, owner: 'shared/ops-vocab.js' },
   {
@@ -569,12 +609,109 @@ const VOCABULARIES: {
   },
   { name: 'boarding briefs', members: BOARDING_BRIEFS, owner: 'shared/run-lifecycle.js' },
   { name: 'converge triggers', members: CONVERGE_TRIGGERS, owner: 'shared/run-lifecycle.js' },
+
+  /* The attribution vocabularies zero-touch-console phase 2 added for phases
+   * 5–7 to wire: which of the fourteen automatic-start doors opened, and how
+   * an actor reached the console. Owned before any emitter exists, so the
+   * first emitter imports a word rather than inventing one. */
+  { name: 'start doors', members: START_DOORS, owner: 'shared/run-lifecycle.js' },
+  { name: 'actor vias', members: ACTOR_VIAS, owner: 'shared/run-lifecycle.js' },
+  { name: 'classified by', members: CLASSIFIED_BY, owner: 'shared/run-lifecycle.js' },
+
+  /* The session ledger (zero-touch-console phase 4, chapter 03 SES-1/SES-8/
+   * SES-9): who ended a session, what each spawn site's session was for,
+   * where a turn or dollar cap came from, and what the console decided about
+   * an in-session usage warning. `phase.session` and `run.usage-decision`
+   * write these words; `session-record.ts` and `spawn.ts` import them. */
+  { name: 'session endings', members: ENDED_BY, owner: 'shared/run-lifecycle.js' },
+  { name: 'session modes', members: SESSION_MODES, owner: 'shared/run-lifecycle.js' },
+  { name: 'cap sources', members: CAP_SOURCES, owner: 'shared/run-lifecycle.js' },
+  { name: 'usage decision actions', members: USAGE_DECISION_ACTIONS, owner: 'shared/run-lifecycle.js' },
+
+  /* The declaration licences (zero-touch-console phase 6, chapter 04 WAI-9):
+   * the four ways `record.declared` is ever spent. `consumeDeclaration` takes
+   * one as `why` and every one journals `phase.declaration-consumed`. */
+  { name: 'declaration consumers', members: DECLARATION_CONSUMERS, owner: 'shared/run-lifecycle.js' },
+
+  /* The decision manifest (zero-touch-console phase 3, chapter 13 §1.1): the
+   * seventeen keys a plan answers before a run starts, the states a row can be
+   * in, where an answer came from, and the blocker classes `--needs` accepts
+   * as a key's short form. `scripts/decisions.env` is the bash twin, held
+   * equal by `test/decisions-model.test.ts`; both engines' readers import the
+   * owner. */
+  { name: 'decision keys', members: DECISION_KEYS, owner: 'shared/decisions-model.js' },
+  { name: 'decision states', members: DECISION_STATES, owner: 'shared/decisions-model.js' },
+  { name: 'decision sources', members: DECISION_SOURCES, owner: 'shared/decisions-model.js' },
+  {
+    name: 'need classes',
+    members: NEED_CLASSES,
+    // Derived in decisions-model.js from `SUB_KINDS['blocked-declared']`, whose
+    // literal lives here; the runner's `BlockerSubKind` type derives from the
+    // same array.
+    owner: 'shared/situation-model.js',
+  },
+  /* Why a `never-started:refusal` refused (phase 9, RCV-2) — a cause beside
+   * the sub-kind, never a fourth sub-kind; `refusalCauseOf` is its one reader. */
+  { name: 'refusal causes', members: REFUSAL_CAUSES, owner: 'shared/situation-model.js' },
+
+  /* The ladder's vehicles and who drives each (zero-touch-console phase 10,
+   * LFC-2/RCV-10). The client's `RungVehicle` union used to be a second
+   * spelling of the vehicle list — a vehicle renamed in the owner would have
+   * left it naming a rung nothing owned; it derives from the owner now. The
+   * server's `switch` over vehicles names them one `case` at a time, which is
+   * a comparison, not a re-declaration. */
+  { name: 'rung vehicles', members: RUNG_VEHICLES, owner: 'shared/ladder-model.js' },
+  { name: 'rung drivers', members: RUNG_DRIVERS, owner: 'shared/ladder-model.js' },
+
+  /* The wait axis's reasons. `run-lifecycle.js` compares against each member
+   * in turn (`recorded === 'external' || …`) because `status-vocab.js`, the
+   * owner, imports IT — `test/run-lifecycle.test.ts` asserts that copy agrees
+   * over every member, which is what holds it honest (LFC-5). */
+  { name: 'wait reasons', members: WAIT_REASONS, owner: 'shared/status-vocab.js', allow: ['shared/run-lifecycle.js'] },
   { name: 'autonomy modes', members: AUTONOMY_MODES, owner: 'shared/run-lifecycle.js' },
   { name: 'on-limit policies', members: ON_LIMIT_POLICIES, owner: 'shared/run-lifecycle.js' },
   { name: 'MCP policies', members: MCP_POLICIES, owner: 'shared/run-lifecycle.js' },
+  // The fleet's words (zero-touch phase 17, FLT-6 / R-F6): the tiers, and what
+  // the census says about every console of a machine.
+  { name: 'fleet tiers', members: FLEET_TIERS, owner: 'shared/fleet-model.js' },
+  { name: 'census provenances', members: CENSUS_PROVENANCES, owner: 'shared/fleet-model.js' },
+  { name: 'liveness', members: LIVENESS, owner: 'shared/fleet-model.js' },
+  { name: 'census discrepancies', members: CENSUS_DISCREPANCIES, owner: 'shared/fleet-model.js' },
+  { name: 'unowned hows', members: UNOWNED_HOWS, owner: 'shared/fleet-model.js' },
+  { name: 'instance health kinds', members: INSTANCE_HEALTH_KINDS, owner: 'shared/fleet-model.js' },
   { name: 'git modes', members: GIT_MODES, owner: 'shared/run-lifecycle.js' },
   { name: 'reviewer policies', members: REVIEWER_POLICIES, owner: 'shared/run-lifecycle.js' },
   { name: 'ultra-review modes', members: ULTRA_REVIEW_MODES, owner: 'shared/run-lifecycle.js' },
+
+  /* The policy table (phase 11): the 18 intervention classes and where an
+   * answer came from; the relay's two modes and the probe verdict words the
+   * prelude and `doctor` share. */
+  { name: 'policy classes', members: POLICY_CLASSES, owner: 'shared/policy-model.js' },
+  { name: 'policy sources', members: POLICY_SOURCES, owner: 'shared/policy-model.js' },
+  { name: 'relay modes', members: RELAY_MODES, owner: 'shared/run-settings.js' },
+  { name: 'probe statuses', members: PROBE_STATUSES, owner: 'shared/ops-vocab.js' },
+
+  /* The relay (phase 14): the two hook events a question arrives on, the
+   * exclusions and the budget that take a question to a person, and who
+   * answered one. The journal, the inbox, the client's question card and the
+   * relay itself all read these; `QuestionAnsweredBy` and the reasons' type
+   * derive from the owner. */
+  { name: 'relay mechanisms', members: RELAY_MECHANISMS, owner: 'shared/relay-model.js' },
+  { name: 'question exclusions', members: QUESTION_EXCLUSIONS, owner: 'shared/relay-model.js' },
+  { name: 'question unanswerable reasons', members: QUESTION_UNANSWERABLE_REASONS, owner: 'shared/relay-model.js' },
+  { name: 'question answered-by words', members: QUESTION_ANSWERED_BY, owner: 'shared/relay-model.js' },
+
+  /* The off switch and the boot (phase 16): how strong a Shut down press is,
+   * what it achieves, why the process went away, the clocks it discards, why a
+   * boot holds its automation, and who said a session ended. The server's
+   * stop plan, the readiness inventory, the dialog and the Sessions page all
+   * read these; each type derives from its owner. */
+  { name: 'shutdown modes', members: SHUTDOWN_MODES, owner: 'shared/ops-vocab.js' },
+  { name: 'shutdown durabilities', members: SHUTDOWN_DURABILITIES, owner: 'shared/ops-vocab.js' },
+  { name: 'shutdown intents', members: SHUTDOWN_INTENTS, owner: 'shared/ops-vocab.js' },
+  { name: 'shutdown clock sources', members: SHUTDOWN_CLOCK_SOURCES, owner: 'shared/ops-vocab.js' },
+  { name: 'boot hold kinds', members: BOOT_HOLD_KINDS, owner: 'shared/ops-vocab.js' },
+  { name: 'presence end sources', members: PRESENCE_END_SOURCES, owner: 'shared/run-lifecycle.js' },
 ];
 
 /** Every source file the scan covers — tests excluded; they may say anything. */
@@ -593,6 +730,8 @@ function sourceFiles(): string[] {
   walk(join(VIEWER, 'shared'));
   walk(join(VIEWER, 'server'));
   walk(join(VIEWER, 'client', 'src'));
+  // The fleet supervisor's own sources (Pro; absent from the free tree).
+  if (existsSync(join(VIEWER, 'fleet'))) walk(join(VIEWER, 'fleet'));
   return out;
 }
 
@@ -652,4 +791,100 @@ test('no file outside the owner re-declares a vocabulary as a literal', () => {
     [],
     `a vocabulary must have ONE owner — import it instead of re-typing its members:\n  ${offences.join('\n  ')}`,
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * 2b. Every situation an errand names is one the vocabulary can parse (RCV-11)
+ * ------------------------------------------------------------------ */
+
+test('every `situation:` literal under server/ parses to a SITUATIONS member — an errand is filed under a word every reader knows', () => {
+  // `stallPark` used to write `situation: 'silent-session:unfixable'`, a key in
+  // no vocabulary: `parseSituationKey` answered `unknown`, so the card, the
+  // inbox and the client read a stall park as a phase nobody could classify.
+  // Every situation an errand, a hint or a rung record names is a member now.
+  const LITERAL = /\bsituation:\s*'([a-z][a-z-]*(?::[a-z][a-z-]*)?)'/g;
+  const offences: string[] = [];
+  let seen = 0;
+  for (const file of sourceFiles()) {
+    const rel = relative(VIEWER, file).split('\\').join('/');
+    if (!rel.startsWith('server/')) continue;
+    const text = readFileSync(file, 'utf8');
+    for (const m of text.matchAll(LITERAL)) {
+      seen += 1;
+      // The parser folds an unknown head to `unknown`, so a literal is known
+      // only when its own head IS the member the parser answered — `unknown`'s
+      // own family (`unknown:declaration-cap`, phase 6) passes; an invented
+      // head like `silent-session` does not.
+      const { id } = parseSituationKey(m[1]);
+      const known = (SITUATIONS as readonly string[]).includes(id) && m[1].split(':')[0] === id;
+      if (!known) offences.push(`${rel}: situation: '${m[1]}' parses to ${id}`);
+    }
+  }
+  assert.ok(seen >= 4, `the scan sees the literals (${seen})`);
+  assert.deepEqual(offences, []);
+  // The specimen itself, by name.
+  const runner = readFileSync(join(VIEWER, 'server/runner/runner.ts'), 'utf8');
+  assert.ok(!runner.includes("'silent-session:unfixable'"), 'the stall park files under a SITUATIONS member (never-started)');
+});
+
+/* ------------------------------------------------------------------ *
+ * 3. The doors, the actor, and the wait reasons have writers (phase 2 of zero-touch-console)
+ * ------------------------------------------------------------------ */
+
+test('START_DOORS is the census — fourteen doors, owned once — and the actor shape is spelled once', () => {
+  assert.equal(START_DOORS.length, 14, 'chapter 02 of the sep-review audit counted fourteen automatic-start doors');
+  assert.equal(new Set(START_DOORS).size, START_DOORS.length, 'no door may be listed twice');
+  for (const door of START_DOORS) assert.match(door, /^[a-z][a-z0-9-]*$/, `${door} is not a kebab-case word`);
+  assert.ok(Object.isFrozen(START_DOORS) && Object.isFrozen(ACTOR_VIAS) && Object.isFrozen(ACTOR_FIELDS));
+  // Seven since phase 7: `event` is the transport of a door opened by an
+  // observation (a recovery exiting, a declaration landing) — three of the
+  // fourteen — which is neither a clock nor a request.
+  assert.deepEqual([...ACTOR_VIAS], ['api', 'cli', 'signal', 'timer', 'boot', 'hook', 'event']);
+  assert.deepEqual([...CLASSIFIED_BY], ['drive', 'outcome', 'closed', 'heal']);
+  assert.equal(OPERATOR_DOOR, 'operator');
+  assert.ok(!(START_DOORS as readonly string[]).includes(OPERATOR_DOOR), 'the press is not an automatic door');
+  assert.deepEqual([...ACTOR_FIELDS], ['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter']);
+  // The nine `startRun` doors lead, then the five that spawn some other way —
+  // the census's order, which phase 7's lint reads back.
+  assert.deepEqual(START_DOORS.slice(0, 9), [
+    'boot-readopt', 'wait-clock', 'converge-relaunch', 'converge-heal', 'recovery-continue',
+    'pty-continue', 'watch-landed', 'mcp-require-timeout', 'outcome-inbox',
+  ]);
+});
+
+/**
+ * Every wait reason has a PRODUCTION writer — an assignment under `server/`,
+ * not a comparison. `scope` was only ever derived and `schedule` only ever
+ * written by a test, so `waitReason` was null in 53 of 53 run files and
+ * `lifecycle.wait.kind` a guess on every one (LFC-5, gate ACC-11.3).
+ *
+ * The assigned values are read off the two shapes a writer has: the named
+ * writer's argument (`setRunState(state, …, { kind: '<reason>' })`) and a
+ * direct `state.waitReason = '<reason>'`. `setRunState` itself must have a
+ * caller outside `test/` — it had exactly one, in `run-lifecycle.test.ts`.
+ */
+test('every WAIT_REASONS member is ASSIGNED somewhere under server/, and setRunState has a non-test caller', () => {
+  const assigned = new Map<string, string[]>();
+  let namedWriterCalls = 0;
+  for (const file of sourceFiles()) {
+    const rel = relative(VIEWER, file).split('\\').join('/');
+    if (!rel.startsWith('server/')) continue;
+    const text = readFileSync(file, 'utf8');
+    // The named writer's argument: a bare literal, or every arm of a ternary
+    // (`kind: head?.slug === SCHEDULE_HOLDER ? 'schedule' : 'scope'`).
+    for (const m of text.matchAll(/setRunState\([^;]*?\bkind:\s*([^,}]*)/gs)) {
+      for (const lit of m[1].matchAll(/'([a-z-]+)'/g)) {
+        (assigned.get(lit[1]) ?? assigned.set(lit[1], []).get(lit[1]))!.push(rel);
+      }
+    }
+    for (const m of text.matchAll(/\bwaitReason\s*=\s*'([a-z-]+)'/g)) {
+      (assigned.get(m[1]) ?? assigned.set(m[1], []).get(m[1]))!.push(rel);
+    }
+    namedWriterCalls += (text.match(/\bsetRunState\(/g) ?? []).length - (rel === 'server/runner/state.ts' ? 1 : 0);
+  }
+  const unwritten = WAIT_REASONS.filter((reason) => !assigned.has(reason));
+  assert.deepEqual(unwritten, [], 'these WAIT_REASONS have no production writer under server/ — write one or drop the word');
+  const unlisted = [...assigned.keys()].filter((reason) => !(WAIT_REASONS as readonly string[]).includes(reason));
+  assert.deepEqual(unlisted, [], 'a writer assigns a wait reason WAIT_REASONS does not hold');
+  assert.ok(namedWriterCalls >= 5, `setRunState is called ${namedWriterCalls} time(s) under server/ — the named writer must be the production path`);
 });

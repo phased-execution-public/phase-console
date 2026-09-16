@@ -37,7 +37,7 @@ import type { RunSetupMode } from './modes';
 import { MODES, shows } from './modes';
 import type { RunSetupField, RunSetupValues } from './schema';
 
-export type StageId = 'what' | 'how' | 'money' | 'review';
+export type StageId = 'decisions' | 'what' | 'how' | 'money' | 'review';
 
 export interface Stage {
   id: StageId;
@@ -50,6 +50,17 @@ export interface Stage {
 }
 
 export const STAGES: readonly Stage[] = Object.freeze([
+  {
+    // First, since 5.0.0 (phase 11): everything a run could ask a person
+    // mid-run is asked here, before anything starts — the decision manifest
+    // with each row's state, the four probes, and the answers the door
+    // requires. Launch stays disabled while a blocking row is outstanding.
+    id: 'decisions',
+    label: 'Decisions',
+    short: 'Decide',
+    blurb:
+      'Every decision this run could ask for, answered before it starts: the manifest, what the probes found, and what the door requires.',
+  },
   {
     id: 'what',
     label: 'What runs',
@@ -87,6 +98,12 @@ export type ControlStage = Exclude<StageId, 'review'>;
  * flat layout is the stages' sections in order, so they still need a home.
  */
 export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.freeze({
+  resumeOnRestart: 'decisions',
+  relay: 'decisions',
+  accounts: 'decisions',
+  acknowledgedWaivers: 'decisions',
+  manifestOverride: 'decisions',
+
   onlyPhases: 'what',
   startAfter: 'what',
 
@@ -170,6 +187,11 @@ export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.free
   onlyPhases: 'Only these phases',
   phaseOptions: 'Per-phase overrides',
   prompt: 'First prompt',
+  resumeOnRestart: 'If the console restarts, continue this run',
+  relay: 'Relay questions to a person',
+  accounts: 'Accounts it may spend (id:minimum headroom %)',
+  acknowledgedWaivers: 'Acknowledged waivers',
+  manifestOverride: 'Start anyway, recorded as',
 });
 
 /** Which modes get the stage bar. See the header. */
@@ -270,7 +292,7 @@ export function stageOf(field: RunSetupField): ControlStage {
   return STAGE_OF[field];
 }
 
-/** The four stages — or none, for a flat mode. */
+/** The five stages — or none, for a flat mode. */
 export function stagesFor(mode: RunSetupMode, overlay: boolean): readonly Stage[] {
   return isStaged(mode, overlay) ? STAGES : [];
 }

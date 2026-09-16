@@ -15,9 +15,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Both are read when the modules below load, so the redirect has to come first:
 // a policy read out of the operator's real config would make this suite depend
@@ -29,7 +30,9 @@ process.env.XDG_STATE_HOME = STATE_HOME;
 process.env.PHASE_CONSOLE_LOG = '';
 
 const { SKILL_DIR } = await import('../server/config.ts');
-const { POLICY_PATH } = await import('../server/runner/approvals.ts');
+const {
+  POLICY_PATH, QUESTION_CLASS, carvedPolicy, classifyTool, loadPolicy,
+} = await import('../server/runner/approvals.ts');
 const { Service } = await import('../server/service.ts');
 
 const flags = {
@@ -296,6 +299,7 @@ test('Stop: an unknown run, session or missing body fails open', async () => {
 const laned = (profile: string, extra: Record<string, unknown> = {}) => {
   const service = new Service(flags as never);
   const noted: Noted[] = [];
+  const denials: { phase: number; command: string; matched: string }[] = [];
   (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
     busy: () => true,
     current: () => ({
@@ -303,9 +307,10 @@ const laned = (profile: string, extra: Record<string, unknown> = {}) => {
     }),
     note: (event: string, data: Record<string, unknown>, phase?: number) =>
       noted.push({ event, data, phase }),
+    noteWaitDenied: (phase: number, denial: { command: string; matched: string }) => denials.push({ phase, ...denial }),
     park: () => {},
   });
-  return { service, noted };
+  return { service, noted, denials };
 };
 
 const bash = (command: string) => ({ tool_name: 'Bash', tool_input: { command } });
@@ -349,6 +354,51 @@ test('the refusal is written down, with the fragment that matched it', async () 
   assert.equal(denied!.data.rule, 'in-turn-wait');
   assert.match(String(denied!.data.matched), /until .*do/);
   service.close();
+});
+
+test('the refusal reaches the lane\'s own signals, so the local-job ladder can climb it — and a declaration is never refused (RCV-5)', async () => {
+  const { service, denials } = laned('bypass');
+  const command = 'until [ -f /tmp/suite.done ]; do sleep 30; done';
+  assert.equal(decision(await service.decideToolUse(bash(command), 'r1')).permissionDecision, 'deny');
+  assert.deepEqual(denials.map((d) => [d.phase, d.command]), [[2, command]],
+    'a denied wait opens no call, so this is the only way the watchdog learns the lane is still waiting');
+  assert.match(denials[0].matched, /until/);
+  // The documented way to declare a wait carries `--watch`, and must never be refused as one.
+  const declare = 'bash scripts/phase-outcome.sh demo 2 waiting-external --wait-minutes 30 --watch cmd:"test -f /tmp/suite.done"';
+  assert.equal(decision(await service.decideToolUse(bash(declare), 'r1')).permissionDecision, 'allow');
+  assert.equal(denials.length, 1, 'and a declaration is no refusal');
+  service.close();
+});
+
+test('ACC-8.4 (TRS-3): a guard denial followed by a waiting-external declaration with NO --watch ref is journalled phase.watch-missing at the hook — and the call is still allowed', async () => {
+  // The measured shape (REC-48): refused `until … sleep` at 16:11:52, refused
+  // `--watch` at 16:21:02, then `waiting-external` 37 s later with `watch: []`
+  // — a blind park that resumed 581 minutes late. The hook is where the gap is
+  // first visible: the denial the runner stamped on the RECORD (the lane's own
+  // episode is retired by this very call) and a declaration with no ref.
+  const command = 'until ! pgrep -f run_ring.sh >/dev/null 2>&1; do sleep 30; done';
+  const { service, noted } = laned('trusted', {
+    phases: { 2: { toolDenied: { tool: 'Bash', rule: 'in-turn-wait', command, matched: 'until [^`]+; *do', at: '2026-09-12T16:11:52.381Z' } } },
+  });
+  const declare = 'bash scripts/phase-outcome.sh demo 2 waiting-external --wait-minutes 30 --reason "ring job still running"';
+  assert.equal(decision(await service.decideToolUse(bash(declare), 'r1')).permissionDecision, 'allow', 'a declaration is never refused');
+  const missing = noted.filter((n) => n.event === 'phase.watch-missing');
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].phase, 2);
+  assert.equal(missing[0].data.source, 'hook');
+  assert.equal(missing[0].data.command, command);
+  assert.equal(missing[0].data.deniedAt, '2026-09-12T16:11:52.381Z');
+  assert.match(String(missing[0].data.declaration), /waiting-external --wait-minutes 30/);
+  // The recipe followed in full — a `--watch` ref — journals nothing.
+  const withRef = 'bash scripts/phase-outcome.sh demo 2 waiting-external --wait-minutes 30 --watch cmd:"test -f /tmp/ring.done"';
+  assert.equal(decision(await service.decideToolUse(bash(withRef), 'r1')).permissionDecision, 'allow');
+  assert.equal(noted.filter((n) => n.event === 'phase.watch-missing').length, 1, 'a declaration that carries its ref is not missing one');
+  service.close();
+  // …and with no denial on the record, a ref-less declaration is the session's own business here.
+  const { service: clean, noted: quiet } = laned('trusted');
+  assert.equal(decision(await clean.decideToolUse(bash(declare), 'r1')).permissionDecision, 'allow');
+  assert.equal(quiet.filter((n) => n.event === 'phase.watch-missing').length, 0);
+  clean.close();
 });
 
 test('the guard does not touch the deny list, and says so in its own voice', async () => {
@@ -442,4 +492,319 @@ test('a call this console cannot place is allowed — the hook fails open everyw
   const answer = decision(await service.decideToolUse(bash('sleep 600'), null));
   assert.equal(answer.permissionDecision, 'allow');
   service.close();
+});
+
+/* ------------------------------------------------------------------ *
+ * The question class (TRS-1) — a question survives every profile
+ * ------------------------------------------------------------------ */
+
+const ASK_QUESTION = {
+  tool_name: 'AskUserQuestion',
+  tool_input: {
+    questions: [{
+      question: 'Another live session holds this phase. How should I proceed?',
+      header: 'Collision',
+      multiSelect: false,
+      options: [{ label: 'Ask it first (Recommended)', description: '' }, { label: 'I take the phase', description: '' }],
+    }],
+  },
+};
+
+test('ACC-8.4 (TRS-1): on guarded, trusted AND bypass the question class classifies hold — never allow or deny — whatever the ask list holds', () => {
+  assert.deepEqual(QUESTION_CLASS, ['AskUserQuestion']);
+  for (const profile of ['guarded', 'trusted', 'bypass'] as const) {
+    for (const carveOut of [false, true]) {
+      const policy = carvedPolicy(loadPolicy('/nonexistent'), profile, carveOut);
+      assert.equal(classifyTool('AskUserQuestion', ASK_QUESTION.tool_input, policy, profile), 'hold',
+        `${profile}${carveOut ? ' + carve-out' : ''}: a question is not a permission`);
+    }
+    // An operator's written allow rule cannot answer it either — `always` comes after the question class.
+    const allowed = { ...carvedPolicy(loadPolicy('/nonexistent'), profile, false), always: ['AskUserQuestion'] };
+    assert.equal(classifyTool('AskUserQuestion', {}, allowed, profile), 'hold');
+    // The wall is still consulted first: a deny rule naming the tool refuses it.
+    const walled = { ...carvedPolicy(loadPolicy('/nonexistent'), profile, false), deny: ['AskUserQuestion'] };
+    assert.equal(classifyTool('AskUserQuestion', {}, walled, profile), 'deny', 'the deny list before anything else');
+  }
+});
+
+test('ACC-8.4 (TRS-1): at the hook a held question is answered by the plan\'s ambiguity row — journalled as a hold, never asked, never allowed', async () => {
+  for (const profile of ['guarded', 'trusted', 'bypass']) {
+    const { service, noted } = laned(profile);
+    const answer = decision(await service.decideToolUse(ASK_QUESTION, 'r1'));
+    assert.equal(answer.permissionDecision, 'deny', `${profile}: the CLI takes only allow or deny, and a bare allow carries no answer`);
+    assert.match(answer.permissionDecisionReason, /by policy \(ambiguity: ruling\)/);
+    assert.match(answer.permissionDecisionReason, /NOT a refusal of your work/);
+    assert.match(answer.permissionDecisionReason, /ruling --kind ambiguity/);
+    assert.match(answer.permissionDecisionReason, /blocked --needs <key>/);
+    const held = noted.filter((n) => n.event === 'phase.policy-answered');
+    assert.equal(held.length, 1, `${profile}: one record of the question and its answer`);
+    assert.equal(held[0].data.decision, 'hold');
+    assert.equal(held[0].data.decisionKey, 'ambiguity');
+    assert.equal(held[0].data.answer, 'ruling');
+    assert.equal(held[0].data.source, 'default');
+    assert.equal(held[0].data.tool, 'AskUserQuestion');
+    assert.equal(held[0].phase, 2);
+    assert.deepEqual(held[0].data.questions, [{
+      question: 'Another live session holds this phase. How should I proceed?',
+      options: ['Ask it first (Recommended)', 'I take the phase'],
+      multiSelect: false,
+    }]);
+    assert.equal(service.approvals.pending().length, 0, 'no card was raised');
+    assert.ok(!noted.some((n) => n.event === 'phase.approval-auto-granted'), 'and nothing was granted');
+    service.close();
+  }
+  // A plan whose ambiguity row wants a person: the session is told to declare, not to guess.
+  const { service, noted } = laned('trusted', {
+    manifest: { decisions: [{ key: 'ambiguity', state: 'answered', source: 'plan', value: 'halt' }] },
+  });
+  const halted = decision(await service.decideToolUse(ASK_QUESTION, 'r1'));
+  assert.equal(halted.permissionDecision, 'deny');
+  assert.match(halted.permissionDecisionReason, /needs-human --needs ambiguity/);
+  assert.equal(noted.find((n) => n.event === 'phase.policy-answered')?.data.source, 'plan');
+  service.close();
+});
+
+test('ACC-8.10 (TRS-7): a raised card and its ending are on the run that asked — phase.approval-raised, then exactly one phase.approval-decided', async () => {
+  mkdirSync(join(POLICY_PATH, '..'), { recursive: true });
+  writeFileSync(POLICY_PATH, `${JSON.stringify({ autoApprove: false })}\n`, 'utf8');
+  const { service, noted } = laned('guarded');
+  try {
+    const pending = Symbol('still asking');
+    const outcome = await Promise.race([
+      service.decideToolUse(bash('psql -c "select 1"'), 'r1'),
+      new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+    ]);
+    assert.equal(outcome, pending);
+    const card = service.approvals.pending()[0];
+    const raised = noted.filter((n) => n.event === 'phase.approval-raised');
+    assert.equal(raised.length, 1, 'a raise is on the run');
+    assert.equal(raised[0].data.approvalId, card.id);
+    assert.equal(raised[0].data.matched, 'Bash(psql:*)', 'naming the rule that asked');
+    assert.equal(raised[0].phase, 2);
+    service.approvals.disarm('r1');
+    await new Promise((resolve) => setImmediate(resolve));
+    const decided = noted.filter((n) => n.event === 'phase.approval-decided');
+    assert.equal(decided.length, 1, 'one ending, one record — the run ending included');
+    assert.equal(decided[0].data.decision, 'deny');
+    assert.equal(decided[0].data.decidedBy, 'run ended');
+  } finally {
+    service.close();
+    rmSync(POLICY_PATH, { force: true });
+  }
+});
+
+test('ACC-8.10 (TRS-11): an answer given on a card recovered after a restart answers the session\'s identical call — once, and no second card', async () => {
+  const { INSTANCE_STATE_DIR } = await import('../server/config.ts');
+  const at = new Date().toISOString();
+  mkdirSync(join(INSTANCE_STATE_DIR, 'approvals'), { recursive: true });
+  writeFileSync(join(INSTANCE_STATE_DIR, 'approvals', 'pending.json'), JSON.stringify([{
+    id: 'kept-1', runId: 'r1', slug: 'demo', phase: 2, kind: 'tool', title: 'Bash: psql', detail: 'd', evidence: [],
+    tool: { name: 'Bash', input: { command: 'psql -c "select 2"' } }, createdAt: at, expiresAt: new Date(Date.now() + 60_000).toISOString(), status: 'pending',
+  }]), 'utf8');
+  mkdirSync(join(POLICY_PATH, '..'), { recursive: true });
+  writeFileSync(POLICY_PATH, `${JSON.stringify({ autoApprove: false })}\n`, 'utf8');
+  const { service } = laned('guarded');
+  try {
+    assert.deepEqual(service.approvals.recover(() => ({ answerable: true })), { answerable: 1, unanswerable: {} });
+    assert.equal(service.approvals.settle('kept-1', 'allow', 'phone'), true);
+    const answer = decision(await service.decideToolUse(bash('psql -c "select 2"'), 'r1'));
+    assert.equal(answer.permissionDecision, 'allow');
+    assert.match(answer.permissionDecisionReason, /recovered after the console restarted/);
+    assert.equal(service.approvals.pending().length, 0, 'answered by the kept decision, not by a second card');
+    // Spent: the same call again is an ordinary ask.
+    const pending = Symbol('still asking');
+    const again = await Promise.race([
+      service.decideToolUse(bash('psql -c "select 2"'), 'r1'),
+      new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+    ]);
+    assert.equal(again, pending);
+  } finally {
+    service.approvals.disarm();
+    service.close();
+    rmSync(POLICY_PATH, { force: true });
+  }
+});
+
+/**
+ * What a real `PermissionRequest` body gets told.
+ *
+ * Phase 1 of zero-touch-console captured these bodies from `claude -p` on
+ * 2.1.270 (`fixtures/spikes/permissionrequest.md` tells the story): the event
+ * fires in print mode, for Bash outside the allow list and, with a permission
+ * host, for AskUserQuestion. On that event the CLI honours `allow` and `deny`
+ * only — an `ask` is an answer nobody can act on. Since phase 14 the event has
+ * its own door (`POST /hooks/permission-request` → `decidePermissionRequest`),
+ * which answers in the event's own wire shape: `decision.behavior`.
+ */
+const PERMISSION_BODIES = () => readFileSync(
+  fileURLToPath(new URL('./fixtures/spikes/permissionrequest.jsonl', import.meta.url)), 'utf8',
+).split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+
+type PermissionReply = { hookSpecificOutput: { hookEventName: string; decision: { behavior: string; message?: string; updatedInput?: Record<string, unknown> } } };
+
+test('the captured PermissionRequest bodies replay through their own route to allow or deny, never ask', async () => {
+  const bodies = PERMISSION_BODIES();
+  assert.ok(bodies.length >= 1, 'the phase-1 spike captured at least one body');
+  // `laned`, not `serviceOn`: a real body names its session, and the lookup
+  // that matches it walks `run.phases`.
+  const { service, noted } = laned('bypass');
+  for (const body of bodies) {
+    const label = `${body.tool_name} (${String(body.session_id).slice(0, 8)})`;
+    assert.equal(body.hook_event_name, 'PermissionRequest', `${label}: a PermissionRequest body`);
+    assert.equal(typeof body.tool_name, 'string', `${label}: tool_name is a string`);
+    assert.ok(!('tool_use_id' in body), `${label}: the CLI sends no tool_use_id on this event`);
+    const reply = await service.decidePermissionRequest(body as never, 'r1') as PermissionReply;
+    assert.equal(reply.hookSpecificOutput.hookEventName, 'PermissionRequest', `${label}: the event's own shape`);
+    const { behavior } = reply.hookSpecificOutput.decision;
+    assert.ok(behavior === 'allow' || behavior === 'deny', `${label}: ${behavior}`);
+    assert.notEqual(behavior, 'ask', `${label}: never asked`);
+    if (behavior === 'deny') assert.ok(reply.hookSpecificOutput.decision.message, `${label}: a denial says why`);
+  }
+  // …and each arrival is on the run, before its decision.
+  assert.equal(noted.filter((n) => n.event === 'phase.permission-request').length, bodies.length);
+  assert.ok(noted.some((n) => n.event === 'phase.permission-request' && n.data.tool === 'AskUserQuestion'));
+  service.close();
+});
+
+/* ------------------------------------------------------------------ *
+ * The relay (phase 14) — the exclusions, the push, the wire shapes
+ * ------------------------------------------------------------------ */
+
+/**
+ * `laned`, on a run whose relay is ARMED, with every act the relay performs on
+ * the record: parks, pushes, the notice to the session. The relay's own window
+ * is shortened on the instance so a raised question answers in milliseconds.
+ */
+async function relayLaned(profile = 'trusted', extra: Record<string, unknown> = {}) {
+  const { INSTANCE_STATE_DIR } = await import('../server/config.ts');
+  const { defaultCategories } = await import('../server/push/catalogue.ts');
+  // The relay keeps the keys each phase asked on disk; every case starts clean.
+  rmSync(join(INSTANCE_STATE_DIR, 'relay'), { recursive: true, force: true });
+  const service = new Service(flags as never);
+  const noted: Noted[] = [];
+  const parks: { reason: string; phase: number | null; kind: string }[] = [];
+  const told: { phase: number; answers: unknown[] }[] = [];
+  const pushed: { category: string; title: string; body: string }[] = [];
+  (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    busy: () => true,
+    current: () => ({
+      id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: profile, phases: {}, status: 'running',
+      relay: 'last-resort', relayArming: { armed: true, version: '2.1.270', floor: '2.1.268', at: new Date().toISOString() },
+      ...extra,
+    }),
+    note: (event: string, data: Record<string, unknown>, phase?: number) => noted.push({ event, data, phase }),
+    noteWaitDenied: () => {},
+    park: (reason: string, phase: number | null, kind: string) => { parks.push({ reason, phase, kind }); return true; },
+    tellRelayAnswer: (phase: number, answers: unknown[]) => { told.push({ phase, answers }); return { ok: true }; },
+  });
+  const inner = service as unknown as {
+    prefs: Record<string, unknown>;
+    push: { announce: (...args: unknown[]) => void };
+    relay: { deps: { answerMs?: number } };
+  };
+  inner.prefs.notify = defaultCategories();
+  inner.push.announce = (category: unknown, message: unknown) => {
+    pushed.push({ category: category as string, ...(message as { title: string; body: string }) });
+  };
+  inner.relay.deps.answerMs = 25;
+  return { service, noted, parks, told, pushed };
+}
+
+const asking = (questions: unknown[], extra: Record<string, unknown> = {}) => ({
+  tool_name: 'AskUserQuestion', tool_input: { questions }, session_id: 'sess-q', tool_use_id: 'toolu_q', ...extra,
+});
+const choice = (text: string, labels: string[], more: Record<string, unknown> = {}) => ({
+  question: text, header: 'Choice', multiSelect: false, options: labels.map((label) => ({ label, description: '' })), ...more,
+});
+
+test('ACC-8.16 (AC-5): each of the five exclusions is phase.question-unanswerable, a needs-human park and ONE push — never a window', async () => {
+  const cases: { reason: string; body: Record<string, unknown>; extra?: Record<string, unknown>; first?: Record<string, unknown> }[] = [
+    { reason: 'deny-list', body: asking([choice('How should the branch land?', ['Rebase it', 'Run `git push origin main`'])]) },
+    { reason: 'multi-select', body: asking([choice('Which checks should run?', ['lint', 'types'], { multiSelect: true })]) },
+    // Prose the deny list cannot match — `git reset --hard` here would be the wall's, and the wall is consulted first.
+    { reason: 'destructive-option', body: asking([choice('The checks are green. What now?', ['Wait for review', 'Merge the PR now'])]) },
+    { reason: 'run-stopped', body: asking([choice('Carry on after the wall?', ['Yes', 'No'])]), extra: { status: 'parked' } },
+    {
+      reason: 'repeated-key',
+      first: asking([choice('Which port should the worker take?', ['8080', '9090'])]),
+      body: asking([choice('Which port should the worker take?', ['8080', '9090'])]),
+    },
+  ];
+  for (const { reason, body, extra, first } of cases) {
+    const { service, noted, parks, pushed } = await relayLaned('trusted', extra ?? {});
+    try {
+      if (first) {
+        // Asked and answered once — the relay answers it at the end of its window.
+        const answered = decision(await service.decideToolUse(first as never, 'r1'));
+        assert.equal(answered.permissionDecision, 'allow', `${reason}: the first ask is answered`);
+        pushed.length = 0;
+      }
+      const raisedBefore = service.approvals.counts().raised;
+      const reply = decision(await service.decideToolUse(body as never, 'r1'));
+      assert.equal(reply.permissionDecision, 'deny', `${reason}: never auto-answered`);
+      assert.match(reply.permissionDecisionReason, /needs-human --needs ambiguity/, `${reason}: told to declare, not guess`);
+      const refused = noted.filter((n) => n.event === 'phase.question-unanswerable');
+      assert.equal(refused.length, 1, `${reason}: one record`);
+      assert.equal(refused[0].data.reason, reason);
+      assert.equal(refused[0].phase, 2);
+      assert.equal(parks.length, 1, `${reason}: parked`);
+      assert.equal(parks[0].kind, 'needs-human');
+      assert.equal(parks[0].phase, 2);
+      assert.equal(pushed.length, 1, `${reason}: exactly one push`);
+      assert.equal(pushed[0].category, 'needs-you');
+      assert.equal(service.approvals.counts().raised, raisedBefore, `${reason}: no card, no window`);
+    } finally {
+      service.approvals.disarm();
+      service.close();
+    }
+  }
+});
+
+test('ACC-8.16: on an ARMED run a question is raised with a session-ask push, answered allow + updatedInput by rule, and the session is told — on both hooks', async () => {
+  const q = choice('Which colour should the banner be?', ['Red', 'Blue (Recommended)']);
+  const { service, noted, pushed, told } = await relayLaned('guarded');
+  try {
+    const reply = await service.decideToolUse(asking([q]) as never, 'r1') as {
+      hookSpecificOutput: { permissionDecision: string; updatedInput?: { questions: unknown; answers: Record<string, string> } };
+    };
+    assert.equal(reply.hookSpecificOutput.permissionDecision, 'allow', 'no denial — the answer IS the allow');
+    assert.deepEqual(reply.hookSpecificOutput.updatedInput?.questions, [q]);
+    assert.deepEqual(reply.hookSpecificOutput.updatedInput?.answers, { 'Which colour should the banner be?': 'Blue (Recommended)' });
+    assert.equal(pushed.filter((p) => p.category === 'session-ask').length, 1, 'a lane\'s question also pushes');
+    assert.match(pushed.find((p) => p.category === 'session-ask')!.body, /Which colour should the banner be\?/);
+    assert.ok(noted.some((n) => n.event === 'phase.question-raised' && n.data.mechanism === 'pre-tool-use'));
+    assert.equal(noted.find((n) => n.event === 'phase.question-answered')?.data.by, 'recommended');
+    assert.ok(!noted.some((n) => n.event === 'phase.policy-answered'), 'the relay answered it, not the policy table');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(told.length, 1, 'the session is told who answered');
+  } finally {
+    service.close();
+  }
+
+  // The same question through the transport phase 1 measured: the event's own shape.
+  const second = await relayLaned('guarded');
+  try {
+    const body = PERMISSION_BODIES().find((entry) => entry.tool_name === 'AskUserQuestion')!;
+    const reply = await second.service.decidePermissionRequest(body as never, 'r1') as PermissionReply;
+    assert.equal(reply.hookSpecificOutput.decision.behavior, 'allow');
+    assert.deepEqual(reply.hookSpecificOutput.decision.updatedInput?.answers, { 'Which colour should the banner be?': 'Blue (Recommended)' });
+    assert.ok(second.noted.some((n) => n.event === 'phase.question-raised' && n.data.mechanism === 'permission-request'));
+  } finally {
+    second.service.close();
+  }
+});
+
+test('a run whose relay is NOT armed still answers a question by policy — the relay is the last resort, not the default', async () => {
+  const { service, noted } = await relayLaned('trusted', {
+    relayArming: { armed: false, version: null, floor: '2.1.268', reason: 'version-unknown', at: new Date().toISOString() },
+  });
+  try {
+    const reply = decision(await service.decideToolUse(asking([choice('Anything?', ['Yes', 'No'])]) as never, 'r1'));
+    assert.equal(reply.permissionDecision, 'deny');
+    assert.match(reply.permissionDecisionReason, /by policy \(ambiguity: ruling\)/);
+    assert.ok(noted.some((n) => n.event === 'phase.policy-answered'));
+    assert.ok(!noted.some((n) => n.event === 'phase.question-raised'));
+  } finally {
+    service.close();
+  }
 });

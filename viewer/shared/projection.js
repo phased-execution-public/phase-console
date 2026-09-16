@@ -110,6 +110,7 @@ export const DOCUMENT_PLAN_FIELDS = Object.freeze([
   'provenance',
   'callouts',
   'graph',
+  'decisions',
 ]);
 
 /**

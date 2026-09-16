@@ -18,7 +18,8 @@ below is the long version, in the order it is worth reading.
 | [The loop](loop.md) | The autopilot's specification: the three modes, how a stopped phase is read (situations), what the machine tries before it asks (the ladder), convergence, session presence, and what is still a person's. |
 | [The artifacts](artifacts.md) | Plan, handoff, memory, and the optional QA record — one job each, never duplicated. |
 | [What you control](controls.md) | Every knob — the launch defaults and the ladder's caps and toggles — plus the full command reference for the engine and its helpers. |
-| [Session budget](session-budget.md) | The ten decisions a plan records: model, budget, phase size, batching, QA, branch, skills, gates, MCP servers, docs root. |
+| [Session budget](session-budget.md) | The eleven decisions a plan records: model, budget, phase size, batching, QA, branch, skills, gates, MCP servers, docs root, and the decision manifest. |
+| [Decisions](decisions.md) | The decision manifest: every question a run could ask a person, answered before it starts — the `## Decisions` table, the twin `decisions.sh` writes, and `--needs`. |
 | [Model handling](model-handling.md) | How a phase's model is chosen, and what changes when you run a different one. |
 
 ## Gates and safety

@@ -15,7 +15,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync,
 import { dirname } from 'node:path';
 
 import { log } from '../log.ts';
-import { journalFile } from './state.ts';
+import { journalFile } from './run-paths.ts';
 
 export type JournalEntry = {
   seq: number;

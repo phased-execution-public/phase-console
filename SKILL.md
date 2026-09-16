@@ -11,7 +11,7 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 4.11.0
+  version: 5.0.0
 ---
 
 # Phased Execution
@@ -108,7 +108,10 @@ runs inside machinery it should not mistake for a malfunction. The short version
 - **A denied tool is a decision, not a failure.** The run's permission profile (`guarded` · `trusted` ·
   `bypass`) moves only what a person is *asked* about; the `deny` wall is identical in all three and holds
   with the console dead. Do the work that does not need the denied tool and record the rest as an operator
-  errand under **Outstanding** — never route around the wall. (Identical *across profiles* — not
+  errand under **Outstanding** — never route around the wall. The console offers a deny-list denial back
+  to the operator as a **widen card** (Allow strikes that rule for this plan and resumes your own
+  session); if the phase cannot proceed without the tool, declare `phase-outcome.sh <slug> <N> blocked
+  --needs permission --rule "<rule>" --command "<command>"` and stop. (Identical *across profiles* — not
   immutable: an operator can strike a built-in rule out of the wall, per plan or globally, and that
   strike then applies to every profile at once.)
 - **Never wait inside a turn.** A supervised session's `Bash` call that by construction waits — `until
@@ -119,11 +122,24 @@ runs inside machinery it should not mistake for a malfunction. The short version
   - **A long job of your own** — start it in the background (`run_in_background: true`, or
     `… > /tmp/x.log 2>&1 &`), carry on with work that does not depend on it, and poll it with a SINGLE
     bounded check per turn. Leave one open too long and the console nudges you once; leave it far longer
-    and it parks the phase, carrying your own loop's condition as a `cmd:` watch ref so it can bring you
-    back when the job is genuinely done.
+    and it parks the phase in its own name (never spending your waits), minting a `cmd:` ref from your
+    loop — polled only if the operator allows minted refs, so expect to come back on the park's clock.
   - **Somebody else's clock** (a CI run, a deploy window) — commit, write the handoff `in-progress`, then
-    `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, and stop.
+    `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, and stop. **Name the
+    ref**: a wait declared without one right after the console refused your in-turn wait takes a ref
+    minted from the refused command, else the plan's `- **Waits on:**` refs, else it is refused and the
+    phase parks for a person (`phase.watch-missing`).
   A short `sleep` is fine, and a §Verification command may take as long as the plan needs.
+- **A question is held, never a permission.** `AskUserQuestion` is answered by the console. With the
+  run's relay armed (`relay: last-resort`, CLI 2.1.268+, your phase's own session) a person gets 60 s,
+  then a relay rule, the sole `(Recommended)` option or the first answers — you are told which, and if
+  it is wrong you declare `blocked --needs ambiguity` rather than asking again; a question it will not
+  answer by rule (multi-select, a destructive option, a repeat, …) comes back unanswerable — hand off
+  `in-progress`, declare `needs-human --needs ambiguity`, stop. With no relay the plan's `ambiguity` row
+  answers: `ruling` — decide from the plan, record `ruling --kind ambiguity`, carry on; `ask`/`halt` —
+  `needs-human --needs ambiguity`, stop. **The floor:** every session the relay is not armed for is
+  spawned with `--permission-prompts none` (CLI 2.1.259+) — nothing can ask a person, the
+  tool is not even offered, and a call that would prompt is denied: do not retry it.
 - **An operator can change the run under you** — model, effort, budgets, skills, MCP servers, even
   `reviewEachPhase`, which inserts a fresh reviewer over your diff at phase-finish whose
   `requested-changes` holds your dependents exactly as a person's would. If the board does not move after a
@@ -135,7 +151,8 @@ runs inside machinery it should not mistake for a malfunction. The short version
   that wedged before the CLI's init frame has no session id, and is boarded FRESH with a resume brief
   instead. So the tree, the handoff and the journal are the memory that survives; the transcript is not.
 - **A message can arrive mid-phase.** *Ask* (answer, then carry on) and *steer* (do this differently from
-  here) are written to your stdin from the console or `bin/btw`. A steer outranks the plan for the rest of
+  here) are written to your stdin from the console or `bin/btw` — a steer may also be a person's answer,
+  from the inbox, to a prompt your lane stopped on. A steer outranks the plan for the rest of
   the phase — record the departure as a `ruling --kind deviation`.
 
 ## Modes
@@ -200,6 +217,35 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    branch for the whole plan (every phase, including concurrent ones, commits to it) and record its name.
    (The console can also impose a run-level work branch `pe/<slug>` at launch; the plan line stays the
    default for hand-driven sessions.) See `references/conventions.md` §Branches.
+   **Then elicit the decision manifest — ONE question at a time, before authoring.** Nothing asks a
+   person mid-run: every decision a run can need is asked here, once, and written as a row of the
+   plan's **`## Decisions`** table (`references/plan-format.md` §Decisions). Ask each with
+   `AskUserQuestion`, the Tier-1 default first and marked `(Recommended)`, and write the answer as
+   `| \`<key>\` | <value> | <who answered> | answered | <yes|no> | plan | <evidence> |`; a key the
+   user leaves open stays `outstanding` with an owner (an `outstanding` row with NO owner fails
+   `validate.sh`, F25), and one they rule out is `waived` with the reason as its value. The seventeen
+   keys, in order — `permission.policy` (this plan's ask/deny/allow overlay, `autoApprove`; also
+   goes on a `**Permissions:**` line) · `permission.destructive` (publishing and destructive verbs:
+   `deny`, with named per-phase exceptions — `**May publish:**`) · `credentials` (backticked ids on
+   `**Credentials:**` + `**Credential policy:** require|continue`; a phase adds its own with
+   `- **Credentials:**`) · `accounts` (`**Accounts:**` as `\`id:minHeadroom\`` pairs, a percent) ·
+   `mcp` (the MCP question above) · `gates` (`Gate-check` on every `*(GATED)*` heading — a missing one
+   fails the lint, F24, and reads as `ai` — and `Gates: delegated|operator`) ·
+   `verification.person-check` (allow, halt, or an owner when a §Verification fragment is prose —
+   `- **Person-check:**`) · `qa.exhausted` (`**QA exhausted:** waive|halt|<owner>`; skip when QA is
+   off) · `waits` (each expected external wait, its `--watch` ref and its maximum — `**Wait budget:**`
+   and per phase `- **Waits on:** <ref> · <max>`) · `human-acts` (steps denied to an agent, each with
+   the ref that proves it landed — `- **Human step:**`) · `ambiguity` (ruling, ask or halt when the
+   plan did not decide — `**When in doubt:**`) · `budgets` (run, phase and turn ceilings) ·
+   `resume.on-restart` (continue, hold or ask — the RUN's answer) · `plan-health` (whether the advisory
+   lints gate this plan) · `stop` (`autonomy`, and who is told on a halt) · `relay` (`off` or
+   `last-resort` — a question a session asks mid-run gets 60 s in front of a person, then a rule
+   answers; arms only at CLI 2.1.268+) · `announce` (which categories push, to whom). The shipped
+   defaults (`POLICY_DEFAULTS`): `gates: delegated` · `qa.exhausted: waive` · `resume.on-restart:
+   continue` · `ambiguity: ruling` — the template's four — and `verification.person-check: operator` ·
+   `credentials: continue` · `mcp: continue` · `relay: off` · `waits: window`. The template carries
+   the skeleton; `scripts/phase-graph.sh <slug> --decisions`
+   reads it back, and the boot prompt hands each phase its rows.
 2. Draft the plan in the `references/plan-format.md` shape. **Every phase must be self-contained** — written
    so a session with zero prior context can execute it from the plan + its handoff alone. **Required and
    load-bearing: the `## Phase graph` table.** Its `Depends on` column is the machine-readable dependency
@@ -207,7 +253,8 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    numbers, ranges like `1–7`, or `—` for none). Also fill `Parallel-safe with`, repos, exit criteria, and
    the explicit **"Blocking vs simultaneous"** callout. **Every phase needs a runnable
    `- **Verification:**`** — whole backticked commands or a fenced block proving its exit criteria
-   (`validate.sh` warns F14 on any open phase without one; the autopilot parks such a phase at boarding).
+   (`validate.sh` fails F14 `verification-empty-open` on any open phase without one; the autopilot parks
+   such a phase at boarding).
    **Gates are categorized.** Mark externally-gated
    phases `*(GATED)*` in their `### Phase N` heading with a `- **Gates (must clear first):** …` line AND a
    category directive `- **Gate-check:** …`:
@@ -240,7 +287,10 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    status, **and** the live DAG board, so you see at a glance what is done, what this phase depends on, and
    whether it is genuinely `ready`. Read this phase's **dependency** handoffs (the phase's `depends_on`, not
    merely the previous number), `docs/plans/<slug>.md` §Phase N + §Session budget, and memory
-   `project_<slug>`. **Invoke any skills named on §Session budget's `Skills (every session):` line** before
+   `project_<slug>`. **Read the phase's decision rows** — `scripts/phase-graph.sh <slug> --decisions <N>`
+   (the boot prompt prints them; an `outstanding` row is a decision nobody has answered, and a
+   `blocked` or `needs-human` you declare must name its key with `--needs`). **Invoke any skills named
+   on §Session budget's `Skills (every session):` line** before
    implementing (the boot prompt lists them too). If the plan or the phase names **MCP servers**, confirm
    they are connected (`/mcp`, or `claude mcp list`) before implementing; if one needs authentication,
    **stop and ask the operator to sign it in** rather than working around it — the plan chose that server
@@ -249,8 +299,8 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    not reach. Do not improvise a substitute for it and do not treat it as a blocker: do the work that
    does not depend on it, and record what you could not do — naming the server — under **Outstanding**
    in the handoff, as an errand for the operator. Only when the phase genuinely cannot proceed at all,
-   record it — `bash scripts/phase-outcome.sh <slug> <N> needs-human --reason "mcp <name> needs
-   sign-in"` — hand off `blocked`, and stop.)
+   record it — `bash scripts/phase-outcome.sh <slug> <N> needs-human --needs mcp --reason "mcp <name>
+   needs sign-in"` — hand off `blocked`, and stop.)
    That must be enough — if it isn't, the previous handoff was
    deficient; note the gap so it gets fixed.
 2. **Confirm readiness, then the budget.** If the board shows this phase as `waiting`, a dependency isn't
@@ -305,7 +355,7 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    when it can, a merge commit when it cannot — and `remove [--force]` takes the tree, the merged branch and the lock away
    (`list` shows every hand lane). Never `git worktree add` a sibling folder of the project by hand —
    nothing sweeps it and, until now, nothing inside it found the docs root. (**Unattended**: never wait for an answer that cannot come —
-   file `bash scripts/phase-outcome.sh <slug> <N> blocked --reason "lock held by <owner>"
+   file `bash scripts/phase-outcome.sh <slug> <N> blocked --needs lock --reason "lock held by <owner>"
    --watch lock:<slug>/<N>`, hand off `in-progress` if you already did work, and stop; the supervisor
    queues the retry for when the lock frees.) The lock auto-expires (lease) and is released at phase-finish.
    See `references/conventions.md` §Locking + §Scoped concurrency.
@@ -331,8 +381,8 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    - `manual: …` / `blocked: …` / `OVERDUE: …` → **STOP.** Tell the operator what the gate needs and
      where to clear it: Phase Console → plan → phase → **Gate card** (Approve), or
      `scripts/gate-approve.sh <slug> <N> --by "<who>"`. Never implement past an unapproved human gate.
-     (**Unattended**: file `bash scripts/phase-outcome.sh <slug> <N> needs-human --reason "<gate> needs
-     the operator"` and stop.)
+     (**Unattended**: file `bash scripts/phase-outcome.sh <slug> <N> needs-human --needs gates --reason
+     "<gate> needs the operator"` and stop.)
 3. **Publish the task list** — `scripts/phase-tasks.sh`, not a task tool. Reset (which drops the
    previous phase's), then one `create` per task with subjects prefixed **`pN.taskM`**
    (e.g. `p2.task1 — wire endpoint`), and an `update` as each starts and finishes:
@@ -357,11 +407,16 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    most often omits, because at the time it felt obvious:
    ```
    bash scripts/phase-outcome.sh <slug> <N> ruling --kind ambiguity|deviation|deferral \
-     --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"]
+     --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"] \
+     [--needs <decision key>] [--remember plan|global]
    ```
    One appended NDJSON line, and **nothing acts on it** — it is not an outcome, it does not park the
    phase and it never ends your turn, which is exactly what makes it safe to record whenever you are
-   in doubt. It costs a line and it buys a reader. `references/conventions.md` §Rulings.
+   in doubt. It costs a line and it buys a reader. **Name the decision key it answers** (`--needs
+   <key>`, one of the manifest's) whenever there is one: a keyed ruling is what the console's inbox
+   offers to remember, and `--remember plan` writes it as a `## Decisions` row the moment it is recorded
+   (`--remember global` asks the owning console to make it this console's `policy.<key>` answer — the
+   words must be an answer word for the key). `references/conventions.md` §Rulings.
 
 ### Mode 3 — `phase-finish` (phase is done)
 
@@ -430,7 +485,10 @@ checklist is what makes it unmissable: **never hand off a phase whose verificati
    done, what remains, and what you are waiting on; (3) declare the wait machine-readably:
    `bash scripts/phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --reason "<what>"
    --watch <ref>`; (4) stop. The supervisor parks the phase and resumes THIS session when the window
-   elapses. (An interactive session may instead simply keep the turn and wait.) **A session nobody supervises** (no
+   elapses — within the phase's wait budget (a window past what is left is refused with a
+   `waiting-external-timeout` halt, never shortened; `- **Waits on:** <ref> · <max>` allows more), and
+   never while your session is still running. (An interactive session may instead simply keep the turn
+   and wait.) **A session nobody supervises** (no
    `PE_OUTCOME_FILE` in its environment) writes the same declaration into the console's inbox
    (`runs/<instance>/<slug>/outcomes/phase-NN.json`, printed on stderr); a running Phase Console with `--allow-run`
    picks it up, parks the phase `waiting` and resumes THAT session at the window — a hand-driven session can
@@ -506,9 +564,15 @@ Scripts resolve the superproject root automatically when run from inside a submo
   `Depends on` column, no `Repos` column, a row shorter than the header (**F20**) — or a cell it read but
   could not believe: a discarded `Depends on` token, a repeated Phase row, a zero-padded number, a phase
   with two handoff files (**F21**) — naming each. F20 and F21 are F1-tier gates, not advisories: a board
-  whose scopes are fiction is how two sessions end up in one working tree.
-  Plus the **advisory family F14–F19, F22–F23** on stderr, which
-  never changes the exit code: F14 nothing runnable in §Verification · F15 an unregistered MCP server ·
+  whose scopes are fiction is how two sessions end up in one working tree. **Since 5.0.0 four more
+  checks gate, each naming itself in its line:** `verification-empty-open` (**F14** — an open, not-done
+  phase whose §Verification holds nothing runnable; it warned before), `gate-directive-missing` and
+  `gate-type-unknown` (**F24** — a `*(GATED)*` heading with no `Gate-check`, which reads as `ai` until
+  it has one, and a directive whose type is not on the list), and `decision-outstanding-unowned`
+  (**F25** — a `## Decisions` row nobody owes; its siblings `decision-key-unknown`,
+  `decision-state-unknown`, `decision-source-unknown` are the same tier).
+  Plus the **advisory family F15–F19, F22–F23** on stderr, which
+  never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
   **F22** bring-up inside §Verification (move it to `- **Setup:**`) · **F23** an expected failure stated
@@ -529,16 +593,36 @@ Scripts resolve the superproject root automatically when run from inside a submo
   to do when one will not connect — with no phase argument, the plan-wide `## Session budget` line alone;
   with one, that phase's answer, which for `--mcp` is the plan line UNIONED with the phase's own bullet
   and for `--mcp-policy` is the phase's bullet OVERRIDING the plan's. Empty `--mcp-policy` means the plan
-  has no opinion, which is a different fact from `continue`), and **`--plan-status`** (the stored operator
+  has no opinion, which is a different fact from `continue`), **`--credentials [N]`** /
+  **`--credential-policy [N]`** (the credential ids a phase needs and what the plan says when one is not
+  held — the two MCP shapes exactly: `**Credentials:**` ∪ `- **Credentials:**`, and
+  `**Credential policy:** require|continue` overridden by the phase's bullet, silence printing nothing),
+  **`--accounts`** (the `**Accounts:**` line as `id<TAB>minHeadroom` per line), **`--wait-budget [N]`**
+  (how long a phase may stay parked on its declared waits, as `minutes<TAB>phase|plan` — its own
+  `- **Waits on:** <ref> · <max>` bullet, else the plan's `**Wait budget:**`; nothing means the console's
+  default) / **`--waits-on N`** (that bullet's refs, one per line — a `date:` among them countersigns a
+  wait up to that instant), **`--qa-exhausted`** (the `**QA exhausted:**` line's one word — `waive`,
+  `halt`, or an owner — the answer the console acts on when a phase's QA rounds run out) /
+  **`--person-check N`** (that phase's `- **Person-check:**` bullet — `allow`, `halt`, or an owner — what
+  to do with a §Verification fragment written as prose; silence prints nothing and the console's
+  policy table answers),
+  **`--decisions [N]`**
+  (the decision manifest as it HOLDS — the plan's `## Decisions` rows with
+  `docs/handoffs/<slug>/decisions.md` merged over them and, with a phase, that phase's own rows over
+  both — one `key<TAB>state<TAB>owner<TAB>blocking<TAB>source<TAB>value` line per row that exists,
+  in vocabulary order; a plan with no manifest prints nothing), and **`--plan-status`** (the stored operator
   decision as one bare word — the raw `status:`, where `--closed` is the predicate over it). The board is
   model-aware
   (batches size to the plan's `## Session budget`) and shows QA markers when gating is on. Parses the
   `## Phase graph` table (deps, ranges, markdown-bold cells) + `### Phase N` `Size:`/`Gate-check:` bullets +
   handoff statuses + `test-status.md` + `gate-status.md`; warns on drift. Sizing/budget constants live in
   `scripts/sizing.env` and the model vocabulary (aliases, full ids, the `[1m]` window suffix) in
-  `scripts/models.env`; the gate vocabulary + category split in `scripts/gates.env`; the MCP surcharge in
-  `scripts/mcp.env`; and the verification-command vocabulary the F16/F17/F18 lints read (cwd-sensitive
-  leads, names never worth a warning, commands that wait on an external clock) in `scripts/verify.env`.
+  `scripts/models.env`; the gate vocabulary + category split + the undeclared-gate default (`GATE_DEFAULT`)
+  in `scripts/gates.env`; the MCP surcharge in
+  `scripts/mcp.env`; the verification-command vocabulary the F16/F17/F18 lints read (cwd-sensitive
+  leads, names never worth a warning, commands that wait on an external clock) in `scripts/verify.env`;
+  and the decision manifest's keys, states, sources and `--needs` classes in `scripts/decisions.env` — the
+  bash twin of `viewer/shared/decisions-model.js`, which owns them.
 - `scripts/new-handoff.sh <slug> <N> <title> [status] [--qa] [--force]` — scaffold the phase handoff +
   create/update `INDEX.md`. Auto-fills `depends_on` + `blocks` from the graph and the
   `## ▶ Start next phase(s)` section (a boot prompt per unblocked phase). `status` is one of the four
@@ -556,7 +640,7 @@ Scripts resolve the superproject root automatically when run from inside a submo
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F20/F21, and the advisory family F14–F19, F22–F23 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25, and the advisory family F15–F19, F22–F23 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
 - `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts> <N> [--owner ID] [--lease S]
@@ -628,8 +712,16 @@ Scripts resolve the superproject root automatically when run from inside a submo
   `create --status deleted` is refused (exit 2) even though the flattened signature above reads as if
   every word were legal everywhere.
 - `scripts/phase-outcome.sh <slug> <N> <complete|waiting-external|blocked|needs-human|partial|no-defect>
-  [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601]` — the
+  [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601] [--needs KEY] [--rule TEXT]
+  [--command TEXT]` — the
   session→runner channel: ONE atomic JSON file at `$PE_OUTCOME_FILE`, read once and consumed.
+  **`--needs <key>` is REQUIRED on `blocked` and `needs-human`** (exit 2 without it) and refused on
+  the rest: the decision the session is missing, as a key of the plan's `## Decisions` manifest
+  (`scripts/decisions.env`) or a blocker class as its short form — `credential`, `permission`, `gate`,
+  `external`, `lock`. The runner reads it BEFORE the prose, so `blocked-declared:credential` is what a
+  declaration `--needs credential` classifies as whatever its `--reason` says, and
+  `blocked-declared:unknown` now means "a key the manifest lacks" — a defect report, not a routine.
+  `--rule`/`--command` structure a permission block beside it (the rule that refused, the command).
   `--wait-minutes` and `--until` are the resume clock and belong to the three statuses that PARK —
   `waiting-external`, `blocked` and `needs-human` (mutually exclusive; absent means the runner's
   default window) — `--until` is the right one when you know the wall-clock moment rather than the
@@ -644,12 +736,40 @@ Scripts resolve the superproject root automatically when run from inside a submo
   read-only: `npm ci` passes it — 60 s, and **at most 12 runs per phase**, after which the ref reads
   `refused`; so write a ref that only READS and costs little). The resume instruction names what actually happened, so
   read it rather than assuming the thing you waited for succeeded — a cancelled run is not a result.
+  A ref no scheme parses is still recorded, with a warning on stderr: nothing will ever check it.
+  **Declarations are bounded.** `waiting-external` spends the phase's 4 waits and its wait budget;
+  each other status is acted on at most 4 times per phase — a fifth is recorded, not acted on, and parks
+  the phase for a person until an operator's Retry; a `blocked`/`needs-human` clock is capped at 7 days;
+  and unsupervised, two `partial`s within 5 minutes are one act. A declaration stands until a newer one,
+  a `git commit` or `phase-outcome.sh` call in the resumed session, the board closing the phase, or a
+  Retry spends it.
   Its second
-  shape, **`… <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral] [--cost-if-wrong …]`**,
+  shape, **`… <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral] [--cost-if-wrong …]
+  [--needs <key>] [--remember plan|global] [--by WHO]`**,
   appends one NDJSON line to the plan's ruling ledger (`$PE_RULINGS_FILE`, else
-  `runs/<instance>/<slug>/rulings.ndjson`) — what a session DECIDED, as opposed to how it ended.
+  `runs/<instance>/<slug>/rulings.ndjson`) — what a session DECIDED, as opposed to how it ended —
+  stamped with its id (the digest `rulings.ts` derives) and, with `--needs`, the manifest KEY it
+  answers (`decisionKey`; a key, never a blocker short form — a ruling is not a blocker).
   A ruling is never an outcome: nothing acts on it, it takes none of the outcome flags above, and
-  declaring one does not declare the other.
+  declaring one does not declare the other. `--remember plan` promotes it at once — a `## Decisions`
+  row through `decisions.sh promote` (source `ruling`, evidence the id) and an attributed ack in the
+  ledger; `--remember global` asks the console that owns the repository to hold the words as its
+  `policy.<key>` answer, through the same route the inbox's action uses, and exits 1 naming the
+  Settings page when no console answers.
+- `scripts/decisions.sh <slug> [--phase N] answer <key> --value TEXT | waive <key> --reason TEXT |
+  promote --from-ruling <id> --key <key> | list` — the deterministic writer for the decision
+  manifest's mutable twin, `docs/handoffs/<slug>/decisions.md`, which `--decisions` merges OVER the
+  plan's own `## Decisions` rows (a twin row replaces the plan's whole row for its key; a row written
+  with `--phase N` replaces both, for that phase). `answer` records a value (state `answered`, source
+  `run`, keeping the row's `blocking` unless `--blocking yes|no` says otherwise); `waive` records that
+  the decision does not apply, with the reason as its value; `promote` turns a ruling from the plan's
+  ledger into a standing answer (source `ruling`, evidence `ruling <id>`); `list` is the engine's own
+  read-back. `--by` names who (default `$PE_OWNER`, else user@host) and `--evidence` what backs the
+  answer (default the script's own stamp). It writes exactly the shape the readers parse (the
+  `qa-mode.sh` rule), atomically and
+  idempotently, validates the key against `scripts/decisions.env` and the phase against the plan
+  (exit 2), reads its own row back through `phase-graph.sh --decisions` (exit 1 if the file carries a
+  row it did not write), and never touches git. Never edit the twin by hand.
 - `scripts/gate-approve.sh <slug> <N> [--by WHO] [--note TEXT] [--revoke]` — record (or revoke) a gate
   clearance in `docs/handoffs/<slug>/gate-status.md` — the approval `--gate-status` honours for **every**
   gate kind. Written by the console's Gate card, by an AI session that verified an `ai` gate's conditions,
@@ -673,7 +793,10 @@ Scripts resolve the superproject root automatically when run from inside a submo
 - **Three more ship and are not verbs you call.** `scripts/session-hook.sh` is a user-scope Claude Code
   hook (SessionStart / SessionEnd / Stop / Notification) that tells the console which sessions are live on
   this machine — installed from Settings ▸ Automation or `phase-console install-hooks`, always exits 0, and
-  on SessionStart prints your own session id back to you with the `phase-lock.sh --session <id>` line.
+  on SessionStart prints your own session id back to you with the `phase-lock.sh --session <id>` line and
+  names the other live sessions in the repository. With no console answering it drops the event into the
+  instance's inbox and, node present, drains it itself with `phase-console sessions ingest`
+  (`PHASE_CONSOLE_HOOK_INGEST=0` leaves the inbox for the console).
   `scripts/instance.sh` and `scripts/scope.sh` are **sourced, never executed**: they are the bash halves of
   `viewer/shared/instances.mjs` (where a console's state directory is) and `viewer/shared/scope.js` (how a
   plan's Repos column is read), so the scripts answer identically with no console up and no node on PATH.
@@ -698,8 +821,12 @@ Scripts resolve the superproject root automatically when run from inside a submo
   credentials, attach them to plans and phases — *reading* the registry needs no flag). Shut down is
   deliberately not behind a flag. One flag switches something OFF rather than on: **`--no-converge`**
   stops the convergence loop's automatic triggers (boot / docs change / timer / the minute after a halt);
-  the operator's own *Recover & continue* press converges regardless. What that loop does, and everything
-  else the console wraps around a session, is `references/console-surface.md`.
+  the operator's own *Recover & continue* press converges regardless. `phase-console doctor [instance]`
+  runs the run-start prelude's probes and the machine checks — the Claude CLI against the relay floor,
+  `gh auth status`, the hooks — with no plan in front of them, and exits 1 naming the first blocking
+  row; `phase-console sessions ingest [instance]` drains the session-presence inbox with no console up. What
+  that loop does, and everything else the console wraps around a session, is
+  `references/console-surface.md`.
 
 - **For maintainers of this repository, never for a session working a plan:** `scripts/gates.sh
   [--quick] [--list] [--ci] [--build] [--keep-going] [--install-hook] [--help]` — the release gate, on
@@ -729,7 +856,9 @@ The load-bearing rules a session must not get wrong; full rationale in `referenc
 - **The handoff is the contract.** If a fresh session can't start cold from it, fix the handoff; link to the
   plan, never re-list the roadmap. (conventions §Memory, §Docs layout)
 - **Record the decisions the plan did not make for you** — `phase-outcome.sh <slug> <N> ruling …`, one
-  line per judgement call, nothing acts on it. The handoff carries the same words for a person.
+  line per judgement call, nothing acts on it. The handoff carries the same words for a person. And
+  the decisions it DID make live in its `## Decisions` manifest: a block you cannot get past is
+  declared by key (`blocked --needs <key>`), never asked in prose — prose reaches nobody.
   (conventions §Rulings)
 - **`phase-graph.sh` is the truth for done/ready/next** — never infer from phase numbers or a remembered
   cursor; "finished" means the board shows **every** phase `done`. (conventions §Status source of truth)
@@ -755,13 +884,15 @@ The load-bearing rules a session must not get wrong; full rationale in `referenc
   implement; a `manual` (human) gate stops everything until a person does the numbered steps and approves
   (console Gate card or `gate-approve.sh`); auto checks (`date`/`phase`/…) answer by themselves. An
   approval clears ANY kind; `--revoke` restores the gate. Never implement past an unapproved human gate
-  — **unless the operator has delegated it** (Settings ▸ Automation, off by default), in which case the
+  — **unless it is delegated** (the plan's `gates` row, else Settings ▸ Automation — on by default
+  since 5.0.0, `gates: delegated`; a gate that states no condition stays a person's), in which case the
   boot prompt briefs you to verify each condition against evidence you can cite and record it as
   `ai-session-delegated`, or STOP naming the condition you could not verify. Never approve a gate you
   cannot cite evidence for. (plan-format §Gates; conventions §Gates)
 - **Validate before you trust the board** — `scripts/validate.sh <slug>` catches malformed rows, undefined
-  deps, cycles, a table whose columns cannot be located by name, cells it could not believe, and
-  inconsistent handoffs; a silently-wrong board is the worst failure.
+  deps, cycles, a table whose columns cannot be located by name, cells it could not believe, an open
+  phase with nothing runnable to verify it, a gated heading with no `Gate-check` (or an unknown type),
+  a decision row nobody owes, and inconsistent handoffs; a silently-wrong board is the worst failure.
 - **Skill vs work-state split.** The skill lives in its own install (a plugin, or a clone under
   `~/.claude*/skills/`); plans/handoffs/reports/test-status/locks are work-state in the project repo's
   `docs/`. Never write work-state into the skill folder. (conventions §Docs layout & repo split)

@@ -76,6 +76,68 @@ says when this console may START phases at all — windows, cron openings and qu
 both; outside it a ready phase queues saying when boarding opens, a recovery you ask for is never
 held, and a phase already running is never interrupted. `docs/loop.md` is the specification.
 
+**Nothing asks you mid-run.** Since 5.0.0 the launch form opens on a **Decisions** stage: the plan's
+`## Decisions` manifest with each row's state, four probes run before anything is spent (the accounts
+the run may spend, its MCP servers, the credentials it names, a channel to announce on), and the
+answers the door requires — continue after a console restart, arm the relay, which accounts with how
+much headroom, an acknowledgement of every waived row. A blocking row still open disables Launch and
+names itself; the one way past it is an override the run records. `phase-console doctor` runs the
+same probes and the machine checks by hand — hooks, unit, CLI version, `gh`, the environment — and
+exits non-zero naming the first failing row (`--json` prints the report).
+
+**The relay answers what a session still asks.** It is off by default: a run without it carries
+`--permission-prompts none`, so anything that would prompt is denied and the session is told nobody can
+answer. Armed (`relay: last-resort`), it arms only at a Claude CLI of 2.1.268 or later — below that the
+run keeps the floor and journals `run.relay-refused` — and a question a session raises
+(`AskUserQuestion`) is held 60 s for a person on its question card; unanswered, the console answers at
+55 s by a relay rule, else the sole `(Recommended)` option, else the first, with no model call, and
+files a ruling keyed `ambiguity`. A multi-select question, one with a destructive option, a deny-list
+match, a question on a halted or parked run, the same question twice in one phase, and anything past
+the phase's question budget go to a person instead — a `needs-human` park and one push.
+`docs/decisions.md` has the row.
+
+**What a session decided reaches the next plan.** A ruling that names its decision key
+(`phase-outcome.sh … ruling --needs <key>`) is an inbox row with **Remember for this plan** (a
+`## Decisions` row, source `ruling`) and, when its words are an answer the console can hold,
+**Remember on this console**; a session can do the first as it records (`--remember plan`). The
+console's own answers live on Settings ▸ Automation ▸ **Policy answers** — every row of the policy
+table, edited in place, each change journalled — and the plan wizard opens by reading the
+repository's ledgers, then asks the manifest and the plan's machine-read fields one numbered
+question at a time, showing the manifest filled in before anything is written. Settings ▸
+Permissions raises an acknowledgeable banner when the policy in force cannot ask (the ask list
+struck empty) or the deny wall is struck, and refuses a rule that would never match
+(`Bash(:*)`, `git(:*)`).
+
+**A refused account stays refused until you clear it.** When the API refuses an account's credential
+itself (not its usage), the account is `retired` together with every account in its organisation, and
+no run spends any of them. `POST /api/accounts/<id>/clear-retired` is the one way back — for the
+credential and its whole organisation — and `POST /api/accounts/<id>/probe-entitlement` asks first: one
+declared one-turn session under that account, whose answer can retire it again. Both need
+`--allow-accounts`; `docs/controls.md` has the rest.
+
+
+**Shut down, at the strength you mean.** Settings' **Shut down** exits the console, and its dialog says
+beforehand whether that lasts (nothing supervises the process), lasts until the next login, or comes
+straight back with every run checkpointed (a supervisor keeps it alive). Where a unit runs the console,
+**Stay off…** also unloads and disables the unit and leaves a stop marker (`stopped-by-console.json` in
+its state directory), so not even a login brings the work back. Both dialogs list what will stop and
+what survives — lanes, clocks, runs on disk, live sessions, cards, unread inboxes — and confirming
+acknowledges that list. A console that boots under the marker, or under `autostart: false` in the
+machine profile, holds its automation: nothing is re-adopted or converged until **Clear the stop and
+resume** (or **Release it for this boot**) in Settings — `POST /api/automation/hold/release`,
+`--allow-run` — runs the boot pass it held. The profile is not edited, so `autostart: false` holds the
+next boot too.
+
+**The machine has limits of its own.** `~/.config/phase-console/fleet.json` is the machine profile every
+console reads — remote access, the notifier, webhooks, quiet hours, each console's `autostart` — and its
+`maxSessions` is the machine's lane ceiling: every console's live lanes summed, beside each console's own
+`--max-sessions`, so a phase queued behind it names `machine cap` as its holder. `GET /api/instances` is
+the census of every console the machine records. A session in a directory no console claims is never
+handed to whichever console happens to be running: its presence events wait in the machine's unowned
+sink (`~/.local/state/phase-console/fleet/sessions/inbox/`). And while a console is down, its own
+presence inbox is drained without it by `phase-console sessions ingest` — the hook runs it when its
+POST finds nobody — which does nothing while that console answers.
+
 
 ## Where things live (two places)
 

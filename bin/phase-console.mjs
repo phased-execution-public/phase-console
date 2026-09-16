@@ -8,12 +8,15 @@
 //   phase-console uninstall-skill        take that copy away again
 //   phase-console install-hooks          add the session-presence hook to ~/.claude/settings.json
 //   phase-console uninstall-hooks        take it out again · hooks-status: is it there?
+//   phase-console doctor [instance]      the prelude's probes and the machine checks; exit 1 names the first failing row
+//   phase-console sessions ingest [instance]  drain the session-presence inbox with no console up
 //
 // This file replaces `bin/phase-console.mjs`, which is Pro: it is the
 // multi-instance CLI (`list`, `open`, `start`, `stop`, `restart`, `status`,
-// `logs`, `remove`, `update` and the `--agent-*` flags), and every one of those
-// verbs drives either the registry's second slot or `viewer/deploy/`, neither of
-// which exists here. What could not simply vanish with it is the rest of this
+// `logs`, `remove`, `update`, `autostart`, `profile`, `fleet` and the
+// `--agent-*` flags), and every one of those verbs drives the registry's second
+// slot, the machine profile, `viewer/deploy/` or `viewer/fleet/`, none of which
+// exists here. What could not simply vanish with it is the rest of this
 // file: npm's `bin` target, the node floor, the package-root resolver, and the
 // five skill/hook verbs, which the free tier needs most of all — installing the
 // skill is how anyone uses this at all.
@@ -157,8 +160,8 @@ if (['uninstall-skill', '--uninstall-skill'].includes(args[0])) {
 }
 
 // ---- the session-presence hook ---------------------------------------------
-// `install-hooks` writes three entries (SessionStart, SessionEnd, Stop) into
-// the user's ~/.claude/settings.json — merge, never clobber; idempotent — so
+// `install-hooks` writes four entries (SessionStart, SessionEnd, Stop, Notification)
+// into the user's ~/.claude/settings.json — merge, never clobber; idempotent — so
 // every Claude session on this machine reports itself to the console that owns
 // its directory; `uninstall-hooks` takes exactly those out; `hooks-status` says
 // which is true (exit 0 installed, 1 not).
@@ -200,6 +203,37 @@ if (['install-hooks', 'uninstall-hooks', 'hooks-status'].includes(args[0])) {
   process.exit(await hooksVerb(args[0], args.slice(1)));
 }
 
+// ---- doctor ------------------------------------------------------------------
+// The run-start prelude's probes with no plan in front of them, plus the
+// machine checks (phase 11): asks a running console when one answers on the
+// instance's port, reads the state directory and the machine when none does.
+// The verb itself lives in `bin/doctor-verb.mjs`, shared with the free tree's
+// bin, so neither copy of this file carries it twice.
+if (['doctor', '--doctor'].includes(args[0])) {
+  // `doctor fleet` asks after every console of the machine at once. Refused by
+  // name here, because the shared verb would otherwise read `fleet` as the name
+  // of an instance and answer that no such console exists.
+  if (args[1] === 'fleet') {
+    process.stderr.write(
+      "phase-console: 'doctor fleet' checks a fleet of consoles, which is Phase Console Pro.\n"
+      + 'This build checks one console:  phase-console doctor [<instance>]\n',
+    );
+    process.exit(2);
+  }
+  const { doctorVerb } = await import(pathToFileURL(join(root, 'bin', 'doctor-verb.mjs')).href);
+  process.exit(await doctorVerb(args.slice(1), { root, preferBuilt }));
+}
+
+// ---- the session inbox, drained with no console ----------------------------
+// `phase-console sessions ingest` (zero-touch phase 16, REG-2): the hook's
+// drops applied through the registry's own code when no console is up — the
+// hook itself runs it when its POST finds nobody. The verb lives in
+// `bin/sessions-verb.mjs`, shared with the free tree's bin.
+if (args[0] === 'sessions') {
+  const { sessionsVerb } = await import(pathToFileURL(join(root, 'bin', 'sessions-verb.mjs')).href);
+  process.exit(await sessionsVerb(args.slice(1), { root, preferBuilt }));
+}
+
 // ---- the fleet verbs, named rather than mistaken for a directory -----------
 // Without this, a bare `list` reached the block below, which turns a bare first
 // argument into `--root list` — so a verb that manages consoles would BOOT one,
@@ -217,6 +251,7 @@ if (['install-hooks', 'uninstall-hooks', 'hooks-status'].includes(args[0])) {
 // runs this predicate against every agent flag and every capability flag.
 const FLEET_VERBS = new Set([
   'list', 'open', 'stop', 'restart', 'status', 'log', 'logs', 'update', 'remove',
+  'autostart', 'profile', 'fleet',
 ]);
 const isAgentFlag = (arg) => /^--(?:un)?install-agent$|^--agent-[a-z][a-z-]*$/.test(arg ?? '');
 if (args[0] === 'start') args.shift();

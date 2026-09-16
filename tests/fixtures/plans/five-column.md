@@ -23,3 +23,18 @@ lint clean.
 | 1 | Alpha | — | api | tests pass |
 | 2 | Beta  | 1 | api | docs updated |
 | 3 | Gamma | 2 | web | deploy succeeds |
+
+## Phases
+
+### Phase 1 — Alpha
+- **Verification:**
+  - `true`
+
+### Phase 2 — Beta
+- **Verification:**
+  - `true`
+
+### Phase 3 — Gamma
+- **Verification:**
+  - `true`
+

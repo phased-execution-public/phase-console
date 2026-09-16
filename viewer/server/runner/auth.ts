@@ -31,7 +31,16 @@ export type AuthStatus = {
   email?: string;
   method?: string;
   organisation?: string;
+  /**
+   * The organisation's id — the one stable key an entitlement breaker can hang
+   * on (zero-touch-console phase 8, ACT-8): an organisation policy that refuses
+   * one login refuses every login in the organisation, and this is how the
+   * console knows two registrations are the same organisation. Never shown raw.
+   */
+  orgId?: string;
   subscription?: string;
+  /** The config directory the CLI answered FOR — proof the probe ran under the account it was asked about. */
+  configDirectory?: string;
   checkedAt: string;
   /** Present when the probe itself could not answer, as opposed to answering "no". */
   detail?: string;
@@ -140,7 +149,12 @@ export function parseAuth(stdout: string, stderr: string, checkedAt: string): Au
         email: str(parsed.email),
         method: str(parsed.authMethod),
         organisation: str(parsed.orgName),
+        // Kept, not dropped: `orgId` is what the breaker is keyed by and
+        // `configDirectory` is which account the answer is ABOUT. Both were
+        // read off the wire and thrown away before phase 8 (ACT-8).
+        orgId: str(parsed.orgId),
         subscription: str(parsed.subscriptionType),
+        configDirectory: str(parsed.configDirectory),
         checkedAt,
       };
     }

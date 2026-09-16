@@ -31,7 +31,8 @@ import { join } from 'node:path';
 import { Runner } from '../server/runner/runner.ts';
 import { Approvals } from '../server/runner/approvals.ts';
 import { recoveryActions } from '../server/service.ts';
-import { newRun, runDir, saveRun } from '../server/runner/state.ts';
+import { loadRun, newRun, runDir, saveRun } from '../server/runner/state.ts';
+import { RECOVER_MAX_PER_PHASE } from '../server/runner/runner-core.ts';
 import { laneNames } from '../server/runner/worktree.ts';
 import { MAX_FAILURE_CONTEXT_BYTES } from '../server/runner/failure-context.ts';
 import { phaseActions } from '../shared/phase-model.js';
@@ -290,6 +291,125 @@ test('recheck starts no session at all', async () => {
     assert.equal(log.length, before, 'recheck must spawn nothing');
     assert.equal(state.phases['1'].status, 'done');
     assert.equal(state.halt, null, 'the halt is cleared once the phase actually closes');
+  } finally { h.cleanup(); }
+});
+
+test('ACC-5.1 (RCV-4): two rechecks over unchanged evidence yield one run.recover and one refusal naming it — no second phase.halted, the halt keeps its clock, the streak is not charged', async () => {
+  const h = harness();
+  try {
+    const log: SpawnLog = [];
+    const runner = makeRunner(h, spawnSpy(log));
+    const started = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
+    await runner.wait();
+    const runId = started.id;
+    const before = runner.current() ?? loadRun(h.root, 'demo', runId, null)!;
+    assert.equal(before.phases['1'].halt?.kind, 'no-handoff', 'the phase ended with no handoff');
+    const haltAt = before.phases['1'].halt!.at;
+    const streak = before.consecutiveFailures;
+    const halted = journalOf(h.root, 'demo', runId).filter((e) => e.event === 'phase.halted').length;
+    const spawnsBefore = log.length;
+
+    // A person looks again, having changed nothing. The board still reads
+    // ready (no handoff), so the recheck meets the SAME ending.
+    const first = await runner.recover({
+      slug: 'demo', root: h.root, runId, phase: 1, mode: 'recheck', by: 'operator', fingerprint: 'fp-unchanged',
+    });
+    await runner.wait();
+    assert.equal(log.length, spawnsBefore, 'a recheck spawns nothing');
+    const after1 = loadRun(h.root, 'demo', runId, null)!;
+    assert.equal(after1.phases['1'].halt?.kind, 'no-handoff');
+    assert.equal(after1.phases['1'].halt?.at, haltAt, 'the halt keeps its clock — a recheck that found the same ending is not a new fact');
+    assert.equal(after1.consecutiveFailures, streak, 'and the streak is not charged for a recovery that spawned nothing');
+    assert.equal(after1.status, first.status === 'running' ? after1.status : first.status);
+    const j1 = journalOf(h.root, 'demo', runId);
+    assert.equal(j1.filter((e) => e.event === 'phase.halted').length, halted, 'no second phase.halted');
+    const recovers = j1.filter((e) => e.event === 'run.recover');
+    assert.equal(recovers.length, 1);
+    assert.equal(recovers[0].data?.fingerprint, 'fp-unchanged');
+    assert.equal(recovers[0].data?.recovers, 1);
+    assert.equal(recovers[0].data?.max, RECOVER_MAX_PER_PHASE);
+    const rechecks = j1.filter((e) => e.event === 'run.recheck');
+    assert.equal(rechecks.length, 1);
+    assert.equal(rechecks[0].data?.verdict, 'unchanged');
+    assert.equal((rechecks[0].data?.halt as { kind?: string } | undefined)?.kind, 'no-handoff');
+    assert.deepEqual(after1.recoveries?.['1']?.recovers, {
+      count: 1, lastAt: after1.recoveries!['1'].recovers!.lastAt, lastFingerprint: 'fp-unchanged', lastMode: 'recheck',
+    });
+
+    // The second look over the SAME evidence is refused before it is armed.
+    const second = await runner.recover({
+      slug: 'demo', root: h.root, runId, phase: 1, mode: 'recheck', by: 'operator', fingerprint: 'fp-unchanged',
+    });
+    await runner.wait();
+    assert.equal(second.status, after1.status, 'the state comes back as it was');
+    assert.equal(runner.busy(), false, 'nothing is armed');
+    const j2 = journalOf(h.root, 'demo', runId);
+    assert.equal(j2.filter((e) => e.event === 'run.recover').length, 1, 'one run.recover, not two');
+    const refused = j2.filter((e) => e.event === 'run.recover.refused');
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0].data?.why, 'unchanged');
+    assert.equal(refused[0].data?.fingerprint, 'fp-unchanged');
+    assert.equal(refused[0].data?.recovers, 1);
+    assert.equal(j2.filter((e) => e.event === 'phase.halted').length, halted, 'still no second phase.halted');
+    assert.equal(loadRun(h.root, 'demo', runId, null)!.recoveries?.['1']?.recovers?.count, 1, 'a refusal charges nothing');
+
+    // New evidence — a different fingerprint — is a new instruction: armed, counted as the second.
+    const third = await runner.recover({
+      slug: 'demo', root: h.root, runId, phase: 1, mode: 'recheck', by: 'operator', fingerprint: 'fp-moved',
+    });
+    await runner.wait();
+    assert.ok(third);
+    assert.equal(journalOf(h.root, 'demo', runId).filter((e) => e.event === 'run.recover').length, 2);
+    assert.equal(loadRun(h.root, 'demo', runId, null)!.recoveries?.['1']?.recovers?.count, 2);
+  } finally { h.cleanup(); }
+});
+
+test('ACC-5.1 (RCV-4): the recover verb is bounded per phase — past RECOVER_MAX_PER_PHASE it is refused capped, and a confirmed recheck resets the streak', async () => {
+  const h = harness();
+  try {
+    const log: SpawnLog = [];
+    const runner = makeRunner(h, spawnSpy(log));
+    const started = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
+    await runner.wait();
+    const runId = started.id;
+    for (let i = 1; i <= RECOVER_MAX_PER_PHASE; i++) {
+      await runner.recover({ slug: 'demo', root: h.root, runId, phase: 1, mode: 'recheck', by: 'operator', fingerprint: `fp-${i}` });
+      await runner.wait();
+    }
+    assert.equal(loadRun(h.root, 'demo', runId, null)!.recoveries?.['1']?.recovers?.count, RECOVER_MAX_PER_PHASE);
+    await runner.recover({ slug: 'demo', root: h.root, runId, phase: 1, mode: 'recheck', by: 'operator', fingerprint: 'fp-more' });
+    await runner.wait();
+    const capped = journalOf(h.root, 'demo', runId).filter((e) => e.event === 'run.recover.refused');
+    assert.equal(capped.length, 1);
+    assert.equal(capped[0].data?.why, 'capped');
+    assert.equal(capped[0].data?.max, RECOVER_MAX_PER_PHASE);
+
+    // Retry — the operator's "from the top" — clears the ledger; an automatic
+    // retry (the healer's rung) carries it, exactly as it carries the streak.
+    assert.equal(runner.current()?.recoveries?.['1']?.recovers?.count, RECOVER_MAX_PER_PHASE);
+    runner.retry(1, undefined, { press: false });
+    assert.equal(runner.current()?.recoveries?.['1']?.recovers?.count, RECOVER_MAX_PER_PHASE, 'an automatic retry clears nothing');
+    runner.retry(1);
+    assert.equal(runner.current()?.recoveries?.['1']?.recovers, undefined, 'a person\'s Retry clears the ledger');
+
+    // …and a recheck that FINDS the phase done is the success path: run.recovered, the streak reset.
+    const h2 = harness();
+    try {
+      const log2: SpawnLog = [];
+      const r2 = makeRunner(h2, spawnSpy(log2));
+      const s2 = await r2.start({ slug: 'demo', root: h2.root, autonomy: 'keep-going' });
+      await r2.wait();
+      assert.ok(loadRun(h2.root, 'demo', s2.id, null)!.consecutiveFailures >= 1, 'the no-handoff ending charged the streak');
+      writeFileSync(h2.handoff, 'status: complete');
+      await r2.recover({ slug: 'demo', root: h2.root, runId: s2.id, phase: 1, mode: 'recheck', by: 'operator', fingerprint: 'fp-done' });
+      await r2.wait();
+      const done = loadRun(h2.root, 'demo', s2.id, null)!;
+      assert.equal(done.phases['1'].status, 'done');
+      assert.equal(done.consecutiveFailures, 0, 'a confirmed phase breaks "N in a row" (RCV-3)');
+      const j = journalOf(h2.root, 'demo', s2.id);
+      assert.ok(j.some((e) => e.event === 'run.recovered'));
+      assert.equal(j.filter((e) => e.event === 'run.recheck')[0]?.data?.verdict, 'confirmed');
+    } finally { h2.cleanup(); }
   } finally { h.cleanup(); }
 });
 
@@ -568,8 +688,16 @@ test('a retried phase boots knowing what failed last time', async () => {
     assert.match(prompt, /the repository is right/,
       'the evidence is a snapshot from before the retry; the session must be told to check it');
 
-    // The insert is an addition to a prompt, not a replacement for one.
-    const insert = prompt.slice(prompt.indexOf('What happened on the previous'));
+    // The insert is an addition to a prompt, not a replacement for one — and it
+    // is measured ALONE. The slice used to run to the end of the prompt, so the
+    // unattended contract appended after it (~2 KB) counted against this budget
+    // and every line a later phase added to that contract was a hidden spend
+    // here (zero-touch-console P3 hit it adding `--needs`; P5 extends the same
+    // directive). The contract must still come AFTER the insert.
+    const at = prompt.indexOf('What happened on the previous');
+    const contract = prompt.indexOf('UNATTENDED SESSION CONTRACT', at);
+    assert.ok(at >= 0 && contract > at, 'the failure context rides before the unattended contract');
+    const insert = prompt.slice(at, contract);
     assert.ok(Buffer.byteLength(insert) <= MAX_FAILURE_CONTEXT_BYTES + 200,
       `the failure context was ${Buffer.byteLength(insert)} bytes`);
   } finally { h.cleanup(); }
@@ -894,7 +1022,7 @@ test('a transcript that cannot be carried to the account paying spawns nothing a
     const log: SpawnLog = [];
     const runner = makeRunner(h, spawnSpy(log), GREEN, {
       // The port is refused: the file is not under the account that wrote it.
-      portTranscript: () => false,
+      portTranscript: () => ({ findable: false, ported: false, why: 'not found' as const }),
     });
     const started = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
     await runner.wait();

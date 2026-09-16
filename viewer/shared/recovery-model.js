@@ -92,35 +92,82 @@ export const MECHANISM_LEGEND =
  */
 /**
  * A halt kind, as a type — the array below is the one truth and this is the only
- * way to name it in a type position. Without it every consumer had to retype the
- * seventeen words, which is exactly what `server/runner/state.ts` and
- * `client/src/lib/api/runs.ts` both did.
+ * way to name it in a type position. Without it every consumer had to
+ * retype the twenty-four words, which is exactly what `server/runner/state.ts`
+ * and `client/src/lib/api/runs.ts` both did. (The count in that sentence is held
+ * to the array by `test/docs-parity.test.ts`: it read "seventeen" for months
+ * while the array held eighteen — LFC-10.)
+ *
+ * Frozen and typed `const` rather than a bare array, so the typedef below is a
+ * UNION of the words and not `string`: `state.ts` derives its `HaltKind` from
+ * it, and a writer naming a kind this list lacks is a type error there rather
+ * than a run file nothing can classify — `plan-deadlocked` was written by the
+ * drive loop for weeks while in no list at all (LFC-1).
  * @typedef {(typeof HALT_KINDS)[number]} HaltKind
  */
-export const HALT_KINDS = [
-  'verify-failed',
-  'no-handoff',
-  'phase-blocked',
-  'waiting-external-timeout',
-  'needs-human',
-  'plan-lint',
-  'phase-crashed',
-  'budget',
-  'plan-unreadable',
-  'failure-streak',
-  'models-exhausted',
-  'verification-preflight',
-  'mcp-preflight',
-  // Kinds added when the formerly-kindless halt sites were named:
-  'run-preflight', // start() refused: auth/config preflight failed
-  'recovery-failed', // a recovery attempt crashed or explained why it could not finish
-  'orphaned-session', // adopt() found a live session from an earlier console
-  'runner-crashed', // the drive loop itself threw
-  // A worktree lane's commits would not merge into the run branch. The merge
-  // was aborted and every commit survives on `pe/<slug>/pN`; what is missing is
-  // a decision only a person can make about two edits to the same lines.
-  'worktree-merge',
-];
+export const HALT_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'verify-failed',
+    'no-handoff',
+    'phase-blocked',
+    'waiting-external-timeout',
+    'needs-human',
+    'plan-lint',
+    'phase-crashed',
+    'budget',
+    'plan-unreadable',
+    'failure-streak',
+    'models-exhausted',
+    'verification-preflight',
+    'mcp-preflight',
+    // Kinds added when the formerly-kindless halt sites were named:
+    'run-preflight', // start() refused: auth/config preflight failed
+    'recovery-failed', // a recovery attempt crashed or explained why it could not finish
+    'orphaned-session', // adopt() found a live session from an earlier console
+    'runner-crashed', // the drive loop itself threw
+    // A worktree lane's commits would not merge into the run branch. The merge
+    // was aborted and every commit survives on `pe/<slug>/pN`; what is missing is
+    // a decision only a person can make about two edits to the same lines.
+    'worktree-merge',
+    // The four the LFC-1 census found written with no word, or with a word no
+    // list held (zero-touch-console phase 2). All four are RUN-level.
+    //
+    // A QA verdict — `fail`, or a `pending` nobody ever recorded — holds every
+    // phase that is left; nothing is ready and nothing is in flight. The drive
+    // loop had diagnosed this precisely and written the word into no vocabulary.
+    'plan-deadlocked',
+    // The board offers nothing to run and nothing is in flight, yet phases
+    // remain — each behind a gate, an errand, a Retry or another plan's lock, in
+    // any mixture. The halt reason names every holder and the door that clears
+    // it; this word names the shape, which used to have none.
+    'nothing-ready',
+    // A dead console: the run was found in flight with no live child and no
+    // record of why the console that drove it went away — whether or not a
+    // phase was mid-session when it did (a LIVE leftover session is the other
+    // word, `orphaned-session`).
+    'interrupted-by-restart',
+    // The operator pressed Stop on a run this console was not driving. The halt
+    // exists so the run page has a reason to show; the kind, so that reason is
+    // never read as a wall.
+    'operator-stop',
+    // A person was ASKED — a verification card, a tool approval card — and did
+    // not answer inside the card's clock (zero-touch-console phase 6, WAI-10).
+    // Distinct from `needs-human`, an errand nobody has been asked about yet:
+    // here the question stood for hours with the run WAITING on it, and the
+    // park says so. PHASE-level: the card was one phase's.
+    'awaiting-person',
+    // The run's OWN credential was refused — an organisation policy, an
+    // expired or signed-out login, a billing hold, a certificate the API
+    // would not accept (zero-touch-console phase 9, RCV-1). RUN-level on
+    // purpose: `needs-human` is phase-level, so a blocked credential used to
+    // settle the phase and hand the run its next candidate — ten boardings of
+    // one plan inside 157 s, $223.69, every record reading `success`. Nothing
+    // downstream can spend under a credential the API refuses, so the run
+    // stops, the account is retired for its organisation (`leaveAccount`) and
+    // the errand names the sign-in.
+    'credential-refused',
+  ]),
+);
 
 /**
  * Which halt kinds are facts about ONE PHASE, and which stop the whole RUN.
@@ -159,30 +206,43 @@ export const HALT_KINDS = [
  * CLASSIFICATION — what each kind is about — and `halt()` is the one router
  * that acts on it so far.
  */
-export const PHASE_HALT_KINDS = [
-  'verify-failed',
-  'no-handoff',
-  'phase-blocked',
-  'waiting-external-timeout',
-  'needs-human',
-  'phase-crashed',
-  'verification-preflight',
-  'mcp-preflight',
-  'recovery-failed',
-  'orphaned-session',
-  'worktree-merge',
-];
+export const PHASE_HALT_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'verify-failed',
+    'no-handoff',
+    'phase-blocked',
+    'waiting-external-timeout',
+    'needs-human',
+    'awaiting-person',
+    'phase-crashed',
+    'verification-preflight',
+    'mcp-preflight',
+    'recovery-failed',
+    'orphaned-session',
+    'worktree-merge',
+  ]),
+);
 
 /** The kinds that stop the whole run — see `PHASE_HALT_KINDS`. */
-export const RUN_HALT_KINDS = [
-  'budget',
-  'plan-unreadable',
-  'plan-lint',
-  'failure-streak',
-  'models-exhausted',
-  'run-preflight',
-  'runner-crashed',
-];
+export const RUN_HALT_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'budget',
+    'plan-unreadable',
+    'plan-lint',
+    'failure-streak',
+    'models-exhausted',
+    'run-preflight',
+    'runner-crashed',
+    // The run-level parks and stops LFC-1 named: each is about the RUN — its
+    // plan wedged, its board empty, its console gone, its operator's press.
+    'plan-deadlocked',
+    'nothing-ready',
+    'interrupted-by-restart',
+    'operator-stop',
+    // The wall the run's own credential is: no phase can board under it.
+    'credential-refused',
+  ]),
+);
 
 /** True when this halt kind settles one phase rather than stopping the run. */
 export function isPhaseHalt(kind) {
@@ -281,6 +341,7 @@ export const KIND_PROFILE = {
     autoClass: 'halted-missing-handoff',
   },
   'needs-human': { sessionShaped: false, humanClass: null, autoClass: null },
+  'awaiting-person': { sessionShaped: false, humanClass: null, autoClass: null },
   'plan-lint': { sessionShaped: false, humanClass: 'plan-repair', autoClass: 'halted-verification' },
   'phase-crashed': {
     sessionShaped: false,
@@ -308,6 +369,27 @@ export const KIND_PROFILE = {
   // 3am. The errand names both lanes and the conflicted files, and both lane
   // branches are intact for whoever reads it.
   'worktree-merge': { sessionShaped: false, humanClass: null, autoClass: null },
+  // A parked run, and a person's: somebody has to give the holding phase a
+  // verdict, waive it, or switch the plan's QA gate off. No agent class,
+  // because a recovery session cannot record a verdict it did not reach.
+  'plan-deadlocked': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  // A parked run whose every remaining phase already carries its own errand,
+  // gate or Retry. The per-phase classifier owns each of those; the run itself
+  // wants nothing launched on its behalf.
+  'nothing-ready': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  // Crash-shaped, like `runner-crashed`: the honest offer is a resume, and the
+  // ladder decides the rest from the phase it finds.
+  'interrupted-by-restart': { sessionShaped: false, humanClass: 'interrupted-resume', autoClass: 'ladder' },
+  // The operator's own act. Nothing automatic re-opens it (`stoppedBy:
+  // 'operator'` already gates every resume path) and the "new agent" button
+  // has nothing to fix.
+  'operator-stop': { sessionShaped: false, humanClass: null, autoClass: null },
+  // A refused credential is the resource ladder's (`resource-wall:auth`): an
+  // account with a different organisation, or the sign-in a person does. No
+  // agent briefing can clear it and no closeout applies — the session that hit
+  // the wall did nothing wrong. Not a park: the run STOPPED, and the breaker
+  // (`accounts/learned.ts`) keeps it stopped until a person clears the account.
+  'credential-refused': { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource' },
 };
 
 /**

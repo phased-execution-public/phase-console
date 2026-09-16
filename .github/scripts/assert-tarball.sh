@@ -49,6 +49,8 @@ for p in \
   "viewer/server/accounts/index.js" \
   "viewer/server/accounts/usage.ts" \
   "viewer/server/accounts/transcripts.ts" \
+  "viewer/server/accounts/learned.ts" \
+  "viewer/server/accounts/entitlement-probe.ts" \
   "viewer/server/launcher.ts" \
   "viewer/server/launcher.js" \
   "viewer/server/hooks-install.ts" \
@@ -64,6 +66,8 @@ for p in \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
   "viewer/shared/situation-model.js" \
+  "viewer/shared/decisions-model.js" \
+  "viewer/shared/cli-tools.js" \
   "viewer/shared/ladder-model.js" \
   "viewer/shared/attention-model.js" \
   "viewer/shared/run-lifecycle.js" \
@@ -85,8 +89,29 @@ for p in \
   "viewer/server/analysis/spend.ts" \
   "viewer/server/runner/models.ts" \
   "viewer/server/runner/liveness.ts" \
+  "viewer/server/runner/session-record.ts" \
+  "viewer/server/runner/wait-budget.ts" \
+  "viewer/server/runner/run-paths.ts" \
+  "viewer/server/actor.ts" \
+  "viewer/server/api/actor.ts" \
+  "viewer/server/start-ceiling.ts" \
   "viewer/server/runner/rulings.ts" \
   "viewer/server/runner/ultrareview.ts" \
+  "viewer/shared/policy-model.js" \
+  "viewer/server/runner/policy.ts" \
+  "viewer/server/prelude.ts" \
+  "viewer/server/credentials-probe.ts" \
+  "viewer/server/doctor.ts" \
+  "viewer/shared/relay-model.js" \
+  "viewer/server/relay.ts" \
+  "viewer/server/relay-host.ts" \
+  "viewer/server/relay-host.js" \
+  "viewer/server/cli-init.ts" \
+  "viewer/server/shutdown.ts" \
+  "viewer/shared/fleet-model.js" \
+  "viewer/server/fleet.ts" \
+  "bin/doctor-verb.mjs" \
+  "bin/sessions-verb.mjs" \
   "scripts/models.env" \
   "viewer/scripts/check-stamp.mjs" \
   "viewer/run" \
@@ -100,6 +125,7 @@ for p in \
   "scripts/new-handoff.sh" \
   "scripts/qa-record.sh" \
   "scripts/qa-mode.sh" \
+  "scripts/decisions.sh" \
   "scripts/phase-outcome.sh" \
   "scripts/phase-tasks.sh" \
   "scripts/repair-artefacts.sh" \
@@ -113,6 +139,7 @@ for p in \
   "scripts/mcp.env" \
   "scripts/gates.env" \
   "scripts/verify.env" \
+  "scripts/decisions.env" \
   "templates/plan.md" \
   "templates/handoff.md" \
   "templates/INDEX.md" \

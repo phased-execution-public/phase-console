@@ -50,9 +50,58 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      mirror per RUN, so per-lane worktrees there share it, and since 2026-09-05 the superproject's own
      ROOT mounts as the mirror's first tree; `scope-unmapped` and `has-submodules` still refuse by name.
      See references/plan-format.md. -->
+<!-- The lines the ## Decisions rows below resolve from — all optional, all machine-read
+     (phase-graph.sh --credentials / --credential-policy / --accounts; the rest by the console at
+     run start). Write them plain, like the MCP servers line above:
+     **Credentials:** `gh`, `npm-token`        <-- backticked credential ids EVERY phase needs, probed
+                                                  before a phase boards; a phase adds its own with
+                                                  "- **Credentials:** `x`" in its block
+     **Credential policy:** require            <-- require (refuse at boarding when one is not held)
+                                                  | continue (run, and report the gap). Silence lets
+                                                  the run's setting decide; a phase may override.
+     **Accounts:** `default:20`, `work:10`     <-- which Claude accounts may spend, in order, each
+                                                  with its minimum five-hour headroom as a percent
+     **Permissions:** …                        <-- this plan's ask/deny/allow overlay (the
+                                                  `permission.policy` row)
+     **May publish:** none                     <-- the `permission.destructive` row: which branch,
+                                                  remote or tag a phase may push to, if any
+     **QA exhausted:** waive                   <-- waive | halt | <owner> — once the QA round budget
+                                                  is spent (the `qa.exhausted` row)
+     **When in doubt:** prefer X · never Y · record a ruling   <-- the `ambiguity` row
+     **Wait budget:** 8h                       <-- the ceiling on any one external wait (`waits`) -->
 <!-- Branch policy (references/conventions.md §Branches): default = commit to the branch already checked out;
      create a branch ONLY if the user asked, and then use ONE branch for ALL phases (incl. independent ones).
      Optional: per-phase model overrides, e.g. "Phase 5 (architecture) → Opus; Phases 2–3 (codegen) → Haiku". -->
+
+## Decisions
+<!-- The decision manifest (references/plan-format.md §Decisions): every decision a run can need,
+     answered BEFORE the run starts — nothing asks a person mid-run. One row per key of the closed
+     vocabulary (scripts/decisions.env), MACHINE-READ by both engines: phase-graph.sh --decisions [N]
+     and the console. Mode 1 asks each with one question and writes the answer here; a row you leave
+     `outstanding` must name its owner (an unowned outstanding row fails validate.sh, F25) and a
+     `blocking: yes` row that is still outstanding refuses the run at its door. `waived` = "does not
+     apply here", with the reason as the value. Answers that arrive later go through
+     scripts/decisions.sh, never a hand edit of docs/handoffs/<slug>/decisions.md. -->
+
+| key | value | owner | state | blocking | source | evidence |
+|---|---|---|---|---|---|---|
+| `permission.policy` | | operator | outstanding | yes | plan | |
+| `permission.destructive` | | operator | outstanding | yes | plan | |
+| `credentials` | | operator | outstanding | yes | plan | |
+| `accounts` | | operator | outstanding | yes | plan | |
+| `mcp` | | operator | outstanding | no | plan | |
+| `gates` | delegated | policy | answered | no | default | the shipped default |
+| `verification.person-check` | | operator | outstanding | no | plan | |
+| `qa.exhausted` | waive | policy | answered | no | default | the shipped default |
+| `waits` | | operator | outstanding | no | plan | |
+| `human-acts` | | operator | outstanding | yes | plan | |
+| `ambiguity` | ruling | policy | answered | no | default | the shipped default |
+| `budgets` | | operator | outstanding | no | plan | |
+| `resume.on-restart` | continue | policy | answered | no | default | the shipped default |
+| `plan-health` | | operator | outstanding | no | plan | |
+| `stop` | | operator | outstanding | no | plan | |
+| `relay` | | operator | outstanding | yes | plan | |
+| `announce` | | operator | outstanding | no | plan | |
 
 ## Phase graph
 <!-- Make blocking vs parallel obvious. This table is MACHINE-READ: scripts/phase-graph.sh
@@ -90,11 +139,18 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      - **QA:** on                 <-- on | off — this phase's own QA gate, whatever the plan says
      - **MCP:** `github`          <-- UNIONED with the plan-wide MCP servers line
      - **MCP policy:** require    <-- require | continue — OVERRIDES the plan-wide policy
-     Read back with phase-graph.sh --size/--qa-mode/--mcp/--mcp-policy <N>. -->
+     - **Credentials:** `x`       <-- UNIONED with the plan-wide Credentials line
+     - **Credential policy:** continue   <-- OVERRIDES the plan-wide credential policy
+     - **Waits on:** gh:<repo>#run · 45m <-- an expected external wait: the ref, and its maximum
+     - **Human step:** <who, what, proof ref>   <-- a step denied to an agent, and what proves it landed
+     - **Person-check:** halt     <-- allow | halt | <owner> when a §Verification fragment is prose
+     Read back with phase-graph.sh --size/--qa-mode/--mcp/--mcp-policy/--credentials/--credential-policy/--decisions <N>. -->
   <!-- Externally gated? mark *(GATED)* in the heading, write the conditions (numbered operator steps
        for human gates) in "- **Gates (must clear first):**", and categorize with
        "- **Gate-check:** ai <check>" (a session clears it — prefer) | "manual <who>" (a person
-       approves via the console's Gate card or scripts/gate-approve.sh) | "date 2026-12-01" | "phase 8". -->
+       approves via the console's Gate card or scripts/gate-approve.sh) | "date 2026-12-01" | "phase 8".
+       The directive is REQUIRED on a *(GATED)* heading: without it the gate reads as `ai` and
+       validate.sh fails the plan (F24). -->
 - **Read first:** this plan §Phase 1 (phase 1 has no prior handoff)
 - **Files to create/modify:**
 - **Steps:** high level (the `p1.taskM` task list is created at execution time)
@@ -110,6 +166,8 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
   colour the phase red — e.g. `docker compose up -d`. Bring-up inside §Verification is what F22 fires on.
 - **Verification:** the runnable command/test that proves each exit criterion above — phase-finish runs
   these green before handing off. Re-check a CLI flag's current docs before relying on its semantics.
+  An open phase with nothing runnable here FAILS `validate.sh` (F14) — replace the placeholder:
+  - `echo "TODO: the commands that prove phase 1's exit criteria" && false`
   <!-- Monorepo? Add "- **Verify in:** <repo-relative dir>" to run them somewhere other than the root.
        Omitted = the root. A missing or escaping path falls back to the root and journals it. -->
 - **Handoff must record:** what Phase 2 needs to start cold
@@ -122,6 +180,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 - **Steps:**
 - **Exit criteria:** numbered, specific, **independently verifiable** outcomes.
 - **Verification:** the runnable command/test that proves each exit criterion (run green at phase-finish).
+  - `echo "TODO: the commands that prove phase 2's exit criteria" && false`
 - **Handoff must record:**
 
 ## End-to-end verification

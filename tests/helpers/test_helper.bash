@@ -165,3 +165,5 @@ setup_super_lane() {
   git -C "$hub/sub" worktree add -q "$LANE" -b pe/demo-p1 >/dev/null 2>&1
 }
 pe_lane()     { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/phase-lane.sh"        "$@"; }
+pe_decisions() { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TODAY:-2026-09-14}" \
+                "$SYS_BASH" "$PE_SCRIPTS/decisions.sh" "$@"; }

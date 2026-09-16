@@ -41,6 +41,7 @@ import {
 import { BarList, ChartNumbers } from '@/components/charts';
 import { api, type MetricFamily } from '@/lib/api';
 import { useDebugBundle } from '@/lib/queries';
+import { consolePath } from '@/lib/base';
 
 /** A family worth a bar chart has more than one labelled sample. */
 function chartable(family: MetricFamily): boolean {
@@ -158,7 +159,7 @@ export default function HealthSection(_props: { route: ViewProps['route'] }) {
               copiedLabel="Copied the bundle"
             />
             <Button asChild size="sm">
-              <a href="/api/debug/bundle?download=1" download>
+              <a href={consolePath('/api/debug/bundle?download=1')} download>
                 Download bundle
               </a>
             </Button>
@@ -267,7 +268,7 @@ export default function HealthSection(_props: { route: ViewProps['route'] }) {
           ) : (
             <p className="text-xs text-ink-muted">
               {`${data.metrics.length} families, as `}
-              <a className="text-action underline" href="/api/metrics">
+              <a className="text-action underline" href={consolePath('/api/metrics')}>
                 <code>/api/metrics</code>
               </a>
               {' renders them right now. This console keeps no history — a chart over time is a question '}

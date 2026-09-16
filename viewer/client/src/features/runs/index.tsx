@@ -56,7 +56,7 @@ import {
 import { usePrefs } from '@/lib/prefs';
 import { relativeTime } from '@/lib/format';
 import { Button, Card, Chip, Empty, PageError, Skeleton, toast } from '@/components/ui';
-import { ApprovalQueue, type Decide } from './approvals';
+import { ApprovalQueue, type Answer, type Decide } from './approvals';
 
 /**
  * What answering one approval card takes, named off the callback's own type —
@@ -225,6 +225,28 @@ export default function RunsView({ route }: { route?: Route }) {
     (id, decision, reason, remember, rule) => answerCard({ id, decision, reason, remember, rule }),
     [answerCard],
   );
+  // A pick on a relayed question (phase 14) — the same invalidation bundle as a
+  // card's answer, since it takes a card down too.
+  const pick = useApiMutation<
+    { slug: string; approvalId: string; key: string; label: string },
+    Awaited<ReturnType<typeof api.answerQuestion>>
+  >({
+    fn: ({ slug, approvalId, key, label }) => api.answerQuestion(slug, approvalId, [{ key, label }]),
+    invalidates: keys.afterInboxAct(),
+    onDone: (result, { label }) => {
+      if (!result?.ok) toast(result?.error ?? 'the question could not be answered', 'warn');
+      else
+        toast(
+          result.remaining ? `Answered “${label}” · ${result.remaining} left` : `Answered “${label}”`,
+          'ok',
+        );
+    },
+  });
+  const { mutate: pickOption } = pick;
+  const answerQuestion: Answer = useCallback(
+    (approval, key, label) => pickOption({ slug: approval.slug, approvalId: approval.id, key, label }),
+    [pickOption],
+  );
 
 
 
@@ -323,7 +345,12 @@ export default function RunsView({ route }: { route?: Route }) {
 
         {/* Then, always: a session parked with its hand up is the first thing
             on this page that is waiting on a person. */}
-        <ApprovalQueue approvals={approvals} allowRun={allowRun} onDecide={decide} />
+        <ApprovalQueue
+          approvals={approvals}
+          allowRun={allowRun}
+          onDecide={decide}
+          onAnswer={answerQuestion}
+        />
 
         {looksLikeAuthFailure(active ?? null, auth) && (
           <AuthCard
@@ -384,7 +411,7 @@ export default function RunsView({ route }: { route?: Route }) {
         )}
 
         {base.length || cut.closed.length ? (
-          <section className="flex flex-col gap-3" aria-label="The fleet">
+          <section className="flex flex-col gap-3" aria-label="This console's runs">
             {/* The switch, in BOTH shapes — a toggle only reachable from one
                 side of itself is a trap door. */}
             <div className="flex items-center justify-end">
@@ -426,7 +453,7 @@ export default function RunsView({ route }: { route?: Route }) {
                     title="No run matches"
                     body={
                       base.length
-                        ? `The fleet holds ${base.length} run${base.length === 1 ? '' : 's'}. Widen the filters to see them.`
+                        ? `This console holds ${base.length} run${base.length === 1 ? '' : 's'}. Widen the filters to see them.`
                         : `${cut.closed.length} run${cut.closed.length === 1 ? '' : 's'} belong${cut.closed.length === 1 ? 's' : ''} to closed plans.`
                     }
                     action={

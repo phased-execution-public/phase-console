@@ -141,7 +141,7 @@ test('with everything off, a silent launch carries no skills at all', async () =
   const { root, cleanup } = scratch();
   try {
     const { svc, captured } = service(root, { defaultSkills: ['graph-tool'] });
-    await svc.startRun('alpha', {});
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'] });
     assert.equal(captured[0]!.skills, undefined, 'the machine default no longer rides along uninvited');
   } finally { cleanup(); }
 });
@@ -151,9 +151,9 @@ test('the preference seeds a fresh run, and what was picked rides WITH the defau
   try {
     const { svc, captured } = service(root, { defaultSkills: ['graph-tool'] });
     svc.savePreferences({ attachDefaultSkills: true });
-    await svc.startRun('alpha', {});
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'] });
     assert.deepEqual(captured[0]!.skills, ['graph-tool']);
-    await svc.startRun('alpha', { skills: ['investigate'] });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], skills: ['investigate'] });
     // A union, not a coup: the attach box and the picker are separate answers,
     // and ticking one must not erase the other.
     assert.deepEqual(captured[1]!.skills, ['graph-tool', 'investigate']);
@@ -164,10 +164,10 @@ test('the per-launch choice beats the preference, in both directions', async () 
   const { root, cleanup } = scratch();
   try {
     const { svc, captured } = service(root, { defaultSkills: ['graph-tool'] });
-    await svc.startRun('alpha', { attachDefaultSkills: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], attachDefaultSkills: true });
     assert.deepEqual(captured[0]!.skills, ['graph-tool'], 'a tick beats an off preference');
     svc.savePreferences({ attachDefaultSkills: true });
-    await svc.startRun('alpha', { attachDefaultSkills: false, skills: ['investigate'] });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], attachDefaultSkills: false, skills: ['investigate'] });
     assert.deepEqual(captured[1]!.skills, ['investigate'], 'an untick beats an on preference');
   } finally { cleanup(); }
 });
@@ -176,7 +176,7 @@ test('an explicit empty list survives as none — the operator unchecked every b
   const { root, cleanup } = scratch();
   try {
     const { svc, captured } = service(root, { defaultSkills: ['graph-tool'] });
-    await svc.startRun('alpha', { skills: [] });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], skills: [] });
     assert.deepEqual(captured[0]!.skills, []);
   } finally { cleanup(); }
 });
@@ -186,9 +186,9 @@ test('a resume never re-seeds from the preference — the run answers for itself
   try {
     const { svc, captured } = service(root, { defaultSkills: ['graph-tool'] });
     svc.savePreferences({ attachDefaultSkills: true });
-    await svc.startRun('alpha', { resumeRunId: 'run-1', skills: ['investigate'] });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], resumeRunId: 'run-1', skills: ['investigate'] });
     assert.deepEqual(captured[0]!.skills, ['investigate'], 'the picked list passes through untouched');
-    await svc.startRun('alpha', { resumeRunId: 'run-1' });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], resumeRunId: 'run-1' });
     assert.equal(captured[1]!.skills, undefined, 'an omission stays an omission, so sticky skills rule');
   } finally { cleanup(); }
 });
@@ -201,7 +201,7 @@ test('qa: true turns the gate on before the runner starts, with the waived backf
   const { root, cleanup } = scratch({ handoffs: [1, 2] });
   try {
     const { svc, captured } = service(root);
-    await svc.startRun('alpha', { qa: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], qa: true });
     assert.equal(captured.length, 1, 'the run still started');
     const table = readFileSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md'), 'utf8');
     // Anchored on the LATEST handoff (phase 2), so phase 1 — complete before
@@ -216,7 +216,7 @@ test('QA on launch without --allow-writes is refused loudly, naming the flag', a
   const { root, cleanup } = scratch({ handoffs: [1] });
   try {
     const { svc, captured } = service(root, { allowWrites: false });
-    await assert.rejects(() => svc.startRun('alpha', { qa: true }), /--allow-writes/);
+    await assert.rejects(() => svc.startRun('alpha', { acknowledgedWaivers: ['announce'], qa: true }), /--allow-writes/);
     assert.equal(captured.length, 0, 'a refused activation must not half-start the run');
     assert.ok(!existsSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md')));
   } finally { cleanup(); }
@@ -227,10 +227,10 @@ test('the preference activates QA for a fresh run, and qa: false vetoes it', asy
   try {
     const { svc, captured } = service(root);
     svc.savePreferences({ qaByDefault: true });
-    await svc.startRun('alpha', { qa: false });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], qa: false });
     assert.ok(!existsSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md')),
       'unticking the box means no activation, whatever the preference says');
-    await svc.startRun('alpha', {});
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'] });
     assert.ok(existsSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md')));
     assert.equal(captured.length, 2);
   } finally { cleanup(); }
@@ -241,7 +241,7 @@ test('a resume does not let the preference activate QA behind the run', async ()
   try {
     const { svc } = service(root);
     svc.savePreferences({ qaByDefault: true });
-    await svc.startRun('alpha', { resumeRunId: 'run-1' });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], resumeRunId: 'run-1' });
     assert.ok(!existsSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md')));
   } finally { cleanup(); }
 });
@@ -250,9 +250,9 @@ test('a plan already under QA starts without another activation write', async ()
   const { root, cleanup } = scratch({ handoffs: [1] });
   try {
     const { svc, captured } = service(root);
-    await svc.startRun('alpha', { qa: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], qa: true });
     const before = readFileSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md'), 'utf8');
-    await svc.startRun('alpha', { qa: true });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], qa: true });
     const after = readFileSync(join(root, 'docs', 'handoffs', 'alpha', 'test-status.md'), 'utf8');
     assert.equal(after, before, 'activation is once; a second launch finds the gate already on');
     assert.equal(captured.length, 2);
@@ -285,7 +285,7 @@ test('a named phase somebody else holds refuses the launch outright', async () =
     claim(root, 1, 'someone/else', 1800);
     const { svc, captured } = service(root);
     await assert.rejects(
-      () => svc.startRun('alpha', { onlyPhases: [1] }),
+      () => svc.startRun('alpha', { acknowledgedWaivers: ['announce'], onlyPhases: [1] }),
       (error: Error) => {
         assert.equal(error.name, 'PhaseClaimedError');
         assert.match(error.message, /claimed by someone\/else/);
@@ -301,7 +301,7 @@ test('a LAPSED claim refuses nothing', async () => {
   try {
     claim(root, 1, 'someone/else', -60);
     const { svc, captured } = service(root);
-    await svc.startRun('alpha', { onlyPhases: [1] });
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'], onlyPhases: [1] });
     assert.equal(captured.length, 1, 'a lease that ran out is not a holder');
   } finally { cleanup(); }
 });
@@ -314,7 +314,7 @@ test('a whole-plan run is not refused by one claimed phase', async () => {
   try {
     claim(root, 1, 'someone/else', 1800);
     const { svc, captured } = service(root);
-    await svc.startRun('alpha', {});
+    await svc.startRun('alpha', { acknowledgedWaivers: ['announce'] });
     assert.equal(captured.length, 1);
   } finally { cleanup(); }
 });

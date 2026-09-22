@@ -354,3 +354,4 @@ describe('a second console on one machine', () => {
     expect(warnings().join(' ')).not.toMatch(/held by the live console/);
   });
 });
+

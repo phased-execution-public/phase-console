@@ -391,6 +391,36 @@ describe('spend that was never reported is named, not shown as zero', () => {
     expect(container.textContent).toMatch(/phase 1/);
   });
 
+  // Run deadaff9 (autopilot-token-drain H7): the tile read $266.34 while
+  // $111.87 was running in live sessions, because a session is booked only
+  // when it ends. Both halves, side by side, and never summed into one figure
+  // that would hide which half can still grow.
+  it("shows the live sessions' running cost beside the booked spend", () => {
+    const { container } = render(
+      <RunTiles
+        run={{ ...LOST, status: 'running', spentUsd: 266.34 } as RunState}
+        phases={[{ phase: 1, status: 'done', attempts: 1, costUsd: 266.34 }] as never}
+        total={3}
+        liveness={[{ phase: 2, spentUsd: 80.68 }, { phase: 3, spentUsd: 31.19 }, { phase: 4 }] as never}
+      />,
+    );
+    expect(container.textContent).toContain('$266.34');
+    expect(container.textContent).toMatch(/\+\s*\$111\.87 live/);
+    expect(container.textContent).not.toContain('$378.21');
+  });
+
+  it('claims nothing live when no session in flight has reported a cost', () => {
+    const { container } = render(
+      <RunTiles
+        run={{ ...LOST, spentUsd: 12 } as RunState}
+        phases={[{ phase: 1, status: 'done', attempts: 1, costUsd: 12 }] as never}
+        total={3}
+        liveness={[{ phase: 2 }] as never}
+      />,
+    );
+    expect(container.textContent).not.toMatch(/live/);
+  });
+
   it('is unchanged when every phase reported its spend', () => {
     const { container } = render(
       <RunTiles

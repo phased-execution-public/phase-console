@@ -41,7 +41,7 @@ type Dist = {
 
 /** A build that satisfies every check — the baseline each case mutates. */
 function baseline(): Dist {
-  return {
+  return withRepoChunk({
     assets: {
       'index-aaaa.js': 'navigator.serviceWorker.register("/sw.js");\n',
       'sessions-bbbb.js': 'export const Sessions = 1;\n',
@@ -50,7 +50,6 @@ function baseline(): Dist {
       // Phase 4's two. A destination chunk missing from the precache is a page
       // absent from the offline shell, so the gate names each one — which means
       // the baseline has to carry each one too.
-      'repo-mmmm.js': 'export const Repo = 1;\n',
       'debug-nnnn.js': 'export const Debug = 1;\n',
       'mcp-eeee.js': 'export const Mcp = 1;\n',
       'permissions-ffff.js': 'export const Permissions = 1;\n',
@@ -76,7 +75,15 @@ function baseline(): Dist {
     },
     buildRev: true,
     manifest: true,
-  };
+  });
+}
+
+// The free tree strips the Pro lines above, and with them the repo chunk that
+// carried the dynamic import — so a free baseline puts a plain repo chunk back.
+// In the Pro tree the key already exists and this is a no-op.
+function withRepoChunk(dist: Dist): Dist {
+  dist.assets['repo-mmmm.js'] ??= 'export const Repo = 1;\n';
+  return dist;
 }
 
 function render(dist: Dist, dir: string): void {
@@ -192,6 +199,48 @@ test('run-setup reached from the plan chunk INDIRECTLY fails too', () => {
   assert.equal(ok, false);
   assert.ok(failures(out).some((l) => l.includes('never statically pulls run-setup')), out);
 });
+
+/*
+ * The same rule for the Repo destination's one heavy section.
+ *
+ * React Flow and d3-dag (~97 KiB gzipped, `test/fixtures/spikes/react-flow-bundle.md`)
+ * ride behind the Landscape section, which is reached through
+ * `features/repo/pro/lazy-landscape`. Three ways that stops being true, each
+ * named: a static import folds the library into the precached repo chunk;
+ * the landscape chunk itself gets precached (the worker's globIgnores name it);
+ * the document preloads it. All three are rename-proof — they find whichever
+ * chunk carries React Flow — because the pane check taught that a name is
+ * exactly what a bundler is free to change.
+ */
+test('React Flow reached from the repo chunk by a STATIC import fails', () => {
+  const dist = baseline();
+  dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
+  dist.assets['repo-mmmm.js'] = 'import { Map } from "./map-rrrr.js";\nexport const Repo = Map;\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('carries no React Flow')), out);
+  assert.match(out, /lazy-landscape/, 'the detail names the module to import instead');
+});
+
+test('a React Flow chunk in the precache fails, whatever it is called', () => {
+  const dist = baseline();
+  dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
+  dist.sw!.precache.push('map-rrrr.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the precache excludes React Flow')), out);
+});
+
+test('modulepreloading a React Flow chunk fails — fetched on first paint by everyone', () => {
+  const dist = baseline();
+  dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
+  dist.html.preload.push('map-rrrr.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('never modulepreloads React Flow')), out);
+});
+
+
 
 test('run-setup reached by a DYNAMIC import is exactly what is wanted', () => {
   // The whole fix is a `lazy()`. A check that counted this edge would report

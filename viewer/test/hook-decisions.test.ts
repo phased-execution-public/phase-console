@@ -111,6 +111,37 @@ test('a guarded run that opted out of auto-grant still gets a person for the sam
   rmSync(POLICY_PATH, { force: true });
 });
 
+test('a trusted run of a plan that lands by pull request still gets a card for `gh pr merge`, and never a push', async () => {
+  // The publish carve-out (many-plans-one-repo phase 8). Under `trusted` the
+  // ask list is emptied to the pinned set, and `gh pr merge` was an everyday
+  // ask — so a landing session under a `Land: trunk` plan would have merged a
+  // pull request with nobody asked. `planPublishes` pins its two acts.
+  const { service } = serviceOn('trusted');
+  (service as unknown as { planPublishes: (slug: string) => boolean }).planPublishes = (slug) => slug === 'demo';
+  const MERGE = { tool_name: 'Bash', tool_input: { command: 'gh pr merge 7 --merge' } };
+  const pending = Symbol('still asking');
+  const outcome = await Promise.race([
+    service.decideToolUse(MERGE, 'r1'),
+    new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+  ]);
+  assert.equal(outcome, pending, 'the merge raised a card instead of being trusted through');
+  assert.equal(service.approvals.pending().length, 1);
+  // The push stays the console's: the wall refuses it on every profile.
+  const push = decision(await service.decideToolUse(
+    { tool_name: 'Bash', tool_input: { command: 'git push origin pe/demo-p1' } }, 'r1',
+  ));
+  assert.equal(push.permissionDecision, 'deny');
+  service.approvals.disarm();
+  service.close();
+
+  // …and a plan that does NOT land by pull request keeps the everyday answer:
+  // `trusted` trusts the merge verb like any other ask.
+  const plain = serviceOn('trusted');
+  const answer = decision(await plain.service.decideToolUse(MERGE, 'r1'));
+  assert.equal(answer.permissionDecision, 'allow');
+  plain.service.close();
+});
+
 test('a denial says whose decision it is, names the rule, and is written down', async () => {
   const { service, noted } = serviceOn('bypass');
   const answer = decision(await service.decideToolUse(
@@ -315,7 +346,12 @@ const laned = (profile: string, extra: Record<string, unknown> = {}) => {
 
 const bash = (command: string) => ({ tool_name: 'Bash', tool_input: { command } });
 
-test('a supervised session may not wait inside its own turn, on any profile', async () => {
+test('a supervised session may not wait inside its own turn on somebody else\'s clock, on any profile', async () => {
+  // Since autopilot-token-drain phase 1 a wait on the session's OWN job is
+  // allowed (`test/wait-procedure.test.ts` (b)), so the parser-robustness
+  // shapes below wait on a named remote (`gh run view`) rather than on a
+  // `/tmp` flag: what they prove — that no spelling hides a wait from the
+  // splitter — is unchanged, and a `/tmp` flag would now be allowed on sight.
   for (const profile of ['guarded', 'trusted', 'bypass']) {
     for (const command of [
       'until [ "$(gh run view 1 -q .status)" = completed ]; do sleep 15; done',
@@ -324,12 +360,12 @@ test('a supervised session may not wait inside its own turn, on any profile', as
       'gh run watch 42',
       // The fourth round's shapes, end to end: a trailing `&` backgrounds only
       // the last statement, and an escaped quote is not a quote.
-      'until [ -f /tmp/x ]; do sleep 30; done; echo ok &',
-      'echo \\" && until [ -f /tmp/x ]; do sleep 30; done',
-      'echo "$(until [ -f /tmp/x ]; do sleep 30; done)"',
+      'until gh run view 1 --exit-status; do sleep 30; done; echo ok &',
+      'echo \\" && until gh run view 1 --exit-status; do sleep 30; done',
+      'echo "$(until gh run view 1 --exit-status; do sleep 30; done)"',
       // Round 4's: a script piped into a shell, exempt data run by eval, and
       // a backgrounded job the same command then waits for.
-      "cat <<'EOF' | bash\nuntil [ -f /tmp/x ]; do sleep 30; done\nEOF",
+      "cat <<'EOF' | bash\nuntil gh run view 1 --exit-status; do sleep 30; done\nEOF",
       'eval "$(printf \'sleep 600\')"',
       'sleep 600 & wait',
     ]) {
@@ -339,7 +375,7 @@ test('a supervised session may not wait inside its own turn, on any profile', as
       // The wording has to be actionable, and has to name the alternative —
       // a deny a session cannot act on is a deny it will try to route around.
       assert.match(answer.permissionDecisionReason, /wait inside a turn/);
-      assert.match(answer.permissionDecisionReason, /run_in_background/);
+      assert.match(answer.permissionDecisionReason, /in the FOREGROUND/);
       assert.match(answer.permissionDecisionReason, /waiting-external/);
       service.close();
     }
@@ -356,15 +392,21 @@ test('the refusal is written down, with the fragment that matched it', async () 
   service.close();
 });
 
-test('the refusal reaches the lane\'s own signals, so the local-job ladder can climb it — and a declaration is never refused (RCV-5)', async () => {
+test('the refusal reaches the lane\'s own signals, so the wait ladder can climb it — and a declaration is never refused (RCV-5)', async () => {
   const { service, denials } = laned('bypass');
-  const command = 'until [ -f /tmp/suite.done ]; do sleep 30; done';
+  // RCV-5's refusal of a wait on the session's own job was reversed by
+  // autopilot-token-drain phase 1 — that wait is allowed now and reaches no
+  // ladder. A refused wait is somebody else's clock, and still reaches it.
+  const own = 'until [ -f /tmp/suite.done ]; do sleep 30; done';
+  assert.equal(decision(await service.decideToolUse(bash(own), 'r1')).permissionDecision, 'allow');
+  assert.deepEqual(denials, [], 'an allowed wait is no denial');
+  const command = 'until gh run view 7 --exit-status; do sleep 30; done';
   assert.equal(decision(await service.decideToolUse(bash(command), 'r1')).permissionDecision, 'deny');
   assert.deepEqual(denials.map((d) => [d.phase, d.command]), [[2, command]],
     'a denied wait opens no call, so this is the only way the watchdog learns the lane is still waiting');
   assert.match(denials[0].matched, /until/);
   // The documented way to declare a wait carries `--watch`, and must never be refused as one.
-  const declare = 'bash scripts/phase-outcome.sh demo 2 waiting-external --wait-minutes 30 --watch cmd:"test -f /tmp/suite.done"';
+  const declare = 'bash scripts/phase-outcome.sh demo 2 waiting-external --wait-minutes 30 --watch gh:o/r#run/7';
   assert.equal(decision(await service.decideToolUse(bash(declare), 'r1')).permissionDecision, 'allow');
   assert.equal(denials.length, 1, 'and a declaration is no refusal');
   service.close();

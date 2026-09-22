@@ -45,6 +45,13 @@ export interface DebugEntry {
   slug?: string;
   runId?: string;
   phase?: number;
+  /**
+   * The correlation ids the source line carried (envelope v2). Absent on a v1
+   * line and never invented — "this predates the ids" and "this was written
+   * outside every span" are both real answers.
+   */
+  traceId?: string;
+  spanId?: string;
   data?: Record<string, unknown>;
 }
 
@@ -138,6 +145,8 @@ export type DebugIndexParams = {
   slug?: string;
   run?: string;
   phase?: number;
+  /** One trace, exactly: the run's whole story and nothing that merely shares its clock. */
+  trace?: string;
   q?: string;
   since?: string;
   until?: string;
@@ -172,9 +181,48 @@ export function debugIndexPath(base: string, params: DebugIndexParams = {}): str
   return `${base}${all.length ? `?${all.join('&')}` : ''}`;
 }
 
+/** One sink's live size, its policy row, and how many files the next sweep would touch. */
+export type RetentionSinkReport = {
+  sink: string;
+  files: number;
+  bytes: number;
+  due: number;
+};
+
+export type RetentionAction = {
+  kind: 'delete' | 'rotate' | 'truncate' | 'oversized';
+  sink: string;
+  path: string;
+  bytes: number;
+  keepBytes?: number;
+  why: string;
+};
+
+export type RetentionReport = {
+  at: string;
+  policy: Record<string, number>;
+  sinks: RetentionSinkReport[];
+  bytes: number;
+  actions: RetentionAction[];
+};
+
+/* ------------------------------------------------------------------ *
+ * The trace — the run on one axis, across all four sources (Pro)
+ * ------------------------------------------------------------------ */
+
+
 export const debugApi = {
   debugIndex: (params: DebugIndexParams = {}) =>
     request<DebugIndex>(debugIndexPath('/api/debug/index', params)),
   debugRuns: (slug: string) => request<DebugRuns>(`/api/debug/runs${query({ slug })}`),
   debugBundle: (params: { slug?: string } = {}) => request<DebugBundle>(`/api/debug/bundle${query(params)}`),
+  debugRetention: () => request<RetentionReport>('/api/debug/retention'),
+  /*
+     A plain href, not a fetch: the browser's own download machinery names the
+     file from `content-disposition` and streams it to disk. The same reason
+     the landing packet is an `<a download>` — a tar.gz through `request()`
+     would be parsed as JSON, fail, and lose the bytes.
+  */
+  runBundleHref: (slug: string, runId: string, since?: string) =>
+    `/api/debug/bundle${query({ slug, run: runId, since, download: 1 })}`,
 };

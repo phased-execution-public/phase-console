@@ -40,14 +40,34 @@ process.env.PHASE_CONSOLE_LOG = '';
 // `worktree.test.ts` and `wire-formats.test.ts` for the first two).
 for (const key of ['PE_WORKTREE', 'PE_BRANCH', 'PE_SCOPE', 'PE_OWNER']) delete process.env[key];
 
+/**
+ * The PHYSICAL spelling of a path — what `PE_WORKTREE` carries since SCH-1.
+ *
+ * 🔴 The claim's tree dimension is compared physically on BOTH sides now
+ * (phase 3, `realish()` in `treeFor`; `pwd -P` in `phase-lock.sh`), because
+ * `/tmp/x` and `/private/tmp/x` are one directory and a string compare carved
+ * a session away from itself. macOS's `$TMPDIR` is exactly that symlink, so a
+ * fixture's `cwd` and the claim it produces are two spellings of one tree and
+ * these assertions have to say which one they mean.
+ */
+const phys = (dir: string): string => { try { return realpathSync.native(dir); } catch { return dir; } };
+
 const { Runner } = await import('../server/runner/runner.ts');
 const { Scheduler } = await import('../server/runner/scheduler.ts');
+const { SHARED_CHECKOUT_TOKEN } = await import('../shared/scope.js');
 // Dynamic for the same reason as the two above: `runDir` resolves through
 // `STATE_DIR`, which config.ts reads at import time from the env set just above.
 const { runDir, consoleRunsDir } = await import('../server/runner/state.ts');
 const { ensureIntegration, holdsBranch, isRegistered, laneNames, worktreeHome } = await import('../server/runner/worktree.ts');
 import type { LockView } from '../server/runner/scheduler.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
+// Dynamic, for exactly the reason the four above are: a STATIC import hoists
+// over the `XDG_STATE_HOME` assignment at the top of this file, and
+// `config.ts` resolves `STATE_DIR` at module load — so the belt in
+// `state-sandbox.ts` fires and the suite refuses to run.
+const { INSTANCE } = await import('../server/config.ts');
+const { configureLog } = await import('../server/log.ts');
+const { runTraceId } = await import('../server/trace.ts');
 
 type Repo = { root: string; scripts: string; state: string; cleanup: () => void };
 
@@ -1134,7 +1154,7 @@ test('an isolated run tells its session the branch its lock must name', async ()
     // claims on one repository as disjoint only when both name a branch AND a
     // tree and both differ.
     assert.equal(env?.PE_BRANCH, 'pe/demo');
-    assert.equal(env?.PE_WORKTREE, cwd);
+    assert.equal(env?.PE_WORKTREE, phys(cwd));
     // …and the SCOPE is untouched. Isolation carves by the branch+tree pair
     // and only by it: a run that narrowed its scope because it had a tree
     // would claim two sessions cannot collide when they plainly can. `all` is
@@ -1156,7 +1176,7 @@ test('a shared-checkout run writes a QUALIFIED lock — its branch, plus the sha
     const requests = await requestsFor(r, { onlyPhases: [1], gitMode: 'new-branch' });
     assert.equal(requests[0]!.cwd, r.root);
     assert.equal(requests[0]!.env?.PE_BRANCH, 'pe/demo');
-    assert.equal(requests[0]!.env?.PE_WORKTREE, r.root,
+    assert.equal(requests[0]!.env?.PE_WORKTREE, phys(r.root),
       'the shared root IS the tree this session edits, and the claim says so');
   } finally { r.cleanup(); }
 });
@@ -1176,7 +1196,7 @@ test('a REFUSED run claims the shared tree — qualified, and colliding exactly 
     assert.equal(requests[0]!.cwd, r.root);
     assert.equal(runStateAfter(r).checkout, 'refused');
     assert.equal(requests[0]!.env?.PE_BRANCH, 'pe/demo');
-    assert.equal(requests[0]!.env?.PE_WORKTREE, r.root,
+    assert.equal(requests[0]!.env?.PE_WORKTREE, phys(r.root),
       'refused means the shared tree, and the claim names it');
   } finally { r.cleanup(); }
 });
@@ -1424,7 +1444,7 @@ test('F-1 — a resume that DROPS isolation really moves, on a pooled Runner', a
     // Still a new-branch run: it commits on `pe/demo` — now in the shared
     // root, and the claim says BOTH facts. The tree is what changed hands.
     assert.equal(resumed.env?.PE_BRANCH, 'pe/demo');
-    assert.equal(resumed.env?.PE_WORKTREE, r.root);
+    assert.equal(resumed.env?.PE_WORKTREE, phys(r.root));
   } finally { r.cleanup(); }
 });
 
@@ -1570,6 +1590,50 @@ test('F-4 — an isolated run\'s durable child record names its tree and branch'
   } finally { r.cleanup(); }
 });
 
+test('P15 — a LANE\'s durable child record says its tree is locked, and the run its base', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    // Two facts a person reading the Now page asks of a lane, both decided
+    // by the runner and, until now, both kept only where their process was:
+    // the `git worktree lock` phase 7 fastens on the lane (in git's registry,
+    // read back by `checkouts()` for the git card alone) and the base the
+    // lane's branch was cut from (in memory, `baseResolved`, and the journal).
+    // The row is drawn from the run record, so the run record carries them.
+    const seen: Record<string, unknown>[] = [];
+    await requestsFor(
+      r,
+      { onlyPhases: [1], gitMode: 'new-branch' },
+      { planWorktrees: () => 'on' },
+      (request) => {
+        request.onPid?.(process.pid);
+        const dir = runDir(r.root, 'demo');
+        const file = readdirSync(dir).find((f) => /^run-.*\.json$/.test(f));
+        if (file) {
+          const live = JSON.parse(readFileSync(join(dir, file), 'utf8')) as Record<string, unknown>;
+          const children = (live.children ?? {}) as Record<string, Record<string, unknown>>;
+          for (const child of Object.values(children)) seen.push(child);
+        }
+      },
+    );
+    assert.ok(seen.length, 'no child record was written at all — the rest would be vacuous');
+    for (const child of seen) {
+      assert.equal(child.branch, 'pe/demo-p1', `not a lane: ${JSON.stringify(child)}`);
+      assert.match(String(child.locked), /^phase-console lane demo p1 /,
+        `the lane's lock reason is not on its record: ${JSON.stringify(child)}`);
+    }
+    const state = runStateAfter(r);
+    const base = state.base as { ref?: string; sha?: string; source?: string; declaredBy?: string } | undefined;
+    assert.ok(base, 'the resolved base is not on the run record');
+    assert.equal(base.ref, 'main');
+    assert.match(String(base.sha), /^[0-9a-f]{40}$/);
+    // The fixture has no remote, so `origin/HEAD` falls to the local trunk —
+    // and nobody declared a word, so the shipped default answered.
+    assert.equal(base.source, 'trunk');
+    assert.equal(base.declaredBy, 'default');
+  } finally { r.cleanup(); }
+});
+
 test('F-3 — the cap counts a run that is still ACQUIRING, not just one that finished', async () => {
   const r = repo();
   try {
@@ -1656,7 +1720,7 @@ test('F-1a — after the settle the run claims NOTHING, though `checkout` still 
     // pair collides with every other claim on the root, which is exactly the
     // carve-out this run no longer holds.
     assert.equal(reader.branchFor(1), 'pe/demo');
-    assert.equal(reader.treeFor(1), r.root,
+    assert.equal(reader.treeFor(1), phys(r.root),
       'with the worktree gone, the claimed tree is the shared root');
     assert.equal(reader.worktreeFor(1), undefined,
       'the run names a checkout the settle has already removed');
@@ -1724,11 +1788,12 @@ test('EC3 — a second run after a DIRTY settle degrades honestly, and says whic
   const r = repo();
   try {
     makeGitRepo(r);
-    // The half of "a second run after either starts cleanly" that nothing was
-    // executing. After a dirty settle the tree is KEPT — deliberately, it holds
-    // uncommitted work — and it holds `pe/demo`, so the next run cannot have
-    // the branch. The honest outcome is a NAMED degrade, not a silent one and
-    // not a failure, and this pins which name.
+    // After a dirty settle the tree is KEPT — deliberately, it holds
+    // uncommitted work — and it holds `pe/demo`. The next run used to degrade
+    // to the shared root with `branch-in-use`, naming a directory the console
+    // had made itself; since G9 it ADOPTS it, because a kept tree is kept
+    // precisely because it holds this plan's own unfinished work and the run
+    // that wants it is the same plan's next attempt.
     const first = await requestsFor(r, { ...ISOLATED_RUN }, {}, (request) => {
       writeFileSync(join(request.cwd!, 'unsaved.txt'), 'never committed\n');
     });
@@ -1739,12 +1804,13 @@ test('EC3 — a second run after a DIRTY settle degrades honestly, and says whic
 
     writeFileSync(join(r.state, 'done'), '');
     const second = await requestsFor(r, { ...ISOLATED_RUN });
-    assert.equal(second[0]!.cwd, r.root, 'two trees cannot hold one branch');
+    assert.equal(second[0]!.cwd, phys(tree), 'the second run takes the tree its own plan left');
     const state = runStateAfter(r);
-    assert.equal(state.checkout, 'refused');
-    assert.equal(state.isolationRefusal, 'branch-in-use');
-    assert.equal(state.workRoot, undefined);
-    // …and the operator's uncommitted work is still exactly where it was.
+    assert.equal(state.checkout, 'worktree');
+    assert.equal(state.isolationRefusal, undefined, 'nothing was refused');
+    assert.equal(state.workRoot, phys(tree));
+    // …and the killed session's uncommitted work is still exactly where it was:
+    // adopting moves nothing and removes nothing.
     assert.equal(readFileSync(join(tree, 'unsaved.txt'), 'utf8'), 'never committed\n');
   } finally { r.cleanup(); }
 });
@@ -1759,9 +1825,19 @@ test('EC3 — a second run after a DIRTY settle degrades honestly, and says whic
  * `Runner`, which is the only place the two paths can be told apart.
  * ------------------------------------------------------------------ */
 
-/** Take `pe/demo` away from the run: remove its tree, hold the branch elsewhere. */
+/**
+ * Take `pe/demo` away from the run: remove its tree, hold the branch elsewhere.
+ *
+ * The `unlock` is the operator's own hand, and it is load-bearing since phase
+ * 7: a run's checkout is `git worktree lock`ed while the run holds it, and
+ * `git worktree prune` SKIPS a locked registration — so a person who deletes
+ * the directory and prunes finds the branch still held, with git saying
+ * "skipping locked worktree". That is the lock working. The console's own
+ * paths unlock first (`pruneRegistrations`), which is what R4-4 proves.
+ */
 function stealTheBranch(r: Repo, tree: string): string {
   rmSync(tree, { recursive: true, force: true });
+  try { git(r.root, 'worktree', 'unlock', tree); } catch { /* not locked: nothing to undo */ }
   git(r.root, 'worktree', 'prune');
   const held = join(r.root, '..', `held-${basename(r.root)}`);
   git(r.root, 'worktree', 'add', '-q', held, 'pe/demo');
@@ -1803,7 +1879,7 @@ test('R4-1 — a resume REFUSED `branch-in-use` clears the tree it can no longer
       // root collides with every claim on it, and the held tree's `pe/demo`
       // collides on the branch besides.
       assert.equal(resumed.env?.PE_BRANCH, 'pe/demo');
-      assert.equal(resumed.env?.PE_WORKTREE, r.root);
+      assert.equal(resumed.env?.PE_WORKTREE, phys(r.root));
     } finally { rmSync(held, { recursive: true, force: true }); }
   } finally { r.cleanup(); }
 });
@@ -2152,12 +2228,17 @@ test('QA8-3 — a NEW run meeting the previous run\'s kept tree is told the trut
     stageNextRun(r);
     const second = await requestsFor(r, { ...ISOLATED_RUN });
     const prompt = second[0]!.prompt;
-    assert.equal(second[0]!.cwd, r.root, 'the second run got a tree, so no branch is held');
+    // Since G9 the second run does not meet that refusal at all: the holder is
+    // this plan's OWN previous integration tree under the console's worktree
+    // home, so it is adopted and the session is boarded INTO it. The bullet the
+    // old assertion guarded against ("check out pe/demo") is never reached,
+    // because a run with its own checkout is told it already has one.
+    assert.equal(second[0]!.cwd, phys(tree), 'the kept tree is adopted, not refused');
     assert.doesNotMatch(prompt, /BEFORE editing anything: if `pe\/demo` exists/,
       'the new run was told to check out a branch git will refuse it');
-    assert.match(prompt, /is checked out in another working tree at/);
-    assert.ok(prompt.includes(tree), 'the prompt does not say WHERE the branch is held');
-    // And git really would have refused, which is what makes the old bullet a lie.
+    assert.match(prompt, /Your cwd IS a console-managed worktree/, 'the session is told it has its checkout');
+    // And git really would have refused a checkout in the root, which is what
+    // made the old bullet a lie and what adoption sidesteps entirely.
     assert.throws(() => git(r.root, 'checkout', 'pe/demo'),
       (error: unknown) => /already used by worktree/.test(String((error as { stderr?: string }).stderr ?? error)),
       'git allowed the checkout, so the honest bullet is not needed here');
@@ -2268,6 +2349,11 @@ test('QA8-2 — once the operator frees the branch, the very next prompt says so
     // telling sessions the branch is held and to commit somewhere else — the
     // stale half of the defect, and the reason this is a question for git and
     // never for state.
+    // The unlock is part of "exactly what that bullet asked" since phase 7:
+    // the console locks its own run checkout, and `git worktree remove` refuses
+    // a locked tree (git wants `--force` TWICE). One `unlock` is the whole
+    // remedy, and it is what `docs/controls.md` now tells an operator to do.
+    git(r.root, 'worktree', 'unlock', tree);
     git(r.root, 'worktree', 'remove', '--force', tree);
     assert.equal(await isRegistered(r.root, tree), false, 'the tree survived the removal');
     stageNextRun(r);
@@ -2609,9 +2695,9 @@ test('P1/W5 — …and a confined scope keeps the exact pair a shared run states
     await driveOn(driver, r, { onlyPhases: [1], gitMode: 'new-branch' });
     const { env, cwd } = driver.requests[0]!;
     assert.equal(env?.PE_BRANCH, 'pe/demo');
-    assert.equal(env?.PE_WORKTREE, cwd, 'the shared root is the tree, and it is what keeps two shared runs colliding');
+    assert.equal(env?.PE_WORKTREE, phys(cwd), 'the shared root is the tree, and it is what keeps two shared runs colliding');
     assert.equal(granted[0]!.branch, 'pe/demo');
-    assert.equal(granted[0]!.tree, cwd);
+    assert.equal(granted[0]!.tree, phys(cwd));
     scheduler.close();
   } finally { r.cleanup(); }
 });
@@ -2681,5 +2767,343 @@ test("P1/QA-F1 — the run's OWN claim is never a reason to refuse it its checko
     assert.equal(git(r.root, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main', "the run's own claim blocked its own reclaim");
     assert.equal(journalEvents(r, 'run.isolation-reclaimed').length, 1);
     assert.equal(runStateAfter(r).checkout, 'worktree');
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * many-plans-one-repo phase 4 — the decisions that left no trace, and
+ * the settle that claimed more than it did.
+ * ------------------------------------------------------------------ */
+
+test('S10 — a settle session that ends badly leaves the run PENDING, never "pushed"', async () => {
+  // A usage wall, a permission refusal or a crash still leaves `resultText`
+  // non-null, and `settleSession` returned it — so the caller answered "the
+  // last phase's session was asked to push and open the pull request" and the
+  // run FINISHED. The branch was never pushed and nothing anywhere said so.
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const requests: SpawnRequest[] = [];
+    const done = join(r.state, 'done');
+    // Phases succeed; the SETTLE session hits a wall. Keyed on the settle's own
+    // prompt, which is the only thing that tells the two spawns apart.
+    const spawn: SpawnFn = async (request) => {
+      requests.push(request);
+      const phase = /BOOT phase (\d+)/.exec(request.prompt)?.[1];
+      if (phase) writeFileSync(done, `${phase}\n`, { flag: 'a' });
+      if (!/settles through the MERGE QUEUE/.test(request.prompt)) return outcome();
+      return {
+        ...outcome(),
+        signal: { subtype: 'error_max_turns', code: 1, text: 'usage limit reached' },
+        resultText: 'I ran out of turns before pushing anything',
+      };
+    };
+    const runner = new Runner({
+      scriptsDir: r.scripts, spawn, verificationText: () => '`true`',
+    } as never);
+    // `merge-queue` rather than `pr`, because with `openPr` on the LAST phase's
+    // own prompt carries the PR block and `prBlockEmitted` closes the settle
+    // before a session is ever spent. Both strategies go through the one
+    // `settleSession`, which is where the dishonesty was.
+    await runner.start({
+      slug: 'demo', root: r.root, gitMode: 'new-branch', openPr: false, settle: 'merge-queue',
+    } as never);
+    await runner.wait();
+
+    const settle = requests.filter((q) => /settles through the MERGE QUEUE/.test(q.prompt));
+    assert.equal(settle.length, 1, 'a settle session was spent, or this proves nothing');
+    const pending = journalEvents(r, 'run.settle-pending')
+      .map((line) => line.data as Record<string, unknown>);
+    assert.ok(pending.length > 0, 'a settle that did not end well leaves the branch PENDING');
+    assert.ok(
+      pending.some((line) => typeof line.reason === 'string' && /ended/.test(String(line.reason))),
+      `and it says WHY the session could not settle it: ${JSON.stringify(pending)}`,
+    );
+    assert.deepEqual(journalEvents(r, 'run.settled'), [],
+      'nothing claims the branch was rebased and published');
+  } finally { r.cleanup(); }
+});
+
+test('BASE-1/S12 — run.isolation names the base the run branch forked from', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    // The root stands on ANOTHER plan's branch, which is the ordinary state of
+    // the machine this runs on — and what `worktree add -b … HEAD` used to fork
+    // from.
+    const trunk = git(r.root, 'rev-parse', 'HEAD');
+    git(r.root, 'checkout', '-q', '-b', 'pe/other');
+    writeFileSync(join(r.root, 'other.txt'), 'other\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', "another plan's work");
+
+    await requestsFor(r, { ...ISOLATED_RUN });
+    const line = isolationEvents(r).at(-1)?.data as Record<string, unknown> | undefined;
+    assert.ok(line, 'the isolation decision is journalled');
+    assert.equal(line!.base, 'main', 'the base is NAMED, not inferred from HEAD');
+    assert.equal(line!.baseSha, trunk);
+    assert.equal(git(r.root, 'rev-parse', 'pe/demo'), trunk, 'and the branch really forked there');
+  } finally { r.cleanup(); }
+});
+
+test('S12 — phase.admitted is journalled even when nothing blocked', async () => {
+  // It sat inside `if (blockers.length)`, so the ordinary case — an admission
+  // that waited for nothing, which is where the CARVE-OUT does its work — left
+  // no record at all.
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    // A scheduler, because `admit()` is what journals this and it returns null
+    // without one — a harness with no scheduler never admits at all.
+    const scheduler = new Scheduler({ max: 8 });
+    await driveOn(makeRunner(r, { scheduler }), r, { onlyPhases: [1], gitMode: 'new-branch' });
+    scheduler.close();
+    const admitted = journalEvents(r, 'phase.admitted')
+      .map((entry) => entry.data as Record<string, unknown>);
+    assert.equal(admitted.length, 1, 'one admission, one line');
+    assert.equal(typeof admitted[0]!.waitedMs, 'number', 'waitedMs: 0 is a fact, not noise');
+    assert.equal(admitted[0]!.scope, 'all');
+  } finally { r.cleanup(); }
+});
+
+test('S11-c — two shared-root new-branch runs serialise, however disjoint their scopes', async () => {
+  // Both are told to stand the ONE shared checkout on their own `pe/<slug>`,
+  // and git allows a branch one working tree. Disjoint SCOPES do not make two
+  // branches fit in one directory, and nothing in the vocabulary said so.
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const scheduler = new Scheduler({ max: 8 });
+    let granted: { scope?: readonly string[] }[] = [];
+    const driver = makeRunner(r, {
+      scheduler, phaseScope: () => ['web'],
+    }, () => { granted = scheduler.snapshot().grants; });
+    await driveOn(driver, r, { onlyPhases: [1], gitMode: 'new-branch' });
+    const claimed = granted[0]?.scope ?? [];
+    assert.ok(claimed.includes(SHARED_CHECKOUT_TOKEN),
+      `a shared-root new-branch run claims the whole checkout: ${JSON.stringify(claimed)}`);
+    // …and the token never reaches the lock file or the session, because it
+    // names no repository.
+    assert.equal(driver.requests[0]!.env?.PE_SCOPE, 'web');
+    scheduler.close();
+  } finally { r.cleanup(); }
+});
+
+test('S11-c — a run with its own checkout does NOT claim it', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const scheduler = new Scheduler({ max: 8 });
+    let granted: { scope?: readonly string[] }[] = [];
+    const driver = makeRunner(r, { scheduler }, () => { granted = scheduler.snapshot().grants; });
+    await driveOn(driver, r, { ...ISOLATED_RUN, onlyPhases: [1] });
+    assert.notEqual(driver.requests[0]!.cwd, r.root, 'no tree was taken, so this proves nothing');
+    assert.ok(!(granted[0]?.scope ?? []).includes(SHARED_CHECKOUT_TOKEN),
+      'an isolated run makes no claim on the shared checkout');
+    scheduler.close();
+  } finally { r.cleanup(); }
+});
+
+test('S6 — a phase that commits OUTSIDE its Repos cell is journalled', async () => {
+  // Nothing detected this at all. The Repos cell is what admission carves on,
+  // what the lock records, and what two plans are allowed to run concurrently
+  // on the strength of — and it was enforced nowhere.
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    // A submodule the phase's scope does NOT name, and a scoped directory it does.
+    const web = join(r.root, 'web');
+    mkdirSync(web, { recursive: true });
+    git(web, 'init', '-q', '-b', 'main');
+    writeFileSync(join(web, 'app.ts'), 'export const a = 1;\n');
+    git(web, 'add', '-A');
+    git(web, 'commit', '-q', '-m', 'web base');
+    mkdirSync(join(r.root, 'docs'), { recursive: true });
+    writeFileSync(join(r.root, 'docs', 'note.md'), 'scoped\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'docs + gitmodules');
+    writeFileSync(join(r.root, '.gitmodules'),
+      '[submodule "web"]\n\tpath = web\n\turl = ../web\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'gitmodules');
+
+    // The session commits in `web`, which its scope never named.
+    const driver = makeRunner(r, { phaseScope: () => ['docs'] }, (request) => {
+      if (!/BOOT phase/.test(request.prompt)) return;
+      writeFileSync(join(web, 'app.ts'), 'export const a = 2;\n');
+      git(web, 'add', '-A');
+      git(web, 'commit', '-q', '-m', 'work the plan never declared');
+    });
+    await driveOn(driver, r, { onlyPhases: [1] });
+
+    const drift = journalEvents(r, 'phase.scope-drift')
+      .map((line) => line.data as Record<string, unknown>);
+    assert.equal(drift.length, 1, `exactly the undeclared repository: ${JSON.stringify(drift)}`);
+    assert.equal(drift[0]!.repo, 'web');
+    assert.equal(drift[0]!.scope, 'docs');
+    assert.deepEqual(
+      (drift[0]!.commits as { subject: string }[]).map((c) => c.subject),
+      ['work the plan never declared'],
+    );
+  } finally { r.cleanup(); }
+});
+
+test('S6 — a phase that stays inside its scope journals nothing', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const web = join(r.root, 'web');
+    mkdirSync(web, { recursive: true });
+    git(web, 'init', '-q', '-b', 'main');
+    writeFileSync(join(web, 'app.ts'), 'export const a = 1;\n');
+    git(web, 'add', '-A');
+    git(web, 'commit', '-q', '-m', 'web base');
+    mkdirSync(join(r.root, 'docs'), { recursive: true });
+    writeFileSync(join(r.root, 'docs', 'note.md'), 'scoped\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'docs');
+    writeFileSync(join(r.root, '.gitmodules'), '[submodule "web"]\n\tpath = web\n\turl = ../web\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'gitmodules');
+
+    await driveOn(makeRunner(r, { phaseScope: () => ['docs'] }), r, { onlyPhases: [1] });
+    assert.deepEqual(journalEvents(r, 'phase.scope-drift'), [],
+      'a probe that fires on a clean run is a probe an operator learns to ignore');
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * The trace — one id from the drive to every line it causes (phase 5)
+ * ------------------------------------------------------------------ */
+
+test('TRC-1 — a drive stamps ONE derived trace on its journal and on what it logs', async () => {
+  const r = repo();
+  const logFile = join(r.root, 'console.ndjson');
+  configureLog(logFile);
+  const wasDebug = process.env.PHASE_CONSOLE_DEBUG;
+  process.env.PHASE_CONSOLE_DEBUG = '*';
+  try {
+    makeGitRepo(r);
+    await driveOn(makeRunner(r), r, { ...ISOLATED_RUN });
+
+    const runId = String(runStateAfter(r).id);
+    const expected = runTraceId(INSTANCE.id, 'demo', runId);
+
+    // 1. Every journal line of the run carries it — not only the ones written
+    //    inside a span, because the id belongs to the RUN, not to the writer.
+    const dir = runDir(r.root, 'demo');
+    const file = readdirSync(dir).find((f) => /^run-.*\.jsonl$/.test(f))!;
+    const journal = readFileSync(join(dir, file), 'utf8').split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.ok(journal.length > 3, `expected a real journal, got ${journal.length} lines`);
+    for (const line of journal) {
+      assert.equal(line.traceId, expected, `${String(line.event)} carries another run's trace`);
+      assert.equal(line.v, 2);
+    }
+
+    // 2. The snapshot line, so a reader with only the journal can find the id
+    //    without knowing how it is derived.
+    const snapshot = journal.filter((l) => l.event === 'run.trace');
+    assert.equal(snapshot.length, 1, 'one run.trace per drive');
+    assert.equal((snapshot[0]!.data as Record<string, unknown>).traceId, expected);
+
+    // 3. And the console log written DURING the drive carries the same id,
+    //    which is the whole point: one `grep` instead of the six-step walk.
+    const logged = readFileSync(logFile, 'utf8').split('\n').filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((line) => line.traceId === expected);
+    assert.ok(logged.length > 0, 'nothing the drive logged joined the run’s trace');
+    assert.ok(
+      logged.some((l) => String(l.event).startsWith('git.')),
+      'the git the drive ran is in it — that is the join that did not exist before',
+    );
+
+    // 4. A phase span inside it: the same trace, a different span, and the
+    //    phase number on the line.
+    const phaseLines = logged.filter((l) => l.phase === 1);
+    assert.ok(phaseLines.length > 0, 'no line was written inside the phase span');
+    assert.notEqual(phaseLines[0]!.spanId, snapshot[0]!.spanId, 'the phase has a span of its own');
+  } finally {
+    configureLog(null);
+    if (wasDebug === undefined) delete process.env.PHASE_CONSOLE_DEBUG;
+    else process.env.PHASE_CONSOLE_DEBUG = wasDebug;
+    r.cleanup();
+  }
+});
+
+test('TRC-2 — a RESUMED drive rejoins the same trace, because it recomputes rather than remembers', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const driver = makeRunner(r);
+    await driveOn(driver, r, { ...ISOLATED_RUN });
+    const runId = String(runStateAfter(r).id);
+    await driveOn(driver, r, { resumeRunId: runId, onlyPhases: [2] });
+
+    const traces = new Set(journalEvents(r, 'run.trace').map((l) => (l.data as Record<string, unknown>).traceId));
+    assert.deepEqual([...traces], [runTraceId(INSTANCE.id, 'demo', runId)],
+      'two drives of one run are one trace — a minted id would have made them two');
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 7 — a PHASE may ask for a checkout of its own, or decline one.
+ * ------------------------------------------------------------------ */
+
+test('P7 — a phase saying `worktree` gets a lane on a plan whose Worktrees directive is off', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const requests = await requestsFor(
+      r,
+      { onlyPhases: [1], gitMode: 'new-branch' },
+      // The plan says nothing at all about worktrees; the PHASE says yes.
+      { planIsolation: () => 'worktree' },
+    );
+    const { cwd } = requests[0]!;
+    assert.notEqual(cwd, r.root, 'the phase asked for a lane and did not get one');
+    assert.equal(git(cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), 'pe/demo-p1');
+  } finally { r.cleanup(); }
+});
+
+test('P7 — a phase saying `shared` declines a lane the PLAN turned on', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const requests = await requestsFor(
+      r,
+      { onlyPhases: [1], gitMode: 'new-branch' },
+      // 🔴 Both ways, and this is the direction that matters: a phase that
+      // must see its siblings' work as it lands cannot be given a lane by a
+      // plan-wide setting it has explicitly carved itself out of.
+      { planWorktrees: () => 'on', planIsolation: () => 'shared' },
+    );
+    assert.equal(requests[0]!.cwd, r.root, 'the phase declined a lane and was given one anyway');
+  } finally { r.cleanup(); }
+});
+
+test('P7 — the run branch is cut from the base the PLAN names, and the prompt says which', async () => {
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    // A branch the plan names as its base, holding a commit `main` lacks.
+    git(r.root, 'branch', 'release/5.1');
+    writeFileSync(join(r.root, 'on-main.txt'), 'main moved on\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'a commit only main has');
+
+    const requests = await requestsFor(
+      r,
+      { onlyPhases: [1], gitMode: 'new-branch' },
+      { planWorktrees: () => 'on', planBaseBranch: () => 'release/5.1' },
+    );
+    const { cwd } = requests[0]!;
+    assert.notEqual(cwd, r.root, 'no lane was taken, so this proves nothing');
+    // The lane forks from the run branch, which forked from the NAMED base —
+    // so main's extra commit must not be in it.
+    assert.equal(
+      git(cwd, 'rev-list', '--count', 'release/5.1..HEAD'), '0',
+      'the run branch was cut from somewhere other than the base the plan named',
+    );
   } finally { r.cleanup(); }
 });

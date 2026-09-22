@@ -88,7 +88,31 @@ export type Device = {
    * the device instead of reading as a failure. Additive JSON.
    */
   quiet?: QuietHours;
+  /**
+   * The origin the subscription came in under (`https://<host>[:port]`), when
+   * the caller that registered it says. One browser reached through two
+   * addresses is two origins, and so two service workers; this is how a row
+   * says which one it belongs to. Additive JSON, and absent on every
+   * subscription this console's own routes make.
+   */
+  site?: string;
+  /**
+   * The paired device this subscription belongs to, when the caller admitted it
+   * as one — so revoking a device can find the pushes it would still receive.
+   * Additive JSON, and absent on this console's own subscriptions.
+   */
+  deviceId?: string;
 };
+
+/** What a caller may say about where a subscription came from — strings only, bounded. */
+export type SubscribeExtra = { site?: unknown; deviceId?: unknown };
+
+function extraFields(extra: SubscribeExtra | undefined): { site?: string; deviceId?: string } {
+  const out: { site?: string; deviceId?: string } = {};
+  if (typeof extra?.site === 'string' && extra.site.trim()) out.site = extra.site.trim().slice(0, 200);
+  if (typeof extra?.deviceId === 'string' && extra.deviceId.trim()) out.deviceId = extra.deviceId.trim().slice(0, 64);
+  return out;
+}
 
 export type PublicDevice = Omit<Device, 'endpoint' | 'keys'> & { service: string };
 
@@ -194,13 +218,15 @@ export class Push {
    * Subscribing twice from the same browser is the normal case, not an error —
    * a permission re-grant, a reinstall, a page that could not tell. The
    * endpoint identifies the device, so a repeat updates rather than duplicates,
-   * and an existing row keeps its category choices unless new ones are given.
+   * and an existing row keeps its category choices unless new ones are given —
+   * and its `site` and `deviceId` unless the repeat names new ones.
    */
-  subscribe(input: unknown, categories: unknown, label: unknown): PublicDevice | { error: string } {
+  subscribe(input: unknown, categories: unknown, label: unknown, extra?: SubscribeExtra): PublicDevice | { error: string } {
     const parsed = parseSubscription(input);
     if ('error' in parsed) return parsed;
 
     const name = typeof label === 'string' && label.trim() ? label.trim().slice(0, 60) : 'a browser';
+    const where = extraFields(extra);
     const existing = this.devices.find((d) => d.endpoint === parsed.endpoint);
 
     if (existing) {
@@ -208,6 +234,7 @@ export class Push {
       existing.label = name;
       existing.failures = 0;
       if (categories !== undefined) existing.categories = sanitiseCategories(categories);
+      Object.assign(existing, where);
       this.persist();
       return this.publicOf(existing);
     }
@@ -221,10 +248,11 @@ export class Push {
       createdAt: new Date().toISOString(),
       lastOkAt: null,
       failures: 0,
+      ...where,
     };
     this.devices.push(device);
     this.persist();
-    log.info('push.subscribed', { id: device.id, label: device.label, service: origin(device.endpoint) });
+    log.info('push.subscribed', { id: device.id, label: device.label, service: origin(device.endpoint), ...where });
     this.devicesChanged();
     return this.publicOf(device);
   }
@@ -529,7 +557,7 @@ function read(file: string = FILE): Device[] {
     return parsed
       .filter((d) => d?.endpoint && d?.keys?.p256dh && d?.keys?.auth)
       .map((d) => {
-        const { quiet: rawQuiet, ...rest } = d as Device & { quiet?: unknown };
+        const { quiet: rawQuiet, site, deviceId, ...rest } = d as Device & { quiet?: unknown; site?: unknown; deviceId?: unknown };
         const quiet = parseQuietHours(rawQuiet);
         return {
           ...rest,
@@ -538,6 +566,7 @@ function read(file: string = FILE): Device[] {
           // A hand-edited or half-written window is dropped rather than
           // half-honoured: quiet hours nobody asked for must not exist.
           ...(quiet && !('error' in quiet) ? { quiet } : {}),
+          ...extraFields({ site, deviceId }),
         } as Device;
       });
   } catch {

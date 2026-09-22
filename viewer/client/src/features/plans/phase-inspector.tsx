@@ -31,6 +31,7 @@ import { usePlan } from '@/lib/queries';
 import { pad2 } from '@/lib/format';
 import type { PhaseEta, PhaseView } from '@/lib/api';
 import { FlagsCell, LockChip, PhaseDetails, ScopeCell, SizeCell } from './phase-cells';
+import { NotesSection } from './notes-section';
 
 /**
  * What the sheet fetches FOR ITSELF, rather than making its host tab pay.
@@ -149,6 +150,11 @@ export function PhaseInspector({
       }
     >
       <PhaseDetails slug={slug} phase={record} eta={eta} />
+      {/* What earlier phases LEFT for this one. It hangs off the sheet rather
+          than off `PhaseDetails` because it is not a field of the phase: it is
+          three other files' opinion of it, fetched on open like the prose
+          above, and nothing on a board row should pay a subprocess for it. */}
+      <NotesSection slug={slug} phase={record.phase} enabled={open} />
     </Inspector>
   );
 }

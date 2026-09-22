@@ -172,6 +172,10 @@ now="$(date +%s)"
 
 _field()  { grep -m1 "^$1=" "$lockfile" 2>/dev/null | sed "s/^$1=//" || true; }
 _fmt()    { [ -z "${1:-}" ] && { printf '?'; return; }; date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$1"; }
+# The string `owner` takes when nobody states one. It is the SAME for every
+# hand-driven session on this machine, which is why `conflicts` may not read it
+# as proof of ownership — see the mine/foreign test there.
+default_owner="$(id -un)@$(hostname -s 2>/dev/null || hostname)"
 _write()  {
   # Last resort before the file is written: `conflicts` has always read the
   # plan's Repos cell when told no --scope; `claim` refused to, so a hand claim
@@ -185,8 +189,49 @@ _write()  {
   if [ -z "$scope" ] && [ -n "$phase" ]; then
     scope="$(scope_normalize "$("$SCRIPT_DIR/phase-graph.sh" "$slug" --repos "$phase" 2>/dev/null || true)")"
   fi
+  # `worktree=` is the half of the carve rule that names a PLACE, and a place has
+  # exactly one physical spelling: on macOS `/tmp/x` and `/private/tmp/x` are one
+  # directory, and comparing the two raw strings carved a session away from
+  # itself — it read its own live lock as somebody else's tree. `--here` already
+  # resolved with `pwd -P`; an explicit `--worktree` (and `$PE_WORKTREE`, which
+  # the runner exports from the console's own state, unresolved) did not, so the
+  # one dimension a claim is DECIDED on depended on how the caller spelled it.
+  if [ -n "$worktree" ] && [ -d "$worktree" ]; then
+    worktree="$(cd "$worktree" 2>/dev/null && pwd -P || printf '%s' "$worktree")"
+  fi
   mkdir -p "$lockdir"
   local tmp="$lockfile.tmp.$$"
+  # `release` on ANOTHER phase of this slug rmdir's `.locks` the moment it takes
+  # the last lock away, and that can land between the mkdir above and this
+  # redirect — a claim failing because somebody else FINISHED. One retry after
+  # re-creating the directory is the whole of that race.
+  if ! _lock_body > "$tmp" 2>/dev/null; then
+    mkdir -p "$lockdir"
+    _lock_body > "$tmp"
+  fi
+  if [ "${1:-}" = create ]; then
+    # Create-if-absent, atomically. `mv` cannot do this — it clobbers — so two
+    # claimers racing the `[ -f "$lockfile" ]` test in the claim arm BOTH wrote
+    # and BOTH were told "claimed": measured at 40 winners in 20 rounds. `ln`
+    # fails when the target exists, which is the only primitive POSIX offers
+    # that DECIDES a race rather than joining it. (A hard link, not a symlink:
+    # the lock must stay a plain file to every reader.)
+    if ln "$tmp" "$lockfile" 2>/dev/null; then rm -f "$tmp"; return 0; fi
+    rm -f "$tmp"; return 1
+  fi
+  mv "$tmp" "$lockfile"
+}
+# `mv` clobbers, so "I wrote it" is not "I hold it": two force-claims (or two
+# takeovers of one lapsed lease) landing together leave exactly ONE owner in the
+# file and both callers believing they won. Read it back and believe the file —
+# the only claim a caller may act on is the one the lock actually carries.
+_confirm_held() {  # _confirm_held <verb>
+  local got; got="$(_field owner)"
+  [ "$got" = "$owner" ] && return 0
+  printf 'phase %s: %s lost to %s — that session holds the lock now.\n' "$phase" "$1" "$got" >&2
+  return 1
+}
+_lock_body() {
   {
     printf 'slug=%s\n'        "$slug"
     printf 'phase=%s\n'       "$phase"
@@ -223,8 +268,31 @@ _write()  {
     # script, or by a session that never said, must go on colliding with
     # everything rather than silently qualifying as disjoint.
     [ -n "$branch" ] && printf 'branch=%s\n' "$branch"
-  } > "$tmp"
-  mv "$tmp" "$lockfile"
+    # Which drive took this lock (5.1.0) — the trace the console put in this
+    # session's environment when it spawned it.
+    #
+    # It narrows nothing and is read by nobody who decides anything: like
+    # `worktree=`, it is for the OUTSIDE observer. A stale lock whose owner is
+    # the machine default used to be a dead end — now it names the run whose
+    # journal explains it, and `grep <trace>` over the console log finds the
+    # drive that took it. `span=` rides WITH `trace=`, never without: a span id
+    # alone points into a trace nobody named.
+    if [ -n "${PE_TRACE_ID:-}" ]; then
+      printf 'trace=%s\n' "$PE_TRACE_ID"
+      [ -n "${PE_SPAN_ID:-}" ] && printf 'span=%s\n' "$PE_SPAN_ID"
+    fi
+    # The pid of the process that took the lock. A lock could already say WHO,
+    # WHERE and WHICH SESSION; the one thing it could never say is whether the
+    # process holding it is still alive — which is exactly the fact a reader
+    # wants when the owner is the machine default and no session id was ever
+    # known (see `conflicts`). Recorded here, acted on by the console later.
+    #
+    # It is also the one field that always prints, which is load-bearing: every
+    # line above is conditional, so with no scope, session, tree or branch the
+    # group's exit status was the last failing `[ -n … ]` test, and this function
+    # is called in a position where `set -e` reads that as a write failure.
+    printf 'pid=%s\n' "$$"
+  }
 }
 # Refresh the docs clone, and REPORT. Two things used to be wrong with the
 # one-liner this replaces: it swallowed git's exit code (`|| true`), so
@@ -272,6 +340,56 @@ _git_refresh() {
   printf 'phase-lock: could not refresh %s (%s) — reading the local copy\n' "$DOCS_ROOT" "$action" >&2
   return 0
 }
+# Out of retries: the lock commit is on this clone and can never be published.
+#
+# Leaving it there is what turned a missed push into a permanent injury. Every
+# later `_git_refresh` rebases that commit onto the upstream, conflicts on the
+# same lock path, aborts — so the clone can never pull ANYTHING again, and its
+# `conflicts` answers for the rest of its life from a view frozen at the moment
+# it lost one race. The docs index is the one tree every session on the machine
+# touches, so one session's dead clone is every session's stale answer (G-IDX).
+#
+# So take our own commit off (`--mixed`, which keeps the files), and then ask
+# the upstream the question the push was never able to: who holds this lock
+# THERE? Two different facts, two different answers:
+#
+#   • somebody else holds it → this claim is not merely unpublished, it is
+#     WRONG. Drop the local file and refuse, because reporting "claimed" here is
+#     the same lie the silent `return 0` used to tell.
+#   • nobody does (or it is ours) → the claim is true and simply local-only,
+#     which is exactly what UNPUBLISHED has always meant. Keep it, say so in a
+#     word a caller can grep for, on stdout (where the verb reports) AND on
+#     stderr (where a supervisor looks).
+#
+# Either way the commit comes off, so the clone can pull again.
+_resolve_unpublishable() {  # _resolve_unpublishable <verb>
+  local verb="$1" rel up_owner ahead
+  rel="docs/handoffs/$slug/.locks/phase-$pad.lock"
+  ahead="$( cd "$DOCS_ROOT" && git rev-list --count '@{upstream}..HEAD' 2>/dev/null || printf 0 )"
+  if [ "${ahead:-0}" -gt 0 ]; then
+    ( cd "$DOCS_ROOT" && git reset --mixed HEAD~1 >/dev/null 2>&1 ) || true
+  fi
+  # Fetch first: the rebase retries may have left the remote-tracking ref behind
+  # the upstream we were losing to.
+  ( cd "$DOCS_ROOT" && git fetch -q >/dev/null 2>&1 ) || true
+  up_owner="$( cd "$DOCS_ROOT" \
+      && git show "@{upstream}:$rel" 2>/dev/null | grep -m1 '^owner=' | sed 's/^owner=//' || true )"
+  case "$verb" in
+    claim|refresh|takeover|force)
+      if [ -n "$up_owner" ] && [ "$up_owner" != "$owner" ]; then
+        rm -f "$lockfile"
+        printf 'phase %s: the %s could not be published and the upstream lock is held by %s — NOT claimed.\n' \
+          "$phase" "$verb" "$up_owner" >&2
+        printf '  → pull, then take a ready phase with a disjoint scope, or --force once that session is gone.\n' >&2
+        exit 1
+      fi
+      ;;
+  esac
+  printf 'UNPUBLISHED: phase %s lock is on disk but its commit could not be pushed after %s attempts — other clones will not see it until docs/handoffs/%s/.locks is pushed\n' \
+    "$phase" "$_git_retries" "$slug"
+  printf 'phase-lock: UNPUBLISHED — %s phase %s (%s): the lock is local-only after %s attempts\n' \
+    "$verb" "$phase" "$slug" "$_git_retries" >&2
+}
 _git_sync() {  # _git_sync <verb>
   [ "$use_git" = 1 ] || return 0
   local attempt=1
@@ -289,17 +407,7 @@ _git_sync() {  # _git_sync <verb>
     fi
     attempt=$((attempt + 1))
     if [ "$attempt" -gt "$_git_retries" ]; then
-      # Out of retries. The claim IS on disk and the caller keeps it — that half
-      # of the contract does not change — but it is local-only, and this used to
-      # `return 0` in complete silence. A lock nobody else can see is exactly the
-      # lock the cooperative guard cannot do its job with: the next clone pulls,
-      # sees nothing, claims the same phase, and two sessions build one unit of
-      # work. Say so, in a word a caller can grep for, on stdout (where the verb
-      # already reports) AND on stderr (where a supervisor looks).
-      printf 'UNPUBLISHED: phase %s lock is on disk but its commit could not be pushed after %s attempts — other clones will not see it until docs/handoffs/%s/.locks is pushed\n' \
-        "$phase" "$_git_retries" "$slug"
-      printf 'phase-lock: UNPUBLISHED — %s phase %s (%s): the lock is local-only after %s attempts\n' \
-        "$1" "$phase" "$slug" "$_git_retries" >&2
+      _resolve_unpublishable "$1"
       return 0
     fi
     printf 'phase-lock: git sync retry %s/%s (%s)\n' "$attempt" "$_git_retries" "$1" >&2
@@ -333,23 +441,40 @@ case "$action" in
         # unqualified lock collides with everything, so the carve-out this field
         # exists for would evaporate one third of a lease into the run.
         [ -n "$branch" ] || branch="$(_field branch)"
-        _write; _git_sync refresh
+        _write; _confirm_held refresh || exit 1; _git_sync refresh
         printf 'phase %s: lock refreshed for %s (lease %ss)\n' "$phase" "$owner" "$lease"; exit 0
       fi
       if [ -n "$cur_lease" ] && [ "$now" -ge "$cur_lease" ]; then
-        _write; _git_sync takeover
+        _write; _confirm_held takeover || exit 1; _git_sync takeover
         printf 'phase %s: takeover — previous lease (held by %s) had expired\n' "$phase" "$cur_owner"; exit 0
       fi
       if [ "$force" = 1 ]; then
-        _write; _git_sync force
+        _write; _confirm_held force || exit 1; _git_sync force
         printf 'phase %s: force-claimed from %s\n' "$phase" "$cur_owner"; exit 0
       fi
       printf 'phase %s is being worked by %s (lease until %s).\n' "$phase" "$cur_owner" "$(_fmt "$cur_lease")" >&2
       printf '  → stop that session, re-run with --force to take over, or start another ready phase.\n' >&2
       exit 1
     fi
-    _write; _git_sync claim
-    printf 'phase %s: claimed by %s (lease %ss)\n' "$phase" "$owner" "$lease"; exit 0
+    # The free-phase branch, and the one that has to DECIDE a race: the test
+    # above and this write are two steps, and two sessions boarded inside that
+    # gap were both told "claimed". `_write create` links the file into place and
+    # fails if anything is already there, so losing here means somebody landed in
+    # between — and they get the same answer the test above would have given.
+    if _write create; then
+      _git_sync claim
+      printf 'phase %s: claimed by %s (lease %ss)\n' "$phase" "$owner" "$lease"; exit 0
+    fi
+    cur_owner="$(_field owner)"; cur_lease="$(_field lease_until)"
+    if [ "$cur_owner" = "$owner" ]; then
+      # Lost the race to OURSELVES — a second claim by the same owner is the
+      # refresh it would have been had it arrived a millisecond later.
+      _write; _confirm_held refresh || exit 1; _git_sync refresh
+      printf 'phase %s: lock refreshed for %s (lease %ss)\n' "$phase" "$owner" "$lease"; exit 0
+    fi
+    printf 'phase %s is being worked by %s (lease until %s).\n' "$phase" "$cur_owner" "$(_fmt "$cur_lease")" >&2
+    printf '  → stop that session, re-run with --force to take over, or start another ready phase.\n' >&2
+    exit 1
     ;;
   release)
     _git_refresh
@@ -438,6 +563,16 @@ case "$action" in
       se="$(grep -m1 '^session=' "$f" | sed 's/^session=//' || true)"
       br="$(grep -m1 '^branch=' "$f" | sed 's/^branch=//' || true)"
       wt="$(grep -m1 '^worktree=' "$f" | sed 's/^worktree=//' || true)"
+      # The lock's own recorded tree, resolved the way the caller's is. The
+      # claim side canonicalises from now on, but this comparison runs against a
+      # file SOMEBODY ELSE wrote — every lock written before that, and every one
+      # written by something that is not this script. `/tmp/x` and
+      # `/private/tmp/x` are one directory on macOS, and comparing the two raw
+      # strings carved two sessions apart into one working tree: the one
+      # dimension a claim is decided on, decided by a spelling.
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        wt="$(cd "$wt" 2>/dev/null && pwd -P || printf '%s' "$wt")"
+      fi
       [ -n "$l" ] && [ "$now" -ge "$l" ] && continue      # expired: free to take
       # Ours only when we can PROVE it, which owner alone cannot do. `owner`
       # defaults to `<user>@<host>` — the SAME string for every hand-driven
@@ -453,10 +588,18 @@ case "$action" in
       # a lock with NO session recorded falls back to owner, which is then all
       # there is to go on, and which keeps one session's OTHER phases (a batch)
       # from crying wolf against themselves.
+      #
+      # And the fallback itself is only evidence when the owner is a name the
+      # CALLER chose. `<user>@<host>` is what every hand-driven session on this
+      # machine gets when it states none, so two of them read each other as
+      # "mine" and each was told "safe to start" over the other's live lock. A
+      # session-less lock carrying the machine default is therefore FOREIGN: we
+      # cannot prove it is ours, so it is not. (`pid=` is written for the day a
+      # reader may prove it; nothing acts on it yet.)
       mine=0
       if [ -n "$se" ]; then
-        [ -n "$session" ] && [ "$se" = "$session" ] && mine=1
-      elif [ "$o" = "$owner" ]; then
+        if [ -n "$session" ] && [ "$se" = "$session" ]; then mine=1; fi
+      elif [ "$o" = "$owner" ] && [ "$o" != "$default_owner" ]; then
         mine=1
       fi
       [ "$mine" = 1 ] && continue
@@ -472,7 +615,18 @@ case "$action" in
       # collision stands — which keeps every lock written before these fields
       # existed exactly as safe as it was, and retires the false carve a
       # branch alone bought two sessions sharing one checkout.
-      if claim_disjoint "$branch" "$worktree" "$br" "$wt"; then continue; fi
+      #
+      # One case the qualification may NOT carve, and the scheduler already knew
+      # it as `sameUnitOfWork`: two claims on ONE phase of ONE plan. However they
+      # are qualified they write the same handoff, take the same lock and make
+      # the same commit, so a different branch in a different tree does not make
+      # them different work — it makes them the same work done twice. Without
+      # this, bash answered "disjoint" exactly where the console answered
+      # "collides", and the two halves of one guard disagreed about the single
+      # case the guard exists for.
+      _same_unit=0
+      if [ -n "$phase" ] && [ "$s" = "$slug" ] && [ "$p" = "$phase" ]; then _same_unit=1; fi
+      if [ "$_same_unit" = 0 ] && claim_disjoint "$branch" "$worktree" "$br" "$wt"; then continue; fi
       hits=$((hits + 1))
       overlap="$(scope_overlap "$scope" "$sc")"
       [ -n "$sc" ] || sc="unstated"

@@ -94,12 +94,13 @@ Install the phased-execution skill for me, and ask before each step.
 4. Before enabling anything, explain these one at a time and let me answer each:
      --allow-writes   scaffold plans/handoffs, record QA, take locks, close plans
      --allow-run      spawn unattended Claude sessions that edit my repository
-                      for hours — the widest of the seven, say so plainly
+                      for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
      --allow-accounts register Claude accounts and switch between them mid-run
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
+     --allow-publish  push a finished phase's pe/* branch, never a trunk or forced
    Default every one of them to off. Then start it with only what I chose:
      bash <skill>/start --root <repo> [flags]
 5. Open http://127.0.0.1:4123 and confirm it loads. If it does not, tell me
@@ -175,9 +176,9 @@ header is trustworthy only because nothing but the proxy can reach the port.
 [Phase Console](docs/console.md) · [متریک‌ها](docs/metrics.md) · [نصبِ دستی](docs/install.md) ·
 [نسخه‌بندی و انتشار](docs/releasing.md) · [مرجع](docs/reference.md)
 
-از ۵.۰، اجرایی که بدونِ حضورِ شما پیش می‌رود به این‌ها تکیه دارد: `phase-console doctor`،
-[تصمیم‌هایی](docs/decisions.md) که اجرا با آن‌ها شروع می‌شود، رله‌ای برای پرسشی که نشست وسطِ اجرا می‌پرسد، و
-گزینهٔ **Stay off…** در Shut down — [docs/controls.md](docs/controls.md) (انگلیسی).
+از ۵.۱ چند برنامه می‌توانند هم‌زمان روی یک مخزن کار کنند — یک چک‌اوت برای هر اجرا، یک شناسهٔ ردیابی در سراسرِ
+هرچه یک اجرا می‌کند، و یادداشت‌هایی که پیش از شروعِ یک فاز به آن می‌رسند؛ ۵.۰ `phase-console doctor`،
+[تصمیم‌هایی](docs/decisions.md) که اجرا با آن‌ها شروع می‌شود و رله را آورد — [docs/controls.md](docs/controls.md) (انگلیسی).
 
 به Claude Code و `bash` و `git` نیاز دارد. کنسول علاوه بر آن Node ‏22.18+ (یا ‏23.6+) می‌خواهد و
 **هیچ وابستگیِ اجرایی** ندارد. انتشارها تگِ `vX.Y.Z` هستند با یک GitHub Release که تاربالِ بسته‌بندی‌شده را دارد، و دستی بریده می‌شوند —

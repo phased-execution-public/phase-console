@@ -199,6 +199,24 @@ test('every script SKILL.md and references/ name actually exists', () => {
   }
 });
 
+/** SKILL.md's Mode 2 — the procedure a session follows while it is BUILDING. */
+const mode2Section = (): string => {
+  const skill = read('SKILL.md');
+  const from = skill.indexOf('### Mode 2');
+  const to = skill.indexOf('### Mode 3');
+  assert.ok(from > 0 && to > from, 'SKILL.md lost its Mode 2 section');
+  return skill.slice(from, to);
+};
+
+
+test('references/plan-format.md shows the Issues: line and the per-phase bullet as examples', () => {
+  // Phase 2 wrote the directive's grammar; an author still needs to SEE the two
+  // shapes — the plan-wide line and the phase's own override — to write one.
+  const doc = read('references/plan-format.md');
+  assert.match(doc, /\*\*Issues:\*\* (?:off|draft|file)\b/, 'no plan-wide `**Issues:** <word>` example');
+  assert.match(doc, /- \*\*Issues:\*\* (?:off|draft|file)\b/, 'no per-phase `- **Issues:** <word>` example');
+});
+
 /* ------------------------------------------------------------------ *
  * 3. The CLI verbs
  * ------------------------------------------------------------------ */
@@ -318,12 +336,24 @@ test('the advisory family the documents name is exactly the one the engine emits
   assert.ok(emitted.size >= 6, `expected several advisories, parsed ${emitted.size}`);
 
   const skill = read('SKILL.md');
-  // SKILL.md states the family as ranges: "F14–F19, F22–F23". Expand them.
+  // SKILL.md states the family in ONE bolded span — `**advisory family F15–F19,
+  // F22–F23, F28**` — of ranges and, since 5.1.0, standalone ids: F28 joined a
+  // family that had been contiguous, and expanding ranges alone would have read
+  // the new member as absent while it sat in the sentence being read.
+  //
+  // The span is what is parsed, and not the whole document, because the reverse
+  // assertion below is the load-bearing one: every id NAMED must be emitted, and
+  // sweeping standalone ids out of the whole file would collect F14 and F24 from
+  // the gating sentence beside it and fail on lints that correctly do not warn.
+  const span = /\*\*advisory family ([^*]+)\*\*/.exec(skill)?.[1] ?? '';
   const named = new Set<string>();
-  for (const m of skill.matchAll(/F(\d+)\s*[–-]\s*F?(\d+)/g)) {
+  for (const m of span.matchAll(/F(\d+)\s*[–-]\s*F?(\d+)/g)) {
     for (let n = Number(m[1]); n <= Number(m[2]); n++) named.add(`F${n}`);
   }
-  assert.ok(named.size > 0, 'SKILL.md no longer states the advisory family as a range');
+  for (const m of span.replace(/F\d+\s*[–-]\s*F?\d+/g, ' ').matchAll(/\bF(\d+)\b/g)) {
+    named.add(`F${m[1]}`);
+  }
+  assert.ok(named.size > 0, 'SKILL.md no longer states the advisory family in one bolded span');
 
   for (const id of emitted) {
     assert.ok(named.has(id), `${id} is emitted as an advisory but SKILL.md's family omits it`);

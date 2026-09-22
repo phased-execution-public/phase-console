@@ -38,6 +38,7 @@ import { Badge, Button, Checkbox, RelativeTime, StatusBadge, toast } from '@/com
 import { toHash } from '@/app/routes';
 import { useWindowLeft } from '@/lib/clock';
 import { flagReason, splitActions } from './model';
+import { MicField } from '@/features/approve/mic-field';
 
 /* ------------------------------------------------------------------ *
  * Performing one
@@ -223,7 +224,7 @@ export interface InboxRowProps {
   /** Keyboard triage: this row is the cursor. */
   selected?: boolean;
   onSelect?: () => void;
-  perform: (item: InboxItem, action: InboxAction) => void;
+  perform: (item: InboxItem, action: InboxAction, says?: string) => void;
   ack?: (item: InboxItem) => void;
   /** `${item.id}:${verb}` of whatever is in flight. */
   busy?: string;
@@ -264,7 +265,9 @@ export function InboxRow({
   hrefFor,
 }: InboxRowProps) {
   const [open, setOpen] = useState(false);
+  const [said, setSaid] = useState('');
   const { primary, rest } = splitActions(item);
+  const says = item.actions.find((action) => action.says)?.says;
   const ui = SEVERITY_UI[item.severity] ?? 'queued';
   const since = Date.parse(item.since);
   // A relayed question's window (phase 14): the console answers by rule when it closes.
@@ -391,9 +394,32 @@ export function InboxRow({
         </div>
       )}
 
+      {/* The operator's words, when an action takes them (phase 15): a
+          reply to a session's ask, an issue draft's new title or body. ONE box
+          per row, not per button — the `#/approve` card's rule — and the
+          first action that takes words names it. A press sends whatever is in
+          it only to an action that declared a field; the rest carry nothing. */}
+      {says && (
+        <MicField
+          label={says.label}
+          placeholder={says.placeholder}
+          value={said}
+          onChange={setSaid}
+          disabled={Boolean(busy)}
+        />
+      )}
+
       <div className="flex flex-wrap items-center gap-1.5">
         {primary && (
-          <ActionButton item={item} action={primary} primary perform={perform} busy={busy} index={1} />
+          <ActionButton
+            item={item}
+            action={primary}
+            primary
+            perform={perform}
+            busy={busy}
+            index={1}
+            said={said}
+          />
         )}
         {rest.map((action, i) => (
           <ActionButton
@@ -403,6 +429,7 @@ export function InboxRow({
             perform={perform}
             busy={busy}
             index={primary ? i + 2 : i + 1}
+            said={said}
           />
         ))}
         <Button size="sm" variant="ghost" asChild>
@@ -463,13 +490,16 @@ function ActionButton({
   perform,
   busy,
   index,
+  said,
 }: {
   item: InboxItem;
   action: InboxAction;
   primary?: boolean;
-  perform: (item: InboxItem, action: InboxAction) => void;
+  perform: (item: InboxItem, action: InboxAction, says?: string) => void;
   busy?: string;
   index: number;
+  /** The row's box, handed only to an action that declared a field for it. */
+  said?: string;
 }) {
   const reason = flagReason(action.flag);
   return (
@@ -479,7 +509,7 @@ function ActionButton({
       disabled={Boolean(action.flag) || busy === `${item.id}:${action.verb}`}
       title={reason}
       data-verb={action.verb}
-      onClick={() => perform(item, action)}
+      onClick={() => (action.says ? perform(item, action, said ?? '') : perform(item, action))}
     >
       {action.label}
       {index <= 3 && !action.flag && (

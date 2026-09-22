@@ -53,6 +53,9 @@ import {
 import { setPsReader, forgetPid, type ProcessState } from '../server/pid.ts';
 import { newLaneSignals } from '../server/runner/liveness.ts';
 import { Runner } from '../server/runner/runner.ts';
+import {
+  RESUME_CACHE_COLD_MS, RESUME_FRESH_MIN_CONTEXT, RESUME_FRESH_PARTIAL_REASONS, tokensLabel,
+} from '../server/runner/usage.ts';
 import { sessionLedgerDefect, sessionRecordOf } from '../server/runner/session-record.ts';
 import type { SpawnOutcome } from '../server/runner/spawn.ts';
 import { ENDED_BY, SESSION_MODES, START_DOORS } from '../shared/run-lifecycle.js';
@@ -181,6 +184,12 @@ const KILL_ALLOWED: Record<string, string> = {
     + 'servers) — and what is left here is the no-group fallback (a spawn seam that gave us no pid)',
   'runner/auth.ts':
     'the `claude auth status` probe, killed at its 20s timeout',
+  'shell.ts':
+    'the command seam\'s own timeout, on a child it started itself a moment ago. Deliberately NOT '
+    + 'the signal ladder: these are git, du, gh and a setup `sh -c` — piped, short-lived, no turn to '
+    + 'close and no session to end, and the ladder exists for a `claude -p` whose SIGINT writes the '
+    + 'result that books the turn. The one `claude` this seam must never take is spawn.ts\'s, which '
+    + 'stays outside it by name (with pid.ts\'s `ps`) in the two lints below',
   'runner/spawn.ts':
     'onAbort\'s fallback for a child with NO pid — there is no group to address, so the '
     + 'ladder has nothing to work with; the pid path above it goes through wakeAndTerm()',
@@ -666,8 +675,12 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
   },
   'runner/runner-control.ts': { count: 1, why: 'resumeWithInstruction hands it to resumableSession before the spawn' },
   'runner/runner-loop.ts': {
-    count: 1,
-    why: 'the wait-resume bookkeeping asks whether one is named — a gone own-session is journalled, never re-armed',
+    count: 3,
+    why: 'the wait-resume bookkeeping asks whether one is named — a gone own-session is journalled, never re-armed; '
+      + 'the boarding hands a hint-less resume to resumableSession before its prompt is final, so a session not '
+      + 'worth resuming boards fresh with the resume brief (autopilot-token-drain phase 4); and the boot mail '
+      + 'names the session it is handed to on the mailbox journal line — a decoration on a record, reaching no '
+      + 'spawn and no --resume (many-plans-one-repo phase 11)',
   },
   'runner/runner.ts': {
     count: 3,
@@ -712,6 +725,28 @@ test('clause 1: every --resume passes the one gate, the gate reads presence, and
     + 'resumableSession; a removed read must delete its RESUME_ID_READERS entry.\n'
     + Object.entries(RESUME_ID_READERS).map(([f, v]) => `  ${f} ×${v.count} — ${v.why}`).join('\n')
     + `\nfound: ${reads.join(', ')}`);
+});
+
+/**
+ * autopilot-token-drain phase 4 amended the outcome-protocol invariant. It said
+ * "the resume is ALWAYS the phase's own session — never a fresh boot", and a
+ * session 681k tokens large and four hours cold was resumed by it for $27. The
+ * amendment has to read the SAME wherever a session or a maintainer learns it,
+ * and with the numbers the gate really uses — so the sentence is built here from
+ * `runner/usage.ts`, and a threshold changed in code without its docs fails.
+ */
+test('the resume invariant reads the same in CLAUDE.md, SKILL.md and console-surface.md — with the numbers the gate uses', () => {
+  const sentence = `a session is resumed only while it is worth resuming: one that ended at ≥ ${tokensLabel(RESUME_FRESH_MIN_CONTEXT)} `
+    + `tokens of context and is cold (idle ≥ ${RESUME_CACHE_COLD_MS / 60_000} min) or under another account, that declared `
+    + `\`partial --reason ${RESUME_FRESH_PARTIAL_REASONS.join('|')}\`, or that the console checkpointed is boarded FRESH `
+    + 'with the resume brief instead';
+  const repo = new URL('../../', import.meta.url);
+  for (const doc of ['CLAUDE.md', 'SKILL.md', 'references/console-surface.md']) {
+    const text = readFileSync(new URL(doc, repo), 'utf8').replace(/\s+/g, ' ');
+    assert.ok(text.includes(sentence), `${doc} does not state the amended resume invariant verbatim:\n  ${sentence}`);
+  }
+  assert.doesNotMatch(readFileSync(new URL('CLAUDE.md', repo), 'utf8'), /resume is ALWAYS the phase's own/,
+    'the unamended invariant is gone');
 });
 
 test('the wait budget is evaluated through ONE expression — at park and at resume, and nowhere else', () => {
@@ -1186,4 +1221,79 @@ test('AC-14 (QRL-6): exactly one auto-answer call site under server/ — the rel
   for (const later of ['this.takeKept(', 'this.hold(', 'destructiveOption(', 'runStopped(']) {
     assert.ok(body.indexOf(later) > wall, `${later} comes after the deny list`);
   }
+});
+
+// ── SCH-3 — two schedulers of work read the raw presence ─────────────────────
+// `sessions.presenceOfLock` is the registry's word about the session a lock
+// NAMES, and `service-runs.ts` documents in its own comment why that word is
+// unusable for a lane: a lane's lock outlives its attempt's session by design
+// (the keepalive rewrites it every refresh, still naming a session that
+// exited), so the raw answer is `ended` for a claim a run is actively holding.
+//
+// `lockPresenceFor` is the wrapper that knows this. `claimHolders` already went
+// through it; the SCHEDULER's admission dep and CONVERGE's debris dep did not —
+// the two places where `ended` means "take that lock away and start a second
+// session in the same tree".
+test('SCH-3: every presence dep goes through lockPresenceFor, never the raw registry', () => {
+  const raw = hits(/presence\w*:\s*\(lock\w*\)\s*=>\s*this\.sessions\.presenceOfLock\(/);
+  assert.deepEqual(raw, [],
+    `a presence dep reads the raw registry instead of lockPresenceFor: ${raw.join(', ')}`);
+
+  // The positive half, so the lint cannot pass by seeing nothing: both deps
+  // exist and both name the wrapper.
+  const wrapped = hits(/presence\w*:\s*\(lock\w*\)\s*=>\s*this\.lockPresenceFor\(/);
+  assert.ok(wrapped.length >= 2, `expected the scheduler's and converge's deps: ${wrapped.join(', ')}`);
+  const files = new Set(wrapped.map((hit) => hit.slice(0, hit.indexOf(':'))));
+  assert.ok(files.has('service-base.ts'), `the scheduler's dep: ${wrapped.join(', ')}`);
+  assert.ok(files.has('service-runs.ts'), `converge's dep: ${wrapped.join(', ')}`);
+});
+
+// ── LCK-6 — five spawn sites claimed UNQUALIFIED ─────────────────────────────
+// The main attempt injects all four claim fields (`PE_OWNER`, `PE_SCOPE`,
+// `PE_WORKTREE`, `PE_BRANCH`); the reviewer, the closeout, the repair and both
+// resume sites injected the first two. A session's own `phase-lock.sh claim`
+// therefore wrote a lock with no branch and no tree — which collides with
+// EVERYTHING — and it stayed that way until the runner's keepalive rewrote it,
+// up to a third of a lease into the run. Two isolated runs that should have
+// carved cleanly serialised against each other for ten minutes, every time.
+//
+// One helper answers for every site, because the failure was five places
+// agreeing about two fields and forgetting two.
+test('LCK-6: every phase-scoped spawn builds its claim env from claimEnv', () => {
+  // Scoped to `runner/`: the account probe, the MCP probe and the agent also
+  // set `PE_OWNER`, and none of them claims a phase lock. Inside the runner,
+  // one site may write the field — the helper — and that is the whole rule.
+  const owners = hits(/PE_OWNER:/).filter((hit) => hit.startsWith('runner/'));
+  assert.deepEqual(owners.map((hit) => hit.slice(0, hit.indexOf(':'))), ['runner/runner-base.ts'],
+    `a runner spawn sets PE_OWNER outside claimEnv: ${owners.join(', ')}`);
+  assert.equal(owners.length, 1, `claimEnv should be the only writer: ${owners.join(', ')}`);
+
+  // The positive half, so the lint cannot pass by seeing nothing: the helper is
+  // defined once, and every phase-scoped spawn spreads it.
+  const built = hits(/protected async claimEnv\(/);
+  assert.equal(built.length, 1, `claimEnv is defined ${built.length} times: ${built.join(', ')}`);
+  const spread = hits(/\.\.\.\(await this\.claimEnv\(/);
+  assert.ok(spread.length >= 6, `expected every phase-scoped spawn to spread it: ${spread.join(', ')}`);
+
+  // And nothing sets PE_BRANCH/PE_WORKTREE beside it either — the pair is the
+  // thing that was forgotten, so it may not be assembled a second way.
+  const pair = hits(/PE_(BRANCH|WORKTREE):/).filter((hit) => hit.startsWith('runner/'));
+  assert.deepEqual(pair.map((hit) => hit.slice(0, hit.indexOf(':'))), ['runner/runner-base.ts', 'runner/runner-base.ts'],
+    `the claim pair is assembled outside claimEnv: ${pair.join(', ')}`);
+});
+
+// ── LCK-2 — a foreign takeover was journalled and then ignored ───────────────
+// The keepalive is the only thing that ever learns its lock was taken. It
+// journalled `phase.lock-lost`, cleared its own timer — and let the lane carry
+// on editing the working tree another session now holds the claim to. The
+// journal line was written for a person who was not there.
+test('LCK-2: losing the lock stops the lane, it does not merely say so', () => {
+  const runner = SOURCES.find((s) => s.rel === 'runner/runner.ts')!.lines.join('\n');
+  const at = runner.indexOf("this.record('phase.lock-lost'");
+  assert.ok(at > 0, 'the lock-lost arm is still here');
+  // A window around the arm, because the stop is ordered BEFORE the journal
+  // line on purpose: the line reports what the stop did.
+  const arm = runner.slice(at - 1_600, at + 400);
+  assert.match(arm, /this\.stopPhase\(/, 'the lock-lost arm stops the lane');
+  assert.match(arm, /stopped: stopped\.ok/, 'and the journal line reports whether it could');
 });

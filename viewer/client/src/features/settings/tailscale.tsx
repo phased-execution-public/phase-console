@@ -362,6 +362,7 @@ export function TailscaleCard({
   );
 }
 
+
 function Body({
   status,
   port,
@@ -386,7 +387,7 @@ function Body({
     return (
       <>
         <p className="text-sm text-ink-muted">
-          Tailscale is not installed on this machine. It is the only supported way to reach this console from
+          Tailscale is not installed on this machine. It is the supported way to reach this console from
           another device: it puts an authenticating proxy in front of a server that never leaves loopback, so
           nothing is ever exposed to a network.
         </p>

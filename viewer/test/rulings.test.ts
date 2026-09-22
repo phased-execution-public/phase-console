@@ -97,6 +97,34 @@ test('the id bash stamps is the id the console derives, and the stamped one is w
   assert.equal(readRulings(file)[0].id, rulingId('demo', 5, RULING.at, 'hand-written fixture'));
 });
 
+test('a deferral carries who it is for — the bash default included — and only a readable addressee', () => {
+  const file = ledger();
+  const write = (args: string[], at: string) => execFileSync('/bin/bash', [
+    join(SCRIPTS, 'phase-outcome.sh'), 'demo', '5', 'ruling', '--kind', 'deferral', ...args,
+  ], { env: { ...process.env, PE_RULINGS_FILE: file, PE_NOW: at } });
+
+  write(['--what', 'left the second decoder', '--for', '9'], '2026-08-10T21:10:03Z');
+  write(['--what', 'left the harder half'], '2026-08-10T21:11:03Z');
+  write(['--what', 'a fact for everyone', '--for', 'all'], '2026-08-10T21:12:03Z');
+  const [explicit, defaulted, broadcast] = readRulings(file);
+  assert.equal(explicit.for, '9');
+  // bash writes the default rather than leaving the reader to know it — one
+  // place for "a deferral with no addressee is for whoever comes next".
+  assert.equal(defaulted.for, 'next');
+  assert.equal(broadcast.for, 'all');
+
+  // A hand-written line saying something else is read WITHOUT the field: a
+  // `for` nothing can resolve is worse than none, because `--notes` would
+  // silently collect it for nobody while its writer believes it was addressed.
+  writeFileSync(file, line({ ...RULING, kind: 'deferral', for: 'the next person' }));
+  assert.equal(readRulings(file)[0].for, undefined);
+  writeFileSync(file, line({ ...RULING, kind: 'deferral', for: 0 }));
+  assert.equal(readRulings(file)[0].for, undefined);
+  // And only a deferral is addressed to anyone at all.
+  writeFileSync(file, line({ ...RULING, kind: 'ambiguity', for: '9' }));
+  assert.equal(readRulings(file)[0].for, undefined);
+});
+
 test('a decision key rides along when it is one of the manifest keys, and is dropped when it is not', () => {
   const file = ledger();
   execFileSync('/bin/bash', [

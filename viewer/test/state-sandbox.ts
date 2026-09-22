@@ -48,6 +48,17 @@ process.env.XDG_CONFIG_HOME = join(dir, 'config');
  */
 process.env.PHASE_CONSOLE_PTY_IDLE_MS ??= '20000';
 
+/**
+ * A restart never updates the repository under test. A console restarts onto
+ * the latest version of its copy since 2026-09-18 — fetch, fast-forward,
+ * build — and a console a test starts runs FROM this repository, so a test that
+ * pressed Restart once asked the real updater to move and rebuild the tree the
+ * suite was running from. Off for every test and every console a test spawns
+ * (they inherit this environment); a test that exercises the update injects a
+ * stand-in for the updater and turns it back on for itself.
+ */
+process.env.PHASE_CONSOLE_SELF_UPDATE = '0';
+
 process.on('exit', () => {
   // Before the directory goes, so the pid files are still there to read.
   try { sweepBrokers(dir); } catch { /* a leftover broker is not a test failure */ }

@@ -30,6 +30,7 @@ import {
   DEBUG_SOURCES, PER_SOURCE_CAP, clampLimit, deliveryEntries, displayPath, healthEntries,
   journalRunIds, mergeIndex, readConsoleLog, readJournals, readOutcomes, readRulingEntries,
   readSupervisorLogs, scrubText, scrubValue, supervisorLogPaths,
+  isTraceId,
 } from './sources.ts';
 import type { NotificationRecord } from '../notifications.ts';
 
@@ -120,10 +121,11 @@ export function isSlug(value: unknown): value is string {
  * CREATED a directory out there. One parameter guarded and its twin left open
  * is the shape of most path-traversal fixes that do not work.
  *
- * `[0-9a-f]{8}` is `recovery.ts`'s vocabulary and `listRuns`'s: a run id is a
- * short hex string and nothing else has ever been one.
+ * `[0-9a-f]{8,32}` is `recovery.ts`'s vocabulary and `listRuns`'s: a run id is
+ * a short hex string and nothing else has ever been one. The range spans the
+ * eight-hex ids minted before 5.1.0 and the twelve minted since (S9-b).
  */
-export const RUN_ID_RE = /^[0-9a-f]{8}$/i;
+export const RUN_ID_RE = /^[0-9a-f]{8,32}$/i;
 
 export function isRunId(value: unknown): value is string {
   return typeof value === 'string' && RUN_ID_RE.test(value);
@@ -527,5 +529,10 @@ export function parseDebugQuery(params: URLSearchParams): DebugQuery {
     if (value) query[key] = value;
   }
   if (phase !== undefined) query.phase = phase;
+  // Validated, not trusted: a `?trace=` that is not a trace id would match
+  // nothing and read as "this run has no evidence", which is the one wrong
+  // answer this page can give. An unusable value is IGNORED instead.
+  const trace = (params.get('trace') ?? '').trim();
+  if (isTraceId(trace)) query.traceId = trace;
   return query;
 }

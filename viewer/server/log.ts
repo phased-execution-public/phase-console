@@ -17,18 +17,47 @@ import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync }
 import { dirname } from 'node:path';
 
 import { STATE_DIR, defaultLogFile } from './config.ts';
+import { count } from './counters.ts';
+import { current } from './trace.ts';
 
-export type Level = 'info' | 'warn' | 'error';
+/** Worst last, so a numeric rank is just the index. */
+export const LEVELS = ['debug', 'info', 'warn', 'error'] as const;
+export type Level = (typeof LEVELS)[number];
 
+const RANK: Record<Level, number> = { debug: 0, info: 1, warn: 2, error: 3 };
+
+/**
+ * One line of the console log.
+ *
+ * `v: 2` is the envelope version and is on EVERY line, traced or not — a reader
+ * must be able to tell "this file predates the ids" from "this line was written
+ * outside a span", and a version that only appeared on traced lines could not
+ * say either. v1 lines have no `v` at all and are read by `withDerivedIds()`
+ * in the journal's twin of this shape.
+ */
 export type Entry = {
+  v?: 2;
   time: string;
   level: Level;
   event: string;
+  traceId?: string;
+  spanId?: string;
+  parentSpanId?: string;
+  phase?: number;
+  attempt?: number;
+  sessionId?: string;
+  actor?: string;
   data?: Record<string, unknown>;
 };
 
-/** Env-tunable so a test can rotate with kilobytes instead of megabytes. */
-const MAX_BYTES = Number(process.env.PHASE_CONSOLE_LOG_MAX_BYTES) || 8 * 1024 * 1024;
+/**
+ * Env-tunable so a test can rotate with kilobytes instead of megabytes.
+ *
+ * 16 MB, doubled from 8 in 5.1.0: a console that logs every git command, every
+ * engine call and every HTTP request writes several times what one that logged
+ * none of them did, and the pair (live + `.1`) is still bounded at ~32 MB.
+ */
+export const LOG_MAX_BYTES = Number(process.env.PHASE_CONSOLE_LOG_MAX_BYTES) || 16 * 1024 * 1024;
 /** Enough recent history for the UI to explain a degraded state, not a second log. */
 const RING_SIZE = 200;
 
@@ -100,7 +129,7 @@ function open(): void {
 function rotateIfLarge(): void {
   if (!file) return;
   try {
-    if (statSync(file).size > MAX_BYTES) rotate();
+    if (statSync(file).size > LOG_MAX_BYTES) rotate();
   } catch {
     /* no file yet, or a rotation race — either way, keep going */
   }
@@ -125,7 +154,7 @@ function removeOversizedRelic(): void {
   try {
     const relic = `${file}.1`;
     const size = statSync(relic).size;
-    if (size > 2 * MAX_BYTES) {
+    if (size > 2 * LOG_MAX_BYTES) {
       rmSync(relic);
       write('info', 'log.relic-removed', { bytes: size });
     }
@@ -147,17 +176,155 @@ function plain(value: unknown): unknown {
   return value;
 }
 
+/* ------------------------------------------------------------------ *
+ * Volume — the level floor, the per-channel opt-in, and the override
+ * ------------------------------------------------------------------ */
+
+/** How long a runtime override lasts when the caller does not say. */
+const DEFAULT_OVERRIDE_MS = 30 * 60_000;
+/** And the longest it may last at all — an override that never reverts is a setting. */
+const MAX_OVERRIDE_MS = 24 * 60 * 60_000;
+
+export type LevelState = {
+  level: Level;
+  /** The raw `PHASE_CONSOLE_DEBUG` spec in force: a csv of channels, or `*`. */
+  debug: string;
+  source: 'env' | 'override';
+  /** When an override lapses. Absent when the env is answering. */
+  until?: number;
+};
+
+let override: { level?: Level; debug?: string; until: number } | null = null;
+
+function envLevel(): Level {
+  const raw = (process.env.PHASE_CONSOLE_LOG_LEVEL ?? '').trim().toLowerCase();
+  return (LEVELS as readonly string[]).includes(raw) ? (raw as Level) : 'info';
+}
+
+function envDebug(): string {
+  return process.env.PHASE_CONSOLE_DEBUG ?? '';
+}
+
+/**
+ * What the log is admitting right now.
+ *
+ * The deadline is compared against a clock rather than armed on a `setTimeout`:
+ * a timer would hold the event loop open, would die with the process that set
+ * it, and could not be tested without really sleeping.
+ */
+export function levelState(now: number = Date.now()): LevelState {
+  if (override && now <= override.until) {
+    return {
+      level: override.level ?? envLevel(),
+      debug: override.debug ?? envDebug(),
+      source: 'override',
+      until: override.until,
+    };
+  }
+  return { level: envLevel(), debug: envDebug(), source: 'env' };
+}
+
+/**
+ * Turn the level (or a debug channel) up for a while.
+ *
+ * Behind `POST /api/debug/level`, which is why it reverts by itself: the point
+ * is to catch one misbehaving run, not to leave a console writing debug lines
+ * until somebody remembers.
+ */
+export function setLevel(
+  opts: { level?: Level; debug?: string; ttlMs?: number },
+  now: number = Date.now(),
+): LevelState {
+  if (opts.level !== undefined && !(LEVELS as readonly string[]).includes(opts.level)) {
+    throw new Error(`unknown log level ${JSON.stringify(opts.level)} — one of ${LEVELS.join(', ')}`);
+  }
+  const ttl = Math.min(Math.max(opts.ttlMs ?? DEFAULT_OVERRIDE_MS, 0), MAX_OVERRIDE_MS);
+  override = { level: opts.level, debug: opts.debug, until: now + ttl };
+  return levelState(now);
+}
+
+/** Drop the override; the environment answers again. */
+export function revertLevel(): void {
+  override = null;
+}
+
+/** `git.command` → `git`. The channel is the event name's first segment. */
+function channelOf(event: string): string {
+  const dot = event.indexOf('.');
+  return dot === -1 ? event : event.slice(0, dot);
+}
+
+function channelOn(channel: string, spec: string): boolean {
+  if (!spec) return false;
+  for (const token of spec.split(/[\s,]+/)) {
+    if (token === '*' || token === channel) return true;
+  }
+  return false;
+}
+
+/**
+ * Would a `debug` line on this channel be written?
+ *
+ * Asked BEFORE building an expensive payload — a command's output tail, a
+ * diff's byte count — so the cost of the detail is only paid when somebody
+ * asked for it.
+ */
+function enabled(channel: string, state: LevelState = levelState()): boolean {
+  return RANK.debug >= RANK[state.level] || channelOn(channel, state.debug);
+}
+
+/**
+ * The level floor, with one deliberate exception.
+ *
+ * A named debug channel OUTRANKS the floor. "Show me every git command" that
+ * also required lowering the global level would flood the log with everything
+ * else at the same moment — which is the log you are trying to read.
+ */
+function admits(level: Level, event: string, state: LevelState): boolean {
+  if (RANK[level] >= RANK[state.level]) return true;
+  return level === 'debug' && channelOn(channelOf(event), state.debug);
+}
+
 function write(level: Level, event: string, data?: Record<string, unknown>): void {
-  const entry: Entry = { time: new Date().toISOString(), level, event };
+  if (!admits(level, event, levelState())) return;
+
+  const span = current();
+  const entry: Entry = {
+    v: 2,
+    time: new Date().toISOString(),
+    level,
+    event,
+    // Read from the ambient span at WRITE time: the call sites are hundreds of
+    // lines over thirty files, and a parameter every one had to remember is a
+    // parameter most would forget.
+    ...(span
+      ? {
+          traceId: span.traceId,
+          spanId: span.spanId,
+          ...(span.parentSpanId === undefined ? {} : { parentSpanId: span.parentSpanId }),
+          ...(span.phase === undefined ? {} : { phase: span.phase }),
+          ...(span.attempt === undefined ? {} : { attempt: span.attempt }),
+          ...(span.sessionId === undefined ? {} : { sessionId: span.sessionId }),
+          ...(span.actor === undefined ? {} : { actor: span.actor }),
+        }
+      : {}),
+  };
   if (data && Object.keys(data).length) {
     entry.data = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, plain(v)])) as Record<string, unknown>;
   }
+
+  // Counted where it is ADMITTED, not where it is called: a line the level
+  // dropped is not a line this console wrote, and counting it would make the
+  // meter answer a question nobody asked (how loud would it be at debug).
+  count('log_lines_total', [level]);
 
   ring.push(entry);
   if (ring.length > RING_SIZE) ring.shift();
 
   // launchd captures stderr, so a problem is visible even without the file.
-  if (level !== 'info' && !consoleGone) {
+  // `debug` stays out of it: its whole reason to exist is volume nobody wants
+  // on a terminal.
+  if ((level === 'warn' || level === 'error') && !consoleGone) {
     try {
       process.stderr.write(`[phase-console] ${level} ${event}${entry.data ? ` ${JSON.stringify(entry.data)}` : ''}\n`);
     } catch { consoleGone = true; }
@@ -167,7 +334,7 @@ function write(level: Level, event: string, data?: Record<string, unknown>): voi
   open();
   if (!file) return;
   try {
-    if (bytes > MAX_BYTES) rotate();
+    if (bytes > LOG_MAX_BYTES) rotate();
     const line = `${JSON.stringify(entry)}\n`;
     appendFileSync(file, line, 'utf8');
     bytes += Buffer.byteLength(line);
@@ -177,6 +344,15 @@ function write(level: Level, event: string, data?: Record<string, unknown>): voi
 }
 
 export const log = {
+  /**
+   * High-volume detail — every git command, every engine call, every request.
+   *
+   * Dropped at the default level and admitted either by lowering the floor or,
+   * far more usefully, by naming its channel in `PHASE_CONSOLE_DEBUG`.
+   */
+  debug: (event: string, data?: Record<string, unknown>) => write('debug', event, data),
+  /** Is this debug channel on? Ask before building a payload you would throw away. */
+  enabled: (channel: string) => enabled(channel),
   info: (event: string, data?: Record<string, unknown>) => write('info', event, data),
   warn: (event: string, data?: Record<string, unknown>) => write('warn', event, data),
   error: (event: string, data?: Record<string, unknown>) => write('error', event, data),

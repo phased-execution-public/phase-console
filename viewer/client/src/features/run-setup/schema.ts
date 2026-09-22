@@ -35,12 +35,25 @@ import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions, RelayMode } 
 import { RELAY_MODES } from '@shared/run-settings.js';
 import { RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
 import {
+  DEFAULT_RETENTION,
   DEFAULT_SETTLE,
   ISOLATION_MODES,
   SETTLE_STRATEGIES,
+  WORKTREE_RETENTION,
+  retentionOf,
   type IsolationMode,
   type SettleStrategy,
 } from '@shared/worktree-model.js';
+import {
+  CONFLICT_POLICIES,
+  DEFAULT_CONFLICT,
+  DEFAULT_LAND,
+  LAND_POLICIES,
+  type ConflictPolicy,
+  type LandPolicy,
+} from '@shared/landing-model.js';
+import { DEFAULT_MESSAGING, MESSAGING_WORDS, type MessagingWord } from '@shared/message-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES, type IssueMode } from '@shared/issues-model.js';
 import {
   AUTONOMY_MODES,
   GIT_MODES,
@@ -85,6 +98,31 @@ export interface RunSetupValues {
    * has nothing to settle.
    */
   settle: SettleStrategy;
+  /**
+   * The seven words many-plans-one-repo phase 15 gave the form. Every one is
+   * ALSO a plan line (or a Settings default), and the plan outranks the run:
+   * the word chosen here speaks only where the plan is silent, the
+   * `mcpPolicy` precedent — the control's hint says so.
+   *
+   * `baseBranch` — what `pe/<slug>` and every lane branch are cut from
+   * (`origin/HEAD`, `head`, or a ref); empty means "the plan's line, else the
+   * console's preference". Immutable once the run's branch exists.
+   * `maxConcurrentPerRepo` — how many isolated runs this run will stand
+   * beside in its repository, clamped to the console's cap; empty means the
+   * console's number. A `<input type=number>` value, so a string.
+   * `worktreeRetention` — a `WORKTREE_RETENTION` word, or `ttl:<h>`.
+   */
+  baseBranch: string;
+  maxConcurrentPerRepo: string;
+  worktreeRetention: string;
+  /** What a phase's commits do when it settles, where the plan is silent. */
+  landing: LandPolicy;
+  /** What a landing that will not merge cleanly does, where the plan is silent. */
+  conflictPolicy: ConflictPolicy;
+  /** Whether this run's sessions may message each other, where the plan is silent. */
+  messaging: MessagingWord;
+  /** Whether a session may open an issue outside its phase; tightens only, mid-run. */
+  issuesMode: IssueMode;
   /** Which class this run's admissions are scanned in (`shared/orchestration-model.js`). */
   priority: RunPriority;
   /** A plan slug this run begins AFTER. Empty means no chain. Start-only. */
@@ -139,6 +177,12 @@ export interface RunSetupValues {
   accounts: string;
   acknowledgedWaivers: string[];
   manifestOverride: string;
+  /**
+   * The answers to the prelude's verification probe (2026-09-18): the exact
+   * commands, by fingerprint, the operator approves though the built-in tier
+   * would not run them, and the fragments set aside as `<phase>:<fp>`.
+   */
+  verifyAnswers: { approve: string[]; waive: string[] };
 }
 
 export type RunSetupField = keyof RunSetupValues;
@@ -163,6 +207,13 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
   openPr: 'openPr',
   isolation: 'isolation',
   settle: 'settle',
+  baseBranch: 'baseBranch',
+  maxConcurrentPerRepo: 'maxConcurrentPerRepo',
+  worktreeRetention: 'worktreeRetention',
+  landing: 'landing',
+  conflictPolicy: 'conflictPolicy',
+  messaging: 'messaging',
+  issuesMode: 'issuesMode',
   priority: 'priority',
   startAfter: 'startAfter',
   reviewEachPhase: 'reviewEachPhase',
@@ -190,6 +241,7 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
   accounts: 'accounts',
   acknowledgedWaivers: 'acknowledgedWaivers',
   manifestOverride: 'manifestOverride',
+  verifyAnswers: 'verifyAnswers',
 });
 
 /**
@@ -227,6 +279,27 @@ export const runSetupSchema = z.object({
   isolation: z.enum(ISOLATION_MODES as unknown as [IsolationMode, ...IsolationMode[]]),
   // From the owner list for the same reason isolation is — see above.
   settle: z.enum(SETTLE_STRATEGIES as unknown as [SettleStrategy, ...SettleStrategy[]]),
+  // Phase 15's seven. A ref is free text (the two words that are questions,
+  // `origin/HEAD` and `head`, are named by the owner but a branch name is
+  // anything git accepts); the cap is a whole number the door clamps to the
+  // console's; retention is asked of the owner's coercer because its
+  // vocabulary is OPEN (`ttl:<h>` is a member with a parameter); the four
+  // words are the owner lists, never a second literal.
+  baseBranch: z.string().check(
+    z.refine((text) => text.trim() === '' || !/\s/.test(text.trim()), {
+      message: 'A base branch is one ref — origin/HEAD, head, or a branch name',
+    }),
+  ),
+  maxConcurrentPerRepo: whole('Runs beside it in the repository', 1, 99),
+  worktreeRetention: z.string().check(
+    z.refine((text) => retentionOf(text) === text.trim().toLowerCase(), {
+      message: `Retention is ${WORKTREE_RETENTION.join(', ')}, or ttl:<hours>`,
+    }),
+  ),
+  landing: z.enum(LAND_POLICIES as unknown as [LandPolicy, ...LandPolicy[]]),
+  conflictPolicy: z.enum(CONFLICT_POLICIES as unknown as [ConflictPolicy, ...ConflictPolicy[]]),
+  messaging: z.enum(MESSAGING_WORDS as unknown as [MessagingWord, ...MessagingWord[]]),
+  issuesMode: z.enum(ISSUE_MODES as unknown as [IssueMode, ...IssueMode[]]),
   // From the owner list for the same reason isolation is — see above.
   priority: z.enum(RUN_PRIORITIES as unknown as [RunPriority, ...RunPriority[]]),
   startAfter: z.string(),
@@ -272,6 +345,7 @@ export const runSetupSchema = z.object({
   ),
   acknowledgedWaivers: z.array(z.string()),
   manifestOverride: z.string(),
+  verifyAnswers: z.object({ approve: z.array(z.string()), waive: z.array(z.string()) }),
 });
 
 /** `''` is "no ceiling"; anything else must be a non-negative number. */
@@ -321,6 +395,20 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   // The pull request: exactly what a new-branch run has always ended with, so
   // a form nobody touched settles the way this console has always settled.
   settle: DEFAULT_SETTLE,
+  // Phase 15's seven, each at its owner's default — and for the three the
+  // console also answers, the EMPTY word: a blank ref and a blank cap mean
+  // "the plan's line, else the console's preference", which is what every run
+  // before the fields existed got. Retention opens on the shipped word (the
+  // preference seeds over it), the four words on the fail-safe member each:
+  // commits held for a person, a conflict halts, sessions may message, and an
+  // outward write is never a default.
+  baseBranch: '',
+  maxConcurrentPerRepo: '',
+  worktreeRetention: DEFAULT_RETENTION,
+  landing: DEFAULT_LAND,
+  conflictPolicy: DEFAULT_CONFLICT,
+  messaging: DEFAULT_MESSAGING,
+  issuesMode: DEFAULT_ISSUES,
   // The ordinary class and no chain: a form nobody touched queues exactly the
   // way this console queued before either control existed.
   priority: 'normal',
@@ -361,6 +449,7 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   accounts: '',
   acknowledgedWaivers: [],
   manifestOverride: '',
+  verifyAnswers: { approve: [], waive: [] },
 });
 
 /** `"default:20, work:10"` → `[{id, minHeadroomPct}]`; empty → `[]`; unreadable → `undefined`. */

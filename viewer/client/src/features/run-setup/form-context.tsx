@@ -10,7 +10,14 @@
  */
 
 import { createContext, useContext, type ReactNode } from 'react';
-import type { AccountView, IsolationPreflight, McpServerView, PhaseView, SkillInfo } from '@/lib/api';
+import type {
+  AccountView,
+  IsolationPreflight,
+  McpServerView,
+  PhaseView,
+  PlanReviewer,
+  SkillInfo,
+} from '@/lib/api';
 import type { Source } from './fields';
 import type { PressField, ToggleField } from './fields';
 import type { RunSetupContext, RunSetupMode } from './modes';
@@ -61,9 +68,17 @@ export interface SetupForm {
   planSkills: string[];
   planMcp: string[];
   planPhases: PhaseView[];
+  /** Where the plan orders its own reviewer — what the review-doubled advisory reads. */
+  planReviewers: PlanReviewer[];
   qaMode?: string;
   pushBroken?: boolean;
   allowWrites?: boolean;
+  /**
+   * `--allow-publish` on this console — what `Landing: pr|trunk` and
+   * `Issues: file` will actually DO here (phase 15). `false` draws the hint
+   * that names the flag; undefined (an older server) says nothing.
+   */
+  allowPublish?: boolean;
   skillsEnabled: boolean;
   canQaToggle: boolean;
   canAutoRecover: boolean;

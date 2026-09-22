@@ -14,11 +14,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  processResources,
   CLAUDE_COMM, forgetPid, pidAlive, processState, setPsReader, type PsReader,
 } from '../server/pid.ts';
 import { presenceOf } from '../server/sessions/registry.ts';
 
-/** `ps -o stat=,comm=,lstart=` output for a pid, as one row. */
+/** `ps -o stat=,comm=,rss=,pcpu=,lstart=` output for a pid, as one row. */
 function ps(rows: Record<number, { stat: string; comm?: string; lstart?: string }>): PsReader {
   return (pid) => {
     const row = rows[pid];
@@ -147,8 +148,36 @@ test('`comm` is the column, because `ucomm` names the versioned binary', () => {
   } finally { setPsReader(restore); forgetPid(); }
 });
 
-test('the real reader asks ps for comm, not ucomm', async () => {
+test('the real reader asks ps for comm, not ucomm — and keeps lstart last', async () => {
   const source = await import('node:fs').then((fs) => fs.readFileSync(
     new URL('../server/pid.ts', import.meta.url), 'utf8'));
-  assert.match(source, /'stat=,comm=,lstart='/, 'ucomm names the versioned binary, not the CLI');
+  assert.match(source, /'stat=,comm=,rss=,pcpu=,lstart='/,
+    'ucomm names the versioned binary, not the CLI — and `lstart` is the only column with spaces '
+    + 'in it, so anything added after it would be swallowed by the date');
+  // The match above is exact, so it is already the whole assertion: an argv
+  // asking for `ucomm` could not also be this string. A second, negative check
+  // over the source would read this file's own explanation of why NOT `ucomm`
+  // and fail on the documentation — which is the shape phase 5 met in
+  // `docs-parity` and phase 13 met again here.
+});
+
+test('the resources ride the one ps, and are absent rather than zero when it did not say', () => {
+  const LSTART = 'Sat Aug 22 20:30:07 2026';
+  const restore = setPsReader(null);
+  try {
+    // A `ps` that printed all five columns.
+    setPsReader(() => ({ stat: 'S', comm: 'claude', rss: 402_144, pcpu: 7.5, lstart: LSTART }));
+    assert.equal(processState(SELF), 'running');
+    assert.deepEqual(processResources(SELF), { rssKb: 402_144, cpuPct: 7.5 });
+
+    // A `ps` that printed the older three. "I did not look" and "it is using
+    // nothing" are different facts, and this returns the first as absence.
+    forgetPid();
+    setPsReader(() => ({ stat: 'S', comm: 'claude', lstart: LSTART }));
+    assert.equal(processState(SELF), 'running', 'the state still answers without them');
+    assert.equal(processResources(SELF), null);
+
+    // A pid nobody has probed costs no subprocess to ask about.
+    assert.equal(processResources(999_999), null);
+  } finally { setPsReader(restore); forgetPid(); }
 });

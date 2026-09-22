@@ -9,7 +9,7 @@ they work across machines and accounts.
 
 **Scope decides who may run beside you.** What makes two sessions dangerous is a shared *working tree*,
 not the mere fact of being two — so the rule is about scope: *never two live sessions whose scopes
-intersect; same repo ⇒ serialized; `all` ⇒ exclusive; disjoint ⇒ parallel.* Scope comes from the plan's
+intersect; same repo ⇒ serialized; `all` ⇒ exclusive against every unqualified claim; disjoint ⇒ parallel.* Scope comes from the plan's
 Repos column, and `phase-lock.sh <slug> conflicts <N> --scope "<csv>"` answers the question across every
 plan before you start — a working tree doesn't know which plan asked for it. Every boot prompt states
 its phase's scope and the command to check it. A phase that declares nothing counts as `all` and runs
@@ -56,6 +56,22 @@ rules became strikeable from Settings (by name, behind a confirm), an operator w
 quietly re-add the force-push denials on top of a wall they removed. The two asks (`git push`,
 `gh pr create`) stay pinned either way: one human tap to publish is about the run's shape, not the
 wall.
+
+**The console's own push is a second door, and a narrower one.** `--allow-publish` is the eighth
+capability flag, off by default like the other seven, and the only way this console itself ever
+reaches a remote: a finished phase's own `pe/*` branch, pushed to `origin` through one seam
+(`pushRef` in `runner/worktree.ts`) with one frozen argv — `git push --porcelain --no-follow-tags
+origin refs/heads/<ref>:refs/heads/<ref>`. Never a trunk, never `pe/integration`, never with force,
+never a delete, never a second try after a non-fast-forward rejection, never a name outside
+`^pe/[A-Za-z0-9._-]+(-p\d+)?$` — a ref outside that shape is refused before git is spawned. Two
+conditions must both hold, the flag and a `permission.destructive` row in the plan that allows
+`git push`; without either the landing parks with `phase.landing-push-refused {reason}` and nothing
+reaches the origin. A free console parses the flag and pushes nothing. The wall above stands
+untouched: the landing session the console boards afterwards never pushes — the push was the
+console's act, and the deny wall still refuses it — and its two acts, `gh pr create` and
+`gh pr merge`, are pinned asks under every permission profile, answerable without a person only by
+that same `permission.destructive` row.
+
 
 **Every session carries two caps.** Every `claude -p` the spawn door starts passes `--max-budget-usd`
 and `--max-turns`, and its `phase.session` line names the policy that set each. With no

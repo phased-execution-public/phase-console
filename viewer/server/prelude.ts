@@ -14,15 +14,17 @@
  *      starts once the form's answers are given (`docs/decisions.md` — the
  *      manifest is opt-in until a run asks for it). Only a row somebody WROTE
  *      can block.
- *   2. Four PROBES run, each over the console's own facts and never over a
+ *   2. Five PROBES run, each over the console's own facts and never over a
  *      secret's value: the accounts the run may spend (entitlement, sign-in,
  *      headroom against the declared minimum), the MCP servers the plan names
  *      (the boarding preflight, one pass), the credentials it names (presence
  *      by id — `credentials-probe.ts`), and a delivery channel for the
  *      announcements nobody will otherwise hear (a subscribed device,
  *      `PHASE_CONSOLE_NOTIFY`, a webhook; under `--remote` also Tailscale up
- *      and Serve pointing at this port). A probe that could not RUN answers
- *      `skip` and refuses nothing — the MCP preflight's rule.
+ *      and Serve pointing at this port), and — since 2026-09-18 — every
+ *      §Verification command the run would stop on for a person
+ *      (`probeVerification`). A probe that could not RUN answers `skip` and
+ *      refuses nothing — the MCP preflight's rule.
  *   3. The BLOCKING list is computed: an `outstanding` row marked `blocking:
  *      yes`, a `waived` row the start did not acknowledge, and a failed probe
  *      whose stated condition holds (`credential policy: require`, `MCP policy:
@@ -47,7 +49,7 @@ import type { RelayMode } from '../shared/run-settings.js';
 import type { HeadroomVerdict } from './accounts/index.ts';
 import type { CredentialVerdict } from './credentials-probe.ts';
 import type { PolicyPrefs } from './runner/policy.ts';
-import type { AccountRequirement, ManifestDecision, ResolvedManifest } from './runner/state.ts';
+import type { AccountRequirement, ManifestDecision, ResolvedManifest, RunVerifyApprovals } from './runner/state.ts';
 
 /** One probe's answer: the word, the reason, and (when some but not all failed) the warnings. */
 export type ProbeVerdict = {
@@ -61,7 +63,7 @@ export type ProbeVerdict = {
 /** A manifest row as the prelude rendered it, plus the probe that judged it. */
 export type PreludeRow = ManifestDecision & { probe?: PreludeProbeId };
 
-export type PreludeProbeId = 'accounts' | 'mcp' | 'credentials' | 'delivery';
+export type PreludeProbeId = 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'verification';
 
 export type Prelude = {
   slug: string;
@@ -77,6 +79,8 @@ export type Prelude = {
   accounts: AccountRequirement[];
   credentials: ResolvedManifest['credentials'];
   delivery: ResolvedManifest['delivery'];
+  /** The draft's §Verification answers, resolved to exact texts — what `startRun` stores on the run. */
+  verifyApprovals?: RunVerifyApprovals;
   at: string;
 };
 
@@ -90,6 +94,40 @@ export type PreludeOptions = {
   mcpServers?: string[];
   mcpPolicy?: string;
   permissionProfile?: string;
+  /** The phases the run will drive — probe 5 blocks only on these; empty is every open phase. */
+  onlyPhases?: number[];
+  autonomy?: string;
+  /**
+   * The draft's answers to probe 5, by fingerprint: `approve` exact commands
+   * the built-in tier would not run, `waive` fragments as `<phase>:<fp>`. The
+   * service resolves them against the reviews into exact texts — an fp that
+   * names no approvable command answers nothing.
+   */
+  verifyAnswers?: { approve?: string[]; waive?: string[] };
+};
+
+/**
+ * One phase's verification review, as probe 5 reads it — the shape
+ * `runner/verify-review.ts` returns, spelled here so this file stays a leaf
+ * (the offline doctor imports it).
+ */
+export type VerificationReviewFact = {
+  phase: number;
+  verdict: string;
+  park?: string;
+  runs: string[];
+  items: { text: string; reason: string; fp?: string; approvable?: boolean }[];
+  waived: { text: string; reason: string }[];
+  setup: { text: string; reason: string; fp?: string; approvable?: boolean }[];
+  missing: string[];
+};
+
+export type VerificationFacts = {
+  reviews: readonly VerificationReviewFact[];
+  /** The run's `onlyPhases` when it is scoped; null for every open phase. */
+  scope: readonly number[] | null;
+  /** The draft's answers, resolved to exact texts. */
+  answers?: RunVerifyApprovals;
 };
 
 /** The facts the prelude reads. Every field is a function so a caller supplies only what it has. */
@@ -120,6 +158,12 @@ export type PreludeDeps = {
   };
   credentials: { held: (ids: readonly string[]) => Promise<CredentialVerdict[]> };
   delivery: () => Promise<DeliveryFacts>;
+  /**
+   * Probe 5's facts — the verification review of every open phase. Optional:
+   * with no plan in front of it (the doctor) there is nothing to review, and
+   * the probe answers `skip`.
+   */
+  verification?: () => Promise<VerificationFacts | null>;
   prefs: PolicyPrefs;
   now?: () => string;
 };
@@ -135,7 +179,7 @@ export type DeliveryFacts = {
 const UNUSABLE_AUTH = new Set(['expired', 'signed-out', 'unusable']);
 
 /* ------------------------------------------------------------------ *
- * The four probes — pure over facts
+ * The probes — pure over facts
  * ------------------------------------------------------------------ */
 
 export type AccountFacts = {
@@ -379,6 +423,80 @@ export function manifestRows(
   return rows;
 }
 
+/**
+ * Probe 5 — verification (2026-09-18, run f0da619a): everything a run's
+ * §Verification would stop for a person, asked at the door. A phase in scope
+ * that would PARK — `Person-check: halt` with a fragment the runner will not
+ * run, nothing runnable, every lead missing — or that would ALWAYS ask
+ * (`halt-on-everything`) refuses the start until each is answered: approve the
+ * exact command, waive it for this run, or fix the plan. What only MIGHT ask,
+ * a Setup command that will not run, a missing binary and a phase outside the
+ * scope are warnings. The detail carries every review, for the Decisions stage.
+ */
+export function probeVerification(facts: VerificationFacts | null): ProbeVerdict {
+  if (!facts) return { status: 'skip', ok: true, reason: 'no plan in front of the probe' };
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const inScope = (phase: number) => !facts.scope?.length || facts.scope.includes(phase);
+  // What the door can ANSWER stops the start: a named command or fragment it
+  // would park on (approve it or waive it), and anything it would always ask.
+  // A park with nothing to name — no bullet, a bullet the parser lost, every
+  // lead missing — is lint F14's and boarding's, as it was before this probe:
+  // shown here, never a reason to refuse a run whose first hours are fine.
+  const stops = (review: VerificationReviewFact) =>
+    (review.verdict === 'parks' && review.items.length > 0) || review.verdict === 'asks';
+  const blocking = facts.reviews.filter((review) => inScope(review.phase) && stops(review));
+  const warnings: string[] = [];
+  for (const review of facts.reviews) {
+    if (!inScope(review.phase) && stops(review)) {
+      warnings.push(`phase ${review.phase} (outside this run's phases) would stop for a person — ${review.park ?? 'answer it before widening the run'}`);
+    }
+    if (review.verdict === 'parks' && !review.items.length && review.park) {
+      warnings.push(`phase ${review.phase} will park at boarding: ${review.park}`);
+    }
+    if (review.verdict === 'may-ask') {
+      for (const item of review.items) {
+        warnings.push(`phase ${review.phase}: a person may be asked on a red — ${item.text} — ${item.reason}`);
+      }
+    }
+    for (const item of review.setup) {
+      warnings.push(`phase ${review.phase}: its Setup will not run ${item.text} — ${item.reason}`);
+    }
+    if (review.verdict !== 'parks') {
+      for (const lead of review.missing) {
+        warnings.push(`phase ${review.phase}: \`${lead}\` is not installed here — its command will be skipped`);
+      }
+    }
+  }
+  const detail = { reviews: facts.reviews, scope: facts.scope, ...(facts.answers ? { answers: facts.answers } : {}) };
+  const withWarnings = warnings.length ? { warnings } : {};
+  if (blocking.length) {
+    const [first, ...rest] = blocking;
+    const why = first.items[0] ? `${first.items[0].text} — ${first.items[0].reason}` : (first.park ?? 'it would stop');
+    return {
+      status: 'fail',
+      ok: false,
+      reason: `${plural(blocking.length, 'phase')} would stop for a person — phase ${first.phase}: ${why}`
+        + (rest.length ? ` (and ${rest.map((review) => `phase ${review.phase}`).join(', ')})` : '')
+        + ' — approve the exact command, waive it for this run, or fix the plan',
+      ...withWarnings,
+      detail,
+    };
+  }
+  const counted = facts.reviews.filter((review) => inScope(review.phase));
+  const commands = counted.reduce((sum, review) => sum + review.runs.length, 0);
+  const approved = facts.answers?.approve.length ?? 0;
+  const waived = counted.reduce((sum, review) => sum + review.waived.length, 0);
+  return {
+    status: 'ok',
+    ok: true,
+    reason: `${plural(commands, 'command')} in ${plural(counted.length, 'open phase')} run on their own`
+      + (approved ? `, ${approved} by your approval` : '')
+      + (waived ? `, ${waived} set aside` : ''),
+    ...withWarnings,
+    detail,
+  };
+}
+
 /* ------------------------------------------------------------------ *
  * The prelude
  * ------------------------------------------------------------------ */
@@ -436,15 +554,30 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
   const deliveryFacts = await deps.delivery();
   const delivery = probeDelivery(deliveryFacts);
 
+  // Probe 5 — verification. A review that could not RUN refuses nothing (the
+  // MCP preflight's rule): "I could not check" is not "it will stop".
+  let verificationFacts: VerificationFacts | null = null;
+  let verificationError: string | null = null;
+  if (deps.verification) {
+    try { verificationFacts = await deps.verification(); } catch (error) {
+      verificationError = String((error as Error)?.message ?? error);
+    }
+  }
+  const verificationVerdict: ProbeVerdict = verificationError
+    ? { status: 'skip', ok: true, reason: `the verification review could not run: ${verificationError}` }
+    : probeVerification(verificationFacts);
+
   const probes: Record<PreludeProbeId, ProbeVerdict> = {
     accounts: accountsVerdict, mcp: mcpVerdict, credentials: credentialsVerdict,
     delivery: { status: delivery.status, ok: delivery.ok, reason: delivery.reason, ...(delivery.warnings ? { warnings: delivery.warnings } : {}) },
+    verification: verificationVerdict,
   };
   for (const row of rows) {
     if (row.key === 'accounts') row.probe = 'accounts';
     if (row.key === 'mcp') row.probe = 'mcp';
     if (row.key === 'credentials') row.probe = 'credentials';
     if (row.key === 'announce') row.probe = 'delivery';
+    if (row.key === 'verification.person-check') row.probe = 'verification';
   }
 
   // The blocking list, in reading order.
@@ -467,6 +600,9 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
   if (!accountsVerdict.ok) blocking.push({ key: 'accounts', why: accountsVerdict.reason });
   if (!mcpVerdict.ok) blocking.push({ key: 'mcp', why: mcpVerdict.reason });
   if (!credentialsVerdict.ok) blocking.push({ key: 'credentials', why: credentialsVerdict.reason });
+  // Under the manifest row that owns the class — a new key would be a decision
+  // key the plan format does not have.
+  if (!verificationVerdict.ok) blocking.push({ key: 'verification.person-check', why: verificationVerdict.reason });
   const deliveryAcknowledged = acknowledged.includes('announce');
   if (!delivery.ok) {
     const announce = rows.find((r) => r.key === 'announce');
@@ -494,6 +630,7 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
       missing: verdicts.filter((v) => v.status === 'fail').map((v) => v.id),
     },
     delivery: { ok: delivery.ok, channels: delivery.channels, acknowledged: deliveryAcknowledged },
+    ...(verificationFacts?.answers ? { verifyApprovals: verificationFacts.answers } : {}),
     at,
   };
 }

@@ -92,3 +92,77 @@ export function environmentReport(
   }
   return issues;
 }
+
+/* ------------------------------------------------------------------ *
+ * git, under this process's own PATH (5.1.0, errand E7)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The facts `doctor.ts`'s `gitVerdict` grades. Collected here because this is
+ * the module about what THIS process's environment actually is, as opposed to
+ * what a person's interactive shell would answer.
+ *
+ * `exec` is injected so the probe is testable and so the two callers — the
+ * live console and the offline CLI verb — can each supply the runner they
+ * already have, rather than this module importing a child-process seam into
+ * a file whose whole value is that it imports almost nothing.
+ */
+export type GitProbeExec = (
+  file: string,
+  args: readonly string[],
+  opts?: { cwd?: string },
+) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+
+export async function probeGit(
+  exec: GitProbeExec,
+  root: string | null,
+): Promise<{ version: string | null; code: number | null; stderr?: string; insideWorkTree: boolean | null; path?: string; root?: string | null }> {
+  const first = (text: string): string => (text ?? '').split('\n').find((line) => line.trim()) ?? '';
+
+  // WHICH git, before whether it works: two are usually installed (Apple's
+  // shim in /usr/bin and Homebrew's in /opt/homebrew/bin) and under launchd
+  // the first one wins, which is exactly the E7 trap.
+  let path: string | undefined;
+  try {
+    const which = await exec('/usr/bin/which', ['git']);
+    if (which.code === 0) path = first(which.stdout).trim() || undefined;
+  } catch {
+    /* `which` is a convenience; its absence must not fail the probe */
+  }
+
+  let version: { code: number | null; stdout: string; stderr: string };
+  try {
+    version = await exec('git', ['--version']);
+  } catch {
+    return { version: null, code: null, insideWorkTree: null, ...(path ? { path } : {}), root };
+  }
+  if (version.code !== 0) {
+    return {
+      version: first(version.stdout).trim() || null,
+      code: version.code,
+      stderr: first(version.stderr).trim(),
+      insideWorkTree: null,
+      ...(path ? { path } : {}),
+      root,
+    };
+  }
+
+  // `null` rather than `false` with no root open: there is nothing to be
+  // inside, which is not the same as being outside a repository.
+  let insideWorkTree: boolean | null = null;
+  if (root) {
+    try {
+      const inside = await exec('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root });
+      insideWorkTree = inside.code === 0 && first(inside.stdout).trim() === 'true';
+    } catch {
+      insideWorkTree = null;
+    }
+  }
+  return {
+    version: first(version.stdout).trim() || null,
+    code: 0,
+    insideWorkTree,
+    ...(path ? { path } : {}),
+    root,
+  };
+}

@@ -19,8 +19,12 @@
  */
 
 import { DECISION_KEYS, type DecisionKey } from '../shared/decisions-model.js';
+import { ISSUE_MODES } from '../shared/issues-model.js';
+import { LAND_POLICIES, GITLINK_POLICIES, CONFLICT_POLICIES } from '../shared/landing-model.js';
+import { MESSAGING_WORDS } from '../shared/message-model.js';
 import { POLICY_DEFAULTS } from '../shared/policy-model.js';
 import { MCP_POLICIES } from '../shared/run-lifecycle.js';
+import { ISOLATION_DIRECTIVES, WORKTREE_RETENTION } from '../shared/worktree-model.js';
 
 export type PlanField = {
   /** The field's name, as the prompt and the test spell it. */
@@ -71,6 +75,26 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'bring-up commands that run before verification and can never fail a phase' },
   { field: 'Checkout', flags: ['--checkout'], home: '- **Checkout:** default',
     question: 'a phase that must stand on the trunk, not the run branch (after a merge)' },
+  { field: 'Landing', flags: ['--land'], home: `**Landing:** ${LAND_POLICIES.join('|')} and - **Land:**`,
+    question: "what happens to a phase's commits when it settles (default hold — a person merges)" },
+  { field: 'Base branch', flags: ['--base-branch'], home: '**Base branch:** origin/HEAD|head|<ref>',
+    question: 'what the run branch is cut from (default origin/HEAD — a fresh cut from the remote)' },
+  { field: 'Gitlink', flags: ['--gitlink'], home: `**Gitlink:** ${GITLINK_POLICIES.join('|')}`,
+    question: 'whether a superproject phase that lands also moves the submodule pointer (default bump)' },
+  { field: 'On conflict', flags: ['--conflict-policy'], home: `**Conflicts:** ${CONFLICT_POLICIES.join('|')}`,
+    question: 'what a landing that will not merge cleanly does (default halt)' },
+  { field: 'Isolation', flags: ['--isolation'], home: `- **Isolation:** ${ISOLATION_DIRECTIVES.join('|')}`,
+    question: "whether a phase gets a checkout of its own or uses the run's (default the run's)" },
+  { field: 'Clash zones', flags: ['--clash-zones'], home: '**Clash zones:** `path`, `path`',
+    question: 'paths two concurrent phases must never both touch, warned about before they do' },
+  { field: 'Repo capacity', flags: [], home: '**Capacity:** <n>',
+    question: 'how many isolated runs one repository may carry at once (default 3)' },
+  { field: 'Worktree retention', flags: [], home: `**Retention:** ${WORKTREE_RETENTION.join('|')}|ttl:<h>`,
+    question: "what becomes of a run's worktree when it settles (default keep-on-failure)" },
+  { field: 'Messaging', flags: ['--messaging'], home: `**Messaging:** ${MESSAGING_WORDS.join('|')}`,
+    question: 'whether sessions of this plan may message each other mid-phase (default on)' },
+  { field: 'Issues', flags: ['--issues'], home: `**Issues:** ${ISSUE_MODES.join('|')} and - **Issues:**`,
+    question: 'whether a session may open an issue for something outside its phase (default off)' },
   { field: 'Skills', flags: [], home: '**Skills (every session):**',
     question: 'skills every session re-invokes before implementing (default none)' },
   { field: 'Worktrees', flags: [], home: '- **Worktrees:** on|off',
@@ -83,8 +107,13 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
 export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
   '--lint': 'validates the plan; reads every field above and authors none',
   '--memory-block': "the board's five buckets, computed from the handoffs",
+  // Phase 3 (S8-a): what a DEPENDENT may build on — done AND QA-passed. A
+  // reading of the board and the QA table, authored by neither.
+  '--verified': 'the done set narrowed to phases whose QA verdict passes — computed, never written',
   '--qa-result': 'a recorded verdict, written by qa-record.sh after a review',
   '--qa-history': 'every recorded round, same source',
+  '--landing': 'a recorded landing, written by phase-landing.sh once the work actually moved',
+  '--notes': 'composes what a phase is handed by the phases before it — their handoff notes, their deferral rulings and the messages addressed to it',
   '--qa-prompt': "composes the reviewer's brief from the fields above",
   '--boot-prompt': "composes a session's boot prompt from the fields above (Skills reaches a session only through it)",
   '--plan-status': 'the frontmatter status, written by close-plan.sh, never asked',
@@ -95,6 +124,7 @@ export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
 export const MANIFEST_QUESTIONS: Readonly<Record<DecisionKey, string>> = Object.freeze({
   'permission.policy': "this plan's ask/deny/allow overlay and autoApprove (also a **Permissions:** line)",
   'permission.destructive': 'publishing and destructive verbs: deny, with named per-phase exceptions (**May publish:**)',
+  issues: `whether a session may open an issue it finds outside its phase: ${ISSUE_MODES.join('|')} (**Issues:**)`,
   credentials: 'the logins it needs (**Credentials:**) and whether a missing one parks a phase (**Credential policy:**)',
   accounts: 'which accounts may spend, each with a headroom floor (**Accounts:** `id:min`)',
   mcp: 'the MCP servers, and what a phase does when one will not connect (**MCP policy:**)',

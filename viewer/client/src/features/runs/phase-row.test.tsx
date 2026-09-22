@@ -11,7 +11,7 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { EvidenceLine, LivenessChip, RulingsChip } from './phase-row';
+import { ContextChip, EvidenceLine, LivenessChip, RulingsChip } from './phase-row';
 import type { EvidenceProof, LaneLiveness } from '@/lib/api';
 import { STALL_SIGNAL_META } from '@shared/attention-model.js';
 
@@ -96,6 +96,68 @@ describe('<LivenessChip>', () => {
       />,
     );
     expect(screen.getByText('Bash')).toBeInTheDocument();
+  });
+});
+
+/*
+ * autopilot-token-drain phase 3: what a live lane's session costs in context.
+ * The run that motivated it peaked at 957k with nothing on any surface saying so.
+ */
+describe('<ContextChip>', () => {
+  const tokens = {
+    context: 412_300,
+    peak: 455_000,
+    calls: 312,
+    rebuilds: 2,
+    input: 900,
+    cacheRead: 60_000_000,
+    cacheWrite: 700_000,
+    output: 90_000,
+    pollCalls: 17,
+    window: 1_000_000,
+  };
+
+  it('renders nothing before the session has made a call — or without a lane', () => {
+    const { container } = render(<ContextChip liveness={lane()} />);
+    expect(container).toBeEmptyDOMElement();
+    const { container: none } = render(<ContextChip liveness={undefined} />);
+    expect(none).toBeEmptyDOMElement();
+  });
+
+  it('shows the context now and at its peak, the rebuilds and the status checks', () => {
+    render(<ContextChip liveness={lane({ tokens })} />);
+    const chip = screen.getByText('412K ctx · peak 455K · 2 rebuilds · 17 polls');
+    expect(chip.getAttribute('title')).toMatch(/of a 1\.0M window \(41 %\)/);
+    expect(chip.getAttribute('title')).toMatch(/312 API calls/);
+    expect(chip).not.toHaveAttribute('data-stage');
+  });
+
+  it('leaves out what has not happened: no peak above now, no rebuilds, no polls', () => {
+    render(
+      <ContextChip liveness={lane({ tokens: { ...tokens, peak: 412_300, rebuilds: 0, pollCalls: 0 } })} />,
+    );
+    expect(screen.getByText('412K ctx')).toBeInTheDocument();
+  });
+
+  it('marks a session past the wrap-up line, and one being checkpointed', () => {
+    const { unmount } = render(
+      <ContextChip
+        liveness={lane({ tokens: { ...tokens, context: 612_000, peak: 612_000, stage: 'wrap-up' } })}
+      />,
+    );
+    const told = screen.getByText(/^612K ctx/);
+    expect(told).toHaveAttribute('data-stage', 'wrap-up');
+    expect(told.getAttribute('title')).toMatch(/told to wrap up/);
+    unmount();
+
+    render(
+      <ContextChip
+        liveness={lane({ tokens: { ...tokens, context: 812_000, peak: 812_000, stage: 'checkpoint' } })}
+      />,
+    );
+    const cut = screen.getByText(/^812K ctx/);
+    expect(cut).toHaveAttribute('data-stage', 'checkpoint');
+    expect(cut.getAttribute('title')).toMatch(/boards fresh/);
   });
 });
 

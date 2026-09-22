@@ -38,7 +38,11 @@ import { run, readMemoryBlock, readSessionPlan, type EngineResult, type PhaseSta
 import { loadGateVocab, gateKindOf } from '../server/analysis/gates.ts';
 import { parseQaRounds, parseTestStatus } from '../server/parse/folder.ts';
 import { nextQaRound } from '../server/qa-round.ts';
-import { parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor } from '../server/parse/plan.ts';
+import {
+  parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor,
+  landFor, gitlinkFor, issuesFor, isolationFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
+  type Plan,
+} from '../server/parse/plan.ts';
 import { mergeDecisions, formatDecisionsTsv, parseDecisionsTsv } from '../shared/decisions-model.js';
 import { readDecisions, readCredentials, readWaitBudget, readWaitsOn } from '../server/engine.ts';
 import { extractCommands } from '../server/runner/verify.ts';
@@ -1013,6 +1017,66 @@ test('the live plan library validates', { skip: !liveAvailable && 'no live plan 
  * The fixture corpus itself
  * ------------------------------------------------------------------ */
 
+/**
+ * The nine directives 5.1.0 adds, both parsers, every phase of every fixture.
+ *
+ * This family is the one that answers `value<TAB>source`, and the source token
+ * is the part worth pinning: everything above it either answers a bare word or
+ * a list, so a parser that resolved the levels in the wrong order would still
+ * print something plausible. Here it would print `hold` from the plan while the
+ * engine printed `hold` from the phase, and the only visible difference — the
+ * word the console uses to decide whether the wizard still has to ask — is the
+ * one a bare-word comparison would have thrown away.
+ */
+test('the two parsers agree about landing, isolation and issues — the word AND which level said it', async () => {
+  const perPhase: [string, (plan: Plan, phase: number) => { value: string; source: string } | undefined][] = [
+    ['--land', (plan, phase) => landFor(plan, phase)],
+    ['--gitlink', (plan, phase) => gitlinkFor(plan, phase)],
+    ['--issues', (plan, phase) => issuesFor(plan, phase)],
+    ['--isolation', (plan, phase) => isolationFor(plan, phase)],
+  ];
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      for (const [flag, read] of perPhase) {
+        const fromEngine = await engine(corpus, [slug, flag, String(phase)], `${slug} p${phase} ${flag}`);
+        const js = read(plan, phase);
+        // `--isolation` is the one arm that legitimately prints nothing: a
+        // phase that says nothing inherits the run, and the run is not in the
+        // plan. Both sides must say nothing, not one of them a default.
+        const fromJs = js === undefined ? '' : `${js.value}\t${js.source}`;
+        if (fromEngine !== fromJs) {
+          problems.push(`${slug} p${phase} ${flag}: JS ${JSON.stringify(fromJs)} vs engine ${JSON.stringify(fromEngine)}`);
+        }
+      }
+    });
+    assert.deepEqual(problems, [], `${corpus.name} directive mismatches:\n  ${problems.join('\n  ')}`);
+  });
+});
+
+test('the two parsers agree about the plan-wide directives — base branch, conflicts, messaging, clash zones', async () => {
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    for (const record of samplePlans(corpus)) {
+      const { slug } = record;
+      const plan = record.plan!;
+      const cases: [string, string][] = [
+        ['--base-branch', `${baseBranchOf(plan).value}\t${baseBranchOf(plan).source}`],
+        ['--conflict-policy', `${conflictPolicyOf(plan).value}\t${conflictPolicyOf(plan).source}`],
+        ['--messaging', `${messagingOf(plan).value}\t${messagingOf(plan).source}`],
+        ['--clash-zones', clashZonesOf(plan).join(', ')],
+      ];
+      for (const [flag, fromJs] of cases) {
+        const fromEngine = await engine(corpus, [slug, flag], `${slug} ${flag}`);
+        if (fromEngine !== fromJs) {
+          problems.push(`${slug} ${flag}: JS ${JSON.stringify(fromJs)} vs engine ${JSON.stringify(fromEngine)}`);
+        }
+      }
+    }
+    assert.deepEqual(problems, [], `${corpus.name} plan-wide directive mismatches:\n  ${problems.join('\n  ')}`);
+  });
+});
+
 test('the fixture corpus is real, and covers the divergences this suite exists for', () => {
   const files = safeList(FIXTURES).filter((f) => f.endsWith('.md') && !f.startsWith('bad-'));
   assert.ok(files.length > 15, `expected a real fixture corpus, saw ${files.length}`);
@@ -1028,6 +1092,7 @@ test('the fixture corpus is real, and covers the divergences this suite exists f
     'skilled.md', 'unbolded.md',  // the skills line, bolded and not
     'nested-verification.md', 'sibling-verification.md',  // both §Verification shapes
     'decisions.md', 'credentials.md',  // the decision manifest (with an undeclared gate) and the credential directives
+    'landing.md', 'messaging.md', 'issues.md',  // the 5.1.0 directives: plan-only, phase-only, both, and silence
   ]) {
     assert.ok(files.includes(required), `fixture ${required} is missing from the parity corpus`);
   }

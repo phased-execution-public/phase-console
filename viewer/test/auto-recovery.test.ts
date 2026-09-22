@@ -1909,6 +1909,75 @@ test('a landing resumes the phase\'s own session — the declaration SURVIVES, n
   } finally { s.cleanup(); }
 });
 
+/* ---- autopilot-token-drain phase 4: the resume policy on a stopped run ---- */
+
+const P4_HOUR = 60 * 60_000;
+
+/** A session's counters as `record.tokens` keeps them, ended `endedAgoMs` ago. */
+const tokensEnded = (sessionId: string, lastContext: number, endedAgoMs: number) => [{
+  mode: 'phase', attempt: 1, sessionId, resumed: false, model: 'claude-opus-5[1m]', window: 1_000_000,
+  calls: 300, lastContext, peakContext: lastContext, input: 600, cacheWrite: 900_000, cacheRead: 90_000_000,
+  output: 120_000, rebuilds: 0, account: 'default', endedAt: new Date(Date.now() - endedAgoMs).toISOString(),
+}];
+
+test('autopilot-token-drain P4: the healer offers no own-session rung for a session not worth resuming — it names why, and an unblock boards fresh', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    const resolve = (svc as unknown as {
+      resolveVehicle: (
+        rung: unknown, situation: unknown, record: unknown, evidence: unknown, slug: string, state: unknown,
+      ) => { vehicle?: { kind: string; brief?: string; mode?: string }; refused?: string };
+    }).resolveVehicle.bind(svc);
+    const cold = { phase: 4, status: 'failed', sessionId: 'sess-big', tokens: tokensEnded('sess-big', 681_000, 4 * P4_HOUR) };
+    const evidence = { phase: 4, handoff: { exists: true, outstanding: 'finish the parser' } };
+
+    const own = resolve({ vehicle: 'resume-own-session', params: { mode: 'continue' } }, { key: 'work-in-progress' }, cold, evidence, 'alpha', null);
+    assert.equal(own.vehicle, undefined, 'no --resume of a 681k session four hours cold');
+    assert.match(own.refused ?? '', /not worth resuming/);
+    assert.match(own.refused ?? '', /681k tokens of context/);
+    const closeout = resolve({ vehicle: 'closeout-own-session' }, { key: 'done-unrecorded' }, cold, evidence, 'alpha', null);
+    assert.match(closeout.refused ?? '', /not worth resuming/);
+    const unblock = resolve({ vehicle: 'unblock-session' }, { key: 'blocked-declared:unknown' }, cold, evidence, 'alpha', null);
+    assert.deepEqual(unblock.vehicle, { kind: 'reboard', brief: 'unblock' }, 'the unblock boards fresh with its brief');
+
+    const warm = { ...cold, tokens: tokensEnded('sess-big', 681_000, 2 * 60_000) };
+    const resumed = resolve({ vehicle: 'resume-own-session', params: { mode: 'continue' } }, { key: 'work-in-progress' }, warm, evidence, 'alpha', null);
+    assert.equal(resumed.vehicle?.kind, 'session', 'a warm session is resumed as before');
+  } finally { s.cleanup(); }
+});
+
+test('autopilot-token-drain P4: a landing for a session not worth resuming re-boards the phase fresh with the landing as its brief — never --resume', async () => {
+  const s = scratch();
+  try {
+    const state = declaredParkRun(s.root);
+    state.phases['2'].tokens = tokensEnded('sess-own-1', 700_000, 3 * P4_HOUR);
+    saveRun(state);
+    const svc = service(s.root);
+    const resumed: unknown[] = [];
+    const retried: { phase: number; addendum?: string }[] = [];
+    (svc as unknown as Record<string, unknown>).recoverPhase = async (...args: unknown[]) => { resumed.push(args); return null; };
+    (svc as unknown as Record<string, unknown>).retryPhase = async (
+      _slug: string, phase: number, override?: { addendum?: string },
+    ) => {
+      retried.push({ phase, addendum: override?.addendum });
+      return loadRun(s.root, 'alpha', state.id);
+    };
+
+    const live = loadRun(s.root, 'alpha', state.id)!;
+    await (svc as unknown as {
+      onWatchLanded: (slug: string, st: RunState, phase: number, landed: { ref: string; state: string; detail?: string }) => Promise<void>;
+    }).onWatchLanded('alpha', live, 2, { ref: OUTAGE_REFS[0], state: 'landed', detail: 'completed: success' });
+
+    assert.equal(resumed.length, 0, 'the 700k session is not resumed');
+    assert.equal(retried.length, 1, 'the phase is re-boarded fresh instead');
+    assert.equal(retried[0].phase, 2);
+    assert.match(retried[0].addendum ?? '', /has landed: gh:acme\/app#run\/33123610977/, 'carrying what landed');
+    assert.match(retried[0].addendum ?? '', /700k tokens of context/, 'and why its session is not resumed');
+    assert.equal(loadRun(s.root, 'alpha', state.id)!.phases['2'].watchResumes, 1, 'counted like any delivery');
+  } finally { s.cleanup(); }
+});
+
 /**
  * A clock for driving `WatchScheduler.tick()` by hand: its timers never fire,
  * so nothing races the test and nothing holds the process open.
@@ -3053,5 +3122,112 @@ test('RCV-10: a declared blocker on the outside world with no ref parks on the l
     const waiting = events.find((e) => e.event === 'phase.waiting')!;
     assert.deepEqual({ by: waiting.data.by, rung: waiting.data.rung, wait: waiting.data.wait }, { by: 'ladder', rung: 'timed-park', wait: 'external' });
     assert.ok(events.some((e) => e.event === 'phase.rung' && e.data.rung === 'timed-park' && e.data.vehicle === 'timed-park'));
+  } finally { s.cleanup(); }
+});
+
+
+/* ── G-PIN12 — the seven mutation-proved pins from the phase-12 QA report ─────
+ * `console-parallel-repaint` phase 12's QA round found five arms the phase had
+ * changed with no test that bites: reverting each left the phase's own suites
+ * green. QA wrote the pins, mutation-proved every one of them RED against the
+ * committed code — and did not commit them, because a QA round's job is the
+ * verdict. They have sat in an appendix ever since, which is the same as not
+ * existing: the arms are unguarded and the next refactor takes them silently.
+ * Adopted here verbatim in intent, adjusted only where this tree's helpers
+ * have moved on. */
+test('P12-QA anchor arm (true): a run with NO candidate whose halt phase reads a person\'s or machine\'s situation writes the errand once and lets it stand', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    // No candidate: the only record is phase 3, which the board reads `waiting`
+    // (2 is not done) and no child is driving — `classifyOpenPhases` skips it
+    // and the healer falls to the anchor arm on `halt.phase`.
+    const state = haltedRun(s.root);
+    delete state.phases['2'];
+    const rec = phaseRecord(state, 3);
+    rec.status = 'failed';
+    state.activePhase = 3;
+    state.halt = { at: new Date().toISOString(), reason: 'phase 3 did not verify: 1 of 2 command(s) failed — npm test', phase: 3, kind: 'verify-failed' };
+    saveRun(state);
+    const announced: unknown[] = [];
+    (svc as never as Record<string, unknown>).announceErrand = (d: unknown) => { announced.push(d); };
+
+    const first = await svc.maybeAutoRecover('alpha');
+    assert.equal(first.launched, false, first.reason);
+    assert.match(first.reason ?? '', /is a person's to settle$/, 'the anchor arm, not the exhaustion path');
+    const written = loadRun(s.root, 'alpha', state.id)!.recoveries?.['3']?.errand;
+    assert.ok(written, 'the anchor arm writes the errand');
+    assert.equal(announced.length, 1);
+
+    const second = await svc.maybeAutoRecover('alpha');
+    assert.match(second.reason ?? '', /is a person's to settle \(the errand has stood since/);
+    const after = loadRun(s.root, 'alpha', state.id)!.recoveries?.['3']?.errand;
+    assert.equal(after?.at, written!.at, 'the clock survives');
+    assert.equal(announced.length, 1, 'no second push');
+    const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${state.id}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string });
+    assert.equal(journal.filter((j) => j.event === 'phase.errand').length, 1, 'one journal line');
+  } finally { s.cleanup(); }
+});
+
+test('P12-QA exhaustion arm: a CHANGED ask is news — a rung climbed since is written again with a fresh clock, a second line and a second push', async () => {
+  const s = scratch();
+  try {
+    const svc = service(s.root);
+    stubMint(svc);
+    const state = haltedRun(s.root);
+    state.recoveries = { 2: { attempts: 5, lastAt: new Date().toISOString() } };
+    saveRun(state);
+    const announced: unknown[] = [];
+    (svc as never as Record<string, unknown>).announceErrand = (d: unknown) => { announced.push(d); };
+
+    const first = await svc.maybeAutoRecover('alpha');
+    assert.equal(first.launched, false, first.reason);
+    const written = loadRun(s.root, 'alpha', state.id)!.recoveries?.['2']?.errand;
+    assert.ok(written);
+    assert.deepEqual(written!.tried, []);
+    assert.equal(announced.length, 1);
+
+    // Between sweeps a rung lands on the record: the ask's `tried` changes.
+    (svc as never as { editStoredRunById: (slug: string, id: string, f: (st: RunState) => void) => unknown })
+      .editStoredRunById('alpha', state.id, (stored) => {
+        stored.recoveries!['2'].rungs = [{ situation: 'verify-red', rung: 'fix-agent', at: new Date(Date.now() - 1000).toISOString(), outcome: 'failed' }];
+      });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = await svc.maybeAutoRecover('alpha');
+    assert.equal(second.launched, false, second.reason);
+    assert.doesNotMatch(second.reason ?? '', /has stood since/, 'a changed ask is not a standing one');
+    const after = loadRun(s.root, 'alpha', state.id)!.recoveries?.['2']?.errand;
+    assert.deepEqual(after!.tried, ['fix-agent → failed'], 'the new tried list is on the card');
+    assert.notEqual(after!.at, written!.at, 'with a fresh clock');
+    assert.equal(announced.length, 2, 'and a second push');
+    const journal = readFileSync(join(runDir(s.root, 'alpha'), `run-${state.id}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line) as { event: string });
+    assert.equal(journal.filter((j) => j.event === 'phase.errand').length, 2);
+  } finally { s.cleanup(); }
+});
+
+test('P12-QA healer: a declared needs-human whose reason is the console\'s own wall heals its errand with the policy remedy — no refs, no watch note', async () => {
+  const s = scratch();
+  try {
+    const WALL = "Edit/Write on .claude/** is permission-denied in this unattended session ('sensitive file'); run the edits by hand.";
+    const state = declaredParkRun(s.root);
+    const record = state.phases['2'];
+    record.note = WALL;
+    delete record.watch;
+    record.declared = { status: 'needs-human', reason: WALL, at: new Date().toISOString() };
+    state.halt = { ...state.halt!, reason: `phase 2 needs a person: ${WALL}` };
+    saveRun(state);
+    const svc = service(s.root);
+    const out = await svc.maybeAutoRecover('alpha');
+    assert.equal(out.launched, false, out.reason);
+    assert.match(out.reason ?? '', /declared needs-human/);
+    assert.match(out.reason ?? '', /a person's to settle/);
+    const slot = loadRun(s.root, 'alpha', state.id)!.recoveries!['2']!;
+    assert.equal(slot.errand!.situation, 'blocked-declared:permission');
+    assert.equal(slot.errand!.need, WALL);
+    assert.match(slot.errand!.how, /Settings ▸ Permissions/);
+    assert.doesNotMatch(slot.errand!.how, /watching its refs/);
   } finally { s.cleanup(); }
 });

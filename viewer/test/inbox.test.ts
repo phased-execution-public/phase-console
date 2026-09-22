@@ -680,6 +680,20 @@ test('a recent ruling is an fyi row keyed on the PHASE, not the ruling', () => {
   assert.deepEqual(row.actions, [], 'seeing it IS the interaction');
 });
 
+test('a deferral says who it was left for, so the row is an address and not just a label', () => {
+  // `Deferral` alone says a session left something; it does not say the thing
+  // is waiting for phase 7, which is the only part an operator can act on.
+  const row = (value: string | undefined) => buildInbox(
+    { rulings: [{ ...RULING, kind: 'deferral', what: 'left the second decoder', for: value }], acks: {} },
+    NOW,
+  ).items[0];
+  assert.match(row('9').title, /deferred to phase 9/i);
+  assert.match(row('next').title, /deferred to the next phase/i);
+  assert.match(row('all').title, /deferred to every later phase/i);
+  // A deferral written before `--for` existed still reads — it just says less.
+  assert.match(row(undefined).title, /Deferral/);
+});
+
 test('several rulings on one phase collapse to ONE row that counts the rest', () => {
   const three = [
     RULING,
@@ -2144,6 +2158,7 @@ test('instance health: under --remote, Tailscale stopped and Serve pointing else
   assert.equal(buildInbox(ours, NOW).items.length, 0);
 });
 
+
 test('instance health: an orphaned sibling and a sibling with no live process are needs-you; one stopped on purpose is not', () => {
   const sibling = (over: Record<string, unknown>) => ({
     id: '3a3a6ca6-tour', name: 'tour', root: '/tmp/tour', liveness: 'stopped', discrepancies: [] as string[],
@@ -2172,4 +2187,211 @@ test('instance health: an orphaned sibling and a sibling with no live process ar
   assert.equal(buildInbox(facts([sibling({ stoppedAt: '2026-09-13T04:12:17.000Z' })]), NOW).items.length, 0,
     'a foreground console closed cleanly is not down — nothing was meant to keep it up');
   assert.equal(buildInbox(facts([sibling({ liveness: 'running' })]), NOW).items.length, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 7 — clash zones: the pairs that merge CLEANLY and are wrong
+ * afterwards.
+ * ------------------------------------------------------------------ */
+
+const ZONED = {
+  a: 'pe/alpha', b: 'pe/beta', state: 'overlap',
+  files: ['package-lock.json'], zones: ['**/package-lock.json'],
+};
+
+test('P7 — a clash zone raises ONE `fyi` row, beside the conflict rows and never instead of them', () => {
+  // 🔴 `overlap`, not `conflicted`: git would merge these two happily, which
+  // is exactly the problem. A radar that only spoke at `conflicted` would say
+  // nothing until the lockfile was already wrong.
+  const raised = conflicts({ git: [{ ...OLDER, radar: [ZONED] }, { ...YOUNGER, radar: [ZONED] }] });
+
+  assert.equal(raised.length, 1, 'both probes carry the pair; the operator is told once');
+  const [item] = raised;
+  assert.equal(item.severity, 'fyi', 'nothing is broken yet — a needs-you row here teaches people to stop reading');
+  assert.match(item.title, /both branches are editing a clash zone/);
+  assert.match(item.need, /package-lock\.json/);
+  assert.equal(item.slug, 'beta', 'the YOUNGER run is the one worth serializing');
+  assert.equal(item.actions.find((action) => action.verb === 'serialize')?.label, 'Serialize beta');
+});
+
+test('P7 — a zoned pair that is ALSO conflicted produces both rows, and they are different cards', () => {
+  const both = { ...ZONED, state: 'conflicted' };
+  const raised = conflicts({ git: [{ ...OLDER, radar: [both] }, { ...YOUNGER, radar: [both] }] });
+
+  assert.equal(raised.length, 2, 'a conflict and a zone are two things to say about one pair');
+  assert.deepEqual(
+    raised.map((item) => item.severity).sort(), ['fyi', 'needs-you'],
+    'and they are not the same severity, which is why they are not one row',
+  );
+  // Distinct subjects, so acknowledging one does not silence the other.
+  assert.equal(new Set(raised.map((item) => item.id)).size, 2);
+});
+
+test('P7 — a pair with no zones raises no zone row at all', () => {
+  const raised = conflicts({ git: bothSee(CONFLICT) });
+  assert.deepEqual(raised.map((item) => item.severity), ['needs-you']);
+});
+
+/* ------------------------------------------------------------------ *
+ * issue-draft — a session's draft, held for a person (phase 12)
+ * ------------------------------------------------------------------ */
+
+const DRAFT = {
+  id: 'abcdefabcdef', slug: 'demo', phase: 3, action: 'file', repo: 'phased-execution',
+  title: 'phase-lock.sh drops the lease on a slow disk', where: 'scripts/phase-lock.sh:212',
+  state: 'pending-approval', stateAt: '2026-08-22T11:00:00.000Z', runId: 'r1',
+};
+
+test('a pending-approval draft is a needs-you row with Approve, Discard and two Edits, keyed on the draft id', () => {
+  const { items } = buildInbox({ issueDrafts: [DRAFT], flags: { allowPublish: true }, acks: {} }, NOW);
+  assert.equal(items.length, 1);
+  const [row] = items;
+  assert.equal(row.kind, 'issue-draft');
+  assert.equal(row.severity, 'needs-you');
+  assert.equal(row.id, inboxItemId({ kind: 'issue-draft', slug: 'demo', phase: 3, runId: 'r1', subject: 'abcdefabcdef' }));
+  assert.match(row.title, /demo phase 3 — file an issue on phased-execution/);
+  assert.match(row.title, /phase-lock\.sh drops the lease/);
+  assert.match(row.need, /scripts\/phase-lock\.sh:212/);
+  assert.match(row.how, /Approve files it/);
+  assert.equal(row.since, DRAFT.stateAt);
+  assert.equal(row.href, '#/plan/demo/phase/3');
+  assert.deepEqual(row.actions.map((a) => [a.verb, a.method, a.endpoint]), [
+    ['approve', 'POST', '/api/run/demo/issues/abcdefabcdef/file'],
+    ['discard', 'POST', '/api/run/demo/issues/abcdefabcdef/discard'],
+    ['edit-title', 'POST', '/api/run/demo/issues/abcdefabcdef/edit'],
+    ['edit-body', 'POST', '/api/run/demo/issues/abcdefabcdef/edit'],
+  ]);
+  assert.equal(row.actions[0].flag, undefined, 'the flag is on, so Approve is pressable');
+  assert.deepEqual(row.actions[2].says, { field: 'title', label: 'New title', placeholder: DRAFT.title });
+  assert.equal(row.actions[3].says?.field, 'body');
+});
+
+test('with --allow-publish off the Approve action carries the flag and the row says so', () => {
+  const { items } = buildInbox({ issueDrafts: [DRAFT], flags: {}, acks: {} }, NOW);
+  const [row] = items;
+  assert.equal(row.actions[0].flag, 'publish');
+  assert.equal(row.actions[1].flag, undefined, 'Discard needs no capability');
+  assert.match(row.how, /--allow-publish/);
+});
+
+test('a comment and a close draft name their number; a close held for the landing is fyi with Discard alone', () => {
+  const { items } = buildInbox({
+    issueDrafts: [
+      { ...DRAFT, id: 'bbbbbbbbbbbb', action: 'comment', number: 17, text: 'seen again from phase 3', title: undefined, where: undefined },
+      { ...DRAFT, id: 'cccccccccccc', action: 'close', number: 12, reason: 'fixed in 9159e249', title: undefined, where: undefined, state: 'pending-landing', note: 'held until phase 3 has landed (pr)' },
+    ],
+    flags: { allowPublish: true }, acks: {},
+  }, NOW);
+  assert.equal(items.length, 2);
+  const comment = items.find((i) => i.severity === 'needs-you')!;
+  const close = items.find((i) => i.severity === 'fyi')!;
+  assert.match(comment.title, /comment on phased-execution#17/);
+  assert.match(comment.need, /seen again from phase 3/);
+  assert.match(close.title, /close phased-execution#12/);
+  assert.match(close.title, /waits for phase 3 to land/);
+  assert.match(close.need, /fixed in 9159e249/);
+  assert.match(close.how, /held until phase 3 has landed/);
+  assert.deepEqual(close.actions.map((a) => a.verb), ['discard']);
+});
+
+test('every other state raises nothing — filed, discarded, duplicate, over-budget, failed, drafted', () => {
+  const states = ['drafted', 'duplicate', 'filing', 'filed', 'commented', 'closed', 'discarded', 'over-budget', 'failed'];
+  const { items } = buildInbox({
+    issueDrafts: states.map((state, i) => ({ ...DRAFT, id: `${i}`.repeat(12), state })),
+    flags: { allowPublish: true }, acks: {},
+  }, NOW);
+  assert.deepEqual(items, []);
+});
+
+test('a draft of a closed plan raises nothing, and an acked row hides', () => {
+  const closed = buildInbox({ issueDrafts: [DRAFT], plans: [{ slug: 'demo', closed: true } as never], acks: {} }, NOW);
+  assert.deepEqual(closed.items, []);
+  const id = inboxItemId({ kind: 'issue-draft', slug: 'demo', phase: 3, runId: 'r1', subject: 'abcdefabcdef' });
+  const acked = buildInbox({ issueDrafts: [DRAFT], acks: { [id]: { at: '2026-08-22T11:30:00.000Z' } } }, NOW);
+  assert.deepEqual(acked.items, []);
+});
+
+/* ------------------------------------------------------------------ *
+ * message — what a session said to the OPERATOR (phase 15, over phase 10's
+ * `operator:` address, which was delivered to "the inbox" and rendered nowhere)
+ * ------------------------------------------------------------------ */
+
+const ASK = {
+  id: 'aaaaaaaaaaaa', slug: 'demo', phase: 4, kind: 'ask', from: 'phase:demo/4', to: 'operator:',
+  text: 'The plan names release/5.1 as the base but origin has no such branch — fork from main?',
+  state: 'delivered', priority: 'normal', writtenAt: '2026-09-21T10:00:00.000Z', runId: 'r1',
+};
+
+test('an ask addressed to the operator is a needs-you row with Answer (a reply, with the text) and Mark seen (an ack)', () => {
+  const { items } = buildInbox({ messages: [ASK], flags: { allowRun: true }, acks: {} }, NOW);
+  assert.equal(items.length, 1);
+  const [row] = items;
+  assert.equal(row.kind, 'message');
+  assert.equal(row.severity, 'needs-you');
+  assert.equal(row.id, inboxItemId({ kind: 'message', slug: 'demo', phase: 4, runId: 'r1', subject: 'aaaaaaaaaaaa' }));
+  assert.match(row.title, /demo phase 4 asks you/);
+  assert.match(row.need, /origin has no such branch/);
+  assert.match(row.how, /Answer/);
+  assert.equal(row.since, ASK.writtenAt);
+  assert.equal(row.href, '#/plan/demo/phase/4');
+  assert.deepEqual(row.actions.map((a) => [a.verb, a.method, a.endpoint]), [
+    ['answer', 'POST', '/api/run/demo/messages/aaaaaaaaaaaa/reply'],
+    ['seen', 'POST', '/api/run/demo/messages/aaaaaaaaaaaa/ack'],
+  ]);
+  // The reply goes back to the sender, and the words are the person's own.
+  assert.deepEqual(row.actions[0].body, { to: 'phase:demo/4', phase: 4 });
+  assert.deepEqual(row.actions[0].says, { field: 'text', label: 'Your answer', placeholder: 'What the session should know' });
+  assert.equal(row.actions[0].flag, undefined, 'the run flag is on, so Answer is pressable');
+  assert.equal(row.actions[1].says, undefined, 'an ack carries no words');
+});
+
+test('a NOTE to the operator is fyi with Mark seen alone; a high-priority ask is urgent', () => {
+  const { items } = buildInbox({
+    messages: [
+      { ...ASK, id: 'bbbbbbbbbbbb', kind: 'note', text: 'Landed the schema; the wizard order is pinned.' },
+      { ...ASK, id: 'cccccccccccc', priority: 'high' },
+    ],
+    flags: { allowRun: true }, acks: {},
+  }, NOW);
+  assert.equal(items.length, 2);
+  const idOf = (subject: string) => inboxItemId({ kind: 'message', slug: 'demo', phase: 4, runId: 'r1', subject });
+  const note = items.find((i) => i.id === idOf('bbbbbbbbbbbb'))!;
+  const urgent = items.find((i) => i.id === idOf('cccccccccccc'))!;
+  assert.equal(note.severity, 'fyi');
+  assert.match(note.title, /demo phase 4 says/);
+  assert.deepEqual(note.actions.map((a) => a.verb), ['seen']);
+  assert.equal(urgent.severity, 'urgent');
+});
+
+test('without --allow-run the Answer action carries the flag and the row says so; Mark seen needs nothing', () => {
+  const { items } = buildInbox({ messages: [ASK], flags: {}, acks: {} }, NOW);
+  const [row] = items;
+  assert.equal(row.actions[0].flag, 'run');
+  assert.equal(row.actions[1].flag, undefined);
+  assert.match(row.how, /--allow-run/);
+});
+
+test('a message that is acked, answered, expired or refused raises nothing, and one to a phase never does', () => {
+  const { items } = buildInbox({
+    messages: [
+      { ...ASK, id: '111111111111', state: 'acked' },
+      { ...ASK, id: '222222222222', state: 'expired' },
+      { ...ASK, id: '333333333333', state: 'refused' },
+      { ...ASK, id: '444444444444', to: 'phase:demo/5' },
+      // Answered: a reply names it, so the ask is closed even though its own
+      // state never moved.
+      { ...ASK, id: '555555555555' },
+      { ...ASK, id: '666666666666', kind: 'reply', from: 'operator:', to: 'phase:demo/4', replyTo: '555555555555', state: 'delivered' },
+    ],
+    flags: { allowRun: true }, acks: {},
+  }, NOW);
+  assert.deepEqual(items, []);
+});
+
+test('a message of a closed plan raises nothing, and an acked row hides', () => {
+  const closed = buildInbox({ messages: [ASK], plans: [{ slug: 'demo', closed: true } as never], acks: {} }, NOW);
+  assert.deepEqual(closed.items, []);
+  const id = inboxItemId({ kind: 'message', slug: 'demo', phase: 4, runId: 'r1', subject: 'aaaaaaaaaaaa' });
+  const acked = buildInbox({ messages: [ASK], acks: { [id]: { at: '2026-09-21T10:30:00.000Z' } } }, NOW);
+  assert.deepEqual(acked.items, []);
 });

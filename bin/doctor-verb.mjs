@@ -42,10 +42,10 @@ const USAGE = [
 ].join('\n');
 
 /** `execFile` with stdout kept and a timeout the runtime enforces. */
-function run(file, args, timeoutMs = 10_000) {
+function run(file, args, timeoutMs = 10_000, cwd) {
   return new Promise((done) => {
     try {
-      execFile(file, args, { timeout: timeoutMs, windowsHide: true }, (error, stdout, stderr) => {
+      execFile(file, args, { timeout: timeoutMs, windowsHide: true, ...(cwd ? { cwd } : {}) }, (error, stdout, stderr) => {
         if (!error) { done({ code: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') }); return; }
         const code = typeof error.code === 'number' ? error.code : null;
         done({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? error.message ?? '') });
@@ -177,7 +177,7 @@ export async function doctorVerb(argv, ctx) {
   let report = asked.report ?? null;
   if (!report) {
     const { hooksStatus } = await load('hooks-install');
-    const { environmentReport } = await load('env-doctor');
+    const { environmentReport, probeGit } = await load('env-doctor');
     const { probeAccounts, probeCredentials, probeDelivery } = await load('prelude');
     const { probeCredential } = await load('credentials-probe');
     const stateDir = instance ? instances.instanceStateDir(instance.id, instance.default) : null;
@@ -223,6 +223,16 @@ export async function doctorVerb(argv, ctx) {
         const verdict = await probeCredential('gh', probeDeps);
         return { status: verdict.status, ok: verdict.status !== 'fail', reason: verdict.reason };
       },
+      // A console that answered `/api/doctor` reported its own flags in its
+      // own rows above; this offline path has no process holding the flag, so
+      // off is the truth here.
+      publish: () => false,
+      // Under THIS process's PATH, which is a person's shell rather than the
+      // launch agent's — so a `doctor` run by hand and one asked of the console
+      // can legitimately disagree, and that disagreement is itself errand E7's
+      // signature. `run()` resolves `code: null` when a binary is absent, which
+      // is the shape the probe reads as "not on PATH".
+      git: () => probeGit((file, args, opts) => run(file, args, 10_000, opts?.cwd), instance?.root ?? null),
       environment: () => environmentReport(),
       console: async () => asked.state ?? null,
     };

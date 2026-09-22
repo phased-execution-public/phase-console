@@ -31,12 +31,24 @@ import type { DecisionKey } from '../shared/decisions-model.js';
 import { sanitiseSchedule, type SchedulePolicy } from '../shared/schedule-policy.js';
 import {
   DEFAULT_SETTLE, isolationMode, settleOf, WORKTREE_DEFAULTS, reclaimModeOf,
+  DEFAULT_ISOLATION_FOR_NEW_BRANCH, DEFAULT_MAX_PER_REPO, DEFAULT_RETENTION,
+  ISOLATED, retentionOf,
   type IsolationReclaim,
   type IsolationMode, type SettleStrategy,
   worktreeRootOf,
   type WorktreeRoot,
 } from '../shared/worktree-model.js';
+import {
+  CONFLICT_POLICIES, DEFAULT_BASE_BRANCH, DEFAULT_CONFLICT, DEFAULT_LAND, LAND_POLICIES,
+} from '../shared/landing-model.js';
+import { DEFAULT_MESSAGING, MESSAGING_WORDS } from '../shared/message-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES } from '../shared/issues-model.js';
 import { sanitiseCategories, type CategoryId } from './push/catalogue.ts';
+// A value import, and it is safe because `retention-policy.ts` imports nothing.
+// The sweeper itself (`retention.ts`) logs, so it reaches `log.ts`, which reads
+// the log path from here — importing the sweeper would close that ring. The
+// table moved down to a leaf for exactly that reason, as `run-paths.ts` did.
+import { RETENTION_DEFAULTS, type RetentionPolicy, sanitiseRetention } from './retention-policy.ts';
 // Type-only, and it must stay that way: `runner/state.ts` imports `STATE_DIR`
 // from here at runtime, so a value import would close the cycle. Node erases
 // `import type` before it ever resolves the specifier.
@@ -129,6 +141,23 @@ export type Flags = {
    * is display, and the URLs are never served back anyway.
    */
   allowWebhooks: boolean;
+  /**
+   * `--allow-publish` — the console may make OUTWARD WRITES on the repository's
+   * behalf: push a `pe/*` branch (`runner/worktree.ts` §`pushRef`, the one
+   * seam) so a phase's landing does not depend on a session being resumable,
+   * and — once the issues estate lands — file, comment on and close issues
+   * (many-plans-one-repo decision 20).
+   *
+   * The eighth capability flag, and the second that leaves the machine: where
+   * `--allow-webhooks` sends an ANNOUNCEMENT somewhere else, this sends the
+   * WORK. So it is narrowed twice more before anything happens — the plan's
+   * `permission.destructive` row must allow `git push` for the console to push
+   * that plan's branches, and its `Issues:` line must say `file` for the console
+   * to file — and it is off by default, with a `doctor` row that says so.
+   * It never widens a session: the landing session still opens the pull
+   * request itself, under the same asks it always had.
+   */
+  allowPublish: boolean;
   /**
    * Hostnames this console answers to besides localhost, reached through an
    * authenticating proxy that puts the caller's identity in a header.
@@ -479,6 +508,7 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     allowAccounts: false,
     allowMcp: false,
     allowWebhooks: false,
+    allowPublish: false,
     remoteHosts: [],
     remoteUsers: splitList(process.env.PHASE_CONSOLE_REMOTE_USERS),
     scriptsDir: join(SKILL_DIR, 'scripts'),
@@ -506,6 +536,7 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     else if (arg === '--allow-accounts') flags.allowAccounts = true;
     else if (arg === '--allow-mcp') flags.allowMcp = true;
     else if (arg === '--allow-webhooks') flags.allowWebhooks = true;
+    else if (arg === '--allow-publish') flags.allowPublish = true;
     else if (arg === '--remote') flags.remoteHosts.push(...splitList(next()));
     else if (arg === '--remote-user') { usersFromFlag = true; flags.remoteUsers.push(...splitList(next())); }
     else if (arg === '--scripts') flags.scriptsDir = resolve(expandHome(next() ?? ''));
@@ -513,6 +544,11 @@ export function parseFlags(argv: string[], instance: Instance = INSTANCE): Flags
     // Repeatable and additive to the environment, like --remote: an operator
     // adding one for a session should not have to restate what the plist bakes in.
     else if (arg === '--default-skills') flags.defaultSkills.push(...splitList(next()));
+    // Not a `Flags` field: it sets the environment the log reads, so one flag
+    // and one variable cannot disagree, and `POST /api/debug/level` overrides
+    // either of them at runtime without a restart.
+    else if (arg === '--log-level') process.env.PHASE_CONSOLE_LOG_LEVEL = (next() ?? '').trim();
+    else if (arg === '--debug') process.env.PHASE_CONSOLE_DEBUG = (next() ?? '').trim();
     else if (arg === '--log-file') flags.logFile = resolve(expandHome(next() ?? ''));
     else if (arg === '--no-log-file') flags.logFile = null;
     else if (arg === '--help' || arg === '-h') { printHelp(); process.exit(0); }
@@ -697,17 +733,21 @@ export function isLoopbackHost(host: string): boolean {
 
 /**
  * The capability flags, worst blast radius first — the order a refusal names
- * them in. One list, so an eighth flag cannot be added without appearing here.
+ * them in. One list, so a ninth flag cannot be added without appearing here.
  *
- * `--allow-webhooks` sits below the session-spawning flags and above writes: it
- * cannot run anything, but unlike a write it leaves the machine, and on a wide
- * bind it is the one that turns an open port into somebody else's outbound
- * request generator.
+ * `--allow-publish` sits right under the session-spawning flags: it is the one
+ * flag that puts this repository's WORK somewhere other people build on (a
+ * pushed branch, a filed issue), which is a wider act than an announcement
+ * and a narrower one than a session that edits for hours.
+ * `--allow-webhooks` sits below it and above writes: it cannot run anything,
+ * but unlike a write it leaves the machine, and on a wide bind it is the one
+ * that turns an open port into somebody else's outbound request generator.
  */
 const CAPABILITY_FLAGS: ReadonlyArray<readonly [string, (flags: Flags) => boolean]> = [
   ['--allow-run', (f) => f.allowRun],
   ['--allow-terminal', (f) => f.allowTerminal],
   ['--allow-agent', (f) => f.allowAgent],
+  ['--allow-publish', (f) => f.allowPublish],
   ['--allow-accounts', (f) => f.allowAccounts],
   ['--allow-mcp', (f) => f.allowMcp],
   ['--allow-webhooks', (f) => f.allowWebhooks],
@@ -824,6 +864,13 @@ function printHelp(): void {
                     Telegram, your own relay). Off means no outbound request is
                     made at all, whatever is registered.
                     See ${DOCS_URL}/webhooks.md
+  --allow-publish   enable outward writes on the repository's behalf: push a
+                    finished phase's \`pe/*\` branch (never a trunk, never with
+                    force) and, where a plan says so, file issues. Narrowed by
+                    each plan's permission.destructive row and Issues: line; off
+                    means the console pushes nothing and files nothing, and a
+                    landing that needs a push parks with the reason.
+                    See ${DOCS_URL}/safety-rails.md
   --remote <host>   also answer to this hostname, fronted by an authenticating
                     proxy (e.g. \`tailscale serve\`). Repeatable. Turns on strict
                     Host checking, so any other Host is refused.
@@ -840,6 +887,8 @@ function printHelp(): void {
   --scripts <dir>   phased-execution scripts dir (default: the skill this lives in)
   --log-file <p>    structured log (default ${defaultLogFile()})
   --no-log-file     log to stderr only
+  --log-level <l>   debug | info | warn | error (default info)
+  --debug <list>    debug channels: git,engine,http,shell,scheduler,sessions,retention,trace or *
 `);
 }
 
@@ -895,7 +944,12 @@ export function staticRootDir(): string | null {
  * Is the code on disk newer than the code we are running?
  * ------------------------------------------------------------------ */
 
-const BOOTED_AT = Date.now();
+/**
+ * When this process started. Also this process's identity on `/api/state`
+ * (`bootedAt`): the Restart dialog reloads the page once the console answers
+ * with a DIFFERENT one, rather than guessing how long a restart takes.
+ */
+export const BOOTED_AT = Date.now();
 let mtimeCache: { at: number; newest: number } | null = null;
 
 /**
@@ -1023,6 +1077,57 @@ export type Prefs = {
    * directory. `shared/worktree-model.js` §`WORKTREE_ROOTS`.
    */
   worktreeRoot?: WorktreeRoot;
+  /**
+   * How many ISOLATED runs this console may hold in ONE repository at once.
+   *
+   * `worktreeMaxConcurrent` beside it is about the machine's disk — every
+   * managed tree, wherever it stands — and it cannot express the thing two
+   * plans in one repository actually contend for: the repository's own object
+   * database, its index locks, and an operator's ability to understand what is
+   * happening in it. A console driving eight plans across eight repositories
+   * is doing nothing unusual; eight isolated runs in ONE is a repository
+   * nobody can read. Both caps apply, and the narrower one answers first.
+   */
+  maxConcurrentPerRepo?: number;
+  /**
+   * What becomes of a run's worktree when the run settles —
+   * `shared/worktree-model.js` §`WORKTREE_RETENTION`, plus `ttl:<h>`.
+   */
+  worktreeRetention?: string;
+  /**
+   * The base a run branch is cut from when the plan does not say.
+   *
+   * The plan's own `**Base branch:**` outranks it (`parse/plan.ts`
+   * §`baseBranchOf`), because a plan's statement is versioned and describes the
+   * work; this is the console's answer for every plan that is silent, and the
+   * shipped value is what the code already did — the repository's default
+   * branch.
+   */
+  baseBranch?: string;
+  /**
+   * Serialise a `conflicted` radar pair by landing order (many-plans-one-repo
+   * phase 9): when on, a phase whose branch the repository's radar measured
+   * as conflicting with another live phase's waits behind a `radar` holder
+   * until the one the landing order puts first has landed, journalled
+   * `phase.radar-hold`. OFF in 5.1 — the radar stays advisory, exactly as it
+   * was — and a FREE preference like the flag beside it: a free console has
+   * no radar, so the switch does nothing there and says so.
+   */
+  radarSerialize?: boolean;
+  /**
+   * The launch form's opening values for four of phase 15's run fields — what
+   * a run gets when its plan is silent AND the operator names nothing. Each is
+   * a word from its shared owner (`LAND_POLICIES`, `CONFLICT_POLICIES`,
+   * `MESSAGING_WORDS`, `ISSUE_MODES`), shipped at the owner's own default:
+   * commits are held for a person, a conflict halts, sessions may message,
+   * and an outward write is never a default. The plan's line outranks all
+   * four; the run door resolves them for a fresh run exactly as `isolation`
+   * is resolved (`service-runs.ts` §`startRun`).
+   */
+  landing?: string;
+  conflictPolicy?: string;
+  messaging?: string;
+  issuesMode?: string;
   /**
    * May a run TAKE its branch back from a checkout that is sitting on it?
    *
@@ -1233,6 +1338,7 @@ export type Prefs = {
   stallRetryBurst?: number;
   stallExternalWaitMs?: number;
   stallLocalJobMs?: number;
+  stallLoopRun?: number;
   /**
    * Whether the stall watchdog may PARK a lane by itself — the automatic park
    * `external-wait` makes (default on). The KNOWN-SINCE off switch (SLF-9): the
@@ -1267,6 +1373,17 @@ export type Prefs = {
    * `undefined` (and being suppressed by accident).
    */
   notify: Record<CategoryId, boolean>;
+
+  /**
+   * How long every sink this console writes is kept.
+   *
+   * Rebuilt rather than spread, exactly like `notify` and for the same reason:
+   * a stored block missing a key must take that row's shipped default, not
+   * read `undefined` — and here an `undefined` cap is not a suppressed
+   * notification, it is a sweep with no bound or a sweep that deletes
+   * everything. `sanitiseRetention` is the one place that is settled.
+   */
+  retention: RetentionPolicy;
 };
 
 const CONFIG_DIR = configDir();
@@ -1276,6 +1393,9 @@ const DEFAULT_PREFS: Prefs = {
   recentRoots: [], theme: 'system', density: 'comfortable', sort: 'activity',
   attachDefaultSkills: false, qaByDefault: false, gitMode: 'default-branch', openPrOnComplete: true, repoGuard: true,
   isolation: 'queue', settle: DEFAULT_SETTLE, ...WORKTREE_DEFAULTS,
+  maxConcurrentPerRepo: DEFAULT_MAX_PER_REPO, worktreeRetention: DEFAULT_RETENTION,
+  baseBranch: DEFAULT_BASE_BRANCH, radarSerialize: false,
+  landing: DEFAULT_LAND, conflictPolicy: DEFAULT_CONFLICT, messaging: DEFAULT_MESSAGING, issuesMode: DEFAULT_ISSUES,
   isolationReclaim: 'clean-only', deleteMergedRunBranches: true,
   reviewEachPhaseByDefault: false, reviewerPolicy: 'comment-only',
   autoRecoverByDefault: true, autoContinueRecovery: true, watchCmdRefs: true, watchMintedCmdRefs: false, mcpPolicy: 'continue',
@@ -1289,6 +1409,7 @@ const DEFAULT_PREFS: Prefs = {
   relayRules: [],
   ...STALL_DEFAULTS, stallEscalateMs: STALL_ESCALATE_MS, stallAutomaticPark: true,
   notify: sanitiseCategories(undefined),
+  retention: RETENTION_DEFAULTS,
 };
 
 /**
@@ -1388,6 +1509,8 @@ export function gitDoorRefusal(shape: {
 export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   'attachDefaultSkills' | 'qaByDefault' | 'gitMode' | 'openPrOnComplete' | 'repoGuard'
   | 'isolation' | 'settle' | 'worktreeMaxConcurrent' | 'worktreeSetup' | 'worktreeCopyEnv' | 'worktreeRoot'
+  | 'maxConcurrentPerRepo' | 'worktreeRetention' | 'baseBranch' | 'radarSerialize'
+  | 'landing' | 'conflictPolicy' | 'messaging' | 'issuesMode'
   | 'isolationReclaim' | 'deleteMergedRunBranches'
   | 'reviewEachPhaseByDefault' | 'reviewerPolicy'
   | 'autoRecoverByDefault' | 'autoContinueRecovery' | 'watchCmdRefs' | 'watchMintedCmdRefs' | 'mcpPolicy'
@@ -1397,7 +1520,8 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   | 'delegateHumanGates' | 'policy' | 'allowUnverifiedPhases' | 'ladderExtendOnProgress' | 'convergeEveryMs'
   | 'budgetAutoRaisePct' | 'mcpRequireTimeoutMs' | 'boardingSchedule' | 'relayRules'
   | 'stallSilentMs' | 'stallSpinTurns' | 'stallStalemateAttempts' | 'stallRetryBurst'
-  | 'stallExternalWaitMs' | 'stallLocalJobMs' | 'stallEscalateMs' | 'stallAutomaticPark'> {
+  | 'stallExternalWaitMs' | 'stallLocalJobMs' | 'stallEscalateMs' | 'stallAutomaticPark'
+  | 'stallLoopRun'> {
   const bool = (value: unknown, fallback: boolean): boolean => (typeof value === 'boolean' ? value : fallback);
   // A cap is a finite, non-negative number or it is the default — a string,
   // a negative or NaN in config.json must never turn the ladder unbounded
@@ -1420,7 +1544,19 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     repoGuard: bool(parsed.repoGuard, true),
     // By the owner's coercer, not a local `===`: only the exact word isolates,
     // and the one place that rule is written is `shared/worktree-model.js`.
-    isolation: isolationMode(parsed.isolation),
+    //
+    // 🔴 …with ONE default that depends on another setting (decision 13). A run
+    // whose branch the console cuts itself owns that branch — nobody is sitting
+    // in it — so a checkout of its own costs one tree and buys the entire
+    // "two plans, one repository" story. A `default-branch` console gets
+    // `queue`, because there the run's branch is one somebody may be standing
+    // on. The guard is `undefined`, never `'queue'`: a stated choice outranks
+    // a default, and the direction that costs less is the one that serialises.
+    isolation: parsed.isolation === undefined
+      && parsed.gitMode === 'new-branch'
+      && DEFAULT_ISOLATION_FOR_NEW_BRANCH
+      ? ISOLATED
+      : isolationMode(parsed.isolation),
     // Through the SAME fold every other reader uses, and for the same reason
     // it exists: a `config.json` written before this setting shipped carries
     // `openPrOnComplete: false` and nothing else, and that operator asked for
@@ -1442,6 +1578,31 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     // Only the exact word `state` moves the trees out of the project — the
     // fail-safe direction, and the placement a person can find.
     worktreeRoot: worktreeRootOf(parsed.worktreeRoot),
+    // `positive`, for `worktreeMaxConcurrent`'s reason exactly: a cap of zero
+    // refuses every isolated run in the repository while the setting still
+    // reads "isolation is on".
+    maxConcurrentPerRepo: positive(parsed.maxConcurrentPerRepo, DEFAULT_MAX_PER_REPO),
+    // By the owner's coercer, which knows both the words and `ttl:<h>` — and
+    // whose fallback is the DEFAULT rather than `prune`, so a typo can never
+    // be the reason a tree was deleted.
+    worktreeRetention: retentionOf(parsed.worktreeRetention),
+    // Trimmed, and a non-string reads as no opinion — `worktreeSetup`'s rule,
+    // for the same reason: this value becomes a git argv.
+    baseBranch: typeof parsed.baseBranch === 'string' && parsed.baseBranch.trim()
+      ? parsed.baseBranch.trim()
+      : DEFAULT_BASE_BRANCH,
+    // Off unless the file says `true`: the fail-safe direction, since on is
+    // the setting that makes a phase wait.
+    radarSerialize: bool(parsed.radarSerialize, false),
+    // Phase 15's four launch defaults: only a member of the owner's vocabulary
+    // is read, and everything else is the owner's default — the fail-safe
+    // direction for each (`hold` writes nothing, `halt` stops, `on` costs
+    // nothing unused, `off` files nothing).
+    landing: LAND_POLICIES.includes(parsed.landing as never) ? String(parsed.landing) : DEFAULT_LAND,
+    conflictPolicy: CONFLICT_POLICIES.includes(parsed.conflictPolicy as never)
+      ? String(parsed.conflictPolicy) : DEFAULT_CONFLICT,
+    messaging: MESSAGING_WORDS.includes(parsed.messaging as never) ? String(parsed.messaging) : DEFAULT_MESSAGING,
+    issuesMode: ISSUE_MODES.includes(parsed.issuesMode as never) ? String(parsed.issuesMode) : DEFAULT_ISSUES,
     // Only the exact word turns the reclaim off — the same fail-safe direction
     // `gitMode` and `mcpPolicy` take, applied to the setting whose two answers
     // are "move a clean tree" and "never touch anything".
@@ -1492,6 +1653,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     // turned it back into five minutes (SLF-9, KNOWN-SINCE).
     stallExternalWaitMs: cap(parsed.stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs),
     stallLocalJobMs: positive(parsed.stallLocalJobMs, STALL_LOCAL_JOB_MS),
+    stallLoopRun: positive(parsed.stallLoopRun, STALL_DEFAULTS.stallLoopRun),
     stallAutomaticPark: bool(parsed.stallAutomaticPark, true),
     // `cap`, not `positive`, for the same reason as the external-wait clock
     // above: a zero detector threshold would flag every lane on its first tick
@@ -1573,6 +1735,7 @@ export function loadPrefs(instance: Instance = INSTANCE): Prefs {
     lastRoot: scoped.lastRoot,
     ...sanitiseAutomation(migrated),
     notify: sanitiseCategories(scoped.notify),
+    retention: sanitiseRetention(scoped.retention),
   });
 }
 

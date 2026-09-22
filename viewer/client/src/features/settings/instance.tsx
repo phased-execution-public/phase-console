@@ -36,6 +36,7 @@ import {
 import { settingsHref } from '@/app/routes';
 import { SettingsSectionFrame, sectionFor } from './nav';
 import { RestartButton } from './restart';
+import { RetentionCard } from './retention';
 import { ShutdownButton } from './shutdown';
 import { TailscaleCard } from './tailscale';
 
@@ -126,6 +127,20 @@ export function InstanceSection() {
           </div>
         </CardBody>
       </Card>
+
+      <RetentionCard />
+      {/* Two retentions, two pages, said once (phase 15): the card above is
+          what becomes of this console's LOGS; what becomes of a settled run's
+          CHECKOUTS is a launch default, edited where the other launch
+          defaults are. */}
+      <p className="text-2xs text-ink-faint">
+        Logs and their retention are above. What becomes of a run&rsquo;s checkouts when it settles is a
+        launch default — <em>When the run settles, its checkouts</em> in{' '}
+        <a href={settingsHref('automation')} className="text-action underline">
+          Automation
+        </a>
+        .
+      </p>
 
       <TailscaleCard
         port={state.port ?? 4123}

@@ -22,7 +22,7 @@
  *     plan has none at all; the section must cost nothing there.
  */
 
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -30,6 +30,7 @@ const hooks = vi.hoisted(() => ({
   diagnosis: vi.fn(),
   rulings: vi.fn(),
   consoleState: vi.fn(),
+  issues: vi.fn(),
 }));
 
 vi.mock('@/lib/queries', async (original) => ({
@@ -37,6 +38,7 @@ vi.mock('@/lib/queries', async (original) => ({
   useDiagnosis: hooks.diagnosis,
   useRulings: hooks.rulings,
   useConsoleState: hooks.consoleState,
+  useIssues: hooks.issues,
 }));
 
 // The drawer's neighbours each fetch or render something of their own; none of
@@ -45,6 +47,18 @@ vi.mock('@/components/situation', () => ({ SituationSummary: () => <div data-tes
 vi.mock('@/features/plans/gate-card', () => ({ PhaseGate: () => null }));
 vi.mock('@/components/recovery-actions', () => ({ RecoveryActions: () => null }));
 vi.mock('./phase-row', () => ({ EvidenceLine: () => null }));
+// The notes section has tests of its own; here the question is only whether
+// the drawer mounts it for THIS phase, and only once open.
+vi.mock('@/features/plans/notes-section', () => ({
+  NotesSection: (props: { slug: string; phase: number; enabled?: boolean }) => (
+    <div
+      data-testid="notes"
+      data-slug={props.slug}
+      data-phase={props.phase}
+      data-enabled={String(props.enabled)}
+    />
+  ),
+}));
 
 import { PhaseDrawer } from './phase-drawer';
 import type { RunState } from '@/lib/api';
@@ -70,10 +84,29 @@ const runWith = (qa?: unknown): RunState =>
     phases: { '3': { phase: 3, status: 'done', ...(qa ? { qa } : {}) } },
   }) as never;
 
-function view(run?: RunState | null) {
+const ISSUE = (number: number, phase: number, over: Record<string, unknown> = {}) => ({
+  number,
+  state: 'open',
+  title: `Issue ${number}`,
+  labels: [],
+  assignees: [],
+  updatedAt: '2026-09-21T10:00:00.000Z',
+  url: `https://github.com/acme/demo/issues/${number}`,
+  provenance: { slug: 'alpha', phase, draftId: `d${number}` },
+  ...over,
+});
+
+function view(run?: RunState | null, issues: unknown[] = []) {
   hooks.diagnosis.mockReturnValue({ data: DIAGNOSIS, error: null, isFetching: false });
   hooks.rulings.mockReturnValue({ data: { rulings: [] } });
   hooks.consoleState.mockReturnValue({ data: { allowTerminal: false } });
+  hooks.issues.mockReturnValue({
+    data: {
+      at: 0,
+      refreshing: false,
+      repos: [{ key: 'root', label: 'demo', scopeToken: 'root', kind: 'root', state: 'fresh', issues }],
+    },
+  });
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const out = render(
     <QueryClientProvider client={client}>
@@ -82,8 +115,10 @@ function view(run?: RunState | null) {
   );
   // The drawer fetches on open, so every assertion below is about an open one.
   const details = out.container.querySelector('details')!;
-  details.open = true;
-  details.dispatchEvent(new Event('toggle'));
+  act(() => {
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+  });
   return out;
 }
 
@@ -111,5 +146,38 @@ describe('the phase drawer shows every QA round the run paid for', () => {
   it('shows nothing with no run at all — the Phases tab, where rounds are not knowable', () => {
     view(null);
     expect(screen.queryByText('QA rounds:')).toBeNull();
+  });
+});
+
+describe('the phase drawer carries what the phase left behind (many-plans-one-repo phase 15)', () => {
+  it('mounts the forward notes for THIS phase, enabled once the drawer is open', () => {
+    // Phase 11's notes section, on the run page too: a note addressed to
+    // this phase is read here as well as on the Phases tab.
+    view(runWith());
+    const notes = screen.getByTestId('notes');
+    expect(notes.dataset.slug).toBe('alpha');
+    expect(notes.dataset.phase).toBe('3');
+    expect(notes.dataset.enabled).toBe('true');
+  });
+
+  it('lists the issues the sessions of this phase filed, linked, and none of another phase’s', () => {
+    // Phase 12's provenance: an issue filed from a draft carries the slug and
+    // the phase, and that is the whole join — no title match, no label.
+    view(runWith(), [ISSUE(7, 3), ISSUE(8, 3, { state: 'closed' }), ISSUE(9, 4)]);
+    const section = screen.getByRole('region', { name: /Issues filed by this phase/ });
+    const links = within(section).getAllByRole('link');
+    expect(links.map((a) => a.getAttribute('href'))).toEqual([
+      'https://github.com/acme/demo/issues/7',
+      'https://github.com/acme/demo/issues/8',
+    ]);
+    expect(section).toHaveTextContent('#7');
+    expect(section).toHaveTextContent('Issue 7');
+    expect(section).toHaveTextContent('closed');
+    expect(section).not.toHaveTextContent('Issue 9');
+  });
+
+  it('says nothing about issues when this phase filed none — absent is the common case', () => {
+    view(runWith(), [ISSUE(9, 4)]);
+    expect(screen.queryByRole('region', { name: /Issues filed by this phase/ })).toBeNull();
   });
 });

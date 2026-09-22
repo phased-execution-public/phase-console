@@ -83,7 +83,17 @@ const PID_CACHE_SOFT = 256;
 /** A hard ceiling for the case where every sample is genuinely fresh. */
 const PID_CACHE_MAX = 1024;
 
-type Sample = { at: number; state: ProcessState; comm: string; startedMs: number | null };
+type Sample = {
+  at: number;
+  state: ProcessState;
+  comm: string;
+  startedMs: number | null;
+  rss?: number;
+  pcpu?: number;
+};
+
+/** What a process is COSTING, as the one `ps` reports it. */
+export type ProcessResources = { rssKb: number; cpuPct: number };
 
 const cache = new Map<number, Sample>();
 
@@ -111,7 +121,15 @@ const inflight = new Map<number, Promise<Sample | null>>();
  * passes it. See `reconcileRun`.
  */
 
-export type PsRow = { stat: string; comm: string; lstart: string };
+export type PsRow = {
+  stat: string;
+  comm: string;
+  lstart: string;
+  /** Resident set size in KB, as `ps` reports it. */
+  rss?: number;
+  /** Percentage of one CPU, as `ps` reports it. */
+  pcpu?: number;
+};
 
 /**
  * Test seam: the raw `ps` read, so a suite can answer without a real process.
@@ -146,7 +164,13 @@ function defaultReadPs(pid: number): Promise<PsRow | null> {
     // `invariants.test.ts` greps for `('ps',` and asserts it appears exactly
     // once in `server/`. A line break between them would make the one reader
     // invisible to the lint that exists to keep it the only one.
-    execFile('ps', ['-o', 'stat=,comm=,lstart=', '-p', String(pid)],
+    // `rss` and `pcpu` ride the ONE `ps` this console is allowed to shell —
+    // they are free here and a second probe for them would be a second reader,
+    // which `invariants.test.ts` clause 1 refuses and which is exactly how two
+    // answers about one process came to disagree. They sit BEFORE `lstart`
+    // because `lstart` is the only column with spaces in it and so must stay
+    // last for `parsePs` to split on whitespace at all.
+    execFile('ps', ['-o', 'stat=,comm=,rss=,pcpu=,lstart=', '-p', String(pid)],
       { encoding: 'utf8', timeout: 1_000 },
       // A non-zero exit is `ps` saying "no such process" — but so is a missing
       // `ps`. The caller separates them with `kill(0)`; here, "could not read"
@@ -159,11 +183,26 @@ function defaultReadPs(pid: number): Promise<PsRow | null> {
 function parsePs(out: string): PsRow | null {
   const line = out.split('\n').find((row) => row.trim() !== '');
   if (!line) return null;
-  // `stat` and `comm` are single tokens; `lstart` is the rest, and it contains
-  // spaces ("Sat Aug 22 20:30:07 2026"), so it cannot be split on whitespace.
-  const match = /^\s*(\S+)\s+(\S+)\s+(.*)$/.exec(line);
-  if (!match) return null;
-  return { stat: match[1], comm: match[2], lstart: match[3].trim() };
+  // `stat`, `comm`, `rss` and `pcpu` are single tokens; `lstart` is the rest,
+  // and it contains spaces ("Sat Aug 22 20:30:07 2026"), so it cannot be split
+  // on whitespace and has to stay last.
+  const wide = /^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(line);
+  if (wide) {
+    const rss = Number(wide[3]);
+    const pcpu = Number(wide[4]);
+    return {
+      stat: wide[1], comm: wide[2], lstart: wide[5].trim(),
+      ...(Number.isFinite(rss) ? { rss } : {}),
+      ...(Number.isFinite(pcpu) ? { pcpu } : {}),
+    };
+  }
+  // A reader that answers the three-column shape — every test seam written
+  // before the two columns were added, and any `ps` that will not print them.
+  // Kept rather than migrated: the resources are a decoration, and losing the
+  // state, the identity and the start time to gain them would be a bad trade.
+  const narrow = /^\s*(\S+)\s+(\S+)\s+(.*)$/.exec(line);
+  if (!narrow) return null;
+  return { stat: narrow[1], comm: narrow[2], lstart: narrow[3].trim() };
 }
 
 /** Does the process exist at all? `EPERM` means it does and is not ours. */
@@ -202,6 +241,8 @@ function store(pid: number, now: number, raw: PsRow | null): Sample | null {
     state: stateOf(raw.stat),
     comm: raw.comm,
     startedMs: parseStart(raw.lstart),
+    ...(raw.rss === undefined ? {} : { rss: raw.rss }),
+    ...(raw.pcpu === undefined ? {} : { pcpu: raw.pcpu }),
   };
   cache.set(pid, sample);
   evictStale(now);
@@ -376,6 +417,21 @@ export function pidAlive(pid: number, options?: ProbeOptions): boolean {
 export function pidHoldsWork(pid: number, options?: ProbeOptions): boolean {
   const state = processState(pid, options);
   return state === 'running' || state === 'stopped';
+}
+
+/**
+ * What this process is costing, from the sample the state probe already took.
+ *
+ * Never shells anything of its own — it reads the cache `processState` fills,
+ * so asking is free and asking about a pid nobody has probed answers `null`
+ * rather than starting a subprocess on a read path. "I have not looked" and
+ * "it is using nothing" are different facts and this returns the first as
+ * absence, which is the same posture the rest of this file takes.
+ */
+export function processResources(pid: number): ProcessResources | null {
+  const sample = cache.get(pid);
+  if (!sample || sample.rss === undefined || sample.pcpu === undefined) return null;
+  return { rssKb: sample.rss, cpuPct: sample.pcpu };
 }
 
 /** The CLI's own processes, for a probe that only knows what it started. */

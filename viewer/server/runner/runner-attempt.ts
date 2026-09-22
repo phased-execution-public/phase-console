@@ -8,7 +8,6 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
-import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -27,7 +26,7 @@ import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
   type PersistedEscalation,
 } from './freeze.ts';
-import { CASCADE_SKIP_REASON, STOPPED_SKIP_REASON, extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './verify.ts';
+import { CASCADE_SKIP_REASON, STOPPED_SKIP_REASON, extractCommands, resolveLead, verifyPhase } from './verify.ts';
 import { qaVerdictInstruction } from '../qa-session.ts';
 import type { QueueKind } from '../../shared/run-lifecycle.js';
 import { nextQaRound, qaReportPath, parseQaHistory } from '../qa-round.ts';
@@ -42,7 +41,8 @@ import {
 } from './wait-budget.ts';
 import { pollableRefs, unpollableRefs } from '../watch-refs.ts';
 import { RESUME_REFUSED_RECHECK_MS, declaredClock, ordinalSuffix, type DeclaredClock } from './wait-budget.ts';
-import type { VettedResume } from './runner-core.ts';
+import { closeoutSkipNote, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, type VettedResume } from './runner-core.ts';
+import type { ResumePolicy } from './usage.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
@@ -69,7 +69,7 @@ import {
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type QaRoundRecord, type RunStatus, type VerifySummary, clearWatchBookkeeping, isSessionGone,
-  syncWaitClock, chargeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge,
+  syncWaitClock, chargeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge, prepareReboard,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
 import {
@@ -88,17 +88,9 @@ import {
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
 import { RunnerLoop } from './runner-loop.ts';
-
-/**
- * The durable PATH fix, which differs by tier: both trees are started from a
- * shell, and only the Pro tree also has an agent whose installer bakes a
- * cleaned PATH into the unit. Assembled from a list so the free tree gets the
- * first sentence alone rather than a pointer to a script it does not ship.
- */
-const PATH_FIX_HINT = [
-  ' (start the console from a full shell',
-  ')',
-].join('');
+import { allLeadsMissingPark, approvalsForPhase, reviewPhase } from './verify-review.ts';
+import type { VerifyApprovals } from './verify.ts';
+import { withSpan } from '../trace.ts';
 
 
 export abstract class RunnerAttempt extends RunnerLoop {
@@ -122,7 +114,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
   ): Promise<{ carryOn: boolean; completed: boolean }> {
     const before = await this.artefactScan(phase);
     try {
-      return await this.attemptSession(phase, prompt, model, owner, lane, chosen, opts);
+      // The phase's own span, inside the run's. Everything below it — the
+      // session spawned, the git it runs, the bash scripts that session calls —
+      // inherits the phase number and the attempt, so a line found on its own
+      // says which retry of which phase produced it. The attempt is stated
+      // here and nowhere else: a retry is a new attempt inside one run, and
+      // that distinction is exactly what a reader of a failed phase needs.
+      return await withSpan(
+        'phase.attempt',
+        { phase, attempt: (this.state?.phases?.[phase]?.attempts ?? 0) + 1 },
+        () => this.attemptSession(phase, prompt, model, owner, lane, chosen, opts),
+      );
     } finally {
       await this.noteArtefacts(before, phase);
     }
@@ -133,13 +135,42 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * an account switch, a model's window, a spent cap — through the one gate, as
    * every `--resume` goes. Without `port`, a transcript under another account is
    * not carried over (a fresh boot is what those paths always chose); a session
-   * that is gone is never offered again.
+   * that is gone is never offered again. `notWorth` is the gate's `fresh`: the
+   * session is there and resuming it would write its whole context again, and
+   * the caller hands the phase to `reboardNotWorth` rather than going on here.
    */
-  private resumeAgain(record: PhaseRecord, opts: { port?: boolean } = {}): VettedResume | undefined {
-    if (!record.sessionId) return undefined;
-    if (!opts.port && !this.transcriptFollows(record)) return undefined;
+  private resumeAgain(record: PhaseRecord, opts: { port?: boolean } = {}): { resume?: VettedResume; notWorth?: ResumePolicy } {
+    if (!record.sessionId) return {};
+    if (!opts.port && !this.transcriptFollows(record)) return {};
     const gate = this.resumableSession(record, record.sessionId);
-    return gate.ok ? gate.resume : undefined;
+    if (gate.ok) return { resume: gate.resume };
+    return gate.why === 'fresh' && gate.policy ? { notWorth: gate.policy } : {};
+  }
+
+  /**
+   * End this attempt and have the phase boarded fresh with the resume brief,
+   * because the session it would continue in place is not worth resuming
+   * (autopilot-token-drain phase 4). Not a fresh spawn here: this attempt's
+   * prompt may be a continuation — a `continue` brief, a wait-resume — that
+   * means nothing to a session with no context, and only the drive loop's
+   * boarding composes the boot prompt with the brief. The same re-board the
+   * context checkpoint makes (`Runner.noteContext`).
+   */
+  private reboardNotWorth(
+    phase: number, record: PhaseRecord, policy: ResumePolicy, sessionId = record.sessionId ?? 'unknown',
+  ): { carryOn: boolean; completed: boolean } {
+    prepareReboard(record);
+    record.resumeSessionId = undefined;
+    const hint: BoardingHint = reboardResumeBrief(resumePolicyInstruction(policy, sessionId));
+    record.boardingHint = hint;
+    record.note = `session ${sessionId} is not worth resuming — ${resumePolicyWhy(policy)} — `
+      + 'the next attempt boards fresh with the resume brief';
+    this.record('phase.reboard-requested', {
+      situation: hint.situation, rung: hint.rung, brief: hint.brief, by: 'console',
+    }, phase);
+    this.persist();
+    this.emit('phase', { phase, status: record.status, note: record.note });
+    return { carryOn: true, completed: false };
   }
 
   /**
@@ -188,6 +219,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
       const gate = this.resumableSession(record, asked);
       if (gate.ok) resume = gate.resume;
       else if (gate.why === 'session-live') return this.holdForLiveSession(phase, asked);
+      // Not worth resuming — the boarding asks first and composes the brief, so
+      // this is the backstop: this prompt may be a continuation, so re-board.
+      else if (gate.why === 'fresh' && gate.policy) return this.reboardNotWorth(phase, record, gate.policy, asked);
     }
     // The two caps this phase's sessions run under, each with the policy that
     // set it (SES-8): the run's own budget or the plan's size for the dollars,
@@ -275,30 +309,22 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // PE_SCOPE rides along for the same reason one level up: the session
         // claims its own lock, and a claim that names no scope writes a lock
         // every other reader has to treat as colliding with everything.
+        // All four claim fields, from the one helper every spawn site uses
+        // (LCK-6). The owner is this attempt's, which is not always the run's:
+        // `phase-lock.sh` reports the lock as the session's own so it refreshes
+        // rather than stopping, while every other reader still sees it held.
+        // The tree and the branch are `qualificationFor`'s answer — both, or
+        // NEITHER for a scope the run root does not contain, because a pair
+        // describing a tree the session never edits is worse than no pair.
         env: await this.sessionEnv({
-          PE_OWNER: owner,
-          PE_SCOPE: formatScope(scope),
-          // The checkout this session works in, when it is not the shared one,
-          // so the session's OWN `phase-lock.sh claim` records where it is
-          // working. Recorded, never acted on: the scope above is still the
-          // whole repository, because a linked worktree shares its refs (see
-          // the `worktree=` comment in `phase-lock.sh`). Absent — the default —
-          // leaves the child's environment byte-identical to what it was.
-          //
-          // Read through the base, so BOTH shapes answer: a worktree lane
-          // (`Lane.worktree`) and an isolated run (`state.workRoot`) — and a
-          // shared run states its root, which is what keeps two of them
-          // colliding. Absent, with the branch, for a scope the root does not
-          // contain: the pair would describe a tree the session never edits.
-          ...(claim.tree ? { PE_WORKTREE: claim.tree } : {}),
-          // And the branch that checkout is on, which — unlike the worktree
-          // path — IS acted on: the session's own `phase-lock.sh claim` writes
-          // it, and `conflicts` then reads two claims on one repository as
-          // disjoint when both name a branch and the two differ. Set only when
-          // this session has a tree of its own, so a phase in the shared
-          // checkout keeps writing an unqualified lock — which is what it is.
-          // Absent leaves the child's environment byte-identical.
-          ...(claim.branch ? { PE_BRANCH: claim.branch } : {}),
+          ...(await this.claimEnv(phase, { owner, scope })),
+          // How this session reaches a PEER (5.1.0): the plan's mailbox and this
+          // run's bearer, from the one helper, so a site cannot state the
+          // ledger and forget the token.
+          ...this.messagingEnv(),
+          // …and where it records a finding outside its phase (phase 12), from the
+          // sibling helper, so a site cannot state the mailbox and forget the ledger.
+          ...this.issuesEnv(),
           // Where `phase-outcome.sh` writes the session's declared outcome —
           // the machine-readable record the runner reads on exit instead of
           // guessing from prose.
@@ -514,8 +540,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
             policy === 'switch' || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
           if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel)) {
             // Continue NOW, on the account that can pay — same session when
-            // its transcript came along, a fresh boot prompt when it did not.
-            resume = this.resumeAgain(record);
+            // its transcript came along, a fresh boot prompt when it did not,
+            // and a fresh boarding with the resume brief when it is too large
+            // to rewrite into the new account's cache.
+            const again = this.resumeAgain(record);
+            if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+            resume = again.resume;
             this.persist();
             continue;
           }
@@ -566,8 +596,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
               record.model = first.model;
               modelWalls.length = 0;
               // The same session, when its transcript is where this account
-              // looks — the phase keeps whatever it had done.
-              resume = this.resumeAgain(record);
+              // looks — the phase keeps whatever it had done — unless the wait
+              // left it too large and too cold to be worth resuming.
+              const again = this.resumeAgain(record);
+              if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+              resume = again.resume;
               this.record('phase.model-window-retry', { model: first.model, resume: resume?.sessionId ?? null }, phase);
               continue;
             }
@@ -585,7 +618,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
         case 'resume': {
           if (!record.sessionId) { this.halt('the session hit a cap but reported no session id to resume', phase, 'phase-crashed'); return { carryOn: false, completed: false }; }
-          resume = this.resumeAgain(record, { port: true });
+          const again = this.resumeAgain(record, { port: true });
+          if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+          resume = again.resume;
           // The CLI enforced the cap the console set, so the resume carries on
           // under double that cap — attributed as a raise, so a second spent
           // cap reads as the phase outgrowing it rather than as a crash.
@@ -618,7 +653,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
             const policy = state.onLimit ?? 'wait';
             const wantSwitch = policy === 'switch' || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
             if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel)) {
-              resume = this.resumeAgain(record);
+              const again = this.resumeAgain(record);
+              if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+              resume = again.resume;
               this.persist();
               continue;
             }
@@ -849,6 +886,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const setupText = await this.deps.setupText?.(state.slug, phase);
     const verify = this.deps.verify ?? verifyPhase;
     const cwd = await this.verifyCwd(phase);
+    const approvals = this.verifyApprovalsFor(phase);
     // The opt-in the preflight honoured, honoured here too: a phase that
     // states no verification passes on its handoff, and the record says
     // WAIVED rather than "0 commands green" (`allowUnverifiedPhases`).
@@ -858,12 +896,26 @@ export abstract class RunnerAttempt extends RunnerLoop {
         stage: 'verify', reason: 'the plan states no verification', by: 'allowUnverifiedPhases',
       }, phase);
     }
+    // And the operator's answer at the start door: every check this phase's
+    // plan wrote was set aside, so it passes on its handoff — the same shape,
+    // signed `launch` rather than by a preference.
+    const setAside = !waived && approvals?.waive?.size ? extractCommands(text, 'verify', approvals) : null;
+    const allWaived = Boolean(setAside && !setAside.commands.length && !setAside.notRun.length && setAside.waived.length);
+    if (allWaived) {
+      this.record('phase.verify-waived', {
+        stage: 'verify', reason: 'every check was waived at the run\'s start', by: 'launch', notRun: setAside!.waived,
+      }, phase);
+    }
     const verification = waived ? {
       ok: true, ran: [], notRun: [],
       reason: 'the plan states no verification for this phase — passed on the handoff (allowUnverifiedPhases)',
+    } : allWaived ? {
+      ok: true, ran: [], notRun: [], waived: setAside!.waived,
+      reason: 'every check in this phase\'s §Verification was waived at the run\'s start — passed on the handoff',
     } : await verify(text, {
       cwd,
       ...(setupText ? { setupText } : {}),
+      ...(approvals ? { approvals } : {}),
       preflightSkip: this.verifyEnv().preflightSkip,
       // Explicit, and longer than the 15-minute default: a real phase's
       // verification is a full suite, sometimes a container build, and the
@@ -894,6 +946,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
       },
     });
     record.verification = verification;
+    // A partial set-aside rides the same line, so the record names the checks
+    // the operator answered at the door rather than letting them vanish.
+    if (!allWaived && verification.waived?.length) {
+      this.record('phase.verify-waived', {
+        stage: 'verify', reason: `${verification.waived.length} check(s) waived at the run's start`,
+        by: 'launch', notRun: verification.waived,
+      }, phase);
+    }
     // The verdict, on the same channel — so a reader who watched the checklist
     // fill in also sees it close, and one who arrived late sees only this.
     this.emit('verify', {
@@ -942,13 +1002,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // disposition is the SAME park, with the same sentence, not a twelve-hour
     // card asking a person to vouch for checks a machine simply lacks.
     if (!verification.ran.length && verification.skipped?.length) {
-      const leads = [...new Set(verification.skipped.map((entry) => entry.lead))].join(', ');
+      const leads = [...new Set(verification.skipped.map((entry) => entry.lead))];
       record.status = 'parked';
-      record.note = `phase ${phase}'s §Verification cannot run on this machine — every command's lead `
-        + `is missing from the PATH (${leads}). Fix the PATH${PATH_FIX_HINT}, rewrite the bullet `
-        + 'with what exists, or Repair with AI, then Retry.';
+      record.note = allLeadsMissingPark(phase, leads);
       record.endedAt = new Date().toISOString();
-      this.record('phase.verify-unrunnable', { leads: leads.split(', '), skipped: verification.skipped.length }, phase);
+      this.record('phase.verify-unrunnable', { leads, skipped: verification.skipped.length }, phase);
       this.emit('phase', { phase, status: 'parked', note: record.note });
       // The RUN parks too, as the card's timeout does: the board already reads
       // done (the session wrote its handoff), so a parked record left in a
@@ -1251,16 +1309,20 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // A fresh boarding needs the phase's own boot prompt under the instruction:
     // it has no conversation to continue and knows nothing about the plan.
     let prompt = brief;
-    if (opts.fresh) {
+    const boardFresh = async (): Promise<boolean> => {
       let boot = '';
       try { boot = (await this.engine(['--boot-prompt', String(phase)])).stdout; } catch { boot = ''; }
       if (!boot.trim()) {
         this.record('phase.qa-session-skipped', {
           reason: `the engine produced no boot prompt for phase ${phase}, so no fresh session could be boarded`,
         }, phase);
-        return null;
+        return false;
       }
       prompt = `${boot.trim()}\n\n---\n\n${brief}`;
+      return true;
+    };
+    if (opts.fresh) {
+      if (!await boardFresh()) return null;
     } else if (!record.sessionId || isSessionGone(record)) {
       this.record('phase.qa-session-skipped', {
         reason: record.sessionId
@@ -1273,9 +1335,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // The one resumability check every `--resume` takes (`resumableSession`):
     // the transcript is carried to the account paying, and the session is not
     // still running — or the round is not spawned at all. A review that cannot
-    // start is not a round that failed.
+    // start is not a round that failed. A session not worth resuming
+    // (`resumePolicy`, autopilot-token-drain phase 4) is reviewed FRESH instead:
+    // the independence comes from the reviewer subagent either way, and one
+    // verdict is not worth writing the whole conversation into the cache again.
     const gate = opts.fresh ? null : this.resumableSession(record, record.sessionId);
-    if (gate && !gate.ok) {
+    const fresh = opts.fresh === true || (gate !== null && !gate.ok && gate.why === 'fresh');
+    if (gate && !gate.ok && gate.why === 'fresh') {
+      if (!await boardFresh()) return null;
+    } else if (gate && !gate.ok) {
       if (gate.why === 'unported') {
         this.markSessionGone(record, record.sessionId!, 'its transcript is not under the account this run pays with');
       }
@@ -1301,7 +1369,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // reader could never recover: this event carried a session id and nothing
     // else, and the report the QA method requires was never linked anywhere.
     this.record('phase.qa-session', {
-      ...(opts.fresh ? { fresh: true } : { sessionId: record.sessionId }),
+      ...(fresh ? { fresh: true } : { sessionId: record.sessionId }),
       round, report, brief,
       ...(opts.verb ? { verb: opts.verb } : {}),
     }, phase);
@@ -1349,8 +1417,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // is read back from `test-status.md`, which is the only channel that
         // can gate anything.
         env: await this.sessionEnv({
-          PE_OWNER: autopilotOwner(state.id),
-          PE_SCOPE: formatScope(lane?.grant?.scope ?? await this.scopeFor(phase)),
+          // All four claim fields, never two (LCK-6): a reviewer that claimed
+          // unqualified collided with every isolated run beside it.
+          ...(await this.claimEnv(phase)),
+          // A reviewer is a peer too: it may leave a note for the phase it
+          // reviewed, and reading its own mail costs nothing.
+          ...this.messagingEnv(),
+          // …and where it records a finding outside its phase (phase 12), from the
+          // sibling helper, so a site cannot state the mailbox and forget the ledger.
+          ...this.issuesEnv(),
           PE_RULINGS_FILE: rulingsFile(state.root, state.slug),
           PE_TASKS_FILE: this.armTasksFile(phase),
         }),
@@ -1962,44 +2037,30 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const state = this.state!;
     if (this.deps.verify) return null;
     const text = await this.deps.verificationText(state.slug, phase);
-    const { commands, notRun } = extractCommands(text);
-
-    if (!commands.length) {
-      const specimen = notRun[0];
-      if (text?.trim()) {
-        // "0 entries refused" was reachable and read like a bug: a §Verification
-        // holding only an environment preamble refuses nothing and runs nothing,
-        // so it needs the sentence that says exactly that.
-        return `phase ${phase}'s §Verification contains nothing the runner can execute — `
-          + (notRun.length
-            ? `${notRun.length} entr${notRun.length === 1 ? 'y' : 'ies'} refused`
-              + (specimen ? ` (first: ${specimen.reason})` : '')
-            : 'it sets up an environment but never runs a check')
-          + '. Fix the plan bullet into whole, copy-runnable commands, then Retry.';
-      }
-      // The parser handed over nothing — but a plan that DECLARES the bullet
-      // deserves a different sentence than one that omits it: the first sends
-      // the author to their formatting, the second to their keyboard. Blaming
-      // "the plan states no verification" for a shape the parser lost once
-      // sent an operator hunting a bug in a plan that had none.
-      if (await this.deps.verificationDeclared?.(state.slug, phase)) {
-        return `phase ${phase}'s §Verification exists in the plan but the console could not read `
-          + 'a runnable command out of it — check the bullet\'s shape against '
-          + 'references/plan-format.md §6, or Repair with AI, then Retry.';
-      }
-      // The one opt-in that lowers the bar: a phase that states no
-      // verification boards and passes on its handoff (`allowUnverifiedPhases`,
-      // off by default). Only for a plan that OMITS the bullet — a bullet the
-      // runner could not read is a formatting fault the author should hear
-      // about, and parks above regardless of the preference.
-      if (this.deps.allowUnverifiedPhases?.() === true) {
-        this.record('phase.verify-waived', {
-          stage: 'preflight', reason: 'the plan states no verification', by: 'allowUnverifiedPhases',
-        }, phase);
-        return null;
-      }
-      return `the plan states no verification for phase ${phase} — nothing would prove the work. `
-        + 'Add a §Verification command to the plan, then Retry.';
+    // One prediction (`verify-review.ts`), asked by every reader — the launch
+    // door, the plan page, plan health, the repair gate and this boarding —
+    // so none of them can promise what boarding will not do. It decides the
+    // park and writes its sentence; the warnings below are this record's.
+    const review = reviewPhase({
+      phase,
+      verification: text,
+      // The parser handed over nothing — a plan that DECLARES the bullet sends
+      // the author to their formatting, one that omits it to their keyboard.
+      declared: text?.trim() ? true : Boolean(await this.deps.verificationDeclared?.(state.slug, phase)),
+      personCheck: this.personCheckFor(phase).answer,
+      autonomy: state.autonomy,
+      approvals: this.verifyApprovalsFor(phase),
+      // The one opt-in that lowers the bar, for a plan that OMITS the bullet.
+      allowUnverified: this.deps.allowUnverifiedPhases?.() === true,
+      pathEnv: process.env.PATH,
+      preflightSkip: this.verifyEnv().preflightSkip,
+    });
+    if (review.verdict === 'parks') return review.park ?? null;
+    if (review.unverified) {
+      this.record('phase.verify-waived', review.waived.length
+        ? { stage: 'preflight', reason: 'every check was waived at the run\'s start', by: 'launch', notRun: review.waived }
+        : { stage: 'preflight', reason: 'the plan states no verification', by: 'allowUnverifiedPhases' }, phase);
+      return null;
     }
 
     const warnings: string[] = [];
@@ -2009,17 +2070,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // deliberately does NOT ask when the board vouches for measured work —
     // so every phase of a real plan promised a question the run never posed,
     // and the run page read as a wall of pending permission asks.
-    const asks = state.autonomy === 'halt-on-everything';
-    // The plan's word for prose checks (phase 11, ZTD-6): `halt` stops the
-    // phase HERE, before a session is paid for — the plan said a check written
-    // as prose is a plan defect, not a person's question. `allow` and an
-    // owner's name are answered at verification (`askHuman`).
-    if (notRun.length && this.personCheckFor(phase).answer === 'halt') {
-      return `phase ${phase}'s §Verification holds ${notRun.length} check${notRun.length === 1 ? '' : 's'} written as prose `
-        + `(first: ${notRun[0].text.slice(0, 120)}) and the plan says Person-check: halt — fix the bullet into runnable `
-        + 'commands, or change the phase\'s Person-check, then Retry.';
-    }
-    for (const held of notRun) {
+    const asks = review.verdict === 'asks';
+    for (const held of review.items) {
       const message = asks
         ? `a person will be asked: ${held.text} — ${held.reason}`
         : `left for a person on the record: ${held.text} — ${held.reason} `
@@ -2030,7 +2082,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
     const declared = (await this.deps.verifyIn?.(state.slug, phase))?.trim();
     if (!declared) {
-      const sensitive = commands.filter((command) => {
+      const sensitive = review.runs.filter((command) => {
         if (/^cd\s/.test(command.trim())) return false; // names its own directory
         const lead = this.leadToken(command);
         return lead ? this.verifyEnv().cwdSensitive.has(lead) : false;
@@ -2043,29 +2095,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
       }
     }
 
-    const missing = unresolvableLeads(commands, process.env.PATH, this.verifyEnv().preflightSkip);
-    for (const lead of missing.keys()) {
+    for (const lead of review.missing) {
       // The consequence named matches what the runner will actually DO now:
       // skip and record, never run to a 127 halt. `python` gets its errand.
-      const hint = lead === 'python' && !missing.has('python3')
+      const hint = lead === 'python' && !review.missing.includes('python3')
         ? ' — this machine has python3; write python3' : '';
       const message = `\`${lead}\` is not on the verification PATH — its command will be `
         + `SKIPPED at verification (recorded, not failed)${hint}`;
       warnings.push(message);
       detail.push({ kind: 'missing-lead', lead, message });
-    }
-    if (missing.size) {
-      // When EVERY command's lead is missing, boarding would buy a session
-      // whose verification cannot run at all — the same park F14/F17 promise.
-      const anyRunnable = commands.some((command) => {
-        const lead = resolveLead(command);
-        return !lead || !missing.has(lead);
-      });
-      if (!anyRunnable) {
-        return `phase ${phase}'s §Verification cannot run on this machine — every command's lead `
-          + `is missing from the PATH (${[...missing.keys()].join(', ')}). Fix the PATH${PATH_FIX_HINT}, `
-          + 'rewrite the bullet with what exists, or Repair with AI, then Retry.';
-      }
     }
 
     // On the record too, not just the journal: the journal is rendered by
@@ -2082,6 +2120,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
       delete record.preflightDetail;
     }
     return null;
+  }
+
+  /**
+   * This phase's answers from the start door (`RunState.verifyApprovals`), as
+   * the extractor reads them — undefined when the run has none.
+   */
+  protected verifyApprovalsFor(phase: number): VerifyApprovals | undefined {
+    return approvalsForPhase(this.state?.verifyApprovals, phase);
   }
 
   /**
@@ -2563,6 +2609,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
         const why = [
           `the session declared partial${declared.reason ? ` (${declared.reason})` : ''} — work remains, resume it`,
         ];
+        // Before the climb: the gate reads it at boarding, and a `budget` or
+        // `context` reason boards the next attempt fresh (`resumePolicy`).
+        record.lastPartial = { sessionId: record.sessionId ?? null, reason: declared.reason ?? null, at: new Date().toISOString() };
         const climbed = await this.climb(record, board, 'outcome', {
           situation: situationOf('work-in-progress', why),
           sessionId: record.sessionId,
@@ -2934,12 +2983,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // closeout could resume a session stamped gone or one still running.
     const gate = this.resumableSession(record, record.sessionId);
     if (!gate.ok) {
-      return {
-        ran: false,
-        note: gate.why === 'session-live'
-          ? `session ${record.sessionId} is still running, so it was not resumed to close the phase out`
-          : `session ${record.sessionId} cannot be resumed (${gate.why}), so the runner could not ask it to finish`,
-      };
+      return { ran: false, note: closeoutSkipNote(gate, record.sessionId) };
     }
     const started = new Date().toISOString();
     this.record('phase.closeout', { sessionId: record.sessionId, boardState, because: worked.why }, phase);
@@ -2966,8 +3010,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
         hookEvents: this.deps.stream?.hookEvents ?? true,
         onHandle: (handle) => { this.attachHandle(phase, handle); },
         env: await this.sessionEnv({
-          PE_OWNER: autopilotOwner(state.id),
-          PE_SCOPE: formatScope(this.lanes.get(phase)?.grant?.scope ?? await this.scopeFor(phase)),
+          ...(await this.claimEnv(phase)),   // all four claim fields (LCK-6)
+          ...this.messagingEnv(),
+          // …and where it records a finding outside its phase (phase 12), from the
+          // sibling helper, so a site cannot state the mailbox and forget the ledger.
+          ...this.issuesEnv(),
           // Armed, not merely named: `armOutcomeFile` deletes whatever is
           // there, so a stale file from a previous attempt can never speak for
           // this one. `written_at` is the second guard, on read.

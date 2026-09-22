@@ -110,6 +110,24 @@ describe('the field matrix', () => {
     expect(screen.queryByRole('tablist')).toBeNull();
   });
 
+  it("a phase launch carries the plan's own reviewer, so the doubled-review advisory reaches it", async () => {
+    // "Run only this one" offers Review each phase too (autopilot-token-drain
+    // phase 5): a single phase reviewed twice is the same double spend.
+    await mount(
+      {
+        kind: 'phase',
+        slug: 'alpha',
+        phase: 3,
+        run: null,
+        qaMode: 'off',
+        planReviewers: [{ section: 'Adversarial review', excerpt: 'dispatch ONE fresh-context reviewer' }],
+      },
+      { reviewEachPhaseByDefault: true },
+    );
+    await stage(/How it runs/);
+    expect((await screen.findByTestId('review-doubled')).textContent).toContain('Adversarial review');
+  });
+
   it('a phase launch is staged, and carries the git section on "How it runs"', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null });
     // Five stages since 5.0.0 (phase 11), Decisions first and selected.

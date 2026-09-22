@@ -56,7 +56,11 @@ test('scripts/decisions.env is the JS owner, word for word — every list', () =
 });
 
 test('the vocabulary is closed and its members are well-formed', () => {
-  assert.equal(DECISION_KEYS.length, 17, 'chapter 13 §1.1 names seventeen keys');
+  assert.equal(DECISION_KEYS.length, 18, 'chapter 13 §1.1\'s seventeen keys, plus `issues` (5.1.0)');
+  assert.ok(
+    (DECISION_KEYS as readonly string[]).includes('issues'),
+    'whether a session may open an issue is a decision a run needs and nobody was asking',
+  );
   assert.equal(new Set(DECISION_KEYS).size, DECISION_KEYS.length, 'no key twice');
   for (const k of DECISION_KEYS) assert.match(k, /^[a-z][a-z0-9.-]*$/, `key "${k}" is not a bare lower-case word`);
   for (const c of NEED_CLASSES) {

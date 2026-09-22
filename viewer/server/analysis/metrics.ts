@@ -44,6 +44,7 @@
 
 import { BOARD_BUCKETS } from '../../shared/status-vocab.js';
 import type { PhaseState } from '../engine.ts';
+import { read as readCounter, type CounterFamily } from '../counters.ts';
 
 /** One plan, as the board sees it. A subset of `analysis/stats.ts` `PlanStats`. */
 export type MetricsPlan = {
@@ -174,6 +175,35 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
     'Bytes those checkouts occupy. Absent where du could not answer.'],
   ['phase_console_branch_conflicted_files', 'gauge',
     'Files a plan\'s run branch already conflicts on with another live branch.'],
+  // The process-lifetime counters (5.1.0, `server/counters.ts`). Appended for
+  // the same reason as the three above, and monotonic WITHIN a process: a
+  // restart resets them, which is what a Prometheus counter is. `build_info`
+  // already carries the identity a scraper needs to tell one process's series
+  // from the next.
+  ['phase_console_log_lines_total', 'counter', 'Console log lines written, by level. A line the level dropped is not counted.'],
+  ['phase_console_journal_appends_total', 'counter', 'Journal lines appended across every run this process drove.'],
+  ['phase_console_journal_overflow_total', 'counter', 'Journals that crossed the soft cap and fell back to the terminal reserve.'],
+  ['phase_console_transcript_shed_total', 'counter', 'Transcript records dropped rather than stored, by kind.'],
+  ['phase_console_git_commands_total', 'counter', 'Git commands run through the seam, by verb and whether they exited 0.'],
+  ['phase_console_git_command_seconds_total', 'counter', 'Seconds spent inside git, by verb.'],
+  ['phase_console_engine_calls_total', 'counter', 'Bash engine calls, by script and whether the answer was cached.'],
+  ['phase_console_http_requests_total', 'counter', 'HTTP requests answered, by status class.'],
+  ['phase_console_shell_commands_total', 'counter', 'Other child processes run through the seam, by binary and whether they exited 0.'],
+  ['phase_console_retention_removed_total', 'counter', 'Files retention deleted, by sink.'],
+];
+
+/** The counter families, in emission order, with the labels each is keyed by. */
+const COUNTER_FAMILIES: readonly (readonly [CounterFamily, string, readonly string[]])[] = [
+  ['log_lines_total', 'phase_console_log_lines_total', ['level']],
+  ['journal_appends_total', 'phase_console_journal_appends_total', []],
+  ['journal_overflow_total', 'phase_console_journal_overflow_total', []],
+  ['transcript_shed_total', 'phase_console_transcript_shed_total', ['kind']],
+  ['git_commands_total', 'phase_console_git_commands_total', ['verb', 'ok']],
+  ['git_command_seconds_total', 'phase_console_git_command_seconds_total', ['verb']],
+  ['engine_calls_total', 'phase_console_engine_calls_total', ['script', 'cache']],
+  ['http_requests_total', 'phase_console_http_requests_total', ['status']],
+  ['shell_commands_total', 'phase_console_shell_commands_total', ['command', 'ok']],
+  ['retention_removed_total', 'phase_console_retention_removed_total', ['sink']],
 ];
 
 /**
@@ -259,6 +289,19 @@ export function renderMetrics(facts: MetricsFacts): string {
     out.push(...family(name, type, help(name), samples));
   };
 
+  // Last, so nothing above it moves: a scrape's line order is what a saved
+  // diff is read against.
+  const emitCounters = () => {
+    for (const [family, name, labelNames] of COUNTER_FAMILIES) {
+      const rows = readCounter(family);
+      if (!rows.length) continue; // absent is honest; a zero would be a claim
+      emit(name, 'counter', rows.map(([values, value]) => ({
+        labels: Object.fromEntries(labelNames.map((label, i) => [label, values[i] ?? ''])),
+        value,
+      })));
+    }
+  };
+
   emit('phase_console_build_info', 'gauge', [{
     labels: { version: facts?.version ?? 'unknown', instance: facts?.instanceId ?? 'unknown' },
     value: 1,
@@ -332,6 +375,8 @@ export function renderMetrics(facts: MetricsFacts): string {
     git.map((entry) => ({ labels: { slug: entry.slug }, value: entry.diskBytes ?? NaN })));
   emit('phase_console_branch_conflicted_files', 'gauge',
     git.map((entry) => ({ labels: { slug: entry.slug }, value: entry.conflictedFiles })));
+
+  emitCounters();
 
   return `${out.join('\n')}\n`;
 }

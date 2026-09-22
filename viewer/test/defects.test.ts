@@ -245,7 +245,7 @@ test('finished runs past the retention window are swept; nothing else is', () =>
     assert.ok(removed.length > 0, 'nothing in the tree ever deleted a run file — that was the defect');
 
     const left = new Set(readdirSync(runDir(dir.root, 'demo'))
-      .map((n) => /^run-([0-9a-f]{8})\.json$/.exec(n)?.[1]).filter(Boolean) as string[]);
+      .map((n) => /^run-([0-9a-f]{8,32})\.json$/.exec(n)?.[1]).filter(Boolean) as string[]);
     assert.ok(left.has(young), 'a run inside the window is kept');
     assert.ok(left.has(unfinished), 'an UNFINISHED run is never swept, however old — it may still be written to');
     assert.ok(left.has(live), 'a run a live process is driving is never swept');

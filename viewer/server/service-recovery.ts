@@ -10,7 +10,6 @@
  */
 import { basename, join, resolve as resolvePath, sep } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { instanceId } from '../shared/instances.mjs';
 import {
@@ -26,7 +25,8 @@ import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type Hooks
 import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
   ConvergeScheduler, convergePlan, evidenceFingerprint, HALT_DELAY_MS, MAX_BOOT_RESUMES, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
-import { RECOVER_MAX_PER_PHASE } from './runner/runner-core.ts';
+import { RECOVER_MAX_PER_PHASE, resumePolicyInstruction } from './runner/runner-core.ts';
+import { resumePolicy } from './runner/usage.ts';
 import { planWrite, runWrite } from './writes.ts';
 import {
   run, invalidate, readMemoryBlock, readQaMode, readSessionPlan, readLint, readGateStatus,
@@ -397,6 +397,26 @@ export abstract class ServiceRecovery extends ServiceRuns {
         // takes them all.
         .filter((issue) => request.phase == null || issue.phase == null || issue.phase === request.phase);
       if (!issues.length) {
+        // Say what IS true when the phase's §Verification is what stopped it
+        // (run f0da619a): a command the runner merely does not know is
+        // answered by one exact approval — the operator's to give, never a
+        // paid session's — and a park the facts have already cleared by Retry.
+        const [review] = request.phase != null
+          ? await this.verificationReviews(request.slug, { onlyPhases: [request.phase], run: runState ?? null })
+          : [];
+        const answers = review?.items.filter((item) => item.approvable) ?? [];
+        if (review && answers.length) {
+          return refuse(409,
+            `phase ${request.phase}'s §Verification needs your approval, not a repair: `
+            + `${answers.map((item) => item.text).join('; ')} — approve it when the run is started again `
+            + '(the Decisions stage lists it), and the phase boards with no session spent.');
+        }
+        const parked = request.phase != null ? runState?.phases?.[String(request.phase)] : undefined;
+        if (review && review.verdict !== 'parks' && parked?.status === 'parked'
+          && VERIFICATION_PARK_NOTE.test(parked.note ?? '')) {
+          return refuse(409,
+            `phase ${request.phase}'s §Verification is runnable now — Retry boards it; nothing needs repairing.`);
+        }
         return refuse(409,
           `${request.slug} has no plan errors to repair — the board and its artefacts agree.`);
       }
@@ -540,15 +560,20 @@ export abstract class ServiceRecovery extends ServiceRuns {
         ? pooled
         : link.runId ? loadRun(this.root.path, slug, link.runId, this.liveRunId()) : null;
       if (target?.halt?.kind === 'verification-preflight') {
-        const advisories = await this.verificationPreflight(
-          slug, target.onlyPhases?.length ? target.onlyPhases : undefined);
-        const fixed = advisories.length === 0;
+        // Judged by the rule that parked it — the verification review, under
+        // the run's own start-door answers — never by the session's word, and
+        // never by "is anything runnable", which called a repair fixed while
+        // `Person-check: halt` would park the same phase again.
+        const parks = (await this.verificationReviews(slug, {
+          ...(target.onlyPhases?.length ? { onlyPhases: target.onlyPhases } : {}), run: target,
+        })).filter((review) => review.verdict === 'parks').map((review) => review.park!);
+        const fixed = parks.length === 0;
         return {
           fixed,
           headline: fixed ? `${slug}'s §Verification is runnable` : `${slug} still has unrunnable §Verification`,
           detail: fixed
-            ? 'Every open phase now extracts a runnable verification command — boarding will pass.'
-            : advisories.join('; '),
+            ? 'Every open phase now reviews clear — boarding will pass.'
+            : parks.join('; '),
         };
       }
       const lint = await this.lint(slug);
@@ -2411,9 +2436,22 @@ export abstract class ServiceRecovery extends ServiceRuns {
       by: 'watch', via: 'timer', origin: 'watch-scheduler', trigger: landed.ref,
       guard: 'autoContinueRecovery,allowRun,!liveRunner,!fleetHold', counter: `watchResumes:${resumes}`,
     });
-    const drive = sessionId
+    // A session not worth resuming (autopilot-token-drain phase 4, `resumePolicy`)
+    // is not handed to the resume vehicle, whose gate would refuse it every
+    // delivery: the phase re-boards fresh, the landing and the reason as its words.
+    const notWorth = sessionId
+      ? resumePolicy(record, sessionId, { now: Date.now(), paying: state.accountId ?? 'default' })
+      : null;
+    const resumeIt = Boolean(sessionId) && notWorth?.choice !== 'fresh';
+    const drive = resumeIt
       ? this.recoverPhase(slug, c.phase, 'resume', { by: 'watch', instruction, settled: true })
-      : this.retryPhase(slug, c.phase, undefined, watchActor);
+      : this.retryPhase(
+        slug, c.phase,
+        notWorth?.choice === 'fresh' && sessionId
+          ? { addendum: `${resumePolicyInstruction(notWorth, sessionId)}\n\n${instruction}` }
+          : undefined,
+        watchActor,
+      );
     // The drive is registered BEFORE anything can observe it and released by
     // whichever settlement handler runs — the scheduler holds the landed offer
     // back exactly as long as this entry lives (`watchResumeInFlight`).
@@ -2431,7 +2469,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
           ?? (this.root ? loadRun(this.root.path, slug, state.id, this.liveRunIds()) : null);
         const rec = after && after.id === state.id ? after.phases[String(c.phase)] : null;
         let launched: boolean;
-        if (!sessionId) launched = result != null;
+        if (!resumeIt) launched = result != null;
         else if (!rec) launched = true; // the run moved on — nothing left to un-charge against
         else {
           const endedAfter = rec.endedAt ? Date.parse(rec.endedAt) : null;

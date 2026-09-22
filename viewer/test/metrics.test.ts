@@ -28,6 +28,7 @@ import {
   METRICS_CONTENT_TYPE, METRIC_FAMILIES, PHASE_STATES, escapeLabel, renderMetrics,
   type MetricsFacts,
 } from '../server/analysis/metrics.ts';
+import { count } from '../server/counters.ts';
 
 /* ------------------------------------------------------------------ *
  * a real parser, so "parseable" means parsed
@@ -176,6 +177,27 @@ test('the body is valid Prometheus exposition text', () => {
     assert.ok(parsed.type.has(name), `${name} emitted samples with no TYPE`);
   }
 });
+
+/**
+ * The process-lifetime counters are not part of `FACTS` — they are state this
+ * process accumulated — so the fixture has to be rich in that dimension too, or
+ * "the declared families and the emitted ones agree in BOTH directions" passes
+ * for every counter by way of "no data", which is the one excuse that test
+ * exists to refuse.
+ *
+ * Seeded ONCE, at load: the byte-identity test below compares two scrapes of an
+ * unchanged console, and a counter that moved between them is a changed console.
+ */
+count('log_lines_total', ['info']);
+count('journal_appends_total', []);
+count('journal_overflow_total', []);
+count('transcript_shed_total', ['tool_result']);
+count('git_commands_total', ['status', 'true']);
+count('git_command_seconds_total', ['status'], 0.25);
+count('engine_calls_total', ['phase-graph.sh', 'hit']);
+count('http_requests_total', ['2xx']);
+count('shell_commands_total', ['gh', 'true']);
+count('retention_removed_total', ['git-trace']);
 
 test('a _total is a counter and a counter is a _total — the suffix is not decoration', () => {
   const parsed = parse(renderMetrics(FACTS));

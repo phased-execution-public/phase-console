@@ -51,6 +51,7 @@ import {
 import type { LaunchSpec, SessionMeta } from './terminal.ts';
 import { inboxTasksFile } from './runner/tasks.ts';
 import { MANIFEST_ORDER, MANIFEST_QUESTIONS, PLAN_FIELDS, manifestDefault } from './plan-fields.ts';
+import { envCarrier } from './trace.ts';
 
 /**
  * A prompt bigger than this is a file, not a message. 32 KB since phase 12:
@@ -506,6 +507,10 @@ export function buildAgentLaunch(
         // `phase-tasks.sh` wrote the same file by its own fallback rule — and
         // nothing read it.
         ...(qaMeta && ctx.root ? { PE_TASKS_FILE: inboxTasksFile(ctx.root, qaMeta.slug, qaMeta.phase) } : {}),
+        // And which trace this reviewer's own evidence belongs to. A pty agent
+        // is the one session a PERSON is watching, so it is also the one whose
+        // trace id is worth being able to paste into the Debug page.
+        ...envCarrier(),
       },
       // Where the conversation lives — see `resumeTarget`. Server-composed
       // from the registry record, never a path the browser sent; the same rule

@@ -33,7 +33,7 @@ export function fixtureRuns(): FixtureRun[] {
   const out: FixtureRun[] = [];
   for (const slug of fixtureSlugs()) {
     for (const name of readdirSync(join(FIXTURE_DIR, slug)).sort()) {
-      const id = /^run-([0-9a-f]{8})\.json$/.exec(name)?.[1];
+      const id = /^run-([0-9a-f]{8,32})\.json$/.exec(name)?.[1];
       if (!id) continue;
       const file = join(FIXTURE_DIR, slug, name);
       out.push({ slug, runId: id, file, state: JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown> });
@@ -47,7 +47,7 @@ export function fixtureJournals(): FixtureJournal[] {
   const out: FixtureJournal[] = [];
   for (const slug of fixtureSlugs()) {
     for (const name of readdirSync(join(FIXTURE_DIR, slug)).sort()) {
-      const id = /^run-([0-9a-f]{8})\.jsonl$/.exec(name)?.[1];
+      const id = /^run-([0-9a-f]{8,32})\.jsonl$/.exec(name)?.[1];
       if (!id) continue;
       const file = join(FIXTURE_DIR, slug, name);
       const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean)

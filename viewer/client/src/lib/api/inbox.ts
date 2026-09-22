@@ -25,7 +25,9 @@ export type InboxKind =
   | 'session-ask'
   | 'conflict'
   | 'question'
-  | 'policy';
+  | 'policy'
+  | 'issue-draft'
+  | 'message';
 
 /** How loudly: `urgent` interrupts, `needs-you` waits for a person, `fyi` informs. */
 export type InboxSeverity = 'urgent' | 'needs-you' | 'fyi';

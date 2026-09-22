@@ -81,6 +81,7 @@ export const FLAG_REASON: Record<string, string> = {
   accounts: 'Account management is off. Restart the console with --allow-accounts.',
   mcp: 'MCP management is off. Restart the console with --allow-mcp.',
   terminal: 'Terminals are off. Restart the console with --allow-terminal.',
+  publish: 'Publishing is off. Restart the console with --allow-publish.',
 };
 
 export const flagReason = (flag: string | undefined): string | undefined =>
@@ -164,6 +165,13 @@ export interface NowLane {
   effort?: string;
   /** The live child, when there is one — a queued lane has none. */
   child?: ChildRef;
+  /**
+   * The base the run's branch — and so this lane's — was cut from, as the
+   * runner resolved it (`RunState.base`, phase 15). A fact about the RUN,
+   * carried on the lane so the branch chip's title can say it without a
+   * second fetch. Absent when the run never resolved one.
+   */
+  base?: RunState['base'];
   startedAt?: string;
   costUsd: number;
   turns?: number;
@@ -285,6 +293,7 @@ export function nowLanes(
         ...((record.model ?? run.model) ? { model: record.model ?? run.model } : {}),
         ...((record.effort ?? run.effort) ? { effort: record.effort ?? run.effort } : {}),
         ...(child ? { child } : {}),
+        ...(run.base ? { base: run.base } : {}),
         ...((child?.startedAt ?? record.startedAt)
           ? { startedAt: child?.startedAt ?? record.startedAt }
           : {}),

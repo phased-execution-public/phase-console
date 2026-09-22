@@ -429,6 +429,32 @@ test('records the board has overtaken become done, and the anchored halt clears'
   assert.equal(state.consecutiveFailures, 0);
 });
 
+test('a record THIS run attempted is closed while checkpointed and unverified — never "outside this run" (H7)', () => {
+  // Measured (autopilot-token-drain H7): P2's session held its handoff
+  // in-progress and was cut by the live wall; P3's session in the SAME run then
+  // finished P2's closeout artefacts, and the reconcile pass wrote "closed
+  // outside this run" over a phase this run had spent a session on.
+  const state = newRun({ slug: 'demo', root: '/tmp/whatever', model: 'opus' });
+  const attempted = phaseRecord(state, 2);
+  attempted.status = 'waiting';
+  attempted.attempts = 1;
+  attempted.startedAt = '2026-09-16T13:05:00.000Z';
+  attempted.sessionId = 'sess-p2';
+  attempted.parkedUntil = '2026-09-16T16:30:00.000Z';
+  phaseRecord(state, 4).status = 'pending';
+
+  const { closed } = reconcileRecordsAgainstBoard(state, { 2: 'done', 4: 'done' });
+
+  assert.deepEqual(closed.sort((a, b) => a - b), [2, 4]);
+  assert.equal(state.phases['2'].status, 'done', 'still closed — reconcile closes, it never re-runs');
+  assert.equal(
+    state.phases['2'].note,
+    'closed while checkpointed — the board reads done; not verified by this run',
+  );
+  assert.doesNotMatch(state.phases['2'].note ?? '', /outside this run/);
+  assert.match(state.phases['4'].note ?? '', /closed outside this run/, 'a phase this run never started keeps the old words');
+});
+
 test('a failed record whose phase the board does NOT read done is untouched — reconcile never re-runs', () => {
   const state = newRun({ slug: 'demo', root: '/tmp/whatever', model: 'opus' });
   state.status = 'halted';

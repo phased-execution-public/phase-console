@@ -112,15 +112,19 @@
  * written before this still name it — and is no longer produced.
  */
 
-import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
-import { normalizeToken } from '../../shared/scope.js';
+import { DEFAULT_BASE_BRANCH, PUSH_ARGV } from '../../shared/landing-model.js';
+import { normalizeToken, SHARED_CHECKOUT_TOKEN } from '../../shared/scope.js';
 import {
-  pairKey, qualifiedRef, type RadarState, type IsolationReclaim, type WorktreeRoot,
+  pairKey, qualifiedRef,
+  ourWorktreeLock, parseWorktreeLockReason, worktreeLockReason,
+  DEFAULT_RETENTION, retentionOf, retentionTtlHours,
+  type RadarState, type IsolationReclaim, type WorktreeRoot,
 } from '../../shared/worktree-model.js';
+import { shell } from '../shell.ts';
 
 /** How long any one git invocation may take. A wedged merge must end. */
 const GIT_TIMEOUT_MS = 120_000;
@@ -152,25 +156,31 @@ const GIT_TIMEOUT_MS = 120_000;
  */
 export type GitRun = { ok: boolean; stdout: string; stderr: string };
 
-function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<GitRun> {
-  return new Promise((done) => {
-    execFile('git', args, {
-      cwd,
-      timeout: GIT_TIMEOUT_MS,
-      maxBuffer: 8 * 1024 * 1024,
-      // Nothing below parses git's prose, and pinning the locale keeps it that
-      // way — the same reasoning as `server/git.ts`.
-      //
-      // `env` overrides the inherited set entirely, for a caller that must not
-      // inherit one: `GIT_DIR` in the console's own environment makes every
-      // read below answer about a DIFFERENT repository, and a read a browser
-      // can cause (`git-browse.ts`) must not be steerable that way. Absent, the
-      // behaviour is exactly what it was.
-      env: env ?? { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
-    }, (error, stdout, stderr) => {
-      done({ ok: !error, stdout: String(stdout), stderr: String(stderr) });
-    });
+async function git(cwd: string, args: string[], env?: NodeJS.ProcessEnv): Promise<GitRun> {
+  const run = await shell('git', args, {
+    channel: 'git',
+    intent: 'worktree',
+    cwd,
+    timeout: GIT_TIMEOUT_MS,
+    // Nothing below parses git's prose, and pinning the locale keeps it that
+    // way — the same reasoning as `server/git.ts`.
+    //
+    // `env` overrides the inherited set entirely, for a caller that must not
+    // inherit one: `GIT_DIR` in the console's own environment makes every
+    // read below answer about a DIFFERENT repository, and a read a browser
+    // can cause (`git-browse.ts`) must not be steerable that way. Absent, the
+    // behaviour is exactly what it was.
+    env: env ?? { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
+    // `head`, not `ends`: several readers below parse this output.
+    capture: { keep: 8 * 1024 * 1024, mode: 'head' },
+    // `ok:false` is this helper's ANSWER — most of what this module asks is
+    // "does this branch exist", "is this registration stale", "can this tree be
+    // taken". Every caller reads `ok`, and every DECISION taken on one is
+    // journalled in its own right (`run.isolation-adopted`, `run.mirror-drifted`,
+    // `phase.worktree-landing`). `PHASE_CONSOLE_DEBUG=git` shows them all.
+    expectFailure: true,
   });
+  return { ok: run.ok, stdout: run.stdout, stderr: run.stderr };
 }
 
 /**
@@ -315,8 +325,12 @@ export function scopeConfined(root: string, scopes: Iterable<string>): boolean {
   for (const raw of scopes) {
     const token = normalizeToken(raw);
     // An unusable token (punctuation, a stray number) is not a claim about a
-    // tree, so it cannot be a claim about a tree outside this one.
-    if (!token || token === 'all') continue;
+    // tree, so it cannot be a claim about a tree outside this one. Neither is
+    // an INTERNAL token: `.shared-checkout` is how a shared-root new-branch run
+    // says it needs the whole checkout (S11-c) and names no repository at all,
+    // so reading it as one would make every such run's claim unqualified —
+    // which is a silent loss of both carve dimensions, not a refusal.
+    if (!token || token === 'all' || token === normalizeToken(SHARED_CHECKOUT_TOKEN)) continue;
     if (own && token === own) continue;
     // `resolve` collapses `..`; `realish` then follows symlinks, and it has to,
     // because a symlink is the one way a token can name a path that LOOKS
@@ -352,22 +366,21 @@ export const SETUP_TIMEOUT_MS = 10 * 60_000;
 export async function runSetup(
   dir: string, command: string, timeoutMs = SETUP_TIMEOUT_MS,
 ): Promise<{ ok: boolean; output: string }> {
-  return new Promise((done) => {
-    execFile('sh', ['-c', command], {
-      cwd: dir,
-      timeout: timeoutMs,
-      maxBuffer: 8 * 1024 * 1024,
-      env: { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
-    }, (error, stdout, stderr) => {
-      const output = `${String(stdout)}${String(stderr)}`.trim();
-      done({
-        ok: !error,
-        // Bounded: this goes in a journal entry an operator reads in a browser,
-        // and `npm ci` alone is thousands of lines.
-        output: output.length > 4000 ? `${output.slice(0, 4000)}\n…(truncated)` : output,
-      });
-    });
+  const run = await shell('sh', ['-c', command], {
+    channel: 'shell',
+    intent: 'worktree-setup',
+    cwd: dir,
+    timeout: timeoutMs,
+    capture: { keep: 8 * 1024 * 1024 },
+    env: { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0' },
   });
+  const output = `${run.stdout}${run.stderr}`.trim();
+  return {
+    ok: run.ok,
+    // Bounded: this goes in a journal entry an operator reads in a browser,
+    // and `npm ci` alone is thousands of lines.
+    output: output.length > 4000 ? `${output.slice(0, 4000)}\n…(truncated)` : output,
+  };
 }
 
 /**
@@ -401,6 +414,129 @@ export async function copyEnvFiles(from: string, to: string): Promise<string[]> 
   return copied;
 }
 
+/** Where a repository lists the ignored files a fresh checkout still needs. */
+export const WORKTREE_INCLUDE = '.worktreeinclude';
+
+/** The caps a `.worktreeinclude` copy is bounded by, unless the caller says otherwise. */
+export const INCLUDE_MAX_FILES = 200;
+
+export const INCLUDE_MAX_BYTES = 50 * 1024 * 1024;
+
+/** Is `entry` a path this repository is allowed to name? */
+function safeInclude(from: string, entry: string): string | null {
+  // Absolute paths and `~` are refused outright rather than resolved: a
+  // `.worktreeinclude` is a statement about THIS repository, and a line that
+  // reaches outside it is either a mistake or an attempt to make the console
+  // copy something for somebody.
+  if (!entry || isAbsolute(entry) || entry.startsWith('~')) return null;
+  const target = resolve(from, entry);
+  const base = resolve(from);
+  // `..` is caught here rather than by scanning the string, so a line that
+  // climbs out and back in (`nested/../../escape.txt`) is judged by where it
+  // ENDS UP — which is the only question that matters.
+  if (target !== base && !target.startsWith(`${base}${sep}`)) return null;
+  return target;
+}
+
+/** Every file under `dir`, with its size, deepest-last. Used only for the caps. */
+async function weigh(dir: string): Promise<{ files: number; bytes: number }> {
+  let files = 0;
+  let bytes = 0;
+  const walk = async (at: string): Promise<void> => {
+    for (const entry of await readdir(at, { withFileTypes: true })) {
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) { await walk(path); continue; }
+      if (!entry.isFile()) continue;
+      files += 1;
+      try { bytes += (await stat(path)).size; } catch { /* a file that went away weighs nothing */ }
+    }
+  };
+  await walk(dir);
+  return { files, bytes };
+}
+
+/**
+ * Copy the ignored files a build needs into a freshly minted tree.
+ *
+ * `copyEnvFiles` beside it answers the common case — the handful of `.env*`
+ * files at a repository root — and could not answer the rest: a service
+ * account JSON, a `config/` directory, a generated certificate. Those are
+ * gitignored by design and a linked worktree has none of them, so a tree the
+ * console mints builds on the operator's machine and not in its own checkout.
+ *
+ * Four rules, and each one is a refusal rather than a coercion:
+ *
+ *  - **inside the repository, always.** A line that resolves outside `from` is
+ *    refused and NAMED (`safeInclude`). An operator's `../secrets.env` is
+ *    either a mistake or somebody asking the console to copy a file for them.
+ *  - **capped, at files AND bytes.** A `.worktreeinclude` naming `node_modules/`
+ *    is a plausible typo, and a checkout that silently copies a gigabyte is a
+ *    disk an operator loses without ever being told why.
+ *  - **named when refused.** A file that was not copied because of a cap or a
+ *    rule reads, to the build that needed it, exactly like a bug in the
+ *    checkout. The caller journals this list.
+ *  - **only for a tree this call minted**, and only behind `worktreeCopyEnv` —
+ *    the caller's obligation, exactly as for `copyEnvFiles`: copying an
+ *    operator's ignored files into a second directory is a decision they make,
+ *    never one they discover.
+ */
+export async function copyIncluded(
+  from: string, to: string,
+  opts: { maxFiles?: number; maxBytes?: number } = {},
+): Promise<{ copied: string[]; refused: string[] }> {
+  const maxFiles = opts.maxFiles ?? INCLUDE_MAX_FILES;
+  const maxBytes = opts.maxBytes ?? INCLUDE_MAX_BYTES;
+  let body: string;
+  try {
+    body = await readFile(join(from, WORKTREE_INCLUDE), 'utf8');
+  } catch {
+    // No file at all — every repository, which is why this is not an error.
+    return { copied: [], refused: [] };
+  }
+
+  const entries = body.split('\n').map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'));
+  const copied: string[] = [];
+  const refused: string[] = [];
+  let files = 0;
+  let bytes = 0;
+  let capped = false;
+
+  for (const entry of entries) {
+    const target = safeInclude(from, entry);
+    if (!target || !existsSync(target)) { refused.push(entry); continue; }
+    let weight: { files: number; bytes: number };
+    try {
+      const info = await stat(target);
+      weight = info.isDirectory() ? await weigh(target) : { files: 1, bytes: info.size };
+    } catch { refused.push(entry); continue; }
+    // 🔴 Weighed BEFORE it is copied, so a cap never leaves half a directory
+    // in the tree: a partially-copied `config/` is worse than an absent one,
+    // because the build fails somewhere far from the cause.
+    if (capped || files + weight.files > maxFiles || bytes + weight.bytes > maxBytes) {
+      // 🔴 A STOP, not a skip: once the cap is reached every remaining entry
+      // is refused, including small ones that would still fit. A cap that let
+      // later entries through would copy an arbitrary subset decided by file
+      // order, which is the one outcome nobody can reason about from the
+      // `.worktreeinclude` they wrote.
+      capped = true;
+      refused.push(entry);
+      continue;
+    }
+    try {
+      const dest = resolve(to, entry);
+      await mkdir(dirname(dest), { recursive: true });
+      await cp(target, dest, { recursive: true, errorOnExist: false, force: true });
+      files += weight.files;
+      bytes += weight.bytes;
+      copied.push(entry);
+    } catch {
+      refused.push(entry);
+    }
+  }
+  return { copied, refused };
+}
+
 /**
  * Give a run's own integration tree back, if it holds nothing that is not a commit.
  *
@@ -432,7 +568,7 @@ export async function pruneRunTree(
   if (mirror) return pruneMirror({ integration: names.integration, mounts: mirror });
 
   if (!(await isRegistered(root, names.integration))) {
-    await git(root, ['worktree', 'prune']);
+    await pruneRegistrations(root, names.integration);
     return { removed, kept };
   }
   const lanes = await registeredLanes(root, opts, names.integration);
@@ -440,7 +576,7 @@ export async function pruneRunTree(
     kept.push(names.integration);
     return { removed, kept };
   }
-  const out = await git(root, ['worktree', 'remove', '--force', names.integration]);
+  const out = await removeTree(root, names.integration);
   if (out.ok) {
     removed.push(names.integration);
     await git(root, ['worktree', 'prune']);
@@ -450,14 +586,24 @@ export async function pruneRunTree(
   return { removed, kept };
 }
 
-/** Every registered worktree of this run that is not its integration tree. */
+/**
+ * Every registered worktree of this run that is not its integration tree.
+ *
+ * `integration` may be omitted, and then the answer is every registered tree
+ * under the run's directory — the question a recursive DELETE has to ask
+ * (`pruneRun`, WT-1), as opposed to the question a single tree's removal asks.
+ *
+ * 🔴 A read that FAILED answers "something is registered here", not "nothing
+ * is". Both callers treat an empty list as permission to remove a directory,
+ * and a git that would not run is the one answer that cannot give it.
+ */
 async function registeredLanes(
-  root: string, opts: LaneHome & { runId: string }, integration: string,
+  root: string, opts: LaneHome & { runId: string }, integration?: string,
 ): Promise<string[]> {
-  const out = await git(root, ['worktree', 'list', '--porcelain']);
-  if (!out.ok) return [];
   const base = `${realish(join(laneHome(opts), opts.runId))}/`;
-  const skip = realish(integration);
+  const out = await git(root, ['worktree', 'list', '--porcelain']);
+  if (!out.ok) return [base];
+  const skip = integration ? realish(integration) : '';
   return out.stdout.split('\n')
     .filter((line) => line.startsWith('worktree '))
     .map((line) => realish(line.slice('worktree '.length).trim()))
@@ -710,9 +856,9 @@ export async function holdsBranch(root: string, dir: string, branch: string): Pr
  * HEAD.
  */
 export async function ensureIntegration(
-  root: string, names: LaneNames,
-): Promise<WorktreeStep & { created?: boolean }> {
-  return ensureCheckout(root, { dir: names.integration, branch: names.runBranch });
+  root: string, names: LaneNames, opts?: CheckoutOpts,
+): Promise<WorktreeStep & { created?: boolean; base?: string; baseSha?: string }> {
+  return ensureCheckout(root, { dir: names.integration, branch: names.runBranch }, opts);
 }
 
 /**
@@ -730,7 +876,7 @@ export async function ensureIntegration(
  */
 export async function ensureDetachedIntegration(
   root: string, dir: string, sha: string,
-): Promise<WorktreeStep & { created?: boolean }> {
+): Promise<WorktreeStep & { created?: boolean; base?: string; baseSha?: string }> {
   return ensureCheckout(root, { dir, detachAt: sha });
 }
 
@@ -777,6 +923,20 @@ export type CheckoutAt =
    */
   | { dir: string; detachAt: string };
 
+/** What a caller may tell `ensureCheckout` beyond the tree's own identity. */
+export type CheckoutOpts = {
+  /**
+   * The base a NEW run branch is cut from, already resolved to a commit.
+   *
+   * Absent means "decide it the way this function always did" — the local
+   * trunk, else HEAD — so every caller that has no opinion keeps its behaviour
+   * byte for byte. Ignored entirely when the branch already exists: a base is a
+   * statement about creation, and re-basing an existing branch is a merge, not
+   * a checkout.
+   */
+  base?: BaseResolution;
+};
+
 /**
  * Keep a console-made tree under `<root>/.worktrees` out of the root's own
  * `git status`.
@@ -815,8 +975,8 @@ async function ensureExcluded(docsRoot: string): Promise<void> {
 }
 
 async function ensureCheckout(
-  root: string, at: CheckoutAt,
-): Promise<WorktreeStep & { created?: boolean }> {
+  root: string, at: CheckoutAt, opts?: CheckoutOpts,
+): Promise<WorktreeStep & { created?: boolean; base?: string; baseSha?: string }> {
   // Both halves read ONCE, here, from the discriminant — rather than asking
   // `'branch' in at` at each site. Exactly one of them is defined, and every
   // branch below is written against that pair, so the two shapes cannot drift
@@ -930,7 +1090,11 @@ async function ensureCheckout(
         };
       }
     } else {
-      await git(root, ['worktree', 'prune']);
+      // The directory is gone and the registration may still be LOCKED — a
+      // console killed between the lock and the removal, or an operator's own
+      // `rm -rf`. `prune` skips a locked registration, so the unlock has to
+      // come first or the rebuild below meets "already exists" for ever.
+      await pruneRegistrations(root, names.integration);
     }
   }
 
@@ -972,13 +1136,45 @@ async function ensureCheckout(
   }
 
   const exists = wanted ? await refExists(root, names.runBranch) : false;
+  // 🔴 A NEW run branch forks from the TRUNK, not from `HEAD` (BASE-1). `HEAD`
+  // is whatever the operator's own checkout happens to be standing on, and on
+  // the machine that runs this that is routinely another plan's `pe/<slug>`, a
+  // detached sha, or a trunk three weeks stale — so one plan's unfinished work
+  // silently became the next plan's base, and the shared-run prompt claimed
+  // "the default branch" the whole time (CV-5). `defaultBranchOf` asks the
+  // repository rather than guessing, and answers `undefined` for one whose
+  // trunk it cannot name — where `HEAD` is the honest fallback and the only
+  // one there is. Fetching first is deliberately NOT done here: the console
+  // talks to no remote (`WORKTREE_VERBS`), and a base branch chosen from the
+  // remote is phase 6's option.
+  //
+  // 🔴 …and it is resolved ONCE, to a COMMIT, before the fork. The caller's
+  // `base` is already pinned (`resolveBase`); the fallback is pinned here for
+  // the same reason. Forking at the ref NAME let the trunk move between the
+  // decision and the `worktree add` — a second console landing a merge, an
+  // operator pulling — so the run started from a commit nobody chose while the
+  // journal reported the one that had been read a moment earlier.
+  const resolved = !wanted || exists
+    ? undefined
+    : opts?.base ?? await resolveBase(root, DEFAULT_BASE_BRANCH);
+  const base = resolved?.ref;
+  const baseSha = resolved?.sha ?? '';
+  const forkAt = baseSha || 'HEAD';
   const args = !wanted
     ? ['worktree', 'add', '--detach', names.integration, detachAt!]
     : exists
       ? ['worktree', 'add', names.integration, names.runBranch]
-      : ['worktree', 'add', '-b', names.runBranch, names.integration, 'HEAD'];
+      : ['worktree', 'add', '-b', names.runBranch, names.integration, forkAt];
   const out = await git(root, args);
-  if (out.ok) return { ok: true, created: true };
+  if (out.ok) {
+    return {
+      ok: true, created: true,
+      // Named only when it IS a name — the journal's `run.isolation {base}`
+      // must not invent one for the fallback, since "we forked from HEAD" and
+      // "we forked from main" are the two facts this exists to tell apart.
+      ...(base && baseSha ? { base, baseSha } : {}),
+    };
+  }
   return { ok: false, detail: firstLine(out.stderr) || 'git worktree add failed' };
 }
 
@@ -1023,7 +1219,7 @@ async function discardFreshDir(
   root: string, dir: string,
 ): Promise<{ removed: boolean; detail?: string }> {
   if (!(await isRegistered(root, dir))) return { removed: true };
-  const out = await git(root, ['worktree', 'remove', '--force', dir]);
+  const out = await removeTree(root, dir);
   if (!out.ok) return { removed: false, detail: firstLine(out.stderr) || 'git worktree remove failed' };
   await git(root, ['worktree', 'prune']);
   return { removed: true };
@@ -1200,6 +1396,156 @@ export async function defaultBranchOf(repo: string): Promise<string | undefined>
     if (await refExists(repo, name)) return name;
   }
   return undefined;
+}
+
+/**
+ * Which arm of `resolveBase` answered — the fact that makes the record honest.
+ *
+ * "We forked from `main`" is four different statements depending on how `main`
+ * was arrived at, and only one of them is what the operator asked for. A run
+ * whose plan says `origin/HEAD` and whose repository has no remote forks from
+ * the local trunk, which is the right answer and is NOT the answer requested;
+ * `run.base-branch` carries the difference so nobody has to infer it later.
+ */
+export type BaseSource =
+  /** `symbolic-ref refs/remotes/origin/HEAD` — the remote's own idea of home. */
+  | 'origin-head'
+  /** The local trunk, because there is no remote (or it has no HEAD). */
+  | 'trunk'
+  /** The word `head`: whatever this checkout has out, today's behaviour named. */
+  | 'head'
+  /** A ref the caller spelled out, verified to exist. */
+  | 'ref';
+
+/** The base a run branch is cut from, pinned at the moment it was chosen. */
+export type BaseResolution = {
+  /** The ref as a person would write it — `main`, `HEAD`, `release/5.1`. */
+  ref: string;
+  /**
+   * Its commit AT RESOLUTION TIME, and the thing the branch is actually minted
+   * at. A base is a point in time or it is not a base: between the resolve and
+   * the `worktree add` a second console can land a merge, and forking at the
+   * NAME would silently move the run's starting point under it.
+   */
+  sha: string;
+  source: BaseSource;
+};
+
+export { DEFAULT_BASE_BRANCH, ourWorktreeLock, worktreeLockReason };
+
+/**
+ * Tell git this tree is in use, with a reason a person and a sweep can read.
+ *
+ * `git worktree lock` is the one mechanism git itself offers for "do not
+ * remove this", and the console's sweeps are not the only thing it protects
+ * against: `git worktree prune` skips a locked tree, and `worktree remove`
+ * refuses one. That is the point — the tree a live session is writing in
+ * should be hard to delete from any direction, including a person's own
+ * `git worktree remove` typed in the wrong terminal.
+ *
+ * Best effort and silent on failure. A tree that could not be locked is the
+ * state every tree was in before this existed: the sweeps' own landed/dirty
+ * rules still stand between it and deletion, and failing a checkout because a
+ * belt could not be fastened would be the worse trade.
+ */
+export async function lockTree(root: string, dir: string, reason: string): Promise<boolean> {
+  const out = await git(root, ['worktree', 'lock', '--reason', reason, dir]);
+  return out.ok;
+}
+
+/**
+ * Remove a console tree, unlocking it first.
+ *
+ * 🔴 `git worktree remove` REFUSES a locked tree and `git worktree prune`
+ * SKIPS a locked registration — which is exactly what a lock is for, and
+ * exactly what turns every one of this module's own removals into a silent
+ * no-op the moment locking ships. Measured, not predicted: four
+ * `git-strategy.test.ts` cases went red the hour the run tree started locking
+ * itself, among them "a registration whose directory an operator deleted is
+ * rebuilt", because `prune` would not drop a locked registration for a
+ * directory that no longer existed and `worktree add` then refused the path.
+ *
+ * So the unlock is HERE, inside the one function that removes, rather than at
+ * each call site — the `serialised()` rule applied to a second hazard. Whether
+ * the tree MAY be removed is a separate question with a separate answer
+ * (`lockPermits`), and every caller that has to respect a person's lock asks
+ * it first; by the time a path reaches this function the decision is made.
+ */
+async function removeTree(root: string, dir: string): Promise<GitRun> {
+  await unlockTree(root, dir);
+  return git(root, ['worktree', 'remove', '--force', dir]);
+}
+
+/**
+ * Drop registrations whose directory is gone, unlocking a named one first.
+ *
+ * `prune` skips a locked registration, so the one shape that needs saying is
+ * "this directory has gone and its registration is still locked" — a console
+ * killed between the lock and the removal. Called with no `dir` it is exactly
+ * `git worktree prune`.
+ */
+async function pruneRegistrations(root: string, dir?: string): Promise<void> {
+  if (dir) await unlockTree(root, dir);
+  await git(root, ['worktree', 'prune']);
+}
+
+/**
+ * Give the lock back. Safe on a tree that holds none — git says so and
+ * nothing else happens, which is the answer a caller wants when it is
+ * unlocking defensively before a remove.
+ */
+export async function unlockTree(root: string, dir: string): Promise<boolean> {
+  const out = await git(root, ['worktree', 'unlock', dir]);
+  return out.ok;
+}
+
+/**
+ * Turn a base-branch WORD into a commit, or into nothing at all.
+ *
+ * The option table's three shapes, in the order a reader meets them:
+ *
+ *  - **`origin/HEAD`** (the default) — the remote's own default branch, then
+ *    the local trunk. This is `defaultBranchOf` with the arms told apart: the
+ *    fallback is a perfectly good answer and a materially different one.
+ *  - **`head`** — this checkout's HEAD, which is exactly what `ensureCheckout`
+ *    did before any of this existed. Kept as a WORD so an operator who wants
+ *    the old behaviour can ask for it rather than discovering it.
+ *  - **anything else** — a ref, verified. `release/5.1`, a tag, a sha.
+ *
+ * 🔴 An unresolvable ref answers `undefined`, and the caller must NOT quietly
+ * fall back to the trunk. Forking from `main` because the operator's
+ * `release/9.9` does not exist puts the run's work on a base nobody chose, and
+ * the journal would then report `main` as though that had been the plan — a
+ * record that is worse than no record. Silence here is what lets the caller
+ * refuse out loud.
+ */
+export async function resolveBase(
+  repo: string, word?: string,
+): Promise<BaseResolution | undefined> {
+  const asked = String(word ?? '').trim() || DEFAULT_BASE_BRANCH;
+  const at = async (ref: string, source: BaseSource): Promise<BaseResolution | undefined> => {
+    const sha = await commitOf(repo, ref);
+    return sha ? { ref, sha, source } : undefined;
+  };
+
+  if (asked.toLowerCase() === 'head') return at('HEAD', 'head');
+
+  if (asked.toLowerCase() === DEFAULT_BASE_BRANCH.toLowerCase()) {
+    const head = await git(repo, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    if (head.ok) {
+      const name = head.stdout.trim().replace(/^origin\//, '');
+      if (name && await refExists(repo, name)) return at(name, 'origin-head');
+    }
+    // Not `defaultBranchOf` verbatim: it would re-ask the remote arm that just
+    // failed, and — more to the point — its answer cannot say WHICH arm spoke,
+    // which is the one thing this function exists to report.
+    for (const name of ['main', 'master']) {
+      if (await refExists(repo, name)) return at(name, 'trunk');
+    }
+    return undefined;
+  }
+
+  return at(asked, 'ref');
 }
 
 /**
@@ -1470,15 +1816,62 @@ async function resyncLane(root: string, names: LaneNames): Promise<LaneResync | 
  * point of keeping the branch is that they are still there. Reuse is also where
  * the lane is caught up with the run branch — see `resyncLane`.
  */
-export async function acquireLane(
+export function acquireLane(
   root: string, names: LaneNames,
-): Promise<WorktreeStep & { dir?: string; resync?: LaneResync }> {
-  const integration = await ensureIntegration(root, names);
-  if (!integration.ok) return integration;
+  opts?: CheckoutOpts & {
+    /**
+     * The `git worktree lock` reason to fasten on the lane while it lives —
+     * `worktreeLockReason({ kind: 'lane', … })`. Absent leaves the tree
+     * unlocked, which is every caller's behaviour before locks existed.
+     */
+    lock?: string;
+  },
+): Promise<WorktreeStep & { dir?: string; resync?: LaneResync; locked?: boolean }> {
+  // 🔴 Serialised on the INTEGRATION tree, the `landLane` rule applied to the
+  // acquisition (many-plans-one-repo phase 8). Two lanes admitted in the same
+  // instant — disjoint scopes, `maxParallel: 2` — both reached
+  // `ensureIntegration` before either had minted `pe/<slug>`, and the loser's
+  // `worktree add -b pe/<slug>` failed with "cannot lock ref: reference
+  // already exists". That read as `phase.worktree-failed`, the lane silently
+  // shared the root, its session committed on the trunk, and it never landed
+  // at all. The same key as the landing's, so a lane is never forked from a
+  // run branch mid-merge either.
+  return serialised(names.integration, () => acquireLaneBody(root, names, opts));
+}
 
+async function acquireLaneBody(
+  root: string, names: LaneNames,
+  opts?: CheckoutOpts & { lock?: string },
+): Promise<WorktreeStep & { dir?: string; resync?: LaneResync; locked?: boolean }> {
+  const integration = await ensureIntegration(root, names, opts);
+  if (!integration.ok) return integration;
+  // Re-fastened on a REUSED lane too, not only a fresh one: a retry adopts the
+  // tree its first attempt made, and a lock that only ever went on at creation
+  // would leave every retried lane bare — which is exactly the lane most worth
+  // protecting, because it is the one that already has commits in it.
+  //
+  // And SAID, not only done (phase 15): `locked` is whether git accepted the
+  // reason, because the runner writes it onto the lane's durable child record
+  // on that word alone — a row reading "locked" over a lock git refused would
+  // be a string we hoped for, not a fact. Absent when no lock was asked for.
+  const lock = async (): Promise<{ locked?: boolean }> => {
+    if (!opts?.lock) return {};
+    return { locked: await lockTree(root, names.dir, opts.lock) };
+  };
+
+  // 🔴 REGISTERED IS NOT ENOUGH — the directory has to be there (WT-3), the
+  // same lesson `ensureCheckout` already learned one level up. `git worktree
+  // list` keeps printing a registration whose directory an operator deleted
+  // (git calls it *prunable*), so registration alone said "adopt this" about
+  // nothing at all: `resyncLane`'s `git merge` then failed with ENOENT, which
+  // reads as `skipped` — "the lane is usable exactly as it stands" — and the
+  // phase boarded a session into a cwd that does not exist.
   if (await isRegistered(root, names.dir)) {
-    const resync = await resyncLane(root, names);
-    return { ok: true, dir: names.dir, ...(resync ? { resync } : {}) };
+    if (existsSync(names.dir)) {
+      const resync = await resyncLane(root, names);
+      return { ok: true, dir: names.dir, ...(resync ? { resync } : {}), ...(await lock()) };
+    }
+    await pruneRegistrations(root, names.dir);
   }
   await mkdir(dirname(names.dir), { recursive: true });
 
@@ -1488,16 +1881,39 @@ export async function acquireLane(
     : ['worktree', 'add', '-b', names.laneBranch, names.dir, names.runBranch];
   const out = await git(root, args);
   if (!out.ok) return { ok: false, detail: firstLine(out.stderr) || 'git worktree add failed' };
-  return { ok: true, dir: names.dir };
+  return { ok: true, dir: names.dir, ...(await lock()) };
 }
+
+/**
+ * A conflict that is not two edits to the same lines — the kinds no rebase
+ * session is asked to settle (many-plans-one-repo decision 17): both sides
+ * ADDED a path, one side DELETED what the other edited, or both sides moved
+ * a SUBMODULE pointer. Content conflicts are a judgement about text; these
+ * are a judgement about intent, and the console halts on them at once.
+ */
+export type StructuralConflict = { file: string; kind: 'add/add' | 'modify/delete' | 'submodule' };
 
 export type LandResult =
   /** Nothing to land — the lane made no commits. Not a failure. */
   | { kind: 'empty' }
   /** The run branch now contains the lane's commits. */
   | { kind: 'merged'; fastForward: boolean; commits: number }
-  /** git could not merge them. The merge was aborted; every commit survives. */
-  | { kind: 'conflict'; files: string[]; detail: string }
+  /**
+   * git could not merge them. The merge was aborted; every commit survives.
+   * `structural` names the conflicted paths that are NOT content clashes —
+   * present (possibly empty) whenever the tree could be read before the abort.
+   */
+  | { kind: 'conflict'; files: string[]; detail: string; structural?: StructuralConflict[] }
+  /**
+   * Somebody else is holding the target tree, and said why.
+   *
+   * Only the STAGING tree can answer this, and only to a lock this console did
+   * not write: an operator resolving a conflict by hand in `pe/integration` is
+   * doing the one thing a settle must not interrupt. Not a failure — the run
+   * branch is untouched and every commit is on it, so the landing parks
+   * (`staging-locked`, phase 8's park kind) and tries again later.
+   */
+  | { kind: 'locked'; by: string }
   /** Something else went wrong (a missing branch, a wedged git). */
   | { kind: 'failed'; detail: string };
 
@@ -1515,7 +1931,47 @@ export type LandResult =
  * lane, and an operator opening the directory would find a mess with no note
  * saying who made it.
  */
-export async function landLane(
+/**
+ * One merge at a time per TARGET TREE — the mutex both landings needed.
+ *
+ * 🔴 A working tree has ONE index and ONE `MERGE_HEAD`, and two merges into it
+ * at once is not a race that sometimes loses a commit: it is two processes
+ * sharing one half-finished merge. Measured (WT-2, SET-1): a conflict blamed on
+ * the wrong lane, `merge --abort` taking the OTHER lane's merge with it, and
+ * `index.lock` failures returned as `failed` — a kind nothing halts on, so the
+ * run carried on with a lane silently unlanded.
+ *
+ * Keyed by the target directory rather than held on a Runner, because the two
+ * callers have different scopes and the tree is what is actually shared: two
+ * lanes of one run meet in one `integration/`, and two PLANS' settles meet in
+ * the console's single `pe/integration` staging tree. A per-Runner chain would
+ * have fixed the first and left the second, which is how the audit found them
+ * as two findings. One chain per path fixes both, and a caller cannot forget to
+ * take it because it is inside the function that does the merging.
+ *
+ * The chain never rejects: each link swallows its predecessor's outcome, so one
+ * landing that throws cannot wedge every landing after it.
+ */
+const landing = new Map<string, Promise<unknown>>();
+
+function serialised<T>(dir: string, body: () => Promise<T>): Promise<T> {
+  const key = realish(dir);
+  const previous = landing.get(key) ?? Promise.resolve();
+  const next = previous.then(body, body);
+  // Held until it settles, then dropped when nothing newer has taken the key —
+  // an unbounded map keyed by path would grow for the life of the console.
+  landing.set(key, next.catch(() => undefined));
+  void next.catch(() => undefined).then(() => {
+    if (landing.get(key) === next) landing.delete(key);
+  });
+  return next;
+}
+
+export function landLane(root: string, names: LaneNames): Promise<LandResult> {
+  return serialised(names.integration, () => landLaneBody(root, names));
+}
+
+async function landLaneBody(
   root: string, names: LaneNames,
 ): Promise<LandResult> {
   if (!(await refExists(root, names.laneBranch))) {
@@ -1540,12 +1996,52 @@ export async function landLane(
   if (merge.ok) return { kind: 'merged', fastForward: false, commits };
 
   // Conflicted, or refused for another reason. `--abort` is safe either way:
-  // with no merge in progress it fails harmlessly and changes nothing.
+  // with no merge in progress it fails harmlessly and changes nothing. The
+  // structural read happens BEFORE the abort, which is the only moment the
+  // index still says how each path conflicted.
   const files = await conflictedFiles(names.integration);
+  const structural = files.length ? await structuralConflicts(names.integration) : [];
   await git(names.integration, ['merge', '--abort']);
   const detail = firstLine(merge.stderr) || firstLine(merge.stdout) || 'git merge failed';
   if (!files.length) return { kind: 'failed', detail };
-  return { kind: 'conflict', files, detail };
+  return { kind: 'conflict', files, detail, structural };
+}
+
+/**
+ * Which conflicted paths are structural, read from the index mid-merge.
+ *
+ * `status --porcelain`'s two status columns spell the unmerged states: `AA`
+ * both added, `DU`/`UD` deleted by one side and modified by the other, `AU`/`UA`
+ * added by one side only (a rename or an add against a delete), `DD` both
+ * deleted, `UU` both modified. A `UU` whose path is a gitlink (`diff --raw`
+ * mode `160000`) is a submodule pointer both sides moved — which git reports
+ * as a plain modify/modify and is the one shape no text merge can touch.
+ */
+async function structuralConflicts(cwd: string): Promise<StructuralConflict[]> {
+  const out: StructuralConflict[] = [];
+  const status = await git(cwd, ['status', '--porcelain', '--untracked-files=no']);
+  if (!status.ok) return out;
+  const both: string[] = [];
+  for (const line of status.stdout.split('\n')) {
+    if (line.length < 4) continue;
+    const xy = line.slice(0, 2);
+    const file = line.slice(3).trim();
+    if (xy === 'AA') out.push({ file, kind: 'add/add' });
+    else if (xy === 'DU' || xy === 'UD' || xy === 'AU' || xy === 'UA' || xy === 'DD') out.push({ file, kind: 'modify/delete' });
+    else if (xy === 'UU') both.push(file);
+  }
+  if (both.length) {
+    // The unmerged entries as `diff --raw` prints them: `:<mode1> <mode2> …`
+    // per path; a gitlink is mode 160000 on the side that holds it.
+    const raw = await git(cwd, ['diff', '--raw', '--diff-filter=U', '--', ...both]);
+    if (raw.ok) {
+      for (const line of raw.stdout.split('\n')) {
+        const m = /^:(\d{6}) (\d{6}) .*\t(.+)$/.exec(line);
+        if (m && (m[1] === '160000' || m[2] === '160000')) out.push({ file: m[3]!.trim(), kind: 'submodule' });
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -1577,8 +2073,16 @@ export type StagingNames = {
  * scope the branch has: two consoles on two repositories never collide, and two
  * plans in one repository share the tree they are supposed to share.
  */
-export function stagingNames(consoleDir: string): StagingNames {
-  return { branch: STAGING_BRANCH, dir: join(consoleDir, 'staging') };
+export function stagingNames(consoleDir: string, repoKey?: string): StagingNames {
+  // 🔴 The ROOT keeps `staging/` exactly, with no leaf — byte for byte the
+  // path every console that predates this wrote, so a staging tree that
+  // already exists is still found and still adopted rather than abandoned
+  // beside a new empty one holding the same branch.
+  const key = (repoKey ?? '').trim();
+  return {
+    branch: STAGING_BRANCH,
+    dir: key ? join(consoleDir, 'staging', key) : join(consoleDir, 'staging'),
+  };
 }
 
 /**
@@ -1594,7 +2098,30 @@ export function stagingNames(consoleDir: string): StagingNames {
  * published, so it runs inside the console (`worktree.ts`, merge verbs only)
  * rather than as a session with a push carve-out.
  */
-export async function landIntegration(
+export function landIntegration(
+  root: string, opts: { branch: string; staging: StagingNames },
+): Promise<LandResult> {
+  // Console-wide, because the staging tree is (SET-1): `pe/integration` is ONE
+  // branch with ONE checkout shared by every plan of this console, and two
+  // settles arriving together met `worktree add` refusing, a conflict blamed on
+  // the wrong plan, and `ahead` counts read mid-merge.
+  return serialised(opts.staging.dir, () => landIntegrationBody(root, opts));
+}
+
+/**
+ * The staging checkout, made if it is not there yet — `landIntegration` does
+ * this itself, but a MIRROR needs it done in MOUNT order first (phase 8): a
+ * submodule's staging tree stands INSIDE the root's (`staging/sub` under
+ * `staging/`, the mirror's own shape), and landing deepest-first would create
+ * the submodule's before the root's — after which `git worktree add staging`
+ * refuses the non-empty directory it finds. Make the trees shallowest-first,
+ * then merge deepest-first.
+ */
+export function ensureStaging(root: string, staging: StagingNames): Promise<WorktreeStep> {
+  return serialised(staging.dir, () => ensureCheckout(root, { dir: staging.dir, branch: staging.branch }));
+}
+
+async function landIntegrationBody(
   root: string, opts: { branch: string; staging: StagingNames },
 ): Promise<LandResult> {
   const { branch, staging } = opts;
@@ -1606,6 +2133,18 @@ export async function landIntegration(
     return { kind: 'failed', detail: ensured.detail ?? 'no staging worktree' };
   }
 
+  // 🔴 Whose tree is this, right now? The in-process chain above serialises
+  // THIS console's settles; it says nothing about a person who has opened the
+  // staging tree to resolve a conflict by hand, or about a second console on
+  // the same repository. `git worktree lock` is the cross-process answer,
+  // because it is the one git itself enforces — and a lock this console did
+  // not write is a `locked` result rather than a merge, which is the whole
+  // difference between "wait your turn" and "somebody's work destroyed".
+  const held = (await checkouts(root)).find((entry) => realish(entry.dir) === realish(staging.dir));
+  if (held?.locked !== undefined && !ourWorktreeLock(held.locked)) {
+    return { kind: 'locked', by: held.locked || 'no reason given' };
+  }
+
   // Counted against the STAGING branch, not against a merge base: the question
   // is "does this branch hold anything staging does not", and a run whose work
   // is already in there (a re-settle, a resumed run that settled once) must
@@ -1614,22 +2153,62 @@ export async function landIntegration(
   const commits = Number(ahead.stdout.trim()) || 0;
   if (!commits) return { kind: 'empty' };
 
-  const ff = await git(staging.dir, ['merge', '--ff-only', branch]);
-  if (ff.ok) return { kind: 'merged', fastForward: true, commits };
+  // 🔴 ASK BEFORE TOUCHING THE TREE. `merge --abort` does undo a conflicted
+  // merge, and this module has leaned on that since P12 — but an abort is a
+  // repair, and a repair can fail: a killed console between the merge and the
+  // abort leaves the staging tree holding conflict markers, and the NEXT
+  // plan's settle then fails for a reason that has nothing to do with it.
+  // `merge-tree --write-tree` merges in MEMORY and says so by exit status, so
+  // the tree the other plans share is never entered at all on the one path
+  // that would have dirtied it. `radarPair` reads the same command; the output
+  // shape is documented there.
+  const trial = await git(root, ['merge-tree', '--write-tree', '--name-only', staging.branch, branch]);
+  if (!trial.ok) {
+    const lines = trial.stdout.split('\n');
+    const files: string[] = [];
+    for (const raw of lines.slice(1)) {
+      const line = raw.trim();
+      if (!line) break;
+      files.push(line);
+    }
+    // A `merge-tree` that failed with NO paths is a probe that could not run —
+    // an ancient git, an unrelated history — not a verdict. Fall through and
+    // let the real merge answer, exactly as this did before the pre-check.
+    if (files.length) {
+      return {
+        kind: 'conflict', files,
+        detail: `${branch} and ${staging.branch} would conflict in ${files.join(', ')}`,
+      };
+    }
+  }
 
-  const merge = await git(staging.dir, [
-    'merge', '--no-ff', '--no-edit', '-m', `Merge ${branch} into ${staging.branch}`, branch,
-  ]);
-  if (merge.ok) return { kind: 'merged', fastForward: false, commits };
+  // Ours while the merge runs, so a person opening the staging tree mid-settle
+  // finds git refusing rather than a half-finished index.
+  await lockTree(root, staging.dir, worktreeLockReason({
+    kind: 'staging', slug: branch.replace(/^pe\//, ''), runId: 'settle',
+  }));
+  try {
+    const ff = await git(staging.dir, ['merge', '--ff-only', branch]);
+    if (ff.ok) return { kind: 'merged', fastForward: true, commits };
 
-  // Aborted, exactly as `landLane` aborts, and for the same reason: a staging
-  // tree left holding conflict markers would break the NEXT plan's settle for a
-  // reason that has nothing to do with it.
-  const files = await conflictedFiles(staging.dir);
-  await git(staging.dir, ['merge', '--abort']);
-  const detail = firstLine(merge.stderr) || firstLine(merge.stdout) || 'git merge failed';
-  if (!files.length) return { kind: 'failed', detail };
-  return { kind: 'conflict', files, detail };
+    const merge = await git(staging.dir, [
+      'merge', '--no-ff', '--no-edit', '-m', `Merge ${branch} into ${staging.branch}`, branch,
+    ]);
+    if (merge.ok) return { kind: 'merged', fastForward: false, commits };
+
+    // Aborted, exactly as `landLane` aborts, and for the same reason: a staging
+    // tree left holding conflict markers would break the NEXT plan's settle for a
+    // reason that has nothing to do with it.
+    const files = await conflictedFiles(staging.dir);
+    await git(staging.dir, ['merge', '--abort']);
+    const detail = firstLine(merge.stderr) || firstLine(merge.stdout) || 'git merge failed';
+    if (!files.length) return { kind: 'failed', detail };
+    return { kind: 'conflict', files, detail };
+  } finally {
+    // Always: a settle that threw must not leave the tree locked against the
+    // next one, and our own lock is not a protection once nothing is merging.
+    await unlockTree(root, staging.dir);
+  }
 }
 
 
@@ -1893,6 +2472,19 @@ export async function ensureMirror(opts: {
       await rm(names.integration, { recursive: true, force: true });
       await rm(mirrorManifestPath(names.integration), { force: true });
     }
+    // 🔴 …and then PRUNE EACH SOURCE (MIR-1). `discardFreshDir`'s failure was
+    // swallowed above and the `rm -rf` runs regardless, so a mount git declined
+    // to remove — a dirty tree, a submodule parent, a transient lock — left its
+    // registration behind pointing at a directory this teardown has just
+    // deleted. That ghost goes on HOLDING `pe/<slug>` in its submodule, and
+    // every later run of the plan refuses `branch-in-use` for a checkout nobody
+    // can find. Prune is a pure repair — it drops registrations whose directory
+    // is gone and touches nothing that exists — so it is unconditional, and it
+    // is asked of each MOUNT's own repository because that is where its
+    // registration lives.
+    for (const source of new Set(mounts.map((mount) => mount.source))) {
+      await git(source, ['worktree', 'prune']);
+    }
     return { ok: false, created: [], adopted, refusal, detail };
   };
 
@@ -2016,24 +2608,105 @@ export async function detectMirror(integration: string): Promise<MirrorMount[]> 
  * The `holding` question `holdsBranch` answers for a single-repo checkout,
  * asked of every repository the manifest names.
  */
-export async function validateMirror(integration: string, runBranch: string): Promise<boolean> {
+export async function validateMirror(integration: string, runBranch: string): Promise<boolean>;
+export async function validateMirror(
+  integration: string, runBranch: string, opts: { explain: true },
+): Promise<MirrorVerdict>;
+export async function validateMirror(
+  integration: string, runBranch: string, opts?: { explain?: boolean },
+): Promise<boolean | MirrorVerdict> {
+  const verdict = await mirrorVerdict(integration, runBranch);
+  return opts?.explain ? verdict : verdict.ok;
+}
+
+/**
+ * Why a mirror did not validate — the fact the boolean threw away (MIR-2).
+ *
+ * 🔴 `false` was all three of "there is no mirror here", "a mount is missing"
+ * and "a mount is standing somewhere else", and the caller could only act on
+ * the union: rebuild, which refuses `branch-in-use` on the mount still holding
+ * the ref, which degrades the whole run to the shared checkout PERMANENTLY.
+ * The third case is the one that actually happens — `git submodule update`
+ * inside a root mount detaches the sibling submodule mount, measured — and it
+ * is the one that is cheap to repair, because a mount that drifted still exists
+ * and `git switch` moves it back. Naming it is what makes the repair possible.
+ */
+export type MirrorVerdict = {
+  ok: boolean;
+  refusal?: 'no-mirror' | 'mount-missing' | 'mirror-drifted';
+  /** Root-relative mounts standing on the wrong branch — the recoverable shape. */
+  drifted?: string[];
+  /** Root-relative mounts whose directory or registration is gone. */
+  missing?: string[];
+};
+
+async function mirrorVerdict(integration: string, runBranch: string): Promise<MirrorVerdict> {
   const manifest = await readMirror(integration);
-  if (!manifest || !manifest.mounts.length) return false;
+  if (!manifest || !manifest.mounts.length) return { ok: false, refusal: 'no-mirror' };
+  const drifted: string[] = [];
+  const missing: string[] = [];
   for (const mount of manifest.mounts) {
     const dir = join(integration, mount.rel);
-    if (!existsSync(dir)) return false;
+    if (!existsSync(dir) || !(await isRegistered(mount.source, dir))) {
+      missing.push(mount.rel);
+      continue;
+    }
     // A DETACHED mirror's mounts own no branch, so `holdsBranch` would fail
     // every one of them and the run would rebuild a perfectly good mirror on
     // every drive. The question for this shape is the one it can answer:
     // is the mount still a registered worktree standing on no branch at all?
-    if (manifest.detached) {
-      if (!(await isRegistered(mount.source, dir))) return false;
-      if (await branchAt(mount.source, dir)) return false;
-      continue;
-    }
-    if (!(await holdsBranch(mount.source, dir, runBranch))) return false;
+    const on = await branchAt(mount.source, dir);
+    if (manifest.detached ? on !== undefined : on !== runBranch) drifted.push(mount.rel);
   }
-  return true;
+  if (missing.length) {
+    return {
+      ok: false, refusal: 'mount-missing', missing,
+      ...(drifted.length ? { drifted } : {}),
+    };
+  }
+  if (drifted.length) return { ok: false, refusal: 'mirror-drifted', drifted };
+  return { ok: true };
+}
+
+/**
+ * Put a drifted mount back on the run branch — the repair `mirror-drifted`
+ * exists to make reachable.
+ *
+ * `switch` and not `worktree add`: the tree is there, it is registered, it is
+ * this run's, and the only thing wrong with it is the ref it stands on. It
+ * refuses a mount holding uncommitted work for the reason every refusal in this
+ * module refuses — a `switch` that would carry somebody's edits onto another
+ * branch is a change to their work, and a named refusal costs a degrade while a
+ * silent one costs the work.
+ */
+export async function reattachMirror(integration: string, runBranch: string): Promise<{
+  ok: boolean; moved: string[]; detail?: string;
+}> {
+  const manifest = await readMirror(integration);
+  if (!manifest) return { ok: false, moved: [], detail: 'no mirror manifest' };
+  const verdict = await mirrorVerdict(integration, runBranch);
+  if (verdict.ok) return { ok: true, moved: [] };
+  if (verdict.refusal !== 'mirror-drifted') {
+    return { ok: false, moved: [], detail: verdict.refusal ?? 'the mirror is not standing' };
+  }
+  const moved: string[] = [];
+  for (const rel of verdict.drifted ?? []) {
+    const mount = manifest.mounts.find((m) => m.rel === rel);
+    if (!mount) return { ok: false, moved, detail: `${rel}: not in the manifest` };
+    const dir = join(integration, rel);
+    if (await isDirty(dir)) {
+      return { ok: false, moved, detail: `${rel}: the mount holds uncommitted work` };
+    }
+    const args = manifest.detached
+      ? ['switch', '--detach', 'HEAD']
+      : ['switch', runBranch];
+    const out = await git(dir, args);
+    if (!out.ok) {
+      return { ok: false, moved, detail: `${rel}: ${firstLine(out.stderr) || 'git switch failed'}` };
+    }
+    moved.push(rel);
+  }
+  return { ok: true, moved };
 }
 
 /**
@@ -2108,7 +2781,7 @@ export async function pruneMirror(opts: {
       kept.push(dir);
       continue;
     }
-    const out = await git(mount.source, ['worktree', 'remove', '--force', dir]);
+    const out = await removeTree(mount.source, dir);
     if (out.ok) {
       removed.push(dir);
       await git(mount.source, ['worktree', 'prune']);
@@ -2186,16 +2859,52 @@ async function conflictedFiles(cwd: string, cap = 20): Promise<string[]> {
  *    the audit trail of which lane produced which commits.
  */
 export async function pruneRun(
-  root: string, opts: LaneHome & { runId: string; slug: string; phases: number[] },
-): Promise<{ removed: string[]; kept: string[] }> {
+  root: string, opts: LaneHome & {
+    runId: string; slug: string; phases: number[];
+    /**
+     * `shared/worktree-model.js` §`WORKTREE_RETENTION`, plus `ttl:<h>`. Absent
+     * is the shipped default, so a caller that has no opinion gets
+     * `keep-on-failure` rather than today's unconditional removal.
+     */
+    retention?: string;
+    /** Did this run end badly? The one question `keep-on-failure` asks. */
+    failed?: boolean;
+    /** Injected clock, for `ttl:<h>`. */
+    now?: number;
+  },
+): Promise<{ removed: string[]; kept: string[]; lockedForeign: ForeignLock[] }> {
   const removed: string[] = [];
   const kept: string[] = [];
+  const lockedForeign: ForeignLock[] = [];
+  const locks = await lockIndex(root);
+  const policy = opts.retention ?? DEFAULT_RETENTION;
+  const failed = opts.failed ?? false;
+  const now = opts.now ?? Date.now();
+  // Policy first, then the lock — in that order, because asking the other way
+  // round takes a lock OFF a tree it then decides to keep, leaving a live
+  // tree unprotected as a side effect of a question about a preference.
+  const mayRemove = async (dir: string): Promise<boolean> =>
+    (await retentionAllows({ policy, dir, failed, now }))
+    && lockPermits({ root, dir, locks, live: new Set(), foreign: lockedForeign });
 
-  for (const phase of opts.phases) {
+  // 🔴 ASK THE DISK, never only the caller's list (WT-1). `phases` comes from
+  // `Runner.worktreePhases`, which is in-memory and never persisted — so a
+  // drive that boarded no laned phase (a resume, a second console, a run picked
+  // up after a crash) passed `[]`. The loop below then did nothing, `kept` was
+  // empty, and the guarded `rm -rf` at the bottom took the whole run directory
+  // with two lanes' uncommitted work in it: the exact catastrophe this file's
+  // header documents, reached from the one direction the guard did not cover.
+  // `sweepStale` has read the directory names all along; this now does too, and
+  // the union is the honest set — the caller may know about a lane whose
+  // directory is already gone, and the disk knows about lanes it does not.
+  const phases = [...new Set([...opts.phases, ...await lanePhasesOnDisk(opts)])];
+
+  for (const phase of phases) {
     const names = laneNames({ ...opts, phase });
     if (!(await isRegistered(root, names.dir))) continue;
     if (!(await landed(root, names))) { kept.push(names.dir); continue; }
-    const out = await git(root, ['worktree', 'remove', '--force', names.dir]);
+    if (!(await mayRemove(names.dir))) { kept.push(names.dir); continue; }
+    const out = await removeTree(root, names.dir);
     if (out.ok) removed.push(names.dir); else kept.push(names.dir);
   }
 
@@ -2210,24 +2919,53 @@ export async function pruneRun(
       removed.push(...pruned.removed);
       kept.push(...pruned.kept);
     } else if (await isRegistered(root, names.integration)) {
-      if (await isDirty(names.integration)) {
+      if (await isDirty(names.integration) || !(await mayRemove(names.integration))) {
         kept.push(names.integration);
       } else {
-        const out = await git(root, ['worktree', 'remove', '--force', names.integration]);
+        const out = await removeTree(root, names.integration);
         if (out.ok) removed.push(names.integration); else kept.push(names.integration);
       }
     }
-    // Only when nothing is left: `worktree prune` drops registrations whose
-    // directories are already gone, which is exactly the state a `rm -rf` by an
-    // operator leaves behind.
-    if (!kept.length) {
-      await git(root, ['worktree', 'prune']);
+    // 🔴 `worktree prune` UNCONDITIONALLY (CRASH-1). It was gated on
+    // `!kept.length`, which is exactly backwards: a kept lane is the state in
+    // which a SIBLING's registration is most likely stale — a conflict halt
+    // that an operator resolved by deleting one tree by hand — and leaving that
+    // registration standing keeps its branch held, so the next run of the plan
+    // refuses `branch-in-use` for a directory nobody can see. Prune is a pure
+    // repair: it drops registrations whose directory is already gone and
+    // touches nothing that exists.
+    await git(root, ['worktree', 'prune']);
+    // …but the `rm -rf` still is not. The extra question is the disk's, not the
+    // caller's: `kept` names only trees this call LOOKED at, and a lane the
+    // caller never named (WT-1's empty list, a lane from an earlier attempt)
+    // would be deleted wholesale by a recursive remove of the run directory.
+    if (!kept.length && !(await registeredLanes(root, opts)).length) {
       await rm(join(laneHome(opts), opts.runId), { recursive: true, force: true });
     }
   }
 
-  return { removed, kept };
+  return { removed, kept, lockedForeign };
 }
+
+/**
+ * The lane phase numbers with a DIRECTORY under this run's home.
+ *
+ * `sweepStale` has always read them this way (`p<N>`, the only shape
+ * `laneNames` writes); `pruneRun` trusted its caller instead, which is WT-1.
+ */
+async function lanePhasesOnDisk(opts: LaneHome & { runId: string }): Promise<number[]> {
+  try {
+    return (await readdir(join(laneHome(opts), opts.runId), { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => /^p(\d+)$/.exec(entry.name))
+      .filter((match): match is RegExpExecArray => Boolean(match))
+      .map((match) => Number(match[1]));
+  } catch {
+    // No run directory at all — the case for every run that never opted in.
+    return [];
+  }
+}
+
 
 /**
  * Is everything in this lane's checkout safely somewhere else?
@@ -2253,6 +2991,96 @@ async function landed(root: string, names: LaneNames): Promise<boolean> {
   return !(await isDirty(names.dir));
 }
 
+/** A tree somebody else locked, and what they said. Reported, never touched. */
+export type ForeignLock = { dir: string; reason: string };
+
+/**
+ * Does the retention policy allow removing this tree NOW?
+ *
+ * Asked AFTER the safety questions and before the lock, because the three
+ * answer different things and only this one is a preference. `landed()` has
+ * already refused to remove work that exists nowhere else; this decides what
+ * becomes of a tree that holds nothing but a checkout.
+ *
+ * `keep-on-failure` is the default and the only word that needs the caller's
+ * help: a green run's tree holds nothing its branch does not, and a red one
+ * holds the only copy of what went wrong — the state an operator opens to find
+ * out why. `failed` is the run's own verdict, passed in rather than inferred,
+ * because this module knows nothing about run records and should not learn.
+ */
+async function retentionAllows(opts: {
+  policy: string; dir: string; failed: boolean; now: number;
+}): Promise<boolean> {
+  const policy = retentionOf(opts.policy);
+  if (policy === 'keep') return false;
+  if (policy === 'keep-on-failure' && opts.failed) return false;
+  const hours = retentionTtlHours(policy);
+  // `prune`, and `keep-on-failure` on a run that ended well: no clock involved.
+  if (hours === undefined) return true;
+  let age = Infinity;
+  try {
+    age = opts.now - (await stat(opts.dir)).mtimeMs;
+  } catch {
+    // The directory is not there to age. Nothing is being kept by saying yes.
+  }
+  return age >= hours * 3_600_000;
+}
+
+/**
+ * Every locked tree of this repository, by resolved path.
+ *
+ * ONE `worktree list` for a whole sweep rather than a `git` per tree: a sweep
+ * runs at every boot and every drive, and the registry is a single read that
+ * already answers the question for every directory it will visit.
+ */
+async function lockIndex(root: string): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  for (const entry of await checkouts(root)) {
+    if (entry.locked !== undefined) index.set(realish(entry.dir), entry.locked);
+  }
+  return index;
+}
+
+/**
+ * The one place a sweep decides what a lock means — and the one place it is
+ * allowed to take one off.
+ *
+ * Three answers, and the middle one is the whole point:
+ *
+ *  - **not locked** → the ordinary rules decide;
+ *  - **locked by somebody else** → KEPT, and reported once so the journal can
+ *    name the reason. An operator's `git worktree lock --reason "I am
+ *    bisecting"` is a sentence addressed to exactly this code, and a sweep
+ *    that removed the tree anyway would make the mechanism worthless;
+ *  - **locked by us, for a run that is over** → unlocked, then removed. Our
+ *    own lock protects a live tree; leaving it on a dead one would wedge the
+ *    next run of the plan for ever, which is the failure `sweepStale` exists
+ *    to end.
+ *
+ * `live` is how a lock of ours belonging to a run that is still going is told
+ * from one whose console died. A sweep visits only dead runs, but the tree it
+ * is visiting may be locked by a DIFFERENT, live run — a lane directory reused
+ * across runs of one plan — and taking that lock off would unprotect a tree
+ * somebody is writing in.
+ */
+async function lockPermits(opts: {
+  root: string; dir: string; locks: Map<string, string>;
+  live: ReadonlySet<string>; foreign: ForeignLock[];
+}): Promise<boolean> {
+  const reason = opts.locks.get(realish(opts.dir));
+  if (reason === undefined) return true;
+  if (!ourWorktreeLock(reason)) {
+    if (!opts.foreign.some((entry) => realish(entry.dir) === realish(opts.dir))) {
+      opts.foreign.push({ dir: opts.dir, reason });
+    }
+    return false;
+  }
+  const mine = parseWorktreeLockReason(reason);
+  if (mine && opts.live.has(mine.runId)) return false;
+  await unlockTree(opts.root, opts.dir);
+  return true;
+}
+
 /** What a sweep did, in paths, so the caller can journal it in words. */
 export type SweepResult = {
   /** Checkouts removed. */
@@ -2261,6 +3089,8 @@ export type SweepResult = {
   kept: string[];
   /** The run ids whose directory is now gone entirely. */
   runs: string[];
+  /** Trees a person (or another tool) locked. Reported once each, never taken. */
+  lockedForeign: ForeignLock[];
 };
 
 /**
@@ -2302,6 +3132,18 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   children?: (runId: string) => readonly (number | null | undefined)[];
   /** Does this pid still hold work? `pid.ts`'s `pidHoldsWork`, injected. */
   probe?: (pid: number) => boolean;
+  /**
+   * The retention policy — `pruneRun`'s, and for the same reasons — or, since
+   * phase 15, a function of the run id: each dead run is asked for ITS word
+   * (`RunState.worktreeRetention`, the launch form's) and the caller answers
+   * the console's where the run said nothing. A word alone applies to every
+   * run the sweep meets, as it always did.
+   */
+  retention?: string | ((runId: string) => string | undefined);
+  /** Did this run end badly? `keep-on-failure`'s one question, per run. */
+  failed?: (runId: string) => boolean;
+  /** Injected clock, for `ttl:<h>`. */
+  now?: number;
 }): Promise<SweepResult> {
   // BOTH homes, whatever the setting says today: a tree made under the other
   // one is still this console's to sweep.
@@ -2312,6 +3154,19 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   const removed: string[] = [];
   const kept: string[] = [];
   const runs: string[] = [];
+  const lockedForeign: ForeignLock[] = [];
+  const locks = await lockIndex(root);
+  const policyFor = (runId: string): string =>
+    (typeof opts.retention === 'function' ? opts.retention(runId) : opts.retention) ?? DEFAULT_RETENTION;
+  const failedRun = opts.failed ?? (() => false);
+  const now = opts.now ?? Date.now();
+  // Policy, then the lock — `pruneRun`'s order and its reason. `live` is the
+  // run ids this console is driving: a lock of OURS naming one of them is a
+  // live tree, even though the directory sits under a run this sweep has
+  // already decided is over.
+  const mayRemove = async (dir: string, runId: string): Promise<boolean> =>
+    (await retentionAllows({ policy: policyFor(runId), dir, failed: failedRun(runId), now }))
+    && lockPermits({ root, dir, locks, live, foreign: lockedForeign });
 
   for (const base of homes) {
     let entries: string[];
@@ -2348,7 +3203,8 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
         });
         if (!(await isRegistered(root, names.dir))) continue;
         if (!(await landed(root, names))) { keptHere.push(names.dir); continue; }
-        const out = await git(root, ['worktree', 'remove', '--force', names.dir]);
+        if (!(await mayRemove(names.dir, runId))) { keptHere.push(names.dir); continue; }
+        const out = await removeTree(root, names.dir);
         if (out.ok) removed.push(names.dir); else keptHere.push(names.dir);
       }
 
@@ -2366,10 +3222,10 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
           removed.push(...pruned.removed);
           keptHere.push(...pruned.kept);
         } else if (await isRegistered(root, names.integration)) {
-          if (await isDirty(names.integration)) {
+          if (await isDirty(names.integration) || !(await mayRemove(names.integration, runId))) {
             keptHere.push(names.integration);
           } else {
-            const out = await git(root, ['worktree', 'remove', '--force', names.integration]);
+            const out = await removeTree(root, names.integration);
             if (out.ok) removed.push(names.integration); else keptHere.push(names.integration);
           }
         }
@@ -2386,7 +3242,7 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   // Once, at the end: registrations whose directories are gone — the ones this
   // sweep just removed by hand, and any an operator deleted themselves.
   if (removed.length || runs.length) await git(root, ['worktree', 'prune']);
-  return { removed, kept, runs };
+  return { removed, kept, runs, lockedForeign };
 }
 
 /** What a registration sweep found: what it dropped, and what it will not touch. */
@@ -2423,11 +3279,39 @@ export type UnmanagedSweep = {
 export async function sweepUnmanaged(root: string, opts?: {
   /** Directories the console manages — the state root(s); anything under them is ours. */
   managed?: Iterable<string>;
+  /**
+   * The OTHER repositories to sweep — a mirror's mounts (MIR-1).
+   *
+   * 🔴 A registration lives in the repository it is a worktree OF. A mirror's
+   * mounts are worktrees of the SUBMODULES, so their registrations sit in
+   * `.git/modules/<sub>/worktrees/*` and this sweep — which only ever asked the
+   * root — was blind to every one of them. A mount whose directory a failed
+   * build removed therefore kept holding `pe/<slug>` in that submodule
+   * FOREVER, and every later run of the plan refused `branch-in-use` for a
+   * checkout nobody could find. The root is always swept; these are swept too.
+   */
+  repos?: Iterable<string>;
 }): Promise<UnmanagedSweep> {
+  const repos = [...new Set([realish(root), ...[...(opts?.repos ?? [])].map((dir) => realish(dir))])];
+  if (repos.length > 1) {
+    const all: UnmanagedSweep = { pruned: [], unmanaged: [] };
+    for (const repo of repos) {
+      const one = await sweepOneRepo(repo, opts?.managed);
+      all.pruned.push(...one.pruned);
+      all.unmanaged.push(...one.unmanaged);
+    }
+    return all;
+  }
+  return sweepOneRepo(repos[0]!, opts?.managed);
+}
+
+async function sweepOneRepo(
+  root: string, managedDirs?: Iterable<string>,
+): Promise<UnmanagedSweep> {
   const out = await git(root, ['worktree', 'list', '--porcelain']);
   if (!out.ok) return { pruned: [], unmanaged: [] };
 
-  const managed = [...(opts?.managed ?? [])].map((dir) => realish(dir));
+  const managed = [...(managedDirs ?? [])].map((dir) => realish(dir));
   const ours = (dir: string): boolean => managed.some(
     (base) => dir === base || `${dir}/`.startsWith(`${base}/`),
   );
@@ -2474,11 +3358,28 @@ export async function sweepUnmanaged(root: string, opts?: {
  * read is on the console-wide allow-list already, so the `branch` exemption
  * covers the DELETE and nothing else.
  */
-export async function runBranches(repo: string, slug: string): Promise<string[]> {
+export async function runBranches(repo: string, slug: string, opts?: {
+  /**
+   * Every OTHER plan this console knows about.
+   *
+   * 🔴 The lane form `-p<N>` is not a private namespace: a plan may be slugged
+   * `demo-p9`, and then `pe/demo-p9` is ITS run branch while `runBranches('demo')`
+   * reads it as `demo`'s phase-9 lane — and this list feeds `deleteMergedBranches`
+   * (SWP-1). `new-plan.sh` now refuses such a slug at birth, which closes the
+   * door for new plans; this closes it for the ones that already exist, where
+   * the only thing that can tell the two apart is knowing the other plan is
+   * there. Absent, the old reading stands, which is correct for a caller that
+   * has no plan list to offer.
+   */
+  otherSlugs?: Iterable<string>;
+}): Promise<string[]> {
   const out = await git(repo, [
     'for-each-ref', '--format=%(refname:short)', `refs/heads/pe/${slug}`, `refs/heads/pe/${slug}-*`,
   ]);
   if (!out.ok) return [];
+  const foreign = new Set(
+    [...(opts?.otherSlugs ?? [])].filter((other) => other && other !== slug).map((other) => `pe/${other}`),
+  );
   // 🔴 …and then filtered EXACTLY, because the glob is not the rule. Slugs
   // share prefixes: `pe/state-path-*` matches `pe/state-path-hardening`, a
   // different plan's branch, and this list feeds a DELETE. The lane form is
@@ -2486,7 +3387,7 @@ export async function runBranches(repo: string, slug: string): Promise<string[]>
   // than its intent is a glob that eventually deletes somebody's work.
   const lane = new RegExp(`^pe/${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-p\\d+)?$`);
   return out.stdout.split('\n').map((line) => line.trim())
-    .filter((name) => lane.test(name));
+    .filter((name) => lane.test(name) && !foreign.has(name));
 }
 
 /** What a merged-branch deletion did, per repository. */
@@ -2612,6 +3513,15 @@ export type CheckoutEntry = {
   managed: boolean;
   /** `worktree list` still prints a checkout whose directory is gone. */
   prunable: boolean;
+  /**
+   * The `git worktree lock` reason, when the tree is locked.
+   *
+   * An EMPTY STRING is a real answer and a different one from absent: git
+   * allows a lock with no reason at all, and a sweep meeting one must treat it
+   * as somebody's (`ourWorktreeLock('')` is false) rather than as unlocked.
+   * Absent means the tree is not locked.
+   */
+  locked?: string;
   /** Bytes on disk, when `du` could answer. Managed trees only. */
   disk?: number;
   /**
@@ -2708,6 +3618,27 @@ export async function divergence(
 }
 
 /**
+ * How many of `branch`'s commits past `trunk` sit on NO `covered` branch —
+ * the `pr` settle's question once phases land by pull request of their own
+ * (many-plans-one-repo phase 8): with every lane that opened a PR excluded,
+ * what is left on `pe/<slug>` is exactly what a run-branch pull request would
+ * still be for. Merge commits are the console's own bookkeeping (`landLane`'s
+ * `--no-ff`) and never count as work. `undefined` when git could not answer —
+ * a missing branch is not zero.
+ */
+export async function uncoveredCommits(
+  root: string, opts: { branch: string; trunk: string; covered: readonly string[] },
+): Promise<number | undefined> {
+  const out = await git(root, [
+    'rev-list', '--count', '--no-merges', `${opts.trunk}..${opts.branch}`,
+    ...opts.covered.map((ref) => `^${ref}`),
+  ]);
+  if (!out.ok) return undefined;
+  const n = Number(out.stdout.trim());
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/**
  * The files `b` changed since it and `a` last agreed.
  *
  * Three dots, not two, and the difference is the whole reason a radar can
@@ -2721,6 +3652,31 @@ async function changedFiles(root: string, a: string, b: string, cap: number): Pr
   const out = await git(root, ['diff', '--name-only', `${a}...${b}`]);
   if (!out.ok) return [];
   return out.stdout.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, cap);
+}
+
+/**
+ * The commits `base..HEAD` added, subject-first and capped — the evidence
+ * `phase.scope-drift` carries (S6).
+ *
+ * Deliberately here rather than in the caller: `never-push.test.ts` polices the
+ * argument lists under `server/`, and one more file that shells git is one more
+ * surface for that gate to reason about. `log` joins `WORKTREE_VERBS` as its
+ * twelfth member for the reason `status` and `for-each-ref` are on it — a pure
+ * read is still invisible to a gate that asks what THIS file runs.
+ */
+export async function commitsSince(
+  repo: string, base: string, cap = 20,
+): Promise<{ sha: string; subject: string }[]> {
+  const out = await git(repo, [
+    'log', `--max-count=${cap}`, '--format=%h%x00%s', `${base}..HEAD`,
+  ]);
+  if (!out.ok) return [];
+  return out.stdout.split('\n').map((line) => line.trim()).filter(Boolean)
+    .map((line) => {
+      const [sha, ...rest] = line.split('\0');
+      return { sha: sha ?? '', subject: rest.join('\0') };
+    })
+    .filter((row) => row.sha);
 }
 
 /** The same, plus whether the cap swallowed anything. */
@@ -2744,6 +3700,49 @@ export async function changedSince(
  * The distinction matters exactly once, for `disk` — we may report on what
  * we made, and measuring someone else's checkout is not our business.
  */
+/**
+ * Undo git's C-style quoting of a porcelain value.
+ *
+ * 🔴 `worktree list --porcelain` does NOT always print a path or a lock reason
+ * verbatim: anything holding a non-ASCII byte, a quote, a backslash or a
+ * control character comes back wrapped in double quotes with those bytes
+ * escaped — `"mine \342\200\224 do not touch"` for a reason with an em dash in
+ * it. Measured, not assumed: a test wrote exactly that reason and read it back
+ * mangled. It matters in both directions. A reason rendered with its escapes
+ * intact is a journal line an operator cannot match against what they typed;
+ * and a PATH quoted this way would be compared against a real directory and
+ * never equal it, so a tree with an accented character in its path would read
+ * as a different tree from itself.
+ *
+ * The octal escapes are BYTES, not code points — that is what `\342\200\224`
+ * is — so they are collected and decoded as UTF-8 at the end rather than
+ * turned into characters one at a time.
+ */
+export function unquoteGitValue(value: string): string {
+  if (value.length < 2 || !value.startsWith('"') || !value.endsWith('"')) return value;
+  const body = value.slice(1, -1);
+  const bytes: number[] = [];
+  const simple: Record<string, number> = {
+    a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, '\\': 92,
+  };
+  for (let i = 0; i < body.length; i += 1) {
+    if (body[i] !== '\\') {
+      // Everything that was not escaped is already a character; its own UTF-8
+      // bytes go in, so a mixed value decodes as one string at the end.
+      for (const byte of new TextEncoder().encode(body[i])) bytes.push(byte);
+      continue;
+    }
+    const next = body[i + 1] ?? '';
+    if (next in simple) { bytes.push(simple[next]); i += 1; continue; }
+    const octal = /^[0-7]{1,3}/.exec(body.slice(i + 1));
+    if (octal) { bytes.push(parseInt(octal[0], 8) & 0xff); i += octal[0].length; continue; }
+    // A backslash git did not write as an escape. Keep it: inventing a rule
+    // for it would corrupt a value that was fine.
+    bytes.push(92);
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
 export async function checkouts(
   root: string, stateRoot?: string | readonly string[], env?: NodeJS.ProcessEnv,
 ): Promise<CheckoutEntry[]> {
@@ -2765,7 +3764,7 @@ export async function checkouts(
   for (const raw of out.stdout.split('\n')) {
     const line = raw.trim();
     if (line.startsWith('worktree ')) {
-      const dir = realish(line.slice('worktree '.length).trim());
+      const dir = realish(unquoteGitValue(line.slice('worktree '.length).trim()));
       current = {
         dir,
         root: dir === home,
@@ -2780,6 +3779,14 @@ export async function checkouts(
       current.branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
     } else if (line === 'prunable' || line.startsWith('prunable ')) {
       current.prunable = true;
+    } else if (line === 'locked' || line.startsWith('locked ')) {
+      // Two shapes, and the bare one is not a missing value: git lets a tree
+      // be locked with no reason, and `''` is what says so. `ourWorktreeLock`
+      // reads it as somebody else's, which is the safe answer for a lock that
+      // declines to say who wrote it.
+      current.locked = line === 'locked'
+        ? ''
+        : unquoteGitValue(line.slice('locked '.length).trim());
     }
   }
 
@@ -2815,12 +3822,15 @@ export async function checkouts(
  */
 export async function treeDisk(dir: string): Promise<number | undefined> {
   if (!existsSync(dir)) return undefined;
-  const out = await new Promise<{ ok: boolean; stdout: string }>((done) => {
-    execFile('du', ['-sk', dir], {
-      timeout: 30_000,
-      maxBuffer: 1024 * 1024,
-      env: { ...process.env, LC_ALL: 'C', BLOCKSIZE: '1024' },
-    }, (error, stdout) => done({ ok: !error, stdout: String(stdout) }));
+  const out = await shell('du', ['-sk', dir], {
+    channel: 'shell',
+    intent: 'tree-disk',
+    timeout: 30_000,
+    capture: { keep: 1024 * 1024, mode: 'head' },
+    env: { ...process.env, LC_ALL: 'C', BLOCKSIZE: '1024' },
+    // `du` warns and exits non-zero on any directory it cannot read, which is
+    // routine under a tree the operator owns differently.
+    expectFailure: true,
   });
   if (!out.ok) return undefined;
   const kb = Number(out.stdout.trim().split(/\s+/)[0]);
@@ -3088,4 +4098,143 @@ export async function probeMirrorGit(opts: {
   view.radar.sort((x, y) => RADAR_RANK[x.state] - RADAR_RANK[y.state]
     || pairKey(x.a, x.b).localeCompare(pairKey(y.a, y.b)));
   return view;
+}
+
+/* ------------------------------------------------------------------ *
+ * Landing — the ONE seam that may ever reach a remote
+ * ------------------------------------------------------------------ */
+
+/**
+ * The branches this console may ever push: a run branch `pe/<slug>` or a lane
+ * branch `pe/<slug>-p<N>` — the two shapes `laneNames` mints, and nothing a
+ * person would name a trunk. A ref outside this shape is refused BEFORE git is
+ * spawned, whatever the caller was allowed.
+ *
+ * The hyphen before `p<N>` is the same load-bearing hyphen `laneNames`
+ * explains: `pe/<slug>/p4` cannot exist while `pe/<slug>` does.
+ */
+export const PUSH_REF = /^pe\/[A-Za-z0-9._-]+(-p\d+)?$/;
+
+/** Why a push did not happen — every word is a refusal the journal names. */
+export type PushRefusal =
+  /** The ref is not a `pe/…` branch (`PUSH_REF`). Refused before spawning. */
+  | 'ref-not-pe'
+  /** The remote is not a NAME — empty, a URL, an option — or the repository has no remote by that name. */
+  | 'no-remote'
+  /** The caller was not allowed to push (the flag, the plan's row). Refused before spawning, before anything is read. */
+  | 'not-allowed'
+  /** The caller passed a refspec (`a:b`, `+a`, a glob) rather than a branch name. Refused before spawning. */
+  | 'refspec'
+  /** git refused the push — a non-fast-forward. The remote is unchanged; nothing retries. */
+  | 'rejected'
+  /** Anything else: a branch that does not exist locally, a wedged git. */
+  | 'failed';
+
+/** What the porcelain reply's first column said about the ref. */
+export type PushFlag = 'new' | 'fast-forward' | 'up-to-date';
+
+export type PushResult =
+  | { ok: true; flag: PushFlag; sha: string; ref: string; remote: string; summary: string }
+  | { ok: false; reason: PushRefusal; detail: string };
+
+/**
+ * `git push --porcelain`'s status flag, first character of each status line.
+ * Phase 1's arm G-4 measured them: `*` new, `=` up to date, ` ` (a SPACE)
+ * fast-forward, `!` rejected, `-` deleted, `+` forced — so the line is read by
+ * its first byte and split on tabs, never trimmed.
+ */
+const PUSH_FLAGS: Readonly<Record<string, PushFlag | 'rejected' | 'deleted' | 'forced'>> = Object.freeze({
+  '*': 'new', '=': 'up-to-date', ' ': 'fast-forward', '!': 'rejected', '-': 'deleted', '+': 'forced',
+});
+
+/**
+ * Push one branch to one remote — the one publication this console makes.
+ *
+ * Decision 7 of many-plans-one-repo: the console may push `pe/*` refs (never a
+ * trunk, never with force) so a phase's landing does not depend on a session
+ * being resumable to run `git push`; opening the pull request and merging it
+ * stay a session's act. The contract `never-push.test.ts` holds this to:
+ * exactly one `push` argv in `viewer/server`, in THIS file, opening with
+ * `PUSH_ARGV`, carrying one remote and exactly one fully-qualified refspec,
+ * and no force, delete, mirror, tags, prune or all flag — ever.
+ *
+ * Every refusal is a WORD (`PushRefusal`), and the four that need no git are
+ * decided before git is spawned: `not-allowed` first, so a caller that was
+ * not allowed learns nothing about the repository; then the shape of the ref
+ * and of the remote. It never retries: a rejected push is git saying the
+ * remote has moved, and the only way past that is a rebase, which is a
+ * session's act under its own name.
+ *
+ * Postcondition on `ok`: the remote-tracking ref `refs/remotes/<remote>/<ref>`
+ * equals `refs/heads/<ref>` — git moves it on a successful push, and the
+ * landing engine's restart path (`resumeLanding`) reads exactly that equality
+ * to know a push happened without asking the network.
+ */
+export async function pushRef(
+  repo: string, ref: string, opts: { remote: string; allowed: boolean },
+): Promise<PushResult> {
+  if (!opts.allowed) {
+    return {
+      ok: false, reason: 'not-allowed',
+      detail: 'this console may not push — --allow-publish is off, or the plan\'s permission.destructive row does not allow `git push`',
+    };
+  }
+  // A refspec is a MAPPING; the caller names a branch and this seam builds the
+  // one mapping it will ever make, `refs/heads/<ref>:refs/heads/<ref>`.
+  if (/[:+*?^~\\[\s]/.test(ref) || ref.startsWith('-')) {
+    return { ok: false, reason: 'refspec', detail: `${JSON.stringify(ref)} is a refspec, not a branch name — name the branch alone` };
+  }
+  if (!PUSH_REF.test(ref)) {
+    return { ok: false, reason: 'ref-not-pe', detail: `${ref} is not a pe/<slug> or pe/<slug>-p<N> branch — the console pushes nothing else` };
+  }
+  const remote = opts.remote.trim();
+  // A remote NAME: `origin`, `upstream`. A URL here would be a push to a place
+  // no repository config names, and an option would be an argument to git.
+  if (!remote || remote.startsWith('-') || /[\s:/@]/.test(remote)) {
+    return { ok: false, reason: 'no-remote', detail: `${JSON.stringify(opts.remote)} is not a remote name` };
+  }
+  const local = await commitOf(repo, `refs/heads/${ref}`);
+  if (!local) return { ok: false, reason: 'failed', detail: `refs/heads/${ref} does not exist in ${repo}` };
+
+  const refspec = `refs/heads/${ref}:refs/heads/${ref}`;
+  const argv = ['push', '--porcelain', '--no-follow-tags', remote, refspec];
+  // The literal above IS the vocabulary's `PUSH_ARGV`, and it is written out
+  // rather than spread so `never-push.test.ts`'s scanner can see it — a spread
+  // carries no `'push'` string and would sail past every shape assertion.
+  // Held to the vocabulary at the call, so the two cannot drift apart.
+  if (argv.slice(0, PUSH_ARGV.length).join('\u0000') !== PUSH_ARGV.join('\u0000')) {
+    throw new Error('pushRef: the push argv drifted from PUSH_ARGV (shared/landing-model.js)');
+  }
+  const out = await git(repo, argv);
+
+  // The status lines are `<flag>\t<from>:<to>\t<summary>`; the LAST one is
+  // ours (there is exactly one refspec). Parsed on success AND failure: a
+  // rejected push exits 1 and still prints its `!` line, and the line is the
+  // honest answer where stderr would be prose.
+  const status = out.stdout.split('\n')
+    .filter((line) => line.includes('\t') && !line.startsWith('To ') && line !== 'Done')
+    .map((line) => ({ flag: PUSH_FLAGS[line.charAt(0)], summary: line.split('\t')[2] ?? '' }))
+    .pop();
+  if (!out.ok) {
+    const stderr = firstLine(out.stderr);
+    if (status?.flag === 'rejected') {
+      return { ok: false, reason: 'rejected', detail: status.summary || stderr || 'the remote refused the push' };
+    }
+    if (/does not appear to be a git repository|Could not read from remote|not a git repository/i.test(out.stderr)
+      || /^fatal: '.*' does not appear to be/i.test(stderr)) {
+      return { ok: false, reason: 'no-remote', detail: stderr || `no remote ${remote}` };
+    }
+    return { ok: false, reason: 'failed', detail: stderr || 'git push failed' };
+  }
+  if (!status || status.flag === 'deleted' || status.flag === 'forced' || status.flag === 'rejected') {
+    // A flag this seam never asked for is a defect, not an outcome — say so
+    // loudly rather than record a landing the argv could not have produced.
+    return { ok: false, reason: 'failed', detail: `unexpected push status ${JSON.stringify(status?.flag ?? 'none')}: ${firstLine(out.stdout)}` };
+  }
+  // The postcondition, read from git rather than assumed from exit 0.
+  const tracking = await commitOf(repo, `refs/remotes/${remote}/${ref}`);
+  if (tracking !== local) {
+    return { ok: false, reason: 'failed', detail: `pushed, but refs/remotes/${remote}/${ref} reads ${tracking.slice(0, 12) || 'nothing'} where ${local.slice(0, 12)} was expected` };
+  }
+  return { ok: true, flag: status.flag, sha: local, ref, remote, summary: status.summary };
 }

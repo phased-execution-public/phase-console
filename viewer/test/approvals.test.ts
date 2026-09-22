@@ -46,6 +46,31 @@ test('everything irreversible sits in deny, where it holds without the console',
   }
 });
 
+test('crossSessionInbound is written only when the plan allows messaging, and only as `accept`', () => {
+  // Phase 1, arm S-C, is what makes this the only workable value. Decision 14
+  // assumed the console could post into a session's inbox PAST a `hold`,
+  // because it holds that session's own `CLAUDE_CODE_MESSAGING_TOKEN` and so
+  // counts as an "own child". It cannot: the own-child exception is
+  // conditioned on NO `crossSessionInbound` value applying, and a value from
+  // `--settings` applies. There is no setting under which the CLI both holds
+  // peers and lets the console through — so the console takes responsibility
+  // for what reaches the session instead (the mark rule: `frameMessage`, the
+  // `[[msg:<id>]]` tag, and the budgets).
+  const on = buildSettings({ runId: 'r1', token: 't', origin: 'http://x', messaging: true });
+  assert.equal(on.crossSessionInbound, 'accept');
+
+  // OMITTED, not `hold`, when messaging is off: the CLI's own default stands,
+  // rather than this console asserting a value it has no opinion about.
+  const off = buildSettings({ runId: 'r1', token: 't', origin: 'http://x', messaging: false });
+  assert.ok(!('crossSessionInbound' in off), 'a messaging-off run must state nothing');
+  const silent = buildSettings({ runId: 'r1', token: 't', origin: 'http://x' });
+  assert.ok(!('crossSessionInbound' in silent));
+
+  // And it is not a permission: it must never reach the permissions block,
+  // where a profile or a strike could move it.
+  assert.ok(!JSON.stringify(on.permissions).includes('crossSessionInbound'));
+});
+
 test('the ask list is never handed to the CLI — headless has nobody to ask', () => {
   // An `ask` rule in `-p` mode is a refusal with extra steps: there is no
   // terminal to prompt. A real run wrote its file, had the commit refused, and
@@ -72,6 +97,21 @@ test('the hook is pointed at this console and given a bearer token', () => {
   // Matching every tool would put a network round trip in front of every Read.
   assert.match(entry.matcher, /Bash/);
   assert.ok(!/\bRead\b/.test(entry.matcher));
+});
+
+test('the poll-loop guard\'s status tools reach the hook, on every profile, and nothing else is added', async () => {
+  // autopilot-token-drain phase 2: `ListAgents`, `TaskOutput` and `BashOutput`
+  // never reached this console, so a session polling with them was invisible
+  // to it — 297 `ListAgents` calls in one phase. The guard owns the list.
+  const { POLL_STATUS_TOOLS } = await import('../shared/poll-loop.js');
+  const matchers = ['guarded', 'trusted', 'bypass'].map((profile) => {
+    const settings = buildSettings({ runId: 'r1', token: 't', origin: 'http://x', profile } as never);
+    return (settings.hooks as { PreToolUse: { matcher: string }[] }).PreToolUse[0].matcher;
+  });
+  assert.equal(new Set(matchers).size, 1, 'the matcher is the same on every profile');
+  const tools = matchers[0].split('|');
+  for (const tool of POLL_STATUS_TOOLS) assert.ok(tools.includes(tool), `${tool} reaches the hook`);
+  for (const tool of ['Read', 'Glob', 'Grep', 'Agent', 'Monitor']) assert.ok(!tools.includes(tool), `${tool} does not`);
 });
 
 test('an operator policy adds rules but can never remove a default', () => {
@@ -1081,7 +1121,12 @@ test('without the carve-out nothing about the wall moves — most runs never see
   const base = loadPolicy('/nonexistent');
   const trusted = carvedPolicy(base, 'trusted', false);
   assert.deepEqual(trusted.deny, base.deny, 'the wall is the wall');
-  assert.deepEqual(trusted.ask, [], 'trusted still empties the ask list');
+  // Emptied EXCEPT the pinned set (SHR-1): `trusted` stops asking about the
+  // everyday steps of the work, and never about the verbs that reach out of
+  // the session's own tree or out of the machine.
+  const { ALWAYS_ASK } = await import('../server/runner/approvals.ts');
+  assert.deepEqual([...trusted.ask].sort(), [...ALWAYS_ASK].sort(),
+    'trusted empties the ask list down to the pinned set');
 });
 
 test('the carve-out moves exactly bare push to ask, and walls the destructive shapes', async () => {
@@ -1103,8 +1148,9 @@ test('the carve-out moves exactly bare push to ask, and walls the destructive sh
 test('under trusted, the carve-out asks survive — the push and the PR still get a card', async () => {
   const { carvedPolicy, OPEN_PR_ASK } = await import('../server/runner/approvals.ts');
   const carved = carvedPolicy(loadPolicy('/nonexistent'), 'trusted', true);
-  assert.deepEqual([...carved.ask].sort(), [...OPEN_PR_ASK].sort(),
-    'exactly the two world-visible acts keep asking; everything else trusts');
+  const { ALWAYS_ASK } = await import('../server/runner/approvals.ts');
+  assert.deepEqual([...carved.ask].sort(), [...new Set([...OPEN_PR_ASK, ...ALWAYS_ASK])].sort(),
+    'the two world-visible acts, plus the pinned set; every everyday step trusts');
   assert.equal(classifyTool('Bash', { command: 'git push -u origin pe/demo' }, carved, 'trusted'), 'ask');
   assert.equal(classifyTool('Bash', { command: 'gh pr create --title x' }, carved, 'trusted'), 'ask');
   assert.equal(classifyTool('Bash', { command: 'git push --force origin pe/demo' }, carved, 'trusted'), 'deny');
@@ -1119,6 +1165,51 @@ test('the settings file a carve-out run hands its child reflects the carved wall
   const deny = (settings.permissions as { deny: string[] }).deny;
   assert.ok(!deny.includes('Bash(git push:*)'), 'the CLI-side wall lets the one push through');
   assert.ok(deny.includes('Bash(git push --force:*)'), 'and still refuses a rewrite outright');
+  assert.ok(deny.includes('Bash(terraform apply:*)'), 'the rest of the wall is untouched');
+});
+
+/* ------------------------------------------------------------------ *
+ * The publish carve-out: the landing session's two asks, and no push
+ * (many-plans-one-repo phase 8)
+ * ------------------------------------------------------------------ */
+
+test('the publish carve-out pins `gh pr create` and `gh pr merge` through trusted, and leaves the push wall standing', async () => {
+  const { carvedPolicy, PUBLISH_ASK, PUSH_DENY, ALWAYS_ASK } = await import('../server/runner/approvals.ts');
+  const base = loadPolicy('/nonexistent');
+  const carved = carvedPolicy(base, 'trusted', false, true);
+  // The push is the CONSOLE's act (`pushRef`); the session never gets it.
+  assert.deepEqual(carved.deny, base.deny, 'the wall is the wall — no push comes off it');
+  assert.ok(carved.deny.includes(PUSH_DENY));
+  assert.deepEqual([...carved.ask].sort(), [...new Set([...PUBLISH_ASK, ...ALWAYS_ASK])].sort(),
+    'the two landing acts, plus the pinned set; every everyday step trusts');
+  assert.equal(classifyTool('Bash', { command: 'gh pr create --base main --head pe/demo-p1' }, carved, 'trusted'), 'ask');
+  assert.equal(classifyTool('Bash', { command: 'gh pr merge 7 --merge' }, carved, 'trusted'), 'ask');
+  assert.equal(classifyTool('Bash', { command: 'git push origin pe/demo-p1' }, carved, 'trusted'), 'deny');
+  assert.equal(classifyTool('Bash', { command: 'git commit -m x' }, carved, 'trusted'), 'allow');
+});
+
+test('both carve-outs together: the settle\'s push moves to ask AND the landing\'s merge is pinned', async () => {
+  const { carvedPolicy, PUBLISH_ASK, OPEN_PR_ASK, ALWAYS_ASK } = await import('../server/runner/approvals.ts');
+  const carved = carvedPolicy(loadPolicy('/nonexistent'), 'trusted', true, true);
+  assert.deepEqual([...carved.ask].sort(), [...new Set([...OPEN_PR_ASK, ...PUBLISH_ASK, ...ALWAYS_ASK])].sort());
+  assert.equal(classifyTool('Bash', { command: 'git push -u origin pe/demo' }, carved, 'trusted'), 'ask');
+  assert.equal(classifyTool('Bash', { command: 'gh pr merge 7 --merge' }, carved, 'trusted'), 'ask');
+});
+
+test('`gh pr merge` is a publishing rule — never auto-granted, only excepted by the plan\'s destructive row', async () => {
+  const { publishingRule } = await import('../server/runner/approvals.ts');
+  assert.equal(publishingRule('Bash', { command: 'gh pr merge 7 --merge' }), 'Bash(gh pr merge:*)');
+  assert.equal(publishingRule('Bash', { command: 'gh pr create --title x' }), 'Bash(gh pr create:*)');
+  assert.equal(publishingRule('Bash', { command: 'gh pr view 7 --json state' }), null, 'a read is not a publishing act');
+});
+
+test('the settings file a publish-carve-out run hands its child still denies the push', () => {
+  const settings = buildSettings({
+    runId: 'r10', token: 't', origin: 'http://127.0.0.1:4123',
+    profile: 'trusted', publishCarveOut: true,
+  });
+  const deny = (settings.permissions as { deny: string[] }).deny;
+  assert.ok(deny.includes('Bash(git push:*)'), 'the landing session never pushes — the console did');
   assert.ok(deny.includes('Bash(terraform apply:*)'), 'the rest of the wall is untouched');
 });
 
@@ -1703,4 +1794,77 @@ test('the streaming-mode smoke replays: the resumed session\'s hook re-fires for
   assert.deepEqual(Object.keys(resumed.updatedInput).sort(), Object.keys(honoured).sort(), 'questions and answers, as honoured');
   assert.deepEqual(resumed.updatedInput.questions, honoured.questions);
   assert.deepEqual(Object.keys(resumed.updatedInput.answers as object), Object.keys(honoured.answers), 'answers keyed by question text');
+});
+
+/* ------------------------------------------------------------------ *
+ * many-plans-one-repo phase 4 — SHR-1 / MIR-2: the shared `.git` verbs,
+ * and the issue verbs, pinned through every profile.
+ * ------------------------------------------------------------------ */
+
+test('SHR-1: the shared-state git verbs raise a card on EVERY profile', async () => {
+  // Linked worktrees share one object database, one `refs/stash`, and one
+  // `.git/config` — so `git stash` in a lane pops in another, `git config
+  // core.hooksPath` rewrites it for every tree at once, and a `git submodule
+  // update` inside a root mount DETACHES the sibling submodule mount, which
+  // is measured (MIR-2) and degrades the whole mirror permanently. All six
+  // were forbidden in prose four times and enforced nowhere.
+  const { profilePolicy, DEFAULT_ASK: ASK, DEFAULT_DENY: DENY, classifyTool: classify, PERMISSION_PROFILES: profiles } =
+    await import('../server/runner/approvals.ts');
+  const base = { deny: [...DENY], ask: [...ASK], allow: [] };
+  const shared = [
+    'git stash push -u -m x', 'git config core.hooksPath .githooks',
+    'git worktree add ../scratch pe/demo', 'git submodule update --init',
+    'git checkout other-branch', 'git switch other-branch',
+  ];
+  for (const profile of profiles) {
+    for (const command of shared) {
+      assert.equal(
+        classify('Bash', { command }, profilePolicy(base, profile), profile), 'ask',
+        `${profile}: ${command}`,
+      );
+    }
+  }
+});
+
+test('SHR-1: filing an issue is a person’s act on every profile too', async () => {
+  const { profilePolicy, DEFAULT_ASK: ASK, DEFAULT_DENY: DENY, classifyTool: classify, PERMISSION_PROFILES: profiles } =
+    await import('../server/runner/approvals.ts');
+  const base = { deny: [...DENY], ask: [...ASK], allow: [] };
+  const issues = [
+    'gh issue create --title x --body y',
+    'gh issue comment 4 --body y',
+    'gh issue close 4',
+  ];
+  for (const profile of profiles) {
+    for (const command of issues) {
+      assert.equal(
+        classify('Bash', { command }, profilePolicy(base, profile), profile), 'ask',
+        `${profile}: ${command}`,
+      );
+    }
+  }
+});
+
+test('SHR-1: an ordinary ask rule is still emptied by a trusted profile', async () => {
+  // The pin is NARROW on purpose: `trusted` exists to stop asking about the
+  // everyday steps, and a pin that swallowed the whole ask list would make the
+  // profile a word with no behaviour.
+  const { profilePolicy, DEFAULT_ASK: ASK, DEFAULT_DENY: DENY, classifyTool: classify } =
+    await import('../server/runner/approvals.ts');
+  const base = { deny: [...DENY], ask: [...ASK], allow: [] };
+  assert.equal(classify('Bash', { command: 'npm install left-pad' }, profilePolicy(base, 'guarded'), 'guarded'), 'ask');
+  assert.equal(classify('Bash', { command: 'npm install left-pad' }, profilePolicy(base, 'trusted'), 'trusted'), 'allow');
+});
+
+test('SHR-1: an operator who strikes a pinned rule really strikes it', async () => {
+  // The pin is a DEFAULT, not a second wall. `deny` is the wall; everything on
+  // the ask list is struck by name through the policy file, and a pin that
+  // survived a named strike would be the one rule an operator cannot remove.
+  const { profilePolicy, DEFAULT_DENY: DENY, classifyTool: classify } =
+    await import('../server/runner/approvals.ts');
+  const struck = { deny: [...DENY], ask: ['Bash(git commit:*)'], allow: [] };
+  assert.equal(
+    classify('Bash', { command: 'git stash push -u' }, profilePolicy(struck, 'trusted'), 'trusted'), 'allow',
+    'the rule is not in this policy at all, so nothing pins it',
+  );
 });

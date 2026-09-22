@@ -257,3 +257,224 @@ EOF
   # phase 2 is a date gate (auto), not human — delegation must not reword it.
   refute_contains "$output" "DELEGATED"
 }
+
+# 2026-09-18 (run f0da619a): `git merge-base` is a read — the deny rule matched
+# it as `git merge` because the verb had no boundary. The boundary must not
+# open `git push;true` either, which a whole gate-check line can carry.
+_git_gate_plan() {  # _git_gate_plan <gate-check cmd>
+  cat > "$DOCS_ROOT/docs/plans/gitgate.md" <<PLAN
+---
+slug: gitgate
+created: 2026-01-01
+status: active
+phases: 2
+handoffs: docs/handoffs/gitgate/
+memory: project_gitgate
+---
+# gitgate
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | a | — | — | r | x |
+| 2 | b | 1 | — | r | x |
+
+### Phase 2 — b *(GATED)*
+- **Gate-check:** cmd $1
+PLAN
+}
+
+@test "gate-status: a read-only git gate (merge-base) is evaluated, not refused" {
+  setup_docs gatecheck gitgate
+  _git_gate_plan 'git merge-base --is-ancestor HEAD HEAD'
+  run pg gitgate --gate-status 2
+  refute_contains "$output" "REFUSED"
+  assert_contains "$output" "cmd gate not executed"
+}
+
+@test "gate-status: git push stays refused behind a separator or a global option" {
+  setup_docs gatecheck gitgate
+  _git_gate_plan 'git push;true'
+  PHASE_EXEC_GATES=1 run pg gitgate --gate-status 2
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "REFUSED"
+  _git_gate_plan 'git -C . push origin main'
+  PHASE_EXEC_GATES=1 run pg gitgate --gate-status 2
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "REFUSED"
+}
+
+@test "gate-status: a redirect to /dev/null is not a write" {
+  setup_docs gatecheck gitgate
+  _git_gate_plan 'grep -q x /nonexistent 2>/dev/null'
+  run pg gitgate --gate-status 2
+  refute_contains "$output" "REFUSED"
+}
+
+# ── S8-a — a cross-plan gate read the other plan's DONE set, not its verified one
+# `done` and `verified` are two different questions once QA gates, and this gate
+# asked the easy one: a phase whose QA verdict is `fail` is `done` on the board
+# (its handoff says complete) and is exactly the phase a dependent plan must not
+# build on. The engine already knows the difference — `_is_verified` — it simply
+# was not asked across the plan boundary.
+@test "gate-status: a cross-plan gate stays blocked while the other plan's phase has QA fail (S8-a)" {
+  setup_docs linear otherplan
+  setup_docs gatecheck xp
+  cat > "$DOCS_ROOT/docs/plans/xp.md" <<'EOF'
+---
+slug: xp
+created: 2026-01-01
+status: active
+phases: 1
+handoffs: docs/handoffs/xp/
+memory: project_xp
+---
+# xp
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | waitother | — | — | r | x |
+
+### Phase 1 — waitother *(GATED)*
+- **Gate-check:** plan otherplan:1
+EOF
+  write_handoff otherplan 1 alpha complete
+  # QA on for otherplan, and phase 1 FAILED it.
+  "$SYS_BASH" "$PE_SCRIPTS/qa-mode.sh" otherplan on >/dev/null
+  qa_record otherplan 1 fail --report reports/phase-01-qa.md
+  run pg xp --gate-status 1
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "blocked"
+
+  # …and clears the moment the verdict does.
+  qa_record otherplan 1 pass --report reports/phase-01-qa-r2.md
+  run pg xp --gate-status 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "otherplan"
+}
+
+@test "verified: the mode the cross-plan gate reads — done AND QA-passed (S8-a)" {
+  setup_docs linear otherplan
+  write_handoff otherplan 1 alpha complete
+  write_handoff otherplan 2 beta complete
+  run pg otherplan --verified
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "1"
+  assert_contains "$output" "2"
+
+  "$SYS_BASH" "$PE_SCRIPTS/qa-mode.sh" otherplan on >/dev/null
+  qa_record otherplan 2 fail --report reports/phase-02-qa.md
+  run pg otherplan --verified
+  [ "$status" -eq 0 ]
+  # phase 2 is done and NOT verified: the whole point of the mode.
+  refute_contains " $output " " 2 "
+}
+
+@test "verified: with QA off, verified is exactly done (S8-a)" {
+  setup_docs linear otherplan
+  write_handoff otherplan 1 alpha complete
+  done_set="$(pg otherplan --memory-block | grep '^done:' | sed 's/^done:[[:space:]]*//')"
+  [ "$(pg otherplan --verified)" = "$done_set" ]
+}
+
+# ── S8-b — nothing tied "done" to "landed" ───────────────────────────────────
+# A settles `keep`, so its work sits on `pe/A` and never reaches the trunk. B's
+# `plan A:5` gate clears on A being verified, B forks from the trunk, and B
+# builds on a tree that does not contain the thing it gated on. The gate half is
+# phase 7's (the `landed`/`pr-merged` kinds and the ledger); the FREE half is
+# saying so, because a gate that clears silently is what made this invisible.
+@test "gate-status: a cleared cross-plan gate warns when the other plan's branch is not on trunk (S8-b)" {
+  setup_docs linear otherplan
+  setup_docs gatecheck xp
+  cat > "$DOCS_ROOT/docs/plans/xp.md" <<'EOF'
+---
+slug: xp
+created: 2026-01-01
+status: active
+phases: 1
+handoffs: docs/handoffs/xp/
+memory: project_xp
+---
+# xp
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | waitother | — | — | r | x |
+
+### Phase 1 — waitother *(GATED)*
+- **Gate-check:** plan otherplan:1
+EOF
+  write_handoff otherplan 1 alpha complete
+  # A docs root that is a git repo, with otherplan's run branch unmerged.
+  git -C "$DOCS_ROOT" init -q -b main
+  git -C "$DOCS_ROOT" config user.email t@t.t; git -C "$DOCS_ROOT" config user.name t
+  git -C "$DOCS_ROOT" add -A >/dev/null; git -C "$DOCS_ROOT" commit -qm base
+  git -C "$DOCS_ROOT" checkout -q -b pe/otherplan
+  echo work > "$DOCS_ROOT/work.txt"; git -C "$DOCS_ROOT" add work.txt; git -C "$DOCS_ROOT" commit -qm work
+  git -C "$DOCS_ROOT" checkout -q main
+
+  run pg xp --gate-status 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "clear"
+  assert_contains "$output" "advisory"
+  assert_contains "$output" "pe/otherplan"
+  assert_contains "$output" "main"
+}
+
+@test "gate-status: once the branch is on trunk the advisory stops (S8-b)" {
+  setup_docs linear otherplan
+  setup_docs gatecheck xp
+  cat > "$DOCS_ROOT/docs/plans/xp.md" <<'EOF'
+---
+slug: xp
+created: 2026-01-01
+status: active
+phases: 1
+handoffs: docs/handoffs/xp/
+memory: project_xp
+---
+# xp
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | waitother | — | — | r | x |
+
+### Phase 1 — waitother *(GATED)*
+- **Gate-check:** plan otherplan:1
+EOF
+  write_handoff otherplan 1 alpha complete
+  git -C "$DOCS_ROOT" init -q -b main
+  git -C "$DOCS_ROOT" config user.email t@t.t; git -C "$DOCS_ROOT" config user.name t
+  git -C "$DOCS_ROOT" add -A >/dev/null; git -C "$DOCS_ROOT" commit -qm base
+  git -C "$DOCS_ROOT" branch pe/otherplan     # merged by construction: same commit
+
+  run pg xp --gate-status 1
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "advisory"
+}
+
+@test "gate-status: no branch, no git, no advisory — silence is not a claim (S8-b)" {
+  setup_docs linear otherplan
+  setup_docs gatecheck xp
+  cat > "$DOCS_ROOT/docs/plans/xp.md" <<'EOF'
+---
+slug: xp
+created: 2026-01-01
+status: active
+phases: 1
+handoffs: docs/handoffs/xp/
+memory: project_xp
+---
+# xp
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | waitother | — | — | r | x |
+
+### Phase 1 — waitother *(GATED)*
+- **Gate-check:** plan otherplan:1
+EOF
+  write_handoff otherplan 1 alpha complete
+  run pg xp --gate-status 1
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "advisory"
+}

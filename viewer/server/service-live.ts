@@ -10,12 +10,11 @@
  */
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { instanceId } from '../shared/instances.mjs';
 import {
-  INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs, savePrefs,
-  serverIsStale, staticRoot,
+  BOOTED_AT, INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs,
+  savePrefs, serverIsStale, staticRoot,
   type Flags, type Prefs, type RootCheck,
 } from './config.ts';
 import {
@@ -23,15 +22,17 @@ import {
   type RunLink, type SessionEventName, type SessionRecord, type SessionView,
 } from './sessions/registry.ts';
 import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type HooksWrite } from './hooks-install.ts';
+import { REFUSAL_REASON } from './runner/worktree.ts';
 import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
   ConvergeScheduler, convergePlan, HALT_DELAY_MS, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
 import { planWrite, runWrite } from './writes.ts';
 import {
   run, invalidate, readMemoryBlock, readQaMode, readSessionPlan, readLint, readGateStatus,
-  readText, readBoardText, type Board, type QaMode, type SessionPlan, type LintResult,
+  readText, readBoardText, readNotes, type Board, type QaMode, type SessionPlan, type LintResult,
   type GateStatus,
 } from './engine.ts';
+import type { Note } from './parse/notes.ts';
 import {
   composeFollowUp, isReviewVerdict, MAX_COMMENTS, phaseDiff, reviewHold,
   type CommentSide, type PhaseDiff, type ReviewRecord, type ReviewVerdict,
@@ -86,7 +87,7 @@ import {
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading, type Forecast,
 } from './analysis/stats.ts';
-import { mcpServersFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
+import { landFor, mcpServersFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
 import {
   Runner, applySettings, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
@@ -1908,6 +1909,32 @@ export abstract class ServiceLive extends ServiceBase {
     ));
   }
 
+  /**
+   * What earlier phases left for phase N — handoff notes, deferral rulings and
+   * boot-deliverable mail, in the order the phase's own boot prompt carries
+   * them.
+   *
+   * Asked of the ENGINE rather than of `parse/notes.ts`, even though the twin
+   * is right there: the engine is what the session will actually be handed,
+   * and a drawer that showed a second reading of the same files would be a
+   * page quietly disagreeing with the prompt. The twin's job is to be held to
+   * this answer by `notes-boot-parity.test.ts`, not to replace it.
+   *
+   * NOT cached by revision alone: a message or a ruling is appended to a
+   * ledger OUTSIDE `docs/`, so the plan's revision does not move when one
+   * arrives. `revision` still keys the entry, and the ledgers' own writers
+   * invalidate — see `Runner.boardPhase`, which drops the slug's entries
+   * before it reads the boot prompt.
+   */
+  async notes(slug: string, phase: number): Promise<Note[]> {
+    const record = this.store?.get(slug);
+    if (!record) return [];
+    return readNotes(await run(
+      this.engineOpts(), 'phase-graph.sh', [slug, '--notes', String(phase)],
+      { slug, revision: record.revision },
+    ));
+  }
+
   /* ---------------------------------------------------------------- *
    * Composed views
    * ---------------------------------------------------------------- */
@@ -1929,7 +1956,12 @@ export abstract class ServiceLive extends ServiceBase {
     const source = this.root && record.plan?.phased
       ? planRuns ?? listRuns(this.root.path, record.slug, this.liveRunIds())
       : [];
-    const runs = source.map((run) => ({ id: run.id, status: run.status, phases: run.phases }));
+    const runs = source.map((run) => ({
+      id: run.id, status: run.status, phases: run.phases,
+      // …and its start-door answers, so plan health does not report as
+      // unanswered a command the operator already approved.
+      ...(run.verifyApprovals ? { verifyApprovals: run.verifyApprovals } : {}),
+    }));
     return { record, board, qaMode, runs };
   }
 
@@ -2226,6 +2258,11 @@ export abstract class ServiceLive extends ServiceBase {
         gates: detail?.gates,
         gateCheck: detail?.gateCheck,
         gateKind: gateKindOf(detail?.gateCheck, detail?.gated ?? false, this.gateVocab),
+        // The plan's `Land:` word for this phase and which level said it —
+        // through the parser's own resolver, the same reading the runner
+        // lands by (phase 15's chip on the phase table and drawer). FREE:
+        // the word is the plan's; only the engine that acts on it is Pro.
+        land: landFor(plan, row.phase),
         model: detail?.model,
         effort: detail?.effort,
         goal: detail?.goal,
@@ -2292,6 +2329,9 @@ export abstract class ServiceLive extends ServiceBase {
         slug, title: plan.title, provenance: plan.provenance, context: plan.context,
         architecture: plan.architecture, endToEnd: plan.endToEnd, sessionBudget: plan.sessionBudget,
         graph: plan.graph, callouts: plan.callouts,
+        // Board, not document: the run page's launch form advises from it, and it
+        // is a few short excerpts where the prose it is read out of is 64.7 KB.
+        reviewers: plan.reviewers,
         sections: plan.sections.map((s) => ({ title: s.title, body: s.body })),
         // The manifest as it HOLDS — the plan's rows with the twin merged over
         // them, the same answer `phase-graph.sh --decisions` prints — then each
@@ -2632,6 +2672,9 @@ export abstract class ServiceLive extends ServiceBase {
       // True once the server files on disk are newer than this process. The
       // browser reloads from disk; this process cannot.
       serverStale: serverIsStale(),
+      // This process's start, which is also its identity: a restart is over
+      // for a page when the console answers with a different one.
+      bootedAt: new Date(BOOTED_AT).toISOString(),
       // Which client this server would serve right now — `dist` once a build
       // exists, else the legacy `web/`. Picked per request, so it can change
       // under a long-lived process; Settings reports it rather than leaving the
@@ -2670,6 +2713,12 @@ export abstract class ServiceLive extends ServiceBase {
       // seeing where your own console would speak is display — this decides
       // whether the Add/Remove/Test verbs exist AND whether any POST is made.
       allowWebhooks: this.flags.allowWebhooks,
+      // The outward-write gate (phase 8's eighth flag): whether a finished
+      // phase's `pe/*` branch may be pushed and an issue draft filed. Served
+      // so the launch form and Settings ▸ Automation can say beside the
+      // `Issues:` and `Landing:` controls what a word will actually do on
+      // THIS console — `file` holds drafts for a person, `pr` never pushes.
+      allowPublish: this.flags.allowPublish,
       // Every live run. The old singular `run` — "the FIRST live run of any
       // plan" — was dropped once the pool made it a lie: with two plans
       // driving, any consumer of it read plan B's run while looking at plan A.
@@ -2723,6 +2772,12 @@ export abstract class ServiceLive extends ServiceBase {
       // portable to paste, and free of the username in a screenshot.
       platform: process.platform,
       home: homedir(),
+      // `REFUSAL_REASON`, so a surface that meets a run record's
+      // `isolationRefusal` KEY can render the sentence (G-20). The record
+      // stores the key alone, deliberately — prose stored beside it would
+      // drift from the code that decided the refusal — so the table travels
+      // once, here, by reference, and every card looks its key up in it.
+      refusalReasons: REFUSAL_REASON,
       // What a NEW run would start with, so the picker can pre-check them and
       // say where they came from. Not what any existing run has — that is on
       // the run.

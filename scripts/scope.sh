@@ -29,12 +29,32 @@
 # scope_normalize <cell> → normalized csv on stdout ('' for a cell with no repos)
 scope_normalize() {
   printf '%s' "${1:-}" | awk '
+    # Fold `.` and `..` out of a token, segment-wise — the twin of `foldRelative`
+    # in viewer/shared/scope.js. A Repos cell is written by a person, and
+    # `packages/../docs` is a path a person writes; nothing folded it, so it read
+    # as DISJOINT from `docs` and cleared two sessions into one working tree by a
+    # spelling. Segment-wise on purpose: `..b` and `b..` are names, not climbs,
+    # and a `..` with nothing to pop is dropped rather than kept.
+    function fold(s,   n, i, parts, out, top) {
+      if (index(s, ".") == 0) return s
+      n = split(s, parts, "/")
+      top = 0
+      for (i = 1; i <= n; i++) {
+        if (parts[i] == "." || parts[i] == "") continue
+        if (parts[i] == "..") { if (top > 0) top-- ; continue }
+        out[++top] = parts[i]
+      }
+      s = ""
+      for (i = 1; i <= top; i++) s = (s == "" ? out[i] : s "/" out[i])
+      return s
+    }
     function norm(t,   s) {
       s = tolower(t)
       if (s == "*") return "all"
       if (s == "and") return ""          # a conjunction between repos
       gsub(/[^a-z0-9._\/-]/, "", s)
       while (s ~ /\/\//) sub(/\/\//, "/", s)
+      s = fold(s)
       sub(/^[^a-z0-9]+/, "", s)
       sub(/[^a-z0-9]+$/, "", s)
       if (length(s) < 2 || length(s) > 64) return ""
@@ -135,8 +155,34 @@ claim_disjoint() {
   # toplevel under a run's workspace) — is the same ground. Segment-wise via a
   # literal-prefix strip (quoted pattern), so `/w/a-b` is not inside `/w/a`.
   if [ "$at" = "$bt" ]; then return 1; fi
-  if [ "${at#"$bt"/}" != "$at" ]; then return 1; fi
-  if [ "${bt#"$at"/}" != "$bt" ]; then return 1; fi
+  if _same_ground "$bt" "$at"; then return 1; fi
+  if _same_ground "$at" "$bt"; then return 1; fi
+  return 0
+}
+
+# The console's own worktree home, as a path SEGMENT. `WORKTREES_DIR` in
+# viewer/server/runner/worktree.ts is the definition; this and
+# `WORKTREE_HOME_SEGMENT` in viewer/shared/scope.js are its two mirrors.
+WORKTREE_HOME_SEGMENT='.worktrees'
+
+# _same_ground <outer> <inner> → exit 0 iff <inner> is inside <outer> in the
+# sense that makes two claims contend. The twin of `sameGround` in scope.js.
+#
+# Plain containment was the whole test, and under `worktreeRoot: project` — the
+# shipped default — that is wrong: the home is `<root>/.worktrees/`, so EVERY
+# tree the console makes is literally inside the shared root and a cap-refused
+# shared run collided with all three isolated runs beside it, while the same
+# three under `state` carved cleanly. The home is a BOUNDARY, not a step down:
+# crossing it at any depth means the two are not the same ground. Beyond it
+# nesting is normal again (a mirror's submodule mount inside a run's tree is
+# still the same ground), and the branch dimension must still differ before
+# `claim_disjoint` clears anything.
+_same_ground() {
+  local outer="$1" inner="$2" rest
+  [ "$inner" = "$outer" ] && return 0
+  rest="${inner#"$outer"/}"
+  [ "$rest" = "$inner" ] && return 1        # not inside at all
+  case "/$rest/" in *"/$WORKTREE_HOME_SEGMENT/"*) return 1 ;; esac
   return 0
 }
 

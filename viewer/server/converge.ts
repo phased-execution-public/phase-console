@@ -49,7 +49,7 @@ import {
 } from './runner/state.ts';
 import { log } from './log.ts';
 import { doorActor, viaOfTrigger, type StartActor } from './actor.ts';
-import { WATCH_INELIGIBLE_ROW_STATES, WATCH_INELIGIBLE_STATUSES } from './watch-refs.ts';
+import { WATCH_INELIGIBLE_ROW_STATES, watchEligible } from './watch-refs.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
 import type {
   ConvergeTrigger as ConvergeTriggerWord, ResumePath, ResumeTrigger,
@@ -266,6 +266,37 @@ export function runIsDead(
   return true;
 }
 
+/**
+ * Is this lock's owner an autopilot lane whose RUN is still in flight — this
+ * console's, or another console's on the same root? (S5-a)
+ *
+ * `lockPresenceFor` used to ask only "is this one of MY live runners", which is
+ * the right question for one console and answers `no` for every lane of every
+ * other console sharing the root. It then fell through to the registry, which
+ * answers about the session the lock NAMES — and a lane's lock outlives its
+ * attempt's session by design, because the keepalive rewrites it every refresh
+ * still naming a session that has exited. So the answer for a perfectly healthy
+ * foreign lane was `ended`, and `ended` is the word that makes a lock debris:
+ * the second console admitted over the claim and then released it.
+ *
+ * The fact that settles it is on disk — the other run's own file — and the
+ * predicate is `runIsDead`, deliberately reused rather than re-derived: a second
+ * opinion about whether a run is over is how two consoles come to disagree about
+ * one lock, which is the whole shape of this finding.
+ */
+export function lockHeldByLiveRun(
+  owner: string,
+  live: ReadonlySet<string>,
+  runs: readonly RunState[],
+  pidAlive: (pid: number) => boolean = realPidAlive,
+): boolean {
+  const runId = autopilotRunId(owner);
+  if (!runId) return false;
+  if (live.has(runId)) return true;
+  const run = runs.find((candidate) => candidate.id === runId);
+  return run != null && !runIsDead(run, live, pidAlive);
+}
+
 /** The run a plan is "on" — the same answer `latestRun` gives: the one still open, else the newest. */
 export function latestOf(runs: readonly RunState[]): RunState | null {
   return runs.find((run) => run.status !== 'finished') ?? runs[0] ?? null;
@@ -401,7 +432,7 @@ export function evidenceFingerprint(
     // which is the exact "permanent spin" the latch's own comment below exists
     // to stop (QA F3). One list, two readers: `watch-scheduler.ts` skips these
     // phases and this skips their rows.
-    if (WATCH_INELIGIBLE_STATUSES.has(record.status)) continue;
+    if (!watchEligible(record)) continue;
     for (const row of record.watchState?.refs ?? []) {
       if (row.nextDueAt === undefined) continue;
       // …and only rows the scheduler will advance: a `refused` row is terminal,

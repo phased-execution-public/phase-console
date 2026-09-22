@@ -6,6 +6,8 @@ node_modules/
 client/dist/
 # `npm run verify:dist` builds here so the live client/dist is never touched.
 client/.dist-verify/
+# `deploy/self-update.sh` moves the live client here for the instant of a swap.
+client/.dist-previous/
 dist/
 *.local.json
 .DS_Store

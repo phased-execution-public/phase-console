@@ -174,7 +174,63 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    console's to read at run start. The wizard also describes **`Permissions:`** (`permission.policy`),
    **`May publish:`** (`permission.destructive`) and **`When in doubt:`** (`ambiguity`) lines, but no
    engine or console code reads them — only the `## Decisions` row answers those keys, so write the
-   row. Per phase, `- **Waits on:** <ref>[, <ref>…] · <max>`,
+   row.
+
+   **Where the work HAPPENS and where it LANDS (5.1.0).** Seven more §Session budget lines, each
+   read back as `word<TAB>phase|plan|default` so a console can tell "this plan chose it" from "this
+   plan never considered it" — the distinction that decides whether the wizard still has to ask.
+   **`Landing:`** `hold|integrate|pr|trunk` (`--land [N]`; `hold` is the default and is today's
+   behaviour — a person merges) · **`Base branch:`** `origin/HEAD|head|<ref>` (`--base-branch`; the
+   two words are questions, everything else is a git ref passed through whole) · **`Gitlink:`**
+   `bump|leave` (`--gitlink [N]`) · **`Conflicts:`** `halt|park|rebase-session`
+   (`--conflict-policy`) · **`Isolation:`** `shared|worktree` (`--isolation [N]`) ·
+   **`Clash zones:`** backticked paths (`--clash-zones`) · **`Messaging:`** `on|off`
+   (`--messaging`). Per phase, `- **Land:**`, `- **Gitlink:**`, `- **Isolation:**` and
+   `- **Issues:**` OVERRIDE the plan-wide line for that phase alone; `Base branch`, `Conflicts`,
+   `Clash zones` and `Messaging` are plan-wide and the arm REFUSES a phase argument, because each is
+   a claim about the RUN that one phase cannot make — a phase that could turn `Messaging` off would
+   be turning off a transport its siblings are relying on. There is deliberately **no per-phase
+   `Notify:` bullet** for the same reason, and one more: who hears about a phase is a property of the
+   run and the operator, not of the work.
+
+   `Messaging: off` reaches one more reader than its name suggests. **`--notes N`** — what earlier
+   phases left for phase N, and what its boot prompt carries — has three sources, and mail is one of
+   them; `off` suppresses that source alone. A `deferral` ruling and a handoff's
+   `## Notes for later phases` bullets are not messaging and are still collected, because a plan
+   saying "these sessions do not write to each other" has said nothing about its own record.
+   `references/handoff-format.md` §6 has the grammar, the bound and the lint (**F26**).
+
+   Two of them behave unlike the rest, deliberately. **`Isolation` has no default**: a phase that
+   says nothing inherits the RUN, and the run is not in this document, so `--isolation` prints
+   nothing at all rather than inventing `shared`. And **an unrecognised word is not adopted** — the
+   readers fall through it to the next level, which is right for a reader (a typo must never
+   silently become a policy) and is why the lint exists to say so: **F27** `land-word-unknown` fails
+   a plan with `Land: sometimes` or `Issues: maybe`, naming the level and the word.
+   **F30** `note-target-done` is the notes family's advisory: a `## Notes for later phases` bullet
+   addressed to a phase that is already done, which nothing will ever board with. Its gating sibling
+   **F26** `note-target-unknown` is one addressed to a phase the plan does not have.
+   **F28** `land-needs-lane` is advisory: a phase that LANDS from a checkout it shares carries every
+   commit on that branch, not just its own.
+
+   **`Issues:`** `off|draft|file` (`--issues [N]`, and the `issues` manifest row) is the outward-write
+   directive and defaults to `off`, because opening an issue on somebody's repository is not something
+   a plan that never considered the question should start doing. `draft` is the recommended answer:
+   the session writes, the console holds it in the inbox, a person approves. Budgets are three per
+   phase and ten per run — small on purpose, since a phase with four things to report has found a
+   CLASS of problem, and a class is one issue with four bullets. The two shapes, plan-wide in
+   §Session budget and per phase under its `### Phase N`:
+   > **Issues:** draft
+   ```
+   ### Phase 7 — Migrate the billing job
+   - **Issues:** file
+   ```
+   The plan-wide word is the default for every phase; the bullet overrides it for that phase alone
+   (`--issues 7` prints `file<TAB>phase`, `--issues` alone `draft<TAB>plan`, and a plan with neither
+   line prints `off<TAB>default`). Write `file` only on a phase whose findings a person has decided
+   in advance not to read first — a migration sweep across many files, say — and never on a phase
+   whose scope includes a repository somebody else owns.
+
+   Per phase, `- **Waits on:** <ref>[, <ref>…] · <max>`,
    `- **Human step:** <who, what, proof ref>` and `- **Person-check:** allow|halt|<owner>` refine
    the `waits`, `human-acts` and `verification.person-check` rows for that phase alone. `Waits on:`
    names what the phase waits on and, after the `·`, overrides the budget for that phase; a `date:` ref
@@ -297,6 +353,18 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      | `phase N` / `phases N,M,…` | auto | those phases of THIS plan reaching verified |
      | `plan <slug>:<phases>` | auto | those phases of ANOTHER plan reaching done |
      | `cmd <read-only command>` | auto | the command exiting 0 (executed only under `PHASE_EXEC_GATES=1` — the autopilot sets it; page views never do, and answer `unevaluated:` instead) |
+     | `landed N` | auto | phase N's row in `docs/handoffs/<slug>/landing.md` reaching the state ITS landing policy ends at (`hold` → `held`, `integrate` → `integrated`, `pr` → `pr-merged`, `trunk` → `landed`) |
+     | `pr-merged N` | auto | phase N's row reaching `pr-merged`, whatever its policy says |
+
+     The two landing kinds read a FILE and run nothing — no `gh`, no network, no
+     authentication — which is the whole reason they exist as gate types rather than as a `cmd`
+     gate: a gate that shells out answers `unevaluated:` for a page view and `clear` for the
+     autopilot, and one gate giving a session and its supervisor opposite instructions at the same
+     instant is a failure this format has already had once. Before any record they answer
+     `blocked: phase N has no landing record yet (policy pr)`; `scripts/phase-landing.sh` writes the
+     record. A `landed`/`pr-merged` gate naming a phase the plan does not have fails the lint
+     (**F29** `landed-gate-unknown-phase`) — it could never clear, and reads exactly like a phase
+     that has simply not landed yet.
 
      **The directive is required.** A `*(GATED)*` heading with **no** Gate-check reads as **ai** (the
      default `scripts/gates.env` names — `GATE_DEFAULT`; it read as human until 5.0.0, and the
@@ -404,6 +472,15 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      and the audit found a prose-only verification card asking a person for twelve hours. A done
      phase is not judged about history, and a closed plan's issues are noted, not gating.
      Backticked numbers alone (`1`, an exit-code table) do not count as runnable.
+     **What the runner reads as a command** (2026-09-18): a lead from its built-in set (`npm`, `node`,
+     `bash`, `bats`, `git`, `grep`, `test`, …) or a script path; a negation `! grep …`, a descriptor
+     duplication `2>&1`, a redirect into `/dev/null` and a `$(…)` inside double quotes (judged like any
+     other command) are all read; a backgrounded `cmd &` is refused — its exit code is never read. Under
+     `- **Person-check:** halt` any fragment it will not run parks the phase at boarding, naming it and
+     why. The console's **start door** asks first: the launch form's Decisions stage lists each such
+     command, to approve by its exact text (only where an approval can make it run — never the deny
+     wall, an off-machine write or an unparseable shape) or to waive for that run, once, before anything
+     spawns.
      It warns (**F17**) when a command's lead binary is **not installed on this machine** — write the
      check with what exists (`grep -R` not `rg`, `python3` not `python`): the autopilot SKIPS such a
      command at verification (recorded, not failed), and a phase whose every check is skipped parks.

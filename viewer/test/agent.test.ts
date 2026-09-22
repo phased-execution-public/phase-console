@@ -495,3 +495,26 @@ test('a recovery ticket honors model, effort and skills — the dialog depends o
   assert.match(prompt, /\/design-review/, 'picked skills reach the recovery prompt');
   assert.match(prompt, /plan-repair|Repair/i, 'and it is still the recovery briefing');
 });
+
+test('the wizard asks the launch words as one block, in the order the plan authored them, after the issues key (phase 15)', () => {
+  // The nine plan fields many-plans-one-repo phase 2 added (plus the per-phase
+  // `Isolation:` phase 7 slotted among them) are what the launch form's seven
+  // run fields read through — a run's word speaks only where the plan is
+  // silent, so a plan whose wizard never asked the question is a plan whose
+  // operator never chose. Contiguous, so a reader of the prompt meets them as
+  // one decision; and `issues` is asked as a MANIFEST key before any of them.
+  const block = ['Landing', 'Base branch', 'Gitlink', 'On conflict', 'Isolation', 'Clash zones',
+    'Repo capacity', 'Worktree retention', 'Messaging', 'Issues'];
+  const names = PLAN_FIELDS.map((f) => f.field);
+  const start = names.indexOf('Landing');
+  assert.ok(start >= 0, 'Landing is a plan field');
+  assert.deepEqual(names.slice(start, start + block.length), block, 'the landing family is one contiguous block, in the plan\'s order');
+  const text = planPrompt('a brief', 'phased-execution', CTX.scriptsDir);
+  const issuesKey = text.indexOf('`issues` —');
+  const landingField = text.indexOf('. Landing — ');
+  assert.ok(issuesKey >= 0 && landingField > issuesKey, 'the issues manifest key is asked before the Landing field');
+  // Every run field has a question: the form's word is never the only place it was ever chosen.
+  for (const field of ['Base branch', 'Repo capacity', 'Worktree retention', 'Landing', 'On conflict', 'Messaging', 'Issues']) {
+    assert.ok(text.includes(`. ${field} — `), `${field} is asked`);
+  }
+});

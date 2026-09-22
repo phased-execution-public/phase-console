@@ -44,7 +44,14 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { Bot, Play, ShieldCheck } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Button, TabsContent, toast } from '@/components/ui';
-import { api, automationPrefs, type PhaseView, type RunState, type SkillInfo } from '@/lib/api';
+import {
+  api,
+  automationPrefs,
+  type PhaseView,
+  type PlanReviewer,
+  type RunState,
+  type SkillInfo,
+} from '@/lib/api';
 import {
   keys,
   toastError,
@@ -56,6 +63,7 @@ import {
   useVerifyPreflight,
   usePrelude,
 } from '@/lib/queries';
+import { DEFAULT_ISOLATION_FOR_NEW_BRANCH, ISOLATED } from '@shared/worktree-model.js';
 import { startSession } from '@/lib/start-session';
 import { cn } from '@/lib/cn';
 import { plural } from '@/lib/format';
@@ -107,6 +115,12 @@ export interface RunSetupProps {
   /** What the plan asks every session to invoke / attach. Shown, never unticked here. */
   planSkills?: string[];
   planMcp?: string[];
+  /**
+   * Where the plan orders its own in-session reviewer (`plan.reviewers`). With
+   * Review each phase on, the Reviewers section says every phase would be
+   * reviewed twice (autopilot-token-drain phase 5).
+   */
+  planReviewers?: PlanReviewer[];
   /** The plan's qa-mode; `off` is the only value that offers the QA toggle. */
   qaMode?: string;
   /**
@@ -151,6 +165,7 @@ export function RunSetup({
   planPhases = [],
   planSkills = [],
   planMcp = [],
+  planReviewers = [],
   qaMode,
   pushBroken,
   allowWrites,
@@ -288,7 +303,23 @@ export function RunSetup({
   const Bool = mode === 'defaults' ? PressField : ToggleField;
 
   const set = <K extends RunSetupField>(field: K, next: RunSetupValues[K]) => {
-    setTouched((prior) => ({ ...prior, [field]: next }));
+    setTouched((prior) => {
+      // Decision 13, in the form: a branch the console cuts is isolated by
+      // default. The seed answers from the preference, which is `queue` on a
+      // default-branch console — right for a run that adopts a branch somebody
+      // may be standing on, wrong the moment the operator asks for a NEW one.
+      // Only while nobody has said (the operator's own tick outranks it), and
+      // only on a launch: the defaults page saves one key at a time and the
+      // server folds this default itself; a live run's checkout is settled.
+      const follows =
+        field === 'gitMode' &&
+        next === 'new-branch' &&
+        prior.isolation === undefined &&
+        mode !== 'defaults' &&
+        mode !== 'live' &&
+        DEFAULT_ISOLATION_FOR_NEW_BRANCH;
+      return { ...prior, [field]: next, ...(follows ? { isolation: ISOLATED } : {}) };
+    });
     // Settings ▸ Automation saves as you go, one key at a time, merged
     // server-side: two tabs flipping different knobs must not overwrite each
     // other, and there is no "Save" on a page of preferences.
@@ -427,9 +458,13 @@ export function RunSetup({
     planSkills,
     planMcp,
     planPhases,
+    planReviewers,
     qaMode,
     pushBroken,
     allowWrites,
+    // From the console's own state rather than a prop: the flag is a fact
+    // about THIS process, which every launch surface shares (phase 15).
+    allowPublish: state?.allowPublish,
     skillsEnabled,
     canQaToggle,
     canAutoRecover,
@@ -588,6 +623,16 @@ const PREF_KEY: Partial<Record<RunSetupField, string>> = {
   isolation: 'isolation',
   autoRecover: 'autoRecoverByDefault',
   mcpPolicy: 'mcpPolicy',
+  // Phase 15's seven, each under the key `server/config.ts` stores it as —
+  // the same name on both sides, listed for `isolation`'s reason: absence
+  // here means the control silently does not save in `defaults` mode.
+  baseBranch: 'baseBranch',
+  maxConcurrentPerRepo: 'maxConcurrentPerRepo',
+  worktreeRetention: 'worktreeRetention',
+  landing: 'landing',
+  conflictPolicy: 'conflictPolicy',
+  messaging: 'messaging',
+  issuesMode: 'issuesMode',
   // Both were seeded FROM prefs and rendered in `defaults` mode, and absent
   // from this map — so flipping either in Settings ▸ Automation changed local
   // state and saved nothing (console-parallel-repaint P12, the posture sweep).

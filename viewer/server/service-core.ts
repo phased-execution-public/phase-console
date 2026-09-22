@@ -14,7 +14,6 @@
 import { basename, join } from 'node:path';
 import type { DecisionRow } from '../shared/decisions-model.js';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 
 import { instanceId } from '../shared/instances.mjs';
@@ -44,6 +43,7 @@ import {
   degradedState, hasShutdownWork, onDegraded, requestRestart, requestShutdown, stopPlan, supervisor,
 } from './lifecycle.ts';
 import { log } from './log.ts';
+import { shell } from './shell.ts';
 import {
   CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
@@ -125,6 +125,7 @@ import {
   isVerdict, qaKey, type QaFacts, type QaRequest,
 } from './qa-session.ts';
 import { BLOCKED_ON } from '../shared/plan-vocab.js';
+import { planEffortOf, planModelOf } from '../shared/run-settings.js';
 import type { Presence } from '../shared/run-lifecycle.js';
 import {
   Approvals, classifyTool, matchedDenyRule, loadPolicy, loadPolicyFor, policyExtras, addPolicyRules,
@@ -737,6 +738,9 @@ export function ptyClaudeSessions(
  */
 export const INBOX_SOURCES = [
   'run:', 'approval', 'lock', 'account', 'mcp', 'health', 'plan', 'gate', 'qa', 'environment',
+  // The repository radar's transitions: a clash-zone warning is an inbox row,
+  // so the thing that produces one has to be able to nudge the inbox.
+  'repo:',
   // Registry beats too (a session's waiting flag is an inbox fact now). Every
   // attach/detach/turn-end schedules the same debounced 400 ms tick a run
   // event does — one refetch per beat, deliberately accepted.
@@ -870,13 +874,15 @@ export function recoveryActions(
 }
 
 /** `git status --porcelain`, or empty when it cannot be read. */
-export function gitPorcelain(root: string): Promise<string> {
-  return new Promise((resolve) => {
-    execFile('git', ['status', '--porcelain'], {
-      cwd: root, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
-      env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
-    }, (error, stdout) => resolve(error ? '' : String(stdout).trim()));
+export async function gitPorcelain(root: string): Promise<string> {
+  const run = await shell('git', ['status', '--porcelain'], {
+    channel: 'git', intent: 'porcelain', cwd: root, timeout: 15_000,
+    capture: { keep: 4 * 1024 * 1024, mode: 'head' },
+    env: { ...process.env, NO_COLOR: '1', TERM: 'dumb' },
+    // A root that is not a repository answers this every time it is asked.
+    expectFailure: true,
   });
+  return run.ok ? run.stdout.trim() : '';
 }
 
 /**
@@ -915,17 +921,14 @@ export function describeToolInput(input: unknown): string {
  * `claude-opus-5[1m]` ran on plain `opus`: the one part of the name the
  * operator wrote on purpose — the window — was the part thrown away, and the
  * board then sized the plan's sessions against a window it was not running on.
+ *
+ * The reading itself lives in `shared/run-settings.js` (`planModelOf`) so the
+ * launch form's per-phase table shows the very token the runner boards with.
  */
-export function modelAlias(text?: string): string | undefined {
-  const match = /\b(?:claude-)?(?:fable|opus|sonnet|haiku)(?:-[0-9a-z.]+)*(?:\[1m\])?/i.exec(text ?? '');
-  return match ? match[0].toLowerCase() : undefined;
-}
+export const modelAlias: (text?: string) => string | undefined = planModelOf;
 
-/** The same, for `**Effort:**` — one of the five the CLI accepts, or nothing. */
-export function effortOf(text?: string): string | undefined {
-  const match = /\b(low|medium|high|xhigh|max)\b/i.exec(text ?? '');
-  return match ? match[1].toLowerCase() : undefined;
-}
+/** The same, for `**Effort:**` — one of the five the CLI accepts, or nothing (`planEffortOf`). */
+export const effortOf: (text?: string) => string | undefined = planEffortOf;
 
 /**
  * How a session ended, in the words a notification can carry.
@@ -941,12 +944,13 @@ export function describeExit(session: SessionInfo): string {
 }
 
 /** Read-only git, for approval evidence. Never fails the request it decorates. */
-export function gitRead(cwd: string, args: string[]): Promise<string> {
-  return new Promise((resolve) => {
-    execFile('git', args, { cwd, timeout: 5_000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
-      resolve(error ? '' : String(stdout).trim().slice(0, 4_000));
-    });
+export async function gitRead(cwd: string, args: string[]): Promise<string> {
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'evidence', cwd, timeout: 5_000,
+    capture: { keep: 1024 * 1024, mode: 'head' },
+    expectFailure: true,
   });
+  return run.ok ? run.stdout.trim().slice(0, 4_000) : '';
 }
 
 /**

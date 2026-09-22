@@ -1,5 +1,19 @@
 import '@testing-library/jest-dom/vitest';
+import { configure } from '@testing-library/react';
 import { vi } from 'vitest';
+
+// `waitFor` polls until its expectation holds, and gives up after
+// `asyncUtilTimeout` — testing-library's own bound, stock 1000 ms, which
+// `testTimeout` in vite.config.ts does NOT govern. Raised for the reason that
+// one was: on a loaded machine (load average 10 on 14 cores, a full gate and
+// two foreign suites running) the second of three sequential clicks in
+// `runs/board.test.tsx` lost the race at 1 s, with the same file green in
+// isolation under the same load. A liveness bound on the harness, never an
+// assertion about the app: a passing `waitFor` returns the moment its
+// expectation holds, a wrong expectation still fails identically, only later,
+// and the bound stays well inside the 20 s test budget so three waits in one
+// test still report as a `waitFor` timeout rather than the test's own.
+configure({ asyncUtilTimeout: 5000 });
 
 // jsdom has no matchMedia, and the shell asks for it on first render to decide
 // whether it is a phone. Default: not a phone, no listeners — a test that cares

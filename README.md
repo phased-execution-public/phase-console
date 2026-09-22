@@ -38,8 +38,6 @@ stay correct. And since 2.3.0 the console converges on that board by itself: a p
 short is classified and its situation's ladder climbed, within caps in rungs and dollars; exhausted,
 it leaves you **one errand** and drives everything else — [the loop](docs/loop.md) is the spec._
 
----
-
 ## Install
 
 | You want                         | Run                                                                                             | Notes                                                                                                     |
@@ -81,12 +79,13 @@ Install the phased-execution skill for me, and ask before each step.
 4. Before enabling anything, explain these one at a time and let me answer each:
      --allow-writes   scaffold plans/handoffs, record QA, take locks, close plans
      --allow-run      spawn unattended Claude sessions that edit my repository
-                      for hours — the widest of the seven, say so plainly
+                      for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
      --allow-accounts register Claude accounts and switch between them mid-run
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
+     --allow-publish  push a finished phase's pe/* branch, never a trunk or forced
    Default every one of them to off. Then start it with only what I chose:
      bash <skill>/start --root <repo> [flags]
 5. Open http://127.0.0.1:4123 and confirm it loads. If it does not, tell me
@@ -140,10 +139,7 @@ header is trustworthy only because nothing but the proxy can reach the port.
 ```
 
 
-The long version, including push notifications and exactly what is enforced →
-**[docs/phone.md](docs/phone.md)**
-
----
+The long version, including push notifications and exactly what is enforced → **[docs/phone.md](docs/phone.md)**
 
 ## Everything else
 
@@ -154,8 +150,8 @@ The long version, including push notifications and exactly what is enforced →
 [QA gating](docs/qa-gating.md) · [Safety rails](docs/safety-rails.md) · [Phase Console](docs/console.md) · [Metrics](docs/metrics.md) ·
 [Install by hand](docs/install.md) · [Versioning & releases](docs/releasing.md) · [Reference](docs/reference.md)
 
-5.0 adds what an unattended run leans on: `phase-console doctor`, the [decisions](docs/decisions.md) a run
-starts with, a relay for a session's mid-run question, and Shut down's **Stay off…** — [docs/controls.md](docs/controls.md).
+5.1 lets many plans work one repository at once — a checkout per run, one trace id through everything a run does,
+notes that reach a phase before it starts; 5.0 added `phase-console doctor`, the [decisions](docs/decisions.md) a run starts with, and the relay — [docs/controls.md](docs/controls.md).
 
 Needs Claude Code, plus `bash` and `git`. The console adds Node 22.18+ (or 23.6+) and has **no
 runtime dependencies**. Releases: `vX.Y.Z` tags with a GitHub Release carrying the packed tarball,

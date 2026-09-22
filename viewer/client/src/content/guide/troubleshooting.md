@@ -4,7 +4,7 @@ If the Autopilot tab shows the plan but every start button is dead, the console 
 `--allow-run`. **The line at the very top of this Guide page says which it is** — it reads this
 console's own switches rather than describing a console in general.
 
-The fix is a restart with the flag: **Launch ▸ The seven switches** has the command, and Settings ▸
+The fix is a restart with the flag: **Launch ▸ The eight switches** has the command, and Settings ▸
 Start with every capability composes it for you.
 
 **Is the machine ready at all?** `phase-console doctor` runs the checks a run's start would, with no

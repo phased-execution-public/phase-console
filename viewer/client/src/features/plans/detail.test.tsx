@@ -662,7 +662,12 @@ describe('the plan surface renders its parts', () => {
     // It arrives through a `lazy()` boundary, so this also proves the Suspense
     // fallback resolves rather than leaving the tab on a spinner for ever.
     renderPlan(['demo', 'run']);
-    expect(await screen.findByText('Start a run')).toBeInTheDocument();
+    // The run chunk is the heaviest lazy boundary the client has (the phase
+    // table, the launch form, the landing card…), and under the full parallel
+    // suite vitest can take more than the 1 s default to transform it. The
+    // wait is about the chunk, never the page: a spinner that never resolves
+    // still fails here, five seconds later.
+    expect(await screen.findByText('Start a run', {}, { timeout: 5000 })).toBeInTheDocument();
   });
 
   it('reports a missing phase instead of rendering an empty panel', async () => {

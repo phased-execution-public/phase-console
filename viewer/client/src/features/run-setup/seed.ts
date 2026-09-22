@@ -64,6 +64,14 @@ const PREF_SOURCE: Readonly<Partial<Record<RunSetupField, readonly string[]>>> =
   attachDefaultSkills: ['attachDefaultSkills'],
   mcpPolicy: ['mcpPolicy'],
   autoRecover: ['autoRecoverByDefault'],
+  // Phase 15's seven, each under the key `server/config.ts` stores it as.
+  baseBranch: ['baseBranch'],
+  maxConcurrentPerRepo: ['maxConcurrentPerRepo'],
+  worktreeRetention: ['worktreeRetention'],
+  landing: ['landing'],
+  conflictPolicy: ['conflictPolicy'],
+  messaging: ['messaging'],
+  issuesMode: ['issuesMode'],
 });
 
 export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, Origins] {
@@ -91,6 +99,17 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
     values.reviewerPolicy = prefs.reviewerPolicy;
     values.autoRecover = prefs.autoRecoverByDefault;
     values.mcpPolicy = prefs.mcpPolicy;
+    // Phase 15's seven — the defaults page edits the preferences themselves,
+    // so every one opens on the folded preference (the console's own default
+    // where nobody set one). The ref and the cap are shown as the words the
+    // console holds: on this page they ARE the console's answer.
+    values.baseBranch = prefs.baseBranch;
+    values.maxConcurrentPerRepo = String(prefs.maxConcurrentPerRepo);
+    values.worktreeRetention = prefs.worktreeRetention;
+    values.landing = prefs.landing;
+    values.conflictPolicy = prefs.conflictPolicy;
+    values.messaging = prefs.messaging;
+    values.issuesMode = prefs.issuesMode;
     return [values, origins];
   }
 
@@ -159,6 +178,23 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   // chain, which is what every run file written before this feature says.
   values.priority = runPriority(run?.priority);
   values.startAfter = run?.startAfter ?? '';
+  // Phase 15's seven. An EXISTING run answers for itself — an absent word on
+  // a real run means the owner's default (or, for the ref and the cap, "the
+  // console's"), never "fall back to the preference": a live run's form must
+  // open on what the run IS. A fresh start takes the preference for the four
+  // words and for retention; the ref and the cap open EMPTY on a fresh start,
+  // because empty is the honest word for "the plan's line, else the console's
+  // preference" — writing the console's number into the run would freeze a
+  // preference the operator may change tomorrow.
+  values.baseBranch = run?.baseBranch ?? '';
+  values.maxConcurrentPerRepo = run?.maxConcurrentPerRepo ? String(run.maxConcurrentPerRepo) : '';
+  values.worktreeRetention = run
+    ? (run.worktreeRetention ?? prefs.worktreeRetention)
+    : prefs.worktreeRetention;
+  values.landing = run ? (run.landing ?? EMPTY.landing) : prefs.landing;
+  values.conflictPolicy = run ? (run.conflictPolicy ?? EMPTY.conflictPolicy) : prefs.conflictPolicy;
+  values.messaging = run ? (run.messaging ?? EMPTY.messaging) : prefs.messaging;
+  values.issuesMode = run ? (run.issuesMode ?? EMPTY.issuesMode) : prefs.issuesMode;
   // A run answers for itself; a fresh start takes the preference. Absent on
   // the run means OFF, not "fall back to the pref" — unlike `openPr`, whose
   // absent-under-new-branch state means true.
@@ -214,6 +250,8 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   values.accounts = run ? formatAccounts(run.accounts) : '';
   values.acknowledgedWaivers = [];
   values.manifestOverride = '';
+  // Probe 5's answers are the draft's own, like a waiver: asked per launch.
+  values.verifyAnswers = { approve: [], waive: [] };
 
   for (const field of RUN_SEEDED) mark(field, run ? 'run' : 'defaults');
 
@@ -269,6 +307,13 @@ export const RUN_SEEDED = [
   'isolation',
   'priority',
   'startAfter',
+  'baseBranch',
+  'maxConcurrentPerRepo',
+  'worktreeRetention',
+  'landing',
+  'conflictPolicy',
+  'messaging',
+  'issuesMode',
   'reviewEachPhase',
   'reviewerPolicy',
   'ultracode',

@@ -10,7 +10,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { RELAY_CLI_FLOOR } from '../shared/run-settings.js';
 import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import {
-  atLeast, cliVerdict, consoleVerdict, doctorExitCode, doctorReport, environmentVerdict, formatDoctor, hooksVerdict,
+  atLeast, cliVerdict, consoleVerdict, doctorExitCode, doctorReport, environmentVerdict, formatDoctor, gitVerdict, hooksVerdict,
   skipped,
   type DoctorDeps, type DoctorRow,
 } from '../server/doctor.ts';
@@ -49,6 +49,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     unit: async () => ({ installed: true, disabled: false, runAtLoad: true, stoppedMarker: false, label: 'com.phase-console.abcd1234-demo' }),
     cliVersion: async () => '2.1.270',
     gh: async () => okv('gh auth status: signed in'),
+    git: async () => ({ version: 'git version 2.50.0', code: 0, insideWorkTree: true, path: '/opt/homebrew/bin/git', root: '/home/someone/demo' }),
     environment: () => [],
     console: async () => ({ healthy: true, serverStale: false, version: 'built at deadbeef' }),
     now: () => NOW,
@@ -58,14 +59,17 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
 
 test('every row answers ok|fail|skip with a reason, in the documented order; a clean machine is ok', async () => {
   const report = await doctorReport(deps());
-  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'cli', 'gh', 'environment', 'console'];
+  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
   assert.deepEqual(report.rows.map((r) => r.id), order);
   for (const row of report.rows) {
     assert.ok((PROBE_STATUSES as readonly string[]).includes(row.status), `${row.id}: ${row.status}`);
     assert.ok(row.reason.length > 8, `${row.id} carries a reason`);
     assert.equal(typeof row.blocking, 'boolean');
   }
-  assert.deepEqual(report.rows.filter((r) => r.blocking).map((r) => r.id), ['accounts', 'credentials', 'hooks', 'environment', 'console']);
+  assert.deepEqual(
+    report.rows.filter((r) => r.blocking).map((r) => r.id),
+    ['accounts', 'credentials', 'hooks', 'git', 'environment', 'console'],
+  );
   assert.equal(report.ok, true);
   assert.equal(report.firstFailing, null);
   assert.equal(doctorExitCode(report), 0);
@@ -177,3 +181,80 @@ test('`phase-console doctor --help` exits 0 with the usage, from both bins', () 
   assert.equal(bad.status, 2);
   assert.match(bad.stderr, /unknown argument --bogus/);
 });
+
+/* ------------------------------------------------------------------ *
+ * The `git` row (5.1.0, errand E7)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Why this row exists, in one incident.
+ *
+ * Under launchd the console's `PATH` leads with `/usr/bin`, where macOS keeps
+ * Apple's `git` SHIM. Until `xcodebuild -license` has been accepted that shim
+ * exits 69 and prints the licence notice to stderr — for every invocation, of
+ * every subcommand, forever. On 2026-09-16 this console's own run `f0da619a`
+ * therefore read its repository as `not-a-repo`, was refused isolation, and
+ * degraded to the shared root. `doctor` reported the environment HEALTHY
+ * throughout, because nothing it probed ran git.
+ *
+ * So the row runs git under **this process's own `PATH`** rather than a shell's:
+ * a probe that finds the Homebrew git a developer has in their interactive
+ * shell answers a question nobody asked, and answers it reassuringly.
+ */
+test('GIT-1 — an unaccepted Xcode licence is a red row that names the command', () => {
+  const verdict = gitVerdict({
+    version: null,
+    code: 69,
+    stderr: 'You have not agreed to the Xcode license agreements. Please run sudo xcodebuild -license.',
+    insideWorkTree: null,
+  });
+  assert.equal(verdict.status, 'fail');
+  assert.match(verdict.reason, /xcodebuild -license/, 'the errand is the useful half of this row');
+});
+
+test('GIT-2 — git missing from PATH is a fail, not a skip: nothing this console does works without it', () => {
+  const verdict = gitVerdict({ version: null, code: null, insideWorkTree: null });
+  assert.equal(verdict.status, 'fail');
+  assert.match(verdict.reason, /PATH/);
+});
+
+test('GIT-3 — a working git over an open repository is ok, and says which git', () => {
+  const verdict = gitVerdict({
+    version: 'git version 2.39.5 (Apple Git-154)',
+    code: 0,
+    insideWorkTree: true,
+    path: '/usr/bin/git',
+    root: '/home/someone/demo',
+  });
+  assert.equal(verdict.status, 'ok');
+  assert.match(verdict.reason, /2\.39\.5/);
+  assert.match(verdict.reason, /\/usr\/bin\/git/, 'WHICH git is the whole point — two are usually installed');
+});
+
+test('GIT-4 — git works but the root is not a repository: that is the symptom E7 produced', () => {
+  const verdict = gitVerdict({ version: 'git version 2.50.0', code: 0, insideWorkTree: false, root: '/home/someone/demo' });
+  assert.equal(verdict.status, 'fail');
+  assert.match(verdict.reason, /not a git repository/);
+});
+
+test('GIT-5 — no source directory open is ok, not a fail: there is nothing to be inside', () => {
+  const verdict = gitVerdict({ version: 'git version 2.50.0', code: 0, insideWorkTree: null });
+  assert.equal(verdict.status, 'ok');
+});
+
+test('GIT-6 — a probe that could not run is a skip, which is not the same as a failure', () => {
+  assert.equal(gitVerdict(null).status, 'skip');
+});
+
+test('GIT-7 — the row is in the report, blocking, and a red one fails the exit code', async () => {
+  const green = await doctorReport(deps());
+  const row = green.rows.find((one: DoctorRow) => one.id === 'git');
+  assert.ok(row, `there is no git row: ${green.rows.map((one: DoctorRow) => one.id).join(', ')}`);
+  assert.equal(row.blocking, true, 'a console whose git is broken cannot do anything at all');
+  assert.equal(doctorExitCode(green), 0);
+
+  const red = await doctorReport(deps({ git: async () => ({ version: null, code: 69, stderr: 'Xcode license', insideWorkTree: null }) }));
+  assert.equal(doctorExitCode(red), 1, 'E7 must be an exit code, not a sentence nobody reads');
+  assert.equal(red.firstFailing?.id, 'git');
+});
+

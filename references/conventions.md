@@ -226,7 +226,10 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   UNQUALIFIED, which collides with everything** — same fail-safe direction as an absent `scope`, so every
   lock written before the fields existed serialises exactly as it did. `status` and `list` print them.
   See §Scoped concurrency.
-- Leases auto-expire (default 30 min) so a dead session's lock can be taken over; refresh by re-claiming.
+- Leases auto-expire (default **2 h**, `phase-lock.sh` `lease=7200`) so a dead session's lock can be
+  taken over; refresh by re-claiming. It is two hours because a real phase of a real plan runs for
+  forty-five minutes to two, and a lease shorter than the work it protects hands the tree to the next
+  caller mid-phase. The console keepalives its own lanes every lease/3.
   Release at phase-finish (`phase-lock.sh <slug> release <N> --owner … --git`). Cooperative, not a hard mutex.
   **An operator can also release it out from under you** — the console's Locks view forces one, and the
   convergence loop releases the lock of a session it can prove is dead (`references/console-surface.md`).
@@ -234,9 +237,25 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
 
 ## Scoped concurrency (working-tree safety)
 - **The invariant: never two live sessions whose scopes intersect. Same repo ⇒ serialized; `all` ⇒
-  exclusive; disjoint ⇒ parallel.** What makes two sessions unsafe is a shared *working tree* — they
-  overwrite each other's files mid-edit and tests fail for unrelated reasons — not the mere fact of being
-  two. So the rule is about scope, not about counting sessions.
+  exclusive against every unqualified claim; disjoint ⇒ parallel.** What makes two sessions unsafe is a
+  shared *working tree* — they overwrite each other's files mid-edit and tests fail for unrelated
+  reasons — not the mere fact of being two. So the rule is about scope, not about counting sessions.
+- **`all` is exclusive against every *unqualified* claim — not against the world.** The older wording
+  ("`all` ⇒ exclusive", full stop) described a rule the code has never had: `all` is carved like any
+  other scope once **both** claims are qualified. Two claims that each declare a branch AND a working
+  tree, and differ in both, are physically disjoint — different files on disk — and may run at the same
+  time even when one of them says `all`. What `all` cannot be carved against is a claim that declares
+  neither, because such a claim has said nothing about where it is working. Unqualified in *either*
+  dimension collides with everything (`claimsDisjoint` in `shared/scope.js`, `claim_disjoint` in
+  `scripts/scope.sh`).
+- **A lock with no `scope=` line reads as `all`, in both languages.** It is an *unknown* scope, so it
+  collides with everything — and the scheduler and bash now agree on that. They did not always: the
+  scheduler once read a scopeless lock as the plan's Repos cell while bash read it as `all`, so one
+  side admitted work the other had refused. Never infer a lock's scope from its plan; a lock that did
+  not say is a lock that owns the tree.
+- **A hand lane under a superproject is swept like any other.** `phase-lane.sh remove` takes the tree,
+  the merged branch and the lock away whether or not the repository has submodules; there is no class
+  of lane the sweep skips and leaves for a person to find.
 - **Scope = the plan's Repos column**, normalised by `shared/scope.js` (JS) and `scripts/scope.sh` (bash);
   `phase-graph.sh <slug> --repos <N>` prints it. `all` and an *undeclared* cell touch everything. A path
   token nests segment-wise: `packages` ∩ `packages/cart-api` collide, `api` and `api-gateway` do not.
@@ -455,7 +474,7 @@ paragraph of a handoff that the next session skims, because at the time it felt 
 **Record it as it happens:**
 
 ```bash
-bash scripts/phase-outcome.sh <slug> <N> ruling --kind ambiguity|deviation|deferral   --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"]   [--needs <decision key>] [--remember plan|global] [--by WHO]
+bash scripts/phase-outcome.sh <slug> <N> ruling --kind ambiguity|deviation|deferral   --what "<what you decided>" --why "<why>" [--cost-if-wrong "<what it costs if this was wrong>"]   [--for <M|next|all>] [--needs <decision key>] [--remember plan|global] [--by WHO]
 ```
 
 One appended NDJSON line, to `$PE_RULINGS_FILE` (the runner injects it) or, unsupervised, to
@@ -474,7 +493,20 @@ words are an answer the console can hold for the key, **Remember on this console
 - **`deviation`** — the plan said one thing and you did another, with a reason. The reader needs to
   know the plan and the tree now disagree.
 - **`deferral`** — something in scope was deliberately left. The reader needs it on a list, not in
-  prose.
+  prose. **It is the one kind with an addressee**: `--for <M|next|all>` says which phase you left it
+  to (a number, every phase that depends on yours, or all of them), defaulting to `next` — and that
+  is what puts it in `phase-graph.sh <slug> --notes M`, and so into M's boot prompt, whether or not
+  anybody remembers to copy it into a handoff. `--for` is refused on the other two kinds, because an
+  ambiguity and a deviation are a session explaining ITSELF and a note nobody is addressed by is a
+  note nobody reads.
+
+**Where a forward-looking ruling ends up, and why there are two places.** A `deferral --for M` and a
+handoff's `- **Phase M:** …` bullet are collected by the same reader and arrive in the same block of
+M's boot prompt, so neither is a substitute for the other and both are worth writing: **the ledger
+is what the console reads and the handoff is what a person reads**, and a phase that is never
+boarded again still has a reader. Write the ruling when you make the call — that is the moment you
+know why — and the bullet at phase-finish, when you know how it turned out.
+`references/handoff-format.md` §6 has the bullet grammar and the bound.
 
 **A ruling is not an outcome and never becomes one.** The outcome protocol says how a session ENDED
 and the runner acts on it; **nothing acts on a ruling** — it does not park a phase, does not climb

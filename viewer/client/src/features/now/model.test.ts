@@ -743,3 +743,21 @@ describe('plans in flight', () => {
     expect(plansInFlight(many, 6)).toHaveLength(6);
   });
 });
+
+describe('what a lane carries about its checkout (many-plans-one-repo phase 15)', () => {
+  it("carries the run's resolved base onto every lane, absent when the run never resolved one", () => {
+    // The base every `pe/<slug>-pN` was cut from is a fact about the RUN,
+    // resolved once and written on its record; a lane row shows it on the
+    // branch chip's title, so the lane has to hold it without a second fetch.
+    const base = {
+      ref: 'main',
+      sha: 'abcdef1234567890',
+      source: 'origin-head' as const,
+      declaredBy: 'plan' as const,
+    };
+    const [withBase] = nowLanes([run({ base, phases: { '4': record() as never } })]);
+    expect(withBase?.base).toEqual(base);
+    const [without] = nowLanes([run({ phases: { '4': record() as never } })]);
+    expect(without?.base).toBeUndefined();
+  });
+});

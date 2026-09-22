@@ -54,6 +54,10 @@ export function HowItRuns() {
       <Block heading="Branch and checkout" on={on('gitMode')}>
         <BranchSection />
       </Block>
+      {/* Phase 15: where a phase's commits go and what a stuck landing does,
+          then what a session may say and file. Two groups rather than one,
+          because they are two decisions — one about the repository, one
+          about the sessions. */}
       <Block heading="Who pays" on={on('accountId')}>
         <AccountSection />
       </Block>

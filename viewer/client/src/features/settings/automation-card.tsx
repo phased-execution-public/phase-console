@@ -22,6 +22,8 @@
 
 import { useConsoleState, useSavePrefs } from '@/lib/queries';
 import { automationPrefs } from '@/lib/api';
+import { cn } from '@/lib/cn';
+import { settingsHref } from '@/app/routes';
 import { Button, Card, CardBody, CardHeader, CardTitle, CardSkeleton } from '@/components/ui';
 import { RunSetup } from '@/features/run-setup/run-setup';
 import { NumberField } from '@/features/settings/ladder';
@@ -63,6 +65,28 @@ export function AutomationCard() {
             other mode opens on. No submit button: a page of preferences has
             no "Save", and each field is its own patch. */}
         <RunSetup mode="defaults" />
+
+        {/* Not a preference either, and not a verb: the eighth capability flag
+            (phase 8), stated beside the landing and issues defaults it
+            governs, because `Landing: pr` and `Issues: file` above mean one
+            thing with it and another without — and nothing on this page can
+            turn it on. A start flag is changed at the start command. */}
+        <p className={cn(row, 'text-2xs text-ink-muted')} data-testid="publish-flag">
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Outward writes</span>
+            <span className="mt-0.5 block">
+              <code>--allow-publish</code> is <strong>{state?.allowPublish ? 'on' : 'off'}</strong> on this
+              console — a start flag, not a preference.{' '}
+              {state?.allowPublish
+                ? 'A phase whose word is pr or trunk is pushed and its pull request opened; an issue a plan says to file is filed.'
+                : 'Nothing is pushed and no issue is filed: a pr or trunk landing is held and says so, and Issues: file holds every draft in the inbox for a person. Restart with the flag to change that.'}{' '}
+              <a href={settingsHref('essentials')} className="text-action underline">
+                Essentials
+              </a>{' '}
+              shows the start command.
+            </span>
+          </span>
+        </p>
 
         {/* Not a preference — which is why it is a verb button and not a
             toggle: a freeze is an ACT with a moment and an author, the same
@@ -134,6 +158,19 @@ export function AutomationCard() {
             </span>
           </span>
           {onOff(prefs.repoGuard, 'repoGuard')}
+        </div>
+
+        <div className={row}>
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Serialise conflicted branches</span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              When the repository&apos;s conflict radar measures two live branches as CONFLICTED, make the one
+              the landing order puts second wait until the first has landed (a <code>radar</code> holder on
+              the queue, <code>phase.radar-hold</code> in the journal). Off (shipped): the radar stays
+              advisory — the pair is shown, nothing waits. Does nothing on a console without the radar.
+            </span>
+          </span>
+          {onOff(prefs.radarSerialize, 'radarSerialize')}
         </div>
 
         <div className={row}>

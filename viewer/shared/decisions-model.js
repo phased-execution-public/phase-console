@@ -47,15 +47,23 @@
 import { SUB_KINDS } from './situation-model.js';
 
 /**
- * The seventeen keys — a closed vocabulary (chapter 13 §1.1). Also the value a
- * ruling, an errand and a `needs-human` reason carry as its `decisionKey`, and
- * what `phase-outcome.sh … blocked|needs-human --needs <key>` is validated
- * against (together with `NEED_CLASSES` below).
+ * The eighteen keys — a closed vocabulary (chapter 13 §1.1's seventeen, plus
+ * `issues` in 5.1.0). Also the value a ruling, an errand and a `needs-human`
+ * reason carry as its `decisionKey`, and what `phase-outcome.sh …
+ * blocked|needs-human --needs <key>` is validated against (together with
+ * `NEED_CLASSES` below).
+ *
+ * `issues` sits beside `permission.destructive` because it is the same kind of
+ * question asked about a different verb: what may this run write OUTWARD, to a
+ * place no `git reset` takes back. A plan that answered the push question and
+ * never answered this one is exactly the plan whose sessions opened four
+ * copies of one issue.
  */
 export const DECISION_KEYS = Object.freeze(
   /** @type {const} */ ([
     'permission.policy',
     'permission.destructive',
+    'issues',
     'credentials',
     'accounts',
     'mcp',

@@ -24,7 +24,7 @@ import {
   RESOLVED_SEGMENTS, WARN_SEGMENTS, boundary, clampLimit, deliveryEntries, displayPath,
   healthEntries, isDebugLevel, isDebugSource, journalLevel, maskHome, mergeIndex, readConsoleLog,
   readJournals, readOutcomes, readRulingEntries, readSupervisorLogs, scrubText, scrubValue,
-  supervisorLogPaths, tailLines, type DebugBucket, type DebugEntry, type DebugSource,
+  supervisorLogPaths, tailLines, debugMatches, type DebugBucket, type DebugEntry, type DebugSource,
 } from '../server/debug/sources.ts';
 import {
   Debug, isRunId, isSlug, parseDebugQuery, parseExposition, tallyDelivery, type DebugDeps,
@@ -833,7 +833,7 @@ test('L-B — a three-segment kind is classified, not skipped', () => {
   assert.equal(journalLevel('run.adopt.alive'), 'info');
 });
 
-test('L-B — the level vocabulary is checked against ALL 242 kinds', () => {
+test('L-B — the level vocabulary is checked against every kind in the catalogue', () => {
   // The round-1 parser matched `[a-z0-9-]+` after the first dot and so read
   // 228 of 232 rows, and its assertion was only "each word matches
   // something" — which `defect` and `failure` both satisfied while being
@@ -914,7 +914,92 @@ test('L-B — the level vocabulary is checked against ALL 242 kinds', () => {
   // and a re-adoption held by a stop marker or `autostart: false`
   // (`run.readopt-held`) — the `boot.*`, `shutdown.*` and new `sessions.*` rows
   // are log-family names outside the count.
-  assert.equal(kinds.length, 298, `the catalogue has ${kinds.length} kinds; the parser found a different number`);
+  // 299 since autopilot-token-drain phase 2 (the poll-loop guard): an episode
+  // of status checks the PreToolUse hook began refusing (`phase.poll-loop`).
+  // 301 since autopilot-token-drain phase 3 (token telemetry): a session's API
+  // calls folded as it ended (`phase.tokens`) and the context line a phase's
+  // own session passed (`phase.context-wrapup`).
+  // 302 since autopilot-token-drain phase 4 (the resume policy): the gate's
+  // answer on whether a session is worth resuming (`phase.resume-policy`).
+  // 304 since autopilot-token-drain phase 6 (the usage brake): an account braked
+  // at a usage decision (`run.usage-brake`) and released (`run.usage-brake-released`).
+  // 305 since 2026-09-18 (the verification launch door): the start door's
+  // §Verification answers, counted and signed (`run.verify-approvals`).
+  // 310 since many-plans-one-repo phase 4 (the decisions that left no trace):
+  // a lane's merge-back ANNOUNCED before it runs (`phase.worktree-landing`), a
+  // phase committing outside its Repos cell (`phase.scope-drift`), a previous
+  // run's kept checkout taken over (`run.isolation-adopted`), a mirror mount put
+  // back on the run branch (`run.mirror-drifted`), and the probe's own failure
+  // (`runner.scope-drift-probe`).
+  // 313 since many-plans-one-repo phase 5 (the logging core): the run's own
+  // derived correlation id, snapshotted once per drive (`run.trace`), and the
+  // two SPAN names a reader meets on every console line of a drive — the drive
+  // itself (`run.drive`) and one phase attempt inside it (`phase.attempt`).
+  // 320 since many-plans-one-repo phase 10 (the messaging core): the seven
+  // `phase.message*` lines a peer's message leaves behind — one per state a
+  // send can reach (`message-sent`, `-delivered`, `-deferred`, `-expired`,
+  // `-refused`, `-replied`) and the boarding prompt that carried mail
+  // (`phase.messages-booted`). The `messages.*` and `hook.message-rejected`
+  // log families are outside this count by construction, as every log family
+  // is. All seven rows sit inside `<!--!pro:start-->` markers — the delivery
+  // engine is Pro — so the FREE tree's catalogue is 313 and its own copy of
+  // this test reads its own number; this count is THIS tree's.
+  // 321 since many-plans-one-repo phase 11 (forward notes): the boarding
+  // prompt that carried what earlier phases left for a phase
+  // (`phase.notes-booted`). That row is FREE — the notes block is the free
+  // engine's, and only one of its three sources is Pro data — so the free
+  // tree's catalogue moves with it, from 313 to 314.
+  // 325 since many-plans-one-repo phase 7 (isolation for many plans): the base
+  // a run branch was cut from and which arm answered (`run.base-branch`), a
+  // sweep leaving a tree somebody else locked (`run.worktree-locked-foreign`),
+  // and two branches both touching a clash zone (`run.clash-zone`). The first
+  // two are FREE — the base resolver and the sweeps are the free engine's — so
+  // the free tree's catalogue moves 314 → 316; `run.clash-zone` sits inside
+  // `<!--!pro:start-->` markers, because the radar that produces it is Pro.
+  // `repo.radar-failed` is a LOG family and outside this count by construction.
+  // 327 since many-plans-one-repo phase 13 (debug viewers and detectors): what
+  // a lane's process is costing (`phase.resources`) and a lane suspected of
+  // going round in circles (`phase.suspect`). The first is FREE — the reading
+  // rides the one `ps` the liveness probe already takes — so the free tree's
+  // catalogue moves 316 → 317; `phase.suspect` sits inside `<!--!pro:start-->`
+  // markers, because the evidence half reaches the runner as a Pro dep and the
+  // free tree is handed none. `sessions.suspect` is a LOG family and outside
+  // this count, like every log family.
+  // 340 since many-plans-one-repo phase 8 (landing policy engine): the
+  // thirteen landing rows — `phase.landing`, `-degraded`, `-pushed`,
+  // `-push-refused`, `-session`, `-session-done`, `-recorded`, `-resumed`,
+  // `-conflict`, `-failed`, `-record-failed`, `run.integration-landed`,
+  // `run.staging-locked`. All thirteen sit inside `<!--!pro:start-->` markers
+  // (the engine is Pro, and the one runner-emitted row rides a Pro region),
+  // so the free tree's catalogue stays at 317. `runner.landing-failed` is a
+  // LOG family and outside this count by construction.
+  // 341 since many-plans-one-repo phase 9 (the radar hold): `phase.radar-hold`
+  // — a phase queued behind a `radar` holder, with the conflicted pair and who
+  // lands first. Inside the same `<!--!pro:start-->` block as the landing rows
+  // (the hold is answered by the Pro landscape), so the free tree stays at 317.
+  // `scheduler.fleet-scope` is a LOG family and outside this count.
+  // 351 since many-plans-one-repo phase 12 (issues from sessions): the ten
+  // `phase.issue-*` lines a session's draft leaves behind — one per state the
+  // drafts engine can move it to (`issue-drafted`, `-pending`, `-deduped`,
+  // `-over-budget`, `-refused`, `-filed`, `-commented`, `-closed`, `-failed`,
+  // `-discarded`). All ten sit inside `<!--!pro:start-->` markers — the engine
+  // and the one `gh` writer are Pro — so the free tree stays at 317. The
+  // `issues.append-failed` and `issues.read-failed` rows are a LOG family and
+  // outside this count by construction.
+  // 319 is the FREE tree's catalogue, and every row only the Pro tree has rides
+  // a `<!--!pro:start-->` region of the same document — which the materializer
+  // strips — so the Pro rows are counted from those regions and the pin is true
+  // in both trees: 319 + 32 here, 319 + 0 there. (5.1.0: `phase.suspect` moved
+  // out of its region, since the free runner carries the record site.) A Pro
+  // row written OUTSIDE a region still fails here, as it should.
+  let inPro = false;
+  let proRows = 0;
+  for (const line of doc.split('\n')) {
+    if (line.trim() === '<!--!pro:start-->') inPro = true;
+    else if (line.trim() === '<!--!pro:end-->') inPro = false;
+    else if (inPro && /^\| `(?:phase|run|policy)\.[a-z0-9.-]+` \|/.test(line)) proRows += 1;
+  }
+  assert.equal(kinds.length, 319 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -938,7 +1023,33 @@ test('L-B — the level vocabulary is checked against ALL 242 kinds', () => {
   // and was refused it on its CLI's version — reads as error through the same
   // word, and loud is right: the operator asked for a last resort and the run
   // is going without one.
-  assert.ok(tally.error > 0 && tally.error < 47, `${tally.error} kinds read as error — check the vocabulary`);
+  // 47 since many-plans-one-repo phase 10: `phase.message-refused` — the
+  // console declining to carry a peer's message — reads as error through the
+  // same `refused` word, and loud is right for the same reason every refusal
+  // before it is: a session was told its words would not go, and the one thing
+  // worse than a refusal here is a quiet one. (The bound is exclusive, so it
+  // moves to 48; the comment above reading "47 since phase 14" was describing
+  // a tally of 46.)
+  // 48 since many-plans-one-repo phase 7: `run.worktree-include-refused` — a
+  // `.worktreeinclude` entry the checkout would not copy — reads as error
+  // through the same `refused` word, and loud is right for a reason this
+  // family keeps re-proving: to the build that needed the file, a quiet
+  // refusal is indistinguishable from a bug in the checkout, and the operator
+  // debugs the wrong thing. (Exclusive bound, so it moves to 49.)
+  // 51 since many-plans-one-repo phase 8: `phase.landing-push-refused` (the
+  // console declining — or being refused — the one push it makes) reads as
+  // error through the shared `refused` word, and `phase.landing-failed` and
+  // `phase.landing-record-failed` through `failed`. All three are loud on
+  // purpose: a landing that quietly did not happen is a `landed N` gate that
+  // waits for ever with nothing on the page saying why. (Exclusive bound,
+  // so it moves to 52.)
+  // 53 since many-plans-one-repo phase 12: `phase.issue-refused` (the plan's
+  // `off` word declining a session's draft) reads as error through the shared
+  // `refused` word and `phase.issue-failed` through `failed`. Loud is right
+  // for both: a draft that quietly went nowhere is a finding a session was
+  // told would be filed and nobody ever reads. (Exclusive bound, so it moves
+  // to 54.)
+  assert.ok(tally.error > 0 && tally.error < 54, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 
@@ -1011,4 +1122,84 @@ test('M-A (round 3) — the encoded branch allows a space only on the way to the
   // The two branches agree, encoded or plain.
   assert.equal(maskHome(`${MAC}/John Smith/work/secret`), '~/work/secret');
   assert.equal(maskHome('%2Fhome%2FMary Ann%2Fx and then'), '~%2Fx and then');
+});
+
+/* ------------------------------------------------------------------ *
+ * The trace filter (phase 5)
+ *
+ * The Debug page's whole job is putting every log this console writes on one
+ * time axis. `?trace=` is what turns that axis into an ANSWER: one run's
+ * journal, the console lines its drive wrote, the git it ran and the session's
+ * own declarations, selected by an id that is on all of them and on nothing
+ * else.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A console log file holding exactly these lines, read back the way the index
+ * reads one. `readConsoleLog()` merges the in-memory ring too, so the answer is
+ * narrowed to the events this fixture actually wrote.
+ */
+function logEntries(lines: Record<string, unknown>[]): DebugEntry[] {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-debug-trace-'));
+  const file = join(dir, 'console.ndjson');
+  writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
+  const wanted = new Set(lines.map((l) => String(l.event)));
+  try {
+    configureLog(file);
+    return readConsoleLog().entries.filter((e) => wanted.has(e.event));
+  } finally {
+    configureLog(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('DBG-TRC: a debug entry carries the ids its source line carried', () => {
+  const traceId = 'a'.repeat(32);
+  const spanId = 'b'.repeat(16);
+
+  const [entry] = logEntries([
+    { v: 2, time: '2026-09-18T10:00:00.000Z', level: 'info', event: 'run.started', traceId, spanId, phase: 3 },
+  ]);
+
+  assert.equal(entry.traceId, traceId);
+  assert.equal(entry.spanId, spanId);
+  assert.equal(entry.phase, 3, 'and the phase, which the index could already filter on');
+});
+
+test('DBG-TRC: a v1 line without ids simply has none — it is not invented', () => {
+  const [entry] = logEntries([
+    { time: '2026-09-18T10:00:00.000Z', level: 'info', event: 'run.started' },
+  ]);
+  assert.equal(entry.traceId, undefined);
+  assert.equal(entry.spanId, undefined);
+});
+
+test('DBG-TRC: ?trace= parses, and filters the index to that trace alone', () => {
+  const traceId = 'c'.repeat(32);
+  const other = 'd'.repeat(32);
+
+  const query = parseDebugQuery(new URLSearchParams(`trace=${traceId}`));
+  assert.equal(query.traceId, traceId);
+
+  const entries = logEntries([
+    { v: 2, time: '2026-09-18T10:00:00.000Z', level: 'info', event: 'mine', traceId },
+    { v: 2, time: '2026-09-18T10:00:01.000Z', level: 'info', event: 'theirs', traceId: other },
+    { time: '2026-09-18T10:00:02.000Z', level: 'info', event: 'untraced' },
+  ]);
+
+  assert.deepEqual(
+    entries.filter((e) => debugMatches(e, query)).map((e) => e.event),
+    ['mine'],
+    'an untraced line is not in SOME trace — it is in none, and must not be swept in',
+  );
+});
+
+test('DBG-TRC: a trace id that is not one is ignored rather than filtering everything away', () => {
+  for (const bad of ['', 'not-hex', 'A'.repeat(32), 'a'.repeat(31)]) {
+    assert.equal(
+      parseDebugQuery(new URLSearchParams(`trace=${bad}`)).traceId,
+      undefined,
+      `?trace=${bad} should be ignored`,
+    );
+  }
 });

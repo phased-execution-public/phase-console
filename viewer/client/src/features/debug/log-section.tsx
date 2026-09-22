@@ -145,6 +145,14 @@ function Row({ entry, onOpen }: { entry: DebugEntry; onOpen: () => void }) {
         <span className="font-mono text-2xs break-all text-ink-muted">{entry.event}</span>
         <span className="ml-2 text-xs break-words text-ink">{entry.text}</span>
       </span>
+      {entry.traceId ? (
+        <span
+          className="hidden shrink-0 font-mono text-2xs text-ink-faint sm:inline"
+          title={`trace ${entry.traceId}`}
+        >
+          {entry.traceId.slice(0, 8)}
+        </span>
+      ) : null}
       {entry.slug ? (
         <span className="hidden shrink-0 text-2xs text-ink-faint sm:inline">
           {entry.slug}
@@ -172,6 +180,11 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
   const phaseRaw = route.query.phase ?? '';
   const phase = phaseRaw && Number.isFinite(Number(phaseRaw)) ? Number(phaseRaw) : undefined;
   const follow = route.query.follow === '1';
+  // Validated here as well as on the server: a `?trace=` that is not a trace id
+  // would narrow the page to nothing, which reads as "this run left no
+  // evidence" — the one wrong answer this page can give.
+  const traceRaw = route.query.trace ?? '';
+  const trace = /^[0-9a-f]{32}$/.test(traceRaw) ? traceRaw : '';
 
   // Every key the server parses. These were read from the URL and then not
   // sent for one round, which is worse than not offering them: the module
@@ -187,6 +200,7 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
     ...(until ? { until } : {}),
     ...(run ? { run } : {}),
     ...(phase !== undefined ? { phase } : {}),
+    ...(trace ? { trace } : {}),
   };
 
   const { data, isPending, error, refetch } = useDebugIndex(params);

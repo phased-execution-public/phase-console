@@ -373,7 +373,8 @@ describe('an option edited under another name', () => {
     await mount({ mode: 'start', context: { slug: 'alpha', run: null } });
     await waitFor(() => expect(screen.getByRole('button', { name: /Start/ })).toBeTruthy());
 
-    const git = screen.getByLabelText(/branch/i) as HTMLSelectElement;
+    // Anchored since phase 15: "Base branch" is a control of its own now.
+    const git = screen.getByLabelText(/^branch$/i) as HTMLSelectElement;
     fireEvent.change(git, { target: { value: 'new-branch' } });
 
     const settle = await screen.findByLabelText(/^When the plan completes$/);

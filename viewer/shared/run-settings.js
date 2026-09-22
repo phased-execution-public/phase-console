@@ -220,6 +220,28 @@ export const RUN_START_FIELDS = Object.freeze([
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
+  // The answers to the prelude's fifth probe, verification (2026-09-18): the
+  // exact commands, by fingerprint, the built-in tier would not run but the
+  // operator approves, and the `<phase>:<fp>` fragments set aside. START-only
+  // for the reason the prelude's answers above are — the door judged them, and a
+  // patch cannot re-answer it.
+  'verifyAnswers',
+  // What many-plans-one-repo phase 15 gave the launch form, every field of it
+  // ALSO a plan line (or a Settings default) — the run's word speaks only
+  // where the plan is silent, the `mcpPolicy` precedent. Each takes a word
+  // from its shared owner and nothing else: `baseBranch` is a ref
+  // (`shared/landing-model.js` names the members that are questions rather
+  // than answers), `maxConcurrentPerRepo` a whole number clamped to the
+  // console's own cap, `worktreeRetention` a `WORKTREE_RETENTION` member or
+  // `ttl:<h>`, and the rest members of `LAND_POLICIES`, `CONFLICT_POLICIES`,
+  // `MESSAGING_WORDS` and `ISSUE_MODES`.
+  'baseBranch',
+  'maxConcurrentPerRepo',
+  'worktreeRetention',
+  'landing',
+  'conflictPolicy',
+  'messaging',
+  'issuesMode',
 ]);
 
 /**
@@ -351,6 +373,25 @@ export const RUN_SETTINGS_FIELDS = Object.freeze([
   'qaFixStrategy',
   'qaRoundBudgetUsd',
   'onLimit',
+  // Phase 15's seven, every one read here too — three of them with a RULE
+  // that lives at the door and in `applySettings`, not in this list (the
+  // `isolation` precedent above: the list describes what the route READS).
+  // `landing` and `conflictPolicy` move both ways: they decide what happens
+  // when a phase settles, which has not happened yet for the phases to come.
+  // `baseBranch` is read and refused with a 409 once the run's branch exists
+  // — it was cut from the old word, and a new one would describe a fork that
+  // never happened. `issuesMode` is read and may only TIGHTEN (file → draft →
+  // off): loosening it mid-run would let sessions already boarded file on the
+  // repository under a word nobody launched them with. `messaging`,
+  // `worktreeRetention` and `maxConcurrentPerRepo` move both ways and land on
+  // the next spawn, the next settle and the next admission.
+  'baseBranch',
+  'maxConcurrentPerRepo',
+  'worktreeRetention',
+  'landing',
+  'conflictPolicy',
+  'messaging',
+  'issuesMode',
 ]);
 
 /** Accepted on `start` and refused on `settings` — asserted, not assumed. */
@@ -375,6 +416,128 @@ export const PHASE_OPTION_FIELDS = Object.freeze([
   // both choices about one phase's work, and silence is what inherits the run's.
   'ultracode',
 ]);
+
+/**
+ * Where a phase's model or effort came from: `retry` (this attempt's Retry with
+ * edits) · `run` (this run's per-phase choice) · `plan` (the plan's own bullet) ·
+ * `default` (the run's default), strongest first.
+ * @typedef {'retry'|'run'|'plan'|'default'} PhaseChoiceSource
+ */
+
+/**
+ * What one phase runs as for one field (a model, an effort), resolved from the
+ * four places that may say — and which of them answered.
+ *
+ * The order is the runner's and is never rearranged: the attempt, then the run's
+ * per-phase choice, because both are more recent and more specific than the plan;
+ * then the plan, the durable statement of what the phase needs; then the run's
+ * default. `source` is undefined only when nothing answered, which leaves the
+ * machine's own default.
+ *
+ * ONE function with two readers (autopilot-token-drain phase 5): the runner boards
+ * the phase with it (`optionsFor`), and the launch form's per-phase table shows it.
+ * They were two copies of one rule, and run `deadaff9` launched with a form that
+ * never said the plan's `high` sat below the run default's `max`. An empty string is
+ * "no choice here", the per-phase select's own empty value.
+ * @param {{ retry?: string, run?: string, plan?: string, fallback?: string }} [levels]
+ * @returns {{ value: string | undefined, source: PhaseChoiceSource | undefined }}
+ */
+export function resolvePhaseChoice({ retry, run, plan, fallback } = {}) {
+  if (retry) return { value: retry, source: 'retry' };
+  if (run) return { value: run, source: 'run' };
+  if (plan) return { value: plan, source: 'plan' };
+  if (fallback) return { value: fallback, source: 'default' };
+  return { value: undefined, source: undefined };
+}
+
+/**
+ * A plan's `**Model:**` bullet, read as the model the phase will be started on.
+ *
+ * The match keeps the whole model token, not just the family word. It used to
+ * collapse to a bare alias, which meant a plan that carefully asked for
+ * `claude-opus-5[1m]` ran on plain `opus`: the one part of the name the operator
+ * wrote on purpose — the window — was the part thrown away. The server reads the
+ * bullet through this function, so the launch form can show exactly that token.
+ * @param {string | undefined} text
+ * @returns {string | undefined}
+ */
+export function planModelOf(text) {
+  const match = /\b(?:claude-)?(?:fable|opus|sonnet|haiku)(?:-[0-9a-z.]+)*(?:\[1m\])?/i.exec(text ?? '');
+  return match ? match[0].toLowerCase() : undefined;
+}
+
+/**
+ * The same, for `**Effort:**` — one of the five levels the CLI accepts, or nothing.
+ * @param {string | undefined} text
+ * @returns {string | undefined}
+ */
+export function planEffortOf(text) {
+  const match = /\b(low|medium|high|xhigh|max)\b/i.exec(text ?? '');
+  return match ? match[1].toLowerCase() : undefined;
+}
+
+/**
+ * Where a plan orders its OWN reviewer inside the building session — what the
+ * launch form advises from when `reviewEachPhase` would review the same diff a
+ * second time (autopilot-token-drain phase 5; run `deadaff9` paid for both on
+ * every phase it finished).
+ *
+ * Two shapes count, and only as orders:
+ * - `dispatch` (any tense) with a reviewer at most 3 words after it —
+ *   `dispatch ONE fresh-context reviewer`, `dispatches a code-reviewer subagent`;
+ * - a `subagent_type` whose value names a reviewer —
+ *   `subagent_type: feature-dev:code-reviewer`. `subagent_type: Explore` is not one.
+ * A sentence negated before the match ("No remaining phase dispatches a reviewer
+ * agent") orders nothing, and "a reviewer's verdict → dispatch the `Agent`" puts
+ * the reviewer BEFORE the verb, which is talk about one.
+ *
+ * Narrow on purpose: an advisory that fires on a plan merely discussing reviews
+ * teaches an operator to ignore it. One mention per section — the nearest `##` to
+ * `####` heading above it, `''` before any — and at most five.
+ * @param {string | undefined} markdown
+ * @returns {{ section: string, excerpt: string }[]}
+ */
+export function inPlanReviewers(markdown) {
+  const text = markdown ?? '';
+  const headings = [...text.matchAll(/^#{2,4}\s+(.+?)\s*$/gm)].map((m) => ({
+    at: m.index ?? 0,
+    title: m[1],
+  }));
+  const orders =
+    /\bdispatch(?:es|ed|ing)?\s+(?:[\w`'’()-]+\s+){0,3}?[\w`:-]*reviewers?\b|\bsubagent_type\W{0,4}[\w:-]*review/gi;
+  const negated = /\b(?:no|not|never|without|nor|cannot|can['’]t|don['’]t|doesn['’]t|removed)\b/i;
+  /** @type {{ section: string, excerpt: string }[]} */
+  const found = [];
+  const sections = new Set();
+  for (const match of text.matchAll(orders)) {
+    const at = match.index ?? 0;
+    const lead = sentenceLead(text, at);
+    if (negated.test(lead)) continue;
+    const section = headings.filter((heading) => heading.at < at).pop()?.title ?? '';
+    if (sections.has(section)) continue;
+    sections.add(section);
+    const words = text
+      .slice(at - lead.length, at + match[0].length + 160)
+      .replace(/\s+/g, ' ')
+      .trim();
+    found.push({ section, excerpt: words.length > 240 ? `${words.slice(0, 239).trimEnd()}…` : words });
+    if (found.length === 5) break;
+  }
+  return found;
+}
+
+/**
+ * The part of the sentence before `at`: back to the nearest sentence end, blank
+ * line, list marker or heading, whichever is closest.
+ * @param {string} text
+ * @param {number} at
+ * @returns {string}
+ */
+function sentenceLead(text, at) {
+  const window = text.slice(Math.max(0, at - 400), at);
+  const pieces = window.split(/[.!?;][)"'’*_`\]]*\s+|\n\s*\n|\n\s*(?:[-*+]|\d+\.)\s+|\n#{1,6}\s/);
+  return pieces[pieces.length - 1] ?? '';
+}
 
 /**
  * What `POST /api/agent/ticket` takes for the two launches this form mints —

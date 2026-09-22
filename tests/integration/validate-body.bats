@@ -54,3 +54,30 @@ setup() {
   [ "$status" -eq 0 ]
   assert_contains "$output" "overwriting"
 }
+
+@test "validate: the scaffolded handoff carries the notes section, and it lints clean" {
+  pe_newho demo 1 root complete >/dev/null
+  local body; body="$(cat "$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md")"
+  assert_contains "$body" "## Notes for later phases"
+  # The section is scaffolded as an HTML comment that TEACHES the grammar by
+  # example — `- **Phase 7:** …`. Read as content, phase 7 is not in this plan
+  # and every freshly scaffolded handoff would fail its own plan's F26.
+  run pe_validate demo
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "VALIDATE OK"
+  refute_contains "$output" "note-target-unknown"
+}
+
+@test "validate: a note addressed to a phase that does not exist fails the whole validator (F26)" {
+  pe_newho demo 1 root complete >/dev/null
+  # Into the SECTION, the way a finishing session writes it — a bullet appended
+  # to the end of the file is under `## Outstanding / blockers` and is nobody's
+  # note at all.
+  local f="$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md"
+  awk '/^## Notes for later phases/ { print; print ""; print "- **Phase 40:** addressed to nobody."; next } { print }' \
+    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  run pe_validate demo
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "note-target-unknown"
+  assert_contains "$output" "40"
+}

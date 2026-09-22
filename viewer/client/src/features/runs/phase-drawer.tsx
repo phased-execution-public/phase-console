@@ -29,8 +29,9 @@
 
 import { useState } from 'react';
 import { Button, Chip, KeyValue, RelativeTime, toast } from '@/components/ui';
-import { api, type Ruling, type RulingKind, type RunState } from '@/lib/api';
-import { toastError, useConsoleState, useDiagnosis, useRulings } from '@/lib/queries';
+import { api, type Issue, type Ruling, type RulingKind, type RunState } from '@/lib/api';
+import { toastError, useConsoleState, useDiagnosis, useIssues, useRulings } from '@/lib/queries';
+import { NotesSection } from '@/features/plans/notes-section';
 import { SituationSummary } from '@/components/situation';
 import { navigate } from '@/app/router';
 import { sessionsHref } from '@/app/routes';
@@ -134,6 +135,14 @@ export function PhaseDrawer({
   // phase with no run record at all, which the diagnosis cannot.
   const { data: ledger } = useRulings(slug, open);
   const rulings = (ledger?.rulings ?? []).filter((ruling) => ruling.phase === phase);
+  // What the sessions of this phase FILED (phase 12): every issue whose
+  // provenance names this plan and this phase, across every repository the
+  // console watches. The join is the provenance and nothing else — no title
+  // match, no label — so a hand-filed issue never shows up as a session's.
+  const { data: issuesPayload } = useIssues(open);
+  const filed = (issuesPayload?.repos ?? [])
+    .flatMap((repo) => repo.issues)
+    .filter((issue) => issue.provenance?.slug === slug && issue.provenance.phase === phase);
 
   const failed = (data?.verification?.ran ?? []).filter((x) => !x.ok);
   const qaRounds = run?.phases?.[String(phase)]?.qa ?? [];
@@ -307,6 +316,13 @@ export function PhaseDrawer({
 
           {rulings.length > 0 && <RulingList slug={slug} rulings={rulings} />}
 
+          {/* What earlier phases left FOR this one (phase 11) — the same
+              section the Phases tab mounts, so a note is read wherever the
+              phase is looked at. Renders nothing when nothing was left. */}
+          <NotesSection slug={slug} phase={phase} enabled={open} />
+
+          {filed.length > 0 && <FiledIssues issues={filed} />}
+
           {/* Every way forward, from the one shared model — the agent path
               included, which this panel never offered before. Blurbs render as
               visible text: this is the read-the-evidence surface. */}
@@ -332,6 +348,39 @@ export function PhaseDrawer({
         </div>
       )}
     </details>
+  );
+}
+
+/**
+ * What the sessions on this phase FILED (many-plans-one-repo phase 12): the
+ * issues that grew out of their drafts, each a link to where it lives now.
+ * The state is GitHub's word, because a closed issue is the one a reader
+ * most wants to know about.
+ */
+function FiledIssues({ issues }: { issues: readonly Issue[] }) {
+  return (
+    <section
+      className="rounded border border-rule bg-ground px-2 py-1.5"
+      aria-labelledby="filed-issues-title"
+    >
+      <h4 id="filed-issues-title" className="text-2xs font-semibold text-ink">
+        Issues filed by this phase
+        <span className="ml-1.5 font-normal text-ink-faint">— from the drafts its sessions recorded</span>
+      </h4>
+      <ul className="mt-1.5 flex flex-col gap-1">
+        {issues.map((issue) => (
+          <li key={issue.url} className="flex flex-wrap items-baseline gap-1.5 text-2xs">
+            <a href={issue.url} target="_blank" rel="noreferrer" className="font-mono text-action underline">
+              #{issue.number}
+            </a>
+            <span className="text-ink">{issue.title}</span>
+            <Chip tone={issue.state === 'closed' ? 'neutral' : 'ok'} mono>
+              {issue.state}
+            </Chip>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

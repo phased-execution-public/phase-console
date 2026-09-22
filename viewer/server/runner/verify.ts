@@ -77,6 +77,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -88,7 +89,7 @@ import { log } from '../log.ts';
 // uses, and importing the constant from `runner-core.ts` would be a cycle
 // (it imports this file).
 import { killLadder, type LadderEnding } from './signals.ts';
-import type { VerifyRun, VerifySkip, VerifySummary } from './state.ts';
+import type { VerifyNotRun, VerifyRun, VerifySkip, VerifySummary } from './state.ts';
 
 /**
  * Kept in step with `GATE_CMD_DENY` in scripts/phase-graph.sh — same intent,
@@ -110,11 +111,21 @@ import type { VerifyRun, VerifySkip, VerifySummary } from './state.ts';
  * `gh api … -q …` — which is exactly what a watch ref wants. A blanket
  * `gh (release|api)` line here would have broken the reads without adding a
  * single refusal.
+ *
+ * The git clause's verb must END where it ends, and may follow global options
+ * (2026-09-18). With no boundary, `git merge-base --is-ancestor` read as a
+ * merge — the second stop run f0da619a held at its phase 18 — while
+ * `git -C ../other push` and `git --no-pager commit` walked past the verb the
+ * clause expected right after `git`. The boundary is "not a word character and
+ * not a hyphen", never whitespace alone: a whole gate-check line can carry
+ * `git push;true`. The hyphenated verbs that WRITE the tree (`merge-file`,
+ * `merge-index`, `merge-one-file`, `checkout-index`) stay refused;
+ * `merge-base`, `merge-tree` and `commit-graph` read.
  */
 const MUTATION_DENY = new RegExp(
   '(^|[;&|\\s])(rm|mv|dd|mkfs|shutdown|reboot|kill|pkill|chown|chmod|sudo)(\\s|$)'
   + '|terraform\\s+(apply|destroy)'
-  + '|git\\s+(push|reset|clean|checkout|commit|rebase|merge)'
+  + '|git(\\s+(-[Cc]\\s+\\S+|--?[\\w-]+(=\\S+)?))*\\s+(push|reset|clean|checkout|commit|rebase|merge)(-(file|index|one-file))?([^-\\w]|$)'
   + '|docker\\s+(rm|rmi|kill|stop|system\\s+prune)'
   + '|task\\s+[a-z:]*(deploy|ship|update|apply|destroy)'
   + '|(npm|pnpm|yarn|cargo|gem|twine|poetry|uv)\\s+(publish|version|deprecate|unpublish|dist-tag|owner|access)'
@@ -122,6 +133,21 @@ const MUTATION_DENY = new RegExp(
   + '|>\\s*/|>>\\s*/',
   'i',
 );
+
+/**
+ * A redirect into `/dev/null` discards output; it writes nothing. The deny
+ * rule's `>\s*\/` is there for a write to an absolute path, and it read
+ * `grep -q x f 2>/dev/null` as one — "mutates", the class no answer may carve.
+ * It is removed before the rule is asked, and `>& file` (a write plus `2>&1`)
+ * is folded to `> file` so the write is still seen. The bash twin is
+ * `_deny_view` in scripts/phase-graph.sh.
+ */
+const DEV_NULL_REDIRECT = /[0-9&]?>>?&?\s*\/dev\/null(?=$|[\s;&|)])/g;
+
+/** Does this segment look like it changes something? The one reading of `MUTATION_DENY`. */
+function mutates(segment: string): boolean {
+  return MUTATION_DENY.test(segment.replace(DEV_NULL_REDIRECT, ' ').replace(/>&(?=\s*[^\s0-9-])/g, '>'));
+}
 
 /**
  * Only these lead a command the runner will execute. An allowlist rather than a
@@ -137,6 +163,10 @@ const VERBS = new Set([
   'python', 'python3', 'pytest', 'uv', 'poetry', 'ruff', 'mypy', 'black', 'tox', 'alembic',
   'go', 'cargo', 'rustc',
   'bash', 'sh', 'zsh', 'shellcheck',
+  // A test runner like jest or pytest — and this repository's own. Its absence
+  // halted a run (f0da619a, 2026-09-18): `Person-check: halt` parks a phase on
+  // any fragment read as prose, and eight phases verified with `bats`.
+  'bats',
   'docker', 'docker-compose', 'kubectl', 'gh',
   'git', 'terraform',
   'curl', 'dig', 'ssh', 'psql', 'redis-cli', 'jq',
@@ -421,8 +451,49 @@ function dockerSetupGate(segment: string): string | null {
 
 export type Extraction = {
   commands: string[];
-  notRun: { text: string; reason: string }[];
+  notRun: VerifyNotRun[];
+  /** Fragments the run's own answers set aside: not run, not asked about, still on the record. */
+  waived: VerifyNotRun[];
 };
+
+/**
+ * Which wall refused a fragment. Only `unknown-lead` can ever be approved —
+ * and only when approving would actually make it run (`approvable`).
+ */
+export type RefusalCode =
+  | 'unknown-lead' | 'mutates' | 'reaches-out' | 'unreadable' | 'background'
+  | 'prose' | 'names-file' | 'fragment' | 'other';
+
+type Refusal = { code: RefusalCode; reason: string; lead?: string };
+
+const refusal = (code: RefusalCode, reason: string, lead?: string): Refusal =>
+  (lead ? { code, reason, lead } : { code, reason });
+
+/**
+ * The operator's answers for one phase, keyed by `commandFingerprint`.
+ *
+ * `approve` relaxes exactly ONE judgement for that exact text — "is this a
+ * command I recognise?" — and nothing else: the deny wall, the named-script
+ * wall, the off-machine gates and the wrapper recursion all still run, so an
+ * approved `frobnicate && rm -rf x` is still refused. `waive` sets a refused
+ * fragment aside for this phase. Neither ever reaches `runSingleCommand` (the
+ * `cmd:` watch door), which runs strings a SESSION wrote.
+ */
+export type VerifyApprovals = {
+  approve?: ReadonlySet<string>;
+  waive?: ReadonlySet<string>;
+};
+
+/**
+ * The sha256 of a command's WHOLE text, whitespace folded — so markdown
+ * wrapping is not a different command, and one more flag is. What an approval
+ * is bound to (the practice Claude Code's exact-command rules and OWASP's
+ * "bind approval to the exact action" both describe); `condense` truncates for
+ * display and must never key anything.
+ */
+export function commandFingerprint(text: string): string {
+  return createHash('sha256').update(text.replace(/\s+/g, ' ').trim()).digest('hex');
+}
 
 /**
  * Pull candidate commands out of a Verification bullet.
@@ -431,8 +502,10 @@ export type Extraction = {
  * taken whole. Anything that is not recognisably a command, or that would mutate
  * something, comes back in `notRun` with the reason — never dropped.
  */
-export function extractCommands(text: string | undefined, lane: Lane = 'verify'): Extraction {
-  const out: Extraction = { commands: [], notRun: [] };
+export function extractCommands(
+  text: string | undefined, lane: Lane = 'verify', approvals?: VerifyApprovals,
+): Extraction {
+  const out: Extraction = { commands: [], notRun: [], waived: [] };
   if (!text || !text.trim()) return out;
 
   const candidates: string[] = [];
@@ -485,28 +558,46 @@ export function extractCommands(text: string | undefined, lane: Lane = 'verify')
   // Prose with no code spans at all still states a requirement — say so rather
   // than reporting a phase with zero commands as cleanly verified.
   if (!candidates.length) {
-    out.notRun.push({
-      text: condense(masked.replace(INLINE, ' ')),
+    const prose = masked.replace(INLINE, ' ');
+    const item: VerifyNotRun = {
+      text: condense(prose),
       reason: 'no command in the plan text — verify by hand',
-    });
+      code: 'prose',
+      fp: commandFingerprint(prose),
+      approvable: false,
+    };
+    (approvals?.waive?.has(item.fp!) ? out.waived : out.notRun).push(item);
     return out;
   }
 
-  const refused: { text: string; reason: string; cited: boolean }[] = [];
+  const refused: (VerifyNotRun & { cited: boolean })[] = [];
   for (const candidate of candidates) {
-    const reason = refuse(candidate, lane);
+    const fp = commandFingerprint(candidate);
+    const approved = approvals?.approve?.has(fp) ?? false;
+    const verdict = refuse(candidate, lane, approved);
     // Dropped from both lists — see `PREAMBLE`. Not run, and not reported.
-    if (reason === PREAMBLE) continue;
-    if (!reason) out.commands.push(candidate);
-    else refused.push({ text: condense(candidate), reason, cited: namesAThing(candidate) });
+    if (verdict === PREAMBLE) continue;
+    if (!verdict) { out.commands.push(candidate); continue; }
+    const item: VerifyNotRun = {
+      text: condense(candidate),
+      reason: verdict.reason,
+      code: verdict.code,
+      ...(verdict.lead ? { lead: verdict.lead } : {}),
+      fp,
+      // Approvable means an approval would make it RUN — asked of the same
+      // judgement with the one relaxation, never inferred from the code.
+      approvable: verdict.code === 'unknown-lead' && refuse(candidate, lane, true) === null,
+    };
+    if (approvals?.waive?.has(fp)) { out.waived.push(item); continue; }
+    refused.push({ ...item, cited: namesAThing(candidate) });
   }
 
   // A name in backticks beside commands that ran is the prose talking about
   // something, not a check somebody owes. With nothing runnable in the bullet it
   // is reported like any other fragment — that phase really was not verified.
-  for (const item of refused) {
-    if (item.cited && out.commands.length) continue;
-    out.notRun.push({ text: item.text, reason: item.reason });
+  for (const { cited, ...item } of refused) {
+    if (cited && out.commands.length) continue;
+    out.notRun.push(item);
   }
 
   return out;
@@ -604,47 +695,101 @@ const PREAMBLE = '\u0000preamble';
  */
 type Lane = 'verify' | 'setup';
 
-/** Why this candidate will not be run, or null when it will be. */
-function refuse(candidate: string, lane: Lane = 'verify'): string | null {
-  if (!candidate) return 'empty';
+/**
+ * Why this candidate will not be run, or null when it will be.
+ *
+ * `approved` is the operator's exact-text approval of THIS candidate: it
+ * relaxes "is this a command I recognise?" for its segments and nothing else.
+ */
+function refuse(candidate: string, lane: Lane = 'verify', approved = false): Refusal | typeof PREAMBLE | null {
+  if (!candidate) return refusal('fragment', 'empty');
   // A continuation of the command above it: running `…` is nonsense, and
   // guessing what it continues would be worse.
-  if (/^(…|\.\.\.)/.test(candidate)) return 'a continuation fragment, not a whole command';
-  if (candidate.length > 2_000) return 'implausibly long for a command';
-  if (/\n/.test(candidate)) return 'spans multiple lines';
-  return refuseCommand(candidate, 0, lane);
+  if (/^(…|\.\.\.)/.test(candidate)) return refusal('fragment', 'a continuation fragment, not a whole command');
+  if (candidate.length > 2_000) return refusal('fragment', 'implausibly long for a command');
+  if (/\n/.test(candidate)) return refusal('fragment', 'spans multiple lines');
+  return refuseCommand(candidate, 0, lane, approved);
 }
 
 const MAX_NESTING = 3;
 
-/** Every segment a shell would run must pass, or the whole command is refused. */
-function refuseCommand(command: string, depth: number, lane: Lane = 'verify'): string | null {
-  if (depth > MAX_NESTING) return 'nests commands more deeply than the runner will judge';
+/** What `segments` answers when the structure would be a guess. */
+const UNREADABLE_STRUCTURE = refusal('unreadable',
+  'could not be read with confidence — unbalanced quoting, or a substitution '
+  + 'whose inner command the runner cannot judge');
 
-  const parts = segments(unwrap(command));
-  if (!parts) {
-    return 'could not be read with confidence — unbalanced quoting, or a substitution '
-      + 'whose inner command the runner cannot judge';
-  }
-  if (!parts.length) return 'empty';
+/** What `segments` answers for a lone `&`. */
+const BACKGROUNDED = refusal('background',
+  'backgrounds a command with `&` — bash returns at once and never reads its exit code, '
+  + 'so it could prove nothing');
+
+/**
+ * Every segment a shell would run must pass, or the whole command is refused —
+ * and so must every command a double-quoted `$(…)` runs.
+ */
+function refuseCommand(
+  command: string, depth: number, lane: Lane = 'verify', approved = false,
+): Refusal | typeof PREAMBLE | null {
+  if (depth > MAX_NESTING) return refusal('unreadable', 'nests commands more deeply than the runner will judge');
+
+  const split = segments(unwrap(command));
+  if ('refusal' in split) return split.refusal;
+  if (!split.parts.length) return refusal('fragment', 'empty');
 
   // A preamble segment is skipped rather than returned, so that
   // `export PATH=… && npm test` stays the runnable command it obviously is —
   // returning on the first segment would have dropped the suite along with the
   // export. Only a command that is preamble the whole way down is one.
   let preambleOnly = true;
-  for (const segment of parts) {
-    const reason = refuseSegment(segment, depth, lane);
+  for (const segment of split.parts) {
+    const reason = refuseSegment(segment, depth, lane, approved);
     if (reason === PREAMBLE) continue;
     if (reason) return reason;
     preambleOnly = false;
   }
+  // `test "$(ls a | wc -l)" -ge 8` is how this plan format writes a check, and
+  // `echo "$(rm -rf x)"` used to run because nothing looked inside the quotes.
+  // What a substitution runs is judged like any other command.
+  for (const sub of split.inner) {
+    const reason = refuseCommand(sub, depth + 1, lane, approved);
+    if (reason && reason !== PREAMBLE) return reason;
+  }
   return preambleOnly ? PREAMBLE : null;
 }
 
-function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): string | null {
+/**
+ * Shell keywords that head a command without replacing it — `! grep …`,
+ * `if grep …`, `then echo ok`, `do grep x "$f"`. Walked past, and the command
+ * after them judged under its own name: otherwise an approved loop would carry
+ * `do ssh host '…'` past the ssh gate as a command called `do`.
+ */
+const KEYWORD_PREFIX = /^(!|if|elif|then|else|do|while|until)\s+/;
+
+/**
+ * Words that are shell grammar rather than a program. They run nothing by
+ * themselves, so a loop or conditional is an exact-text approval away — with
+ * every command inside it still judged.
+ */
+const SHELL_GRAMMAR = new Set(['for', 'in', 'done', 'fi', 'esac', 'case', '{', '}']);
+
+/** Which wall an unrecognised lead hits: a click (`unknown-lead`), or prose and file names that never are. */
+function unknownCode(text: string, raw: string, tokens: readonly string[]): RefusalCode {
+  if (SHELL_GRAMMAR.has(raw)) return 'unknown-lead';
+  if (HTTP_CALL.test(text.trim())) return 'prose';
+  if (tokens.length === 1) return raw.includes('/') || /\.[A-Za-z0-9]{1,8}$/.test(raw) ? 'names-file' : 'prose';
+  if (!/^[A-Za-z_][A-Za-z0-9_.+-]*$/.test(raw.replace(/^.*\//, ''))) return 'prose';
+  return 'unknown-lead';
+}
+
+function refuseSegment(
+  input: string, depth: number, lane: Lane = 'verify', approved = false,
+): Refusal | typeof PREAMBLE | null {
+  let segment = input.trim();
+  for (let keyword = KEYWORD_PREFIX.exec(segment); keyword; keyword = KEYWORD_PREFIX.exec(segment)) {
+    segment = segment.slice(keyword[0].length);
+  }
   const tokens = headOf(tokenize(segment));
-  if (!tokens.length) return `\`${condense(segment)}\` sets a variable but runs nothing`;
+  if (!tokens.length) return refusal('other', `\`${condense(segment)}\` sets a variable but runs nothing`);
 
   const raw = tokens[0];
   const verb = raw.replace(/^.*\//, ''); // /usr/bin/node → node
@@ -655,7 +800,7 @@ function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): s
   // Deliberately not confined to the working tree — a plan legitimately points
   // at a sibling repo.
   if (verb === 'cd') {
-    if (tokens.length > 2) return '`cd` with more than one argument is not a path this can check';
+    if (tokens.length > 2) return refusal('other', '`cd` with more than one argument is not a path this can check');
     return null;
   }
 
@@ -689,19 +834,29 @@ function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): s
   // `./x.ts` and `node test/x.ts` are unaffected, being an instruction and a
   // command respectively.
   if (tokens.length === 1 && CITED_SOURCE.test(raw)) {
-    return `\`${verb.slice(0, 32)}\` names a file rather than a command`;
+    return refusal('names-file', `\`${verb.slice(0, 32)}\` names a file rather than a command`);
+  }
+
+  // The deny wall BEFORE the recognition test, so `rm -rf build` reads as what
+  // it is ("mutates", which no answer can carve) rather than as a program the
+  // runner merely does not know — the one class an approval may relax.
+  if (mutates(segment)) {
+    return refusal('mutates', `\`${condense(segment)}\` looks like it mutates something — a human should run this`);
   }
 
   const isScript = SCRIPT_PATH.test(raw);
-  const known = VERBS.has(raw) || VERBS.has(verb) || isScript
+  const recognised = VERBS.has(raw) || VERBS.has(verb) || isScript
     || (lane === 'setup' && (SETUP_VERBS.has(raw) || SETUP_VERBS.has(verb)));
-  if (!known) return `\`${verb.slice(0, 32)}\` is not a recognised command`;
-  if (isScript && MUTATING_SCRIPT.test(verb)) {
-    return `\`${verb.slice(0, 32)}\` is named for something that changes state — a human should run this`;
+  const code = recognised ? null : unknownCode(segment, raw, tokens);
+  // An approval relaxes recognition for a real program the runner does not
+  // know, and for nothing else: prose, a named file and a single word stay
+  // refused even under an approved fingerprint (defense in depth — the
+  // service admits only approvable fingerprints, and this must not rely on it).
+  if (!recognised && !(approved && code === 'unknown-lead')) {
+    return refusal(code!, `\`${verb.slice(0, 32)}\` is not a recognised command`, verb.slice(0, 64));
   }
-
-  if (MUTATION_DENY.test(segment)) {
-    return `\`${condense(segment)}\` looks like it mutates something — a human should run this`;
+  if (isScript && MUTATING_SCRIPT.test(verb)) {
+    return refusal('mutates', `\`${verb.slice(0, 32)}\` is named for something that changes state — a human should run this`);
   }
 
   // The setup lane keeps EVERY one of these gates and overrides exactly one.
@@ -731,7 +886,10 @@ function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): s
     : (REACHES_OUT[verb] ?? REACHES_OUT[raw]);
   if (gate) {
     const objection = gate(segment.trim());
-    if (objection) return `\`${condense(segment)}\` ${objection} — a person should run this, not an unattended runner`;
+    if (objection) {
+      return refusal('reaches-out',
+        `\`${condense(segment)}\` ${objection} — a person should run this, not an unattended runner`);
+    }
   }
 
   // `xargs grep …`, `docker compose run … pytest`, `bash -c '…'` all run a
@@ -739,9 +897,9 @@ function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): s
   // denylist gets walked straight past.
   const inner = innerCommand(verb, tokens);
   if (inner === UNREADABLE) {
-    return `\`${condense(segment)}\` runs another command the runner could not read`;
+    return refusal('unreadable', `\`${condense(segment)}\` runs another command the runner could not read`);
   }
-  if (inner) return refuseCommand(inner, depth + 1, lane);
+  if (inner) return refuseCommand(inner, depth + 1, lane, approved);
 
   return null;
 }
@@ -753,13 +911,26 @@ function refuseSegment(segment: string, depth: number, lane: Lane = 'verify'): s
 /**
  * Split on the control operators, respecting quotes.
  *
- * Returns null when the result would be a guess: an unbalanced quote, or any
- * substitution — `$(…)`, a backtick, `<(…)` — whose inner command cannot be
- * known without running it. Refusing sends it to a person, which is the safe
- * direction; the alternative is executing structure this did not understand.
+ * Refuses when the result would be a guess: an unbalanced quote, or an
+ * UNQUOTED substitution — `$(…)`, a backtick, `<(…)` — whose output is
+ * word-split into the command itself. Refusing sends it to a person, which is
+ * the safe direction; the alternative is executing structure this did not
+ * understand.
+ *
+ * A `$(…)` INSIDE double quotes is one word whatever it prints, so its command
+ * comes back in `inner`, to be judged like any other. It used to be read past
+ * entirely — `echo "$(rm -rf x)"` ran (2026-09-18). A backtick inside double
+ * quotes is still refused.
+ *
+ * `2>&1`, `>&2`, `1>&-` duplicate a descriptor and `&>` / `>&` send output to a
+ * file: redirections, not separators (`2>&1` was split, and `1` judged as a
+ * command). `|&` is a pipe. A LONE `&` backgrounds what precedes it: bash
+ * returns at once and never reads its exit code, so a red suite read green —
+ * refused.
  */
-function segments(command: string): string[] | null {
+function segments(command: string): { parts: string[]; inner: string[] } | { refusal: Refusal } {
   const out: string[] = [];
+  const inner: string[] = [];
   let buffer = '';
   let quote: string | null = null;
 
@@ -770,6 +941,15 @@ function segments(command: string): string[] | null {
     if (quote) {
       // Inside single quotes a backslash is literal; inside double quotes it escapes.
       if (quote === '"' && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+      if (quote === '"' && ch === '`') return { refusal: UNREADABLE_STRUCTURE };
+      if (quote === '"' && ch === '$' && next === '(') {
+        const close = closingParen(command, i + 1);
+        if (close < 0) return { refusal: UNREADABLE_STRUCTURE };
+        inner.push(command.slice(i + 2, close));
+        buffer += command.slice(i, close + 1);
+        i = close;
+        continue;
+      }
       if (ch === quote) quote = null;
       buffer += ch;
       continue;
@@ -777,23 +957,46 @@ function segments(command: string): string[] | null {
 
     if (ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
     if (ch === '"' || ch === "'") { quote = ch; buffer += ch; continue; }
-    if (ch === '`') return null;
-    if (ch === '$' && next === '(') return null;
-    if ((ch === '<' || ch === '>') && next === '(') return null;
+    if (ch === '`') return { refusal: UNREADABLE_STRUCTURE };
+    if (ch === '$' && next === '(') return { refusal: UNREADABLE_STRUCTURE };
+    if ((ch === '<' || ch === '>') && next === '(') return { refusal: UNREADABLE_STRUCTURE };
     // A subshell anywhere but wrapping the whole command (already unwrapped) is
     // structure this will not take apart.
-    if (ch === '(' || ch === ')') return null;
+    if (ch === '(' || ch === ')') return { refusal: UNREADABLE_STRUCTURE };
 
-    if (ch === '&' && next === '&') { out.push(buffer); buffer = ''; i++; continue; }
-    if (ch === '|' && next === '|') { out.push(buffer); buffer = ''; i++; continue; }
-    if (ch === '|' || ch === ';' || ch === '&') { out.push(buffer); buffer = ''; continue; }
+    if (ch === '&') {
+      if (next === '&') { out.push(buffer); buffer = ''; i++; continue; }
+      if (/[<>]$/.test(buffer) || next === '>') { buffer += ch; continue; }
+      return { refusal: BACKGROUNDED };
+    }
+    if (ch === '|' && (next === '|' || next === '&')) { out.push(buffer); buffer = ''; i++; continue; }
+    if (ch === '|' || ch === ';') { out.push(buffer); buffer = ''; continue; }
 
     buffer += ch;
   }
 
-  if (quote) return null;
+  if (quote) return { refusal: UNREADABLE_STRUCTURE };
   out.push(buffer);
-  return out.map((s) => s.trim()).filter(Boolean);
+  return { parts: out.map((s) => s.trim()).filter(Boolean), inner };
+}
+
+/** The index of the `)` closing the `(` at `open`, quotes respected — or -1. */
+function closingParen(text: string, open: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (quote === '"' && ch === '\\') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '\\') { i++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '(') depth++;
+    else if (ch === ')' && --depth === 0) return i;
+  }
+  return -1;
 }
 
 /** `(cd api && pytest -q)` is one command wearing parentheses. */
@@ -1012,6 +1215,8 @@ export type VerifyOptions = {
    * (`DOCKER_SETUP_OK`) and a shorter clock — see `runSetup`.
    */
   setupText?: string;
+  /** This phase's start-door answers (`approvalsForPhase`) — for both the Setup and the verification lanes. */
+  approvals?: VerifyApprovals;
 };
 
 /**
@@ -1042,9 +1247,11 @@ export const DEFAULT_PREFLIGHT_SKIP: ReadonlySet<string> = new Set([
 export function resolveLead(command: string): string | null {
   let rest = command.trim();
   for (;;) {
-    const assignment = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.exec(rest);
-    if (!assignment) break;
-    rest = rest.slice(assignment[0].length);
+    // `! grep …` negates `grep`: its lead is `grep`. Read as `!`, the missing-
+    // binary check called it absent and SKIPPED the line (2026-09-18).
+    const prefix = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.exec(rest) ?? /^!\s+/.exec(rest);
+    if (!prefix) break;
+    rest = rest.slice(prefix[0].length);
   }
   const token = rest.split(/\s+/)[0] ?? '';
   if (!token || token.includes('/')) return null;
@@ -1108,7 +1315,7 @@ export const STOPPED_SKIP_REASON = 'the run was stopped before this command';
 export async function verifyPhase(
   verificationText: string | undefined, opts: VerifyOptions,
 ): Promise<VerifySummary> {
-  const { commands, notRun } = extractCommands(verificationText);
+  const { commands, notRun, waived } = extractCommands(verificationText, 'verify', opts.approvals);
   // Bring-up first, and its result kept OUT of everything below. It runs even
   // when §Verification turns out to be unrunnable here — the whole point is
   // that the two are separate questions, and "the stack came up but nothing
@@ -1127,6 +1334,7 @@ export async function verifyPhase(
       reason: `nothing runnable in this phase's verification (${notRun.length} fragment${notRun.length === 1 ? '' : 's'} left for a human)`,
       ran: [],
       notRun,
+      ...(waived.length ? { waived } : {}),
       ...(setup ? { setup } : {}),
     };
   }
@@ -1171,6 +1379,7 @@ export async function verifyPhase(
       reason: `all ${commands.length} command(s) are unrunnable here — leads not on the verification PATH: ${leads}`,
       ran: [],
       notRun: [...notRun, ...skipped.map((s) => ({ text: s.command, reason: s.reason }))],
+      ...(waived.length ? { waived } : {}),
       skipped,
       ...(setup ? { setup } : {}),
     };
@@ -1237,6 +1446,7 @@ export async function verifyPhase(
     ran,
     notRun,
     ...(skipped.length ? { skipped } : {}),
+    ...(waived.length ? { waived } : {}),
     ...(setup ? { setup } : {}),
   };
 }
@@ -1257,7 +1467,7 @@ async function runSetup(
   opts: VerifyOptions,
 ): Promise<{ ok: false; command: string; output: string } | undefined> {
   if (!opts.setupText?.trim()) return undefined;
-  const { commands } = extractCommands(opts.setupText, 'setup');
+  const { commands } = extractCommands(opts.setupText, 'setup', opts.approvals);
   // A count is not a clock: eight commands at the verification timeout is four
   // hours of preamble nothing will ever mark red. Bring-up that has not
   // returned in ten minutes is not going to.
@@ -1422,7 +1632,7 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
 export async function runSingleCommand(
   command: string, opts: VerifyOptions,
 ): Promise<{ refused?: string; ok: boolean; code?: number; detail?: string; ms?: number }> {
-  const refusal = refuse(command);
+  const verdict = refuse(command);
   // `PREAMBLE` is a SENTINEL, not a sentence — a NUL-prefixed marker the plan
   // path (`:277`) consumes by skipping the line entirely. This caller has
   // nowhere to skip to: a watch ref that is pure preamble (`cmd:"export FOO=1"`
@@ -1430,10 +1640,10 @@ export async function runSingleCommand(
   // lands instantly) can never exit 0 in a way that means anything, so it
   // is a refusal — but it must be a refusal in words, or `\u0000preamble`
   // reaches a journal line and an operator errand verbatim.
-  if (refusal === PREAMBLE) {
+  if (verdict === PREAMBLE) {
     return { ok: false, refused: 'sets something up and then runs nothing — there is no result to wait for' };
   }
-  if (refusal) return { ok: false, refused: refusal };
+  if (verdict) return { ok: false, refused: verdict.reason };
   const run = await runOne(command, opts);
   return {
     ok: run.ok,

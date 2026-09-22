@@ -85,7 +85,8 @@ import { STALL_SIGNAL_KIND, factsFor, splitSituation } from './fact-map.js';
 
 /**
  * @typedef {'errand'|'approval'|'gate'|'sign-in'|'mcp-auth'|'qa'|'lock'
- *   |'health'|'stall'|'ruling'|'session-ask'|'conflict'|'question'|'policy'} InboxKind
+ *   |'health'|'stall'|'ruling'|'session-ask'|'conflict'|'question'|'policy'
+ *   |'issue-draft'|'message'} InboxKind
  */
 
 /**
@@ -158,6 +159,23 @@ export const INBOX_KINDS = Object.freeze(
      * answer. Appended at the end for `session-ask`'s reason.
      */
     'policy',
+    /**
+     * An issue a SESSION drafted (many-plans-one-repo phase 12) — a problem it
+     * tripped over outside its phase, held here until a person presses
+     * Approve (files it on the repository through the console's one writer),
+     * Discard, or edits it first. `needs-you` while it waits, `fyi` for a
+     * close held until its phase lands. Appended at the end for
+     * `session-ask`'s reason.
+     */
+    'issue-draft',
+    /**
+     * What a SESSION said to the operator (many-plans-one-repo phase 15, over
+     * phase 10's `operator:` address): an `ask` is `needs-you` — Answer
+     * replies to the sender, Mark seen acks it — a `note` is `fyi`, and a
+     * `high`-priority ask is `urgent`. Appended at the end for
+     * `session-ask`'s reason.
+     */
+    'message',
   ]),
 );
 
@@ -182,6 +200,8 @@ export const INBOX_KIND_LABELS = Object.freeze({
   conflict: 'Conflict',
   question: 'Question',
   policy: 'Policy answered',
+  'issue-draft': 'Issue draft',
+  message: 'Message',
 });
 
 /**
@@ -595,7 +615,7 @@ export const STALL_META = Object.freeze({
  * ------------------------------------------------------------------ */
 
 /**
- * @typedef {'stalemate'|'retrying'|'external-wait'|'silent'|'spinning'} StallSignal
+ * @typedef {'stalemate'|'retrying'|'external-wait'|'silent'|'spinning'|'looping'} StallSignal
  */
 
 /**
@@ -649,7 +669,7 @@ export const STALL_META = Object.freeze({
  * @type {readonly StallSignal[]}
  */
 export const STALL_SIGNALS = Object.freeze(
-  /** @type {const} */ (['stalemate', 'retrying', 'external-wait', 'silent', 'spinning']),
+  /** @type {const} */ (['stalemate', 'retrying', 'external-wait', 'silent', 'spinning', 'looping']),
 );
 
 /**
@@ -698,6 +718,13 @@ export const STALL_SIGNAL_META = Object.freeze({
     pref: 'stallSpinTurns',
     severity: 'needs-you',
   }),
+  looping: Object.freeze({
+    label: 'Looping',
+    blurb:
+      'Three tool calls in a row were the same call and failed the same way — same tool, same command, same words back. The session is not stuck and it is not quiet: it is retrying something that is not going to start working, which is the one silence detector none of the others can see, because a lane looping is producing output the whole time. Deliberately the LOWEST-ranked signal and deliberately the one with no remedy: three identical failures is very often a session that solves it on the fourth try, and the cost of being wrong here is a killed session and a parked phase. So it is said, once per (phase, attempt, call), and a person decides.',
+    pref: 'stallLoopRun',
+    severity: 'needs-you',
+  }),
 });
 
 /**
@@ -712,7 +739,7 @@ export const STALL_SIGNAL_META = Object.freeze({
  *
  * @type {Readonly<{ stallSilentMs: number, stallSpinTurns: number,
  *   stallStalemateAttempts: number, stallRetryBurst: number,
- *   stallExternalWaitMs: number }>}
+ *   stallExternalWaitMs: number, stallLoopRun: number }>}
  */
 export const STALL_DEFAULTS = Object.freeze({
   /**
@@ -761,6 +788,23 @@ export const STALL_DEFAULTS = Object.freeze({
    * 35-minute squat is caught at minute five.
    */
   stallExternalWaitMs: 5 * MINUTE,
+  /**
+   * This many identical failing tool calls in a row before the lane reads as
+   * looping.
+   *
+   * Three, and a COUNT rather than a duration for `stallRetryBurst`'s reason:
+   * what makes a loop a loop is that nothing got between the tries. Two is a
+   * retry — the overwhelmingly common and correct thing for a session to do
+   * with a flaky registry or a file something else is writing. Three is the
+   * first count at which "it will work next time" has stopped being the likely
+   * explanation, and it is still low enough to be seen inside a minute rather
+   * than after the session has spent twenty on it. The identity is the whole
+   * tuple — tool, the call's own summary, and a digest of the words that came
+   * back — so a retry that fails DIFFERENTLY resets to one, which is what
+   * separates a session going round in circles from one working through a
+   * list of real problems.
+   */
+  stallLoopRun: 3,
 });
 
 /**
@@ -817,6 +861,18 @@ export const STALL_ESCALATE_MS = 45 * MINUTE;
  * Overridable per console as the `stallLocalJobMs` preference (Settings ▸
  * Automation), like the detector thresholds.
  */
+/**
+ * The window the wait procedure GRANTS a session on its own job: "one foreground
+ * call bounded by the Bash timeout ... at most once per ten minutes" (rule 3).
+ *
+ * The local-job nudge used to fire on the first tick after the `external-wait`
+ * signal opened, which is `stallExternalWaitMs` — five minutes by default — so
+ * the console interrupted a session halfway through the allowance it had just
+ * given it, for doing exactly what it was told. The nudge now waits out the
+ * larger of the two. (console-open-findings O6.)
+ */
+export const LOCAL_JOB_GRACE_MS = 10 * MINUTE;
+
 export const STALL_LOCAL_JOB_MS = 45 * MINUTE;
 
 /**

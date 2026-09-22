@@ -94,13 +94,36 @@ export function outcomeInboxDir(root: string, slug: string): string {
   return join(runDir(root, slug), 'outcomes');
 }
 
-export function inboxOutcomeFile(root: string, slug: string, phase: number): string {
-  return join(outcomeInboxDir(root, slug), `phase-${String(phase).padStart(2, '0')}.json`);
+/**
+ * The name an unsupervised declaration lands under.
+ *
+ * `phase-NN-<written_at>.json`, the stamp in basic ISO form (`20260810T211003Z`).
+ * It used to be `phase-NN.json` — ONE name per phase, written with `mv` — so a
+ * session that declared `partial` and then `blocked` silently destroyed the
+ * first, and a console that had been away long enough to need both got exactly
+ * one (S9-a). Two properties earn the stamp: the names are distinct, and
+ * because the form is fixed-width and colon-free, sorting them as plain strings
+ * IS sorting them chronologically, so a backlog is ingested oldest-first
+ * without opening a single file.
+ *
+ * Nothing in TypeScript WRITES one — `scripts/phase-outcome.sh` does. This
+ * names the shape, for tests and for the docs check; with no stamp it spells
+ * the legacy name, which `inboxOutcomePhase` still reads and which is what is
+ * already sitting in every inbox at upgrade.
+ */
+export function inboxOutcomeFile(root: string, slug: string, phase: number, writtenAt?: string): string {
+  const stamp = writtenAt ? `-${writtenAt.replace(/[:-]/g, '')}` : '';
+  return join(outcomeInboxDir(root, slug), `phase-${String(phase).padStart(2, '0')}${stamp}.json`);
 }
 
-/** The phase an inbox file name addresses, or null for a name that is not one. */
+/**
+ * The phase an inbox file name addresses, or null for a name that is not one.
+ *
+ * Both shapes: `phase-08.json` (written by a 5.0.0 script, and by every one
+ * already on disk at upgrade) and `phase-08-20260810T211003Z.json`.
+ */
 export function inboxOutcomePhase(file: string): number | null {
-  const m = /(?:^|\/)phase-(\d{2,})\.json$/.exec(file);
+  const m = /(?:^|\/)phase-(\d{2,})(?:-\d{8}T\d{6}Z)?\.json$/.exec(file);
   return m ? Number.parseInt(m[1], 10) : null;
 }
 

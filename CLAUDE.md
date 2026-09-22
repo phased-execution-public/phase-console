@@ -207,7 +207,11 @@ reconciles to `paused` with its clock intact and the service re-arms the resume 
 checkpoints the live session and re-attempts at once under the account with headroom, `pause` means
 what it says. The scheduler's usage throttle is keyed **per account**, so one spent login never
 stalls a queue another account would pay for; `throttledUntil` stays as the soonest expiry for
-readers that predate that.
+readers that predate that. Before the wall, a warning past `ALERT_PCT` that no switch can answer
+engages the account's **usage brake** (`Scheduler.brake`): no NEW lane on it while one is live —
+never a refused start — until a reading of that window under `WARN_PCT` or its reset. At the wall, a
+reset further off than `LIMIT_ACTION_COOLDOWN_MS` waits on the first rate-limit burst rather than
+after two `none` decisions (autopilot-token-drain phase 6).
 
 ### Getting the console started — the desktop artifact and the start command
 
@@ -236,9 +240,13 @@ rather than refusing.
   `phase-graph.sh --lint`; `validate.sh` delegates to it and adds handoff body/consistency checks.
   F20 and F21 are F1-tier gates, not advisories — `LINT OK` on a plan whose scopes are fiction is how
   two sessions end up in one working tree.
-  **F14** rides the same arm as a WARNING (stderr, exit untouched): an open, not-done phase whose
-  §Verification holds nothing runnable — the thing the autopilot would otherwise park on at boarding.
-  **F15** rides it too, same tier and same reasoning: a plan or phase naming an MCP server, an
+  **F14** rides the same arm and has GATED since 5.0.0 (`verification-empty-open`): an open, not-done
+  phase whose §Verification holds nothing runnable. It asks only "is anything runnable?"; what the
+  autopilot actually parks on — a single fragment it will not run under `Person-check: halt` — is
+  answered by ONE review, `runner/verify-review.ts`, which boarding, the start response, the plan
+  page, plan health, the repair gate and the prelude's fifth probe all ask (2026-09-18, run f0da619a:
+  five weaker readers had called a `bats` line fine).
+  **F15** rides the same arm as a WARNING (stderr, exit untouched): a plan or phase naming an MCP server, an
   account or a credential this machine has not registered — the console tells bash its registries
   through `PE_MCP_SERVERS`, `PE_ACCOUNTS` and `PE_CREDENTIALS` (unset disables the check; set but
   empty is a real answer), and the run-start prelude is the gate that acts on it. **F16** rides it too: a §Verification command that waits on an
@@ -256,7 +264,12 @@ rather than refusing.
   §Verification that will be read by a machine: F22 when a bring-up command sits inside it (move it to
   `- **Setup:**`, which runs BEFORE verification and can never colour a phase red), F23 when an expected
   failure is stated in PROSE beside a command (the runner reads exit codes, not sentences, so it calls
-  that phase red). The advisory family is therefore F14–F19 plus F22–F23 — eight ids.
+  that phase red). **F28** joins them in 5.1.0 (`land-needs-lane`): a phase that LANDS from a
+  checkout it shares lands whatever else is in it. **F30** (`note-target-done`) closes the family: a
+  forward note addressed to a phase that is already done — the near miss of F26, and its own id
+  because an id that both gates and warns cannot answer "did the lint fail?". The advisory family is
+  therefore F15–F19, F22–F23, F28 and F30 — nine ids; F14 gates, and so do F26
+  (`note-target-unknown`), F27 (`land-word-unknown`) and F29 (`landed-gate-unknown-phase`).
 - **An empty `ready` set is four facts, so the engine says which.** `--memory-block` is the only
   engine command the runner reads, and it emitted five bucket lines — collapsing "finished", "all in
   flight", "closed" and "nothing can ever move again" into one silence. It now also emits
@@ -293,18 +306,25 @@ rather than refusing.
   plan's manifest lets the console answer one, and that answer is announced.
   The PreToolUse hook fails open and carries workflow, never safety. The **Stop hook** rides the same
   settings file with the same philosophy: it nudges a session ending with neither a handoff nor a
-  declared outcome (at most twice), fails open, and the runner's own exit-time outcome check — not
-  the hook — is the load-bearing enforcement.
+  declared outcome (at most twice), lets one go whose own subagents or monitors still run in the
+  background (`hook.stop-awaiting` — their notification starts its next turn), fails open, and the
+  runner's own exit-time outcome check — not the hook — is the load-bearing enforcement.
 - **The outcome protocol is the session→runner channel; prose never is.** A session declares how it
   ended via `scripts/phase-outcome.sh` → one atomic JSON file at `PE_OUTCOME_FILE`, read once,
   journalled, consumed, staleness-guarded twice (deleted pre-spawn; `written_at` checked against the
-  attempt). `waiting-external` parks the phase as `waiting` and the resume is ALWAYS the phase's own
-  session (`--resume`) — never a fresh boot, never a pty agent. The handoff `.md` stays the
+  attempt). `waiting-external` parks the phase as `waiting` and the resume is the phase's own session
+  (`--resume`), never a pty agent — but a session is resumed only while it is worth resuming: one that
+  ended at ≥ 250k tokens of context and is cold (idle ≥ 55 min) or under another account, that declared
+  `partial --reason budget|context`, or that the console checkpointed is boarded FRESH with the resume
+  brief instead (`phase.resume-policy`). The one gate, `resumableSession`, asks `resumePolicy`
+  (`runner/usage.ts`, where the numbers live) for every `--resume`, after the gone and live checks and
+  before any transcript port. The handoff `.md` stays the
   engine/human contract; its status vocabulary (`complete|in-progress|blocked|pending`) is frozen —
   `waiting` is a runner state, never a handoff status.
 - **Reconcile closes records, never re-runs them.** The drive loop's reconcile pass (and the
-  read-path resolver) flips a record the board has overtaken to `done` ("closed outside this run")
-  and dissolves halts anchored to it; a `failed` record whose phase the board does not show done is
+  read-path resolver) flips a record the board has overtaken to `done` ("closed outside this run", or
+  "closed while checkpointed — the board reads done; not verified by this run" when this run had started
+  the phase) and dissolves halts anchored to it; a `failed` record whose phase the board does not show done is
   untouched. Recovery is resolve-first (board re-read before any launch), the session API is the
   first vehicle (`--allow-run`), the pty agent is for plan repairs (`--allow-agent`) and people, and
   "found nothing wrong" is a recorded outcome (`no-defect`), not a failure.
@@ -473,11 +493,14 @@ never passed), `--allow-run` (spawn unattended `claude -p` sessions that edit a 
 *reading* the usage meters needs no flag), `--allow-mcp` (register MCP servers, hold their
 credentials, attach them to plans and phases — *reading* the registry, the statuses and the catalog
 needs no flag), `--allow-webhooks` (POST every announcement to the URLs you register — Slack, Discord,
-Telegram, your own relay; the only flag that sends anything off the machine, and *reading* the
-destination list needs none). All seven default off — the set is `CAPABILITY_FLAGS` in
+Telegram, your own relay; one of the two that send anything off the machine, and *reading* the
+destination list needs none), `--allow-publish` (push a finished phase's `pe/*` branch — never a trunk, never
+with force — and file issues on the repository's behalf, where a plan's `permission.destructive` row and
+`Issues:` line allow it; off means no push and no issue — the other outward-reaching flag, and the only
+one that writes to a repository somebody else reads). All eight default off — the set is `CAPABILITY_FLAGS` in
 `server/config.ts`, and `viewer/test/skill-sync.test.ts` holds this paragraph's count to it. Shut down
 is deliberately *not* behind a flag. One flag switches something OFF rather than on: `--no-converge`
-stops the convergence loop's automatic triggers; it is not a capability flag and is not one of the seven.
+stops the convergence loop's automatic triggers; it is not a capability flag and is not one of the eight.
 
 ## Packaging, versions and releases
 

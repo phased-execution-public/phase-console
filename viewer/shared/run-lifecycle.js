@@ -131,6 +131,33 @@ export const RUN_SETTLED = Object.freeze(
   RUN_STATUSES.filter((status) => ['halted', 'parked', 'interrupted', 'finished', 'paused'].includes(status)),
 );
 
+/**
+ * The terminal run statuses that mean "this did not end well".
+ *
+ * `keep-on-failure`'s one question (phase 7). DERIVED, like every other subset
+ * here, and the exclusions are the content: `finished` is the only happy
+ * terminal, and `paused` is a person's deliberate act rather than a failure —
+ * a paused run's tree is kept for the reason every live run's is, not because
+ * anything went wrong. A run still in flight is not asked at all: its tree is
+ * not being swept.
+ *
+ * @type {readonly RunStatus[]}
+ */
+export const RUN_ENDED_BADLY = Object.freeze(
+  RUN_STATUSES.filter((status) => ['halted', 'parked', 'interrupted'].includes(status)),
+);
+
+/**
+ * Did this run end badly? `undefined` — a run record that could not be read —
+ * answers NO: inventing a failure would keep every unreadable run's tree for
+ * ever, which is the leak the retention policy exists to bound.
+ * @param {{status?: string} | null | undefined} run
+ * @returns {boolean}
+ */
+export function runEndedBadly(run) {
+  return RUN_ENDED_BADLY.includes(/** @type {never} */ (run?.status));
+}
+
 /* ------------------------------------------------------------------ *
  * Phases
  * ------------------------------------------------------------------ */
@@ -711,10 +738,20 @@ export const ENDED_BY = Object.freeze(
  *   - `closeout` — the phase's own session resumed to finish its paperwork.
  *   - `pr` — the session that opens the run's pull request or settles its merge
  *     queue.
+ *   - `landing` (Pro) — the session that opens ONE phase's pull request after
+ *     the console pushed its branch, and records the landing ledger row.
  *   - `review` — the automatic reviewer over a finished phase.
  */
 export const SESSION_MODES = Object.freeze(
-  /** @type {const} */ (['phase', 'resume', 'repair', 'qa', 'closeout', 'pr', 'review']),
+  /** @type {const} */ ([
+    'phase',
+    'resume',
+    'repair',
+    'qa',
+    'closeout',
+    'pr',
+    'review',
+  ]),
 );
 
 /** @typedef {(typeof SESSION_MODES)[number]} SessionMode */
@@ -767,9 +804,11 @@ export const CAP_SOURCES = Object.freeze(
  *   - `park` — `pause`: checkpoint the lane for a person.
  *   - `none` — nothing can act on it (no other account, a lane standing down).
  *
- * Journalled with `enacted: false` until zero-touch-console phase 8's account
- * helper carries the action out: the record exists so a warning at 99 % stops
- * being a line nothing reads.
+ * The switch and the park are carried out at the wall by the live wall. What the
+ * decision itself enacts (autopilot-token-drain phase 6) is the usage brake —
+ * no new lane on the account while one is live — unless a `switch` has an
+ * account with headroom; so `enacted` is true only for a `throttle`, which the
+ * brake carries out, and `brake` says whether the account is braked.
  */
 export const USAGE_DECISION_ACTIONS = Object.freeze(
   /** @type {const} */ (['throttle', 'switch', 'park', 'none']),

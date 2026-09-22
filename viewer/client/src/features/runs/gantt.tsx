@@ -20,20 +20,32 @@
  *     header says which. A confident wrong picture is the failure mode here.
  *   - **the critical path is named in text**, not only drawn. The overlay is a
  *     highlight; the sentence under it is what someone can act on.
+ *
+ * Since many-plans-one-repo phase 13 the DRAWING is
+ * `components/swimlane.tsx` — the geometry, the tick ladder, the hatch and the
+ * `.state-*` bridge, with no opinion about what a row is — and this file is the
+ * adapter that says a row is a PHASE, a bar is a boarding, and a label with two
+ * attempts behind it is a button. Debug ▸ Timeline draws six other kinds of row
+ * through the same primitive, and the alternative was a second copy of all four
+ * constants: the bar table had already drifted once that way, painting
+ * `verifying` with `--action` while every badge in the console painted it
+ * `--status-verifying`.
  */
 
 import { useMemo, type ReactNode } from 'react';
 
 import { Badge, Button, Card, CardBody, CardHeader, CardTitle, Empty, Legend } from '@/components/ui';
+import { AXIS, ROW, Swimlane, ticksFor, type SwimlaneRow } from '@/components/swimlane';
 import { duration } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { BarKind, RunTimeline, TimelineLane, TimelineMark } from '@/lib/api';
 
-/** Row geometry, in the SVG's own units. The viewBox does the scaling. */
-const ROW = 22;
-const BAR = 11;
-const TRACK = 1000;
-const AXIS = 16;
+/**
+ * Re-exported rather than re-declared: the geometry moved to the primitive, and
+ * this module's own tests plus `features/runs`'s callers name it here. One
+ * definition, two addresses — the alternative is the drift the file lead names.
+ */
+export { ticksFor, AXIS, ROW };
 
 /**
  * What each bar kind means, and the one CLASS that decides its colour.
@@ -70,38 +82,6 @@ const MARK_GLYPH: Record<TimelineMark['kind'], string> = {
   start: '▶',
 };
 
-/**
- * Tick every 1, 2, 5 … of a sane unit, aiming for six or so labels.
- *
- * Exported because "does the axis label the time the journal says" is the
- * cheapest half of exit criterion 1 to check, and it should be checkable
- * without rendering an SVG.
- */
-export function ticksFor(spanMs: number, target = 6): number[] {
-  if (!(spanMs > 0)) return [];
-  const raw = spanMs / target;
-  const units = [
-    1_000,
-    5_000,
-    15_000,
-    30_000,
-    60_000,
-    5 * 60_000,
-    15 * 60_000,
-    30 * 60_000,
-    3_600_000,
-    2 * 3_600_000,
-    6 * 3_600_000,
-    12 * 3_600_000,
-    86_400_000,
-    7 * 86_400_000,
-  ];
-  const step = units.find((unit) => unit >= raw) ?? units.at(-1)!;
-  const out: number[] = [];
-  for (let at = 0; at <= spanMs; at += step) out.push(at);
-  return out;
-}
-
 /** One lane's numbers as a sentence — the screen-reader text and the tooltip. */
 export function laneLabel(lane: TimelineLane): string {
   const parts: string[] = [];
@@ -134,9 +114,6 @@ export function Gantt({
   className?: string;
 }) {
   const { lanes, spanMs, marks } = timeline;
-  const ticks = useMemo(() => ticksFor(spanMs), [spanMs]);
-  const x = (ms: number): number => (spanMs > 0 ? (ms / spanMs) * TRACK : 0);
-  const height = AXIS + lanes.length * ROW;
   const marksByPhase = useMemo(() => {
     const map = new Map<number, TimelineMark[]>();
     for (const mark of marks) {
@@ -146,6 +123,70 @@ export function Gantt({
     }
     return map;
   }, [marks]);
+
+  const rows: SwimlaneRow[] = useMemo(
+    () =>
+      lanes.map((lane) => ({
+        key: String(lane.phase),
+        ariaLabel: laneLabel(lane),
+        emphasis: lane.critical,
+        label: (
+          <>
+            {lane.attempts >= 2 && onCompare ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-auto px-1 py-0 font-mono text-2xs"
+                onClick={() => onCompare(lane.phase)}
+                title={`Compare phase ${lane.phase}'s ${lane.attempts} attempts`}
+              >
+                p{lane.phase}
+                <span className="ml-1 text-ink-faint">×{lane.attempts}</span>
+              </Button>
+            ) : (
+              <span className="px-1 font-mono text-2xs text-ink-faint tabular-nums">p{lane.phase}</span>
+            )}
+            {lane.critical ? (
+              <span className="text-2xs text-action" title="On the measured critical path" aria-hidden="true">
+                ◆
+              </span>
+            ) : null}
+          </>
+        ),
+        bars: lane.bars.map((bar, i) => ({
+          key: `${bar.kind}-${bar.startMs}-${i}`,
+          startMs: bar.startMs,
+          endMs: bar.endMs,
+          state: BAR_STYLE[bar.kind].state,
+          open: bar.open,
+          outlined: lane.critical,
+          title:
+            `p${lane.phase} attempt ${bar.attempt}: ${BAR_STYLE[bar.kind].label} ` +
+            `${duration(bar.endMs - bar.startMs)}${bar.open ? ' (still open)' : ''}`,
+        })),
+        marks: (marksByPhase.get(lane.phase) ?? []).map((mark, i) => ({
+          key: `${mark.kind}-${mark.atMs}-${i}`,
+          atMs: mark.atMs,
+          glyph: MARK_GLYPH[mark.kind],
+          state: mark.ok === false ? 'state-failed' : undefined,
+          title: `${duration(mark.atMs)} · ${mark.kind}: ${mark.label}`,
+        })),
+      })),
+    [lanes, marksByPhase, onCompare],
+  );
+
+  const axisMarks = useMemo(
+    () =>
+      marks
+        .filter((mark) => mark.phase === undefined)
+        .map((mark, i) => ({
+          key: `run-${mark.kind}-${mark.atMs}-${i}`,
+          atMs: mark.atMs,
+          glyph: MARK_GLYPH[mark.kind],
+          title: `${duration(mark.atMs)} · ${mark.kind}: ${mark.label}`,
+        })),
+    [marks],
+  );
 
   const criticalText = timeline.criticalPath.length
     ? `${timeline.criticalPath.map((phase) => `p${phase}`).join(' → ')} · ${duration(timeline.criticalMs)}`
@@ -171,167 +212,14 @@ export function Gantt({
       <CardBody>
         {lanes.length ? (
           <>
-            <div className="grid grid-cols-[4.5rem_1fr] gap-x-2">
-              {/* The labels sit outside the SVG so they stay real text: a
-                  phase with two attempts is a BUTTON, and an <svg><text> is
-                  not something anyone can click with a keyboard. */}
-              <ol className="flex flex-col" style={{ paddingTop: `${(AXIS / height) * 100}%` }}>
-                {lanes.map((lane) => (
-                  <li
-                    key={lane.phase}
-                    className="flex items-center gap-1"
-                    style={{ height: `${(ROW / height) * 100}%`, minHeight: '1.25rem' }}
-                  >
-                    {lane.attempts >= 2 && onCompare ? (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-auto px-1 py-0 font-mono text-2xs"
-                        onClick={() => onCompare(lane.phase)}
-                        title={`Compare phase ${lane.phase}'s ${lane.attempts} attempts`}
-                      >
-                        p{lane.phase}
-                        <span className="ml-1 text-ink-faint">×{lane.attempts}</span>
-                      </Button>
-                    ) : (
-                      <span className="px-1 font-mono text-2xs text-ink-faint tabular-nums">
-                        p{lane.phase}
-                      </span>
-                    )}
-                    {lane.critical ? (
-                      <span
-                        className="text-2xs text-action"
-                        title="On the measured critical path"
-                        aria-hidden="true"
-                      >
-                        ◆
-                      </span>
-                    ) : null}
-                  </li>
-                ))}
-              </ol>
-
-              <svg
-                viewBox={`0 0 ${TRACK} ${height}`}
-                preserveAspectRatio="none"
-                className="w-full"
-                style={{ height: `${Math.max(height, 40)}px` }}
-                role="img"
-                aria-label={`Run timeline over ${duration(spanMs)}, ${lanes.length} phases`}
-              >
-                <defs>
-                  {/* An open bar is hatched. `patternUnits` in userSpace so the
-                      hatch does not stretch with the non-uniform viewBox. */}
-                  <pattern
-                    id="pe-gantt-open"
-                    width="6"
-                    height="6"
-                    patternUnits="userSpaceOnUse"
-                    patternTransform="rotate(35)"
-                  >
-                    <rect width="6" height="6" fill="var(--ground-deep)" />
-                    <line x1="0" y1="0" x2="0" y2="6" stroke="currentColor" strokeWidth="3" opacity="0.55" />
-                  </pattern>
-                </defs>
-
-                {/* The axis: a gridline and a label per tick. */}
-                {ticks.map((at) => (
-                  <g key={at}>
-                    <line
-                      x1={x(at)}
-                      y1={AXIS}
-                      x2={x(at)}
-                      y2={height}
-                      stroke="var(--rule)"
-                      strokeWidth="0.5"
-                      vectorEffect="non-scaling-stroke"
-                    />
-                    <text x={x(at) + 2} y={11} fontSize="9" fill="var(--ink-faint)">
-                      {duration(at)}
-                    </text>
-                  </g>
-                ))}
-
-                {/* Run-level marks — each start of the run, with its door — sit on
-                    the axis itself: they belong to no lane. */}
-                {marks
-                  .filter((mark) => mark.phase === undefined)
-                  .map((mark, i) => (
-                    <text
-                      key={`run-${mark.kind}-${mark.atMs}-${i}`}
-                      x={x(mark.atMs)}
-                      y={AXIS - 2}
-                      fontSize="8"
-                      textAnchor="middle"
-                      className="[--state:var(--ink-muted)]"
-                      fill="var(--state)"
-                    >
-                      {MARK_GLYPH[mark.kind]}
-                      <title>{`${duration(mark.atMs)} · ${mark.kind}: ${mark.label}`}</title>
-                    </text>
-                  ))}
-
-                {lanes.map((lane, row) => {
-                  const y = AXIS + row * ROW;
-                  return (
-                    <g key={lane.phase} role="img" aria-label={laneLabel(lane)}>
-                      {/* The lane's own track, so an empty stretch reads as a
-                          gap in THIS phase rather than as page background. */}
-                      <rect
-                        x={0}
-                        y={y + (ROW - BAR) / 2}
-                        width={TRACK}
-                        height={BAR}
-                        fill="var(--ground-deep)"
-                        opacity={lane.critical ? 0.9 : 0.5}
-                        rx="2"
-                      />
-                      {lane.bars.map((bar, i) => {
-                        const style = BAR_STYLE[bar.kind];
-                        const width = Math.max(1.5, x(bar.endMs) - x(bar.startMs));
-                        return (
-                          <rect
-                            key={`${bar.kind}-${bar.startMs}-${i}`}
-                            x={x(bar.startMs)}
-                            y={y + (ROW - BAR) / 2}
-                            width={width}
-                            height={BAR}
-                            rx="2"
-                            className={style.state}
-                            fill={bar.open ? 'url(#pe-gantt-open)' : 'var(--state)'}
-                            // The open-bar hatch paints in `currentColor`, so
-                            // the state has to reach it as a colour too.
-                            color="var(--state)"
-                            stroke={lane.critical ? 'var(--action)' : 'none'}
-                            strokeWidth={lane.critical ? 1 : 0}
-                            vectorEffect="non-scaling-stroke"
-                          >
-                            <title>
-                              {`p${lane.phase} attempt ${bar.attempt}: ${style.label} ` +
-                                `${duration(bar.endMs - bar.startMs)}${bar.open ? ' (still open)' : ''}`}
-                            </title>
-                          </rect>
-                        );
-                      })}
-                      {(marksByPhase.get(lane.phase) ?? []).map((mark, i) => (
-                        <text
-                          key={`${mark.kind}-${mark.atMs}-${i}`}
-                          x={x(mark.atMs)}
-                          y={y + ROW - 2}
-                          fontSize="7"
-                          textAnchor="middle"
-                          className={mark.ok === false ? 'state-failed' : '[--state:var(--ink-faint)]'}
-                          fill="var(--state)"
-                        >
-                          {MARK_GLYPH[mark.kind]}
-                          <title>{`${duration(mark.atMs)} · ${mark.kind}: ${mark.label}`}</title>
-                        </text>
-                      ))}
-                    </g>
-                  );
-                })}
-              </svg>
-            </div>
+            <Swimlane
+              rows={rows}
+              spanMs={spanMs}
+              axisMarks={axisMarks}
+              hatchId="pe-gantt-open"
+              tickLabel={duration}
+              ariaLabel={`Run timeline over ${duration(spanMs)}, ${lanes.length} phases`}
+            />
 
             {/* The shared key — the bar's own paint at legend size, since a
                 gantt band and a legend dot must be the same mark. */}

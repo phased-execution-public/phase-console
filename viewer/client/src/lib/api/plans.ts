@@ -6,6 +6,7 @@
 import { request, post, q } from './client';
 import { type HEALTH_SEVERITIES } from '../../../../shared/ops-vocab.js';
 import { type GATE_KINDS } from '../../../../shared/plan-vocab.js';
+import type { LandPolicy } from '../../../../shared/landing-model.js';
 import { PLAN_INCLUDES, includeParam } from '../../../../shared/projection.js';
 import type { EtaEstimate, EvidenceProof, PhaseEta, PhaseLive, PreflightWarning } from './runs';
 
@@ -166,6 +167,13 @@ export interface PhaseView {
    * so a freshly built client keeps working against a not-yet-restarted older
    * server; absent reads as `none`. */
   gateKind?: (typeof GATE_KINDS)[number];
+  /**
+   * The plan's `Land:` word for this phase and which level said it — the
+   * phase's own bullet, the plan's `Landing:` line, or the vocabulary's
+   * default (`hold`). Optional against an older server; absent reads as the
+   * default. Phase 15's chip on the phase table and drawer reads it.
+   */
+  land?: { value: LandPolicy; source: 'phase' | 'plan' | 'default' };
   model?: string;
   effort?: string;
   goal?: string;
@@ -327,6 +335,18 @@ export interface PlanFile {
   /** `?include=document` — the whole plan re-shipped; no client surface reads it. */
   sections?: { title: string; body: string }[];
   path?: string;
+  /**
+   * Where the plan orders its own in-session reviewer (`inPlanReviewers`), in the
+   * board projection — the launch form advises from it when `reviewEachPhase`
+   * would review the same diff again. Optional: an older server does not send it.
+   */
+  reviewers?: PlanReviewer[];
+}
+
+/** One place a plan orders its own reviewer: the section it is in, and its words. */
+export interface PlanReviewer {
+  section: string;
+  excerpt: string;
 }
 
 export interface HandoffRow {
@@ -639,6 +659,31 @@ export interface PhaseReview {
   staleTip: boolean;
 }
 
+/* ---------------- forward notes (server/parse/notes.ts) ----------------
+ * What earlier phases left for one that has not started. Three sources, one
+ * list: a handoff's `## Notes for later phases` bullets, a `deferral` ruling
+ * addressed with `--for`, and mail a peer sent `--deliver boot`. `trailer` is
+ * the bound's own row and is never a note. */
+
+export type NoteKind = 'handoff' | 'deferral' | 'message' | 'trailer';
+
+export interface PhaseNote {
+  /** Who left it: a handoff's basename, or `phase-<N>` for a ledger line. */
+  source: string;
+  kind: NoteKind;
+  /** The message or ruling id — `-` for a handoff bullet, which has none. */
+  id: string;
+  /** When it was written — `-` when the handoff never said. */
+  at: string;
+  text: string;
+}
+
+export interface PhaseNotes {
+  slug: string;
+  phase: number;
+  notes: PhaseNote[];
+}
+
 /* ---------------- landing (server/landing.ts) ----------------
  * How a finished plan leaves the machine: a branch, a commit range, and a
  * packet of files. Mirrored by hand like the review shapes above. */
@@ -786,6 +831,12 @@ export const plansApi = {
       `/api/plans/${q(slug)}/gate/${phase}`,
       body,
     ),
+  /* What earlier phases LEFT for this one — the same block its boot prompt
+     carries, from the same engine arm. Unflagged and read-only: it reads a
+     handoff, a rulings ledger and a messages ledger, all of which a console
+     with no flags may already read. */
+  notes: (slug: string, phase: number | string) =>
+    request<PhaseNotes>(`/api/plans/${q(slug)}/notes/${phase}`),
   /* Read-only, and deliberately unflagged: looking at what a session changed
      is display, the same class as reading its handoff. */
   review: (slug: string, phase: number | string, range?: { base?: string; tip?: string }) => {

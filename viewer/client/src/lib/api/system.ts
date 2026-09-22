@@ -5,7 +5,12 @@
 
 import { request, post, q } from './client';
 import type { BootHold, ConsoleState, SupervisorInfo } from './state';
-import type { ShutdownClockSource, ShutdownDurability, ShutdownMode } from '@shared/ops-vocab.js';
+import type {
+  RestartUpdateState,
+  ShutdownClockSource,
+  ShutdownDurability,
+  ShutdownMode,
+} from '@shared/ops-vocab.js';
 import type { Liveness } from '@shared/fleet-model.js';
 import type { SessionInventory } from './sessions';
 import type { HealthIssue } from './plans';
@@ -307,6 +312,47 @@ export interface RestartReadiness {
   run: { slug: string; status: string; phase?: number } | null;
   /** A restart has always killed every pty. Now it says so before it does. */
   sessions?: SessionInventory;
+  /**
+   * A restart updates the copy first (2026-09-18): whether this console can,
+   * and the update in hand — its progress while it runs, what it did after.
+   * Absent where the console cannot update itself.
+   */
+  update?: { available: boolean; run: RestartUpdateView | null };
+}
+
+/** What `deploy/self-update.sh` answered — the fields a person reads. */
+export interface SelfUpdateResultView {
+  result: string;
+  from: string;
+  to: string;
+  target: string;
+  upstream: string;
+  moved: boolean;
+  npmCi: boolean;
+  warnings: string[];
+  reason: string;
+}
+
+/** A restart's update: `running`, then `restarting` or `stopped`, with the sentence saying which. */
+export interface RestartUpdateView {
+  state: RestartUpdateState;
+  startedAt: string;
+  finishedAt?: string;
+  by: string;
+  detail: string;
+  result?: SelfUpdateResultView;
+}
+
+/**
+ * What pressing Restart did. `updating`: the copy updates first, and the
+ * process restarts after; `waiting`: pressed mid-run, it restarts once the
+ * live sessions have finished.
+ */
+export interface RestartOutcome {
+  ok: boolean;
+  reason?: string;
+  updating?: boolean;
+  waiting?: boolean;
 }
 
 /** The console's own fetchers — merged into `api` by `./index`. */
@@ -332,8 +378,20 @@ export const systemApi = {
   authLogin: () => post<{ opened?: boolean; detail?: string }>('/api/auth/login'),
   restartReadiness: () => request<RestartReadiness>('/api/restart'),
   /* No `by`: the server DERIVES the actor from the request — a browser is
-   * `operator`, a script is `script`, a tailnet caller its login (SHD-3). */
-  restart: () => post<unknown>('/api/restart', {}),
+   * `operator`, a script is `script`, a tailnet caller its login (SHD-3).
+   * A bare press updates first where the console can; `update: false` is the
+   * plain restart, `whenIdle` waits for the live sessions instead of being
+   * refused mid-run, and `cancel` calls a waiting restart off. */
+  restart: (options: { update?: boolean; whenIdle?: boolean; cancel?: boolean } = {}) =>
+    post<RestartOutcome>(
+      '/api/restart',
+      options.cancel
+        ? { cancel: true }
+        : {
+            ...(options.update === false ? { update: false } : {}),
+            ...(options.whenIdle ? { whenIdle: true } : {}),
+          },
+    ),
 
   /* The off switch. `confirm` is required by the server so a replayed or stray
    * POST cannot end a console; the dialog is what supplies it — and, having

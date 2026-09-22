@@ -21,6 +21,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { brotliDecompressSync, gunzipSync } from 'node:zlib';
+import { levelState, revertLevel } from '../server/log.ts';
 
 type Captured = { status: number; body: unknown; headers: Record<string, unknown> };
 
@@ -38,14 +39,19 @@ function decode(out: Captured, chunk: unknown): void {
  * takes a silently different path from the server's — the same trap
  * `routes.test.ts` documents at its own `call`.
  */
-async function call(service: unknown, path: string): Promise<Captured> {
+async function call(
+  service: unknown,
+  path: string,
+  opts: { method?: string; body?: unknown; noConsoleHeader?: boolean } = {},
+): Promise<Captured> {
   const { handleApi } = await import('../server/api/routes.ts');
   const out: Captured = { status: 0, body: null, headers: {} };
+  const payload = opts.body === undefined ? null : Buffer.from(JSON.stringify(opts.body));
   const req = {
-    method: 'GET',
-    headers: { 'x-phase-console': '1' } as Record<string, string>,
+    method: opts.method ?? 'GET',
+    headers: (opts.noConsoleHeader ? {} : { 'x-phase-console': '1' }) as Record<string, string>,
     on() { return this; },
-    [Symbol.asyncIterator]: async function* () { /* GET has no body */ },
+    [Symbol.asyncIterator]: async function* () { if (payload) yield payload; },
   };
   const res = {
     req,
@@ -460,4 +466,129 @@ test('M-D — an undated row reaches the tail rather than being ordered out of i
   } finally {
     rmSync(projectRoot, { recursive: true, force: true });
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * GET/POST /api/debug/level (phase 5)
+ *
+ * Turning debug on used to mean restarting the console with an environment
+ * variable — which loses the very run you were trying to look at. The override
+ * reverts by itself because the alternative is a console left writing debug
+ * lines until somebody remembers, and nobody remembers.
+ * ------------------------------------------------------------------ */
+
+test('LVL-1: GET reports what the log is admitting, and where the answer comes from', async () => {
+  const service = fakeService();
+  const res = await call(service, '/api/debug/level');
+
+  assert.equal(res.status, 200);
+  assert.equal(res.body.level, 'info');
+  assert.equal(res.body.source, 'env');
+  assert.deepEqual(res.body.levels, ['debug', 'info', 'warn', 'error']);
+});
+
+test('LVL-2: POST flips the level, says when it lapses, and reverts on its own', async () => {
+  const service = fakeService();
+  try {
+    const set = await call(service, '/api/debug/level', { method: 'POST', body: { level: 'debug', ttlMs: 60_000 } });
+    assert.equal(set.status, 200);
+    assert.equal(set.body.level, 'debug');
+    assert.equal(set.body.source, 'override');
+    assert.equal(typeof set.body.until, 'number');
+
+    assert.equal(levelState().level, 'debug', 'the log itself, not just the answer');
+
+    // Past the deadline the environment answers again — no timer, no restart.
+    assert.equal(levelState(Number(set.body.until) + 1).level, 'info');
+    assert.equal(levelState(Number(set.body.until) + 1).source, 'env');
+  } finally { revertLevel(); }
+});
+
+test('LVL-3: POST can turn a debug CHANNEL on without lowering the level', async () => {
+  const service = fakeService();
+  try {
+    const set = await call(service, '/api/debug/level', { method: 'POST', body: { debug: 'git', ttlMs: 60_000 } });
+    assert.equal(set.status, 200);
+    assert.equal(set.body.debug, 'git');
+    assert.equal(set.body.level, 'info', 'the floor is untouched — that is the point of the pair');
+  } finally { revertLevel(); }
+});
+
+test('LVL-4: DELETE puts it back at once', async () => {
+  const service = fakeService();
+  await call(service, '/api/debug/level', { method: 'POST', body: { level: 'debug', ttlMs: 600_000 } });
+  const back = await call(service, '/api/debug/level', { method: 'DELETE' });
+  assert.equal(back.status, 200);
+  assert.equal(back.body.source, 'env');
+  assert.equal(levelState().source, 'env');
+});
+
+test('LVL-5: a level nobody defined is a 400, and changes nothing', async () => {
+  const service = fakeService();
+  const res = await call(service, '/api/debug/level', { method: 'POST', body: { level: 'chatty' } });
+  assert.equal(res.status, 400);
+  assert.match(String(res.body.error), /chatty/);
+  assert.equal(levelState().source, 'env');
+});
+
+test('LVL-6: the write is refused without the console header, like every other POST', async () => {
+  const service = fakeService();
+  const res = await call(service, '/api/debug/level', { method: 'POST', body: { level: 'debug' }, noConsoleHeader: true });
+  assert.equal(res.status, 403);
+  assert.equal(levelState().source, 'env');
+});
+
+/* ------------------------------------------------------------------ *
+ * Retention, the run bundle and the session event log (5.1.0)
+ * ------------------------------------------------------------------ */
+
+test('RTE-1 — GET /api/debug/retention is a read: no flag, no CSRF header, every sink named', async () => {
+  const report = {
+    at: '2026-09-18T12:00:00.000Z',
+    policy: { runRetainDays: 30 },
+    sinks: [{ sink: 'console-log', files: 1, bytes: 12, due: 0 }],
+    bytes: 12,
+    actions: [],
+  };
+  const out = await call(fakeService({ retentionNow: () => report }), '/api/debug/retention', {
+    noConsoleHeader: true,
+  });
+  assert.equal(out.status, 200, 'seeing what is on your own disk is display, not capability');
+  assert.deepEqual(out.body, report);
+});
+
+test('RTE-2 — GET /api/debug/bundle?run= without a slug is refused by name', async () => {
+  const out = await call(fakeService(), '/api/debug/bundle?run=aaaaaaaa');
+  assert.equal(out.status, 400);
+  assert.match(String((out.body as { error: string }).error), /slug/);
+});
+
+test('RTE-3 — a run bundle for a run that is not there is a 404, not a half-built archive', async () => {
+  const out = await call(fakeService(), '/api/debug/bundle?slug=demo&run=aaaaaaaa');
+  assert.equal(out.status, 404);
+  assert.match(String((out.body as { error: string }).error), /aaaaaaaa/);
+});
+
+test('RTE-4 — the run-id and slug guards still refuse a traversal on the bundle path', async () => {
+  const bad = await call(fakeService(), '/api/debug/bundle?slug=demo&run=..%2F..%2Fetc');
+  assert.equal(bad.status, 400);
+  assert.match(String((bad.body as { error: string }).error), /run must be a run id/);
+});
+
+test('RTE-5 — GET /api/sessions/<id>/events answers with the lines and the id it was asked for', async () => {
+  const events = [{ v: 1, at: '2026-09-18T12:00:00.000Z', event: 'SessionStart' }];
+  const out = await call(
+    fakeService({ sessionEvents: (id: string, limit?: number) => (id === 'sess-1' && limit === 5 ? events : []) }),
+    '/api/sessions/sess-1/events?limit=5',
+  );
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body, { sessionId: 'sess-1', events });
+});
+
+test('RTE-6 — a session with no events answers an empty list rather than a 404', async () => {
+  // A session that ended before this version shipped has no log, and that is
+  // not an error — it is the same shape as a session that was simply quiet.
+  const out = await call(fakeService({ sessionEvents: () => [] }), '/api/sessions/nobody/events');
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body, { sessionId: 'nobody', events: [] });
 });

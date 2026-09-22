@@ -480,7 +480,10 @@ export function qaVerdictInstruction(
     + 'Never grade your own work directly, and never hand-edit test-status.md. '
     // The P8 lesson, in the brief rather than in a memory: a session
     // dispatched the reviewer and ended its turn "to pick it up when it
-    // returns". Nothing picks it up — the subagent dies with the turn.
+    // returns", and no verdict was recorded. A background reviewer can wake
+    // a `-p` session into a new turn (measured later, autopilot-token-drain
+    // E3) — but only inside the CLI's background-wait ceiling, while a
+    // foreground dispatch returns WITH the verdict, which nothing can lose.
     + 'The subagent is work inside YOUR turn: wait for it in the foreground and record its verdict '
     + 'before you end — a turn that ends while the reviewer is still running records nothing.';
 }

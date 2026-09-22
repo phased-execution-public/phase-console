@@ -30,10 +30,10 @@
  *   keeps an open Settings page from shelling out twice a second.
  */
 
-import { execFile } from 'node:child_process';
 
 import { DEFAULT_PORT, listInstances, liveness } from '../shared/instances.mjs';
 import type { Liveness } from '../shared/fleet-model.js';
+import { shell } from './shell.ts';
 
 /** Where macOS puts the CLI when Tailscale came from the App Store build. */
 const APP_BINARY = '/Applications/Tailscale.app/Contents/MacOS/Tailscale';
@@ -189,27 +189,22 @@ type Run = { ok: boolean; stdout: string; code?: string };
  * machine and reported `installed-not-running` on the one console that runs
  * supervised, with Tailscale plainly running.
  */
-function run(binary: string, args: string[]): Promise<Run> {
-  return new Promise((resolve) => {
-    execFile(
-      binary,
-      args,
-      {
-        timeout: probeTimeoutMs(),
-        maxBuffer: 4 * 1024 * 1024,
-        env: { ...process.env, TERM: process.env.TERM || 'dumb' },
-      },
-      (error, stdout) => {
-        if (!error) return resolve({ ok: true, stdout: String(stdout) });
-        const code = typeof (error as NodeJS.ErrnoException).code === 'string'
-          ? (error as NodeJS.ErrnoException).code
-          : undefined;
-        // A non-zero exit still prints usable JSON in some states, so stdout is
-        // kept even on failure.
-        resolve({ ok: false, stdout: String(stdout ?? ''), code });
-      },
-    );
+async function run(binary: string, args: string[]): Promise<Run> {
+  const result = await shell(binary, args, {
+    channel: 'shell',
+    intent: 'tailscale',
+    timeout: probeTimeoutMs(),
+    capture: { keep: 4 * 1024 * 1024, mode: 'head' },
+    env: { ...process.env, TERM: process.env.TERM || 'dumb' },
+    // Tailscale not being installed, or not running, is one of the answers
+    // this probe exists to give.
+    expectFailure: true,
   });
+  if (result.ok) return { ok: true, stdout: result.stdout };
+  const errno = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  // A non-zero exit still prints usable JSON in some states, so stdout is
+  // kept even on failure.
+  return { ok: false, stdout: result.stdout, ...(typeof errno === 'string' ? { code: errno } : {}) };
 }
 
 function parse(text: string): Record<string, unknown> | null {

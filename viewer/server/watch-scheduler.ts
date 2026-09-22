@@ -48,7 +48,7 @@ import { type ConvergeClock, REAL_CLOCK } from './converge.ts';
 import type { RunState, PhaseRecord } from './runner/state.ts';
 import {
   pollableRefs, probeWatchRef, nextDueFor, WATCH_FLOOR_MS, WATCH_CMD_TIMEOUT_MS,
-  WATCH_INELIGIBLE_STATUSES, MAX_CMD_RUNS_PER_PHASE,
+  MAX_CMD_RUNS_PER_PHASE, watchEligible,
   type WatchRefTarget, type WatchState,
 } from './watch-refs.ts';
 
@@ -312,7 +312,7 @@ export class WatchScheduler {
      */
     sink?: { changed: boolean },
   ): WatchRefTarget[] {
-    if (WATCH_INELIGIBLE_STATUSES.has(record.status)) return [];
+    if (!watchEligible(record)) return [];
     const declared = record.declared?.watch;
     const refs = [...(declared?.length ? declared : record.watch ?? [])];
     // The one wait the console can answer entirely from its own state, added

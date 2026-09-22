@@ -3,7 +3,7 @@
  *
  * This file replaces `viewer/shared/instances.mjs` when
  * `scripts/build-free-tree.mjs` materializes the public repository. It is not
- * a smaller module: it exports the SAME 56 names, with the same signatures and
+ * a smaller module: it exports the SAME 58 names, with the same signatures and
  * the same return shapes, because eleven other modules import from here and a
  * missing export is a crash at load rather than a feature that is absent.
  * `viewer/test/free-tree-shape.test.ts` diffs the two export sets and fails on
@@ -346,6 +346,31 @@ function sanitizeProfileFields(raw) {
   if (Number.isInteger(raw.maxSessions) && raw.maxSessions > 0) out.maxSessions = raw.maxSessions;
   if (typeof raw.hookScript === 'string' && raw.hookScript.startsWith('/')) out.hookScript = raw.hookScript;
   return out;
+}
+
+/**
+ * The direct door (many-plans-one-repo phases 21–22) is Pro: it is the fleet
+ * supervisor's second listener, and this tree has no supervisor to open one, so
+ * a profile's `reach` block is never read here — `sanitizeProfileFields` above
+ * drops it with every other field it does not know. The two readers keep their
+ * names and shapes because `free-tree-shape.test.ts` holds this file to the Pro
+ * export set, and they answer what "no block" answers there: no door, and the
+ * default mode. The rule id is this tree's own — the Pro table it would name
+ * lives in `reach-model.js`, which is a Pro path. Both take what the Pro
+ * readers take (a raw block; an environment) and read none of it, which is why
+ * neither names a parameter — the free tree's lint would call it unused.
+ *
+ * @returns {{ reach: null, rule: string }}
+ */
+export function explainReach() {
+  return { reach: null, rule: 'not-in-this-tree' };
+}
+
+/**
+ * @returns {{ mode: 'tailscale', reach: null, rule: null }}
+ */
+export function readReach() {
+  return { mode: 'tailscale', reach: null, rule: null };
 }
 
 /**

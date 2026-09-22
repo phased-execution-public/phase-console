@@ -234,6 +234,17 @@ if (args[0] === 'sessions') {
   process.exit(await sessionsVerb(args.slice(1), { root, preferBuilt }));
 }
 
+// ---- one run, exported ---------------------------------------------------
+// `phase-console diagnostics --run <id>`: the run bundle from the command
+// line, streamed from a live console and built from the state directory when
+// none answers — because the moment somebody most needs one is the moment the
+// console will not start. The verb lives in `bin/diagnostics-verb.mjs`, shared
+// with the free tree's bin, so neither copy of this file carries it twice.
+if (args[0] === 'diagnostics') {
+  const { diagnosticsVerb } = await import(pathToFileURL(join(root, 'bin', 'diagnostics-verb.mjs')).href);
+  process.exit(await diagnosticsVerb(args.slice(1), { root, preferBuilt }));
+}
+
 // ---- the fleet verbs, named rather than mistaken for a directory -----------
 // Without this, a bare `list` reached the block below, which turns a bare first
 // argument into `--root list` — so a verb that manages consoles would BOOT one,

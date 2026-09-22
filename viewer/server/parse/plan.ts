@@ -17,10 +17,28 @@ import {
   sections, findSection, labelledBullets, bullet, tableAfter, plainCell,
   type Section,
 } from './markdown.ts';
-import { wantsDefaultCheckout } from '../../shared/worktree-model.js';
+import { wantsDefaultCheckout, ISOLATION_DIRECTIVES } from '../../shared/worktree-model.js';
+import {
+  LAND_POLICIES, DEFAULT_LAND, GITLINK_POLICIES, DEFAULT_GITLINK,
+  CONFLICT_POLICIES, DEFAULT_CONFLICT, DEFAULT_BASE_BRANCH,
+} from '../../shared/landing-model.js';
+import { MESSAGING_WORDS, DEFAULT_MESSAGING } from '../../shared/message-model.js';
+import { ISSUE_MODES, DEFAULT_ISSUES } from '../../shared/issues-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
+import { inPlanReviewers } from '../../shared/run-settings.js';
 import type { DecisionRow } from '../../shared/decisions-model.js';
 import type { McpPolicy } from '../runner/state.ts';
+
+/**
+ * The 5.1.0 directive types, DERIVED from the imported vocabularies rather
+ * than re-declared: `LAND_POLICIES` is the owner, so a word added there is a
+ * word this parser accepts on the same commit, with no second list to forget.
+ */
+type LandPolicy = (typeof LAND_POLICIES)[number];
+type GitlinkPolicy = (typeof GITLINK_POLICIES)[number];
+type ConflictPolicy = (typeof CONFLICT_POLICIES)[number];
+type IssueMode = (typeof ISSUE_MODES)[number];
+type IsolationDirective = (typeof ISOLATION_DIRECTIVES)[number];
 
 /**
  * `**Credential policy:**` — the SAME vocabulary as `McpPolicy`
@@ -75,6 +93,16 @@ export type PhaseDetail = {
    * can turn a phase red for a reason unrelated to its work (register R27).
    */
   setup?: string;
+  /**
+   * 5.1.0 — this phase's own half of the landing and isolation directives,
+   * resolved against the plan's by `landFor` / `gitlinkFor` / `isolationFor` /
+   * `issuesFor`. Absent means the bullet is missing OR says something that is
+   * not one of its words: the reader falls through and lint F27 names it.
+   */
+  land?: LandPolicy;
+  gitlink?: GitlinkPolicy;
+  isolation?: IsolationDirective;
+  issues?: IssueMode;
   /**
    * `**QA:** on|off` — this phase's OWN QA regime, overriding the plan's
    * `**QA gate:**` where it is stated, inheriting where it is silent.
@@ -229,7 +257,33 @@ export type SessionBudget = {
    * mood on a given afternoon.
    */
   worktrees?: 'on' | 'off';
+  /**
+   * Where the plan's phases land and where they run (5.1.0). Each is the
+   * plan-wide half of a directive a phase may also carry; `landFor` and its
+   * siblings below resolve the pair and say WHICH level answered, because
+   * "this plan chose hold" and "this plan never considered landing" are two
+   * facts and the console treats them differently.
+   *
+   * Absent means the line is missing OR says something that is not one of its
+   * words — the same fall-through `mcpPolicy` takes, with lint F27 naming it.
+   */
+  landing?: LandPolicy;
+  /** `**Base branch:**` — a word (`origin/HEAD`, `head`) or any git ref, verbatim. */
+  baseBranch?: string;
+  gitlink?: GitlinkPolicy;
+  conflictPolicy?: ConflictPolicy;
+  messaging?: 'on' | 'off';
+  issues?: IssueMode;
+  isolation?: IsolationDirective;
+  /** `**Clash zones:**` — paths two concurrent phases must never both touch. Empty when none. */
+  clashZones: string[];
 };
+
+/** Which level of the plan answered a directive — the source token the engine prints. */
+export type DirectiveSource = 'phase' | 'plan' | 'default';
+
+/** A resolved directive: the word, and which level said it. */
+export type Resolved<T extends string> = { value: T; source: DirectiveSource };
 
 export type Plan = {
   slug: string;
@@ -263,6 +317,11 @@ export type Plan = {
   graph: PhaseRow[];
   /** Blocking / Independent callout lines under the graph table. */
   callouts: string[];
+  /**
+   * Where the plan orders its own in-session reviewer (`inPlanReviewers`) — what
+   * the launch form advises from when `reviewEachPhase` would double it.
+   */
+  reviewers: { section: string; excerpt: string }[];
   phases: Record<number, PhaseDetail>;
   body: string;
 };
@@ -546,12 +605,71 @@ function parseSessionBudget(section?: Section): SessionBudget {
     if (m) { worktrees = m[1].toLowerCase() as 'on' | 'off'; break; }
   }
 
+  // 5.1.0's plan-wide directives (`_plan_directive` in phase-graph.sh): the
+  // label at the START of a line after any quote marks, then the first word
+  // after the first colon, checked against its vocabulary. An unrecognised
+  // word is `undefined` — the reader falls THROUGH it, and lint F27 is what
+  // says so, exactly as `mcpPolicyOf` does with a typo'd policy.
+  const landing = planWord(flat, 'Landing', LAND_POLICIES);
+  const gitlink = planWord(flat, 'Gitlink', GITLINK_POLICIES);
+  const conflictPolicy = planWord(flat, 'Conflicts', CONFLICT_POLICIES);
+  const messaging = planWord(flat, 'Messaging', MESSAGING_WORDS);
+  const issues = planWord(flat, 'Issues', ISSUE_MODES);
+  const isolation = planWord(flat, 'Isolation', ISOLATION_DIRECTIVES);
+  // The base branch is the one value that is not a vocabulary — two words are
+  // special and everything else is a git ref, passed through whole — so it
+  // takes the raw remainder rather than its first token.
+  const baseBranch = /^[\s>]*\*{0,2}Base branch\*{0,2}[ \t]*:(.*)$/im.exec(flat)?.[1]
+    ?.replace(/[*`]/g, '').trim() || undefined;
+  const clashZonesLine = /^[\s>]*\*{0,2}Clash zones\*{0,2}[ \t]*:(.*)$/im.exec(flat)?.[1] ?? '';
+  const clashZones = [...new Set(
+    [...clashZonesLine.matchAll(/`([^`]+)`/g)].map((m) => m[1].trim()).filter(Boolean),
+  )];
+
   return {
     raw, targetModel: model, budget, branch, skills, mcpServers, mcpPolicy, credentials, credentialPolicy, accounts, qaGate, worktrees,
+    clashZones,
     ...(setupLine ? { setup: setupLine } : {}),
     ...(waitBudgetMinutes !== undefined ? { waitBudgetMinutes } : {}),
     ...(qaExhausted !== undefined ? { qaExhausted } : {}),
+    ...(landing !== undefined ? { landing } : {}),
+    ...(baseBranch !== undefined ? { baseBranch } : {}),
+    ...(gitlink !== undefined ? { gitlink } : {}),
+    ...(conflictPolicy !== undefined ? { conflictPolicy } : {}),
+    ...(messaging !== undefined ? { messaging } : {}),
+    ...(issues !== undefined ? { issues } : {}),
+    ...(isolation !== undefined ? { isolation } : {}),
   };
+}
+
+/**
+ * One plan-wide directive, as its first word, or undefined when the line is
+ * missing or says something that is not one of `words`.
+ *
+ * `_plan_directive | _first_word` plus the membership test `_resolve_directive`
+ * applies — the two are one step here because nothing needs the raw value of a
+ * closed directive, and keeping them apart invited a reader that took the word
+ * without checking it.
+ */
+function planWord<T extends string>(flat: string, label: string, words: readonly T[]): T | undefined {
+  const re = new RegExp(`^[\\s>]*\\*{0,2}${label}\\*{0,2}[ \\t]*:(.*)$`, 'im');
+  const word = policyWord(re.exec(flat)?.[1]);
+  return words.includes(word as T) ? (word as T) : undefined;
+}
+
+/**
+ * The same, for a phase's own `- **Label:**` bullet — `_phase_directive |
+ * _first_word` with `_resolve_directive`'s membership test.
+ *
+ * The bullet marker is required and the bold is not, which is the engine's
+ * rule (`^[[:space:]]*[-*][[:space:]]*\*{0,2}Label\*{0,2}[[:space:]]*:`) and
+ * not the stricter one `qaBullet` uses. The two differ deliberately and the
+ * asymmetry is pinned in `viewer/test/parse.test.ts`.
+ */
+function phaseWord<T extends string>(block: string, label: string, words: readonly T[]): T | undefined {
+  const re = new RegExp(`^[ \\t]*[-*][ \\t]*\\*{0,2}${label}\\*{0,2}[ \\t]*:(.*)$`, 'im');
+  const word = policyWord(re.exec(block)?.[1]);
+  return words.includes(word as T) ? (word as T) : undefined;
 }
 
 /**
@@ -798,6 +916,84 @@ export function personCheckFor(plan: Plan | undefined, phase: number): string | 
 }
 
 /**
+ * The 5.1.0 directives, resolved — `_resolve_directive()` in `phase-graph.sh`.
+ *
+ * Phase bullet, else plan line, else the engine's own default, and the answer
+ * SAYS WHICH. Everything above this point either answers a bare word (and lets
+ * silence mean "the run decides") or unions two levels; this family does
+ * neither, because its words have defaults and a default that cannot be told
+ * apart from a choice is a wizard that stops asking a question nobody answered.
+ *
+ * `undefined` is returned only where the engine prints nothing — `isolationFor`
+ * alone, whose default belongs to the run and not to the plan.
+ */
+function resolve<T extends string>(
+  own: T | undefined, planWide: T | undefined, fallback: T,
+): Resolved<T> {
+  if (own !== undefined) return { value: own, source: 'phase' };
+  if (planWide !== undefined) return { value: planWide, source: 'plan' };
+  return { value: fallback, source: 'default' };
+}
+
+/** What happens to a phase's commits when it settles — `land_for_phase()`. */
+export function landFor(plan: Plan | undefined, phase?: number): Resolved<LandPolicy> {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.land;
+  return resolve(own, plan?.sessionBudget.landing, DEFAULT_LAND);
+}
+
+/** Whether a landing superproject phase also moves the gitlink — `gitlink_for_phase()`. */
+export function gitlinkFor(plan: Plan | undefined, phase?: number): Resolved<GitlinkPolicy> {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.gitlink;
+  return resolve(own, plan?.sessionBudget.gitlink, DEFAULT_GITLINK);
+}
+
+/** Whether a session may open an issue for something outside its phase — `issues_for_phase()`. */
+export function issuesFor(plan: Plan | undefined, phase?: number): Resolved<IssueMode> {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.issues;
+  return resolve(own, plan?.sessionBudget.issues, DEFAULT_ISSUES as IssueMode);
+}
+
+/**
+ * Whether a phase gets a checkout of its own — `isolation_for_phase()`.
+ *
+ * The one member of this family that can answer NOTHING. A phase that says
+ * nothing inherits the run, and the run is not in the plan: answering `shared`
+ * here would be the parser deciding a question the operator owns, and would
+ * make a run-level `worktree` setting unreachable on every plan ever written.
+ */
+export function isolationFor(plan: Plan | undefined, phase?: number): Resolved<IsolationDirective> | undefined {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.isolation;
+  if (own !== undefined) return { value: own, source: 'phase' };
+  const planWide = plan?.sessionBudget.isolation;
+  return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
+}
+
+/** What the run branch is cut from — `plan_base_branch()`. Plan-wide: a base branch is a fact about the RUN. */
+export function baseBranchOf(plan: Plan | undefined): Resolved<string> {
+  const own = plan?.sessionBudget.baseBranch;
+  return own !== undefined ? { value: own, source: 'plan' } : { value: DEFAULT_BASE_BRANCH, source: 'default' };
+}
+
+/** What a landing that will not merge cleanly does — `plan_conflict_policy()`. Plan-wide. */
+export function conflictPolicyOf(plan: Plan | undefined): Resolved<ConflictPolicy> {
+  return resolve(undefined, plan?.sessionBudget.conflictPolicy, DEFAULT_CONFLICT);
+}
+
+/** Whether this plan's sessions may message each other — `plan_messaging()`. Plan-wide. */
+export function messagingOf(plan: Plan | undefined): Resolved<'on' | 'off'> {
+  return resolve(undefined, plan?.sessionBudget.messaging, DEFAULT_MESSAGING as 'on' | 'off');
+}
+
+/**
+ * The paths two concurrent phases must never both touch — `plan_clash_zones()`.
+ * A list, so no source token: an empty list and a plan that never named one are
+ * the same instruction to everything that reads it.
+ */
+export function clashZonesOf(plan: Plan | undefined): string[] {
+  return plan?.sessionBudget.clashZones ?? [];
+}
+
+/**
  * How long a phase may stay parked on its declared waits, and which line said
  * so — `wait_budget_for_phase()`: the phase's `Waits on:` max, else the plan's
  * `Wait budget:`, else undefined (the console's default applies). With no
@@ -896,6 +1092,14 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       credentials: credentialsBullet(block.raw),
       credentialPolicy: credentialPolicyBullet(block.raw),
       personCheck: personCheckBullet(block.raw),
+      // 5.1.0: where this phase's work lands and where it runs. Each is the
+      // phase half of a plan-wide line; `landFor` and its siblings resolve the
+      // pair. `Land` and not `Landing` on purpose — the plan-wide line is a
+      // policy for the plan, the bullet is what THIS phase does.
+      land: phaseWord(block.raw, 'Land', LAND_POLICIES),
+      gitlink: phaseWord(block.raw, 'Gitlink', GITLINK_POLICIES),
+      isolation: phaseWord(block.raw, 'Isolation', ISOLATION_DIRECTIVES),
+      issues: phaseWord(block.raw, 'Issues', ISSUE_MODES),
       // What the phase waits on and its own parked-time allowance
       // (`waits_on_refs()` / `wait_budget_for_phase()`).
       waitsOn: waitsOnBullet(block.raw),
@@ -940,6 +1144,7 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
     decisions: parseDecisionsTable(findSection(secs, 'Decisions')?.body ?? ''),
     graph,
     callouts: calloutLines(body),
+    reviewers: inPlanReviewers(body),
     phases,
     body,
   };

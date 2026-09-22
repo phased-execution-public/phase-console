@@ -363,6 +363,48 @@ test('subscribing twice from one browser updates rather than duplicates', () => 
   assert.equal(register.list()[0].label, 'Mac · Chrome (again)');
 });
 
+test('a subscription keeps the site it came in under and the device it belongs to — public, persisted, strings only', async () => {
+  const { recent } = await import('../server/log.ts');
+  const register = new push.Push([]);
+  // Every test browser shares one endpoint, and a repeat endpoint is an UPDATE
+  // that logs nothing — so each browser here gets an endpoint of its own.
+  const fresh = () => ({ ...subscriptionJson().json, endpoint: `https://push.example.com/sub/${randomBytes(6).toString('hex')}` });
+  const json = fresh();
+  const device = register.subscribe(json, undefined, 'phone', { site: 'https://192.168.1.20:4443', deviceId: 'a1b2c3d4e5f6' });
+  assert.ok(!('error' in device));
+  assert.equal(device.site, 'https://192.168.1.20:4443');
+  assert.equal(device.deviceId, 'a1b2c3d4e5f6');
+
+  const listed = register.list().find((row) => row.id === device.id)!;
+  assert.equal(listed.site, 'https://192.168.1.20:4443', 'a page may see where a device subscribed');
+  assert.equal(listed.deviceId, 'a1b2c3d4e5f6');
+  assert.ok(!('endpoint' in listed) && !('keys' in listed), 'and still never its endpoint or keys');
+  const reread = new push.Push([]).list().find((row) => row.id === device.id)!;
+  assert.equal(reread.site, 'https://192.168.1.20:4443', 'kept on disk');
+  assert.equal(reread.deviceId, 'a1b2c3d4e5f6');
+
+  const line = recent(500).findLast((entry) => entry.event === 'push.subscribed' && entry.data?.id === device.id);
+  assert.equal(line?.data?.site, 'https://192.168.1.20:4443', 'the subscribed line names the site');
+  assert.equal(line?.data?.deviceId, 'a1b2c3d4e5f6', 'and the device');
+
+  const moved = register.subscribe(json, undefined, 'phone', { site: 'https://mac.local:4443' });
+  assert.ok(!('error' in moved));
+  assert.equal(moved.id, device.id, 'the same browser, the same row');
+  assert.equal(moved.site, 'https://mac.local:4443', 'under the site it came in under this time');
+  assert.equal(moved.deviceId, 'a1b2c3d4e5f6', 'a re-subscribe that names no device keeps the one it had');
+
+  const junk = register.subscribe(fresh(), undefined, 'tablet', { site: 42, deviceId: ['a1b2c3d4e5f6'] });
+  assert.ok(!('error' in junk));
+  assert.equal('site' in junk, false, 'a site that is not a string is no site');
+  assert.equal('deviceId' in junk, false);
+  const plain = register.subscribe(fresh(), undefined, 'laptop');
+  assert.ok(!('error' in plain));
+  assert.equal('site' in plain, false, 'and a caller that says nothing records nothing');
+
+  // The register file is this whole suite's: leave it as it was found.
+  for (const row of [device, junk, plain]) register.unsubscribe(row.id);
+});
+
 test('a re-subscribe keeps the categories already chosen', () => {
   const register = new push.Push([]);
   const { json } = subscriptionJson();

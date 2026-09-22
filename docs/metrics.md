@@ -10,9 +10,9 @@ Everything the cost and progress pages show is on this endpoint too, so a figure
 rather than watched. It is a plain read like every other GET: no flag turns it on, no token guards
 it, and the console binds to loopback.
 
-**20 families.** The list below comes from `viewer/server/analysis/metrics.ts` `METRIC_FAMILIES`,
-and `viewer/test/docs-parity.test.ts` holds this document to it — a family added to one and not the
-other fails the suite, as does calling a counter a gauge.
+**30 families** ship in both tiers. The list below comes from `viewer/server/analysis/metrics.ts`
+`METRIC_FAMILIES`, and `viewer/test/docs-parity.test.ts` holds this document to it — a family added
+to one and not the other fails the suite, as does calling a counter a gauge.
 
 ## Scraping it
 
@@ -58,6 +58,16 @@ which kind of scrape you got.
 | `phase_console_worktrees` | gauge | Console-managed checkouts a plan's isolated run holds. Absent when no isolated run exists. |
 | `phase_console_worktree_disk_bytes` | gauge | Bytes those checkouts occupy. Absent where du could not answer. |
 | `phase_console_branch_conflicted_files` | gauge | Files a plan's run branch already conflicts on with another live branch. |
+| `phase_console_log_lines_total` | counter | Console log lines written, by level. A line the level dropped is not counted. |
+| `phase_console_journal_appends_total` | counter | Journal lines appended across every run this process drove. |
+| `phase_console_journal_overflow_total` | counter | Journals that crossed the soft cap and fell back to the terminal reserve. |
+| `phase_console_transcript_shed_total` | counter | Transcript records dropped rather than stored, by kind. |
+| `phase_console_git_commands_total` | counter | Git commands run through the seam, by verb and whether they exited 0. |
+| `phase_console_git_command_seconds_total` | counter | Seconds spent inside git, by verb. |
+| `phase_console_engine_calls_total` | counter | Bash engine calls, by script and whether the answer was cached. |
+| `phase_console_http_requests_total` | counter | HTTP requests answered, by status class. |
+| `phase_console_shell_commands_total` | counter | Other child processes run through the seam, by binary and whether they exited 0. |
+| `phase_console_retention_removed_total` | counter | Files retention deleted, by sink. |
 
 **Labels.** `slug` on everything per-plan; `state` on `phase_console_phases`
 (`done` · `ready` · `in-progress` · `waiting` · `stuck`); `status` and `closed` on
@@ -85,6 +95,20 @@ exceptions: `rate()` over a mislabelled family is wrong in a way nothing reports
   itself, which is worth an alert of its own.
 
 **The three worktree families are ABSENT, not zero, until a run isolates.** `phase_console_worktrees`,
+### The counters reset with the process
+
+The ten `_total` families added in 5.1.0 (`server/counters.ts`) are **process-lifetime**: they count
+from this console's start and a restart puts them back to zero. That is what a Prometheus counter is
+— the scraper owns rate and reset detection — and `phase_console_build_info` already carries the
+version and instance a scraper needs to tell one process's series from the next.
+
+Two consequences worth knowing before alerting on them. A family with **no data yet is ABSENT, not
+zero**, because most are keyed by a value that comes out of the work (a git verb, a script name, a
+binary) and a zero would have to invent one. And every one of them is **capped at 64 distinct label
+values**; past that, new values fold into `other` so the total stays right — a counter keyed by
+anything a caller can invent is how a metrics endpoint becomes the thing that runs a machine out of
+memory.
+
 `phase_console_worktree_disk_bytes` and `phase_console_branch_conflicted_files` report only on runs
 working in a checkout of their own (*Give this run its own checkout*, on the launch form — see
 [what you control](controls.md)), so on a console that has never isolated

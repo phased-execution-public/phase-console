@@ -4,8 +4,9 @@
  * repository.
  */
 
-import { execFile } from 'node:child_process';
 import { relative } from 'node:path';
+
+import { shell } from './shell.ts';
 
 export type GitFileInfo = {
   sha?: string;
@@ -24,23 +25,50 @@ export type GitRepoInfo = {
   dirty: string[];
 };
 
-const SEP = '';
+/**
+ * Field separator inside a `--format`: **NUL**, not the unit separator.
+ *
+ * 🔴 `\x1f` was a forgery, and `git-browse.ts` said so in a note of its own
+ * when it moved (P8 QA round 4) — pointing at THIS file, which never did. A
+ * commit subject may legally contain `\x1f`; nothing rejects it; so a crafted
+ * message shifted every field after it, and a commit could report an author, an
+ * author date and a relative date of its own choosing, with the fabricated date
+ * PARSING. NUL is the one byte git’s porcelain will not carry inside a commit
+ * message, which is why `log` offers it as a format escape for exactly this.
+ *
+ * TWO constants, not one, for the reason `git-browse.ts` needs three: the byte
+ * may never appear in an ARGV — `execFile` rejects an argument containing NUL
+ * outright (`ERR_INVALID_ARG_VALUE`) — so what goes into the argv is git’s own
+ * ESCAPE and what the parser splits on is the byte git then emits.
+ *
+ * The RECORD separator stays the newline, because none of these fields can
+ * contain one: `%s` is the subject, which git’s own `format_subject` joins
+ * wrapped lines into with spaces, and `%h`, `%an` and the dates are
+ * single-line by construction.
+ */
+const SEP = '\x00';
+/** `git log --format` escape for it. Never the literal byte. */
+const SEP_LOG = '%x00';
 
-function git(
+async function git(
   cwd: string, args: string[], timeout = 5000, env?: NodeJS.ProcessEnv,
 ): Promise<string> {
-  return new Promise((resolve) => {
-    // `env` REPLACES the inherited set when a caller passes one. Only
-    // `git-browse.ts` does, and for a reason worth naming here: a `GIT_DIR` in
-    // the console's own environment makes these reads answer about a different
-    // repository, and the browse surface is reachable from a browser. Absent,
-    // the child inherits exactly as it always did.
-    execFile('git', args, {
-      cwd, timeout, maxBuffer: 4 * 1024 * 1024, ...(env ? { env } : {}),
-    }, (error, stdout) => {
-      resolve(error ? '' : String(stdout));
-    });
+  // `env` REPLACES the inherited set when a caller passes one. Only
+  // `git-browse.ts` does, and for a reason worth naming here: a `GIT_DIR` in
+  // the console's own environment makes these reads answer about a different
+  // repository, and the browse surface is reachable from a browser. Absent,
+  // the child inherits exactly as it always did.
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'read', cwd, timeout,
+    // `head`, not `ends`: every caller of this helper PARSES what it returns.
+    capture: { keep: 4 * 1024 * 1024, mode: 'head' },
+    ...(env ? { env } : {}),
+    // This helper answers `''` for every failure by contract — several callers
+    // ask questions whose answer is legitimately "no" (is this a work tree, has
+    // this ref an upstream).
+    expectFailure: true,
   });
+  return run.ok ? run.stdout : '';
 }
 
 export async function repoInfo(root: string, docsDir?: string): Promise<GitRepoInfo> {
@@ -61,7 +89,7 @@ export async function repoInfo(root: string, docsDir?: string): Promise<GitRepoI
 
 /** Last commit that touched `path`. */
 export async function lastCommit(root: string, path: string): Promise<GitFileInfo> {
-  const format = ['%h', '%s', '%an', '%aI', '%ar'].join(SEP);
+  const format = ['%h', '%s', '%an', '%aI', '%ar'].join(SEP_LOG);
   const out = await git(root, ['log', '-1', `--format=${format}`, '--', path]);
   const [sha, subject, author, date, relativeDate] = out.trim().split(SEP);
   return sha ? { sha, subject, author, date, relativeDate } : {};
@@ -92,7 +120,7 @@ export async function commitsTouching(
 ): Promise<{ sha: string; subject?: string; date?: string }[]> {
   const paths = Array.isArray(path) ? path.filter(Boolean) : [path];
   if (!paths.length) return [];
-  const format = ['%h', '%s', '%ad'].join(SEP);
+  const format = ['%h', '%s', '%ad'].join(SEP_LOG);
   const out = await git(root, ['log', `-${Math.max(1, Math.min(limit, 1_000))}`, `--format=${format}`,
     '--date=short', '--', ...paths]);
   return out.split('\n').filter(Boolean).map((line) => {
@@ -138,7 +166,7 @@ export async function firstParent(root: string, sha: string): Promise<string | u
 export async function commitsInRange(
   root: string, base: string | undefined, tip: string, limit = 200,
 ): Promise<{ sha: string; subject?: string; date?: string; author?: string }[]> {
-  const format = ['%h', '%s', '%ad', '%an'].join(SEP);
+  const format = ['%h', '%s', '%ad', '%an'].join(SEP_LOG);
   const range = base ? `${base}..${tip}` : tip;
   const out = await git(root, [
     'log', `-${Math.max(1, Math.min(limit, 500))}`, `--format=${format}`, '--date=short', range,
@@ -247,9 +275,40 @@ export type DiffStatRow = {
 export async function diffStat(
   root: string, range: DiffRange, opts: { env?: NodeJS.ProcessEnv } = {},
 ): Promise<DiffStatRow[]> {
-  const out = await git(root, [
+  return (await diffStatDetailed(root, range, opts)).rows;
+}
+
+/** Bytes of `--numstat -z` a stat read may produce before it is a truncation. */
+const STAT_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The same read, able to say **"there was more than I could hold"**.
+ *
+ * 🔴 `git()` caps stdout at 4 MB and answers `''` on overflow, and `''` parses
+ * to ZERO ROWS — so a range touching 26 000 files, whose `--numstat` is tens of
+ * megabytes, reached the Changes section as an empty list and rendered as
+ * *"nothing changed"* (G-DIFF). The one thing a diff surface must never say
+ * about a range that changed everything. A capped answer and a failure are
+ * different facts, and so is a capped answer and an empty one: this returns
+ * whatever rows it could parse AND says the list stops short, which is what the
+ * caller needs to write "diff too large to list" instead of a lie.
+ */
+export async function diffStatDetailed(
+  root: string, range: DiffRange, opts: { env?: NodeJS.ProcessEnv } = {},
+): Promise<{ rows: DiffStatRow[]; overflow: boolean }> {
+  // One byte over the budget is how truncation is DETECTED — `diffText`'s own
+  // trick, and the reason this cannot go through the swallowing `git()`.
+  const raw = await gitRaw(root, [
     'diff', '--no-color', '--no-ext-diff', '-M', '--numstat', '-z', ...rangeArgs(range),
-  ], 15_000, opts.env);
+  ], { maxBuffer: STAT_MAX_BYTES + 1, timeout: 15_000, ...(opts.env ? { env: opts.env } : {}) });
+  // A read that FAILED is not an overflow and not an empty diff — it is a
+  // question that could not be put. `[]` with `overflow: false` is what every
+  // caller has always got for it.
+  if (raw === null) return { rows: [], overflow: false };
+  const overflow = raw.length > STAT_MAX_BYTES;
+  // The final record of a truncated stream is a fragment, so it is dropped
+  // rather than parsed into a row with half a pathname in it.
+  const out = overflow ? raw.slice(0, raw.lastIndexOf('\0') + 1) : raw;
   const fields = out.split('\0');
   const rows: DiffStatRow[] = [];
   for (let i = 0; i < fields.length; i += 1) {
@@ -274,7 +333,7 @@ export async function diffStat(
     i += 2;
     rows.push({ path: newPath, ...(oldPath ? { oldPath } : {}), ...counts });
   }
-  return rows;
+  return { rows, overflow };
 }
 
 /**
@@ -282,20 +341,22 @@ export async function diffStat(
  * string. Only the diff reads above need the distinction, so the swallowing
  * helper every other function here uses stays exactly as it was.
  */
-function gitRaw(
+async function gitRaw(
   cwd: string, args: string[],
   opts: { maxBuffer: number; timeout: number; env?: NodeJS.ProcessEnv },
 ): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile('git', args, {
-      cwd, timeout: opts.timeout, maxBuffer: opts.maxBuffer, ...(opts.env ? { env: opts.env } : {}),
-    }, (error, stdout) => {
-      // `maxBuffer` exceeded still delivers the truncated stdout, and that is a
-      // capped answer rather than a failure. No output at all is a real one.
-      if (error && !stdout) return resolve(null);
-      resolve(String(stdout));
-    });
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'read-raw', cwd, timeout: opts.timeout,
+    // The old `maxBuffer` truncated from the front and delivered the prefix;
+    // `head` is that behaviour exactly, and it is what a parser needs.
+    capture: { keep: opts.maxBuffer, mode: 'head' },
+    ...(opts.env ? { env: opts.env } : {}),
+    expectFailure: true,
   });
+  // A capped answer is still an answer — that was true of `maxBuffer` too. No
+  // output at all is a real failure.
+  if (!run.ok && !run.stdout) return null;
+  return run.stdout;
 }
 
 /* ------------------------------------------------------------------ *
@@ -464,28 +525,28 @@ export async function formatPatch(
  * a display. It is exactly wrong for an export: "the bundle is empty" and "no
  * bundle was written" must not look alike.
  */
-function gitWrite(cwd: string, args: string[], timeout: number): Promise<GitExport> {
-  return new Promise((resolve) => {
-    execFile('git', args, { cwd, timeout, maxBuffer: 4 * 1024 * 1024 }, (error, _stdout, stderr) => {
-      if (!error) return resolve({ ok: true });
-      resolve({ ok: false, error: String(stderr).trim().slice(0, 500) || (error as Error).message });
-    });
+async function gitWrite(cwd: string, args: string[], timeout: number): Promise<GitExport> {
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'export', cwd, timeout,
+    capture: { keep: 4 * 1024 * 1024, mode: 'head' },
   });
+  if (run.ok) return { ok: true };
+  return { ok: false, error: run.stderr.trim().slice(0, 500) || run.error?.message || `exit ${run.code}` };
 }
 
 /** Both streams and the exit status — for the verbs whose stderr is the answer. */
-function gitBoth(
+async function gitBoth(
   cwd: string, args: string[], timeout: number,
 ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    execFile('git', args, {
-      cwd, timeout, maxBuffer: 8 * 1024 * 1024,
-      // A translated git is still a correct git; a parser that reads its prose
-      // is not. Nothing here depends on the wording any more (see
-      // `bundleVerify`), and pinning the locale keeps it that way.
-      env: { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb' },
-    }, (error, stdout, stderr) => {
-      resolve({ ok: !error, stdout: String(stdout), stderr: String(stderr) });
-    });
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'export-verify', cwd, timeout,
+    capture: { keep: 8 * 1024 * 1024, mode: 'head' },
+    // A translated git is still a correct git; a parser that reads its prose
+    // is not. Nothing here depends on the wording any more (see
+    // `bundleVerify`), and pinning the locale keeps it that way.
+    env: { ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb' },
+    // `bundleVerify` asks a yes/no question; a `no` is its answer.
+    expectFailure: true,
   });
+  return { ok: run.ok, stdout: run.stdout, stderr: run.stderr };
 }

@@ -31,6 +31,7 @@ import { join } from 'node:path';
 import { Runner } from '../server/runner/runner.ts';
 import { Approvals } from '../server/runner/approvals.ts';
 import { recoveryActions } from '../server/service.ts';
+import { resumeOffer } from '../server/service-runs.ts';
 import { loadRun, newRun, runDir, saveRun } from '../server/runner/state.ts';
 import { RECOVER_MAX_PER_PHASE } from '../server/runner/runner-core.ts';
 import { laneNames } from '../server/runner/worktree.ts';
@@ -1044,4 +1045,63 @@ test('a transcript that cannot be carried to the account paying spawns nothing a
     assert.equal(lost.length, 1);
     assert.equal(lost[0].data?.account, 'info');
   } finally { h.cleanup(); }
+});
+
+/**
+ * console-open-findings O1 — the recovery payload must not offer a resume the
+ * resume policy will refuse.
+ *
+ * `phaseDiagnosis` computed `resumable` from two facts (a session exists, the
+ * CLI still holds it) and skipped the third that the runner's own gate applies:
+ * `resumePolicy`. So a phase whose session the policy has already written off —
+ * checkpointed, `partial --reason budget|context`, or large and cold — was shown
+ * "Resume with instruction", and pressing it returned the policy's reason. An
+ * offer nothing can accept is worse than no offer: it costs a person a round
+ * trip to learn what the console already knew. `resolveVehicle` got this right
+ * (it ANDs `notWorth?.choice !== 'fresh'`); the payload is now the same helper.
+ */
+test('O1: a session the resume policy writes off is not offered as resumable', () => {
+  const RESUMABLE = { sessionId: 'sess-warm', tokens: [{ sessionId: 'sess-warm', context: 10_000, at: new Date().toISOString() }] };
+  const warm = resumeOffer(RESUMABLE as never, 'default', Date.now());
+  assert.equal(warm.resumable, true, 'a small warm session is still resumable');
+  assert.equal(warm.policy?.choice, 'resume');
+
+  // The console checkpointed it: the policy says fresh, so nothing may offer a resume.
+  const checkpointed = resumeOffer(
+    { ...RESUMABLE, contextCheckpoint: { at: new Date().toISOString(), sessionId: 'sess-warm', tokens: 820_000 } } as never,
+    'default', Date.now(),
+  );
+  assert.equal(checkpointed.policy?.choice, 'fresh', 'the policy writes a checkpointed session off');
+  assert.equal(checkpointed.resumable, false, 'so the payload must not offer it');
+
+  // It declared itself spent.
+  const spent = resumeOffer(
+    { ...RESUMABLE, lastPartial: { at: new Date().toISOString(), sessionId: 'sess-warm', reason: 'budget' } } as never,
+    'default', Date.now(),
+  );
+  assert.equal(spent.policy?.choice, 'fresh');
+  assert.equal(spent.resumable, false);
+
+  // No session at all is not resumable, and asks the policy nothing.
+  const none = resumeOffer({} as never, 'default', Date.now());
+  assert.equal(none.resumable, false);
+  assert.equal(none.policy, null);
+});
+
+test('O1: the actions the payload offers agree with its own resumable flag', () => {
+  const checkpointed = resumeOffer(
+    {
+      sessionId: 'sess-big',
+      tokens: [{ sessionId: 'sess-big', context: 900_000, at: new Date().toISOString() }],
+      contextCheckpoint: { at: new Date().toISOString(), sessionId: 'sess-big', tokens: 900_000 },
+    } as never,
+    'default', Date.now(),
+  );
+  // the exact call phaseDiagnosis makes — one flag, feeding both fields
+  const actions = recoveryActions('failed', checkpointed.resumable, null);
+  assert.ok(actions.length > 0, 'still a way forward');
+  assert.ok(
+    !actions.some((a) => a.id === 'closeout'),
+    'a closeout resumes the session — never offered for one the policy refuses',
+  );
 });

@@ -27,6 +27,8 @@
  *                and no stopped-by-console marker                          (Pro)
  *   cli          the Claude CLI version against the relay floor
  *   gh           `gh auth status`
+ *   publish      `--allow-publish`: may this console push `pe/*` branches and
+ *                file issues at all (advisory — off is a fine console)
  *   environment  the environment doctor's issues (PATH, a foreign home, push) BLOCKING
  *   console      a console answering on the instance's port, and healthy     BLOCKING when unhealthy
  */
@@ -41,7 +43,7 @@ import type { HooksStatus } from './hooks-install.ts';
 import type { ProbeVerdict } from './prelude.ts';
 
 export type DoctorRowId =
-  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'unit' | 'cli' | 'gh' | 'environment' | 'console';
+  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'unit' | 'cli' | 'gh' | 'publish' | 'git' | 'environment' | 'console';
 
 export type DoctorRow = {
   id: DoctorRowId;
@@ -84,6 +86,18 @@ export type DoctorDeps = {
   unit: () => Promise<UnitFacts | null>;
   cliVersion: () => Promise<string | undefined>;
   gh: () => Promise<ProbeVerdict>;
+  /**
+   * Is `--allow-publish` on — may this console push a `pe/*` branch or file an
+   * issue at all? A flag read, so it is synchronous and never throws; absent
+   * (an older deps builder) reads as off, which is the truthful default.
+   */
+  publish?: () => boolean;
+  /**
+   * `git --version` and `rev-parse --is-inside-work-tree` at the root, run
+   * under the CONSOLE's own `process.env.PATH`. `null` = the probe could not
+   * run at all, which is not the same as git being broken.
+   */
+  git: () => Promise<GitFacts | null>;
   environment: () => EnvIssue[];
   /** A console on the instance's port: reachable, healthy, and whether its dist is stale. `null` = nothing answered. */
   console: () => Promise<{ healthy: boolean; serverStale?: boolean; version?: string } | null>;
@@ -148,6 +162,104 @@ export function hooksVerdict(status: HooksStatus | null): ProbeVerdict {
   return { status: 'ok', ok: true, reason: `installed in ${status.path}, pointing at this copy` };
 }
 
+
+export type GitFacts = {
+  /** `git --version`'s first line, or `null` when it printed none. */
+  version: string | null;
+  /** Its exit code. `null` means git was not on this process's `PATH` at all. */
+  code: number | null;
+  /** stderr's first line — where Apple's licence notice lands. */
+  stderr?: string;
+  /** `rev-parse --is-inside-work-tree` at the root; `null` = no root open to ask about. */
+  insideWorkTree: boolean | null;
+  /** WHICH git answered. Two are usually installed and they behave differently. */
+  path?: string;
+  root?: string | null;
+};
+
+/** Apple's shim's exit code for an unaccepted licence, and the sentence it prints. */
+const XCODE_LICENCE_CODE = 69;
+const XCODE_LICENCE = /xcode license|xcodebuild -license/i;
+
+/**
+ * Is git usable by THIS process?
+ *
+ * The row exists because of one measured incident (errand E7). Under launchd
+ * the console's `PATH` leads with `/usr/bin`, where macOS keeps Apple's `git`
+ * SHIM — and until `xcodebuild -license` has been accepted that shim exits 69
+ * with a licence notice, for every subcommand, forever. On 2026-09-16 this
+ * console's own run read its repository as `not-a-repo`, was refused isolation
+ * and degraded to the shared root, while `doctor` reported the environment
+ * healthy the whole time: nothing it probed ran git.
+ *
+ * Blocking, because a console that cannot run git cannot make a worktree, read
+ * a branch, or land anything — every capability it has is downstream of this.
+ * And "git works in my terminal" is not the question: the probe runs under the
+ * console's own environment, which under a launch agent is a different `PATH`
+ * from the one a person sees.
+ */
+export function gitVerdict(facts: GitFacts | null): ProbeVerdict {
+  if (!facts) return skipped('the git probe could not run');
+  const where = facts.path ? ` (${facts.path})` : '';
+  if (facts.code === null) {
+    return {
+      status: 'fail',
+      ok: false,
+      reason: 'git is not on this console’s PATH — every worktree, branch read and landing needs it',
+    };
+  }
+  if (facts.code === XCODE_LICENCE_CODE || XCODE_LICENCE.test(facts.stderr ?? '')) {
+    return {
+      status: 'fail',
+      ok: false,
+      reason: `git${where} exits ${facts.code}: the Xcode license has not been accepted. `
+        + 'Run `sudo xcodebuild -license accept` once — until then every git this console runs fails silently.',
+    };
+  }
+  if (facts.code !== 0) {
+    return {
+      status: 'fail',
+      ok: false,
+      reason: `git${where} exited ${facts.code}${facts.stderr ? ` — ${facts.stderr}` : ''}`,
+    };
+  }
+  const version = facts.version ?? 'git';
+  if (facts.insideWorkTree === false) {
+    return {
+      status: 'fail',
+      ok: false,
+      reason: `${version}${where} runs, but ${facts.root ?? 'the source directory'} is not a git repository`,
+    };
+  }
+  return {
+    status: 'ok',
+    ok: true,
+    reason: facts.insideWorkTree === true
+      ? `${version}${where}, and the source directory is a git repository`
+      : `${version}${where}`,
+  };
+}
+
+/**
+ * The publish row: advisory in both directions. Off is the shipped default and
+ * a perfectly good console — every landing policy but `pr` and `trunk` needs
+ * no push, and those two park with the reason when the flag is off. On says
+ * what the flag licenses and what still narrows it, so an operator reading
+ * `doctor` is never surprised by a push they did not know was possible.
+ */
+export function publishVerdict(on: boolean): ProbeVerdict {
+  return on
+    ? {
+      status: 'ok', ok: true,
+      reason: 'on — the console may push pe/* branches (never a trunk, never with force) and file issues, '
+        + 'only where a plan\'s permission.destructive row and Issues: line allow it',
+    }
+    : {
+      status: 'skip', ok: true,
+      reason: 'off — the console pushes nothing and files nothing; a `Land: pr|trunk` phase parks with the reason '
+        + '(start with --allow-publish to let a landing push its pe/* branch)',
+    };
+}
 
 export function cliVerdict(version: string | undefined): ProbeVerdict {
   const ok = atLeast(version, RELAY_CLI_FLOOR);
@@ -218,6 +330,10 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
   rows.push(row('hooks', 'Session-presence hooks', true, hooksVerdict(await deps.hooks().catch(() => null))));
   rows.push(row('cli', 'Claude CLI', false, cliVerdict(await deps.cliVersion().catch(() => undefined))));
   rows.push(row('gh', 'GitHub CLI', false, await settle(deps.gh, 'gh auth status')));
+  rows.push(row('publish', 'Outward writes (--allow-publish)', false, publishVerdict(safePublish(deps))));
+  // BLOCKING, unlike `gh` and `cli`: a console whose git does not run cannot
+  // make a worktree, read a branch, or land anything — see `gitVerdict`.
+  rows.push(row('git', 'git', true, gitVerdict(await deps.git().catch(() => null))));
   rows.push(row('environment', 'Environment', true, environmentVerdict(safeIssues(deps))));
   const consoleState = await deps.console().catch(() => null);
   rows.push(row('console', 'Console', true, consoleVerdict(consoleState, deps.instance?.port)));
@@ -235,6 +351,10 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
 
 function safeIssues(deps: DoctorDeps): EnvIssue[] {
   try { return deps.environment(); } catch { return []; }
+}
+
+function safePublish(deps: DoctorDeps): boolean {
+  try { return deps.publish?.() === true; } catch { return false; }
 }
 
 /** The CLI's exit code: 1 when a blocking row failed, else 0. */

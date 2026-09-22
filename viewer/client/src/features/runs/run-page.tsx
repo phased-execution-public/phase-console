@@ -79,6 +79,7 @@ export function RunView({ detail }: { detail: PlanDetail }) {
   const planPhases = detail.phases;
   const planSkills = detail.plan?.sessionBudget?.skills ?? [];
   const planMcp = detail.plan?.sessionBudget?.mcpServers ?? [];
+  const planReviewers = detail.plan?.reviewers ?? [];
 
   const client = useQueryClient();
   const { data: state } = useConsoleState();
@@ -288,12 +289,15 @@ export function RunView({ detail }: { detail: PlanDetail }) {
         planPhases={planPhases}
         planSkills={planSkills}
         planMcp={planMcp}
+        planReviewers={planReviewers}
         qaMode={detail.summary.qaMode}
         allowWrites={Boolean(state?.allowWrites)}
         liveness={detailRun?.liveness}
       />
 
-      {run && <RunTiles run={run} phases={phases} total={detail.phases.length} />}
+      {run && (
+        <RunTiles run={run} phases={phases} total={detail.phases.length} liveness={detailRun?.liveness} />
+      )}
 
       {/* Why this run started, and what it cost and ran session by session
           (phase 19) — under the tiles that give the totals: the two questions
@@ -301,10 +305,12 @@ export function RunView({ detail }: { detail: PlanDetail }) {
       {run && <WhyStarted ledger={runLedger} manifest={run.manifest ?? null} />}
       {run && <LedgerCard ledger={runLedger} />}
 
+
       {/* Where the work IS, under the tiles that say how it is going. Only for
           a run with a checkout story — an isolated one, or one that asked and
           was refused; an ordinary shared run gets nothing here. */}
       <GitCard run={run} git={detailRun?.git} />
+
 
       {/* Always rendered: a plan with no phase graph is a fact about the PLAN,
           and the table says so in the plan's words. The card that used to stand
@@ -327,6 +333,7 @@ export function RunView({ detail }: { detail: PlanDetail }) {
           sessions: terminals?.sessions,
           qaMode: detail.summary.qaMode,
           planSkills,
+          planReviewers,
           allowWrites: Boolean(state?.allowWrites),
         }}
       />

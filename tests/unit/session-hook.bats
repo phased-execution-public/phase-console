@@ -41,7 +41,10 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
-printf '%s' "${CURL_STUB_CODE:-200}"
+# `-w "\n%{http_code}"`: the BODY, then a newline, then the code — which is
+# what the hook splits on to read the console's answer (`peers`, and whatever
+# else it learns to send).
+printf '%s\n%s' "${CURL_STUB_BODY:-}" "${CURL_STUB_CODE:-200}"
 exit "${CURL_STUB_EXIT:-0}"
 STUB
   chmod +x "$STUB/node" "$STUB/curl"
@@ -418,4 +421,116 @@ STUB
   case "$names" in *1700000000123-s1-Stop-[0-9]*.json*) : ;; *) echo "no tie-broken name in: $names"; false ;; esac
   # Both are complete records of the same event.
   for f in $files; do assert_contains "$(cat "$f")" '"event":"Stop"'; done
+}
+
+# ── S1-b — the peer sentence never named the check that answers it ───────────
+# A session told "another session is live in this repository" has learned a
+# fact it cannot act on: whether that session shares its WORKING TREE is a
+# different question, and the read-only scan that answers it costs one command
+# and looks across every plan (a working tree does not know which plan asked for
+# it). Without the line, the answer a fresh session actually acted on was
+# "somebody else is here, carry on" — which is how a hand session was told "safe
+# to start" against a console lane that had been granted but not yet claimed
+# (S1-a's other half).
+@test "hook: a SessionStart that names peers also names the conflicts check (S1-b)" {
+  export CURL_STUB_BODY='{"peers":"1 other session is live here: s2 (phase 4 of demo)."}'
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "1 other session is live here"
+  assert_contains "$output" "phase-lock.sh"
+  assert_contains "$output" "conflicts"
+}
+
+@test "hook: a SessionStart with NO peers says nothing about conflicts (S1-b)" {
+  # The line is advice about a situation. With nobody else here there is no
+  # situation, and a hook that always says everything is a hook nobody reads.
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "additionalContext"
+  refute_contains "$output" "conflicts"
+}
+
+# ---------------------------------------------------------------------------
+# The trace carrier (5.1.0): the presence record joins the drive that spawned
+# the session. The hook is the one thing that fires for EVERY session, so this
+# is where a person's terminal and a runner's lane become distinguishable by
+# something better than cwd and clock.
+# ---------------------------------------------------------------------------
+
+@test "hook: the body carries trace and span from the session's environment" {
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  export PE_TRACE_ID=0123456789abcdef0123456789abcdef
+  export PE_SPAN_ID=fedcba9876543210
+  run bash -c "printf '%s' '$(payload SessionStart)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"trace":"0123456789abcdef0123456789abcdef"'
+  assert_contains "$body" '"span":"fedcba9876543210"'
+}
+
+@test "hook: with no trace in the environment both keys are present and empty" {
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  unset PE_TRACE_ID PE_SPAN_ID
+  run bash -c "printf '%s' '$(payload SessionStart)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"trace":""'
+  assert_contains "$body" '"span":""'
+}
+
+# ---- the messaging socket (5.1.0) --------------------------------------------
+#
+# The hook is the ONLY way the console can learn either value: the socket path
+# is /tmp/cc-socks/<the CLI's own pid>.sock, which nothing outside the process
+# knows, and the token is minted per session. Phase 1, arm S-B measured that
+# both are already exported when SessionStart fires.
+
+@test "hook: SessionStart forwards the CLI's inbox socket and its token" {
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  export CLAUDE_CODE_MESSAGING_SOCKET=/tmp/cc-socks/90400.sock
+  export CLAUDE_CODE_MESSAGING_TOKEN=0123456789abcdef0123456789abcdef
+  run bash -c "printf '%s' '$(payload SessionStart)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"messaging_socket":"/tmp/cc-socks/90400.sock"'
+  assert_contains "$body" '"messaging_token":"0123456789abcdef0123456789abcdef"'
+}
+
+@test "hook: the token is NEVER in the additionalContext the session reads back" {
+  # That line goes into the session's own transcript, which is replayed into a
+  # browser and copied into bug reports. A secret there is a secret published.
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  export CLAUDE_CODE_MESSAGING_SOCKET=/tmp/cc-socks/90400.sock
+  export CLAUDE_CODE_MESSAGING_TOKEN=sup3rs3cr3ttok3nsup3rs3cr3ttok3n
+  run bash -c "printf '%s' '$(payload SessionStart)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  refute_contains "$output" 'sup3rs3cr3ttok3nsup3rs3cr3ttok3n'
+  refute_contains "$output" '/tmp/cc-socks/90400.sock'
+  # …while the POST body did carry it.
+  assert_contains "$(cat "$STUB/curl.body")" 'sup3rs3cr3ttok3nsup3rs3cr3ttok3n'
+}
+
+@test "hook: only SessionStart carries them — a Stop or an End would teach a stale path" {
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  export CLAUDE_CODE_MESSAGING_SOCKET=/tmp/cc-socks/90400.sock
+  export CLAUDE_CODE_MESSAGING_TOKEN=0123456789abcdef0123456789abcdef
+  for event in Stop SessionEnd Notification; do
+    run bash -c "printf '%s' '$(payload "$event")' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+    [ "$status" -eq 0 ]
+    body="$(cat "$STUB/curl.body")"
+    assert_contains "$body" '"messaging_socket":""'
+    assert_contains "$body" '"messaging_token":""'
+  done
+}
+
+@test "hook: with no socket in the environment both keys are present and empty" {
+  # The body is a fixed-shape object every field of which the registry reads by
+  # name — the same rule the trace keys follow.
+  export PHASE_CONSOLE_URL="http://127.0.0.1:4999"
+  unset CLAUDE_CODE_MESSAGING_SOCKET CLAUDE_CODE_MESSAGING_TOKEN
+  run bash -c "printf '%s' '$(payload SessionStart)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  body="$(cat "$STUB/curl.body")"
+  assert_contains "$body" '"messaging_socket":""'
+  assert_contains "$body" '"messaging_token":""'
 }

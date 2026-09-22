@@ -345,8 +345,95 @@ if (repoChunk) {
   );
 }
 
+/*
+ * The Repo destination's one heavy section, by the emulator's three rules.
+ *
+ * The Landscape section (many-plans-one-repo phase 14) draws the repository
+ * map on React Flow with a d3-dag layout — ~97 KiB gzipped by the phase-1
+ * spike (`test/fixtures/spikes/react-flow-bundle.md`), behind a section most
+ * readers of `#/repo` never open. `features/repo/index.tsx` reaches it through
+ * `features/repo/pro/lazy-landscape`, so the library rides in a chunk of its
+ * own: not in the repo chunk's static graph, not in the precache, not
+ * preloaded. Each is found by CONTENT — whichever chunk carries React Flow's
+ * own class prefix — for the reason the pane check gives: a name is exactly
+ * what a bundler is free to change. In the free tree nothing imports the
+ * library and no chunk carries it, so the three read as vacuously true there;
+ * the Pro block below is what asserts the chunk exists at all.
+ */
+const REACT_FLOW_MARK = 'react-flow__';
+const reactFlowChunks = assets.filter(
+  (name) =>
+    name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(REACT_FLOW_MARK),
+);
+if (repoChunk) {
+  const repoGraph = chunkClosure(repoChunk);
+  const pulled = [...repoGraph].filter((name) => reactFlowChunks.includes(name));
+  check(
+    `the repo route's static graph carries no React Flow (${repoGraph.size} chunks walked)`,
+    pulled.length === 0,
+    `${pulled.join(', ')} is reachable from ${repoChunk} by static imports. The Landscape section must be ` +
+      'reached through `features/repo/pro/lazy-landscape` — never `landscape-section` or `repo-map` ' +
+      'directly from anything the Repo destination mounts.',
+  );
+}
+const precachedReactFlow = reactFlowChunks.filter((name) => sw.includes(name));
+check(
+  `the precache excludes React Flow, whatever the chunk is called (${reactFlowChunks.join(', ') || 'none'})`,
+  precachedReactFlow.length === 0,
+  `precached: ${precachedReactFlow.join(', ')} — add it to globIgnores in vite.config.ts. A renamed landscape ` +
+    'chunk is the usual cause; see the note in features/repo/pro/lazy-landscape.tsx.',
+);
+
 const preloaded = [...html.matchAll(/<link[^>]+rel="modulepreload"[^>]+href="\/assets\/([^"]+)"/g)].map(
   (match) => match[1],
+);
+const preloadedReactFlow = reactFlowChunks.filter((name) => preloaded.includes(name));
+check(
+  'the document never modulepreloads React Flow, whatever the chunk is called',
+  preloadedReactFlow.length === 0,
+  `modulepreloaded: ${preloadedReactFlow.join(', ')} — a preloaded chunk is fetched by every visitor on ` +
+    'first paint. Usually a static import that should be a `lazy()`; see features/repo/pro/lazy-landscape.tsx.',
+);
+/*
+ * The same rule for the fleet app's one heavy piece.
+ *
+ * The pairing QR (many-plans-one-repo phase 23) is drawn by the `qrcode`
+ * encoder, which nobody opening the fleet app to read an inbox needs.
+ * `features/fleet/reach.tsx` reaches it through `features/fleet/lazy-qr`, so
+ * the encoder rides in a chunk of its own: not in the Fleet chunk's static
+ * graph, not in the precache, not preloaded. Found by CONTENT — the encoder's
+ * own error sentence — for the reason the two checks above give. In the free
+ * tree nothing imports it and no chunk carries it, so the three read as
+ * vacuously true there; the Pro block asserts the chunk exists at all.
+ */
+const QR_MARK = 'too big to be stored in a QR Code';
+const qrChunks = assets.filter(
+  (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(QR_MARK),
+);
+const fleetChunk = assets.find((name) => /^fleet-.*\.js$/.test(name));
+if (fleetChunk) {
+  const fleetGraph = chunkClosure(fleetChunk);
+  const pulled = [...fleetGraph].filter((name) => qrChunks.includes(name));
+  check(
+    `the fleet chunk's static graph carries no QR encoder (${fleetGraph.size} chunks walked)`,
+    pulled.length === 0,
+    `${pulled.join(', ')} is reachable from ${fleetChunk} by static imports. The pairing QR must be ` +
+      'reached through `features/fleet/lazy-qr` — never `qr-code` directly from anything the fleet app mounts.',
+  );
+}
+const precachedQr = qrChunks.filter((name) => sw.includes(name));
+check(
+  `the precache excludes the QR encoder, whatever the chunk is called (${qrChunks.join(', ') || 'none'})`,
+  precachedQr.length === 0,
+  `precached: ${precachedQr.join(', ')} — add it to globIgnores in vite.config.ts. A renamed qr-code chunk ` +
+    'is the usual cause; see the note in features/fleet/lazy-qr.tsx.',
+);
+const preloadedQr = qrChunks.filter((name) => preloaded.includes(name));
+check(
+  'the document never modulepreloads the QR encoder, whatever the chunk is called',
+  preloadedQr.length === 0,
+  `modulepreloaded: ${preloadedQr.join(', ')} — a preloaded chunk is fetched by every visitor on first paint. ` +
+    'Usually a static import that should be a `lazy()`; see features/fleet/lazy-qr.tsx.',
 );
 const preloadedXterm = xtermChunks.filter((name) => preloaded.includes(name));
 check(

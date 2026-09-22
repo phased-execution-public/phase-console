@@ -313,3 +313,107 @@ describe('the phase table’s branch chip', () => {
     expect(screen.queryByTestId('branch-chip')).toBeNull();
   });
 });
+
+/*
+ * The landing chips (many-plans-one-repo phase 15): what the PLAN says
+ * happens to a phase's commits (`Land:`, resolved phase → plan → default by
+ * the server, `PhaseView.land`) and, once the engine has written one, where
+ * the landing HAS GOT TO (`PhaseRecord.landing.state`). Two chips because they
+ * are two facts from two sources — the plan's word never changes while the
+ * run drives; the state does.
+ */
+function mountLandingTable(planPhases: PhaseView[], state: RunState | null) {
+  const client = new QueryClient(queryClientConfig);
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouterProvider initial="#/plan/demo/run">
+        <TooltipProvider>
+          <PhaseTable slug="demo" run={state} planPhases={planPhases} live allowRun />
+        </TooltipProvider>
+      </MemoryRouterProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe('the phase table’s landing chips', () => {
+  it('shows the plan’s Land: word on the row, and says where the word came from', () => {
+    mountLandingTable(
+      [
+        { ...branchPhase(10), land: { value: 'pr', source: 'phase' } },
+        { ...branchPhase(11), land: { value: 'integrate', source: 'plan' } },
+      ],
+      null,
+    );
+    const chips = screen.getAllByTestId('land-chip');
+    expect(chips.map((c) => c.textContent)).toEqual(['Land: pr', 'Land: integrate']);
+    expect(chips[0]!.getAttribute('title')).toMatch(/this phase’s own `Land:` line/);
+    expect(chips[1]!.getAttribute('title')).toMatch(/the plan’s `Land:` line/);
+  });
+
+  it('says nothing for the shipped default — every row would say hold, and a chip on every row says nothing', () => {
+    mountLandingTable([{ ...branchPhase(10), land: { value: 'hold', source: 'default' } }], null);
+    expect(screen.queryByTestId('land-chip')).toBeNull();
+  });
+
+  it('shows a hold the plan asked for by name — that is a decision, not a default', () => {
+    mountLandingTable([{ ...branchPhase(10), land: { value: 'hold', source: 'plan' } }], null);
+    expect(screen.getByTestId('land-chip')).toHaveTextContent('Land: hold');
+  });
+
+  it('shows where the landing has got to once the engine has written a state, on its own row only', () => {
+    const state = branchRun({});
+    state.phases = {
+      '10': {
+        phase: 10,
+        status: 'done',
+        attempts: 1,
+        costUsd: 0,
+        landing: {
+          policy: 'pr',
+          conflict: 'halt',
+          state: 'pr-open',
+          step: 'watch',
+          attempts: 1,
+          at: '2026-09-21T10:30:00.000Z',
+          repos: { '': { branch: 'pe/demo-p10', state: 'pr-open' } },
+        },
+      },
+    } as RunState['phases'];
+    mountLandingTable(
+      [{ ...branchPhase(10), land: { value: 'pr', source: 'plan' } }, branchPhase(11)],
+      state,
+    );
+    const chips = screen.getAllByTestId('landing-state-chip');
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent('pr-open');
+    expect(chips[0]!.getAttribute('title')).toMatch(/watching the pull request/);
+  });
+
+  it('paints a parked landing as needing a person, in the state vocabulary’s own tone', () => {
+    const state = branchRun({});
+    state.phases = {
+      '10': {
+        phase: 10,
+        status: 'done',
+        attempts: 1,
+        costUsd: 0,
+        landing: {
+          policy: 'integrate',
+          conflict: 'park',
+          state: 'conflict',
+          step: 'parked',
+          attempts: 1,
+          at: '2026-09-21T10:30:00.000Z',
+          repos: { '': { branch: 'pe/demo-p10', state: 'conflict' } },
+        },
+      },
+    } as RunState['phases'];
+    mountLandingTable([branchPhase(10)], state);
+    const chip = screen.getByTestId('landing-state-chip');
+    expect(chip).toHaveTextContent('conflict');
+    expect(chip.getAttribute('title')).toMatch(/parked/);
+    // The amber family — a person owns the next step — never the failed red:
+    // nothing failed, the engine set the phase aside and drove on.
+    expect(chip.className).toMatch(/text-accent/);
+  });
+});

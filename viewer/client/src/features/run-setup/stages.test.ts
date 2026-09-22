@@ -78,10 +78,18 @@ describe('every field has a stage', () => {
   });
 
   it('puts the scope on What runs, the money and the stops on Money and stops, the rest on How', () => {
-    // The prelude's five on Decisions (phase 11) — the three the door
-    // requires, the waivers a person acknowledges, and the recorded override.
+    // The prelude's answers on Decisions (phase 11) — the three the door
+    // requires, the waivers a person acknowledges, the recorded override, and
+    // (2026-09-18) the verification probe's approvals and waivers.
     expect([...fieldsOnStage('start', 'decisions')].sort()).toEqual(
-      ['accounts', 'acknowledgedWaivers', 'manifestOverride', 'relay', 'resumeOnRestart'].sort(),
+      [
+        'accounts',
+        'acknowledgedWaivers',
+        'manifestOverride',
+        'relay',
+        'resumeOnRestart',
+        'verifyAnswers',
+      ].sort(),
     );
     // A phase launch asks them too: on a finished run it is a fresh start.
     expect(stageHasControls('phase', 'decisions')).toBe(true);

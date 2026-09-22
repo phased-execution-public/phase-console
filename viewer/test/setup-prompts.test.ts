@@ -92,3 +92,4 @@ test('the README stays short enough to be read', () => {
   assert.ok(lines < 200, `README.md is ${lines} lines — move deep sections into docs/`);
 });
 
+

@@ -171,7 +171,9 @@ twin() {  # twin <slug> <rows…>  — write a decisions.md twin in the writer's
 @test "boot-prompt: a plan with no manifest still tells the session the keys and the duty" {
   setup_docs linear linear
   run pg linear --boot-prompt 1
-  assert_contains "$output" "this plan carries no \`## Decisions\` manifest — the keys are: permission.policy, permission.destructive, credentials"
+  # `issues` (5.1.0) sits third, beside `permission.destructive`: both answer
+  # what this run may write OUTWARD, to a place no `git reset` takes back.
+  assert_contains "$output" "this plan carries no \`## Decisions\` manifest — the keys are: permission.policy, permission.destructive, issues, credentials"
   assert_contains "$output" "blocked --needs <key> --reason"
 }
 

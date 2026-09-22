@@ -77,8 +77,10 @@ test('start-time preflight names each phase that would park, by its actual defec
     // Phase 1's nested sub-bullets are runnable — the shape that used to read
     // as "no verification" must produce no advisory at all.
     assert.doesNotMatch(advisories.join('\n'), /phase 1/);
-    assert.match(advisories[0], /phase 2's §Verification yields nothing the runner can execute/);
-    assert.match(advisories[1], /phase 3 has no §Verification/);
+    // The advisory IS boarding's own park sentence (2026-09-18): one review
+    // decides both, so the start response cannot promise what boarding breaks.
+    assert.match(advisories[0], /phase 2's §Verification contains nothing the runner can execute/);
+    assert.match(advisories[1], /the plan states no verification for phase 3/);
 
     // Scoping to a phase asks about that phase only.
     assert.deepEqual(await svc.verificationPreflight('preview', [1]), []);

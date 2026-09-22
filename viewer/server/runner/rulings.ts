@@ -77,6 +77,16 @@ export type Ruling = {
   /** What it costs if the call was wrong — the field that makes a ruling worth reading. */
   costIfWrong?: string;
   /**
+   * Who a DEFERRAL was left for: a phase number, `next` (every phase that
+   * depends on this one) or `all`. It is what turns "I left this for later"
+   * into something `phase-graph.sh --notes N` can hand to a session that does
+   * not exist yet — a deferral nobody is addressed by is a note nobody reads.
+   *
+   * Only a deferral has one. An ambiguity and a deviation are a session
+   * explaining ITSELF, and `phase-outcome.sh` refuses `--for` on both.
+   */
+  for?: string;
+  /**
    * The decision key the ruling answers (`phase-outcome.sh … --needs <key>`),
    * kept only when it is one of the manifest's keys. This is what turns a
    * ruling from a note into something the inbox can offer to remember and
@@ -131,6 +141,15 @@ export function rulingId(slug: string, phase: number, at: string, what: string):
 /** The shape a stamped id must have to be believed: what `rulingId` emits. */
 const STAMPED_ID_RE = /^[0-9a-f]{12}$/;
 
+/**
+ * A deferral's addressee, as `--notes` resolves it: a phase number from 1, the
+ * dependency relation `next`, or the broadcast `all`. Anything else is read as
+ * ABSENT rather than carried, because a `for` nothing can resolve is worse
+ * than none — the note is collected for nobody while its writer believes it
+ * was handed over, which is exactly the failure F26 exists to name.
+ */
+const FOR_RE = /^([1-9][0-9]*|next|all)$/;
+
 function isDecisionKey(value: unknown): value is DecisionKey {
   return typeof value === 'string' && (DECISION_KEYS as readonly string[]).includes(value);
 }
@@ -160,14 +179,18 @@ function toRuling(parsed: Record<string, unknown>): Ruling | null {
   const stamped = typeof parsed.id === 'string' && STAMPED_ID_RE.test(parsed.id) ? parsed.id : null;
   const by = typeof parsed.by === 'string' && parsed.by.trim() ? parsed.by.trim().slice(0, 64) : undefined;
   const relay = relayOf(parsed.relay);
+  const kind = isKind(parsed.kind) ? parsed.kind : 'ambiguity';
+  const addressee = kind === 'deferral' && typeof parsed.for === 'string' && FOR_RE.test(parsed.for)
+    ? parsed.for : undefined;
   return {
     id: stamped ?? rulingId(slug, phase, at, what),
     slug,
     phase,
-    kind: isKind(parsed.kind) ? parsed.kind : 'ambiguity',
+    kind,
     what,
     ...(why ? { why } : {}),
     ...(cost ? { costIfWrong: cost } : {}),
+    ...(addressee ? { for: addressee } : {}),
     ...(isDecisionKey(parsed.decisionKey) ? { decisionKey: parsed.decisionKey } : {}),
     ...(session ? { sessionId: session } : {}),
     ...(by ? { by } : {}),

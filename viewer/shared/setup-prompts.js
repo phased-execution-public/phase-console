@@ -46,12 +46,13 @@ export const INSTALL_PROMPT = `Install the phased-execution skill for me, and as
 4. Before enabling anything, explain these one at a time and let me answer each:
      --allow-writes   scaffold plans/handoffs, record QA, take locks, close plans
      --allow-run      spawn unattended Claude sessions that edit my repository
-                      for hours — the widest of the seven, say so plainly
+                      for hours — the widest of the eight, say so plainly
      --allow-terminal a real shell in the browser, running as me
      --allow-agent    interactive claude sessions and the New-plan wizard
      --allow-accounts register Claude accounts and switch between them mid-run
      --allow-mcp      register MCP servers and attach them to plans and phases
      --allow-webhooks POST every announcement to a Slack/Discord/Telegram URL
+     --allow-publish  push a finished phase's pe/* branch, never a trunk or forced
    Default every one of them to off. Then start it with only what I chose:
      bash <skill>/start --root <repo> [flags]
 5. Open http://127.0.0.1:4123 and confirm it loads. If it does not, tell me
@@ -103,6 +104,7 @@ export const TAILSCALE_PROMPT = `Make my Phase Console reachable from my phone o
 
 Never widen --host to expose the console on a network interface. The identity
 header is trustworthy only because nothing but the proxy can reach the port.`;
+
 
 /** Everything above, by id, so a surface can enumerate rather than hard-code. */
 export const SETUP_PROMPTS = [

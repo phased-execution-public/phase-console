@@ -25,7 +25,7 @@ import { fromAutomation } from '../../shared/automation-model.js';
 import { buildAgentLaunch, type ResumeTarget } from '../agent.ts';
 import { parseRecoveryRequest, type RecoveryFacts } from '../recovery.ts';
 import { parseQaRequest, type QaFacts } from '../qa-session.ts';
-import { isClientDisconnect, log } from '../log.ts';
+import { isClientDisconnect, log, LEVELS, levelState, revertLevel, setLevel, type Level } from '../log.ts';
 import { EFFORTS, isEffort, PERMISSION_MODES } from '../runner/spawn.ts';
 import {
   DEFAULT_PERMISSION_PROFILE, isPermissionProfile, type PolicyScope,
@@ -42,17 +42,22 @@ import { searchCatalog } from '../mcp/index.ts';
 import { MCP_ID_RE } from '../mcp/store.ts';
 import { isMcpPolicy, isOnLimitPolicy, type PhaseOptions } from '../runner/state.ts';
 import { METRICS_CONTENT_TYPE } from '../analysis/metrics.ts';
-import { debugFor } from '../debug/deps.ts';
+import { debugFor, runBundleDeps } from '../debug/deps.ts';
+import { parseSince, runBundle } from '../debug/bundle.ts';
 import { isRunId, isSlug, parseDebugQuery } from '../debug/index.ts';
 import type { DebugEntry } from '../debug/sources.ts';
 import { sendBody } from '../http/compress.ts';
 import { RUN_PRIORITIES, type RunPriority } from '../../shared/orchestration-model.js';
-import { ULTRA_REVIEW_MODES, type UltraReviewMode } from '../../shared/run-lifecycle.js';
+import { AUTONOMY_MODES, ULTRA_REVIEW_MODES, type UltraReviewMode } from '../../shared/run-lifecycle.js';
 import { PLAN_INCLUDES, STATE_INCLUDES, parseInclude } from '../../shared/projection.js';
 import {
-  ISOLATED, ISOLATION_MODES, SETTLE_STRATEGIES,
+  ISOLATED, ISOLATION_MODES, SETTLE_STRATEGIES, retentionOf,
   type IsolationMode, type SettleStrategy,
 } from '../../shared/worktree-model.js';
+import { CONFLICT_POLICIES, LAND_POLICIES, type ConflictPolicy, type LandPolicy } from '../../shared/landing-model.js';
+import { ISSUE_MODES, type IssueMode } from '../../shared/issues-model.js';
+import { MESSAGING_WORDS, type MessagingWord } from '../../shared/message-model.js';
+import { branchExists, issuesModeLoosens } from '../runner/runner-core.ts';
 import { QA_DIRECTIVES } from '../../shared/plan-vocab.js';
 
 export type ApiContext = { service: Service };
@@ -303,6 +308,21 @@ const SCOPE_KEYS = ['slug', 'category', 'runId', 'sessionId', 'phase'] as const;
  * it against the cached meters), or nothing — never an arbitrary string.
  */
 /**
+ * The launch draft's answers to the prelude's verification probe (2026-09-18):
+ * `approve` is a list of `commandFingerprint`s, `waive` of `<phase>:<fp>`.
+ * Fingerprints only — a command's text is not an answer, because the prelude
+ * resolves every fp against its own reviews and the door never trusts a string
+ * it was sent. Anything off shape is dropped; nothing left is no answer.
+ */
+function verifyAnswersOf(approve: unknown, waive: unknown): { approve: string[]; waive: string[] } | undefined {
+  const list = (value: unknown, shape: RegExp) => (Array.isArray(value) ? value : [])
+    .filter((entry): entry is string => typeof entry === 'string' && shape.test(entry))
+    .slice(0, 512);
+  const answers = { approve: list(approve, /^[0-9a-f]{64}$/), waive: list(waive, /^\d{1,4}:[0-9a-f]{64}$/) };
+  return answers.approve.length || answers.waive.length ? answers : undefined;
+}
+
+/**
  * The accounts a start may name, checked against the instance's own registry
  * (phase 11): the machine login always, a registered id, `auto` never (the
  * prelude wants a LIST to judge, not a choice to make). A minimum outside
@@ -451,6 +471,20 @@ function intProblem(value: unknown, field: string, min: number, max: number): st
     return `${field} must be a whole number between ${min} and ${ceiling}.`;
   }
   return null;
+}
+
+/**
+ * A retention word the vocabulary knows — a `WORKTREE_RETENTION` member or a
+ * readable `ttl:<h>` — lower-cased; anything else is `undefined`, "you did
+ * not say". Membership is asked of the owner's coercer because the vocabulary
+ * is OPEN (the ttl member has a parameter), and a word the coercer had to
+ * fall back on is dropped rather than stored: a typo must never be the reason
+ * a tree was deleted.
+ */
+function retentionWord(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const word = value.trim().toLowerCase();
+  return word && retentionOf(word) === word ? word : undefined;
 }
 
 /**
@@ -771,6 +805,20 @@ export async function handleApi(
       json(res, 200, { sessions: service.sessionViews() });
       return true;
     }
+
+    // `GET /api/sessions/<id>/events`: the raw hook payloads, in order. The
+    // registry's record says what is true NOW; this says how it got that way,
+    // which is the only form in which a presence bug is arguable. A read, so
+    // no flag — and the credentials were filtered at the write, not here, so
+    // there is nothing on this path that could forget to.
+    if (head === 'sessions' && rest[1] === 'events' && req.method === 'GET') {
+      const limit = Number(url.searchParams.get('limit'));
+      json(res, 200, {
+        sessionId: rest[0],
+        events: service.sessionEvents(rest[0] ?? '', Number.isFinite(limit) && limit > 0 ? limit : undefined),
+      });
+      return true;
+    }
     // `GET /api/converge`: the convergence loop's standing — on or off for this
     // console, the sweep interval, what is queued, and its last pass per plan
     // (the Pulse's convergence line). Display only: no flag.
@@ -912,6 +960,7 @@ export async function handleApi(
         }));
         return true;
       }
+
 
       json(res, 404, { error: 'unknown repository surface' });
       return true;
@@ -1264,8 +1313,17 @@ export async function handleApi(
         // Derived, not supplied (SHD-3): the client used to send the literal
         // `'console'`, so a click, a script and a tailnet caller were one
         // record. The body may still offer a LABEL; the transport is read.
-        const outcome = service.restart(actorOfRequest(req, service.flags, body), body.force === true);
-        json(res, outcome.ok ? 200 : 409, outcome);
+        const actor = actorOfRequest(req, service.flags, body);
+        // `update: false` is the plain restart; anything else lets a console
+        // that can update itself come back on the latest version, and
+        // `whenIdle` lets a press made mid-run wait for the live sessions
+        // instead of being refused. Both are answered at once with 202 — the
+        // process goes down only once the update, or the wait, is over.
+        const outcome = service.restart(actor, body.force === true, {
+          update: body.update !== false,
+          ...(body.whenIdle === true ? { whenIdle: true } : {}),
+        });
+        json(res, outcome.ok ? (outcome.updating || outcome.waiting ? 202 : 200) : 409, outcome);
         return true;
       }
     }
@@ -1980,6 +2038,69 @@ export async function handleApi(
     // console somebody debugs. Its own log, the supervisor's stdout/stderr pair
     // and the environment doctor's findings are all still there, and they are
     // the three things that explain why no directory opened.
+    /**
+     * How loud this console is, and for how long.
+     *
+     * Turning debug on used to mean restarting with an environment variable —
+     * which loses the very run you were trying to look at. The override reverts
+     * by ITSELF, on a deadline compared against the clock rather than a timer,
+     * because a console left writing debug lines until somebody remembers is a
+     * console writing debug lines forever.
+     *
+     * Local scope and the console header, like every other POST that changes
+     * this process: it is not a capability (a read-only console must still be
+     * able to explain itself) but it is nobody else's page's business.
+     */
+    /*
+     * `GET /api/debug/retention`: every sink's bytes, its policy row, and what
+     * the next sweep would do. A read, so no flag and no CSRF header — "what is
+     * using my disk" is display, and it was the question this console could not
+     * answer at all. The list of actions is the SAME list the sweep performs,
+     * so the card can promise it rather than describing a second computation.
+     */
+    if (head === 'debug' && rest[0] === 'retention' && req.method === 'GET') {
+      json(res, 200, service.retentionNow());
+      return true;
+    }
+
+    if (head === 'debug' && rest[0] === 'level') {
+      if (req.method === 'GET') {
+        json(res, 200, { ...levelState(), levels: LEVELS });
+        return true;
+      }
+      if (req.method === 'DELETE') {
+        const refused = guardCsrf(req);
+        if (refused) { json(res, 403, { error: refused }); return true; }
+        revertLevel();
+        log.info('log.level-reverted', { by: actorOfRequest(req, service.flags).by });
+        json(res, 200, { ...levelState(), levels: LEVELS });
+        return true;
+      }
+      if (req.method === 'POST') {
+        const refused = guardCsrf(req);
+        if (refused) { json(res, 403, { error: refused }); return true; }
+        const body = await readBody(req);
+        const level = body.level === undefined ? undefined : String(body.level);
+        const debugSpec = body.debug === undefined ? undefined : String(body.debug).slice(0, 200);
+        const ttlMs = Number.isFinite(Number(body.ttlMs)) ? Number(body.ttlMs) : undefined;
+        try {
+          const state = setLevel({
+            ...(level === undefined ? {} : { level: level as Level }),
+            ...(debugSpec === undefined ? {} : { debug: debugSpec }),
+            ...(ttlMs === undefined ? {} : { ttlMs }),
+          });
+          log.info('log.level-changed', {
+            level: state.level, debug: state.debug, until: state.until,
+            by: actorOfRequest(req, service.flags, body).by,
+          });
+          json(res, 200, { ...state, levels: LEVELS });
+        } catch (error) {
+          json(res, 400, { error: String((error as Error)?.message ?? error) });
+        }
+        return true;
+      }
+    }
+
     if (head === 'debug' && req.method === 'GET') {
       const debug = debugFor(service);
 
@@ -1999,9 +2120,10 @@ export async function handleApi(
       // with `?run=../../../x` created a directory outside the state dir.
       const runParam = url.searchParams.get('run');
       if (runParam !== null && !isRunId(runParam)) {
-        json(res, 400, { error: 'run must be a run id: eight hex characters' });
+        json(res, 400, { error: 'run must be a run id: 8-32 hex characters' });
         return true;
       }
+
 
       // The log explorer's read: every source, merged and filtered.
       if (rest[0] === 'index') {
@@ -2022,6 +2144,41 @@ export async function handleApi(
       // browser saves rather than renders; the default is a plain read so
       // `curl /api/debug/bundle` is the one-liner the docs can promise.
       if (rest[0] === 'bundle') {
+        // `?run=` asks a different question — "why did THIS run do that" —
+        // and gets a different artefact: a tar.gz of one run's own files.
+        // Always a download, because a gzip rendered inline is nothing.
+        if (runParam) {
+          if (!slugParam) {
+            json(res, 400, { error: 'a run bundle needs its plan: pass slug=<plan> with run=<id>' });
+            return true;
+          }
+          try {
+            const built = await runBundle(
+              {
+                slug: slugParam,
+                runId: runParam,
+                since: parseSince(url.searchParams.get('since'), Date.now()),
+              },
+              runBundleDeps(service, slugParam, runParam),
+            );
+            sendBody(
+              res,
+              200,
+              built.body,
+              {
+                'content-type': 'application/gzip',
+                'content-disposition': `attachment; filename="${built.filename}"`,
+                'cache-control': 'no-store',
+              },
+              // Already compressed: a `vary` and a second encoding would only
+              // make it bigger and confuse every proxy between here and a phone.
+              { compressible: false },
+            );
+          } catch (error) {
+            json(res, 404, { error: String((error as Error)?.message ?? error) });
+          }
+          return true;
+        }
         const bundle = await debug.bundle(slugParam ? { slug: slugParam } : {});
         if (url.searchParams.get('download') === '1') {
           const body = Buffer.from(`${JSON.stringify(bundle, null, 2)}\n`, 'utf8');
@@ -2282,6 +2439,25 @@ export async function handleApi(
       }
       if (sub === 'qa-prompt' && arg) { text(res, 200, await service.qaPrompt(slug, Number(arg))); return true; }
       if (sub === 'memory-block') { text(res, 200, await service.memoryBlock(slug)); return true; }
+      /* What earlier phases left for this one — the same block its boot prompt
+       * carries, so a person can read a phase's mail before boarding it and
+       * after, and see whether the session was ever handed the thing somebody
+       * meant it to have.
+       *
+       * Unflagged and GET-only: it reads three files a `--allow-writes`-less
+       * console may already read (a handoff, a rulings ledger, a messages
+       * ledger) and answers with the engine's own words. Mounted
+       * `plans/<slug>/notes/<N>` like `gate`, `qa-prompt` and `review`. */
+      if (sub === 'notes' && arg) {
+        if (req.method !== 'GET') { json(res, 405, { error: 'GET' }); return true; }
+        const phase = Number(arg);
+        if (!Number.isInteger(phase) || phase < 1) {
+          json(res, 400, { error: 'the notes route needs a phase number' });
+          return true;
+        }
+        json(res, 200, { slug, phase, notes: await service.notes(slug, phase) });
+        return true;
+      }
       // Read-only: what boarding will find before any money is spent —
       // missing leads, cwd-unpinned commands, human-only fragments, phases
       // that would park. The plan page badges from this.
@@ -2773,7 +2949,7 @@ export async function handleApi(
         // has ever started a run on — which is every plan somebody is driving
         // by hand.
         // The run-start prelude for the launch form's DRAFT (phase 11): the
-        // manifest rendered and the four probes run over the console's own
+        // manifest rendered and the probes run over the console's own
         // facts, before Launch is pressed — the same computation the start
         // door makes, so what the form shows is what the door will judge.
         // The draft's answers ride in the query.
@@ -2788,6 +2964,11 @@ export async function handleApi(
           const relay = (RELAY_MODES as readonly string[]).includes(q.get('relay') ?? '') ? q.get('relay')! : undefined;
           const resume = q.get('resumeOnRestart');
           const ack = (q.get('ack') ?? '').split(',').map((k) => k.trim()).filter(Boolean);
+          // Probe 5's question: which phases the run will drive, under which
+          // autonomy, and the draft's answers so far (fingerprints only).
+          const only = (q.get('only') ?? '').split(',').map(Number).filter((n) => Number.isInteger(n) && n > 0);
+          const autonomy = (AUTONOMY_MODES as readonly string[]).includes(q.get('autonomy') ?? '') ? q.get('autonomy')! : undefined;
+          const verifyAnswers = verifyAnswersOf((q.get('approve') ?? '').split(','), (q.get('waive') ?? '').split(','));
           try {
             const prelude = await service.prelude(slug, {
               ...(accounts?.length ? { accounts } : {}),
@@ -2797,6 +2978,9 @@ export async function handleApi(
               ...(q.get('model') ? { model: q.get('model')! } : {}),
               ...(q.get('profile') ? { permissionProfile: q.get('profile')! } : {}),
               ...(q.get('mcpPolicy') ? { mcpPolicy: q.get('mcpPolicy')! } : {}),
+              ...(only.length ? { onlyPhases: only } : {}),
+              ...(autonomy ? { autonomy } : {}),
+              ...(verifyAnswers ? { verifyAnswers } : {}),
             });
             json(res, 200, { prelude });
           } catch (error) {
@@ -2833,6 +3017,8 @@ export async function handleApi(
         });
         return true;
       }
+
+
 
       // `POST /api/run/:slug/rulings/:id/remember {scope: plan|global}` — a
       // ruling becomes a standing answer (phase 12). Before the run-verb block
@@ -2880,6 +3066,10 @@ export async function handleApi(
               // arbitrary but finite, because "keep reviewing forever" is the
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
+              // The per-repository threshold (phase 15): a whole number, and
+              // a ceiling that is merely finite — the console's own cap clamps
+              // it at admission, so the door need not know that number.
+              ?? intProblem(body.maxConcurrentPerRepo, 'maxConcurrentPerRepo', 1, 99)
               ?? phaseOptionsProblem(body.phaseOptions);
             if (problem) { json(res, 400, { error: problem }); return true; }
 
@@ -3036,6 +3226,22 @@ export async function handleApi(
               // `auto` resolves in the service against the cached meters.
               accountId: accountChoice(body.accountId, service),
               onLimit: isOnLimitPolicy(body.onLimit) ? body.onLimit : undefined,
+              // Phase 15's seven, read by the posture every word above takes:
+              // only a member of the owner's vocabulary means anything, and
+              // everything else is `undefined` — "you did not say" — so the
+              // plan's line, the stored preference or the shipped default
+              // decides. A typo must never fork a branch from a ref nobody
+              // named, delete a tree, or let a session file an issue.
+              baseBranch: typeof body.baseBranch === 'string' && body.baseBranch.trim()
+                ? body.baseBranch.trim().slice(0, 128) : undefined,
+              maxConcurrentPerRepo: body.maxConcurrentPerRepo === undefined || body.maxConcurrentPerRepo === null
+                || body.maxConcurrentPerRepo === '' ? undefined : Number(body.maxConcurrentPerRepo),
+              worktreeRetention: retentionWord(body.worktreeRetention),
+              landing: LAND_POLICIES.includes(body.landing as never) ? body.landing as LandPolicy : undefined,
+              conflictPolicy: CONFLICT_POLICIES.includes(body.conflictPolicy as never)
+                ? body.conflictPolicy as ConflictPolicy : undefined,
+              messaging: MESSAGING_WORDS.includes(body.messaging as never) ? body.messaging as MessagingWord : undefined,
+              issuesMode: ISSUE_MODES.includes(body.issuesMode as never) ? body.issuesMode as IssueMode : undefined,
               // A boolean or nothing: absent lets the stored preference (fresh
               // run) or the run's own sticky choice (resume) decide.
               autoRecover: typeof body.autoRecover === 'boolean' ? body.autoRecover : undefined,
@@ -3063,6 +3269,15 @@ export async function handleApi(
                     : actorOfRequest(req, service.flags, body).by,
                 }
                 : undefined,
+              // Probe 5's answers (2026-09-18): fingerprints only. A command's
+              // TEXT is not an answer — the prelude resolves each fp against
+              // its own reviews, so the door never trusts a string it was sent.
+              ...(() => {
+                const draft = body.verifyAnswers && typeof body.verifyAnswers === 'object'
+                  ? body.verifyAnswers as { approve?: unknown; waive?: unknown } : null;
+                const verifyAnswers = draft ? verifyAnswersOf(draft.approve, draft.waive) : undefined;
+                return verifyAnswers ? { verifyAnswers } : {};
+              })(),
             });
             // Advisory, best-effort: which phases will park at boarding for an
             // unrunnable §Verification, and which are claimed by a live holder
@@ -3385,6 +3600,7 @@ export async function handleApi(
               // arbitrary but finite, because "keep reviewing forever" is the
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
+              ?? intProblem(body.maxConcurrentPerRepo, 'maxConcurrentPerRepo', 1, 99)
               ?? phaseOptionsProblem(body.phaseOptions);
             if (problem) { json(res, 400, { error: problem }); return true; }
 
@@ -3402,6 +3618,36 @@ export async function handleApi(
                   error: 'A run cannot be moved into its own checkout while it is running — '
                     + 'its commits are on the branch in the checkout it started in. '
                     + 'Stop the run and start it again with isolation on.',
+                });
+                return true;
+              }
+            }
+            // Two more one-way words (phase 15), refused out loud for
+            // isolation's reason. The base branch is a fact about the PAST
+            // once the run's branch has been cut: a new word would describe a
+            // fork that never happened. Re-asserting the word the run already
+            // has stays a 200 — a form that resubmits every field must not
+            // 409 on the one it did not touch.
+            if (typeof body.baseBranch === 'string' && body.baseBranch.trim()) {
+              const live = await service.runFor(slug);
+              if (live && branchExists(live) && live.baseBranch !== body.baseBranch.trim()) {
+                json(res, 409, {
+                  error: `The run's branch has already been cut${live.baseBranch ? ` from ${live.baseBranch}` : ''} — `
+                    + 'a base branch can be changed only before the first phase boards. '
+                    + 'Stop the run and start it again with the new base.',
+                });
+                return true;
+              }
+            }
+            // …and `issuesMode` may only TIGHTEN: loosening it would let the
+            // sessions already boarded file on the repository under a word
+            // nobody launched them with.
+            if (ISSUE_MODES.includes(body.issuesMode as never)) {
+              const live = await service.runFor(slug);
+              if (live && issuesModeLoosens(live, body.issuesMode as string)) {
+                json(res, 409, {
+                  error: `A run's issues word may only tighten mid-run (file → draft → off) — this run is at `
+                    + `${live.issuesMode ?? 'off'}. Stop the run and start it again to widen it.`,
                 });
                 return true;
               }
@@ -3502,6 +3748,22 @@ export async function handleApi(
               ...(body.qaRoundBudgetUsd === undefined
                 ? {} : { qaRoundBudgetUsd: numberOrNull(body.qaRoundBudgetUsd) }),
               ...(isOnLimitPolicy(body.onLimit) ? { onLimit: body.onLimit } : {}),
+              // Phase 15's seven. The two refusals have already 409'd above,
+              // so what reaches `applySettings` here is a move it may make or
+              // the no-op of re-asserting what the run is. Presence, not
+              // truthiness, on the three that can be CLEARED (`''`/`null` is
+              // the operator taking the run's word off, which `applySettings`
+              // stores as no key); a word off a closed vocabulary is dropped.
+              ...(typeof body.baseBranch === 'string' ? { baseBranch: body.baseBranch.trim().slice(0, 128) } : {}),
+              ...('maxConcurrentPerRepo' in body
+                ? { maxConcurrentPerRepo: body.maxConcurrentPerRepo === null || body.maxConcurrentPerRepo === ''
+                    ? null : Number(body.maxConcurrentPerRepo) } : {}),
+              ...('worktreeRetention' in body ? { worktreeRetention: retentionWord(body.worktreeRetention) ?? null } : {}),
+              ...(LAND_POLICIES.includes(body.landing as never) ? { landing: body.landing as LandPolicy } : {}),
+              ...(CONFLICT_POLICIES.includes(body.conflictPolicy as never)
+                ? { conflictPolicy: body.conflictPolicy as ConflictPolicy } : {}),
+              ...(MESSAGING_WORDS.includes(body.messaging as never) ? { messaging: body.messaging as MessagingWord } : {}),
+              ...(ISSUE_MODES.includes(body.issuesMode as never) ? { issuesMode: body.issuesMode as IssueMode } : {}),
             }, actorOfRequest(req, service.flags, body).by);
             json(res, 200, { run });
             return true;

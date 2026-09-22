@@ -414,9 +414,13 @@ describe('the contract', () => {
     // is untouched, so this is the redesign's promise stated as bytes.
     // …plus, since 5.0.0 (phase 11), the Decisions stage's three required
     // answers at the end: the run's own words for `resume.on-restart` and
-    // `relay`, and the account list the prelude resolved for it.
+    // `relay`, and the account list the prelude resolved for it — and, since
+    // 5.1.0 (many-plans-one-repo phase 15), the five words the form always
+    // says (`landing`, `conflictPolicy`, `messaging`, `issuesMode`,
+    // `worktreeRetention`), each at its owner's default. The ref and the cap
+    // are omissions on a start whose form left them blank.
     expect(JSON.stringify(mocks.runStart.mock.calls[0]![1])).toBe(
-      '{"model":"opus","effort":"max","onLimit":"switch","autonomy":"keep-going","phaseBudgetUsd":null,"runBudgetUsd":null,"permissionProfile":"trusted","skills":[],"mcpPolicy":"continue","gitMode":"default-branch","ultraReview":"off","priority":"normal","startAfter":"","autoRecover":true,"resumeOnRestart":true,"relay":"off","accounts":[{"id":"default","minHeadroomPct":0}]}',
+      '{"model":"opus","effort":"max","onLimit":"switch","autonomy":"keep-going","phaseBudgetUsd":null,"runBudgetUsd":null,"permissionProfile":"trusted","skills":[],"mcpPolicy":"continue","gitMode":"default-branch","ultraReview":"off","priority":"normal","startAfter":"","landing":"hold","conflictPolicy":"halt","messaging":"on","issuesMode":"off","worktreeRetention":"keep-on-failure","autoRecover":true,"resumeOnRestart":true,"relay":"off","accounts":[{"id":"default","minHeadroomPct":0}]}',
     );
   });
 

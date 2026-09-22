@@ -403,3 +403,48 @@ test('formatPatch: a range git cannot resolve is a reported failure, not an empt
   assert.deepEqual(made.files, []);
   assert.ok((made.error ?? '').length > 0, 'git said why');
 });
+
+/* ------------------------------------------------------------------ *
+ * many-plans-one-repo phase 4 — G-FS: the `\x1f` forgery.
+ * ------------------------------------------------------------------ */
+
+test('G-FS: a commit subject carrying the old separator cannot shift the fields', () => {
+  // `git-browse.ts` moved to NUL in P8 QA round 4 and left a 🔴 note saying
+  // "git.ts uses \x1f and this module copied it, which was wrong the moment the
+  // fields came from repository CONTENT". The note was right and `git.ts` was
+  // never fixed: a subject may legally contain \x1f, and `%h\x1f%s\x1f%an…`
+  // then hands the parser a record whose every later field is the attacker's.
+  const repo = scratch('pc-git-sep-');
+  git(repo, 'init', '-q', '-b', 'main');
+  const US = String.fromCharCode(31);
+  const forged = `innocent${US}forged-author${US}2001-01-01T00:00:00+00:00${US}20 years ago`;
+  writeFileSync(join(repo, 'f.txt'), 'x\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', forged);
+
+  const info = lastCommit(repo, 'f.txt');
+  return info.then((one) => {
+    assert.equal(one.subject, forged, 'the whole subject is the subject, separator bytes and all');
+    assert.equal(one.author, 'Phase Console Test', 'the author is git’s, never the message’s');
+    assert.notEqual(one.date, '2001-01-01T00:00:00+00:00');
+    assert.notEqual(one.relativeDate, '20 years ago');
+  });
+});
+
+test('G-FS: commitsTouching keeps one row per commit under the same forgery', async () => {
+  const repo = scratch('pc-git-sep2-');
+  git(repo, 'init', '-q', '-b', 'main');
+  const US = String.fromCharCode(31);
+  writeFileSync(join(repo, 'f.txt'), 'a\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', `first${US}2099-12-31`);
+  writeFileSync(join(repo, 'f.txt'), 'b\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'second');
+
+  const rows = await commitsTouching(repo, 'f.txt', 10);
+  assert.equal(rows.length, 2, 'two commits, two rows');
+  assert.equal(rows[0]!.subject, 'second');
+  assert.equal(rows[1]!.subject, `first${US}2099-12-31`);
+  assert.notEqual(rows[1]!.date, '2099-12-31', 'the date is git’s --date=short, never the message’s');
+});

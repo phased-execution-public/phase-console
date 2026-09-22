@@ -51,10 +51,12 @@ export type FleetHold = {
   by: string;
   /**
    * `machine` on a hold a supervisor wrote for every console of the machine;
-   * absent on this console's own marker. Never written to disk — the file a
-   * record came from is what says which it is.
+   * `restart` on the one a restart holds in memory while it updates the copy
+   * (`Service.restartHold`); absent on this console's own marker. Never written
+   * to disk — where a record came from is what says which it is. Both scoped
+   * holds hold automatic starts only: neither is a freeze.
    */
-  scope?: 'machine';
+  scope?: 'machine' | 'restart';
 };
 
 /**

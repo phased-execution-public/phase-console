@@ -65,6 +65,8 @@ import { TASK_STATUSES } from '../shared/task-model.js';
 import { RUN_PRIORITIES } from '../shared/orchestration-model.js';
 import { SITUATIONS } from '../shared/situation-model.js';
 import { RULING_KINDS } from '../shared/attention-model.js';
+import { ISSUE_STATES } from '../shared/issues-model.js';
+import { MESSAGE_KINDS, MESSAGE_PRIORITIES, MESSAGING_WORDS } from '../shared/message-model.js';
 import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { QA_WORDS, VERIFICATION_WORDS } from '../shared/evidence-model.js';
 import { transcriptFile } from '../server/runner/transcript.ts';
@@ -172,7 +174,7 @@ const CATEGORY_COUNT_WORDS: Record<string, number> = {
   two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
   nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
   sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
-  'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24,
+  'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24, 'twenty-five': 25,
 };
 
 test('docs/phone.md documents every push category, and the right number of them', () => {
@@ -873,6 +875,16 @@ test('SKILL.md never names a flag no script implements', () => {
   for (const m of read('viewer/server/runner/spawn.ts').matchAll(/argv\.push\('(--[a-z][a-z0-9-]*)'/g)) {
     universe.add(m[1]);
   }
+  // …and the `.mjs` helpers beside them. They ship in the same directory and a
+  // session types them the same way, so a flag one of them implements is not an
+  // invented one — `rehearsal-assert.mjs --reach` was the first flag no `.sh`
+  // file also happened to carry, and it read as invented for that reason alone.
+  // Only THIS direction widens: whether every `.mjs` flag is also documented is
+  // a separate editorial question, and the test below deliberately still asks it
+  // of the helper `.sh` scripts alone.
+  for (const file of readdirSync(`${root}scripts/`).filter((f) => f.endsWith('.mjs'))) {
+    for (const m of read(`scripts/${file}`).matchAll(/'(--[a-z][a-z0-9-]*)'/g)) universe.add(m[1]);
+  }
 
   const invented = [...new Set(skill.match(/--[a-z][a-z0-9-]*/g) ?? [])]
     .filter((flag) => !universe.has(flag))
@@ -955,11 +967,32 @@ test('the UNDOCUMENTED_FLAGS allowance never outlives the flags it excuses', () 
  * Deleting the row was the old rule, and it left older logs holding words no
  * document explained.
  */
-const EVENT_LITERAL = /'((?:phase|run|policy)\.[a-z0-9][a-z0-9.-]*)'/g;
-const LOG_CALL = /\blog\.(?:info|warn|error)\(\s*'([^']+)'/g;
+/**
+ * The name prefixes this scan recognises as an event.
+ *
+ * `phase`, `run` and `policy` were the whole vocabulary while every event was
+ * about a run. 5.1.0 adds seven more, each naming a subsystem rather than a
+ * lifecycle — `git` and `shell` (the one command seam, phase 5), `http` and
+ * `engine` (the two other things the console shells or serves), `msg` and
+ * `issue` (phases 10 and 12), `retention` (phase 6). They are added HERE, in
+ * phase 2, before any of them is emitted, so that the first line of phase 5
+ * that writes `git.command` fails `docs-parity` until it also writes the row —
+ * rather than the scan being widened later, by which time there are forty
+ * undocumented names and widening it is a chore somebody defers.
+ */
+const EVENT_LITERAL = /'((?:phase|run|policy|git|http|engine|shell|msg|issue|retention)\.[a-z0-9][a-z0-9.-]*)'/g;
+/**
+ * `debug` joins the three levels whose first argument is a documented name.
+ *
+ * It is not a lesser level with lesser rules: `PHASE_CONSOLE_LOG_LEVEL=debug`
+ * is exactly what an operator turns on when something has gone wrong, so a
+ * debug line whose name no document explains is an undocumented name at the
+ * one moment somebody is reading the log.
+ */
+const LOG_CALL = /\blog\.(?:info|warn|error|debug)\(\s*'([^']+)'/g;
 const ONWARN_CALL = /\bon(?:Warn|Info)\??\.?\(\s*'([^']+)'/g;
 /** A sink call whose first argument opens a template literal — the composed name the rule refuses. */
-const COMPOSED_EVENT = /\b(?:log\.(?:info|warn|error)|this\.(?:record|note)|journal\.append|deps\.journal|on(?:Warn|Info)\??\.?)\(\s*`/g;
+const COMPOSED_EVENT = /\b(?:log\.(?:info|warn|error|debug)|this\.(?:record|note)|journal\.append|deps\.journal|on(?:Warn|Info)\??\.?)\(\s*`/g;
 
 function serverSources(): { rel: string; text: string }[] {
   const out: { rel: string; text: string }[] = [];
@@ -1217,6 +1250,10 @@ function evidenceShapes(prefix: 'V'): number {
 }
 
 const SPELLED_COUNTS: SpelledCount[] = [
+  { file: 'viewer/shared/issues-model.js', find: /(\w+) states because each one is a different thing/, expect: [ISSUE_STATES.length], what: 'ISSUE_STATES' },
+  { file: 'viewer/shared/message-model.js', find: /(\w+) kinds and not (\w+), because a note/, expect: [MESSAGE_KINDS.length, MESSAGE_KINDS.length - 1], what: 'MESSAGE_KINDS' },
+  { file: 'viewer/shared/message-model.js', find: /the same ([\w-]+)-word vocabulary a run's admission class/, expect: [MESSAGE_PRIORITIES.length], what: 'MESSAGE_PRIORITIES (= RUN_PRIORITIES)' },
+  { file: 'viewer/shared/message-model.js', find: /line's (\w+) words\./, expect: [MESSAGING_WORDS.length], what: 'MESSAGING_WORDS' },
   { file: 'viewer/shared/decisions-model.js', find: /The (\w+) keys — a closed vocabulary/, expect: [DECISION_KEYS.length], what: 'DECISION_KEYS' },
   { file: 'viewer/shared/attention-model.js', find: /(\w+) kinds, because the (\w+) need different things/, expect: [RULING_KINDS.length, RULING_KINDS.length], what: 'RULING_KINDS' },
   { file: 'viewer/shared/attention-model.js', find: /`qa` rows on the (\w+) QA situations/, expect: [SITUATIONS.filter((s) => s.startsWith('qa-')).length], what: 'the qa-* SITUATIONS' },
@@ -1443,6 +1480,7 @@ test('ACC-8.7 (LFC-9, TRS-4): the carve-out\'s "one tap" sentences say what the 
   const rails = read('docs/safety-rails.md');
   assert.match(rails, /one human tap — auto-grant never answers either card/);
 });
+
 
 test('ACC-7.5 (REG-8): every notification_type the CLI documents is mapped, answers a wait, or is ignored on purpose — and the hook-install help says four entries', async () => {
   const { NOTIFICATION_WAIT_KINDS, NOTIFICATION_ANSWERS, NOTIFICATION_IGNORED } = await import('../server/sessions/registry.ts');

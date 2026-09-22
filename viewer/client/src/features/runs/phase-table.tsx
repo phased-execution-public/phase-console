@@ -49,6 +49,7 @@ import {
   type PhaseRecord,
   type PhaseScope,
   type PhaseView,
+  type PlanReviewer,
   type QueueEntry,
   type RunState,
   type TerminalSession,
@@ -68,8 +69,16 @@ import { QaButton, QaVerdict } from '@/components/qa-launcher';
 import { LaunchDialog } from '@/features/run-setup/launch-dialog';
 import { RecoveryButton } from './status-strip';
 import { PhaseDrawer } from './phase-drawer';
-import { EvidenceLine, LivenessChip, PhaseActorLine, PhaseStateChip, RulingsChip } from './phase-row';
+import {
+  ContextChip,
+  EvidenceLine,
+  LivenessChip,
+  PhaseActorLine,
+  PhaseStateChip,
+  RulingsChip,
+} from './phase-row';
 import { BranchChip } from './git-card';
+import { LandChip, LandingStateChip } from './landing-chips';
 import { TaskLine } from './task-summary';
 import { RecoveryActions } from '@/components/recovery-actions';
 import { queueEntryFor, waitingLabel } from './session-panes';
@@ -139,6 +148,8 @@ export type PhaseRecovery = {
   qaMode?: string;
   /** Skills the plan asks every session to invoke. */
   planSkills?: string[];
+  /** Where the plan orders its own reviewer — "Run only this one" advises from it. */
+  planReviewers?: PlanReviewer[];
   /** Whether the console may turn QA on for the plan — a different flag from allowAgent. */
   allowWrites?: boolean;
 };
@@ -508,6 +519,7 @@ export function PhaseTable({
             ...(recovery?.qaMode ? { qaMode: recovery.qaMode } : {}),
             ...(recovery?.allowWrites !== undefined ? { allowWrites: recovery.allowWrites } : {}),
             ...(recovery?.planSkills?.length ? { planSkills: recovery.planSkills } : {}),
+            ...(recovery?.planReviewers?.length ? { planReviewers: recovery.planReviewers } : {}),
           }}
           onClose={() => setLaunchPhase(null)}
         />
@@ -658,13 +670,19 @@ function PhaseRows({
               nothing when its fact is absent. */}
           {p.proof && <EvidenceLine proof={p.proof} />}
           <LivenessChip liveness={liveness} />
+          <ContextChip liveness={liveness} />
           <RulingsChip count={rulings} />
           {/* …and a fifth, once a run can drive lanes on branches of their
               own: which branch THIS row's session is committing on. Read off
               the run's live children, keyed by phase like `phases` is —
               absent means the lane is on the run's own branch, which is every
               lane that did not take a worktree. */}
-          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} />
+          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} base={run?.base} />
+          {/* …and where the commits GO (phase 15): the plan's `Land:` word,
+              resolved by the server, and — once the engine has written one —
+              where the landing has got to. Two facts, two chips. */}
+          <LandChip land={p.land} />
+          <LandingStateChip landing={r?.landing} />
           {/* …and a fourth: what the SESSION says it is doing. The panel
               below carries the whole list for the open lane; a run with
               three lanes needs the one-line version on each row. */}
@@ -1154,13 +1172,16 @@ function PhaseCard({
           <QaVerdict qa={p.qa} />
           {p.proof && <EvidenceLine proof={p.proof} />}
           <LivenessChip liveness={liveness} />
+          <ContextChip liveness={liveness} />
           <RulingsChip count={rulings} />
           {/* …and a fifth, once a run can drive lanes on branches of their
               own: which branch THIS row's session is committing on. Read off
               the run's live children, keyed by phase like `phases` is —
               absent means the lane is on the run's own branch, which is every
               lane that did not take a worktree. */}
-          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} />
+          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} base={run?.base} />
+          <LandChip land={p.land} />
+          <LandingStateChip landing={r?.landing} />
         </>
       }
       facts={

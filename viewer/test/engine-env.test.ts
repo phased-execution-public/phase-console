@@ -190,6 +190,31 @@ test('an ordinary lint result is read the ordinary way', () => {
   assert.deepEqual(bad.issues, ['F3 cycle: 2 -> 3 -> 2']);
 });
 
+test('the summary is the VERDICT line, not the first line that looks like one', () => {
+  // `validate.sh` prints the plan's `LINT OK` first and its handoff verdict
+  // last. The runner's `plan-lint` halt quoted the first — so a run parked
+  // over a hand-written handoff missing its boot section carried the reason
+  // "left the plan failing validate.sh: LINT OK: rehearsal-c — 2 phases,
+  // well-formed and acyclic" (many-plans-one-repo phase 17, live run 4).
+  const bad = readLint({
+    code: 1,
+    stdout: [
+      'LINT OK: rehearsal-c — 2 phases, well-formed and acyclic',
+      "  ✗ phase-01-wait-for-a-and-build.md: missing the '▶ Start next phase(s)' boot section",
+      'VALIDATE FAIL: rehearsal-c — 1 handoff problem(s)',
+      '',
+    ].join('\n'),
+    stderr: '', ms: 10, timedOut: false,
+  });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.summary, 'VALIDATE FAIL: rehearsal-c — 1 handoff problem(s)');
+  assert.deepEqual(bad.issues, ["✗ phase-01-wait-for-a-and-build.md: missing the '▶ Start next phase(s)' boot section"]);
+  // And when both verdicts are green, the later one still speaks for the whole.
+  const fine = readLint(ok('LINT OK: demo — 3 phases\nVALIDATE OK: demo\n'));
+  assert.equal(fine.ok, true);
+  assert.equal(fine.summary, 'VALIDATE OK: demo');
+});
+
 /* ------------------------------------------------------------------ *
  * readSessionPlan — members are not the flags
  * ------------------------------------------------------------------ */

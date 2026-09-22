@@ -102,6 +102,12 @@ export const SSE_EVENTS = [
   // when one is written: no phase changes state, no run advances, and the
   // ledger outlives every run of the plan.
   'run:rulings',
+  // The REPOSITORY's conflict radar moved (phase 7) — a pair's verdict
+  // changed, or a pair touching a clash zone appeared or went. Deliberately
+  // not `run:*`: the radar's unit is the repository, and one transition is
+  // news to every run in it. Transitions only, so a quiet repository is
+  // silent on the wire.
+  'repo:radar',
   // A plan's structural lint finished. `/api/plans/<slug>` no longer awaits it:
   // `validate.sh` walks every handoff, and on the 22-handoff plan somebody was
   // actually working on that was 11.27 s the page paid before it could paint a
@@ -109,6 +115,10 @@ export const SSE_EVENTS = [
   // written straight into the plan's cache, so it is a push and never a reason
   // to go and ask again.
   'plan:lint',
+  // A restart's update moved (2026-09-18): it began, it answered, the restart
+  // followed or did not. Every tab's Restart card and banner hear it, not only
+  // the one whose button was pressed.
+  'restart',
 ] as const;
 
 export type SseEvent = (typeof SSE_EVENTS)[number];

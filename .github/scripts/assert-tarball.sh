@@ -63,6 +63,8 @@ for p in \
   "viewer/server/pty/scrollback.ts" \
   "viewer/server/pty/spawn-helper.ts" \
   "viewer/shared/scope.js" \
+  "viewer/shared/landing-model.js" \
+  "viewer/shared/issues-model.js" \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
   "viewer/shared/situation-model.js" \
@@ -101,6 +103,11 @@ for p in \
   "viewer/server/runner/policy.ts" \
   "viewer/server/prelude.ts" \
   "viewer/server/credentials-probe.ts" \
+  "viewer/server/trace.ts" \
+  "viewer/server/shell.ts" \
+  "viewer/server/git-trace.ts" \
+  "viewer/server/counters.ts" \
+  "viewer/shared/message-model.js" \
   "viewer/server/doctor.ts" \
   "viewer/shared/relay-model.js" \
   "viewer/server/relay.ts" \
@@ -110,8 +117,16 @@ for p in \
   "viewer/server/shutdown.ts" \
   "viewer/shared/fleet-model.js" \
   "viewer/server/fleet.ts" \
+  "viewer/shared/poll-loop.js" \
+  "viewer/server/runner/usage.ts" \
+  "viewer/server/runner/verify-review.ts" \
   "bin/doctor-verb.mjs" \
   "bin/sessions-verb.mjs" \
+  "bin/diagnostics-verb.mjs" \
+  "viewer/server/retention.ts" \
+  "viewer/server/retention-policy.ts" \
+  "viewer/server/debug/bundle.ts" \
+  "viewer/server/debug/tar.ts" \
   "scripts/models.env" \
   "viewer/scripts/check-stamp.mjs" \
   "viewer/run" \
@@ -132,6 +147,7 @@ for p in \
   "scripts/gate-approve.sh" \
   "scripts/close-plan.sh" \
   "scripts/handoff-status.sh" \
+  "scripts/phase-landing.sh" \
   "scripts/scope.sh" \
   "scripts/instance.sh" \
   "scripts/session-hook.sh" \
@@ -140,6 +156,9 @@ for p in \
   "scripts/gates.env" \
   "scripts/verify.env" \
   "scripts/decisions.env" \
+  "scripts/landing.env" \
+  "scripts/messages.env" \
+  "scripts/issues.env" \
   "templates/plan.md" \
   "templates/handoff.md" \
   "templates/INDEX.md" \
@@ -186,6 +205,7 @@ for a in \
   "viewer/scripts/check-dist.mjs" \
   "viewer/scripts/verify-dist.mjs" \
   "viewer/scripts/precompress.mjs" \
+  "viewer/scripts/replay-poll-guard.mjs" \
   "docs/" \
   "tests/" \
   "evals/" \

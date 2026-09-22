@@ -105,7 +105,37 @@ everything else is `info`. An unrecognised kind reads `info` on purpose — a
 false warning trains a reader to filter warnings out, which costs more than a
 missed one.
 
-## Tying it together
+## Tying it together — grep the trace id
+
+**Since 5.1.0 there is one id, and it is on everything.** A run's trace is
+`runTraceId(instance, slug, runId)` — 32 hex, **derived rather than minted**, so
+a console that restarts and resumes the run recomputes the same id instead of
+starting a second one. It is on every journal line of that run, on every
+console-log line written while its drive was running, on every `git.command`
+the drive caused, in the environment of every session it spawned
+(`PE_TRACE_ID`, `TRACEPARENT`), on the lines those sessions write with
+`phase-tasks.sh` and `phase-outcome.sh`, on the lock they take (`trace=`) and in
+their presence-hook record.
+
+```bash
+# the run's own id, from its journal
+grep -m1 '"event":"run.trace"' ~/.local/state/phase-console/runs/<instance>/<slug>/run-<id>.jsonl
+
+# everything, everywhere, in one pass
+grep -r "$TRACE" ~/.local/state/phase-console/ ~/work/<repo>/docs/handoffs/
+```
+
+The Debug page takes the same id: `?trace=<id>` on `GET /api/debug/index`, and
+the trace chip on any row.
+
+Two things it does NOT answer, by design. A line written **outside** any span
+carries no trace — that is "no trace", not "some trace", and the filter will not
+sweep it in. And a **v1 file** (anything written before 5.1.0) has no ids at
+all; the journal reader derives one on read (`withDerivedIds`), marking those
+lines `v: 1`, but a v1 console log cannot be joined and the walk below is the
+fallback for it.
+
+### The walk, for v1 files and for what the id does not cover
 
 Six identifiers name the same piece of work, and each file knows only some of
 them. This is the walk:
@@ -147,6 +177,7 @@ curl -s 'localhost:4123/api/debug/index?source=outcome&slug=<slug>'
 # who holds the lock, on which branch, in which tree
 cat docs/handoffs/<slug>/.locks/phase-07.lock
 ```
+
 
 ## The delivery ledger
 
@@ -205,6 +236,15 @@ through two passes:
    webhook URLs, and any run of 40+ mixed-case-with-digits characters. A git
    sha, a UUID, a slug and an ISO timestamp all survive — none of them has the
    case mix.
+   Since 5.1.0 there is a backstop under those named shapes: **any run of 32+
+   token characters whose Shannon entropy exceeds 4.5 bits** is replaced with
+   `[high-entropy]`. The two numbers are each chosen against one false
+   positive. 32, because shorter mixed runs are ordinary — a base64'd id, a
+   slug, a filename. And 4.5 bits, because a 16-symbol alphabet cannot exceed
+   4.0 however random it is, and hex is what a log line is FULL of: every sha,
+   every trace id, every span id survives by arithmetic rather than by luck,
+   while a base64 or base62 secret draws on 62–64 symbols and lands near
+   5.5–6.0. The threshold sits in a genuinely empty band.
 2. **The operator's home path**, masked to `~` — the macOS `Users` form and
    the Linux `/home/<name>` one alike, whether or not it is this machine's: a
    journal written on one box and read on another still names somebody.
@@ -218,6 +258,102 @@ The reason is that the console is reachable from a phone over a tailnet, and a
 log line is the single most likely place for a token to have been echoed by a
 command. One rule for every export path, so there is no surface where a secret
 survives.
+
+## One run, for a post-mortem
+
+The bundle above is a snapshot of the CONSOLE, and it is the right artefact for
+"is this console well". It is the wrong one for "why did phase 7 park at 03:14
+on Tuesday" — for that it held the journal of no run, the transcript of no
+session, no task ledger, no outcome, no ruling, no lock, no git trace, and a
+log slice chosen by recency rather than by relevance.
+
+So there is a second bundle, of ONE run:
+
+```
+GET /api/debug/bundle?slug=<plan>&run=<id>[&since=30m]
+phase-console diagnostics --run <id> [--slug <plan>] [--since 30m] [--out FILE]
+```
+
+Both answer a gzipped tar. `since` takes a window back from now (`30m`, `2h`,
+`7d`) or an instant, and narrows every time-stamped member; a line whose time
+cannot be read is always kept, because "I could not date it" and "it is old"
+are different facts.
+
+```
+MANIFEST.json      schema "phase-console/run-bundle", version 2, every member
+                   with its size, everything that was ABSENT, and the notes
+record.json        the run record — status, phases, timings
+journal.ndjson     the run's journal
+transcript.ndjson  the session transcript
+tasks/             this run's per-phase ledgers, and the plan's inbox copies
+outcomes/          the same, for declared outcomes
+rulings.ndjson     what the sessions DECIDED, as opposed to how they ended
+messages.ndjson    the plan's message ledger
+git-trace.ndjson   git's own Trace2, folded one line per process
+sessions/          each session's raw hook payloads, in arrival order
+locks/             the plan's phase locks
+worktrees.json     what each live run's checkout looked like
+console/           the console log, cut to this run
+env.json           an ALLOW-LISTED environment; see below
+versions.json      console, node, platform, instance
+diagnosis/         one file per phase on record
+SUMMARY.json       counts, phases, and the journal events that read as trouble
+ANALYSIS.md        the same in prose (Pro)
+```
+
+The CLI verb **works with the console down**, and that is the point of it
+existing as a verb rather than only a button: the moment somebody most needs a
+bundle is the moment the console will not start. With a console answering on
+the instance's own port it streams from it instead, because a live console
+holds run state that has not been checkpointed. It checks the console's
+identity before it does — a port is derived from a root, and the answer on it
+may be a different project's console.
+
+`env.json` is an **allow-list**, not a deny-list: `PATH`, `HOME`, `SHELL`,
+`LANG`, `TERM`, `TZ`, `TMPDIR`, `NODE_ENV`, `NODE_OPTIONS`, the two XDG dirs,
+`CLAUDE_CONFIG_DIR`, and anything under `PHASE_CONSOLE_` or `PE_`. A name
+matching `/TOKEN|SECRET|KEY|PASS|AUTH/i` is then dropped WHOLE — the name of a
+secret is itself a hint. `PATH` leads the list because the worst environment
+bug this console has had was a PATH bug (an unaccepted Xcode licence shadowing
+`git` under launchd), and it was unanswerable from a bundle that did not carry
+it.
+
+**The manifest says the redaction is best-effort, and means it.** It is
+regexes, a home mask and an entropy heuristic. It catches the shapes we know
+and the ones random enough to guess at; it does not catch a password that
+looks like a word. Read a bundle before you share it.
+
+## What is kept, and for how long
+
+Every sink this console writes is bounded by one table, in
+`viewer/server/retention-policy.ts`, swept at boot and once a day.
+`GET /api/debug/retention` reports each sink's live size, its policy row, and
+what the NEXT sweep would do — which is also what Settings ▸ This instance ▸
+**Logs and retention** shows. The shipped table:
+
+| Sink | Kept |
+|---|---|
+| `console.log` | rotates at 16 MB, one previous kept |
+| supervisor `console.out.log` / `console.err.log` | copy-truncated past 32 MB, keeping the last 8 MB |
+| run records, journals and their sidecars | 30 days, at least 20 per plan, 2 GiB in total |
+| task ledgers | 30 days |
+| declared outcomes, and the `ignored` pile | 30 days, at most 200 a plan |
+| ruling ledgers | **never pruned**; reported past 16 MB |
+| session event logs | pruned with the session record; 1 MB each |
+| raw git traces | leftovers past 24 h; 64 MB in the console's directory |
+| message ledgers | rotate at 8 MB, the rotated copy kept 90 days |
+
+
+Three verbs and one non-verb, and the choice per sink is the design.
+**`delete`** for a file nothing is writing to. **`rotate`** (rename to `.1`)
+for a file whose writer opens it fresh each time. **`truncate`** —
+copy-truncate on the same inode — for a file whose writer holds a descriptor
+for the life of the process: the supervisor's stdout is opened ONCE by launchd,
+and rotating it with `rename` would leave launchd writing to an unlinked inode,
+so the console keeps logging, the log file stays empty forever, and nothing
+anywhere reports an error. And **`oversized`**, which acts on nothing and only
+says the number: the ruling ledger IS the record, and the console log is
+rotated by the writer that owns it.
 
 ## Traps
 

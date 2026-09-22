@@ -62,3 +62,30 @@ load ../helpers/test_helper
   [ "$status" -eq 0 ]
   [[ "$output" != *"F17"* ]]
 }
+
+# 2026-09-18: `! grep …` negates a command; the lead is the command it negates.
+# `_verification_lead` answered nothing for `!`, so a missing binary behind a
+# negation was never named — and the runner, reading `!` as the lead, skipped it.
+@test "F17: a negated command names the lead it negates" {
+  setup_docs missing-lead ml
+  cat > "$DOCS_ROOT/docs/plans/neg.md" <<'PLAN'
+---
+slug: neg
+created: 2026-01-01
+status: active
+phases: 1
+handoffs: docs/handoffs/neg/
+memory: project_neg
+---
+# neg
+## Phase graph
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | a | — | — | r | x |
+
+### Phase 1 — a
+- **Verification:** `! pe-definitely-absent-xyz --flag src/`
+PLAN
+  run pg neg --lint
+  assert_contains "$output" 'F17 phase 1: §Verification lead `pe-definitely-absent-xyz`'
+}

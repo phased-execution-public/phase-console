@@ -157,6 +157,7 @@ export function LadderCard() {
     stallStalemateAttempts: positive(stored.stallStalemateAttempts, STALL_DEFAULTS.stallStalemateAttempts),
     stallRetryBurst: positive(stored.stallRetryBurst, STALL_DEFAULTS.stallRetryBurst),
     stallExternalWaitMs: positive(stored.stallExternalWaitMs, STALL_DEFAULTS.stallExternalWaitMs),
+    stallLoopRun: positive(stored.stallLoopRun, STALL_DEFAULTS.stallLoopRun),
     // Not a member of STALL_DEFAULTS on purpose — that map is a bijection with
     // the stall signals, and this is the clock on the ANNOUNCEMENT rather than
     // on any detector. Same `?? shipped` rule.
@@ -395,6 +396,21 @@ export function LadderCard() {
           zero="0 never calls a lane spinning."
           disabled={busy}
           onSave={num('stallSpinTurns')}
+        />
+        {/* The sixth signal, and the one no silence detector can see: a lane
+            looping is producing output the whole time. Noticing only — there
+            is no rung for it, because three identical failures is very often a
+            session that succeeds on the fourth try. */}
+        <NumberField
+          pref="stallLoopRun"
+          id="stall-loop"
+          label="Call it looping after"
+          value={stall.stallLoopRun}
+          unit="identical failures"
+          hint={`Identical failing tool calls in a row — same tool, same command, same words back (shipped: ${STALL_DEFAULTS.stallLoopRun}). Noticing only: an inbox row and \`phase.suspect\`, never a park.`}
+          zero="0 never calls a lane looping."
+          disabled={busy}
+          onSave={num('stallLoopRun')}
         />
         <NumberField
           pref="stallStalemateAttempts"

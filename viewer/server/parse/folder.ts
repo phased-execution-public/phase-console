@@ -1,11 +1,15 @@
 /**
- * The other three artefacts in a handoff folder: `INDEX.md`, `test-status.md`
+ * The other artefacts in a handoff folder: `INDEX.md`, `test-status.md`, `landing.md`
  * and `.locks/phase-NN.lock`.
  */
 
 import { tableAfter, plainCell } from './markdown.ts';
 import { parseScope } from '../../shared/scope.js';
 import { QA_RESULTS, QA_RESULT_WORDS } from '../../shared/plan-vocab.js';
+import { LANDING_STATES } from '../../shared/landing-model.js';
+
+/** Derived from the owner, so a state added there needs no second list here. */
+type LandingState = (typeof LANDING_STATES)[number];
 
 export type IndexRow = { phase: number; title: string; status: string; link?: string };
 
@@ -263,4 +267,72 @@ export function parseLock(text: string, file: string, now = Date.now()): Lock | 
     ...(values.session ? { session: values.session.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 128) || undefined } : {}),
     file,
   };
+}
+
+/**
+ * A row of `docs/handoffs/<slug>/landing.md` — where one phase's work, in one
+ * repository, has actually got to. Written by `scripts/phase-landing.sh`.
+ */
+export type LandingRow = {
+  phase: number;
+  /** Root-relative repository path; empty for a plain repo or the superproject root. */
+  repo: string;
+  /** `LANDING_STATES`, or `unknown` for a row that exists and does not parse. */
+  state: LandingState | 'unknown';
+  policy: string;
+  ref: string;
+  sha: string;
+  pr: string;
+  by: string;
+  recorded: string;
+  note: string;
+};
+
+const LANDING_HEADING = /landing/i;
+
+/**
+ * Rows of `## Landings`, columns located BY HEADER NAME.
+ *
+ * By name and not by position because this ledger has ten columns and will
+ * grow — and a reader that counted would answer confidently and wrongly the
+ * first time somebody added one, which is the failure `table_shape_issues` and
+ * `decisionRowsFromCells` both exist for. An unrecognised state reads as
+ * `unknown` rather than being dropped or defaulted to a real one: a gate must
+ * be able to tell "the ledger says something I do not understand" from "the
+ * ledger says nothing", because only the second is a phase that has not landed.
+ */
+export function parseLanding(text: string): LandingRow[] {
+  const rows = tableAfter(text, (title) => LANDING_HEADING.test(title));
+  const out: LandingRow[] = [];
+  let col: Record<string, number> | undefined;
+  for (const row of rows) {
+    if (!col) {
+      const names = row.cells.map((c) => plainCell(c).toLowerCase());
+      if (names.includes('phase') && names.includes('state')) {
+        col = {};
+        names.forEach((name, i) => { col![name] = i; });
+      }
+      continue;
+    }
+    const at = (name: string) => (col![name] === undefined ? '' : plainCell(row.cells[col![name]] ?? ''));
+    const phase = at('phase');
+    if (!/^\d+$/.test(phase)) continue;
+    const state = at('state').toLowerCase();
+    // A `-` is how the writer spells an empty cell, so it is emptiness and not
+    // a value — the same reading `reportCell` gives it above.
+    const cell = (name: string) => { const v = at(name); return v === '-' ? '' : v; };
+    out.push({
+      phase: Number(phase),
+      repo: cell('repo'),
+      state: (LANDING_STATES as readonly string[]).includes(state) ? (state as LandingState) : 'unknown',
+      policy: cell('policy'),
+      ref: cell('ref'),
+      sha: cell('sha'),
+      pr: cell('pr'),
+      by: cell('by'),
+      recorded: cell('recorded'),
+      note: cell('note'),
+    });
+  }
+  return out;
 }

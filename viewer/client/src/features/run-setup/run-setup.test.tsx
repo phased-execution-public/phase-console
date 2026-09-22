@@ -167,6 +167,36 @@ describe('the field matrix', () => {
     expect(await screen.findByText(/Give this run its own checkout/)).toBeTruthy();
   });
 
+  it('a branch the console cuts is isolated by default — the box opens ticked when Branch flips to new-branch (decision 13)', async () => {
+    // The console's own default-branch preference seeds `queue`, which is the
+    // right answer for a run that adopts a branch somebody may be standing
+    // on. The moment the operator asks for a NEW branch, nobody is — so the
+    // box follows `DEFAULT_ISOLATION_FOR_NEW_BRANCH` (phase 15), and the
+    // payload says so. An operator who unticks it is still heard.
+    await mount({ mode: 'phase', context: { slug: 'alpha', phase: 3, run: null } });
+    await screen.findByText('Branch');
+    fireEvent.change(screen.getByLabelText('Branch'), { target: { value: 'new-branch' } });
+    const box = await screen.findByLabelText(/Give this run its own checkout/);
+    expect(box).toBeChecked();
+    fireEvent.click(screen.getByRole('button', { name: 'Run phase 3' }));
+    await waitFor(() => expect(runStart).toHaveBeenCalledTimes(1));
+    expect(runStart.mock.calls[0]![1]).toMatchObject({ gitMode: 'new-branch', isolation: 'worktree' });
+  });
+
+  it('an isolation choice the operator made survives a branch-mode flip', async () => {
+    // Order matters here: the operator unticks the box under new-branch, flips
+    // to default-branch and back. Their word stands — the default answers only
+    // while nobody has said.
+    await mount({ mode: 'phase', context: { slug: 'alpha', phase: 3, run: null } });
+    await screen.findByText('Branch');
+    fireEvent.change(screen.getByLabelText('Branch'), { target: { value: 'new-branch' } });
+    fireEvent.click(await screen.findByLabelText(/Give this run its own checkout/));
+    expect(screen.getByLabelText(/Give this run its own checkout/)).not.toBeChecked();
+    fireEvent.change(screen.getByLabelText('Branch'), { target: { value: 'default-branch' } });
+    fireEvent.change(screen.getByLabelText('Branch'), { target: { value: 'new-branch' } });
+    expect(await screen.findByLabelText(/Give this run its own checkout/)).not.toBeChecked();
+  });
+
   it('a live queue run is shown the isolation box OFF and cannot turn it on', async () => {
     // The mid-run rule made visible. The route 409s a raise, and a control an
     // operator can press that will always fail is worse than one they cannot:
@@ -379,7 +409,7 @@ describe('the payloads', () => {
     expect('accountId' in body).toBe(false);
   });
 
-  it('the Automation patch is the ten run-shaped preferences', () => {
+  it('the Automation patch is the fifteen run-shaped preferences', () => {
     expect(buildPrefs(values({ qa: true, autoRecover: true }))).toEqual({
       attachDefaultSkills: false,
       qaByDefault: true,
@@ -403,6 +433,14 @@ describe('the payloads', () => {
       reviewerPolicy: 'comment-only',
       autoRecoverByDefault: true,
       mcpPolicy: 'continue',
+      // Phase 15's launch defaults, each at its owner's word. The ref and the
+      // cap are absent: a blank one is no preference to save, and the door
+      // would drop it rather than store it.
+      worktreeRetention: 'keep-on-failure',
+      landing: 'hold',
+      conflictPolicy: 'halt',
+      messaging: 'on',
+      issuesMode: 'off',
     });
   });
 });
@@ -519,6 +557,58 @@ describe('a PR run that cannot ask for its one tap says so', () => {
   });
 });
 
+describe('a plan that reviews its own phases, and a console review on top', () => {
+  // Run `deadaff9` paid twice for every phase it finished: the plan's own
+  // §Adversarial review, which each builder dispatched, and the console's review
+  // session ($9.62 on P1, $7.26 on P8). Nothing on the launch linked the two.
+  const ADVERSARIAL = [
+    {
+      section: 'Adversarial review (the review that needs no human)',
+      excerpt:
+        'At phase-finish, before the handoff: dispatch ONE fresh-context reviewer (`Agent`, `subagent_type: feature-dev:code-reviewer`…',
+    },
+  ];
+  const start = { mode: 'start', context: { slug: 'alpha', run: null } };
+  const advice = () => screen.queryByTestId('review-doubled');
+
+  it("advises when Review each phase would double the plan's own reviewer, naming where the plan orders it", async () => {
+    await mount(
+      { ...start, planReviewers: ADVERSARIAL, qaMode: 'off' },
+      { prefs: { reviewEachPhaseByDefault: true } },
+    );
+    const note = await screen.findByTestId('review-doubled');
+    expect(note.textContent).toMatch(/reviewed twice/);
+    expect(note.textContent).toContain('Adversarial review (the review that needs no human)');
+    expect(note.textContent).toContain('dispatch ONE fresh-context reviewer');
+    expect(note.textContent).toMatch(/\$7–10 a phase/);
+  });
+
+  it("advises when the plan's QA gate already sends every phase to a fresh reviewer", async () => {
+    await mount({ ...start, qaMode: 'on (plan directive)' }, { prefs: { reviewEachPhaseByDefault: true } });
+    expect((await screen.findByTestId('review-doubled')).textContent).toMatch(/QA gate/);
+  });
+
+  it('appears the moment the console review is turned on, and not before', async () => {
+    await mount(
+      { ...start, planReviewers: ADVERSARIAL, qaMode: 'off' },
+      { prefs: { reviewEachPhaseByDefault: false } },
+    );
+    const row = (await screen.findByText('Review each phase')).closest('div')!;
+    expect(advice()).toBeNull();
+    fireEvent.click(row.querySelector('button')!);
+    expect(await screen.findByTestId('review-doubled')).toBeInTheDocument();
+  });
+
+  it('stays quiet for a plan that orders no reviewer of its own', async () => {
+    await mount(
+      { ...start, planReviewers: [], qaMode: 'off' },
+      { prefs: { reviewEachPhaseByDefault: true } },
+    );
+    await screen.findByText('Review each phase');
+    expect(advice()).toBeNull();
+  });
+});
+
 describe('what the form says after pressing the button', () => {
   /** Every toast message this submit produced, in order, with its kind. */
   const said = () => toastMock.mock.calls.map((c) => [c[0], c[1] ?? 'ok']);
@@ -583,5 +673,144 @@ describe('the scope a continue carries (client-11)', () => {
 
   it('still narrows a PHASE launch, which says its scope outright', () => {
     expect(buildRunPayload('phase', values(), { slug: 'alpha', phase: 3 }).onlyPhases).toEqual([3]);
+  });
+});
+
+/* ── G-PIN12 — the seven mutation-proved pins from the phase-12 QA report ─────
+ * `console-parallel-repaint` phase 12's QA round found five arms the phase had
+ * changed with no test that bites: reverting each left the phase's own suites
+ * green. QA wrote the pins, mutation-proved every one of them RED against the
+ * committed code — and did not commit them, because a QA round's job is the
+ * verdict. They have sat in an appendix ever since, which is the same as not
+ * existing: the arms are unguarded and the next refactor takes them silently.
+ * Adopted here verbatim in intent, adjusted only where this tree's helpers
+ * have moved on. */
+it("P12-QA the defaults page saves the hold policy too, with the server's own word", async () => {
+  await mount({ mode: 'defaults' }, { prefs: { reviewEachPhaseByDefault: true } });
+  const row = (await screen.findByText('…and let it hold dependent phases')).closest('div')!;
+  fireEvent.click(row.querySelector('button')!);
+  await waitFor(() => expect(savePrefs).toHaveBeenCalledWith({ reviewerPolicy: 'may-hold' }));
+});
+
+describe('phase 15 — the seven launch words', () => {
+  const SEVEN = values({
+    model: 'opus',
+    gitMode: 'new-branch',
+    baseBranch: ' release/5.1 ',
+    maxConcurrentPerRepo: '2',
+    worktreeRetention: 'ttl:24',
+    landing: 'pr',
+    conflictPolicy: 'park',
+    messaging: 'off',
+    issuesMode: 'draft',
+  });
+
+  it('a start carries every one of them, the numbers as numbers and the ref trimmed', () => {
+    const payload = buildRunPayload('start', SEVEN, { slug: 'alpha' });
+    expect(payload).toMatchObject({
+      baseBranch: 'release/5.1',
+      maxConcurrentPerRepo: 2,
+      worktreeRetention: 'ttl:24',
+      landing: 'pr',
+      conflictPolicy: 'park',
+      messaging: 'off',
+      issuesMode: 'draft',
+    });
+  });
+
+  it('the four words are sent WHENEVER shown, defaults included — a live patch must be able to say them', () => {
+    // `hold`, `halt`, `on` and `off` are answers, not absences: on a live run
+    // an omitted field means "leave it alone", so a form that dropped the
+    // default could turn a run to `pr` and never take it back.
+    const payload = buildRunPayload('start', values({ model: 'opus' }), { slug: 'alpha' });
+    expect(payload).toMatchObject({
+      landing: 'hold',
+      conflictPolicy: 'halt',
+      messaging: 'on',
+      issuesMode: 'off',
+    });
+    // …while an empty ref and an empty cap are omissions on a START (the plan's
+    // line, the console's preference or the fresh cut decides), and the
+    // retention word travels whenever shown, like the four.
+    expect('baseBranch' in payload).toBe(false);
+    expect('maxConcurrentPerRepo' in payload).toBe(false);
+    expect(payload.worktreeRetention).toBe('keep-on-failure');
+  });
+
+  it("a live patch can CLEAR the run's ref and cap — the console's word then decides again", () => {
+    const payload = buildRunPayload('live', values({ baseBranch: '', maxConcurrentPerRepo: '' }), {
+      slug: 'alpha',
+      run: RUN,
+    });
+    expect(payload.baseBranch).toBe('');
+    expect(payload.maxConcurrentPerRepo).toBeNull();
+  });
+
+  it('a narrow phase launch carries none of the seven — it inherits the run', () => {
+    const payload = buildRunPayload('phase', SEVEN, { slug: 'alpha', phase: 3, run: RUN });
+    for (const key of [
+      'baseBranch',
+      'maxConcurrentPerRepo',
+      'worktreeRetention',
+      'landing',
+      'conflictPolicy',
+      'messaging',
+      'issuesMode',
+    ]) {
+      expect(key in payload, `${key} is not a phase launch's to decide`).toBe(false);
+    }
+  });
+
+  it('the defaults page shows the seven and saves them under their preference keys', () => {
+    for (const field of [
+      'baseBranch',
+      'maxConcurrentPerRepo',
+      'worktreeRetention',
+      'landing',
+      'conflictPolicy',
+      'messaging',
+      'issuesMode',
+    ] as const) {
+      expect(shows('defaults', field), `defaults shows ${field}`).toBe(true);
+      expect(shows('live', field), `live shows ${field}`).toBe(true);
+    }
+    expect(buildPrefs(SEVEN)).toMatchObject({
+      baseBranch: 'release/5.1',
+      maxConcurrentPerRepo: 2,
+      worktreeRetention: 'ttl:24',
+      landing: 'pr',
+      conflictPolicy: 'park',
+      messaging: 'off',
+      issuesMode: 'draft',
+    });
+    // An empty cap on the defaults page is NOT a preference to save: the door
+    // drops a zero rather than storing it, and the shipped default stands.
+    expect('maxConcurrentPerRepo' in buildPrefs(values())).toBe(false);
+  });
+
+  it('renders the base, the cap and the retention under the branch on a new-branch start', async () => {
+    await mount(
+      { mode: 'start', context: { slug: 'alpha', run: null } },
+      { allowPublish: false, prefs: { gitMode: 'new-branch' } },
+    );
+    expect(await screen.findByLabelText('Base branch')).toBeInTheDocument();
+    expect(screen.getByLabelText('Runs beside it in the repository')).toBeInTheDocument();
+    expect(screen.getByLabelText('When the run settles, its checkouts')).toBeInTheDocument();
+  });
+
+
+  it('a live run whose branch exists shows the base branch read-only, and says why', async () => {
+    const branched = {
+      ...RUN,
+      status: 'running',
+      gitMode: 'new-branch',
+      checkout: 'worktree',
+      baseBranch: 'main',
+    } as unknown as RunState;
+    await mount({ mode: 'live', context: { slug: 'alpha', run: branched } });
+    const base = await screen.findByLabelText('Base branch');
+    expect(base).toBeDisabled();
+    expect(base).toHaveValue('main');
+    expect(screen.getByText(/already been cut/)).toBeInTheDocument();
   });
 });

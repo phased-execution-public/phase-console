@@ -19,12 +19,16 @@ import {
 } from '../../../../shared/run-settings.js';
 import { type BLOCKED_ON } from '../../../../shared/plan-vocab.js';
 import { type RunPriority } from '../../../../shared/orchestration-model.js';
+import { type PolicySource } from '../../../../shared/policy-model.js';
 import {
   type CheckoutState,
   type IsolationMode,
   type RadarState,
   type SettleStrategy,
 } from '../../../../shared/worktree-model.js';
+import { type ConflictPolicy, type LandPolicy, type LandingState } from '../../../../shared/landing-model.js';
+import { type IssueMode } from '../../../../shared/issues-model.js';
+import { type MessagingWord } from '../../../../shared/message-model.js';
 
 /* ---------------- the autopilot ----------------
  * Mirrors `server/runner/state.ts` (`RunState`, `PhaseRecord`, `VerifySummary`),
@@ -167,6 +171,43 @@ export interface LaneLiveness {
    * silence on every surface an operator has.
    */
   retries?: { count: number; since: string };
+  /**
+   * What this attempt's session has cost in context so far. Absent until its
+   * first API call. See `server/runner/liveness.ts` `LaneTokens`.
+   */
+  tokens?: LaneTokens;
+  /**
+   * What the session in flight has cost so far, in dollars — not yet in the
+   * run's `spentUsd`, which books a session when it ends. Absent until its
+   * first `result`. See `server/runner/liveness.ts`.
+   */
+  spentUsd?: number;
+}
+
+/**
+ * A live lane's context and caching (autopilot-token-drain phase 3).
+ *
+ * `context` is the newest API call's — what every further call re-reads — and
+ * `peak` the largest; `input`, `cacheRead`, `cacheWrite` and `output` are this
+ * attempt's sums. `rebuilds` counts calls that wrote the cache again instead of
+ * reading it, `pollCalls` the status checks the poll-loop guard counted.
+ * `window` is the context window the server judged against, when it knew the
+ * model; `stage` is the line the context has passed — `wrap-up` (the session has
+ * been told to finish up) or `checkpoint` (the console is ending it and boarding
+ * the next attempt fresh) — and absent below both.
+ */
+export interface LaneTokens {
+  context: number;
+  peak: number;
+  calls: number;
+  rebuilds: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+  pollCalls: number;
+  window?: number;
+  stage?: 'wrap-up' | 'checkpoint';
 }
 
 /* ---------------- rulings (Phase 5's ledger) ---------------- */
@@ -529,6 +570,48 @@ export interface QaRound {
   at?: string;
 }
 
+/** The landing engine's position for one phase — `server/runner/state.ts` `PhaseLanding`. */
+export interface PhaseLanding {
+  /** The policy resolved for this phase (`--land N`). */
+  policy: LandPolicy;
+  /** The conflict policy read once at the landing. */
+  conflict: ConflictPolicy;
+  /** The ledger's word for the phase as a whole: the least-advanced repository. */
+  state: LandingState | 'pending';
+  /** The engine's own position — finer than the ledger's word. */
+  step: 'local' | 'push' | 'session' | 'verify' | 'watch' | 'done' | 'parked';
+  /** Where a PARKED landing resumes from, when it may. Absent on a park a person owns. */
+  resumeFrom?: 'local' | 'push' | 'session' | 'verify';
+  /** One entry per mounted repository, keyed by the ledger's repo key (`''` is the root). */
+  repos: Record<string, PhaseLandingRepo>;
+  /** How many times the remote half has been attempted. */
+  attempts: number;
+  /** Rebase sessions spent on a lane conflict. Absent means none. */
+  rebases?: number;
+  /** When the landing last moved. */
+  at: string;
+  /** Why it parked or degraded, in one sentence. */
+  note?: string;
+}
+
+export interface PhaseLandingRepo {
+  /** The branch this repository's work is on — the lane branch, else the run branch. */
+  branch: string;
+  state: LandingState | 'pending';
+  /** The sha the push put on the remote, once it did. */
+  pushed?: string;
+  /** The pull request, once verified against `gh pr view`. */
+  pr?: {
+    repo: string;
+    number: number;
+    url: string;
+    state: string;
+    mergedAt?: string;
+    mergeCommit?: string;
+    checkedAt: string;
+  };
+}
+
 export interface PhaseRecord {
   phase: number;
   status: PhaseStatus;
@@ -588,6 +671,23 @@ export interface PhaseRecord {
   /** Servers this phase asked for and boarded without. Absent when all connected. */
   mcpDegraded?: McpDegradation[];
   verification?: VerifySummary;
+  /**
+   * Where this phase's landing has got to (many-plans-one-repo phase 8) —
+   * mirrors `server/runner/state.ts` `PhaseLanding`. Absent on every phase
+   * of a plan whose word is `hold`, and on a free console. Read by the run
+   * page's landing card (phase 15).
+   */
+  landing?: PhaseLanding;
+  /**
+   * Why THIS phase stopped, when the run drove on without it — mirrors
+   * `server/runner/state.ts` `PhaseRecord.halt`, written by `settlePhase()`.
+   * A parked landing's halt carries the engine's whole sentence: the run
+   * branch, the conflicted files, the other lanes that wrote the same branch
+   * and where to resolve it (`laneConflictHalt`), which is what the landing
+   * card shows a person verbatim. Absent while the phase runs and on every
+   * record the run-level `halt` still describes.
+   */
+  halt?: { at: string; reason: string; phase?: number; kind?: HaltKind | (string & {}) };
   /**
    * Every QA round this phase has been through, oldest first — mirrors
    * `server/runner/state.ts` `QaRoundRecord`.
@@ -756,6 +856,13 @@ export interface ChildRef {
    * own branch** — set only alongside `worktree`, never on its own.
    */
   branch?: string;
+  /**
+   * The `git worktree lock` reason the runner fastened on `worktree`, written
+   * only when git accepted it (phase 15). **Absent means not locked by this
+   * console** — a shared-root lane, a run-level checkout, or a lock git
+   * refused — so a row that reads "locked" is the runner's own word.
+   */
+  locked?: string;
 }
 
 export interface RunState {
@@ -900,6 +1007,38 @@ export interface RunState {
    * before the feature and one that says `normal` are the same fact.
    */
   priority?: RunPriority;
+  /**
+   * The seven words the launch form gained in many-plans-one-repo phase 15
+   * (mirrors `server/runner/state.ts`). Each is absent when the run said
+   * nothing — the plan's line, the console's preference or the owner's
+   * default then decides — and the plan's own line outranks every one of
+   * them. `baseBranch` is immutable once the run's branch exists;
+   * `issuesMode` may only tighten mid-run (the settings door 409s the other
+   * direction, `features/run-setup/sections.tsx` says so beside the control).
+   */
+  baseBranch?: string;
+  /**
+   * What that word (or the plan's line, the preference, the shipped default)
+   * RESOLVED to when the run's branch was cut — the ref, the commit, which
+   * arm answered (`origin-head` · `trunk` · `head` · `ref`) and who declared
+   * the word (`plan` · `run` · `console` · `default`). Written once by the
+   * runner (phase 15); absent on a run whose word resolved to nothing and on
+   * every run file from before the field. The lane row reads it — "what was
+   * every lane cut from" is asked most by whoever arrives after the console
+   * that decided.
+   */
+  base?: {
+    ref: string;
+    sha: string;
+    source: 'origin-head' | 'trunk' | 'head' | 'ref' | (string & {});
+    declaredBy: PolicySource | (string & {});
+  };
+  maxConcurrentPerRepo?: number;
+  worktreeRetention?: string;
+  landing?: LandPolicy;
+  conflictPolicy?: ConflictPolicy;
+  messaging?: MessagingWord;
+  issuesMode?: IssueMode;
   /** A plan slug this run boards after. Absent means no chain. */
   startAfter?: string;
   /** The operator's hold: nothing new boards, live lanes keep running. */
@@ -1114,6 +1253,12 @@ export interface CheckoutEntry {
   prunable: boolean;
   /** Bytes on disk, when `du` could answer. Managed trees only. */
   disk?: number;
+  /**
+   * The `git worktree lock` reason, when the tree is locked. An EMPTY string
+   * is a real answer — git allows a lock with no reason — and a different one
+   * from absent, which means the tree is not locked.
+   */
+  locked?: string;
 }
 
 /** What two live branches would do to each other if they met. */
@@ -1123,6 +1268,12 @@ export interface RadarPair {
   state: RadarState;
   /** The files the verdict is about: the overlap, or the conflicted subset. */
   files: string[];
+  /**
+   * The clash zones this pair touches, when it touches any — files that merge
+   * CLEANLY and are wrong afterwards. Absent when it touches none, which is a
+   * different fact from a console with no radar.
+   */
+  zones?: string[];
 }
 
 /** One run's git situation, as the console observed it from outside. */
@@ -1346,8 +1497,8 @@ export interface PreludeRow {
   source: string;
   /** Where the prelude got the row: the plan (or its twin), the launch form, or a shipped default. */
   origin: string;
-  /** Which probe judged it, for the four probed rows. */
-  probe?: 'accounts' | 'mcp' | 'credentials' | 'delivery';
+  /** Which probe judged it, for the probed rows. */
+  probe?: 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'verification';
 }
 
 /** One probe's answer — the word, the reason, the warnings when some but not all failed. */
@@ -1356,13 +1507,50 @@ export interface ProbeVerdict {
   ok: boolean;
   reason: string;
   warnings?: string[];
+  /** The probe's facts — for `verification`, a `VerificationDetail`. */
+  detail?: unknown;
+}
+
+/** A §Verification fragment the runner will not run on its own, and why (`VerifyNotRun`). */
+export interface VerificationItem {
+  text: string;
+  reason: string;
+  /** The sha256 of the whole command — what an answer is bound to. */
+  fp?: string;
+  /** One exact approval would make it run. Nothing destructive, off-machine or unparseable ever is. */
+  approvable?: boolean;
+}
+
+/** One phase's verification review, as the fifth probe reports it (`runner/verify-review.ts`). */
+export interface VerificationReviewView {
+  phase: number;
+  verdict: 'clear' | 'records' | 'may-ask' | 'asks' | 'parks';
+  park?: string;
+  runs: string[];
+  items: VerificationItem[];
+  waived: VerificationItem[];
+  setup: VerificationItem[];
+  missing: string[];
+}
+
+/** Probe 5's detail: every open phase's review, the run's scope, and the draft's answers resolved. */
+export interface VerificationDetail {
+  reviews: VerificationReviewView[];
+  scope: number[] | null;
+  answers?: {
+    approve: { fp: string; text: string }[];
+    waive: { phase: number; fp: string; text: string }[];
+  };
 }
 
 /** The run-start prelude (`GET /api/run/:slug/prelude`, and the body of a 409 at the start door). */
 export interface Prelude {
   slug: string;
   rows: PreludeRow[];
-  probes: Record<'accounts' | 'mcp' | 'credentials' | 'delivery', ProbeVerdict>;
+  /** `verification` is absent from a console older than 2026-09-18. */
+  probes: Record<'accounts' | 'mcp' | 'credentials' | 'delivery', ProbeVerdict> & {
+    verification?: ProbeVerdict;
+  };
   blocking: { key: string; why: string }[];
   waived: string[];
   acknowledged: string[];
@@ -1371,6 +1559,12 @@ export interface Prelude {
   credentials: { policy: string; ids: string[]; held: string[]; missing: string[] };
   delivery: { ok: boolean; channels: string[]; acknowledged: boolean };
   at: string;
+}
+
+/** The launch draft's answers to probe 5 — fingerprints; waivers as `<phase>:<fp>`. */
+export interface VerifyAnswers {
+  approve: string[];
+  waive: string[];
 }
 
 /** The manifest as `run.start` echoed it and the run stores it. */
@@ -1393,6 +1587,10 @@ export interface PreludeDraft {
   model?: string;
   profile?: string;
   mcpPolicy?: string;
+  /** Probe 5's question: the phases the run will drive, its autonomy, and the answers so far. */
+  onlyPhases?: number[];
+  autonomy?: string;
+  verifyAnswers?: VerifyAnswers;
 }
 
 export interface RunSettings {
@@ -1510,6 +1708,7 @@ export interface AskResult {
 }
 
 /** The autopilot's fetchers — merged into `api` by `./index`. */
+
 export const runsApi = {
   /* ---- autopilot ---- */
   runs: () => request<RunState[]>('/api/runs'),
@@ -1543,7 +1742,7 @@ export const runsApi = {
   runStart: (slug: string, options?: RunSettings) => post<RunEnvelope>(`/api/run/${q(slug)}/start`, options),
   /**
    * The run-start prelude for the launch form's DRAFT (phase 11): the manifest
-   * rendered and the four probes run over the console's own facts, before
+   * rendered and the probes run over the console's own facts, before
    * Launch is pressed. The draft's answers ride in the query so the form shows
    * exactly what the door will judge.
    */
@@ -1558,6 +1757,10 @@ export const runsApi = {
     if (draft.model) params.set('model', draft.model);
     if (draft.profile) params.set('profile', draft.profile);
     if (draft.mcpPolicy) params.set('mcpPolicy', draft.mcpPolicy);
+    if (draft.onlyPhases?.length) params.set('only', draft.onlyPhases.join(','));
+    if (draft.autonomy) params.set('autonomy', draft.autonomy);
+    if (draft.verifyAnswers?.approve.length) params.set('approve', draft.verifyAnswers.approve.join(','));
+    if (draft.verifyAnswers?.waive.length) params.set('waive', draft.verifyAnswers.waive.join(','));
     const query = params.toString();
     return request<{ prelude: Prelude }>(`/api/run/${q(slug)}/prelude${query ? `?${query}` : ''}`);
   },

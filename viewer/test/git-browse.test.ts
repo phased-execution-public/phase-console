@@ -30,7 +30,7 @@ import {
   attributeCheckouts, branchList, checkoutList, commitGraph, divergences, gitEnv, localRefs,
   submoduleDirs,
   parseAheadBehind, parseBatchAheadBehind, parseGraph, parseRefs, parseRunBranch, pickTarget,
-  repoDiff, repoTargets, rootTarget, safePath, safeRev, settleHistory, treeClaims, trunkOf,
+  refHead, repoDiff, repoTargets, rootTarget, safePath, safeRev, settleHistory, treeClaims, trunkOf,
 } from '../server/git-browse.ts';
 import { stagingNames, type CheckoutEntry } from '../server/runner/worktree.ts';
 import type { JournalEntry } from '../server/runner/journal.ts';
@@ -219,7 +219,8 @@ test('safeRev refuses a flag, a range and anything outside the charset', () => {
   for (const bad of [
     '--upload-pack=touch /tmp/x', '--output=/tmp/x', '-c', '--exec=x',
     'a..b', 'a...b',                       // a smuggled range
-    'a;rm -rf /', 'a b', 'a|b', 'a$(id)', 'a`id`', 'a\\b', 'HEAD:file',
+    'a;rm -rf /', 'a b',                   // whitespace — never in a ref name
+    'a\\b', 'HEAD:file', 'a?b', 'a*b', 'a[b',  // `check-ref-format` forbids each of these
     '', '   ', 'x'.repeat(201),
   ]) {
     assert.equal(safeRev(bad), null, `safeRev must refuse ${JSON.stringify(bad)}`);
@@ -227,6 +228,10 @@ test('safeRev refuses a flag, a range and anything outside the charset', () => {
   for (const good of [
     'HEAD', 'main', 'pe/demo-p4', 'HEAD~3', 'HEAD^', 'v1.2.3', 'a'.repeat(40), 'origin/main',
     'HEAD@{1}',
+    // Legal in a ref name and INERT as an argv member — this surface runs
+    // `execFile`, never a shell (see the module header), so refusing these
+    // bought nothing and cost every branch carrying one its page (G-REF).
+    'a|b', 'a$(id)', 'a`id`', 'feat/user\'s-fix', 'wip#42', 'fix(scope)', 'a=b', 'ré-écrire',
     // Legal in a ref and inert as an argument — a branch called
     // `feat,with-a-comma` was refused until QA round 4 found it.
     'feat,with-a-comma', 'feat+plus',
@@ -1118,6 +1123,7 @@ test('settle history joins the record and the journal, newest first', () => {
   assert.equal(failed?.detail, 'conflict in a.ts');
 });
 
+
 test('a default-branch run has no branch to name, and a detached one is named by where it stands', () => {
   const out = settleHistory([
     {
@@ -1180,4 +1186,80 @@ test('a directory that is not a repository answers empty rather than throwing', 
   assert.deepEqual(graph.tips, []);
   const branches = await branchList(base);
   assert.deepEqual(branches.branches, []);
+});
+
+/* ================================================================== *
+ * many-plans-one-repo phase 4 — G-REF and G-DIFF.
+ * ================================================================== */
+
+test('G-REF: every branch name `branches` emits is accepted by the graph', async () => {
+  // The branches section links each row to `graph?ref=<name>`, and `safeRev`'s
+  // charset allowlist refused names git is perfectly happy to create — so the
+  // console listed a branch and then refused to show it, indistinguishably
+  // from "that revision is not here".
+  const { root } = fixture();
+  const legal = [
+    "feat/user's-fix",   // an apostrophe
+    'wip#42',            // a hash
+    'fix(scope)',        // parentheses
+    'a=b',               // an equals
+    'ré-écrire',         // non-ASCII
+    'feat!breaking',     // a bang
+    'pe/demo%2',         // a percent
+  ];
+  for (const name of legal) git(root, 'branch', name, 'main');
+
+  const listed = (await branchList(root)).branches.map((row) => row.name);
+  for (const name of legal) {
+    assert.ok(listed.includes(name), `branches emitted ${name}`);
+    assert.equal(safeRev(name), name, `graph?ref= must accept ${name}`);
+    assert.ok(await commitGraph(root, { ref: name, limit: 5 }), `the graph answers for ${name}`);
+  }
+});
+
+test('G-REF: the refusals that matter are still refusals', () => {
+  // Widening the charset must not widen what an OPTION or a RANGE can be.
+  const nul = `nul${String.fromCharCode(0)}byte`;
+  for (const rev of ['--output=/tmp/x', '-c', 'a..b', 'a...b', ':(glob)**', 'has space', nul, '']) {
+    assert.equal(safeRev(rev), null, `${JSON.stringify(rev)} must be refused`);
+  }
+  assert.equal(safeRev('x'.repeat(201)), null);
+});
+
+test('G-DIFF: a diff too large to read says so, and never "nothing changed"', async () => {
+  // `git.ts`'s `git()` caps stdout at 4 MB and answers '' on overflow, so a
+  // 26 000-file range parsed to ZERO rows — rendered as "nothing changed" over
+  // a range that changed everything.
+  const { root } = fixture();
+  execFileSync('mkdir', ['-p', join(root, 'gen')]);
+  for (let n = 0; n < 26_000; n += 1) {
+    const name = `gen/${String(n).padStart(6, '0')}-${'a-deliberately-long-pathname-segment-'.repeat(4)}so-the-stat-overflows-past-four-megabytes.txt`;
+    writeFileSync(join(root, name), `${name}\n`);
+  }
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', 'a very large change');
+
+  const diff = await repoDiff(root, { base: 'HEAD~1', tip: 'HEAD' });
+  assert.ok(diff, 'the range resolves');
+  assert.equal(diff!.overflow, true, 'the stat overflowed its buffer and says so');
+  assert.equal(diff!.filesTruncated, true, 'a list that silently stops is a lie');
+  assert.ok(diff!.fileCount > 0, '"nothing changed" is the one answer this range must never give');
+});
+
+/* ================================================================== *
+ * refHead — the one rev read the landscape makes (phase 9)
+ * ================================================================== */
+
+test('refHead answers the commit a ref resolves to, and nothing for a ref that is not here or not a ref', async () => {
+  const { root } = fixture();
+  const main = git(root, 'rev-parse', 'main');
+  assert.equal(await refHead(root, 'main'), main);
+  assert.equal(await refHead(root, 'pe/demo'), main, 'the run branch was cut from main and has not moved');
+  advance(root, 'pe/demo', 1);
+  assert.notEqual(await refHead(root, 'pe/demo'), main);
+  // Absent, never a guess: a branch nobody made, and a string the envelope refuses
+  // (a leading `-` is the `--upload-pack=` class; `..` is a range, not a rev).
+  assert.equal(await refHead(root, 'pe/integration'), undefined);
+  assert.equal(await refHead(root, '--upload-pack=x'), undefined);
+  assert.equal(await refHead(root, 'main..pe/demo'), undefined);
 });

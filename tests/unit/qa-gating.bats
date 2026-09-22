@@ -189,10 +189,13 @@ write_qa() {  # write_qa <slug> <phase> <result>
   run pg diamond --boot-prompt 2
   assert_contains "$output" "qa-record.sh"
   assert_contains "$output" "holds every dependent"
-  # The P8 lesson: the subagent dies with the turn that dispatched it, so the
-  # duty has to say "inside your turn" — a session that ended "to pick it up
-  # when it returns" recorded nothing and parked the plan on a fixed defect.
+  # The P8 lesson: a session that ended its turn "to pick it up when it
+  # returns" recorded nothing and parked the plan on a fixed defect, so the
+  # duty says "inside your turn". And it says how (autopilot-token-drain P1): a
+  # FOREGROUND dispatch returns with the verdict, where waiting on a background
+  # reviewer is how one phase came to poll it 311 times.
   assert_contains "$output" "inside your turn"
+  assert_contains "$output" "in the FOREGROUND"
   assert_contains "$output" "records nothing"
 }
 

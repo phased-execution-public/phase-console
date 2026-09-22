@@ -30,10 +30,11 @@
  */
 
 import {
+  appendFileSync,
   closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync,
   writeSync, type FSWatcher,
 } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 
 import { CLAUDE_COMM, processState, type ProcessState } from '../pid.ts';
 import type { Presence, PresenceEndSource } from '../../shared/run-lifecycle.js';
@@ -175,6 +176,16 @@ export type HookPayload = {
   reason?: string;
   owner?: string;
   scope?: string;
+  /**
+   * The trace this session belongs to, from `PE_TRACE_ID` in its environment
+   * (5.1.0). The hook fires for EVERY session — the console's own, a
+   * reviewer's, a person's — and until now a session's arrival and the run
+   * that spawned it could be matched only by cwd and clock. Empty string when
+   * the session was not spawned inside a span, which is the normal case for a
+   * person's own terminal.
+   */
+  trace?: string;
+  span?: string;
   user?: string;
   host?: string;
   pid?: number;
@@ -200,6 +211,36 @@ export type HookPayload = {
    * and never weakly correlated with anybody's lock (SLF-2, REG-6).
    */
   probe?: boolean;
+  /**
+   * The config dir the session reads its Claude login from — the hook's
+   * `CLAUDE_CONFIG_DIR`, or the CLI's default `~/.claude` when unset, as an
+   * absolute path. What names the ACCOUNT a person's session spends, so a usage
+   * decision can count who else is on the window (autopilot-token-drain H6).
+   * Absent from a hook that predates the field — such a session is counted as
+   * unattributed, never guessed.
+   */
+  config_dir?: string;
+  /**
+   * An environment credential (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`,
+   * …) is set in the session, so the config dir does NOT name what it spends.
+   * A flag only: the credential never leaves the session.
+   */
+  auth_env?: boolean;
+  /**
+   * The CLI's own cross-session inbox socket and this session's token for it
+   * (5.1.0), both already exported when the `SessionStart` hook runs — phase 1,
+   * arm S-B measured exactly that. It is the ONLY way the console learns them:
+   * the socket path is `/tmp/cc-socks/<the CLI's pid>.sock`, which nothing
+   * outside the process knows, and the token is minted per session.
+   *
+   * Two rules ride with them, both enforced here rather than trusted:
+   * the token is a SECRET and is never put in a view, an SSE frame, a log line
+   * or the hook's own `additionalContext`; and both are dropped on `SessionEnd`,
+   * because a socket path whose session has gone is a path a later session's pid
+   * can be assigned.
+   */
+  messaging_socket?: string;
+  messaging_token?: string;
 };
 
 export type SessionRecord = {
@@ -207,6 +248,19 @@ export type SessionRecord = {
   kind: SessionKind;
   /** The console's own probe — see `HookPayload.probe`. */
   probe?: true;
+  /** The login's config dir — see `HookPayload.config_dir`. */
+  configDir?: string;
+  /** An env credential outranks `configDir` — see `HookPayload.auth_env`. */
+  authEnv?: true;
+  /**
+   * How to reach this session's CLI inbox — see `HookPayload.messaging_socket`.
+   *
+   * `token` is a SECRET. It lives here and in the 0600 registry file and
+   * nowhere else: `sessionViews` replaces this whole block with
+   * `{ socket: true }`, which is the only thing any reader outside the server
+   * needs to know — whether a message can be delivered at all.
+   */
+  messaging?: { socket: string; token: string; at: string };
   cwd: string;
   /** The project root the hook resolved for `cwd`, when it could. */
   root?: string;
@@ -220,6 +274,13 @@ export type SessionRecord = {
   pid?: number;
   /** ISO — the first SessionStart seen (or the first event, when it was not a start). */
   startedAt: string;
+  /**
+   * ISO — the newest SessionStart whose `source` was `resume`. The id survives
+   * `claude --resume`, so `startedAt` cannot say that a person just came back to
+   * this session; this re-opens its claim window (`claimWindowEnds`, REG-3). A
+   * `compact` start is the same session carrying on and does not move it.
+   */
+  resumedAt?: string;
   /** ISO — the newest event seen. */
   lastSeen: string;
   /**
@@ -302,8 +363,17 @@ export type SessionRecord = {
  */
 export type TurnsSource = 'stream' | 'hook' | 'unknown';
 
-/** A record as the API serves it: the record plus the answers readers want. */
-export type SessionView = SessionRecord & {
+/**
+ * A record as the API serves it: the record plus the answers readers want, and
+ * MINUS the one secret it holds.
+ *
+ * `messaging` is narrowed rather than dropped — `{ socket: true }` answers the
+ * reader's real question ("can a message reach this session at all") and the
+ * type is what stops a later `...record` spread putting the token back: a
+ * writer that assigned the record's own block here is a type error.
+ */
+export type SessionView = Omit<SessionRecord, 'messaging'> & {
+  messaging?: { socket: true };
   presence: SessionPresence;
   /** See `TurnsSource`. */
   turnsSource: TurnsSource;
@@ -391,6 +461,34 @@ export function weaklyCorrelatable(record: SessionRecord, nowMs: number): boolea
   const until = record.endedAt ? Date.parse(record.endedAt) : nowMs;
   return until - Date.parse(record.startedAt) >= WEAK_MIN_LIFETIME_MS;
 }
+
+/**
+ * How long a session that has claimed nothing counts as a PEER of a phase it is
+ * not correlated to (REG-3) — the bound on "the first minute of every hand
+ * session", the window between a session starting and its claim.
+ *
+ * It had no bound, and that was the defect: every `claude` a person left open
+ * in the root held every phase in the repository for as long as its process
+ * lived, so three terminals doing unrelated work kept a whole plan queued with
+ * no lock anywhere. Generous rather than a literal minute, because a phase
+ * session reads its handoff and its plan before it claims; past it, the lock is
+ * the contract again — a session that is going to work a phase claims it.
+ */
+export const PEER_CLAIM_WINDOW_MS = 10 * 60_000;
+
+/**
+ * When a session's claim window shuts (ms epoch): its NEWEST start plus
+ * `PEER_CLAIM_WINDOW_MS`. The newest start is `resumedAt` when a resume came
+ * after the first start — `claude --resume` keeps the id, so `startedAt` alone
+ * would give a person coming back to a session no window at all. No readable
+ * start is no evidence of a recent one: `-Infinity`, shut.
+ */
+export function claimWindowEnds(record: Pick<SessionRecord, 'startedAt' | 'resumedAt'>): number {
+  const starts = [record.startedAt, record.resumedAt]
+    .map((iso) => (iso ? Date.parse(iso) : Number.NaN))
+    .filter((ms) => Number.isFinite(ms));
+  return starts.length ? Math.max(...starts) + PEER_CLAIM_WINDOW_MS : -Infinity;
+}
 const INBOX_DEBOUNCE_MS = 100;
 export const INBOX_POLL_MS = 30_000;
 
@@ -443,6 +541,91 @@ export type ChangeMeta = { via: IngestVia; lateMs: number; history: boolean };
 export const HEARTBEAT_PERSIST_MS = 15_000;
 
 /* ------------------------------------------------------------------ *
+ * The raw event log
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where the payloads go, per session.
+ *
+ * `.events.ndjson` rather than `.events.json` on purpose: `readRecords` filters
+ * on `.json` and would otherwise parse this file as a session record, fail, and
+ * warn `sessions.record-unreadable` once per boot forever.
+ */
+export function sessionEventsFile(dir: string, sessionId: string): string {
+  // Checked rather than trusted: a route hands this whatever the caller typed.
+  // `SESSION_ID_RE` admits no `/`, so this is a belt over a wall — but the wall
+  // is one regex edit away from being widened by somebody who did not know a
+  // path was built from it.
+  if (!SESSION_ID_RE.test(sessionId)) throw new Error(`not a session id: ${sessionId}`);
+  return join(dir, `${sessionId}.events.ndjson`);
+}
+
+/**
+ * Past this the file stops, with one marker line.
+ *
+ * A session that loops writes events forever, and this file is exported in a
+ * run bundle. A megabyte is thousands of hooks — far more than any real session
+ * produces, and small enough that a thousand stale sessions cannot fill a disk.
+ */
+export const SESSION_EVENTS_CAP = 1024 * 1024;
+
+/** A heartbeat line at most this often, per session. The runner beats per stream event. */
+export const SESSION_EVENTS_BEAT_MS = 60_000;
+
+export type SessionEventLine = {
+  v: 1;
+  /** The hook's own clock. */
+  at: string;
+  /** The console's, when it applied it. */
+  appliedAt: string;
+  /** How far behind the console was — the inbox drain's lateness, in ms. */
+  lateMs: number;
+  via: IngestVia | 'runner';
+  event: string;
+  payload: Record<string, unknown>;
+};
+
+/**
+ * The payload, minus its credentials.
+ *
+ * `messaging_token` is the CLI's cross-session inbox token — a real secret, and
+ * the reason `SessionView` omits `messaging` at the type level. Writing the raw
+ * payload to a durable, greppable, bundle-exported file would hand it straight
+ * back through a different door. The KEY is kept with a masked value, because
+ * "this session had a messaging token" is exactly what a post-mortem needs and
+ * is not itself a secret.
+ */
+function scrubPayload(payload: HookPayload): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...payload };
+  if (out.messaging_token !== undefined) out.messaging_token = '[redacted]';
+  if (out.messaging_socket !== undefined) out.messaging_socket = '[redacted]';
+  return out;
+}
+
+/**
+ * Read a session's events back. `limit` takes the NEWEST lines, because the end
+ * of the sequence is what a post-mortem starts from.
+ */
+export function readSessionEvents(dir: string, sessionId: string, limit?: number): SessionEventLine[] {
+  let text: string;
+  try {
+    text = readFileSync(sessionEventsFile(dir, sessionId), 'utf8');
+  } catch {
+    return [];
+  }
+  const lines: SessionEventLine[] = [];
+  for (const raw of text.split('\n')) {
+    if (!raw.trim()) continue;
+    try {
+      lines.push(JSON.parse(raw) as SessionEventLine);
+    } catch {
+      /* a half-written last line is the writer being killed mid-append, not a bug to report */
+    }
+  }
+  return typeof limit === 'number' && limit > 0 && lines.length > limit ? lines.slice(-limit) : lines;
+}
+
+/* ------------------------------------------------------------------ *
  * Pure pieces
  * ------------------------------------------------------------------ */
 
@@ -493,6 +676,69 @@ export function parseHookPayload(body: unknown): HookPayload | null {
   const root = str(b.root, 1024); if (root && root.startsWith('/')) out.root = root;
   if (at && Number.isFinite(Date.parse(at))) out.at = at;
   if (b.probe === true || b.probe === 1 || b.probe === '1') out.probe = true;
+  const configDir = str(b.config_dir, 1024); if (configDir && configDir.startsWith('/')) out.config_dir = configDir;
+  if (b.auth_env === true || b.auth_env === 1 || b.auth_env === '1') out.auth_env = true;
+  // The inbox socket and its token (5.1.0). Validated by SHAPE rather than
+  // taken on trust, because the console will later `net.connect` to whatever
+  // path lands here: an absolute path, ending `.sock`, with no separator
+  // trickery — a hook body is a POST anything on this machine can make.
+  const socket = str(b.messaging_socket, 1024);
+  const msgToken = str(b.messaging_token, 256);
+  if (socket && MESSAGING_SOCKET_RE.test(socket) && !socket.split('/').includes('..')
+    && msgToken && MESSAGING_TOKEN_RE.test(msgToken)) {
+    out.messaging_socket = socket;
+    out.messaging_token = msgToken;
+  }
+  return out;
+}
+
+/**
+ * The CLI's socket path shape: absolute, no `..` step, ending `.sock`.
+ *
+ * Measured as `/tmp/cc-socks/<pid>.sock` (phase 1, arm S-A), but not pinned to
+ * `/tmp/cc-socks` — the CLI is free to move its own directory, and a console
+ * that refused the new path would silently lose every socket delivery while
+ * reporting nothing wrong. The shape is what matters: this path is handed to
+ * `net.connect`.
+ */
+const MESSAGING_SOCKET_RE = /^\/(?:[^/\0\n]+\/)*[^/\0\n]+\.sock$/;
+/** 32 lowercase hex, as measured — bounded generously in case the CLI widens it. */
+const MESSAGING_TOKEN_RE = /^[A-Za-z0-9._-]{8,256}$/;
+
+/** Live sessions no run spawned, per account (autopilot-token-drain phase 6, H6) — see `sessionsByAccount`. */
+export type AccountSessions = { byAccount: Record<string, number>; unattributed: number };
+
+/**
+ * Count the LIVE sessions nobody's run spawned — a person's `claude`, a console
+ * agent — by the account each one spends, for a usage decision to say who else
+ * is on the window. Run deadaff9's account drained with interactive sessions
+ * beside it that nothing could see.
+ *
+ * A session counts against an account only when its hook reported a config dir
+ * that exactly one account uses (compared lexically, trailing slashes aside —
+ * the repository's rule for paths, never `realpath`). Everything else live is
+ * `unattributed`: a hook too old to say, a dir no registered account uses, a
+ * dir two accounts share, or an environment credential that outranks the dir.
+ * With `unattributed > 0` the per-account numbers are floors.
+ *
+ * `accountDirs` holds only the accounts whose credential IS their dir — the
+ * caller leaves token accounts out, since a token's session reads `~/.claude`
+ * like the machine login's does.
+ */
+export function sessionsByAccount(
+  views: readonly Pick<SessionView, 'kind' | 'presence' | 'probe' | 'configDir' | 'authEnv'>[],
+  accountDirs: readonly { accountId: string; configDir: string }[],
+): AccountSessions {
+  const lexical = (dir: string): string => resolvePath(dir).replace(/\/+$/, '') || '/';
+  const out: AccountSessions = { byAccount: {}, unattributed: 0 };
+  for (const view of views) {
+    if (view.kind === 'autopilot' || view.probe || view.presence !== 'live') continue;
+    const dir = view.configDir && !view.authEnv ? lexical(view.configDir) : null;
+    const owners = dir ? accountDirs.filter((account) => lexical(account.configDir) === dir) : [];
+    if (owners.length !== 1) { out.unattributed += 1; continue; }
+    const id = owners[0]!.accountId;
+    out.byAccount[id] = (out.byAccount[id] ?? 0) + 1;
+  }
   return out;
 }
 
@@ -522,6 +768,14 @@ export function applyEvent(prev: SessionRecord | undefined, p: HookPayload, nowI
   if (p.transcript_path) base.transcript = p.transcript_path;
   if (p.owner) { base.owner = p.owner; base.kind = kindOf(p.owner); }
   if (p.probe) base.probe = true;
+  if (p.config_dir) base.configDir = p.config_dir;
+  if (p.auth_env) base.authEnv = true;
+  // The inbox socket, from the one event that carries it. Never from a Stop or
+  // a Notification: those fire for a session whose socket may already be gone,
+  // and the CLI does not re-export it.
+  if (p.event === 'SessionStart' && p.messaging_socket && p.messaging_token) {
+    base.messaging = { socket: p.messaging_socket, token: p.messaging_token, at };
+  }
   if (p.scope) base.scope = p.scope;
   if (p.user) base.user = p.user;
   if (p.host) base.host = p.host;
@@ -534,6 +788,12 @@ export function applyEvent(prev: SessionRecord | undefined, p: HookPayload, nowI
     case 'SessionStart':
       if (!prev) base.startedAt = at;
       if (p.source) base.source = p.source;
+      // A person coming back to a session may be about to claim a phase: the
+      // claim window re-opens. Never from a start the end already outdated,
+      // and never backwards for a resume replayed out of order.
+      if (p.source === 'resume' && !stale && (!base.resumedAt || Date.parse(at) > Date.parse(base.resumedAt))) {
+        base.resumedAt = at;
+      }
       // A fresh start (or a resume) is not waiting on anything yet.
       if (!stale) { revive(base); closeWait(base, at, 'answered'); }
       break;
@@ -551,6 +811,11 @@ export function applyEvent(prev: SessionRecord | undefined, p: HookPayload, nowI
         delete base.endedDetectedAt;
         if (p.reason) base.reason = p.reason; else delete base.reason;
         closeWait(base, at, 'ended');
+        // The socket goes with the session, and so does the token. The path is
+        // `/tmp/cc-socks/<pid>.sock`: keeping it would leave the console ready
+        // to write somebody's message into whatever process the OS assigns that
+        // pid next. A resume re-registers both on its own SessionStart.
+        delete base.messaging;
       }
       break;
     case 'Notification': {
@@ -600,7 +865,24 @@ export type PresenceProbe = (pid: number) => boolean | ProcessState;
 export function presenceOf(
   record: SessionRecord, nowMs: number, probe?: PresenceProbe,
 ): SessionPresence {
-  if (record.endedAt) return 'ended';
+  // `endedAt` is a CLAIM by the hook; the pid is a FACT about the process. When
+  // they disagree, the fact wins — and they disagree routinely, because Claude
+  // Code fires SessionEnd for `/clear` and the process it fires it for is the
+  // one still sitting in front of the operator (PRS-1).
+  //
+  // This used to return `ended` outright, before any probe. `ended` is the one
+  // answer that makes a foreign lock DEBRIS: converge releases it and boarding
+  // starts a second session in the same working tree, while the first is still
+  // typing. So ask, and only when nobody can vouch either way does the hook's
+  // word stand: no pid, no probe, or a probe that threw. `unknown` says exactly
+  // what is true — the two witnesses disagree — and unknown releases nothing.
+  if (record.endedAt) {
+    if (!record.pid || !probe) return 'ended';
+    let answer: boolean | ProcessState;
+    try { answer = probe(record.pid); } catch { return 'ended'; }
+    const state: ProcessState = answer === true ? 'running' : answer === false ? 'gone' : answer;
+    return state === 'gone' ? 'ended' : 'unknown';
+  }
   if (record.pid && probe) {
     let answer: boolean | ProcessState = true;
     try { answer = probe(record.pid); } catch { answer = true; }
@@ -782,6 +1064,10 @@ export class SessionRegistry {
   private readonly records = new Map<string, SessionRecord>();
   /** Per session: when a heartbeat last reached the disk. See `HEARTBEAT_PERSIST_MS`. */
   private readonly beatAt = new Map<string, number>();
+  /** Bytes already on each session's raw event log, so the cap costs no `stat` per hook. */
+  private readonly eventBytes = new Map<string, number>();
+  /** When each session last wrote a heartbeat LINE — a coarser clock than `beatAt`. */
+  private readonly eventBeatAt = new Map<string, number>();
   /** The unmapped `notification_type` values already warned about — once per value (REG-8). */
   private readonly unmappedSeen = new Set<string>();
   private watcher: FSWatcher | null = null;
@@ -950,9 +1236,23 @@ export class SessionRegistry {
       return prev ?? applyEvent(undefined, { ...payload, notification_type: undefined, message: undefined }, this.now().toISOString());
     }
     const appliedAt = this.now();
-    const next = applyEvent(prev, payload, appliedAt.toISOString());
     const at = payload.at && Number.isFinite(Date.parse(payload.at)) ? Date.parse(payload.at) : appliedAt.getTime();
     const lateMs = Math.max(0, appliedAt.getTime() - at);
+    // The RAW payload, before it is folded. `applyEvent` is a projection: it
+    // answers "what is true now", and every question about a presence bug is
+    // about the SEQUENCE, which folding destroys. Written FIRST, so a payload
+    // that makes the fold throw is still on record — that is exactly the
+    // payload somebody will want to see.
+    this.appendEvent({
+      v: 1,
+      at: new Date(at).toISOString(),
+      appliedAt: appliedAt.toISOString(),
+      lateMs,
+      via,
+      event: payload.event,
+      payload: scrubPayload(payload),
+    }, payload.session_id);
+    const next = applyEvent(prev, payload, appliedAt.toISOString());
     const history = via !== 'post' && lateMs > INBOX_HISTORY_HORIZON_MS;
     next.lastEvent = {
       event: payload.event, at: new Date(at).toISOString(), appliedAt: appliedAt.toISOString(), lateMs, via,
@@ -1000,6 +1300,17 @@ export class SessionRegistry {
     const iso = now.toISOString();
     if (Date.parse(iso) > Date.parse(record.lastSeen)) record.lastSeen = iso;
     if (opts.turnEnded) record.streamTurns = (record.streamTurns ?? 0) + 1;
+    // One line a minute at most. The runner beats per STREAM EVENT, which is
+    // thousands a run: unthrottled, a session's own heartbeats would fill its
+    // event log and push out the four hook kinds the log exists for.
+    const beatLine = this.eventBeatAt.get(sessionId);
+    if (beatLine == null || nowMs - beatLine >= SESSION_EVENTS_BEAT_MS) {
+      this.eventBeatAt.set(sessionId, nowMs);
+      this.appendEvent({
+        v: 1, at: iso, appliedAt: iso, lateMs: 0, via: 'runner', event: 'heartbeat',
+        payload: { ...(opts.turnEnded ? { turnEnded: true } : {}), streamTurns: record.streamTurns ?? 0 },
+      }, sessionId);
+    }
     // The session is producing again after its latest ask, so the ask was
     // answered (REG-4) — the clearing rule that needs no hook the CLI does not
     // send. Written at once, whatever the throttle says: a wait that ended is
@@ -1251,7 +1562,14 @@ export class SessionRegistry {
       if ((endedAgo != null && endedAgo > RETAIN_ENDED_MS) || silentFor > RETAIN_SILENT_MS) {
         this.records.delete(record.sessionId);
         this.beatAt.delete(record.sessionId);
+        this.eventBytes.delete(record.sessionId);
+        this.eventBeatAt.delete(record.sessionId);
         try { rmSync(join(this.opts.dir, `${record.sessionId}.json`), { force: true }); } catch { /* best effort */ }
+        // The raw event log goes WITH the record, never before it and never
+        // after: an events file whose record is gone is an orphan nothing can
+        // name, and retention's own sweep only exists to catch the ones a
+        // console that died mid-prune left behind.
+        try { rmSync(sessionEventsFile(this.opts.dir, record.sessionId), { force: true }); } catch { /* best effort */ }
         this.opts.onChange?.(record, 'prune');
         n++;
       }
@@ -1330,12 +1648,23 @@ export class SessionRegistry {
     // fifths the console talking to itself. `probes: true` shows them.
     return this.list().filter((record) => opts.probes || !record.probe).map((record) => {
       const plan = correlate(record, locks, nowMs, runs);
+      // `messaging` is pulled OUT of the spread rather than overwritten after
+      // it: a later field added to `SessionRecord` beside it would otherwise
+      // ride along on the next refactor, and the whole point of this line is
+      // that the secret cannot leave by accident.
+      const { messaging, ...rest } = record;
       return {
-        ...record,
+        ...rest,
         turns: turnsOf(record),
         turnsSource: turnsSourceOf(record),
         presence: this.presenceOfRecord(record, nowMs),
         ...(plan ? { plan } : {}),
+        // The messaging block is REPLACED, not omitted: a reader's real
+        // question is "can a message reach this session at all", and the answer
+        // is worth showing. The token is not, and this is the one place every
+        // API payload and every `sessions` SSE frame is built, so redacting
+        // here is redacting everywhere. `messages-routes.test.ts` holds it.
+        ...(messaging ? { messaging: { socket: true as const } } : {}),
       };
     });
   }
@@ -1403,6 +1732,54 @@ export class SessionRegistry {
       this.opts.onChange?.(record, 'SessionEnd');
     }
     return presence;
+  }
+
+  /**
+   * One line onto the session's raw event log, until the cap.
+   *
+   * The cap is a STOP, not a truncation, and it writes one marker before it
+   * stops. A file that simply ended would make "this session was quiet" and "we
+   * stopped listening" the same picture — the distinction a post-mortem needs
+   * most, destroyed by the mechanism meant to protect it. The size is tracked
+   * in memory rather than `stat`ed per append: a hook arrives on a request
+   * path, and a `stat` per event is a syscall per event forever.
+   */
+  private appendEvent(line: SessionEventLine, sessionId: string): void {
+    let file: string;
+    try {
+      file = sessionEventsFile(this.opts.dir, sessionId);
+    } catch {
+      return; // not a session id — `applyEvent` will refuse it too
+    }
+    let size = this.eventBytes.get(sessionId);
+    if (size === undefined) {
+      try { size = statSync(file).size; } catch { size = 0; }
+    }
+    if (size >= SESSION_EVENTS_CAP) return;
+    const text = `${JSON.stringify(line)}\n`;
+    const capped = size + text.length >= SESSION_EVENTS_CAP;
+    const body = capped
+      ? `${text}${JSON.stringify({
+          v: 1,
+          at: line.appliedAt,
+          appliedAt: line.appliedAt,
+          lateMs: 0,
+          via: line.via,
+          event: 'sessions.events-capped',
+          payload: { bytes: size + text.length, cap: SESSION_EVENTS_CAP },
+        })}\n`
+      : text;
+    try {
+      mkdirSync(this.opts.dir, { recursive: true });
+      appendFileSync(file, body, { encoding: 'utf8', mode: 0o600 });
+      this.eventBytes.set(sessionId, capped ? SESSION_EVENTS_CAP : size + text.length);
+      if (capped) this.opts.onWarn?.('sessions.events-capped', { sessionId, cap: SESSION_EVENTS_CAP });
+    } catch (error) {
+      // A read-only state directory must not stop presence from working: the
+      // record is the load-bearing artefact and this is the evidence beside it.
+      this.opts.onWarn?.('sessions.events-failed', { file, error: (error as Error).message });
+      this.eventBytes.set(sessionId, SESSION_EVENTS_CAP);
+    }
   }
 
   private persist(record: SessionRecord): void {

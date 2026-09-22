@@ -16,7 +16,6 @@
  * never an answer about the plan in front of it.
  */
 
-import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 
 import { BOARD_BUCKETS } from '../shared/status-vocab.js';
@@ -24,6 +23,11 @@ import { QA_MODES } from '../shared/plan-vocab.js';
 import type { McpPolicy } from '../shared/run-lifecycle.js';
 import { parseDecisionsTsv } from '../shared/decisions-model.js';
 import type { DecisionRow } from '../shared/decisions-model.js';
+import { LANDING_STATES } from '../shared/landing-model.js';
+import type { LandingRow } from './parse/folder.ts';
+import { NOTE_KINDS, type Note } from './parse/notes.ts';
+import { shell } from './shell.ts';
+import { envCarrier } from './trace.ts';
 
 export type EngineResult = {
   code: number;
@@ -166,7 +170,13 @@ export function scriptEnv(
   // two inputs, stated the same way (phase 11).
   if (opts.credentials) env.PE_CREDENTIALS = opts.credentials.join(' ');
   if (opts.accounts) env.PE_ACCOUNTS = opts.accounts.join(' ');
-  return { ...env, ...(extra?.env ?? {}) };
+  // AFTER the denial filter, and for the same reason the four lines above are
+  // assignments rather than inheritances: the filter denies every `PE_*` this
+  // console happened to be STARTED with, and two of these begin `PE_`. Stating
+  // them here is what makes them mean "this console said so". The cache key is
+  // built in `run()` from script, slug, revision, args and root — never from
+  // the env — so a span cannot turn every engine call into a cache miss.
+  return { ...env, ...(extra?.env ?? {}), ...envCarrier() };
 }
 
 /* ------------------------------------------------------------------ *
@@ -338,39 +348,37 @@ async function spawn(
   extra?: { env?: Record<string, string> },
 ): Promise<EngineResult> {
   await acquire();
-  const started = Date.now();
   try {
-    const result = await new Promise<EngineResult>((resolve) => {
-      execFile(
-        'bash',
-        [join(opts.scriptsDir, script), ...args],
-        {
-          timeout: TIMEOUT_MS,
-          maxBuffer: 8 * 1024 * 1024,
-          cwd: opts.root,
-          env: scriptEnv(opts, extra),
-        },
-        (error, stdout, stderr) => {
-          const failure = error as (Error & { code?: unknown; killed?: boolean }) | null;
-          // `killed` alone cannot tell a TIMEOUT from a maxBuffer overflow —
-          // Node sets it for both, and only the string `code` separates them.
-          // Conflating them made an oversized `validate.sh` (a plan big enough
-          // to emit more than 8 MB of lint) read as "timed out", and readLint
-          // deliberately reports a timeout as `ok: true` — so a plan whose lint
-          // FAILED loudest of all reported clean.
-          const overflow = failure?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
-          const timedOut = Boolean(failure?.killed) && !overflow;
-          const code = failure && typeof failure.code === 'number'
-            ? failure.code
-            : failure ? 1 : 0;
-          resolve({
-            code, stdout: String(stdout), stderr: String(stderr),
-            ms: Date.now() - started, timedOut, overflow,
-          });
-        },
-      );
+    const run = await shell('bash', [join(opts.scriptsDir, script), ...args], {
+      channel: 'engine',
+      intent: script,
+      timeout: TIMEOUT_MS,
+      cwd: opts.root,
+      // `scriptEnv` has already applied the denial filter; the seam's trace
+      // carrier is spread AFTER it, so the four ids reach the script even
+      // though two of them begin `PE_`. The cache key is computed in `run()`
+      // and is untouched by any of this.
+      env: scriptEnv(opts, extra) as NodeJS.ProcessEnv,
+      // `head`: every reader below parses this output line by line.
+      capture: { keep: 8 * 1024 * 1024, mode: 'head' },
+      // A non-zero exit is how the engine says `LINT FAIL`, `--closed`, or
+      // "this gate is blocked". Every one of them is read as a value.
+      expectFailure: true,
     });
-    return result;
+    // An overflow is NOT a timeout, and the difference decides the verdict: a
+    // killed-at-45 s run proves nothing, while a run that overran 8 MB of
+    // output proves there was a great deal to report. Reporting the second as
+    // the first turned the loudest possible lint failure into `ok: true`.
+    // Under the seam the two are separate facts rather than one `killed` flag
+    // that had to be disambiguated by an error code string.
+    return {
+      code: run.code ?? 1,
+      stdout: run.stdout,
+      stderr: run.stderr,
+      ms: run.ms,
+      timedOut: run.timedOut,
+      overflow: run.truncatedBytes > 0,
+    };
   } finally {
     release();
   }
@@ -551,6 +559,99 @@ export function readCredentials(result: EngineResult): string[] {
   return result.stdout.trim().split(',').map((s) => s.trim()).filter(Boolean);
 }
 
+/** A resolved 5.1.0 directive: the word, and which level of the plan said it. */
+export type Directive = { value: string; source: 'phase' | 'plan' | 'default' };
+
+/**
+ * `--land [N]` / `--gitlink [N]` / `--isolation [N]` / `--issues [N]` /
+ * `--conflict-policy` / `--messaging` / `--base-branch` — one
+ * `value<TAB>source` line, or nothing.
+ *
+ * `undefined` on a failed read AND on an empty one, which is the same answer
+ * on purpose: both mean "the engine did not tell me", and the caller's
+ * fallback is its own default either way. That is honest here, unlike
+ * `readDecisions`, because these directives HAVE defaults — there is nothing a
+ * caller could do differently with the distinction, and inventing an `error`
+ * field nobody branches on is how a shape that looks careful stops being read.
+ * `--isolation` legitimately prints nothing (the run decides), so a silent
+ * `undefined` is the expected answer there rather than a degraded one.
+ */
+export function readDirective(result: EngineResult): Directive | undefined {
+  if (result.timedOut || result.code !== 0) return undefined;
+  const [value, source] = result.stdout.trim().split('\t');
+  if (!value) return undefined;
+  return source === 'phase' || source === 'plan' || source === 'default'
+    ? { value, source }
+    : { value, source: 'default' };
+}
+
+/** `--land [N]`, named for its caller — the same read, so the shape cannot drift. */
+export const readLand = readDirective;
+/** `--issues [N]`. */
+export const readIssues = readDirective;
+
+/**
+ * `--landing N` — the landing LEDGER's rows for one phase, as TSV in
+ * `LANDING_COLUMNS` order.
+ *
+ * An empty array from a SUCCESSFUL read is the load-bearing answer here: it is
+ * what "this phase has not landed" looks like, and it is what a `landed N`
+ * gate blocks on. A failed read returns the same empty array rather than an
+ * error object because the gate is evaluated by the engine itself — this
+ * reader feeds display, and a display that invents rows is worse than one that
+ * shows none.
+ */
+export function readLanding(result: EngineResult): LandingRow[] {
+  if (result.timedOut || result.code !== 0) return [];
+  const out: LandingRow[] = [];
+  for (const line of result.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const cells = line.split('\t');
+    const phase = Number(cells[0]);
+    if (!Number.isInteger(phase)) continue;
+    const at = (i: number) => (cells[i] ?? '').trim().replace(/^-$/, '');
+    const state = at(2).toLowerCase();
+    out.push({
+      phase,
+      repo: at(1),
+      state: (LANDING_STATES as readonly string[]).includes(state) ? (state as LandingRow['state']) : 'unknown',
+      policy: at(3),
+      ref: at(4),
+      sha: at(5),
+      pr: at(6),
+      by: at(7),
+      recorded: at(8),
+      note: at(9),
+    });
+  }
+  return out;
+}
+
+/**
+ * `--notes N` — `source<TAB>kind<TAB>id<TAB>at<TAB>text` per line.
+ *
+ * All three sources, in the order the phase should read them: urgent mail
+ * first, then oldest to newest, bounded, with a `trailer` row when the bound
+ * dropped anything. The row type is `parse/notes.ts`'s, which is the JS twin
+ * of this arm — `viewer/test/notes-boot-parity.test.ts` holds the two to each
+ * other, so there is exactly one shape and one order in the system.
+ */
+export function readNotes(result: EngineResult): Note[] {
+  if (result.timedOut || result.code !== 0) return [];
+  return result.stdout.split('\n')
+    .map((line) => line.split('\t'))
+    .filter((cells) => cells.length >= 5 && cells[4].trim())
+    .map((cells) => ({
+      source: cells[0].trim(),
+      kind: (NOTE_KINDS as readonly string[]).includes(cells[1].trim())
+        ? (cells[1].trim() as Note['kind'])
+        : 'handoff',
+      id: cells[2].trim(),
+      at: cells[3].trim(),
+      text: cells.slice(4).join('\t').trim(),
+    }));
+}
+
 export type SessionGroup = {
   index: number;
   phases: number[];
@@ -613,7 +714,12 @@ export type LintResult = { ok: boolean; issues: string[]; summary: string; timed
 export function readLint(result: EngineResult): LintResult {
   const text = `${result.stdout}\n${result.stderr}`.trim();
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-  const summary = lines.find((l) => /^(LINT|VALIDATE)\s+(OK|FAIL)/.test(l)) ?? lines.at(-1) ?? '';
+  // The LAST verdict line, not the first: `validate.sh` prints the plan's
+  // `LINT OK` before it reads the handoffs and its `VALIDATE FAIL` after, and
+  // a halt that quoted the first told the operator a parked run was fine
+  // (many-plans-one-repo phase 17, live rehearsal 4).
+  const verdicts = lines.filter((l) => /^(LINT|VALIDATE)\s+(OK|FAIL)/.test(l));
+  const summary = verdicts.at(-1) ?? lines.at(-1) ?? '';
   // An overflow is NOT a timeout, and the difference decides the verdict: a
   // killed-at-45 s run proves nothing, while a run that overran 8 MB of output
   // proves there was a great deal to report. Reporting the second as the first

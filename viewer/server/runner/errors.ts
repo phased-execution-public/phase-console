@@ -20,6 +20,7 @@
 import type { EndedBy } from '../../shared/run-lifecycle.js';
 import type { CredentialClass } from '../../shared/ops-vocab.js';
 import { MODELS_ENV_FALLBACK, modelFamily } from './models.ts';
+import { envCarrier } from '../trace.ts';
 
 export type Disposition =
   /** Transient; try the same phase again shortly. */
@@ -101,7 +102,7 @@ export type StopSignal = {
   /** The result's `terminal_reason`: `completed`, `aborted_tools`, `max_turns`, `tool_deferred`… */
   terminalReason?: string;
   /** Background tasks the CLI started and never reported finished. */
-  backgroundTasks?: { id: string; description: string }[];
+  backgroundTasks?: { id: string; description: string; taskType?: string }[];
 };
 
 /**
@@ -562,11 +563,17 @@ export const CONSOLE_MAX_RETRIES = '15';
 /**
  * The background-task ceiling set on every child: the CLI's documented default
  * (600 000 ms, chapter 09 row 42), set explicitly rather than inherited by
- * accident (SES-12). At the end of a `-p` run the CLI waits this long for the
- * session's background tasks and then terminates them. Longer would hold a
- * finished session's process — and its lock — for work the model can no longer
- * read; `0` would hold it for ever. The warning it prints is now recognised
- * (`RE.bgTasks`), so the kill is no longer silent.
+ * accident (SES-12). At the end of a `-p` run the CLI waits up to this long for
+ * the session's background tasks and then terminates them. What that wait holds
+ * was measured (autopilot-token-drain §Context, CLI 2.1.273): a background SHELL
+ * is stopped about five seconds after the turn ends whatever this says, while an
+ * Agent or Monitor running in the background keeps the process alive — bounded by this ceiling
+ * — and its completion starts a new turn, so the model does read that work. Past the ceiling it
+ * is stopped unread (E7, CLI 2.1.274: at a 15 s ceiling, 15 s after the turn ended), which is why
+ * wait rule 4 says "ten minutes" and `test/wait-procedure.test.ts` holds that number to this one.
+ * Longer would hold a session's process, and its lock, for an agent that has
+ * stopped reporting; `0` would hold it for ever. The warning it prints is
+ * recognised (`RE.bgTasks`), so the kill is not silent.
  */
 export const BG_WAIT_CEILING_MS = 600_000;
 
@@ -588,6 +595,14 @@ export function childEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessE
     // The watchdog governs 429/529; this covers everything else it does not.
     CLAUDE_CODE_MAX_RETRIES: decided.maxRetries.value,
     CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: decided.bgWaitCeilingMs.value,
+    // The session's own evidence — its task list, its declared outcome, its
+    // lock, its presence hook — is written by a process this console lets go
+    // of. Nothing afterwards could correlate those with the drive that started
+    // them, so the id travels in the environment. Last, and always stated:
+    // outside a span every key is `undefined`, which DELETES an inherited
+    // `TRACEPARENT` rather than handing a stranger's trace to a two-hour
+    // session.
+    ...envCarrier(),
   };
 }
 

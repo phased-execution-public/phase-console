@@ -17,7 +17,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,8 +29,9 @@ import {
   laneNames, optedIn, pairKey, parseGitmodulesPaths, probeRunGit, pruneMirror, pruneRun,
   previewIsolation,
   pruneRunTree, radarPair, readMirror, resolveMounts, runSetup, sameGitFacts, scopeConfined,
-  stagingNames, sweepStale, sweepUnmanaged, treeDisk, validateMirror,
-  branchAt, commitOf, defaultBranchOf, deleteMergedBranches, ensureDetachedIntegration,
+  stagingNames, sweepStale, sweepUnmanaged, treeDisk, validateMirror, resolveBase,
+  ourWorktreeLock, worktreeLockReason, copyIncluded,
+  branchAt, commitOf, defaultBranchOf, deleteMergedBranches, ensureDetachedIntegration, uncoveredCommits,
   reclaimBranch, runBranches, holdsDetached, holdsBranch,
   REFUSAL_REASON, mirrorManifestPath,
   laneHome,
@@ -425,6 +426,127 @@ test('EC2 — a conflicting lane is refused, the merge is ABORTED, and every com
   assert.equal(git(a.integration, 'status', '--porcelain'), '');
 });
 
+test('EC2 — a conflict says whether it is STRUCTURAL: add/add, modify/delete and a submodule pointer are named as such, a content clash is not', async () => {
+  const { root, stateDir } = fixture({ 'shared.txt': 'base\n', 'gone.txt': 'to be deleted\n' });
+  const opts = { stateDir, runId: 'run1', slug: 'demo' };
+  const a = laneNames({ ...opts, phase: 4 });
+  const b = laneNames({ ...opts, phase: 9 });
+  assert.equal((await acquireLane(root, a)).ok, true);
+  assert.equal((await acquireLane(root, b)).ok, true);
+
+  // add/add: both lanes CREATE the same new file with different content.
+  // modify/delete: one lane edits a file the other deletes.
+  // content: both edit the same line of an existing file.
+  commitIn(a.dir, 'new.txt', 'from 4\n', 'phase 4 adds');
+  commitIn(a.dir, 'gone.txt', 'edited by 4\n', 'phase 4 edits');
+  commitIn(a.dir, 'shared.txt', 'phase 4 wrote this\n', 'phase 4 shared');
+  commitIn(b.dir, 'new.txt', 'from 9\n', 'phase 9 adds');
+  rmSync(join(b.dir, 'gone.txt'));
+  git(b.dir, 'add', '-A');
+  git(b.dir, 'commit', '-q', '-m', 'phase 9 deletes');
+  commitIn(b.dir, 'shared.txt', 'phase 9 wrote this\n', 'phase 9 shared');
+
+  assert.equal((await landLane(root, a)).kind, 'merged');
+  const clash = await landLane(root, b);
+  assert.equal(clash.kind, 'conflict');
+  const conflict = clash as { files: string[]; structural?: { file: string; kind: string }[] };
+  assert.deepEqual([...conflict.files].sort(), ['gone.txt', 'new.txt', 'shared.txt']);
+  assert.deepEqual(
+    (conflict.structural ?? []).map((s) => `${s.file}:${s.kind}`).sort(),
+    ['gone.txt:modify/delete', 'new.txt:add/add'],
+    'the two structural kinds are named per file, and the content clash is not among them',
+  );
+  // …and the abort still left nothing behind.
+  assert.equal(git(a.integration, 'status', '--porcelain'), '');
+});
+
+test('EC2 — a submodule pointer that both lanes moved is a structural conflict', async () => {
+  // A superproject whose one submodule both lanes advance to different
+  // commits: git cannot merge two gitlinks, and no session should be asked to.
+  const base = mkdtempSync(join(tmpdir(), 'p22-wt-sub-'));
+  trash.push(base);
+  const sub = join(base, 'sub');
+  execFileSync('mkdir', ['-p', sub]);
+  git(sub, 'init', '-q', '-b', 'main');
+  writeFileSync(join(sub, 'lib.txt'), 'v1\n');
+  git(sub, 'add', '-A');
+  git(sub, 'commit', '-q', '-m', 'v1');
+  const root = join(base, 'repo');
+  const stateDir = join(base, 'state');
+  execFileSync('mkdir', ['-p', root, stateDir]);
+  git(root, 'init', '-q', '-b', 'main');
+  writeFileSync(join(root, 'README.md'), 'base\n');
+  git(root, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', sub, 'sub');
+  git(root, 'commit', '-q', '-m', 'base with submodule');
+
+  const opts = { stateDir, runId: 'run1', slug: 'demo' };
+  const a = laneNames({ ...opts, phase: 4 });
+  const b = laneNames({ ...opts, phase: 9 });
+  assert.equal((await acquireLane(root, a)).ok, true);
+  assert.equal((await acquireLane(root, b)).ok, true);
+  // Each lane records a DIFFERENT commit for the gitlink — two new commits in
+  // the submodule, one per lane, written straight into the index by sha.
+  for (const [lane, text, msg] of [[a, 'v2-from-4', 'phase 4 bumps sub'], [b, 'v2-from-9', 'phase 9 bumps sub']] as const) {
+    writeFileSync(join(sub, 'lib.txt'), `${text}\n`);
+    git(sub, 'add', '-A');
+    git(sub, 'commit', '-q', '-m', text);
+    const sha = git(sub, 'rev-parse', 'HEAD');
+    git(lane.dir, 'update-index', '--cacheinfo', `160000,${sha},sub`);
+    git(lane.dir, 'commit', '-q', '-m', msg);
+  }
+  assert.equal((await landLane(root, a)).kind, 'merged');
+  const clash = await landLane(root, b);
+  assert.equal(clash.kind, 'conflict');
+  const conflict = clash as { files: string[]; structural?: { file: string; kind: string }[] };
+  assert.deepEqual(conflict.files, ['sub']);
+  assert.deepEqual(conflict.structural, [{ file: 'sub', kind: 'submodule' }]);
+});
+
+test('uncoveredCommits counts the run branch\'s work no covered lane holds — merge commits never count', async () => {
+  // The `pr` settle's question (phase 8): every done phase landed by its own
+  // pull request, so is there anything left on `pe/<slug>` for a run-branch PR
+  // to carry? Two lanes, both merged in with `--no-ff`; the merge commits are
+  // the console's bookkeeping, not work.
+  const { root, stateDir } = fixture();
+  const one = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 1 });
+  const two = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 2 });
+  await acquireLane(root, one);
+  await acquireLane(root, two);
+  commitIn(one.dir, 'a.txt', 'one\n', 'phase 1');
+  commitIn(two.dir, 'b.txt', 'two\n', 'phase 2');
+  assert.equal((await landLane(root, one)).kind, 'merged');
+  assert.equal((await landLane(root, two)).kind, 'merged');
+
+  assert.equal(await uncoveredCommits(root, { branch: 'pe/demo', trunk: 'main', covered: ['pe/demo-p1', 'pe/demo-p2'] }), 0,
+    'both lanes cover everything; the merge commit is not work');
+  assert.equal(await uncoveredCommits(root, { branch: 'pe/demo', trunk: 'main', covered: ['pe/demo-p1'] }), 1,
+    "phase 2's commit is on the run branch and on no covered lane");
+  assert.equal(await uncoveredCommits(root, { branch: 'pe/demo', trunk: 'main', covered: [] }), 2);
+  assert.equal(await uncoveredCommits(root, { branch: 'pe/nope', trunk: 'main', covered: [] }), undefined, 'a missing branch is not zero');
+});
+
+test('two lanes acquired in the same instant both get a tree — the run branch is minted once, not raced', async () => {
+  // Measured (many-plans-one-repo phase 8): two phases with disjoint scopes
+  // admitted together on a run whose `pe/demo` did not exist yet. Both
+  // `acquireLane`s reached `ensureIntegration` before either had minted the
+  // branch, and the loser's `worktree add -b pe/demo` failed with "cannot lock
+  // ref 'refs/heads/pe/demo': reference already exists" — so the second lane
+  // silently shared the root, committed on `main`, and never landed at all.
+  const { root, stateDir } = fixture();
+  const one = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 1 });
+  const two = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 2 });
+
+  const [a, b] = await Promise.all([acquireLane(root, one), acquireLane(root, two)]);
+
+  assert.ok(a.ok, `lane 1: ${a.detail}`);
+  assert.ok(b.ok, `lane 2: ${b.detail}`);
+  assert.equal(git(root, 'rev-parse', 'pe/demo-p1'), git(root, 'rev-parse', 'pe/demo'));
+  assert.equal(git(root, 'rev-parse', 'pe/demo-p2'), git(root, 'rev-parse', 'pe/demo'));
+  assert.ok(await isRegistered(root, one.dir));
+  assert.ok(await isRegistered(root, two.dir));
+});
+
+
 test('landing a lane that never existed says so instead of throwing', async () => {
   const { root, stateDir } = fixture();
   const names = laneNames({ stateDir, runId: 'run1', slug: 'demo', phase: 5 });
@@ -699,7 +821,7 @@ test('D10 — two belts hold the sweep off: a live run, and a dead one whose chi
 
   // Belt 1: this console is driving run1 right now.
   const live = await sweepStale(root, { stateDir, slug: 'demo', liveRunIds: ['run1'] });
-  assert.deepEqual(live, { removed: [], kept: [], runs: [] });
+  assert.deepEqual(live, { removed: [], kept: [], runs: [], lockedForeign: [] });
   assert.ok(await isRegistered(root, names.dir), 'a live run must be untouched');
 
   // Belt 2: run1 is NOT this console's — it belongs to a console that died —
@@ -712,7 +834,7 @@ test('D10 — two belts hold the sweep off: a live run, and a dead one whose chi
     children: (runId) => (runId === 'run1' ? [4242] : []),
     probe: (pid) => pid === 4242,
   });
-  assert.deepEqual(held, { removed: [], kept: [], runs: [] });
+  assert.deepEqual(held, { removed: [], kept: [], runs: [], lockedForeign: [] });
   assert.ok(await isRegistered(root, names.dir));
 
   // …and once that pid is gone, the same call sweeps.
@@ -777,7 +899,7 @@ test('D10 — an operator\'s uncommitted hand-resolution in `integration/` is ne
 test('D10 — a plan that never used worktrees costs the sweep nothing', async () => {
   const { root, stateDir } = fixture();
   const swept = await sweepStale(root, { stateDir, slug: 'demo', liveRunIds: [] });
-  assert.deepEqual(swept, { removed: [], kept: [], runs: [] });
+  assert.deepEqual(swept, { removed: [], kept: [], runs: [], lockedForeign: [] });
   assert.equal(git(root, 'worktree', 'list').split('\n').length, 1, 'nothing was created');
 });
 
@@ -2272,4 +2394,594 @@ test('P1/QA-F1 — a live claim that named NO tree holds every tree the reclaim 
   assert.equal(preview.refusal, 'branch-in-use');
   assert.match(String(preview.detail), /live session holds it \(sam@laptop, other-plan phase 2\)/);
   assert.equal(git(root, 'rev-parse', '--abbrev-ref', 'HEAD'), branch);
+});
+
+/* ------------------------------------------------------------------ *
+ * many-plans-one-repo phase 4 — audit B.
+ * ------------------------------------------------------------------ */
+
+test('WT-1: pruneRun with an EMPTY phase list asks the disk and removes nothing', async () => {
+  // `pruneWorktrees` derives `phases` from `this.worktreePhases`, which is
+  // in-memory and never persisted — so a drive that boarded no laned phase (a
+  // resume, a second console) passed `[]`, skipped the per-lane loop entirely,
+  // found `kept` empty, and `rm -rf`'d the whole run directory with two lanes'
+  // uncommitted work in it. The catastrophe the module header documents.
+  const { root, stateDir } = fixture();
+  const opts = { stateDir, runId: 'run1', slug: 'demo' };
+  const a = laneNames({ ...opts, phase: 4 });
+  const b = laneNames({ ...opts, phase: 9 });
+  await acquireLane(root, a);
+  await acquireLane(root, b);
+  commitIn(a.dir, 'a.txt', 'a\n', 'phase 4');
+  commitIn(b.dir, 'b.txt', 'b\n', 'phase 9');
+
+  const { removed, kept } = await pruneRun(root, { ...opts, phases: [] });
+  assert.deepEqual(removed, [], 'nothing may be removed — both lanes hold unlanded commits');
+  assert.ok(kept.includes(a.dir) && kept.includes(b.dir), 'both lanes are reported kept');
+  assert.ok(existsSync(join(a.dir, 'a.txt')), "phase 4's work survives");
+  assert.ok(existsSync(join(b.dir, 'b.txt')), "phase 9's work survives");
+  assert.ok(existsSync(join(stateDir, 'worktrees', 'run1')), 'the run directory survives');
+});
+
+test('WT-1: pruneRun with an empty list still clears a run whose lanes all landed', async () => {
+  const { root, stateDir } = fixture();
+  const opts = { stateDir, runId: 'run1', slug: 'demo' };
+  const a = laneNames({ ...opts, phase: 1 });
+  await acquireLane(root, a);
+  commitIn(a.dir, 'one.txt', '1\n', 'one');
+  await landLane(root, a);
+
+  const { removed, kept } = await pruneRun(root, { ...opts, phases: [] });
+  assert.deepEqual(kept, []);
+  assert.ok(removed.includes(a.dir), 'a landed lane is still finished with');
+  assert.ok(!existsSync(join(stateDir, 'worktrees', 'run1')));
+});
+
+test('WT-2: two lanes landing at once both land, into one integration tree', async () => {
+  // Two `finally` blocks calling `landLane` concurrently share one index and one
+  // MERGE_HEAD: a conflict blamed on the wrong lane, `merge --abort` of the
+  // other lane's merge, and `index.lock` failures read as `failed` with no halt.
+  for (let round = 0; round < 20; round += 1) {
+    const { root, stateDir } = fixture();
+    const opts = { stateDir, runId: `run${round}`, slug: 'demo' };
+    const a = laneNames({ ...opts, phase: 4 });
+    const b = laneNames({ ...opts, phase: 9 });
+    await acquireLane(root, a);
+    await acquireLane(root, b);
+    commitIn(a.dir, 'a.txt', 'a\n', 'phase 4');
+    commitIn(b.dir, 'b.txt', 'b\n', 'phase 9');
+
+    const [ra, rb] = await Promise.all([landLane(root, a), landLane(root, b)]);
+    for (const [name, result] of [['p4', ra], ['p9', rb]] as const) {
+      assert.ok(
+        result.kind === 'merged' || result.kind === 'conflict',
+        `round ${round}: ${name} answered ${result.kind} — ${JSON.stringify(result)}`,
+      );
+    }
+    assert.ok(contains(root, a.runBranch, a.laneBranch), `round ${round}: phase 4 landed`);
+    assert.ok(contains(root, b.runBranch, b.laneBranch), `round ${round}: phase 9 landed`);
+  }
+});
+
+test('SET-1: two plans settling into one staging tree at once do not fight over its index', async () => {
+  const { root, stateDir } = fixture();
+  const staging = stagingNames(stateDir);
+  for (const slug of ['alpha', 'beta']) {
+    git(root, 'branch', `pe/${slug}`, 'main');
+    const tmp = join(stateDir, `w-${slug}`);
+    git(root, 'worktree', 'add', '-q', tmp, `pe/${slug}`);
+    commitIn(tmp, `${slug}.txt`, `${slug}\n`, slug);
+    git(root, 'worktree', 'remove', '--force', tmp);
+  }
+  const [ra, rb] = await Promise.all([
+    landIntegration(root, { branch: 'pe/alpha', staging }),
+    landIntegration(root, { branch: 'pe/beta', staging }),
+  ]);
+  for (const [name, result] of [['alpha', ra], ['beta', rb]] as const) {
+    assert.ok(
+      result.kind === 'merged' || result.kind === 'conflict',
+      `${name} answered ${result.kind} — ${JSON.stringify(result)}`,
+    );
+  }
+  assert.ok(contains(root, staging.branch, 'pe/alpha'));
+  assert.ok(contains(root, staging.branch, 'pe/beta'));
+});
+
+test('WT-3: a lane registered but whose directory is gone is rebuilt, not adopted', async () => {
+  const { root, stateDir } = fixture();
+  const names = laneNames({ stateDir, runId: 'run1', slug: 'demo', phase: 7 });
+  await acquireLane(root, names);
+  assert.ok(existsSync(names.dir));
+  rmSync(names.dir, { recursive: true, force: true });
+
+  const again = await acquireLane(root, names);
+  assert.equal(again.ok, true, again.detail);
+  assert.ok(existsSync(join(names.dir, 'README.md')), 'a session must not board into a directory that is gone');
+});
+
+test('BASE-1: a fresh run branch forks from the TRUNK, not from whatever the root has out', async () => {
+  // The root routinely stands on another plan's branch, a detached sha or a
+  // stale trunk — and `worktree add -b … HEAD` forked from it, so one plan's
+  // work silently became another plan's base.
+  const { root, stateDir } = fixture();
+  const trunkSha = git(root, 'rev-parse', 'HEAD');
+  git(root, 'checkout', '-q', '-b', 'pe/other');
+  writeFileSync(join(root, 'other.txt'), 'other\n');
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', "another plan's work");
+  assert.notEqual(git(root, 'rev-parse', 'HEAD'), trunkSha);
+
+  const names = laneNames({ stateDir, runId: 'run1', slug: 'demo', phase: 0 });
+  const made = await ensureIntegration(root, names);
+  assert.equal(made.ok, true, made.detail);
+  assert.equal(git(root, 'rev-parse', 'pe/demo'), trunkSha, 'pe/demo forks from main');
+  assert.equal(made.base, 'main');
+  assert.equal(made.baseSha, trunkSha);
+});
+
+test('BASE-1: a repository with no nameable trunk still gets its branch, from HEAD', async () => {
+  const { root, stateDir } = fixture();
+  git(root, 'branch', '-m', 'main', 'trunkless');
+  const head = git(root, 'rev-parse', 'HEAD');
+  const names = laneNames({ stateDir, runId: 'run1', slug: 'demo', phase: 0 });
+  const made = await ensureIntegration(root, names);
+  assert.equal(made.ok, true, made.detail);
+  assert.equal(git(root, 'rev-parse', 'pe/demo'), head);
+  assert.equal(made.base, undefined, 'no trunk to name');
+});
+
+test('SWP-1: runBranches does not read ANOTHER plan’s run branch as this plan’s lane', async () => {
+  const { root } = fixture();
+  git(root, 'branch', 'pe/demo', 'main');
+  git(root, 'branch', 'pe/demo-p4', 'main');
+  git(root, 'branch', 'pe/demo-p9', 'main');   // …which is also plan `demo-p9`'s RUN branch
+  const mine = await runBranches(root, 'demo', { otherSlugs: ['demo-p9'] });
+  assert.deepEqual(mine.sort(), ['pe/demo', 'pe/demo-p4']);
+  // With nobody else declared, the old reading stands — there is no other plan.
+  assert.deepEqual((await runBranches(root, 'demo')).sort(), ['pe/demo', 'pe/demo-p4', 'pe/demo-p9']);
+});
+
+test('MIR-1: sweepUnmanaged prunes a vanished registration inside every mounted repository', async () => {
+  // A mirror's mounts are worktrees of the SUBMODULES, so their registrations
+  // live in `.git/modules/<sub>/worktrees/*`. Sweeping only the root left a
+  // ghost holding `pe/<slug>` in a submodule forever, and every later run of
+  // that plan refused `branch-in-use`.
+  const { root } = fixture();
+  const sub = join(root, 'sub');
+  mkdirSync(sub);
+  git(sub, 'init', '-q', '-b', 'main');
+  writeFileSync(join(sub, 'f.txt'), 'x\n');
+  git(sub, 'add', '-A');
+  git(sub, 'commit', '-q', '-m', 'base');
+  const ghost = join(root, 'ghost');
+  git(sub, 'worktree', 'add', '-q', '-b', 'pe/demo', ghost);
+  rmSync(ghost, { recursive: true, force: true });
+  assert.match(git(sub, 'worktree', 'list', '--porcelain'), /prunable/);
+
+  const swept = await sweepUnmanaged(root, { repos: [sub] });
+  assert.ok(swept.pruned.some((dir) => dir.endsWith('ghost')), JSON.stringify(swept));
+  assert.ok(!/prunable/.test(git(sub, 'worktree', 'list', '--porcelain')), 'the submodule registration is gone');
+  // …and the branch is free again, which is the whole point.
+  git(sub, 'worktree', 'add', '-q', join(root, 'again'), 'pe/demo');
+});
+
+test('MIR-2: a mount an operator switched off the run branch is named, not a silent false', async () => {
+  const { root, stateDir } = fixture();
+  const sub = join(root, 'sub');
+  mkdirSync(sub);
+  git(sub, 'init', '-q', '-b', 'main');
+  writeFileSync(join(sub, 'f.txt'), 'x\n');
+  git(sub, 'add', '-A');
+  git(sub, 'commit', '-q', '-m', 'base');
+  const names = laneNames({ stateDir, runId: 'run1', slug: 'demo', phase: 0 });
+  const made = await ensureMirror({ names, runId: 'run1', slug: 'demo', mounts: [{ rel: 'sub', source: sub }] });
+  assert.equal(made.ok, true, made.detail);
+  assert.equal(await validateMirror(names.integration, 'pe/demo'), true);
+
+  git(join(names.integration, 'sub'), 'switch', '-q', '-c', 'scratch');
+  const drifted = await validateMirror(names.integration, 'pe/demo', { explain: true });
+  assert.equal(drifted.ok, false);
+  assert.equal(drifted.refusal, 'mirror-drifted');
+  assert.deepEqual(drifted.drifted, ['sub']);
+});
+
+test('W10: a lane conflict halt names the OTHER live lanes, and says nothing lost', async () => {
+  // Audit B verified this by reading and noted it had no test. A conflict is by
+  // definition about two pieces of work, and a message naming only the lane
+  // that finished second sends whoever reads it to look at half the problem.
+  const { laneConflictHalt } = await import('../server/runner/runner-loop.ts');
+  const names = laneNames({ stateDir: '/s', runId: 'r1', slug: 'demo', phase: 4 });
+
+  const withSiblings = laneConflictHalt({
+    phase: 4, names, files: ['src/a.ts', 'src/b.ts'], detail: 'merge failed', others: [9, 11],
+  });
+  assert.match(withSiblings, /phase 9, phase 11/, 'both other lanes are named');
+  assert.match(withSiblings, /ABORTED and nothing was lost/);
+  assert.match(withSiblings, /pe\/demo-p4/, 'where the commits still are');
+  assert.match(withSiblings, /src\/a\.ts, src\/b\.ts/);
+  assert.ok(withSiblings.includes(names.integration), 'where to resolve it');
+  assert.match(withSiblings, /Retry phase 4/);
+
+  // …and no dangling clause when this lane was the only one.
+  const alone = laneConflictHalt({
+    phase: 4, names, files: ['src/a.ts'], detail: 'merge failed', others: [],
+  });
+  assert.ok(!/other live lane/.test(alone), 'no sentence about lanes that do not exist');
+  assert.match(alone, /Retry phase 4/);
+});
+
+/* ================================================================== *
+ * Phase 7 — isolation for many plans.
+ *
+ * Six exit criteria, six headings. Every one of them is a question
+ * about what git ACTUALLY did, asked of a throwaway repository, in the
+ * idiom the rest of this file established: nothing is mocked, and the
+ * assertion is a `git` read of the result.
+ * ================================================================== */
+
+/* ------------------------------------------------------------------ *
+ * 1. The base a run branch is cut from — chosen, not guessed.
+ * ------------------------------------------------------------------ */
+
+test('P7 base: `origin/HEAD` resolves through the remote, and reports which arm answered', async () => {
+  const { root } = fixture();
+  // A bare origin whose HEAD is `main`, cloned the way a real remote is set up:
+  // `symbolic-ref refs/remotes/origin/HEAD` exists only because `clone` wrote it.
+  const origin = join(root, '..', 'origin.git');
+  git(root, 'init', '--bare', '-q', '-b', 'main', origin);
+  git(root, 'remote', 'add', 'origin', origin);
+  git(root, 'push', '-q', 'origin', 'main');
+  git(root, 'remote', 'set-head', 'origin', 'main');
+
+  const main = git(root, 'rev-parse', 'main');
+  const base = await resolveBase(root, 'origin/HEAD');
+
+  assert.equal(base?.ref, 'main');
+  assert.equal(base?.sha, main);
+  assert.equal(base?.source, 'origin-head', 'the remote answered, and the record must say so');
+});
+
+test('P7 base: with no remote, `origin/HEAD` falls back to the LOCAL trunk and says `trunk`', async () => {
+  const { root } = fixture();
+  // The operator's own checkout is standing somewhere else entirely — the whole
+  // reason BASE-1 exists. The fallback must still be the trunk, never HEAD.
+  git(root, 'checkout', '-q', '-b', 'pe/other');
+  commitIn(root, 'drift.txt', 'elsewhere\n', 'a commit on another branch');
+
+  const base = await resolveBase(root, 'origin/HEAD');
+
+  assert.equal(base?.ref, 'main');
+  assert.equal(base?.sha, git(root, 'rev-parse', 'main'));
+  assert.equal(base?.source, 'trunk');
+});
+
+test('P7 base: `head` is the checkout HEAD — the word that reproduces today\'s fork byte for byte', async () => {
+  const { root } = fixture();
+  git(root, 'checkout', '-q', '-b', 'pe/other');
+  commitIn(root, 'drift.txt', 'elsewhere\n', 'a commit on another branch');
+  const head = git(root, 'rev-parse', 'HEAD');
+
+  const base = await resolveBase(root, 'head');
+
+  assert.equal(base?.sha, head, '`head` means exactly what the checkout has out');
+  assert.equal(base?.source, 'head');
+  assert.notEqual(base?.sha, git(root, 'rev-parse', 'main'), 'and it is NOT the trunk');
+});
+
+test('P7 base: a NAMED ref is verified, and an unknown one resolves to nothing at all', async () => {
+  const { root } = fixture();
+  git(root, 'branch', 'release/5.1');
+  commitIn(root, 'later.txt', 'after\n', 'a commit main has and the release does not');
+
+  const named = await resolveBase(root, 'release/5.1');
+  assert.equal(named?.ref, 'release/5.1');
+  assert.equal(named?.sha, git(root, 'rev-parse', 'release/5.1'));
+  assert.equal(named?.source, 'ref');
+
+  // 🔴 Silence, not a fallback. Forking from `main` because the operator's
+  // `release/9.9` does not exist would put the run's work on a base nobody
+  // asked for, and the journal would say `main` as if that had been the plan.
+  assert.equal(await resolveBase(root, 'release/9.9'), undefined);
+});
+
+test('P7 base: a run branch is minted AT the resolved sha, not at whatever the ref means later', async () => {
+  const { root, stateDir } = fixture();
+  const names = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 0 });
+  const base = await resolveBase(root, 'origin/HEAD');
+  const pinned = base!.sha;
+  // The trunk MOVES between the resolution and the checkout — a second console,
+  // an operator pulling. A base is a point in time or it is not a base.
+  commitIn(root, 'moved.txt', 'later\n', 'the trunk moves under the run');
+
+  const made = await ensureIntegration(root, names, { base });
+
+  assert.ok(made.ok, made.detail);
+  assert.equal(git(names.integration, 'rev-parse', 'HEAD'), pinned);
+  assert.notEqual(git(root, 'rev-parse', 'main'), pinned, 'the fixture must really have moved');
+});
+
+/* ------------------------------------------------------------------ *
+ * 2. Locks — a live tree says so, and a sweep never takes one it did
+ *    not write.
+ * ------------------------------------------------------------------ */
+
+test('P7 lock: a live lane locks its tree with OUR reason, and `checkouts` reads it back', async () => {
+  const { root, stateDir } = fixture();
+  const names = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 4 });
+  await ensureIntegration(root, names);
+  const made = await acquireLane(root, names, {
+    lock: worktreeLockReason({ kind: 'lane', slug: 'demo', phase: 4, runId: 'r1', at: '2026-09-18T10:00:00.000Z' }),
+  });
+  assert.ok(made.ok, made.detail);
+  // The acquisition SAYS whether the lock took (phase 15): the runner writes
+  // the reason onto the lane's durable child record only on this word, so a
+  // row that reads "locked" is never a string we hoped git accepted.
+  assert.equal(made.locked, true, 'acquireLane must report the lock it fastened');
+
+  const registry = await checkouts(root, [stateDir]);
+  const lane = registry.find((entry) => realish(entry.dir) === realish(names.dir));
+  assert.ok(lane, 'the lane must be in the registry');
+  assert.equal(
+    lane.locked,
+    'phase-console lane demo p4 r1 2026-09-18T10:00:00.000Z',
+    'the reason is the grammar, and its FIRST token is what a sweep asks about',
+  );
+  assert.ok(ourWorktreeLock(lane.locked), 'and it reads back as ours');
+
+  // git itself must agree — the assertion that makes this a real lock and not
+  // a string we wrote into our own data structure.
+  assert.match(git(root, 'worktree', 'list', '--porcelain'), /^locked phase-console lane demo p4/m);
+});
+
+test('P7 lock: a DEAD run\'s own lock is unlocked and the tree swept; a HAND lock is kept and named once', async () => {
+  const { root, stateDir } = fixture();
+  const home = join(stateDir, 'worktrees');
+
+  // ONE dead run, two lanes — because two runs of one plan cannot both hold
+  // `pe/demo`, and the lock question is per TREE, not per run. Lane 1 carries
+  // our own stale lock; lane 2 carries a person's.
+  const ours = laneNames({ home, runId: 'r1', slug: 'demo', phase: 1 });
+  const theirs = laneNames({ home, runId: 'r1', slug: 'demo', phase: 2 });
+  await ensureIntegration(root, ours);
+  await acquireLane(root, ours, {
+    lock: worktreeLockReason({ kind: 'lane', slug: 'demo', phase: 1, runId: 'r1', at: '2026-09-18T10:00:00.000Z' }),
+  });
+  await acquireLane(root, theirs, { lock: 'mine — do not touch, I am bisecting' });
+
+  const swept = await sweepStale(root, { homes: [home], slug: 'demo', liveRunIds: [] });
+
+  assert.ok(swept.removed.some((dir) => realish(dir) === realish(ours.dir)),
+    'our own stale lock is not a reason to leave a landed tree standing for ever');
+  assert.ok(!existsSync(ours.dir), 'and the directory is really gone');
+
+  assert.ok(swept.kept.some((dir) => realish(dir) === realish(theirs.dir)), "a person's lock is never taken");
+  assert.ok(existsSync(theirs.dir), 'and their tree is really still there');
+  assert.deepEqual(
+    swept.lockedForeign.map((entry) => realish(entry.dir)), [realish(theirs.dir)],
+    'reported ONCE, with the reason, so the journal can say whose it is',
+  );
+  assert.equal(swept.lockedForeign[0].reason, 'mine — do not touch, I am bisecting');
+
+  // …and git still holds it, which is what makes the report a fact. Git
+  // C-QUOTES a reason holding a non-ASCII byte, which is why the assertion
+  // above is against the decoded value and this one against the raw line.
+  assert.match(git(root, 'worktree', 'list', '--porcelain'), /^locked "mine \\342\\200\\224 do not touch/m);
+});
+
+/* ------------------------------------------------------------------ *
+ * 3. Retention — what becomes of a tree when its run is over.
+ * ------------------------------------------------------------------ */
+
+/** A run with one landed lane, ready for a retention decision. */
+async function landedLane(slug: string): Promise<{ root: string; home: string; dir: string }> {
+  const { root, stateDir } = fixture();
+  const home = join(stateDir, 'worktrees');
+  const names = laneNames({ home, runId: 'r1', slug, phase: 1 });
+  await ensureIntegration(root, names);
+  await acquireLane(root, names);
+  return { root, home, dir: names.dir };
+}
+
+test('P7 retention: `keep` removes nothing, `prune` removes, and `keep-on-failure` keeps a FAILED run\'s clean lane', async () => {
+  for (const [policy, failed, survives] of [
+    ['keep', false, true],
+    ['prune', true, false],
+    ['keep-on-failure', true, true],
+    ['keep-on-failure', false, false],
+  ] as const) {
+    const slug = `ret-${policy}-${failed}`;
+    const { root, home, dir } = await landedLane(slug);
+    await pruneRun(root, { home, runId: 'r1', slug, phases: [1], retention: policy, failed });
+    assert.equal(
+      existsSync(dir), survives,
+      `${policy} on a ${failed ? 'failed' : 'clean'} run must ${survives ? 'keep' : 'remove'} the lane`,
+    );
+  }
+});
+
+test('P7 retention: `ttl:1` keeps a young tree and removes it once the hour has passed', async () => {
+  const young = await landedLane('ttl-young');
+  await pruneRun(young.root, {
+    home: young.home, runId: 'r1', slug: 'ttl-young', phases: [1],
+    retention: 'ttl:1', now: Date.now() + 59 * 60_000,
+  });
+  assert.ok(existsSync(young.dir), 'fifty-nine minutes is not an hour');
+
+  const old = await landedLane('ttl-old');
+  await pruneRun(old.root, {
+    home: old.home, runId: 'r1', slug: 'ttl-old', phases: [1],
+    retention: 'ttl:1', now: Date.now() + 61 * 60_000,
+  });
+  assert.ok(!existsSync(old.dir), 'and sixty-one minutes is');
+});
+
+test('P15 retention: the stale sweep asks each run for ITS word, and falls back to the console\'s', async () => {
+  // Two dead runs of two plans under one home: r1 said `keep` when it was
+  // launched (the run's own `worktreeRetention`), r2 said nothing. Under a
+  // console whose word is `prune`, r1's tree stands and r2's goes.
+  const { root, stateDir } = fixture();
+  const home = join(stateDir, 'worktrees');
+  const keep = laneNames({ home, runId: 'r1', slug: 'ret-run-keep', phase: 1 });
+  await ensureIntegration(root, keep);
+  await acquireLane(root, keep);
+  const silent = laneNames({ home, runId: 'r2', slug: 'ret-run-silent', phase: 1 });
+  await ensureIntegration(root, silent);
+  await acquireLane(root, silent);
+
+  const words: Record<string, string | undefined> = { r1: 'keep', r2: undefined };
+  const swept = await sweepStale(root, {
+    homes: [home], slug: 'ret-run-keep', liveRunIds: [],
+    retention: (runId) => words[runId] ?? 'prune',
+  });
+  assert.ok(existsSync(keep.dir), 'r1 said keep, and keep it is');
+  assert.ok(!existsSync(silent.dir), 'r2 said nothing, so the console\'s prune decides');
+  assert.ok(swept.removed.includes(silent.dir));
+});
+
+test('P7 retention: a DIRTY tree survives every word, including `prune`', async () => {
+  const { root, home, dir } = await landedLane('ret-dirty');
+  writeFileSync(join(dir, 'unsaved.txt'), 'a session was killed mid-edit\n');
+
+  await pruneRun(root, { home, runId: 'r1', slug: 'ret-dirty', phases: [1], retention: 'prune', failed: false });
+
+  assert.ok(existsSync(dir), 'uncommitted work outranks every retention word there is');
+  assert.equal(readFileSync(join(dir, 'unsaved.txt'), 'utf8'), 'a session was killed mid-edit\n');
+});
+
+/* ------------------------------------------------------------------ *
+ * 5. Staging — one tree per REPOSITORY, and a lock over it.
+ * ------------------------------------------------------------------ */
+
+test('P7 staging: the root keeps `staging/`, and each sub-repository gets its own leaf under it', () => {
+  assert.equal(stagingNames('/s').dir, '/s/staging', 'the root is unchanged, byte for byte');
+  assert.equal(stagingNames('/s', '').dir, '/s/staging', 'an empty repo key IS the root');
+  assert.equal(stagingNames('/s', 'web-admin').dir, '/s/staging/web-admin');
+  assert.equal(stagingNames('/s', 'app/core').dir, '/s/staging/app/core');
+  // One branch name in N unrelated object databases: they never meet, so they
+  // never collide — the same reasoning `qualifiedRef` exists for on the radar.
+  assert.equal(stagingNames('/s', 'web-admin').branch, 'pe/integration');
+});
+
+test('P7 staging: a settle LOCKS the staging tree, and a person\'s lock parks it instead of merging', async () => {
+  const { root, stateDir } = fixture();
+  const staging = stagingNames(stateDir);
+  const names = laneNames({ stateDir, runId: 'r1', slug: 'demo', phase: 1 });
+  await ensureIntegration(root, names);
+  commitIn(names.integration, 'feature.txt', 'work\n', 'a commit to settle');
+
+  const first = await landIntegration(root, { branch: names.runBranch, staging });
+  assert.equal(first.kind, 'merged');
+  assert.equal(
+    git(root, 'rev-parse', 'pe/integration'), git(root, 'rev-parse', 'pe/demo'),
+    'the staging branch really holds the run branch',
+  );
+
+  // A person takes the staging tree while a SECOND plan tries to settle into it.
+  git(root, 'worktree', 'lock', '--reason', 'resolving a conflict by hand', staging.dir);
+  const other = laneNames({ stateDir, runId: 'r2', slug: 'other', phase: 1 });
+  await ensureIntegration(root, other);
+  commitIn(other.integration, 'other.txt', 'more work\n', 'a commit the second plan would settle');
+  const second = await landIntegration(root, { branch: 'pe/other', staging });
+
+  assert.equal(second.kind, 'locked', 'a human-locked staging tree is never merged into');
+  assert.equal(second.kind === 'locked' && second.by, 'resolving a conflict by hand');
+  assert.ok(
+    !contains(root, 'pe/integration', 'pe/other'),
+    'and nothing of the second plan went in — the whole point of the park',
+  );
+});
+
+test('P7 staging: a settle that WOULD conflict is refused before the tree is touched', async () => {
+  const { root, stateDir } = fixture({ 'shared.txt': 'base\n' });
+  const staging = stagingNames(stateDir);
+
+  // Two plans, both editing one file, from the same base.
+  const a = laneNames({ stateDir, runId: 'r1', slug: 'alpha', phase: 1 });
+  await ensureIntegration(root, a);
+  commitIn(a.integration, 'shared.txt', 'alpha\n', 'alpha edits the shared file');
+  assert.equal((await landIntegration(root, { branch: a.runBranch, staging })).kind, 'merged');
+
+  const b = laneNames({ stateDir, runId: 'r2', slug: 'beta', phase: 1 });
+  await ensureIntegration(root, b);
+  commitIn(b.integration, 'shared.txt', 'beta\n', 'beta edits the same file');
+
+  const clash = await landIntegration(root, { branch: b.runBranch, staging });
+
+  assert.equal(clash.kind, 'conflict');
+  assert.deepEqual(clash.kind === 'conflict' ? clash.files : [], ['shared.txt']);
+  // 🔴 The pre-check is the point: the tree is never left half-merged, so the
+  // NEXT plan's settle fails for its own reasons and not for beta's.
+  assert.equal(git(staging.dir, 'status', '--porcelain'), '', 'the staging tree is clean');
+  assert.equal(readFileSync(join(staging.dir, 'shared.txt'), 'utf8'), 'alpha\n');
+});
+
+/* ------------------------------------------------------------------ *
+ * 6. `.worktreeinclude` — the gitignored files a build needs.
+ * ------------------------------------------------------------------ */
+
+test('P7 include: named files and directories are copied into a fresh tree', async () => {
+  const { root } = fixture();
+  const to = join(root, '..', 'fresh-include');
+  mkdirSync(join(root, 'config'), { recursive: true });
+  mkdirSync(to, { recursive: true });
+  writeFileSync(join(root, '.worktreeinclude'), [
+    '# the handful of ignored files a build needs',
+    'local.settings.json',
+    '',
+    'config/',
+  ].join('\n'));
+  writeFileSync(join(root, 'local.settings.json'), '{"key":"value"}\n');
+  writeFileSync(join(root, 'config', 'dev.json'), '{"port":1}\n');
+
+  const done = await copyIncluded(root, to);
+
+  assert.deepEqual(done.copied.sort(), ['config/', 'local.settings.json']);
+  assert.deepEqual(done.refused, []);
+  assert.equal(readFileSync(join(to, 'local.settings.json'), 'utf8'), '{"key":"value"}\n');
+  assert.equal(readFileSync(join(to, 'config', 'dev.json'), 'utf8'), '{"port":1}\n');
+});
+
+test('P7 include: a path that leaves the repository is REFUSED and named, never copied', async () => {
+  const { root } = fixture();
+  const to = join(root, '..', 'fresh-escape');
+  mkdirSync(to, { recursive: true });
+  writeFileSync(join(root, '..', 'secrets.env'), 'TOKEN=real\n');
+  writeFileSync(join(root, '.worktreeinclude'), [
+    '../secrets.env',
+    '/etc/hosts',
+    'nested/../../escape.txt',
+    'missing.json',
+  ].join('\n'));
+
+  const done = await copyIncluded(root, to);
+
+  assert.deepEqual(done.copied, []);
+  // 🔴 NAMED, not silently dropped. An operator whose build fails because a
+  // file was not copied must be able to see that the console refused it, and
+  // why — a silent refusal reads as a bug in the checkout.
+  assert.deepEqual(done.refused.sort(), ['../secrets.env', '/etc/hosts', 'missing.json', 'nested/../../escape.txt']);
+  assert.ok(!existsSync(join(to, 'secrets.env')), 'a path outside the repository is never read');
+});
+
+test('P7 include: the file cap stops the copy and names what it did not take', async () => {
+  const { root } = fixture();
+  const to = join(root, '..', 'fresh-cap');
+  mkdirSync(join(root, 'many'), { recursive: true });
+  mkdirSync(to, { recursive: true });
+  // Exactly the cap: the directory fits, and the one file after it does not.
+  for (let i = 0; i < 200; i += 1) writeFileSync(join(root, 'many', `f${i}.txt`), 'x\n');
+  writeFileSync(join(root, '.worktreeinclude'), ['many/', 'after-the-cap.txt'].join('\n'));
+  writeFileSync(join(root, 'after-the-cap.txt'), 'never reached\n');
+
+  const done = await copyIncluded(root, to, { maxFiles: 200 });
+
+  assert.deepEqual(done.refused, ['after-the-cap.txt'], 'the cap is a stop, and it says where it stopped');
+  assert.ok(!existsSync(join(to, 'after-the-cap.txt')));
+});
+
+test('P7 include: no `.worktreeinclude` is not an error — it is every repository', async () => {
+  const { root } = fixture();
+  const to = join(root, '..', 'fresh-none');
+  mkdirSync(to, { recursive: true });
+  assert.deepEqual(await copyIncluded(root, to), { copied: [], refused: [] });
 });

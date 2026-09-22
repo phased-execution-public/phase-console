@@ -34,10 +34,13 @@ import HealthSection from './health-section';
 const SUBTITLE = 'Logs, journals and diagnostics — what the console saw';
 
 /**
- * All four bodies in the destination's own chunk, for Repo's reason: none of
- * them pulls a dependency the rest of the app does not already have, so
- * splitting further would only add round trips and grow the service worker's
- * precache list.
+ * Every body in the destination's own chunk, for Repo's reason: none of them
+ * pulls a dependency the rest of the app does not already have, so splitting
+ * further would only add round trips and grow the service worker's precache
+ * list. The map is keyed by `DebugSection`, so a section added to
+ * `DEBUG_SECTIONS` without a body here is a compile error rather than a blank
+ * page — which is also what keeps the two Pro sections' marker regions
+ * matched: strip one half and the other stops typechecking.
  */
 const SECTION_BODY: Record<DebugSection, React.ComponentType<{ route: ViewProps['route'] }>> = {
   logs: LogSection,

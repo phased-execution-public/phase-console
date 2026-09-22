@@ -10,7 +10,6 @@
  */
 import { basename, dirname, join, relative } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { instanceId } from '../shared/instances.mjs';
 import {
@@ -71,7 +70,7 @@ import {
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading,
 } from './analysis/stats.ts';
-import { credentialsFor, mcpServersFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
+import { credentialsFor, mcpServersFor, personCheckFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
 import { mergeDecisions } from '../shared/decisions-model.js';
 import { PreludeRefusal, preludeFor, resolvedManifest, type DeliveryFacts, type Prelude, type PreludeDeps, type PreludeOptions } from './prelude.ts';
 import { credentialsHeld } from './credentials-probe.ts';
@@ -82,6 +81,34 @@ import { probeAccounts, probeCredentials, probeDelivery, probeMcp } from './prel
 import { cliVersion } from './accounts/transcripts.ts';
 import { unitName, unitPath } from '../shared/instances.mjs';
 import { execFile as execFileCb } from 'node:child_process';
+
+/**
+ * Is the phase's own session worth offering as a resume?
+ *
+ * THREE facts, not two: there must be a session, the CLI must still hold it,
+ * and the resume policy must not already have written it off (checkpointed,
+ * `partial --reason budget|context`, or large and cold/under another account).
+ * The recovery payload used to ask only the first two, so a session the runner's
+ * gate would refuse was still shown as "Resume with instruction" — and pressing
+ * it came back with the policy's reason, an offer nothing could accept.
+ * `resolveVehicle` already asked all three; this is that computation, named once
+ * so the two callers cannot drift again. (console-open-findings O1.)
+ *
+ * `paying` is the account that would pay for the resume, or null when the caller
+ * cannot say — the account is then not judged, exactly as `resumePolicy` documents.
+ */
+export function resumeOffer(
+  record: RunPhaseRecord | undefined,
+  paying: string | null,
+  now: number = Date.now(),
+): { sessionId: string | undefined; resumable: boolean; policy: ResumePolicy | null } {
+  const sessionId = record?.sessionId ?? record?.resumeSessionId;
+  const gone = Boolean(record && isSessionGone(record));
+  const policy = record && sessionId && !gone
+    ? resumePolicy(record, sessionId, { now, paying })
+    : null;
+  return { sessionId, resumable: Boolean(sessionId) && !gone && policy?.choice !== 'fresh', policy };
+}
 
 /** `execFile` with stdout kept, for the unit reader — a 10 s timeout the runtime enforces. */
 function execText(file: string, args: string[]): Promise<{ code: number | null; stdout: string }> {
@@ -95,7 +122,7 @@ function execText(file: string, args: string[]): Promise<{ code: number | null; 
     } catch { resolve({ code: null, stdout: '' }); }
   });
 }
-import { policyForPlan, policyPrefsOf } from './runner/policy.ts';
+import { policyForKey, policyForPlan, policyPrefsOf } from './runner/policy.ts';
 import { tailscaleStatus } from './tailscale.ts';
 import {
   declarationCooldownFor, declaredClock, evaluateWait, openWaitEntry, ordinalSuffix, parkedMsOf,
@@ -123,7 +150,8 @@ import { ISOLATED, isolationMode } from '../shared/worktree-model.js';
 import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
 } from '../shared/recovery-model.js';
-import { environmentReport, type EnvIssue } from './env-doctor.ts';
+import { environmentReport, probeGit, type EnvIssue } from './env-doctor.ts';
+import { shell } from './shell.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
 import { journalFile } from './runner/run-paths.ts';
@@ -137,15 +165,21 @@ import {
 import type { LaneLiveness } from './runner/liveness.ts';
 import { REFUSAL_REASON, type RunGitView } from './runner/worktree.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
+// FREE: the four shared owners the launch defaults are read through (phase
+// 15) — the words are free vocabulary; only the engines behind them are Pro.
+import { CONFLICT_POLICIES, landPolicyOf, type ConflictPolicy, type LandPolicy } from '../shared/landing-model.js';
+import { MESSAGING_WORDS, type MessagingWord } from '../shared/message-model.js';
+import { ISSUE_MODES, type IssueMode } from '../shared/issues-model.js';
 import {
   autoResolveRun, childrenOf, retirePhaseHalt, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, pidHoldsWork, procIdentity,
   reconcileRecordsAgainstBoard, resetForRetry, resolveRunsAgainst, retryOverrideFrom, saveRun,
   slugsNeedingBoard, runDir, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText, setRunState,
-  type BoardingBrief, type Errand, type McpPolicy, type PhaseOptions, type PreflightWarning, type RungRecord, type RunState, type VerifySummary, clearWatchBookkeeping, isSessionGone,
+  type BoardingBrief, type Errand, type McpPolicy, type PhaseOptions, type PreflightWarning, type RungRecord, type RunState, type RunVerifyApprovals, type VerifySummary, clearWatchBookkeeping, isSessionGone,
   journalOf, prepareReboard, chargeDeclaration, consumeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge,
   type Actor,
 } from './runner/state.ts';
-import { RECOVER_MAX_PER_PHASE } from './runner/runner-core.ts';
+import { RECOVER_MAX_PER_PHASE, resumePolicyWhy } from './runner/runner-core.ts';
+import { resumePolicy, type ResumePolicy } from './runner/usage.ts';
 import { asActor, doorActor, stoppedByOf, unattributedActor, type StartActor } from './actor.ts';
 import { ceilingSentence } from './start-ceiling.ts';
 import {
@@ -156,6 +190,7 @@ import {
 import { readTranscript, transcriptFile, type TranscriptEntry } from './runner/transcript.ts';
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './runner/verify.ts';
 import { loadVerifyEnv } from './runner/verify-env.ts';
+import { approvalsForPhase, resolveVerifyAnswers, reviewPhase, type PhaseReview } from './runner/verify-review.ts';
 import { checkAuth, checkAuthFor, forgetAuth, openLoginTerminal, openCommandTerminal, shellQuote, type AuthStatus } from './runner/auth.ts';
 import { Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir, type AccountView } from './accounts/index.ts';
 import { Mcp, type McpServerView } from './mcp/index.ts';
@@ -317,80 +352,125 @@ export abstract class ServiceRuns extends ServiceLive {
   }
 
   /**
-   * The boarding preflight's answer for every open phase, at the moment the
-   * operator presses Start — advisory only, computed with the SAME extractor
-   * boarding will use. The runner still parks per phase; this exists because
-   * that park used to be the operator's first sight of a defect that was
-   * readable before the run was created.
+   * The verification REVIEW (`runner/verify-review.ts`) of every open phase —
+   * the one prediction of what boarding will do, asked by every reader here:
+   * the start response, the plan page's report, the launch door and the
+   * repair gate. `run` supplies a live run's answers and autonomy; a launch
+   * draft passes its own. A done phase is history, and is skipped.
    */
-  async verificationPreflight(slug: string, onlyPhases?: number[]): Promise<string[]> {
+  async verificationReviews(slug: string, opts: {
+    onlyPhases?: readonly number[];
+    answers?: RunVerifyApprovals;
+    autonomy?: string;
+    run?: RunState | null;
+  } = {}): Promise<PhaseReview[]> {
     const record = this.store?.get(slug);
     if (!record?.plan?.phased) return [];
+    const plan = record.plan;
     const board = await this.board(slug).catch(() => null);
     const done = new Set(board?.done ?? []);
-    const out: string[] = [];
-    for (const row of record.plan.graph) {
+    const prefs = policyPrefsOf(this.prefs);
+    const rows = mergeDecisions(plan.decisions, record.decisionsTwin);
+    const answers = opts.answers ?? opts.run?.verifyApprovals;
+    const verifyEnv = loadVerifyEnv(this.flags.scriptsDir);
+    const out: PhaseReview[] = [];
+    for (const row of plan.graph) {
       if (done.has(row.phase)) continue;
-      if (onlyPhases?.length && !onlyPhases.includes(row.phase)) continue;
-      const detail = record.plan.phases[row.phase];
-      if (extractCommands(detail?.verification).commands.length) continue;
-      const declared = /\*\*\s*Verification\b/i.test(detail?.raw ?? '');
-      out.push(declared
-        ? `phase ${row.phase}'s §Verification yields nothing the runner can execute — it will park at boarding`
-        : `phase ${row.phase} has no §Verification — it will park at boarding`);
+      if (opts.onlyPhases?.length && !opts.onlyPhases.includes(row.phase)) continue;
+      const detail = plan.phases[row.phase];
+      out.push(reviewPhase({
+        phase: row.phase,
+        verification: detail?.verification,
+        setup: detail?.setup,
+        declared: /\*\*\s*Verification\b/i.test(detail?.raw ?? ''),
+        // The order `Runner.personCheckFor` resolves in: the phase's bullet,
+        // then the run's manifest (or, before a run, the plan's rows), then
+        // this console's word, then the shipped `operator`.
+        personCheck: personCheckFor(plan, row.phase)
+          ?? (opts.run
+            ? policyForKey('verification.person-check', opts.run, prefs)
+            : policyForPlan('verification.person-check', rows, prefs))?.answer
+          ?? null,
+        autonomy: opts.autonomy ?? opts.run?.autonomy ?? 'keep-going',
+        approvals: approvalsForPhase(answers, row.phase),
+        allowUnverified: this.prefs.allowUnverifiedPhases === true,
+        preflightSkip: verifyEnv.preflightSkip,
+      }));
     }
     return out;
   }
 
   /**
+   * The boarding preflight's answer for every open phase, at the moment the
+   * operator presses Start — advisory only, and the same REVIEW boarding
+   * asks, so it names exactly the phases boarding will park and why. It used
+   * to ask a weaker question ("is anything runnable at all?") and called a
+   * plan fine that parked at its phase 2 (run f0da619a).
+   */
+  async verificationPreflight(slug: string, onlyPhases?: number[]): Promise<string[]> {
+    const reviews = await this.verificationReviews(slug, { onlyPhases });
+    return reviews.filter((review) => review.verdict === 'parks').map((review) => review.park!);
+  }
+
+  /**
    * The boarding preflight's findings for every open phase, STRUCTURED — the
-   * same predicates boarding uses (one extractor, one lead resolver, one
-   * verify.env), computed on demand so a plan page can badge "N commands
-   * cannot run here" BEFORE any money is spent. The journal-only string twin
-   * of this data predicted the dominant halt class 44 times and was rendered
-   * by nothing.
+   * same review boarding asks, computed on demand so a plan page can badge
+   * "N commands cannot run here" BEFORE any money is spent. The journal-only
+   * string twin of this data predicted the dominant halt class 44 times and
+   * was rendered by nothing. Under `Person-check: halt` a refused command now
+   * reads "will PARK the run", not "a person may be asked" — the second was
+   * the promise boarding broke.
    */
   async verifyPreflightReport(slug: string): Promise<
     { phases: { phase: number; warnings: PreflightWarning[] }[]; computedAt: string } | null
   > {
     const record = this.store?.get(slug);
     if (!record?.plan?.phased) return null;
-    const board = await this.board(slug).catch(() => null);
-    const done = new Set(board?.done ?? []);
     const verifyEnv = loadVerifyEnv(this.flags.scriptsDir);
     const phases: { phase: number; warnings: PreflightWarning[] }[] = [];
-    for (const row of record.plan.graph) {
-      if (done.has(row.phase)) continue;
-      const detail = record.plan.phases[row.phase];
-      const { commands, notRun } = extractCommands(detail?.verification);
+    for (const review of await this.verificationReviews(slug)) {
+      const detail = record.plan.phases[review.phase];
       const warnings: PreflightWarning[] = [];
-      if (!commands.length) {
-        const declared = /\*\*\s*Verification\b/i.test(detail?.raw ?? '');
+      const answerOf = (item: PhaseReview['items'][number]) => ({
+        ...(item.fp ? { fp: item.fp } : {}),
+        approvable: item.approvable === true,
+      });
+      if (!review.runs.length && review.verdict === 'parks') {
         warnings.push({
           kind: 'nothing-runnable',
-          message: declared
+          parks: true,
+          message: /\*\*\s*Verification\b/i.test(detail?.raw ?? '')
             ? 'its §Verification yields nothing the runner can execute — it will park at boarding'
             : 'it has no §Verification — it will park at boarding',
         });
-      } else {
-        for (const held of notRun) {
+      } else if (review.verdict === 'parks' && !review.missing.length) {
+        for (const held of review.items) {
           warnings.push({
-            kind: 'human-check', command: held.text,
+            kind: 'human-check', command: held.text, parks: true, ...answerOf(held),
+            message: `will PARK the run at boarding (Person-check: halt): ${held.text} — ${held.reason}`,
+          });
+        }
+      } else {
+        for (const held of review.items) {
+          warnings.push({
+            kind: 'human-check', command: held.text, ...answerOf(held),
             // "may", not "will": whether the card is actually raised depends
             // on the run's autonomy and on what else proves the phase —
             // `halt-on-everything` always asks, `keep-going` only when no
             // machine evidence backs the board. This probe has no run yet.
-            message: `a person may be asked: ${held.text} — ${held.reason}`,
+            message: `a person may be asked: ${held.text} — ${held.reason} `
+              + '(asks only if nothing else proves the phase)',
           });
         }
-        for (const lead of unresolvableLeads(commands, process.env.PATH, verifyEnv.preflightSkip).keys()) {
+        for (const lead of review.missing) {
           warnings.push({
             kind: 'missing-lead', lead,
+            ...(review.verdict === 'parks' ? { parks: true } : {}),
             message: `\`${lead}\` is not installed here — its command will be SKIPPED at verification`,
           });
         }
-        if (!/\*\*\s*Verify in:?\*\*/i.test(detail?.raw ?? '')) {
-          const sensitive = commands.filter((command) => {
+        if (review.runs.length && !/\*\*\s*Verify in:?\*\*/i.test(detail?.raw ?? '')) {
+          const sensitive = review.runs.filter((command) => {
             if (/^cd\s/.test(command.trim())) return false;
             const lead = resolveLead(command);
             return lead ? verifyEnv.cwdSensitive.has(lead) : false;
@@ -404,7 +484,7 @@ export abstract class ServiceRuns extends ServiceLive {
           }
         }
       }
-      if (warnings.length) phases.push({ phase: row.phase, warnings });
+      if (warnings.length) phases.push({ phase: review.phase, warnings });
     }
     return { phases, computedAt: new Date().toISOString() };
   }
@@ -473,7 +553,7 @@ export abstract class ServiceRuns extends ServiceLive {
     // be an exception the automatic callers swallowed (ACT-2).
 
     // THE PRELUDE (phase 11, ZTD-2/QRL-2): the decision manifest rendered and
-    // four probes run before any spend, for a FRESH run — a resume answered
+    // probes run before any spend, for a FRESH run — a resume answered
     // at its own door and its stored fields stand. A blocking row still
     // `outstanding`, an unacknowledged waiver or a failed blocking probe
     // refuses the start (`PreludeRefusal` → 409 at the route, every entry
@@ -496,6 +576,12 @@ export abstract class ServiceRuns extends ServiceLive {
         accounts: prelude.accounts,
         acknowledgedWaivers: prelude.acknowledged,
         ...(override && prelude.blocking.length ? { manifestOverride: { rows: override.rows, by: override.by } } : { manifestOverride: undefined }),
+        // The draft's §Verification answers as the prelude resolved them —
+        // exact texts, signed — and never the raw draft: an fp that named no
+        // approvable command answered nothing and is not carried.
+        verifyApprovals: prelude.verifyApprovals
+          ? { ...prelude.verifyApprovals, by: options.actor?.by ?? 'operator', at: prelude.at }
+          : undefined,
       };
     }
 
@@ -572,12 +658,35 @@ export abstract class ServiceRuns extends ServiceLive {
     // spends a slot — and charged only once the runner has actually started.
     const admitted = this.admitStart(actor, slug, options.resumeRunId ?? null);
     if (!admitted.ok) throw new Error(ceilingSentence(admitted));
+    // Phase 15's four launch defaults resolve by isolation's rule exactly: an
+    // explicit word in the dialog beats the preference, a fresh run that says
+    // nothing takes the preference, and a RESUME keeps the run's own sticky
+    // word. Every other door into `startRun` omits them, and omitting must
+    // mean the preference rather than a silent vocabulary default. (The
+    // plan's own line still outranks whatever the run carries — the runner
+    // reads the plan first and the run's word only where it is silent.)
+    const fresh = !options.resumeRunId;
+    const landing = options.landing ?? (fresh ? landPolicyOf(this.prefs.landing) as LandPolicy : undefined);
+    const conflictPolicy = options.conflictPolicy
+      ?? (fresh && CONFLICT_POLICIES.includes(this.prefs.conflictPolicy as never)
+        ? this.prefs.conflictPolicy as ConflictPolicy : undefined);
+    const messaging = options.messaging
+      ?? (fresh && MESSAGING_WORDS.includes(this.prefs.messaging as never)
+        ? this.prefs.messaging as MessagingWord : undefined);
+    const issuesMode = options.issuesMode
+      ?? (fresh && ISSUE_MODES.includes(this.prefs.issuesMode as never)
+        ? this.prefs.issuesMode as IssueMode : undefined);
+
     const state = await this.runnerFor(slug).start({
       ...options,
       actor,
       autoRecover,
       mcpPolicy,
       isolation,
+      landing,
+      conflictPolicy,
+      messaging,
+      issuesMode,
       skills,
       slug,
       root: this.root.path,
@@ -589,7 +698,7 @@ export abstract class ServiceRuns extends ServiceLive {
 
   /**
    * The run-start prelude for a plan (phase 11): the manifest rendered, the
-   * four probes run, the blocking list computed — over the console's live
+   * probes run, the blocking list computed — over the console's live
    * facades. `GET /api/run/:slug/prelude` serves it for the launch form's
    * draft (the form's answers ride in as `options`); `startRun` runs it again
    * at the door. Pure in `prelude.ts`; this is the deps builder.
@@ -644,6 +753,17 @@ export abstract class ServiceRuns extends ServiceLive {
           tailscale,
         };
       },
+      // Probe 5: the verification review of every open phase — the same one
+      // boarding asks — under the draft's answers, resolved to exact texts.
+      verification: async () => {
+        const autonomy = options.autonomy;
+        const bare = await this.verificationReviews(slug, { ...(autonomy ? { autonomy } : {}) });
+        const answers = resolveVerifyAnswers(bare, options.verifyAnswers);
+        const reviews = answers
+          ? await this.verificationReviews(slug, { ...(autonomy ? { autonomy } : {}), answers })
+          : bare;
+        return { reviews, scope: options.onlyPhases?.length ? options.onlyPhases : null, ...(answers ? { answers } : {}) };
+      },
       prefs: policyPrefsOf(this.prefs),
     };
     return preludeFor(slug, options, deps);
@@ -651,7 +771,7 @@ export abstract class ServiceRuns extends ServiceLive {
 
   /**
    * `phase-console doctor`'s report, answered by THIS console (phase 11): the
-   * prelude's four probes over the live facades with no plan in front of them,
+   * prelude's four plan-free probes over the live facades (the fifth, verification, needs a plan),
    * and the machine rows read here. `GET /api/doctor` serves it; the CLI
    * prefers it to its own off-line reading whenever a console answers.
    */
@@ -692,7 +812,7 @@ export abstract class ServiceRuns extends ServiceLive {
           devices: this.push.list().length, notifyCommand: Boolean(notifyCommand()),
           webhooks: this.webhooks.list().length, remote, tailscale,
         });
-        return { status: verdict.status, ok: verdict.ok, reason: verdict.reason };
+        return { status: verdict.status, ok: verdict.ok, reason: verdict.reason, ...(verdict.warnings ? { warnings: verdict.warnings } : {}) };
       },
       hooks: async () => this.hooksStatus(),
       unit: async () => {
@@ -704,6 +824,24 @@ export abstract class ServiceRuns extends ServiceLive {
         const [verdict] = await credentialsHeld(['gh'], root ? { cwd: root } : {});
         return { status: verdict.status, ok: verdict.status !== 'fail', reason: verdict.reason };
       },
+      publish: () => this.flags.allowPublish === true,
+      // Under the CONSOLE's own environment, which under a launch agent is a
+      // different PATH from a person's shell — that difference IS errand E7.
+      git: () => probeGit(
+        async (file, args, opts) => {
+          const run = await shell(file, args, {
+            channel: 'shell',
+            intent: 'doctor git probe',
+            ...(opts?.cwd ? { cwd: opts.cwd } : {}),
+            timeout: 10_000,
+            // A non-zero exit is this probe's ANSWER — an unaccepted Xcode
+            // licence exits 69 — so it must not surface as an `info` fault.
+            expectFailure: true,
+          });
+          return { code: run.code, stdout: run.stdout, stderr: run.stderr };
+        },
+        root ?? null,
+      ),
       environment: () => this.environment.issues,
       console: async () => ({ healthy: degradedState().healthy, serverStale: serverIsStale(), version: distRev() ? `built at ${distRev()}` : undefined }),
     };
@@ -904,6 +1042,7 @@ export abstract class ServiceRuns extends ServiceLive {
     this.rulingsCache.set(slug, { stamp, rulings });
     return rulings;
   }
+
 
   /** How much of a run's journal the policy rows read — the timeline's bound, a tenth of it. */
   private static readonly POLICY_JOURNAL_TAIL = 2_000;
@@ -1492,9 +1631,10 @@ export abstract class ServiceRuns extends ServiceLive {
    */
   freezeFleet(by = 'console'): { ok: boolean; reason?: string; frozen: FleetHold | null; runs: number } {
     const already = this.fleetHold();
-    // A machine hold is not this console's freeze: it holds automatic starts and
-    // leaves live sessions running, so Freeze-all still has work to stop.
-    if (already && already.scope !== 'machine') {
+    // A machine hold (or a restart's) is not this console's freeze: it holds
+    // automatic starts and leaves live sessions running, so Freeze-all still
+    // has work to stop.
+    if (already && !already.scope) {
       return { ok: false, reason: 'the console is already frozen', frozen: already, runs: 0 };
     }
     const hold = this.markFleetFrozen(by);
@@ -2589,7 +2729,11 @@ export abstract class ServiceRuns extends ServiceLive {
       // A `continue` is spent by the launch it authorised: the next restart asks again.
       consumeDecision: (runId) => { this.resumeDecisions.delete(runId); this.resumeAsks.delete(runId); },
       resumeWait: (slug, runId, trigger) => this.resumeOverdueWait(slug, runId, trigger, { count: true }),
-      presence: (lock) => this.sessions.presenceOfLock(lock),
+      // Through `lockPresenceFor`, never the raw registry (SCH-3) — and this is
+      // the dep that DELETES a lock: converge's `endedSessionLocks` releases
+      // what reads `ended`. A lane's lock outliving its attempt's session is
+      // ordinary, so the raw word here released claims that runs were holding.
+      presence: (lock) => this.lockPresenceFor(lock),
       heal: (slug, pass) => this.maybeAutoRecover(slug, pass),
       startRun: (slug, options) => this.startRun(slug, options),
       editRun: (slug, runId, apply) => this.editStoredRunById(slug, runId, apply),
@@ -2937,8 +3081,15 @@ export abstract class ServiceRuns extends ServiceLive {
           this.outcomeTimers.set(key, timer);
           return;
         }
-        const m = /^([^/]+)\/outcomes\/(phase-\d{2,}\.json)$/.exec(name);
-        if (!m) return;
+        // `inboxOutcomePhase` owns the name shape — both the legacy
+        // `phase-NN.json` and the stamped `phase-NN-<written_at>.json` S9-a
+        // introduced. A regex spelled here instead is how the WATCHER went on
+        // ignoring every stamped declaration while the sweep read them fine:
+        // the inbox still worked, but only once a minute, and the "resume this
+        // session now" path it exists for is not a once-a-minute path. The
+        // `[^/]+` also keeps `outcomes/ignored/…` out, as the old literal did.
+        const m = /^([^/]+)\/outcomes\/([^/]+)$/.exec(name);
+        if (!m || inboxOutcomePhase(m[2]) === null) return;
         const key = `${m[1]}/${m[2]}`;
         const prev = this.outcomeTimers.get(key);
         if (prev) clearTimeout(prev);
@@ -2978,7 +3129,17 @@ export abstract class ServiceRuns extends ServiceLive {
       try { this.ingestRulingsFor(slug); } catch (error) { log.warn('rulings.boot-ingest', { slug, error }); }
       let names: string[] = [];
       try { names = readdirSync(outcomeInboxDir(root, slug)); } catch { continue; }
-      for (const name of names) this.ingestOutcomeFile(slug, join(outcomeInboxDir(root, slug), name));
+      // OLDEST FIRST. Since S9-a a phase can have several declarations waiting
+      // — `partial` then `blocked`, say — and applying them in `readdir` order
+      // is applying them in whatever order the filesystem hands back, which for
+      // two declarations of one phase means the newest can be overwritten by
+      // the older one. The stamp in the name is fixed-width and colon-free
+      // precisely so this sort is chronological without opening anything; a
+      // legacy `phase-NN.json` sorts before every stamped sibling, which is the
+      // right place for it (it was written by an older script, so it IS older).
+      for (const name of [...names].sort()) {
+        this.ingestOutcomeFile(slug, join(outcomeInboxDir(root, slug), name));
+      }
     }
   }
 
@@ -3671,6 +3832,10 @@ export abstract class ServiceRuns extends ServiceLive {
       ptySessions: ptyClaudeSessions(this.terminals.state().sessions),
     });
 
+    // One computation for both `resumable` and the actions it gates — the two
+    // used to carry the same expression twice, and both omitted the policy.
+    const offer = resumeOffer(record, run.accountId ?? 'default');
+
     return {
       runId: run.id,
       phase,
@@ -3689,12 +3854,12 @@ export abstract class ServiceRuns extends ServiceLive {
       verifiedIn: record.verifiedIn ?? null,
       lint: record.lint ?? null,
       closeout: record.closeout ?? null,
-      sessionId: record.sessionId ?? record.resumeSessionId ?? null,
-      resumable: Boolean(record.sessionId ?? record.resumeSessionId) && !isSessionGone(record),
+      sessionId: offer.sessionId ?? null,
+      resumable: offer.resumable,
       note: record.note ?? null,
       workingTree: dirty ? dirty.split('\n').slice(0, 40) : [],
       lock,
-      actions: recoveryActions(record.status, Boolean(record.sessionId ?? record.resumeSessionId) && !isSessionGone(record), classified?.situation ?? null),
+      actions: recoveryActions(record.status, offer.resumable, classified?.situation ?? null),
       situation: classified?.situation ?? null,
       evidence: classified ? summariseEvidence(classified.evidence) : [],
       // Claimed versus evidenced, from the same four facts the board, the
@@ -4288,10 +4453,18 @@ export abstract class ServiceRuns extends ServiceLive {
     // climb" and hide the flag that was actually in the way.
     // …and a session the CLI has refused to resume is no session either: the
     // own-session rungs skip, and the ladder reaches the fresh one.
-    const resumable = Boolean(record?.sessionId ?? record?.resumeSessionId) && !(record && isSessionGone(record));
+    // …and neither is one not worth resuming (autopilot-token-drain phase 4): the
+    // runner's gate would refuse it (`resumePolicy`), so the own-session rungs
+    // skip by name here and the ladder reaches the fresh one without spending
+    // a rung on a refusal. The account is judged only when the run is known.
+    const { sessionId: ownSession, resumable, policy: notWorth } =
+      resumeOffer(record, state ? state.accountId ?? 'default' : null);
     const noSession = record && isSessionGone(record)
       ? 'the CLI holds no conversation under the phase\'s session id here'
-      : 'the phase has no session to resume';
+      : notWorth?.choice === 'fresh'
+        ? `the phase's session ${ownSession} is not worth resuming — ${resumePolicyWhy(notWorth)} — `
+          + 'a fresh session with the resume brief is cheaper'
+        : 'the phase has no session to resume';
     const agent = true;
     // The drive loop's availability probe may carry no evidence (a preset
     // situation skips the gather); the healer always does.

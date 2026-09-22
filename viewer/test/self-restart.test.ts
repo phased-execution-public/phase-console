@@ -74,3 +74,19 @@ test('reexec: a spawn that throws is reported false, never thrown — the exit s
   const spawn = (() => { throw new Error('ENOENT'); }) as unknown as Parameters<typeof reexec>[1];
   assert.equal(reexec(plan, spawn), false);
 });
+
+test('every /api/state answer names the process that gave it — the page knows a restart is over when that changes', async () => {
+  // The Restart dialog used to reload on a fixed four-second guess, which a
+  // restart that updates and builds first overruns by a minute. `bootedAt` is
+  // the process's identity: the same across reads, different after a restart.
+  const { Service } = await import('../server/service.ts');
+  const { BOOTED_AT } = await import('../server/config.ts');
+  const svc = new Service({ port: 0, host: '127.0.0.1', open: false, allowWrites: false, logFile: null } as never);
+  try {
+    const first = (svc.state() as { bootedAt?: string }).bootedAt;
+    assert.equal(first, new Date(BOOTED_AT).toISOString());
+    assert.equal((svc.state() as { bootedAt?: string }).bootedAt, first);
+  } finally {
+    svc.close();
+  }
+});

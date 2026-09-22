@@ -54,6 +54,7 @@ import { log } from '../log.ts';
 import { API_RETRY_ERRORS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
 import { DEFAULT_KILL_AFTER_MS, INT_GRACE_MS, forgetInterrupt, groupSignal, interruptOnce, wakeAndTerm } from './signals.ts';
 import { resolveCaps, type SessionCaps } from './session-record.ts';
+import { foldUsage, newUsageTracker, usageOf, type CallUsage, type TokenCounters } from './usage.ts';
 import { PERMISSION_MODES, type PERMISSION_PROFILES } from '../../shared/run-settings.js';
 
 type PermissionProfile = (typeof PERMISSION_PROFILES)[number];
@@ -206,7 +207,7 @@ export type PermissionMode = (typeof PERMISSION_MODES)[number];
  * which is what turns "some text somewhere in the phase's output" into an
  * answer the console can attribute to the question that caused it.
  */
-export const OPERATOR_MARK = /\[\[(ask|steer|relay):([0-9a-z]{4,16})\]\]/i;
+export const OPERATOR_MARK = /\[\[(ask|steer|relay|msg):([0-9a-z]{4,16})\]\]/i;
 
 /** The tag in a piece of text, normalised, or null. */
 export function operatorMark(text: string): string | null {
@@ -218,9 +219,41 @@ export function operatorMark(text: string): string | null {
  * Build the tag for one operator message. `relay` is the console's own notice
  * after the relay answered a question nobody did (phase 14) — tagged like the
  * others so its echo is recognised, never an answer the console waits for.
+ * `msg` is a PEER's message (5.1.0): tagged for the same reason and one more —
+ * the same message can legitimately arrive twice (a restart sweep re-sending a
+ * row a dead console left `delivering`, a boot prompt carrying a note a live
+ * send already delivered), and the mark is the only thing that lets the
+ * recipient tell.
  */
-export function markFor(kind: 'ask' | 'steer' | 'relay', id: string): string {
+export function markFor(kind: 'ask' | 'steer' | 'relay' | 'msg', id: string): string {
   return `[[${kind}:${id}]]`;
+}
+
+/**
+ * The mark on a PEER's message, as the receiving session replays it — or null.
+ *
+ * The socket transport learns nothing from the connection: the CLI's inbox
+ * writes zero bytes back on every outcome, accepted or refused (phase 1, arm
+ * S-B). The receiver's own stream is therefore the only evidence a message
+ * landed, and arm S-E measured its exact shape — a `user` line with
+ * `origin.kind === "peer"`, under `--replay-user-messages`, which `buildArgv`
+ * already passes on every console-spawned session.
+ *
+ * It needs its own reader because `message.content` on that line is a **string**
+ * while the echo path below reads `content` as an array of blocks: a peer
+ * message therefore produced `[]`, then an empty text, then no mark, and was
+ * invisible. Two readers over one line would be worse — a message recorded as
+ * delivered twice — so this one is keyed on `origin.kind` and the echo path on
+ * `unecho`, and neither can claim the other's line.
+ */
+export function peerMark(message: unknown): string | null {
+  if (!message || typeof message !== 'object') return null;
+  const line = message as { type?: unknown; origin?: { kind?: unknown }; message?: { content?: unknown } };
+  if (line.type !== 'user') return null;
+  if (line.origin?.kind !== 'peer') return null;
+  const content = line.message?.content;
+  if (typeof content !== 'string' || !content) return null;
+  return operatorMark(content);
 }
 
 /**
@@ -351,6 +384,37 @@ export type StreamEvent =
    * own output still arrives as `subagent`.
    */
   | { kind: 'step'; tools: number }
+  /**
+   * One API call of the PHASE's own conversation and what it cost in context
+   * (autopilot-token-drain phase 3, `runner/usage.ts`).
+   *
+   * One event per call, not per line: the CLI emits a line per content block,
+   * every one carrying the call's usage, so they are folded by `message.id`
+   * (`id`) and a repeat is emitted only if it reported more. `totals` is the
+   * session's fold after this call — what a lane keeps and shows, and what the
+   * outcome carries as `tokens`. Emitted before the turn's `step`. A subagent's
+   * calls are its own context and are not counted here, nor is the CLI's
+   * synthetic zero-usage message.
+   */
+  | { kind: 'usage'; id?: string; call: CallUsage; rebuild: boolean; totals: TokenCounters }
+  /**
+   * A background task the CLI started, or reported finished, for this session
+   * — `system/task_started` and `system/task_notification` (autopilot-token-drain
+   * phase 1).
+   *
+   * Carried because a turn that ends while the session's own agent or monitor
+   * works is a WAIT, not an exit: that task keeps the `-p` process alive and its
+   * completion starts a new turn, where a background shell dies with the turn
+   * (`liveness.ts` `wakesTheSession`). `tool` is the tool call that started the
+   * task, paired by `tool_use_id` — a Monitor reaches the stream as
+   * `task_type: local_bash`, like a background Bash, and only its tool tells
+   * them apart.
+   */
+  | {
+    kind: 'background'; op: 'started'; taskId: string;
+    taskType?: string; tool?: string; description?: string; ownedBySubagent?: boolean;
+  }
+  | { kind: 'background'; op: 'ended'; taskId: string; status?: string }
   | { kind: 'hook'; name: string; event: string; outcome?: string }
   /**
    * A message the operator sent into a running session. Emitted twice for one
@@ -358,7 +422,11 @@ export type StreamEvent =
    * is written, and this emits it again — same `mark` — when the CLI echoes it
    * back, which is the only evidence it arrived.
    */
-  | { kind: 'injected'; text: string; mark?: string; delivered?: boolean; steer?: boolean; relay?: boolean }
+  | {
+    kind: 'injected'; text: string; mark?: string; delivered?: boolean; steer?: boolean; relay?: boolean;
+    /** A PEER's message, arriving over the CLI's own inbox rather than our stdin. */
+    peer?: boolean;
+  }
   /** The session's reply to one of those, recognised by the tag it repeats. */
   | { kind: 'answer'; text: string; mark: string }
   /** stdin was closed by the watchdog rather than by the conversation ending. */
@@ -577,6 +645,8 @@ export type SpawnOutcome = {
   costSource?: 'result' | 'stream' | 'none';
   /** The caps that reached argv, with their sources. */
   caps?: SessionCaps;
+  /** The session's API calls folded (`runner/usage.ts`): context, caching, rebuilds. Zero calls when none streamed. */
+  tokens?: TokenCounters;
 };
 
 export type SpawnFn = (request: SpawnRequest) => Promise<SpawnOutcome>;
@@ -811,7 +881,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    * cover the endings where nothing does.
    *
    *   `costSource`       where the last `total_cost_usd` came from, or `none`.
-   *   `reportedTurns`    the CLI's own `num_turns`, the highest seen.
+   *   `reportedTurns`    the CLI's own `num_turns`, summed over the session's
+   *                      turns — the CLI counts each turn from one (see the
+   *                      `result` handler).
    *   `turnIds`          distinct `message.id`s of the phase's own assistant
    *                      messages. One API turn arrives as SEVERAL assistant
    *                      lines — its thinking and its tool call share one id
@@ -821,11 +893,16 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    *                      come back for it. A `result` whose `terminal_reason`
    *                      is `aborted_*` closed the turn without finishing it.
    *   `ending`           who ended the session, first writer wins.
+   *   `usage`            the phase's own API calls folded by `message.id` —
+   *                      context, caching, rebuilds (`runner/usage.ts`). A
+   *                      resumed session's first call can rebuild; a fresh
+   *                      one's builds.
    */
   let costSource: 'result' | 'stream' | 'none' = 'none';
   let reportedTurns: number | null = null;
   const turnIds = new Set<string>();
   let anonymousTurns = 0;
+  const usage = newUsageTracker({ resumed: Boolean(request.resume) });
   let turnOpen = true;                 // the boot prompt is the first open turn
   let isError = false;
   let terminalReason: string | undefined;
@@ -834,8 +911,12 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   const deniedIds = new Set<string>();
   /** A tool call's name and aim, by id — what a `permission_denied` line does not repeat. Bounded like `toolStartedAt`. */
   const toolInfo = new Map<string, { name: string; summary: string }>();
-  /** Background tasks the CLI started and has not reported finished (`system/task_started`). */
-  const backgroundTasks = new Map<string, string>();
+  /**
+   * Background tasks the CLI started and has not reported finished
+   * (`system/task_started`), with the CLI's `task_type` and the tool call that
+   * started each — see the `background` event.
+   */
+  const backgroundTasks = new Map<string, { description: string; taskType?: string; tool?: string }>();
   let ending: { endedBy: EndedBy; reason?: string } | null = null;
   const noteEnding = (endedBy: EndedBy, reason?: string): void => {
     if (ending) return;
@@ -867,11 +948,12 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    *   `sentSinceLastResult`  a flag, not a tally, and only for an *untagged*
    *                          caller — one whose messages `unecho` cannot track.
    *                          Setting it twice is the same as setting it once.
-   *   `turnsSeen`            the CLI's own `num_turns`, which is what tells an
-   *                          extra `result` for a turn already counted from a
-   *                          genuine new turn. Only a new turn may close stdin,
-   *                          so a duplicate cannot close the door on a question
-   *                          that has not been answered yet.
+   *   `lastResultTurns`      the previous `result`'s `num_turns`, and
+   *   `movedSinceResult`     whether the conversation moved after it — the two
+   *                          facts that tell an extra `result` for a turn
+   *                          already counted from a genuine new turn. Only a
+   *                          new turn may close stdin, so a duplicate cannot
+   *                          close the door on a question not yet answered.
    */
   /** The boot-prompt turn has produced its result: the phase's work is done. */
   let phaseTurnDone = false;
@@ -879,8 +961,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
   let sentSinceLastResult = false;
   /** Tags of operator messages written but not yet echoed back by the CLI. */
   const unecho = new Set<string>();
-  /** The highest turn number any result has reported. */
-  let turnsSeen = 0;
+  /** The previous result's `num_turns`; `undefined` until a result arrives. */
+  let lastResultTurns: number | null | undefined;
+  /** A user, assistant, delta or task-notification line arrived after the previous result. */
+  let movedSinceResult = false;
   let injected = 0;
   let stdinOpen = true;
 
@@ -953,6 +1037,30 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       if (firstEventTimer) { clearTimeout(firstEventTimer); firstEventTimer = null; }
     }
     try { request.onEvent?.(event); } catch { /* a listener must not kill the run */ }
+  };
+
+  /**
+   * One sighting of an API call's usage, from whichever line carried it — the
+   * `message_start` and `message_delta` stream events or the assistant lines —
+   * folded by the call's id, so only a new call or a sighting that reported more
+   * reaches the listener. The phase's own conversation only; callers check.
+   *
+   * All three, because none is enough alone (measured on the live CLI,
+   * 2026-09-17): `message_start` is the earliest and its context is exact, but
+   * its `output_tokens` is a snapshot of 2–4, and every assistant line of the
+   * call repeats that snapshot; only `message_delta` carries the final count,
+   * and it exists only with partial messages on.
+   */
+  let streamCallId: string | undefined;
+  const noteUsage = (callId: string | undefined, raw: unknown): void => {
+    const call = usageOf(raw);
+    if (!call) return;
+    const folded = foldUsage(usage, callId, call);
+    if (!folded.changed) return;
+    emit({
+      kind: 'usage', ...(callId ? { id: callId } : {}),
+      call: folded.call, rebuild: folded.rebuild, totals: { ...usage.counters },
+    });
   };
 
   /* ---- writing to the child ---- */
@@ -1268,6 +1376,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     const type = message.type;
     const sub = typeof message.subtype === 'string' ? message.subtype : undefined;
     const parent = typeof message.parent_tool_use_id === 'string' ? message.parent_tool_use_id : undefined;
+    // The conversation moved: what separates a new turn's `result` from a
+    // repeat of the last one (see the `result` handler).
+    if (type === 'user' || type === 'assistant' || type === 'stream_event'
+      || (type === 'system' && sub === 'task_notification')) movedSinceResult = true;
 
     // The running total, whichever message carried it, the last one winning
     // (SES-1). `result` is the documented carrier; reading it wherever it
@@ -1354,18 +1466,37 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // Background work the CLI is holding open for this session. Whatever is
     // still open when the process ends is what the CLI's background-task
     // ceiling terminated (SES-12) — the one list that can name those tasks,
-    // since the CLI's own warning names only the ceiling.
+    // since the CLI's own warning names only the ceiling. Each start and end is
+    // also an event: the Stop hook and liveness need to know, while the session
+    // lives, whether a turn ended on an agent or monitor that will wake it.
     if (type === 'system' && (sub === 'task_started' || sub === 'task_notification')) {
-      const taskId = typeof message.task_id === 'string' ? message.task_id : '';
+      const taskId = typeof message.task_id === 'string' ? message.task_id.slice(0, 80) : '';
       if (taskId && sub === 'task_started') {
-        const description = typeof message.description === 'string' ? message.description : '';
-        backgroundTasks.set(taskId, description.slice(0, MAX_RESULT_TEXT));
+        const description = (typeof message.description === 'string' ? message.description : '').slice(0, MAX_RESULT_TEXT);
+        const taskType = typeof message.task_type === 'string' && message.task_type
+          ? message.task_type.slice(0, 40) : undefined;
+        const toolUseId = typeof message.tool_use_id === 'string' ? message.tool_use_id : '';
+        const tool = toolUseId ? toolInfo.get(toolUseId)?.name : undefined;
+        backgroundTasks.set(taskId, {
+          description, ...(taskType ? { taskType } : {}), ...(tool ? { tool } : {}),
+        });
         if (backgroundTasks.size > MAX_PENDING_TOOLS) {
           const oldest = backgroundTasks.keys().next().value;
           if (oldest !== undefined) backgroundTasks.delete(oldest);
         }
+        emit({
+          kind: 'background', op: 'started', taskId,
+          ...(taskType ? { taskType } : {}),
+          ...(tool ? { tool } : {}),
+          ...(description ? { description } : {}),
+          ...(message.owned_by_subagent === true ? { ownedBySubagent: true } : {}),
+        });
       } else if (taskId) {
         backgroundTasks.delete(taskId);
+        emit({
+          kind: 'background', op: 'ended', taskId,
+          ...(typeof message.status === 'string' && message.status ? { status: message.status.slice(0, 40) } : {}),
+        });
       }
       return;
     }
@@ -1436,7 +1567,23 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     }
 
     if (type === 'stream_event') {
-      const event = (message.event ?? {}) as { type?: string; delta?: Record<string, unknown> };
+      const event = (message.event ?? {}) as {
+        type?: string; delta?: Record<string, unknown>; message?: { id?: unknown; usage?: unknown }; usage?: unknown;
+      };
+      // The API call opening and closing: its id and exact context at the start,
+      // its final output count at the delta (`noteUsage`). A delta names no id,
+      // so it belongs to the call the last start opened.
+      if (event.type === 'message_start' || event.type === 'message_delta') {
+        if (parent) return;
+        if (event.type === 'message_start') {
+          const callId = event.message?.id;
+          streamCallId = typeof callId === 'string' && callId ? callId : undefined;
+          noteUsage(streamCallId, event.message?.usage);
+        } else if (streamCallId) {
+          noteUsage(streamCallId, event.usage);
+        }
+        return;
+      }
       if (event.type !== 'content_block_delta') return;
       const delta = event.delta ?? {};
       if (typeof delta.text === 'string' && delta.text) {
@@ -1524,6 +1671,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         const turnId = (message.message as { id?: unknown } | undefined)?.id;
         if (typeof turnId === 'string' && turnId) turnIds.add(turnId);
         else anonymousTurns++;
+        // What this API call cost in context — already known from its
+        // `message_start` when partial messages are on, and the only source
+        // when they are off (`noteUsage`).
+        noteUsage(
+          typeof turnId === 'string' && turnId ? turnId : undefined,
+          (message.message as { usage?: unknown } | undefined)?.usage,
+        );
         emit({
           kind: 'step',
           tools: (content?.content ?? []).filter(
@@ -1541,6 +1695,16 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // at all, which is why every result a session ever produced was dropped
     // here without a trace.
     if (type === 'user') {
+      // A PEER's message, replayed. Read before the block path below because
+      // its `message.content` is a STRING, not an array of blocks — so the
+      // block path sees nothing at all and a socket delivery had no evidence
+      // (phase 1, arm S-E). Keyed on `origin.kind`, never on a pending tag:
+      // this message never went down our stdin and so never entered `unecho`.
+      const peer = parent ? null : peerMark(message);
+      if (peer) {
+        emit({ kind: 'injected', text: stripMark(String((message.message as { content?: string }).content ?? '')), mark: peer, delivered: true, peer: true });
+        return;
+      }
       const blocks = (message.message as { content?: unknown[] } | undefined)?.content;
       const content = Array.isArray(blocks) ? blocks : [];
 
@@ -1607,13 +1771,23 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       isError = message.is_error === true;
       terminalReason = typeof message.terminal_reason === 'string' && message.terminal_reason
         ? message.terminal_reason : undefined;
-      // A result that reports a turn number already seen is a duplicate, not a
-      // turn boundary — and telling those apart is the CLI's job, not ours.
+      // One `result` per turn, and `num_turns` counts the API calls of THAT turn
+      // only: across one session it restarts (measured 2 → 1, CLI 2.1.273,
+      // autopilot-token-drain §Context) while `total_cost_usd` stays
+      // cumulative. Reading "not above the highest count seen" as a duplicate
+      // dropped every later turn of a session that turned more than once — the
+      // session woken by its own subagent running in the background is exactly that session. A
+      // duplicate is a result that repeats the previous one's count with nothing
+      // of the conversation between them; every other result is a new turn,
+      // and the turns it reports are added.
       const reported = typeof message.num_turns === 'number' ? message.num_turns : null;
-      const newTurn = reported === null || reported > turnsSeen;
-      if (reported !== null) turnsSeen = Math.max(turnsSeen, reported);
-      if (reported !== null) turns = Math.max(turns, reported);
-      if (reported !== null) reportedTurns = Math.max(reportedTurns ?? 0, reported);
+      const newTurn = lastResultTurns === undefined || reported !== lastResultTurns || movedSinceResult;
+      lastResultTurns = reported;
+      movedSinceResult = false;
+      if (newTurn && reported !== null) {
+        turns += reported;
+        reportedTurns = (reportedTurns ?? 0) + reported;
+      }
       const text = message.result ?? message.error;
       if (typeof text === 'string') resultText = text;
       // The authoritative denial ledger. A denial the stream already announced
@@ -1728,7 +1902,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     const bookedTurns = midTurn ? Math.max(reportedTurns ?? 0, steps) : (reportedTurns ?? steps);
     const turnsSource: 'result' | 'stream' = reportedTurns !== null && bookedTurns === reportedTurns ? 'result' : 'stream';
     const endedBy: EndedBy = ending?.endedBy ?? 'exit';
-    const openTasks = [...backgroundTasks].map(([id, description]) => ({ id, description }));
+    const openTasks = [...backgroundTasks].map(([id, task]) => ({
+      id, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}),
+    }));
+    // A background task does not outlive its process, whatever the stream last
+    // said about it. Announced here so a lane the runner goes on using — a
+    // closeout, a resume — never counts a dead session's task as outstanding.
+    for (const task of openTasks) emit({ kind: 'background', op: 'ended', taskId: task.id, status: 'process-exited' });
     finish({
       signal: {
         subtype,
@@ -1758,6 +1938,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       turnsSource,
       costSource,
       caps: resolveCaps(request),
+      tokens: { ...usage.counters },
     });
   });
 });

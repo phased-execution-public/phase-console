@@ -54,6 +54,34 @@ const MAX_LEN = 64;
  * `parseScope` is the entry point for a whole cell; this handles a single token
  * and does not split, so callers must not hand it `"hub docs"`.
  */
+/**
+ * Fold `.` and `..` segments out of a token, segment-wise.
+ *
+ * A Repos cell is written by a person, and `packages/../docs` is a path a
+ * person writes. Nothing folded it, so it stayed a token in its own right and
+ * read as DISJOINT from `docs` — two sessions cleared into one working tree by
+ * a spelling. Segment-wise on purpose: `..b` and `b..` are names, not climbs.
+ * A `..` with nothing left to pop is dropped rather than kept, because a token
+ * that climbs out of its own name says nothing about a repository.
+ *
+ * Mirrored by `fold_relative` in `scripts/scope.sh`.
+ * @param {string} t
+ * @returns {string}
+ */
+function foldRelative(t) {
+  if (!t.includes('.')) return t; // the overwhelmingly common case, untouched
+  const out = [];
+  for (const seg of t.split('/')) {
+    if (seg === '.' || seg === '') continue;
+    if (seg === '..') {
+      out.pop();
+      continue;
+    }
+    out.push(seg);
+  }
+  return out.join('/');
+}
+
 export function normalizeToken(raw) {
   let t = String(raw ?? '')
     .trim()
@@ -62,6 +90,7 @@ export function normalizeToken(raw) {
   if (t === 'and') return ''; // a conjunction between repos
   t = t.replace(ALLOWED, ''); // markdown, `#`, `~`, `×`, …
   t = t.replace(/\/{2,}/g, '/'); // `a//b` is `a/b`
+  t = foldRelative(t); // `docs/../hub` is `hub`
   t = t.replace(/^[^a-z0-9]+/, '').replace(/[^a-z0-9]+$/, '');
   if (t.length < MIN_LEN || t.length > MAX_LEN) return '';
   return t;
@@ -192,9 +221,74 @@ export function claimsDisjoint(a, b) {
   // subdirectory (a mirror's mount, a cwd-derived toplevel under a run's
   // workspace) must not read as a different place than the workspace itself.
   // Segment-wise, like the token rule: `/w/a-b` is not inside `/w/a`.
-  if (`${leftTree}/`.startsWith(`${rightTree}/`)) return false;
-  if (`${rightTree}/`.startsWith(`${leftTree}/`)) return false;
+  if (sameGround(leftTree, rightTree)) return false;
+  if (sameGround(rightTree, leftTree)) return false;
   return true;
+}
+
+/**
+ * The console's own worktree home, as a path SEGMENT.
+ *
+ * `WORKTREES_DIR` in `server/runner/worktree.ts` is the definition; this is a
+ * mirror, spelled out because this module imports nothing by design (it is
+ * bundled, imported by node's test runner, and mirrored line-for-line in
+ * `scripts/scope.sh`). Change one, change all three.
+ */
+const WORKTREE_HOME_SEGMENT = '.worktrees';
+
+/**
+ * Which REPOSITORY a working tree belongs to, as a key.
+ *
+ * Every tree the console makes lives under `<root>/.worktrees/`, so the root
+ * is the prefix before that segment — the same boundary `sameGround` reads,
+ * for the same reason, and spelled once here so the two cannot disagree. A
+ * path with no such segment IS a repository checkout and keys to itself.
+ *
+ * 🔴 A MIRROR's mounts all key to the SUPERPROJECT, deliberately. The key
+ * exists for the per-repository capacity cap, and the thing being counted is
+ * runs: a mirror run is ONE run holding one set of trees, and counting its
+ * mounts separately would let three mirror runs of a three-repository
+ * superproject read as nine and cap a repository that holds three.
+ *
+ * @param {string | undefined} tree Absolute path of a working tree.
+ * @returns {string} The repository key, or `''` for no tree at all.
+ */
+export function repoKeyOf(tree) {
+  const path = String(tree ?? '').trim();
+  if (!path) return '';
+  const cut = Math.max(
+    path.lastIndexOf(`/${WORKTREE_HOME_SEGMENT}/`),
+    path.lastIndexOf(`\\${WORKTREE_HOME_SEGMENT}\\`),
+  );
+  return cut > 0 ? path.slice(0, cut) : path.replace(/[/\\]+$/, '');
+}
+
+/**
+ * Is `inner` the same ground as `outer` — i.e. inside it, in the sense that
+ * makes two claims contend?
+ *
+ * Plain containment was the whole test, and under `worktreeRoot: 'project'`
+ * that is wrong in the one configuration that ships by default: the home is
+ * `<root>/.worktrees/`, so EVERY tree the console makes is literally inside the
+ * shared root, and a cap-refused shared run collided with all three isolated
+ * runs beside it — while the same three runs under `worktreeRoot: 'state'`
+ * carved cleanly. The same runs, a different answer, decided by a setting whose
+ * entire job is to choose a location.
+ *
+ * So the home is a BOUNDARY, not a step down: crossing it, at any depth, means
+ * the two paths are not the same ground. What is beyond the boundary still
+ * nests normally — a mirror's submodule mount inside a run's tree is the same
+ * ground and still collides — and the branch dimension still has to differ
+ * before `claimsDisjoint` clears anything at all, so two claims on one ref are
+ * unaffected.
+ * @param {string} outer
+ * @param {string} inner
+ * @returns {boolean}
+ */
+function sameGround(outer, inner) {
+  if (!`${inner}/`.startsWith(`${outer}/`)) return false;
+  const rest = inner.slice(outer.length);
+  return !`${rest}/`.includes(`/${WORKTREE_HOME_SEGMENT}/`);
 }
 
 /**
@@ -210,10 +304,36 @@ function isDetachedSpelling(branch) {
   return branch.startsWith('detached@');
 }
 
-/** The csv form written to a lock file and passed to `--scope`. */
+/**
+ * The token a SHARED-ROOT new-branch run adds to its own admission (S11-c).
+ *
+ * Not a repository, and never written to a lock file or shown to anybody — see
+ * `formatScope`, which drops it. It exists because two such runs must
+ * serialise and no dimension the vocabulary already has can say so: their
+ * scopes may be disjoint (so they are never compared at all), their trees are
+ * EQUAL (so the branch/tree pair carves nothing either way), and what actually
+ * collides is the requirement that the one shared checkout stand on `pe/<slug>`
+ * — two different branches in one directory. Every run that makes that demand
+ * claims this token, so they meet; a run with a checkout of its own never asks
+ * for it, and neither does one that commits on the branch it found.
+ *
+ * The name is chosen to survive `normalizeToken` UNCHANGED — a leading `.` is
+ * folded out as a path segment, which would have made the constant and its own
+ * normalised form two different strings — and to be one no repository would
+ * carry. A directory that did carry it would merely serialise with these runs,
+ * which is the safe direction.
+ */
+export const SHARED_CHECKOUT_TOKEN = 'pe--shared-checkout';
+
+/**
+ * The csv form written to a lock file and passed to `--scope`.
+ *
+ * Internal tokens are dropped: a lock file is read by people and by the bash
+ * half, and neither has any use for a word that names no repository.
+ */
 export function formatScope(tokens) {
   const list = Array.isArray(tokens) ? tokens : parseScope(tokens);
-  return list.join(',');
+  return list.filter((token) => token !== SHARED_CHECKOUT_TOKEN).join(',');
 }
 
 /** Which tokens of `a` and `b` actually collided — for saying *why* in a message. */

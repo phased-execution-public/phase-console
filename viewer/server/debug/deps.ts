@@ -10,12 +10,15 @@
  */
 
 import { statSync } from 'node:fs';
+import { join } from 'node:path';
 
 import type { Service } from '../service.ts';
+import type { BundleDeps } from './bundle.ts';
 import { Debug, type ConsoleFacts, type DebugDeps } from './index.ts';
 import { consoleDetached, previousRunEndedCleanly } from '../log.ts';
-import { INSTANCE, distRev } from '../config.ts';
+import { INSTANCE, INSTANCE_STATE_DIR, distRev } from '../config.ts';
 import { runDir } from '../runner/state.ts';
+import { runTraceId } from '../trace.ts';
 
 /**
  * How many announcements the delivery ledger reads back.
@@ -125,4 +128,38 @@ function safely<T>(read: () => T): T | undefined {
 
 export function debugFor(service: Service): Debug {
   return new Debug(debugDeps(service));
+}
+
+/**
+ * …and the same mapping for the RUN bundle.
+ *
+ * Separate from `debugDeps` because the two bundles answer different questions
+ * over different scopes: that one is "is this console well" and reads no run's
+ * files at all, this one is "why did this run do that" and reads almost nothing
+ * else. Sharing a dep object would mean every future field on either had to
+ * justify itself to both.
+ */
+export function runBundleDeps(service: Service, slug: string, runId: string): BundleDeps {
+  const root = service.root?.path ?? null;
+  return {
+    runDir: root ? runDir(root, slug) : '',
+    instanceDir: INSTANCE_STATE_DIR,
+    // The locks are work-state in the docs root, not console state — a plan's
+    // `.locks/` is beside its handoffs, which is where a person looks for them.
+    locksDir: service.root?.handoffsDir ? join(service.root.handoffsDir, slug, '.locks') : null,
+    // DERIVED, never minted: the same function the journal and the drive's span
+    // call, so a bundle built after a restart still finds the first half of the
+    // run's log lines.
+    traceId: runTraceId(INSTANCE.id, slug, runId),
+    console: () => debugDeps(service).console(),
+    worktrees: () => safely(() => service.runGitFacts()) ?? [],
+    versions: () => ({
+      console: distRev() ?? 'unbuilt',
+      node: process.version,
+      platform: process.platform,
+      instance: { id: INSTANCE.id, name: INSTANCE.name },
+    }),
+    diagnosis: (phase: number) => service.phaseDiagnosis(slug, phase),
+    env: process.env,
+  };
 }

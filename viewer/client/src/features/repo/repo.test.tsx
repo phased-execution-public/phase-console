@@ -616,6 +616,7 @@ describe('every view here is quotable', () => {
     expect(sectionFor('trees')).toBe('trees');
   });
 
+
   it('asks the server for the section the URL names', async () => {
     mount('#/repo/branches?repo=sub');
     await screen.findByRole('heading', { name: 'Repo' });

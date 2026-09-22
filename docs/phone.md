@@ -222,7 +222,7 @@ console's id, so two consoles never overwrite each other's cards. That namespaci
 once, at 5.0.0: a card delivered before the upgrade stands beside its successor rather than being
 replaced by it.
 
-**Sixteen categories, per device**, because a phone and a laptop rarely want the same ones. This
+**Seventeen categories, per device**, because a phone and a laptop rarely want the same ones. This
 table is the catalogue (`viewer/server/push/catalogue.ts`), and a test holds it to it — if the two
 ever disagree, the catalogue is right:
 
@@ -244,14 +244,15 @@ ever disagree, the catalogue is right:
 | **Console problems** | on | The console degraded, its file watch went deaf, or it restarted after a crash. The supervisor failing quietly is the worst case, because everything else still looks fine. |
 | **Usage limits** | on | A Claude account this console runs work as hit a usage window — the 5-hour session, the weekly allowance, or a per-model one — with when it resets, plus what the run did about it (waited, switched account, paused) and an account that needs signing in again. |
 | **Usage climbing** | off | Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next long phase will not finish". Off by default: the meters show the same numbers all the time, and the wall itself still announces under Usage limits. |
+| **Issue drafted by a session** | on | A session tripped over a problem outside its phase and drafted an issue for it (the plan's `Issues:` word allows it). Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this tells you what landed. Not urgent: nothing is spending while a draft waits, and a filed issue is a record, not a wall. |
 
 Five are sent **urgent** — *Permission needed*, *Session waiting on you*, *A phase needs you*,
 *QA verdict owed or failed* and *Run halted* — because they are the ones that mean nothing moves
-until you act; urgent interrupts a focus mode and buzzes a wrist. The other eleven arrive quietly.
+until you act; urgent interrupts a focus mode and buzzes a wrist. The other twelve arrive quietly.
 A channel that always buzzes is a channel you turn off, and the notification it gets turned off for
 is the one that mattered.
 
-A gate is deliberately one of the quiet eleven, and it is the distinction the split exists for: it
+A gate is deliberately one of the quiet twelve, and it is the distinction the split exists for: it
 waits on a decision rather than on a session parked dead with a hook open, and nothing is spending
 while it waits.
 
@@ -365,6 +366,7 @@ Slack or a webhook of your own work the same way.
 > point the script somewhere you control. Both places are out of a web page's reach on purpose: the
 > environment, and a file no route writes — so nothing reachable from a browser gets to choose which
 > command runs.
+
 
 
 ## What is actually enforced

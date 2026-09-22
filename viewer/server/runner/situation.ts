@@ -28,7 +28,6 @@
  * the journal facts, to the situation it really was.
  */
 
-import { execFile } from 'node:child_process';
 
 import {
   SITUATIONS, SITUATION_ACTOR, SITUATION_BLURBS, SITUATION_LABELS, SUB_KINDS,
@@ -36,6 +35,7 @@ import {
 } from '../../shared/situation-model.js';
 import { subKindOfNeed } from '../../shared/decisions-model.js';
 import type { PhaseRecord, RunState } from './state.ts';
+import { shell } from '../shell.ts';
 
 export {
   SITUATIONS, SITUATION_ACTOR, SITUATION_BLURBS, SITUATION_LABELS, SUB_KINDS,
@@ -228,12 +228,16 @@ export type EvidenceDeps = {
 };
 
 export function gitIn(root: string): (args: string[]) => Promise<string | null> {
-  return (args) => new Promise((resolve) => {
-    execFile('git', args, {
-      cwd: root, timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
+  return async (args) => {
+    const run = await shell('git', args, {
+      channel: 'git', intent: 'situation', cwd: root, timeout: 15_000,
+      capture: { keep: 4 * 1024 * 1024, mode: 'head' },
       env: { ...process.env, NO_COLOR: '1', TERM: 'dumb', GIT_OPTIONAL_LOCKS: '0' },
-    }, (error, stdout) => resolve(error ? null : String(stdout)));
-  });
+      // The classifier asks about trees that may not be repositories at all.
+      expectFailure: true,
+    });
+    return run.ok ? run.stdout : null;
+  };
 }
 
 /**
@@ -649,10 +653,12 @@ export function classifySituation(e: PhaseEvidence): Situation {
   }
 
   /* 4b. Nobody has claimed it, and somebody is in the repository (REG-3): a live
-   * session the registry shows here, holding no lock, uncorrelated or working
-   * this very phase. The first minute of every hand session looks exactly like
-   * this, and the ladder must not climb into a tree a person is standing in —
-   * `foreign-live` has no rung, which is the point: wait, never fight. */
+   * session the registry shows here, holding no lock, working this very phase —
+   * or uncorrelated and still inside its claim window (`peersInRepository`
+   * drops it once the window shuts). The first minutes of every hand session
+   * look exactly like this, and the ladder must not climb into a tree a person
+   * is standing in — `foreign-live` has no rung, which is the point: wait,
+   * never fight. */
   if (!e.lock && e.registry?.peer && e.registry.live) {
     return situation('foreign-live', [
       `no lock is held, but the session registry shows a live Claude session in this repository`

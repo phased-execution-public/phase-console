@@ -280,7 +280,14 @@ export type LaunchSpec = {
    * runs as a different Claude account: `CLAUDE_CONFIG_DIR` for a profile,
    * `CLAUDE_CODE_OAUTH_TOKEN` for a token.
    */
-  env?: Record<string, string>;
+  /**
+   * `string | undefined` on purpose: the merge below is
+   * `{...process.env, ...launch.env}`, so an `undefined` value DELETES an
+   * inherited key rather than being absent from the spread. That is how the
+   * trace carrier removes a `TRACEPARENT` the operator's own shell exported
+   * (`server/trace.ts` `envCarrier`).
+   */
+  env?: Record<string, string | undefined>;
   /**
    * Where the child starts, overriding the open root. Server-composed only —
    * the verify mint runs a command in the phase's own `Verify in:` directory,

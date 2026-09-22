@@ -216,6 +216,43 @@ const SECRET_PATTERNS: readonly RegExp[] = [
 ];
 
 /**
+ * The entropy backstop — a run of token characters random enough to be a key.
+ *
+ * Every pattern above names a credential somebody thought of. This one catches
+ * the ones nobody did, and it matters because the run bundle exists to be
+ * SHARED: a redaction that works on the shapes we listed and not on the vendor
+ * prefix that shipped last week is worse than none, since the manifest tells
+ * the reader it was redacted.
+ *
+ * Both numbers are chosen against one false positive each.
+ *
+ * **32 characters**, because shorter runs of mixed characters are ordinary —
+ * a base64'd 16-byte id, a slug, a filename.
+ *
+ * **4.5 bits**, because a 16-symbol alphabet cannot exceed 4.0 however random
+ * it is, and hex is what a log line is FULL of: every sha, every trace id,
+ * every span id. Masking those would destroy the bundle's whole purpose. A
+ * base64 or base62 secret draws on 62–64 symbols and lands near 5.5–6.0, so
+ * the threshold sits in a genuinely empty band rather than being a guess.
+ */
+const ENTROPY_MASK = '[high-entropy]';
+const ENTROPY_MIN_LENGTH = 32;
+const ENTROPY_MIN_BITS = 4.5;
+const ENTROPY_RUN = /[A-Za-z0-9+/=_-]{32,}/g;
+
+/** Shannon entropy of a string, in bits per character. */
+export function shannonBits(text: string): number {
+  const counts = new Map<string, number>();
+  for (const character of text) counts.set(character, (counts.get(character) ?? 0) + 1);
+  let bits = 0;
+  for (const count of counts.values()) {
+    const p = count / text.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+/**
  * Mask every secret-shaped run in a string.
  *
  * The userinfo and `key=value` patterns keep their non-secret half, because
@@ -238,6 +275,12 @@ export function redact(text: string): string {
       return MASK;
     });
   }
+  // Last, so a run a named pattern already replaced is not re-examined: `MASK`
+  // is short and low-entropy, and the ones that keep a prefix have already had
+  // their secret half removed.
+  ENTROPY_RUN.lastIndex = 0;
+  out = out.replace(ENTROPY_RUN, (match) =>
+    (match.length >= ENTROPY_MIN_LENGTH && shannonBits(match) > ENTROPY_MIN_BITS ? ENTROPY_MASK : match));
   return out;
 }
 

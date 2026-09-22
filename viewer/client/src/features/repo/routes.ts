@@ -1,5 +1,6 @@
 /**
- * The Repo destination's own routes — six sections, and the URL is the state.
+ * The Repo destination's own routes — six sections (seven with the Pro
+ * landscape), and the URL is the state.
  *
  * Every section, every target, every open inspector is addressable, because a
  * surface whose whole job is evidence has to be quotable. The alternative for

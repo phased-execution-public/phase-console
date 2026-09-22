@@ -53,8 +53,8 @@
  * scheme whose refs are WRITTEN by a session rather than read by one.
  */
 
-import { execFile } from 'node:child_process';
 import type { WatchStateWord } from '../shared/run-lifecycle.js';
+import { shell } from './shell.ts';
 
 /** Every scheme this console will poll. The list is written here and nowhere else. */
 export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'cmd'] as const;
@@ -73,6 +73,12 @@ export type WatchState = {
   state: WatchStateWord;
   /** What the probe saw, for the journal and the resume brief ("completed: failure"). */
   detail?: string;
+  /**
+   * A merged pull request's merge commit — what the landing ledger's
+   * `pr-merged --sha` records (many-plans-one-repo phase 8). Only a `gh-pr`
+   * probe that saw `MERGED` sets it.
+   */
+  mergeCommit?: string;
 };
 
 /**
@@ -110,6 +116,20 @@ export const WATCH_POLL_MS: Readonly<Record<WatchScheme, number>> = Object.freez
  */
 export const WATCH_INELIGIBLE_STATUSES: ReadonlySet<string> =
   new Set(['done', 'skipped', 'running', 'verifying', 'gated']);
+
+/**
+ * Is this phase watchable — its status not on the list above, OR a DONE phase
+ * whose landing is waiting on its pull request (many-plans-one-repo phase 8)?
+ * The one exception to "a finished phase has nothing left to resume": the
+ * work is done and what is still open is the world's answer to `gh:…#pr/<n>`,
+ * which the landing ledger records the moment it lands. Both readers of the
+ * status set — the scheduler and the evidence fingerprint — ask this, so a
+ * landing's row is probed and its due time is counted, or neither is.
+ */
+export function watchEligible(record: { status: string; landing?: { step?: string } }): boolean {
+  if (!WATCH_INELIGIBLE_STATUSES.has(record.status)) return true;
+  return record.status === 'done' && record.landing?.step === 'watch';
+}
 
 /**
  * Row STATES the scheduler never advances — the row-level twin of
@@ -439,30 +459,43 @@ function probeGh(
 ): Promise<WatchState> {
   const argv = target.kind === 'gh-run'
     ? ['run', 'view', target.id, '--repo', target.repo, '--json', 'status,conclusion']
-    : ['pr', 'view', target.number, '--repo', target.repo, '--json', 'state,mergedAt'];
-  return new Promise((resolve) => {
-    execFile('gh', argv, {
+    : ['pr', 'view', target.number, '--repo', target.repo, '--json', 'state,mergedAt,mergeCommit'];
+  return probe();
+
+  async function probe(): Promise<WatchState> {
+    const run = await shell('gh', argv, {
+      channel: 'shell',
+      intent: 'watch-ref',
       timeout: opts.timeoutMs ?? 10_000,
       env: opts.env ?? process.env,
-      maxBuffer: 256 * 1024,
-    }, (error, stdout) => {
-      if (error) {
-        resolve({ ref: target.ref, state: 'unknown', detail: String(error.message ?? error).slice(0, 160) });
-        return;
-      }
-      try {
-        const json = JSON.parse(String(stdout));
-        if (target.kind === 'gh-run') {
-          const state = runLanded(json);
-          const detail = [json.status, json.conclusion].filter(Boolean).join(': ');
-          resolve({ ref: target.ref, state, ...(detail ? { detail } : {}) });
-        } else {
-          const state = prLanded(json);
-          resolve({ ref: target.ref, state, ...(json.state ? { detail: String(json.state) } : {}) });
-        }
-      } catch {
-        resolve({ ref: target.ref, state: 'unknown', detail: 'unparseable gh output' });
-      }
+      capture: { keep: 256 * 1024, mode: 'head' },
+      // A ref the watcher cannot read yet answers `unknown`, and the scheduler
+      // simply asks again — that is the whole design of a watch.
+      expectFailure: true,
     });
-  });
+
+    if (!run.ok) {
+      const detail = run.error?.message || run.stderr || `gh exited ${run.code}`;
+      return { ref: target.ref, state: 'unknown', detail: String(detail).slice(0, 160) };
+    }
+    try {
+      const json = JSON.parse(run.stdout);
+      if (target.kind === 'gh-run') {
+        const detail = [json.status, json.conclusion].filter(Boolean).join(': ');
+        return { ref: target.ref, state: runLanded(json), ...(detail ? { detail } : {}) };
+      }
+      // `mergeCommit` is an object (`{oid}`) in gh's JSON; carried as the sha
+      // alone, and only on a MERGED answer, for the landing ledger's row.
+      const merge = json.mergeCommit;
+      const oid = merge && typeof merge === 'object' ? (merge as { oid?: unknown }).oid : merge;
+      return {
+        ref: target.ref,
+        state: prLanded(json),
+        ...(json.state ? { detail: String(json.state) } : {}),
+        ...(json.state === 'MERGED' && typeof oid === 'string' && oid ? { mergeCommit: oid } : {}),
+      };
+    } catch {
+      return { ref: target.ref, state: 'unknown', detail: 'unparseable gh output' };
+    }
+  }
 }

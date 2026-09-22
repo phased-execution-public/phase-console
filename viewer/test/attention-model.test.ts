@@ -33,6 +33,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 import {
+  ASK_KINDS,
   INBOX_KINDS,
   INBOX_KIND_LABELS,
   INBOX_SEVERITIES,
@@ -79,21 +80,30 @@ test('INBOX_KINDS is the InboxKind union, same words, same order', () => {
     union,
     'shared/attention-model.js and client/src/lib/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
   );
-  assert.equal(union.length, 14, union.join(','));
+  assert.equal(union.length, 16, union.join(','));
   assert.ok(Object.isFrozen(INBOX_KINDS), 'a vocabulary is frozen');
 });
 
-test('conflict, question and then policy were APPENDED — every earlier kind keeps the rank it sorted at', () => {
+test('conflict, question, policy, issue-draft and then message were APPENDED — every earlier kind keeps the rank it sorted at', () => {
   // The union order is `sortInbox`'s third tie-break, so inserting a kind in
   // the middle silently reorders a list an operator reads top-down. The
   // append-only contract is what makes a new kind free; this is the assertion
-  // that keeps it true. `question` (zero-touch phase 14) and `policy` (phase 19)
-  // went on the end, in that order.
-  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'policy');
+  // that keeps it true. `question` (zero-touch phase 14), `policy` (phase 19)
+  // and `issue-draft` (many-plans-one-repo phase 12) went on the end, in that
+  // order, and `message` (phase 15) after them.
+  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'message');
   assert.deepEqual(
-    INBOX_KINDS.slice(0, 13),
-    ['errand', 'approval', 'gate', 'sign-in', 'mcp-auth', 'qa', 'lock', 'health', 'stall', 'ruling', 'session-ask', 'conflict', 'question'],
+    INBOX_KINDS.slice(0, 15),
+    ['errand', 'approval', 'gate', 'sign-in', 'mcp-auth', 'qa', 'lock', 'health', 'stall', 'ruling', 'session-ask', 'conflict', 'question', 'policy', 'issue-draft'],
   );
+});
+
+test('an issue draft is a person\'s decision, not a session stopped dead — never an ASK kind', () => {
+  // The top bar counts `ASK_KINDS` as "waiting on you": a session parked at a
+  // prompt. A draft waits too, but nothing is spending while it does, so it
+  // must not inflate the number that means "a session is blocked right now".
+  assert.ok(INBOX_KINDS.includes('issue-draft'));
+  assert.ok(!(ASK_KINDS as readonly string[]).includes('issue-draft'));
 });
 
 test('INBOX_SEVERITIES is the InboxSeverity union, worst first', () => {
@@ -387,7 +397,8 @@ test('the stall SIGNALS are a different list from the stall KINDS, on purpose', 
   // a lane that is still alive, from the event stream it is already reading.
   // Conflating them is how a detector ends up firing on a plan nobody is
   // running.
-  assert.deepEqual([...STALL_SIGNALS], ['stalemate', 'retrying', 'external-wait', 'silent', 'spinning']);
+  assert.deepEqual([...STALL_SIGNALS],
+    ['stalemate', 'retrying', 'external-wait', 'silent', 'spinning', 'looping']);
   for (const signal of STALL_SIGNALS) {
     assert.ok(!(STALL_KINDS as readonly string[]).includes(signal), `${signal} is a signal, not a kind`);
   }

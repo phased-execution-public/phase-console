@@ -619,3 +619,159 @@ setup() {
   run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --branch "pe/b" --worktree "/home/sam/wt/b"
   [ "$status" -eq 0 ]
 }
+
+# ── LCK-3 — the default owner proves nothing ─────────────────────────────────
+# `owner` defaults to `<user>@<host>`, which is the SAME string for every
+# hand-driven session on one machine. Skipping a lock on owner equality made
+# this scan blind to every other local session: a live lock on
+# `scope=phased-execution` was reported as "safe to start", and a shared working
+# tree is the one thing the verb exists to refuse. A lock that names no session
+# AND carries the machine default is therefore foreign — we cannot prove it is
+# ours, so it is not.
+@test "scope: two default-owner hand sessions read each other as FOREIGN (LCK-3)" {
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --scope "api-server"
+  run pe_lock scoped conflicts 4 --scope "api-server"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "CONFLICT"
+}
+
+@test "scope: a NAMED owner with no session is still ours (LCK-3 narrows, it does not widen)" {
+  # The batch case: `--owner sessionA` is a per-session identity the caller
+  # chose, so owner equality is evidence there. Only the machine default is not.
+  setup_docs scoped scoped
+  write_legacy_lock scoped 2 sessionA
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionA --session mine
+  [ "$status" -eq 0 ]
+}
+
+# ── S7-5 — bash lacked the scheduler's sameUnitOfWork rule ───────────────────
+# Two claims on ONE phase of ONE plan are the same unit of work however they are
+# qualified: they write the same handoff, the same lock and the same commit.
+# Branch+tree carve two DIFFERENT phases apart; they must never carve one phase
+# apart, or bash answers "disjoint" where the console answers "collides".
+@test "scope: two claims on ONE phase collide even in different trees (S7-5)" {
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/a" --worktree "/home/sam/wt/a"
+  run pe_lock scoped conflicts 2 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "/home/sam/wt/b"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "CONFLICT"
+}
+
+@test "scope: the same phase NUMBER in another plan is a different unit of work (S7-5)" {
+  # sameUnitOfWork is (slug, phase) — the pair, never the number alone.
+  setup_docs scoped scoped
+  mkdir -p "$DOCS_ROOT/docs/plans" "$DOCS_ROOT/docs/handoffs/other"
+  cp "$PE_DIR/tests/fixtures/plans/scoped.md" "$DOCS_ROOT/docs/plans/other.md"
+  pe_lock other claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/a" --worktree "/home/sam/wt/a"
+  run pe_lock scoped conflicts 2 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "/home/sam/wt/b"
+  [ "$status" -eq 0 ]
+}
+
+# ── SCP-1 / S11-a — the bash half of the two path rules ──────────────────────
+@test "scope: a `..` segment is folded, so a relative spelling collides (SCP-1)" {
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server"
+  run pe_lock scoped conflicts 4 --scope "docs/../api-server" --owner sessionB --session mine
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "CONFLICT"
+}
+
+@test "scope: a console-managed tree does not nest into the root holding it (S11-a)" {
+  # `worktreeRoot: project` puts every managed tree at `<root>/.worktrees/…`,
+  # so plain containment made a shared run collide with every isolated run
+  # beside it — and the same runs under `state` carved cleanly.
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/other" --worktree "/repo/.worktrees/runs/other/abc/integration"
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/shared" --worktree "/repo"
+  [ "$status" -eq 0 ]
+}
+
+@test "scope: beyond the home, nesting is nesting again (S11-a narrows, it does not delete)" {
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/a" --worktree "/repo/.worktrees/runs/a/f0/integration"
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "/repo/.worktrees/runs/a/f0/integration/phased-execution"
+  [ "$status" -eq 1 ]
+}
+
+@test "scope: a directory merely NAMED like the home is not the home (S11-a)" {
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/a" --worktree "/repo/.worktreesX/thing"
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "/repo"
+  [ "$status" -eq 1 ]
+}
+
+# ── SCH-1 — the tree dimension was a raw string compare ──────────────────────
+# `/tmp/x` and `/private/tmp/x` are ONE directory on macOS. A lock recorded with
+# the first spelling and a caller standing in the second carved apart — two
+# sessions in one working tree, cleared by a symlink. `--here` already derives
+# `pwd -P` for the CALLER; the missing half was the lock's own recorded path,
+# which is read verbatim off a file somebody else wrote.
+@test "scope: a lock recorded at /tmp/x collides with a caller at /private/tmp/x (SCH-1)" {
+  setup_docs scoped scoped
+  real="$(cd /tmp && pwd -P)"          # /private/tmp on macOS, /tmp elsewhere
+  if [ "$real" = "/tmp" ]; then skip "no symlinked /tmp on this filesystem"; fi
+  mkdir -p /tmp/sch1-tree
+  pe_lock scoped claim 2 --owner sessionA --session theirs --scope "api-server" \
+    --branch "pe/a" --worktree "/tmp/sch1-tree"
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "$real/sch1-tree"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "CONFLICT"
+}
+
+@test "scope: the claim writes the PHYSICAL spelling of its tree (SCH-1)" {
+  setup_docs scoped scoped
+  real="$(cd /tmp && pwd -P)"
+  if [ "$real" = "/tmp" ]; then skip "no symlinked /tmp on this filesystem"; fi
+  mkdir -p /tmp/sch1-write
+  pe_lock scoped claim 2 --owner sessionA --scope "api-server" --worktree "/tmp/sch1-write"
+  grep -q "^worktree=$real/sch1-write\$" "$DOCS_ROOT/docs/handoffs/scoped/.locks/phase-02.lock"
+}
+
+@test "scope: a tree that does not exist is recorded as written (SCH-1)" {
+  # Nothing to resolve, and inventing a resolution would be worse than keeping
+  # the caller's word: a path on another machine, or one not made yet.
+  setup_docs scoped scoped
+  pe_lock scoped claim 2 --owner sessionA --scope "api-server" --worktree "/no/such/tree"
+  grep -q '^worktree=/no/such/tree$' "$DOCS_ROOT/docs/handoffs/scoped/.locks/phase-02.lock"
+}
+
+@test "scope: a lock ALREADY on disk with the symlinked spelling still collides (SCH-1, the read side)" {
+  # The write side canonicalises from now on; this is every lock written before
+  # it did, and every one written by something that is not this script. The
+  # comparison happens against a file somebody else wrote, so the READER has to
+  # resolve too — otherwise the fix only protects locks that never needed it.
+  setup_docs scoped scoped
+  real="$(cd /tmp && pwd -P)"
+  if [ "$real" = "/tmp" ]; then skip "no symlinked /tmp on this filesystem"; fi
+  mkdir -p /tmp/sch1-read
+  mkdir -p "$DOCS_ROOT/docs/handoffs/scoped/.locks"
+  now="$(date +%s)"
+  cat > "$DOCS_ROOT/docs/handoffs/scoped/.locks/phase-02.lock" <<EOF
+slug=scoped
+phase=2
+owner=sessionA
+host=testhost
+claimed_at=$now
+lease_until=$((now + 1800))
+scope=api-server
+session=theirs
+worktree=/tmp/sch1-read
+branch=pe/a
+EOF
+  run pe_lock scoped conflicts 4 --scope "api-server" --owner sessionB --session mine \
+    --branch "pe/b" --worktree "$real/sch1-read"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "CONFLICT"
+}

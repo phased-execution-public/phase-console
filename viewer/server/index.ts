@@ -12,7 +12,7 @@
  */
 
 import { signalActor } from './actor.ts';
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { existsSync, statSync } from 'node:fs';
 import { extname, join, normalize, resolve } from 'node:path';
 import { execFile, spawn as spawnChild, spawnSync } from 'node:child_process';
@@ -37,6 +37,9 @@ import { accessLedger, classify } from './api/access.ts';
 import { sendFile } from './http/static.ts';
 import { refuse } from './terminal.ts';
 import { HOOK_TIMEOUT_SECONDS } from './runner/approvals.ts';
+import { agentClassOf } from './api/actor.ts';
+import { count } from './counters.ts';
+import { bind, current, parseTraceparent, withSpan } from './trace.ts';
 
 const flags = parseFlags(process.argv.slice(2));
 const portWasNamed = process.argv.includes('--port') || process.argv.includes('-p')
@@ -130,7 +133,96 @@ if (startRoot) {
   if (!check.ok) process.stderr.write(`phase-console: ${startRoot} — ${check.reason}\n`);
 }
 
-const server = createServer(async (req, res) => {
+/**
+ * The route a path belongs to, for a field somebody can group by.
+ *
+ * Deliberately coarse — the first two segments — because the alternative is
+ * cardinality: `/api/runs/<uuid>/phases/7` is one row per run per phase, which
+ * is not a route, it is a path, and `path` is already on the line. A pattern
+ * table matching every route would be a second copy of `api/routes.ts` that
+ * rots the first time somebody adds one.
+ */
+function routeOf(pathname: string): string {
+  const parts = pathname.split('/').filter(Boolean);
+  return parts.length ? `/${parts.slice(0, 2).join('/')}` : '/';
+}
+
+/** The two paths that hold a connection open instead of answering it. */
+const STREAM_PATHS = new Set(['/events', '/api/debug/tail']);
+
+const server = createServer(async (req, res) => withSpan(
+  'http.request',
+  {
+    // The request id IS the span id — one identifier, not two, so a client
+    // holding its `x-request-id` can grep the log and find everything the
+    // handler did, not merely the line about the request.
+    ...(parseTraceparent(headerOf(req, 'traceparent')) ?? {}),
+  },
+  () => handleRequest(req, res),
+));
+
+/** A header as a single string, or undefined. Node hands back arrays sometimes. */
+function headerOf(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+
+async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const started = Date.now();
+  const span = current();
+  // A caller's own id wins, so a client can correlate from its side. Bounded
+  // and scrubbed: it goes into a log line and a response header, and neither is
+  // a place to echo whatever a browser felt like sending.
+  const supplied = (headerOf(req, 'x-request-id') ?? '').replace(/[^\w.-]/g, '').slice(0, 64);
+  const requestId = supplied || span?.spanId || '';
+  if (requestId) { try { res.setHeader('x-request-id', requestId); } catch { /* already sent */ } }
+
+  const path = (req.url ?? '/').split('?')[0];
+  const streaming = STREAM_PATHS.has(path);
+  const base = {
+    method: req.method ?? 'GET',
+    path,
+    route: routeOf(path),
+    requestId,
+    agentClass: agentClassOf(req.headers['user-agent']),
+  };
+
+  if (streaming) {
+    // A stream has no status to report at the end and no length: it is opened
+    // and later dropped, and BOTH halves are worth a line, because "the phone
+    // stopped getting events" is a question about the close.
+    log.debug('http.stream', { ...base, phase: 'open' });
+    let closed = false;
+    const noteClose = () => {
+      if (closed) return;
+      closed = true;
+      log.debug('http.stream', { ...base, phase: 'close', ms: Date.now() - started, status: res.statusCode });
+    };
+    // `bind` is load-bearing and was measured: a plain EventEmitter runs a
+    // listener in the EMITTER's async context, not the one it was registered
+    // in, so an unbound listener writes its line OUTSIDE the request span —
+    // the open half carried the ids and the close half carried none, which is
+    // the one shape that looks like a leak rather than a bug.
+    res.on('close', bind(noteClose));
+    res.on('finish', bind(noteClose));
+  } else {
+    res.on('finish', bind(() => {
+      const ms = Date.now() - started;
+      const status = res.statusCode;
+      const bytes = Number(res.getHeader('content-length') ?? 0) || 0;
+      const data = { ...base, status, ms, bytes };
+      // By CLASS, not by code: `404` and `403` are one alerting question and
+      // 40 distinct statuses are 40 series nobody queries.
+      count('http_requests_total', [`${Math.floor(status / 100)}xx`]);
+      // At or past 400, or slower than a second, the line arrives whether or
+      // not anybody turned the channel on first: those are exactly the requests
+      // somebody comes looking for afterwards, and a record that required
+      // foresight is not a record.
+      if (status >= 400 || ms >= 1000) log.info('http.request', data);
+      else log.debug('http.request', data);
+    }));
+  }
+
   // A client that disappears mid-response surfaces as an 'error' on the
   // request or response stream; unhandled, that is an uncaught exception per
   // request. Handling is mandatory, logging the routine ones is not.
@@ -190,7 +282,7 @@ const server = createServer(async (req, res) => {
     return;
   }
   sendFile(res, target, securityHeaders());
-});
+}
 
 /**
  * The terminal's socket.

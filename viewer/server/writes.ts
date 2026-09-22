@@ -8,7 +8,6 @@
  * (never a shell string), so nothing here can be turned into shell injection.
  */
 
-import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 
@@ -19,10 +18,12 @@ import {
   QA_RESULTS, QA_DIRECTIVES,
 } from '../shared/plan-vocab.js';
 import { DECISION_KEYS } from '../shared/decisions-model.js';
+import { LANDING_STATES } from '../shared/landing-model.js';
+import { shell } from './shell.ts';
 
 export type WriteAction =
   | 'new-plan' | 'new-handoff' | 'qa-record' | 'gate-approve' | 'lock-claim' | 'lock-release'
-  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote';
+  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote' | 'landing-record';
 
 export type WriteRequest = {
   action: WriteAction;
@@ -70,6 +71,18 @@ export type WriteRequest = {
   rulingId?: string;
   key?: string;
   ledger?: string;
+  /**
+   * The landing ledger row to record (`landing-record`): the state — one of
+   * `LANDING_STATES` — and the cells `phase-landing.sh` takes. `reason` is the
+   * row's note. The repo key is the mount's root-relative path and MAY be
+   * empty (a plain repository, or the root itself), which is why it is a
+   * separate field rather than folded into `path`.
+   */
+  state?: string;
+  repo?: string;
+  ref?: string;
+  sha?: string;
+  pr?: string;
 };
 
 export type WriteOutcome = {
@@ -334,6 +347,50 @@ export function planWrite(request: WriteRequest, opts: { root: string; docsDir?:
       };
     }
 
+    case 'landing-record': {
+      // The ledger the two landing gates read (`landed N`, `pr-merged N`), and
+      // the only writer of it. The engine's landing engine records here after
+      // every step it takes; a session records here from its own shell. Both
+      // reach ONE script, and this plan is the shape check on the console's
+      // side: a state the vocabulary lacks, or a cell carrying a pipe, is
+      // refused before the script is spawned rather than by it.
+      const slug = requireSlug(request.slug);
+      const phase = requirePhase(request.phase);
+      const state = (request.state ?? '').trim().toLowerCase();
+      if (!(LANDING_STATES as readonly string[]).includes(state)) {
+        throw new WriteError(`A landing state must be one of ${LANDING_STATES.join(', ')}.`);
+      }
+      const cell = (name: string, raw: string | undefined, max = 256): string => {
+        const value = (raw ?? '').trim();
+        if (/[|\r\n]/.test(value)) throw new WriteError(`The landing ${name} may not contain a pipe or a newline.`);
+        if (value.length > max) throw new WriteError(`The landing ${name} is limited to ${max} characters.`);
+        return value;
+      };
+      const repo = cell('repo', request.repo);
+      const ref = cell('ref', request.ref);
+      const sha = cell('sha', request.sha, 64);
+      if (sha && !/^[0-9a-f]{7,64}$/i.test(sha)) throw new WriteError('A landing sha is 7–64 hex characters.');
+      const pr = cell('pr', request.pr, 512);
+      const by = cell('by', request.by, 64);
+      if (by && !GATE_BY.test(by)) throw new WriteError('Who recorded must be 1-64 characters: letters, digits, spaces, dots, @, + or dashes.');
+      const note = cleanReason(request.reason, 280);
+      const args = [slug, String(phase), state];
+      // An empty repo key is the plain repository (the ledger's `-` cell), and
+      // the writer spells that by OMISSION — `--repo ''` is refused by its own
+      // `${2:?}` guard.
+      if (repo) args.push('--repo', repo);
+      if (ref) args.push('--ref', ref);
+      if (sha) args.push('--sha', sha);
+      if (pr) args.push('--pr', pr);
+      if (by) args.push('--by', by);
+      if (note) args.push('--note', note);
+      return {
+        script: 'phase-landing.sh',
+        args,
+        description: `Record phase ${phase} of ${slug} as ${state}${repo ? ` in ${repo}` : ''}`,
+      };
+    }
+
     case 'open-editor':
       throw new WriteError('Editor launches do not go through planWrite.');
 
@@ -349,24 +406,16 @@ export async function runWrite(
   if (plan.args.includes('--git')) throw new WriteError('refusing to run a script with --git');
 
   const command = `${plan.script} ${plan.args.join(' ')}`;
-  return new Promise((resolveOutcome) => {
-    execFile(
-      'bash',
-      [join(opts.scriptsDir, plan.script), ...plan.args],
-      {
-        timeout: 20_000,
-        maxBuffer: 4 * 1024 * 1024,
-        cwd: opts.root,
-        env: { ...process.env, ...(plan.env ?? {}), DOCS_ROOT: opts.root, NO_COLOR: '1', TERM: 'dumb' },
-      },
-      (error, stdout, stderr) => {
-        const code = error && typeof (error as { code?: unknown }).code === 'number'
-          ? (error as unknown as { code: number }).code
-          : error ? 1 : 0;
-        resolveOutcome({ ok: code === 0, command, code, stdout: String(stdout), stderr: String(stderr) });
-      },
-    );
+  const run = await shell('bash', [join(opts.scriptsDir, plan.script), ...plan.args], {
+    channel: 'engine',
+    intent: plan.script,
+    timeout: 20_000,
+    cwd: opts.root,
+    capture: { keep: 4 * 1024 * 1024, mode: 'head' },
+    env: { ...process.env, ...(plan.env ?? {}), DOCS_ROOT: opts.root, NO_COLOR: '1', TERM: 'dumb' },
   });
+  const code = run.code ?? 1;
+  return { ok: code === 0, command, code, stdout: run.stdout, stderr: run.stderr };
 }
 
 /**
@@ -411,15 +460,18 @@ export async function openInEditor(path: string, docsDir: string): Promise<Write
     // side), `xdg-open` on a Linux desktop. A miss is an honest ok:false.
     : [openerCandidates()[0] ?? 'xdg-open', [target]];
 
-  return new Promise((resolveOutcome) => {
-    execFile(command, args, { timeout: 10_000 }, (error, stdout, stderr) => {
-      resolveOutcome({
-        ok: !error,
-        command: `${command} ${args.join(' ')}`,
-        code: error ? 1 : 0,
-        stdout: String(stdout),
-        stderr: String(stderr),
-      });
-    });
+  const run = await shell(command, args, {
+    channel: 'shell',
+    intent: 'open-in-editor',
+    timeout: 10_000,
+    // An editor that is not installed is an honest `ok:false`, not a fault.
+    expectFailure: true,
   });
+  return {
+    ok: run.ok,
+    command: `${command} ${args.join(' ')}`,
+    code: run.ok ? 0 : 1,
+    stdout: run.stdout,
+    stderr: run.stderr,
+  };
 }

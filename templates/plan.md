@@ -68,7 +68,31 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      **QA exhausted:** waive                   <-- waive | halt | <owner> — once the QA round budget
                                                   is spent (the `qa.exhausted` row)
      **When in doubt:** prefer X · never Y · record a ruling   <-- the `ambiguity` row
-     **Wait budget:** 8h                       <-- the ceiling on any one external wait (`waits`) -->
+     **Wait budget:** 8h                       <-- the ceiling on any one external wait (`waits`)
+     **Issues:** off                           <-- off | draft | file — whether a session may open an
+                                                  issue for something it finds OUTSIDE its phase (the
+                                                  `issues` row). `draft` is the recommended answer:
+                                                  the console holds the draft and a person approves.
+                                                  Budgets are 3 per phase, 10 per run. -->
+<!-- Where the work HAPPENS and where it LANDS — all optional, all machine-read
+     (phase-graph.sh --land / --base-branch / --gitlink / --conflict-policy / --isolation /
+     --clash-zones / --messaging). Each answers `word<TAB>phase|plan|default`, so the console can tell
+     "this plan chose it" from "this plan never considered it":
+     **Landing:** hold                         <-- hold (nothing; a person merges — the default and
+                                                  today's behaviour) | integrate | pr | trunk. A phase
+                                                  overrides it with "- **Land:** pr".
+     **Base branch:** origin/HEAD              <-- what the run branch is cut from: origin/HEAD (a
+                                                  fresh cut, the default) | head | any git ref
+     **Gitlink:** bump                         <-- bump | leave — whether a superproject phase that
+                                                  lands also moves the submodule pointer
+     **Conflicts:** halt                       <-- halt (today) | park (this phase only, keep
+                                                  driving) | rebase-session
+     **Isolation:** shared                     <-- shared | worktree — a phase may override; silence
+                                                  means the RUN decides, which is usually right
+     **Clash zones:** `path/`, `file`          <-- paths two concurrent phases must never both touch
+     **Messaging:** on                         <-- on | off — whether this plan's sessions may message
+                                                  each other mid-phase. Plan-wide; a phase cannot
+                                                  turn off a transport its siblings rely on. -->
 <!-- Branch policy (references/conventions.md §Branches): default = commit to the branch already checked out;
      create a branch ONLY if the user asked, and then use ONE branch for ALL phases (incl. independent ones).
      Optional: per-phase model overrides, e.g. "Phase 5 (architecture) → Opus; Phases 2–3 (codegen) → Haiku". -->
@@ -87,6 +111,7 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 |---|---|---|---|---|---|---|
 | `permission.policy` | | operator | outstanding | yes | plan | |
 | `permission.destructive` | | operator | outstanding | yes | plan | |
+| `issues` | | operator | outstanding | no | plan | |
 | `credentials` | | operator | outstanding | yes | plan | |
 | `accounts` | | operator | outstanding | yes | plan | |
 | `mcp` | | operator | outstanding | no | plan | |
@@ -141,6 +166,11 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      - **MCP policy:** require    <-- require | continue — OVERRIDES the plan-wide policy
      - **Credentials:** `x`       <-- UNIONED with the plan-wide Credentials line
      - **Credential policy:** continue   <-- OVERRIDES the plan-wide credential policy
+     - **Land:** pr               <-- hold | integrate | pr | trunk — OVERRIDES the plan-wide Landing
+     - **Gitlink:** leave         <-- bump | leave — OVERRIDES the plan-wide Gitlink
+     - **Isolation:** worktree    <-- shared | worktree — a checkout of its own, or the run's. Silence
+                                      inherits the RUN, which is a different fact from `shared`.
+     - **Issues:** draft          <-- off | draft | file — OVERRIDES the plan-wide Issues
      - **Waits on:** gh:<repo>#run · 45m <-- an expected external wait: the ref, and its maximum
      - **Human step:** <who, what, proof ref>   <-- a step denied to an agent, and what proves it landed
      - **Person-check:** halt     <-- allow | halt | <owner> when a §Verification fragment is prose

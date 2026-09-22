@@ -3,9 +3,10 @@
  *
  * ## The URL is the state, here as everywhere in this destination
  *
- * `#/repo/issues?repo=&state=&label=&q=&issue=` — the four filters and the open
- * inspector. A filtered board is quotable, survives a reload and pastes into a
- * message; the alternative for "look at these three" is a screenshot, which is
+ * `#/repo/issues?repo=&state=&label=&q=&filed=&issue=` — the five filters and
+ * the open inspector (`filed=sessions`, phase 12, keeps the issues a session of
+ * this console filed). A filtered board is quotable, survives a reload and
+ * pastes into a message; the alternative for "look at these three" is a screenshot, which is
  * the one form of evidence nobody can check.
  *
  * `?repo=` is the SAME parameter the other five sections use for their target,
@@ -91,6 +92,7 @@ function filterFrom(query: Record<string, string | undefined>): IssueFilter {
     ...(query.repo ? { repo: query.repo } : {}),
     ...(query.label ? { label: query.label } : {}),
     ...(query.q ? { q: query.q } : {}),
+    ...(query.filed === 'sessions' ? { filed: 'sessions' as const } : {}),
   };
 }
 
@@ -104,6 +106,7 @@ function href(current: IssueFilter, patch: Partial<IssueFilter> & { issue?: stri
     state: next.state === DEFAULT_FILTER.state ? undefined : next.state,
     label: next.label,
     q: next.q,
+    filed: next.filed,
     issue: patch.issue,
   });
 }
@@ -243,6 +246,28 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           </Select>
         </label>
 
+        {/* Who filed it (phase 12): everyone, or only the sessions of this
+            console — the issues carrying a provenance, which is also what the
+            chip on each such row renders. Two options, so the sentinel trick
+            the other controls need is not needed here. */}
+        <label className="flex flex-col gap-1 text-2xs text-ink-muted">
+          <span>Filed by</span>
+          <Select
+            value={filter.filed ?? 'anyone'}
+            onValueChange={(value) =>
+              navigate(href(filter, { filed: value === 'sessions' ? 'sessions' : undefined }))
+            }
+          >
+            <SelectTrigger className="min-w-32" aria-label="Filed by">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="anyone">Anyone</SelectItem>
+              <SelectItem value="sessions">Sessions</SelectItem>
+            </SelectContent>
+          </Select>
+        </label>
+
         {/* A form, not a keystroke listener: typing into the address bar on
             every character fills the back stack with half-typed words. */}
         <form
@@ -267,7 +292,11 @@ export default function IssuesSection({ route }: { route: ViewProps['route'] }) 
           </Button>
         </form>
 
-        {(filter.repo || filter.label || filter.q || filter.state !== DEFAULT_FILTER.state) && (
+        {(filter.repo ||
+          filter.label ||
+          filter.q ||
+          filter.filed ||
+          filter.state !== DEFAULT_FILTER.state) && (
           <Button size="sm" variant="ghost" onClick={() => navigate(repoHref('issues'))}>
             Clear
           </Button>

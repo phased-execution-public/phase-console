@@ -19,9 +19,16 @@ import {
 import { join } from 'node:path';
 
 import { DEFAULT_PRIORITY, type RunPriority } from '../../shared/orchestration-model.js';
+import {
+  DEFAULT_CONFLICT, DEFAULT_LAND,
+  type ConflictPolicy, type LandPolicy, type LandingState,
+} from '../../shared/landing-model.js';
+import { DEFAULT_ISSUES, type IssueMode } from '../../shared/issues-model.js';
+import { DEFAULT_MESSAGING, type MessagingWord } from '../../shared/message-model.js';
 import { HALT_KINDS, isAdjudicatedHalt } from '../../shared/recovery-model.js';
 import type { QaFixStrategy, RelayMode } from '../../shared/run-settings.js';
 import type { CredentialClass } from '../../shared/ops-vocab.js';
+import type { PolicySource } from '../../shared/policy-model.js';
 import { WAIT_REASONS, waitReasonOf } from '../../shared/status-vocab.js';
 import {
   DEFAULT_SETTLE, ISOLATED,
@@ -34,7 +41,8 @@ import { pidAlive, pidHoldsWork, processState, type ProcessState } from '../pid.
 import type { PermissionProfile } from './approvals.ts';
 // Type-only, so nothing is imported at runtime and the pair that would
 // otherwise be a cycle (`rulings.ts` needs `runDir` from here) never forms one.
-import type { LaneLiveness, StallState } from './liveness.ts';
+import type { LaneLiveness, PhaseSuspect, StallState } from './liveness.ts';
+import type { ContextMark, PartialMark, TokenAttempt } from './usage.ts';
 import type { Ruling } from './rulings.ts';
 import type { TaskItem } from './tasks.ts';
 import type { LadderEnding } from './signals.ts';
@@ -335,6 +343,51 @@ export type PreflightWarning = {
   message: string;
   lead?: string;
   command?: string;
+  /** Boarding will PARK on this (the verification review's `parks` verdict), not merely note it. */
+  parks?: boolean;
+  /** `commandFingerprint` of the whole command — what an approval at the start door is bound to. */
+  fp?: string;
+  /** One exact approval at the start door would make it run. */
+  approvable?: boolean;
+};
+
+/**
+ * A §Verification fragment the runner will not execute, and why.
+ *
+ * `code` names which wall refused it (`verify.ts` `RefusalCode`), `lead` the
+ * program when the objection is "not a command I know", and `fp` is the
+ * sha256 of the WHOLE normalised command — `text` is display-truncated, so it
+ * cannot key anything. `approvable` is true only when an operator's exact
+ * approval would make it run: nothing destructive, off-machine or unparseable
+ * ever is. All four are optional because records written before 2026-09-18
+ * carry only `text` and `reason`.
+ */
+export type VerifyNotRun = {
+  text: string;
+  reason: string;
+  code?: string;
+  lead?: string;
+  fp?: string;
+  approvable?: boolean;
+};
+
+/**
+ * The operator's answers to the verification review, given ONCE at the start
+ * door (2026-09-18, the zero-touch launch): commands the run may execute that
+ * the built-in tier would not, and fragments it may set aside.
+ *
+ * Bound to EXACT text — `fp` is `commandFingerprint` of the whole command — so
+ * a plan edited after the start is a new, unapproved command and takes the
+ * Person-check path it always took; an answer never widens to a program name.
+ * An approval relaxes only "is this a command I know": the deny wall, the
+ * off-machine gates and the wrapper recursion still judge it. `waive` is per
+ * phase. `text` is kept for the record a person reads later.
+ */
+export type RunVerifyApprovals = {
+  approve: { fp: string; text: string }[];
+  waive: { phase: number; fp: string; text: string }[];
+  by?: string;
+  at?: string;
 };
 
 export type VerifySummary = {
@@ -342,7 +395,9 @@ export type VerifySummary = {
   reason: string;
   ran: VerifyRun[];
   /** Commands present in the plan that the runner would not execute, and why. */
-  notRun: { text: string; reason: string }[];
+  notRun: VerifyNotRun[];
+  /** Fragments the run's start-door answers set aside for this phase. */
+  waived?: VerifyNotRun[];
   /** Commands skipped because their lead is not installed here. Optional —
    * records written before the skip machinery simply never have it. */
   skipped?: VerifySkip[];
@@ -409,6 +464,64 @@ export type QaRoundRecord = {
   turns?: number;
   /** When the run observed this round, ISO. Not when the reviewer wrote its report. */
   at?: string;
+};
+
+/** Where the landing engine is, per phase — see `PhaseRecord.landing`. */
+export type PhaseLanding = {
+  /** The policy the plan resolved for this phase (`--land N`). */
+  policy: LandPolicy;
+  /** The plan's conflict policy, read once at the landing so a mid-run edit cannot change a landing already under way. */
+  conflict: ConflictPolicy;
+  /** The ledger's word for the phase as a whole: the least-advanced repository. */
+  state: LandingState | 'pending';
+  /**
+   * The engine's own position, which is finer than the ledger's word and is
+   * what a restart continues from: `local` (nothing remote has happened),
+   * `push` (about to / mid push), `session` (the landing session is owed or in
+   * flight), `verify` (a row was recorded and awaits `gh pr view`),
+   * `watch` (the PR is open and the watch clock owns it), `done`, `parked`.
+   */
+  step: 'local' | 'push' | 'session' | 'verify' | 'watch' | 'done' | 'parked';
+  /**
+   * Where a PARKED landing resumes from on the next drive, when it may: a
+   * refused push re-asks the flag, a session that recorded nothing is spent
+   * again, a verifier that could not answer is asked again. Absent on a park
+   * a person owns (a closed pull request, a conflict, the attempt cap).
+   */
+  resumeFrom?: 'local' | 'push' | 'session' | 'verify';
+  /** One entry per mounted repository the phase touched, keyed by the ledger's repo key. */
+  repos: Record<string, PhaseLandingRepo>;
+  /** How many times the remote half has been attempted (a restart resumes; it never re-pushes). */
+  attempts: number;
+  /**
+   * How many rebase sessions the LOCAL half spent on a lane conflict (`On
+   * conflict: rebase-session`): the plan allows exactly one, so a second
+   * conflict parks. Absent means none.
+   */
+  rebases?: number;
+  /** When the landing last moved. */
+  at: string;
+  /** Why it parked or degraded, in one sentence, for the run page. */
+  note?: string;
+};
+
+export type PhaseLandingRepo = {
+  /** The branch this repository's work is on — the lane branch, else the run branch. */
+  branch: string;
+  /** The ledger row's state for this repository, as last recorded or verified. */
+  state: LandingState | 'pending';
+  /** The sha the push put on the remote, once it did. */
+  pushed?: string;
+  /** The pull request, once the landing session's row was VERIFIED against `gh pr view`. */
+  pr?: {
+    repo: string;
+    number: number;
+    url: string;
+    state: string;
+    mergedAt?: string;
+    mergeCommit?: string;
+    checkedAt: string;
+  };
 };
 
 export type PhaseRecord = {
@@ -524,6 +637,21 @@ export type PhaseRecord = {
    * `require` case parks instead and writes none.
    */
   credentialsMissing?: { id: string; reason: string }[];
+  /**
+   * Where this phase's LANDING has got to — the console's own copy of what the
+   * ledger (`docs/handoffs/<slug>/landing.md`) records, plus the steps the
+   * ledger does not hold (a push that succeeded but was not yet recorded, a
+   * session in flight). Written by the landing engine (Pro,
+   * `server/pro/landing/engine.ts`); absent on every phase of a plan whose
+   * policy is `hold` and on every record written before 5.1.0.
+   *
+   * `state` is the LEDGER's word for the phase as a whole (worst repository
+   * wins); `step` is the engine's own position, which is what a restart
+   * resumes from (`resumeLanding`). `repos` is keyed by the mount's
+   * root-relative path (`''` for a plain repository or the root itself), which
+   * is the ledger's own key.
+   */
+  landing?: PhaseLanding;
   /**
    * The `require` park this record is sitting in: when it began and which
    * servers it waits for. The resource ladder's clock reads `at` — after
@@ -1006,6 +1134,39 @@ export type PhaseRecord = {
    */
   liveness?: LaneLiveness;
   /**
+   * What each session of this phase cost in context, newest last, at most
+   * `MAX_TOKEN_ATTEMPTS` (autopilot-token-drain phase 3; `runner/usage.ts`).
+   * Written when a session ends, by `spawnSession` — the same moment
+   * `phase.tokens` is journalled — for every session that made an API call.
+   *
+   * HISTORY, like `qa`: it survives a Retry and a re-board. Phase 4's resume
+   * gate reads the entry for the session it would resume (its `lastContext`,
+   * `endedAt`, `resumed`). Absent on every record written before this shipped.
+   */
+  tokens?: TokenAttempt[];
+  /**
+   * The context wrap-up this phase's session was sent at `CONTEXT_WRAPUP_FRACTION`
+   * of its window — which session, at what context, and whether it arrived.
+   * Spent once per SESSION: a `--resume` of the session already told is not told
+   * again, a new session is.
+   */
+  contextWrapup?: ContextMark;
+  /**
+   * The checkpoint the console took at `CONTEXT_CHECKPOINT_FRACTION` of the
+   * window: the session it ended, and the context it ended at. The next attempt
+   * boarded fresh with the resume brief rather than `--resume` it — what Phase 4's
+   * gate reads to refuse resuming that session by any other path.
+   */
+  contextCheckpoint?: ContextMark;
+  /**
+   * The newest `partial` declared for this phase — which session, why, when
+   * (autopilot-token-drain phase 4). The resume gate reads it: a session that
+   * declared `partial --reason budget|context` said itself that it is spent, so
+   * the next attempt boards fresh with the resume brief rather than `--resume` it.
+   * Kept like `contextCheckpoint`, replaced by the next `partial`.
+   */
+  lastPartial?: PartialMark;
+  /**
    * The stall episode in progress, when there is one. Written when a signal
    * first holds and DELETED when it clears — its presence is the episode, so
    * `phase.stall` is journalled once per episode rather than once per tick.
@@ -1015,6 +1176,19 @@ export type PhaseRecord = {
    * announce itself again the moment the new one started.
    */
   stall?: StallState;
+  /**
+   * What the console SUSPECTS of this lane, and has deliberately not acted on
+   * (many-plans-one-repo phase 13). Today one kind: `loop` — three identical
+   * failing tool calls in a row. Written once per (phase, attempt, call) and
+   * cleared with the rest of the attempt's evidence on a retry, so a suspicion
+   * inherited from the attempt an operator gave up on never speaks twice.
+   *
+   * Deliberately separate from `stall`, which is a live EPISODE the ladder acts
+   * on. This is testimony: it is kept after the episode clears, because the
+   * question it answers — "what did this lane look like when it went wrong" —
+   * is asked after the fact.
+   */
+  suspect?: PhaseSuspect;
   /**
    * What the silent-session watchdog has already done about this phase.
    *
@@ -1197,7 +1371,7 @@ export type ManifestDecision = {
 
 /**
  * What `run.start` echoes (phase 11, ZTD-2): the manifest as it stood when the
- * run was admitted — every row with its state, the four probes' verdicts, the
+ * run was admitted — every row with its state, the probes' verdicts, the
  * accounts clause in force, the credentials named and held, the delivery
  * channel found — and the recorded override when a blocking row was passed
  * on purpose. Stored on the run so a person reading a halted run six hours
@@ -1419,6 +1593,15 @@ export type ChildRef = {
    * disagree exactly when it matters, on a record written by another version.
    */
   branch?: string;
+  /**
+   * The `git worktree lock` reason fastened on `worktree` (phase 7), written
+   * only when git accepted it (phase 15). **Absent means not locked by this
+   * console** — a shared-root lane, a run-level checkout (whose lock is the
+   * run tree's, not this child's), or a lock git refused. What lets a row say
+   * "locked" in the runner's own words instead of inferring it from the fact
+   * that a lock is always asked for.
+   */
+  locked?: string;
 };
 
 /**
@@ -1695,6 +1878,12 @@ export type RunState = {
   accounts?: AccountRequirement[];
   acknowledgedWaivers?: string[];
   manifest?: ResolvedManifest;
+  /**
+   * The operator's answers at the start door for §Verification (2026-09-18) —
+   * what the run may execute that the built-in tier would not, and what it may
+   * set aside. See `RunVerifyApprovals`. Absent on runs started before it.
+   */
+  verifyApprovals?: RunVerifyApprovals;
   phaseBudgetUsd: number | null;
   runBudgetUsd: number | null;
   spentUsd: number;
@@ -1971,6 +2160,72 @@ export type RunState = {
    * fresh `high` behind it. A class is a preference; starvation is a bug.
    */
   priority?: RunPriority;
+  /**
+   * The seven words the launch form gained in many-plans-one-repo phase 15 —
+   * each ALSO a plan line, and the plan outranks every one of them (the
+   * `mcpPolicy` precedent: a plan's statement is versioned and describes the
+   * work; a launch choice speaks only where the plan is silent). Each is
+   * written only when it says something, so a run file from before the field
+   * means what it always meant.
+   *
+   * `baseBranch` — what `pe/<slug>` (and every lane's `pe/<slug>-pN`) is cut
+   * from, when the plan's `**Base branch:**` says nothing; absent means the
+   * console's `baseBranch` preference, then `origin/HEAD`. Immutable once the
+   * branch EXISTS (`checkout` set): the fork already happened, and a new word
+   * would describe one that never did. The route refuses it with a 409.
+   */
+  baseBranch?: string;
+  /**
+   * What `baseBranch` (or the plan's line, or the preference, or the shipped
+   * word) RESOLVED to, pinned at the moment the run's branch was cut — the
+   * ref as a person writes it, the commit it stood at, which arm answered
+   * (`origin-head` · `trunk` · `head` · `ref`, `worktree.ts` `BaseSource`)
+   * and who declared the word (`plan` · `run` · `console` · `default`).
+   * Written once by the runner's `baseFor()` (phase 15) beside the
+   * `run.base-branch` journal line; absent on a run whose word resolved to
+   * nothing, and on every run file from before the field.
+   */
+  base?: { ref: string; sha: string; source: string; declaredBy: PolicySource };
+  /**
+   * How many isolated runs this run will stand BESIDE in its repository — the
+   * admission threshold it is judged against, clamped to the console's own
+   * `maxConcurrentPerRepo` (a run may make itself more conservative, never
+   * outbid the console; the `maxParallel`/`--max-sessions` rule). Absent
+   * means the console's number.
+   */
+  maxConcurrentPerRepo?: number;
+  /**
+   * What becomes of the trees the console mints for this run when it
+   * settles — `WORKTREE_RETENTION`, or `ttl:<h>`. Absent means the console's
+   * `worktreeRetention` preference, read fresh at the settle.
+   */
+  worktreeRetention?: string;
+  /**
+   * What happens to a phase's commits when it settles, when neither the
+   * phase's `- **Land:**` nor the plan's `**Landing:**` says. **Absent means
+   * `hold`** — the one policy that writes nothing.
+   */
+  landing?: LandPolicy;
+  /**
+   * What a landing that will not merge cleanly does, when the plan's
+   * `**Conflicts:**` says nothing. **Absent means `halt`.**
+   */
+  conflictPolicy?: ConflictPolicy;
+  /**
+   * Whether this run's sessions may message each other, when the plan's
+   * `**Messaging:**` says nothing. **Absent means `on`**, so only `off` is
+   * ever written. Lands on the next spawn: a session's settings file and its
+   * token are written per attempt.
+   */
+  messaging?: MessagingWord;
+  /**
+   * Whether a session may open an issue for something outside its phase, when
+   * neither the phase's `- **Issues:**` nor the plan's `**Issues:**` says.
+   * **Absent means `off`** — an outward write is never a default. A patch
+   * may only TIGHTEN it (`file` → `draft` → `off`); the route refuses the
+   * other direction with a 409.
+   */
+  issuesMode?: IssueMode;
   /**
    * The operator has stopped this run boarding anything new.
    *
@@ -2250,6 +2505,14 @@ export type NewRunOptions = {
   reviewerPolicy?: ReviewerPolicy;
   ultracode?: boolean;
   ultraReview?: UltraReviewMode;
+  /** Phase 15's seven — see `RunState`. */
+  baseBranch?: string;
+  maxConcurrentPerRepo?: number;
+  worktreeRetention?: string;
+  landing?: LandPolicy;
+  conflictPolicy?: ConflictPolicy;
+  messaging?: MessagingWord;
+  issuesMode?: IssueMode;
   /** Heal halts automatically. `true` takes the default budget; an object names it. */
   autoRecover?: boolean | { attempts?: number };
   /** The manifest answers and the resolved manifest — see `RunState`. */
@@ -2258,6 +2521,7 @@ export type NewRunOptions = {
   accounts?: AccountRequirement[];
   acknowledgedWaivers?: string[];
   manifest?: ResolvedManifest;
+  verifyApprovals?: RunVerifyApprovals;
 };
 
 /**
@@ -2278,7 +2542,13 @@ function settleFor(opts: Pick<NewRunOptions, 'settle' | 'openPr'>): SettleStrate
 export function newRun(opts: NewRunOptions): RunState {
   const now = new Date().toISOString();
   return {
-    id: randomUUID().slice(0, 8),
+    // TWELVE hex digits, not eight (S9-b). A run id is not merely a filename:
+    // `autopilot/<runId>` is what a lane writes into a lock's `owner=`, so it
+    // is the name two consoles use to decide whose lock a lock is — and two
+    // runs sharing an id share their locks, their journal and their run file.
+    // `randomUUID()` is dash-separated, so the dashes come out before the
+    // slice; `.slice(0, 12)` on the raw string would have taken one.
+    id: randomUUID().replace(/-/g, '').slice(0, 12),
     slug: opts.slug,
     root: opts.root,
     status: 'running',
@@ -2349,6 +2619,16 @@ export function newRun(opts: NewRunOptions): RunState {
     ...(opts.accounts?.length ? { accounts: opts.accounts.map((a) => ({ ...a })) } : {}),
     ...(opts.acknowledgedWaivers?.length ? { acknowledgedWaivers: [...opts.acknowledgedWaivers] } : {}),
     ...(opts.manifest ? { manifest: opts.manifest } : {}),
+    ...(opts.verifyApprovals && (opts.verifyApprovals.approve.length || opts.verifyApprovals.waive.length)
+      ? {
+        verifyApprovals: {
+          approve: opts.verifyApprovals.approve.map((a) => ({ ...a })),
+          waive: opts.verifyApprovals.waive.map((w) => ({ ...w })),
+          ...(opts.verifyApprovals.by ? { by: opts.verifyApprovals.by } : {}),
+          ...(opts.verifyApprovals.at ? { at: opts.verifyApprovals.at } : {}),
+        },
+      }
+      : {}),
     ...(opts.onlyPhases?.length ? { onlyPhases: [...opts.onlyPhases] } : {}),
     ...(opts.phaseOptions ? { phaseOptions: { ...opts.phaseOptions } } : {}),
     ...(opts.skills?.length ? { skills: [...opts.skills] } : {}),
@@ -2397,6 +2677,21 @@ export function newRun(opts: NewRunOptions): RunState {
     // string would read as configured and hold nothing, which is the shape of
     // setting this codebase keeps deciding not to have.
     ...(opts.startAfter ? { startAfter: opts.startAfter } : {}),
+    // Phase 15's seven, each written only when it says something (see
+    // `RunState`). The first three are written whatever the git strategy:
+    // retention governs any tree the console mints, the cap counts the run in
+    // its repository, and the base is what a LANE's branch is cut from even
+    // when the run itself took none. The last four store their shipped default
+    // as no key — a run file that says `landing: hold` and one that says
+    // nothing are one fact.
+    ...(opts.baseBranch?.trim() ? { baseBranch: opts.baseBranch.trim() } : {}),
+    ...(typeof opts.maxConcurrentPerRepo === 'number' && opts.maxConcurrentPerRepo > 0
+      ? { maxConcurrentPerRepo: opts.maxConcurrentPerRepo } : {}),
+    ...(opts.worktreeRetention ? { worktreeRetention: opts.worktreeRetention } : {}),
+    ...(opts.landing && opts.landing !== DEFAULT_LAND ? { landing: opts.landing } : {}),
+    ...(opts.conflictPolicy && opts.conflictPolicy !== DEFAULT_CONFLICT ? { conflictPolicy: opts.conflictPolicy } : {}),
+    ...(opts.messaging && opts.messaging !== DEFAULT_MESSAGING ? { messaging: opts.messaging } : {}),
+    ...(opts.issuesMode && opts.issuesMode !== DEFAULT_ISSUES ? { issuesMode: opts.issuesMode } : {}),
     // Same omission convention again: off is absent. The POLICY is written only
     // when a reviewer is on, because a policy on a run with no reviewer is a
     // setting that reads as configured and does nothing — and there are TWO
@@ -3009,7 +3304,7 @@ export function pruneRuns(
   const candidates: { id: string; file: string; at: number }[] = [];
   let total = 0;
   for (const name of readdirSync(dir)) {
-    const id = /^run-([0-9a-f]{8})\.json$/.exec(name)?.[1];
+    const id = /^run-([0-9a-f]{8,32})\.json$/.exec(name)?.[1];  // 8..32 — see S9-b in scheduler.ts
     if (!id) continue;
     total++;
     if (isLive(id, keep)) continue;
@@ -3032,11 +3327,41 @@ export function pruneRuns(
     try {
       rmSync(candidate.file, { force: true });
       rmSync(journalFile(root, slug, candidate.id), { force: true });
+      for (const sidecar of runSidecars(dir, candidate.id)) rmSync(sidecar, { recursive: true, force: true });
       removed.push(candidate.id);
       survivors--;
     } catch { /* a file we cannot remove is retried next sweep */ }
   }
   return removed;
+}
+
+/**
+ * Everything else a run leaves behind, so a swept record takes its evidence
+ * with it instead of leaving five orphans nobody can name.
+ *
+ * Before 5.1.0 this was the record and the journal and nothing more: the
+ * transcript (`.log.jsonl`, capped at 16 MB EACH), every phase's task ledger,
+ * every phase's declared outcome, the folded git trace and the run's raw
+ * Trace2 directory all outlived the run by exactly forever. Nothing read them
+ * — `loadRun` returns null for a record that is gone — so they were pure
+ * residue, and a console driving a plan for a month accumulated hundreds.
+ *
+ * The id is matched EXACTLY rather than by prefix. Run ids are 8–32 hex, so
+ * `run-aaaaaaaa*` also matches `run-aaaaaaaabbbb.log.jsonl` — a different run,
+ * whose transcript a prefix sweep would take while its record stayed.
+ */
+function runSidecars(dir: string, id: string): string[] {
+  const exact = new RegExp(`^run-${id}(?:\\.log\\.jsonl|\\.git\\.ndjson|-p\\d+-(?:tasks\\.ndjson|outcome\\.json))$`);
+  const out: string[] = [];
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return out; }
+  for (const name of names) {
+    if (exact.test(name)) out.push(join(dir, name));
+  }
+  // The raw Trace2 directory the drain folds from, `git-trace/<runId>/`.
+  const raw = join(dir, 'git-trace', id);
+  if (existsSync(raw)) out.push(raw);
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -3554,6 +3879,9 @@ export function latestEnding(records: readonly PhaseRecord[]): PhaseRecord | nul
  * re-runs them. Clearing the halt is part of the same truth: a halt anchored
  * to a phase that is now done is a card about nothing.
  */
+/** The reconcile note for a record this run attempted — see `reconcileRecordsAgainstBoard`. */
+export const RECONCILED_ATTEMPTED_NOTE = 'closed while checkpointed — the board reads done; not verified by this run';
+
 export const RECONCILABLE: readonly PhaseStatus[] = [
   'failed', 'parked', 'waiting', 'pending', 'interrupted', 'gated', 'queued',
 ];
@@ -3637,7 +3965,15 @@ export function reconcileRecordsAgainstBoard(
     );
     if (surviving) continue;
     record.status = 'done';
-    record.note = 'closed outside this run (the board reads done)';
+    // Whose work the board is reading is not something the board can say. A
+    // phase this run never started was closed by someone else; one it DID start
+    // — a session checkpointed by a wall, a lane parked or waiting — may have
+    // been finished by a sibling lane of this very run (autopilot-token-drain H7:
+    // P3's session closed P2's artefacts, and P2 read "outside this run"). Either
+    // way nothing here ran the phase's §Verification, and the note says so.
+    record.note = record.attempts > 0 || record.startedAt
+      ? RECONCILED_ATTEMPTED_NOTE
+      : 'closed outside this run (the board reads done)';
     record.endedAt ??= now;
     // A record that STARTED and reports no spend did not cost nothing — its
     // session was lost before the CLI's terminal `result` arrived. Say so.
@@ -3991,7 +4327,7 @@ export function listRuns(root: string, slug: string, liveRunId?: LiveRuns): RunS
   if (!existsSync(dir)) return [];
   const runs: RunState[] = [];
   for (const name of readdirSync(dir)) {
-    const id = /^run-([0-9a-f]{8})\.json$/.exec(name)?.[1];
+    const id = /^run-([0-9a-f]{8,32})\.json$/.exec(name)?.[1];  // 8..32 — see S9-b in scheduler.ts
     if (!id) continue;
     const state = loadRun(root, slug, id, liveRunId);
     if (state) runs.push(state);

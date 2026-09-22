@@ -1,7 +1,7 @@
 {
   "_comment": "The FREE tree's package manifest. Differs from the Pro one in exactly three ways, all of which follow from what the free tree IS: (1) the identity fields name the PUBLIC repository, because this file ships inside it and a bug report has to reach a repository the reporter can see; (2) the `files` allowlist drops `viewer/deploy/` and `viewer/fleet/` — the launchd agent, the desktop launcher and the second entry point are Pro, and both directories are proPaths, so listing either here would name a path that does not exist; (3) the `free:preview` and `free:diff` scripts are gone, because both run the split tooling, which is a proPath too. Everything else is deliberately identical, version included: the two trees are one product at one version, and a free tarball that disagreed about the node floor or the bin target would be a second packaging contract to keep in step. `.github/scripts/assert-tarball.sh` reads this list in whichever tree it runs in.",
   "name": "phase-console",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "Phase Console — local web console for the phased-execution Claude Code skill: plan boards, phase handoffs, QA gating, autopilot runs.",
   "license": "MIT",
   "author": "phased-execution-public (https://github.com/phased-execution-public)",
@@ -71,6 +71,10 @@
     "viewer/shared/relay-model.js",
     "viewer/shared/orchestration-model.js",
     "viewer/shared/fleet-model.js",
+    "viewer/shared/landing-model.js",
+    "viewer/shared/message-model.js",
+    "viewer/shared/issues-model.js",
+    "viewer/shared/poll-loop.js",
     "viewer/scripts/check-stamp.mjs",
     "viewer/client/dist/",
     "viewer/client/src/assets/fonts/OFL.txt"

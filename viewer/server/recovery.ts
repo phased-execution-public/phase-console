@@ -211,17 +211,21 @@ export type RecoveryFacts = RecoveryRequest & {
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,79}$/i;
 
 /**
- * Same shape a run id takes everywhere else in this codebase: minted as
- * `randomUUID().slice(0, 8)` by `runner/state.ts` `newRun`, and read back by
- * `listRuns` as `/^run-([0-9a-f]{8})\.json$/`. Eight LOWERCASE hex digits —
- * case-sensitive on purpose, because an uppercase id can never name a file
- * `listRuns` will return.
+ * Same shape a run id takes everywhere else in this codebase: minted as twelve
+ * hex digits by `runner/state.ts` `newRun`, and read back by `listRuns` as
+ * `/^run-([0-9a-f]{8,32})\.json$/`. LOWERCASE hex, case-sensitive on purpose,
+ * because an uppercase id can never name a file `listRuns` will return.
+ *
+ * 8..32 rather than exactly 12: the mint was eight until 5.1.0 (S9-b — a run id
+ * is the lock-owner identity, so a collision is two runs sharing one lock), and
+ * every id already on disk still has to resolve. A reader may widen; it may
+ * never retire what it used to accept.
  *
  * Spelled out here rather than imported because this module is a leaf (see the
  * header): importing `runner/state.ts` would pull the whole loop into the
  * prompt builder and into the no-server tests that are the point of the leaf.
  */
-const RUN_ID_RE = /^[0-9a-f]{8}$/;
+const RUN_ID_RE = /^[0-9a-f]{8,32}$/;
 
 /**
  * Validate the recovery half of a `POST /api/terminal` body.
@@ -262,7 +266,7 @@ export function parseRecoveryRequest(
   let runId: string | undefined;
   if (body.runId != null && body.runId !== '') {
     if (typeof body.runId !== 'string' || !RUN_ID_RE.test(body.runId)) {
-      return bad('runId must be an 8-character run id.');
+      return bad('runId must be a run id: 8-32 lowercase hex characters.');
     }
     runId = body.runId;
   }

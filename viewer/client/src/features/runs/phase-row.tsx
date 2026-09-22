@@ -27,7 +27,7 @@
 import { memo } from 'react';
 import { Chip, KeyValue, RelativeTime, StateChip } from '@/components/ui';
 import { phaseSessionHref } from '@/app/routes';
-import { relativeTime } from '@/lib/format';
+import { plural, relativeTime, weight } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { EvidenceProof, LaneLiveness, PhaseLive, PhaseLock } from '@/lib/api';
 import { PHASE_ACTOR_LABELS } from '@/lib/status-vocab';
@@ -276,6 +276,50 @@ export function LivenessChip({ liveness }: { liveness: LaneLiveness | undefined 
       }
     >
       {openTool ? openTool.name : <RelativeTime at={at} />}
+    </Chip>
+  );
+}
+
+/**
+ * What a live lane's session costs in context (autopilot-token-drain phase 3).
+ *
+ * Every tool call re-reads the whole conversation, so the context is the price
+ * of each next call — and the run this exists for peaked at 957k with no surface
+ * saying so, while a status check every four seconds paid it again each time.
+ * The chip names now and the peak, the cache rebuilds and the status checks, and
+ * warns once the server says the session is past the wrap-up line (`stage`); the
+ * server owns the thresholds, so this reads the word and never a fraction.
+ * Nothing renders before the session's first call.
+ */
+export function ContextChip({ liveness }: { liveness: LaneLiveness | undefined }) {
+  const tokens = liveness?.tokens;
+  if (!tokens) return null;
+  const parts = [`${weight(tokens.context)} ctx`];
+  if (tokens.peak > tokens.context) parts.push(`peak ${weight(tokens.peak)}`);
+  if (tokens.rebuilds > 0) parts.push(plural(tokens.rebuilds, 'rebuild'));
+  if (tokens.pollCalls > 0) parts.push(plural(tokens.pollCalls, 'poll'));
+  const share = tokens.window
+    ? ` of a ${weight(tokens.window)} window (${Math.round((tokens.context / tokens.window) * 100)} %)`
+    : '';
+  const said =
+    tokens.stage === 'checkpoint'
+      ? ' The console is checkpointing this session; the next attempt boards fresh.'
+      : tokens.stage === 'wrap-up'
+        ? ' The session has been told to wrap up and hand off.'
+        : '';
+  return (
+    <Chip
+      tone={tokens.stage ? 'warn' : 'neutral'}
+      mono
+      data-stage={tokens.stage}
+      title={
+        `Context ${weight(tokens.context)} now, peak ${weight(tokens.peak)}${share}. ` +
+        `${plural(tokens.calls, 'API call')} this attempt: ${weight(tokens.cacheRead)} read from cache, ` +
+        `${weight(tokens.cacheWrite)} written, ${plural(tokens.rebuilds, 'cache rebuild')}, ` +
+        `${plural(tokens.pollCalls, 'status check')}.${said}`
+      }
+    >
+      {parts.join(' · ')}
     </Chip>
   );
 }

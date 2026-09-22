@@ -256,7 +256,20 @@ if [ "$verb" = "create" ]; then
   git -C "$repo" worktree lock --reason "phase-lane $slug p$phase$suffix $owner $(date +%F)" "$dir" >/dev/null 2>&1 || true
   if [ "$detach" = 1 ]; then shown="detached at $run_branch"; else shown="$branch"; fi
   printf 'lane ready: %s (%s, locked)\n  cd "%s"\n' "$dir" "$shown" "$dir"
-  printf '  bash %s/phase-lock.sh %s claim %s --scope "%s" --here\n' "$SCRIPT_DIR" "$slug" "$phase" "$scope_csv"
+  # 🔴 A QA lane claims NOTHING (S7-2). `phase-lock.sh claim` refuses a second
+  # claim on the same slug+phase however it is qualified — the scheduler's
+  # `sameUnitOfWork` rule, which bash learned in phase 3 — so the `claim … --here`
+  # line printed here could only ever fail beside the build lane it was made to
+  # sit next to, and the reviewer who ran it read the refusal as "somebody else
+  # is building here". A round is recorded, not claimed; that is the instruction
+  # it actually needs.
+  if [ -n "$qa" ]; then
+    printf '  # a QA round claims no lock — the build lane holds this phase. Record the verdict:\n'
+    printf '  bash %s/qa-record.sh %s %s pass|fail|waived --round %s --report docs/handoffs/%s/reports/phase-%02d-qa%s.md\n' \
+      "$SCRIPT_DIR" "$slug" "$phase" "$qa" "$slug" "$phase" "$qa"
+  else
+    printf '  bash %s/phase-lock.sh %s claim %s --scope "%s" --here\n' "$SCRIPT_DIR" "$slug" "$phase" "$scope_csv"
+  fi
   printf 'when done:\n'
   if [ "$detach" = 0 ]; then
     printf '  bash %s/phase-lane.sh %s merge %s%s%s    # folds %s onto %s: fast-forward, else a merge commit\n' \
@@ -277,22 +290,47 @@ if [ "$verb" = "merge" ]; then
     echo "the lane at $dir is detached (or not on $branch) — nothing to merge; cherry-pick its commits by sha" >&2
     exit 2
   fi
-  on="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
-  [ "$on" = "$run_branch" ] || { echo "the main checkout $repo stands on $on, not on $run_branch — check the run branch out there first (it is where the merge lands)" >&2; exit 1; }
-  [ -z "$(git -C "$repo" status --porcelain --ignore-submodules=all)" ] || { echo "the main checkout $repo has uncommitted changes — commit or stash them before merging into it" >&2; exit 1; }
+  # 🔴 ASK GIT which tree holds the run branch (S7-4). Requiring `$repo` itself
+  # to stand on `pe/<slug>` was wrong in both directions: under isolation the
+  # console holds the branch in its own mirror, so the merge was IMPOSSIBLE; and
+  # under a shared run the main checkout is exactly where a live session is
+  # working, so the merge would have swapped files under it. git allows a branch
+  # one working tree, so there is always at most one right answer and it is
+  # cheap to ask for.
+  target=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) _wt="${line#worktree }" ;;
+      "branch refs/heads/$run_branch") target="$_wt" ;;
+    esac
+  done <<EOF
+$(git -C "$repo" worktree list --porcelain 2>/dev/null || true)
+EOF
+  [ -n "$target" ] || { echo "$run_branch is checked out in no working tree of $repo — check it out somewhere (it is where the merge lands)" >&2; exit 1; }
+  # …and NEVER a tree the console is driving a run in. `<root>/.worktrees/runs/`
+  # is the console's own runs home (`worktree.ts` §The layout): a merge there
+  # moves files under a session mid-phase, and the console would then land the
+  # lane's commits a second time when the run settles.
+  case "$target" in
+    "$root_p/.worktrees/runs/"*)
+      echo "$run_branch is held by a console run's tree ($target) — a merge there would move files under a live session." >&2
+      echo "  Let the run settle (or stop it), then merge; or take the commits by sha." >&2
+      exit 1 ;;
+  esac
+  [ -z "$(git -C "$target" status --porcelain --ignore-submodules=all)" ] || { echo "the checkout holding $run_branch ($target) has uncommitted changes — commit them before merging into it" >&2; exit 1; }
   ahead="$(git -C "$repo" rev-list --count "$run_branch..$branch")"
   if [ "$ahead" = 0 ]; then echo "nothing to merge: $branch holds no commit $run_branch lacks"; exit 0; fi
-  if git -C "$repo" merge --ff-only "$branch" >/dev/null 2>&1; then
-    echo "fast-forwarded $run_branch to $branch ($ahead commit(s)) in $repo"
+  if git -C "$target" merge --ff-only "$branch" >/dev/null 2>&1; then
+    echo "fast-forwarded $run_branch to $branch ($ahead commit(s)) in $target"
     exit 0
   fi
-  if git -C "$repo" merge --no-ff --no-edit -m "Merge $branch into $run_branch" "$branch" >/dev/null 2>&1; then
-    echo "merge commit: $branch ($ahead commit(s)) folded into $run_branch in $repo — $(git -C "$repo" rev-parse --short=12 HEAD)"
+  if git -C "$target" merge --no-ff --no-edit -m "Merge $branch into $run_branch" "$branch" >/dev/null 2>&1; then
+    echo "merge commit: $branch ($ahead commit(s)) folded into $run_branch in $target — $(git -C "$target" rev-parse --short=12 HEAD)"
     exit 0
   fi
   echo "merge conflict — aborted, nothing changed. Conflicting files:" >&2
-  git -C "$repo" diff --name-only --diff-filter=U >&2 || true
-  git -C "$repo" merge --abort >/dev/null 2>&1 || true
+  git -C "$target" diff --name-only --diff-filter=U >&2 || true
+  git -C "$target" merge --abort >/dev/null 2>&1 || true
   echo "resolve by merging $run_branch INTO the lane ($dir) and merging again" >&2
   exit 1
 fi
@@ -316,7 +354,16 @@ else
 fi
 echo "removed $dir"
 if [ "$has_branch" = 1 ]; then
-  if git -C "$repo" branch -d "$branch" >/dev/null 2>&1; then
+  # 🔴 `--force` KEEPS the branch (G-LANE). The refusal above says so in as many
+  # words — "remove --force to keep the branch and drop the tree" — and then this
+  # deleted it anyway whenever `branch -d` judged it merged, which `-d` judges
+  # against the CURRENT checkout's HEAD rather than against the run branch. The
+  # one place this script's promise and its act disagreed; the line is printed
+  # now, for a person who has read the ahead count and decided.
+  if [ "$force" = 1 ]; then
+    echo "kept $branch — --force keeps the branch. Delete it yourself when you are done with it:"
+    echo "  git -C $repo branch -d $branch    # refuses while it holds commits $run_branch lacks"
+  elif git -C "$repo" branch -d "$branch" >/dev/null 2>&1; then
     echo "deleted $branch (merged)"
   else
     echo "kept $branch — it holds commits $run_branch lacks; merge them or delete it yourself (never -D here)"

@@ -46,6 +46,21 @@ export interface Issue {
   body?: string;
   /** True when `body` was cut at the server's byte ceiling. */
   bodyTruncated?: boolean;
+  /**
+   * Which plan, phase and run FILED this issue, when a session of this console
+   * did (phase 12) — joined on by the server from the plans' issue ledgers.
+   * Absent on every issue a person opened; the "filed by sessions" filter and
+   * the provenance chip read nothing else.
+   */
+  provenance?: IssueProvenance;
+}
+
+/** Where a session-filed issue came from. */
+export interface IssueProvenance {
+  slug: string;
+  phase: number;
+  runId?: string;
+  draftId: string;
 }
 
 export interface RepoIssues {

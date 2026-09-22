@@ -39,6 +39,7 @@
  */
 
 import { DECISION_KEYS } from './decisions-model.js';
+import { ISSUE_MODES } from './issues-model.js';
 import { MCP_POLICIES } from './run-lifecycle.js';
 import { RELAY_MODES } from './run-settings.js';
 
@@ -104,6 +105,10 @@ export const OWNER_RE = /^[A-Za-z0-9][A-Za-z0-9._@/-]{0,63}$/;
 export const DECISION_ANSWERS = Object.freeze({
   'permission.policy': null,
   'permission.destructive': null,
+  // The plan's `**Issues:**` line, from `shared/issues-model.js` — a closed
+  // vocabulary, unlike its neighbour, because "may a session open an issue"
+  // has three answers and not a paragraph of them.
+  issues: ISSUE_MODES,
   credentials: MCP_POLICIES,
   accounts: null,
   mcp: MCP_POLICIES,
@@ -141,6 +146,9 @@ export const POLICY_DEFAULTS = Object.freeze({
   mcp: 'continue',
   relay: 'off',
   waits: 'window',
+  // Nothing was ever filed before there was a word for it, so `off` is not a
+  // policy choice here — it is the behaviour every existing plan already has.
+  issues: 'off',
 });
 
 /**

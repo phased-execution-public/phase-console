@@ -45,8 +45,10 @@ describe('SSE → Query bridge', () => {
     expect(extra, `phantom events: ${extra.join(', ')}`).toEqual([]);
   });
 
-  it('carries the 26 wire names, run events included', () => {
-    expect(SSE_EVENTS).toHaveLength(26);
+  it('carries every wire name, run events included — 28 free, two more Pro', () => {
+    // 28 since 2026-09-18: `restart`, a restart's update moving — every tab's
+    // Restart card and banner hear it, not only the tab that pressed.
+    expect(SSE_EVENTS).toContain('restart');
     // Sessions are on the stream deliberately: the socket is a session's own
     // live channel, but the dashboard card and the nav badges do not hold it.
     expect(SSE_EVENTS).toContain('sessions');
@@ -75,6 +77,23 @@ describe('SSE → Query bridge', () => {
     // whenever the page last loaded.
     expect(SSE_EVENTS).toContain('run:git');
     expect(EVENT_EFFECTS['run:git'].slugScoped).toBe('run');
+    // many-plans-one-repo phase 7's conflict radar. Deliberately NOT `run:*`:
+    // the radar's unit is the repository, so one transition is news to every
+    // run in it. (This assertion and the count above were both missed when it
+    // landed — the count read 26 against 27 names, so this suite was red from
+    // that commit until phase 13 noticed.)
+    expect(SSE_EVENTS).toContain('repo:radar');
+    // The two Pro names, declared in a `!pro:` region of `sse.ts` — so the free
+    // tree carries 28 names and this tree 30, and the count below is written
+    // to hold BOTH (this suite runs in the free tree too, under `verify-free`).
+    // Phase 10's mailbox, given a reader in phase 13: its own event for
+    // `run:rulings`' reason, the mailbox is per PLAN and outlives every run of
+    // it, so nothing else on the wire moves when a message lands. Phase 12's
+    // issue drafts: the plan's own list and the estate chip on the repository
+    // page both move on it, and nothing else on the wire does.
+    const proNames: string[] = [];
+    for (const name of proNames) expect(SSE_EVENTS).toContain(name);
+    expect(SSE_EVENTS).toHaveLength(28 + proNames.length);
     // The runner prefixes its own events (`server/runner/runner.ts` emits
     // `run:` + event). Listening for `phase` instead of `run:phase` is the
     // mistake this pins down.
@@ -100,10 +119,24 @@ describe('SSE → Query bridge', () => {
   });
 
   it('keeps the firehose out of the cache', () => {
-    // These two arrive many times a second while a phase is talking; routing
-    // them through invalidation would refetch the run object per line.
+    // `run:stream` arrives many times a second while a phase is talking;
+    // routing it through invalidation would refetch the run object per line.
     expect(EVENT_EFFECTS['run:stream'].streamOnly).toBe(true);
-    expect(EVENT_EFFECTS['run:journal'].streamOnly).toBe(true);
+
+    // `run:journal` used to be the second of the pair and is no longer, and the
+    // distinction is worth keeping straight. It still must not invalidate the
+    // RUN — that is what `streamOnly` was protecting — but phase 13's trace is
+    // projected from the journal and this is the only event that says a new
+    // line landed. So it carries an empty `invalidate` and a narrow `patch`:
+    // nothing about the run is refetched, and the two debug queries that are
+    // genuinely stale are. (`streamOnly` would defeat it entirely —
+    // `applyEffect` returns early on the flag, so a row carrying both would run
+    // neither half.)
+    expect(EVENT_EFFECTS['run:journal'].streamOnly).toBeUndefined();
+    expect(EVENT_EFFECTS['run:journal'].invalidate).toEqual([]);
+    expect(EVENT_EFFECTS['run:journal'].slugScoped).toBeUndefined();
+    // The patch is the Pro half — the free tree has no trace to invalidate, so
+    // its row is the bare `{ invalidate: [] }` and this line is not in it.
   });
 
   it('makes a file change reach the board', () => {

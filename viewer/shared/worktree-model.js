@@ -359,16 +359,16 @@ export function wantsDefaultCheckout(value) {
 /**
  * The settle strategies a MULTI-REPOSITORY (mirror) run cannot take.
  *
- * `integration` and `merge-queue` both end at ONE tree — the console's staging
- * checkout, a rebase against one upstream — and a mirror run's work lives in N
- * repositories. Rather than merge some of the work and strand the rest, the
- * run refuses the strategy BY NAME at settle time and the client disables the
- * choice up front; one spelling here keeps the two in agreement.
+ * `merge-queue` ends at ONE tree — a rebase against one upstream — and a
+ * mirror run's work lives in N repositories. Rather than rebase some of the
+ * work and strand the rest, the run refuses the strategy BY NAME at settle
+ * time and the client disables the choice up front; one spelling here keeps
+ * the two in agreement. `integration` left this set in 5.1 (many-plans-one-repo
+ * phase 8): the staging tree exists once PER REPOSITORY (`stagingNames(home,
+ * repoKey)`), so a mirror settles every mount into its own, deepest first.
  * @type {ReadonlySet<SettleStrategy>}
  */
-export const SETTLE_UNSUPPORTED_MULTI = Object.freeze(
-  new Set(/** @type {const} */ (['integration', 'merge-queue'])),
-);
+export const SETTLE_UNSUPPORTED_MULTI = Object.freeze(new Set(/** @type {const} */ (['merge-queue'])));
 
 /**
  * The repo-qualified spelling of a branch — `web-admin · pe/demo`.
@@ -384,4 +384,206 @@ export const SETTLE_UNSUPPORTED_MULTI = Object.freeze(
  */
 export function qualifiedRef(repo, branch) {
   return repo ? `${repo} · ${branch}` : branch;
+}
+
+/* ------------------------------------------------------------------ *
+ * Many plans in one repository (phase 2 — the words; phase 7 — the behaviour)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The per-phase `- **Isolation:**` words, which are NOT `ISOLATION_MODES`.
+ *
+ * A run is `queue` or `worktree`; a PHASE says `shared` or `worktree`, because
+ * from a phase's side the question is "do I get a tree of my own or do I use
+ * the run's", and `queue` is a statement about the run's scheduler that a
+ * phase cannot make. `shared` maps to the run's own checkout. Keeping the two
+ * lists apart is what stops a phase bullet reading as a scheduler setting.
+ * @typedef {(typeof ISOLATION_DIRECTIVES)[number]} IsolationDirective
+ */
+export const ISOLATION_DIRECTIVES = Object.freeze(/** @type {const} */ (['shared', 'worktree']));
+
+/**
+ * Does a phase's directive ask for a checkout of its own?
+ *
+ * The question rather than the word, so no reader outside this file re-types
+ * either member — `vocab-owners.test.ts` scans for exactly that, and it is
+ * right to: a second spelling of this list is how a phase comes to be given a
+ * lane by one reader and denied one by another.
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function directiveIsolates(value) {
+  return value === ISOLATION_DIRECTIVES[1];
+}
+
+/**
+ * Decision 13: a run the console cuts a NEW branch for is isolated by default.
+ *
+ * It was `false`, which is why two plans on one repository could be admitted
+ * into one checkout: a new branch is the console's own, nobody else is
+ * standing on it, and a tree of its own costs a checkout and buys the whole
+ * concurrency this plan is about. A run that ADOPTS an existing branch is not
+ * covered by this — the operator may well be sitting in that tree.
+ */
+export const DEFAULT_ISOLATION_FOR_NEW_BRANCH = true;
+
+/**
+ * What becomes of a run's worktree when the run settles.
+ *
+ * `keep-on-failure` is the default and the only one that needs explaining: a
+ * green run's tree holds nothing the branch does not, and a red one holds the
+ * only copy of what went wrong. `prune` always removes, `keep` never does, and
+ * `ttl:<h>` removes after that many hours — the one parameterised member,
+ * which is why `retentionOf` exists rather than an `includes` test.
+ * @typedef {(typeof WORKTREE_RETENTION)[number] | `ttl:${number}`} WorktreeRetention
+ */
+export const WORKTREE_RETENTION = Object.freeze(/** @type {const} */ (['prune', 'keep-on-failure', 'keep']));
+
+/** The option table's default. */
+export const DEFAULT_RETENTION = 'keep-on-failure';
+
+/**
+ * What each retention word is CALLED, decided once (phase 15) — the three
+ * closed members; a `ttl:<h>` is read out as its hours by whoever renders it.
+ * @type {Readonly<Record<(typeof WORKTREE_RETENTION)[number], string>>}
+ */
+export const RETENTION_LABELS = Object.freeze({
+  prune: 'are removed',
+  'keep-on-failure': 'are kept only if the run ended badly',
+  keep: 'are kept',
+});
+
+/**
+ * The hours in a `ttl:<h>`, or undefined for anything that is not one.
+ *
+ * Zero and negative are `undefined` rather than 0: `ttl:0` reads as "remove it
+ * immediately", which is `prune` said obscurely, and a policy that deletes a
+ * failed run's tree the instant it is written should have to say `prune`.
+ */
+export function retentionTtlHours(value) {
+  const m = /^ttl:(\d+)$/.exec(
+    String(value ?? '')
+      .trim()
+      .toLowerCase(),
+  );
+  if (!m) return undefined;
+  const hours = Number(m[1]);
+  return Number.isFinite(hours) && hours > 0 ? hours : undefined;
+}
+
+/**
+ * Coerce anything to a retention policy — a word, a readable `ttl:<h>`, else
+ * the default. An unreadable ttl falls back rather than throwing, and falls
+ * back to the DEFAULT rather than to `prune`: a typo must never be the reason
+ * a tree was deleted.
+ */
+export function retentionOf(value) {
+  const word = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  if (WORKTREE_RETENTION.includes(/** @type {never} */ (word))) return word;
+  return retentionTtlHours(word) === undefined ? DEFAULT_RETENTION : word;
+}
+
+/**
+ * How many ISOLATED runs the console may hold in ONE repository at once.
+ *
+ * Three, like the machine-wide worktree cap, and for a different reason: that
+ * one bounds disk, this one bounds how much is happening in a repository a
+ * person may have to read. Both apply; the narrower answers first.
+ */
+export const DEFAULT_MAX_PER_REPO = 3;
+
+/**
+ * The first token of a `git worktree lock --reason` this console wrote.
+ *
+ * A sweep must never take a tree somebody else locked — an operator's own
+ * `git worktree lock`, another tool's — so "is this lock mine?" is asked of
+ * the reason's first word and of nothing else. One token, because a reason
+ * reads `phase-console <runId> p<N>` and the run id is not knowable to a
+ * sweep scanning another console's trees.
+ */
+export const WORKTREE_LOCK_PREFIXES = Object.freeze(/** @type {const} */ (['phase-console']));
+
+/**
+ * Which of the console's three tree shapes a lock belongs to.
+ *
+ * The SECOND token of the reason, and it is there because the three are swept
+ * by different rules: a lane is removed once it has landed, a run's own
+ * checkout only after every lane of it has gone, and the staging tree is
+ * console-wide and belongs to whichever settle is holding it this second.
+ * A sweep that could not tell them apart would have to treat all three as the
+ * most dangerous one.
+ * @typedef {(typeof WORKTREE_LOCK_KINDS)[number]} WorktreeLockKind
+ */
+export const WORKTREE_LOCK_KINDS = Object.freeze(/** @type {const} */ (['run', 'lane', 'staging']));
+
+/**
+ * The `git worktree lock --reason` this console writes.
+ *
+ * `phase-console <kind> <slug>[ p<N>] <runId> <ISO>` — five or six tokens, the
+ * first of which is `WORKTREE_LOCK_PREFIXES`'s only member. Every field earns
+ * its place by being a question a sweep asks: the KIND decides which rule
+ * applies, the RUN ID decides whether the holder is still alive (a sweep knows
+ * the live run ids and nothing else about another console's trees), and the
+ * TIMESTAMP is what makes a lock left by a machine that lost power readable as
+ * old rather than merely mysterious. The slug and phase are for the person who
+ * runs `git worktree list` and wants to know what took their tree.
+ *
+ * 🔴 It is a SENTENCE, not a data structure, because git stores it as one and
+ * a person reads it in `git worktree list --porcelain`. Anything that has to
+ * survive a round trip through git's own storage has to survive being read by
+ * a human being too.
+ * @param {{kind: WorktreeLockKind, slug: string, phase?: number, runId: string, at?: string}} opts
+ * @returns {string}
+ */
+export function worktreeLockReason(opts) {
+  const at = opts.at ?? new Date().toISOString();
+  const phase = typeof opts.phase === 'number' ? ` p${opts.phase}` : '';
+  return `${WORKTREE_LOCK_PREFIXES[0]} ${opts.kind} ${opts.slug}${phase} ${opts.runId} ${at}`;
+}
+
+/**
+ * Did THIS console's software write that lock reason?
+ *
+ * Asked of the first token and of nothing else — the run id in the rest of it
+ * is not knowable to a sweep scanning another console's trees, and a sweep
+ * that demanded the whole grammar would refuse to clean up after a version of
+ * itself that spelled the reason differently. Anything else is somebody's:
+ * an operator's own `git worktree lock`, another tool's, a future spelling.
+ * @param {string | undefined} reason
+ * @returns {boolean}
+ */
+export function ourWorktreeLock(reason) {
+  const first = String(reason ?? '')
+    .trim()
+    .split(/\s+/)[0];
+  return WORKTREE_LOCK_PREFIXES.includes(/** @type {never} */ (first));
+}
+
+/**
+ * Read a reason this console wrote back into its fields, or `null`.
+ *
+ * `null` for anything that is not ours AND for one of ours this version cannot
+ * parse — the caller's two answers are "apply my rule" and "leave it alone",
+ * and a half-read lock belongs in the second.
+ * @param {string | undefined} reason
+ * @returns {{kind: WorktreeLockKind, slug: string, phase?: number, runId: string, at: string} | null}
+ */
+export function parseWorktreeLockReason(reason) {
+  if (!ourWorktreeLock(reason)) return null;
+  const parts = String(reason).trim().split(/\s+/);
+  const [, kind, slug, ...rest] = parts;
+  if (!WORKTREE_LOCK_KINDS.includes(/** @type {never} */ (kind)) || !slug || rest.length < 2) return null;
+  const phaseToken = /^p(\d+)$/.exec(rest[0] ?? '');
+  const tail = phaseToken ? rest.slice(1) : rest;
+  if (tail.length !== 2) return null;
+  const [runId, at] = tail;
+  return {
+    kind: /** @type {WorktreeLockKind} */ (kind),
+    slug,
+    ...(phaseToken ? { phase: Number(phaseToken[1]) } : {}),
+    runId,
+    at,
+  };
 }

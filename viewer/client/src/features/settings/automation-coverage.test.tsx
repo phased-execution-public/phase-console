@@ -57,6 +57,17 @@ const ELSEWHERE: Record<string, string> = {
   reviewEachPhaseByDefault: 'RunSetup defaults',
   reviewerPolicy: 'RunSetup defaults',
   autoRecoverByDefault: 'RunSetup defaults',
+  // Phase 15: the three console defaults phase 7 stored with no control, and
+  // the four launch defaults — every one an opening value of a launch, so
+  // every one is edited on the launch form's `defaults` page beside the six
+  // above, in the words a launch reads them by.
+  maxConcurrentPerRepo: 'RunSetup defaults',
+  worktreeRetention: 'RunSetup defaults',
+  baseBranch: 'RunSetup defaults',
+  landing: 'RunSetup defaults',
+  conflictPolicy: 'RunSetup defaults',
+  messaging: 'RunSetup defaults',
+  issuesMode: 'RunSetup defaults',
   // Its own card, because it is a policy object rather than a knob and it is
   // sent whole on every change.
   boardingSchedule: 'ScheduleCard',

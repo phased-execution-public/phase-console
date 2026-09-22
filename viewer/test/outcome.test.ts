@@ -148,3 +148,50 @@ test('WAI-7: peekWrittenAt reads the stamp off a declaration the strict reader r
   assert.equal(peekWrittenAt(junk), null);
   assert.equal(peekWrittenAt(join(tmpdir(), 'pc-outcome-never', 'nothing.json')), null);
 });
+
+// ── S9-a — the inbox name, and the order a backlog is read in ────────────────
+// A session nobody supervises writes `runs/<instance>/<slug>/outcomes/…`, and
+// that name used to be `phase-NN.json` — one per phase, written with `mv`. A
+// second declaration destroyed an unread first, which is the one thing a
+// channel replacing prose must not do. The name now carries the `written_at`
+// stamp in basic ISO form: legal on every filesystem, and sorting as a plain
+// string IS sorting chronologically, which is what lets a backlog be ingested
+// oldest-first without opening anything.
+const { inboxOutcomeFile, inboxOutcomePhase } = await import('../server/runner/outcome.ts');
+
+test('S9-a: an inbox name carries the phase AND the written_at stamp', () => {
+  const file = inboxOutcomeFile('/root', 'demo', 8, '2026-08-10T21:10:03Z');
+  assert.equal(file.endsWith('/outcomes/phase-08-20260810T211003Z.json'), true, file);
+  assert.equal(inboxOutcomePhase(file), 8);
+});
+
+test('S9-a: the bare legacy name still addresses its phase', () => {
+  // A 5.0.0 `phase-outcome.sh` writing into a 5.1.0 console's inbox — and every
+  // file already sitting in one at upgrade.
+  assert.equal(inboxOutcomePhase('/x/outcomes/phase-08.json'), 8);
+  assert.equal(inboxOutcomePhase('/x/outcomes/phase-114.json'), 114);
+});
+
+test('S9-a: a name that is not an outcome is still not one', () => {
+  assert.equal(inboxOutcomePhase('/x/outcomes/ignored'), null);
+  assert.equal(inboxOutcomePhase('/x/outcomes/phase-8.json'), null, 'one digit was never the shape');
+  assert.equal(inboxOutcomePhase('/x/outcomes/phase-08-.json'), null, 'an empty stamp is not a stamp');
+  assert.equal(inboxOutcomePhase('/x/outcomes/phase-08.json.tmp.91'), null);
+});
+
+test('S9-a: stamped names sort oldest-first as plain strings', () => {
+  const names = [
+    'phase-08-20260810T214409Z.json',
+    'phase-08-20260810T211003Z.json',
+    'phase-08-20260809T235959Z.json',
+  ];
+  assert.deepEqual([...names].sort(), [
+    'phase-08-20260809T235959Z.json',
+    'phase-08-20260810T211003Z.json',
+    'phase-08-20260810T214409Z.json',
+  ]);
+  // …and a legacy file sorts before every stamped one, which is the right
+  // order: it was written by an older script, so it is the oldest there is.
+  assert.deepEqual(['phase-08-20260809T235959Z.json', 'phase-08.json'].sort(),
+    ['phase-08-20260809T235959Z.json', 'phase-08.json']);
+});

@@ -8,12 +8,16 @@
  */
 
 import { request, post } from './client';
+import type { RestartUpdateView } from './system';
 import type { SchedulePolicy } from '@shared/schedule-policy.js';
 import type { ResumeAtBootMode } from '@shared/automation-model.js';
 import { type RunPriority } from '@shared/orchestration-model.js';
 import {
+  DEFAULT_MAX_PER_REPO,
+  DEFAULT_RETENTION,
   isolationMode,
   reclaimModeOf,
+  retentionOf,
   settleOf,
   WORKTREE_DEFAULTS,
   type IsolationMode,
@@ -22,6 +26,16 @@ import {
   worktreeRootOf,
   type WorktreeRoot,
 } from '@shared/worktree-model.js';
+import {
+  CONFLICT_POLICIES,
+  DEFAULT_BASE_BRANCH,
+  DEFAULT_CONFLICT,
+  landPolicyOf,
+  type ConflictPolicy,
+  type LandPolicy,
+} from '@shared/landing-model.js';
+import { DEFAULT_MESSAGING, MESSAGING_WORDS, type MessagingWord } from '@shared/message-model.js';
+import { DEFAULT_ISSUES, ISSUE_MODES, type IssueMode } from '@shared/issues-model.js';
 import type { McpPolicy } from './runs';
 import type { GitMode, HolderKind, ReviewerPolicy } from '@shared/run-lifecycle.js';
 import type { BootHoldKind } from '@shared/ops-vocab.js';
@@ -114,6 +128,15 @@ export interface FleetState {
   reachable?: boolean;
   /** A hold on every console of the machine, beside this console's own freeze. */
   hold?: { at: string; by: string } | null;
+}
+
+/** `state.reach` — the Settings card's one line about the fleet's door. */
+export interface ReachState {
+  mode: string;
+  host: string | null;
+  port: number | null;
+  exposure: string | null;
+  door: string | null;
 }
 
 /**
@@ -317,9 +340,24 @@ export interface ConsoleState {
    * Reading the destination list never needs it.
    */
   allowWebhooks?: boolean;
+  /**
+   * `--allow-publish`: whether a finished phase's `pe/*` branch may be pushed
+   * and an issue draft filed on the repository. Off means the landing engine
+   * holds and `Issues: file` holds drafts for a person — the launch form says
+   * so beside the two controls.
+   */
+  allowPublish?: boolean;
   autopilot?: boolean;
   /** True once `server/` on disk is newer than the process serving this page. */
   serverStale?: boolean;
+  /**
+   * When the process serving this page started — also its identity: a restart
+   * is over for a page when the console answers with a different one. Absent
+   * from a server before 2026-09-18.
+   */
+  bootedAt?: string;
+  /** A restart's update, while it runs and after it answered. Absent where the console cannot update itself. */
+  restartUpdate?: RestartUpdateView | null;
   /** Which static root answered — the migration seam, surfaced in Settings. */
   staticRoot?: 'dist' | 'not-built';
   /** The commit `dist` was built from (`dist/.build-rev`); null when unstamped. */
@@ -385,6 +423,13 @@ export interface ConsoleState {
   platform?: string;
   /** The server's home dir, so absolute paths render as "$HOME/…". */
   home?: string;
+  /**
+   * `REFUSAL_REASON` — the sentence for each `isolationRefusal` KEY a run
+   * record can carry (G-20). A surface that meets the key looks it up here
+   * and falls back to the key: an older server sends no table, and a newer
+   * refusal may not be in this one.
+   */
+  refusalReasons?: Record<string, string>;
   sizing?: Sizing;
   searchDocs?: number;
   repo?: {
@@ -419,6 +464,13 @@ export interface ConsoleState {
    */
   resumeAsk?: { slug: string; runId: string; phases: number[]; sessions: string[]; at: string }[];
   fleet?: FleetState;
+  /**
+   * How a phone reaches the fleet (many-plans-one-repo phase 23): the machine
+   * profile's mode, where the direct door is, and the door's state as the
+   * supervisor's beat last said — `null` while no live supervisor runs one.
+   * Absent from a free build and from a server before 5.1.0.
+   */
+  reach?: ReachState;
   /** See `BootHold`. Absent from a server before 5.0.0, which never held. */
   bootHold?: BootHold | null;
   /**
@@ -451,6 +503,8 @@ export interface ConsoleState {
     reviewEachPhaseByDefault?: boolean;
     reviewerPolicy?: ReviewerPolicy;
     repoGuard?: boolean;
+    /** Serialise a `conflicted` radar pair by landing order (phase 9). Off by default. */
+    radarSerialize?: boolean;
     /**
      * What a new run ASKS for: the shared checkout (`queue`, today's behaviour)
      * or one of its own. Meaningful only with `gitMode: 'new-branch'` — which
@@ -466,6 +520,23 @@ export interface ConsoleState {
     isolationReclaim?: IsolationReclaim;
     /** Delete `pe/*` branches once their pull request has MERGED (`-d` only). */
     deleteMergedRunBranches?: boolean;
+    /**
+     * Phase 7's three console defaults, homed with their controls in phase 15:
+     * the per-repository cap, what becomes of a settled run's tree, and the
+     * base a run branch is cut from when the plan does not say.
+     */
+    maxConcurrentPerRepo?: number;
+    worktreeRetention?: string;
+    baseBranch?: string;
+    /**
+     * Phase 15's four launch defaults — the words a fresh run opens on when
+     * its plan is silent: `LAND_POLICIES`, `CONFLICT_POLICIES`,
+     * `MESSAGING_WORDS`, `ISSUE_MODES`.
+     */
+    landing?: LandPolicy;
+    conflictPolicy?: ConflictPolicy;
+    messaging?: MessagingWord;
+    issuesMode?: IssueMode;
     autoRecoverByDefault?: boolean;
     autoContinueRecovery?: boolean;
     watchCmdRefs?: boolean;
@@ -520,6 +591,8 @@ export interface ConsoleState {
     stallStalemateAttempts?: number;
     stallRetryBurst?: number;
     stallExternalWaitMs?: number;
+    /** Identical failing tool calls in a row before a lane reads as `looping` (phase 13). */
+    stallLoopRun?: number;
     /** The same call when it waits on a job this session started itself. */
     stallLocalJobMs?: number;
     /** May the stall watchdog park a lane by itself? Absent reads as on — see `server/config.ts`. */
@@ -564,6 +637,7 @@ export function automationPrefs(state: ConsoleState | undefined): {
   reviewEachPhaseByDefault: boolean;
   reviewerPolicy: ReviewerPolicy;
   repoGuard: boolean;
+  radarSerialize: boolean;
   isolation: IsolationMode;
   worktreeMaxConcurrent: number;
   worktreeSetup: string;
@@ -571,6 +645,13 @@ export function automationPrefs(state: ConsoleState | undefined): {
   worktreeRoot: WorktreeRoot;
   isolationReclaim: IsolationReclaim;
   deleteMergedRunBranches: boolean;
+  maxConcurrentPerRepo: number;
+  worktreeRetention: string;
+  baseBranch: string;
+  landing: LandPolicy;
+  conflictPolicy: ConflictPolicy;
+  messaging: MessagingWord;
+  issuesMode: IssueMode;
   autoRecoverByDefault: boolean;
   autoContinueRecovery: boolean;
   watchCmdRefs: boolean;
@@ -594,6 +675,8 @@ export function automationPrefs(state: ConsoleState | undefined): {
     // Only the exact word may let a reviewer hold work, matching the server.
     reviewerPolicy: prefs.reviewerPolicy === 'may-hold' ? 'may-hold' : 'comment-only',
     repoGuard: prefs.repoGuard ?? true,
+    // Off unless the server wrote `true`: on is the setting that makes a phase wait.
+    radarSerialize: prefs.radarSerialize === true,
     // Through the owner's coercer, so the client and the server cannot answer
     // differently about what a stored value means. An older server has never
     // written the key, which reads as `queue` — today's behaviour.
@@ -609,6 +692,29 @@ export function automationPrefs(state: ConsoleState | undefined): {
     // wrote the key) reads the shipped default rather than a third meaning.
     isolationReclaim: reclaimModeOf(prefs.isolationReclaim),
     deleteMergedRunBranches: prefs.deleteMergedRunBranches ?? true,
+    // Phase 7's three, each through its owner's default (or coercer, where the
+    // vocabulary is open): a console running an older server never wrote them.
+    maxConcurrentPerRepo:
+      typeof prefs.maxConcurrentPerRepo === 'number' && prefs.maxConcurrentPerRepo > 0
+        ? prefs.maxConcurrentPerRepo
+        : DEFAULT_MAX_PER_REPO,
+    worktreeRetention: prefs.worktreeRetention ? retentionOf(prefs.worktreeRetention) : DEFAULT_RETENTION,
+    baseBranch: prefs.baseBranch?.trim() || DEFAULT_BASE_BRANCH,
+    // Phase 15's four launch defaults, each read through its owner's vocabulary
+    // exactly as `server/config.ts` reads them: only a member means anything,
+    // and everything else is the owner's default — the fail-safe direction for
+    // each word (`hold` writes nothing, `halt` stops, `on` costs nothing
+    // unused, `off` files nothing).
+    landing: landPolicyOf(prefs.landing) as LandPolicy,
+    conflictPolicy: CONFLICT_POLICIES.includes(prefs.conflictPolicy as never)
+      ? (prefs.conflictPolicy as ConflictPolicy)
+      : DEFAULT_CONFLICT,
+    messaging: MESSAGING_WORDS.includes(prefs.messaging as never)
+      ? (prefs.messaging as MessagingWord)
+      : DEFAULT_MESSAGING,
+    issuesMode: ISSUE_MODES.includes(prefs.issuesMode as never)
+      ? (prefs.issuesMode as IssueMode)
+      : DEFAULT_ISSUES,
     autoRecoverByDefault: prefs.autoRecoverByDefault ?? true,
     autoContinueRecovery: prefs.autoContinueRecovery ?? true,
     // On, like the server. An older console has never written the key, and a

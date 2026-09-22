@@ -42,6 +42,7 @@ import { BarList, ChartNumbers } from '@/components/charts';
 import { api, type MetricFamily } from '@/lib/api';
 import { useDebugBundle } from '@/lib/queries';
 import { consolePath } from '@/lib/base';
+import { debugHref } from './routes';
 
 /** A family worth a bar chart has more than one labelled sample. */
 function chartable(family: MetricFamily): boolean {
@@ -164,6 +165,23 @@ export default function HealthSection(_props: { route: ViewProps['route'] }) {
               </a>
             </Button>
             <span className="text-2xs text-ink-faint">{`schema ${data.schema} v${data.version}`}</span>
+          </div>
+          {/*
+            A SECOND bundle, and deliberately a second button. This one is the
+            console — every plan, the health rows, the metrics, the newest log
+            lines. The other is one RUN: its journal, its transcript, its task
+            ledgers, its outcomes, its locks, its git trace. "Is this console
+            well" and "why did phase 7 park on Tuesday" are different questions
+            and the first bundle answered only the first.
+          */}
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <Button asChild size="sm" variant="ghost">
+              <a href={debugHref('journal')}>Export one run…</a>
+            </Button>
+            <span className="text-2xs text-ink-faint">
+              One run’s own files, redacted, as a tar.gz — pick it on Journal, or run{' '}
+              <code>phase-console diagnostics --run &lt;id&gt;</code> with the console down.
+            </span>
           </div>
           {data.notes.length ? (
             <ul className="mt-3 flex flex-col gap-1 text-2xs text-ink-faint">

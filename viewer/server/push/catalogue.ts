@@ -18,7 +18,8 @@
 
 export type CategoryId =
   | 'approval' | 'session-ask' | 'needs-you' | 'gate' | 'qa' | 'halted' | 'parked' | 'stalled'
-  | 'phase' | 'finished' | 'ready' | 'changed' | 'session' | 'health' | 'limits' | 'usage-climbing';
+  | 'phase' | 'finished' | 'ready' | 'changed' | 'session' | 'health' | 'limits' | 'usage-climbing'
+  | 'issue';
 
 export type Category = {
   id: CategoryId;
@@ -177,6 +178,16 @@ export const CATEGORIES: readonly Category[] = [
     byDefault: false,
     urgent: false,
   },
+  {
+    id: 'issue',
+    label: 'Issue drafted by a session',
+    detail: 'A session tripped over a problem outside its phase and drafted an issue for it (the plan\'s '
+      + '`Issues:` word allows it). Under `draft` it waits in the inbox for your Approve, Discard or edit; '
+      + 'under `file` it was filed at once and this tells you what landed. Not urgent: nothing is spending '
+      + 'while a draft waits, and a filed issue is a record, not a wall.',
+    byDefault: true,
+    urgent: false,
+  },
 ];
 
 /**
@@ -312,6 +323,11 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
     case 'limits':
     case 'usage-climbing':
       return slug ? `/#/plan/${slug}/run` : '/#/settings';
+    // A draft is decided on the Now page's inbox row; a filed issue is read on
+    // the repository page. Both start from the phase the session was working,
+    // which is where the draft's evidence and the phase's own record meet.
+    case 'issue':
+      return slug && phase ? `/#/plan/${slug}/phase/${phase}` : '/#/repo/issues';
     default: {
       // Exhaustiveness: a new category added to CATEGORIES without a route here
       // is a compile error, not a notification that silently opens the

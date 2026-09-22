@@ -236,7 +236,9 @@ const MECHANISMS: {
     // Gated UPSTREAM, at the convergence loop — its only automatic caller is
     // `maybeAutoRecover`. The token pins that the spawn still lives inside
     // `resumeWithInstruction` and has not grown a second, ungated entry point.
-    guard: 'private async resumeWithInstruction(',
+    // `protected` since phase 8: the landing's rebase session (below) is a
+    // second CALLER of the same one spawn, not a second entry point.
+    guard: 'protected async resumeWithInstruction(',
   },
   {
     id: 'service:recovery-agent-rung',
@@ -292,7 +294,11 @@ const MECHANISMS: {
  * wants a behavioural test beside it — see `watchdog: a frozen lane is never
  * nudged…` below, which is the one for the row Phase 20 added.
  */
-const AUTO_START_MECHANISM_COUNT = 26;
+// 26 in both trees, plus the rows that ride a Pro region above — one, the
+// landing session — read as the marked list's length, so the number is true
+// in the free tree too (where that row is absent by marker).
+const PRO_MECHANISMS: string[] = [];
+const AUTO_START_MECHANISM_COUNT = 26 + PRO_MECHANISMS.length;
 
 test('inventory: every auto-start mechanism is declared, and the count cannot silently move', () => {
   assert.equal(
@@ -369,11 +375,18 @@ const START_SITES: { file: string; count: number; note: string }[] = [
  * The runner's own spawns. `deps.spawn ?? spawnClaude` is the shape every one
  * of them takes, so counting that phrase counts them exactly.
  */
+/**
+ * The loop's Pro spawn sites, as a marked list whose `.length` the count below
+ * reads — so the census is true in both trees (three here, two in the free
+ * tree, where the landing engine and its session are absent by path).
+ */
+const PRO_LOOP_SPAWNS: string[] = [];
+
 const RUNNER_SPAWN_SITES: { file: string; count: number; note: string }[] = [
   {
     file: 'server/runner/runner-loop.ts',
-    count: 2,
-    note: 'autoReview · openPrFromLastLeaf — both gated in place with `fleetFrozen()`',
+    count: 2 + PRO_LOOP_SPAWNS.length,
+    note: `autoReview · openPrFromLastLeaf${PRO_LOOP_SPAWNS.map((s) => ` · ${s}`).join('')} — all gated in place with \`fleetFrozen()\``,
   },
   {
     file: 'server/runner/runner-attempt.ts',

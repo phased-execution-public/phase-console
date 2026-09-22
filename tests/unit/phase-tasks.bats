@@ -144,3 +144,40 @@ inbox_file() { # <slug> <phase>
   assert_contains "$output" "could not be written"
   assert_contains "$output" '"op":"create"'
 }
+
+# ---------------------------------------------------------------------------
+# The trace carrier (5.1.0)
+#
+# A session's task list is written by a process the console let go of hours
+# ago. Nothing afterwards can correlate it with the drive that started it — a
+# task line and a journal line have nothing in common but a timestamp — so the
+# ids travel in the session's environment and are written down here.
+#
+# The byte-identity case is the important one: an older console, a hand-driven
+# session, a `claude` run from a terminal — none of them export the variables,
+# and none of their lines may change shape.
+# ---------------------------------------------------------------------------
+
+@test "tasks: with PE_TRACE_ID/PE_SPAN_ID set the line carries trace and span" {
+  export PE_TRACE_ID="0123456789abcdef0123456789abcdef"
+  export PE_SPAN_ID="fedcba9876543210"
+  run pe_tasks demo 5 create --subject "p5.task1 — wire it"
+  [ "$status" -eq 0 ]
+  grep -q '"trace":"0123456789abcdef0123456789abcdef"' "$PE_TASKS_FILE"
+  grep -q '"span":"fedcba9876543210"' "$PE_TASKS_FILE"
+}
+
+@test "tasks: with the trace unset the line is byte-identical to today's" {
+  unset PE_TRACE_ID PE_SPAN_ID
+  run pe_tasks demo 5 create --id p5.task1 --subject "wire it"
+  [ "$status" -eq 0 ]
+  [ "$(cat "$PE_TASKS_FILE")" = '{"version":1,"type":"task","slug":"demo","phase":5,"op":"create","id":"p5.task1","status":"pending","subject":"wire it","written_at":"2026-08-24T00:10:00Z"}' ]
+}
+
+@test "tasks: a span with no trace carries neither — half a join is not a join" {
+  unset PE_TRACE_ID
+  export PE_SPAN_ID="fedcba9876543210"
+  run pe_tasks demo 5 create --id p5.task1 --subject "wire it"
+  [ "$status" -eq 0 ]
+  ! grep -q '"span"' "$PE_TASKS_FILE"
+}

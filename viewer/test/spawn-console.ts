@@ -74,7 +74,9 @@ export function sandbox(label = 'console'): ConsoleSandbox {
     configHome,
     stateHome,
     root,
-    env: { ...process.env, XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: stateHome },
+    // A console a test starts never updates the repository it runs from (see
+    // state-sandbox.ts) — restated here, where the environment is handed over.
+    env: { ...process.env, XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: stateHome, PHASE_CONSOLE_SELF_UPDATE: '0' },
     cleanup: () => {
       // A console under test is KILLED, not shut down, and since Phase 7 its
       // ptys belong to a broker that survives exactly that. Right in

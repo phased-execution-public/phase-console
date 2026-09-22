@@ -277,3 +277,121 @@ setup() {
   grep -q '^branch=pe/demo-p1$' "$HUB/docs/handoffs/demo/.locks/phase-01.lock"
   grep -q '^worktree=' "$HUB/docs/handoffs/demo/.locks/phase-01.lock"
 }
+
+# ── LCK-1 — claim is check-then-write, so two claimers both "win" ─────────────
+# `[ -f "$lockfile" ]` and the `mv` inside `_write` are two steps with a real
+# gap between them (the scope read alone is tens of milliseconds), and nothing
+# in between makes the create exclusive. Two sessions boarded within that gap
+# were BOTH told "claimed", which is precisely the outcome the whole cooperative
+# guard exists to prevent — and the reason a lock must be created with a call
+# that fails when the target already exists.
+@test "lock: two concurrent claims on one phase — exactly one wins (LCK-1)" {
+  setup_docs linear linear
+  local i rounds=20 wins=0 total=0 ra rb
+  for i in $(seq 1 "$rounds"); do
+    rm -f "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+    # No --scope on purpose: reading the plan's Repos cell is what widens the
+    # window to something two processes can genuinely land inside.
+    # `|| rc=$?` keeps the losing claim's non-zero exit out of `set -e`'s way —
+    # bats runs tests with it on, and a bare `cmd; echo $?` kills the subshell
+    # before it can report the very exit code under test.
+    ( rc=0; "$SYS_BASH" "$PE_SCRIPTS/phase-lock.sh" linear claim 1 --owner raceA >/dev/null 2>&1 || rc=$?
+      echo "$rc" > "$BATS_TEST_TMPDIR/rc.A" ) &
+    ( rc=0; "$SYS_BASH" "$PE_SCRIPTS/phase-lock.sh" linear claim 1 --owner raceB >/dev/null 2>&1 || rc=$?
+      echo "$rc" > "$BATS_TEST_TMPDIR/rc.B" ) &
+    wait
+    ra="$(cat "$BATS_TEST_TMPDIR/rc.A")"; rb="$(cat "$BATS_TEST_TMPDIR/rc.B")"
+    if [ "$ra" = 0 ]; then wins=$((wins + 1)); fi
+    if [ "$rb" = 0 ]; then wins=$((wins + 1)); fi
+    total=$((total + 1))
+    # The loser must be told WHO holds it, not merely refused.
+    if [ "$ra" != 0 ] && [ "$rb" != 0 ]; then echo "round $i: nobody claimed" >&2; return 1; fi
+  done
+  echo "winners=$wins rounds=$total" >&2
+  [ "$wins" -eq "$total" ]
+}
+
+@test "lock: the loser of a race is told who holds it (LCK-1)" {
+  setup_docs linear linear
+  pe_lock linear claim 1 --owner raceA
+  run pe_lock linear claim 1 --owner raceB
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "raceA"
+}
+
+# A force/takeover/refresh writes with `mv`, which clobbers whatever landed in
+# the meantime. Re-reading the owner back off the file is what turns "I wrote
+# it" into "I hold it" — the only claim the caller may act on.
+@test "lock: a force-claim reports the owner the file actually carries (LCK-1)" {
+  setup_docs linear linear
+  pe_lock linear claim 1 --owner sessionA
+  run pe_lock linear claim 1 --owner sessionB --force
+  [ "$status" -eq 0 ]
+  grep -q '^owner=sessionB$' "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+}
+
+# ── LCK-5 — release's rmdir races a claim on another phase of the same slug ───
+# `release` takes the last lock away and rmdir's `.locks`; a claim on a
+# DIFFERENT phase has already mkdir'd it and is about to open its tmp file
+# inside. The window is small, which is why this is a regression net rather
+# than a reproduction — but a claim must never fail because somebody else
+# finished.
+@test "lock: a release that sweeps .locks never breaks a concurrent claim (LCK-5)" {
+  setup_docs linear linear
+  local i rounds=30
+  rm -f "$BATS_TEST_TMPDIR/lck5.fail"
+  for i in $(seq 1 "$rounds"); do
+    pe_lock linear claim 1 --owner sweepA >/dev/null 2>&1
+    ( "$SYS_BASH" "$PE_SCRIPTS/phase-lock.sh" linear release 1 --owner sweepA >/dev/null 2>&1 ) &
+    ( "$SYS_BASH" "$PE_SCRIPTS/phase-lock.sh" linear claim 2 --owner sweepB >/dev/null 2>&1 \
+        || echo "round $i" >> "$BATS_TEST_TMPDIR/lck5.fail" ) &
+    wait
+    rm -f "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-02.lock"
+  done
+  [ ! -f "$BATS_TEST_TMPDIR/lck5.fail" ]
+}
+
+# ── the `pid=` line ──────────────────────────────────────────────────────────
+# A lock records WHO, WHERE and WHICH SESSION. The one thing it could never say
+# is whether the process that took it is still alive — which is the fact a
+# reader most wants when the owner is the machine default and no session id was
+# ever known. Recording it costs one line; acting on it is a later phase's.
+@test "lock: a claim records the pid of the process that took it" {
+  setup_docs linear linear
+  pe_lock linear claim 1 --owner sessionA
+  run grep -c '^pid=[0-9][0-9]*$' "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1" ]
+}
+
+# ---------------------------------------------------------------------------
+# The trace carrier (5.1.0): a lock says which drive took it.
+# ---------------------------------------------------------------------------
+
+@test "lock: the claim records trace= when the session was spawned inside a span" {
+  setup_docs linear linear
+  PE_TRACE_ID="0123456789abcdef0123456789abcdef" PE_SPAN_ID="fedcba9876543210" \
+    run pe_lock linear claim 1 --owner sessionA
+  [ "$status" -eq 0 ]
+  grep -q '^trace=0123456789abcdef0123456789abcdef$' "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+  grep -q '^span=fedcba9876543210$' "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+}
+
+@test "lock: with no trace in the environment the file carries no trace= line" {
+  setup_docs linear linear
+  unset PE_TRACE_ID PE_SPAN_ID
+  run pe_lock linear claim 1 --owner sessionA
+  [ "$status" -eq 0 ]
+  ! grep -q '^trace=' "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock"
+  # And `pid=` must STILL be the last line: it is the one that always prints,
+  # which is what keeps the group's exit status from being a failing `[ -n … ]`.
+  [ "$(tail -1 "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock" | cut -d= -f1)" = pid ]
+}
+
+@test "lock: trace= comes BEFORE pid=, so pid stays the last line" {
+  setup_docs linear linear
+  PE_TRACE_ID="0123456789abcdef0123456789abcdef" PE_SPAN_ID="fedcba9876543210" \
+    run pe_lock linear claim 1 --owner sessionA
+  [ "$status" -eq 0 ]
+  [ "$(tail -1 "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock" | cut -d= -f1)" = pid ]
+}

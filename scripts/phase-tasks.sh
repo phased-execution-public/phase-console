@@ -181,9 +181,28 @@ subject_json="$(     [ -n "$subject" ]     && printf ',"subject":"%s"' "$(_json_
 active_json="$(      [ -n "$active_form" ] && printf ',"active_form":"%s"' "$(_json_str "$active_form")" || true )"
 session_json="$(     [ -n "$session" ]     && printf ',"session_id":"%s"' "$session" || true )"
 
+# The trace this session belongs to, as the console put it in the environment.
+#
+# A task list is written by a process the console let go of hours ago, and
+# nothing afterwards can correlate it with the drive that started it — a task
+# line and a journal line have nothing in common but a timestamp. So the id
+# travels in the session's env and is written down here.
+#
+# `span` rides WITH `trace` and never without it: a span id alone points into a
+# trace nobody named, which is half a join and reads like a whole one. And with
+# neither set — an older console, a hand-driven session, a `claude` run from a
+# terminal — the line is byte-identical to what it has always been.
+trace="${PE_TRACE_ID:-}"
+span="${PE_SPAN_ID:-}"
+trace_json=''
+if [ -n "$trace" ]; then
+  trace_json="$(printf ',"trace":"%s"' "$(_json_str "$trace")")"
+  [ -n "$span" ] && trace_json="${trace_json}$(printf ',"span":"%s"' "$(_json_str "$span")")"
+fi
+
 # ONE line. The file is NDJSON and a single short append is what makes a
 # concurrent reader's tail safe: it either sees the whole record or none of it.
-line="{\"version\":1,\"type\":\"task\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"op\":\"$op\"${id_json}${status_json}${subject_json}${active_json}${session_json},\"written_at\":\"$(_json_str "$now")\"}"
+line="{\"version\":1,\"type\":\"task\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"op\":\"$op\"${id_json}${status_json}${subject_json}${active_json}${session_json}${trace_json},\"written_at\":\"$(_json_str "$now")\"}"
 
 wrote=no
 if mkdir -p "$(dirname "$target")" 2>/dev/null && printf '%s\n' "$line" >> "$target" 2>/dev/null; then

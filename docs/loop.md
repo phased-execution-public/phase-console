@@ -102,7 +102,7 @@ prescribing a lint that is already passing.
 **A halt is either about the phase or about the run.** `shared/recovery-model.js` splits `HALT_KINDS`
 into `PHASE_HALT_KINDS` (`verify-failed` · `no-handoff` · `phase-blocked` · `needs-human` ·
 `awaiting-person` · `waiting-external-timeout` · `verification-preflight` · `mcp-preflight` ·
-`recovery-failed` · `orphaned-session` · `phase-crashed` · `worktree-merge`) and `RUN_HALT_KINDS` (`budget` ·
+`recovery-failed` · `orphaned-session` · `phase-crashed` · `worktree-merge` · `landing-conflict`) and `RUN_HALT_KINDS` (`budget` ·
 `failure-streak` · `models-exhausted` · `run-preflight` · `plan-unreadable` · `plan-lint` ·
 `runner-crashed` · `plan-deadlocked` · `nothing-ready` · `interrupted-by-restart` · `operator-stop` ·
 `credential-refused`).
@@ -296,8 +296,9 @@ streak paragraph above for which counter it reads and who may reset it.
 `convergeEveryMs` per open plan (default 5 min, floor 30 s, 0 = timer off) · 60 s after any halt · on
 **Recover & continue** (the `recover` verb). **One pass, in order:**
 
-1. **Reconcile-close** — records the board has overtaken flip to `done` ("closed outside this run");
-   halts anchored to them dissolve. Reconcile *closes*, never re-runs (CLAUDE.md).
+1. **Reconcile-close** — records the board has overtaken flip to `done` ("closed outside this run", or
+   "closed while checkpointed — the board reads done; not verified by this run" for a phase this run had
+   started); halts anchored to them dissolve. Reconcile *closes*, never re-runs (CLAUDE.md).
 2. **Classify** every non-done phase of the plan's latest run (the situation above).
 3. **Climb** for runs stopped **not by the operator** — `parked` / `halted` / `interrupted`, or paused
    by the system (`stoppedBy: 'system'`, a console shutdown); never a run a person paused or stopped,
@@ -492,8 +493,9 @@ declaration it answers and whether that session is still around (`phase.wait-res
 {by, presence}}`), so an ended author is recorded, never silently resumed over.
 
 **A wait needs a ref** (TRS-3, RCV-5). The in-turn-wait guard denies a Bash call that would wait
-inside the turn (`phase.tool-denied {rule: 'in-turn-wait'}`) and hands the session a recipe ending in
-`--watch <ref>`. A `waiting-external` declared with NO ref after such a denial is followed through
+inside the turn on somebody else's clock (`phase.tool-denied {rule: 'in-turn-wait'}`) and hands the
+session the wait procedure, whose last case ends in `--watch <ref>`; a wait on a job the session
+started itself is allowed (autopilot-token-drain). A `waiting-external` declared with NO ref after such a denial is followed through
 rather than parked blind: the console mints the ref from the refused command and adopts the job
 (`mintWatchRef` — the ref is `minted`, so it runs only under `watchMintedCmdRefs`), else takes the
 plan's own `Waits on:` refs, else REFUSES the declaration (`phase.declaration-refused {why:
@@ -540,8 +542,12 @@ Walls that used to stop a run for a person climb their first rung inline in the 
   'none'}` — but not for ever: past `LIMIT_NONE_MAX` (2) such decisions inside `LIMIT_NONE_WINDOW_MS`
   (60 min) the next one ESCALATES in the ladder's words — `switch-account` recorded as climbed and
   settled `failed`, then a `wait-window` park on the account's reset, or the errand when no clock is
-  known — announced under `limits` (ACT-6). Past `ALERT_PCT` (95) an in-session warning is a journalled
-  decision, `run.usage-decision {action, enacted: false}`.
+  known — announced under `limits` (ACT-6); a reset further off than `LIMIT_ACTION_COOLDOWN_MS` skips
+  the `none`s and waits on the FIRST burst (`trigger: far-reset`). Past `ALERT_PCT` (95) an in-session
+  warning is a journalled decision, `run.usage-decision {action, enacted, brake, headroom,
+  nonRunSessions}`, and unless a switch has somewhere to go it engages the account's usage brake
+  (`run.usage-brake`): no NEW lane on the account while one is live, until a reading of that window
+  under `WARN_PCT` (80) or its reset (`run.usage-brake-released`).
 - **Usage window past the 12 h ceiling** — under `onLimit: wait` the switch is tried first; with no
   account to pay, the run waits on the window itself (restart-safe; `run.waiting`); `pause` keeps its
   word (`autoAccountSwitch`).
@@ -675,17 +681,22 @@ session reads `foreign-live` (queue, never fight, re-evaluate on the next presen
 falls back to the lease rules. Nothing ever releases on a weak match.
 
 **A session with no lock is still somebody** (5.0.0, REG-3). Claiming is the first thing a session
-does, so the minute before its claim is exactly when two sessions collide — and every registry reading
-on a decision path used to be reached through a lock. One predicate, `peersInRepository(root, phase,
-excluding)`, now answers "who else is in this repository and could be about to work this phase":
-sessions `live` (or `unknown` with a pid behind them) whose root is the plan's, minus this console's own
-lanes, sessions strongly correlated to a different phase (their lock speaks), the one whose lock on this
-phase names it, probes, and sessions whose scope — `PE_SCOPE`, else the submodule their cwd is in, else
-`all` — is disjoint from the phase's. Admission reads it as a **`session` holder** named with its id,
-pid and cwd (queued behind, never capped into a park, never released; with the repository guard off
-only a peer correlated to this very phase still blocks); boarding reads it again in the grant→spawn
-window (`phase.peer-race`); and the classifier reads it with no lock at all, so `foreign-live` is
-reachable from presence alone — the ladder waits rather than climbing into a tree a person is in.
+does, so the minutes before its claim are exactly when two sessions collide — and every registry
+reading on a decision path used to be reached through a lock. One predicate, `peersInRepository(root,
+phase, excluding)`, now answers "who else is in this repository and could be about to work this
+phase": sessions `live` (or `unknown` with a pid behind them) whose root is the plan's, minus this
+console's own lanes, sessions strongly correlated to a different phase (their lock speaks), the one
+whose lock on this phase names it, probes, sessions whose scope — `PE_SCOPE`, else the submodule their
+cwd is in, else `all` — is disjoint from the phase's, and, unless correlated to this very phase,
+sessions whose **claim window** has shut: `PEER_CLAIM_WINDOW_MS`, ten minutes after the newest start
+(`startedAt`, or `resumedAt` once `claude --resume` came back to the session; a compaction moves
+neither). Without that bound every terminal a person left open in the root held every phase in the
+repository for as long as it lived. Admission reads it as a **`session` holder** named with its id,
+pid and cwd, its `leaseUntil` the window's end so the lock timer re-scans the moment it shuts (queued
+behind, never capped into a park, never released; with the repository guard off only a peer
+correlated to this very phase still blocks); boarding reads it again in the grant→spawn window
+(`phase.peer-race`); and the classifier reads it with no lock at all, so `foreign-live` is reachable
+from presence alone — the ladder waits rather than climbing into a tree a person is in.
 
 **Human sessions' outcomes.** `phase-outcome.sh` in a session nobody supervises (no `PE_OUTCOME_FILE`)
 writes the same declaration into the console's inbox — `~/.local/state/phase-console/runs/<instance>/
@@ -694,8 +705,11 @@ and a running console with `--allow-run` picks it up: a live runner for the plan
 `Runner.declareOutcome` (`phase.outcome {by:'unsupervised'}`); with no live runner the service edits
 the plan's latest run (or creates one — `run.start` through the `outcome-inbox` door, `{by: 'unsupervised',
 via: 'event', door: 'outcome-inbox', trigger, guard, minted: true}`). `waiting-external` parks the
-phase `waiting` and resumes **that** session at the window; **`partial --reason budget|context|other`**
-("work remains, resume me") re-boards it with a resume of that session; `blocked` / `needs-human` /
+phase `waiting` and resumes **that** session at the window; **`partial --reason other`** ("work remains,
+resume me") re-boards it with a resume of that session, and **`partial --reason budget|context`** — the
+session saying itself that it is spent — re-boards it FRESH with the resume brief. Either resume goes
+through the gate's resume policy first (`phase.resume-policy`): a session that ended at ≥ 250k tokens of
+context and is cold (≥ 55 min) or under another account boards fresh with the resume brief too; `blocked` / `needs-human` /
 `complete` / `no-defect` are kept as declared evidence and announced once. **Read, decide, consume
 LAST** (WAI-7): the file is consumed only once its act has settled; a declaration older than 24 h,
 one the reader rejects, or one whose act threw is set aside under `outcomes/ignored/<name>.<reason>`
@@ -1049,7 +1063,11 @@ is missing — with `--rule` and `--command` beside it for a permission block.
 | `run.recover.refused {why, recovers, max}` · `run.recheck {verdict}` | runner | the recover verb's ledger refused / a recheck's verdict |
 | `run.plan-recover {step}` | service | Recover & continue's three steps |
 | `phase.stall {signal, since, detail, attempt}` · `phase.liveness {cleared, turnsSinceLastTool, commitsSinceStart, treeDirty}` | runner | a stall episode opened / cleared — once each, never per tick |
-| `phase.tool-denied {tool, rule, matched?}` | service | a tool call the console refused — `rule` is a deny-list rule, or `in-turn-wait` for a Bash call that would have waited inside the turn |
+| `phase.tool-denied {tool, rule, matched?}` | service | a tool call the console refused — `rule` is a deny-list rule, `in-turn-wait` for a Bash call that would have waited inside the turn on somebody else's clock, or `poll-loop` for a status check inside a run of them (journal only: never stamped on the record, nothing to widen) |
+| `phase.poll-loop {calls, windowMs, tools, firstAt, nudged}` | service | a poll-loop episode opened: six status checks inside two minutes with no other call between; `nudged` says whether the lane's one notice reached the session |
+| `phase.tokens {mode, attempt?, sessionId, resumed, model, window, calls, lastContext, peakContext, input, cacheWrite, cacheRead, output, rebuilds, pollCalls?, pollDenied?, account}` | runner | one session's API calls folded as it ended — context, caching, cache rebuilds, and the account whose cache it wrote; kept on the phase record as `tokens[]` |
+| `phase.resume-policy {sessionId, choice, reason, contextTokens, idleMs, accountChanged}` | runner | the gate's answer on whether a session is worth resuming — `fresh` when the console checkpointed it, it declared `partial --reason budget` or `context`, or it ended at ≥ 250k and is cold (≥ 55 min) or under another account; the phase then boards fresh with the resume brief |
+| `phase.context-wrapup {stage, context, window, fraction, sessionId, delivered?}` | runner | a phase's own session passed 0.6 × its context window (`wrap-up`: told once to finish, hand off and declare `partial --reason context`) or 0.8 × (`checkpoint`: the lane is checkpointed and the next attempt boards fresh) |
 | `phase.auto-nudged {detail, since, scope?, parkAfterMs?}` · `phase.auto-nudge-refused` | runner | one line written into the session's stdin, and the refusal recorded separately when the write did not reach it. `scope: 'local'` is the local-job ladder, not the silent one |
 | `phase.external-wait {detail, since, scope, command, watch, thresholdMs}` | runner | the wait that parked the phase, whose clock it was on, and any `cmd:` ref lifted out of the loop's own condition |
 | `phase.ruling {id, kind, what, why?, costIfWrong?, sessionId?, at}` | runner, service | a decision a session recorded |

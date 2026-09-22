@@ -78,6 +78,15 @@ export type ScopeGrant = {
   branch?: string;
   /** See `AdmitRequest.tree` — the second carve dimension, carried the same way. */
   tree?: string;
+  /**
+   * The account the admission said it would spend (`AdmitRequest.accountId`),
+   * absent for the machine login — what the usage brake counts live lanes by.
+   * The account at ADMISSION: a lane the live wall later moves is still counted
+   * against the account it boarded on, for as long as it lives.
+   */
+  accountId?: string;
+  /** The repository this grant is counted against — see `AdmitRequest.repo`. */
+  repo?: string;
   at: number;
 };
 
@@ -116,6 +125,24 @@ export type AdmitRequest = {
    * not stall a run that pays with a different one.
    */
   accountId?: string;
+  /**
+   * WHICH repository this work rides in — `RunnerBase.qualificationFor`'s
+   * third answer, and the key the per-repository cap counts against.
+   *
+   * Absent means "not capped and not counted", which is the honest answer for
+   * a run that states no tree at all: a shared-checkout run is serialised by
+   * SCOPE, a stronger guarantee than a count, and counting it would cap a
+   * repository against runs that are already taking turns in it.
+   */
+  repo?: string;
+  /**
+   * The run's OWN per-repository threshold (`RunState.maxConcurrentPerRepo`,
+   * phase 15): how many isolated runs it will stand beside in `repo`. Judged
+   * as `min(console cap, this)` — a run may make itself more conservative
+   * and never outbid the console, the `maxParallel`/`--max-sessions` rule.
+   * Absent means the console's number alone.
+   */
+  repoCap?: number;
   /** The run's abort signal — a Stop must not leave admissions pending. */
   signal?: AbortSignal;
   /**
@@ -164,6 +191,8 @@ export type SessionPeerView = {
   owner: string;
   scope: readonly string[];
   plan: { slug: string; phase: number } | null;
+  /** When the peer's claim window shuts (ms epoch); absent for a session on the phase itself. */
+  claimUntil?: number;
 };
 
 /** What is standing in an entry's way, in the words the queue page shows. */
@@ -199,7 +228,8 @@ export type Holder = {
    * When a `lock` holder's lease lapses (ms epoch). The queue page turns it
    * into "lease ends <t>", and the lock timer wakes the scan at the soonest
    * one — a foreign lock's release is the one event this process may never
-   * hear otherwise.
+   * hear otherwise. On a `session` holder: when its claim window shuts (REG-3)
+   * — the same promise to stop holding, kept by a clock instead of a lease.
    */
   leaseUntil?: number;
   /** The holding session's id (`session=`), when the lock names one — or the peer session itself (`kind: 'session'`). */
@@ -246,6 +276,10 @@ export type QueueEntry = {
   tree?: string;
   /** The account the admission spends — see `AdmitRequest.accountId`. */
   accountId?: string;
+  /** The repository this entry is counted against — see `AdmitRequest.repo`. */
+  repo?: string;
+  /** The run's own threshold in that repository — see `AdmitRequest.repoCap`. */
+  repoCap?: number;
   /** See `AdmitRequest.kind`. Absent reads as `phase`. */
   kind?: QueueKind;
   since: number;
@@ -262,6 +296,13 @@ export type QueueEntry = {
   held?: { at: string; by?: string };
   /** The plan this entry is chained behind and still waiting on. */
   after?: string;
+  /**
+   * Its position in the scan order — the order `poll` walks the queue in
+   * (`scanOrder`: reserving first, then class, bump, arrival), which is the
+   * admission order a forecast can show. Filled by `snapshot` only; the
+   * queue's own array stays in arrival order (many-plans-one-repo phase 9).
+   */
+  order?: number;
 };
 
 /** A lock on disk, as the store already reads it. Scope absent = never declared. */
@@ -420,12 +461,13 @@ export type SchedulerDeps = {
   /**
    * A phase's declared scope, from the plan's Repos column.
    *
-   * Used for a lock that carries no `scope=` line. `phase-lock.sh conflicts`
-   * treats such a lock as UNKNOWN and collides with everything, because bash
-   * cannot always resolve the plan; the console can, and recovering the
-   * declaration the claim would have written is not a weakening — it is the
-   * same SSOT, read from the other end. An unknown plan still falls back to
-   * `all`, so uncertainty keeps its fail-safe direction.
+   * RETIRED as an input to admission (S4-a) and kept only so a caller passing
+   * it is not a type error: a lock with no `scope=` line is UNKNOWN and
+   * collides with everything, in bash and here alike. Recovering the scope the
+   * claim would have written read better than it behaved — it made the
+   * console's answer NARROWER than `phase-lock.sh conflicts`'s about the same
+   * file, which is how a lane was admitted into a tree bash had just refused.
+   * @deprecated nothing reads it; delete the last caller and then this.
    */
   scopeFor?: (slug: string, phase: number) => string[] | undefined;
   /**
@@ -479,6 +521,9 @@ export type SchedulerDeps = {
    * `peersInRepository`. Each becomes a `session` holder: named with its id,
    * pid and cwd on the queue page, queued behind, never capped into a park
    * (`isCappableBlocker` caps only locks) and never released by anything here.
+   * A peer not on the entry's phase answers only inside its claim window, and
+   * its `claimUntil` becomes the holder's `leaseUntil`, so the lock timer
+   * re-scans the moment the window shuts.
    * Asked for PHASE admissions only; synchronous like every other answer an
    * admission reads. Absent: presence alone blocks nothing, the behaviour
    * before this existed.
@@ -555,10 +600,48 @@ export type SchedulerDeps = {
    * before this existed.
    */
   machine?: SchedulerMachine;
+  /**
+   * How many live lanes ONE repository may hold — the operator's
+   * `maxConcurrentPerRepo`. Absent means uncapped, which is what every console
+   * that predates this setting did.
+   */
+  maxPerRepo?: number | (() => number);
 };
 
 /** The pseudo-holder slug for "the machine is full" — beside `session cap`, which is this console's. */
 export const MACHINE_HOLDER = 'machine cap';
+
+/**
+ * The pseudo-holder slug for "this REPOSITORY is full".
+ *
+ * A third cap, and the three bound three different things: `session cap` is
+ * this console's appetite, `machine cap` is the machine's, and this one is
+ * how much may be happening inside ONE repository at a time. A console
+ * driving eight plans across eight repositories is doing nothing unusual;
+ * eight isolated runs in one repository is a repository nobody can read, and
+ * neither of the other two caps can tell the difference.
+ */
+export const REPO_HOLDER = 'repo cap';
+
+/** The pseudo-holder slug for an account whose usage window is nearly spent — see `Scheduler.brake`. */
+export const BRAKE_HOLDER = 'usage brake';
+
+
+/**
+ * One account's usage brake (autopilot-token-drain phase 6, H6): engaged when a
+ * session on the account reported its window past the alert threshold and the
+ * run had nowhere else to spend. `untilMs` is the window's reported reset, or
+ * null when none was reported — a brake with no clock ends only at a reading
+ * under the warning threshold (`Scheduler.releaseBrake`).
+ */
+export type UsageBrake = {
+  accountId: string;
+  since: number;
+  untilMs: number | null;
+  pct: number;
+  /** The window the reading named (`five_hour`, `seven_day`, …) — only a reading of the SAME window can release it. */
+  window?: string;
+};
 
 export type SchedulerSnapshot = {
   max: number;
@@ -577,6 +660,13 @@ export type SchedulerSnapshot = {
   guard: boolean;
   /** Live lanes on the whole machine and its ceiling, or null when no machine ledger is wired. */
   machine: { live: number; max: number | null } | null;
+  /**
+   * How full each repository is, worst-readable-first (by name, so a diff of
+   * two scrapes does not churn). Only repositories with a live lane appear:
+   * a tally of every repository the console has ever seen would be a list
+   * that grows and never shrinks.
+   */
+  capacity: { repo: string; live: number; max: number }[];
   /**
    * The boarding schedule's answer at snapshot time, or null when no policy is
    * set. Reported even when OPEN: a console with a schedule and nothing queued
@@ -654,7 +744,20 @@ export class AdmissionCapped extends AdmissionAborted {
  */
 export function isCappableBlocker(holder: Holder): boolean {
   if (holder.clock) return false;
-  if (holder.kind !== 'lock') return false;
+  // `lock` and `session` — the two kinds that can be a claim nobody is behind.
+  //
+  // `session` was excluded, and it is the shape with NO LEASE at all (REG-3's
+  // holder-with-no-lock: a live peer in the repository that has not claimed).
+  // A SIGSTOPped hand `claude`, or one whose window closed without the hook
+  // firing, therefore held every plan in the repository for the full 24-hour
+  // peer window with nothing able to time it out — the exact condition the
+  // two-hour cap exists for, on the one holder it could not reach.
+  //
+  // A sibling lane (`grant`, `reserved`) stays exempt: that is pipelining, not
+  // contention, and D2 already measured that capping it is worse than the
+  // disease. The rule is presence, not kind: a LIVE peer is a person typing in
+  // the next window, and a person is never debris however long they take.
+  if (holder.kind !== 'lock' && holder.kind !== 'session') return false;
   return holder.presence !== 'live';
 }
 
@@ -665,7 +768,10 @@ export function autopilotOwner(runId: string): string {
 
 /** The run id an autopilot-owned lock names, or null for any other owner. */
 export function autopilotRunId(owner: string): string | null {
-  const m = /^autopilot\/([0-9a-f]{8})$/.exec(owner);
+  // 8..32 hex: `newRun` mints twelve (S9-b) and every lock written before it
+  // carries eight. Bounded on both ends on purpose — this string comes off a
+  // lock file somebody else wrote, and it goes on to name a run.
+  const m = /^autopilot\/([0-9a-f]{8,32})$/.exec(owner);
   return m ? m[1] : null;
 }
 
@@ -724,6 +830,13 @@ export class Scheduler {
    * writes THROUGH.
    */
   private readonly walls: AccountWalls;
+  /**
+   * Per-account usage brakes (`brake`). In memory and per console, unlike the
+   * walls: a brake is a reading this console's own sessions took, released by a
+   * later reading or the reset, and a restart that forgets one costs at most a
+   * lane boarding before the next warning re-engages it.
+   */
+  private readonly brakes = new Map<string, UsageBrake>();
   private throttleTimer: NodeJS.Timeout | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   /** Armed at the soonest lease expiry among blocking locks. See `armLockTimer`. */
@@ -906,6 +1019,49 @@ export class Scheduler {
    * `holders` is what the last refused acquisition saw; a read-only probe
    * (`wouldBlock`) passes the live list instead.
    */
+  /**
+   * Is this entry's REPOSITORY full?
+   *
+   * Counted over live grants at the moment of the scan, which is what makes
+   * the count mean anything: `poll()` grants one entry at a time and the map
+   * is rebuilt each pass, so two runs starting together cannot both read the
+   * pre-count and both pass a cap of one — the race `acquireMachine`'s
+   * reservation exists to close, closed here by counting rather than by
+   * reserving, because nothing outside this console holds a repository slot.
+   *
+   * An entry with no `repo` is never capped: see `AdmitRequest.repo`.
+   */
+  private repoHolder(entry: Waiting): Holder | null {
+    if (!entry.repo) return null;
+    const console = typeof this.deps.maxPerRepo === 'function' ? this.deps.maxPerRepo() : this.deps.maxPerRepo;
+    if (console === undefined || console === null || !Number.isFinite(console) || console <= 0) return null;
+    // The run's own threshold (phase 15) can only LOWER the number: a run may
+    // decide to stand beside fewer, never to outbid the console's cap.
+    const max = entry.repoCap && entry.repoCap > 0 ? Math.min(console, entry.repoCap) : console;
+    const here = [...this.grants.values()].filter((grant) => grant.repo === entry.repo);
+    if (here.length < max) return null;
+    const names = here.map((grant) => `${grant.slug}${grant.phase != null ? ` P${grant.phase}` : ''}`);
+    return {
+      kind: 'reserved', slug: REPO_HOLDER, phase: null,
+      owner: `${entry.repo} already has ${here.length} of ${max} lane${max === 1 ? '' : 's'}`
+        + `: ${names.join(', ')}`,
+      scope: ['all'], overlaps: ['all'],
+    };
+  }
+
+  /** One row per repository holding a live lane — `SchedulerSnapshot.capacity`. */
+  private capacitySnapshot(): { repo: string; live: number; max: number }[] {
+    const max = typeof this.deps.maxPerRepo === 'function' ? this.deps.maxPerRepo() : this.deps.maxPerRepo;
+    if (max === undefined || max === null || !Number.isFinite(max) || max <= 0) return [];
+    const live = new Map<string, number>();
+    for (const grant of this.grants.values()) {
+      if (grant.repo) live.set(grant.repo, (live.get(grant.repo) ?? 0) + 1);
+    }
+    return [...live.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([repo, count]) => ({ repo, live: count, max }));
+  }
+
   private machineHolder(holders: readonly MachineLane[]): Holder | null {
     const machine = this.deps.machine;
     if (!machine) return null;
@@ -951,6 +1107,8 @@ export class Scheduler {
         ...(request.branch ? { branch: request.branch } : {}),
         ...(request.tree ? { tree: request.tree } : {}),
         ...(request.accountId ? { accountId: request.accountId } : {}),
+        ...(request.repo ? { repo: request.repo } : {}),
+        ...(request.repoCap && request.repoCap > 0 ? { repoCap: request.repoCap } : {}),
         ...(request.kind ? { kind: request.kind } : {}),
         // `normal` is stored as an omission here too, so `scanOrder`'s class
         // key is constant across a queue nobody has prioritised and the sort
@@ -1018,6 +1176,8 @@ export class Scheduler {
     if (chained) return [chained];
     const throttle = this.throttleFor(request.accountId);
     if (throttle) return [throttle];
+    const braked = this.brakeFor(request.accountId);
+    if (braked) return [braked];
     // D28: the session cap is NOT a clock, and it no longer short-circuits.
     //
     // Two defects in one early return. It was marked `clock: true` beside the
@@ -1056,6 +1216,78 @@ export class Scheduler {
     try { lanes = this.deps.machine?.lanes() ?? []; } catch { lanes = []; }
     const machine = this.machineHolder(lanes);
     return [...(cap ? [cap] : []), ...(machine ? [machine] : []), ...holders];
+  }
+
+  /**
+   * Admit no NEW lane on this account while one is live on it, until the brake
+   * is released or `untilMs` passes. True when this engaged it; false when a
+   * live brake was already there (it is left as it was — its `since` and clock
+   * are the first reading's).
+   *
+   * Why a brake and not the throttle (autopilot-token-drain H6): run deadaff9's
+   * account read 95 % and the decision was journalled `enacted: false`, so lanes
+   * kept boarding and the window went from 90 to 99 % in 23 minutes. The
+   * throttle is a learned WALL — enacting it at 95 % would refuse the account a
+   * start with 5 % left, which is why that decision was never enacted. The
+   * brake never refuses the ONLY lane on an account: it stops the account
+   * taking on more at once, so what is left is spent one lane at a time.
+   */
+  brake(accountId: string | undefined, opts: { untilMs: number | null; pct: number; window?: string }): boolean {
+    const key = accountId ?? 'default';
+    if (this.brakeOf(key)) return false;
+    const untilMs = opts.untilMs !== null && Number.isFinite(opts.untilMs) ? opts.untilMs : null;
+    this.brakes.set(key, {
+      accountId: key, since: this.now(), untilMs, pct: opts.pct, ...(opts.window ? { window: opts.window } : {}),
+    });
+    log.info('scheduler.braked', { account: key, pct: opts.pct, until: untilMs === null ? null : new Date(untilMs).toISOString() });
+    this.armThrottleTimer();
+    this.announce();
+    return true;
+  }
+
+  /** Release this account's brake; the released brake, or null when none was engaged. Wakes the queue. */
+  releaseBrake(accountId: string | undefined): UsageBrake | null {
+    const key = accountId ?? 'default';
+    const brake = this.brakes.get(key) ?? null;
+    if (!brake) return null;
+    this.brakes.delete(key);
+    log.info('scheduler.brake-released', { account: key });
+    this.announce();
+    this.poll();
+    return brake;
+  }
+
+  /** How many granted lanes said they would spend this account (`ScopeGrant.accountId`). */
+  liveOn(accountId: string | undefined): number {
+    const key = accountId ?? 'default';
+    return [...this.grants.values()].filter((grant) => (grant.accountId ?? 'default') === key).length;
+  }
+
+  /** This account's engaged brake, or null — a brake whose clock has passed is not engaged. */
+  brakeOf(accountId: string | undefined): UsageBrake | null {
+    const brake = this.brakes.get(accountId ?? 'default');
+    if (!brake) return null;
+    return brake.untilMs !== null && brake.untilMs <= this.now() ? null : brake;
+  }
+
+  /**
+   * The holder that says "this account's window is nearly spent and a lane on
+   * it is already live", or null. A SKIP like the throttle — the entry never
+   * ages into `reserving`, because a reservation would hold a checkout against
+   * work another account could pay for.
+   */
+  private brakeFor(accountId: string | undefined): Holder | null {
+    const key = accountId ?? 'default';
+    const brake = this.brakeOf(key);
+    if (!brake) return null;
+    const live = this.liveOn(key);
+    if (!live) return null;
+    const account = key === 'default' ? 'the account' : `account ${key}`;
+    return {
+      kind: 'reserved', slug: BRAKE_HOLDER, phase: null, ...(brake.untilMs !== null ? { clock: true as const } : {}),
+      owner: `${account} at ${Math.round(brake.pct)} % — no new lane while ${live} ${live === 1 ? 'is' : 'are'} live on it`,
+      scope: ['all'], overlaps: ['all'],
+    };
   }
 
   /**
@@ -1100,6 +1332,38 @@ export class Scheduler {
     return this.conflictsFor(probe, []).filter((holder) => holder.owner !== own);
   }
 
+  /**
+   * The holders this admission WALKED PAST because their branch and tree both
+   * differ — the carve-out, named (S12).
+   *
+   * 🔴 The single most consequential decision the scheduler makes was the one
+   * it never wrote down. A carve-out is journalled only when something ELSE
+   * blocked (`phase.queued`), so the ordinary case — two plans admitted into
+   * one repository at the same instant, which is the whole point of the
+   * feature — left a record indistinguishable from "nothing else was running".
+   * When two sessions then collided for real, nothing could say whether the
+   * scheduler had considered the other one at all.
+   *
+   * Computed as the difference between the two readings rather than by a second
+   * scan, so it cannot drift from the decision it describes: everything whose
+   * scope intersects, minus everything that actually blocked.
+   */
+  carvedFor(request: AdmitRequest): Holder[] {
+    const probe: Waiting = {
+      id: '', slug: request.slug, phase: request.phase, runId: request.runId,
+      scope: request.scope.length ? request.scope : ['all'],
+      ...(request.branch ? { branch: request.branch } : {}),
+      ...(request.tree ? { tree: request.tree } : {}),
+      since: this.now(), waitingOn: [], bypassed: 0, reserving: false,
+      resolve: () => {}, reject: () => {}, detach: () => {}, settled: false,
+    };
+    const own = autopilotOwner(request.runId);
+    const key = (holder: Holder): string => `${holder.kind}:${holder.slug}:${holder.phase}:${holder.owner}`;
+    const blocked = new Set(this.conflictsFor(probe, []).map(key));
+    return this.conflictsFor(probe, [], { ignoreCarve: true })
+      .filter((holder) => holder.owner !== own && !blocked.has(key(holder)));
+  }
+
   /** Hand a grant back. The only thing that lets the queue move on its own. */
   release(grant: ScopeGrant | null | undefined): void {
     if (!grant) return;
@@ -1107,6 +1371,7 @@ export class Scheduler {
     this.releaseMachine(grant);
     this.poll();
   }
+
 
   /** Take this entry's lane on the machine; true when there is no machine ledger at all. */
   private acquireMachine(entry: Waiting): boolean {
@@ -1300,6 +1565,25 @@ export class Scheduler {
         continue;
       }
 
+      // Read against `this.grants` as the scan admits, so two entries on one
+      // braked account in the same scan cannot both board past it.
+      const braked = this.brakeFor(entry.accountId);
+      if (braked) {
+        entry.waitingOn = [braked];
+        continue;
+      }
+
+      // A SKIP, like the throttle and the brake above and unlike a scope
+      // conflict: an entry the cap holds must not age into `reserving` and
+      // start blocking everything behind it. Nothing is being taken from it —
+      // the repository is simply busy, and a released lane lets it straight
+      // through on the next scan.
+      const repoFull = this.repoHolder(entry);
+      if (repoFull) {
+        entry.waitingOn = [repoFull];
+        continue;
+      }
+
       const holders = this.blocking(entry, reserved);
       if (holders.length) {
         entry.waitingOn = holders;
@@ -1443,17 +1727,22 @@ export class Scheduler {
   /** Everything the queue page and `state().concurrency` read. */
   snapshot(): SchedulerSnapshot {
     const throttledAccounts = this.walledAccounts();
+    // The scan order, stamped on each entry as `order` — the one place the
+    // admission order leaves this class. Computed once per snapshot, never
+    // stored: it moves with every bump, reprioritise and reservation.
+    const order = new Map(this.scanOrder().map((entry, index) => [entry, index] as const));
     return {
       max: this.maxLive(),
       guard: this.deps.guard?.() ?? true,
       schedule: this.scheduleNow(),
       machine: this.machineSnapshot(),
+      capacity: this.capacitySnapshot(),
       live: this.grants.size,
       queued: this.queue.filter((entry) => !entry.settled).length,
       throttledUntil: throttledAccounts[0]?.until ?? null,
       throttledAccounts,
       grants: [...this.grants.values()],
-      entries: this.queue.filter((entry) => !entry.settled).map((entry) => this.entryView(entry)),
+      entries: this.queue.filter((entry) => !entry.settled).map((entry) => this.entryView(entry, order.get(entry))),
     };
   }
 
@@ -1464,18 +1753,19 @@ export class Scheduler {
   }
 
   /** One queue entry as the page sees it. See `snapshot`. */
-  private entryView(entry: Waiting): QueueEntry {
+  private entryView(entry: Waiting, order?: number): QueueEntry {
     let held: { at: string; by?: string } | null | undefined;
     let after: string | null | undefined;
     try { held = this.deps.holdFor?.(entry.slug, entry.runId); } catch { held = null; }
     try { after = this.deps.chainBlocker?.(entry.slug, entry.runId); } catch { after = null; }
-    return this.entryFields(entry, held ?? null, after ?? null);
+    return this.entryFields(entry, held ?? null, after ?? null, order);
   }
 
   private entryFields(
     entry: Waiting,
     held: { at: string; by?: string } | null,
     after: string | null,
+    order?: number,
   ): QueueEntry {
     return {
       id: entry.id,
@@ -1502,6 +1792,7 @@ export class Scheduler {
       // presses Release.
       ...(held ? { held } : {}),
       ...(after ? { after } : {}),
+      ...(order === undefined ? {} : { order }),
     };
   }
 
@@ -1573,7 +1864,8 @@ export class Scheduler {
     const holders = this.conflictsFor(entry, reserved);
     if (this.deps.guard?.() ?? true) return holders;
     const own = autopilotOwner(entry.runId);
-    return holders.filter((holder) => holder.owner === own || sameUnitOfWork(holder, entry));
+    return holders.filter((holder) => holder.owner === own || sameUnitOfWork(holder, entry)
+    );
   }
 
   /**
@@ -1587,13 +1879,19 @@ export class Scheduler {
    * All three are narrowed by the BRANCH carve-out (`carvedOut` below), which
    * is what makes two isolated runs on one repository admissible together.
    */
-  private conflictsFor(entry: Waiting, reserved: readonly Waiting[]): Holder[] {
+  private conflictsFor(
+    entry: Waiting, reserved: readonly Waiting[],
+    /** Answer as if the carve-out did not exist — see `carvedFor`. */
+    opts?: { ignoreCarve?: boolean },
+  ): Holder[] {
+    const carved = (holder: { slug: string; phase: number | null; branch?: string; tree?: string }): boolean =>
+      !opts?.ignoreCarve && this.carvedOut(holder, entry);
     const holders: Holder[] = [];
 
     for (const grant of this.grants.values()) {
       if (grant.runId === entry.runId && grant.phase === entry.phase) continue;
       if (!scopesIntersect(grant.scope, entry.scope)) continue;
-      if (this.carvedOut(grant, entry)) continue;
+      if (carved(grant)) continue;
       holders.push({
         kind: 'grant',
         slug: grant.slug,
@@ -1625,7 +1923,7 @@ export class Scheduler {
 
       const scope = this.scopeOfLock(lock);
       if (!scopesIntersect(scope, entry.scope)) continue;
-      if (this.carvedOut(lock, entry)) continue;
+      if (carved(lock)) continue;
       const presence = this.presenceOf(lock);
       holders.push({
         kind: 'lock',
@@ -1643,10 +1941,13 @@ export class Scheduler {
       });
     }
 
+
     // A live session in this repository with no claim yet (REG-3): the
     // collision the lock exists to prevent, in the one window where no lock
-    // exists — every hand session's first minute. No carve-out: a peer
-    // declared neither a branch nor a tree, so nothing makes it disjoint.
+    // exists — every hand session's first minutes, bounded by its claim window
+    // (`PEER_CLAIM_WINDOW_MS`; the predicate drops a peer once it shuts). No
+    // carve-out: a peer declared neither a branch nor a tree, so nothing makes
+    // it disjoint.
     if (entry.phase != null && this.deps.peers) {
       let peers: readonly SessionPeerView[] = [];
       try {
@@ -1665,6 +1966,7 @@ export class Scheduler {
           ...(peer.pid ? { pid: peer.pid } : {}),
           cwd: peer.cwd,
           ...(peer.presence === 'live' ? { presence: 'live' as const } : {}),
+          ...(peer.claimUntil != null ? { leaseUntil: peer.claimUntil } : {}),
         });
       }
     }
@@ -1672,7 +1974,7 @@ export class Scheduler {
     for (const ahead of reserved) {
       if (ahead.id === entry.id) continue;
       if (!scopesIntersect(ahead.scope, entry.scope)) continue;
-      if (this.carvedOut(ahead, entry)) continue;
+      if (carved(ahead)) continue;
       holders.push({
         kind: 'reserved',
         slug: ahead.slug,
@@ -1746,13 +2048,23 @@ export class Scheduler {
   }
 
   /**
-   * What a lock covers. See `SchedulerDeps.scopeFor` for why a scopeless lock
-   * is recovered from the plan rather than read as `all` outright.
+   * What a lock covers — and `all` when it does not say (S4-a).
+   *
+   * This used to RECOVER a scopeless lock's scope from the plan's Repos cell,
+   * on the reasoning that the console can read what bash sometimes cannot, so
+   * recovering the declaration the claim would have written is the same SSOT
+   * from the other end. The reasoning is sound and the consequence is not:
+   * `phase-lock.sh conflicts` reads an unstated scope as UNKNOWN and collides
+   * with everything, so the two halves of one guard gave different answers
+   * about the same file — and the console's was the NARROW one. A lane was
+   * admitted into a working tree that bash had refused seconds earlier.
+   *
+   * A guess that is usually right is not a guard. `conventions.md` states the
+   * contract ("an unstated scope reads as unknown, and unknown collides") and
+   * both readers now keep it.
    */
   private scopeOfLock(lock: LockView): string[] {
-    if (lock.scope?.length) return lock.scope;
-    const declared = this.deps.scopeFor?.(lock.slug, lock.phase);
-    return declared?.length ? declared : ['all'];
+    return lock.scope?.length ? lock.scope : ['all'];
   }
 
   private aging(entry: Waiting, now: number): boolean {
@@ -1772,6 +2084,8 @@ export class Scheduler {
       scope: entry.scope,
       ...(entry.branch ? { branch: entry.branch } : {}),
       ...(entry.tree ? { tree: entry.tree } : {}),
+      ...(entry.accountId ? { accountId: entry.accountId } : {}),
+      ...(entry.repo ? { repo: entry.repo } : {}),
       at: this.now(),
     };
     this.grants.set(grant.id, grant);
@@ -1819,8 +2133,14 @@ export class Scheduler {
     // always lands on the soonest.
     if (this.throttleTimer) { clearTimeout(this.throttleTimer); this.throttleTimer = null; }
     const walled = this.walledAccounts();
-    if (this.closed || !walled.length) return;
-    const delay = Math.max(0, walled[0]!.until - this.now());
+    // A brake's reset is a reopening too: what it held may board the moment it
+    // passes, not at the next idle poll.
+    const brakeEnds = [...this.brakes.values()]
+      .map((brake) => brake.untilMs)
+      .filter((at): at is number => at !== null && at > this.now());
+    const soonest = Math.min(walled[0]?.until ?? Infinity, ...brakeEnds);
+    if (this.closed || soonest === Infinity) return;
+    const delay = Math.max(0, soonest - this.now());
     this.throttleTimer = setTimeout(() => {
       this.throttleTimer = null;
       this.poll();
@@ -1835,7 +2155,9 @@ export class Scheduler {
    * console, another machine — but the lease is its promise to lapse, and
    * this timer turns that promise into an admission the moment it does,
    * instead of a wait for the idle poll or an unrelated docs event. Re-armed
-   * on every poll because the blocking set changes under it.
+   * on every poll because the blocking set changes under it. A `session`
+   * holder's claim window (REG-3) is the same kind of promise and wakes it too:
+   * nothing else announces that a window has shut.
    */
   private armLockTimer(): void {
     if (this.lockTimer) { clearTimeout(this.lockTimer); this.lockTimer = null; }
@@ -1844,7 +2166,7 @@ export class Scheduler {
     for (const entry of this.queue) {
       if (entry.settled) continue;
       for (const holder of entry.waitingOn) {
-        if (holder.kind !== 'lock' || holder.leaseUntil == null) continue;
+        if ((holder.kind !== 'lock' && holder.kind !== 'session') || holder.leaseUntil == null) continue;
         if (holder.leaseUntil < soonest) soonest = holder.leaseUntil;
       }
     }

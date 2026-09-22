@@ -131,7 +131,9 @@ test('every stall signal has an entry, and each named kind is a real stall kind'
   // yet. Asserting WHICH ones are null keeps that a decision — a signal that
   // silently went null would be a row that stopped being raised.
   const unmapped = Object.entries(STALL_SIGNAL_KIND).filter(([, k]) => k === null).map(([s]) => s);
-  assert.deepEqual(sorted(unmapped), sorted(['stalemate', 'spinning']));
+  // `looping` (phase 13) is null by design rather than by omission: the one
+  // signal with no remedy, said once as `phase.suspect` for a person to judge.
+  assert.deepEqual(sorted(unmapped), sorted(['stalemate', 'spinning', 'looping']));
 });
 
 test('every inbox kind declares where its rows come from', () => {

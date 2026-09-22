@@ -80,3 +80,21 @@ setup() {
   [ "$status" -eq 0 ]
   assert_contains "$output" "off"
 }
+
+@test "new-plan: a slug ending -p<digits> is refused — it is a lane branch's name (SWP-1)" {
+  # `pe/<slug>-p<N>` is the console's LANE branch. A plan slugged `thing-p4`
+  # therefore mints `pe/thing-p4`, which `runBranches('thing')` reads as plan
+  # `thing`'s lane for phase 4 — and that list feeds a DELETE. The collision
+  # is unfixable after the fact, so the name is refused at birth.
+  run pe_newplan thing-p4
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "-p4"
+  [ ! -e "$DOCS_ROOT/docs/plans/thing-p4.md" ]
+}
+
+@test "new-plan: a slug merely CONTAINING -p, or ending -p with no digits, is fine" {
+  run pe_newplan thing-p
+  [ "$status" -eq 0 ]
+  run pe_newplan thing-p4-more
+  [ "$status" -eq 0 ]
+}

@@ -6,6 +6,25 @@ set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 slug="${1:?usage: new-plan.sh <slug>}"
 
+# 🔴 A slug ending `-p<digits>` is a LANE branch's name (SWP-1). The console
+# mints `pe/<slug>` for a run and `pe/<slug>-p<N>` for phase N's lane, so a plan
+# slugged `thing-p4` owns `pe/thing-p4` — which `runBranches('thing')` reads as
+# plan `thing`'s phase-4 lane, and that list feeds a branch DELETE. Nothing can
+# tell the two apart afterwards: they are the same string. Refused at birth,
+# which is the only moment the name is still free.
+case "$slug" in
+  *-p*)
+    # Everything after the LAST `-p`. All digits ⇒ the collision; anything else
+    # (`thing-p`, `thing-p4-more`, `simple-plan`) is an ordinary name.
+    case "${slug##*-p}" in
+      ''|*[!0-9]*) : ;;
+      *)
+        printf 'refusing the slug %s: a name ending -p<number> collides with the lane branch pe/<slug>-p<N>,\n' "$slug" >&2
+        printf '  which the console deletes once it has landed. Pick another name (e.g. %s-phase).\n' "${slug%-p*}" >&2
+        exit 2 ;;
+    esac ;;
+esac
+
 # shellcheck source=/dev/null
 . "$SKILL_DIR/scripts/instance.sh"
 DOCS_ROOT="$(pe_docs_root)"

@@ -46,6 +46,14 @@ export const AUTOMATION_MAP = Object.freeze({
   qaByDefault: ['defaults', 'qa'],
   reviewEachPhaseByDefault: ['defaults', 'reviewEachPhase'],
   reviewerPolicy: ['defaults', 'reviewerPolicy'],
+  // The launch form's opening values for four of many-plans-one-repo phase
+  // 15's run fields — what a run gets when its plan is silent and the
+  // operator names nothing. Rendered by `RunSetup` in `defaults` mode, beside
+  // the git and QA defaults they belong with.
+  landing: ['defaults', 'landing'],
+  conflictPolicy: ['defaults', 'conflictPolicy'],
+  messaging: ['defaults', 'messaging'],
+  issuesMode: ['defaults', 'issuesMode'],
 
   // What the console may do about a stopped run, by itself.
   autoRecoverByDefault: ['recover', 'enabled'],
@@ -91,6 +99,9 @@ export const AUTOMATION_MAP = Object.freeze({
   stallAutomaticPark: ['stall', 'automaticPark'],
   stallLocalJobMs: ['stall', 'localJobMs'],
   stallEscalateMs: ['stall', 'escalateMs'],
+  // The sixth signal (many-plans-one-repo phase 13): identical failing tool
+  // calls in a row before a lane reads as `looping`. Noticing only — no rung.
+  stallLoopRun: ['stall', 'loopRun'],
 
   // The five whose combinations used to fail silently, plus the worktree three.
   gitMode: ['git', 'mode'],
@@ -104,6 +115,16 @@ export const AUTOMATION_MAP = Object.freeze({
   worktreeSetup: ['git', 'worktreeSetup'],
   worktreeCopyEnv: ['git', 'worktreeCopyEnv'],
   worktreeRoot: ['git', 'worktreeRoot'],
+  // The radar hold (many-plans-one-repo phase 9): serialise a conflicted pair
+  // by landing order, off by default. Beside the guard it resembles.
+  radarSerialize: ['git', 'radarSerialize'],
+  // Phase 7's three, homed here by phase 15 with their controls (the
+  // launch form's `defaults` mode renders them beside isolation): the
+  // per-repository cap, what becomes of a settled run's tree, and the base a
+  // run branch is cut from when the plan does not say.
+  maxConcurrentPerRepo: ['git', 'maxPerRepo'],
+  worktreeRetention: ['git', 'retention'],
+  baseBranch: ['git', 'baseBranch'],
 });
 
 /**

@@ -86,14 +86,35 @@ awk -v st="$status" -v day="$day" -v reason="$reason" -v reopen="$reopen" '
 
 # A closed plan must never gate live work: `phase-lock.sh conflicts` scans every plan,
 # so a dead plan's leftover lock would keep colliding with sessions on other plans.
+#
+# But only a lock that is actually a LEFTOVER. The sweep was unconditional, and
+# a lease that has not passed is not debris: it is a session editing a working
+# tree at this moment. Closing a plan is the operator's statement that nobody
+# cares about it any more — never a licence to unlock somebody else's checkout,
+# which is precisely what it bought: another plan admitted into that tree under
+# a live hand session. A live lease is therefore KEPT and named, and `--force`
+# is how an operator who knows the session is gone says so.
 released=0
+kept=""
 lock_dir="$DOCS_ROOT/docs/handoffs/$slug/.locks"
 if [ "$reopen" = 0 ] && [ -d "$lock_dir" ]; then
+  lock_now="$(date +%s)"
   for lock in "$lock_dir"/phase-*.lock; do
     [ -e "$lock" ] || continue
+    lease_until="$(grep -m1 '^lease_until=' "$lock" | sed 's/^lease_until=//' || true)"
+    lock_owner="$(grep -m1 '^owner=' "$lock" | sed 's/^owner=//' || true)"
+    lock_phase="$(grep -m1 '^phase=' "$lock" | sed 's/^phase=//' || true)"
+    if [ "$force" = 0 ] && [ -n "$lease_until" ] && [ "$lock_now" -lt "$lease_until" ]; then
+      until_h="$(date -r "$lease_until" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$lease_until")"
+      kept="$kept  kept phase ${lock_phase:-?} — held by ${lock_owner:-?} until $until_h (live lease; --force releases it)
+"
+      continue
+    fi
     rm -f "$lock"
     released=$((released + 1))
   done
+  # Refuses a non-empty directory, which is exactly the guard wanted: a kept
+  # lock keeps its folder.
   rmdir "$lock_dir" 2>/dev/null || true
 fi
 
@@ -103,5 +124,6 @@ else
   echo "closed: $slug = $status ($day)  ->  $plan_file"
   [ -n "$reason" ] && echo "  reason: $reason"
   [ "$released" -gt 0 ] && echo "  released $released phase lock(s) held by this plan"
+  [ -n "$kept" ] && printf '%s' "$kept"
 fi
 exit 0

@@ -129,6 +129,7 @@ export const SECTION_SEARCH_TERMS: Readonly<Record<string, string>> = Object.fre
     'permissions policy allow ask deny wall rules strike shipped defaults restore profile guarded trusted bypass auto approve',
   instance: [
     'process restart stop shutdown update interface service worker build revision tailscale remote reach port serving dist',
+    'logs retention disk space prune sweep keep delete transcripts journals rulings git trace size bytes',
   ].join(' '),
 });
 

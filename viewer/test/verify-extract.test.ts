@@ -480,3 +480,138 @@ test('PHASE_CONSOLE_VERIFY_NO_SKIP=1 restores the old run-to-127 behaviour', asy
     assert.equal(summary.skipped, undefined);
   } finally { delete process.env.PHASE_CONSOLE_VERIFY_NO_SKIP; }
 });
+
+/* ------------------------------------------------------------------ *
+ * 2026-09-18: the commands real plans write, and the wall around them
+ *
+ * Run f0da619a (many-plans-one-repo) halted at phase 2 on
+ * `bats tests/unit/landing.bats …` — "written as prose" under
+ * `Person-check: halt` — and its phase 18 held a second stop,
+ * `git merge-base --is-ancestor main HEAD`, read as a merge. A survey of every
+ * plan on the machine found the same class in `2>&1` (split on its `&`),
+ * `2>/dev/null` (read as a write to `/`) and `! grep …` (40 hub lines). The
+ * independent review of the fix found two holes beside them: a `$(…)` inside
+ * double quotes was never judged, and a backgrounded `&` reported green
+ * without waiting for the command it backgrounded.
+ * ------------------------------------------------------------------ */
+
+import * as verifyModule from '../server/runner/verify.ts';
+
+test('the commands real plans write are commands', () => {
+  for (const command of [
+    'bats tests/unit/landing.bats tests/unit/directives.bats tests/unit/gates.bats',
+    'git merge-base --is-ancestor main HEAD',
+    'git merge-tree --write-tree main HEAD',
+    'npm run -ws test -- --run 2>&1 | tail -5',
+    'grep -q x f 2>/dev/null',
+    'grep -q x f > /dev/null',
+    'npm test >/dev/null 2>&1',
+    'npm test &>/dev/null',
+    'npm test |& tail -3',
+    '! grep -q "readonly" src/a.ts',
+    "bash -c '! grep -rn \"from app\" statepath/'",
+    "test \"$(ls viewer/test/fixtures/spikes/*.md | wc -l | tr -d ' ')\" -ge 8",
+    "test \"$(grep -c '30 min' references/conventions.md)\" = 0",
+  ]) {
+    assert.deepEqual(runs(command), [command], `${command} → ${JSON.stringify(held(command))}`);
+  }
+});
+
+test('the wall around them still stands — and closes two holes', () => {
+  const refused: [string, RegExp][] = [
+    ['git merge main', /mutates/],
+    ['git merge-file a b c', /mutates/],
+    ['git checkout-index -a', /mutates/],
+    ['git commit -m x', /mutates/],
+    ['bash -c "git push"', /mutates/],
+    // Global options between `git` and its verb used to hide the verb.
+    ['git -C ../other push origin main', /mutates/],
+    ['git --no-pager commit -m y', /mutates/],
+    // A substitution inside double quotes is judged like any other command.
+    ['echo "$(rm -rf /tmp/x)"', /mutates/],
+    ['test "$(curl -X POST https://example.com/x)" = ok', /non-GET/],
+    // A backgrounded command's exit code is never read, so it proves nothing.
+    ['npm test &', /background/],
+    ['npm test & npm run lint', /background/],
+    // A negation negates; it does not launder.
+    ['! rm -rf build', /mutates/],
+    ['npm test > /etc/passwd', /mutates/],
+    ['npm test &> /etc/x', /mutates/],
+    ['grep x f > /dev/nullx', /mutates/],
+  ];
+  for (const [command, reason] of refused) {
+    assert.deepEqual(runs(command), [], command);
+    assert.match(held(command)[0]?.reason ?? '(nothing held)', reason, command);
+  }
+});
+
+test('a negated command resolves to the command it negates', () => {
+  // Otherwise the missing-binary check calls `!` a missing lead and SKIPS the
+  // line — and a phase whose every line starts with `!` parks.
+  assert.equal(verifyModule.resolveLead('! grep -q x f'), 'grep');
+  assert.equal(verifyModule.resolveLead('FOO=1 grep -q x f'), 'grep');
+});
+
+test('a refusal carries its code, its lead and a fingerprint of the whole command', () => {
+  const [item] = held('frobnicate --check tests/');
+  assert.equal(item.code, 'unknown-lead');
+  assert.equal(item.lead, 'frobnicate');
+  assert.equal(item.approvable, true);
+  assert.match(String(item.fp), /^[0-9a-f]{64}$/);
+  // The fingerprint is of the whole command — never the 240-character display text.
+  const long = `frobnicate ${'a'.repeat(300)}`;
+  assert.notEqual(held(long)[0].fp, held(`${long}b`)[0].fp);
+  // Markdown wrapping is not a different command.
+  assert.equal(only('`frobnicate   --check\n  tests/`').notRun[0].fp, item.fp);
+  // No other wall is approvable: only "not a command I know" is a click away.
+  for (const [command, code] of [
+    ['npm test && rm -rf build', 'mutates'],
+    ['curl -X POST https://example.com/deploy', 'reaches-out'],
+    ['echo $(whoami)', 'unreadable'],
+    ['npm test &', 'background'],
+    ['docs/plans/demo.md', 'names-file'],
+  ] as const) {
+    const [refusal] = held(command);
+    assert.equal(refusal.code, code, command);
+    assert.equal(refusal.approvable, false, command);
+  }
+  assert.equal(only('run the suite by hand and eyeball it').notRun[0].code, 'prose');
+});
+
+test('an approval runs that exact command, relaxes nothing else, and a waiver sets one aside', () => {
+  const { commandFingerprint } = verifyModule as unknown as { commandFingerprint: (text: string) => string };
+  const fp = commandFingerprint('frobnicate --check tests/');
+  const approve = new Set([fp]);
+  assert.deepEqual(
+    extractCommands('`frobnicate --check tests/`', 'verify', { approve }).commands,
+    ['frobnicate --check tests/'],
+  );
+  // The approval is of THAT text: one more flag is another command.
+  assert.deepEqual(extractCommands('`frobnicate --check tests/ --fix`', 'verify', { approve }).commands, []);
+  // It relaxes "is this a command I know" and nothing else.
+  const withRm = 'frobnicate --check tests/ && rm -rf build';
+  assert.match(
+    extractCommands(`\`${withRm}\``, 'verify', { approve: new Set([commandFingerprint(withRm)]) }).notRun[0].reason,
+    /mutates/,
+  );
+  const post = 'curl -X POST https://example.com/deploy';
+  assert.match(
+    extractCommands(`\`${post}\``, 'verify', { approve: new Set([commandFingerprint(post)]) }).notRun[0].reason,
+    /non-GET/,
+  );
+  // A waiver: not run, not asked about, and still on the record.
+  const out = extractCommands('`frobnicate --check tests/` then `npm test`', 'verify', { waive: new Set([fp]) });
+  assert.deepEqual(out.commands, ['npm test']);
+  assert.deepEqual(out.notRun, []);
+  assert.equal(out.waived?.[0]?.fp, fp);
+});
+
+test('an approval relaxes only a real program the runner does not know — never prose, a name or a file', () => {
+  // Defense in depth: the service admits only approvable fingerprints, but the
+  // extractor must not depend on it — an fp that reached it anyway (a stale
+  // run file, a bug upstream) must not turn prose into something bash runs.
+  for (const text of ['!grep x', '**Verification:**', 'docs/plans/demo.md', 'changed']) {
+    const out = extractCommands(`\`${text}\``, 'verify', { approve: new Set([verifyModule.commandFingerprint(text)]) });
+    assert.deepEqual(out.commands, [], text);
+  }
+});

@@ -26,8 +26,9 @@ non-default choice **with its provenance** and a Change link back to the stage t
 
 **Decisions comes first, and a launch with anything to ask opens on it.** It shows the plan's
 `## Decisions` manifest as the console resolves it for this draft — every row with its state and where
-its answer came from — and the four probes a start runs before anything spawns (accounts, MCP servers,
-credentials, delivery) with what each found. Then it asks what the start requires: whether the run
+its answer came from — and the five probes a start runs before anything spawns (accounts, MCP servers,
+credentials, delivery, verification commands) with what each found; a §Verification command the run would
+stop on is approved here by its exact text, or waived for the run. Then it asks what the start requires: whether the run
 continues by itself after a console restart, whether the **relay** is armed (*last resort*: a person is
 asked first, and after 60 s the console answers by rule — see **Permissions**), which accounts the run
 may spend and the headroom each must show, and an acknowledgement of every waived row. The answers are

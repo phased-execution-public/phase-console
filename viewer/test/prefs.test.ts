@@ -122,6 +122,17 @@ test('sanitiseAutomation is the single coercion table', () => {
     // The trees the console makes live inside the project, where a person
     // finds them; the state directory is the older placement, on request.
     worktreeRoot: 'project',
+    // Phase 7's three: a per-REPOSITORY cap beside the machine-wide one (a
+    // repository nobody can read is a different cost from a full disk), the
+    // retention word that decides what a settled run's tree becomes, and the
+    // base a run branch is cut from when the plan does not say.
+    maxConcurrentPerRepo: 3, worktreeRetention: 'keep-on-failure', baseBranch: 'origin/HEAD',
+    // The radar hold (phase 9) ships OFF — the radar stays advisory.
+    radarSerialize: false,
+    // Phase 15's four launch defaults, each the shared owner's own default:
+    // a phase's commits are held for a person, a conflict halts, sessions may
+    // message each other, and an outward write is never a default.
+    landing: 'hold', conflictPolicy: 'halt', messaging: 'on', issuesMode: 'off',
     // The two that ship ON, and both are exceptions with the same reason: they
     // undo damage this console itself does. The work-branch strategy tells
     // every session to check `pe/<slug>` out, so the operator's own tree ends
@@ -178,6 +189,8 @@ test('sanitiseAutomation is the single coercion table', () => {
     // The clock on the ANNOUNCEMENT rather than on a detector — 45 minutes,
     // and one of the two stall numbers that take `cap`: see below.
     stallEscalateMs: 2_700_000,
+    // The sixth signal (phase 13): three identical failing tool calls in a row.
+    stallLoopRun: 3,
     // The boarding schedule is the one OBJECT here, coerced by its own
     // `sanitiseSchedule` beside the rules it has to agree with. Off, with
     // nothing in it: a console that has never set one boards at every hour,
@@ -272,6 +285,7 @@ test('sanitiseAutomation is the single coercion table', () => {
       stallStalemateAttempts: sanitiseAutomation({}).stallStalemateAttempts,
       stallRetryBurst: sanitiseAutomation({}).stallRetryBurst,
       stallExternalWaitMs: sanitiseAutomation({}).stallExternalWaitMs,
+      stallLoopRun: sanitiseAutomation({}).stallLoopRun,
     },
     { ...STALL_DEFAULTS },
   );
@@ -422,7 +436,14 @@ test('every automation preference the loader accepts can also be SET', () => {
     settle: 'keep',
     worktreeSetup: 'npm ci',
     worktreeRoot: 'state',
+    worktreeRetention: 'prune',
+    baseBranch: 'main',
     resumeAtBoot: 'auto',
+    // Phase 15's four launch defaults, each flipped to a legal other word.
+    landing: 'pr',
+    conflictPolicy: 'park',
+    messaging: 'off',
+    issuesMode: 'draft',
   };
   const flipped: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(loaded)) {
@@ -446,4 +467,51 @@ test('every automation preference the loader accepts can also be SET', () => {
   const ignored = Object.keys(flipped).filter((key) => !same(flipped[key], after[key]));
   assert.deepEqual(ignored, [],
     `these preferences load but cannot be set — the writer's list has drifted from the loader's:\n  ${ignored.join('\n  ')}`);
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 7 — the option surface for many plans in one repository.
+ * ------------------------------------------------------------------ */
+
+test('P7: a console that cuts its own branch isolates by DEFAULT, and only silence is overridden', () => {
+  // Decision 13. `queue` stayed the silent state for a `default-branch`
+  // console — nothing there is the console's own branch to isolate — but a
+  // new-branch run's `pe/<slug>` is nobody else's, and a tree of its own is
+  // what lets two plans drive one repository at once.
+  assert.equal(sanitiseAutomation({ gitMode: 'new-branch' }).isolation, 'worktree');
+  assert.equal(sanitiseAutomation({ gitMode: 'default-branch' }).isolation, 'queue');
+  assert.equal(sanitiseAutomation({}).isolation, 'queue');
+
+  // 🔴 An operator who SAID `queue` keeps it. The default answers silence and
+  // nothing else — a setting that overrode a stated choice would be a bug the
+  // operator could only find by watching their runs stop serialising.
+  assert.equal(
+    sanitiseAutomation({ gitMode: 'new-branch', isolation: 'queue' }).isolation, 'queue',
+    'a stated choice outranks the default in the direction that costs less',
+  );
+});
+
+test('P7: the per-repository cap, the retention word and the base branch all have defaults', () => {
+  const shipped = sanitiseAutomation({});
+  assert.equal(shipped.maxConcurrentPerRepo, 3);
+  assert.equal(shipped.worktreeRetention, 'keep-on-failure');
+  assert.equal(shipped.baseBranch, 'origin/HEAD');
+
+  // Coerced by the owner's own functions, never by a local `===` here.
+  assert.equal(sanitiseAutomation({ worktreeRetention: 'ttl:12' }).worktreeRetention, 'ttl:12');
+  assert.equal(
+    sanitiseAutomation({ worktreeRetention: 'ttl:0' }).worktreeRetention, 'keep-on-failure',
+    'an unreadable ttl falls back to the DEFAULT — a typo must never be why a tree was deleted',
+  );
+  assert.equal(sanitiseAutomation({ worktreeRetention: 'delete-it' }).worktreeRetention, 'keep-on-failure');
+
+  // A zero cap would refuse every isolated run while claiming the feature is
+  // on — the same reason `worktreeMaxConcurrent` is `positive`, not `cap`.
+  assert.equal(sanitiseAutomation({ maxConcurrentPerRepo: 0 }).maxConcurrentPerRepo, 3);
+  assert.equal(sanitiseAutomation({ maxConcurrentPerRepo: 5 }).maxConcurrentPerRepo, 5);
+
+  // A non-string base branch reads as no opinion, for the reason
+  // `worktreeSetup` does: a half-coerced value must never reach a git argv.
+  assert.equal(sanitiseAutomation({ baseBranch: 12 } as never).baseBranch, 'origin/HEAD');
+  assert.equal(sanitiseAutomation({ baseBranch: '  release/5.1  ' }).baseBranch, 'release/5.1');
 });

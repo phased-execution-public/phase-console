@@ -26,6 +26,14 @@ pe_outcome()  {                                                "$SYS_BASH" "$PE_
 # phase-tasks.sh is phase-outcome.sh's twin and needs no DOCS_ROOT for the same
 # reason: it writes $PE_TASKS_FILE, or (unsupervised) the console's own inbox.
 pe_tasks()    {                                                "$SYS_BASH" "$PE_SCRIPTS/phase-tasks.sh"       "$@"; }
+# phase-msg.sh is their third sibling and needs no DOCS_ROOT either: it writes
+# $PE_MESSAGES_FILE, or (unsupervised) the console's own inbox for the root it
+# derives the way phase-lock.sh does.
+pe_msg()      {                                                "$SYS_BASH" "$PE_SCRIPTS/phase-msg.sh"         "$@"; }
+# phase-issue.sh is the fourth: it writes $PE_ISSUES_FILE, or (unsupervised) the
+# console's own inbox — but it READS the plan's `**Issues:**` word through
+# phase-graph.sh first, so it does take DOCS_ROOT.
+pe_issue()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" "$SYS_BASH" "$PE_SCRIPTS/phase-issue.sh"       "$@"; }
 # session-hook.sh reads the hook payload on stdin; it needs no DOCS_ROOT either.
 pe_hook()     {                                                "$SYS_BASH" "$PE_SCRIPTS/session-hook.sh"      "$@"; }
 # PE_TODAY keeps closure dates off the wall clock so assertions stay stable.
@@ -42,7 +50,8 @@ pe_close()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TOD
 # happens to run in, so the ambient values are dropped here; a test that wants
 # one sets it itself.
 scrub_pe_env() {
-  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS
+  unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS \
+    PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID
 }
 
 # --- fixtures / scaffolding ---------------------------------------------------

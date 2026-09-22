@@ -92,12 +92,14 @@ const PRE_CHANGE_PHASE_KEYS: Record<string, string> = {
 };
 
 /**
- * Every `plan.*` key. Only four stay in the board projection: the header and the
- * Autopilot tab read `sessionBudget`, and `slug`/`title`/`path` are identity.
+ * Every `plan.*` key. Only five stay in the board projection: the header and the
+ * Autopilot tab read `sessionBudget`, `slug`/`title`/`path` are identity, and
+ * `reviewers` is what the run page's launch form advises from (autopilot-token-drain
+ * P5) — a few hundred bytes, where `sections` it is read out of is 64.7 KB.
  * The rest is the DOCUMENT, and `source-tab.tsx` is its only reader.
  */
 const PRE_CHANGE_PLAN_KEYS: Record<string, string> = {
-  slug: '', title: '', sessionBudget: '', path: '',
+  slug: '', title: '', sessionBudget: '', path: '', reviewers: '',
   provenance: 'document', context: 'document', architecture: 'document', endToEnd: 'document',
   graph: 'document', callouts: 'document', sections: 'document',
   // The `## Decisions` manifest (zero-touch-console P3): Source-tab only.
@@ -489,6 +491,18 @@ test('/api/state carries run summaries, and ?include=runs carries the records th
   const boardKb = KB(board);
   assert.ok(boardKb < 30, `/api/state is ${boardKb.toFixed(1)} KB with one live run — the exit criterion is under 30 KB`);
   assert.ok(fullKb > boardKb * 2, `?include=runs (${fullKb.toFixed(1)} KB) must be materially bigger than the default (${boardKb.toFixed(1)} KB)`);
+});
+
+test('/api/state carries REFUSAL_REASON, the table a surface looks a refused run’s key up in (G-20)', async () => {
+  const { REFUSAL_REASON } = await import('../server/runner/worktree.ts');
+  const board = SVC.state() as { refusalReasons?: Record<string, string> };
+  // The sentences by identity — one table, never a copy that can drift from
+  // the code that decided the refusal.
+  assert.equal(board.refusalReasons, REFUSAL_REASON);
+  assert.ok(Object.keys(REFUSAL_REASON).length >= 10);
+  for (const [key, sentence] of Object.entries(REFUSAL_REASON)) {
+    assert.ok(sentence.length > key.length, `${key} is looked up to a sentence, not to itself`);
+  }
 });
 
 test('a run summary drops transcripts by OMISSION, so a new RunState field rides along', () => {

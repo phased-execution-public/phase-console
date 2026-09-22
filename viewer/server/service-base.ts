@@ -10,7 +10,7 @@
  */
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
-import { execFile, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { census, consumeAutostartOnce, fleetProfile, instanceId, instanceUrl, profileFor, readAutostart } from '../shared/instances.mjs';
@@ -35,12 +35,17 @@ import {
 } from './config.ts';
 import {
   SessionRegistry,
+  claimWindowEnds,
   correlate,
   parseHookPayload,
+  sessionsByAccount,
+  readSessionEvents,
   type ChangeMeta,
   type RegistryChange,
   type RunLink,
+  type SessionEventLine,
   type SessionEventName,
+  presenceOf,
   type SessionRecord,
   type SessionView,
 } from './sessions/registry.ts';
@@ -61,10 +66,11 @@ import {
   type ConvergeTrigger,
   convergeView,
   type ConvergeView,
-  automaticResumes, waitClockPhases, waitClockVerdict, waitHoldWhy, WAIT_OVERDUE_GRACE_MS, evidenceFingerprint } from './converge.ts';
+  automaticResumes, waitClockPhases, waitClockVerdict, waitHoldWhy, WAIT_OVERDUE_GRACE_MS, evidenceFingerprint,
+  lockHeldByLiveRun } from './converge.ts';
 import { evaluateWait, parkedMsOf, RESUME_REFUSED_RECHECK_MS, WAIT_OVERDUE_ANNOUNCE_MS } from './runner/wait-budget.ts';
 import { pollableRefs, probeWatchRef } from './watch-refs.ts';
-import type { ResumeTrigger } from '../shared/run-lifecycle.js';
+import { runEndedBadly, type ResumeTrigger } from '../shared/run-lifecycle.js';
 import { WatchScheduler, type WatchLandingOutcome } from './watch-scheduler.ts';
 import type { WatchState as WatchStateView } from './watch-refs.ts';
 import { runSingleCommand } from './runner/verify.ts';
@@ -161,6 +167,8 @@ import {
   INBOX_ACKS_DIR,
   type InboxAck,
   type InboxFacts,
+  type InboxIssueDraft,
+  type InboxMessage,
   type InboxReach,
   type InboxView,
 } from './inbox.ts';
@@ -186,13 +194,18 @@ import {
 } from './analysis/stats.ts';
 import {
   detachRequestedIn,
+  conflictPolicyOf,
   credentialPolicyFor,
   credentialsFor,
+  gitlinkFor,
+  isolationFor,
+  landFor,
   mcpServersFor,
   personCheckFor,
   type Plan,
   type PhaseDetail,
   type PhaseRow,
+  type Resolved,
 } from './parse/plan.ts';
 import {
   Runner,
@@ -235,7 +248,7 @@ import { credentialsHeld } from './credentials-probe.ts';
 import { asActor, describeActor, doorActor, viaOfTrigger, type StartActor } from './actor.ts';
 import { ceilingSentence, DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR, StartCeiling, type CeilingRefusal, type CeilingVerdict } from './start-ceiling.ts';
 import type { WaitBudget } from './runner/wait-budget.ts';
-import { formatScope, normalizeToken, parseScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
+import { formatScope, normalizeToken, parseScope, repoKeyOf, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE,
   NO_HANDOFF_AUTO_RE,
@@ -248,6 +261,14 @@ import { DELIVERY_ISSUE_ID, deliveryIssue, environmentReport, type EnvIssue } fr
 import { probeDelivery, type DeliveryFacts } from './prelude.ts';
 import { tailscaleStatus } from './tailscale.ts';
 import { CONSOLE_VERSION, Heartbeat, MachineLanes, instancesView, type HeartbeatFacts } from './fleet.ts';
+
+/**
+ * How long `inFlightRuns()` reuses one walk of the store. Short enough that a
+ * run cannot start and finish inside it; long enough that a single admission
+ * scan reads the disk once rather than once per lock.
+ */
+const IN_FLIGHT_RUNS_TTL_MS = 2_000;
+
 import { accessLedger } from './api/access.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
@@ -279,6 +300,7 @@ import {
   newRun,
   phaseRecord,
   pidAlive,
+  processState,
   pidHoldsWork,
   procIdentity,
   pruneRuns,
@@ -322,10 +344,13 @@ import {
   type IsolationPreview,
   type OccupiedTree,
   managedRoots,
+  radarPair,
   worktreeHome,
   worktreesRoot,
+  STAGING_BRANCH,
+  type RunGitView,
 } from './runner/worktree.ts';
-import { reclaimModeOf, WORKTREE_ROOTS } from '../shared/worktree-model.js';
+import { DEFAULT_MAX_PER_REPO, pairKey, reclaimModeOf, WORKTREE_ROOTS } from '../shared/worktree-model.js';
 import { extractCommands, resolveLead, unresolvableLeads, verifyPhase } from './runner/verify.ts';
 import { loadVerifyEnv } from './runner/verify-env.ts';
 import {
@@ -340,7 +365,14 @@ import {
 import { Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir, type AccountView } from './accounts/index.ts';
 import { HEALTH_TTL_MS, Mcp, type McpServerView } from './mcp/index.ts';
 import { IDLE_POLL_MS as ISSUES_SWEEP_MS } from './issues/fetch.ts';
-import { IssuesStore } from './issues/index.ts';
+import {
+  RETENTION_SWEEP_MS,
+  applyRetention,
+  collectRetention,
+  retentionReport,
+  type RetentionReport,
+} from './retention.ts';
+import { IssuesStore, type IssueProvenance } from './issues/index.ts';
 import { pruneMcpConfigs } from './mcp/config.ts';
 import { pruneSettingsFiles, tokenFromSettingsFile, type Approval, type ApprovalEvent } from './runner/approvals.ts';
 import { assertTranscriptLayout, cliVersion, portTranscript } from './accounts/transcripts.ts';
@@ -450,6 +482,16 @@ import type { Presence } from '../shared/run-lifecycle.js';
  * the debris path for one) and a `heartbeat` (the next one repeats it). Every
  * other move is a fact with a reaction behind it and is never dropped.
  */
+/**
+ * A directive the plan actually STATED — a phase bullet or the plan line — or
+ * `undefined` for the vocabulary's default. What lets a run's own word (the
+ * launch form's, phase 15) speak where the plan is silent, without the
+ * runner ever reading the bullets itself.
+ */
+function stated<T extends string>(resolved: Resolved<T>): T | undefined {
+  return resolved.source === 'default' ? undefined : resolved.value;
+}
+
 function droppablePresence(event: RegistryChange): boolean {
   return event === 'prune' || event === 'heartbeat';
 }
@@ -469,6 +511,12 @@ export type SessionPeer = {
   owner: string;
   scope: string[];
   plan: { slug: string; phase: number; strong: boolean } | null;
+  /**
+   * When this peer stops holding the phase (ms epoch): its claim window's end
+   * (`claimWindowEnds`). Absent for a session correlated to the phase itself,
+   * which holds it for as long as it lives.
+   */
+  claimUntil?: number;
 };
 
 /** Why a console boots holding its automation — see `ServiceBase.bootHold`. */
@@ -479,6 +527,29 @@ export type BootHold = {
   by: string;
   why: string;
   marker?: StopMarker;
+};
+
+/** What the Restart button reads before it is pressed — see `ServiceBase.restartReadiness`. */
+export type RestartReadiness = {
+  ok: boolean;
+  reason?: string;
+  supervisor: ReturnType<typeof supervisor>;
+  /** True where nothing supervises: the console re-executes itself rather than relying on a supervisor. */
+  selfRestart?: boolean;
+  busy: boolean;
+  run: { slug: string; status: string; phase?: number } | null;
+  sessions: ReturnType<ServiceBase['sessionInventory']>;
+};
+
+/** What pressing Restart did — see `ServiceBase.restart`. */
+export type RestartOutcome = {
+  ok: boolean;
+  reason?: string;
+  supervisor?: ReturnType<typeof supervisor>;
+  /** The copy is being updated first; the process restarts when the update answers. */
+  updating?: boolean;
+  /** Pressed mid-run: it waits for the live sessions to finish, then updates and restarts. */
+  waiting?: boolean;
 };
 
 /**
@@ -594,6 +665,7 @@ export abstract class ServiceBase {
    * stop.
    */
   private fleetHoldCache: FleetHold | null | undefined;
+
 
   protected mcpRequireTimers = new Map<string, NodeJS.Timeout>();
   /** The MCP health clock — see `startMcpHealthClock`. Replaced on re-open. */
@@ -735,6 +807,23 @@ export abstract class ServiceBase {
     actor: StartActor,
   ): Promise<RunState | null>;
   abstract sessionViews(): SessionView[];
+
+  /**
+   * One session's raw hook payloads, newest-last.
+   *
+   * A read of evidence, not of state: `sessionViews()` answers what is true
+   * now, and this answers how it got that way — the sequence `applyEvent`
+   * folds away. Phase 13's timeline reads it, and so does the run bundle.
+   */
+  sessionEvents(sessionId: string, limit?: number): SessionEventLine[] {
+    try {
+      return readSessionEvents(join(INSTANCE_STATE_DIR, 'sessions'), sessionId, limit);
+    } catch {
+      // Not a session id. An empty list is the honest answer: nothing was
+      // recorded under that name, which is also what a real miss looks like.
+      return [];
+    }
+  }
   abstract startRun(slug: string, options?: Partial<StartOptions>): Promise<RunState>;
   abstract syncRecoveredRun(
     link: { kind: string; slug?: string; phase?: number; runId?: string },
@@ -811,6 +900,33 @@ export abstract class ServiceBase {
    * ever a key here because the store listed it.
    */
   protected rulingsCache = new Map<string, { stamp: string; rulings: Ruling[] }>();
+
+  /**
+   * The issue drafts a person owes a decision on, for the inbox (phase 12),
+   * and which plan filed a number, for the repository page. FREE defaults —
+   * nothing, and nobody — overridden in `ServiceRuns`'s Pro region: the free
+   * tree's inbox draws no draft rows and its estate carries no chip, and the
+   * two call sites (`Service.inbox`, the `IssuesStore` above) compile in both
+   * trees without knowing which one they are in. The rule `messagesBlock`
+   * learned: a name reachable from a shared module must exist in both trees,
+   * and the Pro half is the one that feeds it.
+   */
+  protected inboxIssueDrafts(): InboxIssueDraft[] {
+    return [];
+  }
+
+  /**
+   * The sessions' messages to the OPERATOR, for the inbox (phase 15) — the
+   * same FREE-default / Pro-override arrangement as the drafts above, and for
+   * the same reason: the free tree has no mailbox and draws no message rows.
+   */
+  protected inboxMessages(): InboxMessage[] {
+    return [];
+  }
+
+  protected issueProvenance(_nameWithOwner: string, _number: number): IssueProvenance | undefined {
+    return undefined;
+  }
   protected listeners = new Set<LiveListener>();
   protected repo: GitRepoInfo = { available: false, dirty: [] };
 
@@ -1041,6 +1157,7 @@ export abstract class ServiceBase {
    */
   readonly issues: IssuesStore;
   protected issuesSweepTimer: NodeJS.Timeout | null = null;
+  protected retentionTimer: NodeJS.Timeout | null = null;
 
   /**
    * Presence events raised while this object was still being built.
@@ -1255,7 +1372,9 @@ export abstract class ServiceBase {
       onInfo: (what, detail) => log.info(what, detail),
       // The 30 s poll is what re-applies a real move the construction backlog
       // could not hold (SHD-7) — a deferral, never a drop.
-      onPoll: () => this.applyPresenceReconciliations(),
+      onPoll: () => {
+        this.applyPresenceReconciliations();
+      },
     })
       .load()
       .start();
@@ -1374,6 +1493,9 @@ export abstract class ServiceBase {
     this.machineLanes = new MachineLanes(INSTANCE.id, { name: INSTANCE.name, port: () => this.flags.port });
     this.heartbeat = new Heartbeat(INSTANCE.id, () => this.heartbeatFacts());
     this.scheduler = new Scheduler({
+      // Read per call, like `max` beside it: a flip in Settings takes effect on
+      // the next scan rather than at the next console.
+      maxPerRepo: () => this.prefs.maxConcurrentPerRepo ?? DEFAULT_MAX_PER_REPO,
       max: () => this.flags.maxSessions,
       machine: this.machineLanes,
       // The usage walls, read from the ONE place that persists them. Without
@@ -1430,7 +1552,13 @@ export abstract class ServiceBase {
       etaFor: (slug) => this.etaHint(slug),
       // Presence beats the lease: a lock whose session the registry shows
       // ended stops blocking NOW; a live one is named as live on the queue.
-      presence: (lock) => this.sessions.presenceOfLock(lock),
+      //
+      // Through `lockPresenceFor`, never the raw registry (SCH-3). A LANE's
+      // lock outlives its attempt's session by design — the keepalive rewrites
+      // it every refresh still naming a session that exited — so the raw word
+      // is `ended` for a claim a run is actively holding, and `ended` here is
+      // what stops it blocking and admits a second lane into the same tree.
+      presence: (lock) => this.lockPresenceFor(lock),
       // …and presence speaks with no lock at all (REG-3): a live session in
       // this repository that has not claimed yet is a holder, named.
       peers: (entry) => (this.root?.ok
@@ -1537,6 +1665,9 @@ export abstract class ServiceBase {
     this.issues = new IssuesStore({
       root: () => this.root?.path,
       stateDir: INSTANCE_STATE_DIR,
+      // Which plan filed a number (phase 12) — answered by the Pro half from
+      // the plans' issue ledgers, `undefined` from this base and the free tree.
+      provenance: (nameWithOwner, number) => this.issueProvenance(nameWithOwner, number),
     });
     this.accounts = new Accounts({
       onChange: () => this.emitAccounts(),
@@ -1757,6 +1888,7 @@ export abstract class ServiceBase {
    * skipped: its record is gone, and a lock naming it reads `unknown` and
    * lapses on its lease.
    */
+
   protected applyPresenceReconciliations(): number {
     if (!this.presenceReady || !this.presenceReconcile.size) return 0;
     const pending = [...this.presenceReconcile];
@@ -1781,6 +1913,34 @@ export abstract class ServiceBase {
    * ---------------------------------------------------------------- */
 
   /** The runner for a plan, made on first use. See `runners`. */
+  /**
+   * May the console push this run's `pe/*` branches? The base says no: the
+   * flag and the plan's `permission.destructive` row are the leaf service's
+   * to read (`Service.publishAllowedFor`), and a base that answered yes would
+   * be a base that pushed.
+   */
+  protected publishAllowedFor(_state: RunState, _phase: number): boolean {
+    return false;
+  }
+
+  /**
+   * Does any phase of this plan land by pull request (`Land: pr` or
+   * `trunk`)? The publish carve-out's question (phase 8): such a plan boards
+   * a landing session after each of those phases, and that session's
+   * `gh pr create`/`gh pr merge` must raise a card under every profile. A
+   * plan-wide `Land:` answers for every phase; a phase's own bullet answers
+   * for itself.
+   */
+  protected planPublishes(slug: string): boolean {
+    const plan = this.store?.get(slug)?.plan;
+    if (!plan) return false;
+    const lands = (phase?: number): boolean => {
+      const word = landFor(plan, phase).value;
+      return word === 'pr' || word === 'trunk';
+    };
+    return lands() || Object.keys(plan.phases).some((n) => lands(Number(n)));
+  }
+
   runnerFor(slug: string): Runner {
     const existing = this.runners.get(slug);
     if (existing) return existing;
@@ -1840,6 +2000,20 @@ export abstract class ServiceBase {
    * that may have been killed since, and this is the only thing that says
    * whether anything is behind it.
    */
+  /**
+   * Clash zones by pair key — the ONE thing the radar tells the free half.
+   *
+   * 🔴 A map rather than a call, and that is the whole point of it. The radar
+   * is Pro and the inbox is free, so a free module calling into the Pro one is
+   * a free tree that will not load — the lesson `messagesBlock` taught in
+   * phase 10, restated: a helper a free module reaches must be FREE, and the
+   * Pro half must be the thing that FEEDS it. This map is always here and is
+   * simply always empty in the free tree, so the reader needs no branch and
+   * the free build needs no override.
+   */
+  protected readonly radarZones = new Map<string, string[]>();
+
+
   protected liveRunIds(): Set<string> {
     const ids = new Set<string>();
     for (const runner of this.liveRunners()) {
@@ -1890,6 +2064,13 @@ export abstract class ServiceBase {
               (child) => child.pid,
             ),
           probe: (pid) => pidHoldsWork(pid),
+          // The same two answers the runner's own sweep gives (phase 15):
+          // each dead run's own retention word, else the console's — and
+          // whether it ended badly, which `keep-on-failure` asks. The boot
+          // sweep passed neither before, so it read every run as clean and
+          // every word as the shipped default.
+          retention: (runId) => loadRun(root, record.slug, runId)?.worktreeRetention ?? this.prefs.worktreeRetention,
+          failed: (runId) => runEndedBadly(loadRun(root, record.slug, runId)),
         });
         if (result.removed.length || result.kept.length) {
           log.info('run.worktrees-swept', {
@@ -2033,16 +2214,79 @@ export abstract class ServiceBase {
    */
   protected sweepOldRuns(): void {
     if (!this.root?.ok) return;
+    const policy = loadPrefs().retention;
     const keep = this.liveRunIds();
     let removed = 0;
     for (const record of this.store?.list() ?? []) {
       try {
-        removed += pruneRuns(this.root.path, record.slug, keep).length;
+        removed += pruneRuns(
+          this.root.path,
+          record.slug,
+          keep,
+          Date.now(),
+          policy.runRetainDays * 24 * 60 * 60_000,
+          policy.runRetainMin,
+        ).length;
       } catch {
         /* one unreadable plan directory must not stop the sweep */
       }
     }
     if (removed) log.info('run.records-swept', { runs: removed, kept: keep.size });
+  }
+
+  /**
+   * What the retention table would do right now, and what it found.
+   *
+   * The scan is shared by the sweep and by `GET /api/debug/retention`, so the
+   * card an operator reads and the work the console does are the same list —
+   * a card computed a second way is a card that is eventually wrong about the
+   * thing it exists to promise.
+   */
+  retentionNow(): RetentionReport {
+    const live: Record<string, string[]> = {};
+    for (const runner of this.liveRunners()) {
+      const current = runner.current();
+      if (!current) continue;
+      (live[current.slug] ??= []).push(current.id);
+    }
+    return retentionReport(
+      collectRetention({
+        instanceDir: INSTANCE_STATE_DIR,
+        runsDir: this.root?.ok ? consoleRunsDir(this.root.path) : null,
+        live,
+      }),
+      loadPrefs().retention,
+      Date.now(),
+    );
+  }
+
+  /**
+   * Sweep every sink, then again once a day.
+   *
+   * After `sweepOldRuns`, never before: `pruneRuns` is what decides a run is
+   * gone, and the global byte cap here is a floor UNDER that decision rather
+   * than a second opinion about it. Running the cap first would delete the
+   * sidecars of runs the per-plan rule was about to keep.
+   *
+   * `unref`'d like every other clock here, and daily rather than hourly
+   * because nothing in the table moves faster than that: the two sinks that
+   * can grow quickly (the supervisor's stdio, the console log) are bounded by
+   * size, and a size bound crossed at noon costs one day of a bigger file, not
+   * a full disk.
+   */
+  protected startRetentionClock(): void {
+    if (this.retentionTimer) clearInterval(this.retentionTimer);
+    const tick = (): void => {
+      if (this.fleetHold()) return;
+      try {
+        applyRetention(this.retentionNow().actions);
+      } catch (error) {
+        log.warn('retention.failed', { error: (error as Error).message });
+      }
+    };
+    this.retentionTimer = setInterval(tick, RETENTION_SWEEP_MS);
+    this.retentionTimer.unref?.();
+    tick();
   }
 
   /**
@@ -2262,7 +2506,10 @@ export abstract class ServiceBase {
         unit: row.sources.unit, autostart: row.autostart, stopMarker: row.stopMarker,
         lastSeenAt: row.lastSeenAt, stoppedAt: row.stoppedAt,
       }));
-    return { delivery: { ok: delivery.ok, reason: delivery.reason }, unread: this.notifications.unread(), remote, siblings };
+    const facts: NonNullable<InboxFacts['fleet']> = {
+      delivery: { ok: delivery.ok, reason: delivery.reason }, unread: this.notifications.unread(), remote, siblings,
+    };
+    return facts;
   }
 
   /** `GET /api/instances` — the machine's census, the same report `phase-console list --json` prints. */
@@ -2406,9 +2653,34 @@ export abstract class ServiceBase {
    * `unknown` means in `sessions/registry.ts`.
    */
   protected lockPresenceFor(lock: { owner: string; session?: string }): Presence {
-    const runId = autopilotRunId(lock.owner);
-    if (runId && this.liveRunIds().has(runId)) return 'unknown';
+    // `liveRunIds()` alone answered only for THIS console's runners, so every
+    // lane of every other console on the same root fell through to the registry
+    // — and got `ended`, because a lane's lock outlives its attempt's session.
+    // Two consoles on one root therefore released each other's live claims
+    // (S5-a). The run FILE settles it, through `runIsDead`, so both consoles
+    // reach the same verdict from the same evidence.
+    if (lockHeldByLiveRun(lock.owner, this.liveRunIds(), this.inFlightRuns())) return 'unknown';
     return this.sessions.presenceOfLock(lock);
+  }
+
+  /**
+   * The runs that could still be holding a lane's lock — including other
+   * consoles' — memoised for a beat.
+   *
+   * `lockPresenceFor` is called in loops (every lock, every admission scan,
+   * every converge pass), and this walks the store. The window is short enough
+   * that a run cannot start and finish inside it and long enough that one scan
+   * reads the disk once.
+   */
+  private inFlightRunsMemo: { at: number; runs: RunState[] } | null = null;
+  protected inFlightRuns(): RunState[] {
+    const now = Date.now();
+    if (this.inFlightRunsMemo && now - this.inFlightRunsMemo.at <= IN_FLIGHT_RUNS_TTL_MS) {
+      return this.inFlightRunsMemo.runs;
+    }
+    const runs = this.watchableRuns().map(({ state }) => state);
+    this.inFlightRunsMemo = { at: now, runs };
+    return runs;
   }
 
   /**
@@ -2623,8 +2895,13 @@ export abstract class ServiceBase {
    * a session strongly correlated to a DIFFERENT phase (its lock does), one
    * whose lock on THIS phase names it (the lock is the holder), probes, the
    * sessions named in `excluding`, and a session whose inferred scope is
-   * disjoint from the phase's. What remains — uncorrelated, or correlated to
-   * this phase with no lock — is a peer.
+   * disjoint from the phase's. What remains is a peer: a session correlated to
+   * this phase with no lock, for as long as it lives; any other only inside its
+   * claim window (`PEER_CLAIM_WINDOW_MS` after its newest start, reported as
+   * `claimUntil`). That window is the whole of the case: a session that is
+   * going to work a phase claims it, so one that started long ago and claimed
+   * nothing is not about to — without the bound, every terminal a person left
+   * open in the root held every phase in the repository.
    */
   peersInRepository(
     root: string,
@@ -2662,6 +2939,11 @@ export abstract class ServiceBase {
       })), now, runs) ?? null;
       if (plan && phase && plan.strong && (plan.slug !== phase.slug || plan.phase !== phase.phase)) continue;
       if (phase && locks.some((lock) => lock.slug === phase.slug && lock.phase === phase.phase && lock.session === record.sessionId)) continue;
+      // Working THIS phase (strongly or weakly): a peer while it lives. Anything
+      // else might be about to claim it only until its claim window shuts.
+      const onThisPhase = Boolean(plan && phase && plan.slug === phase.slug && plan.phase === phase.phase);
+      const claimUntil = onThisPhase ? null : claimWindowEnds(record);
+      if (claimUntil != null && now >= claimUntil) continue;
       const peerScope = this.scopeOfSession(record, root);
       if (!scopesIntersect(peerScope, wanted)) continue;
       out.push({
@@ -2673,6 +2955,7 @@ export abstract class ServiceBase {
         owner: record.owner ?? (record.user && record.host ? `${record.user}@${record.host}` : 'a Claude session'),
         scope: peerScope,
         plan,
+        ...(claimUntil != null ? { claimUntil } : {}),
       });
     }
     return out;
@@ -2859,6 +3142,42 @@ export abstract class ServiceBase {
       // prose is read only to WARN on a mismatch, the title names the PR.
       planBranch: (slug) => this.store?.get(slug)?.plan?.sessionBudget.branch,
       planWorktrees: (slug) => this.store?.get(slug)?.plan?.sessionBudget.worktrees,
+      // The plan's own base branch, unresolved: `resolveBase` turns the word
+      // into a commit, and only the runner knows which repository to ask.
+      planBaseBranch: (slug) => this.store?.get(slug)?.plan?.sessionBudget.baseBranch,
+      // Through the parser's own resolver, never a second read of the bullet:
+      // one reading, so the console cannot draw one answer and act on another.
+      planIsolation: (slug, phase) => isolationFor(this.store?.get(slug)?.plan, phase)?.value,
+      // The landing words (many-plans-one-repo phase 8), through the parser's
+      // resolvers — the same reading `phase-graph.sh --land/--gitlink/
+      // --conflict-policy` gives, held to it by `engine-parity.test.ts`.
+      // `landing` and `conflictPolicy` answer only what the PLAN said (a phase
+      // bullet or the plan line), never the vocabulary's default: silence is
+      // what lets the run's own word speak (phase 15 — `RunState.landing` /
+      // `conflictPolicy`), and the runner reads the default after both.
+      planLand: (slug, phase) => stated(landFor(this.store?.get(slug)?.plan, phase)),
+      planGitlink: (slug, phase) => gitlinkFor(this.store?.get(slug)?.plan, phase).value,
+      planConflictPolicy: (slug) => stated(conflictPolicyOf(this.store?.get(slug)?.plan)),
+      planPublishes: (slug) => this.planPublishes(slug),
+      // May the console push THIS run's branches: `--allow-publish` AND the
+      // plan's `permission.destructive` row naming `git push` (the leaf
+      // service answers; the base knows neither the flag's meaning nor the row).
+      publishAllowed: (state, phase) => this.publishAllowedFor(state, phase),
+      // The phases whose gate reads `pr-merged <phase>` / `landed <phase>`,
+      // and the graph's `Depends on` — both off the parsed plan.
+      landingDependents: (slug, phase) => {
+        const plan = this.store?.get(slug)?.plan;
+        if (!plan) return [];
+        const re = new RegExp(`^(?:pr-merged|landed)\\s+${phase}(?:\\s|$)`, 'i');
+        return Object.values(plan.phases)
+          .filter((detail) => re.test((detail.gateCheck ?? '').trim()))
+          .map((detail) => detail.phase)
+          .filter((p): p is number => Number.isInteger(p));
+      },
+      phaseDependencies: (slug, phase) => {
+        const row = this.store?.get(slug)?.plan?.graph.find((r) => r.phase === phase);
+        return row ? [...row.dependsOn] : [];
+      },
       // Every Repos cell of the plan, through the SAME reading admission uses.
       // A second parse of that column is how the console comes to draw one
       // answer while the scheduler acts on another.
@@ -2874,6 +3193,9 @@ export abstract class ServiceBase {
         // lands on the next drive rather than at the next console.
         reclaim: this.prefs.isolationReclaim,
         deleteMergedBranches: this.prefs.deleteMergedRunBranches,
+        maxPerRepo: this.prefs.maxConcurrentPerRepo,
+        retention: this.prefs.worktreeRetention,
+        baseBranch: this.prefs.baseBranch,
       }),
       // Does any phase of this run ask to leave the run branch? Off the parsed
       // plan the store already holds — the same source `verifyIn` is answered
@@ -2892,6 +3214,15 @@ export abstract class ServiceBase {
       // the same lapse clock and the same presence answer, so what admission
       // treats as a live holder the reclaim treats as an occupied tree.
       occupiedTrees: (scope) => this.occupiedTrees(scope),
+      // Every run this console is driving right now, across every plan — the
+      // question a Runner cannot ask, because it sees only its own (SWP-2).
+      // `inFlightRuns()` is folded in beside the live loops for the same reason
+      // `lockPresenceFor` reads it: a run between phases holds its checkout and
+      // is not behind a live loop at that instant.
+      liveRunIds: () => new Set([...this.liveRunIds(), ...this.inFlightRuns().map((run) => run.id)]),
+      // Every plan in the library, so `runBranches` can tell a lane branch from
+      // another PLAN's run branch before deleting it (SWP-1).
+      knownSlugs: () => (this.store?.list() ?? []).map((record) => record.slug),
       // Runs this process is genuinely DRIVING, not statuses on disk: a
       // `running` run whose console was killed holds no checkout this cap
       // should count against a live one. Its tree is the boot sweep's business.
@@ -2961,6 +3292,15 @@ export abstract class ServiceBase {
       // remembers the wall on the account and tells the operator which one.
       accountEnv: (accountId, trustRoots) => this.accounts.envFor(accountId, trustRoots),
       pickAccount: (excluding, forModel) => this.accounts.pickAccount(excluding, forModel),
+      // Who else is spending each account: the presence registry's live
+      // sessions, matched by the config dir their hook reported. A token
+      // account's credential is not its dir, so it names no sessions.
+      nonRunSessions: () => sessionsByAccount(
+        this.sessions.views(),
+        this.accounts.accountIds()
+          .filter((id) => this.accounts.meta(id)?.kind !== 'token')
+          .map((id) => ({ accountId: id, configDir: this.accounts.configDirFor(id) })),
+      ),
       // The resource ladder: the ranked candidates the auth preflight probes
       // one by one, and the three knobs, read live from prefs so Settings
       // applies to the next wall rather than the next run.
@@ -2979,6 +3319,7 @@ export abstract class ServiceBase {
         // Forwarded at last: without it the runner always read the shipped 45
         // minutes, whatever Settings said.
         stallLocalJobMs: this.prefs.stallLocalJobMs,
+        stallLoopRun: this.prefs.stallLoopRun,
       }),
       // The watchdog's own park, switchable off (SLF-9, KNOWN-SINCE).
       stallAutomaticPark: () => this.prefs.stallAutomaticPark !== false,
@@ -3794,6 +4135,10 @@ export abstract class ServiceBase {
     this.recoverApprovals();
     this.sweepRunSecrets();
     this.sweepOldRuns();
+    // Every OTHER sink, after the run records and never before them: the global
+    // byte cap is a floor under `pruneRuns`'s per-plan decision, not a second
+    // opinion about it.
+    this.startRetentionClock();
     // The health cache is empty in a fresh process, so every server reads
     // `unknown` until something asks — and the only thing that asked was an
     // operator opening the MCP page. A console driving unattended runs never
@@ -4230,9 +4575,10 @@ export abstract class ServiceBase {
   } {
     const hold = this.fleetHold();
     // `frozen` is THIS console's own freeze, the console tier's word; a machine
-    // hold is carried beside it, never folded into it — a held console's live
-    // sessions are still running, and the banner must not say otherwise.
-    const own = hold && hold.scope !== 'machine' ? hold : null;
+    // hold (and a restart's) is carried beside it, never folded into it — a held
+    // console's live sessions are still running, and the banner must not say
+    // otherwise. Only the console's own marker has no scope.
+    const own = hold && !hold.scope ? hold : null;
     const state: ReturnType<ServiceBase['fleetState']> = { frozen: Boolean(own), at: own?.at ?? null, by: own?.by ?? null };
     return state;
   }
@@ -4561,6 +4907,8 @@ export abstract class ServiceBase {
     this.mcpHealthTimer = null;
     if (this.issuesSweepTimer) clearInterval(this.issuesSweepTimer);
     this.issuesSweepTimer = null;
+    if (this.retentionTimer) clearInterval(this.retentionTimer);
+    this.retentionTimer = null;
     this.converger.close();
     this.watchClock.close();
     this.watcher.stop();
@@ -4623,16 +4971,13 @@ export abstract class ServiceBase {
    * pressed. Two independent reasons it may refuse, and they read differently:
    * a run in flight is "not now", an unsupervised process is "not from here".
    */
-  restartReadiness(): {
-    ok: boolean;
-    reason?: string;
-    supervisor: ReturnType<typeof supervisor>;
-    /** True where nothing supervises: the console re-executes itself rather than relying on a supervisor. */
-    selfRestart?: boolean;
-    busy: boolean;
-    run: { slug: string; status: string; phase?: number } | null;
-    sessions: ReturnType<Service['sessionInventory']>;
-  } {
+  restartReadiness(): RestartReadiness {
+    const readiness = this.restartGate();
+    return readiness;
+  }
+
+  /** The two refusals — "not now" and "not from here" — or the go-ahead. */
+  private restartGate(): RestartReadiness {
     // Restart used to kill every pty — `shutdown()` calls `service.close()` —
     // and never said so. Since Phase 7 the ptys belong to a broker that
     // outlives this process, so the inventory rides along to say what SURVIVES
@@ -4810,7 +5155,11 @@ export abstract class ServiceBase {
         if (record.plan?.closed) continue;
         let outcomes = 0;
         try {
-          outcomes = readdirSync(outcomeInboxDir(root, record.slug)).filter((name) => /^phase-\d{2,}\.json$/.test(name)).length;
+          // `inboxOutcomePhase` is the one reader of the name shape — a second
+          // regex spelled here would have missed every stamped name the moment
+          // S9-a added one, and the inbox depth would have read 0 with a
+          // backlog sitting in it.
+          outcomes = readdirSync(outcomeInboxDir(root, record.slug)).filter((name) => inboxOutcomePhase(name) !== null).length;
         } catch { outcomes = 0; }
         inventory.inboxDepth.outcomes += outcomes;
         if (this.liveRunner(record.slug)) continue;
@@ -5069,25 +5418,32 @@ export abstract class ServiceBase {
    * something a flag should be able to talk you into.
    */
   restart(
-    who: Actor | string,
-    force = false,
-  ): { ok: boolean; reason?: string; supervisor?: ReturnType<typeof supervisor> } {
+    who: Actor | string, force = false, options: { update?: boolean; whenIdle?: boolean } = {},
+  ): RestartOutcome {
     const actor = asActor(who, 'Service.restart');
     const readiness = this.restartReadiness();
     if (!readiness.ok && (readiness.busy || !force)) {
       return { ok: false, reason: readiness.reason, supervisor: readiness.supervisor };
     }
-    log.warn('restart.requested', { ...actor, supervisor: readiness.supervisor.kind, force });
+    return this.carryOutRestart(actor, readiness.supervisor, force);
+  }
+
+  /** The exit itself: logged, announced, and handed to the registered restarter. */
+  private carryOutRestart(
+    actor: Actor, supervision: ReturnType<typeof supervisor>, force: boolean, note?: string,
+  ): RestartOutcome {
+    log.warn('restart.requested', { ...actor, supervisor: supervision.kind, force });
     this.announce('health', {
       title: 'Phase Console is restarting',
-      body: `${describeActor(actor)} · ${readiness.supervisor.detail}`,
+      body: `${describeActor(actor)} · ${note ? `${note} · ` : ''}${supervision.detail}`,
       tag: tagFor('health', 'restart', String(Date.now())),
     });
     if (!requestRestart(`restart (${actor.by} via ${actor.via} from ${actor.origin})`)) {
       return { ok: false, reason: 'this build has no restart verb registered — restart it by hand' };
     }
-    return { ok: true, supervisor: readiness.supervisor };
+    return { ok: true, supervisor: supervision };
   }
+
 
   markNotificationsRead(ids?: string[] | null): { changed: number; unread: number } {
     const changed = this.notifications.markRead(ids);

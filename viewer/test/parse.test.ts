@@ -6,7 +6,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseFrontMatter, fmString, fmList, fmPhaseList, scalar } from '../server/parse/frontmatter.ts';
-import { parsePlan, parseDependsOn, detachRequestedIn } from '../server/parse/plan.ts';
+import {
+  parsePlan, parseDependsOn, detachRequestedIn,
+  landFor, isolationFor, issuesFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
+} from '../server/parse/plan.ts';
 import { parseHandoff, parseHandoffFilename, normaliseStatus } from '../server/parse/handoff.ts';
 import { parseIndex, parseTestStatus, parseLock } from '../server/parse/folder.ts';
 import { labelledBullets, sections, fences } from '../server/parse/markdown.ts';
@@ -710,4 +713,104 @@ test('detachRequestedIn is the run-level Checkout question, scoped to onlyPhases
   assert.equal(asks('- **Checkout:** main', [1]), false, 'scoped out: the bullet is on phase 2');
   assert.equal(asks('- **Checkout:** main', [2]), true);
   assert.equal(asks('- **Checkout:** main', []), true, 'an empty scope means every phase counts');
+});
+
+/* ------------------------------------------------------------------ *
+ * Where the work happens and where it lands (5.1.0)
+ * ------------------------------------------------------------------ */
+
+/** A two-phase plan with a §Session budget line and a phase-2 bullet, either optional. */
+const directivePlan = (planLine: string, phaseBullet: string) => parsePlan(
+  '---\nslug: d\n---\n\n# D\n\n## Session budget\n'
+  + '**Target model:** `claude-opus-5`\n' + (planLine ? planLine + '\n' : '')
+  + '\n## Phase graph\n\n'
+  + '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |\n'
+  + '|------:|-------|-----------|--------------------|-------|---------------|\n'
+  + '| 1 | One | — | — | api | done |\n'
+  + '| 2 | Two | 1 | — | api | done |\n\n'
+  + '## Phases\n\n### Phase 1 — One\n- **Goal:** g.\n\n'
+  + '### Phase 2 — Two\n- **Goal:** g.\n' + (phaseBullet ? phaseBullet + '\n' : ''),
+  'd', '/tmp/d.md',
+);
+
+test('the landing directives resolve phase over plan over default, and SAY which', () => {
+  const land = (planLine: string, bullet: string) => {
+    const r = landFor(directivePlan(planLine, bullet), 2);
+    return `${r.value}/${r.source}`;
+  };
+
+  assert.equal(land('', ''), 'hold/default', 'a plan that says nothing lands nothing, and says it is a default');
+  assert.equal(land('**Landing:** pr', ''), 'pr/plan');
+  assert.equal(land('', '- **Land:** trunk'), 'trunk/phase', 'a bullet with no plan line behind it is still the phase');
+  assert.equal(land('**Landing:** pr', '- **Land:** integrate'), 'integrate/phase', 'the bullet wins');
+  // The word AGREEING with the plan does not make it the plan's: a phase that
+  // states its policy has stated it, and the console shows the two differently.
+  assert.equal(land('**Landing:** pr', '- **Land:** pr'), 'pr/phase');
+  // A sibling does not inherit phase 2's bullet.
+  assert.equal(
+    `${landFor(directivePlan('', '- **Land:** trunk'), 1).value}`, 'hold',
+    'phase 1 has no bullet and the plan has no line',
+  );
+
+  // The plan-wide label is `Landing` and the phase's is `Land`; neither reads
+  // the other's spelling, which is what keeps "the policy for this plan" and
+  // "what THIS phase does" from quietly becoming one field.
+  assert.equal(land('**Land:** pr', ''), 'hold/default', 'the plan-wide label is Landing, not Land');
+  assert.equal(land('', '- **Landing:** pr'), 'hold/default', "the phase's label is Land, not Landing");
+});
+
+test('an unrecognised directive word falls THROUGH rather than being adopted', () => {
+  // The fail-safe direction, and the reason lint F27 exists: a reader that
+  // coerced `sometimes` to the default would be right about the behaviour and
+  // silent about the typo, so `Land: prr` would behave exactly like a plan
+  // that had never mentioned landing and nothing would ever say so.
+  const r = landFor(directivePlan('**Landing:** pr', '- **Land:** sometimes'), 2);
+  assert.deepEqual(r, { value: 'pr', source: 'plan' }, 'the phase said nothing readable, so the plan answers');
+  const both = landFor(directivePlan('**Landing:** whenever', '- **Land:** sometimes'), 2);
+  assert.deepEqual(both, { value: 'hold', source: 'default' }, 'neither level said a word, so neither is credited');
+});
+
+test('isolation is the one directive with no default — silence is an answer', () => {
+  // A phase that says nothing inherits the RUN, and the run is not in the
+  // plan. Answering `shared` here would be the parser deciding a question the
+  // operator owns, and would make a run-level `worktree` setting unreachable
+  // on every plan ever written.
+  assert.equal(isolationFor(directivePlan('', ''), 2), undefined);
+  assert.deepEqual(isolationFor(directivePlan('', '- **Isolation:** worktree'), 2), { value: 'worktree', source: 'phase' });
+  assert.deepEqual(isolationFor(directivePlan('**Isolation:** shared', ''), 2), { value: 'shared', source: 'plan' });
+});
+
+test('the plan-wide directives are plan-wide — a phase bullet cannot answer them', () => {
+  // `Messaging` off for the run with one phase claiming `on`: honouring the
+  // bullet would let one phase switch on a transport the plan turned off for
+  // everybody, which is a decision about the run and not about the phase.
+  const plan = directivePlan('**Messaging:** off', '- **Messaging:** on');
+  assert.deepEqual(messagingOf(plan), { value: 'off', source: 'plan' });
+  assert.deepEqual(messagingOf(directivePlan('', '')), { value: 'on', source: 'default' });
+  assert.deepEqual(conflictPolicyOf(directivePlan('**Conflicts:** rebase-session', '')), { value: 'rebase-session', source: 'plan' });
+  assert.deepEqual(conflictPolicyOf(directivePlan('', '')), { value: 'halt', source: 'default' });
+});
+
+test('the base branch is a ref, not a vocabulary — the slash and the dot survive', () => {
+  assert.deepEqual(baseBranchOf(directivePlan('**Base branch:** release/5.1', '')), { value: 'release/5.1', source: 'plan' });
+  assert.deepEqual(baseBranchOf(directivePlan('**Base branch:** `head`', '')), { value: 'head', source: 'plan' }, 'backticks are stripped');
+  assert.deepEqual(baseBranchOf(directivePlan('', '')), { value: 'origin/HEAD', source: 'default' });
+  // Two WORDS are special and every other value is a ref passed through whole,
+  // so an unknown value is not a fall-through here the way a policy word is.
+  assert.deepEqual(baseBranchOf(directivePlan('**Base branch:** feature/whatever-42', '')), { value: 'feature/whatever-42', source: 'plan' });
+});
+
+test('clash zones are the backticked paths, deduped, and an empty list is not a null', () => {
+  assert.deepEqual(clashZonesOf(directivePlan('**Clash zones:** `a/`, `b.ts`, `a/`', '')), ['a/', 'b.ts']);
+  assert.deepEqual(clashZonesOf(directivePlan('', '')), [], 'a plan that named none and a plan with none are one instruction');
+  assert.deepEqual(clashZonesOf(directivePlan('**Clash zones:** none, really', '')), [],
+    'unbackticked prose names no path — the same harvest the MCP and Credentials lines use');
+});
+
+test('the issues directive narrows per phase, and defaults to off', () => {
+  const issues = (planLine: string, bullet: string) => issuesFor(directivePlan(planLine, bullet), 2);
+  assert.deepEqual(issues('', ''), { value: 'off', source: 'default' }, 'an outward write is never a default');
+  assert.deepEqual(issues('**Issues:** file', ''), { value: 'file', source: 'plan' });
+  assert.deepEqual(issues('**Issues:** file', '- **Issues:** draft'), { value: 'draft', source: 'phase' });
+  assert.deepEqual(issues('**Issues:** file', '- **Issues:** off'), { value: 'off', source: 'phase' });
 });

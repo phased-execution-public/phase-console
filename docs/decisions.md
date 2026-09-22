@@ -19,12 +19,13 @@ A plan's `## Decisions` section holds one row per **key** of a closed vocabulary
 | `waits` | | dev-lead | outstanding | yes | plan | to be bounded before phase 6 |
 | `qa.exhausted` | QA is off on this plan | operator | waived | no | plan | decision 4 |
 
-The seventeen keys, and what each answers:
+The eighteen keys, and what each answers:
 
 | key | what it decides |
 |---|---|
 | `permission.policy` | this plan's ask / deny / allow overlay, and whether an `ask` means a real tap |
 | `permission.destructive` | publishing and destructive verbs: `deny`, with named per-phase exceptions — a clause beginning with `allow` naming backticked rules (`` deny; allow `Bash(gh pr create:*)` ``) is the one thing that lets auto-grant answer a publishing ask (`git push`, `gh pr create`), and each such grant is announced |
+| `issues` | whether a session may open an issue for a defect it finds OUTSIDE its phase: `off` (it may not ask — the default, because an outward write on somebody's repository is never one), `draft` (it writes a draft, the console holds it in the inbox and a person approves), `file` (it files at once). Budgeted three per phase and ten per run, and filed through one allow-listed `gh` writer under `--allow-publish` — the cap is what turns four reports of one broken lock into the one issue a person can act on |
 | `credentials` | the credential ids every phase needs, and whether a missing one refuses the phase (`require`) or runs it and reports (`continue`) |
 | `accounts` | which Claude accounts may spend, in order, and the minimum five-hour headroom each must show |
 | `mcp` | the MCP servers, and what happens when one will not connect |
@@ -109,7 +110,7 @@ asks for it.
 Since 5.0.0 the console reads the manifest at the run door, not mid-run. `Service.startRun` runs the
 **prelude** (`viewer/server/prelude.ts`): the rows as they hold (plan, twin, and for a plan with no
 `## Decisions` a row synthesised as `answered` from the run's own fields and the policy defaults —
-never `outstanding`), then four probes, each over the console's own facts and never over a secret's
+never `outstanding`), then five probes, each over the console's own facts and never over a secret's
 value:
 
 | Probe | What it checks | When it refuses |
@@ -117,6 +118,7 @@ value:
 | **accounts** | every declared account's registration, sign-in, entitlement and five-hour headroom against its `minHeadroomPct`. With no accounts on the form and no `**Accounts:**` clause, the run may spend the machine login alone — `[{id: default, minHeadroomPct: 0}]`, the headroom verdict's own wall still applying | only when every declared account is unusable; one usable account starts the run, the rest are warnings |
 | **mcp** | `Mcp.preflight` over the plan's servers and the run's | only under `require` |
 | **credentials** | the plan's ids, by presence: `gh`, `claude`/`claude-login`, `env:NAME`, `keychain:SERVICE`, `file:PATH` | only under `require`; an id nobody can probe is `skip`, never a refusal |
+| **verification** | every open phase's §Verification, through the same review boarding asks (`runner/verify-review.ts`): what the runner will run, what it will not and why, under the phase's Person-check and the draft's answers (`verifyAnswers` — exact commands approved by fingerprint, `<phase>:<fp>` fragments waived) | when a phase in the run's scope would PARK on a named command or fragment (`Person-check: halt`) or ALWAYS ask (`halt-on-everything`), under the `verification.person-check` row, until each is approved (only where an approval can make it run) or waived; a park with nothing to name, a Setup refusal, a missing binary and a phase outside the scope are warnings |
 | **delivery** | a channel an unattended run can announce on: a subscribed device; a notifier — `PHASE_CONSOLE_NOTIFY`, else the machine profile's `notifyCommand` (`~/.config/phase-console/fleet.json`, this console's override first); or a webhook, the profile's `webhooks[]` rows counting beside this console's own. With `--remote`, Tailscale must also be running and serving our port | when there is no channel, unless the start acknowledges it |
 
 A probe that could not run answers `skip` and refuses nothing.
@@ -239,7 +241,7 @@ scripts/phase-outcome.sh <slug> <N> blocked --needs credentials --reason "no dep
 scripts/phase-outcome.sh <slug> <N> needs-human --needs gates --reason "the release gate wants a person"
 ```
 
-The key is one of the seventeen, or a blocker class as its short form — `credential`, `permission`,
+The key is one of the eighteen, or a blocker class as its short form — `credential`, `permission`,
 `gate`, `external`, `lock`. The runner reads it **before** the prose: `--needs credential` classifies
 as a credential block whatever the sentence says, and a block whose key the manifest lacks is a
 defect report rather than an errand. `--rule` and `--command` structure a permission block beside it.

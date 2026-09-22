@@ -91,6 +91,7 @@ const RUN_FIELDS = [
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
+  'verifyAnswers',
   'model',
   'effort',
   'autonomy',
@@ -103,6 +104,16 @@ const RUN_FIELDS = [
   'openPr',
   'isolation',
   'settle',
+  // Phase 15's seven, in the order the form draws them: the three that ride
+  // with the branch and the checkout, the two of the landing, the two of what
+  // a session may say and file.
+  'baseBranch',
+  'maxConcurrentPerRepo',
+  'worktreeRetention',
+  'landing',
+  'conflictPolicy',
+  'messaging',
+  'issuesMode',
   'priority',
   'startAfter',
   'reviewEachPhase',
@@ -147,6 +158,7 @@ const PRELUDE_FIELDS = [
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
+  'verifyAnswers',
 ] as const;
 
 const LIVE_FIELDS = RUN_FIELDS.filter(
@@ -164,6 +176,7 @@ const PHASE_FIELDS = [
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
+  'verifyAnswers',
   'model',
   'effort',
   'accountId',
@@ -207,6 +220,16 @@ export const MODES: Readonly<Record<RunSetupMode, ModeSpec>> = Object.freeze({
       'openPr',
       'isolation',
       'settle',
+      // Phase 15: the three console defaults phase 7 stored with no control,
+      // and the four launch defaults — every one an opening value a launch
+      // can still override for itself, like the six above.
+      'baseBranch',
+      'maxConcurrentPerRepo',
+      'worktreeRetention',
+      'landing',
+      'conflictPolicy',
+      'messaging',
+      'issuesMode',
       'reviewEachPhase',
       'reviewerPolicy',
       'autoRecover',
@@ -406,6 +429,29 @@ export function buildRunPayload(
   // these fields existed.
   if (on('priority')) payload.priority = values.priority;
   if (on('startAfter')) payload.startAfter = values.startAfter.trim();
+  // Phase 15's seven. The four WORDS and the retention word are sent whenever
+  // their control is shown, for `priority`'s reason: `hold`, `halt`, `on` and
+  // `off` are answers, and on a live run an omitted field is "leave it alone",
+  // so a form that dropped a default could turn a run to `pr` and never take
+  // it back. The ref and the cap are the exceptions, and each way round for a
+  // reason: on a START an empty ref or cap is an omission (the plan's line,
+  // the console's preference or the fresh cut decides), while on a LIVE run
+  // the operator must be able to CLEAR the run's word — `''` and `null` are
+  // how the settings door reads "take it off" (`applySettings`).
+  if (on('landing')) payload.landing = values.landing;
+  if (on('conflictPolicy')) payload.conflictPolicy = values.conflictPolicy;
+  if (on('messaging')) payload.messaging = values.messaging;
+  if (on('issuesMode')) payload.issuesMode = values.issuesMode;
+  if (on('worktreeRetention')) payload.worktreeRetention = values.worktreeRetention.trim().toLowerCase();
+  if (on('baseBranch')) {
+    const ref = values.baseBranch.trim();
+    if (ref || mode === 'live') payload.baseBranch = ref;
+  }
+  if (on('maxConcurrentPerRepo')) {
+    const n = whole(values.maxConcurrentPerRepo);
+    if (n !== undefined) payload.maxConcurrentPerRepo = n;
+    else if (mode === 'live') payload.maxConcurrentPerRepo = null;
+  }
   if (on('qa') && values.qa) payload.qa = true;
   // QA's own three. `''` is "say nothing", which lets the reviewer keep
   // inheriting the builder's model and effort and the round budget keep its
@@ -457,6 +503,14 @@ export function buildRunPayload(
   }
   if (on('manifestOverride') && values.manifestOverride.trim()) {
     payload.manifestOverride = { by: values.manifestOverride.trim() };
+  }
+  // Probe 5's answers, by fingerprint — omitted when there are none, so a
+  // plan that needs no answer sends exactly what it always did.
+  if (on('verifyAnswers') && (values.verifyAnswers.approve.length || values.verifyAnswers.waive.length)) {
+    payload.verifyAnswers = {
+      approve: [...values.verifyAnswers.approve],
+      waive: [...values.verifyAnswers.waive],
+    };
   }
 
   // Scope. A `phase` launch says it outright; every other mode sends whatever
@@ -566,6 +620,8 @@ export function buildLaunch(
 
 /** The Automation preferences this form owns — one patch, merged server-side. */
 export function buildPrefs(values: RunSetupValues): Record<string, unknown> {
+  const cap = whole(values.maxConcurrentPerRepo);
+  const ref = values.baseBranch.trim();
   return {
     attachDefaultSkills: values.attachDefaultSkills,
     qaByDefault: values.qa,
@@ -577,6 +633,16 @@ export function buildPrefs(values: RunSetupValues): Record<string, unknown> {
     reviewerPolicy: values.reviewerPolicy,
     autoRecoverByDefault: values.autoRecover,
     mcpPolicy: values.mcpPolicy,
+    // Phase 15's seven, under the preference keys `server/config.ts` reads.
+    // A blank cap or ref is no preference to save — the door drops a zero and
+    // an empty ref rather than storing either, and the shipped word stands.
+    ...(cap !== undefined ? { maxConcurrentPerRepo: cap } : {}),
+    ...(ref ? { baseBranch: ref } : {}),
+    worktreeRetention: values.worktreeRetention.trim().toLowerCase(),
+    landing: values.landing,
+    conflictPolicy: values.conflictPolicy,
+    messaging: values.messaging,
+    issuesMode: values.issuesMode,
   };
 }
 

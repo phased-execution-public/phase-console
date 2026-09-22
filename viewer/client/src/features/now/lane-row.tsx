@@ -27,7 +27,7 @@
  */
 
 import { useState } from 'react';
-import { ChevronRight, FolderGit2, Snowflake, Users } from 'lucide-react';
+import { ChevronRight, FolderGit2, Lock, Snowflake, Users } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -40,7 +40,7 @@ import {
   RelativeTime,
   StatusBadge,
 } from '@/components/ui';
-import { LivenessChip } from '@/features/runs/phase-row';
+import { ContextChip, LivenessChip } from '@/features/runs/phase-row';
 import { BranchChip } from '@/features/runs/git-card';
 import { TaskLine } from '@/features/runs/task-summary';
 import { AskBox } from '@/features/runs/ask-box';
@@ -152,12 +152,13 @@ export function LaneRow({
         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
           <Heartbeat lastBeatAt={beat} staleAfterMs={SILENT_AFTER_MS} live={running} label="lane" />
           <LivenessChip liveness={lane.liveness} />
+          <ContextChip liveness={lane.liveness} />
           {/* Which branch this lane's commits land on — only when it has one of
               its own. With two runs of one repository live, "phase 10 of ccp"
               and "phase 10 of ccp" are the same sentence on two different
               branches, and this is the only thing on the row that tells them
               apart. */}
-          <BranchChip branch={lane.child?.branch} />
+          <BranchChip branch={lane.child?.branch} base={lane.base} />
           {/* The OTHER half of the claim. A branch alone never proved two
               sessions were not in one checkout — both dimensions must differ
               for the scan to carve them apart (P1's W3) — so a row that draws
@@ -167,6 +168,21 @@ export function LaneRow({
             <Chip tone="neutral" mono title={`This lane's own checkout: ${claim.tree}`}>
               <FolderGit2 size={11} aria-hidden />
               {claim.tree.split('/').pop()}
+            </Chip>
+          )}
+          {/* …and the lock on that tree (phase 7, said here since phase 15):
+              `git worktree remove` refuses it and `prune` skips it while the
+              lane lives, which is what protects the lane from a sweep in the
+              wrong terminal. Drawn only from the runner's own word — absent
+              means no lock this console fastened, never "probably locked". */}
+          {claim.locked && (
+            <Chip
+              tone="neutral"
+              data-testid="locked-chip"
+              title={`git worktree lock — ${claim.locked}. Removed and pruned by nothing while the lane lives; the runner unlocks it when the lane settles.`}
+            >
+              <Lock size={11} aria-hidden />
+              locked
             </Chip>
           )}
           {claim.shared && (

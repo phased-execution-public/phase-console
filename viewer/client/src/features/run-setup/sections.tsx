@@ -30,7 +30,15 @@ import { SkillPicker } from '@/features/run-setup/skill-picker';
 import { McpPicker } from '@/features/run-setup/mcp-picker';
 import { PRIORITY_LABELS, RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
 import { QA_FIX_STRATEGIES, QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
-import { ISOLATED, SETTLE_LABELS, SETTLE_PUSHES, SETTLE_STRATEGIES } from '@shared/worktree-model.js';
+import {
+  DEFAULT_MAX_PER_REPO,
+  ISOLATED,
+  RETENTION_LABELS,
+  SETTLE_LABELS,
+  SETTLE_PUSHES,
+  SETTLE_STRATEGIES,
+  WORKTREE_RETENTION,
+} from '@shared/worktree-model.js';
 import type { UltraReviewMode } from '@shared/run-lifecycle.js';
 import { NumberField, PressField, SelectField, SetupField, ToggleField } from './fields';
 import { DecisionsSection } from './decisions';
@@ -230,6 +238,11 @@ export function BranchSection() {
   if (!f.on('gitMode')) return null;
   const Bool = f.Bool;
   const branch = values.gitMode === 'new-branch';
+  // A base branch is a fact about the past once the run's branch has been cut
+  // (`checkout` set): the door 409s a new word, so the control says so and
+  // takes nothing rather than letting an operator type a fork that never
+  // happened and learn it from the refusal.
+  const baseLocked = mode === 'live' && Boolean(context.run?.checkout);
   return (
     <div className="flex flex-col gap-3">
       <SelectField
@@ -316,6 +329,65 @@ export function BranchSection() {
           onChange={(next) => f.set('isolation', next ? ISOLATED : 'queue')}
         />
       )}
+      {/* Phase 15's three of the branch and the checkout. Every one is ALSO a
+          plan line or a console default, and the plan outranks the run: the
+          hints say so, because a control that reads as the last word and is
+          not one is how an operator sets a base the plan then ignores. */}
+      {f.live('baseBranch') && (
+        <SetupField
+          label="Base branch"
+          hint={
+            mode === 'defaults'
+              ? 'What pe/<slug> — and every lane branch — is cut from when the plan says nothing: origin/HEAD (the remote’s default, a fresh cut), head (wherever the checkout stands), or a branch name.'
+              : baseLocked
+                ? 'The run’s branch has already been cut from this word — a base branch can be changed only before the first phase boards. Stop the run and start it again to fork elsewhere.'
+                : 'What pe/<slug> — and every lane branch — is cut from: origin/HEAD (the remote’s default, a fresh cut), head (wherever the checkout stands), or a branch name. Empty takes the plan’s Base branch: line, else the console’s preference. A plan that names one outranks this either way.'
+          }
+          source={f.src('baseBranch')}
+          error={f.errors.baseBranch}
+        >
+          {({ id, describedBy }) => (
+            <input
+              id={id}
+              type="text"
+              aria-describedby={describedBy}
+              className={cn(field, 'w-full')}
+              placeholder={
+                mode === 'defaults' ? 'origin/HEAD' : 'the plan’s line, else the console’s preference'
+              }
+              value={values.baseBranch}
+              disabled={baseLocked}
+              onChange={(event) => f.set('baseBranch', event.target.value)}
+            />
+          )}
+        </SetupField>
+      )}
+      {f.live('maxConcurrentPerRepo') && (
+        <NumberField
+          label="Runs beside it in the repository"
+          hint={
+            mode === 'defaults'
+              ? 'How many isolated runs this console may hold in ONE repository at once — beside the machine-wide worktree cap, and the narrower one answers first. A repository nobody can read is a different cost from a full disk.'
+              : 'How many isolated runs this run will stand beside in its repository before it waits its turn. Empty takes the console’s number; a number here can only be smaller than it — a run may make itself more conservative, never outbid the console.'
+          }
+          source={f.src('maxConcurrentPerRepo')}
+          error={f.errors.maxConcurrentPerRepo}
+          value={values.maxConcurrentPerRepo}
+          min={1}
+          placeholder={mode === 'defaults' ? String(DEFAULT_MAX_PER_REPO) : 'the console’s cap'}
+          onChange={(next) => f.set('maxConcurrentPerRepo', next)}
+        />
+      )}
+      {f.live('worktreeRetention') && (
+        <SelectField
+          label="When the run settles, its checkouts"
+          hint="What becomes of the trees the console made for this run once it settles. A tree holding uncommitted work is never removed under any word; keep-on-failure keeps only a run that ended badly, because its checkout holds the only copy of what went wrong."
+          source={f.src('worktreeRetention')}
+          value={values.worktreeRetention}
+          options={RETENTION_OPTIONS}
+          onChange={(next) => f.set('worktreeRetention', next)}
+        />
+      )}
       {/* The `openPr` carve-out pins `git push` and `gh pr create` to *ask* even
           under the Trusted profile — a push and a PR are the run's one
           world-visible act, and the deal is one human tap. The answer window is
@@ -341,6 +413,21 @@ export function BranchSection() {
     </div>
   );
 }
+
+/**
+ * The retention picker's options: the three closed words, and three `ttl:<h>`
+ * presets rather than a free number — a parameterised member the operator
+ * cannot mistype, on a control that would otherwise need a second input to
+ * say "and how many hours".
+ */
+const RETENTION_OPTIONS: [string, string][] = [
+  ...WORKTREE_RETENTION.map((word): [string, string] => [word, RETENTION_LABELS[word]]),
+  ['ttl:6', 'are removed after six hours'],
+  ['ttl:24', 'are removed after a day'],
+  ['ttl:168', 'are removed after a week'],
+];
+
+
 
 /**
  * Who this run spends as, and how much room that account has left.
@@ -589,6 +676,44 @@ export function McpSection() {
   );
 }
 
+/**
+ * The console's review on top of a plan that already reviews itself.
+ *
+ * Run `deadaff9` paid twice for every phase it finished: the plan's own
+ * §Adversarial review, dispatched by each builder, and this toggle's session
+ * ($9.62 on P1, $7.26 on P8). Said, not prevented — two reviews of one diff can
+ * be what somebody wants; paying for them without knowing is the defect. Two
+ * signals, both read before a session is spent: the plan's words ordering a
+ * reviewer (`plan.reviewers`, `inPlanReviewers` on the server) and a QA gate that
+ * is on, whose phase-finish sends every phase to a fresh reviewer anyway.
+ *
+ * It reads the toggle's VALUE itself rather than being gated on it inline: this
+ * is a sentence, not a control, so it has no summary row and no `LIVE_WHEN`
+ * entry for `summaryRows()` to consult (`stages.test.ts`, the H1 scan).
+ */
+function ReviewDoubled() {
+  const { planReviewers, qaMode, values } = useSetupForm();
+  const qaOn = /^on\b/.test(qaMode ?? '');
+  const [first, ...more] = planReviewers;
+  if (!values.reviewEachPhase || (!first && !qaOn)) return null;
+  return (
+    <p className="text-2xs text-ink-muted" data-testid="review-doubled">
+      Every phase would be reviewed twice.{' '}
+      {first && (
+        <>
+          This plan already dispatches its own reviewer — §{first.section || 'the plan'}: &ldquo;
+          {first.excerpt}
+          &rdquo;
+          {more.length > 0 ? ` (and ${more.length} more ${more.length === 1 ? 'place' : 'places'})` : ''}
+          .{' '}
+        </>
+      )}
+      {qaOn && <>This plan&rsquo;s QA gate already sends every finished phase to a fresh reviewer. </>}
+      The console&rsquo;s review on top measured $7–10 a phase — keep one of the two.
+    </p>
+  );
+}
+
 export function ReviewersSection() {
   const f = useSetupForm();
   const { values } = f;
@@ -605,6 +730,7 @@ export function ReviewersSection() {
           onChange={(next) => f.set('reviewEachPhase', next)}
         />
       )}
+      {f.on('reviewEachPhase') && <ReviewDoubled />}
       {/* Only meaningful with the reviewer on, and worth its own row rather
           than a footnote: this is the setting that decides whether an
           unattended run can STOP ITSELF on an opinion nobody has read. */}

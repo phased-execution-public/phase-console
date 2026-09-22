@@ -35,10 +35,10 @@ import {
 import {
   BODY_FETCH_BUDGET_MS, FAIL_BACKOFF_MS, FRESH_MS, IDLE_POLL_MS, RATE_LIMIT_BACKOFF_MS,
   fetchBodies, fetchIssues, ghRunner, mergeBodies, readCache, writeCache,
-  type GhRunner, type Issue, type IssueCache, type IssueReason,
+  type GhRunner, type Issue, type IssueCache, type IssueProvenance, type IssueReason,
 } from './fetch.ts';
 
-export type { Issue, IssueReason } from './fetch.ts';
+export type { Issue, IssueProvenance, IssueReason } from './fetch.ts';
 export type { GitHubRemote, InventoryRepo } from './inventory.ts';
 export {
   INVENTORY_CAP, askableRepos, parseGitHubRemote, parseOriginUrl, readOriginUrl, repoInventory,
@@ -110,6 +110,13 @@ export type IssuesStoreOptions = {
   /** Injected by tests; production takes `ghRunner()`. */
   run?: GhRunner;
   now?: () => number;
+  /**
+   * Which plan, phase and run filed a number, when a session of this console
+   * did (phase 12). Answered from the plans' issue ledgers by the Pro half;
+   * absent — the free console, or a test — means no issue carries a chip.
+   * Joined on every `list()`, never written into the cache.
+   */
+  provenance?: (nameWithOwner: string, number: number) => IssueProvenance | undefined;
 };
 
 export class IssuesStore {
@@ -194,8 +201,18 @@ export class IssuesStore {
         : {}),
       ...(fetchedAt != null ? { fetchedAt, ageMs } : {}),
       ...(cache?.truncated ? { truncated: true } : {}),
-      issues: cache?.issues ?? [],
+      issues: this.withProvenance(name, cache?.issues ?? []),
     };
+  }
+
+  /** The rows with their provenance joined on — a copy, so the cache is never written with one. */
+  private withProvenance(nameWithOwner: string, issues: readonly Issue[]): Issue[] {
+    const lookup = this.opts.provenance;
+    if (!lookup) return [...issues];
+    return issues.map((issue) => {
+      const provenance = lookup(nameWithOwner, issue.number);
+      return provenance ? { ...issue, provenance } : issue;
+    });
   }
 
   /**

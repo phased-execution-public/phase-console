@@ -48,7 +48,7 @@ import {
 import type { RadarPair, RunGitView, RunState } from '@/lib/api';
 import { useConsoleState } from '@/lib/queries';
 import { bytes, homePath, plural, relativeTime } from '@/lib/format';
-import { SETTLE_LABELS, settleOf, type RadarState } from '@shared/worktree-model.js';
+import { ourWorktreeLock, SETTLE_LABELS, settleOf, type RadarState } from '@shared/worktree-model.js';
 
 /** The dash. One spelling, so "not measured" looks the same in every row. */
 const UNKNOWN = '—';
@@ -76,6 +76,20 @@ const RADAR_BLURB: Readonly<Record<RadarState, string>> = Object.freeze({
   unknown: 'The probe could not answer for this pair. Not the same as clean.',
 });
 
+/** Which git arm resolved the base, and who declared the word — in words a title can carry. */
+const BASE_SOURCE_WORDS: Record<string, string> = {
+  'origin-head': 'the remote’s HEAD',
+  trunk: 'the local trunk — no remote to ask',
+  head: 'whatever the checkout had out',
+  ref: 'a ref named by hand',
+};
+const BASE_DECLARED_WORDS: Record<string, string> = {
+  plan: 'the plan’s `Base branch:` line',
+  run: 'this run’s launch form',
+  console: 'Settings ▸ Automation',
+  default: 'the shipped default',
+};
+
 /**
  * The branch one lane is committing on — the chip Now and the phase table wear.
  *
@@ -87,14 +101,21 @@ const RADAR_BLURB: Readonly<Record<RadarState, string>> = Object.freeze({
  * several concurrent branches this lane's commits are landing on, which is the
  * question two lanes in one repository create.
  */
-export function BranchChip({ branch }: { branch?: string }) {
+export function BranchChip({ branch, base }: { branch?: string; base?: RunState['base'] }) {
   if (!branch) return null;
+  // The base every `pe/<slug>-pN` was cut from (phase 15), on the title
+  // rather than the row: two lanes of one plan share it, and what the row
+  // exists to tell apart is the branch.
+  const cut = base
+    ? ` Cut from ${base.ref} at ${base.sha.slice(0, 12)} (${BASE_SOURCE_WORDS[base.source] ?? base.source}; ` +
+      `${BASE_DECLARED_WORDS[base.declaredBy] ?? base.declaredBy}).`
+    : '';
   return (
     <Chip
       tone="neutral"
       mono
       data-testid="branch-chip"
-      title={`This lane commits on ${branch} — its own checkout, not the run's shared tree.`}
+      title={`This lane commits on ${branch} — its own checkout, not the run's shared tree.${cut}`}
     >
       <GitBranch size={11} aria-hidden />
       {branch}
@@ -128,10 +149,23 @@ function RadarRow({ pair }: { pair: RadarPair }) {
         <Badge tone={RADAR_TONE[pair.state]} title={RADAR_BLURB[pair.state]}>
           {pair.state}
         </Badge>
+        {/*
+          A clash zone is worth a badge of its own even when the verdict is
+          `clean` or `overlap`: these files MERGE and are wrong afterwards, so
+          the verdict beside it is the thing that understates the situation.
+        */}
+        {pair.zones?.length ? (
+          <Badge tone="accent" title={`clash zones: ${pair.zones.join(', ')}`} data-testid="radar-zone">
+            clash zone
+          </Badge>
+        ) : null}
         <code className="min-w-0 truncate font-mono text-2xs text-ink-muted">
           {pair.a} ↔ {pair.b}
         </code>
       </div>
+      {pair.zones?.length ? (
+        <p className="pl-0.5 font-mono text-2xs text-ink-faint">{pair.zones.join(', ')}</p>
+      ) : null}
       {pair.files.length > 0 && (
         <p className="pl-0.5 font-mono text-2xs text-ink-faint">
           {pair.files.slice(0, 6).join(', ')}
@@ -173,8 +207,12 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
           <p className="text-2xs text-ink-muted" data-testid="git-refused">
             This run asked for its own checkout and could not have one, so it is working in the shared tree
             with queue semantics — exactly as every run did before worktrees existed. The runner recorded{' '}
-            <code className="font-mono">{run?.isolationRefusal ?? 'no reason'}</code>; the journal below
-            carries the sentence.
+            <code className="font-mono">{run?.isolationRefusal ?? 'no reason'}</code>
+            {/* The sentence is the server's table for the key (G-20); an older
+                server sends none, and then the journal below still has it. */}
+            {run?.isolationRefusal && state?.refusalReasons?.[run.isolationRefusal]
+              ? `: ${state.refusalReasons[run.isolationRefusal]}.`
+              : '; the journal below carries the sentence.'}
           </p>
         )}
 
@@ -192,7 +230,28 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
               ? [['mounts', run.mountedRepos.join(', ')] as [string, React.ReactNode]]
               : []),
             ['branch', shownBranch ? <code className="font-mono text-2xs">{shownBranch}</code> : UNKNOWN],
-            ['base', git?.base ? <code className="font-mono text-2xs">{git.base}</code> : UNKNOWN],
+            // The probe's measured base first; else what the runner RESOLVED
+            // when it cut the branch (phase 15) — the one fact a stopped run's
+            // card can still say, pinned to the commit and naming who declared
+            // the word. Neither, and it is the dash.
+            [
+              'base',
+              git?.base ? (
+                <code className="font-mono text-2xs" data-testid="git-base">
+                  {git.base}
+                </code>
+              ) : run?.base ? (
+                <code
+                  className="font-mono text-2xs"
+                  data-testid="git-base"
+                  title={`Cut at ${run.base.sha} (${BASE_SOURCE_WORDS[run.base.source] ?? run.base.source}; ${BASE_DECLARED_WORDS[run.base.declaredBy] ?? run.base.declaredBy}).`}
+                >
+                  {run.base.ref} @ {run.base.sha.slice(0, 12)}
+                </code>
+              ) : (
+                UNKNOWN
+              ),
+            ],
             [
               'work root',
               shownRoot ? <code className="font-mono text-2xs break-all">{shownRoot}</code> : UNKNOWN,
@@ -271,6 +330,23 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
                   {entry.prunable && (
                     <Chip tone="warn" title="git still lists this checkout and its directory is gone.">
                       prunable
+                    </Chip>
+                  )}
+                  {/*
+                    Two different facts, and an operator needs to tell them
+                    apart before they reach for `git worktree remove`: OUR lock
+                    is the console protecting a live tree and it comes off by
+                    itself, while somebody else's is a tree the sweeps will
+                    never touch — and neither can be removed without one
+                    `git worktree unlock` first.
+                  */}
+                  {entry.locked !== undefined && (
+                    <Chip
+                      tone={ourWorktreeLock(entry.locked) ? 'neutral' : 'warn'}
+                      title={entry.locked || 'locked, with no reason given'}
+                      data-testid="checkout-lock"
+                    >
+                      {ourWorktreeLock(entry.locked) ? 'locked' : 'locked by hand'}
                     </Chip>
                   )}
                   <span className="text-2xs text-ink-faint">{bytes(entry.disk) ?? UNKNOWN}</span>

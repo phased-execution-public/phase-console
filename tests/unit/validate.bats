@@ -91,3 +91,68 @@ load ../helpers/test_helper
   setup_docs bad-decision-unowned g4;          run pe_validate g4;  [ "$status" -ne 0 ]; assert_contains "$output" "decision-outstanding-unowned"
   setup_docs credentials ok;                   run pe_validate ok;  [ "$status" -eq 0 ]
 }
+
+# --------------------------------------------------------------------------
+# The forward-notes family: F26 gates, F30 warns (phase 11)
+# --------------------------------------------------------------------------
+
+@test "F26: a note addressed to a phase this plan does not have FAILS, and names it" {
+  setup_docs diamond diamond
+  write_handoff diamond 1 root complete
+  cat >> "$DOCS_ROOT/docs/handoffs/diamond/phase-01-root.md" <<'NOTE'
+
+## Notes for later phases
+
+- **Phase 4:** the merge reads both halves.
+- **Phase 40:** this one is addressed to nobody.
+NOTE
+  run pe_validate diamond
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "note-target-unknown"
+  assert_contains "$output" "40"
+  assert_contains "$output" "F26"
+  # The well-addressed one is not an offence, and `Next`/`All` never are: they
+  # are relations, and a relation always has a reader.
+  refute_contains "$output" "note for phase 4,"
+}
+
+@test "F26: \`Next\` and \`All\` are never note-target-unknown" {
+  setup_docs diamond diamond
+  write_handoff diamond 1 root complete
+  cat >> "$DOCS_ROOT/docs/handoffs/diamond/phase-01-root.md" <<'NOTE'
+
+## Notes for later phases
+
+- **Next:** a dependency edge, not a number.
+- **All:** everybody after me.
+NOTE
+  # The lint arm, not the whole validator: `write_handoff` scaffolds a minimal
+  # handoff with no boot section, so `validate.sh` has a second, unrelated
+  # reason to fail and "exit 0" would be proving something else.
+  run pg diamond --lint
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "note-target-unknown"
+}
+
+@test "F30: a note addressed to a phase that is already DONE warns, and the lint still passes" {
+  setup_docs diamond diamond
+  write_handoff diamond 1 root complete
+  write_handoff diamond 2 left complete
+  cat >> "$DOCS_ROOT/docs/handoffs/diamond/phase-01-root.md" <<'NOTE'
+
+## Notes for later phases
+
+- **Phase 2:** phase 2 has already been and gone.
+- **Phase 4:** phase 4 has not.
+NOTE
+  run pg diamond --lint
+  # Advisory: the phase exists and the note is well-formed — only its reader
+  # is gone. Its own id, because an id that both gates and warns cannot answer
+  # "did the lint fail?".
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "F30"
+  assert_contains "$output" "note-target-done"
+  assert_contains "$output" "phase 2"
+  refute_contains "$output" "note for phase 4 will never"
+  assert_contains "$output" "LINT OK"
+}

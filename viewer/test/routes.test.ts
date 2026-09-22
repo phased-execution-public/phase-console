@@ -1563,6 +1563,7 @@ test('a write verb against the repo surface is refused', async () => {
   }
 });
 
+
 /* ------------------------------------------------------------------ *
  * The actor — derived from the request, never supplied (SHD-3, ACT-11)
  * ------------------------------------------------------------------ */
@@ -1866,3 +1867,68 @@ test('POST /api/run/:slug/answer takes a person\'s pick on a relayed question �
   const locked = fakeService({ flags: { allowWrites: true, allowRun: false, maxSessions: 4 }, answerQuestion: () => { throw new Error('must not be reached'); } });
   assert.equal((await call(locked, 'POST', '/api/run/demo/answer', { body: { approvalId: 'card-1', key: 'a', label: 'x' } })).status, 403);
 });
+
+/* ------------------------------------------------------------------ *
+ * 2026-09-18 — the launch door's §Verification answers (probe 5)
+ * ------------------------------------------------------------------ */
+
+const FP_A = 'a'.repeat(64);
+const FP_B = 'b'.repeat(64);
+
+test('the start door carries the draft\'s verification answers — fingerprints only, waivers phase-scoped', async () => {
+  const service = fakeService();
+  const ok = await call(service, 'POST', '/api/run/demo/start', {
+    body: {
+      resumeOnRestart: true, relay: 'off', accounts: [{ id: 'default' }],
+      verifyAnswers: { approve: [FP_A, 'bats tests/unit', 7], waive: [`3:${FP_B}`, FP_B, '0x:nope'] },
+    },
+  });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(service._started.at(-1)!.options.verifyAnswers, { approve: [FP_A], waive: [`3:${FP_B}`] },
+    'a command text or a phase-less waiver is not an answer — the door takes fingerprints');
+  // Absent is absent: no key on a start that sent none.
+  await call(service, 'POST', '/api/run/demo/start', {
+    body: { resumeOnRestart: true, relay: 'off', accounts: [{ id: 'default' }] },
+  });
+  assert.equal('verifyAnswers' in service._started.at(-1)!.options, false);
+});
+
+test('GET /api/run/:slug/prelude asks probe 5 about the draft\'s scope, autonomy and answers', async () => {
+  const asked: Record<string, unknown>[] = [];
+  const service = fakeService({
+    prelude: async (_slug: string, options: Record<string, unknown>) => { asked.push(options); return { slug: 'demo', blocking: [], rows: [] }; },
+  });
+  const out = await call(service, 'GET',
+    `/api/run/demo/prelude?only=2,3,x&autonomy=halt-on-everything&approve=${FP_A},nope&waive=3:${FP_B},${FP_B}`);
+  assert.equal(out.status, 200);
+  assert.deepEqual(asked[0], {
+    onlyPhases: [2, 3], autonomy: 'halt-on-everything', verifyAnswers: { approve: [FP_A], waive: [`3:${FP_B}`] },
+  });
+});
+
+test('POST /api/restart hands the update choice to the service, and answers 202 while the copy updates', async () => {
+  // A restart updates the copy first (2026-09-18): the press is answered at
+  // once, and the process goes down only when the update has answered — so the
+  // honest status for "accepted, still working" is 202, not 200.
+  const calls: { force: boolean; options: unknown }[] = [];
+  const svc = fakeService({
+    restart: (_actor: unknown, force: boolean, options: { update?: boolean }) => {
+      calls.push({ force, options });
+      return options.update === false ? { ok: true } : { ok: true, updating: true };
+    },
+  });
+  const updating = await call(svc, 'POST', '/api/restart', { body: {} });
+  assert.equal(updating.status, 202);
+  assert.equal((updating.body as { updating?: boolean }).updating, true);
+
+  const plain = await call(svc, 'POST', '/api/restart', { body: { update: false, force: true } });
+  assert.equal(plain.status, 200);
+  assert.deepEqual(calls, [
+    { force: false, options: { update: true } },
+    { force: true, options: { update: false } },
+  ]);
+
+  const refused = await call(fakeService({ restart: () => ({ ok: false, reason: 'busy' }) }), 'POST', '/api/restart');
+  assert.equal(refused.status, 409);
+});
+

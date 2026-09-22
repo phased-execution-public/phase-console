@@ -1835,3 +1835,118 @@ test('WAI-6: an overdue park is announced ONCE — on the inbox row\'s own condi
     cleanup();
   }
 });
+
+// ── S5-a — a live lane's lock read `ended` between its own attempts ──────────
+// Two consoles on one root. Console B sees a lock owned `autopilot/<runId>`
+// belonging to console A's run. `lockPresenceFor` demoted such a lock to
+// `unknown` only when the run was one of THIS console's live runners — which it
+// never is, from B's side. So B fell through to the raw registry, which answers
+// about the session the lock NAMES; a lane's lock outlives its attempt's
+// session by design, so the answer was `ended`, and `ended` means debris: B
+// admitted over the claim and then released it.
+//
+// The fact that settles it is on disk: A's run file. If that run is in flight,
+// somebody is holding this lock, whoever's console it is.
+const { lockHeldByLiveRun } = await import('../server/converge.ts');
+
+test('S5-a: a lock owned by a FOREIGN run that is in flight is held', () => {
+  const foreign = run({ status: 'running' });
+  assert.equal(
+    lockHeldByLiveRun(`autopilot/${foreign.id}`, new Set(), [foreign], () => false), true,
+    "another console's running run still holds its lane's lock");
+});
+
+test('S5-a: this console\'s own live run is held too, exactly as before', () => {
+  const mine = run({ status: 'running' });
+  assert.equal(lockHeldByLiveRun(`autopilot/${mine.id}`, new Set([mine.id]), [], () => false), true,
+    'the live-runner set alone still answers, with no run file to read');
+});
+
+test('S5-a: a finished foreign run holds nothing', () => {
+  const over = run({ status: 'finished' });
+  assert.equal(lockHeldByLiveRun(`autopilot/${over.id}`, new Set(), [over], () => false), false);
+});
+
+test('S5-a: a stopped run whose child is still alive is held', () => {
+  // `runIsDead`'s own rule, which is the point of reusing it rather than
+  // writing a second opinion: a record can say `halted` while its process runs.
+  const halted = run({ status: 'halted', children: [{ pid: 4242, phase: 1, startedAt: new Date().toISOString(), procStartedAt: 1 }] as never });
+  assert.equal(lockHeldByLiveRun(`autopilot/${halted.id}`, new Set(), [halted], (pid) => pid === 4242), true);
+  assert.equal(lockHeldByLiveRun(`autopilot/${halted.id}`, new Set(), [halted], () => false), false);
+});
+
+test('S5-a: an owner that is not an autopilot lane holds nothing here', () => {
+  // A person's lock is the registry's question, not this one's.
+  const live = run({ status: 'running' });
+  assert.equal(lockHeldByLiveRun('sam@mac', new Set([live.id]), [live], () => false), false);
+  assert.equal(lockHeldByLiveRun(`autopilot/${live.id}`, new Set(), [], () => false), false,
+    'and a run nobody can find is not evidence of anything');
+});
+
+
+/* ── G-PIN12 — the seven mutation-proved pins from the phase-12 QA report ─────
+ * `console-parallel-repaint` phase 12's QA round found five arms the phase had
+ * changed with no test that bites: reverting each left the phase's own suites
+ * green. QA wrote the pins, mutation-proved every one of them RED against the
+ * committed code — and did not commit them, because a QA round's job is the
+ * verdict. They have sat in an appendix ever since, which is the same as not
+ * existing: the arms are unguarded and the next refactor takes them silently.
+ * Adopted here verbatim in intent, adjusted only where this tree's helpers
+ * have moved on. */
+test('P12-QA executor: a RUN-level standing errand (no phase behind it) keeps its clock across sweeps too', async () => {
+  const off = run({ status: 'interrupted', stoppedBy: 'system' }, []);
+  const announced: unknown[] = [];
+  const mk = (now: number) => stubDeps(off, {
+    prefs: () => ({ resumeAtBoot: 'off' }), now: () => now,
+    announceErrand: (...args: unknown[]) => { announced.push(args); },
+  });
+  const plan = (now: number) => planConvergence(facts({ now, runs: [off], prefs: { resumeAtBoot: 'off' }, board: { 1: 'done', 2: 'ready', 3: 'waiting' } }));
+  const first = await executeConvergence(plan(NOW), mk(NOW));
+  assert.equal(first.errands.length, 1, 'the run-level errand is written');
+  assert.ok(off.errand, 'on the run, not a phase');
+  const firstAt = off.errand!.at;
+  assert.equal(announced.length, 1);
+
+  const later = mk(NOW + 60_000);
+  const second = await executeConvergence(plan(NOW + 60_000), later);
+  assert.equal(second.errands.length, 0, 'nothing new to ask');
+  assert.equal(off.errand!.at, firstAt, 'the clock survives');
+  assert.equal(later.lines.filter((l) => l.event === 'run.errand').length, 0, 'no second journal line');
+  assert.equal(announced.length, 1, 'no second push');
+  const outcome = second.outcomes.find((o) => o.action.kind === 'errand');
+  assert.match(outcome?.detail ?? '', /has stood since/);
+});
+
+// ── PRS-1 — the must-not-fire case ───────────────────────────────────────────
+// `/clear` fires SessionEnd for a process that is still in front of the
+// operator. `presenceOf` used to answer `ended` outright for any record with an
+// `endedAt`, and `ended` is the ONE answer that makes a foreign lock debris:
+// converge released it, boarding started a second session in the same working
+// tree, and the first one was still typing.
+//
+// The rule now asks the pid and answers `unknown` when the two witnesses
+// disagree. This is the half of that rule converge owns — `unknown` must
+// release NOTHING. Written as a must-not-fire because the failure was silent:
+// the lock simply vanished, and the release looked exactly like every correct
+// one beside it.
+test('PRS-1: a cleared session\'s lock (endedAt, process alive ⇒ unknown) is never released as debris', () => {
+  const r = run({ status: 'halted', halt: { at: '', reason: 'x' } }, [{ phase: 2, status: 'failed' }]);
+  const locks: LockView[] = [
+    // The cleared session: the hook said ended, the pid says otherwise.
+    { slug: 'alpha', phase: 2, owner: 'sam@laptop', expired: false, leaseUntil: NOW + 3_600_000, session: 'cleared-1' },
+    // A genuinely finished one beside it, so the test proves the rule NARROWS
+    // rather than simply switching debris collection off.
+    { slug: 'alpha', phase: 3, owner: 'sam@laptop', expired: false, leaseUntil: NOW + 3_600_000, session: 'ended-1' },
+  ];
+  const presence = (lock: LockView) => (lock.session === 'cleared-1' ? 'unknown' : 'ended');
+
+  assert.deepEqual(endedSessionLocks(locks, new Set(), presence).map((l) => l.phase), [3],
+    'only the session the registry can prove has ended');
+
+  const plan = planConvergence(facts({ runs: [r], locks, presence }));
+  const debris = plan.actions.filter((a) => a.kind === 'release-debris');
+  assert.deepEqual(debris.map((a) => a.kind === 'release-debris' && a.phase), [3],
+    'converge releases nothing for the cleared session');
+  assert.equal(debris.some((a) => a.kind === 'release-debris' && a.session === 'cleared-1'), false,
+    'and names it nowhere');
+});

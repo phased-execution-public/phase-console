@@ -53,12 +53,17 @@ credentials, and attach them to a plan, a run or one phase; a phase whose server
 runs without them and says so — or parks *before* it spends anything, if the plan or the run asks
 for that — and reading the registry and its statuses needs no flag),
 `--allow-webhooks` (**POST every announcement somewhere else** — a Slack channel, a Discord server,
-a Telegram chat, your own relay; the one switch that sends anything off this machine, so off means
+a Telegram chat, your own relay; the first of two switches that send anything off this machine, so off means
 no outbound request at all even for a URL already registered, payloads carry ids and titles with
 secret-shaped strings masked, and reading the destination list needs no flag —
 [docs/webhooks.md](https://github.com/phased-execution-public/phase-console/blob/main/docs/webhooks.md)),
-or `--allow-terminal` (a real shell). The server itself never pushes — a session's `git push` is denied
-unless the run opens a PR, and then it is a card and one tap. All seven default off. One-time setup per machine:
+`--allow-publish` (**push a finished phase's own `pe/*` branch** to `origin` — never a trunk, never
+`pe/integration`, never with force, never a delete — and only where the plan's `permission.destructive`
+row allows `git push`; the second switch that sends anything off this machine, and off means the
+console pushes nothing — a `Land: pr` phase then parks with the reason),
+or `--allow-terminal` (a real shell). The server itself never pushes except through that one flag —
+a session's `git push` is denied unless the run opens a PR, and then it is a card and one tap. All
+eight default off. One-time setup per machine:
 `cd viewer && npm ci && npm run build` — see `viewer/README.md`.
 
 **It heals its own runs, and asks once.** A phase that stopped short is classified (never started,
@@ -70,8 +75,9 @@ leaves **one errand** (what is needed, how to give it, what it tried) and drives
 Every Ways forward shows the situation, the rungs tried and the next one; the dashboard's *Waiting on
 you* lists only errands, permission cards and sign-ins; the Pulse shows each plan's last convergence
 pass. Install the session-presence hook (Settings ▸ Automation ▸ Session presence or `phase-console
-install-hooks`) and a hand-run `claude` in the repository is seen too — queued behind while it lives,
-its lock released the moment it ends. A **boarding schedule** (Settings ▸ Automation, off by default)
+install-hooks`) and a hand-run `claude` in the repository is seen too — queued behind for ten minutes
+after it starts or resumes (for as long as it lives once it works that very phase), its lock released
+the moment it ends. A **boarding schedule** (Settings ▸ Automation, off by default)
 says when this console may START phases at all — windows, cron openings and quiet hours that win over
 both; outside it a ready phase queues saying when boarding opens, a recovery you ask for is never
 held, and a phase already running is never interrupted. `docs/loop.md` is the specification.

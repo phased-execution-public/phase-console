@@ -52,7 +52,7 @@ export const SECTIONS: readonly GuideSection[] = [
   {
     id: 'running',
     label: 'Launch',
-    lede: 'Every way to start the console — and the seven switches that decide what it may do.',
+    lede: 'Every way to start the console — and the eight switches that decide what it may do.',
     // A menu, not a journey: you pick ONE of these ways in, you do not walk
     // them in order.
     kind: 'topic',

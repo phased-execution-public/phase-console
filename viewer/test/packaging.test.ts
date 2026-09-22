@@ -115,6 +115,25 @@ test('SKILL.md frontmatter parses, and carries the two fields always in context'
   assert.match(fields.get('description')!, /"$/, 'the description stays quoted');
 });
 
+test('the console has no runtime dependency — the map libraries are build-time, like React itself', () => {
+  // `viewer/package.json` keeps every client library under `devDependencies`:
+  // the client is BUILT output, and the server runs on Node alone (node-pty and
+  // ws are optional, with honest degradation). many-plans-one-repo phase 14
+  // added React Flow and d3-dag for the repository map; they belong beside
+  // React, never in a `dependencies` block that would make an install fetch
+  // 3.5 MB of map library for a server that never imports it.
+  const pkg = json('viewer/package.json') as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+    optionalDependencies?: Record<string, string>;
+  };
+  assert.deepEqual(Object.keys(pkg.dependencies ?? {}), [], 'viewer/package.json must carry no `dependencies`');
+  for (const dep of ['react', '@xyflow/react', 'd3-dag', 'qrcode']) {
+    assert.ok(pkg.devDependencies?.[dep], `${dep} is a devDependency`);
+  }
+  assert.deepEqual(Object.keys(pkg.optionalDependencies ?? {}).sort(), ['node-pty', 'ws']);
+});
+
 test('the npm allowlist ships the report template, not the 34 MB screencast', () => {
   // `assets/` shipped the whole directory, and console.gif is 34 MB that every
   // install and every Homebrew bottle paid to put on disk unread. The tarball

@@ -93,7 +93,7 @@ export const MECHANISM_LEGEND =
 /**
  * A halt kind, as a type — the array below is the one truth and this is the only
  * way to name it in a type position. Without it every consumer had to
- * retype the twenty-four words, which is exactly what `server/runner/state.ts`
+ * retype the twenty-five words, which is exactly what `server/runner/state.ts`
  * and `client/src/lib/api/runs.ts` both did. (The count in that sentence is held
  * to the array by `test/docs-parity.test.ts`: it read "seventeen" for months
  * while the array held eighteen — LFC-10.)
@@ -129,6 +129,11 @@ export const HALT_KINDS = Object.freeze(
     // was aborted and every commit survives on `pe/<slug>/pN`; what is missing is
     // a decision only a person can make about two edits to the same lines.
     'worktree-merge',
+    // The same collision, PARKED by the plan's `Conflicts: park` (or by a
+    // `rebase-session` that conflicted a second time) instead of halted: the
+    // phase's work is done and recorded, its lane holds every commit, and the
+    // run drives on. What is owed is the same person's decision, as an errand.
+    'landing-conflict',
     // The four the LFC-1 census found written with no word, or with a word no
     // list held (zero-touch-console phase 2). All four are RUN-level.
     //
@@ -220,6 +225,7 @@ export const PHASE_HALT_KINDS = Object.freeze(
     'recovery-failed',
     'orphaned-session',
     'worktree-merge',
+    'landing-conflict',
   ]),
 );
 
@@ -369,6 +375,12 @@ export const KIND_PROFILE = {
   // 3am. The errand names both lanes and the conflicted files, and both lane
   // branches are intact for whoever reads it.
   'worktree-merge': { sessionShaped: false, humanClass: null, autoClass: null },
+  // The same collision parked by policy rather than halted (phase 8's `On
+  // conflict: park`): the phase is done, the run drove on, and the errand the
+  // landing raised names both lanes and the files. No class, for the reason
+  // `worktree-merge` has none — the one rung the plan allowed (`rebase-session`)
+  // is spent by the landing itself before this word is ever written.
+  'landing-conflict': { sessionShaped: false, humanClass: null, autoClass: null },
   // A parked run, and a person's: somebody has to give the holding phase a
   // verdict, waive it, or switch the plan's QA gate off. No agent class,
   // because a recovery session cannot record a verdict it did not reach.

@@ -17,10 +17,10 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn as spawnProcess } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 process.env.PHASE_CONSOLE_LOG = '';
 
@@ -29,9 +29,10 @@ const { Service, HOOK_EVENTS_PER_MINUTE } = await import('../server/service.ts')
 const { handleApi } = await import('../server/api/routes.ts');
 const { lockPath, readLock } = await import('../server/store.ts');
 const { latestRun, journalFile, newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
-const { inboxOutcomeFile } = await import('../server/runner/outcome.ts');
+const { inboxOutcomeFile, inboxOutcomePhase } = await import('../server/runner/outcome.ts');
 const { instanceId } = await import('../shared/instances.mjs');
 const { recent: recentLog } = await import('../server/log.ts');
+const { PEER_CLAIM_WINDOW_MS } = await import('../server/sessions/registry.ts');
 
 const SCRIPTS = join(SKILL_DIR, 'scripts');
 
@@ -317,8 +318,16 @@ test('phase-outcome.sh from a shell with no PE_OUTCOME_FILE lands in the inbox; 
       delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
       const out = execFileSync('/bin/bash', [join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'waiting-external', '--wait-minutes', '45', '--reason', 'image build', '--watch', 'gh:x#run/1'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       assert.match(out, /"session_id": "s-inbox"/);
-      const expected = inboxOutcomeFile(root, 'alpha', 2);
-      assert.equal(expected.includes(instanceId(root)), true);
+      // The stamp is the script's own `date -u`, so the file is FOUND rather
+      // than predicted (S9-a): one declaration, so exactly one name is there,
+      // and asserting a path that could never exist would have made the
+      // "consumed" poll below pass on an empty directory.
+      const inbox = dirname(inboxOutcomeFile(root, 'alpha', 2));
+      assert.equal(inbox.includes(instanceId(root)), true);
+      const landed = readdirSync(inbox).filter((n) => inboxOutcomePhase(n) === 2);
+      assert.equal(landed.length, 1, `one declaration, one file: ${landed.join(', ')}`);
+      assert.match(landed[0], /^phase-02-\d{8}T\d{6}Z\.json$/);
+      const expected = join(inbox, landed[0]);
       // Picked up (by the watcher, or the boot scan had it been written before) and consumed.
       assert.ok(await poll(() => !existsSync(expected) && latestRun(root, 'alpha') !== null, 6_000), 'the inbox file is consumed and a run exists');
       const state = latestRun(root, 'alpha')!;
@@ -374,7 +383,12 @@ test('REG-1: a declaration from a session still running is refused and kept — 
       const env = { ...process.env, DOCS_ROOT: root, PE_SESSION_ID: 's-took-over' };
       delete (env as Record<string, unknown>).PE_OUTCOME_FILE;
       execFileSync('/bin/bash', [join(SCRIPTS, 'phase-outcome.sh'), 'alpha', '2', 'waiting-external', '--wait-minutes', '45', '--reason', 'took the phase over', '--watch', 'date:2026-09-13T21:15:00Z'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      const file = inboxOutcomeFile(root, 'alpha', 2);
+      // FOUND, not predicted: the name carries the script's own `date -u`
+      // stamp since S9-a, so the only honest way to name it is to look.
+      const inbox = dirname(inboxOutcomeFile(root, 'alpha', 2));
+      const landed = readdirSync(inbox).filter((n) => inboxOutcomePhase(n) === 2);
+      assert.equal(landed.length, 1, `one declaration, one file: ${landed.join(', ')}`);
+      const file = join(inbox, landed[0]);
       assert.ok(await poll(() => announced.some((a) => /A resume is held/.test(a.title)), 6_000), 'the refusal is announced');
       assert.ok(existsSync(file), 'the declaration is KEPT, as evidence, until its author ends');
       assert.equal(latestRun(root, 'alpha'), null, 'no run was parked on it');
@@ -1264,9 +1278,17 @@ test('ACC-7.3 (REG-3): a live foreign session in the plan\'s root with no lock o
     const svc = service(root, { converge: false });
     try {
       await settle(svc);
-      // A person's session, started in the root, no owner, no lock — alive.
+      // A REAL process for the peer, because this test needs it genuinely alive
+      // for the first half and genuinely gone for the second (PRS-1). It used to
+      // register `process.pid` — the test runner's own — and then end the
+      // session while that process kept running, which is the `/clear` shape:
+      // the hook says ended, the pid says otherwise, and presence is now
+      // `unknown`, which blocks. Both halves of this test are about the other
+      // case, so the pid has to actually die.
+      const peerProc = spawnProcess('sleep', ['120'], { stdio: 'ignore' });
+      const peerPid = peerProc.pid!;
       const started = await call(svc, 'POST', '/hooks/session', {
-        version: 1, session_id: 's-peer-hand', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        version: 1, session_id: 's-peer-hand', event: 'SessionStart', cwd: root, root, pid: peerPid,
         user: 'sam', host: 'laptop', source: 'startup', at: new Date().toISOString(),
       });
       assert.equal(started.status, 200, JSON.stringify(started.payload));
@@ -1278,7 +1300,7 @@ test('ACC-7.3 (REG-3): a live foreign session in the plan\'s root with no lock o
       const peer = holders.find((holder) => holder.kind === 'session');
       assert.ok(peer, `a session holder: ${JSON.stringify(holders)}`);
       assert.equal(peer.session, 's-peer-hand');
-      assert.equal(peer.pid, process.pid);
+      assert.equal(peer.pid, peerPid);
       assert.equal(peer.cwd, root);
       assert.equal(peer.presence, 'live');
       assert.match(peer.owner, /^session s-peer-h/);
@@ -1299,17 +1321,103 @@ test('ACC-7.3 (REG-3): a live foreign session in the plan\'s root with no lock o
 
       // A second session starting in the root is told the first is there.
       const second = await call(svc, 'POST', '/hooks/session', {
-        version: 1, session_id: 's-peer-second', event: 'SessionStart', cwd: root, root, pid: process.pid, at: new Date().toISOString(),
+        // No pid: this one exists only to read the peers sentence back, and it
+        // ends immediately below. With the TEST RUNNER's pid it would end while
+        // its process kept running — the `/clear` shape — and read `unknown`
+        // (PRS-1), which blocks the admission just as a live peer does.
+        version: 1, session_id: 's-peer-second', event: 'SessionStart', cwd: root, root, at: new Date().toISOString(),
       });
       assert.match(String((second.payload as { peers?: string }).peers), /s-peer-h/);
       await call(svc, 'POST', '/hooks/session', { version: 1, session_id: 's-peer-second', event: 'SessionEnd', cwd: root, root, at: new Date().toISOString() });
 
+      // The peer's process really goes, and only then does its session end —
+      // the ordinary "that window is closed" case, as opposed to `/clear`.
+      peerProc.kill('SIGKILL');
+      await new Promise((resolve) => { peerProc.on('exit', resolve); });
       await call(svc, 'POST', '/hooks/session', {
         version: 1, session_id: 's-peer-hand', event: 'SessionEnd', cwd: root, root, reason: 'other', at: new Date().toISOString(),
       });
       const grant = await Promise.race([admission, new Promise((resolve) => setTimeout(() => resolve('still-queued'), 5_000))]);
       assert.notEqual(grant, 'still-queued', 'the peer ended: the admission is granted');
       svc.scheduler.release(grant as never);
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+/**
+ * REG-3's window has an END. "The first minute of every hand session" used to
+ * last as long as the process: every `claude` a person left open in the root
+ * held every phase in the repository, so three terminals doing unrelated work
+ * kept a whole plan queued with no lock anywhere. A session that is not on THIS
+ * phase is a peer only until `PEER_CLAIM_WINDOW_MS` after its newest start.
+ */
+test('REG-3 claim window: a session that started in the root longer ago than the window and never claimed holds nothing — a resume re-opens the window, a compaction does not', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    const svc = service(root, { converge: false });
+    try {
+      await settle(svc);
+      const request = { slug: 'alpha', phase: 2, runId: 'window-test-run', scope: ['app'] };
+      const sessionHolders = () => svc.scheduler.wouldBlock(request).filter((holder) => holder.kind === 'session');
+
+      // A person's session, started in the root past the window: alive, no lock, correlated to nothing.
+      const started = await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-idle', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        user: 'sam', host: 'laptop', source: 'startup', at: new Date(Date.now() - PEER_CLAIM_WINDOW_MS - 60_000).toISOString(),
+      });
+      assert.equal(started.status, 200, JSON.stringify(started.payload));
+      assert.equal(existsSync(lockPath(join(root, 'docs', 'handoffs'), 'alpha', 2)), false, 'no lock on disk');
+      assert.equal(svc.sessions.presence('s-peer-idle'), 'live', 'still live — the window lets the phase go, not presence');
+      assert.deepEqual(sessionHolders(), [], 'its claim window has closed: it holds nothing');
+
+      const { evidence, situation } = await svc.classifyPhase('alpha', 2, null, { 1: 'done', 2: 'ready', 3: 'waiting' });
+      assert.equal(evidence.registry ?? null, null, 'no registry witness');
+      assert.notEqual(situation.id, 'foreign-live');
+
+      // A compaction is the same session carrying on: the window stays shut.
+      await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-idle', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        source: 'compact', at: new Date().toISOString(),
+      });
+      assert.deepEqual(sessionHolders(), [], 'a compaction re-opens nothing');
+
+      // A person resuming it may be about to claim: the window opens again, and the holder says when it shuts.
+      const resumedAt = Date.now();
+      await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-idle', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        source: 'resume', at: new Date(resumedAt).toISOString(),
+      });
+      const [resumed] = sessionHolders();
+      assert.ok(resumed, 'a resume re-opens the window');
+      assert.equal(resumed.session, 's-peer-idle');
+      assert.equal(resumed.leaseUntil, resumedAt + PEER_CLAIM_WINDOW_MS, 'the hold lapses when the window shuts');
+    } finally { svc.close(); }
+  } finally { cleanup(); }
+});
+
+test('REG-3 claim window: a session working THIS phase holds it past the window — the window bounds who might be about to claim, never who is at work', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    gitInit(root);
+    handoff(root, 1, 'schema', 'complete');
+    // The person's own claim on phase 2 — no `--session`, so it names them by owner only — whose
+    // lease ran out while the session that took it is still at work.
+    claim(root, 2, 'sam@laptop', -60);
+    const svc = service(root, { converge: false });
+    try {
+      await settle(svc);
+      await call(svc, 'POST', '/hooks/session', {
+        version: 1, session_id: 's-peer-at-work', event: 'SessionStart', cwd: root, root, pid: process.pid,
+        user: 'sam', host: 'laptop', source: 'startup', at: new Date(Date.now() - PEER_CLAIM_WINDOW_MS - 60_000).toISOString(),
+      });
+      const holders = svc.scheduler.wouldBlock({ slug: 'alpha', phase: 2, runId: 'window-test-run', scope: ['app'] });
+      const peer = holders.find((holder) => holder.kind === 'session');
+      assert.ok(peer, `still a holder past the window: ${JSON.stringify(holders)}`);
+      assert.equal(peer.session, 's-peer-at-work');
+      assert.equal(peer.phase, 2, 'named with the phase it works');
+      assert.equal(peer.leaseUntil, undefined, 'working the phase is not a window: nothing lapses');
     } finally { svc.close(); }
   } finally { cleanup(); }
 });

@@ -21,6 +21,11 @@ ENGINE="$SKILL_DIR/scripts/phase-graph.sh"
 # shellcheck source=/dev/null
 . "$SKILL_DIR/scripts/instance.sh"
 DOCS_ROOT="$(pe_docs_root)"; export DOCS_ROOT
+# The prefix every PRINTED command carries — the same contract phase-graph.sh
+# keeps. `export DOCS_ROOT` above reaches this script's own children and nothing
+# else; a line printed for a person to paste runs in THEIR session, whose cwd
+# decides the root unless the line says otherwise.
+CMD="DOCS_ROOT=$DOCS_ROOT bash $SKILL_DIR/scripts"
 plan_file="$DOCS_ROOT/docs/plans/${slug}.md"
 [ -f "$plan_file" ] || { printf 'ERROR: plan not found: %s\n' "$plan_file" >&2; exit 1; }
 
@@ -38,7 +43,7 @@ print_closeout() {
   qa_mode="$(bash "$ENGINE" "$slug" --qa-mode 2>/dev/null || echo off)"
   printf '\n🏁  All phases complete.\n'
   printf '   Close the plan (this is what stops it appearing as outstanding work):\n'
-  printf '     scripts/close-plan.sh %s --status complete --reason "<what shipped>"\n\n' "$slug"
+  printf '     %s/close-plan.sh %s --status complete --reason "<what shipped>"\n\n' "$CMD" "$slug"
   case "$qa_mode" in
     on*)
       printf 'Final full-plan QA (this plan runs QA: %s) — dispatch a FRESH qa-full QA subagent\n' "$qa_mode"
@@ -65,7 +70,7 @@ print_closeout() {
 if closed="$(bash "$ENGINE" "$slug" --closed 2>/dev/null)"; then
   printf '\n🔒  %s is closed (%s) — no next phase.\n\n' "$slug" "${closed#closed }"
   printf 'Nothing here is outstanding work. To resume this plan:\n'
-  printf '  scripts/close-plan.sh %s --reopen\n\n' "$slug"
+  printf '  %s/close-plan.sh %s --reopen\n\n' "$CMD" "$slug"
   exit 0
 fi
 
@@ -128,7 +133,7 @@ if [ "$n_ready" -gt 1 ]; then
   if [ -n "$overlap" ]; then
     printf '   Shared scope (SERIALIZE — never two live sessions on these):%s\n' "$overlap"
   fi
-  printf '   Check before you start either way: `phase-lock.sh %s conflicts <N> --scope "<csv>" --git`.\n' "$slug"
+  printf '   Check before you start either way:\n   %s/phase-lock.sh %s conflicts <N> --scope "<csv>" --git\n' "$CMD" "$slug"
   printf '   If the remaining session budget allows (your live context meter — references/sizing.md),\n'
   printf '   you MAY also continue into ONE of them in THIS session (not a 🔒GATED one — those always\n'
   printf '   start fresh after their gates are confirmed). Commit before switching sessions; never\n'
@@ -151,13 +156,13 @@ else
         ;;
       auto)
         printf '\n▶  Next ready phase: %s  (size %s) — 🔒 GATED (auto-checked).\n' "$ready" "$sz"
-        printf '   ⚠️  Confirm the check reads clear first:  scripts/phase-graph.sh %s --gate-status %s\n' "$slug" "$ready"
+        printf '   ⚠️  Confirm the check reads clear first:  %s/phase-graph.sh %s --gate-status %s\n' "$CMD" "$slug" "$ready"
         printf '   Then start it in a FRESH session using the prompt below (never batched past).\n'
         ;;
       *)
         printf '\n▶  Next ready phase: %s  (size %s) — 🔒 GATED (human).\n' "$ready" "$sz"
         printf '   ⚠️  STOP here — a person must do this gate'\''s steps, then approve it: Phase Console →\n'
-        printf '   plan → phase %s → Gate card, or scripts/gate-approve.sh %s %s --by "<who>".\n' "$ready" "$slug" "$ready"
+        printf '   plan → phase %s → Gate card, or\n   %s/gate-approve.sh %s %s --by "<who>".\n' "$ready" "$CMD" "$slug" "$ready"
         printf '   Then start the phase in a FRESH session using the prompt below (never batched past).\n'
         ;;
     esac

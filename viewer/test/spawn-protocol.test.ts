@@ -195,6 +195,11 @@ for (let i = 0; i < replayHistory; i++) {
 
 let buffer = '';
 let turn = 0;
+// API turns since the last result. The CLI's \`num_turns\` counts the turn a
+// result closes, from one — it restarts every turn (measured 2 → 1, CLI
+// 2.1.273, autopilot-token-drain) — so a turn folded into the next result is
+// counted there, and a running count across the session would double-book.
+let sinceResult = 0;
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => {
   buffer += chunk;
@@ -315,13 +320,16 @@ if (process.env.PC_STUB_HEARD) fs.appendFileSync(process.env.PC_STUB_HEARD, text
     say({ type: 'assistant', session_id: sid,
           message: { role: 'assistant', stop_reason: 'end_turn',
                      content: [{ type: 'text', text: mark ? mark + ' yes, because the cache was cold' : 'turn ' + turn }] } });
+    sinceResult += 1;
     if (noResult.has(turn)) continue;
     // total_cost_usd is the SESSION total, not this turn's share.
-    say({ type: 'result', subtype: 'success', session_id: sid, num_turns: turn,
+    const reported = sinceResult;
+    sinceResult = 0;
+    say({ type: 'result', subtype: 'success', session_id: sid, num_turns: reported,
           total_cost_usd: turn, is_error: false, result: 'done ' + turn });
     if (extraResult.has(turn)) {
-      // Same num_turns: a duplicate, not a new turn.
-      say({ type: 'result', subtype: 'success', session_id: sid, num_turns: turn,
+      // The same result again, with nothing between: a duplicate, not a new turn.
+      say({ type: 'result', subtype: 'success', session_id: sid, num_turns: reported,
             total_cost_usd: turn, is_error: false, result: 'done ' + turn + ' (again)' });
     }
   }
@@ -1450,9 +1458,17 @@ test('the background-task ceiling is set explicitly on the child, and the tasks 
     const env = { ...b.env, PC_STUB_BG_TASK: '1' };
     delete env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
     delete env.CLAUDE_CODE_MAX_RETRIES;
-    const outcome = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env });
+    const events: StreamEvent[] = [];
+    const outcome = await spawnClaude({ prompt: 'BOOT phase 1', cwd: b.dir, env, onEvent: (event) => events.push(event) });
     assert.deepEqual(outcome.signal.backgroundTasks, [{ id: 'bash_7', description: 'npm test -- --run' }]);
     assert.match(outcome.signal.text ?? '', /Background tasks still running after 600s/);
+    // …and a task the process took down with it is announced ended when the
+    // process closes, so a lane the runner reuses for a closeout or a resume
+    // never carries a dead session's task as outstanding (autopilot-token-drain P1).
+    assert.deepEqual(events.filter((event) => event.kind === 'background'), [
+      { kind: 'background', op: 'started', taskId: 'bash_7', description: 'npm test -- --run' },
+      { kind: 'background', op: 'ended', taskId: 'bash_7', status: 'process-exited' },
+    ]);
     const seen = JSON.parse(readFileSync(join(b.dir, 'env.json'), 'utf8')) as Record<string, string | null>;
     assert.equal(seen.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, '600000', 'the documented default, set on purpose');
     assert.equal(seen.CLAUDE_CODE_MAX_RETRIES, '15');

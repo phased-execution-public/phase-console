@@ -294,6 +294,22 @@ export const SHUTDOWN_CLOCK_SOURCES = Object.freeze(
  */
 export const BOOT_HOLD_KINDS = Object.freeze(/** @type {const} */ (['stopped', 'autostart-off']));
 
+/**
+ * Where a restart's update stands (2026-09-18) — a restart brings the console
+ * back on the latest version, so it runs `deploy/self-update.sh` first:
+ * `waiting` — pressed mid-run, it waits for the live sessions to finish while
+ * no new phase boards; `running` — the updater is working and every automatic
+ * start waits; `restarting` — it answered with a copy that is safe to run, and
+ * the process is on its way out; `stopped` — it answered, and the restart did
+ * NOT follow (the copy could not be vouched for, another update held it, a run
+ * started meanwhile, or somebody cancelled the wait). The sentence saying
+ * which rides beside the word.
+ * @typedef {(typeof RESTART_UPDATE_STATES)[number]} RestartUpdateState
+ */
+export const RESTART_UPDATE_STATES = Object.freeze(
+  /** @type {const} */ (['waiting', 'running', 'restarting', 'stopped']),
+);
+
 // ---------------------------------------------------------------------------
 // Push delivery + ETA
 // ---------------------------------------------------------------------------

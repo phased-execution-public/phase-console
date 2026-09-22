@@ -433,6 +433,7 @@ describe('axe — every destination', () => {
 });
 
 describe('axe — every settings section', () => {
+
   for (const section of SETTINGS_SECTIONS) {
     it(
       `settings/${section.id} has no accessibility violations`,

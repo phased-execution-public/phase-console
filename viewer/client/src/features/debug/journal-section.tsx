@@ -20,6 +20,7 @@ import type { ViewProps } from '@/app/router';
 import { useNavigate } from '@/app/router';
 import {
   Banner,
+  Button,
   Card,
   CardBody,
   CardHeader,
@@ -34,7 +35,7 @@ import {
   SelectValue,
   Spinner,
 } from '@/components/ui';
-import type { ApiError } from '@/lib/api';
+import { api, type ApiError } from '@/lib/api';
 import { Gantt } from '@/features/runs/gantt';
 import { useConsoleState, useDebugRuns, useDiagnosis, useTimeline } from '@/lib/queries';
 import { debugHref } from './routes';
@@ -144,6 +145,27 @@ export default function JournalSection({ route }: { route: ViewProps['route'] })
             </SelectContent>
           </Select>
         </label>
+
+        {/*
+          The one action on this page, and it belongs beside the selects that
+          scope it: the plan and run those two resolve are exactly the plan and
+          run the bundle is OF. A plain `<a download>` rather than a fetch —
+          the browser names the file from `content-disposition` and streams a
+          tar.gz to disk, which `request()` would try to parse as JSON.
+        */}
+        <Button asChild size="sm" disabled={!slug || !runId}>
+          <a
+            href={slug && runId ? api.runBundleHref(slug, runId) : '#'}
+            download
+            title={
+              slug && runId
+                ? 'Everything about this run, redacted, as a tar.gz — attach it to an issue or hand it to a model.'
+                : 'Pick a plan and a run first.'
+            }
+          >
+            Export this run
+          </a>
+        </Button>
       </div>
 
       {timeline.isPending ? (

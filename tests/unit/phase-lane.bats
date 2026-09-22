@@ -242,3 +242,80 @@ commit_in() { # <dir> <file> <body> <message>
   assert_contains "$output" "adopted the existing pe/demo-p2"
   assert_contains "$output" "1 commit(s) ahead of and 1 behind pe/demo"
 }
+
+@test "lane: create --qa prints the qa-record instruction and claims NOTHING (S7-2)" {
+  # A QA round runs BESIDE the build lane, and `phase-lock.sh` refuses a second
+  # claim on the same slug+phase however it is qualified (the scheduler's
+  # `sameUnitOfWork` rule, taught to bash in phase 3). So the `claim … --here`
+  # line this used to print was an instruction that could only fail — and the
+  # reviewer who ran it read the refusal as "somebody else is building here".
+  setup_lane_hub
+  run pe_lane demo create 2 --qa 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "qa-record.sh"
+  assert_contains "$output" "--round 1"
+  [[ "$output" != *"claim 2"* ]]
+}
+
+@test "lane: create WITHOUT --qa still prints the claim line" {
+  setup_lane_hub
+  run pe_lane demo create 2
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "claim 2"
+  assert_contains "$output" "--here"
+}
+
+@test "lane: merge lands in whatever tree holds the run branch, not only the main checkout (S7-4)" {
+  # Under isolation the run branch is checked out in the console's mirror, and
+  # under a shared run the main checkout is where a live session is working.
+  # Requiring `$repo` itself to stand on pe/<slug> made merge impossible in the
+  # first case and unsafe in the second.
+  setup_lane_hub
+  pe_lane demo create 2
+  commit_in "$HUB/.worktrees/hand/demo/p2/sub" f lane "lane work"
+  # Move the run branch out of the main checkout into a second tree of its own.
+  other="$BATS_TEST_TMPDIR/elsewhere"
+  git -C "$HUB/sub" checkout -q main
+  git -C "$HUB/sub" worktree add -q "$other" pe/demo
+  run pe_lane demo merge 2
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "$other"
+  [ "$(git -C "$HUB/sub" rev-list --count 'pe/demo..pe/demo-p2')" = 0 ]
+}
+
+@test "lane: merge REFUSES a tree a console run holds (S7-4)" {
+  setup_lane_hub
+  pe_lane demo create 2
+  commit_in "$HUB/.worktrees/hand/demo/p2/sub" f lane "lane work"
+  run_tree="$HUB/.worktrees/runs/demo/abc123def456/integration/sub"
+  git -C "$HUB/sub" checkout -q main
+  mkdir -p "$(dirname "$run_tree")"
+  git -C "$HUB/sub" worktree add -q "$run_tree" pe/demo
+  run pe_lane demo merge 2
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "console run"
+  [ "$(git -C "$HUB/sub" rev-list --count 'pe/demo..pe/demo-p2')" = 1 ]
+}
+
+@test "lane: remove --force PRINTS the branch delete instead of running it (G-LANE)" {
+  # `--force` is documented as "keep the branch and drop the tree" — and then
+  # deleted the branch anyway whenever git judged it merged, which is judged
+  # against the main checkout's HEAD rather than the run branch. The one shape
+  # where the promise and the act disagreed.
+  setup_lane_hub
+  pe_lane demo create 2
+  commit_in "$HUB/.worktrees/hand/demo/p2/sub" f lane "unmerged lane work"
+  run pe_lane demo remove 2 --force
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "branch -d"
+  run git -C "$HUB/sub" rev-parse --verify --quiet "refs/heads/pe/demo-p2"
+  [ "$status" -eq 0 ]
+}
+
+@test "lane: remove WITHOUT --force still deletes the merged branch itself" {
+  setup_lane_hub
+  pe_lane demo create 2
+  run pe_lane demo remove 2
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "deleted pe/demo-p2"
+}

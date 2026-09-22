@@ -57,6 +57,8 @@ import { laneOrder, type NowLane } from './model';
 export interface LaneClaim {
   branch?: string;
   tree?: string;
+  /** The `git worktree lock` reason on `tree`, when the runner fastened one (phase 15). */
+  locked?: string;
   session?: string;
   /** A live child with no checkout of its own — the run's root and branch. */
   shared: boolean;
@@ -71,6 +73,7 @@ export function laneClaim(lane: NowLane): LaneClaim {
   return {
     ...(branch ? { branch } : {}),
     ...(tree ? { tree } : {}),
+    ...(tree && child?.locked ? { locked: child.locked } : {}),
     ...(child?.sessionId ? { session: child.sessionId } : {}),
     shared: child != null && !tree,
     pending: child == null,

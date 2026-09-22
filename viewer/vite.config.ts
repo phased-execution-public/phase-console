@@ -118,7 +118,10 @@ export default defineConfig({
         // forms pulled the captured modules' dependency subtree — React
         // itself — into the named chunk, which made index.html modulepreload
         // xterm for every visitor.
-        globIgnores: ['**/pane-*.js', '**/pane-*.css'],
+        globIgnores: [
+          '**/pane-*.js',
+          '**/pane-*.css',
+        ],
       },
       // No worker in dev. See the `/sw.js` proxy note above.
       devOptions: { enabled: false },

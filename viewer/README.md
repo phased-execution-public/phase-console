@@ -108,6 +108,7 @@ written by an agent session appears without a reload. It is also an installable 
 is precached so it opens instantly (and offline it says so, rather than showing a stale board — live
 data is never cached), and a new build is offered as an update toast, applied only when you accept.
 
+
 ## The autopilot
 
 `--allow-run` lets the console spawn agent sessions. It is a separate flag from `--allow-writes` on
@@ -121,13 +122,16 @@ agree: the plan's own verification commands pass, `validate.sh` still passes, an
 **from disk** says done. Nothing asks the session whether it succeeded.
 
 **Before the first spawn, the prelude (since 5.0.0).** A run cannot start with a decision open: the
-start door reads the plan's `## Decisions` rows and runs four probes — the declared accounts' sign-in
+start door reads the plan's `## Decisions` rows and runs five probes — the declared accounts' sign-in
 and headroom, the plan's MCP servers, the credentials it names (`gh`, the `claude` login, `env:`,
-`keychain:`, `file:` ids — presence only, never a value) and whether anything could deliver an
-announcement — and answers **409** naming each blocking row or failed probe. The launch form's first
-stage, *Decisions*, shows the same report and asks the three answers every run must give
-(resume-on-restart, relay, accounts); a recorded override starts anyway and journals who overrode
-what. Mid-run, an intervention the policy table can answer — a manual gate with `gates: delegated`,
+`keychain:`, `file:` ids — presence only, never a value), whether anything could deliver an
+announcement, and (since 2026-09-18) every §Verification command the run would stop on for a person:
+a phase that would park under `Person-check: halt`, or always ask under `halt-on-everything` — and
+answers **409** naming each blocking row or failed probe. The launch form's first stage, *Decisions*,
+shows the same report, asks the three answers every run must give (resume-on-restart, relay,
+accounts), and lists each such verification command to **approve** — bound to its exact text, with
+every other check still applied, and only where an approval can make it run — or to **waive for this
+run**; a recorded override starts anyway and journals who overrode what. Mid-run, an intervention the policy table can answer — a manual gate with `gates: delegated`,
 QA exhausted with `qa.exhausted: waive`, a console restart with `resumeOnRestart` — is answered and
 journalled as `phase.policy-answered` rather than raised as a card; `blocked-declared:unknown` is
 always a card. `phase-console doctor [instance]` runs the same probes by hand, plus the hooks, the
@@ -167,7 +171,8 @@ exit-time check is the load-bearing layer, and the hook carries workflow, never 
 **Waiting on external work.** A `waiting-external` outcome parks the phase as `waiting` — not a
 failure, not settled: the lane, its scope grant and its lock are released so siblings run, and at
 `parkedUntil` the runner **resumes the phase's own session** (`claude -p --resume`, context intact)
-to verify and close out, or re-file the wait. When every startable phase is parked, the run itself
+to verify and close out, or re-file the wait — unless that session is no longer worth resuming (see
+*Context* below), when the phase boards fresh with the resume brief and the wait in it. When every startable phase is parked, the run itself
 waits with the soonest clock (`waitUntil`) — restart-safe: a console reboot re-arms it exactly like
 a usage-window sleep. The wait budget keeps the wait honest: at most 4 declared waits and, by default,
 8 hours parked per phase (`**Wait budget:**`, or a phase's `- **Waits on:** <ref> · <max>`, raises it).
@@ -203,7 +208,7 @@ provide (`shared/cli-tools.js`, plus the tools this console has seen).
 
 **Liveness — is the lane actually working?** A wedged `Bash` call, a session reasoning in circles and
 a session about to commit all read `running` with a spinner. Every live lane now exposes
-`{lastOutputAt, lastToolUseAt, turnsSinceLastTool, commitsSinceStart, treeDirty, openTool?, stall?}`
+`{lastOutputAt, lastToolUseAt, turnsSinceLastTool, commitsSinceStart, treeDirty, openTool?, stall?, retries?, tokens?}`
 on `GET /api/run/:slug`, and a 60-second ticker raises signals against it (`STALL_SIGNALS`, worst
 first): `stalemate` (`stallStalemateAttempts` attempts that committed nothing and left a clean tree),
 `retrying` (`stallRetryBurst` API retries in a row with nothing productive between them),
@@ -217,6 +222,26 @@ manual verbs (nudge, freeze, stop the lane); two act by themselves. `external-wa
 still silent `STALL_NUDGE_GRACE_MS` (5 min) later, and then left for a person — at most one of each
 per phase until Retry, and never a session that has already done work
 ([docs/loop.md](../docs/loop.md)).
+
+**Context — what each next call costs.** Every tool call re-reads the whole conversation, so the
+runner folds each API call's `message.usage` from the stream (`runner/usage.ts`, deduplicated by
+message id): a lane's `tokens` carries its context now and at its peak, what this attempt read from
+and wrote to the cache, the cache rebuilds (calls that wrote at least max(100k, half the context)) and
+the status checks the poll-loop guard counted, and the run view shows them as a chip beside the
+liveness one. The phase's own session is judged against its model's window (`scripts/models.env`:
+`[1m]` and the big families 1M, anything else 200k): at 0.6 × it is told once to wrap up — commit,
+hand off `in-progress`, declare `partial --reason context` (`phase.context-wrapup`) — and at 0.8 × the
+console checkpoints it and boards the next attempt fresh with the resume brief. Every session's
+counters are journalled `phase.tokens` and kept on the record as `tokens[]`. A resume is judged too, by
+the one gate (`resumePolicy`): a session that ended at ≥ 250k tokens and is cold (≥ 55 min) or under
+another account, that declared `partial --reason budget|context`, or that the console checkpointed is
+boarded fresh with the resume brief instead of `--resume`d — a cold resume writes its whole context into
+the cache again (`phase.resume-policy`).
+
+**Money — booked and live.** A session is added to the run's `spentUsd` only when it ends, so the run
+view's Spent tile shows the live sessions' running cost beside it (`+ $X live`) — each lane's `spentUsd`
+in `liveness[]`, the CLI's own running total as of its latest `result`, and gone the moment the session
+ends and is booked.
 
 **The ladder in the loop.** `interrupted` and `failed` records are not terminal any more. At the top
 of every drive tick, after reconcile, the runner **classifies** each of them — and each phase whose
@@ -279,8 +304,9 @@ read done is a health warning, `record-ahead-of-board`, never rewritten.
 
 **The board is live, not per-lane.** The docs watcher pokes running loops, so a handoff written by a
 manual session mid-run is seen NOW rather than when a lane settles; a reconcile pass at the top of
-every drive tick closes any record the board has overtaken (`done`, noted "closed outside this run")
-and dissolves halts anchored to them — it only ever closes records, never re-runs a failed phase.
+every drive tick closes any record the board has overtaken (`done`, noted "closed outside this run" —
+or, for a phase this run had started, "closed while checkpointed — the board reads done; not verified
+by this run") and dissolves halts anchored to them — it only ever closes records, never re-runs a failed phase.
 
 **Recovery order.** Resolve first: before anything is launched, the board is re-read and reconciled
 — a halt the board has moved past becomes `superseded` with nothing spawned. Then the session API:
@@ -347,10 +373,13 @@ languages, so what the lint warns about at plan time is exactly what gets parked
 (`viewer/test/verify-env.test.ts` runs both engines over the same inputs). Measured: a phase held an
 exclusive claim on a whole repository for 35+ minutes inside two poll loops, invisible to every
 surface — no stream event arrives while a Bash call is open, and the keepalive above kept the lock
-looking healthy. Whose clock it is decides the remedy: a call waiting on the session's own background
-job — a suite, a build, a log it started — is steered once to background the job and carry on
-(`LOCAL_JOB_NUDGE`), and parks only past the far longer `stallLocalJobMs` (45 min,
-`STALL_LOCAL_JOB_MS`). With Settings ▸ Automation's **Park a waiting lane by itself** off
+looking healthy. Whose clock it is decides the remedy: a wait on the session's own job — a suite, a
+build, a log it started — is allowed at the hook (one foreground call bounded by the Bash timeout),
+is steered once with the wait procedure if it stays open (`LOCAL_JOB_NUDGE`), and parks only past the
+far longer `stallLocalJobMs` (45 min, `STALL_LOCAL_JOB_MS`). A wait on somebody else's clock is
+refused at the hook with the same procedure. A session whose turn ends while its own subagents or
+monitors run in the background is let go by the Stop hook (`hook.stop-awaiting`) and is not read as `silent`:
+their notification starts its next turn. With Settings ▸ Automation's **Park a waiting lane by itself** off
 (`stallAutomaticPark`, on by default) the watchdog parks nothing and the stall card stays for a person.
 
 **The run drives to plan completion.** The board is re-read after every phase, so work a finishing
@@ -366,6 +395,16 @@ is journalled `run.failure-streak-reset` with what it was.
 then the plan's own `**Model:**` / `**Effort:**` bullets for that phase, then the run's defaults —
 per field, so choosing a model does not discard an effort the plan asked for. The journal records
 which source answered each one.
+
+**The launch form shows that answer before you press Start.** Every row of the per-phase table reads
+`runs <value> · <source>` under its model and effort selects — *plan*, *set here*, *run default* or
+*this attempt* — computed by the same `resolvePhaseChoice` (`shared/run-settings.js`) the runner
+boards with, so the form cannot promise one effort and the phase run at another. Where the plan and
+the run disagree, the table's summary carries a *plan and run differ on N phases* chip and one note
+per field: the plan's value is below or above the run default (and wins), or a choice made here
+replaces the plan's. With **Review each phase** on, the form also says so when the plan already
+reviews its own work — a section that dispatches a reviewer, or `**QA gate:** on` — because every
+phase would then be reviewed twice at about $7–10 a phase. It is advice, never a block.
 
 **Skills.** The console lists every skill a session could invoke — personal, this repository's, and
 every installed plugin's — and appends the ones you pick to the boot prompt, per run or per phase.
@@ -818,8 +857,9 @@ gates, a press-twice confirm) that shows the exact command first:
 | Turn QA on for a plan | `new-handoff.sh … --qa` (it backfills finished phases as waived) |
 | Close or reopen a plan | `close-plan.sh` (a status and a one-line reason; reopening needs neither) |
 
-`--git` is never passed, so the console never commits or pushes — that stays a deliberate act in a
-terminal. Editing plan or handoff bodies is deliberately not offered; agents write those.
+`--git` is never passed, so these verbs never commit or push — a commit stays a deliberate act in a
+terminal, and the one push the console can make is `--allow-publish`'s, below. Editing plan or
+handoff bodies is deliberately not offered; agents write those.
 
 ### Run isolation — off unless you ask, and it degrades rather than fails
 
@@ -963,7 +1003,15 @@ that is retired, walled in a learned bucket, or at `PREFLIGHT_REFUSE_PCT` (97 %)
 trying the next and, with none left, parking the run with an errand (`run.preflight-refused`). Mid-run
 an account at `WALL_PCT` (99 %) is out of the rank, and a run whose on-limit policy twice finds no move
 inside an hour (`LIMIT_NONE_MAX` in `LIMIT_NONE_WINDOW_MS`) hands the phase to the ladder as
-`resource-wall:usage`: it waits out the window or parks with an errand (`phase.live-wall`).
+`resource-wall:usage`: it waits out the window or parks with an errand (`phase.live-wall`). When the
+reset is further off than `LIMIT_ACTION_COOLDOWN_MS` (10 min) — the window's reported reset, or the
+CLI's own retry delay — no retry can get through, so the FIRST rate-limit burst waits on the window.
+Before the wall, a session's warning past `ALERT_PCT` (95 %) that no account switch can answer engages
+the account's **usage brake**: no new lane boards on that account while one is live on it — the only
+lane is never refused — until a reading of that window under `WARN_PCT` (80 %) or its reset
+(`run.usage-brake` / `run.usage-brake-released`). The decision line (`run.usage-decision`) says what was
+done, and counts the live sessions no run spawned on each account by the config dir their presence hook
+reports (`nonRunSessions`; `unattributed` where it cannot tell).
 
 Every launch surface — the run form, the phase launcher, the recovery and QA dialogs, the agent
 launcher — then offers an **Account** choice (including `auto`, most 5-hour headroom) and, for
@@ -1084,12 +1132,26 @@ file's `permissions.deny` and hold whether or not this console is running.
 `--allow-mcp` gates registration. Reading the registry, the connection statuses and the catalog does
 not — seeing what your own sessions connect to is display, not capability.
 
-`--allow-webhooks` is the seventh switch and the only one that points outward: the same
+`--allow-webhooks` is the seventh switch and the first of two that point outward: the same
 announcements, POSTed as JSON to URLs you register (Slack, Discord, Telegram, your own relay). Off
 means no outbound request at all, even for a URL already on file — the flag is read when a payload
 is about to be sent, not only when one is registered. A URL is stored and never served back, because
 an incoming-webhook URL is the whole authorisation; payloads carry ids, titles and a link home, with
 secret-shaped strings masked on the way out. Schema and recipes: `docs/webhooks.md`.
+
+`--allow-publish` is the eighth switch and the second that points outward — where webhooks send an
+announcement somewhere else, this sends the work. It lets a landing push a finished phase's own
+`pe/*` branch (`pe/<slug>-p<N>` for a lane, `pe/<slug>` for an isolated or mirror run) to `origin`,
+through one seam (`pushRef` in `server/runner/worktree.ts`) with one frozen argv:
+`git push --porcelain --no-follow-tags origin refs/heads/<ref>:refs/heads/<ref>`. Never a trunk,
+never `pe/integration`, never with force, never a delete, never a retry of a rejected push, never a
+name outside `^pe/[A-Za-z0-9._-]+(-p\d+)?$`; and the flag alone is not enough — the plan's
+`permission.destructive` row must allow `git push` too, or the landing parks with
+`phase.landing-push-refused {reason}` and nothing is spawned. The landing session boarded afterwards
+never pushes; its `gh pr create` and `gh pr merge` stay pinned asks under every profile. Off means
+the console pushes nothing, and a free console pushes nothing whatever the flag says; the `publish`
+row of `phase-console doctor` says which. The same flag will let the console file issues where a
+plan's `Issues:` line says `file`.
 
 ## From a phone
 

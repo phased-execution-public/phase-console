@@ -68,7 +68,7 @@ const WRITE_VERBS = [
   'lock', 'unlock', 'merge', 'ready', 'review', 'checkout', 'develop', 'api',
 ];
 
-/** The only two things this console may ask `gh` to do. */
+/** The only things this console may ask `gh` to do — reads, everywhere. */
 const ALLOWED_GH = [
   ['issue', 'list'],
   ['issue', 'view'],
@@ -81,6 +81,7 @@ const ALLOWED_GH = [
   // own state, and the exit code is all that is kept.
   ['auth', 'status'],
 ];
+
 
 /**
  * A spawn of the literal `gh` — `execFile('gh', …)` and every sibling.
@@ -97,8 +98,15 @@ const ALLOWED_GH = [
  * quote is this repository's convention, which is exactly why the double one is
  * the shape a hurried edit arrives in.
  */
+/*
+ * 🔴 `shell` is in the alternation because 5.1.0's command seam
+ * (`server/shell.ts`) is now how a process is started — `shell('gh', argv, …)`.
+ * Leaving it out did not make this gate wrong, it made it VACUOUS: the scan
+ * found no spawn anywhere and the floor below is the only reason anyone
+ * noticed. Any future seam belongs here the day it is written.
+ */
 const SPAWNS_GH =
-  /(?:^|[^.\w$])(?:execFile|execFileSync|exec|execSync|spawn|spawnSync)\s*\(\s*(['"`])gh\1/;
+  /(?:^|[^.\w$])(?:execFile|execFileSync|exec|execSync|spawn|spawnSync|shell)\s*\(\s*(['"`])gh\1/;
 
 /**
  * `gh`'s own subcommand heads — the SECOND of the two filters.
@@ -134,7 +142,15 @@ function tsFiles(dir: string, out: string[] = []): string[] {
  * a reviewer can see the whole set of files that reach GitHub in one place,
  * and so the positive assertion below can prove the list describes real code.
  */
-const GH_CALLERS = ['issues/fetch.ts', 'watch-refs.ts', 'credentials-probe.ts'];
+const GH_CALLERS = [
+  'issues/fetch.ts', 'watch-refs.ts', 'credentials-probe.ts',
+];
+
+/** Is this argv, in this file, one the allow-list grants? */
+function allowed(argv: { file: string; args: string[] }): boolean {
+  const lists: string[][] = [...ALLOWED_GH];
+  return lists.some(([head, verb]) => argv.args[0] === head && argv.args[1] === verb);
+}
 
 /**
  * A source file with its comments removed.
@@ -170,9 +186,9 @@ test('the scanner is looking at the real server, not at nothing', () => {
   assert.ok(GH_ARGVS.length >= 4, `only ${GH_ARGVS.length} gh argv literals found — is the scan reaching them?`);
 });
 
-test('every gh argument list in viewer/server is one of the READ verbs', () => {
+test('every gh argument list in viewer/server is one of the READ verbs — or the writer\'s own three, in the writer alone', () => {
   const offences = GH_ARGVS
-    .filter((argv) => !ALLOWED_GH.some(([head, verb]) => argv.args[0] === head && argv.args[1] === verb))
+    .filter((argv) => !allowed(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
 
   assert.deepEqual(offences, [],
@@ -180,9 +196,10 @@ test('every gh argument list in viewer/server is one of the READ verbs', () => {
 
   // The positive half, for the same reason the git gate asserts its verbs are
   // in use: an allow-list nothing exercises is a hole waiting for a first user.
-  const used = new Set(GH_ARGVS.map((argv) => `${argv.args[0]} ${argv.args[1]}`));
+  const used = new Set(GH_ARGVS.map((argv) => `${argv.file} ${argv.args[0]} ${argv.args[1]}`));
+  const anywhere = new Set(GH_ARGVS.map((argv) => `${argv.args[0]} ${argv.args[1]}`));
   for (const [head, verb] of ALLOWED_GH) {
-    assert.ok(used.has(`${head} ${verb}`),
+    assert.ok(anywhere.has(`${head} ${verb}`),
       `${head} ${verb} is allowed but unused — take it off the list rather than leaving it open`);
   }
 
@@ -192,7 +209,7 @@ test('every gh argument list in viewer/server is one of the READ verbs', () => {
     'a server file outside the named set spawns gh — name it here, deliberately');
 });
 
-test('no writing gh subcommand appears in any file that spawns gh', () => {
+test('no writing gh subcommand appears in any file that spawns gh — the writer excepted, for its three verbs only', () => {
   // Belt to the allow-list's braces. It catches a write reached by a shape the
   // head check cannot see — `['issue', verb]` with `verb` computed, say, whose
   // literal `'close'` would still be sitting in some array nearby.
@@ -204,6 +221,7 @@ test('no writing gh subcommand appears in any file that spawns gh', () => {
   assert.deepEqual(offences, [], 'a writing gh subcommand reached an argument list');
 });
 
+
 test('nothing in server/issues runs anything but gh', () => {
   // `execFile` is the only spawn here and its first argument must be the
   // literal `gh`. A computed binary would make every assertion above decorative.
@@ -214,7 +232,7 @@ test('nothing in server/issues runs anything but gh', () => {
   const spawns: string[] = [];
   for (const file of ISSUES_FILES) {
     for (const match of code(file)
-      .matchAll(/(^|[^.\w$])(execFile|execFileSync|exec|execSync|spawn|spawnSync)\s*\(\s*([^,)]*)/g)) {
+      .matchAll(/(^|[^.\w$])(execFile|execFileSync|exec|execSync|spawn|spawnSync|shell)\s*\(\s*([^,)]*)/g)) {
       spawns.push(`${relative(SERVER_DIR, file)}: ${match[2]}(${match[3].trim()}`);
     }
   }

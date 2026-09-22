@@ -49,6 +49,7 @@ import {
   type RepoDiffParams,
   type IssuesPayload,
   type DebugIndexParams,
+  type RestartReadiness,
 } from './api';
 import { isClosed } from './closure';
 // The module, not the barrel: `components/ui/index.ts` pulls every primitive in,
@@ -100,6 +101,7 @@ export const keys = {
     ['plan', slug, 'qa-report', String(phase), round ?? 'latest'] as const,
   gate: (slug: string, phase: number | string) => ['plan', slug, 'gate', String(phase)] as const,
   review: (slug: string, phase: number | string) => ['plan', slug, 'review', String(phase)] as const,
+  notes: (slug: string, phase: number | string) => ['plan', slug, 'notes', String(phase)] as const,
   landing: (slug: string) => ['plan', slug, 'landing'] as const,
   stats: () => ['stats'] as const,
   /**
@@ -138,6 +140,7 @@ export const keys = {
   debugIndex: (params: unknown) => ['debug', 'index', params] as const,
   debugRuns: (slug: string) => ['debug', 'runs', slug] as const,
   debugBundle: (params: unknown) => ['debug', 'bundle', params] as const,
+  debugRetention: () => ['debug', 'retention'] as const,
   terminal: () => ['terminal'] as const,
   /** The session-presence registry — every Claude session the hook reported for this instance. */
   sessionRegistry: () => ['sessions', 'registry'] as const,
@@ -539,6 +542,9 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
   /* Watcher/server health is part of what `/api/state` reports (including
      `serverStale`, which the shell turns into a banner). */
   health: { invalidate: [keys.state()] },
+  /* A restart's update moved: the Restart card reads `/api/restart`, and the
+     shell's banner reads `restartUpdate` off `/api/state`. */
+  restart: { invalidate: [keys.restart(), keys.state()] },
 
   /* ---- approvals ---- */
   approval: { invalidate: [keys.approvals()] },
@@ -660,7 +666,28 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
      would refetch the whole run object per line. Invalidating nothing here is
      the point, not an omission. */
   'run:stream': { streamOnly: true },
-  'run:journal': { streamOnly: true },
+  // The journal is what the trace is projected from, so a new line means the
+  // picture has moved — and it is the ONLY signal that says so, since the
+  // spans come from four files and only this one announces itself. The live
+  // Journal panel still tails the stream directly through `onSse`; this row
+  // additionally invalidates the trace and the git table.
+  // (`streamOnly` is deliberately NOT set: `applyEffect` returns early on it,
+  // so a row carrying both a `patch` and that flag would run neither. The flag
+  // only ever meant "this row has no cache effect", and now it has one.)
+  // The ROW is in both trees — `EVENT_EFFECTS` is total over `SseEvent`, so a
+  // row a marker swallows is a TS2741 only the free tree's typecheck sees. Only
+  // the `patch` is marked: the free row is `{ invalidate: [] }`, a no-op, which
+  // is exactly what a tree with no Debug ▸ Timeline needs from it.
+  'run:journal': {
+    invalidate: [],
+  },
+
+  /* ---- the repository's conflict radar (phase 7) ---- */
+  // `keys.runs()` because that is where a radar verdict is READ today: the git
+  // card on each run. `keys.repo()` because the Repo destination's checkouts
+  // section shows the same trees. Phase 9's repository-wide landscape lands
+  // under the second key, so this row already points at it.
+  'repo:radar': { invalidate: [keys.runs(), keys.repo()] },
 
   /* ---- the lint, arriving after the page ----
      A cache WRITE and no invalidation: the plan detail the browser is holding
@@ -1066,7 +1093,7 @@ export function usePlanRaw(slug: string | undefined, enabled = true) {
  */
 /**
  * The run-start prelude (phase 11) for the launch form's draft: the manifest
- * with every row's state and the four probes' verdicts, recomputed when the
+ * with every row's state and the probes' verdicts, recomputed when the
  * draft's answers change. Kept while a new draft loads, so the table never
  * blanks between keystrokes.
  */
@@ -1079,6 +1106,9 @@ export function usePrelude(slug: string | undefined, draft: PreludeDraft, enable
     draft.model ?? '',
     draft.profile ?? '',
     draft.mcpPolicy ?? '',
+    draft.onlyPhases ?? [],
+    draft.autonomy ?? '',
+    draft.verifyAnswers ?? null,
   ]);
   return useQuery({
     queryKey: keys.prelude(slug ?? '', key),
@@ -1122,6 +1152,24 @@ export function useGateStatus(slug: string | undefined, phase: number | undefine
  * phase nobody has opened the review for. `keepPreviousData` so switching
  * files inside an open review does not blank the panel.
  */
+/**
+ * What earlier phases left for this one — handoff notes, deferral rulings and
+ * boot-deliverable mail, in the order the phase's own boot prompt carries them.
+ *
+ * `enabled` is the caller's: this is a subprocess on the server and it belongs
+ * to a sheet somebody opened, not to every plan row on the page. Three small
+ * files, so no `keepPreviousData` — a blank beat while switching phases is
+ * honest, and stale notes attributed to the wrong phase are not.
+ */
+export function usePhaseNotes(slug: string | undefined, phase: number | undefined, enabled = true) {
+  return useQuery({
+    queryKey: keys.notes(slug ?? '', phase ?? ''),
+    queryFn: () => api.notes(slug!, phase!),
+    enabled: Boolean(slug) && phase != null && enabled,
+    retry: false,
+  });
+}
+
 export function usePhaseReview(slug: string | undefined, phase: number | undefined, enabled: boolean) {
   return useQuery({
     queryKey: keys.review(slug ?? '', phase ?? ''),
@@ -1278,6 +1326,7 @@ export function useDiagnosis(slug: string | undefined, phase: number | undefined
  * and the reader is usually mid-scroll; dropping to a skeleton there loses
  * their place. A run with no journal file yet is not an error worth retrying.
  */
+
 export function useJournal(slug: string | undefined, id?: number, limit = 500, enabled = true) {
   return useQuery({
     queryKey: keys.journal(slug ?? '', id),
@@ -1505,6 +1554,18 @@ export function usePolicy(slug: string | undefined) {
   });
 }
 
+/**
+ * How often the Restart card re-asks while an update is in hand: while it runs,
+ * while the process is on its way out, and — slowly — while it waits. The `restart` event says the same
+ * thing sooner; the poll is the belt for a tab whose stream dropped mid-build.
+ */
+export function restartPollMs(readiness: RestartReadiness | undefined): number | false {
+  const phase = readiness?.update?.run?.state;
+  if (phase === 'running' || phase === 'restarting') return 1_500;
+  // A wait lasts as long as the live phases do, and the event says when it ends.
+  return phase === 'waiting' ? 15_000 : false;
+}
+
 /** Whether this console can restart itself — asked before the button renders. */
 export function useRestartReadiness(enabled = true) {
   return useQuery({
@@ -1512,6 +1573,7 @@ export function useRestartReadiness(enabled = true) {
     queryFn: api.restartReadiness,
     enabled,
     retry: false,
+    refetchInterval: (query) => restartPollMs(query.state.data),
   });
 }
 
@@ -1878,6 +1940,7 @@ export function useRepoSettles(
   });
 }
 
+
 /* ------------------------------------------------------------------ *
  * Issues — the estate board
  * ------------------------------------------------------------------ */
@@ -1959,6 +2022,25 @@ export function useDebugIndex(params: DebugIndexParams, enabled = true) {
     queryFn: () => api.debugIndex(params),
     enabled,
     staleTime: DEBUG_STALE,
+  });
+}
+
+/**
+ * What every sink this console writes is using, and what the next sweep would
+ * do about it.
+ *
+ * A read with no capability behind it — seeing your own disk is display — and
+ * a slow-ish one: it walks the state directory. The stale time is longer than
+ * the other debug queries because nothing in the retention table moves in
+ * seconds, so a card left open must not re-walk every plan's run directory on
+ * a five-second clock.
+ */
+export function useRetention(enabled = true) {
+  return useQuery({
+    queryKey: keys.debugRetention(),
+    queryFn: () => api.debugRetention(),
+    enabled,
+    staleTime: 60_000,
   });
 }
 

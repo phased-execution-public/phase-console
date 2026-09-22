@@ -70,9 +70,17 @@ describe('the automation defaults card', () => {
     // controls the launch form shows, so they carry no `data-pref` of their own.
     // The fourth Off is `watchMintedCmdRefs` (zero-touch-console phase 6,
     // SLF-8): a `cmd:` ref the console minted itself is never run by default.
+    // The fifth Off is `radarSerialize` (many-plans-one-repo phase 9): a
+    // conflicted radar pair stays advisory until an operator says otherwise.
+    // The sixth On is `messaging` (many-plans-one-repo phase 15): sessions may
+    // message each other unless a plan or an operator says otherwise — a Pro
+    // row, so the free client suite (which `verify-free` runs on the stripped
+    // tree) counts it only where it renders: `5 + PRO_ON`, never a bare 6.
+    const PRO_ON = [
+    ].length;
     const off = await screen.findAllByRole('button', { name: 'Off' });
-    expect(off.length).toBe(4);
-    expect(screen.getAllByRole('button', { name: 'On' }).length).toBe(5);
+    expect(off.length).toBe(5);
+    expect(screen.getAllByRole('button', { name: 'On' }).length).toBe(5 + PRO_ON);
     // …and the card's OWN toggles are named, so the next addition says which.
     const toggles = Object.fromEntries(
       [...document.querySelectorAll('button[data-pref]')].map((el) => [
@@ -82,6 +90,7 @@ describe('the automation defaults card', () => {
     );
     expect(toggles).toEqual({
       repoGuard: 'On',
+      radarSerialize: 'Off',
       autoContinueRecovery: 'On',
       watchCmdRefs: 'On',
       watchMintedCmdRefs: 'Off',
@@ -90,7 +99,9 @@ describe('the automation defaults card', () => {
       // folder: a config from before the key reads as the project.
       worktreeRoot: 'Inside the project',
     });
-    const [branch, mcp] = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    // By label, not by position: phase 15 put four more selects on this card.
+    const branch = screen.getByLabelText('Branch') as HTMLSelectElement;
+    const mcp = screen.getByLabelText('When an MCP server is unavailable') as HTMLSelectElement;
     expect(branch.value).toBe('default-branch');
     // The behaviour change this release is a default moving, so the upgrade
     // path is what matters most: a console whose config predates the key gets
@@ -100,8 +111,7 @@ describe('the automation defaults card', () => {
 
   it('the MCP policy is a choice, and sends only its own key', async () => {
     await mount({ mcpPolicy: 'require' });
-    const selects = (await screen.findAllByRole('combobox')) as HTMLSelectElement[];
-    const mcp = selects[selects.length - 1]!;
+    const mcp = (await screen.findByLabelText('When an MCP server is unavailable')) as HTMLSelectElement;
     expect(mcp.value).toBe('require');
     fireEvent.change(mcp, { target: { value: 'continue' } });
     await waitFor(() => expect(savePrefs).toHaveBeenCalledWith({ mcpPolicy: 'continue' }));
@@ -142,5 +152,31 @@ describe('the automation defaults card', () => {
     await mount({ gitMode: 'new-branch', repoGuard: false, attachDefaultSkills: true });
     expect((await branchSelect()).value).toBe('new-branch');
     expect(await screen.findByText('When the plan completes')).toBeTruthy();
+  });
+});
+
+describe('phase 15 — the launch defaults and the eighth flag', () => {
+  it('renders the three checkout defaults phase 7 stored with no control', async () => {
+    await mount({});
+    expect(await screen.findByLabelText('Base branch')).toBeInTheDocument();
+    expect(screen.getByLabelText('Runs beside it in the repository')).toBeInTheDocument();
+    expect(screen.getByLabelText('When the run settles, its checkouts')).toBeInTheDocument();
+  });
+
+
+  it('states whether --allow-publish is on — a start flag, never a preference', async () => {
+    state.mockResolvedValue({ prefs: {}, defaultSkills: [], allowPublish: false });
+    const client = new QueryClient(queryClientConfig);
+    const { AutomationCard } = await import('./automation-card');
+    render(
+      <QueryClientProvider client={client}>
+        <AutomationCard />
+      </QueryClientProvider>,
+    );
+    const line = await screen.findByTestId('publish-flag');
+    expect(line).toHaveTextContent(/--allow-publish/);
+    expect(line).toHaveTextContent(/off/);
+    // There is no control: a start flag is changed at the start command.
+    expect(screen.queryByRole('button', { name: /allow-publish/ })).toBeNull();
   });
 });

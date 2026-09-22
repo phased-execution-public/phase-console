@@ -96,6 +96,15 @@ export type DebugEntry = {
   slug?: string;
   runId?: string;
   phase?: number;
+  /**
+   * The correlation ids the source line carried (envelope v2, phase 5).
+   *
+   * Absent on a v1 line and never invented: "this predates the ids" and "this
+   * was written outside every span" are both real answers, and a derived id
+   * here would make a row joinable to a trace it was never part of.
+   */
+  traceId?: string;
+  spanId?: string;
   /** The source record, redacted. The L3 raw slot renders this verbatim. */
   data?: Record<string, unknown>;
 };
@@ -112,6 +121,12 @@ export type DebugQuery = {
   slug?: string;
   phase?: number;
   runId?: string;
+  /**
+   * One trace, exactly. The whole point of the axis: a run's journal, the
+   * console lines its drive wrote, the git it ran and the session's own
+   * declarations, selected by an id that is on all of them and on nothing else.
+   */
+  traceId?: string;
   limit?: number;
 };
 
@@ -381,6 +396,11 @@ function fromLogEntry(entry: LogEntry): DebugEntry {
     event: scrubText(entry.event),
     text: scrubText(summarise(entry.event, data)),
     ...(typeof slug === 'string' && slug ? { slug: scrubText(slug) } : {}),
+    // The phase, when the line was written inside a phase span (envelope v2).
+    // The index could always FILTER on `phase`; until v2 a console line simply
+    // never had one, so the filter silently excluded the whole console source.
+    ...(typeof entry.phase === 'number' ? { phase: entry.phase } : {}),
+    ...traceIdsOf(entry),
     ...(data ? { data } : {}),
   };
 }
@@ -564,6 +584,7 @@ function fromJournalEntry(entry: JournalEntry, slug: string, runId: string): Deb
     slug,
     runId,
     ...(typeof entry.phase === 'number' ? { phase: entry.phase } : {}),
+    ...traceIdsOf(entry as unknown as { traceId?: unknown; spanId?: unknown }),
     ...(data ? { data } : {}),
   };
 }
@@ -602,7 +623,12 @@ export function readOutcomes(root: string, slug: string): DebugEntry[] {
   const dir = outcomeInboxDir(root, slug);
   if (!existsSync(dir)) return [];
   let names: string[];
-  try { names = readdirSync(dir).filter((n) => /^phase-\d{2,}\.json$/.test(n)).sort(); } catch { return []; }
+  // `inboxOutcomePhase` owns the name shape (both the legacy `phase-NN.json` and
+  // the stamped `phase-NN-<written_at>.json` S9-a introduced); a second regex
+  // here would have hidden every stamped declaration from the debug view on the
+  // day the writer changed. The sort is chronological for the same reason the
+  // ingest's is — the stamp is fixed-width.
+  try { names = readdirSync(dir).filter((n) => inboxOutcomePhase(n) !== null).sort(); } catch { return []; }
 
   const entries: DebugEntry[] = [];
   for (const name of names) {
@@ -739,7 +765,34 @@ export function healthEntries(issues: readonly HealthIssue[], at: string): Debug
  * The query
  * ------------------------------------------------------------------ */
 
+/** A 32-hex trace and a 16-hex span, or nothing. Never a half-formed id. */
+const TRACE_RE = /^[0-9a-f]{32}$/;
+const SPAN_RE = /^[0-9a-f]{16}$/;
+
+function traceIdsOf(line: { traceId?: unknown; spanId?: unknown }): { traceId?: string; spanId?: string } {
+  const traceId = typeof line.traceId === 'string' && TRACE_RE.test(line.traceId) ? line.traceId : undefined;
+  const spanId = typeof line.spanId === 'string' && SPAN_RE.test(line.spanId) ? line.spanId : undefined;
+  return { ...(traceId ? { traceId } : {}), ...(spanId ? { spanId } : {}) };
+}
+
+/** Is this trace id one this console could have written? */
+export function isTraceId(value: string | undefined | null): boolean {
+  return typeof value === 'string' && TRACE_RE.test(value);
+}
+
+/**
+ * Does this row belong in the answer? Exported as `debugMatches` so the filter
+ * can be held to directly rather than inferred from an assembled index.
+ */
+export function debugMatches(entry: DebugEntry, query: DebugQuery): boolean {
+  return matches(entry, query, boundary(query.since), boundary(query.until));
+}
+
 function matches(entry: DebugEntry, query: DebugQuery, since: number, until: number): boolean {
+  // An UNTRACED row is not in some trace — it is in none. Sweeping it into a
+  // filtered answer is how the one view that is supposed to be a single run's
+  // story quietly becomes everything that happened at the same time.
+  if (query.traceId && entry.traceId !== query.traceId) return false;
   if (query.sources?.length && !query.sources.includes(entry.source)) return false;
   if (query.levels?.length && !query.levels.includes(entry.level)) return false;
   if (query.slug && entry.slug !== query.slug) return false;

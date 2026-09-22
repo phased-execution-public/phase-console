@@ -113,15 +113,26 @@ EOF
 
 # --- D5: a push that CANNOT land, and a rebase that must not be left behind ----
 
-@test "D5: a claim whose lock commit can never be pushed says UNPUBLISHED and leaves the repo clean" {
+@test "D5/SCH-2: a lock commit that loses to a FOREIGN upstream lock is dropped, and the clone can still pull" {
   # The other end of the race above: B does not merely lose it, it loses it to a
   # commit that touches the SAME lock file, so the rebase between retries
-  # CONFLICTS. Two things used to be wrong. `_git_pull` swallowed git's exit code
-  # and left the repo mid-rebase — detached HEAD, conflict markers, a half-applied
-  # lock commit — for the next session on the machine to walk into. And `_git_sync`
-  # exhausted its retries and `return 0`'d in silence, so the caller was told the
-  # phase was claimed while the claim existed on exactly one disk: the next clone
-  # pulls, sees nothing, and claims the same phase.
+  # CONFLICTS and no number of retries can ever publish B's commit.
+  #
+  # Three things used to be wrong, and the third is the one that outlived the
+  # other two. `_git_pull` swallowed git's exit code and left the repo
+  # mid-rebase; `_git_sync` exhausted its retries and `return 0`'d in silence.
+  # Both were fixed. What was not: the unpublishable commit STAYED on B's clone,
+  # so every later `_git_refresh` rebased it onto the upstream again, conflicted
+  # again and aborted again — B could never pull anything, ever, and its
+  # `conflicts` answered for the rest of its life from a clone frozen at the
+  # moment it lost one race. A shared docs index is the one thing every session
+  # on the machine touches, so one session's dead clone is every session's
+  # stale answer (G-IDX).
+  #
+  # And once the upstream is READ rather than merely pushed to, the claim itself
+  # is answerable: the lock upstream is held by somebody else, so B does not
+  # hold this phase. Saying "claimed" would be the same lie the silent
+  # `return 0` told.
   origin="$BATS_TEST_TMPDIR/o5.git"
   git -c init.defaultBranch=main init -q --bare "$origin"
   A="$BATS_TEST_TMPDIR/A5"; B="$BATS_TEST_TMPDIR/B5"
@@ -154,23 +165,62 @@ EOF
   run env DOCS_ROOT="$B" PE_GIT_RETRIES=2 PE_GIT_RETRY_DELAY=0 \
     /bin/bash "$PE_SCRIPTS/phase-lock.sh" demo claim 1 --owner sessB --git
 
-  # The claim itself still succeeds — it is on B's disk and B owns it …
-  [ "$status" -eq 0 ]
-  [ -f "$B/docs/handoffs/demo/.locks/phase-01.lock" ]
-  assert_contains "$output" "claimed by sessB"
-  # … and the honest half: the caller is TOLD it is local-only.
-  assert_contains "$output" "UNPUBLISHED"
+  # B does NOT hold phase 1 — the upstream says sessA does.
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "sessA"
+  [ ! -f "$B/docs/handoffs/demo/.locks/phase-01.lock" ]
 
-  # And nothing is left mid-rebase for the next session to discover.
+  # Nothing is left mid-rebase for the next session to discover.
   [ ! -d "$B/.git/rebase-merge" ]
   [ ! -d "$B/.git/rebase-apply" ]
-  # `git status --porcelain` exits 0 mid-rebase too, so asserting on its exit
-  # code proves nothing. The branch name is the real evidence: a rebase left in
-  # progress reports a detached HEAD.
   run git -C "$B" rev-parse --abbrev-ref HEAD
   [ "$output" = "main" ]
-  run git -C "$B" status --porcelain
-  [[ "$output" != *"UU "* ]]
+
+  # And the clause this test exists for: the clone is not poisoned. A pull
+  # works, and it brings A's lock down.
+  rm -f "$B/.git/hooks/pre-push"
+  run git -C "$B" pull --rebase --autostash
+  [ "$status" -eq 0 ]
+  [ -f "$B/docs/handoffs/demo/.locks/phase-01.lock" ]
+  grep -q '^owner=sessA$' "$B/docs/handoffs/demo/.locks/phase-01.lock"
+}
+
+@test "D5/SCH-2: an unpushable commit with NO foreign upstream lock keeps the claim and says UNPUBLISHED" {
+  # The other half of the resolution, and the reason it is a resolution rather
+  # than a blanket rollback: the push failed for a reason that is nothing to do
+  # with this phase (here a remote that refuses every push). Nobody else holds
+  # the lock, so the claim on B's disk is true — it is simply local-only, which
+  # is exactly what UNPUBLISHED has always meant. The commit still comes off, so
+  # the clone can pull.
+  origin="$BATS_TEST_TMPDIR/o7.git"
+  git -c init.defaultBranch=main init -q --bare "$origin"
+  B="$BATS_TEST_TMPDIR/B7"
+
+  git clone -q "$origin" "$B"
+  git -C "$B" config user.email t@t.t; git -C "$B" config user.name b
+  mkdir -p "$B/docs/plans" "$B/docs/handoffs/demo"
+  cp "$PE_DIR/tests/fixtures/plans/scoped.md" "$B/docs/plans/demo.md"
+  git -C "$B" add -A; git -C "$B" commit -qm init; git -C "$B" push -q -u origin main
+
+  mkdir -p "$origin/hooks"
+  printf '#!/bin/sh\nexit 1\n' > "$origin/hooks/pre-receive"
+  chmod +x "$origin/hooks/pre-receive"
+
+  run env DOCS_ROOT="$B" PE_GIT_RETRIES=2 PE_GIT_RETRY_DELAY=0 \
+    /bin/bash "$PE_SCRIPTS/phase-lock.sh" demo claim 1 --owner sessB --git
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "claimed by sessB"
+  assert_contains "$output" "UNPUBLISHED"
+  [ -f "$B/docs/handoffs/demo/.locks/phase-01.lock" ]
+
+  # The clone is clean and can pull: nothing unpublishable is left on it.
+  run git -C "$B" rev-parse --abbrev-ref HEAD
+  [ "$output" = "main" ]
+  run git -C "$B" rev-list --count origin/main..HEAD
+  [ "$output" = "0" ]
+  rm -f "$origin/hooks/pre-receive"
+  run git -C "$B" pull --rebase --autostash
+  [ "$status" -eq 0 ]
 }
 
 @test "D5: a claim that publishes normally never says UNPUBLISHED" {

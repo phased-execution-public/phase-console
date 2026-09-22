@@ -12,9 +12,10 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
@@ -213,6 +214,7 @@ test('delivery: a device, a notify command or a webhook is a channel; under --re
   assert.equal(probeDelivery({ devices: 1, notifyCommand: false, webhooks: 0, remote: true, tailscale: { running: true, forOurPort: true } }).status, 'ok');
 });
 
+
 test('a channel-less start is refused on the announce row until it is acknowledged (ACC-10.1)', async () => {
   const d = deps({ delivery: async () => ({ devices: 0, notifyCommand: false, webhooks: 0, remote: false }) });
   const refused = await preludeFor('alpha', { resumeOnRestart: true, relay: 'off' }, d);
@@ -358,4 +360,106 @@ test('credentialsHeld memoises per id for the cache window and reports the held 
   assert.equal(asked, 2, 'past the window it is asked again');
   forgetCredentialProbes();
   assert.deepEqual(heldIdsCached(), []);
+});
+
+/* ------------------------------------------------------------------ *
+ * Probe 5 — verification (2026-09-18, run f0da619a)
+ *
+ * Everything a run's §Verification would stop for a person, asked at the door
+ * instead: a phase that would PARK (Person-check: halt with a fragment the
+ * runner will not run, nothing runnable, every lead missing) or that would
+ * ALWAYS ask (halt-on-everything). The facts are the verification reviews the
+ * service computes — this file stays a leaf and never imports the runner.
+ * ------------------------------------------------------------------ */
+
+type ReviewFact = {
+  phase: number; verdict: string; park?: string; runs: string[];
+  items: { text: string; reason: string; fp?: string; approvable?: boolean }[];
+  waived: { text: string; reason: string }[]; setup: { text: string; reason: string }[]; missing: string[];
+};
+
+const review = (over: Partial<ReviewFact> & { phase: number }): ReviewFact => ({
+  verdict: 'clear', runs: ['npm test'], items: [], waived: [], setup: [], missing: [], ...over,
+});
+
+const PARKS = review({
+  phase: 2, verdict: 'parks',
+  park: "phase 2's §Verification holds 1 check the runner will not run (first: frobnicate --check — `frobnicate` is not a recognised command) and the plan says Person-check: halt — …",
+  items: [{ text: 'frobnicate --check', reason: '`frobnicate` is not a recognised command', fp: 'f'.repeat(64), approvable: true }],
+});
+
+test('verification: a phase that would park blocks the start under its own row, naming the phase and why', async () => {
+  const prelude = await preludeFor('alpha', {}, deps({
+    verification: async () => ({ reviews: [review({ phase: 1 }), PARKS], scope: null }),
+  }));
+  assert.equal(prelude.probes.verification.status, 'fail');
+  const block = prelude.blocking.find((b) => b.key === 'verification.person-check');
+  assert.ok(block, JSON.stringify(prelude.blocking));
+  assert.match(block!.why, /phase 2/);
+  assert.match(block!.why, /frobnicate --check/);
+  assert.equal(prelude.rows.find((r) => r.key === 'verification.person-check')?.probe, 'verification');
+  // The detail carries every review, so the Decisions stage can render the answers.
+  assert.equal((prelude.probes.verification.detail as { reviews: unknown[] }).reviews.length, 2);
+});
+
+test('verification: nothing to stop for is ok — may-ask and Setup refusals are warnings, never blocks', async () => {
+  const prelude = await preludeFor('alpha', {}, deps({
+    verification: async () => ({
+      reviews: [
+        review({ phase: 1 }),
+        review({ phase: 2, verdict: 'may-ask', items: [{ text: 'eyeball it', reason: 'no command' }] }),
+        review({ phase: 3, setup: [{ text: 'frobnicate --serve', reason: '`frobnicate` is not a recognised command' }] }),
+      ],
+      scope: null,
+    }),
+  }));
+  assert.equal(prelude.probes.verification.status, 'ok');
+  assert.ok(!prelude.blocking.some((b) => b.key === 'verification.person-check'));
+  assert.ok((prelude.probes.verification.warnings ?? []).length >= 2);
+});
+
+test('verification: halt-on-everything asks always, so it blocks too; a phase outside the scope only warns', async () => {
+  const asks = await preludeFor('alpha', {}, deps({
+    verification: async () => ({
+      reviews: [review({ phase: 2, verdict: 'asks', items: [{ text: 'eyeball it', reason: 'no command' }] })], scope: null,
+    }),
+  }));
+  assert.equal(asks.probes.verification.status, 'fail');
+
+  const scoped = await preludeFor('alpha', {}, deps({
+    verification: async () => ({ reviews: [review({ phase: 1 }), PARKS], scope: [1] }),
+  }));
+  assert.equal(scoped.probes.verification.status, 'ok');
+  assert.ok((scoped.probes.verification.warnings ?? []).some((w) => /phase 2/.test(w)), 'shown, not blocking');
+});
+
+test('verification: with no plan in front of it (the doctor) the probe skips and refuses nothing', async () => {
+  const prelude = await preludeFor('alpha', {}, deps());
+  assert.equal(prelude.probes.verification.status, 'skip');
+  assert.ok(!prelude.blocking.some((b) => b.key === 'verification.person-check'));
+});
+
+test('prelude.ts stays a runtime leaf — the offline doctor imports it (bin/doctor-verb.mjs)', () => {
+  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../server/prelude.ts'), 'utf8');
+  const runtime = [...source.matchAll(/^import (?!type )[^;]*? from '([^']+)'/gm)].map((m) => m[1]);
+  assert.ok(runtime.length > 0);
+  for (const specifier of runtime) {
+    assert.match(specifier, /^\.\.\/shared\//, `prelude.ts imports ${specifier} at runtime — only ../shared/* leaves may be`);
+  }
+});
+
+test('verification: a park the door cannot answer (no bullet, nothing it can name) warns — lint F14 and boarding own it', async () => {
+  // Approve and waive answer a NAMED command or fragment. A phase with no
+  // §Verification at all, or whose every lead is missing from this machine,
+  // has nothing to approve: lint F14 fails the plan and boarding parks the
+  // phase, as they did before this probe. Blocking the start on it would stop
+  // a run whose first hours are fine for a defect the door cannot fix.
+  const prelude = await preludeFor('alpha', {}, deps({
+    verification: async () => ({
+      reviews: [review({ phase: 3, verdict: 'parks', park: 'the plan states no verification for phase 3 — …', runs: [], items: [] })],
+      scope: null,
+    }),
+  }));
+  assert.equal(prelude.probes.verification.status, 'ok');
+  assert.ok((prelude.probes.verification.warnings ?? []).some((w) => /phase 3.*states no verification/.test(w)));
 });

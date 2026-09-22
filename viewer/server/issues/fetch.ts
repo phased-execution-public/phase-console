@@ -39,11 +39,11 @@
  * here, and none can therefore reach a payload.
  */
 
-import { execFile } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { GitHubRemote } from './inventory.ts';
+import { shell } from '../shell.ts';
 
 /* ------------------------------------------------------------------ *
  * Caps and cadences. Every one of them is reported when it bites.
@@ -109,7 +109,17 @@ export type Issue = {
   body?: string;
   /** True when `body` was cut at `BODY_BYTES_MAX`. */
   bodyTruncated?: boolean;
+  /**
+   * Which plan, phase and run FILED this issue, when a session of this console
+   * did (phase 12) — joined on at read time from the plans' issue ledgers,
+   * never cached: the ledger is the record and the cache is GitHub's answer.
+   * Absent on every issue a person opened.
+   */
+  provenance?: IssueProvenance;
 };
+
+/** Where a session-filed issue came from. The repository page's chip and its "filed by sessions" filter. */
+export type IssueProvenance = { slug: string; phase: number; runId?: string; draftId: string };
 
 export type IssueCache = {
   /** `owner/repo`. */
@@ -132,16 +142,19 @@ export type GhRunner = (args: string[]) => Promise<{ ok: boolean; stdout: string
  * ------------------------------------------------------------------ */
 
 /**
- * `gh` with a bounded argv and a built environment.
+ * The environment every `gh` this console spawns gets — built, never inherited.
  *
- * The environment is built rather than inherited for the reason `git-browse`'s
- * is: a `GH_REPO` or `GH_HOST` in the console's own environment would make
- * these reads answer about a different repository, and this surface is
- * reachable from a browser. `GH_PROMPT_DISABLED` and `NO_COLOR` keep a
- * half-configured `gh` from blocking on a prompt or answering in escape codes.
+ * A `GH_REPO` or `GH_HOST` in the console's own environment would make these
+ * reads answer about a different repository — and, since phase 12, make the
+ * one WRITER (`pro/issues/write.ts`, which takes this same environment) file
+ * against one — and this surface is reachable from a browser.
+ * `GH_PROMPT_DISABLED` and `NO_COLOR` keep a half-configured `gh` from
+ * blocking on a prompt or answering in escape codes. The token variables are
+ * forwarded when the operator set them, which is `gh`'s own documented way of
+ * being authenticated; nothing here LOADS one.
  */
-export function ghRunner(env: NodeJS.ProcessEnv = process.env, timeoutMs = GH_TIMEOUT_MS): GhRunner {
-  const child: NodeJS.ProcessEnv = {
+export function ghChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
     PATH: env.PATH ?? '/usr/bin:/bin:/usr/local/bin',
     HOME: env.HOME ?? '',
     LC_ALL: 'C',
@@ -152,17 +165,29 @@ export function ghRunner(env: NodeJS.ProcessEnv = process.env, timeoutMs = GH_TI
     ...(env.GITHUB_TOKEN ? { GITHUB_TOKEN: env.GITHUB_TOKEN } : {}),
     ...(env.GH_CONFIG_DIR ? { GH_CONFIG_DIR: env.GH_CONFIG_DIR } : {}),
   };
-  return (args: string[]) => new Promise((done) => {
-    execFile('gh', args, { timeout: timeoutMs, env: child, maxBuffer: 8 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        // `||` and not `??`, which is the difference between a reason and a
-        // shrug: a binary that is not on PATH fails with an EMPTY stderr and
-        // `spawn gh ENOENT` in the error, and `?? ` keeps the empty string —
-        // so every missing `gh` read as `failed` instead of `no-gh`, and the
-        // one failure an operator can actually fix was the one not named.
-        done({ ok: !error, stdout: String(stdout ?? ''), stderr: String(stderr || error?.message || '') });
-      });
-  });
+}
+
+/** `gh` with a bounded argv and the built environment above. */
+export function ghRunner(env: NodeJS.ProcessEnv = process.env, timeoutMs = GH_TIMEOUT_MS): GhRunner {
+  const child = ghChildEnv(env);
+  return async (args: string[]) => {
+    const run = await shell('gh', args, {
+      channel: 'shell',
+      intent: 'issues',
+      timeout: timeoutMs,
+      env: child,
+      capture: { keep: 8 * 1024 * 1024, mode: 'head' },
+      // Not signed in, no such repository, issues disabled — each is a reason
+      // this reader turns into words for a person.
+      expectFailure: true,
+    });
+    // `||` and not `??`, which is the difference between a reason and a
+    // shrug: a binary that is not on PATH fails with an EMPTY stderr and
+    // `spawn gh ENOENT` in the error, and `?? ` keeps the empty string —
+    // so every missing `gh` read as `failed` instead of `no-gh`, and the
+    // one failure an operator can actually fix was the one not named.
+    return { ok: run.ok, stdout: run.stdout, stderr: run.stderr || run.error?.message || '' };
+  };
 }
 
 /**

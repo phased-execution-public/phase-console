@@ -57,7 +57,10 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 import { argvLiterals } from './argv-scan.ts';
+import { PUSH_ARGV } from '../shared/landing-model.js';
+import { PUSH_REF, pushRef } from '../server/runner/worktree.ts';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 const SERVER_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'server');
 
@@ -143,11 +146,28 @@ const FORBIDDEN = [...REMOTE_VERBS, ...MUTATING_VERBS];
  *    merged into the target" is asked with `for-each-ref --merged`, which is
  *    already on the console-wide list, so the exemption covers the delete and
  *    nothing else.
+ *  - `log` is the twelfth, and it is named here for exactly the reason `status`
+ *    and `for-each-ref` are: a pure READ already on the console-wide `ALLOWED`
+ *    list is still invisible to THIS test, which asks that the exempt file run
+ *    only the verbs its own exemption names. It answers "which commits did this
+ *    repository gain since <sha>" for `phase.scope-drift`, and it is here rather
+ *    than in a fresh file so this gate keeps having exactly one argv surface to
+ *    reason about.
+ *  - `push` is the thirteenth, and it is the one this file was written to
+ *    refuse for ever — until many-plans-one-repo decision 7 (phase 8): the
+ *    console may push `pe/*` refs, and nothing else, so a phase's landing does
+ *    not depend on a session being resumable to run `git push`. It is exempted
+ *    for exactly ONE argv (`pushRef`), and the SHAPE section at the bottom of
+ *    this file is what bounds that argv: it opens with `PUSH_ARGV`, it carries
+ *    one remote and one fully-qualified refspec, it carries no force, delete,
+ *    mirror or tags flag, and it exists in this file alone. `REMOTE_VERBS`
+ *    still bans `push` in every OTHER file, and `fetch`, `pull`, `remote`,
+ *    `clone` and `init` everywhere including here.
  */
 const EXEMPT_FILE = 'runner/worktree.ts';
 const WORKTREE_VERBS = [
   'worktree', 'merge', 'merge-tree', 'rev-parse', 'rev-list', 'diff', 'status',
-  'switch', 'symbolic-ref', 'branch', 'for-each-ref',
+  'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push',
 ];
 
 /** The flag that makes a phased-execution script commit and push its write. */
@@ -189,7 +209,9 @@ const GIT_VERBS = new Set([...FORBIDDEN, ...ALLOWED, 'add', 'rm', 'mv', 'tag', '
  * holes it has had; the self-test at the bottom of this file still proves the
  * scanner can FAIL, against this file's own rules.
  */
-export { argvLiterals, type Argv } from './argv-scan.ts';
+export { argvLiterals } from './argv-scan.ts';
+import type { Argv } from './argv-scan.ts';
+export type { Argv };
 
 function tsFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -234,15 +256,26 @@ test('the exempt file exists and is the only one — the scanner is not policing
     'exactly one file may hold the repository-mutating exemption');
 });
 
-test('no argument list in viewer/server can push, fetch, or otherwise reach a remote', () => {
-  // No exemption here, deliberately: `worktree.ts` is scanned like every other
-  // file. Local mutation was the decision; publication was not.
+test('no argument list in viewer/server can fetch, pull or otherwise reach a remote — and only the one shaped push may push', () => {
+  // `worktree.ts` is scanned like every other file for every remote verb but
+  // one: the single `push` argv `pushRef` holds, which the SHAPE section below
+  // bounds (frozen head, one refspec, no force flag, this file alone). Local
+  // mutation was the first decision; ONE bounded publication was the second
+  // (many-plans-one-repo decision 7), and everything else stays banned.
   const banned = new Set(REMOTE_VERBS);
+  const isTheOnePush = (argv: Argv): boolean =>
+    argv.file === EXEMPT_FILE
+    && argv.args[0] === 'push'
+    && argv.args.slice(0, PUSH_ARGV.length).join('\u0000') === PUSH_ARGV.join('\u0000');
   const offences = ARGVS
     .filter((argv) => argv.args.some((a) => banned.has(a)))
+    .filter((argv) => !isTheOnePush(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
 
   assert.deepEqual(offences, [], 'a remote-talking git verb reached an argument list');
+  // …and there IS exactly one such push, so the exemption above describes the
+  // code rather than a hole nothing uses.
+  assert.equal(ARGVS.filter(isTheOnePush).length, 1, 'exactly one push argv, in the worktree module');
 });
 
 test('no argument list OUTSIDE the worktree module may mutate the repository', () => {
@@ -282,7 +315,7 @@ test('the worktree module runs ONLY the verbs its exemption names', () => {
   // …and of the three the reclaim and the branch hygiene added. Same rule,
   // same reason: an exemption nothing uses is a hole waiting for a first user,
   // and these three are the most dangerous entries on the list.
-  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref']) {
+  for (const verb of ['switch', 'symbolic-ref', 'branch', 'for-each-ref', 'push']) {
     assert.ok(used.has(verb),
       `${verb} is exempted but unused — take it out of WORKTREE_VERBS rather than leaving it open`);
   }
@@ -442,4 +475,154 @@ test('the two script runners refuse --git at runtime, not only in review', async
     /--git/,
     'runWrite must refuse before it spawns anything',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * The allow-list SHAPE the landing engine must fill (phase 8)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Written before the behaviour, deliberately.
+ *
+ * Every test above asserts an ABSENCE — no push argv anywhere — and that is a
+ * gate which stops meaning anything the day the console has to push, which is
+ * phase 8. The three below assert the SHAPE instead: if a push argv exists it
+ * is in one file, it begins with one frozen literal, and it carries none of
+ * the six flags that turn a push into a thing no `git reset` takes back.
+ *
+ * So they are green today against a `pushRef` that refuses everything, green
+ * in phase 8 against one that works, and red for the two cases exit criterion
+ * 4 names — a push outside `runner/worktree.ts`, and a push with `--force`.
+ * Both are proved by the self-test at the end, because a rule that has never
+ * been seen to fail is a rule nobody can trust.
+ */
+
+/** The flags that make a push irreversible, or make it carry more than it was asked to. */
+const PUSH_FORBIDDEN_FLAGS = [
+  '--force', '-f', '--force-with-lease', '--force-if-includes',
+  '--delete', '-d', '--mirror', '--tags', '--follow-tags', '--all', '--prune',
+];
+
+const pushArgvs = () => ARGVS.filter((a) => a.args.includes('push'));
+
+test('a push argv may exist in exactly one file, and it is the worktree module', () => {
+  const holders = [...new Set(pushArgvs().map((a) => a.file))];
+  assert.deepEqual(holders.filter((f) => f !== EXEMPT_FILE), [],
+    'a push reached an argument list outside the one file allowed to hold it');
+  assert.ok(holders.length <= 1, `push argvs in ${holders.length} files`);
+});
+
+test('a push argv begins with the frozen literal, and carries one refspec and no more', () => {
+  assert.deepEqual([...PUSH_ARGV], ['push', '--porcelain', '--no-follow-tags'],
+    'the literal itself changed — every assertion below was written against these three words');
+  for (const argv of pushArgvs()) {
+    assert.deepEqual(argv.args.slice(0, PUSH_ARGV.length), [...PUSH_ARGV],
+      `${argv.file}: a push must open with PUSH_ARGV — the porcelain reply is what the landing ledger is written from`);
+  }
+  // And the constant itself reaches one file. This is what keeps the check
+  // above from going vacuous the day phase 8 writes `[...PUSH_ARGV, remote,
+  // refspec]`: a spread carries no `'push'` literal, so the argv scanner sees
+  // nothing and every assertion in this file would pass over a real push.
+  const users = FILES
+    .filter((file) => /\bPUSH_ARGV\b/.test(readFileSync(file, 'utf8')))
+    .map((file) => relative(SERVER_DIR, file));
+  assert.deepEqual(users.filter((f) => f !== EXEMPT_FILE), [],
+    'PUSH_ARGV was referenced outside the one file allowed to push');
+});
+
+/**
+ * The two verbs allowed to carry one of those flags, each for a measured reason.
+ *
+ * `worktree` — `worktree remove --force` takes a CHECKOUT, never a ref: the
+ *   commits are on the branch afterwards exactly as they were before. And it is
+ *   already refused on a tree this console locked: phase 1's arm G-3 measured
+ *   that one `-f` exits 128 with *"use 'remove -f -f' to override or unlock
+ *   first"*, so the console cannot take a live lane's tree even by mistake.
+ *   `-f -f` appears nowhere and is asserted absent below.
+ * `branch` — `-d`, the form that REFUSES to delete an unmerged branch, with
+ *   `-D` banned by name in its own test above.
+ *
+ * Every other verb is an offence, which is where the force flags actually bite:
+ * `checkout --force`, `clean -f`, `reset` and a forced push all destroy work
+ * that exists nowhere else.
+ */
+const FORCE_ALLOWED_VERBS = new Set(['worktree', 'branch']);
+
+test('a force, delete, mirror or tags flag reaches only the two verbs that may carry one', () => {
+  const carriers = ARGVS
+    .filter((a) => GIT_VERBS.has(a.args[0]))
+    .filter((a) => a.args.some((arg) => PUSH_FORBIDDEN_FLAGS.includes(arg)));
+  const offences = carriers
+    .filter((a) => !FORCE_ALLOWED_VERBS.has(a.args[0]))
+    .map((a) => `${a.file}: ${a.args.join(' ')}`);
+  assert.deepEqual(offences, [],
+    'a force/delete/mirror/tags flag reached a verb that moves refs or reaches a remote — none of that is recoverable');
+
+  // The carve-out is exactly as wide as its reasons. `worktree` may force only
+  // `remove`, and never twice: `-f -f` is the escape hatch that DOES take a
+  // locked tree, which is the one thing a sweep must never be able to do.
+  for (const argv of carriers.filter((a) => a.args[0] === 'worktree')) {
+    assert.ok(argv.args.includes('remove'), `${argv.file}: only \`worktree remove\` may be forced`);
+    assert.ok(argv.args.filter((arg) => arg === '--force' || arg === '-f').length === 1,
+      `${argv.file}: \`-f -f\` overrides a lock and would let a sweep take a live lane's tree (phase 1, arm G-3)`);
+  }
+  for (const argv of carriers.filter((a) => a.args[0] === 'branch')) {
+    assert.ok(argv.args.includes('-d'), `${argv.file}: only the refusing delete form is allowed`);
+  }
+});
+
+test('ls-remote is banned: a landing must read its own ledger, not the network', () => {
+  const offences = ARGVS.filter((a) => a.args.includes('ls-remote')).map((a) => a.file);
+  assert.deepEqual(offences, [],
+    'ls-remote asks the network a question the landing ledger already answers, and asks it on a '
+    + 'clock nobody controls — a gate that shells out gives different callers different answers');
+});
+
+test('the Pro tree holds no git argv at all — git lives in the free half', () => {
+  // `viewer/server/pro/` does not exist yet; phase 8 creates it. The rule is
+  // written now because the moment it exists it will be the obvious place to
+  // put "the bit that pushes", and the whole point of the allow-list is that
+  // there is exactly one such place and it is not edition-dependent.
+  const offences = ARGVS
+    .filter((a) => a.file.startsWith('pro/'))
+    .filter((a) => GIT_VERBS.has(a.args[0]))
+    .map((a) => `${a.file}: ${a.args.join(' ')}`);
+  assert.deepEqual(offences, [],
+    'a git argv under server/pro/ — the free tree would ship a console that cannot do it');
+});
+
+test('the SHAPE rules can FAIL — the same four rules against sources that break them', () => {
+  // Exit criterion 4's two named cases, and the two beside them.
+  const outside = argvLiterals("await git(['push', '--porcelain', '--no-follow-tags', 'origin', 'refs/heads/x:refs/heads/x']);", 'runner/land.ts');
+  assert.equal(outside.length, 1, 'a push in another file must be visible');
+  assert.notEqual(outside[0].file, EXEMPT_FILE, 'and must not be mistaken for the exempt one');
+
+  const forced = argvLiterals("await git(['push', '--force', 'origin', 'main']);", EXEMPT_FILE);
+  assert.ok(forced.some((a) => a.args.some((arg) => PUSH_FORBIDDEN_FLAGS.includes(arg))),
+    'a --force must be visible to the flag ban');
+
+  const wrongHead = argvLiterals("await git(['push', 'origin', 'main']);", EXEMPT_FILE);
+  assert.notDeepEqual(wrongHead[0].args.slice(0, PUSH_ARGV.length), [...PUSH_ARGV],
+    'a push that skips the frozen literal must be visible to the shape check');
+
+  const remote = argvLiterals("await git(['ls-remote', '--heads', 'origin']);", EXEMPT_FILE);
+  assert.ok(remote.some((a) => a.args.includes('ls-remote')), 'ls-remote must be visible to its ban');
+});
+
+test('the seam refuses BEFORE spawning — a caller not allowed learns nothing, and a trunk is never a candidate', async () => {
+  // The placeholder phase 2 wrote here threw for everything and named phase 8.
+  // Phase 8 filled it, and what survives of that test is its point: a caller
+  // "landing" a phase by doing nothing must be impossible, and so must a
+  // caller pushing anything the shape does not admit. Both refusals are
+  // answered against a cwd that is NOT a repository — had git been spawned,
+  // the answer would have been a git failure and not the named word.
+  const nowhere = join(tmpdir(), `never-push-nowhere-${process.pid}`);
+  const forbidden = await pushRef(nowhere, 'pe/x', { remote: 'origin', allowed: false });
+  assert.ok(!forbidden.ok && forbidden.reason === 'not-allowed', JSON.stringify(forbidden));
+  const trunk = await pushRef(nowhere, 'main', { remote: 'origin', allowed: true });
+  assert.ok(!trunk.ok && trunk.reason === 'ref-not-pe', JSON.stringify(trunk));
+  const mapping = await pushRef(nowhere, 'pe/x:main', { remote: 'origin', allowed: true });
+  assert.ok(!mapping.ok && mapping.reason === 'refspec', JSON.stringify(mapping));
+  // The shape the regex admits is exactly the two branch shapes `laneNames` mints.
+  assert.ok(PUSH_REF.test('pe/x') && PUSH_REF.test('pe/x-p3') && !PUSH_REF.test('main'));
 });

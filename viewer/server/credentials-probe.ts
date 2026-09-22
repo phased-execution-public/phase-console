@@ -22,12 +22,12 @@
  * polling the prelude does not fork `gh` on every keystroke.
  */
 
-import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
 import type { ProbeStatus } from '../shared/ops-vocab.js';
+import { shell } from './shell.ts';
 
 /** One credential's verdict — the id, the word, the reason. Never a value. */
 export type CredentialVerdict = { id: string; status: ProbeStatus; reason: string };
@@ -54,18 +54,17 @@ export type ProbeDeps = {
 const PROBE_TIMEOUT_MS = 10_000;
 
 /** `execFile` with a timeout the runtime enforces — no `.kill(` of our own. */
-export function defaultExec(file: string, args: string[]): Promise<{ code: number | null; stderr: string }> {
-  return new Promise((resolve) => {
-    try {
-      execFile(file, args, { timeout: PROBE_TIMEOUT_MS, windowsHide: true }, (error, _stdout, stderr) => {
-        if (!error) { resolve({ code: 0, stderr: String(stderr ?? '') }); return; }
-        const code = typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : null;
-        resolve({ code, stderr: String(stderr ?? (error as Error).message ?? '') });
-      });
-    } catch (error) {
-      resolve({ code: null, stderr: String((error as Error)?.message ?? error) });
-    }
+export async function defaultExec(file: string, args: string[]): Promise<{ code: number | null; stderr: string }> {
+  const run = await shell(file, args, {
+    channel: 'shell',
+    intent: 'credential-probe',
+    timeout: PROBE_TIMEOUT_MS,
+    // "This credential is not signed in" is the answer, not a fault.
+    expectFailure: true,
   });
+  // `code` is `null` for a binary that never started, which the caller reads as
+  // "not installed" rather than "refused".
+  return { code: run.code, stderr: run.stderr || run.error?.message || '' };
 }
 
 function expandHome(path: string, home: string): string {

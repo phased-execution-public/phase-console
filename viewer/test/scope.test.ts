@@ -248,3 +248,83 @@ test('claim qualification narrows scope, it does not replace it', () => {
     'and the qualified pair is what clears it');
   assert.equal(scopesIntersect(['app'], ['docs']), false, 'disjoint scopes never needed a branch');
 });
+
+// ── SCP-1 — `..` survived a scope token ──────────────────────────────────────
+// `normalizeToken` stripped characters and collapsed `//`, but never folded a
+// relative segment, so `docs/../hub` stayed a token in its own right and read
+// as DISJOINT from `hub` — in both languages, identically wrong. A Repos cell is
+// written by a person, and `packages/../docs` is a path a person writes.
+test('a `..` segment is folded, so a relative spelling is the place it names', () => {
+  assert.equal(normalizeToken('docs/../hub'), 'hub');
+  assert.equal(normalizeToken('a/b/../c'), 'a/c');
+  assert.equal(normalizeToken('./hub'), 'hub');
+  assert.equal(normalizeToken('a/./b'), 'a/b');
+});
+
+test('a folded token collides with the place it names', () => {
+  // The RAW cell form — an array argument is a token list that has already been
+  // through `parseScope`, so folding belongs where normalisation happens and
+  // nowhere else.
+  assert.equal(scopesIntersect('docs/../hub', 'hub'), true);
+  assert.equal(scopesIntersect(parseScope('docs/../hub'), parseScope('hub')), true);
+});
+
+test('folding never invents a token above the root', () => {
+  // `..` with nothing to pop is noise, not an escape: a token that climbs out
+  // of its own name says nothing about a repository, so it says nothing at all.
+  assert.equal(normalizeToken('../hub'), 'hub');
+  assert.equal(normalizeToken('..'), '');
+  assert.equal(normalizeToken('.'), '');
+});
+
+test('folding does not touch a name that merely contains dots', () => {
+  assert.equal(normalizeToken('my.repo'), 'my.repo');
+  assert.equal(normalizeToken('a/..b/c'), 'a/..b/c');
+  assert.equal(normalizeToken('a/b../c'), 'a/b../c');
+});
+
+// ── S11-a — every managed tree nests inside the root under `worktreeRoot:
+// 'project'` ────────────────────────────────────────────────────────────────
+// The nesting clause of `claimsDisjoint` says a tree inside another tree is the
+// same ground, which is right for a mirror's mount and wrong for the console's
+// own worktree home: with `project` the home is `<root>/.worktrees/`, so EVERY
+// isolated run's tree is literally inside the shared root, and a cap-refused
+// shared run collided with all three of them. Under `state` the same three runs
+// carved cleanly — the same runs, a different answer, decided by a setting that
+// is meant to choose a location and nothing else.
+test('a console-managed tree does not nest into the root that contains it', () => {
+  const shared = { branch: 'pe/shared', tree: '/repo' };
+  const isolated = { branch: 'pe/other', tree: '/repo/.worktrees/runs/other/abc/integration' };
+  assert.equal(claimsDisjoint(shared, isolated), true);
+  assert.equal(claimsDisjoint(isolated, shared), true);
+});
+
+test('a hand lane under .worktrees is the same exception', () => {
+  assert.equal(
+    claimsDisjoint({ branch: 'pe/a', tree: '/repo' }, { branch: 'pe/a-p3', tree: '/repo/.worktrees/hand/a/p3' }),
+    true);
+});
+
+test('two managed trees still nest into EACH OTHER normally', () => {
+  // The exception is about the boundary the home marks, not about the paths
+  // beyond it: a mirror's submodule mount inside a run's tree is still the same
+  // ground, and must still collide.
+  const run = { branch: 'pe/a', tree: '/repo/.worktrees/runs/a/f0/integration' };
+  const mount = { branch: 'pe/b', tree: '/repo/.worktrees/runs/a/f0/integration/phased-execution' };
+  assert.equal(claimsDisjoint(run, mount), false);
+});
+
+test('the same branch is still the same work, home or no home', () => {
+  // The exception narrows the TREE test only. Two trees on one ref still land
+  // their commits on top of each other.
+  assert.equal(
+    claimsDisjoint({ branch: 'pe/a', tree: '/repo' }, { branch: 'pe/a', tree: '/repo/.worktrees/runs/a/f0/integration' }),
+    false);
+});
+
+test('a directory merely NAMED like the home is not the home', () => {
+  // Segment-wise, like every other path rule here: `.worktreesX` is a folder.
+  assert.equal(
+    claimsDisjoint({ branch: 'pe/a', tree: '/repo' }, { branch: 'pe/b', tree: '/repo/.worktreesX/thing' }),
+    false);
+});

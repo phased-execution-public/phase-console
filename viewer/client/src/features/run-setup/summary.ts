@@ -22,7 +22,9 @@ import { money } from '@/lib/format';
 import { EFFORT_NOTE, MODEL_NOTE } from '@/features/runs/defaults';
 import { PRIORITY_LABELS } from '@shared/orchestration-model.js';
 import { QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
-import { ISOLATED, SETTLE_LABELS } from '@shared/worktree-model.js';
+import { ISOLATED, RETENTION_LABELS, SETTLE_LABELS } from '@shared/worktree-model.js';
+import { CONFLICT_LABELS, LAND_LABELS } from '@shared/landing-model.js';
+import { ISSUE_MODE_LABELS } from '@shared/issues-model.js';
 import type { Source } from './fields';
 import { sourceOf } from './fields';
 import type { RunSetupContext, RunSetupMode } from './modes';
@@ -106,6 +108,29 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       return PRIORITY_LABELS[values.priority] ?? values.priority;
     case 'startAfter':
       return values.startAfter.trim() || 'as soon as the queue allows';
+    // Phase 15's seven. The ref and the cap read as what their emptiness means;
+    // the words read as the owner's labels, and the plan's own line — which
+    // outranks every one of them — is named where a reader could otherwise
+    // take the run's word for the last word.
+    case 'baseBranch':
+      return values.baseBranch.trim() || 'the plan’s line, else the console’s preference';
+    case 'maxConcurrentPerRepo':
+      return values.maxConcurrentPerRepo.trim() === ''
+        ? 'the console’s cap'
+        : `beside at most ${Number(values.maxConcurrentPerRepo) - 1} other${Number(values.maxConcurrentPerRepo) === 2 ? '' : 's'}`;
+    case 'worktreeRetention':
+      return (
+        RETENTION_LABELS[values.worktreeRetention as keyof typeof RETENTION_LABELS] ??
+        `are removed after ${values.worktreeRetention.replace(/^ttl:/, '')} h`
+      );
+    case 'landing':
+      return `${LAND_LABELS[values.landing] ?? values.landing} (the plan’s Landing: line outranks this)`;
+    case 'conflictPolicy':
+      return CONFLICT_LABELS[values.conflictPolicy] ?? values.conflictPolicy;
+    case 'messaging':
+      return values.messaging === 'off' ? 'no — each session works alone' : 'yes';
+    case 'issuesMode':
+      return ISSUE_MODE_LABELS[values.issuesMode] ?? values.issuesMode;
     case 'reviewEachPhase':
       return values.reviewEachPhase ? 'a fresh reviewer after every phase' : 'off';
     case 'reviewerPolicy':
@@ -153,7 +178,7 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
     }
     case 'prompt':
       return values.prompt.trim() ? 'set' : 'none';
-    // The Decisions stage's five (phase 11).
+    // The Decisions stage's answers (phase 11; verification since 2026-09-18).
     case 'resumeOnRestart':
       return values.resumeOnRestart ? 'continue by itself' : 'wait for a person, with one errand';
     case 'relay':
@@ -164,6 +189,16 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       return values.acknowledgedWaivers.length ? values.acknowledgedWaivers.join(', ') : 'none';
     case 'manifestOverride':
       return values.manifestOverride.trim() ? `signed by ${values.manifestOverride.trim()}` : 'none';
+    case 'verifyAnswers': {
+      const { approve, waive } = values.verifyAnswers;
+      if (!approve.length && !waive.length) return 'none';
+      return [
+        approve.length ? `${approve.length} approved` : '',
+        waive.length ? `${waive.length} waived` : '',
+      ]
+        .filter(Boolean)
+        .join(', ');
+    }
     default:
       return String(v);
   }

@@ -29,7 +29,9 @@ each, the client suite, both typechecks, lint, the format check, the build gate 
 scratch build — `--build` builds `client/dist` for real), the scrub, and the tarball assertions.
 `--quick` is typechecks + lint + format + scrub, under a minute; `--list` prints what a call would
 run; `--ci` reinstalls `viewer/node_modules` first; `--keep-going` runs past a failure. A green full
-run records the sha it verified in `.git/phase-console-gates-ok`.
+run records the sha it verified in `.git/phase-console-gates-ok`. Every `node --test` the gates run,
+like `npm test`, carries `--test-timeout=600000 --test-force-exit`: a test still running after ten
+minutes fails by name, and its file exits instead of waiting on a handle nothing will close.
 
 
 **The hook — `scripts/git-hooks/pre-push`.** Once per clone, `scripts/gates.sh --install-hook`
@@ -64,10 +66,11 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **5.9 MB** — 599 entries, 15.7 MB unpacked, measured at **5.0.0** with the pack `tsc`
-emit in place, which is what a release actually packs (4.0.0 was 4.7 MB and 503 entries; 5.0 added
-the server modules the zero-touch work wrote, and the emitted `.js` beside each).
-`assert-tarball.sh` prints the same 599: this
+The tarball is **7.1 MB** — 693 entries, 20 MB unpacked, measured at **5.1.0** with the pack `tsc`
+emit in place, which is what a release actually packs (5.0.0 was 5.9 MB and 599 entries, 4.0.0
+4.7 MB and 503; 5.1 added the landing, messaging, issues, trace, retention and reach modules and
+the emitted `.js` beside each; the free tarball is 576 entries).
+`assert-tarball.sh` prints the same 693: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
@@ -78,6 +81,89 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 `check-dist.mjs` gates first paint on the bytes that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 5.1.0
+
+The root `package.json` says 5.1.0, and `CHANGELOG.md` carries its section. 5.1.0 is a minor version
+and it is **additive**: nothing a 5.0.0 plan, session or script does meets a refusal it did not meet
+before. Every new door — a run's own checkout, landing, notes, the publish flag — is closed until a
+plan directive or a capability flag opens it, and every new lint fires only on a directive 5.0.0 did
+not have. What follows is what an operator, a plan author or a session running an older copy will
+notice, in the order they are likely to notice it.
+
+### Plans: new directives, and the lints over them
+
+- **Nine directives the engine and the console parse identically**, each answering
+  `word<TAB>phase|plan|default` — `--land`, `--landing`, `--base-branch`, `--gitlink`,
+  `--conflict-policy`, `--isolation`, `--clash-zones`, `--issues`, `--messaging`, plus `--notes` and
+  `--verified`. A plan that writes none of them reads exactly as it did under 5.0.0.
+- **Five lint ids are new, and each names itself in its line.** Three gate: F26 `note-target-unknown`
+  (a forward note addressed to a phase the plan does not have), F27 `land-word-unknown` (a `Land:`
+  word outside the vocabulary), F29 `landed-gate-unknown-phase` (a `landed N` gate naming a phase the
+  plan lacks). Two advise on stderr and never change the exit code: F28 `land-needs-lane` (a phase
+  that lands from a checkout it shares) and F30 `note-target-done` (a note addressed to a phase that
+  has already finished). The advisory family is therefore F15–F19, F22–F23, F28 and F30.
+- **Two self-evaluating gate kinds**, `landed N` and `pr-merged N`, read the landing ledger and run
+  nothing. A plan that uses neither is unchanged.
+- **The handoff format gains `## Notes for later phases`**, the only channel that reaches a phase
+  which has not started; `phase-graph.sh <slug> --notes N` collects a phase's notes into its boot
+  prompt. Optional — a handoff without the section is a valid handoff.
+
+### Sessions: new scripts and arms
+
+- `phase-graph.sh <slug> --notes N`, `--verified`, and the directive arms above; `phase-outcome.sh
+  <slug> <N> ruling --kind deferral --for <M|next|all>`; `scripts/phase-landing.sh`, the landing
+  ledger's deterministic writer.
+- **A 5.0.0 copy of the scripts rejects the new flags as unknown options (exit 2).** As at 5.0.0: a
+  session declares with the script its boot prompt names, so move the runtime console's copy and the
+  plugin together — that is the roll-out's first step — before a boot prompt tells a session to pass
+  `--for` or read `--notes`.
+
+### The run: a checkout of its own, locks, one trace id
+
+- **`--allow-publish` is the eighth capability flag**, off by default like the other seven: it is what
+  lets the console push a finished phase's `pe/*` branch — never a trunk, never with force — and file
+  issues on the repository's behalf, where a plan's `permission.destructive` row allows the act.
+  `phase-console doctor` gains a non-blocking `publish` row. A console started without it behaves as
+  5.0.0 did.
+- **A run's branch forks from the trunk at a pinned sha** (`run.isolation` records `base`/`baseSha`,
+  `run.base-branch` records the word and who declared it); a console's worktrees are `git worktree
+  lock`ed with a reason naming the console, the plan, the phase and the time, and sweeps unlock only the
+  console's own stale locks. The retention word — `keep-on-failure` (the default) · `prune` · `keep` ·
+  `ttl:<h>` — decides what becomes of a checkout when the run settles; a dirty tree is never removed. A
+  per-repository cap bounds how many isolated runs stand beside each other; `.worktreeinclude` copies
+  ignored-but-needed files into a fresh worktree; `- **Isolation:** shared|worktree` lets one phase
+  carve itself out of the plan-wide word.
+- **Locks are claimed with `ln`**, so two concurrent claimers can no longer both be told "claimed"; a
+  lock with no `scope=` line reads as `all` in the scheduler as it always did in bash; the runner claims
+  provisionally at grant and STOPS the lane on losing the lock; run ids are twelve hex characters (every
+  reader widened together). New journal line `phase.lock-provisional`.
+- **One trace id joins a run's HTTP request, drive, phase attempts, sessions, scripts, presence hook
+  and git commands**; `viewer/server/shell.ts` is the one seam under every child process. The log
+  envelope is v2, with a `debug` level and `PHASE_CONSOLE_DEBUG=<channel>`; a journal at its cap writes
+  an in-band `journal.full` marker and keeps a reserve for `run.finished`.
+- **Nothing grows without a bound.** `viewer/server/retention.ts` sweeps transcripts, task ledgers,
+  outcomes, git traces and the supervisor's stdio by a table Settings ▸ This instance ▸ Logs and
+  retention can preview; rulings are never pruned. `sessions/<id>.events.ndjson` keeps each session's
+  raw hook payloads, capped at 1 MB with one marker line. `GET /api/debug/bundle?slug=&run=` and
+  `phase-console diagnostics --run <id>` export one run as one redacted tarball — the second works with
+  the console down.
+- **Nine shared-`.git` verbs raise a permission card on every profile** (`git stash`, `config`,
+  `worktree`, `submodule`, `checkout`, `switch`, and `gh issue create`/`comment`/`close`), because one
+  of them in a shared checkout is another lane's problem. A plan that never runs them is unchanged.
+
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained `viewer/shared/landing-model.js`,
+  `viewer/shared/message-model.js`, `viewer/shared/issues-model.js` and `viewer/shared/poll-loop.js`.
+- `.github/scripts/assert-tarball.sh` asserts the new runtime files: `viewer/server/trace.ts`,
+  `viewer/server/shell.ts`, `viewer/server/git-trace.ts`, `viewer/server/counters.ts`,
+  `viewer/server/retention.ts`, `viewer/server/retention-policy.ts`, `viewer/server/debug/bundle.ts`,
+  `viewer/server/debug/tar.ts`, `viewer/server/runner/usage.ts`, `viewer/server/runner/verify-review.ts`,
+  `bin/diagnostics-verb.mjs`, `scripts/phase-landing.sh`, `scripts/landing.env`, `scripts/messages.env`
+  and `scripts/issues.env`.
+
 
 ## Upgrading to 5.0.0
 

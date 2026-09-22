@@ -17,7 +17,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { Banner } from '@/components/ui';
-import { api, type PhaseLock, type RunState } from '@/lib/api';
+import { api, type PhaseLock, type PlanReviewer, type RunState } from '@/lib/api';
 import { keys } from '@/lib/queries';
 import { countdown, relativeTime } from '@/lib/format';
 import { ReleaseStaleButton } from '@/components/release-lock';
@@ -62,6 +62,8 @@ export type LaunchRequest =
       allowWrites?: boolean;
       planSkills?: string[];
       planMcp?: string[];
+      /** Where the plan orders its own reviewer — the doubled-review advisory reads it. */
+      planReviewers?: PlanReviewer[];
       /** Who holds this phase, if anyone. Decides whether this dialog may submit. */
       lock?: PhaseLock;
     }
@@ -73,6 +75,7 @@ export type LaunchRequest =
       allowWrites?: boolean;
       planSkills?: string[];
       planMcp?: string[];
+      planReviewers?: PlanReviewer[];
     }
   | { kind: 'qa'; target: QaTarget; allowWrites?: boolean; lock?: PhaseLock }
   /**
@@ -165,6 +168,7 @@ export function LaunchDialog({
         : {})}
       planSkills={planSkillsOf(request)}
       planMcp={planMcpOf(request)}
+      planReviewers={planReviewersOf(request)}
       pushBroken={pushBroken}
       blocked={blocked}
       {...(blocked ? { blockedReason: 'The claim has to be released before a session can start here.' } : {})}
@@ -292,4 +296,9 @@ function planMcpOf(request: LaunchRequest): string[] {
   if (request.kind === 'qa' || request.kind === 'qa-fix') return request.target.planMcp ?? [];
   if (request.kind === 'recovery') return [];
   return request.planMcp ?? [];
+}
+
+/** Only the two kinds that offer Review each phase carry the plan's own reviewer. */
+function planReviewersOf(request: LaunchRequest): PlanReviewer[] {
+  return request.kind === 'phase' || request.kind === 'continue' ? (request.planReviewers ?? []) : [];
 }

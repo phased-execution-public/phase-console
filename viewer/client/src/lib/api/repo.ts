@@ -31,7 +31,8 @@ import { request, q } from './client';
 export type CheckoutRole = 'root' | 'run' | 'lane' | 'staging' | 'operator' | 'debris';
 
 /** The journal's own settle-event names. */
-export type SettleKind = 'settled' | 'pending' | 'unsupported' | 'landed' | 'failed' | 'released' | 'pruned';
+export type SettleKind =
+  'settled' | 'pending' | 'unsupported' | 'landed' | 'pushed' | 'failed' | 'released' | 'pruned';
 
 /** A repository this console will answer about: the root, a linked worktree, or a mirror mount. */
 export type RepoTargetKind = 'root' | 'submodule' | 'linked' | 'mount';
@@ -199,6 +200,7 @@ export interface RepoSettles {
   scanned: { runs: number; entriesPerRun: number };
 }
 
+
 /* ---------------- fetchers ---------------- */
 
 /**
@@ -268,4 +270,5 @@ export const repoApi = {
 
   repoSettles: (params: { limit?: number; slug?: string; runs?: number; entries?: number } = {}) =>
     request<RepoSettles>(`/api/repo/settles${query(params)}`),
+
 };

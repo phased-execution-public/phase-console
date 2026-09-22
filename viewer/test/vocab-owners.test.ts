@@ -140,7 +140,32 @@ import {
   ISOLATION_RECLAIM,
   isolationMode,
   WORKTREE_ROOTS,
+  ISOLATION_DIRECTIVES,
+  WORKTREE_RETENTION,
 } from '../shared/worktree-model.js';
+import {
+  LAND_POLICIES,
+  GITLINK_POLICIES,
+  CONFLICT_POLICIES,
+  BASE_BRANCH_WORDS,
+  LANDING_STATES,
+  LANDING_COLUMNS,
+  PUSH_ARGV,
+} from '../shared/landing-model.js';
+import {
+  MESSAGE_KINDS,
+  MESSAGE_SCHEMES,
+  MESSAGE_DELIVER,
+  MESSAGE_STATES,
+  MESSAGE_VIAS,
+  MESSAGE_REFUSALS,
+} from '../shared/message-model.js';
+import {
+  ISSUE_MODES,
+  ISSUE_ACTIONS,
+  ISSUE_STATES,
+  ISSUE_FIELDS,
+} from '../shared/issues-model.js';
 
 import {
   PHASE_IN_FLIGHT,
@@ -712,6 +737,62 @@ const VOCABULARIES: {
   { name: 'shutdown clock sources', members: SHUTDOWN_CLOCK_SOURCES, owner: 'shared/ops-vocab.js' },
   { name: 'boot hold kinds', members: BOOT_HOLD_KINDS, owner: 'shared/ops-vocab.js' },
   { name: 'presence end sources', members: PRESENCE_END_SOURCES, owner: 'shared/run-lifecycle.js' },
+
+  /* Many plans in one repository (5.1.0): where a phase's work lands, what a
+   * message between two sessions is spelled with, and what a session may ask
+   * to have filed. Three owners, three bash twins under `scripts/` held to
+   * them word for word by `gates-vocab.test.ts` — this registry is the other
+   * half of that promise, the one that stops a fourth copy appearing in TS. */
+  { name: 'landing policies', members: LAND_POLICIES, owner: 'shared/landing-model.js' },
+  { name: 'gitlink policies', members: GITLINK_POLICIES, owner: 'shared/landing-model.js' },
+  { name: 'conflict policies', members: CONFLICT_POLICIES, owner: 'shared/landing-model.js' },
+  { name: 'base branch words', members: BASE_BRANCH_WORDS, owner: 'shared/landing-model.js' },
+  { name: 'landing states', members: LANDING_STATES, owner: 'shared/landing-model.js' },
+  { name: 'landing columns', members: LANDING_COLUMNS, owner: 'shared/landing-model.js' },
+  {
+    name: 'the push argv',
+    members: PUSH_ARGV,
+    owner: 'shared/landing-model.js',
+    allow: [
+      // The gate that asserts the shape has to name the flags it bans, and a
+      // ban written in terms of the constant it is banning proves nothing.
+      'test/never-push.test.ts',
+      // The ONE push (`pushRef`, phase 8) writes the literal out rather than
+      // spreading the constant, for that gate's sake: its argv scanner reads
+      // string literals, and `[...PUSH_ARGV, remote, refspec]` carries no
+      // `'push'` for it to see — every shape assertion would pass over a real
+      // push. The call site holds the literal to `PUSH_ARGV` at load, so the
+      // two cannot drift; this is a second SPELLING the scanner needs, not a
+      // second owner.
+      'server/runner/worktree.ts',
+    ],
+  },
+  { name: 'message kinds', members: MESSAGE_KINDS, owner: 'shared/message-model.js' },
+  { name: 'message schemes', members: MESSAGE_SCHEMES, owner: 'shared/message-model.js' },
+  { name: 'message delivery requests', members: MESSAGE_DELIVER, owner: 'shared/message-model.js' },
+  { name: 'message states', members: MESSAGE_STATES, owner: 'shared/message-model.js' },
+  { name: 'message transports', members: MESSAGE_VIAS, owner: 'shared/message-model.js' },
+  { name: 'message refusals', members: MESSAGE_REFUSALS, owner: 'shared/message-model.js' },
+  /* Three lists are deliberately NOT registered, because this scan is a
+   * heuristic over comma-separated word runs and a vocabulary it cannot tell
+   * apart from ordinary prose reports every sentence that mentions it:
+   * `MESSAGING_WORDS` (`on, off` — two words that appear in every settings
+   * file in the tree), `WORKTREE_LOCK_PREFIXES` and `PR_MERGED_STATES` (one
+   * member each, so "re-declares" means "contains that word anywhere").
+   * `LANDING_STATES` already owns `pr-merged`, and the other two are pinned
+   * by their bash twins in `gates-vocab.test.ts`. Widening the allow-list for
+   * the eighteen files each would name is how a scan stops being read.
+   *
+   * `MESSAGE_PRIORITIES` is absent for the opposite reason: it IS
+   * `RUN_PRIORITIES`, aliased by identity, so it is already registered — under
+   * its real owner, two entries above. Registering the alias as well would
+   * make that owner an offender against itself. */
+  { name: 'issue modes', members: ISSUE_MODES, owner: 'shared/issues-model.js' },
+  { name: 'issue actions', members: ISSUE_ACTIONS, owner: 'shared/issues-model.js' },
+  { name: 'issue states', members: ISSUE_STATES, owner: 'shared/issues-model.js' },
+  { name: 'issue fields', members: ISSUE_FIELDS, owner: 'shared/issues-model.js' },
+  { name: 'isolation directives', members: ISOLATION_DIRECTIVES, owner: 'shared/worktree-model.js' },
+  { name: 'worktree retention', members: WORKTREE_RETENTION, owner: 'shared/worktree-model.js' },
 ];
 
 /** Every source file the scan covers — tests excluded; they may say anything. */

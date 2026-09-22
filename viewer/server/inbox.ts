@@ -553,7 +553,27 @@ export type InboxFacts = {
     allowAgent?: boolean;
     allowAccounts?: boolean;
     allowMcp?: boolean;
+    /** `--allow-publish` — what Approve on an issue draft needs (phase 12). */
+    allowPublish?: boolean;
   };
+  /**
+   * The plans' issue ledgers (phase 12), any order — every draft a session
+   * wrote and what became of it. Only two states raise a row: a draft
+   * waiting for a person (`pending-approval`) and a close waiting for its
+   * phase to land (`pending-landing`); see `issueDrafts`. A FREE type over
+   * data the Pro engine feeds — the free tree hands the builder none and
+   * draws nothing.
+   */
+  issueDrafts?: readonly InboxIssueDraft[];
+  /**
+   * The plans' mailboxes (phase 15 over phase 10), any order — every message
+   * a session sent and what became of it. Only the ones addressed to the
+   * OPERATOR and still open raise a row (`messages`); a note to a phase is
+   * that phase's, and an acked, answered, expired or refused one is over. A
+   * FREE type over data the Pro mailbox feeds — the free tree hands the
+   * builder none and draws nothing, the `issueDrafts` arrangement.
+   */
+  messages?: readonly InboxMessage[];
   /**
    * The plans `server/analysis/stats.ts` already calls stalled: open, with
    * ready phases, untouched for a week.
@@ -571,6 +591,8 @@ export type InboxFacts = {
   rulings?: readonly {
     id: string; slug: string; phase: number; kind: string; what: string;
     why?: string; costIfWrong?: string; at: string;
+    /** Who a DEFERRAL was left for: a phase number, `next` or `all`. */
+    for?: string;
     /** The manifest key the ruling answers — what makes it rememberable. */
     decisionKey?: string;
     /** A relayed question's answer (phase 14) — remembered as a relay rule, never as a decision row. */
@@ -604,6 +626,53 @@ export type InboxFacts = {
   git?: readonly InboxGit[];
 };
 
+/** One issue draft, narrowed to what its row is decided from — `pro/issues/drafts.ts`'s `IssueDraft` is one. */
+export type InboxIssueDraft = {
+  id: string;
+  slug: string;
+  phase: number;
+  /** `file` · `comment` · `close`. */
+  action: string;
+  /** The estate key — `root`, or a submodule path. */
+  repo: string;
+  title?: string;
+  where?: string;
+  evidence?: string;
+  /** A comment's text, a close's reason. */
+  text?: string;
+  reason?: string;
+  number?: number;
+  /** `ISSUE_STATES`. */
+  state: string;
+  stateAt: string;
+  /** The newest state's note — which flag is off, why a close is held. */
+  note?: string;
+  runId?: string;
+};
+
+/** One message, narrowed to what its row is decided from — `pro/messaging/messages.ts`'s `Message` is one. */
+export type InboxMessage = {
+  id: string;
+  slug: string;
+  /** The phase that SENT it. */
+  phase: number;
+  /** `MESSAGE_KINDS` — `note` · `ask` · `reply`. */
+  kind: string;
+  /** The sender's address (`phase:<slug>/<N>`, `operator:`…). */
+  from: string;
+  /** The address as written. Only `operator:` raises a row. */
+  to: string;
+  text: string;
+  /** `MESSAGE_STATES`. */
+  state: string;
+  /** `MESSAGE_PRIORITIES` — `high` makes an ask urgent. */
+  priority?: string;
+  /** The ask this answers, when `kind` is `reply` — what closes the ask's row. */
+  replyTo?: string;
+  writtenAt: string;
+  runId?: string;
+};
+
 /**
  * One run's git probe, narrowed to what a conflict row is decided from.
  *
@@ -629,7 +698,11 @@ export type InboxGit = {
   /** A mirror run's mounted repositories, root-relative. */
   mounts?: readonly string[];
   /** `RunGitView.radar`, worst first. Only `conflicted` pairs raise anything. */
-  radar?: readonly { a: string; b: string; state: string; files?: readonly string[] }[];
+  radar?: readonly {
+    a: string; b: string; state: string; files?: readonly string[];
+    /** The clash zones this pair touches, from the repository radar (phase 7). */
+    zones?: readonly string[];
+  }[];
 };
 
 /**
@@ -2060,7 +2133,7 @@ function rulingDrafts(facts: InboxFacts, now: number): Draft[] {
     const sorted = [...rulings].sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
     const newest = sorted[0]!;
     const rest = sorted.length - 1;
-    const label = RULING_KIND_LABELS[newest.kind as keyof typeof RULING_KIND_LABELS] ?? 'Ruling';
+    const label = rulingLabel(newest);
     out.push({
       kind: 'ruling',
       severity: 'fyi',
@@ -2091,13 +2164,30 @@ function rulingDrafts(facts: InboxFacts, now: number): Draft[] {
 /** Where a person sets a console-level answer by hand when the row cannot offer it. */
 const POLICY_SETTINGS_POINTER = 'to answer it on every plan, set the key under Settings ▸ Automation ▸ Policy answers';
 
+/**
+ * What the row calls a ruling — and, for a deferral, WHO it was left for.
+ *
+ * `Deferral` on its own says a session left something behind; it does not say
+ * the thing is waiting for phase 7, which is the only half an operator can act
+ * on. The addressee is the whole point of the kind, so it belongs in the title
+ * rather than three clicks away. A deferral written before `--for` existed
+ * still reads — it just says less.
+ */
+function rulingLabel(ruling: { kind: string; for?: string }): string {
+  const label = RULING_KIND_LABELS[ruling.kind as keyof typeof RULING_KIND_LABELS] ?? 'Ruling';
+  if (ruling.kind !== 'deferral' || !ruling.for) return label;
+  if (ruling.for === 'next') return 'Deferred to the next phase';
+  if (ruling.for === 'all') return 'Deferred to every later phase';
+  return `Deferred to phase ${ruling.for}`;
+}
+
 function keyedRulingDraft(
   ruling: NonNullable<InboxFacts['rulings']>[number],
   phase: number,
   facts: InboxFacts,
 ): Draft {
   const key = String(ruling.decisionKey);
-  const label = RULING_KIND_LABELS[ruling.kind as keyof typeof RULING_KIND_LABELS] ?? 'Ruling';
+  const label = rulingLabel(ruling);
   const endpoint = runVerb(ruling.slug, `rulings/${encodeURIComponent(ruling.id)}/remember`);
   // A relayed answer (phase 14): the one thing worth remembering is the answer
   // itself, as a relay rule — never a `## Decisions` row, whose value is a
@@ -2344,8 +2434,14 @@ function instanceHealthDrafts(facts: InboxFacts): Draft[] {
     });
   }
 
+  // Is Tailscale the way a phone reaches this machine? In the free tree it is
+  // the only way; the Pro region below says otherwise under a direct reach.
+  let tailscaleIsTheDoor = true;
+
   const remote = fleet.remote;
-  if (remote && !remote.running) {
+  if (!tailscaleIsTheDoor) {
+    /* the Tailscale rows are not this fleet's door */
+  } else if (remote && !remote.running) {
     out.push({
       kind: 'health',
       severity: 'needs-you',
@@ -2543,6 +2639,69 @@ function isolationDrafts(facts: InboxFacts): Draft[] {
   return out;
 }
 
+/**
+ * Two branches are both editing something that MERGES CLEANLY and is wrong
+ * afterwards — a lockfile, a migration, `.gitmodules`, a generated file.
+ *
+ * `fyi`, never `needs-you`, and that is the whole design of the row. A clash
+ * zone is not a conflict: git will merge these happily, which is exactly the
+ * problem, and the moment worth telling an operator about is while serializing
+ * the two is still cheap. A `needs-you` row for something nothing is broken by
+ * yet is how an inbox teaches people to stop reading it.
+ *
+ * The `conflict` KIND is reused rather than a new one minted — the precedent
+ * `isolationDrafts` set one function below: a new kind is a client-wide
+ * vocabulary change for one card style, and severity already carries the
+ * difference this row needs.
+ */
+function clashZoneDrafts(facts: InboxFacts): Draft[] {
+  const git = facts.git ?? [];
+  const byBranch = runsByBranch(git);
+  const seen = new Set<string>();
+  const out: Draft[] = [];
+
+  for (const entry of git) {
+    for (const pair of entry?.radar ?? []) {
+      if (!pair?.zones?.length || !pair.a || !pair.b) continue;
+      const key = pairKey(pair.a, pair.b);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const target = serializeTarget(pair, byBranch);
+      const zones = [...pair.zones];
+      out.push({
+        kind: 'conflict',
+        severity: 'fyi',
+        subject: `zone:${key}`,
+        ...(target ? { slug: target.slug } : {}),
+        title: `${key} — both branches are editing a clash zone`,
+        need: `They both touch ${zones.length === 1 ? zones[0] : zones.join(', ')}. `
+          + 'Files like these merge cleanly and are wrong afterwards — a lockfile resolves to a '
+          + 'dependency graph neither branch chose, two migrations both claim to be next.',
+        how: target
+          ? `Nothing is broken yet, which is why this is worth reading now. Serialize ${target.slug} `
+            + 'and the two stop editing it at the same time, or merge them in an order you choose.'
+          : 'Nothing is broken yet. Merge these two in an order you choose, rather than letting '
+            + 'whichever lands second inherit the other\'s resolution.',
+        since: '',
+        href: target ? planHref(target.slug, 'run') : toHash('runs'),
+        actions: target
+          ? [{
+            verb: 'serialize',
+            label: `Serialize ${target.slug}`,
+            endpoint: runVerb(target.slug, 'settings'),
+            method: 'POST',
+            body: { isolation: 'queue' },
+            ...gatedBy('run', facts.flags?.allowRun),
+          }]
+          : [],
+      });
+    }
+  }
+
+  return out;
+}
+
 function conflictDrafts(facts: InboxFacts): Draft[] {
   const git = facts.git ?? [];
   const byBranch = runsByBranch(git);
@@ -2601,6 +2760,159 @@ function conflictDrafts(facts: InboxFacts): Draft[] {
 }
 
 /* ------------------------------------------------------------------ *
+ * issue-draft — a session's finding, held for a person (phase 12)
+ * ------------------------------------------------------------------ */
+
+/**
+ * One row per draft a person owes a decision on.
+ *
+ * `pending-approval` is the ask: Approve files it on the repository through
+ * the console's one writer (behind `--allow-publish`, so the action carries
+ * the flag when the console lacks it), Discard drops it, and the two Edits
+ * let a person fix the title or rewrite the body before it goes out — the
+ * words are a session's, and they reach everyone who reads the repository.
+ * `pending-landing` is not an ask: a close the console is holding until the
+ * phase's own work has landed. It is shown `fyi` so a person can see WHY a
+ * close they expected has not happened, with Discard as the only verb.
+ *
+ * Keyed on the draft id, which is content-derived and stable across a
+ * restart, so an ack survives; `since` is the state's own clock, so a draft
+ * that comes back (edited, re-held) reads as new by the standing rule.
+ */
+function issueDrafts(facts: InboxFacts): Draft[] {
+  const closed = new Set((facts.plans ?? []).filter((plan) => plan.closed).map((plan) => plan.slug));
+  const out: Draft[] = [];
+  for (const draft of facts.issueDrafts ?? []) {
+    if (!draft?.slug || closed.has(draft.slug)) continue;
+    if (draft.state !== 'pending-approval' && draft.state !== 'pending-landing') continue;
+    const phase = positivePhase(draft.phase);
+    if (phase == null) continue;
+    const held = draft.state === 'pending-landing';
+    const target = draft.number ? `${draft.repo}#${draft.number}` : draft.repo;
+    const what = draft.action === 'file'
+      ? `file an issue on ${target}: "${draft.title ?? ''}"`
+      : draft.action === 'comment'
+        ? `comment on ${target}`
+        : `close ${target}`;
+    const words = draft.action === 'file' ? draft.evidence ?? '' : draft.action === 'comment' ? draft.text ?? '' : draft.reason ?? '';
+    const need = [
+      draft.where ? `At \`${draft.where}\`.` : '',
+      words ? (words.length > 300 ? `${words.slice(0, 300)}…` : words) : '',
+    ].filter(Boolean).join(' ') || 'A session drafted this outside its phase.';
+    const endpoint = (verb: string) => runVerb(draft.slug, `issues/${encodeURIComponent(draft.id)}/${verb}`);
+    const publish = facts.flags?.allowPublish;
+    const actions: InboxAction[] = held
+      ? [{ verb: 'discard', label: 'Discard', endpoint: endpoint('discard'), method: 'POST' }]
+      : [
+        { verb: 'approve', label: 'Approve', endpoint: endpoint('file'), method: 'POST', ...gatedBy('publish', publish) },
+        { verb: 'discard', label: 'Discard', endpoint: endpoint('discard'), method: 'POST' },
+        {
+          verb: 'edit-title', label: 'Edit title', endpoint: endpoint('edit'), method: 'POST',
+          says: { field: 'title', label: 'New title', ...(draft.title ? { placeholder: draft.title } : {}) },
+        },
+        {
+          verb: 'edit-body', label: 'Rewrite body', endpoint: endpoint('edit'), method: 'POST',
+          says: { field: 'body', label: 'New body', placeholder: 'The whole body, as it should be filed — the provenance footer is appended' },
+        },
+      ];
+    out.push({
+      kind: 'issue-draft',
+      severity: held ? 'fyi' : 'needs-you',
+      subject: draft.id,
+      slug: draft.slug,
+      phase,
+      ...(draft.runId ? { runId: draft.runId } : {}),
+      title: held
+        ? `${draft.slug} phase ${phase} — ${what} waits for phase ${phase} to land`
+        : `${draft.slug} phase ${phase} — ${what}`,
+      need,
+      how: held
+        ? `${draft.note ?? `Held until phase ${phase} has landed`} — the console moves it to Approve by itself; Discard drops it now.`
+        : `Approve files it on the repository through the console's own writer, with the plan's labels and a provenance footer${
+          publish ? '' : ' — this console was started without --allow-publish, so Approve is held until it is restarted with it'
+        }. Discard drops it. Edit the title or rewrite the body first if a session's words need a person's.${
+          draft.note && !held ? ` (${draft.note})` : ''}`,
+      since: draft.stateAt,
+      href: phaseHref(draft.slug, phase),
+      actions,
+    });
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * message — what a session said to the OPERATOR (phase 15)
+ * ------------------------------------------------------------------ */
+
+/**
+ * One row per open message addressed to `operator:`.
+ *
+ * Phase 10 made the operator an address every session can reach — delivered
+ * to "the console's inbox" — and nothing drew it. An `ask` is the row that
+ * needs a person: Answer replies to the sender through the operator's own
+ * door (`POST …/messages/<id>/reply`, the words carried in `says`), Mark seen
+ * acks it. A `note` is `fyi` with Mark seen alone. A `high`-priority ask is
+ * `urgent`, the one severity that interrupts.
+ *
+ * A message is OVER — and raises nothing — once acked, expired or refused,
+ * and an ask is over once ANY reply names it (`replyTo`), because the ask's
+ * own state never moves when it is answered: the answer is a second message.
+ *
+ * Keyed on the message id, content-derived and stable across a restart, so
+ * an ack survives; `since` is the sender's own clock.
+ */
+function messageDrafts(facts: InboxFacts): Draft[] {
+  const closed = new Set((facts.plans ?? []).filter((plan) => plan.closed).map((plan) => plan.slug));
+  const answered = new Set((facts.messages ?? []).map((m) => m?.replyTo).filter((id): id is string => Boolean(id)));
+  const out: Draft[] = [];
+  for (const message of facts.messages ?? []) {
+    if (!message?.slug || closed.has(message.slug)) continue;
+    if (message.to !== 'operator:') continue;
+    if (message.kind === 'reply') continue;
+    if (!['queued', 'delivering', 'delivered', 'held'].includes(message.state)) continue;
+    if (answered.has(message.id)) continue;
+    const phase = positivePhase(message.phase);
+    if (phase == null) continue;
+    const ask = message.kind === 'ask';
+    const run = facts.flags?.allowRun;
+    const endpoint = (verb: string) => runVerb(message.slug, `messages/${encodeURIComponent(message.id)}/${verb}`);
+    const seen: InboxAction = { verb: 'seen', label: 'Mark seen', endpoint: endpoint('ack'), method: 'POST' };
+    const words = message.text.length > 400 ? `${message.text.slice(0, 400)}…` : message.text;
+    out.push({
+      kind: 'message',
+      severity: ask ? (message.priority === 'high' ? 'urgent' : 'needs-you') : 'fyi',
+      subject: message.id,
+      slug: message.slug,
+      phase,
+      ...(message.runId ? { runId: message.runId } : {}),
+      title: ask
+        ? `${message.slug} phase ${phase} asks you${message.priority === 'high' ? ' (urgent)' : ''}`
+        : `${message.slug} phase ${phase} says`,
+      need: words || 'A session sent an empty message.',
+      how: ask
+        ? `Answer replies to phase ${phase}'s session in its own context — it reads your words as a peer's, not as an instruction${
+          run ? '' : ' — this console was started without --allow-run, so Answer is held until it is restarted with it'
+        }. Mark seen closes the row without answering; the session is told nothing.`
+        : 'Nothing is asked. Mark seen closes the row.',
+      since: message.writtenAt,
+      href: phaseHref(message.slug, phase),
+      actions: ask
+        ? [
+          {
+            verb: 'answer', label: 'Answer', endpoint: endpoint('reply'), method: 'POST',
+            body: { to: message.from, phase },
+            says: { field: 'text', label: 'Your answer', placeholder: 'What the session should know' },
+            ...gatedBy('run', run),
+          },
+          seen,
+        ]
+        : [seen],
+    });
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
  * The build
  * ------------------------------------------------------------------ */
 
@@ -2629,9 +2941,12 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
     ...rulingDrafts(facts, now),
     ...policyDrafts(facts, now),
     ...conflictDrafts(facts),
+    ...clashZoneDrafts(facts),
     ...isolationDrafts(facts),
     ...healthDrafts(facts),
     ...instanceHealthDrafts(facts),
+    ...issueDrafts(facts),
+    ...messageDrafts(facts),
   ];
 
   // Dedupe by id, first writer wins. The builders are written so that two

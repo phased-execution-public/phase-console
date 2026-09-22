@@ -129,7 +129,7 @@ test('every halt kind is phase-level or run-level, and never both', () => {
   for (const kind of [
     'verify-failed', 'no-handoff', 'phase-blocked', 'needs-human', 'waiting-external-timeout',
     'verification-preflight', 'mcp-preflight', 'recovery-failed', 'orphaned-session',
-    'phase-crashed', 'worktree-merge',
+    'phase-crashed', 'worktree-merge', 'landing-conflict',
   ]) assert.ok(phase.has(kind), `${kind} is a fact about one phase`);
   for (const kind of [
     'budget', 'failure-streak', 'models-exhausted', 'run-preflight', 'plan-unreadable',

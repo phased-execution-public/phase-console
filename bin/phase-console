@@ -50,9 +50,10 @@ _to_mjs() {
 # `uninstall-hooks` and `hooks-status` were missing from the list above, so each
 # fell through to ./start, which read the verb as a --root path and BOOTED a
 # console: the same defect the header describes for `stop`, in three verbs that
-# nobody had typed yet.
+# nobody had typed yet. `diagnostics` joined them in 5.1.0, and would fall the
+# same way: `--run` reads as neither a flag this script knows nor a path.
 case "${1:-}" in
-  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|sessions)
+  install-skill|uninstall-skill|install-hooks|uninstall-hooks|hooks-status|doctor|sessions|diagnostics)
     _to_mjs "$@" ;;
 esac
 

@@ -43,7 +43,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui';
-import { type LaneLiveness, type PhaseView, type RunState } from '@/lib/api';
+import { type LaneLiveness, type PhaseView, type PlanReviewer, type RunState } from '@/lib/api';
 import { useRunLifecycle } from '@/lib/run-lifecycle';
 import { SwitchAccountRow } from '@/components/switch-account';
 import { SettingsSheet } from './settings-sheet';
@@ -75,6 +75,7 @@ export function Controls({
   planPhases,
   planSkills,
   planMcp = [],
+  planReviewers = [],
   qaMode,
   allowWrites,
   liveness,
@@ -106,6 +107,8 @@ export function Controls({
   planSkills: string[];
   /** What the plan attaches to every session — shown, never unticked here. */
   planMcp?: string[];
+  /** Where the plan orders its own reviewer — the settings sheet advises from it. */
+  planReviewers?: PlanReviewer[];
   /** The plan's qa-mode; `off` offers the launch-time QA toggle. */
   qaMode?: string;
   /** Whether the console may turn QA on — a different flag from allowRun. */
@@ -174,6 +177,7 @@ export function Controls({
             planPhases={planPhases}
             planSkills={planSkills}
             planMcp={planMcp}
+            planReviewers={planReviewers}
             {...(qaMode !== undefined ? { qaMode } : {})}
             {...(allowWrites !== undefined ? { allowWrites } : {})}
             stillWorking={stillWorking}

@@ -182,7 +182,40 @@ case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
 # record, files it as the console's, and leaves it out of the operator's list.
 probe_=0
 [ "${PHASE_CONSOLE_PROBE:-}" = 1 ] && probe_=1
-body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"probe\":$probe_,\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
+# Which Claude login the session spends, so a usage decision can count who else
+# is on an account's window (autopilot-token-drain H6): the config dir the CLI
+# reads its credentials from — unset is the CLI's own default, ~/.claude — and a
+# FLAG when an environment credential outranks that dir. Never the credential.
+config_dir="${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}"
+auth_env_=0
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}${CLAUDE_CODE_USE_BEDROCK:-}${CLAUDE_CODE_USE_VERTEX:-}" ] && auth_env_=1
+# How to reach this session's own CLI inbox, so the console can put a peer's
+# message into it (5.1.0). Both variables are already exported when this hook
+# runs — phase 1, arm S-B measured exactly that — and this is the ONLY way the
+# console can learn either: the socket is /tmp/cc-socks/<the CLI's pid>.sock,
+# which nothing outside the process knows, and the token is minted per session.
+#
+# SessionStart ONLY. A Stop or a Notification fires for a session whose socket
+# may already be gone and the CLI does not re-export it, so carrying them there
+# would teach the registry a stale path it would later connect to.
+#
+# The token is a SECRET: it goes in the POST body, which travels to 127.0.0.1
+# over a loopback socket, and NEVER into the additionalContext line below —
+# that line is printed into the session's own transcript, which is replayed into
+# a browser and copied into bug reports.
+messaging_socket=""
+messaging_token=""
+if [ "$event" = SessionStart ]; then
+  messaging_socket="${CLAUDE_CODE_MESSAGING_SOCKET:-}"
+  messaging_token="${CLAUDE_CODE_MESSAGING_TOKEN:-}"
+fi
+# The trace this session belongs to (5.1.0), so the presence record joins the
+# drive that spawned it. The hook is the one thing that fires for EVERY session
+# — the console's own, a reviewer's, a person's — and until now a session's
+# arrival and its run could only be matched by cwd and clock. Always stated
+# (empty when there is none), because the body is a fixed-shape object every
+# field of which the registry reads positionally by name.
+body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"trace\":\"$(_js "${PE_TRACE_ID:-}")\",\"span\":\"$(_js "${PE_SPAN_ID:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"probe\":$probe_,\"config_dir\":\"$(_js "$config_dir")\",\"auth_env\":$auth_env_,\"messaging_socket\":\"$(_js "$messaging_socket")\",\"messaging_token\":\"$(_js "$messaging_token")\",\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
 
 # ---- deliver: POST to the console, else the inbox ------------------------------
 delivered=0
@@ -257,7 +290,18 @@ if [ "$event" = SessionStart ] && [ -n "$root" ]; then
     how="When you claim a phase lock by hand, pass it: scripts/phase-lock.sh <slug> claim <N> ... --session $session_id (or export PE_SESSION_ID=$session_id)."
   fi
   ctx="Phase Console session presence: this Claude session's id is $session_id. $how That lets the console show this session on the Pulse, queue autopilot lanes behind it while it lives, and release its lock the moment it ends."
-  [ -n "$peers" ] && ctx="$ctx $(printf '%s' "$peers" | cut -c1-1200)"
+  # Naming the peers was only half the sentence. A session that has been told
+  # another is live still has no way to know whether their WORKING TREES
+  # collide — a different question, answered by a read-only scan that costs one
+  # command and looks across EVERY plan, because a working tree does not know
+  # which plan asked for it. Without this line the thing a fresh session
+  # actually acted on was "somebody else is here, carry on", which is how a
+  # hand-driven session came to be told "safe to start" against a console lane
+  # that had been granted and not yet claimed (S1-a's other half).
+  if [ -n "$peers" ]; then
+    ctx="$ctx $(printf '%s' "$peers" | cut -c1-1200)"
+    ctx="$ctx Before you claim a phase, check that nothing live shares your working tree: scripts/phase-lock.sh <slug> conflicts <N> --scope \"<csv>\" --here — exit 0 is clear, 1 names the holders. Never build over a live session."
+  fi
   printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$(_js "$ctx")"
 fi
 exit 0

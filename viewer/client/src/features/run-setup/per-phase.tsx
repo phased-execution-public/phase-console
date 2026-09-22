@@ -43,10 +43,18 @@ import {
 } from '@/components/ui';
 import { cn } from '@/lib/cn';
 import { usePhone } from '@/lib/media';
-import { EFFORTS, effortAlias, modelAlias } from '@/features/runs/defaults';
+import { EFFORTS } from '@/features/runs/defaults';
 import { SkillPicker } from '@/features/run-setup/skill-picker';
 import { McpPicker } from '@/features/run-setup/mcp-picker';
 import { PERMISSION_MODE_LABELS, PHASE_PERMISSION_MODES } from './modes';
+import {
+  SOURCE_LABEL,
+  choiceNotes,
+  phaseChoice,
+  planChoice,
+  type ChoiceField,
+  type PhaseChoice,
+} from './phase-choices';
 import type { McpServerView, PhaseOptions, PhaseView, SkillInfo } from '@/lib/api';
 
 export function PerPhase({
@@ -122,14 +130,34 @@ export function PerPhase({
 
   /* ---- the controls, written once and arranged twice ---- */
 
-  /** What a phase would run as with nothing chosen here. */
-  const inherited = (p: PhaseView) => {
-    const planModel = modelAlias(p.model);
-    const planEffort = effortAlias(p.effort);
-    return {
-      model: planModel ? `${planModel} (plan)` : `${runModel} (run)`,
-      effort: planEffort ? `${planEffort} (plan)` : `${runEffort || 'default'} (run)`,
-    };
+  const runDefault = (field: ChoiceField) => (field === 'model' ? runModel : runEffort);
+
+  /** A resolved choice as words: the value and the level that answered. */
+  const choiceLabel = (choice: PhaseChoice) =>
+    choice.value && choice.source ? `${choice.value} (${SOURCE_LABEL[choice.source]})` : 'machine default';
+
+  /** What a phase would run as with nothing chosen here — the empty option's label. */
+  const inherited = (p: PhaseView) => ({
+    model: choiceLabel(phaseChoice(p, {}, 'model', runModel)),
+    effort: choiceLabel(phaseChoice(p, {}, 'effort', runEffort)),
+  });
+
+  /**
+   * What the phase WILL run as, and which level said so — under its select, on
+   * both shapes. Resolved by the runner's own function, so this line and the
+   * boarding cannot disagree (autopilot-token-drain phase 5).
+   */
+  const runsAs = (p: PhaseView, own: PhaseOptions, field: ChoiceField) => {
+    const choice = phaseChoice(p, own, field, runDefault(field));
+    return (
+      <span
+        data-testid={`runs-as-${field}-${p.phase}`}
+        className="mt-0.5 block truncate text-2xs text-ink-muted"
+      >
+        runs {choice.value ?? 'on the machine default'}
+        {choice.source ? ` · ${SOURCE_LABEL[choice.source]}` : ''}
+      </span>
+    );
   };
 
   const modelSelect = (p: PhaseView, own: PhaseOptions) => (
@@ -153,6 +181,7 @@ export function PerPhase({
           </option>
         ))}
       </select>
+      {runsAs(p, own, 'model')}
     </>
   );
 
@@ -175,6 +204,7 @@ export function PerPhase({
           </option>
         ))}
       </select>
+      {runsAs(p, own, 'effort')}
     </>
   );
 
@@ -377,6 +407,12 @@ export function PerPhase({
     ].filter(Boolean) as { key: string; node: ReactNode }[];
 
   const count = Object.keys(overrides).length;
+  // Phases whose plan names a model or an effort of its own. The summary used to
+  // say every phase inherited the run whenever nothing was overridden — false for
+  // exactly the phases `deadaff9` needed someone to look at.
+  const planned = planPhases.filter((p) => planChoice(p, 'model') || planChoice(p, 'effort')).length;
+  const notes = choiceNotes(planPhases, overrides, { model: runModel, effort: runEffort });
+  const differing = new Set(notes.map((note) => note.phase)).size;
 
   return (
     <details className="rounded-lg border border-rule bg-surface">
@@ -384,12 +420,33 @@ export function PerPhase({
         <span>Per phase</span>
         {count ? (
           <Chip tone="ok">{count} overridden</Chip>
+        ) : planned ? (
+          <span className="text-2xs text-ink-muted">
+            {planned} {planned === 1 ? 'phase follows' : 'phases follow'} the plan's own model or effort
+          </span>
         ) : (
           <span className="text-2xs text-ink-muted">every phase inherits the run's model and effort</span>
+        )}
+        {/* On the summary, because the disclosure starts closed: a warning
+            nobody opens the table to find is not a warning. */}
+        {differing > 0 && (
+          <Chip tone="warn">
+            plan and run differ on {differing} {differing === 1 ? 'phase' : 'phases'}
+          </Chip>
         )}
       </summary>
 
       <div className="border-t border-rule">
+        {notes.length > 0 && (
+          <ul
+            aria-label="Where the plan and this run differ"
+            className="flex flex-col gap-1 px-3 py-2 text-2xs"
+          >
+            {notes.map((note) => (
+              <li key={`${note.phase}-${note.field}`}>{note.text}</li>
+            ))}
+          </ul>
+        )}
         {phone ? (
           // One card per phase. The same controls, stacked, at a size a thumb
           // can hit — a seven-column matrix at 390px is a table wider than the

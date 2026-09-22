@@ -28,15 +28,19 @@
  * Settings card and this detector must agree about what "ten minutes" is.
  */
 
-import { STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS } from '../../shared/attention-model.js';
+import { createHash } from 'node:crypto';
+
+import { LOCAL_JOB_GRACE_MS, STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS } from '../../shared/attention-model.js';
 
 import { externalWaitHit, externalWaitMatch, foldWhitespace, type VerifyEnv } from './verify-env.ts';
 
 import type { StreamEvent } from './spawn.ts';
+import { contextStage, type TokenCounters } from './usage.ts';
+import { isStatusCapable, newPollLoop, observeCall, type PollLoopState } from '../../shared/poll-loop.js';
 
 export type StallSignal = (typeof STALL_SIGNALS)[number];
 
-/** The five knobs, as `config.ts` spells them. */
+/** The knobs, as `config.ts` spells them — one per `STALL_SIGNAL`, plus the local-job clock. */
 export type StallThresholds = {
   /** No PRODUCTIVE output for this long — `silent`. See `lastProductiveAt`. */
   stallSilentMs: number;
@@ -61,6 +65,8 @@ export type StallThresholds = {
    * interrupting a lane that was doing exactly what it was asked to do.
    */
   stallLocalJobMs: number;
+  /** This many identical failing tool calls in a row — `looping`. */
+  stallLoopRun: number;
 };
 
 /**
@@ -1163,6 +1169,44 @@ export type StallState = {
 };
 
 /**
+ * What a `loop` suspicion is evidence OF — which call, how many, what came back.
+ *
+ * The three suspicion shapes live here rather than in `runner/suspect.ts`,
+ * which is where the detectors live, for the rule this tree already follows
+ * with `RunnerDeps`: the TYPE is free and only the implementation is Pro. A
+ * `PhaseRecord` carries one of these and `state.ts` is free, so a shape the
+ * free tree could not name would take the whole record type with it.
+ */
+export type LoopEvidence = {
+  tool: string;
+  /** The call's own one-line summary — for a `Bash` call, the command. */
+  summary: string;
+  /** `callHash` of the words that came back. */
+  hash: string;
+  count: number;
+  /** The calls' own ids, oldest first. */
+  ids: string[];
+};
+
+/** A phase the console suspects of going round in circles. Never acted on. */
+export type PhaseSuspect = {
+  kind: 'loop';
+  /** ISO — when the first call of the run went out. */
+  since: string;
+  detail: string;
+  evidence: LoopEvidence;
+};
+
+/** A session the console suspects has stopped, without being able to prove it. */
+export type SessionSuspect = {
+  kind: 'stuck';
+  sessionId: string;
+  /** ISO — the last thing it wrote. */
+  since: string;
+  detail: string;
+};
+
+/**
  * A tool call that went out and has not come back.
  *
  * `summary` is the call's own one-line summary as `spawn.ts` built it — for a
@@ -1218,6 +1262,47 @@ export type LaneLiveness = {
    * and the stall agree by construction rather than by two derivations.
    */
   retries?: { count: number; since: string };
+  /**
+   * What this attempt's session has cost in context so far (autopilot-token-drain
+   * phase 3). Absent until its first API call.
+   */
+  tokens?: LaneTokens;
+  /**
+   * What the session in flight on this lane has cost so far, in dollars — the
+   * CLI's own running `total_cost_usd` from its latest `result`, so it moves
+   * once per turn rather than per call (autopilot-token-drain phase 6, H7).
+   * NOT yet in `RunState.spentUsd`, which books a session only when it ends:
+   * the two sum to what the run has really spent, and a run view showing only
+   * the booked half once read $266.34 while $111.87 was live. Absent until the
+   * session's first `result`. Filled by `RunnerBase.liveness()` from
+   * `Lane.spentUsd`, not by `livenessOf`, which reads only the signals.
+   */
+  spentUsd?: number;
+};
+
+/**
+ * A live lane's context and caching, as the run payload carries it.
+ *
+ * `context` is the newest call's — what every further call re-reads — and
+ * `peak` the largest; the four token fields are this attempt's sums. `rebuilds`
+ * counts calls that wrote the cache again rather than reading it
+ * (`runner/usage.ts`), and `pollCalls` the status checks the poll-loop guard
+ * counted (phase 2). `window` is the context window the thresholds were judged
+ * against, when the model is known, and `stage` the line `context` has passed
+ * — absent under the wrap-up line, so no surface has to know the fractions.
+ */
+export type LaneTokens = {
+  context: number;
+  peak: number;
+  calls: number;
+  rebuilds: number;
+  input: number;
+  cacheRead: number;
+  cacheWrite: number;
+  output: number;
+  pollCalls: number;
+  window?: number;
+  stage?: 'wrap-up' | 'checkpoint';
 };
 
 /**
@@ -1262,6 +1347,17 @@ export type LaneSignals = {
   turnsSinceLastTool: number;
   /** Insertion-ordered, so index 0 is the oldest unanswered call. */
   openTools: OpenToolAt[];
+  /**
+   * The last `LOOP_WINDOW` FINISHED calls of the lane's own conversation,
+   * oldest first — what `looping` is read from.
+   *
+   * Optional only for a signals object built by hand; `newLaneSignals` gives a
+   * lane one. Deliberately not merged into `openTools`, which is a set of calls
+   * still outstanding and is read by three other things: a call belongs to
+   * exactly one of the two lists at any moment, and conflating them would make
+   * `oldestOpenTool` report a call that has already come back.
+   */
+  recentCalls?: ToolOutcome[];
   /** Refreshed on the slow cadence; see `LaneLiveness`. */
   commitsSinceStart: number;
   treeDirty: boolean;
@@ -1295,9 +1391,145 @@ export type LaneSignals = {
    * (a commit, a declared outcome) ends it.
    */
   waitDenied?: { since: number; lastAt: number; command: string; matched: string; scope: WaitScope; count: number };
+  /**
+   * The background tasks the CLI is holding open for this session, oldest
+   * first — the stream's `background` events, folded. Optional because a lane
+   * that has started none carries none; `awaitingBackground` reads it.
+   */
+  backgroundTasks?: BackgroundTask[];
+  /**
+   * The poll-loop guard's tracker for this session (autopilot-token-drain
+   * phase 2, `shared/poll-loop.js`): the PreToolUse hook folds in the calls it
+   * can judge (`Runner.observeToolCall`), and `applyEvent` every other call the
+   * session makes, which is what breaks a streak. Optional only for a signals
+   * object built by hand; `newLaneSignals` always gives a lane one.
+   */
+  pollLoop?: PollLoopState;
+  /** The one poll-loop notice this lane may be sent has been spent (`Runner.nudgePollLoop`). */
+  pollNudged?: boolean;
+  /**
+   * The newest totals the session's `usage` events reported — replaced, never
+   * added to, because each event already carries the whole fold. Absent until
+   * the first API call (autopilot-token-drain phase 3).
+   */
+  tokens?: TokenCounters;
+  /** The context window this lane's thresholds are judged against, once the runner knows the model. */
+  contextWindow?: number;
+};
+
+/**
+ * One background task the CLI started for this session and has not reported
+ * finished (autopilot-token-drain phase 1).
+ *
+ * The API later phases build on: `spawn.ts` emits the `background` event,
+ * `applyEvent` keeps these, `awaitingBackground` answers which of them wake the
+ * session, and `Runner.awaitingBackground(phase)` hands that to the Stop hook.
+ */
+export type BackgroundTask = {
+  id: string;
+  /** `system/task_started.task_type` — `local_bash`, `local_agent`, `remote_agent`, `monitor_mcp`, … */
+  taskType?: string;
+  /** The tool call that started it, paired by `tool_use_id` — how a `Monitor` is told from a background `Bash`. */
+  tool?: string;
+  description?: string;
+  /** Started by a subagent rather than by the phase's own conversation. */
+  ownedBySubagent?: boolean;
+  /** When the task started (ms). */
+  since: number;
 };
 
 type OpenToolAt = { id: string; name: string; since: number; summary?: string };
+
+/**
+ * One FINISHED tool call of the lane's own conversation.
+ *
+ * The ring of these is what the `looping` signal is read from, and the shape is
+ * chosen so the comparison is a tuple equality rather than a judgement: a tool
+ * name, the call's own one-line summary (for a `Bash` call, the command), and a
+ * digest of the words that came back. Two calls are "the same call, failing the
+ * same way" exactly when all three match — which is what separates a session
+ * going round in circles from one working through a list of real problems, and
+ * why the detector is not fooled by a retry that fails differently.
+ *
+ * The result's own words are DIGESTED rather than kept. A tool result is
+ * unbounded and this ring lives on every lane's signals, which are
+ * checkpointed: keeping ten full results per lane would put a session's stderr
+ * into every run file. The digest answers the only question asked of it.
+ */
+export type ToolOutcome = {
+  ok: boolean;
+  tool: string;
+  /** The call's own summary, as `spawn.ts` built it — capped there at 240. */
+  summary: string;
+  /** `callHash` of the result's detail. */
+  hash: string;
+  /** When the call went OUT, not when it came back — see `loopRun`. */
+  at: number;
+  id?: string;
+};
+
+/**
+ * How many finished calls the ring keeps.
+ *
+ * Ten, which is the window the loop is looked for in. Deliberately small: the
+ * ring is checkpointed with the lane, and a longer memory buys nothing — a
+ * loop is by definition consecutive, so anything before the last break is
+ * already irrelevant.
+ */
+export const LOOP_WINDOW = 10;
+
+/** How much of a result's own words the digest reads. */
+const HASH_READ = 4_000;
+
+/**
+ * A short, stable digest of what a tool result said.
+ *
+ * Whitespace-folded first, so the same failure reported with a different line
+ * wrap is the same failure. Twelve hex characters is the same width the message
+ * ledger uses for an id and is far more than enough for an equality test over
+ * ten values.
+ *
+ * Absent and empty are deliberately the same digest: both are "the call came
+ * back with no words", which is one fact, and a detector that told them apart
+ * would never match two of the many results that carry nothing.
+ */
+export function callHash(detail: string | undefined | null): string {
+  return createHash('sha256').update(foldWhitespace(String(detail ?? '')).slice(0, HASH_READ)).digest('hex').slice(0, 12);
+}
+
+/**
+ * The consecutive identical FAILURES at the end of the ring, if any.
+ *
+ * From the end, because the question is about now: a lane that failed the same
+ * way three times an hour ago and has been fine since is not looping. The run
+ * is broken by anything at all — a success, a different tool, a different
+ * command, different words back — which is what makes "a differing hash resets"
+ * true without a second rule.
+ *
+ * `head` is the OLDEST call of the run, so an episode's clock starts when the
+ * loop started rather than when a tick noticed it. That is the same rule every
+ * other stall signal follows, and it is why `ToolOutcome.at` is the moment the
+ * call went out.
+ */
+export function loopRun(
+  calls: readonly ToolOutcome[],
+): { count: number; head: ToolOutcome; ids: string[] } | null {
+  const last = calls.at(-1);
+  if (!last || last.ok) return null;
+  let i = calls.length - 1;
+  while (i > 0) {
+    const previous = calls[i - 1]!;
+    if (previous.ok || previous.tool !== last.tool || previous.summary !== last.summary
+      || previous.hash !== last.hash) break;
+    i--;
+  }
+  const run = calls.slice(i);
+  return {
+    count: run.length,
+    head: run[0]!,
+    ids: run.map((call) => call.id).filter((id): id is string => Boolean(id)),
+  };
+}
 
 /**
  * The same ceiling `spawn.ts` puts on its pending-tool map, and for the same
@@ -1314,12 +1546,14 @@ export function newLaneSignals(startedAt: number, carry?: { idleAttempts?: numbe
     retriesSinceProgress: 0,
     turnsSinceLastTool: 0,
     openTools: [],
+    recentCalls: [],
     commitsSinceStart: 0,
     treeDirty: false,
     idleAttempts: carry?.idleAttempts ?? 0,
     verifying: false,
     frozen: false,
     stall: null,
+    pollLoop: newPollLoop(),
   };
 }
 
@@ -1410,6 +1644,10 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
       if (event.parent) break;
       signals.lastToolUseAt = at;
       signals.turnsSinceLastTool = 0;
+      // Any call the hook does not judge is the session doing something else,
+      // so it breaks a poll streak. The four the guard reads are the hook's to
+      // count, with the input the stream no longer carries.
+      if (!isStatusCapable(event.name)) observeCall((signals.pollLoop ??= newPollLoop()), { name: event.name }, at);
       if (event.id) {
         // `summary` is already whitespace-collapsed and capped by `summarise`;
         // carried verbatim so the external-clock vocabulary — which spells its
@@ -1426,7 +1664,26 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
     case 'tool-result': {
       if (event.parent) break;
       const i = signals.openTools.findIndex((tool) => tool.id === event.id);
-      if (i >= 0) signals.openTools.splice(i, 1);
+      // The call that went out is where the tool's NAME and its summary live —
+      // a result carries neither — so the outcome can only be assembled here,
+      // while the pair is still together. A result whose call the ring never
+      // saw (the tail cut it off, or the id was never emitted) is dropped
+      // rather than recorded with an invented name: a tuple with a guessed
+      // member would match another guess and report a loop that never happened.
+      if (i >= 0) {
+        const call = signals.openTools[i]!;
+        signals.openTools.splice(i, 1);
+        const calls = (signals.recentCalls ??= []);
+        calls.push({
+          ok: event.ok,
+          tool: call.name,
+          summary: call.summary ?? '',
+          hash: callHash(event.detail),
+          at: call.since,
+          ...(call.id ? { id: call.id } : {}),
+        });
+        if (calls.length > LOOP_WINDOW) calls.splice(0, calls.length - LOOP_WINDOW);
+      }
       break;
     }
     case 'step': {
@@ -1444,9 +1701,59 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
       signals.turnsSinceLastTool = 0;
       break;
     }
+    case 'usage': {
+      // The session's whole fold rides every event, so the newest one replaces.
+      signals.tokens = { ...event.totals };
+      break;
+    }
+    case 'background': {
+      const tasks = (signals.backgroundTasks ??= []);
+      const i = tasks.findIndex((task) => task.id === event.taskId);
+      if (i >= 0) tasks.splice(i, 1);
+      if (event.op === 'started') {
+        tasks.push({
+          id: event.taskId, since: at,
+          ...(event.taskType ? { taskType: event.taskType } : {}),
+          ...(event.tool ? { tool: event.tool } : {}),
+          ...(event.description ? { description: event.description } : {}),
+          ...(event.ownedBySubagent ? { ownedBySubagent: true } : {}),
+        });
+        if (tasks.length > MAX_OPEN_TOOLS) tasks.shift();
+      }
+      break;
+    }
     default:
       break;
   }
+}
+
+/**
+ * Does this outstanding task wake the session when it finishes — so that a
+ * turn ending while it runs is a WAIT rather than an exit?
+ *
+ * Measured, not assumed (autopilot-token-drain §Context E1–E6, CLI 2.1.273,
+ * this runner's framing): after the turn ends, an Agent (`local_agent`) and a
+ * Monitor running in the background keep the `-p` process alive and their
+ * completion starts a new turn — stdin closed or not — while a background Bash
+ * is stopped about five seconds later. A Monitor reaches the stream as
+ * `task_type: local_bash`, exactly like a background Bash: the CLI registers
+ * both through one shell-task path and keeps its `kind: "monitor"` off the
+ * wire. So a monitor is told apart by the tool call that started it.
+ *
+ * Everything else does not count, and the direction of that error is chosen:
+ * a type nobody measured (`remote_agent`, `local_workflow`, the CLI's own MCP
+ * and websocket monitors), or a task a subagent owns, leaves the Stop hook
+ * holding the turn exactly as it did before this existed.
+ */
+export function wakesTheSession(task: Pick<BackgroundTask, 'taskType' | 'tool' | 'ownedBySubagent'>): boolean {
+  if (task.ownedBySubagent) return false;
+  if (task.taskType === 'local_agent') return true;
+  return task.taskType === 'local_bash' && task.tool === 'Monitor';
+}
+
+/** The outstanding background tasks that will wake the session, oldest first. */
+export function awaitingBackground(signals: Pick<LaneSignals, 'backgroundTasks'>): BackgroundTask[] {
+  return (signals.backgroundTasks ?? []).filter(wakesTheSession);
 }
 
 /** The oldest unanswered call, as it goes on the wire. */
@@ -1541,6 +1848,17 @@ function deniedWait(
 }
 
 /** Fall back to the shipped numbers for anything a caller left out or spelled wrong. */
+/**
+ * When the local-job nudge may fire: the larger of the `external-wait` signal's
+ * own threshold and the ten minutes the wait procedure grants a session on its
+ * own job. An operator who widens the signal past ten minutes is honoured; one
+ * who leaves it at the 5-minute default no longer nudges inside the allowance.
+ * (console-open-findings O6.)
+ */
+export function localNudgeAfterMs(stallExternalWaitMs: number): number {
+  return Math.max(stallExternalWaitMs, LOCAL_JOB_GRACE_MS);
+}
+
 export function stallThresholds(prefs?: Partial<StallThresholds> | null): StallThresholds {
   const positive = (value: unknown, fallback: number): number =>
     (typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback);
@@ -1554,6 +1872,7 @@ export function stallThresholds(prefs?: Partial<StallThresholds> | null): StallT
     stallExternalWaitMs: typeof prefs?.stallExternalWaitMs === 'number' && Number.isFinite(prefs.stallExternalWaitMs)
       && prefs.stallExternalWaitMs >= 0 ? prefs.stallExternalWaitMs : STALL_DEFAULTS.stallExternalWaitMs,
     stallLocalJobMs: positive(prefs?.stallLocalJobMs, STALL_LOCAL_JOB_MS),
+    stallLoopRun: positive(prefs?.stallLoopRun, STALL_DEFAULTS.stallLoopRun),
   };
 }
 
@@ -1663,8 +1982,17 @@ export function evaluateStall(
   // Measured from the PRODUCTIVE clock: a session pinned in a retry loop is
   // heard from constantly and is producing nothing, and it is the second of
   // those that this signal is about.
+  //
+  // Not while the session's turn has ended on its own subagents or monitors
+  // running in the background (no call open, a waker outstanding): it is between two halves of
+  // its own work, and their notification starts its next turn. Bounded by the
+  // local-job clock, the same allowance a wait on its own job gets — an agent
+  // that never reports is silence after all.
   const quietFor = now - signals.lastProductiveAt;
-  if (quietFor >= thresholds.stallSilentMs) {
+  const awaitingOwnWork = signals.openTools.length === 0
+    && quietFor < thresholds.stallLocalJobMs
+    && awaitingBackground(signals).length > 0;
+  if (quietFor >= thresholds.stallSilentMs && !awaitingOwnWork) {
     const open = signals.openTools[0];
     return {
       signal: 'silent',
@@ -1686,6 +2014,23 @@ export function evaluateStall(
     };
   }
 
+  // Last, and that is the rank rather than an afterthought. A looping lane is
+  // producing output the whole time, so it is neither silent nor spinning and
+  // in practice no other signal competes with it — but if one ever does, the
+  // other one is the harder fact: silence and a retry storm say the session
+  // cannot work at all, while this says it is working on the wrong thing.
+  const loop = loopRun(signals.recentCalls ?? []);
+  if (loop && loop.count >= thresholds.stallLoopRun) {
+    return {
+      signal: 'looping',
+      // When the FIRST of the run went out — the moment the loop began.
+      since: new Date(loop.head.at).toISOString(),
+      detail: `${loop.count} identical failing ${loop.head.tool} calls in a row`
+        + (loop.head.summary ? `: ${loop.head.summary.slice(0, 120)}` : '')
+        + ', each answered the same way',
+    };
+  }
+
   return null;
 }
 
@@ -1695,6 +2040,8 @@ export function evaluateStall(
  */
 export function livenessOf(phase: number, signals: LaneSignals): LaneLiveness {
   const open = oldestOpenTool(signals);
+  const tokens = signals.tokens;
+  const stage = tokens ? contextStage(tokens.lastContext, signals.contextWindow) : 'ok';
   return {
     phase,
     lastOutputAt: new Date(signals.lastOutputAt).toISOString(),
@@ -1709,6 +2056,23 @@ export function livenessOf(phase: number, signals: LaneSignals): LaneLiveness {
         retries: {
           count: signals.retriesSinceProgress,
           since: new Date(signals.retryBurstSince ?? signals.lastProductiveAt).toISOString(),
+        },
+      }
+      : {}),
+    ...(tokens && tokens.calls > 0
+      ? {
+        tokens: {
+          context: tokens.lastContext,
+          peak: tokens.peakContext,
+          calls: tokens.calls,
+          rebuilds: tokens.rebuilds,
+          input: tokens.input,
+          cacheRead: tokens.cacheRead,
+          cacheWrite: tokens.cacheWrite,
+          output: tokens.output,
+          pollCalls: signals.pollLoop?.counts.status ?? 0,
+          ...(signals.contextWindow ? { window: signals.contextWindow } : {}),
+          ...(stage !== 'ok' ? { stage } : {}),
         },
       }
       : {}),

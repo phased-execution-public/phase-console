@@ -36,6 +36,7 @@ import { dirname, join } from 'node:path';
 import { log } from '../log.ts';
 import { toolStanding } from '../../shared/cli-tools.js';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
+import { POLL_STATUS_TOOLS } from '../../shared/poll-loop.js';
 import { INSTANCE, INSTANCE_STATE_DIR, notifyCommand } from '../config.ts';
 import {
   DEFAULT_PERMISSION_PROFILE, PERMISSION_PROFILES, PROFILE_LABELS,
@@ -75,6 +76,69 @@ export const DEFAULT_DENY = [
 ];
 
 /**
+ * The verbs that write state SEVERAL WORKING TREES SHARE (SHR-1, MIR-2).
+ *
+ * 🔴 A linked worktree is not an isolated repository. Every tree of one
+ * repository shares the object database, `refs/stash`, and `.git/config` —
+ * measured, all three — so:
+ *
+ *  - `git stash` in a lane pushes onto the stack another lane (and the
+ *    operator's own shell) pops from. The skill's own boot prompt warns a
+ *    session never to use bare `stash` for exactly this reason.
+ *  - `git config core.hooksPath …` rewrites the hooks for every tree at once,
+ *    because the common config is shared.
+ *  - `git submodule update` inside a mirror's ROOT mount DETACHES the sibling
+ *    submodule mount — so `validateMirror` answers false, the run refuses
+ *    `worktree-failed`, and the whole mirror degrades permanently (MIR-2).
+ *  - `git worktree`, `git checkout` and `git switch` move a tree off the branch
+ *    the console's lock, its carve-out and its merge-back all name.
+ *
+ * All six were forbidden in prose — four times, in three documents and a boot
+ * prompt — and enforced nowhere at all.
+ */
+export const SHARED_STATE_ASK = [
+  'Bash(git stash:*)',
+  'Bash(git config:*)',
+  'Bash(git worktree:*)',
+  'Bash(git submodule:*)',
+  'Bash(git checkout:*)',
+  'Bash(git switch:*)',
+];
+
+/**
+ * Filing, commenting on and closing an issue — outward-facing acts, like a push.
+ *
+ * A session that spots a defect outside its phase should be able to say so, and
+ * the issues estate (decision 18) is how; but an issue is visible to everyone
+ * who reads the repository, and the deal for anything a run makes visible is
+ * the same one `OPEN_PR_ASK` has: one human tap. Pinned through every profile
+ * for that reason and not because they are dangerous.
+ */
+export const ISSUE_ASK = [
+  'Bash(gh issue create:*)',
+  'Bash(gh issue comment:*)',
+  'Bash(gh issue close:*)',
+];
+
+/**
+ * The ask rules a PROFILE may not empty.
+ *
+ * `trusted` and `bypass` exist to stop asking about the everyday steps of the
+ * work — a commit, an install, a migration. They were never meant to hand a
+ * session the verbs that reach OUT of its own tree, and nothing said so: a
+ * `trusted` run's ask list was emptied wholesale, so the six shared-state verbs
+ * and the three issue verbs were auto-allowed on exactly the runs nobody is
+ * watching.
+ *
+ * It is a DEFAULT, not a second wall. `deny` is the wall. Everything here is
+ * struck by name through the policy file like any other shipped rule, and a pin
+ * that survived a named strike would be the one rule an operator could not
+ * remove — which is the shape the deny half was deliberately moved away from.
+ * The pin keeps a rule the policy HOLDS; it never adds one back.
+ */
+export const ALWAYS_ASK: readonly string[] = Object.freeze([...SHARED_STATE_ASK, ...ISSUE_ASK]);
+
+/**
  * Allowed, but only with a person in the loop. These are the everyday
  * irreversible-ish steps of real work — a commit, a migration, a dependency
  * install — that a run should be able to reach, but not on its own.
@@ -94,6 +158,10 @@ export const DEFAULT_ASK = [
   // The hook matcher has always covered WebSearch; the ask list did not, so it
   // was silently auto-allowed while its sibling raised a card.
   'WebSearch',
+  // The shared-`.git` verbs and the issue verbs — see `ALWAYS_ASK`, which is
+  // what keeps these six raising a card under `trusted` and `bypass` too.
+  ...SHARED_STATE_ASK,
+  ...ISSUE_ASK,
 ];
 
 /**
@@ -147,8 +215,15 @@ export type AutopilotPolicy = {
  * `buildSettings` below. A rule about anything else is real, but it is enforced
  * by the CLI's own permission engine and this console never sees it, which is
  * a distinction the editor has to be able to show.
+ *
+ * The status tools ride along for the poll-loop guard (autopilot-token-drain
+ * phase 2): a session polling with `ListAgents` never reached this console, so
+ * nothing could stop it. They are read-only and cheap to answer, and the list
+ * is the guard's own (`shared/poll-loop.js`), never a copy.
  */
-export const HOOK_TOOLS = ['Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'AskUserQuestion'];
+export const HOOK_TOOLS = [
+  'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'AskUserQuestion', ...POLL_STATUS_TOOLS,
+];
 
 /** Tools whose *path* rules Claude Code does not consult at all. */
 const PATH_RULES_IGNORED = ['Write', 'NotebookEdit', 'Glob'];
@@ -752,10 +827,12 @@ export function profilePolicy(
   opts?: { alwaysAsk?: readonly string[] },
 ): AutopilotPolicy {
   if (profile === 'guarded') return policy;
-  const kept = opts?.alwaysAsk?.length
-    ? policy.ask.filter((rule) => opts.alwaysAsk!.includes(rule))
-    : [];
-  return { ...policy, ask: kept };
+  // `ALWAYS_ASK` unconditionally, plus whatever this call pins on top (the
+  // openPr carve-out's two). FILTERED from the policy rather than added to it:
+  // a pin keeps a rule the policy holds, so an operator's named strike still
+  // removes it and an upgrade's new rule still applies.
+  const pinned = new Set([...ALWAYS_ASK, ...(opts?.alwaysAsk ?? [])]);
+  return { ...policy, ask: policy.ask.filter((rule) => pinned.has(rule)) };
 }
 
 /* ------------------------------------------------------------------ *
@@ -782,8 +859,21 @@ export const PUSH_DENY_CARVED = [
 export const OPEN_PR_ASK = ['Bash(git push:*)', 'Bash(gh pr create:*)'];
 
 /**
- * The publishing ask a call matches — one of the two the carve-out pins for a
- * person — or null (zero-touch-console phase 13, TRS-4).
+ * The LANDING session's two acts (many-plans-one-repo phase 8): a plan whose
+ * `Land:` word is `pr` or `trunk` boards a session after each phase to open
+ * the pull request — and, under `trunk`, merge it. Pinned through every
+ * profile for the reason `OPEN_PR_ASK` is: one human tap per world-visible
+ * act, unless the plan's `permission.destructive` row excepts it by name.
+ *
+ * `git push` is deliberately NOT here. The push is the console's own act
+ * (`pushRef`, the one argv in `runner/worktree.ts`), done before the session
+ * is boarded; the session is told so and the wall keeps refusing it.
+ */
+export const PUBLISH_ASK = ['Bash(gh pr create:*)', 'Bash(gh pr merge:*)'];
+
+/**
+ * The publishing ask a call matches — one of the rules the two carve-outs pin
+ * for a person — or null (zero-touch-console phase 13, TRS-4).
  *
  * The carve-out's whole deal is one human tap to publish, and auto-grant (ON
  * by default) answered it 189 times with nobody asked and nothing announced.
@@ -795,7 +885,7 @@ export const OPEN_PR_ASK = ['Bash(git push:*)', 'Bash(gh pr create:*)'];
  * consults it for its wrapper fallback; a publishing verb hides nothing.
  */
 export function publishingRule(toolName: string, input: unknown): string | null {
-  return firstMatch(OPEN_PR_ASK, toolName, input);
+  return firstMatch([...new Set([...OPEN_PR_ASK, ...PUBLISH_ASK])], toolName, input);
 }
 
 /**
@@ -810,22 +900,34 @@ export function publishingRule(toolName: string, input: unknown): string | null 
  */
 export function carvedPolicy(
   policy: AutopilotPolicy, profile: PermissionProfile, openPrCarveOut: boolean,
+  /**
+   * The plan lands by pull request (`Land: pr`/`trunk` on any phase): the
+   * landing session's `gh pr create` and `gh pr merge` are pinned asks under
+   * every profile. Nothing comes off the wall for it — the push stays the
+   * console's.
+   */
+  publishCarveOut = false,
 ): AutopilotPolicy {
-  if (!openPrCarveOut) return profilePolicy(policy, profile);
+  if (!openPrCarveOut && !publishCarveOut) return profilePolicy(policy, profile);
+  const pinned = [
+    ...(openPrCarveOut ? OPEN_PR_ASK : []),
+    ...(publishCarveOut ? PUBLISH_ASK : []),
+  ];
   const carved: AutopilotPolicy = {
     ...policy,
     // Conditional on the wall actually standing: a carve-out narrows a rule
     // the policy holds, it never resurrects one the operator struck. With the
     // push wall struck, swapping in the force-push denials would quietly
-    // re-add per run what a named, journaled edit removed for good.
-    deny: policy.deny.includes(PUSH_DENY)
+    // re-add per run what a named, journaled edit removed for good. Only the
+    // openPr carve-out touches the wall at all.
+    deny: openPrCarveOut && policy.deny.includes(PUSH_DENY)
       ? [...policy.deny.filter((rule) => rule !== PUSH_DENY), ...PUSH_DENY_CARVED]
       : policy.deny,
     // The "one human tap to publish" asks are about the RUN shape, not the
     // wall — pinned whether or not the wall stands.
-    ask: [...new Set([...policy.ask, ...OPEN_PR_ASK])],
+    ask: [...new Set([...policy.ask, ...pinned])],
   };
-  return profilePolicy(carved, profile, { alwaysAsk: OPEN_PR_ASK });
+  return profilePolicy(carved, profile, { alwaysAsk: pinned });
 }
 
 const POLICY_DIR = join(
@@ -2158,6 +2260,8 @@ export type SettingsOptions = {
   profile?: PermissionProfile;
   /** New-branch runs that will open a PR: bare `git push` moves deny → ask. */
   openPrCarveOut?: boolean;
+  /** Plans that land by pull request: the landing session's `gh pr create`/`gh pr merge` are pinned asks. */
+  publishCarveOut?: boolean;
   /**
    * The relay is armed for this run (phase 14): a `PermissionRequest` `http`
    * hook rides beside `PreToolUse`. Only ever true on a `relay: last-resort`
@@ -2166,6 +2270,26 @@ export type SettingsOptions = {
    * switch the hook off (phase 1, spike S2).
    */
   relay?: boolean;
+  /**
+   * This plan's sessions may be sent messages (the plan's `**Messaging:**`
+   * line, on unless it says otherwise).
+   *
+   * It writes `crossSessionInbound: "accept"`, and that is a decision phase 1
+   * forced rather than a preference. Decision 14 assumed the console could post
+   * into a session's inbox PAST a `hold`, because it holds that session's own
+   * `CLAUDE_CODE_MESSAGING_TOKEN` and so counts as an "own child". Arm S-C
+   * measured it: it cannot. The documented own-child exception is conditioned
+   * on NO `crossSessionInbound` value applying, and a value from `--settings`
+   * applies — so the token buys nothing, and there is no setting under which
+   * the CLI both holds peers and lets the console through.
+   *
+   * So the console takes responsibility for what reaches the session instead —
+   * the MARK RULE: every message it delivers is framed (`frameMessage`) as
+   * information from a peer with no authority, tagged `[[msg:<id>]]`, and
+   * budgeted. `accept` without that framing would be an open door; the framing
+   * is what makes the door safe, and it is why the two shipped together.
+   */
+  messaging?: boolean;
 };
 
 /**
@@ -2179,8 +2303,15 @@ export const PRE_TOOL_USE_MATCHER = HOOK_TOOLS.join('|');
 export function buildSettings(opts: SettingsOptions): Record<string, unknown> {
   const policy = carvedPolicy(
     opts.policy ?? loadPolicy(), opts.profile ?? 'guarded', opts.openPrCarveOut ?? false,
+    opts.publishCarveOut ?? false,
   );
   return {
+    // The one settings key that is not about permissions: whether a PEER may
+    // put a message into this session's inbox. See `SettingsOptions.messaging`
+    // for why `accept` is the only workable value and what pays for it.
+    // Omitted entirely when messaging is off, so the CLI's own default stands
+    // rather than this console asserting a value it has no opinion about.
+    ...(opts.messaging ? { crossSessionInbound: 'accept' } : {}),
     permissions: {
       // `allow` rides along because permission rules merge across scopes: it
       // adds to what the repository already permits and cannot take anything

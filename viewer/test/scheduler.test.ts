@@ -45,8 +45,10 @@ function scheduler(options: {
   presence?: (lock: LockView) => 'live' | 'ended' | 'unknown';
   accountWalls?: AccountWalls;
   etaFor?: (slug: string) => { remainingWeight?: number; label?: string } | undefined;
+  maxPerRepo?: () => number;
 } = {}) {
   return new Scheduler({
+    maxPerRepo: options.maxPerRepo,
     max: options.max ?? 8,
     locks: options.locks ?? (() => []),
     now: options.now,
@@ -210,28 +212,46 @@ test('a live lock on disk blocks an intersecting phase, and an expired one does 
   assert.equal((await blocked).slug, 'mine');
 });
 
-test('a scopeless lock is recovered from the plan, and falls back to `all` when the plan is unknown', async () => {
+test('S4-a: a scopeless lock collides with everything — the console reads it exactly as bash does', async () => {
+  // A lock with no `scope=` line was written by an older script, or by a
+  // session that never said. `phase-lock.sh conflicts` treats it as UNKNOWN and
+  // collides with everything; the scheduler used to RECOVER what the plan says
+  // that phase touches and narrow the lock to it.
+  //
+  // The recovery is a better guess and a worse contract. The two halves of one
+  // guard gave different answers about the same lock file, and the narrower
+  // answer was the console's — so the console admitted a lane into a working
+  // tree that bash had just refused, which is the one disagreement this system
+  // may not have (conventions.md: an unstated scope reads as unknown, and
+  // unknown collides). A guess that is usually right is not a guard.
   const locks: LockView[] = [{ slug: 'legacy', phase: 3, owner: 'old/session', expired: false }];
+
+  // Even with the plan perfectly readable, the lock is unknown and collides.
   const known = scheduler({
     locks: () => locks,
     scopeFor: (slug, phase) => (slug === 'legacy' && phase === 3 ? ['docs'] : undefined),
   });
-
-  // Recovered as `docs`, so an `api` phase is free to run beside it.
-  const disjoint = await known.admit({ slug: 'mine', phase: 1, runId: 'r1', scope: ['api'] });
-  assert.equal(disjoint.slug, 'mine');
-  const overlapping = known.admit({ slug: 'mine', phase: 2, runId: 'r1', scope: ['docs'] });
+  const disjoint = known.admit({ slug: 'mine', phase: 1, runId: 'r1', scope: ['api'] });
   await tick();
-  assert.ok(await pending(overlapping), 'the recovered scope is a real scope');
+  assert.ok(await pending(disjoint), 'an unstated scope is not a narrow scope');
   known.close();
 
-  // No plan to recover it from: the safe reading is that it could be anything.
   const unknown = scheduler({ locks: () => locks });
   const anything = unknown.admit({ slug: 'mine', phase: 1, runId: 'r1', scope: ['api'] });
   await tick();
-  assert.ok(await pending(anything), 'an unreadable scope must collide with everything');
+  assert.ok(await pending(anything), 'and with no plan to read, the same answer');
   unknown.close();
 });
+
+test('S4-a: a lock that STATES its scope still carves, exactly as before', async () => {
+  // The narrowing that is legitimate: the holder said what it touches.
+  const locks: LockView[] = [{ slug: 'legacy', phase: 3, owner: 'old/session', expired: false, scope: ['docs'] }];
+  const s = scheduler({ locks: () => locks });
+  const grant = await s.admit({ slug: 'mine', phase: 1, runId: 'r1', scope: ['api'] });
+  assert.equal(grant.slug, 'mine');
+  s.close();
+});
+
 
 test("a run's own lock never blocks its own next lane", async () => {
   const locks: LockView[] = [
@@ -1834,6 +1854,39 @@ test('ACC-7.3 (REG-3): a live session in the repository with no lock is a `sessi
   } finally { s.close(); }
 });
 
+test('REG-3 claim window: a peer\'s window end is its holder\'s leaseUntil, and the lock timer wakes the scan there with no external poke', async () => {
+  const { isCappableBlocker } = await import('../server/runner/scheduler.ts');
+  // Wide enough that a loaded machine still reaches `admit` before the window shuts.
+  const shuts = Date.now() + 500;
+  const s = new Scheduler({
+    max: 8, locks: () => [],
+    peers: () => (Date.now() < shuts
+      ? [{ sessionId: 's-hand-peer-0003', pid: 4545, cwd: '/work/hub', presence: 'live', owner: 'sam@laptop', scope: ['all'], plan: null, claimUntil: shuts }]
+      : []),
+  });
+  try {
+    const request = { slug: 'alpha', phase: 2, runId: 'run-w', scope: ['app'] };
+    const [holder] = s.wouldBlock(request);
+    assert.equal(holder?.kind, 'session');
+    assert.equal(holder.leaseUntil, shuts, 'the queue can say when the hold lapses');
+    assert.equal(isCappableBlocker(holder), false, 'a window that ends by itself is never capped into a park');
+
+    const blocked = s.admit(request);
+    await tick();
+    assert.ok(await pending(blocked), 'the window is still open');
+    // No poll(), no release, no presence event — the armed timer must do it alone
+    // (the idle poll is a minute away).
+    const grant = await Promise.race([
+      blocked,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('the lock timer never fired for the session holder')), 5_000).unref?.();
+      }),
+    ]);
+    assert.equal(grant.phase, 2);
+    s.release(grant);
+  } finally { s.close(); }
+});
+
 /* ------------------------------------------------------------------ *
  * The machine ceiling (zero-touch phase 17, FLT-7 / ACC-10.7)
  * ------------------------------------------------------------------ */
@@ -1898,3 +1951,277 @@ test('FLT-7: with no machine ceiling a lane is still counted, and the console ca
   gamma.release(b);
   assert.equal(liveLaneTokens().filter((lane) => lane.instance === '33333333-gamma').length, 0);
 });
+
+
+/**
+ * console-open-findings O4 — the usage brake, pinned. `scheduler.test.ts` had no
+ * brake test at all, which is how the finding could be true for a release
+ * without anything noticing.
+ *
+ * Two facts, and they are deliberately different from each other:
+ *
+ *  - the brake is keyed by ACCOUNT and held in memory, per console. It is a
+ *    reading this console's own sessions took; another console's sessions are
+ *    not its to brake.
+ *  - a live lane counts against the account it was ADMITTED on, for as long as
+ *    it lives — `ScopeGrant.accountId`, copied from the request and never
+ *    rewritten. So a lane the live wall later moves to another account is still
+ *    counted where it boarded.
+ *
+ * That second one is what the finding names, and it is by design: the grant is
+ * the record of an admission that already happened, and re-pointing it would
+ * make the count disagree with the decision that produced it. What matters is
+ * that it is WRITTEN DOWN — the brake reads `state.accountId` (the account
+ * paying NOW) while `liveOn` counts the admitted one, and a reader who assumes
+ * those are the same number will be wrong the moment an account switches.
+ */
+test('O4: the brake is per account, and a live lane counts against the account it boarded on', async () => {
+  const s = scheduler({ max: 4 });
+  const a = await s.admit({ slug: 'a', phase: 1, runId: 'r1', scope: ['api'], accountId: 'acct-a' });
+  await s.admit({ slug: 'b', phase: 1, runId: 'r2', scope: ['web'], accountId: 'acct-b' });
+
+  assert.equal(s.liveOn('acct-a'), 1, 'one lane boarded on acct-a');
+  assert.equal(s.liveOn('acct-b'), 1);
+  assert.equal(s.liveOn('acct-c'), 0, 'an account nothing boarded on holds nothing');
+
+  // A brake on one account says nothing about another.
+  assert.equal(s.brake('acct-a', { untilMs: null, pct: 96 }), true);
+  assert.ok(s.brakeOf('acct-a'), 'acct-a is braked');
+  assert.equal(s.brakeOf('acct-b'), null, 'acct-b is not');
+
+  // The grant is the record of an admission that happened: releasing the lane
+  // is what stops it counting, not re-pointing it at another account.
+  s.release(a);
+  assert.equal(s.liveOn('acct-a'), 0, 'a released lane counts nowhere');
+
+  s.releaseBrake('acct-a');
+  assert.equal(s.brakeOf('acct-a'), null, 'and the brake lifts by account too');
+});
+
+// ── S9-b — a run id is the lock-owner identity, and it was 8 hex ─────────────
+// `autopilot/<runId>` is what a lane writes into `owner=`, so a run id is not
+// merely a filename: it is the name two consoles use to decide whose lock a
+// lock is. Eight hex digits is ~4.3e9 values, and the birthday bound over the
+// runs one machine accumulates is not the comfortable margin it looks like —
+// two runs sharing an id share their locks, their journal and their run file.
+// Twelve costs nothing and moves the collision out of reach.
+//
+// FIVE readers spell the shape, in four files (`autopilotRunId`, `listRuns`
+// twice, `recovery.ts`, `debug/index.ts`), and each was written independently
+// against the eight. This test is the net that holds them together: a freshly
+// minted id must be accepted by every one of them, so widening the writer
+// without widening a reader fails here rather than in production.
+const { newRun } = await import('../server/runner/state.ts');
+const { autopilotOwner, autopilotRunId } = await import('../server/runner/scheduler.ts');
+const { RUN_ID_RE: DEBUG_RUN_ID_RE } = await import('../server/debug/index.ts');
+
+function mintedRunId(): string {
+  return newRun({ slug: 'demo', root: '/tmp/demo' }).id;
+}
+
+test('S9-b: a minted run id is twelve lowercase hex digits', () => {
+  for (let i = 0; i < 50; i++) {
+    const id = mintedRunId();
+    assert.match(id, /^[0-9a-f]{12}$/, `minted ${id}`);
+  }
+});
+
+test('S9-b: every reader of the run-id shape accepts a minted id', () => {
+  const id = mintedRunId();
+  assert.equal(autopilotRunId(autopilotOwner(id)), id, 'the lock-owner round trip');
+  assert.equal(DEBUG_RUN_ID_RE.test(id), true, 'debug/index.ts');
+  // `listRuns` reads `run-<id>.json`; the file name is the reader's input.
+  assert.match(`run-${id}.json`, /^run-([0-9a-f]{8,32})\.json$/);
+});
+
+test('S9-b: the eight-hex ids already on disk are still read', () => {
+  // Widening a reader may never retire what it used to accept: every run file
+  // and every lock written before this change carries an eight-hex id.
+  assert.equal(autopilotRunId('autopilot/0a1b2c3d'), '0a1b2c3d');
+  assert.equal(DEBUG_RUN_ID_RE.test('0a1b2c3d'), true);
+});
+
+test('S9-b: an owner that is not an autopilot lane is still nobody', () => {
+  assert.equal(autopilotRunId('sam@mac'), null);
+  assert.equal(autopilotRunId('autopilot/'), null);
+  assert.equal(autopilotRunId('autopilot/../../etc'), null);
+  assert.equal(DEBUG_RUN_ID_RE.test('../secrets'), false);
+  assert.equal(DEBUG_RUN_ID_RE.test(''), false);
+});
+
+// ── PRS-2 — a peer session holder could never be capped ──────────────────────
+// `isCappableBlocker` refused anything that is not `kind: 'lock'`, and a
+// `session` holder — a live peer in the repository, REG-3's holder-with-no-lock
+// — has no lease at all. So a SIGSTOPped hand `claude`, or one whose window was
+// closed without the hook firing, held every plan in the repository behind it
+// for the full 24 h peer window with nothing able to time it out. The lock-wait
+// cap exists for exactly this shape: a claim nobody is behind.
+const { isCappableBlocker: cappable } = await import('../server/runner/scheduler.ts');
+
+test('PRS-2: a session peer that is not live may be capped', () => {
+  const peer = (presence: 'live' | 'ended' | 'unknown') => ({
+    kind: 'session' as const, slug: 'other', phase: 4, presence,
+  });
+  assert.equal(cappable(peer('unknown')), true, 'a stopped or unvouched peer');
+  assert.equal(cappable(peer('ended')), true);
+});
+
+test('PRS-2: a LIVE session peer is never capped', () => {
+  // Unchanged, and the reason the rule is `!== live` rather than a kind test:
+  // a person typing in the next window is not debris, however long they take.
+  assert.equal(cappable({ kind: 'session', slug: 'other', phase: 4, presence: 'live' }), false);
+});
+
+test('PRS-2: a clock holder is still never capped, session or not', () => {
+  // A clock ends at a moment already known; capping it is the console
+  // punishing its own policy.
+  assert.equal(cappable({ kind: 'session', slug: 'other', phase: 4, presence: 'unknown', clock: true }), false);
+  assert.equal(cappable({ kind: 'reserved', slug: 'other', phase: null, presence: 'unknown', clock: true }), false);
+});
+
+test('PRS-2: a sibling lane of this console is still never capped', () => {
+  // `grant`/`reserved` are pipelining, not contention — D2 brought them under
+  // the cap and the cure was worse than the disease.
+  assert.equal(cappable({ kind: 'grant', slug: 'other', phase: 4, presence: 'unknown' }), false);
+  assert.equal(cappable({ kind: 'reserved', slug: 'other', phase: 4, presence: 'unknown' }), false);
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 7 — a per-REPOSITORY cap, beside the machine-wide one.
+ * ------------------------------------------------------------------ */
+
+test('P7 — the fourth isolated run on ONE repository waits on `repo cap`; another repository is admitted', async () => {
+  const s = scheduler({ max: 16, maxPerRepo: () => 3 });
+
+  // Three isolated runs of three different plans, all in `/repos/root`. Their
+  // scopes are disjoint, so nothing but the cap can serialise them — which is
+  // the whole point: this is a cap, not a conflict.
+  const live: ScopeGrant[] = [];
+  for (const [n, token] of [[1, 'api'], [2, 'web'], [3, 'docs']] as const) {
+    live.push(await s.admit({
+      slug: `p${n}`, phase: 1, runId: `r${n}`, scope: [token],
+      branch: `pe/p${n}`, tree: `/repos/root/.worktrees/runs/p${n}/r${n}/integration`,
+      repo: '/repos/root',
+    }));
+  }
+  assert.equal(s.snapshot().live, 3, 'three disjoint scopes in one repository have no reason to queue');
+
+  // The fourth in the SAME repository waits…
+  const fourth = s.admit({
+    slug: 'p4', phase: 1, runId: 'r4', scope: ['infra'],
+    branch: 'pe/p4', tree: '/repos/root/.worktrees/runs/p4/r4/integration',
+    repo: '/repos/root',
+  });
+  await tick();
+  assert.ok(await pending(fourth), 'the cap must hold the fourth');
+  const waiting = s.snapshot().entries.find((entry) => entry.slug === 'p4');
+  assert.equal(waiting?.waitingOn[0]?.slug, 'repo cap', 'and the queue must SAY it is the cap');
+  assert.match(String(waiting?.waitingOn[0]?.owner), /\/repos\/root/, '…naming the repository');
+
+  // …while a run in ANOTHER repository is admitted at once. A cap that bound
+  // the console rather than the repository would hold this one too, which is
+  // exactly the bug `worktreeMaxConcurrent` alone has.
+  const elsewhere = await s.admit({
+    slug: 'p5', phase: 1, runId: 'r5', scope: ['api'],
+    branch: 'pe/p5', tree: '/repos/other/.worktrees/runs/p5/r5/integration',
+    repo: '/repos/other',
+  });
+  assert.equal(elsewhere.slug, 'p5');
+
+  // Releasing one lets the fourth through — a cap, never a park.
+  s.release(live[0]);
+  assert.equal((await fourth).slug, 'p4');
+  assert.deepEqual(s.snapshot().capacity, [
+    { repo: '/repos/other', live: 1, max: 3 },
+    { repo: '/repos/root', live: 3, max: 3 },
+  ]);
+});
+
+test('P15 — a run\'s own repo threshold holds it below the console\'s cap, and never above it', async () => {
+  const s = scheduler({ max: 16, maxPerRepo: () => 3 });
+  const one = await s.admit({
+    slug: 'p1', phase: 1, runId: 'r1', scope: ['api'],
+    branch: 'pe/p1', tree: '/repos/root/.worktrees/runs/p1/r1/integration', repo: '/repos/root',
+  });
+  // A run that said `maxConcurrentPerRepo: 1` will not be the second in its
+  // repository, though the console would allow three.
+  const shy = s.admit({
+    slug: 'p2', phase: 1, runId: 'r2', scope: ['web'],
+    branch: 'pe/p2', tree: '/repos/root/.worktrees/runs/p2/r2/integration', repo: '/repos/root',
+    repoCap: 1,
+  });
+  await tick();
+  assert.ok(await pending(shy), 'the run\'s own threshold holds it');
+  const waiting = s.snapshot().entries.find((entry) => entry.slug === 'p2');
+  assert.equal(waiting?.waitingOn[0]?.slug, 'repo cap');
+  assert.match(String(waiting?.waitingOn[0]?.owner), /1 of 1/, 'the sentence names the run\'s own number');
+  // …while a run that asked for MORE than the console allows is clamped to
+  // the console's number: the second and third are admitted, the fourth waits.
+  const bold2 = await s.admit({
+    slug: 'p3', phase: 1, runId: 'r3', scope: ['docs'],
+    branch: 'pe/p3', tree: '/repos/root/.worktrees/runs/p3/r3/integration', repo: '/repos/root', repoCap: 9,
+  });
+  const bold3 = await s.admit({
+    slug: 'p4', phase: 1, runId: 'r4', scope: ['infra'],
+    branch: 'pe/p4', tree: '/repos/root/.worktrees/runs/p4/r4/integration', repo: '/repos/root', repoCap: 9,
+  });
+  const bold4 = s.admit({
+    slug: 'p5', phase: 1, runId: 'r5', scope: ['ops'],
+    branch: 'pe/p5', tree: '/repos/root/.worktrees/runs/p5/r5/integration', repo: '/repos/root', repoCap: 9,
+  });
+  await tick();
+  assert.ok(await pending(bold4), 'a run cannot outbid the console\'s cap');
+  assert.match(String(s.snapshot().entries.find((entry) => entry.slug === 'p5')?.waitingOn[0]?.owner), /3 of 3/);
+  // One release lets the fourth through under the console's cap…
+  s.release(one);
+  const fourth = await bold4;
+  assert.equal(fourth.slug, 'p5');
+  // …and the shy run boards only once its repository is EMPTY — a threshold
+  // of one means "beside nobody", so every other grant has to go first.
+  s.release(bold2);
+  s.release(bold3);
+  await tick();
+  assert.ok(await pending(shy), 'one lane still live is one too many for a threshold of one');
+  s.release(fourth);
+  assert.equal((await shy).slug, 'p2');
+});
+
+test('P7 — a run with NO repo key is never capped, and never counts against one', async () => {
+  const s = scheduler({ max: 16, maxPerRepo: () => 1 });
+  // A shared-checkout run states no tree and no repository: it is serialised
+  // by scope, which is a stronger guarantee than a count. Counting it would
+  // cap a repository against runs that are already taking turns in it.
+  const a = await s.admit({ slug: 'a', phase: 1, runId: 'r1', scope: ['api'] });
+  const b = await s.admit({ slug: 'b', phase: 1, runId: 'r2', scope: ['web'] });
+  assert.equal(s.snapshot().live, 2);
+  assert.deepEqual(s.snapshot().capacity, [], 'an uncapped run appears in no repository tally');
+  s.release(a);
+  s.release(b);
+});
+
+/* ------------------------------------------------------------------ *
+ * The snapshot's `order` — the scan order, stamped (phase 9)
+ * ------------------------------------------------------------------ */
+
+test('snapshot stamps each entry with its scan position: a bumped entry reads first while arrival order stands', async () => {
+  const s = scheduler({ max: 1 });
+  const head = await s.admit({ slug: 'head', phase: 1, runId: 'r0', scope: ['api'] });
+  s.admit({ slug: 'first', phase: 1, runId: 'r1', scope: ['api'] }).catch(() => {});
+  s.admit({ slug: 'second', phase: 1, runId: 'r2', scope: ['api'] }).catch(() => {});
+  await tick();
+  // Arrival order is the array's order and, with nothing bumped, the scan order too.
+  assert.deepEqual(s.snapshot().entries.map((entry) => [entry.slug, entry.order]), [['first', 0], ['second', 1]]);
+
+  const second = s.snapshot().entries.find((entry) => entry.slug === 'second')!;
+  assert.ok(s.bump(second.id));
+  // The array keeps arrival order — every reader of it still sees the queue it always saw —
+  // while `order` says who the scan will reach first.
+  assert.deepEqual(s.snapshot().entries.map((entry) => [entry.slug, entry.order]), [['first', 1], ['second', 0]]);
+  s.release(head);
+  s.close();
+});
+
+/* ------------------------------------------------------------------ *
+ * The radar hold — `radarSerialize` (phase 9)
+ * ------------------------------------------------------------------ */
+

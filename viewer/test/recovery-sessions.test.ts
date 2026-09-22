@@ -440,14 +440,21 @@ test('the request is validated by name, and nothing is guessed', () => {
   assert.equal(good.ok, true);
   if (good.ok) assert.deepEqual(good.request, { class: 'halted-verification', slug: 'alpha', phase: 3, runId: '9f3a1c7e' });
 
-  // The shape is checked, not merely truncated.
-  for (const bad of ['run-1', 'ABCDEF12', '9f3a1c7', '9f3a1c7ee', '../../etc/passwd', 'x'.repeat(64)]) {
+  // The shape is checked, not merely truncated. `9f3a1c7ee` left this list when
+  // phase 3 (S9-b) widened run ids to TWELVE hex — a run id is the lock-owner
+  // identity, and eight hex collides — so 8..12 are all legal now and only the
+  // charset, the bounds and the traversal shapes are refused.
+  for (const bad of ['run-1', 'ABCDEF12', '9f3a1c7', '0'.repeat(33), '../../etc/passwd', 'x'.repeat(64)]) {
     const parsed = parseRecoveryRequest({
       recoveryClass: 'halted-verification', slug: 'alpha', phase: '3', runId: bad,
     });
     assert.equal(parsed.ok, false, `runId ${JSON.stringify(bad)} should be refused`);
-    if (!parsed.ok) assert.match(parsed.error, /8-character run id/);
+    if (!parsed.ok) assert.match(parsed.error, /run id/);
   }
+  // …and a twelve-hex id, which is what the console now mints, is accepted.
+  assert.equal(parseRecoveryRequest({
+    recoveryClass: 'halted-verification', slug: 'alpha', phase: '3', runId: '9f3a1c7ee012',
+  }).ok, true);
 
   // A plan repair is the one class that may be plan-wide.
   const wide = parseRecoveryRequest({ recoveryClass: 'plan-repair', slug: 'alpha' });

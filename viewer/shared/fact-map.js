@@ -39,7 +39,7 @@
  * `HALT_KIND_SITUATION` is total over `HALT_KINDS` because a halt kind with no
  * situation is a stop nothing can classify, and the classifier's fallback for
  * one is `unknown` — which reads to a person as "the console has no idea",
- * from a console that has a twenty-four-word table saying exactly what happened.
+ * from a console that has a twenty-five-word table saying exactly what happened.
  *
  * `inboxKind: null` is a real answer and means **raise nothing**: `superseded`
  * and `work-in-progress` are the board and a live session doing their jobs.
@@ -265,6 +265,8 @@ export const HALT_KIND_SITUATION = Object.freeze({
   'interrupted-by-restart': 'unknown',
   /** Not a crash: two lanes' edits collided, and no situation the ladder knows is "a person must pick a side". */
   'worktree-merge': 'unknown',
+  /** The same collision parked by policy: the phase is done and the run drove on, so no situation is owed a rung either. */
+  'landing-conflict': 'unknown',
   /** The holding phase's verdict is `pending` or `fail`; the per-phase classifier tells them apart, this names the family. */
   'plan-deadlocked': 'qa-pending',
   /** Every remaining phase waits on a person's door; the reason names each, and a gate is the door the corpus shows most. */
@@ -311,6 +313,10 @@ export const STALL_SIGNAL_KIND = Object.freeze({
   'external-wait': 'park-overdue',
   stalemate: null,
   spinning: null,
+  // The sixth signal (many-plans-one-repo phase 13) is deliberately the one
+  // with no remedy and no rung: it is said once, as `phase.suspect`, and a
+  // person decides. No stall KIND, so no row is derived from it.
+  looping: null,
 });
 
 /**
@@ -353,4 +359,9 @@ export const INBOX_KIND_SOURCE = Object.freeze({
   // What the policy table answered (phase 19) is a run's own record of a
   // situation it met — the park owners write it, the inbox only reads it back.
   policy: 'derived',
+  // A session's issue draft (many-plans-one-repo phase 12) and a message it
+  // addressed to the operator (phase 15) are both read straight off a plan's
+  // ledger — no situation raises either.
+  'issue-draft': 'independent',
+  message: 'independent',
 });

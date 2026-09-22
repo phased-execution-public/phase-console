@@ -16,7 +16,11 @@ import {
 import { parseScope } from '../../shared/scope.js';
 import { CLOSED_PLAN_STATUSES, PLAN_STATUSES } from '../../shared/plan-vocab.js';
 import { ETA_BASES, HEALTH_SEVERITIES } from '../../shared/ops-vocab.js';
-import { extractCommands } from '../runner/verify.ts';
+import { mergeDecisions } from '../../shared/decisions-model.js';
+import { personCheckFor } from '../parse/plan.ts';
+import { policyForPlan } from '../runner/policy.ts';
+import type { RunVerifyApprovals } from '../runner/state.ts';
+import { approvalsForPhase, reviewPhase } from '../runner/verify-review.ts';
 
 /**
  * The slice of a run record the health analysis reads. Structural rather than
@@ -27,6 +31,8 @@ export type RunView = {
   id: string;
   status: string;
   phases: Record<string, { phase: number; status: string }>;
+  /** The run's start-door answers for §Verification — what plan health reads to know a phase is answered. */
+  verifyApprovals?: RunVerifyApprovals;
 };
 
 export type PlanContext = {
@@ -294,7 +300,7 @@ export function isClosedStatus(raw?: string): boolean {
  */
 export const PROGRESS_ISSUE_KINDS = new Set([
   'stale-handoff', 'qa-fail', 'missing-handoff', 'depends-drift', 'index-drift', 'stale-lock', 'no-handoff-dir',
-  'verification-unrunnable', 'record-ahead-of-board',
+  'verification-unrunnable', 'verification-approval', 'record-ahead-of-board',
 ]);
 
 /**
@@ -351,19 +357,50 @@ export function healthIssues(ctx: PlanContext): HealthIssue[] {
         `Phase ${row.phase} is GATED with no Gate-check (it reads as ai until it has one; validate.sh fails it) — add \`ai <check>\` (a session clears it) `
         + 'or `manual <who>` (the Gate card clears it)', row.phase);
     }
-    // A phase whose §Verification yields nothing runnable boards the autopilot
-    // only to park ("nothing would prove the work"). Judged by the SAME
-    // extractor boarding uses, skipped for done phases (their proof is their
-    // handoff) — and it is the issue the plan-repair agent knows how to fix,
-    // which is what lets `resolveRecovery` accept a repair for it at all.
-    if (!board.done.includes(row.phase)
-      && !extractCommands(detail?.verification).commands.length) {
-      const declared = /\*\*\s*Verification\b/i.test(detail?.raw ?? '');
-      add('warning', 'verification-unrunnable',
-        declared
-          ? `Phase ${row.phase}'s §Verification yields nothing the runner can execute — it will park at boarding`
-          : `Phase ${row.phase} has no §Verification — it will park at boarding`,
-        row.phase);
+    // What boarding will do with this phase's §Verification — asked of the ONE
+    // review boarding asks (`runner/verify-review.ts`), with the plan's own
+    // Person-check and the newest run's start-door answers, about the plan
+    // alone (a missing binary is this machine's, not the plan's). It is the
+    // issue the plan-repair agent knows how to fix, which is what lets
+    // `resolveRecovery` accept a repair at all — so it names only what a plan
+    // edit fixes. A command waiting for one exact approval is `info`: an
+    // approval is the operator's, and a paid session could only record an
+    // errand about it (run f0da619a, 2026-09-18).
+    if (!board.done.includes(row.phase)) {
+      const review = reviewPhase({
+        phase: row.phase,
+        verification: detail?.verification,
+        declared: /\*\*\s*Verification\b/i.test(detail?.raw ?? ''),
+        personCheck: personCheckFor(plan, row.phase)
+          ?? policyForPlan('verification.person-check', mergeDecisions(plan.decisions, record.decisionsTwin ?? []), null)?.answer
+          ?? null,
+        approvals: approvalsForPhase(ctx.runs?.[0]?.verifyApprovals, row.phase),
+        skipPathProbe: true,
+      });
+      if (review.verdict === 'parks') {
+        if (!review.items.length) {
+          const declared = /\*\*\s*Verification\b/i.test(detail?.raw ?? '');
+          add('warning', 'verification-unrunnable',
+            declared
+              ? `Phase ${row.phase}'s §Verification yields nothing the runner can execute — it will park at boarding`
+              : `Phase ${row.phase} has no §Verification — it will park at boarding`,
+            row.phase);
+        }
+        for (const item of review.items) {
+          if (item.approvable) {
+            add('info', 'verification-approval',
+              `Phase ${row.phase}'s §Verification needs one approval at the start door: ${item.text} — ${item.reason}`,
+              row.phase);
+          } else {
+            add('warning', 'verification-unrunnable',
+              review.runs.length
+                ? `Phase ${row.phase}'s §Verification: ${item.text} — ${item.reason}; Person-check: halt parks it at boarding`
+                : `Phase ${row.phase}'s §Verification yields nothing the runner can execute — it will park at boarding `
+                  + `(${item.text} — ${item.reason})`,
+              row.phase);
+          }
+        }
+      }
     }
   }
 

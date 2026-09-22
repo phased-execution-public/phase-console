@@ -1,6 +1,6 @@
 ## Console flags
 
-All seven capability switches are off unless named. Flags are read once, at startup.
+All eight capability switches are off unless named. Flags are read once, at startup.
 
 | Flag | Meaning |
 |---|---|
@@ -13,6 +13,7 @@ All seven capability switches are off unless named. Flags are read once, at star
 | `--allow-accounts` | Register Claude accounts and choose one per run. The usage meters need no flag. |
 | `--allow-mcp` | Register MCP servers, hold their credentials, and attach them to plans and phases. *Reading* the registry, the statuses and the catalog needs no flag. |
 | `--allow-webhooks` | POST every announcement this console makes to URLs you register — Slack, Discord, Telegram, your own relay. Off means no outbound request is made at all, whatever is registered. *Reading* the destination list needs no flag. The payload schema and the Slack/Discord/Telegram recipes are in [docs/webhooks.md](https://github.com/phased-execution-public/phase-console/blob/main/docs/webhooks.md) — a link rather than a path, because a packaged copy ships no `docs/` directory. |
+| `--allow-publish` | Push `pe/*` branches (never a trunk, never with force) and file issues, where a plan's `permission.destructive` row and `Issues:` line allow it. Off means no push and no issue, ever; a `Land: pr` landing parks with the reason. |
 | `--port <n>` / `-p` | Pin a port instead of deriving one from the repository path. Never probed past. |
 | `--host <addr>` | The bind address. Defaults to `127.0.0.1` and there is no good reason to change it — see **Mobile setup**. |
 | `--no-open` | Do not open a browser on start. `PHASE_CONSOLE_NO_OPEN=1` does the same. |
@@ -102,7 +103,10 @@ prompt is composed on the server, never taken from the request body.
 ## Auto reviewer
 
 Off by default. With **Review each phase** on, a fresh session reads each finished phase's diff
-and records its findings as comments. It never resumes the phase's own session.
+and records its findings as comments. It never resumes the phase's own session. When the plan
+already reviews its own work — a section that dispatches a reviewer, or `**QA gate:** on` — the
+launch form says every phase would be reviewed twice; keep one of the two. Beside each phase's
+model and effort the same form reads `runs <value> · <source>`, the value the phase will board with.
 
 | Setting | `reviewEachPhase` (run) · `reviewEachPhaseByDefault` (preference) |
 | --- | --- |
@@ -350,6 +354,7 @@ phase, and the phases already queued or in flight keep their places. A run-level
 | `recovery-failed` | phase | A recovery crashed, or said why it could not finish. |
 | `orphaned-session` | phase | A live session from an earlier console was found still working. |
 | `worktree-merge` | phase | A lane's commits would not merge into the run branch; every commit survives on its lane branch. |
+| `landing-conflict` | phase | The same collision, parked by the plan's `Conflicts: park` (or after a rebase session conflicted again): the phase is done, the run drove on, and the errand names both lanes and the files. |
 | `budget` | run | The run's budget is spent. |
 | `plan-unreadable` · `plan-lint` | run | The plan could not be read, or stopped linting. |
 | `failure-streak` | run | Too many phases failed in a row. Only a person's press relaunches it. |

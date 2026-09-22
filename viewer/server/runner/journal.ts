@@ -14,7 +14,10 @@
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+import { INSTANCE } from '../config.ts';
+import { count } from '../counters.ts';
 import { log } from '../log.ts';
+import { current, runTraceId } from '../trace.ts';
 import { journalFile } from './run-paths.ts';
 
 export type JournalEntry = {
@@ -22,11 +25,77 @@ export type JournalEntry = {
   time: string;
   event: string;
   phase?: number;
+  /**
+   * The envelope version. `2` on every line this console writes; `1` on a line
+   * `withDerivedIds()` has given ids it was not written with; absent on a line
+   * straight off disk that predates the columns. A reader must be able to tell
+   * "written with ids" from "ids computed for it".
+   */
+  v?: 1 | 2;
+  /** The RUN's trace — `runTraceId(instance, slug, runId)`, whoever wrote the line. */
+  traceId?: string;
+  /**
+   * The trace the WRITER was in, when that is not the run's.
+   *
+   * An HTTP request, a convergence pass or another run's drive reaching in has
+   * a trace of its own. The line still belongs to this run — that is the
+   * question the id answers — so the crossing is recorded beside it rather than
+   * one side being silently preferred.
+   */
+  viaTraceId?: string;
+  spanId?: string;
+  parentSpanId?: string;
+  attempt?: number;
+  sessionId?: string;
+  actor?: string;
   data?: Record<string, unknown>;
 };
 
 /** A single phase can emit a lot of tool traffic; keep one run's file sane. */
 const MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Held back so a full journal can still say how the run ended.
+ *
+ * The older behaviour stopped appending at the cap and wrote `journal.full` to
+ * the CONSOLE log — so the journal itself simply stopped, mid-run, and the one
+ * line that distinguishes "it finished" from "it was killed" never arrived. A
+ * reader opening the file saw silence and no explanation in it.
+ */
+const RESERVE_BYTES = 256 * 1024;
+
+/**
+ * The events the reserve is for: how the run ENDED, and the marker itself.
+ *
+ * Deliberately no phase traffic. A full journal is full because of phase
+ * traffic, and admitting any of it back would spend the reserve on exactly
+ * what exhausted the file.
+ */
+export const RESERVE_EVENTS: ReadonlySet<string> = new Set([
+  'journal.full',
+  'run.finished',
+  'run.halt',
+  'run.settled',
+  'run.console-shutdown',
+]);
+
+/** What a line needs to be given the ids it was written without. */
+export type DerivedIdSource = { instanceId: string; slug: string; runId: string };
+
+/**
+ * Read a v1 line as if it carried the columns.
+ *
+ * A stored journal is not rewritten — it is an audit trail, and an audit trail
+ * that changes under you is not one. The trace id is instead RE-DERIVED on
+ * read, which it can be precisely because `runTraceId` is a pure function of
+ * three facts the reader already has. Idempotent: a line that already carries
+ * ids is returned untouched, so a mixed file (a run that spanned the upgrade)
+ * projects consistently.
+ */
+export function withDerivedIds(entry: JournalEntry, source: DerivedIdSource): JournalEntry {
+  if (entry.traceId) return entry;
+  return { ...entry, v: 1, traceId: runTraceId(source.instanceId, source.slug, source.runId) };
+}
 
 /**
  * How much of the tail is enough to find the last complete line.
@@ -42,13 +111,28 @@ const TAIL_BYTES = 64 * 1024;
 /** Bytes to read per entry when `read(limit)` is asked for a bounded tail. */
 const BYTES_PER_ENTRY_GUESS = 2 * 1024;
 
+/** Everything about a Journal that a test needs to move and production does not. */
+export type JournalOptions = {
+  /** Which console's run this is. Defaults to this process's instance. */
+  instanceId?: string;
+  maxBytes?: number;
+  reserveBytes?: number;
+};
+
 export class Journal {
   readonly path: string;
+  /** The run's trace — derived, so a restart recomputes it rather than losing it. */
+  readonly traceId: string;
   private seq = 0;
   private overflowed = false;
+  private readonly maxBytes: number;
+  private readonly reserveBytes: number;
 
-  constructor(root: string, slug: string, id: string) {
+  constructor(root: string, slug: string, id: string, options: JournalOptions = {}) {
     this.path = journalFile(root, slug, id);
+    this.traceId = runTraceId(options.instanceId ?? INSTANCE.id, slug, id);
+    this.maxBytes = options.maxBytes ?? MAX_BYTES;
+    this.reserveBytes = Math.min(options.reserveBytes ?? RESERVE_BYTES, this.maxBytes);
     try {
       mkdirSync(dirname(this.path), { recursive: true });
       // Resuming an existing run continues its numbering rather than restarting
@@ -117,29 +201,78 @@ export class Journal {
     return parseLines(text.split('\n').filter(Boolean));
   }
 
-  append(event: string, data?: Record<string, unknown>, phase?: number): JournalEntry {
-    const entry: JournalEntry = {
+  /** Build the next entry, stamping the columns from the ambient span. */
+  private entryFor(event: string, data?: Record<string, unknown>, phase?: number): JournalEntry {
+    const span = current();
+    // A writer in another trace contributes no span POINTERS — a span id from a
+    // different trace is a reference nothing can follow. Its `actor` is carried
+    // anyway: that is an identity ("who caused this line"), not a pointer.
+    const crossing = span !== undefined && span.traceId !== this.traceId;
+    const local = crossing ? undefined : span;
+    return {
       seq: ++this.seq,
       time: new Date().toISOString(),
       event,
+      v: 2,
+      traceId: this.traceId,
+      ...(crossing ? { viaTraceId: span!.traceId } : {}),
+      ...(local === undefined ? {} : { spanId: local.spanId }),
+      ...(local?.parentSpanId === undefined ? {} : { parentSpanId: local.parentSpanId }),
+      ...(local?.attempt === undefined ? {} : { attempt: local.attempt }),
+      ...(local?.sessionId === undefined ? {} : { sessionId: local.sessionId }),
+      ...(span?.actor === undefined ? {} : { actor: span.actor }),
       ...(phase === undefined ? {} : { phase }),
       ...(data && Object.keys(data).length ? { data } : {}),
     };
-    if (this.overflowed) return entry;
+  }
+
+  private writeLine(entry: JournalEntry): void {
     try {
-      if (statSync(this.path).size > MAX_BYTES) {
-        this.overflowed = true;
-        log.warn('journal.full', { path: this.path, note: 'run continues; journal stopped growing' });
-        return entry;
-      }
-    } catch {
-      /* no file yet — that is the normal first append */
-    }
-    try {
+      count('journal_appends_total', []);
       appendFileSync(this.path, `${JSON.stringify(entry)}\n`, 'utf8');
     } catch (error) {
       log.warn('journal.append', { path: this.path, error });
     }
+  }
+
+  /**
+   * Size the file once, and mark the overflow IN BAND the moment it happens.
+   *
+   * The marker is a journal line so the file explains its own ending, and it
+   * names `lastSeq` so a reader can tell a dropped line from one that never
+   * happened. Everything after it is dropped except the reserve.
+   */
+  private checkOverflow(): void {
+    if (this.overflowed) return;
+    let size: number;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      return; // no file yet — that is the normal first append
+    }
+    if (size <= this.maxBytes - this.reserveBytes) return;
+
+    this.overflowed = true;
+    count('journal_overflow_total', []);
+    const marker = this.entryFor('journal.full', {
+      bytes: size,
+      // Read before `entryFor` takes the next number, so this is the last
+      // ordinary line rather than the marker's own predecessor-by-accident.
+      lastSeq: this.seq,
+      reserveBytes: this.reserveBytes,
+      note: 'run continues; only terminal run events are appended from here',
+    });
+    this.writeLine(marker);
+    log.warn('journal.full', { path: this.path, bytes: size, lastSeq: marker.data?.lastSeq });
+  }
+
+  append(event: string, data?: Record<string, unknown>, phase?: number): JournalEntry {
+    this.checkOverflow();
+    const entry = this.entryFor(event, data, phase);
+    // A dropped entry still consumes its `seq`: the gap in the file is the
+    // honest record that something happened and was not written down.
+    if (this.overflowed && !RESERVE_EVENTS.has(event)) return entry;
+    this.writeLine(entry);
     return entry;
   }
 

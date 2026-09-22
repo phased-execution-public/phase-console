@@ -37,7 +37,7 @@ const {
 } = await import('../server/runner/state.ts');
 const { Journal } = await import('../server/runner/journal.ts');
 const { Scheduler } = await import('../server/runner/scheduler.ts');
-const { LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
+const { LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
 const { freezeVerdict } = await import('../server/runner/freeze.ts');
 const { doorActor, pressActor } = await import('../server/actor.ts');
 import type { SpawnFn, SpawnOutcome, SpawnRequest, StreamEvent } from '../server/runner/spawn.ts';
@@ -1116,17 +1116,30 @@ test('a LAPSED claim does not park the phase — it just runs', async () => {
   r.cleanup();
 });
 
-test('the runner looks at the lock but does not take it', async () => {
-  // Claiming it first is what deadlocked two real runs: the session then reads
-  // a lock owned by a stranger and stops. Only the worker claims.
+test('the runner reads the lock, then claims it PROVISIONALLY under its own owner (S1-a)', async () => {
+  // This used to assert the runner never claimed at all. The reason was real:
+  // claiming first deadlocked two live runs, because the session then read a
+  // lock owned by a stranger and — correctly, per the skill's own guardrail —
+  // refused the phase. What changed is the owner. The session runs as
+  // `autopilot/<runId>`, the same string this claim uses, so its own claim is a
+  // same-owner claim, which `phase-lock.sh` treats as a refresh.
+  //
+  // What the old rule cost: between the grant and the child's first claim there
+  // was NO lock on disk, for a process spawn and two preflights, while
+  // `phase-lock.sh conflicts` scans files — so a hand session asking in that
+  // window was told "safe to start" against a lane that was booting.
   const r = repo();
   const { instance } = runner(r, workingSession(r));
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
 
+  const owner = `autopilot/${instance.current()!.id}`;
   const calls = readFileSync(join(r.state, 'locks'), 'utf8').split('\n').filter(Boolean);
-  assert.ok(calls.some((c) => c.includes(' status ')), 'it must check');
-  assert.ok(!calls.some((c) => c.includes(' claim ')), `it must not claim:\n${calls.join('\n')}`);
+  assert.ok(calls.some((c) => c.includes(' status ')), 'it must still check first');
+  const claims = calls.filter((c) => c.includes(' claim '));
+  assert.ok(claims.length > 0, `it must claim the window:\n${calls.join('\n')}`);
+  assert.ok(claims.every((c) => c.includes(`--owner ${owner}`)),
+    `and only ever as itself, so its own session refreshes rather than refusing:\n${claims.join('\n')}`);
   r.cleanup();
 });
 
@@ -2495,7 +2508,16 @@ test('a lane watching its OWN job is nudged, not parked, and only parked much la
   });
 
   // Past the external-wait clock. An external wait would already be parked.
+  // O6: the signal opens at stallExternalWaitMs (5 min), but the wait
+  // procedure grants this session ten — so nothing is said yet.
   clock.wind(6 * 60_000);
+  await instance.tickLiveness();
+  assert.equal(
+    instance.current()!.phases['1'].stallRemedy?.localNudges ?? 0, 0,
+    'never nudged inside the allowance the console itself gave it',
+  );
+  
+  clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
   await instance.tickLiveness();
   const nudged = instance.current()!.phases['1'];
   assert.equal(nudged.stall?.signal, 'external-wait');
@@ -2557,7 +2579,7 @@ test('a local wait whose nudge is refused still parks, and says so once', async 
     summary: 'until [ -f /tmp/suite.done ]; do sleep 30; done',
   });
 
-  clock.wind(6 * 60_000);
+  clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
   await instance.tickLiveness();
   assert.equal(s.sent.length, 0, 'the child refused the write');
   assert.equal(instance.current()!.phases['1'].stallRemedy?.localNudges ?? 0, 0,
@@ -2600,7 +2622,7 @@ test('the refusal latch is per episode — a second wait on the same lane is sai
   await s.gates[0].entered;
 
   s.say({ kind: 'tool', id: 'toolu_one', name: 'Bash', summary: 'until [ -f /tmp/a ]; do sleep 30; done' });
-  clock.wind(6 * 60_000);
+  clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
   await instance.tickLiveness();
   assert.equal(instance.current()!.phases['1'].stall?.signal, 'external-wait', 'episode one');
 
@@ -2612,7 +2634,7 @@ test('the refusal latch is per episode — a second wait on the same lane is sai
 
   // A second wait, minutes later, is a second episode.
   s.say({ kind: 'tool', id: 'toolu_two', name: 'Bash', summary: 'until [ -f /tmp/b ]; do sleep 30; done' });
-  clock.wind(6 * 60_000);
+  clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
   await instance.tickLiveness();
   assert.equal(instance.current()!.phases['1'].stall?.signal, 'external-wait', 'episode two');
 
@@ -6057,7 +6079,9 @@ test('the lease keepalive refreshes the lock under the shared owner, and stands 
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
     await instance.wait();
 
-    const refreshes = claims(r);
+    // The FIRST claim is the runner's provisional one at grant (S1-a); the
+    // keepalive's refreshes come after it, under the same owner.
+    const refreshes = claims(r).filter((line) => !line.includes(`--lease ${PROVISIONAL_LEASE_S}`));
     assert.ok(refreshes.length >= 1, 'the keepalive fired while the session worked');
     assert.match(refreshes[0], /claim 1 --owner autopilot\/\S+ --scope /,
       'the refresh claims under the shared owner WITH the scope');
@@ -6077,9 +6101,28 @@ test('the lease keepalive refreshes the lock under the shared owner, and stands 
     await instance.start({ slug: 'demo', root: r2.root, onlyPhases: [1] });
     await instance.wait();
 
-    assert.equal(journalled(events, 'phase.lock-lost').length, 1,
-      'the takeover is journalled once, and the keepalive stands down instead of fighting');
-    assert.equal(claims(r2).length, 1, 'no second claim was attempted');
+    // With every claim refused, the PROVISIONAL claim is refused too — which is
+    // the TOCTOU caught one layer earlier than it used to be (S1-a): somebody
+    // took the phase between the check and the claim, so no session is ever
+    // spawned and there is no lane, no keepalive and no takeover to stand down
+    // from. The phase PARKS, worded so `rearmLockCapParks` un-parks it when the
+    // holder goes; it must not requeue, because that circuit is unbounded.
+    // Bounded at `PROVISIONAL_REFUSAL_LIMIT`: this stub refuses every claim
+    // while reporting the lock FREE, so each re-armable park is re-boarded and
+    // refused again — until the bound makes the park stay put. That is the
+    // whole reason the bound exists, and the count is the proof it holds.
+    const refusals = journalled(events, 'phase.lock-provisional').length;
+    assert.equal(refusals, PROVISIONAL_REFUSAL_LIMIT, 'every refusal is on the record, and it stops at the bound');
+    assert.equal(journalled(events, 'phase.lock-lost').length, 0, 'nothing was ever held to lose');
+    assert.equal(claims(r2).length, refusals, 'one claim per attempt, not a fight');
+    const parked = instance.current()!.phases['1'];
+    assert.equal(parked.status, 'parked');
+    // A stub that refuses every claim while reporting the lock free is exactly
+    // the disagreement the bound exists for: the first refusals park re-armably
+    // (`LOCK_CAP_PARK_BY_LOCK`), and past `PROVISIONAL_REFUSAL_LIMIT` the park
+    // stays put and says the two answers disagree — otherwise the re-arm
+    // re-boards it for ever.
+    assert.match(parked.note ?? '', /could not be claimed \d+ times running|is locked by .* and has waited/);
   } finally { r2.cleanup(); }
 });
 
@@ -6093,10 +6136,14 @@ test('the keepalive states the runner OWN lease — RUNNER_LEASE_S, 5400 s — o
   assert.equal(RUNNER_LEASE_S * 1000, 9 * LEASE_REFRESH_MS,
     'nine refresh cadences — eight missable ticks — the relationship the docs put in words');
 
+  // REFRESHES, not every claim: the runner's provisional claim at grant states
+  // `PROVISIONAL_LEASE_S` on purpose (S1-a — how long the world is wrong for if
+  // the child never starts, not how long a phase may run).
   const claims = (r: Repo): string[] => {
     const path = join(r.state, 'locks');
     if (!existsSync(path)) return [];
-    return readFileSync(path, 'utf8').split('\n').filter((line) => /\bclaim\b/.test(line));
+    return readFileSync(path, 'utf8').split('\n')
+      .filter((line) => /\bclaim\b/.test(line) && !line.includes(`--lease ${PROVISIONAL_LEASE_S}`));
   };
 
   const r = repo();
@@ -6385,8 +6432,10 @@ test('ladder: a `partial` outcome is work-in-progress at once — the phase re-b
       const m = /(BOOT|RESUMING) phase (\d+)/.exec(request.prompt);
       log.push({ phase: Number(m?.[2]), brief: m?.[1] ?? '?', resume: request.resume, prompt: request.prompt });
       if (calls === 1) {
-        // "I did real work and my budget is nearly spent — resume me."
-        fileOutcome(request, { phase: 1, status: 'partial', reason: 'budget' });
+        // "I did real work and have to stop here — resume me." Any reason but
+        // `budget` or `context`: those two say the session itself is spent,
+        // and the resume policy boards those fresh (autopilot-token-drain P4).
+        fileOutcome(request, { phase: 1, status: 'partial', reason: 'other' });
         return ok({ sessionId: 'sess-p', resultText: 'handing off in-progress, resume me' });
       }
       r.markDone(1);
@@ -6398,7 +6447,7 @@ test('ladder: a `partial` outcome is work-in-progress at once — the phase re-b
 
     const state = instance.current()!;
     assert.deepEqual(journalled(events, 'phase.outcome').map((o) => o.status), ['partial']);
-    assert.deepEqual(journalled(events, 'phase.outcome-partial'), [{ reason: 'budget', climbed: true }]);
+    assert.deepEqual(journalled(events, 'phase.outcome-partial'), [{ reason: 'other', climbed: true }]);
     assert.equal(journalled(events, 'phase.situation')[0].situation, 'work-in-progress');
     const rung = journalled(events, 'phase.rung')[0];
     assert.equal(rung.rung, 'resume-own-session');
@@ -6799,12 +6848,22 @@ test('a console shutdown stamps the run as the system\'s stop and writes the kil
     // A session that hangs until its signal is cut: the shutdown path aborts
     // it, the operator-stop path aborts it the same way — only the bookkeeping
     // must differ.
+    //
+    // Each stop waits for the session to be IN FLIGHT, not for 150 ms: every
+    // assertion below is about stopping a running phase, and a fixed sleep let
+    // a stop land before boarding had written the phase's record whenever the
+    // suite was busy — `phases['1']` undefined, 2 of 2 full runs once
+    // autopilot-token-drain phase 6 added a test file beside this one.
+    let entered: () => void = () => {};
+    const inSession = () => new Promise<void>((resolve) => { entered = resolve; });
     const hang: SpawnFn = (request) => new Promise((resolve) => {
+      entered();
       request.signal?.addEventListener('abort', () => resolve(ok({ sessionId: 'sess-hang', signal: { subtype: 'error_during_execution', code: 143, text: 'terminated' } })), { once: true });
     });
     const { instance } = runner(r, hang);
+    const firstIn = inSession();
     await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await firstIn;
     await (instance as never as { checkpointForShutdown: () => Promise<void> }).checkpointForShutdown();
     await instance.wait();
     const shut = instance.current()!;
@@ -6815,8 +6874,9 @@ test('a console shutdown stamps the run as the system\'s stop and writes the kil
     assert.match(shut.finishedReason ?? '', /console shut down/);
 
     const second = runner(r, hang);
+    const secondIn = inSession();
     await second.instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await secondIn;
     // The operator's stop, as the route derives it from a browser's request.
     await second.instance.stop({ by: 'operator', via: 'api', origin: 'local', remoteUser: null });
     await second.instance.wait();
@@ -6839,8 +6899,9 @@ test('a console shutdown stamps the run as the system\'s stop and writes the kil
     assert.equal(requested[0].data.remoteUser, null);
     // …and a bare `stop()` — a harness's — is `unattributed`, never anybody's.
     const third = runner(r, hang);
+    const thirdIn = inSession();
     await third.instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await thirdIn;
     await third.instance.stop();
     await third.instance.wait();
     const bare = third.instance.current()!;
@@ -7480,6 +7541,27 @@ test('P12 — settle `merge-queue` boards ONE session whose prompt rebases, re-v
   r.cleanup();
 });
 
+test('the start door\'s maxParallel reaches a NEW run, not only a continued one', async () => {
+  // `Runner.start` builds a fresh run from a hand-copied field list, and the
+  // list's own comment names the failure shape: a field the door accepts and
+  // the list forgets reaches the run as silence. The fifth live rehearsal read
+  // exactly that — `--max-sessions 6` on the console, nothing on the run — so
+  // the value is asserted on the record the moment the run exists.
+  const r = repo();
+  const done: SpawnFn = async (request) => {
+    const boot = /BOOT phase (\d+)/.exec(request.prompt);
+    if (boot) r.markDone(Number(boot[1]));
+    return ok({ sessionId: `sess-${boot?.[1] ?? 'x'}` });
+  };
+  const { instance } = runner(r, done, '`true`');
+  await instance.start({
+    slug: 'demo', root: r.root, autonomy: 'keep-going', gitMode: 'current', maxParallel: 2,
+  });
+  assert.equal(instance.current()!.maxParallel, 2, 'a fresh run carries the door\'s maxParallel');
+  await instance.wait();
+  r.cleanup();
+});
+
 test('P12 — a run that never finished settles NOTHING, whatever strategy it was given', async () => {
   const r = repo();
   // Phase 2 never gets marked done, so the run parks with work outstanding.
@@ -7519,6 +7601,40 @@ test('P12 — a run that never finished settles NOTHING, whatever strategy it wa
  * it automatically — opening it becomes an operator errand, and the journal
  * line is what makes that errand findable.
  */
+/**
+ * console-open-findings O2 — a PR session is not a continuation, so a session
+ * the resume POLICY declines must not cancel it.
+ *
+ * `settleSession` puts the last phase's session to the one resume gate, which
+ * refuses for five reasons. Four mean the conversation is unusable. The fifth,
+ * `fresh`, means the session is there and healthy and the policy merely judged
+ * that re-reading its context costs more than starting over — which says nothing
+ * about whether the pull request should be opened. Skipping it there also
+ * produced an errand that could never come true: "Continue this run once that
+ * session has ended" named a session that had ALREADY ended, so the operator was
+ * told to wait for an event in the past.
+ */
+test('O2: a policy-declined session starts the settle session fresh; only a LIVE one is worth waiting for', async () => {
+  const { settleVehicle } = await import('../server/runner/runner-core.ts');
+  assert.deepEqual(
+    settleVehicle('fresh', 'pull request'), { spawn: 'fresh' },
+    'the policy declined a resume, not the pull request',
+  );
+  // the one refusal where waiting is the honest instruction
+  const live = settleVehicle('session-live', 'pull request');
+  assert.ok('skip' in live && /once that session has ended/.test(live.skip));
+  // …and the three where it is not: that session ended long ago
+  for (const why of ['none', 'gone', 'unported'] as const) {
+    const verdict = settleVehicle(why, 'pull request');
+    assert.ok('skip' in verdict, `${why} cannot start a session`);
+    assert.ok(
+      !/once that session has ended/.test(verdict.skip),
+      `${why}: never tell an operator to wait for a session that already ended`,
+    );
+    assert.match(verdict.skip, /by hand/, `${why}: says what the operator can actually do`);
+  }
+});
+
 test('a frozen console does not open the pull request, and says the branch still awaits one', async () => {
   const r = repo();
   r.setParallel(true);
@@ -8378,7 +8494,16 @@ test('a retry storm parks on the METER’s reset time when the CLI reported one'
   // The account's own window, out of band — reported in epoch SECONDS, which is
   // the trap this asserts: reading it as milliseconds parks the phase in 1970
   // and resumes it instantly.
-  const resetsAt = Math.floor((clock.now().getTime() + 90 * 60_000) / 1000);
+  //
+  // EIGHT minutes, inside `LIMIT_ACTION_COOLDOWN_MS`. This read ninety until
+  // autopilot-token-drain phase 6: a reset that far off now makes the live wall
+  // wait on the window at the FIRST rate-limit burst (`trigger: far-reset`,
+  // `usage-brake.test.ts`), so the storm never reaches this watchdog's
+  // recycle-then-park ladder and the second attempt this test awaits never
+  // boards. A near reset is where the ladder still acts, and where its reading
+  // of the meter's clock is still the thing to prove — eight minutes is neither
+  // `RETRY_STORM_PARK_MS` (ten) nor 1970.
+  const resetsAt = Math.floor((clock.now().getTime() + 8 * 60_000) / 1000);
   s.say({ kind: 'limits', status: 'rejected', resetsAt });
 
   const storm = () => {
@@ -8608,7 +8733,7 @@ test('a QA round is a first-class session: task channel, stream, pid handle, and
   assert.equal(seen.length, 1, 'phase 1 was chased once');
   const round = seen[0];
   assert.match(round.name ?? '', /qa-verdict$/);
-  assert.match(round.env?.PE_TASKS_FILE ?? '', /run-[0-9a-f]{8}-p1-tasks\.ndjson$/, 'the reviewer is handed the task channel');
+  assert.match(round.env?.PE_TASKS_FILE ?? '', /run-[0-9a-f]{8,32}-p1-tasks\.ndjson$/, 'the reviewer is handed the task channel');
   assert.ok(round.env?.PE_RULINGS_FILE, 'and the rulings ledger');
   assert.ok(round.env?.PE_OWNER, 'and the owner every hook reads');
   assert.equal(round.env?.PE_OUTCOME_FILE, undefined, 'a reviewer declares no phase outcome');
@@ -8820,9 +8945,12 @@ test('a usage warning past the alert threshold is decided once per window — no
     assert.equal(windows[0].utilization, 0.99);
     const decisions = journalled(events, 'run.usage-decision');
     assert.equal(decisions.length, 1, 'one decision per window and reset, however often the warning repeats');
+    // `brake` and `nonRunSessions` since autopilot-token-drain phase 6: no
+    // scheduler in this harness, so nothing is braked, and no presence
+    // registry, so who else is on the window is `unknown` rather than zero.
     assert.deepEqual(decisions[0], {
       action: 'park', thresholdPct: 95, utilizationPct: 99, window: 'seven_day', resetsAt: 1789956000,
-      policy: 'pause', enacted: false,
+      policy: 'pause', enacted: false, brake: false, nonRunSessions: 'unknown',
     });
     assert.equal(instance.current()!.limits?.utilizationPct, 50, 'the run keeps the latest reading');
   } finally { r.cleanup(); }
@@ -9030,6 +9158,47 @@ test('WAI-9: a new declaration spends the old one once — new-outcome journals 
   } finally { r.cleanup(); }
 });
 
+/**
+ * console-open-findings O3 — a wait-resume whose session is GONE must board with
+ * the resume brief, like every other fresh boarding.
+ *
+ * The gate has two ways to refuse a resume that nothing is wrong with: `fresh`
+ * (the policy would rather start over) and `gone`/`unported` (the CLI no longer
+ * holds that conversation here). Only the first built a
+ * `reboard-resume-brief` hint. The second fell through with `boarding`
+ * undefined, so the session was boarded on the bare `waitResumePrompt` — the
+ * wait's own words, with no engine boot text and no account of what it was
+ * inheriting. That session wakes up mid-phase with a park notice and no idea
+ * there is uncommitted work in the tree, which is exactly what the resume brief
+ * exists to prevent.
+ */
+test('O3: a wait-resume onto a GONE session boards fresh WITH the resume brief, not the bare wait prompt', async () => {
+  const r = repo();
+  try {
+    const gone = { sessionId: 'sess-gone', at: new Date(Date.now() - P5_HOUR).toISOString(), reason: 'No conversation found' };
+    const stale = expiredWait(r, { sessionId: 'sess-gone', resumeSessionId: 'sess-gone', sessionGone: gone });
+    const prompts: string[] = [];
+    const resumes: (string | undefined)[] = [];
+    const spawn: SpawnFn = async (request) => {
+      prompts.push(request.prompt);
+      resumes.push(request.resume);
+      r.markDone(1);
+      return ok({ sessionId: 'sess-new' });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+
+    const briefs = journalled(events, 'phase.brief');
+    assert.equal(briefs.length, 1, 'the boarding composed a brief');
+    assert.equal(briefs[0].rung, 'reboard-resume-brief', 'the same rung the policy-refused path builds');
+    assert.equal(briefs[0].brief, 'resume');
+    assert.deepEqual(resumes, [undefined], 'and it is a FRESH session — never --resume onto a gone one');
+    // the wait's own words still ride under the brief: the park is why it woke
+    assert.match(prompts[0], /the image build/, 'the wait-resume text is carried, not discarded');
+  } finally { r.cleanup(); }
+});
+
 test('WAI-9: a declaration a resumed session left standing is spent under board-closed when the board reads done — not left on a done record', async () => {
   const r = repo();
   try {
@@ -9180,14 +9349,17 @@ test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches th
     await s.gates[0].entered;
     // No call opens: the guard refused it. The only evidence is the refusal.
     instance.noteWaitDenied(1, { command: 'until [ -f /tmp/ring.done ]; do sleep 30; done', matched: 'until [^`]+; *do' });
-    clock.wind(6 * 60_000);
+    clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
     await instance.tickLiveness();
     const nudged = instance.current()!.phases['1'];
     assert.equal(nudged.stall?.signal, 'external-wait');
     assert.equal(nudged.stall?.source, 'denied');
     assert.equal(nudged.stall?.scope, 'local');
     assert.equal(s.sent.length, 1, 'rung 1: the nudge');
-    clock.wind(40 * 60_000);
+    // Land between stallLocalJobMs (45) and the denied signal's own lifetime,
+    // stallLocalJobMs + stallExternalWaitMs (50) — 11 + 35 = 46. The old 40 was
+    // measured from a 6-minute first tick and now overshoots the window.
+    clock.wind(35 * 60_000);
     await instance.tickLiveness();
     const parked = instance.current()!.phases['1'];
     assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
@@ -9213,14 +9385,17 @@ test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder —
     const denied = instance.current()!.phases['1'].toolDenied;
     assert.equal(denied?.rule, 'in-turn-wait', 'the denial is on the RECORD, where a restart cannot lose it');
     assert.equal(denied?.command, 'node --test --watch viewer/test > /tmp/t.log 2>&1');
-    clock.wind(6 * 60_000);
+    clock.wind(11 * 60_000);  // past LOCAL_JOB_GRACE_MS — the window rule 3 grants (O6)
     await instance.tickLiveness();
     const nudged = instance.current()!.phases['1'];
     assert.equal(nudged.stall?.signal, 'external-wait');
     assert.equal(nudged.stall?.source, 'denied');
     assert.equal(nudged.stall?.scope, 'local', 'a --watch runner is the session\'s own job');
     assert.equal(s.sent.length, 1, 'rung 1: the nudge');
-    clock.wind(40 * 60_000);
+    // Land between stallLocalJobMs (45) and the denied signal's own lifetime,
+    // stallLocalJobMs + stallExternalWaitMs (50) — 11 + 35 = 46. The old 40 was
+    // measured from a 6-minute first tick and now overshoots the window.
+    clock.wind(35 * 60_000);
     await instance.tickLiveness();
     const parked = instance.current()!.phases['1'];
     assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
@@ -9232,6 +9407,407 @@ test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder —
     assert.equal(wait.watch, 'cmd:"node --test viewer/test"');
     s.gates[0].release();
     await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P1: a lane whose turn ended on its own subagent running in the background is waiting on its own work — the Stop hook can see the agent, and the silent watchdog leaves the lane alone', async () => {
+  // Measured under `-p`: an Agent running in the background keeps the process alive and its
+  // completion starts a new turn, while a background Bash dies with the turn.
+  // A session waiting like that is quiet by construction; nudging or recycling
+  // it would throw away the agent it is waiting on.
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    s.say({ kind: 'background', op: 'started', taskId: 'a1', taskType: 'local_agent', tool: 'Agent', description: 'review' });
+    s.say({ kind: 'background', op: 'started', taskId: 'b1', taskType: 'local_bash', tool: 'Bash', description: 'npm test' });
+    assert.deepEqual(instance.awaitingBackground(1).map((task) => task.id), ['a1'],
+      'the agent wakes the session; the shell does not');
+    assert.deepEqual(instance.awaitingBackground(2), [], 'a phase with no live lane waits on nothing');
+
+    clock.wind(12 * 60_000);
+    await instance.tickLiveness();
+    assert.equal(instance.current()!.phases['1'].stall, undefined, 'twelve quiet minutes on its own agent are not silence');
+    assert.deepEqual(s.sent, [], 'and nothing is written into the session');
+
+    s.say({ kind: 'background', op: 'ended', taskId: 'a1', status: 'completed' });
+    assert.deepEqual(instance.awaitingBackground(1), [], 'a reported agent is no longer awaited');
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P2: a lane counts its own status checks — the hook asks it, the stream resets it, and it nudges once', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 1 });
+    const clock = fakeClock();
+    const { instance } = runner(r, s.spawn, '`true`', undefined, { now: clock.now });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+    const check = () => {
+      const verdict = instance.observeToolCall(1, { name: 'ListAgents', input: {} });
+      clock.wind(4_000);
+      return verdict?.deny;
+    };
+    const denials = [check(), check(), check(), check(), check()];
+    s.say({ kind: 'tool', name: 'Read', id: 'r1', summary: 'notes.md' });
+    denials.push(check(), check(), check(), check(), check(), check());
+    assert.deepEqual(denials, [false, false, false, false, false, false, false, false, false, false, true],
+      'the Read the stream saw reset the count, so the sixth check after it is the first refused');
+    assert.equal(instance.observeToolCall(2, { name: 'ListAgents', input: {} }), null, 'a phase with no live lane has no tracker');
+
+    assert.equal(instance.nudgePollLoop(1, 'Stop polling.'), true, 'the first nudge reaches the session');
+    assert.equal(instance.nudgePollLoop(1, 'Stop polling.'), false, 'and a lane gets one');
+    assert.equal(s.sent.length, 1);
+    assert.match(s.sent[0], /Stop polling\./);
+    assert.equal(instance.nudgePollLoop(2, 'Stop polling.'), false, 'no lane, no nudge');
+    s.gates[0].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+/** One API call at `context` tokens, as `spawn.ts` emits it — the session's whole fold riding along. */
+const usageAt = (context: number, calls = 1): StreamEvent => ({
+  kind: 'usage', id: `msg_${context}`, rebuild: false,
+  call: { input: 2, cacheWrite: 1_000, cacheRead: context - 1_002, output: 300, context },
+  totals: {
+    calls, lastContext: context, peakContext: context,
+    input: 2 * calls, cacheWrite: 1_000 * calls, cacheRead: context - 1_002, output: 300 * calls, rebuilds: 0,
+  },
+});
+
+const journalledFor = (
+  events: { event: string; data: Record<string, unknown> }[], name: string, phase: number,
+) => events
+  .filter((e) => e.event === 'run:journal' && e.data.event === name && e.data.phase === phase)
+  .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
+
+test('autopilot-token-drain P3: every session\'s API calls are journalled as phase.tokens and kept on the record per attempt', async () => {
+  const r = repo();
+  try {
+    const tokens = {
+      calls: 242, lastContext: 681_000, peakContext: 681_000,
+      input: 500, cacheWrite: 1_300_000, cacheRead: 90_000_000, output: 200_000, rebuilds: 2,
+    };
+    const spawn: SpawnFn = async (request) => {
+      const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1]);
+      r.markDone(phase);
+      // Phase 1's session reported its calls; phase 2's is a fake with none,
+      // which is every harness and every session that never started.
+      return ok({ sessionId: `sess-p${phase}`, ...(phase === 1 ? { tokens } : {}) });
+    };
+    const { instance, events } = runner(r, spawn, '`true`', () => ({ model: 'opus' }));
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+
+    const lines = journalledFor(events, 'phase.tokens', 1);
+    assert.equal(lines.length, 1, 'one line per session that made calls');
+    assert.deepEqual(lines[0], {
+      mode: 'phase', attempt: 1, sessionId: 'sess-p1', resumed: false, model: 'opus', window: 1_000_000,
+      ...tokens, pollCalls: 0, pollDenied: 0, account: 'default',
+    });
+    assert.deepEqual(journalledFor(events, 'phase.tokens', 2), [], 'a session that reported no calls writes no line');
+
+    const kept = instance.current()!.phases['1'].tokens;
+    assert.equal(kept?.length, 1);
+    assert.equal(kept![0].attempt, 1);
+    assert.equal(kept![0].sessionId, 'sess-p1');
+    assert.equal(kept![0].lastContext, 681_000, 'what Phase 4\'s resume gate reads');
+    assert.equal(kept![0].rebuilds, 2);
+    assert.ok(kept![0].endedAt, 'and when that session ended — the idle clock starts there');
+    assert.equal(instance.current()!.phases['2'].tokens, undefined);
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P3: past 0.6 × its window a phase session is told once to wrap up; past 0.8 × it is checkpointed and boards fresh', async () => {
+  const r = repo();
+  try {
+    const s = silentSession(r, { attempts: 2 });
+    const requests: SpawnRequest[] = [];
+    const spawn: SpawnFn = (request) => { requests.push(request); return s.spawn(request); };
+    const { instance, events } = runner(r, spawn, '`true`', () => ({ model: 'opus' }));
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await s.gates[0].entered;
+
+    s.say(usageAt(599_000, 200));
+    assert.deepEqual(s.sent, [], 'under 0.6 × a 1M window nothing is said');
+    assert.equal(instance.liveness().find((lane) => lane.phase === 1)?.tokens?.window, 1_000_000,
+      'the lane shows the window it is judged against');
+
+    s.say(usageAt(612_000, 201));
+    assert.equal(s.sent.length, 1, 'the wrap-up steer goes out');
+    assert.match(s.sent[0], /partial --reason context/);
+    assert.match(s.sent[0], /in-progress/);
+    const wrapups = () => journalledFor(events, 'phase.context-wrapup', 1);
+    assert.deepEqual(wrapups().map((line) => ({ stage: line.stage, context: line.context, window: line.window, delivered: line.delivered })),
+      [{ stage: 'wrap-up', context: 612_000, window: 1_000_000, delivered: true }]);
+    assert.equal(instance.current()!.phases['1'].contextWrapup?.sessionId, 'sess-silent');
+
+    s.say(usageAt(700_000, 230));
+    assert.equal(s.sent.length, 1, 'once per session — a wrap-up it has not finished yet is not a reason to say it again');
+
+    s.say(usageAt(812_000, 260));
+    assert.deepEqual(wrapups().map((line) => line.stage), ['wrap-up', 'checkpoint']);
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.status, 'pending', 'the lane is checkpointed, not failed');
+    assert.equal(record.resumeSessionId, undefined, 'and the 812k session is NOT what the next attempt resumes');
+    assert.equal(record.boardingHint?.brief, 'resume', 'it boards fresh with the resume brief');
+    assert.deepEqual(
+      { sessionId: record.contextCheckpoint?.sessionId, context: record.contextCheckpoint?.context, window: record.contextCheckpoint?.window },
+      { sessionId: 'sess-silent', context: 812_000, window: 1_000_000 },
+    );
+    assert.equal(journalledFor(events, 'phase.checkpointed', 1).length, 1);
+
+    s.say(usageAt(830_000, 261));
+    assert.equal(wrapups().length, 2, 'a session already checkpointed is not checkpointed again');
+
+    s.gates[0].release();
+    await s.gates[1].entered;
+    assert.equal(requests.length, 2, 'the phase was re-boarded');
+    assert.equal(requests[1].resume, undefined, 'fresh — no --resume');
+    assert.match(requests[1].prompt, /checkpointed this phase's previous session at 812k tokens of context/,
+      'and the brief says why it is starting over');
+    s.gates[1].release();
+    await instance.wait();
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P3: only the phase\'s own sessions are wrapped up — a closeout at 900k is left to finish', async () => {
+  // The closeout shape the no-handoff tests use: the first session ends with
+  // work in the tree and no paperwork, and the one continuation resumes it.
+  const r = repo();
+  try {
+    execFileSync('git', ['init', '-q'], { cwd: r.root });
+    writeFileSync(join(r.root, 'half-finished.txt'), 'work in flight\n');
+    const sent: string[] = [];
+    let calls = 0;
+    let closeoutResume: string | undefined;
+    const seen: { phase?: Record<string, unknown>; closeout?: Record<string, unknown> } = {};
+    const live = () => ({ ...instance.liveness().find((lane) => lane.phase === 1)?.tokens });
+    const spawn: SpawnFn = async (request) => {
+      calls++;
+      request.onHandle?.({ pid: undefined, open: () => true, send: (text) => { sent.push(text); return true; }, setFrozen: () => {} });
+      request.onEvent?.({ kind: 'init', sessionId: 'sess-0001', model: 'claude-opus-5[1m]', tools: 0 });
+      if (calls === 1) {
+        request.onEvent?.(usageAt(400_000, 150));
+        seen.phase = live();
+        return ok({ resultText: 'ended without paperwork' });
+      }
+      closeoutResume = request.resume;
+      // A resumed 900k session: past both thresholds from its first call.
+      request.onEvent?.(usageAt(900_000, 151));
+      seen.closeout = live();
+      return ok({ sessionId: 'sess-0001' });
+    };
+    const { instance, events } = runner(r, spawn, '`true`', () => ({ model: 'opus' }));
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+
+    assert.equal(calls, 2, 'the closeout ran');
+    assert.equal(closeoutResume, 'sess-0001');
+    assert.deepEqual(journalledFor(events, 'phase.session', 1).map((line) => line.mode), ['phase', 'closeout']);
+    assert.deepEqual(sent, [], 'no wrap-up steer into a closeout');
+    assert.deepEqual(journalledFor(events, 'phase.context-wrapup', 1), [], 'and no checkpoint of it');
+    assert.deepEqual(journalledFor(events, 'phase.checkpointed', 1), []);
+
+    // The lane shows each session's own numbers — and judges only the phase's.
+    assert.deepEqual({ context: seen.phase?.context, window: seen.phase?.window, stage: seen.phase?.stage },
+      { context: 400_000, window: 1_000_000, stage: undefined });
+    assert.deepEqual({ context: seen.closeout?.context, window: seen.closeout?.window, stage: seen.closeout?.stage },
+      { context: 900_000, window: undefined, stage: undefined },
+      'a closeout borrows neither the phase session\'s window nor a stage it is exempt from');
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * autopilot-token-drain phase 4: the resume policy — fresh when large and cold
+ * ------------------------------------------------------------------ */
+
+/** A session's counters as `record.tokens` keeps them, ended `endedAgoMs` ago. */
+const tokenRow = (sessionId: string, lastContext: number, endedAgoMs: number, account = 'default') => ({
+  mode: 'phase', attempt: 1, sessionId, resumed: false, model: 'claude-opus-5[1m]', window: 1_000_000,
+  calls: 300, lastContext, peakContext: lastContext, input: 600, cacheWrite: 900_000, cacheRead: 90_000_000,
+  output: 120_000, rebuilds: 0, account, endedAt: new Date(Date.now() - endedAgoMs).toISOString(),
+});
+
+test('autopilot-token-drain P4: a waiting-external resume at 600k after 70 min boards FRESH with the resume brief — the wait and the last words ride it', async () => {
+  const r = repo();
+  try {
+    const stale = expiredWait(r, {
+      sessionId: 'sess-wait', resumeSessionId: 'sess-wait', watch: ['gh:acme/app#run/42'],
+      said: 'Parked on the image build — declared waiting-external.',
+      tokens: [tokenRow('sess-wait', 600_000, 70 * 60_000)],
+    });
+    const seen: { prompt: string; resume?: string }[] = [];
+    const spawn: SpawnFn = async (request) => {
+      seen.push({ prompt: request.prompt, resume: request.resume });
+      r.markDone(1);
+      return ok({ sessionId: 'sess-fresh' });
+    };
+    const { instance, events } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: stale.id, onlyPhases: [1] });
+    await instance.wait();
+
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].resume, undefined, 'no --resume of the 600k session');
+    assert.match(seen[0].prompt, /BOOT phase 1 of demo/, 'the engine boot prompt — a fresh session knows nothing else');
+    assert.match(seen[0].prompt, /600k tokens of context/, 'the brief says why the session is not resumed');
+    assert.match(seen[0].prompt, /You were watching: gh:acme\/app#run\/42/, 'the refs it waited on');
+    assert.match(seen[0].prompt, /the image build/, 'and what it waited on');
+    assert.match(seen[0].prompt, /Parked on the image build — declared waiting-external\./, 'and the session\'s last words');
+    const policy = journalled(events, 'phase.resume-policy');
+    assert.deepEqual(policy.map((line) => [line.sessionId, line.choice, line.reason, line.contextTokens, line.accountChanged]),
+      [['sess-wait', 'fresh', 'cache-cold', 600_000, false]]);
+    assert.ok(Number(policy[0].idleMs) >= 70 * 60_000, 'idle from when that session ended');
+    assert.equal(journalled(events, 'phase.start')[0].waitResume, true, 'it is still the wait being answered');
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.status, 'done');
+    assert.equal(record.sessionGone, undefined, 'a session not worth resuming is not a gone one');
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P4: a switch to another account at 824k does not carry the conversation — the phase re-boards fresh with the resume brief', async () => {
+  const r = repo();
+  const spawns: { env?: NodeJS.ProcessEnv; resume?: string; prompt: string }[] = [];
+  const limited: SpawnFn = async (request) => {
+    spawns.push({ env: request.env, resume: request.resume, prompt: request.prompt });
+    if (spawns.length === 1) {
+      const epoch = Math.floor(Date.now() / 1000) + 3600;
+      return ok({
+        signal: { subtype: 'error_during_execution', code: 1, text: `Claude AI usage limit reached|${epoch}` },
+        sessionId: 'sess-p3',
+        tokens: {
+          calls: 434, lastContext: 824_343, peakContext: 835_000, input: 900, cacheWrite: 900_000,
+          cacheRead: 300_000_000, output: 90_000, rebuilds: 1,
+        },
+      });
+    }
+    r.markDone(Number(/BOOT phase (\d+)/.exec(request.prompt)![1]));
+    return ok({ sessionId: 'sess-fresh' });
+  };
+  const { instance, events } = runner(r, limited, '`true`', () => ({ model: 'opus' }), {
+    accountEnv: async (accountId) => (accountId === 'spare' ? { CLAUDE_CODE_OAUTH_TOKEN: 'tok-spare' } : null),
+    pickAccount: () => 'spare',
+    portTranscript: () => ({ findable: true, ported: true, why: 'copied' as const }),
+    leaveAccount: (accountId, leaving) => leaveStub(accountId, leaving),
+  });
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onLimit: 'switch', onlyPhases: [1] });
+    const outcome = await Promise.race([
+      instance.wait().then(() => 'finished'),
+      new Promise<string>((resolve) => setTimeout(resolve, 8_000, 'slept')),
+    ]);
+    if (outcome === 'slept') await instance.stop();
+    assert.equal(outcome, 'finished');
+    assert.equal(spawns.length, 2);
+    assert.equal(spawns[1].resume, undefined, 'the 824k conversation is not resumed under the new account');
+    assert.equal(spawns[1].env?.CLAUDE_CODE_OAUTH_TOKEN, 'tok-spare', 'the fresh boot runs as the account that can pay');
+    assert.match(spawns[1].prompt, /BOOT phase 1/);
+    assert.match(spawns[1].prompt, /another account/, 'and its brief says why it starts over');
+    assert.deepEqual(journalled(events, 'phase.resume-policy').map((line) => [line.choice, line.reason, line.contextTokens, line.accountChanged]),
+      [['fresh', 'account-changed', 824_343, true]]);
+    assert.equal(journalled(events, 'phase.reboard-requested').at(-1)?.brief, 'resume');
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.tokens?.[0].account, 'default', 'the counters name the account that wrote the cache');
+    assert.equal(record.status, 'done');
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P4: a session that declared `partial --reason budget` or `context` is not resumed, even small and warm — the phase boards fresh with the resume brief', async () => {
+  for (const reason of ['budget', 'context']) {
+    const r = repo();
+    try {
+      const log: { resume?: string; prompt: string }[] = [];
+      const spawn: SpawnFn = async (request) => {
+        log.push({ resume: request.resume, prompt: request.prompt });
+        if (log.length === 1) {
+          fileOutcome(request, { phase: 1, status: 'partial', reason });
+          return ok({
+            sessionId: 'sess-p', resultText: 'handing off in-progress',
+            tokens: { calls: 40, lastContext: 120_000, peakContext: 120_000, input: 80, cacheWrite: 120_000, cacheRead: 2_000_000, output: 9_000, rebuilds: 0 },
+          });
+        }
+        r.markDone(1);
+        return ok({ sessionId: 'sess-q' });
+      };
+      const { instance, events } = runner(r, spawn);
+      await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autoRecover: true });
+      await instance.wait();
+
+      assert.equal(log.length, 2, reason);
+      assert.equal(log[1].resume, undefined, `${reason}: the session said itself that it is spent`);
+      assert.match(log[1].prompt, /BOOT phase 1/, reason);
+      assert.match(log[1].prompt, new RegExp(`partial --reason ${reason}\``), `${reason}: the brief names the declaration`);
+      assert.deepEqual(journalled(events, 'phase.resume-policy').map((line) => [line.choice, line.reason]),
+        [['fresh', `partial-${reason}`]]);
+      assert.equal(journalled(events, 'phase.brief-degraded')[0]?.asked, 'continue',
+        `${reason}: the ladder asked for the session, the gate answered fresh`);
+      assert.deepEqual(instance.current()!.phases['1'].lastPartial?.reason, reason);
+      assert.equal(instance.current()!.phases['1'].status, 'done');
+    } finally { r.cleanup(); }
+  }
+});
+
+test('autopilot-token-drain P4: an owed QA verdict on a session not worth resuming is reviewed by a FRESH session, from the boot prompt', async () => {
+  const r = repo();
+  r.setQaOwed('pending');
+  const spawns: { name?: string; resume?: string; prompt: string }[] = [];
+  const spawn: SpawnFn = async (request) => {
+    spawns.push({ name: request.name, resume: request.resume, prompt: request.prompt });
+    const boot = /BOOT phase (\d+)/.exec(request.prompt);
+    if (boot && !/qa-verdict$/.test(request.name ?? '')) { r.markDone(Number(boot[1])); return ok({ sessionId: `sess-p${boot[1]}` }); }
+    return ok();
+  };
+  const { instance, events } = runner(r, spawn, '`true`');
+  try {
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    await instance.wait();
+    // The phase's session ended two hours ago at 700k: its cache is long gone.
+    instance.current()!.phases['1'].tokens = [tokenRow('sess-p1', 700_000, 2 * 60 * 60_000)];
+    const before = spawns.length;
+    await (instance as unknown as { maybeQaVerdict(phase: number): Promise<void> }).maybeQaVerdict(1);
+    assert.equal(spawns.length, before + 1, 'the review is not skipped');
+    const review = spawns.at(-1)!;
+    assert.match(review.name ?? '', /qa-verdict$/);
+    assert.equal(review.resume, undefined, 'and it does not rewrite 700k into the cache to write one verdict');
+    assert.match(review.prompt, /BOOT phase 1/, 'a fresh reviewer boards from the boot prompt');
+    assert.equal(journalled(events, 'phase.qa-session').at(-1)?.fresh, true);
+    const decided = journalled(events, 'phase.resume-policy').at(-1);
+    assert.deepEqual([decided?.sessionId, decided?.choice, decided?.reason], ['sess-p1', 'fresh', 'cache-cold'],
+      'the run\'s own verdict chases resumed their unmeasured sessions; this one was judged cold');
+    assert.equal(journalled(events, 'phase.qa-session-skipped').length, 0);
+  } finally { r.cleanup(); }
+});
+
+test('autopilot-token-drain P4: an instructed resume of a session not worth resuming spawns nothing, marks nothing gone, and says why', async () => {
+  const r = repo();
+  try {
+    const stored = newRun({ slug: 'demo', root: r.root });
+    stored.status = 'halted';
+    stored.onlyPhases = [1];
+    stored.halt = { at: new Date().toISOString(), reason: 'phase 1 verification is red', phase: 1 };
+    stored.phases['1'] = {
+      phase: 1, status: 'failed', attempts: 1, costUsd: 0, sessionId: 'sess-big',
+      tokens: [tokenRow('sess-big', 681_000, 4 * 60 * 60_000)],
+    } as PhaseRecord;
+    saveRun(stored);
+    let spawned = 0;
+    const spawn: SpawnFn = async () => { spawned += 1; return ok(); };
+    const { instance, events } = runner(r, spawn);
+    await instance.recover({
+      slug: 'demo', root: r.root, runId: stored.id, phase: 1, mode: 'resume', instruction: 'fix the red suite', by: 'operator',
+    });
+    await instance.wait();
+    assert.equal(spawned, 0, 'no --resume of a 681k session four hours cold');
+    const state = instance.current() ?? loadRun(r.root, 'demo', stored.id, null)!;
+    assert.equal(state.phases['1'].sessionGone, undefined, 'the session is not gone — resuming it is just not worth it');
+    assert.match(state.finishedReason ?? '', /not worth resuming/);
+    assert.match(state.finishedReason ?? '', /fresh session/);
+    assert.deepEqual(journalled(events, 'phase.resume-policy').map((line) => [line.choice, line.reason]), [['fresh', 'cache-cold']]);
   } finally { r.cleanup(); }
 });
 
@@ -9603,7 +10179,12 @@ test('ACT-6: a rate-limit burst on a single-account console produces — inside 
   r.cleanup();
 });
 
-test('ACT-6: with a reset known, the third wall WAITS on the window — the phase parked on the clock, the wait-window rung recorded, the poke armed', async () => {
+test('ACT-6 + H6: with a reset hours away, the FIRST wall WAITS on the window — the phase parked on the clock, the wait-window rung recorded, the poke armed', async () => {
+  // Amended by autopilot-token-drain phase 6: this read `['none', 'none',
+  // 'wait']` — two `none` decisions ten minutes apart before the same wait,
+  // twenty minutes of retries on a reset four hours off. A reset past
+  // `LIMIT_ACTION_COOLDOWN_MS` now waits on the first burst; the escalation it
+  // reaches is unchanged, and the no-reset park above keeps its two `none`s.
   const r = repo();
   const held = streamingSession(r, false);
   const clock = fakeClock();
@@ -9624,7 +10205,8 @@ test('ACT-6: with a reset known, the third wall WAITS on the window — the phas
     clock.wind(LIMIT_ACTION_COOLDOWN_MS + 1_000);
   }
   const until = new Date(resets * 1000).toISOString();
-  assert.deepEqual(ladderJournal(events, 'phase.live-wall').map((w) => w.action), ['none', 'none', 'wait']);
+  assert.deepEqual(ladderJournal(events, 'phase.live-wall').map((w) => w.action), ['wait']);
+  assert.equal(ladderJournal(events, 'phase.live-wall')[0].trigger, 'far-reset');
   const state = instance.current()!;
   const record = state.phases['1'];
   assert.equal(record.status, 'waiting');
@@ -9970,3 +10552,186 @@ test('RCV-6: a rung the attempt left open is settled at the lane\'s end — situ
     );
   } finally { r.cleanup(); }
 });
+
+/* ------------------------------------------------------------------ *
+ * 2026-09-18: boarding asks the verification REVIEW (verify-review.ts)
+ *
+ * Run f0da619a halted at phase 2 on `bats …` under `Person-check: halt`, and
+ * its park named the fragment but never the reason — "`bats` is not a
+ * recognised command" was the whole story. Boarding now parks on the review's
+ * verdict with the review's sentence, and honours the operator's answers from
+ * the start door (`RunState.verifyApprovals`).
+ * ------------------------------------------------------------------ */
+
+test('a Person-check: halt park names the refused command and why — before a session is bought', async () => {
+  const r = repo();
+  const seen: number[] = [];
+  const { instance } = runner(r, workingSession(r, seen), '- `true`\n- `frobnicate --check tests/`', undefined, {
+    personCheck: () => 'halt',
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  assert.deepEqual(seen, [], 'no session was bought');
+  const note = instance.current()!.phases['1'].note ?? '';
+  assert.match(note, /frobnicate --check tests\/ — `frobnicate` is not a recognised command/);
+  assert.match(note, /Person-check: halt — approve the exact command/);
+  r.cleanup();
+});
+
+test('the bats line that halted run f0da619a boards under Person-check: halt', async () => {
+  const r = repo();
+  const seen: number[] = [];
+  const { instance, events } = runner(r, workingSession(r, seen), '- `true`\n- `bats --version`', undefined, {
+    personCheck: () => 'halt',
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  assert.deepEqual(seen, [1], 'the phase boarded');
+  assert.equal(journalled(events, 'phase.verify-preflight-parked').length, 0);
+  r.cleanup();
+});
+
+test('the start door\'s exact approval boards an unknown command, and the run keeps the answer', async () => {
+  const { commandFingerprint } = await import('../server/runner/verify.ts');
+  const r = repo();
+  const seen: number[] = [];
+  const { instance, events } = runner(r, workingSession(r, seen), '- `true`\n- `frobnicate --check tests/`', undefined, {
+    personCheck: () => 'halt',
+  });
+  const approve = [{ fp: commandFingerprint('frobnicate --check tests/'), text: 'frobnicate --check tests/' }];
+  await instance.start({
+    slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1],
+    verifyApprovals: { approve, waive: [], by: 'operator', at: '2026-09-18T00:00:00.000Z' },
+  });
+  await instance.wait();
+  assert.deepEqual(seen, [1], 'approved at the door, so it boarded');
+  assert.deepEqual(instance.current()!.verifyApprovals?.approve, approve, 'newRun carried the answers');
+  const [line] = journalled(events, 'run.verify-approvals');
+  assert.deepEqual({ approve: line?.approve, waive: line?.waive, by: line?.by }, { approve: 1, waive: 0, by: 'operator' });
+  r.cleanup();
+});
+
+test('a phase whose every check was waived at the door boards and passes on its handoff, journalled as waived', async () => {
+  const { commandFingerprint } = await import('../server/runner/verify.ts');
+  const r = repo();
+  const seen: number[] = [];
+  const prose = 'eyeball the chart on a phone';
+  const { instance, events } = runner(r, workingSession(r, seen), prose, undefined, { personCheck: () => 'halt' });
+  await instance.start({
+    slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1],
+    verifyApprovals: { approve: [], waive: [{ phase: 1, fp: commandFingerprint(prose), text: prose }] },
+  });
+  await instance.wait();
+  assert.deepEqual(seen, [1], 'the waiver was the operator\'s answer, so the phase boarded');
+  const record = instance.current()!.phases['1'];
+  assert.equal(record.status, 'done', record.note);
+  assert.match(record.verification?.reason ?? '', /waived at the run's start/);
+  assert.deepEqual(journalled(events, 'phase.verify-waived').map((line) => line.by), ['launch', 'launch']);
+  r.cleanup();
+});
+
+// ── S1-a — the grant→spawn window held no lock at all ────────────────────────
+// The runner CHECKED the lock and did not take it, for a good reason that has
+// since stopped applying: a lock the runner took first used to be a lock its own
+// session read as a stranger's, so the session refused the phase and the
+// supervisor deadlocked against its own worker. The session now runs AS
+// `autopilot/<runId>` (it has since the PE_OWNER fix), so a claim by the runner
+// under that same owner is a claim the session REFRESHES.
+//
+// What the gap cost: between the scheduler's grant and the child's first
+// `claim` — a process spawn, a prompt build, an MCP preflight — there was no
+// lock on disk at all, and the keepalive does not fire for ten minutes. A hand
+// session running `phase-lock.sh conflicts` in that window scanned files, found
+// none, and was told "safe to start" against a console lane that was booting.
+test('S1-a: the runner claims provisionally at grant, under its own owner, on a short lease', async () => {
+  const r = repo();
+  const { instance } = runner(r, async (request: SpawnRequest) => {
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)![1]);
+    r.markDone(phase);
+    return ok();
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await instance.wait();
+
+  const owner = `autopilot/${instance.current()!.id}`;
+  const calls = readFileSync(join(r.state, 'locks'), 'utf8').split('\n').filter(Boolean);
+
+  // One provisional claim per phase, before that phase's session exists.
+  for (const phase of [1, 2, 3]) {
+    const claim = calls.find((line) => line.startsWith(`demo claim ${phase} `));
+    assert.ok(claim, `no provisional claim for phase ${phase}:\n${calls.join('\n')}`);
+    assert.match(claim!, new RegExp(`--owner ${owner.replace('/', '\\/')}\\b`), claim!);
+    // SHORT. The child refreshes it to the full lease within a minute of
+    // starting; if the child never starts, this is how long the window is wrong
+    // for rather than how long the phase runs.
+    assert.match(claim!, /--lease 900\b/, claim!);
+  }
+
+  // And it is still asked BEFORE it claims — the belt-check has not moved.
+  const firstStatus = calls.findIndex((line) => line.startsWith('demo status 1'));
+  const firstClaim = calls.findIndex((line) => line.startsWith('demo claim 1 '));
+  assert.ok(firstStatus >= 0 && firstStatus < firstClaim,
+    `the lock is claimed before it is read:\n${calls.join('\n')}`);
+  r.cleanup();
+});
+
+
+/* ── G-PIN12 — the seven mutation-proved pins from the phase-12 QA report ─────
+ * `console-parallel-repaint` phase 12's QA round found five arms the phase had
+ * changed with no test that bites: reverting each left the phase's own suites
+ * green. QA wrote the pins, mutation-proved every one of them RED against the
+ * committed code — and did not commit them, because a QA round's job is the
+ * verdict. They have sat in an appendix ever since, which is the same as not
+ * existing: the arms are unguarded and the next refactor takes them silently.
+ * Adopted here verbatim in intent, adjusted only where this tree's helpers
+ * have moved on. */
+test('P12-QA allowUnverifiedPhases: a plan WITH a command still runs it — a red command stays a red verdict, never a waiver', async () => {
+  const r = repo();
+  try {
+    const { instance, events } = runner(r, workingSession(r), '`false`', undefined, { allowUnverifiedPhases: () => true });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+    await instance.wait();
+    const record = instance.current()!.phases['1'];
+    assert.equal(record.verification?.ok, false, 'the command ran and failed');
+    // `ran` holds the command and the verifier's own single retry of a red one.
+    assert.ok((record.verification?.ran.length ?? 0) >= 1, 'the command ran');
+    assert.ok(record.verification?.ran.every((c) => c.command === 'false'), 'and it was the plan\'s command');
+    assert.doesNotMatch(record.verification?.reason ?? '', /allowUnverifiedPhases/);
+    assert.equal(journalled(events, 'phase.verify-waived').length, 0, 'nothing was waived');
+  } finally { r.cleanup(); }
+});
+
+test('P12-QA the runner\'s declared errand: a permission-wall reason reads blocked-declared:permission with the policy remedy; an external one keeps the watch note', async () => {
+  const WALL = "Edit/Write on .claude/** is permission-denied in this unattended session ('sensitive file'); run the edits by hand.";
+  const r = repo();
+  try {
+    const spawn: SpawnFn = async (request) => { fileOutcome(request, { phase: 1, status: 'needs-human', reason: WALL }); return ok(); };
+    const { instance } = runner(r, spawn);
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+    const state = instance.current()!;
+    assert.equal(state.status, 'parked');
+    const errand = state.recoveries?.['1']?.errand;
+    assert.equal(errand?.situation, 'blocked-declared:permission');
+    assert.equal(errand?.need, WALL, 'need is the session\'s own words');
+    assert.match(errand?.how ?? '', /Settings ▸ Permissions/);
+    assert.match(errand?.how ?? '', /Never strike a deny rule/);
+    assert.doesNotMatch(errand?.how ?? '', /watching its refs/);
+    assert.deepEqual(errand?.tried, []);
+  } finally { r.cleanup(); }
+  const r2 = repo();
+  try {
+    const spawn: SpawnFn = async (request) => {
+      fileOutcome(request, { phase: 1, status: 'needs-human', reason: 'the staging gate needs an operator', watch: ['gh:acme/app#run/123'] });
+      return ok();
+    };
+    const { instance } = runner(r2, spawn);
+    await instance.start({ slug: 'demo', root: r2.root, onlyPhases: [1] });
+    await instance.wait();
+    const errand = instance.current()!.recoveries?.['1']?.errand;
+    assert.equal(errand?.situation, 'blocked-declared:external');
+    assert.match(errand?.how ?? '', /^Check its watch refs/);
+    assert.match(errand?.how ?? '', /watching its refs and resumes the session when they land/);
+  } finally { r2.cleanup(); }
+});
+

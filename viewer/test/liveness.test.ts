@@ -195,7 +195,8 @@ test('worst-first: a lane that is both silent and spinning reports the newer, ha
   signals.idleAttempts = 3;
   assert.equal(evaluateStall(signals, stallThresholds(), T0 + 20 * MINUTE)?.signal, 'stalemate');
   // ...and the order it reports in is the vocabulary's own.
-  assert.deepEqual([...STALL_SIGNALS], ['stalemate', 'retrying', 'external-wait', 'silent', 'spinning']);
+  assert.deepEqual([...STALL_SIGNALS],
+    ['stalemate', 'retrying', 'external-wait', 'silent', 'spinning', 'looping']);
 });
 
 /* ------------------------------------------------------------------ *
@@ -628,4 +629,43 @@ test('stallExternalWaitMs: 0 is off — no external-wait from an open call or a 
   const refused = newLaneSignals(T0);
   noteWaitDenied(refused, DENIED_LOCAL, T0, STALL_LOCAL_JOB_MS);
   assert.notEqual(evaluateStall(refused, off, T0 + 9 * MINUTE, { verifyEnv: EXTERNAL_WAIT })?.signal, 'external-wait');
+});
+
+
+/**
+ * console-open-findings O5/O6/O11 — three small corrections, each pinned here.
+ *
+ * O6 is the one with teeth. The console's own wait procedure tells a session it
+ * may hold ONE foreground call on its own job "bounded by the Bash timeout ...
+ * at most once per ten minutes". The local-job nudge then fired on the first
+ * tick after the `external-wait` signal opened, which is `stallExternalWaitMs`
+ * — five minutes by default. So the console interrupted a session for doing
+ * exactly what the console had just told it to do, halfway through the window it
+ * had granted. The text costs one message rather than changing behaviour, which
+ * is why it stayed a P3; it is still the console contradicting itself in
+ * writing.
+ */
+test('O6: the local-job nudge waits out the window the wait procedure grants', async () => {
+  const { localNudgeAfterMs } = await import('../server/runner/liveness.ts');
+  const { STALL_DEFAULTS, STALL_LOCAL_JOB_MS, LOCAL_JOB_GRACE_MS } =
+    await import('../shared/attention-model.js');
+
+  // the procedure's own number, and the reason this constant exists
+  assert.equal(LOCAL_JOB_GRACE_MS, 600_000, 'ten minutes — the bound the procedure quotes');
+
+  // the default: the signal opens at 5 min, but the nudge waits for the full ten
+  assert.equal(
+    localNudgeAfterMs(STALL_DEFAULTS.stallExternalWaitMs),
+    LOCAL_JOB_GRACE_MS,
+    'a 5-minute signal must not nudge a session inside its own 10-minute allowance',
+  );
+
+  // an operator who widens the signal past ten minutes is honoured, not clamped back
+  assert.equal(localNudgeAfterMs(20 * 60_000), 20 * 60_000, 'the larger of the two wins');
+
+  // and the nudge always comes before the 45-minute park, or the rung is dead
+  assert.ok(
+    localNudgeAfterMs(STALL_DEFAULTS.stallExternalWaitMs) < STALL_LOCAL_JOB_MS,
+    'rung 1 must still be reachable before rung 2 parks the lane',
+  );
 });

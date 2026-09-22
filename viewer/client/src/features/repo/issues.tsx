@@ -38,6 +38,7 @@ import { CircleDot, CircleCheck, ExternalLink, RefreshCw } from 'lucide-react';
 import { Badge, Chip, DataTable, Empty, type BadgeTone, type Column } from '@/components/ui';
 import type { Issue, IssueReason, IssuesPayload, RepoIssues } from '@/lib/api';
 import { relativeTime, elapsedWords, plural } from '@/lib/format';
+import { phaseHref } from '@shared/routes.js';
 
 /**
  * How many issues one ticket may carry — `TICKET_ISSUES_MAX` on the server.
@@ -94,6 +95,11 @@ export interface IssueFilter {
   label?: string;
   /** Free text over the number, the title and the repository. */
   q?: string;
+  /**
+   * `sessions` keeps only the issues a session of this console FILED (phase
+   * 12) — the ones carrying a provenance. Absent = everyone's.
+   */
+  filed?: 'sessions';
 }
 
 export const DEFAULT_FILTER: Readonly<IssueFilter> = Object.freeze({ state: 'open' });
@@ -113,6 +119,7 @@ export function issueRef(repo: RepoIssues, issue: Issue): string | undefined {
 const isOpen = (issue: Issue) => issue.state.toUpperCase() !== 'CLOSED';
 
 function matches(repo: RepoIssues, issue: Issue, filter: IssueFilter): boolean {
+  if (filter.filed === 'sessions' && !issue.provenance) return false;
   if (filter.state === 'open' && !isOpen(issue)) return false;
   if (filter.state === 'closed' && isOpen(issue)) return false;
   if (filter.label && !issue.labels.includes(filter.label)) return false;
@@ -153,7 +160,11 @@ export function boardRows(payload: IssuesPayload | undefined, filter: IssueFilte
       kept += 1;
       rows.push({ kind: 'issue', repo, issue, ref: issueRef(repo, issue) ?? '' });
     }
-    if (kept === 0 && (repo.state === 'unknown' || repo.issues.length === 0)) {
+    // Under the sessions filter the question is "which issues did sessions
+    // file", and a repository's own silence is not an answer to it: no
+    // repository row, and the board's empty state says what an empty answer
+    // means (phase 12).
+    if (kept === 0 && filter.filed !== 'sessions' && (repo.state === 'unknown' || repo.issues.length === 0)) {
       rows.push({ kind: 'repo', repo });
     }
   }
@@ -403,13 +414,16 @@ export function IssueBoard({
               )}
             </span>
           ) : (
-            <button
-              type="button"
-              onClick={() => onOpen(row)}
-              className="flex min-h-(--tap-min) w-full min-w-0 items-center text-left text-sm text-ink hover:text-action sm:min-h-0"
-            >
-              <span className="min-w-0 break-words">{row.issue.title}</span>
-            </button>
+            <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+              <button
+                type="button"
+                onClick={() => onOpen(row)}
+                className="flex min-h-(--tap-min) min-w-0 items-center text-left text-sm text-ink hover:text-action sm:min-h-0"
+              >
+                <span className="min-w-0 break-words">{row.issue.title}</span>
+              </button>
+              {row.issue.provenance && <ProvenanceChip provenance={row.issue.provenance} />}
+            </span>
           ),
       },
       {
@@ -532,13 +546,46 @@ export function IssueBoard({
       rowClassName={(row) => (row.kind === 'repo' ? 'bg-ground-deep/30' : undefined)}
       detail={(row) => <RowDetail row={row} {...(onRefresh ? { onRefresh } : {})} refreshing={refreshing} />}
       empty={
-        <Empty
-          icon={<CircleDot size={20} aria-hidden />}
-          title="Nothing matches"
-          body="Every repository this console stands on is listed here — including the ones it could not ask. If this is empty, the filters above are why."
-        />
+        filter.filed === 'sessions' ? (
+          // Its own sentence, because this silence has a different cause from
+          // every other empty board: not a filter over a list, but a plan that
+          // never let its sessions file anything. Say which word does.
+          <Empty
+            icon={<CircleDot size={20} aria-hidden />}
+            title="No issue here was filed by a session"
+            body="A session files one only where its plan allows it — `Issues: draft` in §Session budget holds each draft in the inbox for your Approve, `Issues: file` files at once under --allow-publish. The default is off."
+          />
+        ) : (
+          <Empty
+            icon={<CircleDot size={20} aria-hidden />}
+            title="Nothing matches"
+            body="Every repository this console stands on is listed here — including the ones it could not ask. If this is empty, the filters above are why."
+          />
+        )
       }
     />
+  );
+}
+
+/**
+ * The chip a session-filed issue carries: which plan and phase, linking to
+ * the phase page where the draft's evidence, the run's journal and the
+ * session's transcript all are. A link and not a button, because it leaves
+ * this destination.
+ */
+export function ProvenanceChip({ provenance }: { provenance: NonNullable<Issue['provenance']> }) {
+  return (
+    <a
+      href={phaseHref(provenance.slug, provenance.phase)}
+      className="inline-flex max-w-full items-center"
+      aria-label={`Filed by ${provenance.slug} phase ${provenance.phase}`}
+      title={`Filed by a session of ${provenance.slug}, phase ${provenance.phase}${provenance.runId ? ` (run ${provenance.runId})` : ''} — open the phase`}
+      data-testid="provenance-chip"
+    >
+      <Chip tone="accent" className="max-w-full break-all whitespace-normal">
+        {provenance.slug} · phase {provenance.phase}
+      </Chip>
+    </a>
   );
 }
 

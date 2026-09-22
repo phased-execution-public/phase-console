@@ -72,9 +72,11 @@ const view = (over: Partial<RunGitView> = {}): RunGitView => ({
   ...over,
 });
 
-function mount(node: React.ReactNode) {
+const CAP_REACHED = 'the console already holds as many managed worktrees as `worktreeMaxConcurrent` allows';
+
+function mount(node: React.ReactNode, state: Record<string, unknown> = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
-  client.setQueryData(keys.state(), { allowRun: true, autopilot: true, home: HOME });
+  client.setQueryData(keys.state(), { allowRun: true, autopilot: true, home: HOME, ...state });
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>{node}</TooltipProvider>
@@ -101,6 +103,21 @@ describe('when the card appears at all', () => {
     expect(screen.getByTestId('git-refused').textContent).toContain('cap-reached');
     // …and the shared tree is stated as the outcome, not implied.
     expect(screen.getByTestId('git-card').textContent).toContain('shared with the console');
+  });
+
+  it('renders the refusal as a SENTENCE when the console has told it the words (G-20)', () => {
+    mount(<GitCard run={run({ checkout: 'refused', isolationRefusal: 'cap-reached' })} git={null} />, {
+      refusalReasons: { 'cap-reached': CAP_REACHED },
+    });
+    const refused = screen.getByTestId('git-refused').textContent ?? '';
+    expect(refused).toContain(CAP_REACHED);
+    // The key stays beside the sentence — it is what the journal and the record say.
+    expect(refused).toContain('cap-reached');
+    // A key the table does not hold (an older server, a newer refusal) still reads as the key.
+    mount(<GitCard run={run({ checkout: 'refused', isolationRefusal: 'brand-new' })} git={null} />, {
+      refusalReasons: { 'cap-reached': CAP_REACHED },
+    });
+    expect(screen.getAllByTestId('git-refused')[1]?.textContent).toContain('brand-new');
   });
 });
 
@@ -136,6 +153,42 @@ describe('the measured facts', () => {
     expect(card.textContent).toContain('—');
     expect(card.textContent).toContain('Not measured');
     expect(screen.queryByTestId('radar')).toBeNull();
+  });
+
+  it('reads the base off the run record when the probe has none — pinned to the commit it was cut at (phase 15)', () => {
+    // The probe's `base` is the root checkout's branch, measured; the run
+    // record's is what the runner RESOLVED when it cut the branch — the ref,
+    // the sha and who declared the word. A stopped run has the second and not
+    // the first, and a dash there was the one fact this card could have said.
+    mount(
+      <GitCard
+        run={run({
+          checkout: 'worktree',
+          workRoot: `${HOME}/state/wt/demo`,
+          base: { ref: 'release/5.1', sha: 'abcdef1234567890abcdef', source: 'ref', declaredBy: 'plan' },
+        })}
+        git={null}
+      />,
+    );
+    const base = screen.getByTestId('git-base');
+    expect(base).toHaveTextContent('release/5.1');
+    expect(base).toHaveTextContent('abcdef123456');
+    expect(base.getAttribute('title')).toMatch(/a ref named by hand; the plan’s `Base branch:` line/);
+  });
+
+  it('prefers the probe’s measured base over the record’s word when both are there', () => {
+    mount(
+      <GitCard
+        run={run({
+          checkout: 'worktree',
+          workRoot: `${HOME}/state/wt/demo`,
+          base: { ref: 'release/5.1', sha: 'abcdef1234567890', source: 'ref', declaredBy: 'plan' },
+        })}
+        git={view()}
+      />,
+    );
+    expect(screen.getByTestId('git-base')).toHaveTextContent('main');
+    expect(screen.getByTestId('git-base')).not.toHaveTextContent('release/5.1');
   });
 });
 

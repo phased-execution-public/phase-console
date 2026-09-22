@@ -12,7 +12,7 @@ A category that is off leaves no trace anywhere. Worth stating, because the obvi
 silencing only the buzz — leaves the badge climbing and the inbox filling, which is how people end up
 ignoring the inbox entirely.
 
-## The sixteen categories
+## The seventeen categories
 
 | Category | Tells you | Default |
 |---|---|---|
@@ -29,6 +29,7 @@ ignoring the inbox entirely.
 | **A session ended** | An agent session or terminal finished while you were not watching, or exited with an error. | On |
 | **Console problems** | The console degraded, its file watch went deaf, or it restarted after a crash. | On |
 | **Usage limits** | A Claude account hit a usage window, with when it resets and what the run did about it — and an account that needs signing in again. | On |
+| **Issue drafted by a session** | A session tripped over a problem outside its phase and drafted an issue for it, where the plan's `Issues:` word allows. Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this says what landed. | On |
 | **Usage climbing** | Early warning while a window fills: 80% and 95% crossings. The meters show the same numbers all the time. | **Off** |
 | **Work became ready** | A phase became startable — including because of work you finished yourself, elsewhere. | **Off** |
 | **Plans changed on disk** | Any plan or handoff was written. An agent editing a handoff mid-phase fires this. | **Off** |

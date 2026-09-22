@@ -8,7 +8,6 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
-import { execFile } from 'node:child_process';
 import type { ResolvedPolicy } from '../../shared/policy-model.js';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -27,6 +26,9 @@ import {
   markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
 } from './spawn.ts';
 import { permissionPromptsFor, relayArmingFor, sessionRecordOf, type Cap, type SessionCaps } from './session-record.ts';
+import { loadModelsEnv } from './models.ts';
+import { contextWindowOf, MAX_TOKEN_ATTEMPTS, type TokenAttempt } from './usage.ts';
+import type { PollLoopState } from '../../shared/poll-loop.js';
 import { writeMcpConfigFile, type McpConfigDoc } from '../mcp/config.ts';
 import { RELAY_HOST_SERVER, RELAY_HOST_TOOL, relayHostConfig } from '../relay-host.ts';
 import type { PhaseSize } from '../parse/plan.ts';
@@ -45,8 +47,11 @@ import {
   type LaneLiveness, type LaneSignals, type StallState, type StallThresholds,
 } from './liveness.ts';
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
+// FREE: the shared owner of the messaging words, which the free tree reads
+// too — only the ledger path below it is Pro.
+import { DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import {
-  isRegistered, laneNames, scopeConfined,
+  isRegistered, laneNames, realish, scopeConfined,
   type LaneNames, type RadarState, type RunGitView,
   managedRoots,
   stagingHome,
@@ -78,7 +83,7 @@ import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from '
 import {
   AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
-import { formatScope } from '../../shared/scope.js';
+import { formatScope, repoKeyOf } from '../../shared/scope.js';
 import { Journal } from './journal.ts';
 import { Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
@@ -129,6 +134,7 @@ export abstract class RunnerBase {
   protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind): void;
   protected abstract now(): Date;
   protected abstract onStream(phase: number, event: StreamEvent): void;
+  protected abstract noteContext(phase: number, event: Extract<StreamEvent, { kind: 'usage' }>): void;
   protected abstract armOutcomeFile(phase: number): string;
   protected abstract outcomePath(phase: number): string;
   protected abstract armTasksFile(phase: number): string;
@@ -324,7 +330,16 @@ export abstract class RunnerBase {
    * what keeps two of them colliding whatever branches they name.
    */
   protected treeFor(phase: number): string | undefined {
-    return this.lanes.get(phase)?.worktree ?? this.state?.workRoot ?? this.state?.root;
+    const tree = this.lanes.get(phase)?.worktree ?? this.state?.workRoot ?? this.state?.root;
+    // The PHYSICAL path (SCH-1). This is one half of the pair a claim is
+    // decided on, and it was returned verbatim — so a run whose root is reached
+    // through a symlink (`/tmp/x` for `/private/tmp/x`, which is every macOS
+    // temp path, and any `~/work` behind one) presented a tree that did not
+    // string-match the one a hand session derives with `pwd -P`. Two claims in
+    // ONE directory then read as disjoint, which is the exact collision the
+    // pair exists to refuse. `realish` resolves what exists and walks up for
+    // what does not, so a tree not yet created still answers.
+    return tree ? realish(tree) : undefined;
   }
 
   /**
@@ -361,12 +376,120 @@ export abstract class RunnerBase {
    */
   protected qualificationFor(
     phase: number, scope: readonly string[],
-  ): { branch?: string; tree?: string } {
+  ): { branch?: string; tree?: string; repo?: string } {
     const root = this.state?.root;
     if (!root || !scopeConfined(root, scope)) return {};
     const branch = this.branchFor(phase);
     const tree = this.treeFor(phase);
-    return { ...(branch ? { branch } : {}), ...(tree ? { tree } : {}) };
+    // The repository the tree rides in — the per-repository cap's key. Derived
+    // from the tree rather than from `state.root`, so it is absent for exactly
+    // the admissions that state no tree, which is exactly the set that must
+    // not be capped (`AdmitRequest.repo`).
+    const repo = tree ? repoKeyOf(tree) : '';
+    return {
+      ...(branch ? { branch } : {}),
+      ...(tree ? { tree } : {}),
+      ...(repo ? { repo } : {}),
+    };
+  }
+
+  /**
+   * The four environment variables a spawned session claims its lock with.
+   *
+   * `phase-lock.sh` reads all four (`PE_OWNER`, `PE_SCOPE`, `PE_BRANCH`,
+   * `PE_WORKTREE`) and DECIDES on the pair: a claim that names a branch and a
+   * tree carves against another that names a different pair; one missing either
+   * collides with everything. Five of the six phase-scoped spawn sites injected
+   * the first two only — the reviewer, the closeout, the repair and both resume
+   * sites — so each of those sessions' own first claim was unqualified, and
+   * stayed so until the runner's keepalive rewrote the lock up to a third of a
+   * lease later. Two isolated runs that should have carved cleanly serialised
+   * against each other for ten minutes, every time one of them spawned.
+   *
+   * One helper, because the failure was five places agreeing about two fields
+   * and forgetting two. `qualificationFor` is still the single source of the
+   * pair — including its refusal to state EITHER for a scope the run root does
+   * not contain, which is why this returns a whole env fragment rather than
+   * letting each caller assemble one.
+   */
+  /**
+   * How many times each phase's PROVISIONAL claim has been refused this process
+   * (S1-a). In memory rather than on the record: it is about this run's
+   * boarding attempts, not about the phase's history, and it is only ever read
+   * to stop a cycle.
+   */
+  protected readonly provisionalRefusals = new Map<number, number>();
+
+  protected async claimEnv(phase: number, over: { owner?: string; scope?: readonly string[] } = {}): Promise<Record<string, string>> {
+    const scope = over.scope ?? this.lanes.get(phase)?.grant?.scope ?? await this.scopeFor(phase);
+    const claim = this.qualificationFor(phase, scope);
+    return {
+      PE_OWNER: over.owner ?? autopilotOwner(this.state!.id),
+      PE_SCOPE: formatScope(scope),
+      ...(claim.tree ? { PE_WORKTREE: claim.tree } : {}),
+      ...(claim.branch ? { PE_BRANCH: claim.branch } : {}),
+    };
+  }
+
+  /**
+   * This plan's `**Messaging:**` word; where the plan is silent, the RUN's
+   * own (phase 15 — the launch form's); after both, the shipped `on`.
+   */
+  protected messagingOn(): boolean {
+    const state = this.state;
+    const own = (state?.messaging ?? DEFAULT_MESSAGING) === 'on';
+    if (!state?.slug || !this.deps.messaging?.on) return own;
+    // A plan read that throws must not stop a phase boarding: messaging is a
+    // convenience and the default is on.
+    try { return this.deps.messaging.on(state.slug) ?? own; } catch { return own; }
+  }
+
+  /**
+   * `claimEnv`'s sibling: how a session says something to a PEER.
+   *
+   * One helper for the same reason `claimEnv` is one — every `sessionEnv` site
+   * needs the pair, and a site that stated the ledger and forgot the token
+   * would give a session a channel that 401s on every send. Both, or neither.
+   *
+   * `PE_MESSAGES_FILE` is per PLAN, not per attempt, and that is the one place
+   * this differs from the outcome and task channels next door: those name one
+   * file belonging to one attempt and are deliberately never inherited, while a
+   * note left for phase 7 must outlive the run that wrote it. So it is not
+   * armed (nothing is deleted) and a resumed session finds its own mail.
+   *
+   * Empty when the plan's `**Messaging:**` word is `off`: a session with no
+   * token cannot reach the console's door, `phase-msg.sh` says so and appends
+   * to the ledger instead, and nothing is silently half-on.
+   */
+  protected messagingEnv(): Record<string, string> {
+    const state = this.state;
+    if (!state || !this.messagingOn()) return {};
+    const token = this.deps.messaging?.token?.(state.id) ?? null;
+    return {
+      ...(token ? { PE_MSG_TOKEN: token } : {}),
+    };
+  }
+
+  /**
+   * `messagingEnv`'s sibling (phase 12): where `phase-issue.sh` records a
+   * problem the session tripped over that is not its phase's.
+   *
+   * Per PLAN like the mailbox, and for the mailbox's reason: the dedupe has
+   * to see what an earlier run's phases already drafted, so the file is never
+   * armed and a resumed session finds the plan's drafts where it left them.
+   * Always stated, whatever the plan's `Issues:` word — the script reads the
+   * word itself and refuses under `off`; a session with no ledger would fall
+   * back to the console's own inbox, which is the same file by another route.
+   *
+   * Pro on both lines, the import above and this one — the defect
+   * `messagingEnv` documents, not repeated: the free tree's method is a body
+   * that returns `{}`, and every spawn site spreads it without knowing.
+   */
+  protected issuesEnv(): Record<string, string> {
+    const state = this.state;
+    if (!state) return {};
+    return {
+    };
   }
 
   /**
@@ -420,11 +543,17 @@ export abstract class RunnerBase {
    * branch ONE working tree, so a `pe/integration` tree standing under the
    * other root keeps its place until an operator removes it.
    */
-  protected async stagingFor(): Promise<StagingNames> {
+  protected async stagingFor(repoKey?: string): Promise<StagingNames> {
     const state = this.state!;
     const consoleDir = consoleRunsDir(state.root);
     const mode = worktreeRootOf(this.deps.worktreePrefs?.().root);
-    const at = (m: WorktreeRoot): StagingNames => stagingNames(stagingHome({ mode: m, root: state.root, consoleDir }));
+    // `repoKey` is a MOUNT's root-relative path, empty for the root itself —
+    // which keeps the bare `staging/` it has always had, so an existing tree
+    // is still found. One staging tree per REPOSITORY is what lets a mirror
+    // run settle `integration` at all: the branch name is the same in N
+    // unrelated object databases, and they never meet.
+    const at = (m: WorktreeRoot): StagingNames =>
+      stagingNames(stagingHome({ mode: m, root: state.root, consoleDir }), repoKey);
     // Asked of git, not of the filesystem: a directory that merely exists
     // under the other root (restored, recreated by hand) is not a checkout,
     // and pinning the settle to it would refuse every settle for ever.
@@ -679,7 +808,11 @@ export abstract class RunnerBase {
    */
   liveness(): LaneLiveness[] {
     return [...this.lanes.values()]
-      .map((lane) => livenessOf(lane.phase, lane.signals))
+      .map((lane) => ({
+        ...livenessOf(lane.phase, lane.signals),
+        // The unbooked half of the run's spend (`LaneLiveness.spentUsd`).
+        ...(lane.sessionUsd ? { spentUsd: lane.sessionUsd } : {}),
+      }))
       .sort((a, b) => a.phase - b.phase);
   }
 
@@ -811,6 +944,10 @@ export abstract class RunnerBase {
         ...(this.worktreeFor(lane.phase) ? { worktree: this.worktreeFor(lane.phase)! } : {}),
         ...(this.worktreeFor(lane.phase) && this.branchFor(lane.phase)
           ? { branch: this.branchFor(lane.phase)! } : {}),
+        // The lock the runner fastened on that tree, on git's word (phase 15).
+        // Only a LANE's own — a run-level checkout locks the run tree, which
+        // is not this child's to claim — and only alongside the directory.
+        ...(lane.worktree && lane.lockReason ? { locked: lane.lockReason } : {}),
         // On the lane's own entry, not only the single `freeze` slot — several
         // lanes can be frozen at once, and reconcile + the client read per pid.
         ...(lane.frozen ? { frozen: lane.frozen } : {}),
@@ -970,6 +1107,23 @@ export abstract class RunnerBase {
     }
     const armed = Boolean(armedPath);
     const onEvent = rest.onEvent;
+    // Every session on a lane starts from nothing: the lane must not go on
+    // showing the context of the session before it until this one's first call.
+    // The window goes too, because only the phase's OWN session is judged
+    // against one (`noteContext` sets it) — a closeout must not read as the
+    // checkpoint it is exempt from. That session's status checks count from here.
+    const shared = this.lanes.get(phase);
+    if (shared) {
+      delete shared.signals.tokens;
+      delete shared.signals.contextWindow;
+      // …and the dollars shown as live (`Lane.sessionUsd`): a closeout or a
+      // retry on this lane must not open showing what the session before it
+      // cost — that sum is already booked (autopilot-token-drain H7).
+      delete shared.sessionUsd;
+    }
+    const lane = mode === 'phase' ? shared : undefined;
+    const pollTracker = lane?.signals.pollLoop;
+    const pollBefore = pollTracker ? { ...pollTracker.counts } : undefined;
     const sent: SpawnRequest = {
       ...rest,
       ...(resumeFrom ? { resume: resumeFrom.sessionId } : {}),
@@ -984,6 +1138,10 @@ export abstract class RunnerBase {
       onEvent: (event) => {
         try { this.noteSessionEvent(phase, event, armed, version); } catch { /* bookkeeping never costs the stream */ }
         onEvent?.(event);
+        // The context thresholds, after the lane has taken the event, and for
+        // the phase's OWN sessions only: a closeout, a QA round or a repair is
+        // never told to wrap up, nor ended in the middle of its handoff.
+        if (event.kind === 'usage' && mode === 'phase') this.noteContext(phase, event);
       },
     };
     const ceilings = childEnvDecisions(sent.env ?? process.env);
@@ -994,13 +1152,69 @@ export abstract class RunnerBase {
       bgWaitCeilingMs: Number(ceilings.bgWaitCeilingMs.value),
       bgWaitSource: ceilings.bgWaitCeilingMs.source,
     }, phase);
+    // Whose prompt cache this session writes — read at the spawn, because a
+    // switch can move the run's account while the session is still running.
+    const account = this.state?.accountId ?? 'default';
     const outcome = await (this.deps.spawn ?? spawnClaude)(sent);
+    // Ended, so its cost is the caller's to book (`state.spentUsd +=`, right
+    // after this returns): the lane stops reporting it as live, or the run view
+    // would count it twice until the next session's first `result`.
+    if (shared) delete shared.sessionUsd;
     this.record('phase.session', sessionRecordOf({ mode, request: sent, outcome, attempt: ctx.attempt }), phase);
+    this.noteTokens(phase, mode, sent, outcome, ctx.attempt, lane ? { lane, tracker: pollTracker, before: pollBefore } : undefined, account);
     // What this session REPORTED costing goes to the instance's start ceiling
     // — its dollars-per-hour half reads the last hour's session spend. A cost
     // that never arrived charges nothing (`costSource: 'none'`).
     if (outcome.costUsd > 0) this.deps.startCeiling?.spendUsd(outcome.costUsd);
     return outcome;
+  }
+
+  /**
+   * `phase.tokens`, and the session's entry on the phase record (`record.tokens`)
+   * — once per session, as it ends (autopilot-token-drain phase 3). Only for a
+   * session that made an API call: a harness's fake and a child that never
+   * started report none, and a line of zeros would claim it cost nothing.
+   *
+   * `poll` is the phase's own lane and its poll-loop counts when this session
+   * started, so the status checks booked are this session's rather than the
+   * lane's since boarding; a tracker replaced mid-session counted only this
+   * session's calls, so it is read whole. `account` is the one it was spawned
+   * under — what the resume policy compares with the account paying later.
+   */
+  protected noteTokens(
+    phase: number, mode: SessionMode, request: SpawnRequest, outcome: SpawnOutcome, attempt: number | undefined,
+    poll: { lane: Lane; tracker: PollLoopState | undefined; before: { status: number; denied: number } | undefined } | undefined,
+    account = 'default',
+  ): void {
+    const tokens = outcome.tokens;
+    if (!tokens || tokens.calls <= 0) return;
+    const record = this.state?.phases[String(phase)];
+    const window = contextWindowOf([request.model, record?.actualModel], loadModelsEnv(this.deps.scriptsDir));
+    let polls: { pollCalls: number; pollDenied: number } | undefined;
+    if (poll) {
+      const now = poll.lane.signals.pollLoop?.counts;
+      const from = poll.tracker && poll.lane.signals.pollLoop === poll.tracker ? poll.before : undefined;
+      polls = {
+        pollCalls: Math.max(0, (now?.status ?? 0) - (from?.status ?? 0)),
+        pollDenied: Math.max(0, (now?.denied ?? 0) - (from?.denied ?? 0)),
+      };
+    }
+    const line = {
+      mode,
+      ...(attempt !== undefined ? { attempt } : {}),
+      sessionId: outcome.sessionId ?? null,
+      resumed: Boolean(request.resume),
+      model: request.model ?? null,
+      window,
+      ...tokens,
+      ...(polls ?? {}),
+      account,
+    };
+    this.record('phase.tokens', line, phase);
+    if (!record) return;
+    const entry: TokenAttempt = { ...line, endedAt: this.now().toISOString() };
+    record.tokens = [...(record.tokens ?? []), entry].slice(-MAX_TOKEN_ATTEMPTS);
+    this.persist();
   }
 
   /**

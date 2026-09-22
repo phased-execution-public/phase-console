@@ -24,7 +24,7 @@ const {
   applyEvent, correlate, kindOf, parseHookPayload, presenceOf, turnsOf, weaklyCorrelatable, WEAK_MIN_LIFETIME_MS,
   NOTIFICATION_IGNORED, TRANSCRIPT_GRACE_MS, WAIT_ANSWER_CAP_MS,
   INBOX_AGE_REFUSE_MS, INBOX_DEPTH_WATERMARK, INBOX_HISTORY_HORIZON_MS, TURNS_UNKNOWN_AFTER_EVENTS,
-  peersSentence, turnsSourceOf,
+  peersSentence, turnsSourceOf, PEER_CLAIM_WINDOW_MS, claimWindowEnds,
 } = await import('../server/sessions/registry.ts');
 type HookPayload = import('../server/sessions/registry.ts').HookPayload;
 type SessionRecord = import('../server/sessions/registry.ts').SessionRecord;
@@ -998,6 +998,36 @@ test('REG-9 (ii, iii): the turn count names its writer — the stream, the hook,
   assert.equal(turnsSourceOf({ turns: 0, events: 40, kind: 'agent' }), 'hook', 'only a foreign record has no other reporter to blame');
 });
 
+test('REG-3 claim window: it closes PEER_CLAIM_WINDOW_MS after the newest start — a resume re-opens it; a compaction, a replayed start or a stale one does not', () => {
+  const started = applyEvent(undefined, payload({ event: 'SessionStart', source: 'startup', pid: 7, at: T0 }), T0);
+  assert.equal(started.resumedAt, undefined, 'a first start is `startedAt`, not a resume');
+  assert.equal(claimWindowEnds(started), Date.parse(T0) + PEER_CLAIM_WINDOW_MS);
+
+  // A compaction is the same session carrying on with the same work.
+  const compacted = applyEvent(started, payload({ event: 'SessionStart', source: 'compact', at: at(3 * PEER_CLAIM_WINDOW_MS) }), at(3 * PEER_CLAIM_WINDOW_MS));
+  assert.equal(compacted.resumedAt, undefined);
+  assert.equal(claimWindowEnds(compacted), Date.parse(T0) + PEER_CLAIM_WINDOW_MS);
+
+  // `claude --resume` keeps the id, so `startedAt` cannot say that a person just came back to it.
+  const resumeAt = at(4 * PEER_CLAIM_WINDOW_MS);
+  const resumed = applyEvent(compacted, payload({ event: 'SessionStart', source: 'resume', at: resumeAt }), resumeAt);
+  assert.equal(resumed.resumedAt, resumeAt);
+  assert.equal(resumed.startedAt, T0, 'the first start stays the start');
+  assert.equal(claimWindowEnds(resumed), Date.parse(resumeAt) + PEER_CLAIM_WINDOW_MS);
+
+  // An older resume replayed out of order never pulls the window back.
+  const replayed = applyEvent(resumed, payload({ event: 'SessionStart', source: 'resume', at: at(2 * PEER_CLAIM_WINDOW_MS) }), at(5 * PEER_CLAIM_WINDOW_MS));
+  assert.equal(replayed.resumedAt, resumeAt);
+
+  // A resume older than the end it would undo revives nothing, so it re-opens nothing.
+  const ended = applyEvent(resumed, payload({ event: 'SessionEnd', reason: 'other', at: at(6 * PEER_CLAIM_WINDOW_MS) }), at(6 * PEER_CLAIM_WINDOW_MS));
+  const stale = applyEvent(ended, payload({ event: 'SessionStart', source: 'resume', at: at(5 * PEER_CLAIM_WINDOW_MS) }), at(7 * PEER_CLAIM_WINDOW_MS));
+  assert.equal(stale.resumedAt, resumeAt);
+
+  // No readable start is no evidence of a recent one: the window is shut.
+  assert.equal(claimWindowEnds({ startedAt: 'not a date' }), -Infinity);
+});
+
 test('REG-3 (iv): the peers sentence names each live session, where it stands and what it works — or says nothing for nobody', () => {
   assert.equal(peersSentence('/work/hub', []), null);
   const sentence = peersSentence('/work/hub', [
@@ -1060,4 +1090,51 @@ test('ACC-10.7 (FLT-8): an event from a directory under neither of two consoles 
   } finally {
     rmSync(box, { recursive: true, force: true });
   }
+});
+
+// ── PRS-1 — `/clear` ends a session that is still running ────────────────────
+// Claude Code fires SessionEnd for `/clear`, and the process it fires it for is
+// the very process still sitting in front of the operator. `endedAt` was read
+// FIRST and answered `ended` outright, so the pid probe — the only witness that
+// can tell a finished session from a cleared one — was never consulted.
+//
+// `ended` is the one answer that makes a foreign lock DEBRIS: converge releases
+// it, boarding starts a second session in the same working tree, and the first
+// one is still typing. `unknown` is what is actually true — the hook says it
+// ended, the process says it did not, and nobody can vouch for it — so lease
+// rules apply and nothing is released.
+test('PRS-1: endedAt with the process still RUNNING is unknown, never ended', () => {
+  const live: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99 };
+  const cleared = { ...live, endedAt: at(10) };
+  const now = Date.parse(T0) + 60_000;
+  assert.equal(presenceOf(cleared, now, () => true), 'unknown', '/clear on a live process');
+  assert.equal(presenceOf(cleared, now, () => 'running'), 'unknown');
+});
+
+test('PRS-1: endedAt with the process GONE is still ended', () => {
+  // The ordinary case, and the one the demotion must not touch: the session
+  // finished, the process exited, the lock is debris and converge may take it.
+  const live: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99 };
+  const ended = { ...live, endedAt: at(10) };
+  const now = Date.parse(T0) + 60_000;
+  assert.equal(presenceOf(ended, now, () => false), 'ended');
+  assert.equal(presenceOf(ended, now, () => 'gone'), 'ended');
+});
+
+test('PRS-1: endedAt with NO probe, or no pid, is ended exactly as before', () => {
+  // The demotion needs a witness. With nobody to ask, the hook's word stands —
+  // anything else would make every finished session hold its lock to the lease.
+  const rec: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99, endedAt: at(10) };
+  const now = Date.parse(T0) + 60_000;
+  assert.equal(presenceOf(rec, now), 'ended', 'no probe');
+  assert.equal(presenceOf({ ...rec, pid: undefined }, now, () => true), 'ended', 'no pid');
+  assert.equal(presenceOf(rec, now, () => { throw new Error('ps broke'); }), 'ended',
+    'a probe that cannot answer never OVERTURNS the hook either');
+});
+
+test('PRS-1: a stopped process under endedAt is unknown too', () => {
+  const rec: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99, endedAt: at(10) };
+  const now = Date.parse(T0) + 60_000;
+  assert.equal(presenceOf(rec, now, () => 'stopped'), 'unknown');
+  assert.equal(presenceOf(rec, now, () => 'zombie'), 'unknown');
 });

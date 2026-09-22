@@ -859,3 +859,53 @@ describe('the URL is the state', () => {
     expect(gone).toEqual(['#/repo/issues']);
   });
 });
+
+/* ------------------------------------------------------------------ *
+ * Filed by sessions — the drafts engine's issues carry their provenance
+ * (many-plans-one-repo phase 12)
+ * ------------------------------------------------------------------ */
+
+describe('filed by sessions', () => {
+  const SESSION_ISSUE = issue(41, {
+    title: 'phase-lock.sh drops the lease',
+    labels: ['phase-console', 'from-session', 'demo'],
+    provenance: { slug: 'demo', phase: 3, runId: 'r1', draftId: 'abcdefabcdef' },
+  });
+  const WITH: IssuesPayload = {
+    ...PAYLOAD,
+    repos: [{ ...FRESH, issues: [...FRESH.issues, SESSION_ISSUE] }, STALE, UNKNOWN],
+  };
+
+  it('boardRows keeps only the session-filed issues under filed=sessions, and no repository row at all', () => {
+    const rows = boardRows(WITH, { state: 'all', filed: 'sessions' });
+    expect(rows.map((r) => (r.kind === 'issue' ? r.issue.number : `repo:${r.repo.key}`))).toEqual([41]);
+    // Without the filter every issue is a row, session-filed or not.
+    const all = boardRows(WITH, { state: 'all' }).filter((r) => r.kind === 'issue');
+    expect(all).toHaveLength(4);
+  });
+
+  it('the filter is a URL, read from the route and written by the control', async () => {
+    expect(repoHref('issues', { filed: 'sessions' })).toBe('#/repo/issues?filed=sessions');
+    issues.mockResolvedValue(WITH);
+    mount('#/repo/issues?state=all&filed=sessions');
+    expect(await screen.findByText('phase-lock.sh drops the lease')).toBeTruthy();
+    expect(screen.queryByText('the lock never releases')).toBeNull();
+    const trigger = screen.getByLabelText('Filed by');
+    expect(trigger.textContent).toBe('Sessions');
+  });
+
+  it('a session-filed issue carries a chip linking to the phase that filed it, and a person-filed one does not', async () => {
+    issues.mockResolvedValue(WITH);
+    mount('#/repo/issues?state=all');
+    await screen.findByText('phase-lock.sh drops the lease');
+    const chip = screen.getByRole('link', { name: /filed by demo phase 3/i });
+    expect(chip.getAttribute('href')).toBe('#/plan/demo/phase/3');
+    expect(screen.getAllByRole('link', { name: /filed by .* phase/i })).toHaveLength(1);
+  });
+
+  it('with the filter on and nothing filed by a session, the empty state says so and names the plan word that allows it', async () => {
+    mount('#/repo/issues?state=all&filed=sessions');
+    expect(await screen.findByText(/no issue here was filed by a session/i)).toBeTruthy();
+    expect(screen.getByText(/Issues: draft/)).toBeTruthy();
+  });
+});

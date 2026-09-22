@@ -94,6 +94,12 @@ const SUBTITLE = 'Branches, commits and what changed in this source';
  * form they have not pressed. `check-dist.mjs` asserts it, because a static
  * import that creeps back in is invisible from the source of any file anyone
  * would think to open.
+ *
+ * The Pro seventh section, Landscape, is the other: React Flow and d3-dag
+ * (~97 KiB gzipped, `test/fixtures/spikes/react-flow-bundle.md`) behind a
+ * section most readers never open. It is reached through
+ * `pro/lazy-landscape.tsx` for the same reason, and `check-dist.mjs` holds the
+ * repo chunk free of React Flow and the landscape chunk out of the precache.
  */
 const SECTION_BODY: Record<RepoSection, React.ComponentType<{ route: ViewProps['route'] }>> = {
   graph: GraphSection,

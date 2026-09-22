@@ -61,17 +61,17 @@
  * `SETTLE_EVENTS`.
  */
 
-import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { isAbsolute, join, relative } from 'node:path';
 
-import { diffStat, diffText, type DiffOutput, type DiffStatRow } from './git.ts';
+import { diffStatDetailed, diffText, type DiffOutput, type DiffStatRow } from './git.ts';
 import {
   checkouts, parseGitmodulesPaths, realish, stagingNames, type CheckoutEntry,
 } from './runner/worktree.ts';
 import type { JournalEntry } from './runner/journal.ts';
 import type { RunState } from './runner/state.ts';
 import { detachedRef, type SettleStrategy } from '../shared/worktree-model.js';
+import { shell } from './shell.ts';
 
 /* ------------------------------------------------------------------ *
  * Caps. Every one of them is reported when it bites.
@@ -192,12 +192,16 @@ type GitRead = { ok: boolean; stdout: string };
  * ask", and answering both with `''` is how a display ends up asserting a fact
  * it never measured.
  */
-function git(cwd: string, args: string[], timeout = READ_TIMEOUT_MS): Promise<GitRead> {
-  return new Promise((done) => {
-    execFile('git', args, {
-      cwd, timeout, maxBuffer: READ_MAX_BUFFER, env: gitEnv(),
-    }, (error, stdout) => done({ ok: !error, stdout: String(stdout) }));
+async function git(cwd: string, args: string[], timeout = READ_TIMEOUT_MS): Promise<GitRead> {
+  const run = await shell('git', args, {
+    channel: 'git', intent: 'browse', cwd, timeout,
+    capture: { keep: READ_MAX_BUFFER, mode: 'head' },
+    env: gitEnv(),
+    // Every read here is speculative — does this branch have an upstream, does
+    // this ref exist — and `ok:false` is the answer the parsers below read.
+    expectFailure: true,
   });
+  return { ok: run.ok, stdout: run.stdout };
 }
 
 /* ------------------------------------------------------------------ *
@@ -238,7 +242,32 @@ export function safeRev(value: unknown): string | null {
   if (!rev || rev.length > 200) return null;
   if (rev.startsWith('-')) return null;
   if (rev.includes('..')) return null;
-  if (!/^[A-Za-z0-9._/@^~{}+,-]+$/.test(rev)) return null;
+  // 🔴 A DENYLIST, because the allowlist refused names git is perfectly happy
+  // to create and this module perfectly happy to LIST (G-REF): an apostrophe,
+  // a `#`, parentheses, `=`, `!`, `%`, anything non-ASCII. The branches section
+  // linked each row to `graph?ref=<name>` and the graph then refused it — and
+  // the refusal is deliberately indistinguishable from "that revision is not
+  // here", so a legal branch simply could not be opened, with no way to tell
+  // why. What is actually being defended against is an argument read as an
+  // OPTION or as a RANGE (both above), and a value git could take for a
+  // pathspec; everything else the callers settle by ASKING git (`revExists`,
+  // membership in the ref list), which is what the header already says this
+  // function leaves to them.
+  //
+  // The rule is GIT'S OWN, from `check-ref-format`: a ref name may not contain
+  // a control byte, whitespace, `:`, `?`, `*`, `[` or `\\`. Everything it does
+  // permit — `!`, `#`, `$`, `%`, `&`, `'`, `(`, `)`, `;`, `<`, `=`, `>`, `|`,
+  // `,`, and every non-ASCII byte — is accepted here, and the four rev-syntax
+  // characters the old allowlist carried (`~ ^ { } @`) stay. `:` and `\\` are
+  // kept out on top of that: `\\` git forbids anyway, and `HEAD:file` names a
+  // BLOB, which no surface here has a reason to take.
+  //
+  // The shell metacharacters this used to refuse are not a category that exists
+  // on this surface, and this module's own header says so in as many words —
+  // *"argv arrays only — `execFile`, never a shell, so quoting and `;` and
+  // `$(…)` are not a category that exists here"*. Refusing them bought nothing
+  // and cost a branch its page.
+  if (/[\u0000-\u0020\u007f:?*[\\]/.test(rev)) return null;
   return rev;
 }
 
@@ -1173,6 +1202,14 @@ export type RepoDiff = {
   tip?: string;
   files: DiffStatRow[];
   filesTruncated: boolean;
+  /**
+   * The stat itself overflowed its buffer, so `fileCount` is a FLOOR (G-DIFF).
+   *
+   * Distinct from `filesTruncated`, which says only "the list was cut to the
+   * cap". This says the total is unknown, which is what lets a surface write
+   * "diff too large to list" rather than a number it cannot stand behind.
+   */
+  overflow?: boolean;
   /** Present only when a single path was asked for. */
   patch?: DiffOutput & { path: string };
   /** Every file in the range, so the total is honest even when the list is cut. */
@@ -1219,15 +1256,20 @@ export async function repoDiff(dir: string, opts: {
   // environment, and an inherited `GIT_DIR` makes them answer about a DIFFERENT
   // repository than the one this surface was asked about. The other four
   // surfaces already go through this module's `git()`. (P8 QA round 1, Medium.)
-  const all = await diffStat(dir, range, { env: gitEnv() });
-  const files = all.slice(0, DIFF_FILE_CAP);
+  const all = await diffStatDetailed(dir, range, { env: gitEnv() });
+  const files = all.rows.slice(0, DIFF_FILE_CAP);
 
   const out: RepoDiff = {
     ...(base ? { base } : {}),
     ...(tip ? { tip } : {}),
     files,
-    filesTruncated: all.length > DIFF_FILE_CAP,
-    fileCount: all.length,
+    // 🔴 An overflowed stat is ALWAYS truncated, whatever the row count says
+    // (G-DIFF). The rows are whatever fitted in the buffer, so `fileCount` is a
+    // floor rather than a total — and the old shape reported both as exact,
+    // which is how a 26 000-file range rendered as "nothing changed".
+    filesTruncated: all.overflow || all.rows.length > DIFF_FILE_CAP,
+    ...(all.overflow ? { overflow: true } : {}),
+    fileCount: all.rows.length,
   };
 
   if (path) {
@@ -1245,8 +1287,28 @@ export async function repoDiff(dir: string, opts: {
 
 /** Does this revision resolve to a commit here? The membership check for a rev. */
 async function revExists(dir: string, rev: string): Promise<boolean> {
+  return Boolean(await commitOf(dir, rev));
+}
+
+/** The commit a validated rev names here, or empty. One read, both callers. */
+async function commitOf(dir: string, rev: string): Promise<string> {
   const out = await git(dir, ['rev-parse', '--verify', '--quiet', `${rev}^{commit}`]);
-  return out.ok && Boolean(out.stdout.trim());
+  return out.ok ? out.stdout.trim() : '';
+}
+
+/**
+ * The commit a ref resolves to in this repository, or `undefined`.
+ *
+ * The landscape's one rev read (phase 9): where the staging branch stands.
+ * Validated like every rev this module takes — a leading `-` or a range is
+ * refused before git is asked — and `undefined` for a ref that is not here,
+ * never a guess: a staging branch nobody has made yet is a fact the map
+ * shows as such.
+ */
+export async function refHead(dir: string, ref: string): Promise<string | undefined> {
+  const rev = safeRev(ref);
+  if (!rev) return undefined;
+  return (await commitOf(dir, rev)) || undefined;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1260,8 +1322,10 @@ export type SettleKind =
   | 'pending'
   /** The strategy could not be taken — a mirror run's one-tree settle. */
   | 'unsupported'
-  /** A lane's commits reached the run branch. */
+  /** A lane's commits reached the run branch — or a phase's landing policy took it. */
   | 'landed'
+  /** The console pushed a phase's branch — the one publication it makes (5.1, `pushRef`). */
+  | 'pushed'
   /** A lane's commits did NOT reach it; the integration was abandoned. */
   | 'failed'
   /** A checkout was given back — released, reclaimed or swept. */
@@ -1296,12 +1360,20 @@ const SETTLE_EVENTS: Readonly<Record<string, SettleKind>> = Object.freeze({
   'run.settled': 'settled',
   'run.settle-pending': 'pending',
   'run.settle-unsupported': 'unsupported',
+  'phase.worktree-landing': 'landed',
   'phase.worktree-landed': 'landed',
   'phase.worktree-failed': 'failed',
   'run.worktree-released': 'released',
   'run.isolation-reclaimed': 'released',
   'run.worktrees-swept': 'released',
   'run.branches-pruned': 'pruned',
+  // 🔴 The settle's own ending was missing from the settle history (S10). A
+  // `pr` settle spends a session and journals `phase.pr-session-done` with
+  // whether it ended well — the one line saying whether the branch was actually
+  // published — and the history that exists to answer "what happened to this
+  // branch" did not read it.
+  'phase.pr-session-done': 'settled',
+  'run.errand': 'pending',
 });
 
 /** The journal event names this history is assembled from. */

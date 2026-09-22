@@ -38,6 +38,17 @@
 #                                         # its declared waits (the phase's `Waits on:` max, else the plan's
 #                                         # `Wait budget:`); nothing when the plan is silent (the console default)
 #   phase-graph.sh <slug> --waits-on N    # the refs phase N's `- **Waits on:**` bullet names, one per line
+#   phase-graph.sh <slug> --checkout N    # the phase's `- **Checkout:**` branch, verbatim
+#   phase-graph.sh <slug> --land [N]      # hold|integrate|pr|trunk<TAB>phase|plan|default
+#   phase-graph.sh <slug> --gitlink [N]   # bump|leave<TAB>phase|plan|default
+#   phase-graph.sh <slug> --isolation [N] # shared|worktree<TAB>phase|plan — or nothing (the run decides)
+#   phase-graph.sh <slug> --issues [N]    # off|draft|file<TAB>phase|plan|default
+#   phase-graph.sh <slug> --conflict-policy # halt|park|rebase-session<TAB>plan|default  (plan-wide)
+#   phase-graph.sh <slug> --messaging       # on|off<TAB>plan|default                    (plan-wide)
+#   phase-graph.sh <slug> --base-branch     # <ref><TAB>plan|default                     (plan-wide)
+#   phase-graph.sh <slug> --clash-zones     # the paths two phases must never both touch, csv
+#   phase-graph.sh <slug> --landing N     # the landing LEDGER's row for phase N, as TSV (nothing = no record)
+#   phase-graph.sh <slug> --notes N       # what phase N is handed: source<TAB>note per line
 #   phase-graph.sh <slug> --session-plan [model|budget]
 #                                         # propose which REMAINING phases to batch into one session,
 #                                         # sized to a model's budget (haiku|sonnet|opus|fable) or a
@@ -47,7 +58,7 @@
 # Run from the repo root that owns docs/, or set DOCS_ROOT.
 set -euo pipefail
 
-slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--waits-on N|--boot-prompt N|--session-plan [model|budget]]}"
+slug="${1:?usage: phase-graph.sh <slug> [--lint|--qa-mode|--qa-result N|--qa-history N|--qa-prompt N|--gate-status N|--gate-kind N|--memory-block|--verified|--plan-status|--closed|--ready|--ready-after N|--dependents N|--deps N|--gated N|--size N|--repos N|--mcp [N]|--mcp-policy [N]|--decisions [N]|--credentials [N]|--credential-policy [N]|--accounts|--qa-exhausted|--person-check N|--wait-budget [N]|--waits-on N|--checkout N|--land [N]|--landing N|--base-branch|--gitlink [N]|--conflict-policy|--isolation [N]|--clash-zones|--issues [N]|--messaging|--notes N|--boot-prompt N|--session-plan [model|budget]]}"
 mode="${2:-board}"
 arg="${3:-}"
 
@@ -122,6 +133,17 @@ DOCS_ROOT="$(pe_docs_root)"
 plan_file="$DOCS_ROOT/docs/plans/${slug}.md"
 handoff_dir="$DOCS_ROOT/docs/handoffs/${slug}"
 
+# The prefix EVERY generated command carries. A printed line is pasted into a
+# session whose cwd nobody here controls, and the skill scripts resolve their
+# own docs root from that cwd (`pe_docs_root`: $DOCS_ROOT → the outermost
+# superproject of the cwd → … → pwd). So a bare `bash …/gate-approve.sh` records
+# the approval in whatever repository the reader happens to be sitting in —
+# measured live on 2026-09-17, when a pe-hub plan's gate line read from a hub
+# session would have written `gate-status.md` into hub. Naming the root the plan
+# was actually read from is the whole fix: it is the one fact the generator
+# knows and the reader cannot.
+CMD="DOCS_ROOT=$DOCS_ROOT bash $SCRIPT_DIR"
+
 if [ ! -f "$plan_file" ]; then
   printf 'ERROR: plan not found: %s\n' "$plan_file" >&2
   printf '  → run from the repo root, or set DOCS_ROOT: DOCS_ROOT=/path/to/repo %s ...\n' "$(basename "$0")" >&2
@@ -164,7 +186,7 @@ closed_banner() {
   [ -n "$PLAN_CLOSED_ON" ] && extra="$extra (closed $PLAN_CLOSED_ON)"
   printf '🔒 CLOSED [%s]%s\n' "$PLAN_STATUS" "$extra"
   printf '   This plan no longer reports work or warnings. Reopen it with:\n'
-  printf '   scripts/close-plan.sh %s --reopen\n' "$slug"
+  printf '   %s/close-plan.sh %s --reopen\n' "$CMD" "$slug"
 }
 
 # ---------------------------------------------------------------------------
@@ -373,19 +395,66 @@ mcp_directive() {  # mcp_directive <phase>
 # fallback) and ALSO fails --lint (F24): the default answers the board, the
 # lint makes the author say it. These defaults keep the script alive if the
 # file is ever missing.
-GATE_TYPES="phase phases plan cmd date deadline by manual ai"
+GATE_TYPES="phase phases plan cmd date deadline by manual ai landed pr-merged"
 GATE_TYPES_HUMAN="manual"
 GATE_TYPES_AI="ai"
 GATE_DEFAULT="ai"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/gates.env" ] && . "$SCRIPT_DIR/gates.env"
 
+# Where a phase's work happens and where it lands (5.1.0) — the OWNERS are
+# viewer/shared/landing-model.js and viewer/shared/worktree-model.js, and
+# scripts/landing.env is their bash twin, held equal by
+# viewer/test/gates-vocab.test.ts. Read by --land, --base-branch, --gitlink,
+# --conflict-policy, --isolation, the landed/pr-merged gates and lints F27/F28
+# here; by scripts/phase-landing.sh beside this script.
+LAND_POLICIES="hold integrate pr trunk"
+DEFAULT_LAND="hold"
+GITLINK_POLICIES="bump leave"
+DEFAULT_GITLINK="bump"
+CONFLICT_POLICIES="halt park rebase-session"
+DEFAULT_CONFLICT="halt"
+# Five of these are a VOCABULARY this script does not itself read — they are
+# the bash half of `viewer/shared/landing-model.js`, held to it by
+# `gates-vocab.test.ts`, and read by `scripts/phase-landing.sh` and by a person.
+# shellcheck disable=SC2034  # vocabulary: asserted by gates-vocab.test.ts, read by phase-landing.sh
+BASE_BRANCH_WORDS="origin/HEAD head"
+DEFAULT_BASE_BRANCH="origin/HEAD"
+# shellcheck disable=SC2034  # vocabulary — see above
+LANDING_STATES="held integrated pushed pr-open pr-merged landed conflict failed"
+LANDED_BY_POLICY="hold:held integrate:integrated pr:pr-merged trunk:landed"
+PR_MERGED_STATES="pr-merged"
+ISOLATION_DIRECTIVES="shared worktree"
+# shellcheck disable=SC2034  # vocabulary — see above
+WORKTREE_RETENTION="prune keep-on-failure keep"
+# shellcheck disable=SC2034  # vocabulary — see above
+DEFAULT_RETENTION="keep-on-failure"
+# shellcheck disable=SC2034  # vocabulary — see above
+WORKTREE_LOCK_PREFIXES="phase-console"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/landing.env" ] && . "$SCRIPT_DIR/landing.env"
+
+# What a message between two sessions is spelled with (5.1.0) — the OWNER is
+# viewer/shared/message-model.js, twin scripts/messages.env. Only --messaging
+# and --notes read it here; phase-msg.sh reads the rest.
+MESSAGING_WORDS="on off"
+DEFAULT_MESSAGING="on"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/messages.env" ] && . "$SCRIPT_DIR/messages.env"
+
+# What a session may ask to have filed (5.1.0) — the OWNER is
+# viewer/shared/issues-model.js, twin scripts/issues.env.
+ISSUE_MODES="off draft file"
+DEFAULT_ISSUES="off"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/issues.env" ] && . "$SCRIPT_DIR/issues.env"
+
 # The decision manifest's vocabulary (chapter 13 §1.1) — the OWNER is
 # viewer/shared/decisions-model.js and scripts/decisions.env is its bash twin,
 # held equal by viewer/test/decisions-model.test.ts. Read by --decisions, the
 # F25 lint and the boot prompt here; by decisions.sh (the twin writer) and
 # phase-outcome.sh (--needs) beside this script.
-DECISION_KEYS="permission.policy permission.destructive credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
+DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
 DECISION_STATES="answered outstanding waived"
 DECISION_SOURCES="plan run default ruling"
 NEED_CLASSES="lock permission credential gate external"
@@ -474,7 +543,7 @@ _run_bounded() {  # _run_bounded <seconds> <command-string>
 # `test/verify-extract.test.ts` fails when they drift. They had already drifted:
 # this copy was missing sudo, git commit/rebase/merge, docker system prune and
 # the redirect clause.
-GATE_CMD_DENY='(^|[;&|[:space:]])(rm|mv|dd|mkfs|shutdown|reboot|kill|pkill|chown|chmod|sudo)([[:space:]]|$)|terraform[[:space:]]+(apply|destroy)|git[[:space:]]+(push|reset|clean|checkout|commit|rebase|merge)|docker[[:space:]]+(rm|rmi|kill|stop|system[[:space:]]+prune)|task[[:space:]]+[a-z:]*(deploy|ship|update|apply|destroy)|(npm|pnpm|yarn|cargo|gem|twine|poetry|uv)[[:space:]]+(publish|version|deprecate|unpublish|dist-tag|owner|access)|[[:space:]](delete|put|create|set|modify|terminate|reboot)-|>[[:space:]]*/|>>[[:space:]]*/'
+GATE_CMD_DENY='(^|[;&|[:space:]])(rm|mv|dd|mkfs|shutdown|reboot|kill|pkill|chown|chmod|sudo)([[:space:]]|$)|terraform[[:space:]]+(apply|destroy)|git([[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+|--?[[:alnum:]_-]+(=[^[:space:]]+)?))*[[:space:]]+(push|reset|clean|checkout|commit|rebase|merge)(-(file|index|one-file))?([^-[:alnum:]_]|$)|docker[[:space:]]+(rm|rmi|kill|stop|system[[:space:]]+prune)|task[[:space:]]+[a-z:]*(deploy|ship|update|apply|destroy)|(npm|pnpm|yarn|cargo|gem|twine|poetry|uv)[[:space:]]+(publish|version|deprecate|unpublish|dist-tag|owner|access)|[[:space:]](delete|put|create|set|modify|terminate|reboot)-|>[[:space:]]*/|>>[[:space:]]*/'
 
 # Executing a command written in a markdown file is remote code execution by
 # document: clone a repo, run the board, run their shell. So `cmd` gates are OFF
@@ -497,10 +566,18 @@ GATE_CMD_DENY='(^|[;&|[:space:]])(rm|mv|dd|mkfs|shutdown|reboot|kill|pkill|chown
 # tests for, so nothing routes it to a person by accident.
 _gate_exec_enabled() { [ "${PHASE_EXEC_GATES:-0}" = "1" ]; }
 
+# The text GATE_CMD_DENY is asked about — read the way the runner's `mutates()`
+# reads it (viewer/server/runner/verify.ts): a redirect into /dev/null writes
+# nothing (`2>/dev/null` was refused as a write to `/`), and `>& file` is
+# `> file` plus 2>&1, so the write is still seen.
+_deny_view() {  # _deny_view <command-string>
+  printf '%s' "$1" | sed -E 's#[0-9&]?>>?&?[[:space:]]*/dev/null([[:space:];&|)]|$)# \1#g; s#>&([[:space:]]*[^[:space:]0-9-])#>\1#g'
+}
+
 # Evaluate a `cmd` gate. Echoes the verdict; returns 0 = clear, 1 = not clear.
 _gate_cmd() {  # _gate_cmd <command-string>
   local out rc
-  if printf '%s' "$1" | grep -qE "$GATE_CMD_DENY"; then
+  if _deny_view "$1" | grep -qE "$GATE_CMD_DENY"; then
     printf 'manual: REFUSED — a gate must not mutate anything: %s\n' "$1"
     return 1
   fi
@@ -535,8 +612,12 @@ _gate_plan() {  # _gate_plan <slug:phases>
     printf 'blocked: plan gate references a plan that does not exist: %s\n' "$other"
     return 1
   fi
-  done_line="$(DOCS_ROOT="$DOCS_ROOT" "$0" "$other" --memory-block 2>/dev/null \
-    | grep '^done:' | sed 's/^done:[[:space:]]*//' || true)"
+  # The other plan's VERIFIED set, not its done set (S8-a). Under QA-on those
+  # differ by exactly the phases a dependent must not build on: a `fail` verdict
+  # leaves the handoff `complete`, so the board says done and the gate used to
+  # clear straight through it. Still delegated to this same script rather than
+  # re-reading a second plan's handoffs here — one implementation of "verified".
+  done_line="$(DOCS_ROOT="$DOCS_ROOT" "$0" "$other" --verified 2>/dev/null || true)"
   # Comma-delimited on both sides so "1" cannot match inside "11".
   local done_set
   done_set=",$(printf '%s' "$done_line" | tr -d ' '),"
@@ -549,11 +630,57 @@ _gate_plan() {  # _gate_plan <slug:phases>
     esac
   done
   if [ -z "$missing" ]; then
-    printf 'clear (%s phases %s done)\n' "$other" "$list"
+    _unlanded_advisory "$other"
+    printf 'clear (%s phases %s verified)\n' "$other" "$list"
     return 0
   fi
-  printf 'blocked: %s phase(s)%s not done\n' "$other" "$missing"
+  printf 'blocked: %s phase(s)%s not verified\n' "$other" "$missing"
   return 1
+}
+
+# S8-b — nothing tied "done" to "LANDED", and the gap is invisible by
+# construction.
+#
+# A settles `keep`, so its work sits on `pe/A` and never reaches the trunk. B's
+# `plan A:5` gate clears on A being verified, B's run forks from the trunk, and B
+# builds on a tree that does not contain the very thing it gated on. Every step
+# is correct; the conclusion is wrong.
+#
+# The GATE half is phase 7's — the `landed`/`pr-merged` kinds and the landing
+# ledger, which can refuse. This is the Free half, and it is advisory ON PURPOSE:
+# a plan that settles `keep` does not land until the operator's own merge, so
+# refusing here would deadlock every dependent of every such plan — a permanent
+# block nobody can clear, which is worse than the silence it replaced. So the
+# gate still clears; it simply stops being silent about what it did not check.
+#
+# Two sources, cheapest first, and NOTHING when neither knows: silence is not a
+# claim, and an advisory printed on no evidence would train a reader to ignore it.
+_unlanded_advisory() {  # _unlanded_advisory <other-slug>
+  # TWO `local`s: `branch` reads `$other`, and a name assigned earlier in the
+  # SAME `local` has not taken effect yet (SC2318) — `pe/` plus an empty string.
+  local other="$1"
+  local trunk="" branch="pe/$other" ledger
+  ledger="$DOCS_ROOT/docs/handoffs/$other/landing.md"
+  # The ledger is the better witness where it exists: it records where each
+  # phase's work actually went, per repository, which git in the docs root
+  # cannot see for a submodule at all.
+  # A data row begins `| <phase>` (`phase-landing.sh`'s shape). Any row at all is
+  # enough to stay quiet: it means somebody is recording where this plan's work
+  # goes, so the question is being tracked. WHICH state satisfies which policy is
+  # the gate half's job (`landed N`, phase 7) and deliberately not this one's — an
+  # advisory that tried to adjudicate `pushed` vs `merged` would be a gate
+  # wearing a gate's authority without a gate's ability to be cleared.
+  if [ -f "$ledger" ] && grep -qE '^\|[[:space:]]*[0-9]' "$ledger" 2>/dev/null; then return 0; fi
+  git -C "$DOCS_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  git -C "$DOCS_ROOT" show-ref --verify --quiet "refs/heads/$branch" || return 0
+  for t in main master trunk; do
+    if git -C "$DOCS_ROOT" show-ref --verify --quiet "refs/heads/$t"; then trunk="$t"; break; fi
+  done
+  [ -n "$trunk" ] || return 0
+  if git -C "$DOCS_ROOT" merge-base --is-ancestor "$branch" "$trunk" 2>/dev/null; then return 0; fi
+  printf 'advisory: %s is verified but %s is not on %s — a phase that forks from %s will not have its work (the landing gate is `landed N`; see the plan'"'"'s Land directive)\n' \
+    "$other" "$branch" "$trunk" "$trunk"
+  return 0
 }
 
 # Rough working-set size of a phase: S | M | L (default M). Read from a
@@ -790,6 +917,122 @@ compute_issues() {
   gate_issues
   verification_issues
   decision_issues
+  directive_issues
+  note_issues
+  return 0
+}
+
+# F27 `land-word-unknown` — GATING. A closed directive whose word is not one of
+# its words. One id for all six, with the directive named in the line, because
+# the failure is one failure: `Land: sometimes` and `Issues: yes` are the same
+# mistake and want the same repair. It GATES rather than warns because the
+# readers fall THROUGH an unrecognised word to the next level — which is the
+# right behaviour for a reader (a typo must not silently become a policy) and
+# the wrong silence for an author: `Land: prr` would otherwise behave exactly
+# like a plan that had never mentioned landing, and nothing would ever say so.
+directive_issues() {
+  local p raw word spec
+  # Plan-wide lines. `Base branch` is absent on purpose: it is a git ref, and
+  # this engine has no business deciding which refs exist.
+  for spec in "Landing:$LAND_POLICIES" "Gitlink:$GITLINK_POLICIES" \
+              "Conflicts:$CONFLICT_POLICIES" "Messaging:$MESSAGING_WORDS" \
+              "Issues:$ISSUE_MODES" "Isolation:$ISOLATION_DIRECTIVES"; do
+    raw="$(_plan_directive "${spec%%:*}")"
+    [ -z "$raw" ] && continue
+    word="$(printf '%s' "$raw" | _first_word)"
+    case " ${spec#*:} " in
+      *" $word "*) ;;
+      *) printf 'land-word-unknown — **%s:** "%s" is not one of: %s (F27)\n' "${spec%%:*}" "$word" "${spec#*:}" ;;
+    esac
+  done
+  # Per-phase bullets.
+  for p in "${PHASES[@]}"; do
+    for spec in "Land:$LAND_POLICIES" "Gitlink:$GITLINK_POLICIES" \
+                "Isolation:$ISOLATION_DIRECTIVES" "Issues:$ISSUE_MODES"; do
+      raw="$(_phase_directive "$p" "${spec%%:*}")"
+      [ -z "$raw" ] && continue
+      word="$(printf '%s' "$raw" | _first_word)"
+      case " ${spec#*:} " in
+        *" $word "*) ;;
+        *) printf 'phase %s: land-word-unknown — "- **%s:** %s" is not one of: %s (F27)\n' "$p" "${spec%%:*}" "$word" "${spec#*:}" ;;
+      esac
+    done
+  done
+  return 0
+}
+
+# F26 `note-target-unknown` — GATING. A handoff's `## Notes for later phases`
+# bullet addressed to a phase this plan does not have. The note is not merely
+# undeliverable, it is INVISIBLE: `--notes N` is asked per phase, so a note for
+# phase 30 of a 23-phase plan is never printed to anyone and never reported
+# missing by anything. Whoever wrote it believes it was handed on.
+note_issues() {
+  local dir f n src
+  dir="$DOCS_ROOT/docs/handoffs/$slug"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/phase-*.md; do
+    [ -f "$f" ] || continue
+    src="$(basename "$f")"
+    for n in $(_note_rows_of "$f" | cut -f1); do
+      # `next` and `all` are relations, not numbers, and always have a reader.
+      case "$n" in ''|*[!0-9]*) continue ;; esac
+      case " ${PHASES[*]} " in
+        *" $n "*) ;;
+        *) printf 'note-target-unknown — %s has a note for phase %s, which is not in this plan; nothing will ever deliver it (F26)\n' "$src" "$n" ;;
+      esac
+    done
+  done
+  return 0
+}
+
+# F30 `note-target-done` — ADVISORY (stderr, exit untouched). A note addressed
+# to a phase that is already DONE. It is the near miss of F26 and a different
+# fact: the phase exists and the note is well-formed, but its reader has been
+# and gone, so nothing will ever board with it.
+#
+# Its own id rather than a second verdict under F26, and that is a rule and not
+# a preference: an id that both gates and warns cannot answer "did the lint
+# fail?", which is the only question a caller asks it. Advisory because it is
+# routinely TRUE and harmless — a phase re-run out of order, a note written to
+# a sibling that finished first — and because the repair is a person's call
+# (re-address it, or let it stand as a record of what was said).
+note_done_advisories() {
+  local dir f n src
+  dir="$DOCS_ROOT/docs/handoffs/$slug"
+  [ -d "$dir" ] || return 0
+  for f in "$dir"/phase-*.md; do
+    [ -f "$f" ] || continue
+    src="$(basename "$f")"
+    for n in $(_note_rows_of "$f" | cut -f1); do
+      case "$n" in ''|*[!0-9]*) continue ;; esac
+      case " ${PHASES[*]} " in *" $n "*) ;; *) continue ;; esac
+      [ "$(phase_status "$n")" = "done" ] || continue
+      printf 'F30 %s: note-target-done — its note for phase %s will never be delivered; phase %s is already done\n' "$src" "$n" "$n"
+    done
+  done
+  return 0
+}
+
+# F28 `land-needs-lane` — ADVISORY (stderr, exit untouched). A phase that
+# LANDS from a checkout it shares with other phases lands whatever else is in
+# that checkout: the merge, the push or the pull request carries every commit
+# on the branch, not the phase's own. It is advisory rather than gating because
+# it is a hazard and not an error — a plan whose phases are serial and whose
+# every phase lands with the same policy is fine, and that plan exists.
+land_needs_lane_advisories() {
+  local p policy isolation plan_isolation worktrees
+  plan_isolation="$(_plan_directive 'Isolation' | _first_word)"
+  worktrees="$(printf '%s' "$(_plan_directive 'Worktrees')" | _first_word)"
+  for p in "${PHASES[@]}"; do
+    _is_done "$p" && continue
+    policy="$(land_for_phase "$p" | cut -f1)"
+    [ "$policy" = hold ] && continue
+    isolation="$(isolation_for_phase "$p" | cut -f1)"
+    [ "$isolation" = worktree ] && continue
+    [ -z "$isolation" ] && [ "$plan_isolation" = worktree ] && continue
+    [ -z "$isolation" ] && [ "$worktrees" = on ] && continue
+    printf 'F28 phase %s: land-needs-lane — it lands with `%s` from a checkout it shares, so the merge carries every commit on the branch and not just this phase'"'"'s; give it `- **Isolation:** worktree`, or land it `hold` and let one phase land for all of them\n' "$p" "$policy"
+  done
   return 0
 }
 
@@ -801,6 +1044,10 @@ compute_issues() {
 # found 15 of 143 gated headings demanding a person by accident, and
 # `Gate-check: phase-21 …` (hyphen, not space) reading as manual with nobody
 # knowing the automation was off. Every deviation is reported here.
+#
+# F29 `landed-gate-unknown-phase` rides the same function, because it is the
+# same class of failure for the two landing kinds: a `landed 99` on a 23-phase
+# plan can never clear, and reads exactly like a phase that has not landed yet.
 gate_issues() {
   local p gc gtype gval q
   for p in "${PHASES[@]}"; do
@@ -841,8 +1088,21 @@ gate_issues() {
         _valid_date "$gval" || \
           printf 'phase %s: Gate-check %s needs a real YYYY-MM-DD date, got "%s"\n' "$p" "$gtype" "$gval" ;;
       cmd)
-        printf '%s' "$gval" | grep -qE "$GATE_CMD_DENY" && \
+        _deny_view "$gval" | grep -qE "$GATE_CMD_DENY" && \
           printf 'phase %s: Gate-check cmd looks like it mutates state — a gate must only observe: %s\n' "$p" "$gval" ;;
+      landed|pr-merged)
+        # F29 `landed-gate-unknown-phase` — GATING. A landing gate naming a
+        # phase this plan does not have can never clear, and reads as a
+        # blocked gate rather than as the typo it is: the ledger simply has no
+        # row for phase 99 and never will.
+        case "$gval" in
+          ''|*[!0-9]*) printf 'phase %s: landed-gate-unknown-phase — Gate-check %s needs one phase number, got "%s" (F29)\n' "$p" "$gtype" "$gval" ;;
+          *)
+            case " ${PHASES[*]} " in
+              *" $gval "*) [ "$gval" = "$p" ] && printf 'phase %s: landed-gate-unknown-phase — Gate-check %s references itself, which can never clear (F29)\n' "$p" "$gtype" ;;
+              *) printf 'phase %s: landed-gate-unknown-phase — Gate-check %s references phase %s, which is not in this plan (F29)\n' "$p" "$gtype" "$gval" ;;
+            esac ;;
+        esac ;;
     esac
   done
   return 0
@@ -907,6 +1167,8 @@ _verification_lead() {  # _verification_lead <candidate>
   local c="$1" w
   c="${c#"${c%%[![:space:]]*}"}"
   c="${c#\$ }"
+  # `! grep …` negates `grep`; the lead is `grep` (the runner's resolveLead agrees).
+  case "$c" in '! '*) c="${c#!}"; c="${c#"${c%%[![:space:]]*}"}" ;; esac
   while :; do
     w="${c%%[[:space:]]*}"
     case "$w" in
@@ -1942,6 +2204,481 @@ checkout_directive() {  # checkout_directive <phase> -> the branch, or ""
     || true
 }
 
+# ---------------------------------------------------------------------------
+# Where the work happens and where it lands (5.1.0)
+# ---------------------------------------------------------------------------
+#
+# Nine directives, one shape. Each is read at two levels — a `**Label:**` line
+# in §Session budget and a `- **Label:**` bullet on a phase — and each answers
+# with `value<TAB>phase|plan|default`, which is the ONE thing this family does
+# differently from every reader above it.
+#
+# Why the source token. `--mcp-policy` answers a bare word and lets silence
+# mean "the run decides"; that works because there are two words and both are
+# explicit. Here the words have engine-owned DEFAULTS (a plan that says nothing
+# about landing lands nothing), so a bare `hold` would be two different facts
+# wearing one spelling: "this plan chose hold" and "this plan has not thought
+# about it". The console needs to tell those apart — the first is a decision to
+# report, the second a question to ask in the wizard — so the source rides
+# along. `viewer/server/parse/plan.ts` returns the same pair and
+# engine-parity.test.ts holds them together.
+#
+# The one exception is `--isolation`, which has no engine-owned default: a
+# phase that says nothing inherits the RUN, and the run is not in the plan. Its
+# third state is therefore silence, like `--mcp-policy`'s.
+#
+# The label is matched case-insensitively by `grep -iE`, and the value is
+# everything after the FIRST colon — which is why these readers need no
+# per-label `sed` spelling out `[Ll]and`: a label never contains a colon and a
+# value often does (`ttl:48`, `origin/HEAD`, `gh:repo#pr/4`).
+
+# stdin: one whole directive line. stdout: its value, unemphasised.
+_after_colon() {
+  sed -E 's/^[^:]*:[[:space:]]*//; s/[*`]//g; s/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+_plan_directive() {  # _plan_directive <label-regex> -> the raw value, or ""
+  _section 2 "session budget" \
+    | grep -iE "^[[:space:]>]*\*{0,2}$1\*{0,2}[[:space:]]*:" | head -1 | _after_colon || true
+}
+
+_phase_directive() {  # _phase_directive <phase> <label-regex> -> the raw value, or ""
+  phase_block "$1" \
+    | grep -iE "^[[:space:]]*[-*][[:space:]]*\*{0,2}$2\*{0,2}[[:space:]]*:" | head -1 | _after_colon || true
+}
+
+# The first token, lower-cased — the shape every closed directive below reads.
+_first_word() { awk 'NF>0 { w=tolower($1); sub(/[[:punct:]]+$/, "", w); if (w != "") print w; exit }'; }
+
+# Resolve one closed-vocabulary directive to `word<TAB>source`.
+#   _resolve_directive <phase|""> <plan-label> <phase-label|""> <word-list> <default|"">
+# An unknown word is NOT silently replaced: it falls through to the next level,
+# so a typo reads as "this level said nothing" and lint F27 names it. Replacing
+# it would make `Land: pr` and `Land: prr` behave identically and differ only
+# in a warning nobody reads.
+_resolve_directive() {
+  local phase="$1" plan_label="$2" phase_label="$3" words="$4" fallback="$5" raw word
+  if [ -n "$phase" ] && [ -n "$phase_label" ]; then
+    word="$(_phase_directive "$phase" "$phase_label" | _first_word)"
+    case " $words " in *" $word "*) printf '%s\tphase\n' "$word"; return 0 ;; esac
+  fi
+  raw="$(_plan_directive "$plan_label")"
+  word="$(printf '%s' "$raw" | _first_word)"
+  case " $words " in *" $word "*) printf '%s\tplan\n' "$word"; return 0 ;; esac
+  [ -n "$fallback" ] && printf '%s\tdefault\n' "$fallback"
+  return 0
+}
+
+land_for_phase() {  # land_for_phase [phase] -> hold|integrate|pr|trunk<TAB>source
+  _resolve_directive "${1:-}" 'Landing' 'Land' "$LAND_POLICIES" "$DEFAULT_LAND"
+}
+
+gitlink_for_phase() {  # gitlink_for_phase [phase] -> bump|leave<TAB>source
+  _resolve_directive "${1:-}" 'Gitlink' 'Gitlink' "$GITLINK_POLICIES" "$DEFAULT_GITLINK"
+}
+
+isolation_for_phase() {  # isolation_for_phase [phase] -> shared|worktree<TAB>source, or nothing
+  _resolve_directive "${1:-}" 'Isolation' 'Isolation' "$ISOLATION_DIRECTIVES" ''
+}
+
+issues_for_phase() {  # issues_for_phase [phase] -> off|draft|file<TAB>source
+  _resolve_directive "${1:-}" 'Issues' 'Issues' "$ISSUE_MODES" "$DEFAULT_ISSUES"
+}
+
+plan_conflict_policy() {  # -> halt|park|rebase-session<TAB>source
+  _resolve_directive '' 'Conflicts' '' "$CONFLICT_POLICIES" "$DEFAULT_CONFLICT"
+}
+
+plan_messaging() {  # -> on|off<TAB>source
+  _resolve_directive '' 'Messaging' '' "$MESSAGING_WORDS" "$DEFAULT_MESSAGING"
+}
+
+# The base branch is the one value that is NOT a closed vocabulary: two words
+# are special (`origin/HEAD`, `head`) and everything else is a git ref, passed
+# through whole. So it takes the raw value rather than the first token — a ref
+# may carry a slash, a dot and a dash, and `release/5.1` is one word to git and
+# two to `awk` only if somebody writes a space into it, which is not a ref.
+plan_base_branch() {  # -> <ref><TAB>plan|default
+  local raw
+  raw="$(_plan_directive 'Base branch')"
+  if [ -n "$raw" ]; then printf '%s\tplan\n' "$raw"; return 0; fi
+  printf '%s\tdefault\n' "$DEFAULT_BASE_BRANCH"
+}
+
+# The paths two concurrent phases must never both touch. A list, so no source
+# token: an empty list and "the plan said nothing" are the same instruction.
+plan_clash_zones() {
+  _section 2 "session budget" \
+    | grep -iE '^[[:space:]>]*\*{0,2}Clash zones\*{0,2}[[:space:]]*:' | head -1 \
+    | grep -oE '`[^`]+`' | tr -d '`' | paste -sd ',' - | sed 's/,/, /g' || true
+}
+
+# ---------------------------------------------------------------------------
+# The landing ledger — docs/handoffs/<slug>/landing.md
+# ---------------------------------------------------------------------------
+#
+# Written by scripts/phase-landing.sh, read here by --landing and by the two
+# landing gates. The columns are located BY HEADER NAME, never by position, for
+# the reason table_shape_issues exists: a ledger read positionally is a board
+# that answers confidently and wrongly the first time somebody adds a column.
+LANDING_FILE="$DOCS_ROOT/docs/handoffs/$slug/landing.md"
+
+landing_rows() {  # landing_rows [phase] -> phase<TAB>repo<TAB>state<TAB>policy<TAB>ref<TAB>sha<TAB>pr<TAB>by<TAB>recorded<TAB>note
+  [ -f "$LANDING_FILE" ] || return 0
+  awk -v want="${1:-}" '
+    function plain(s) { gsub(/[*`]/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    /^\|/ {
+      n = split($0, cell, "|")
+      if (!have_header) {
+        for (i = 2; i < n; i++) { col[tolower(plain(cell[i]))] = i }
+        if ("phase" in col && "state" in col) { have_header = 1 }
+        next
+      }
+      if ($0 ~ /^\|[ \t]*[-:|[:space:]]+\|?[ \t]*$/) next
+      phase = plain(cell[col["phase"]])
+      if (phase !~ /^[0-9]+$/) next
+      if (want != "" && phase != want) next
+      printf "%s", phase
+      split("repo state policy ref sha pr by recorded note", want_cols, " ")
+      for (c = 1; c <= 9; c++) {
+        key = want_cols[c]
+        printf "\t%s", (key in col ? plain(cell[col[key]]) : "")
+      }
+      printf "\n"
+    }
+  ' "$LANDING_FILE"
+}
+
+landing_state() {  # landing_state <phase> -> the recorded state, or ""
+  landing_rows "$1" | head -1 | cut -f3
+}
+
+# Which landing state satisfies a `landed` gate under a given policy —
+# LANDED_BY_POLICY, which bash 3.2 carries as `policy:state` pairs.
+_landed_state_for() {  # _landed_state_for <policy>
+  local pair
+  for pair in $LANDED_BY_POLICY; do
+    case "$pair" in "$1":*) printf '%s' "${pair#*:}"; return 0 ;; esac
+  done
+  return 0
+}
+
+# `landed N` / `pr-merged N`. Both answer from the ledger and from nothing
+# else: the point of the pair is that "phase 8's work is on the branch I build
+# on" stops being prose an operator has to confirm.
+_gate_landed() {  # _gate_landed <kind: landed|pr-merged> <phase>
+  local kind="$1" p="$2" policy state wanted
+  case "$p" in ''|*[!0-9]*) printf 'manual: malformed %s gate (expected a phase number): %s\n' "$kind" "$p"; return 1 ;; esac
+  case " ${PHASES[*]} " in
+    *" $p "*) ;;
+    *) printf 'blocked: %s gate names phase %s, which is not in this plan\n' "$kind" "$p"; return 1 ;;
+  esac
+  policy="$(land_for_phase "$p" | cut -f1)"
+  state="$(landing_state "$p")"
+  if [ -z "$state" ]; then
+    printf 'blocked: phase %s has no landing record yet (policy %s)\n' "$p" "$policy"
+    return 1
+  fi
+  if [ "$kind" = pr-merged ]; then
+    case " $PR_MERGED_STATES " in
+      *" $state "*) printf 'clear (phase %s landed: %s)\n' "$p" "$state"; return 0 ;;
+    esac
+    printf 'blocked: phase %s is %s, not merged\n' "$p" "$state"
+    return 1
+  fi
+  wanted="$(_landed_state_for "$policy")"
+  if [ "$state" = "$wanted" ]; then
+    printf 'clear (phase %s landed: %s)\n' "$p" "$state"
+    return 0
+  fi
+  printf 'blocked: phase %s is %s (policy %s wants %s)\n' "$p" "$state" "$policy" "$wanted"
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# Notes a phase is handed by the phases before it (--notes)
+# ---------------------------------------------------------------------------
+#
+# Three sources, one question. A phase that has not started cannot be told
+# anything — it has no session, no transcript and no inbox — so everything a
+# finished phase learned about it has to be left somewhere the ENGINE will read
+# when it finally boards:
+#
+#   1. a handoff's `## Notes for later phases` bullets — what a person wrote
+#      for a person, and what a person will read in the file;
+#   2. the rulings ledger's `deferral` lines — what a session decided to leave,
+#      recorded on its way past rather than remembered until phase-finish;
+#   3. the messages ledger's `deliver: boot` mail — what a peer addressed to a
+#      phase rather than to a session.
+#
+# They are ONE command because the question is one — "what was left for me?" —
+# and a session that has to ask three asks none. Sources 2 and 3 are Pro data
+# read by a FREE script, deliberately: the ledgers are NDJSON a `field()`
+# scanner reads, and a free `phase-graph.sh` that silently dropped two thirds of
+# a phase's mail would be worse than one that never had it.
+#
+# One grammar, in `_note_rows_of` below and nowhere else. It used to be a bare
+# regex read by two hand-rolled awk scans — the lint's and the reader's — which
+# is how a note the lint could see and the reader could not becomes possible.
+# The awk there is written without interval expressions (`[*]*`, never
+# `\*{0,2}`): the macOS awk these scripts target has none, so `{0,2}` matches
+# those four characters literally and the bullet silently never matches. Every
+# other directive regex in this file is read by `grep -E`, where the interval
+# works, which is exactly why the difference is easy to miss.
+
+# How many notes a boot prompt may carry, and how long one may be.
+#
+# The bound is not tidiness: the block is prepended to every boarding prompt of
+# a phase, so an unbounded list is a token bill charged once per attempt and
+# per retry, for text the session mostly already knows. Twelve is what fits on
+# a screen; the trailer says how many older ones were dropped, so nothing is
+# silently swallowed. 500 characters is a note, not an essay — what does not
+# fit belongs in the handoff the note can point at.
+NOTES_MAX="${NOTES_MAX:-12}"
+NOTE_TEXT_MAX=500
+
+# The `## Notes for later phases` section of ONE handoff, as `target<TAB>text`
+# rows — target being a phase number, `next` or `all`, lower-cased.
+#
+# The parser is shared with the F26 lint rather than spelled twice: a note the
+# lint can see and the reader cannot (or the reverse) is the exact failure the
+# lint exists to prevent.
+_note_rows_of() {  # _note_rows_of <handoff-file>
+  awk '
+    function flush(   t) {
+      if (target != "") {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", text)
+        if (text != "") printf "%s\t%s\n", target, text
+      }
+      target = ""; text = ""
+    }
+    tolower($0) ~ /^##[[:space:]]+notes for later phases/ { inside = 1; next }
+    inside && /^##[[:space:]]/ { flush(); inside = 0 }
+    !inside { next }
+    # An HTML COMMENT is not content, and skipping it is load-bearing rather
+    # than tidy: the scaffolded section IS a comment, and it teaches the grammar
+    # by showing `- **Phase 7:** …`. Read as notes, every freshly scaffolded
+    # handoff hands phase 7 an example it never wrote and fails its own plan
+    # F26. Tracked across lines because the block spans them.
+    /<!--/ { comment = 1 }
+    comment { if ($0 ~ /-->/) comment = 0; next }
+    # A new bullet. The label runs to the first colon, and the colon sits INSIDE
+    # the emphasis (`- **Phase 7:** …`), so the closing `**` has to be stripped
+    # off both halves — off the label to read it, off the note so it does not
+    # open with two asterisks everywhere it is shown.
+    /^[[:space:]]*[-*][[:space:]]/ {
+      flush()
+      line = $0
+      sub(/^[[:space:]]*[-*][[:space:]]*/, "", line)
+      sub(/^[*]+/, "", line)
+      ci = index(line, ":")
+      if (ci == 0) next
+      label = substr(line, 1, ci - 1)
+      rest  = substr(line, ci + 1)
+      sub(/[*]+$/, "", label)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", label)
+      lab = tolower(label)
+      sub(/^for[[:space:]]+/, "", lab)
+      if (lab ~ /^phase[[:space:]]+[0-9]+$/) { t = lab; sub(/^phase[[:space:]]+/, "", t); target = t }
+      else if (lab == "next") target = "next"
+      else if (lab == "all")  target = "all"
+      else next
+      sub(/^[*]+[[:space:]]*/, "", rest)
+      text = rest
+      next
+    }
+    # A wrapped sentence is part of the note above it, not a second
+    # instruction — markdown wraps and a handoff is written by hand.
+    inside && target != "" && /^[[:space:]]+[^[:space:]]/ {
+      line = $0; sub(/^[[:space:]]+/, "", line); text = text " " line; next
+    }
+    inside && /^[[:space:]]*$/ { flush(); next }
+    END { flush() }
+  ' "$1"
+}
+
+# Does a note written by <writer> and addressed <target> reach <want>?
+# `next` is a DEPENDENCY relation, never a phase number: on a DAG "the phase
+# after this one" is every phase that lists the writer, and reading it as
+# `writer + 1` would hand a root's note to a phase it never unblocked.
+_note_reaches() {  # _note_reaches <target> <writer> <want>
+  case "$1" in
+    all)  [ "$2" != "$3" ] ;;
+    next) [ "$2" != "$3" ] && _in_list "$2" "${DEPS[$3]:-}" ;;
+    *)    [ "$1" = "$3" ] && [ "$2" != "$3" ] ;;
+  esac
+}
+
+# Where the two ledgers live: the injected path (a lane, a test, the runner)
+# else the console's own state directory, derived exactly as phase-outcome.sh
+# and phase-msg.sh derive it. Prints nothing when there is no root to derive
+# from — an absent ledger is silence, never an error.
+_notes_ledger() {  # _notes_ledger <rulings|messages>
+  local root
+  case "$1" in
+    rulings)  [ -n "${PE_RULINGS_FILE:-}" ]  && { printf '%s' "$PE_RULINGS_FILE"; return 0; } ;;
+    messages) [ -n "${PE_MESSAGES_FILE:-}" ] && { printf '%s' "$PE_MESSAGES_FILE"; return 0; } ;;
+  esac
+  root="$(pe_instance_root 2>/dev/null || true)"
+  [ -n "$root" ] || return 0
+  printf '%s/%s.ndjson' "$(pe_runs_dir "$root" "$slug")" "$1"
+}
+
+# Every note addressed to <phase>, as
+#   urgency<TAB>at<TAB>seq<TAB>source<TAB>kind<TAB>id<TAB>text
+# unsorted and unbounded. `notes_for` does the ordering; this does the reading.
+_notes_candidates() {  # _notes_candidates <phase>
+  local want="$1" p f at src target text seq=0 ledger now id urgency
+  # ---- source 1: the handoffs ----------------------------------------------
+  # DONE phases only. A phase still working may yet change its mind and a
+  # blocked one has not finished the thought; neither has handed anything over,
+  # and a note read off an unfinished handoff is advice its author withdrew.
+  for p in "${PHASES[@]}"; do
+    [ "$p" = "$want" ] && continue
+    [ "$(phase_status "$p")" = "done" ] || continue
+    f="$(handoff_file "$p")"
+    [ -n "$f" ] || continue
+    at="$(grep -m1 '^completed:' "$f" | sed 's/^completed:[[:space:]]*//; s/[[:space:]]*#.*$//' || true)"
+    [ -n "$at" ] || at='-'
+    src="$(basename "$f" .md)"
+    while IFS="$(printf '\t')" read -r target text; do
+      [ -n "$target" ] || continue
+      _note_reaches "$target" "$p" "$want" || continue
+      seq=$((seq + 1))
+      printf '1\t%s\t%s\t%s\thandoff\t-\t%s\n' "$at" "$seq" "$src" "$(printf '%s' "$text" | cut -c1-$NOTE_TEXT_MAX)"
+    done <<EOF
+$(_note_rows_of "$f")
+EOF
+  done
+
+  # ---- source 2: the rulings ledger ----------------------------------------
+  # `deferral` alone. An `ambiguity` or a `deviation` is a session explaining
+  # ITSELF; only a deferral is addressed to somebody — which is the whole
+  # reason `--for` exists on that kind and is refused on the other two.
+  ledger="$(_notes_ledger rulings)"
+  if [ -n "$ledger" ] && [ -f "$ledger" ]; then
+    while IFS="$(printf '\t')" read -r p target at id text; do
+      [ -n "$target" ] || continue
+      _note_reaches "$target" "$p" "$want" || continue
+      seq=$((seq + 1))
+      printf '1\t%s\t%s\tphase-%s\tdeferral\t%s\t%s\n' "$at" "$seq" "$p" "${id:--}" "$(printf '%s' "$text" | cut -c1-$NOTE_TEXT_MAX)"
+    done <<EOF
+$(awk '
+  function field(line, name,    v) {
+    if (match(line, "\"" name "\":\"")) {
+      v = substr(line, RSTART + length(name) + 4); sub(/".*/, "", v); return v
+    }
+    if (match(line, "\"" name "\":[0-9]+")) {
+      v = substr(line, RSTART + length(name) + 3); sub(/[^0-9].*/, "", v); return v
+    }
+    return ""
+  }
+  field($0, "type") != "ruling" { next }
+  field($0, "kind") != "deferral" { next }
+  {
+    # `next` is the default the writer did not have to type: a deferral with no
+    # addressee is for whoever comes next, which is what a session means when
+    # it says "left for later" and does not say for whom.
+    to = field($0, "for"); if (to == "") to = "next"
+    printf "%s\t%s\t%s\t%s\t%s\n", field($0, "phase"), tolower(to), field($0, "at"), field($0, "id"), field($0, "what")
+  }
+' "$ledger")
+EOF
+  fi
+
+  # ---- source 3: the messages ledger ---------------------------------------
+  # Suppressed wholesale by `**Messaging:** off`: that line says this plan's
+  # sessions do not write to each other, and a reader that went on delivering
+  # their mail would be answering a question the plan closed. It says nothing
+  # about the plan's own rulings or its handoffs, so those two stay.
+  if [ "$(plan_messaging | cut -f1)" != off ]; then
+    ledger="$(_notes_ledger messages)"
+    if [ -n "$ledger" ] && [ -f "$ledger" ]; then
+      now="${PE_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+      while IFS="$(printf '\t')" read -r p target at id urgency text; do
+        [ -n "$target" ] || continue
+        _note_reaches "$target" "$p" "$want" || continue
+        seq=$((seq + 1))
+        printf '%s\t%s\t%s\tphase-%s\tmessage\t%s\t%s\n' "${urgency:-1}" "$at" "$seq" "$p" "${id:--}" "$(printf '%s' "$text" | cut -c1-$NOTE_TEXT_MAX)"
+      done <<EOF
+$(awk -v slug="$slug" -v now="$now" '
+  function field(line, name,    v) {
+    if (match(line, "\"" name "\":\"")) {
+      v = substr(line, RSTART + length(name) + 4); sub(/".*/, "", v); return v
+    }
+    if (match(line, "\"" name "\":[0-9]+")) {
+      v = substr(line, RSTART + length(name) + 3); sub(/[^0-9].*/, "", v); return v
+    }
+    return ""
+  }
+  {
+    t = field($0, "type"); id = field($0, "id")
+    # A message whose state has MOVED off queued/held has been dealt with —
+    # delivered, refused, expired. The fold is last-state-wins over appended
+    # delivery lines, exactly as the console folds it, so a boot prompt cannot
+    # hand over the same note twice.
+    if (t == "delivery") { state[id] = field($0, "state"); next }
+    if (t == "ack")      { state[id] = "acked"; next }
+    if (t != "message")  next
+    n++; ids[n] = id
+    froms[n] = field($0, "from"); tos[n] = field($0, "to")
+    delivers[n] = field($0, "deliver"); prios[n] = field($0, "priority")
+    texts[n] = field($0, "text"); ats[n] = field($0, "written_at"); exps[n] = field($0, "expires")
+  }
+  END {
+    for (i = 1; i <= n; i++) {
+      # `boot` alone waits for a phase. `now` and `next-turn` are addressed to a
+      # SESSION, and a session that never started cannot have been meant.
+      if (delivers[i] != "boot") continue
+      st = (ids[i] in state) ? state[ids[i]] : "queued"
+      if (st != "queued" && st != "held") continue
+      if (exps[i] != "" && exps[i] <= now) continue
+      to = tos[i]
+      if (to == "all:") target = "all"
+      else if (to == "next:") target = "next"
+      else if (to == "phase:" slug "/" substr(to, index(to, "/") + 1)) target = substr(to, index(to, "/") + 1)
+      else continue
+      from = froms[i]
+      writer = (index(from, "/") > 0) ? substr(from, index(from, "/") + 1) : ""
+      if (writer !~ /^[0-9]+$/) writer = "-"
+      urgency = (prios[i] == "high") ? 0 : 1
+      printf "%s\t%s\t%s\t%s\t%s\t%s\n", writer, target, ats[i], ids[i], urgency, texts[i]
+    }
+  }
+' "$ledger")
+EOF
+    fi
+  fi
+  return 0
+}
+
+# What phase N was handed, in the order it should read it:
+#   source<TAB>kind<TAB>id<TAB>at<TAB>text
+#
+# Urgent mail first — a `high` message is the one thing here that can change
+# what the session does in its first minute — then oldest to newest, because a
+# note is a story and the ending is what you needed. The bound keeps the NEWEST
+# `NOTES_MAX`: an old note that still mattered has been read by now, and the
+# trailer names how many were left out rather than pretending there were none.
+notes_for() {  # notes_for <phase>
+  local rows total kept dropped tab
+  tab="$(printf '\t')"
+  rows="$(_notes_candidates "$1")"
+  [ -n "$rows" ] || return 0
+  total="$(printf '%s\n' "$rows" | grep -c . || true)"
+  if [ "$total" -gt "$NOTES_MAX" ]; then
+    dropped=$((total - NOTES_MAX))
+    kept="$(printf '%s\n' "$rows" | LC_ALL=C sort -t"$tab" -k1,1 -k2,2r -k3,3nr | head -n "$NOTES_MAX")"
+  else
+    dropped=0
+    kept="$rows"
+  fi
+  printf '%s\n' "$kept" | LC_ALL=C sort -t"$tab" -k1,1 -k2,2 -k3,3n \
+    | awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\n", $4, $5, $6, $2, $7 }'
+  [ "$dropped" -gt 0 ] && printf -- '-\ttrailer\t-\t-\t… and %s older notes, not shown\n' "$dropped"
+  return 0
+}
+
 # THIS phase's QA regime — on | off | waived — the plan's word with the phase's
 # own overriding it. File-independent: it is a statement of INTENT, which is what
 # a boot prompt needs ("do you owe a verdict when you finish?") and is true
@@ -2282,6 +3019,10 @@ case "$mode" in
       [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
       advisories="$(deadlock_advisories)"
       [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
+      advisories="$(land_needs_lane_advisories)"
+      [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
+      advisories="$(note_done_advisories)"
+      [ -n "$advisories" ] && printf '%s\n' "$advisories" >&2
     fi
     if [ -n "$issues" ]; then
       # A closed plan still gets its problems named — they just stop being a gate.
@@ -2393,6 +3134,65 @@ case "$mode" in
     [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --waits-on N\n' >&2; exit 2; }
     case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
     waits_on_refs "$arg"
+    exit 0
+    ;;
+  --land|--gitlink|--isolation|--issues|--conflict-policy|--messaging|--base-branch)
+    # Where a phase's work happens and where it lands (5.1.0). Every arm here
+    # answers `value<TAB>phase|plan|default` — the source token is the point,
+    # since these words have engine-owned defaults and "this plan chose hold"
+    # must not read the same as "this plan never considered landing".
+    #
+    # `--land`, `--gitlink`, `--isolation` and `--issues` take a phase; the
+    # other three are plan-wide and refuse one, because a per-phase base branch
+    # or conflict policy is a fact about the RUN that a phase cannot hold.
+    # `--isolation` alone can answer NOTHING: a phase that says nothing
+    # inherits the run, and the run is not in the plan.
+    case "$mode" in
+      --land|--gitlink|--isolation|--issues)
+        if [ -n "$arg" ]; then
+          case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+        fi ;;
+      *)
+        [ -z "$arg" ] || { printf 'usage: phase-graph.sh <slug> %s   (plan-wide; it takes no phase)\n' "$mode" >&2; exit 2; } ;;
+    esac
+    case "$mode" in
+      --land)            land_for_phase "$arg" ;;
+      --gitlink)         gitlink_for_phase "$arg" ;;
+      --isolation)       isolation_for_phase "$arg" ;;
+      --issues)          issues_for_phase "$arg" ;;
+      --conflict-policy) plan_conflict_policy ;;
+      --messaging)       plan_messaging ;;
+      --base-branch)     plan_base_branch ;;
+    esac
+    exit 0
+    ;;
+  --clash-zones)
+    # The paths two concurrent phases must never both touch, as a csv. No
+    # source token: an empty list and a plan that never named one are the same
+    # instruction to everything that reads it.
+    plan_clash_zones
+    printf '\n'
+    exit 0
+    ;;
+  --landing)
+    # The landing LEDGER, not the policy — what actually happened, as
+    # phase-landing.sh recorded it. One TSV row per record, columns in
+    # LANDING_COLUMNS order; nothing at all when the phase has no record,
+    # which is the fact the `landed` gate blocks on.
+    [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --landing N\n' >&2; exit 2; }
+    case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    landing_rows "$arg"
+    exit 0
+    ;;
+  --notes)
+    # What phase N is handed by the phases before it, from all three sources:
+    # `source<TAB>kind<TAB>id<TAB>at<TAB>text` per line, urgent first and then
+    # oldest to newest, bounded by NOTES_MAX with a `trailer` row naming what
+    # was dropped. Nothing at all when nobody left anything — which is not an
+    # error and not a blank line.
+    [ -n "$arg" ] || { printf 'usage: phase-graph.sh <slug> --notes N\n' >&2; exit 2; }
+    case " ${PHASES[*]} " in *" $arg "*) ;; *) printf 'phase %s is not in this plan\n' "$arg" >&2; exit 2 ;; esac
+    notes_for "$arg"
     exit 0
     ;;
   --decisions)
@@ -2546,7 +3346,7 @@ case "$mode" in
     printf '   a real review, not just tests. Run and extend tests to cover every exit criterion.\n'
     printf -- '4. Write the report from %s/assets/report-template.md to\n' "$skill_root"
     printf -- '   docs/handoffs/%s/%s, then record the verdict:\n' "$slug" "$qa_report"
-    printf '     bash %s/qa-record.sh %s %s <pass|fail|waived> --report %s --round %s\n' "$SCRIPT_DIR" "$slug" "$p" "$qa_report" "$qa_round"
+    printf '     %s/qa-record.sh %s %s <pass|fail|waived> --report %s --round %s\n' "$CMD" "$slug" "$p" "$qa_report" "$qa_round"
     printf -- '5. Commit + push the report + test-status.md, then return the verdict + findings\n'
     printf '   (dependents unblock only once pass|waived; a fail must be pushed to gate them).\n'
     exit 0
@@ -2603,6 +3403,11 @@ case "$mode" in
         # A fact about the world, asserted by a command. See _gate_cmd — off
         # unless PHASE_EXEC_GATES=1.
         if _gate_cmd "$gval"; then exit 0; else exit 1; fi ;;
+      landed|pr-merged)
+        # Has phase N's work actually moved? Read from the landing ledger and
+        # from nothing else — no network, no `gh`, so it answers identically
+        # for a page view, a session and the autopilot.
+        if _gate_landed "$gtype" "$gval"; then exit 0; else exit 1; fi ;;
       date)
         _valid_date "$gval" || { echo "manual: not a valid date: $gval"; exit 1; }
         today="$(date +%F)"; ti="${today//-/}"; gi="${gval//-/}"
@@ -2622,6 +3427,25 @@ case "$mode" in
       *)      echo "manual: $gc"; exit 1 ;;
     esac
     ;;
+  --verified)
+    # The phases that are DONE **and** QA-verified, space-separated — the set a
+    # dependent may safely build on.
+    #
+    # `done` and `verified` are the same question only while QA is off, and a
+    # cross-plan gate was asking the easy one: a phase whose verdict is `fail`
+    # has a `complete` handoff, so it is `done` on the board, and it is exactly
+    # the phase another plan must not gate through (S8-a). `_is_verified` already
+    # knew the difference; nothing had ever asked it across a plan boundary,
+    # because there was no arm to ask through.
+    #
+    # Same shape as `--memory-block`'s `done:` value, so `_gate_plan` reads
+    # either with the same two lines.
+    vf=""
+    for p in "${PHASES[@]}"; do
+      _is_verified "$p" && vf="$vf $p"
+    done
+    printf '%s\n' "${vf# }"
+    exit 0 ;;
   --memory-block)
     # F9: canonical phase-status block for the project_<slug> memory (no drift).
     md_d=""; md_ip=""; md_st=""; md_rd=""; md_wt=""
@@ -2751,12 +3575,30 @@ case "$mode" in
       printf 'They are bring-up, not proof: the runner executes them before §Verification and never\n'
       printf 'marks the phase red for one.\n'
     fi
-    printf 'A long LOCAL job is not an external wait: start it in the background and carry on\n'
-    printf '(`run_in_background: true`, or `… > /tmp/x.log 2>&1 &`), then poll it with a SINGLE\n'
-    printf 'bounded check per turn. Never `until … sleep` inside a turn — the console DENIES the\n'
-    printf 'call, and if one is open for 5 min it nudges you and then parks the phase. If what you\n'
-    printf 'are waiting on is outside this session, commit, hand off `in-progress`, then declare it:\n'
-    printf '    bash %s/phase-outcome.sh %s %s waiting-external --wait-minutes <M> --watch <ref>\n' "$SCRIPT_DIR" "$slug" "$p"
+    # The wait procedure: the same rule sentences as WAIT_PROCEDURE_RULES in
+    # viewer/server/runner/runner-core.ts, SKILL.md and
+    # references/console-surface.md — viewer/test/wait-procedure.test.ts reads
+    # this output against that list. It replaced the old advice to poll a
+    # background job once per turn, which one session obeyed 311 times.
+    printf 'Waiting without polling. Every tool call re-reads your whole context, so a status check\n'
+    printf 'costs as much as an edit. Never make two status checks in a row (`ListAgents`,\n'
+    printf '`TaskOutput`, `date`, `tail`/`grep`/`cat` of a log, `pgrep`, `gh run view`), and never\n'
+    printf 'check on a subagent you dispatched.\n'
+    printf '  1. Work remains → keep working; a background result arrives by itself as a\n'
+    printf '     `<task-notification>`.\n'
+    printf '  2. You need a subagent'\''s answer (a reviewer'\''s verdict) → dispatch the `Agent` in the\n'
+    printf '     FOREGROUND; the call returns with the answer and costs nothing while it runs.\n'
+    printf '  3. You need your own shell job and nothing else is left → wait in ONE foreground call\n'
+    printf '     bounded by the Bash timeout: `until <probe>; do sleep 10; done` with\n'
+    printf '     `timeout: 600000`, at most once per ten minutes. The console allows a wait on your\n'
+    printf '     own job; it refuses one on somebody else'\''s clock.\n'
+    printf '  4. Only subagents or monitors running in the background are left → end your turn; the\n'
+    printf '     session stays alive and their notification wakes you. They are stopped ten minutes\n'
+    printf '     after your turn ends — dispatch a subagent that may take longer in the FOREGROUND.\n'
+    printf '     A background SHELL dies when your turn ends — never end it with one you still need.\n'
+    printf '  5. Somebody else'\''s clock (CI, a deploy, a person) → commit, hand off `in-progress`, then\n'
+    printf '     %s/phase-outcome.sh %s %s waiting-external --wait-minutes <M> --watch <ref>\n' "$CMD" "$slug" "$p"
+    printf '     and stop.\n'
     if [ "${GATED[$p]:-no}" = yes ]; then
       gk="$(gate_kind "$p")"
       ga="$(gate_approved "$p")"
@@ -2775,7 +3617,7 @@ case "$mode" in
               printf '%s\n' "$gc_text" | sed 's/^/    /'
               printf 'Verify each condition for real. If one does not hold yet, DO THE WORK to make it true —\n'
               printf 'clearing this gate is in scope for this session. When every condition holds, record it:\n'
-              printf '    bash %s/gate-approve.sh %s %s --by "ai-session" --note "<one line of evidence>"\n' "$SCRIPT_DIR" "$slug" "$p"
+              printf '    %s/gate-approve.sh %s %s --by "ai-session" --note "<one line of evidence>"\n' "$CMD" "$slug" "$p"
               printf 'then commit + push docs/handoffs/%s/gate-status.md and continue into the phase.\n' "$slug"
               printf 'Only if a condition is genuinely out of reach (missing credentials, a third party):\n'
               printf 'STOP, report exactly what is missing and what you verified, and hand it to the operator.\n'
@@ -2795,11 +3637,11 @@ case "$mode" in
                 printf 'For EACH condition: verify it against evidence you can actually read (a command you\n'
                 printf 'run, a file, a URL you fetch, a CI status). Quote that evidence.\n'
                 printf -- '- Every condition verified → record it and continue into the phase:\n'
-                printf -- '    bash %s/gate-approve.sh %s %s --by "ai-session-delegated" --note "<condition: evidence, per condition>"\n' "$SCRIPT_DIR" "$slug" "$p"
+                printf -- '    %s/gate-approve.sh %s %s --by "ai-session-delegated" --note "<condition: evidence, per condition>"\n' "$CMD" "$slug" "$p"
                 printf -- '- ANY condition you cannot verify from evidence — a visual judgement nobody has made,\n'
                 printf -- '  a credential you lack, a person'"'"'s sign-off, a preview nobody has looked at — STOP.\n'
                 printf -- '  Do not approve it, do not implement past it, and say exactly which condition and why:\n'
-                printf -- '    bash %s/phase-outcome.sh %s %s blocked --needs gates --reason "<the condition you could not verify>"\n' "$SCRIPT_DIR" "$slug" "$p"
+                printf -- '    %s/phase-outcome.sh %s %s blocked --needs gates --reason "<the condition you could not verify>"\n' "$CMD" "$slug" "$p"
                 printf 'Never record an approval you cannot cite evidence for. A gate approved on a guess is\n'
                 printf 'worse than a gate that stopped the run.\n'
               else
@@ -2807,7 +3649,7 @@ case "$mode" in
                 printf 'Operator steps:\n'
                 printf '%s\n' "$gc_text" | sed 's/^/    /'
                 printf 'Ask the operator to do these steps and approve the gate — Phase Console → plan → phase %s\n' "$p"
-                printf -- '→ Gate card, or: bash %s/gate-approve.sh %s %s --by "<who>" --note "<what was done>"\n' "$SCRIPT_DIR" "$slug" "$p"
+                printf -- '→ Gate card, or: %s/gate-approve.sh %s %s --by "<who>" --note "<what was done>"\n' "$CMD" "$slug" "$p"
                 printf 'Do NOT implement past an unapproved human gate.\n'
               fi
               ;;
@@ -2822,14 +3664,14 @@ case "$mode" in
                   # gate no person owns.
                   printf 'That verdict is NOT a refusal and NOT a person'"'"'s gate: a `cmd` gate only executes for a\n'
                   printf 'caller that opts in, and a plain read never does. Evaluate it yourself:\n'
-                  printf '    PHASE_EXEC_GATES=1 bash %s/phase-graph.sh %s --gate-status %s\n' "$SCRIPT_DIR" "$slug" "$p"
+                  printf '    PHASE_EXEC_GATES=1 %s/phase-graph.sh %s --gate-status %s\n' "$CMD" "$slug" "$p"
                   printf 'Read the command first — you are choosing to run text written in a markdown file.\n'
                   ;;
                 *)
-                  printf 'Confirm it is clear before implementing:  bash %s/phase-graph.sh %s --gate-status %s\n' "$SCRIPT_DIR" "$slug" "$p"
+                  printf 'Confirm it is clear before implementing:  %s/phase-graph.sh %s --gate-status %s\n' "$CMD" "$slug" "$p"
                   ;;
               esac
-              printf '(An operator can override a stuck check: bash %s/gate-approve.sh %s %s)\n' "$SCRIPT_DIR" "$slug" "$p"
+              printf '(An operator can override a stuck check: %s/gate-approve.sh %s %s)\n' "$CMD" "$slug" "$p"
               ;;
           esac
           ;;
@@ -2840,14 +3682,38 @@ case "$mode" in
     printf -- '- docs/plans/%s.md §Phase %s + §Session budget (model, budget, branch)\n' "$slug" "$p"
     printf -- '- memory %s\n' "$memory_key"
     printf 'This is a DAG: other phases may be ready too and lower-numbered phases may still be\n'
-    printf 'unfinished — do NOT assume phases below %s are done. Run `scripts/phase-graph.sh %s`\n' "$p" "$slug"
+    printf 'unfinished — do NOT assume phases below %s are done. Run `%s/phase-graph.sh %s`\n' "$p" "$CMD" "$slug"
     printf 'for live state.\n'
+    # What earlier phases LEFT for this one — handoff notes, deferral rulings
+    # and boot-deliverable mail, in one block. It sits here, immediately after
+    # the board and before the decisions manifest, because it is the only part
+    # of this prompt that nobody could have written into the plan: everything
+    # below is the plan's standing instruction, and this is what actually
+    # happened on the way here. Omitted entirely when nobody left anything, so
+    # a plan that never writes a note gets a byte-identical prompt.
+    bp_notes="$(notes_for "$p")"
+    if [ -n "$bp_notes" ]; then
+      bp_n="$(printf '%s\n' "$bp_notes" | awk -F'\t' '$2 != "trailer"' | grep -c . || true)"
+      printf '\n### Notes from earlier phases (%s) — what they left for you, and nothing you can look up:\n' "$bp_n"
+      printf '%s\n' "$bp_notes" | awk -F'\t' '
+        $2 == "trailer" { printf "  %s\n", $5; next }
+        $2 == "message" { printf "  - [%s] %s (mail from %s)\n", $3, $5, $1; next }
+        $2 == "deferral" { printf "  - %s (deferred by %s)\n", $5, $1; next }
+        { printf "  - %s (%s)\n", $5, $1 }
+      '
+      printf 'Each was left by a session that is gone. Say in your handoff what became of each —\n'
+      printf 'acted on, or deliberately not; a note nobody answers is a note nobody writes next time.\n'
+      if printf '%s\n' "$bp_notes" | awk -F'\t' '$2 == "message"' | grep -q .; then
+        printf 'The bracketed ids are mail. Acknowledge the ones you act on, so the sender learns it landed:\n'
+        printf -- '    %s/phase-msg.sh %s %s ack <id>\n' "$CMD" "$slug" "$p"
+      fi
+    fi
     # The decision manifest, resolved for this phase — `outstanding` rows first,
     # because a row nobody has answered is the one thing the session must not
     # discover mid-phase (chapter 13 Tier 0). Then the one duty the manifest
     # puts on a session: a block is declared BY KEY, never asked in prose.
     dec_rows="$(decisions_rows "$p")"
-    printf '\nThis phase'\''s DECISIONS (the plan'\''s manifest, `scripts/phase-graph.sh %s --decisions %s`):\n' "$slug" "$p"
+    printf '\nThis phase'\''s DECISIONS (the plan'\''s manifest, `%s/phase-graph.sh %s --decisions %s`):\n' "$CMD" "$slug" "$p"
     if [ -n "$dec_rows" ]; then
       printf '%s\n' "$dec_rows" | awk -F'\t' '$2 == "outstanding" { printf "  - [%s] %s — owner %s, blocking %s: %s\n", $2, $1, ($3 == "" ? "nobody" : $3), $4, ($6 == "" ? "(no value yet)" : $6) }'
       printf '%s\n' "$dec_rows" | awk -F'\t' '$2 != "outstanding" { printf "  - [%s] %s: %s\n", $2, $1, ($6 == "" ? "(no value)" : $6) }'
@@ -2855,35 +3721,35 @@ case "$mode" in
       printf '  (this plan carries no `## Decisions` manifest — the keys are: %s)\n' "$(printf '%s' "$DECISION_KEYS" | sed 's/ /, /g')"
     fi
     printf 'If you cannot proceed because a decision is missing or wrong, declare it BY KEY and stop:\n'
-    printf -- '    bash %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$SCRIPT_DIR" "$slug" "$p"
+    printf -- '    %s/phase-outcome.sh %s %s blocked --needs <key> --reason "<what you need>"\n' "$CMD" "$slug" "$p"
     printf -- '`--needs` is REQUIRED on `blocked` and `needs-human` (exit 2 without it): a decision key from\n'
     printf 'the list above, or its short form (%s). Never ask in prose — prose reaches nobody.\n' "$(printf '%s' "$NEED_CLASSES" | sed 's/ /, /g')"
     sc="${REPOS[$p]:-all}"
     printf '\nThis phase'\''s SCOPE (the repos it touches, from the plan'\''s Repos column): %s\n' "$sc"
     printf 'Two sessions may run at once ONLY on disjoint scopes. Before implementing:\n'
     printf -- '  1. `git pull`, then check nothing live shares your tree:\n'
-    printf -- '       bash %s/phase-lock.sh %s conflicts %s --scope "%s" --git\n' "$SCRIPT_DIR" "$slug" "$p" "$sc"
+    printf -- '       %s/phase-lock.sh %s conflicts %s --scope "%s" --git\n' "$CMD" "$slug" "$p" "$sc"
     printf -- '     A reported conflict means STOP AND ASK the user — never build over a live session.\n'
     printf -- '  2. Claim it:\n'
-    printf -- '       bash %s/phase-lock.sh %s claim %s --scope "%s" --git\n' "$SCRIPT_DIR" "$slug" "$p" "$sc"
+    printf -- '       %s/phase-lock.sh %s claim %s --scope "%s" --git\n' "$CMD" "$slug" "$p" "$sc"
     printf -- '     (--owner defaults to $PE_OWNER, which the autopilot already exports to its\n'
     printf -- '      sessions — do not override it, or the supervisor cannot release your lock.\n'
     printf -- '      Only a person driving this by hand should pass --owner "<account>/<session>".)\n'
     printf -- '     Need a checkout of your own beside a live build (a QA round, a review)? Never make a\n'
-    printf -- '     sibling folder by hand — `bash %s/phase-lane.sh %s create %s [--qa <round>] [--detach]`\n' "$SCRIPT_DIR" "$slug" "$p"
+    printf -- '     sibling folder by hand — `%s/phase-lane.sh %s create %s [--qa <round>] [--detach]`\n' "$CMD" "$slug" "$p"
     printf -- '     puts one under <root>/.worktrees/hand/, locked; `merge` and `remove` fold it back and clean up.\n'
     printf 'The invariant: never two live sessions whose scopes intersect; same repo ⇒ serialized;\n'
-    printf '`all` ⇒ exclusive; disjoint ⇒ parallel. (Handoff/lock commits in the docs repo are NOT\n'
+    printf '`all` ⇒ exclusive against every unqualified claim; disjoint ⇒ parallel. (Handoff/lock commits in the docs repo are NOT\n'
     printf 'part of your scope — if a commit or pull races another session, pull --rebase and retry\n'
     printf 'up to 3 times; git'\''s own index.lock is the serialization there.)\n'
     printf '\nThen publish this phase'\''s p%s.task* list with `phase-tasks.sh`. Phase Console\n' "$p"
     printf 'renders it live as "What it is doing" — the only way anyone watching an unattended\n'
     printf 'session can see what it thinks it is doing, and it survives a reload and a console\n'
     printf 'restart because the runner folds it into the run record:\n'
-    printf -- '    bash %s/phase-tasks.sh %s %s reset\n' "$SCRIPT_DIR" "$slug" "$p"
-    printf -- '    bash %s/phase-tasks.sh %s %s create --subject "p%s.task1 — <what>"\n' "$SCRIPT_DIR" "$slug" "$p" "$p"
-    printf -- '    bash %s/phase-tasks.sh %s %s update --id p%s.task1 --status in_progress\n' "$SCRIPT_DIR" "$slug" "$p" "$p"
-    printf -- '    bash %s/phase-tasks.sh %s %s update --id p%s.task1 --status completed\n' "$SCRIPT_DIR" "$slug" "$p" "$p"
+    printf -- '    %s/phase-tasks.sh %s %s reset\n' "$CMD" "$slug" "$p"
+    printf -- '    %s/phase-tasks.sh %s %s create --subject "p%s.task1 — <what>"\n' "$CMD" "$slug" "$p" "$p"
+    printf -- '    %s/phase-tasks.sh %s %s update --id p%s.task1 --status in_progress\n' "$CMD" "$slug" "$p" "$p"
+    printf -- '    %s/phase-tasks.sh %s %s update --id p%s.task1 --status completed\n' "$CMD" "$slug" "$p" "$p"
     printf 'The ids are yours: an unnamed create is numbered p%s.task1, p%s.task2 … in order, so an\n' "$p" "$p"
     printf 'update needs nothing read back. Keep the list current as you go.\n'
     printf 'Do NOT go looking for a TodoWrite / TaskCreate / TaskUpdate tool. The CLI stopped\n'
@@ -2894,7 +3760,7 @@ case "$mode" in
     pad="$(printf '%02d' "$((10#$p))")"
     printf '\nWhen done, the deliverable is the HANDOFF — the board reads `status:` from it, and a\n'
     printf 'phase with no handoff does not exist to the board. Scaffold it with:\n'
-    printf -- '    bash %s/new-handoff.sh %s %s <kebab-title> complete\n' "$SCRIPT_DIR" "$slug" "$p"
+    printf -- '    %s/new-handoff.sh %s %s <kebab-title> complete\n' "$CMD" "$slug" "$p"
     printf 'then fill in docs/handoffs/%s/phase-%s-<kebab-title>.md and commit it.\n' "$slug" "$pad"
     printf 'Cannot finish? Hand off `in-progress` (paused, resumable) or `blocked` (needs help) —\n'
     # The QA duty, stated where the session will actually read it — and BEFORE
@@ -2912,15 +3778,15 @@ case "$mode" in
         printf 'writes a `pending` QA row, and a pending row holds every dependent phase exactly\n'
         printf 'as a failure does. Nothing dispatches QA on your behalf. Before you stop, run a\n'
         printf 'FRESH-context QA subagent over this phase (get its brief with\n'
-        printf -- '`scripts/phase-graph.sh %s --qa-prompt %s`) and record what it finds:\n' "$slug" "$p"
+        printf -- '`%s/phase-graph.sh %s --qa-prompt %s`) and record what it finds:\n' "$CMD" "$slug" "$p"
         _bpn="$(qa_next_round "$p")"
         printf -- '    bash %s/qa-record.sh %s %s <pass|fail|waived> --report %s --round %s\n' \
           "$SCRIPT_DIR" "$slug" "$p" "${_bpn#*	}" "${_bpn%%	*}"
         printf 'Never review your own work as the QA verdict, and never hand-edit test-status.md.\n'
         printf 'Dispatch the subagent, record the verdict, THEN stop.\n'
-        printf 'The reviewer is work inside your turn: wait for it to return and record its verdict\n'
-        printf 'before the turn ends. A subagent dies with the turn that dispatched it, so a turn\n'
-        printf 'that ends mid-review records nothing.\n'
+        printf 'The reviewer is work inside your turn: dispatch it in the FOREGROUND, so the call returns\n'
+        printf 'with its verdict and costs nothing while it runs, then record the verdict before the turn\n'
+        printf 'ends. A turn that ends before the verdict is recorded records nothing.\n'
         ;;
       *)
         printf 'never end the session without a handoff. Stop after the handoff exists.\n'
@@ -2929,7 +3795,7 @@ case "$mode" in
     printf 'Waiting on something OUTSIDE this session (a CI build, a PR auto-merge, a deploy\n'
     printf 'window)? Saying so in prose is invisible to the supervisor. Hand off `in-progress`,\n'
     printf 'then declare it and stop:\n'
-    printf -- '    bash %s/phase-outcome.sh %s %s waiting-external --wait-minutes <M> --reason "<what>" --watch <ref>\n' "$SCRIPT_DIR" "$slug" "$p"
+    printf -- '    %s/phase-outcome.sh %s %s waiting-external --wait-minutes <M> --reason "<what>" --watch <ref>\n' "$CMD" "$slug" "$p"
     printf 'The supervisor parks the phase and resumes THIS session when the window elapses.\n'
     exit 0
     ;;
@@ -3021,11 +3887,11 @@ if [ "$HAVE_SIZES" = 1 ]; then
   board_budget="$(resolve_budget "$(plan_model)")"   # F6: honour the plan's Session budget model
   batches="$(compute_groups "$board_budget" | sed 's/ /+/g; s/|/]  [/g')"
   printf 'SUGGESTED BATCHES (budget ~%sK, joined phases share a session): [%s]\n' "$((board_budget / 1000))" "$batches"
-  printf '   model-specific grouping → scripts/phase-graph.sh %s --session-plan <model>\n' "$slug"
+  printf '   model-specific grouping → %s/phase-graph.sh %s --session-plan <model>\n' "$CMD" "$slug"
 fi
 if [ "$done_n" = "$total" ]; then
   printf '\n🏁 All %s phases done — run §End-to-end verification, then close the plan:\n' "$total"
-  printf '   scripts/close-plan.sh %s --status complete --reason "<what shipped>"\n' "$slug"
+  printf '   %s/close-plan.sh %s --status complete --reason "<what shipped>"\n' "$CMD" "$slug"
 elif [ -z "$ready_list" ] && [ -z "$inprog_list" ]; then
   printf '\n⚠️  Nothing ready and nothing in progress — every remaining phase is waiting on a dep.\n'
   printf '   Check the WAITING list above for a stuck/blocked dependency.\n'

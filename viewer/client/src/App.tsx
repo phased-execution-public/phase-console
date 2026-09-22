@@ -288,56 +288,58 @@ export function App() {
         route={route}
         phone={phone}
         banners={
-          (state.fleet?.frozen || state.serverStale || stopped || !online || sse !== 'live') && (
-            <>
-              {/* First, above everything else. A frozen console EXPLAINS every
+          <>
+            {(state.fleet?.frozen || state.serverStale || stopped || !online || sse !== 'live') && (
+              <>
+                {/* First, above everything else. A frozen console EXPLAINS every
                   other symptom on the page — the queue that is not moving, the
                   run that has not spoken — and none of them explains it. */}
-              <FleetFrozenBanner />
-              {state.serverStale && (
-                <Banner severity="warn">
-                  <div className="min-w-0">
-                    <strong>This console is running older code than is on disk.</strong> Node loads the server
-                    once, at startup — the page reloads from disk but the process cannot. Restart it, or a fix
-                    you already have will look like it did not work.
-                  </div>
-                </Banner>
-              )}
-              {/* A console you stopped on purpose outranks every other reading
-                  of a dead stream: "Reconnecting…" would be a promise nothing
-                  is going to keep. */}
-              {stopped ? (
-                <Banner severity="warn">
-                  <Power size={15} className="mt-0.5 shrink-0" aria-hidden />
-                  <div className="min-w-0">
-                    <strong>
-                      {sse === 'live' ? 'This console is shutting down.' : 'This console is off.'}
-                    </strong>{' '}
-                    {stopped.via === 'exit'
-                      ? 'The process has ended.'
-                      : 'Its unit was unloaded and disabled, and a stop marker holds its work — not even a login brings it back.'}{' '}
-                    Start it again with <code className="font-mono text-2xs">{stopped.hint}</code>.
-                  </div>
-                </Banner>
-              ) : (
-                (!online || sse !== 'live') && (
-                  <Banner severity={!online || sse === 'offline' ? 'error' : 'info'}>
-                    <WifiOff size={15} className="mt-0.5 shrink-0" aria-hidden />
+                <FleetFrozenBanner />
+                {state.serverStale && (
+                  <Banner severity="warn">
                     <div className="min-w-0">
-                      {/* Being offline outranks whatever the stream thinks: it
-                        explains the stream, and it is the one the reader can
-                        actually do something about. */}
-                      {!online
-                        ? 'This device is offline. Everything below was loaded before that and is no longer updating.'
-                        : sse === 'offline'
-                          ? 'Live updates stopped. Reload to reconnect.'
-                          : 'Reconnecting to the console — the board may be a moment behind.'}
+                      <strong>This console is running older code than is on disk.</strong> Node loads the
+                      server once, at startup — the page reloads from disk but the process cannot. Restart it,
+                      or a fix you already have will look like it did not work.
                     </div>
                   </Banner>
-                )
-              )}
-            </>
-          )
+                )}
+                {/* A console you stopped on purpose outranks every other reading
+                  of a dead stream: "Reconnecting…" would be a promise nothing
+                  is going to keep. */}
+                {stopped ? (
+                  <Banner severity="warn">
+                    <Power size={15} className="mt-0.5 shrink-0" aria-hidden />
+                    <div className="min-w-0">
+                      <strong>
+                        {sse === 'live' ? 'This console is shutting down.' : 'This console is off.'}
+                      </strong>{' '}
+                      {stopped.via === 'exit'
+                        ? 'The process has ended.'
+                        : 'Its unit was unloaded and disabled, and a stop marker holds its work — not even a login brings it back.'}{' '}
+                      Start it again with <code className="font-mono text-2xs">{stopped.hint}</code>.
+                    </div>
+                  </Banner>
+                ) : (
+                  (!online || sse !== 'live') && (
+                    <Banner severity={!online || sse === 'offline' ? 'error' : 'info'}>
+                      <WifiOff size={15} className="mt-0.5 shrink-0" aria-hidden />
+                      <div className="min-w-0">
+                        {/* Being offline outranks whatever the stream thinks: it
+                        explains the stream, and it is the one the reader can
+                        actually do something about. */}
+                        {!online
+                          ? 'This device is offline. Everything below was loaded before that and is no longer updating.'
+                          : sse === 'offline'
+                            ? 'Live updates stopped. Reload to reconnect.'
+                            : 'Reconnecting to the console — the board may be a moment behind.'}
+                      </div>
+                    </Banner>
+                  )
+                )}
+              </>
+            )}
+          </>
         }
       >
         <RouteFrame view={View} route={route} fullHeight={fullHeight} />

@@ -37,6 +37,7 @@ import { relativeTime } from '@/lib/format';
 const KIND_TONE: Readonly<Record<SettleKind, BadgeTone>> = Object.freeze({
   settled: 'ok',
   landed: 'ok',
+  pushed: 'ok',
   pending: 'neutral',
   unsupported: 'neutral',
   failed: 'bad',
@@ -47,6 +48,7 @@ const KIND_TONE: Readonly<Record<SettleKind, BadgeTone>> = Object.freeze({
 const KIND_BLURB: Readonly<Record<SettleKind, string>> = Object.freeze({
   settled: 'The lane folded back into the run branch.',
   landed: 'The work reached the trunk.',
+  pushed: "The console pushed the phase's branch to its origin — the one publication it makes.",
   pending: 'A settle that has not happened yet. Not a failure.',
   unsupported: 'This repository cannot settle that way — a configuration fact, not an error.',
   failed: 'The settle did not complete. The detail says what stopped it.',

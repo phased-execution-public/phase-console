@@ -225,6 +225,26 @@ const WALL = new Set(['phase.live-wall', 'run.limit-paused', 'phase.model-window
 export const RUNG_EVENTS = new Set(['phase.rung', 'phase.rung-unavailable']);
 const RUNG = RUNG_EVENTS;
 
+/**
+ * Phase events that move no bar and are KNOWN not to — so they are not counted
+ * as `unmapped`.
+ *
+ * `unmapped` exists to say "a phase event landed that this projection does not
+ * understand", and it is only worth reading while it stays small. Two of the
+ * events many-plans-one-repo phase 13 adds are high-volume by construction:
+ * `phase.resources` lands up to once a minute per live lane for the whole run,
+ * and `phase.suspect` lands per loop. Neither is a span or a tick — a memory
+ * reading is a COUNTER, drawn as one by the Chrome export, and a suspicion is
+ * an annotation on a lane that is already drawn — so folding them into
+ * `unmapped` would have a healthy four-hour run report two hundred
+ * "unmodelled" events and make the number useless for the one thing it is for.
+ *
+ * The rule for adding a name here: it must be an event a reader has ALREADY
+ * decided the timeline should not draw. An event nobody has thought about
+ * belongs in `unmapped`, which is exactly the point of the counter.
+ */
+export const KNOWN_NO_BAR = new Set(['phase.resources', 'phase.suspect']);
+
 /* ------------------------------------------------------------------ *
  * Projection
  * ------------------------------------------------------------------ */
@@ -424,8 +444,9 @@ export function projectTimeline(
       continue;
     }
 
-    // Everything else is real journal traffic that simply does not move a bar.
-    unmapped++;
+    // Everything else is real journal traffic that simply does not move a bar —
+    // except the names we have already decided do not move one.
+    if (!KNOWN_NO_BAR.has(entry.event)) unmapped++;
   }
 
   const built: TimelineLane[] = [...lanes.values()]

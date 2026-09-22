@@ -20,7 +20,7 @@ import { useAccounts } from '@/lib/queries';
 import { useNow } from '@/lib/clock';
 import { cn } from '@/lib/cn';
 import { runStatusTitle, runUiState } from '@/lib/status-vocab';
-import type { EtaEstimate, PhaseEta, PhaseRecord, RunState } from '@/lib/api';
+import type { EtaEstimate, LaneLiveness, PhaseEta, PhaseRecord, RunState } from '@/lib/api';
 
 /**
  * The phases this run holds a live session on, lowest first.
@@ -207,8 +207,24 @@ export function RunHeader({
  * no window reported there is nothing to say and the slot goes back to being a
  * freshness stamp.
  */
-export function RunTiles({ run, phases, total }: { run: RunState; phases: PhaseRecord[]; total?: number }) {
+export function RunTiles({
+  run,
+  phases,
+  total,
+  liveness,
+}: {
+  run: RunState;
+  phases: PhaseRecord[];
+  total?: number;
+  /** The run's live lanes (`GET /api/run/:slug` `liveness[]`) — what the sessions in flight have cost. */
+  liveness?: LaneLiveness[];
+}) {
   const done = phases.filter((p) => p.status === 'done').length;
+  // The unbooked half of the spend. A session is booked into `spentUsd` only
+  // when it ends, so a tile showing that alone once read $266.34 while $111.87
+  // was running (autopilot-token-drain H7). Shown BESIDE the booked figure,
+  // never summed into it: the live half is a running total that can still grow.
+  const liveUsd = (liveness ?? []).reduce((sum, lane) => sum + (lane.spentUsd ?? 0), 0);
   // The denominator is the PLAN's phase count, not this run's record count. A
   // run holds a record only for phases it boarded, so a plan wedged after two
   // of eight read "2 / 2" in the tile above the fold — indistinguishable from a
@@ -227,7 +243,19 @@ export function RunTiles({ run, phases, total }: { run: RunState; phases: PhaseR
     <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
       <Tile
         label="Spent"
-        value={money(run.spentUsd)}
+        value={
+          <>
+            {money(run.spentUsd)}
+            {liveUsd > 0 && (
+              <span
+                className="ml-2 font-sans text-sm text-ink-muted"
+                title="What the sessions still running have cost so far. Each is added to Spent when it ends."
+              >
+                + {money(liveUsd)} live
+              </span>
+            )}
+          </>
+        }
         // A phase whose session was lost before the CLI reported its spend
         // books $0, and $0 reads as "this was free" — which is the one thing it
         // certainly was not. Named rather than guessed at.

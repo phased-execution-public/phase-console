@@ -35,7 +35,7 @@
 import { Slot } from '@radix-ui/react-slot';
 import { useState, type ReactNode } from 'react';
 import { Button } from '@/components/ui';
-import type { PhaseView, RunState } from '@/lib/api';
+import type { PhaseView, PlanReviewer, RunState } from '@/lib/api';
 import { RunSetup } from '@/features/run-setup/run-setup';
 
 export function SettingsSheet({
@@ -46,6 +46,7 @@ export function SettingsSheet({
   planPhases,
   planSkills,
   planMcp = [],
+  planReviewers = [],
   qaMode,
   allowWrites,
   stillWorking = false,
@@ -70,6 +71,8 @@ export function SettingsSheet({
   planPhases: PhaseView[];
   planSkills: string[];
   planMcp?: string[];
+  /** Where the plan orders its own reviewer — `RunSetup` advises from it. */
+  planReviewers?: PlanReviewer[];
   qaMode?: string;
   allowWrites?: boolean;
   /** The control that opens it. Defaults to a plain `Settings` button. */
@@ -101,6 +104,7 @@ export function SettingsSheet({
           planPhases={planPhases}
           planSkills={planSkills}
           planMcp={planMcp}
+          planReviewers={planReviewers}
           {...(qaMode !== undefined ? { qaMode } : {})}
           {...(allowWrites !== undefined ? { allowWrites } : {})}
           blocked={!allowRun || stillWorking}

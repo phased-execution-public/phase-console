@@ -28,6 +28,13 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 VIEWER="$ROOT/viewer"
+# Every `node --test` below: no test may run for more than ten minutes, and a
+# file exits once its tests are done. `node --test` has no timeout of its own —
+# one stranded await hung the whole suite silently for 88 minutes — and a timeout
+# alone fails the test but leaves a file with a live handle running for ever.
+# The same two flags as `npm test` (viewer/package.json); test/suite-timeout.test.ts
+# holds them together.
+NODE_TEST_BOUND=(--test-timeout=600000 --test-force-exit)
 # A git hook that runs this inherits git's view of ITS repository (an absolute
 # GIT_DIR in a submodule checkout); the suites below run git in temp repos.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
@@ -83,7 +90,7 @@ stages() {
 # --- the stages, one function each; the name is the stage with - as _ -------
 stage_bash_engine()      { (cd "$ROOT" && bash tests/run-tests.sh); }
 stage_npm_ci()           { (cd "$VIEWER" && npm ci); }
-stage_engine_parity()    { (cd "$VIEWER" && node --test test/engine-parity.test.ts); }
+stage_engine_parity()    { (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" test/engine-parity.test.ts); }
 stage_server_suite() {
   # Serial on purpose: the suite is documented load-sensitive. The three
   # timing-sensitive files run on their own, below, with one retry each.
@@ -94,9 +101,12 @@ stage_server_suite() {
       *) files+=("test/$(basename "$f")") ;;
     esac
   done
-  (cd "$VIEWER" && node --test --test-concurrency=1 "${files[@]}")
+  (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" --test-concurrency=1 "${files[@]}")
 }
-retry_once() { (cd "$VIEWER" && node --test "$1") || (cd "$VIEWER" && node --test "$1"); }
+retry_once() {
+  (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" "$1") \
+    || (cd "$VIEWER" && node --test "${NODE_TEST_BOUND[@]}" "$1")
+}
 stage_terminal()         { retry_once test/terminal.test.ts; }
 stage_spawn_protocol()   { retry_once test/spawn-protocol.test.ts; }
 stage_runner_parallel()  { retry_once test/runner-parallel.test.ts; }

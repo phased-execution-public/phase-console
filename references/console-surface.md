@@ -4,7 +4,8 @@ Contents: What a supervised session is · The convergence loop · The watch cloc
 The Stop hook · Permission profiles and the deny wall · Never wait inside a turn ·
 Questions · Run settings ·
 The remediation ladder · Freeze and thaw · Talking to a running phase ·
-Session terminals · Reading the console's API · Where the state lives
+What happens around your phase · Session terminals · Reading the console's API ·
+Where the state lives
 
 SKILL.md tells a session how to execute a phase. This file tells it what is executing it — the
 machinery Phase Console wraps around a `claude -p` session when a run drives phases by itself
@@ -34,9 +35,11 @@ to the console's inbox without it, which is how a hand-driven session's declarat
 running console.
 
 Two consequences the contract in SKILL.md's boot prompt spells out and that are worth restating
-here: **the process exits when your turn ends** (no `ScheduleWakeup`, no background watcher survives
-it), and **your deliverable is the handoff** — a clean exit with no handoff and no declared outcome
-reads as a failed phase, not as a quiet success.
+here: **what survives the end of your turn is narrow** — a background shell is stopped within
+seconds and `ScheduleWakeup` wakes nothing, while an `Agent` or `Monitor` running in the background keeps the process
+alive (for the CLI's background-wait ceiling, ten minutes) and its completion starts your next turn;
+with nothing outstanding the process exits — and **your deliverable is the handoff** — a clean exit
+with no handoff and no declared outcome reads as a failed phase, not as a quiet success.
 
 Two more facts about the process itself. **It runs under two caps it did not choose.** Every session
 the console spawns carries `--max-budget-usd` and `--max-turns`, set per session by `capsFor`
@@ -49,6 +52,30 @@ process to leave.** When the console stops a session it wakes the process (SIGCO
 SIGINT and gives it `INT_GRACE_MS` (5 s) — long enough for the CLI to close the turn and write its
 `result`, so what the session spent reaches the record — and only then SIGTERMs the process group, with
 a SIGKILL backstop (`viewer/server/runner/signals.ts`).
+
+**It also runs under a context line, judged on every API call** (autopilot-token-drain phase 3,
+`viewer/server/runner/usage.ts`). Each call re-reads the whole conversation, so the console folds every
+call's `message.usage` and compares your newest context with your model's window (`scripts/models.env`
+classes: `[1m]` and the big families 1M, anything else 200k). At **0.6 ×** you are told once, in a
+`Supervisor check`, to finish the step you are on, commit, hand off `in-progress` and declare
+`phase-outcome.sh <slug> <N> partial --reason context`. At **0.8 ×** the console checkpoints the session
+itself and boards the next attempt FRESH with the resume brief — that session is never `--resume`d,
+because resuming it would re-read all of it. Each line acts once per session, and only on the phase's
+own session: a closeout, a QA round or a repair is never cut off. Every session's counters are journalled
+`phase.tokens` and kept on the record as `tokens[]`; the run view shows a live lane's context now and at
+its peak, its cache rebuilds and its status checks.
+
+**And a resume is judged before it happens** (autopilot-token-drain phase 4, `resumePolicy` in
+`viewer/server/runner/usage.ts`). A `--resume` re-reads the whole conversation, and a cold one writes all
+of it into the cache again on its first call — a 681k session resumed four hours later rewrote 554k before
+it did anything. So a session is resumed only while it is worth resuming: one that ended at ≥ 250k tokens
+of context and is cold (idle ≥ 55 min) or under another account, that declared `partial --reason
+budget|context`, or that the console checkpointed is boarded FRESH with the resume brief instead. That
+holds for every resume — a wait whose window elapsed or whose ref landed, a `partial`, an account switch,
+a model's window, a QA round — and the brief carries what the resume would have: your handoff, the
+uncommitted paths, your last words and, for a wait, its refs and what it was waiting on. Each decision is
+journalled `phase.resume-policy`. Declaring `partial --reason context` when told to wrap up is the cheap
+exit, not a request to be resumed into the same context.
 
 ## The convergence loop — converge, classify, climb
 
@@ -85,7 +112,8 @@ next visits your plan. Five schemes:
 | `lock:<slug>/<phase>` | nothing holds that phase's scope any more |
 | `cmd:"<command>"` | the command exits 0 |
 
-**What happens when one lands:** your OWN session is resumed, with your declaration still on the
+**What happens when one lands:** your OWN session is resumed (or, when it is no longer worth resuming —
+above — the phase boards fresh with what landed in its brief), with your declaration still on the
 record and `declared.landed` beside it, and an instruction that names what actually happened. A run
 that ended `cancelled` gets "decide whether to re-run it", not "re-check it" — so read the
 instruction rather than assuming the thing you waited for succeeded. Three resumes per landing; after
@@ -195,17 +223,26 @@ resumes your own session. If the phase cannot proceed without the tool, declare 
 rule and the command as fields —
 `phase-outcome.sh <slug> <N> blocked --needs permission --rule "<the rule>" --command "<the command>"`
 — and stop. The card is driven only from the console's own recorded denial: a wall described in prose,
-a denial that names no rule, and the wait guard's `in-turn-wait` offer nothing to widen.
+a denial that names no rule, and the guards' `in-turn-wait` and `poll-loop` offer nothing to widen.
 
-## Never wait inside a turn
+## Never wait on somebody else's clock inside a turn — and never poll
 
 There is one refusal that is NOT a deny rule, and a session meets it as a deny, so it is worth
 knowing which is which. A `Bash` call that by construction waits — `until …; do sleep …; done`,
 `while true; do sleep …`, `sleep 90`, `sleep 5m`, `watch -n`, `gh run watch`, a `--watch` flag,
-`tail -f`, a foreground `docker compose up` — is refused **before it runs**, on every profile, by
-`Service.decideToolUse` (rule `in-turn-wait`, journalled `phase.tool-denied`). The vocabulary is the
-shared one in `scripts/verify.env`, the same list lint F16 warns from at plan time. `docker compose
-up -d` is carved out: it returns.
+`tail -f`, a foreground `docker compose up` — is matched **before it runs**, on every profile, by
+`Service.decideToolUse`, and refused when the clock it waits on is not the session's own (rule
+`in-turn-wait`, journalled `phase.tool-denied`). The vocabulary is the shared one in
+`scripts/verify.env`, the same list lint F16 warns from at plan time. `docker compose up -d` is
+carved out: it returns.
+
+Whose clock is read off the command (`liveness.ts` `waitScope`): a named remote — `gh`, `aws`,
+`kubectl`, `ssh`, a URL, a deploy verb — is somebody else's and always outranks; a command that
+names something local — a `/tmp` path, a `.log`, a `[ -f … ]` test, a `pgrep` — is your own; one that
+names neither is treated as somebody else's. **A wait on your own job is allowed** (autopilot-token-drain,
+2026-09-16, reversing the refusal half of RCV-5): one foreground call bounded by the Bash timeout
+costs one call, and refusing it left a session with a background job and nothing to do but poll —
+311 status-only calls in one measured phase.
 
 The command is judged **per statement, split the way bash splits it** (`liveness.ts`
 `splitStatements`): a statement ending in a single `&` is backgrounded and never a wait — the one
@@ -229,12 +266,40 @@ is open the turn produces nothing, no stream event arrives, and the phase's excl
 on a lease keepalive that looks perfectly healthy from outside. One measured phase sat 35+ minutes in
 two such loops holding `scope=all`.
 
-Two remedies, and which one applies depends on whose clock you are on:
+What to do instead is one procedure, the same words the deny reason, the boot prompt and SKILL.md
+carry:
 
-| the wait is on | do this |
+**Waiting without polling.** Every tool call re-reads your whole context, so a status check costs as
+much as an edit. Never make two status checks in a row (`ListAgents`, `TaskOutput`, `date`,
+`tail`/`grep`/`cat` of a log, `pgrep`, `gh run view`), and never check on a subagent you dispatched.
+
+| when | do this |
 |---|---|
-| **a job you started** — a suite, a build, a log | background it (`run_in_background: true`, or `… > /tmp/x.log 2>&1 &`) and carry on; poll it with a SINGLE bounded check per turn |
-| **somebody else's clock** — CI, a deploy, a release | commit, hand off `in-progress`, `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, stop |
+| **Work remains** | keep working; a background result arrives by itself as a `<task-notification>`. |
+| **You need a subagent's answer** (a reviewer's verdict) | dispatch the `Agent` in the FOREGROUND; the call returns with the answer and costs nothing while it runs. |
+| **You need your own shell job and nothing else is left** | wait in ONE foreground call bounded by the Bash timeout: `until <probe>; do sleep 10; done` with `timeout: 600000`, at most once per ten minutes. The console allows a wait on your own job; it refuses one on somebody else's clock. |
+| **Only subagents or monitors running in the background are left** | end your turn; the session stays alive and their notification wakes you. They are stopped ten minutes after your turn ends — dispatch a subagent that may take longer in the FOREGROUND. A background SHELL dies when your turn ends — never end it with one you still need. The Stop hook lets that turn end (`hook.stop-awaiting`), and liveness does not read the quiet as `silent` until `stallLocalJobMs`. |
+| **Somebody else's clock** (CI, a deploy, a person) | commit, hand off `in-progress`, `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, stop. |
+
+**A run of status checks is refused too** (rule `poll-loop`, autopilot-token-drain phase 2). The console
+counts your own calls, never a subagent's: `ListAgents`, a `TaskOutput` that does not block,
+`BashOutput`, a `Bash` made only of clock and process probes and reads of a log or task output
+(`date`, `pgrep`, `ps`, `sleep`, and `tail`/`cat`/`grep`/`wc`/`ls`/`stat` of a `*.log`, a `*.output` or a
+`/tasks/` path), and any Bash command repeated, digits folded, within two minutes. Six of those inside
+two minutes with no other call between is a loop: the sixth is refused, and so is every status check
+after it until you make a different call or go two minutes without one (`shared/poll-loop.js`). The
+episode opens with one notice written into your session — once per lane, journalled `phase.poll-loop` —
+and each refusal is journalled `phase.tool-denied`. Like `in-turn-wait` it is not a deny rule: the same
+on every profile, never stamped on the record, nothing to widen. A blocking `TaskOutput` and a
+foreground `Agent` are the waits the procedure asks for, and neither counts.
+
+What survives the end of a turn was measured (CLI 2.1.273, this runner's framing, stdin closed at
+the first result as the runner closes it): a background `Bash` is stopped about five seconds after
+the turn ends; an `Agent` or a `Monitor` running in the background keeps the process alive and its completion starts
+a new turn; a foreground bounded `until … sleep` loop is not blocked by the CLI; a foreground `Agent`
+makes zero parent API calls while it runs. A `Monitor` reaches the stream as `task_type: local_bash`
+— only the tool that started it tells it from a background `Bash` — so the console pairs the task
+to its tool call by `tool_use_id`.
 
 And if a wait is already open when the console looks — the guard catches the call you are about to
 make, not one you made before it existed, or one spelled in a way the vocabulary does not know — the
@@ -243,7 +308,8 @@ same split decides what happens to you, read off the command (`liveness.ts` `wai
 - **External** (`gh`, `aws`, `kubectl`, `ssh`, a URL): after `stallExternalWaitMs` (5 min) the console
   **parks** the phase and releases its lock — in its own name (`by: 'watchdog'`), on its own allowance
   of 4 parks per phase (`WATCHDOG_PARKS_MAX_PER_PHASE`), never your declared waits or your wait budget.
-  Nothing is lost — you are resumed on your own session id.
+  Nothing is lost — you are resumed on your own session id (or boarded fresh with the resume brief,
+  when that session is no longer worth resuming).
 - **Local** (a `/tmp` log, a `tasks/*.output`, a `pgrep`, a `[ -f … ]`): you get **one nudge** into
   your stdin saying what to do instead, and the park only after `stallLocalJobMs` (45 min). The gap
   exists because parking a session 40 minutes into its own suite does not release anything useful; it
@@ -321,7 +387,7 @@ answers to the decision manifest: `resumeOnRestart`, `relay`, `accounts` (`[{id,
 omits `resumeOnRestart`, `relay` or `accounts` is answered **400** naming the missing field — the
 launch form's Decisions stage is where they are answered, and a scripted start has to answer them
 too. With them given, the **prelude** (`viewer/server/prelude.ts`) runs the plan's `## Decisions`
-rows and four probes — accounts, MCP, credentials, delivery — and a blocking row still `outstanding`,
+rows and five probes — accounts, MCP, credentials, delivery, verification — and a blocking row still `outstanding`,
 a `waived` row nobody acknowledged, or a failed blocking probe answers **409** `{unanswered: [{key,
 why}], prelude}`. `manifestOverride: {by}` starts anyway and journals `run.manifest-override`; a
 channel-less start is admitted only with `acknowledgedWaivers: ['announce']`. A resume
@@ -350,6 +416,15 @@ review with real consequences** — a `requested-changes` holds this phase's dep
 person's would. `reviewerPolicy` (`comment-only`, the default, or `may-hold`) is what restricts that.
 
 So: if your phase finishes and the board does not move, look for a review before looking for a bug.
+
+**A reviewer your PLAN orders runs in the FOREGROUND.** When the plan tells you to dispatch a reviewer
+at phase-finish (a `subagent_type` reviewer, a §Adversarial review), dispatch it as a foreground
+`Agent`: the wait procedure's rule 2, a call that returns with the verdict and costs nothing while it
+runs. A reviewer sent to the background leaves a builder with nothing to do but check on it: run
+`deadaff9`'s P3 waited on its reviewers with `ListAgents` + `date` every ~4 s, in streaks of 100 and 198
+calls, and status-only calls were 79 % of that session's context tokens. With
+`reviewEachPhase` on as well, the same diff is reviewed twice; the launch form says so beside the toggle
+(the plan's words, or a QA gate that is on), and keeping one of the two is the operator's call, not yours.
 
 **The two ultra tiers are opt-ins that spend, and both are off.** `ultracode` has no CLI flag — the
 opt-in is the word, so with it on your boot prompt (and every resume or unblock brief) carries a
@@ -483,6 +558,42 @@ verb says who sent it**: a route derives the actor from the request (`actorOfReq
 `operator` for a browser or the CLI and `script` for anything else. A message a script sent is
 recorded as the script's, never as the operator's.
 
+## What happens around your phase — landing, notes, issues, the trace id
+
+Five things the console does around a phase since 5.1.0. None of them is something you do; all of
+them change what your handoff should say.
+
+**Your branch is landed for you, and you never push it.** When a phase settles, the console reads the
+plan's `Land:` word and acts on it — and pushing is *its* act, behind `--allow-publish`, through a
+frozen argv that can only ever push a `pe/*` branch and can never force. So: **never `git push`
+yourself**, and never open the pull request by hand. A phase whose word is `pr` or `trunk` ends with
+the console pushing your lane and spawning a separate landing session whose only job is the PR; if
+you push first, that session finds work already done and the ledger disagrees with the repository. If
+your lane will not merge, that is the plan's `Conflicts:` word to answer, not yours — you may be
+resumed with a bounded instruction to merge the run branch *into* your lane and resolve it, and that
+instruction is deliberately narrower than it looks: merge, resolve, re-verify, commit, stop. Never
+rebase, never force, never touch another branch. The landing ledger is the console's file; write to
+it only through `scripts/phase-landing.sh`, and only when an instruction tells you to.
+
+**Notes from earlier phases arrive in your boot prompt.** A handoff bullet addressed to you, a
+deferral ruling left for you, and mail queued for your boot are collected into one block under
+*"Notes from earlier phases"*. Each was left by a session that is gone, so nothing else will ever
+tell you. Say in your handoff what became of each — acted on, or deliberately not. Leave your own the
+same way, in `## Notes for later phases`: it is the only channel that reaches a phase which has not
+started yet.
+
+**Every line your phase writes carries one trace id.** The run derives it once and it rides the HTTP
+request, the drive, your attempt, your session, the bash scripts and every git command — so a
+post-mortem is one `grep`, and a resumed run continues the same trace instead of splitting in two.
+You do not set it; it matters because it is what makes "what happened during phase 9" answerable at
+all, and it is why a bundle is worth attaching to a bug report.
+
+**Two detectors watch and do nothing.** `looping` notices a lane repeating an identical failing tool
+call over its last ten calls; `stuck` notices a live session silent for twenty minutes. Neither
+acts — they raise a mark a person can see. If you are about to retry the same failing command a
+fourth time, the detector is right and the plan is not going to change under you: stop and declare.
+
+
 ## Session terminals — other sessions on this machine
 
 Every Claude session on the machine reports presence through `scripts/session-hook.sh`
@@ -504,7 +615,8 @@ inbox itself with `phase-console sessions ingest`, which then supplies the peers
 
 A phase the scheduler queues says what it waits behind, in words worth recognising: a lock's owner;
 `session <id> (pid N)` — a live session in the same scope that has not claimed a lock yet, the one
-window a lock cannot guard; `session cap` (`N of N lanes`) — this console is full; or `machine cap`
+window a lock cannot guard, for ten minutes after it starts or resumes (for as long as it lives when
+it is already working that very phase); `session cap` (`N of N lanes`) — this console is full; or `machine cap`
 (`the machine is full — N of M lanes: …`) — every console on this machine together is. None of them
 is a fault in your phase.
 

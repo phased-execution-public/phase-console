@@ -12,7 +12,6 @@ import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, sani
 import { DECISION_KEYS, mergeDecisions } from '../shared/decisions-model.js';
 import { policyForKey, policyForPlan, policyPrefsOf } from './runner/policy.ts';
 import { homedir } from 'node:os';
-import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs';
 
 import { instanceId } from '../shared/instances.mjs';
@@ -98,7 +97,7 @@ import { sanitiseSchedule } from '../shared/schedule-policy.js';
 import { sanitiseRelayRules, type RelayMechanism } from '../shared/relay-model.js';
 import type { RelayReply } from './relay.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
-import { ISOLATION_MODES, ISOLATION_RECLAIM, SETTLE_STRATEGIES, WORKTREE_ROOTS} from '../shared/worktree-model.js';
+import { ISOLATION_MODES, ISOLATION_RECLAIM, pairKey, retentionOf, SETTLE_STRATEGIES, WORKTREE_ROOTS} from '../shared/worktree-model.js';
 import {
   RESUME_AT_BOOT_MODES, fromAutomation, resumeAtBootMode,
 } from '../shared/automation-model.js';
@@ -120,8 +119,10 @@ import {
 import {
   FREEZE_ESCALATE_MS, escalatePersistedFreeze, runFreezeVerdict, type PersistedEscalation,
 } from './runner/freeze.ts';
-import type { LaneLiveness } from './runner/liveness.ts';
-import { inTurnWait } from './runner/liveness.ts';
+import type { BackgroundTask, LaneLiveness } from './runner/liveness.ts';
+import { inTurnWait, waitScope } from './runner/liveness.ts';
+import { pollLoopNotice, waitProcedure } from './runner/runner-core.ts';
+import { isStatusCapable, type PollVerdict } from '../shared/poll-loop.js';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive,
@@ -165,7 +166,7 @@ import {
   autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf,
   parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED,
   PERMISSION_PROFILES, PROFILE_LABELS,
-  DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH,
+  DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH, PUSH_DENY,
   type Evidence, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
 
@@ -176,6 +177,14 @@ import { ServiceRecovery } from './service-recovery.ts';
 import { trimOldest, NOTIFIED_CAP } from './service-base.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
 import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
+// The four launch-default vocabularies (phase 15) are read on a FREE line —
+// the settings door stores the words in both trees, and their owners ship in
+// both (the contracts, phase 2) — so their import sits outside the region
+// below. Inside it, the free tree's typecheck read `LAND_POLICIES` and its three
+// siblings as undeclared names from 5.0.0 until this release.
+import { CONFLICT_POLICIES, LAND_POLICIES } from '../shared/landing-model.js';
+import { MESSAGING_WORDS } from '../shared/message-model.js';
+import { ISSUE_MODES } from '../shared/issues-model.js';
 
 export {
   HOOK_EVENTS_PER_MINUTE,
@@ -1759,6 +1768,14 @@ export class Service extends ServiceRecovery {
     // This console's reach and its siblings — the instance-health rows (FLT-1 iv, FLT-6).
     const fleet = await ok('fleet', () => this.inboxFleetFacts(), undefined);
 
+    // The sessions' issue drafts a person owes a decision on (phase 12) —
+    // every open plan's ledger, through the base's default (nothing) or the
+    // Pro override.
+    const issueDrafts = await ok('issue-drafts', () => this.inboxIssueDrafts(), []);
+    // …and what the sessions said to the operator (phase 15), through the
+    // same base default (nothing) or the Pro override.
+    const messages = await ok('messages', () => this.inboxMessages(), []);
+
     const facts = {
       runs, approvals: this.approvals.all(), plans, locks, lockPresence, fleet,
       sessions: sessionFacts,
@@ -1770,9 +1787,12 @@ export class Service extends ServiceRecovery {
         allowWrites: this.flags.allowWrites, allowRun: this.flags.allowRun,
         allowTerminal: this.flags.allowTerminal, allowAgent: this.flags.allowAgent,
         allowAccounts: this.flags.allowAccounts, allowMcp: this.flags.allowMcp,
+        allowPublish: this.flags.allowPublish,
       },
       rulings,
       policyAnswers,
+      issueDrafts,
+      messages,
       stalledPlans,
       // The isolated runs' branch facts, read from the runner caches — the
       // conflict rows' one fact. Nothing is probed here; see `runGitFacts`.
@@ -1785,7 +1805,16 @@ export class Service extends ServiceRecovery {
           ...(entry.checkout ? { checkout: entry.checkout } : {}),
           ...(entry.isolationRefusal ? { isolationRefusal: entry.isolationRefusal } : {}),
           ...(entry.mounts ? { mounts: entry.mounts } : {}),
-          radar: entry.view.radar,
+          // …with the repository radar's clash zones joined on. The per-run
+          // probe measures the VERDICT; only the repository radar knows the
+          // zones, because only it reads `.phase-console/clash-zones` and the
+          // open plans' lines. Joined here by `pairKey`, through a map the Pro
+          // half fills and this half merely reads — see `radarZones`, and the
+          // free tree, where it is empty and this line is a no-op.
+          radar: entry.view.radar.map((pair) => {
+            const zones = this.radarZones.get(pairKey(pair.a, pair.b));
+            return zones?.length ? { ...pair, zones } : pair;
+          }),
         })),
         // The runs that asked for a checkout and were refused: no probe, no
         // radar — one fact and its reason, for the row that says so (G3).
@@ -2180,8 +2209,10 @@ export class Service extends ServiceRecovery {
    * The Stop hook's decision: may this session end its turn?
    *
    * Yes when the phase's board reads done, or a valid outcome file is
-   * declared, or the session was already blocked twice (the loop guard), or
-   * anything about the question cannot be answered — fail open, always: this
+   * declared, or the session's own subagents or monitors are still working in
+   * the background (their notification wakes it), or the session was already blocked
+   * twice (the loop guard), or anything about the question cannot be
+   * answered — fail open, always: this
    * hook carries workflow, never safety, and the runner's own exit-time
    * check is the load-bearing layer. A block carries the precise
    * instructions: finish the closeout, or declare the wait.
@@ -2235,6 +2266,24 @@ export class Service extends ServiceRecovery {
     });
     if (declared) return allow;
 
+    // A turn that ends while this session's own agents or monitors are still
+    // working is a WAIT, not an exit (autopilot-token-drain phase 1): measured
+    // under `-p`, an Agent or Monitor running in the background keeps the process alive and its
+    // completion starts a new turn. Holding that turn instead is what left a
+    // session nothing to do but poll its reviewer — 311 status-only calls in
+    // one phase. A background SHELL is not in the list: it dies with the turn,
+    // so a session ending on one is still told to finish or declare. A lookup
+    // that throws is no evidence either way, and the decision below stands.
+    let awaiting: BackgroundTask[] = [];
+    try { awaiting = this.runnerByRunId(state.id)?.awaitingBackground?.(phase) ?? []; } catch { awaiting = []; }
+    if (awaiting.length) {
+      log.info('hook.stop-awaiting', {
+        slug: state.slug, phase, sessionId,
+        tasks: awaiting.map((task) => ({ id: task.id, type: task.taskType ?? null, tool: task.tool ?? null })),
+      });
+      return allow;
+    }
+
     const blocks = this.stopBlocks.get(sessionId) ?? 0;
     if (blocks >= 2) return allow;
     if (this.stopBlocks.size > 512) this.stopBlocks.clear();
@@ -2251,7 +2300,8 @@ export class Service extends ServiceRecovery {
           decision: 'block',
           reason: `Phase ${phase} of ${state.slug} is done on the board but its QA verdict is still owed — `
             + 'this plan gates on QA, and a pending row holds every dependent phase exactly as a '
-            + 'failure does. Dispatch a FRESH-context QA subagent now — get its brief with '
+            + 'failure does. Dispatch a FRESH-context QA subagent now, in the FOREGROUND, so the call '
+            + 'returns with its verdict — get its brief with '
             + `\`bash ${this.flags.scriptsDir}/phase-graph.sh ${state.slug} --qa-prompt ${phase}\` — and `
             + `record what it finds with \`bash ${this.flags.scriptsDir}/qa-record.sh ${state.slug} ${phase} `
             + `<pass|fail|waived> --report ${owed.report} --round ${owed.round}\`. Then stop.`,
@@ -2316,6 +2366,10 @@ export class Service extends ServiceRecovery {
     const policy = carvedPolicy(
       loadPolicyFor(run?.slug ?? null), profile,
       run?.gitMode === 'new-branch' && run.openPr !== false,
+      // …and the publish carve-out (phase 8): a plan that lands by pull
+      // request boards landing sessions whose `gh pr create`/`gh pr merge`
+      // ask under every profile. The push is never theirs — the wall stands.
+      run ? this.planPublishes(run.slug) : false,
     );
 
     // The hook fires on every matching tool, so most calls have to be answered
@@ -2347,6 +2401,57 @@ export class Service extends ServiceRecovery {
       if (verdict === 'hold') return this.holdQuestion(run, phase, toolName, input);
     }
 
+    // Both guards below stand down while the lane verifies: `§Verification`
+    // runs the phase's own commands, and a plan is entitled to a slow one there.
+    const verifying = lane ? lane.status === 'verifying' || Boolean(lane.verifyingSince) : false;
+
+    // The poll-loop guard (autopilot-token-drain phase 2). The session's OWN
+    // status checks go to its lane's tracker — never a subagent's: the CLI sets
+    // `agent_id` only on a call made inside one — and the stream feeds that
+    // tracker every other call the session makes, so six checks inside two
+    // minutes with nothing between is a loop, and each check of the episode is
+    // refused with what was seen and the wait procedure. Measured: 311 status
+    // checks in one phase, 79 % of its context tokens.
+    //
+    // Shaped like the in-turn wait guard: outside `policy`, identical on every
+    // profile, only ever turning an `allow` into a deny (a call the wall or a
+    // person decides is neither counted nor refused here), and failing open — a
+    // tracker that throws must not cost the session its call.
+    //
+    // Journalled, never stamped on the record: `record.toolDenied` is the
+    // permission wall's evidence (the widen card, `blocked:permission`), and a
+    // loop is not a wall. There is nothing to widen.
+    if (verdict === 'allow' && run && typeof phase === 'number' && !verifying && !body.agent_id && isStatusCapable(toolName)) {
+      const runner = this.runnerByRunId(run.id);
+      let poll: PollVerdict | null = null;
+      try { poll = runner?.observeToolCall?.(phase, { name: toolName, input }) ?? null; } catch { poll = null; }
+      if (poll?.deny && poll.episode) {
+        const notice = pollLoopNotice(poll.episode, `bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase}`);
+        const command = (input as { command?: unknown } | null)?.command;
+        try {
+          runner?.note('phase.tool-denied', {
+            tool: toolName, rule: 'poll-loop',
+            ...(typeof command === 'string' ? { command: command.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+          }, phase);
+          // The episode's first refusal also writes the notice into the session
+          // — once per lane, the runner's rule — and says whether it landed.
+          if (poll.episodeStart) {
+            const nudged = runner?.nudgePollLoop?.(phase, notice) ?? false;
+            runner?.note('phase.poll-loop', {
+              ...poll.episode, firstAt: new Date(poll.episode.firstAt).toISOString(), nudged,
+            }, phase);
+          }
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: notice,
+          },
+        };
+      }
+    }
+
     // The in-turn wait guard. Deliberately OUTSIDE `policy` — not a deny rule,
     // not a profile, not a strike: `policy.deny` and all three profiles are
     // byte-identical before and after this block, and every profile gets the
@@ -2365,15 +2470,21 @@ export class Service extends ServiceRecovery {
     // hook fails open everywhere else and inventing a deny for a session we
     // are not driving would break an unsupervised CLI that happens to point at
     // this port.
+    //
+    // And a wait on the session's OWN job is allowed (autopilot-token-drain
+    // phase 1, reversing part of RCV-5): one foreground call bounded by the
+    // Bash timeout costs one call, and refusing it left a session with nothing
+    // but a background job and a poll — measured at 311 status-only calls in
+    // one phase. `waitScope` is the split the stall ladder already makes, read
+    // off the same command: `REMOTE_WAIT` outranks, so `gh run watch … >
+    // /tmp/ci.log` is still somebody else's clock, and anything that names
+    // nothing local stays external — the refusal is the default.
     if (verdict === 'allow' && toolName === 'Bash' && run) {
-      const verifying = lane
-        ? lane.status === 'verifying' || Boolean(lane.verifyingSince)
-        : false;
       const bashCommand = (input as { command?: unknown } | null)?.command;
       const matched = verifying || typeof bashCommand !== 'string'
         ? null
         : inTurnWait(bashCommand, loadVerifyEnv(this.flags.scriptsDir));
-      if (matched) {
+      if (matched && waitScope(bashCommand as string) === 'external') {
         const runner = this.runnerByRunId(run.id);
         runner?.note('phase.tool-denied', { tool: toolName, rule: 'in-turn-wait', matched }, phase ?? undefined);
         // …and to the lane's own signals: a denied wait opens no call, so this is
@@ -2389,12 +2500,9 @@ export class Service extends ServiceRecovery {
             hookEventName: 'PreToolUse',
             permissionDecision: 'deny',
             permissionDecisionReason:
-              'the console does not let a supervised session wait inside a turn (matched '
-              + `\`${matched}\`). Start the job in the background — \`run_in_background: true\` or `
-              + '`… > /tmp/x.log 2>&1 &` — and keep working; poll it with a SINGLE bounded check '
-              + 'per turn, never a loop. If the thing you are waiting on is outside this session, '
-              + 'commit, hand off `in-progress`, then `phase-outcome.sh <slug> <N> waiting-external '
-              + '--wait-minutes <M> --watch <ref>` and stop.',
+              'the console does not let a supervised session wait inside a turn on somebody else\'s '
+              + `clock (matched \`${matched}\`); a wait on a job this session started itself is allowed.\n`
+              + waitProcedure(`bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase ?? '<N>'}`),
           },
         };
       }
@@ -2727,6 +2835,19 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * May the console push THIS run's branches (many-plans-one-repo phase 8)?
+   * Two gates, both required: the console was started with `--allow-publish`,
+   * and the plan's `permission.destructive` row names `git push` as an
+   * exception for this phase (a per-phase row outranks the plan-wide one,
+   * exactly as the carve-out's auto-grant reads it). A preference is not a
+   * plan's decision, so nothing in Settings can widen this.
+   */
+  protected override publishAllowedFor(state: RunState, phase: number): boolean {
+    if (!this.flags.allowPublish) return false;
+    return this.destructiveException(state, phase, PUSH_DENY) !== null;
+  }
+
+  /**
    * The plan's `permission.destructive` exception for one publishing rule, or
    * null (TRS-4). Read from the plan's own rows merged for this phase — a
    * per-phase row outranks the plan-wide one — and from the run's manifest when
@@ -2813,6 +2934,7 @@ export class Service extends ServiceRecovery {
       truncated: entries.length >= limit,
     });
   }
+
 
   /**
    * One phase's boardings, and what changed between each consecutive pair.
@@ -3050,6 +3172,7 @@ export class Service extends ServiceRecovery {
     return { ...history, scanned: { runs: runs.length, entriesPerRun: entryCap } };
   }
 
+
   savePreferences(input: Partial<Prefs> & { automation?: unknown }, opts: { by?: string } = {}): Prefs {
     // 🔑 **Either shape, one allowlist.** 3.5.0's `automation` object is
     // FLATTENED here and then picked apart exactly as a flat patch is, so the
@@ -3084,6 +3207,7 @@ export class Service extends ServiceRecovery {
       picked.reviewerPolicy = patch.reviewerPolicy;
     }
     if (typeof patch.repoGuard === 'boolean') picked.repoGuard = patch.repoGuard;
+    if (typeof patch.radarSerialize === 'boolean') picked.radarSerialize = patch.radarSerialize;
     // Membership from the owner list rather than a local pair of `===`. Note
     // this is a DROP and not a coercion: `isolationMode()` would turn a typo
     // into a stored `queue`, and the rule on this door is that a value it
@@ -3107,6 +3231,35 @@ export class Service extends ServiceRecovery {
     // Same DROP-not-coerce rule: a word this door cannot read leaves the
     // operator's placement exactly where it was.
     if (WORKTREE_ROOTS.includes(patch.worktreeRoot as never)) picked.worktreeRoot = patch.worktreeRoot;
+    // The per-REPOSITORY cap, by `worktreeMaxConcurrent`'s rule exactly: a
+    // zero would refuse every isolated run in a repository while the setting
+    // still reads "isolation is on", so it is dropped rather than stored.
+    if (typeof patch.maxConcurrentPerRepo === 'number'
+      && Number.isFinite(patch.maxConcurrentPerRepo) && patch.maxConcurrentPerRepo > 0) {
+      picked.maxConcurrentPerRepo = patch.maxConcurrentPerRepo;
+    }
+    // Retention is the one word-valued setting whose vocabulary is OPEN —
+    // `ttl:<h>` is a member with a parameter — so membership is asked of the
+    // owner's coercer, and a word it had to fall back on is DROPPED rather
+    // than stored. A typo must never become the reason a tree was deleted, and
+    // silently storing `keep-on-failure` for `prun` would hide the typo too.
+    if (typeof patch.worktreeRetention === 'string'
+      && retentionOf(patch.worktreeRetention) === patch.worktreeRetention.trim().toLowerCase()) {
+      picked.worktreeRetention = patch.worktreeRetention.trim().toLowerCase();
+    }
+    // A base branch is free text — it is a ref name — so the only question is
+    // whether anything was said at all. An empty string is not a ref.
+    if (typeof patch.baseBranch === 'string' && patch.baseBranch.trim()) {
+      picked.baseBranch = patch.baseBranch.trim();
+    }
+    // Phase 15's four launch defaults — membership from each owner list, and
+    // a DROP rather than a coercion, the rule every word-valued neighbour
+    // follows: a value this door cannot read leaves the operator's setting
+    // exactly as they left it.
+    if (LAND_POLICIES.includes(patch.landing as never)) picked.landing = patch.landing;
+    if (CONFLICT_POLICIES.includes(patch.conflictPolicy as never)) picked.conflictPolicy = patch.conflictPolicy;
+    if (MESSAGING_WORDS.includes(patch.messaging as never)) picked.messaging = patch.messaging;
+    if (ISSUE_MODES.includes(patch.issuesMode as never)) picked.issuesMode = patch.issuesMode;
     // Membership from the owner list, and a DROP rather than a coercion —
     // the same rule `isolation` above follows: a value this door cannot read
     // leaves the operator's setting exactly as they left it, where
@@ -3148,6 +3301,9 @@ export class Service extends ServiceRecovery {
     if (cap(patch.stallExternalWaitMs)) picked.stallExternalWaitMs = patch.stallExternalWaitMs;
     if (typeof patch.stallAutomaticPark === 'boolean') picked.stallAutomaticPark = patch.stallAutomaticPark;
     if (positive(patch.stallLocalJobMs)) picked.stallLocalJobMs = patch.stallLocalJobMs;
+    // The sixth signal's run length (phase 13) — in the loader since it
+    // shipped and NOT here until phase 15: the Settings control saved nothing.
+    if (positive(patch.stallLoopRun)) picked.stallLoopRun = patch.stallLoopRun;
     // …and the escalation clock takes `cap` on both sides, because 0 means
     // "never re-say it" rather than "every tick". Two lists of the same keys:
     // a key in the loader and not here is a setting that survives a restart

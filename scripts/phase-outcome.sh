@@ -103,7 +103,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/instance.sh"
 # The decision manifest's vocabulary — the OWNER is viewer/shared/decisions-model.js,
 # decisions.env its bash twin (held equal by viewer/test/decisions-model.test.ts).
-DECISION_KEYS="permission.policy permission.destructive credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
+DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
 NEED_CLASSES="lock permission credential gate external"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
@@ -118,7 +118,8 @@ usage() {
   echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · cmd:"<command>"' >&2
   echo '       phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]' >&2
   echo '                        [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]' >&2
-  echo '                        [--needs KEY] [--remember plan|global]' >&2
+  echo '                        [--for <N|next|all>] [--needs KEY] [--remember plan|global]' >&2
+  echo '   --for: who a DEFERRAL is left for (default next) — what `phase-graph.sh --notes N` collects' >&2
   echo '   --needs KEY on a ruling: the decision key it answers (stamped as decisionKey)' >&2
   echo '   --remember plan: write the ruling as a ## Decisions row (source ruling) and ack it' >&2
   echo '   --remember global: ask the owning console to set its policy.<key> answer to --what' >&2
@@ -184,7 +185,7 @@ _watch_problem() {  # _watch_problem <ref>
 reason=""; wait_minutes=""; until_iso=""
 needs=""; rule=""; command_text=""
 watch_count=0; watch_json=""
-what=""; why=""; kind=""; cost=""; remember=""; by_word=""
+what=""; why=""; kind=""; cost=""; remember=""; by_word=""; for_whom=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --reason)       reason="${2:?--reason needs text}"; shift 2 ;;
@@ -195,6 +196,7 @@ while [ $# -gt 0 ]; do
     --why)          why="${2:?--why needs text}"; shift 2 ;;
     --kind)         kind="${2:?--kind needs a word}"; shift 2 ;;
     --cost-if-wrong) cost="${2:?--cost-if-wrong needs text}"; shift 2 ;;
+    --for)          for_whom="${2:?--for needs a phase number, next or all}"; shift 2 ;;
     --remember)     remember="${2:?--remember needs plan or global}"; shift 2 ;;
     --by)           by_word="${2:?--by needs a name}"; shift 2 ;;
     --wait-minutes) wait_minutes="${2:?--wait-minutes needs a number}"; shift 2 ;;
@@ -233,6 +235,24 @@ if [ "$mode" = ruling ]; then
   [ -n "$kind" ] || kind=ambiguity
   case "$kind" in ambiguity|deviation|deferral) : ;; *)
     echo "invalid --kind: $kind (want ambiguity|deviation|deferral)" >&2; exit 2 ;; esac
+  # Who the deferral is FOR. Only a deferral has an addressee: an ambiguity and
+  # a deviation are a session explaining itself, and `--for` on one would be a
+  # note `--notes` will never collect and nobody will ever be told about.
+  #
+  # The default is `next` and it is WRITTEN rather than left to the reader:
+  # "left for later" without a name means "for whoever comes next", and a
+  # reader that had to know the default is a second place the default lives.
+  if [ -n "$for_whom" ]; then
+    [ "$kind" = deferral ] || { echo "--for belongs to --kind deferral: an $kind is a session explaining itself, not a note addressed to a phase" >&2; exit 2; }
+    case "$for_whom" in
+      next|all) : ;;
+      ''|*[!0-9]*) echo "invalid --for: $for_whom (want a phase number, next or all)" >&2; exit 2 ;;
+      0*) [ "$((10#$for_whom))" -gt 0 ] || { echo "invalid --for: $for_whom (a phase is numbered from 1)" >&2; exit 2; } ;;
+      *) [ "$for_whom" -gt 0 ] || { echo "invalid --for: $for_whom (a phase is numbered from 1)" >&2; exit 2; } ;;
+    esac
+  elif [ "$kind" = deferral ]; then
+    for_whom=next
+  fi
   # The key a ruling answers is a manifest KEY, never a blocker short form: a
   # ruling decided something, it is not declaring what blocks it.
   if [ -n "$needs" ]; then
@@ -247,8 +267,8 @@ if [ "$mode" = ruling ]; then
       [ -n "$needs" ] || { echo "--remember $remember needs --needs <key>: a ruling is remembered under the decision key it answers" >&2; exit 2; } ;;
     *) echo "invalid --remember: $remember (want plan|global)" >&2; exit 2 ;;
   esac
-elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ] || [ -n "$remember" ] || [ -n "$by_word" ]; then
-  echo "--what/--why/--kind/--cost-if-wrong/--remember/--by only make sense with ruling, not $status" >&2; exit 2
+elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ] || [ -n "$remember" ] || [ -n "$by_word" ] || [ -n "$for_whom" ]; then
+  echo "--what/--why/--kind/--cost-if-wrong/--for/--remember/--by only make sense with ruling, not $status" >&2; exit 2
 fi
 
 if [ -n "$wait_minutes" ] && [ -n "$until_iso" ]; then
@@ -364,11 +384,12 @@ if [ "$mode" = ruling ]; then
   why_json="$( [ -n "$why" ] && printf ',"why":"%s"' "$(_json_str "$why")" || true )"
   cost_json="$( [ -n "$cost" ] && printf ',"cost_if_wrong":"%s"' "$(_json_str "$cost")" || true )"
   key_json="$( [ -n "$needs" ] && printf ',"decisionKey":"%s"' "$needs" || true )"
+  for_json="$( [ -n "$for_whom" ] && printf ',"for":"%s"' "$for_whom" || true )"
   session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
   id_json="$( [ -n "$ruling_id" ] && printf '"id":"%s",' "$ruling_id" || true )"
   # ONE line: the file is NDJSON and a pretty-printed record would make every
   # reader a parser with state.
-  line="{\"version\":1,\"type\":\"ruling\",${id_json}\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"kind\":\"$kind\",\"what\":\"$(_json_str "$what")\"${why_json}${cost_json}${key_json}${session_json},\"at\":\"$(_json_str "$now")\"}"
+  line="{\"version\":1,\"type\":\"ruling\",${id_json}\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"kind\":\"$kind\",\"what\":\"$(_json_str "$what")\"${why_json}${cost_json}${for_json}${key_json}${session_json},\"at\":\"$(_json_str "$now")\"}"
 
   written=0
   if [ -n "${PE_RULINGS_FILE:-}" ]; then
@@ -466,12 +487,20 @@ rule_line="$( [ -n "$rule" ] && printf '\n  "rule": "%s",' "$(_json_str "$rule")
 command_line="$( [ -n "$command_text" ] && printf '\n  "command": "%s",' "$(_json_str "$command_text")" || true )"
 resume_line="$( [ -n "$resume_after" ] && printf '\n  "resume_after": "%s",' "$(_json_str "$resume_after")" || true )"
 session_line="$( [ -n "$session" ] && printf '\n  "session_id": "%s",' "$session" || true )"
+# The trace this session belongs to (5.1.0). A declaration is the one thing the
+# runner acts on, so "which drive was this the outcome of" is exactly the
+# question worth being able to answer from the file alone — and after a console
+# restart the file is often all that is left. `span` rides WITH `trace`, never
+# without: a span id alone points into a trace nobody named.
+trace_line="$( [ -n "${PE_TRACE_ID:-}" ] && printf '\n  "trace": "%s",' "$(_json_str "$PE_TRACE_ID")" || true )"
+span_line="$( [ -n "${PE_TRACE_ID:-}" ] && [ -n "${PE_SPAN_ID:-}" ] \
+  && printf '\n  "span": "%s",' "$(_json_str "$PE_SPAN_ID")" || true )"
 
 json="{
   \"version\": 1,
   \"slug\": \"$(_json_str "$slug")\",
   \"phase\": $phase,
-  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${resume_line}${session_line}
+  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${resume_line}${session_line}${trace_line}${span_line}
   \"watch\": [$watch_json],
   \"written_at\": \"$(_json_str "$now")\"
 }"
@@ -500,7 +529,14 @@ else
   # the JSON on stdout for whoever is reading, and the exit stays 0.
   root="$(pe_instance_root)"
   inbox="$(pe_runs_dir "$root" "$slug")/outcomes"
-  target="$inbox/phase-$(printf '%02d' "$phase").json"
+  # `phase-NN-<written_at>.json`, never the bare `phase-NN.json` it used to be:
+  # one name per phase meant a second declaration `mv`'d over an unread first,
+  # and this inbox is the ONLY channel a session nobody supervises has into the
+  # autopilot — a channel that destroys its own backlog is prose with extra
+  # steps. The basic ISO form (no colons, no dashes) is legal on every
+  # filesystem AND sorts oldest-first as a plain string, which is exactly what
+  # lets the console ingest a backlog in the order it was written.
+  target="$inbox/phase-$(printf '%02d' "$phase")-$(printf '%s' "$now" | tr -d ':-').json"
   if mkdir -p "$inbox" 2>/dev/null; then
     tmp="$target.tmp.$$"
     if printf '%s\n' "$json" > "$tmp" 2>/dev/null && mv "$tmp" "$target" 2>/dev/null; then

@@ -53,7 +53,7 @@ export const STAGES: readonly Stage[] = Object.freeze([
   {
     // First, since 5.0.0 (phase 11): everything a run could ask a person
     // mid-run is asked here, before anything starts — the decision manifest
-    // with each row's state, the four probes, and the answers the door
+    // with each row's state, the probes, and the answers the door
     // requires. Launch stays disabled while a blocking row is outstanding.
     id: 'decisions',
     label: 'Decisions',
@@ -103,6 +103,7 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
   accounts: 'decisions',
   acknowledgedWaivers: 'decisions',
   manifestOverride: 'decisions',
+  verifyAnswers: 'decisions',
 
   onlyPhases: 'what',
   startAfter: 'what',
@@ -117,6 +118,15 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
   openPr: 'how',
   isolation: 'how',
   settle: 'how',
+  // Phase 15's seven: the branch and checkout, the landing, and what a
+  // session may say and file — all questions about HOW it runs.
+  baseBranch: 'how',
+  maxConcurrentPerRepo: 'how',
+  worktreeRetention: 'how',
+  landing: 'how',
+  conflictPolicy: 'how',
+  messaging: 'how',
+  issuesMode: 'how',
   attachDefaultSkills: 'how',
   skills: 'how',
   mcpServers: 'how',
@@ -165,6 +175,13 @@ export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.free
   openPr: 'Open a PR when the plan completes',
   isolation: 'Give this run its own checkout',
   settle: 'When the plan completes',
+  baseBranch: 'Base branch',
+  maxConcurrentPerRepo: 'Runs beside it in the repository',
+  worktreeRetention: 'When the run settles, its checkouts',
+  landing: 'When a phase settles',
+  conflictPolicy: 'When a landing will not merge',
+  messaging: 'Sessions may message each other',
+  issuesMode: 'Issues a session finds outside its phase',
   priority: 'Queue priority',
   startAfter: 'Start after (optional)',
   reviewEachPhase: 'Review each phase',
@@ -192,6 +209,7 @@ export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.free
   accounts: 'Accounts it may spend (id:minimum headroom %)',
   acknowledgedWaivers: 'Acknowledged waivers',
   manifestOverride: 'Start anyway, recorded as',
+  verifyAnswers: 'Verification commands',
 });
 
 /** Which modes get the stage bar. See the header. */

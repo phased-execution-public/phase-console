@@ -173,7 +173,7 @@ describe('the Decisions stage', () => {
     expect(within(manifest).getByText('credentials')).toBeTruthy();
     expect(within(manifest).getByText('blocks a start')).toBeTruthy();
     expect(within(manifest).getByText('the shipped default')).toBeTruthy();
-    // The four probes.
+    // The probes.
     const probes = within(stage).getByRole('list', { name: 'Probe verdicts' });
     expect(within(probes).getByText(/1 of 1 credential held/)).toBeTruthy();
     expect(within(probes).getByText(/no MCP server named/)).toBeTruthy();
@@ -288,6 +288,144 @@ describe('the Decisions stage', () => {
       'relay',
       'announce',
     ]);
+  });
+
+  it('a command the runner will not run is answered here: approve it, Launch opens, the fingerprint rides the payload', async () => {
+    // Run f0da619a (2026-09-18): a `bats` line halted an autopilot mid-run. The
+    // door now asks about it before anything starts — by exact command.
+    const FP = 'f'.repeat(64);
+    const review = (approved: boolean) => ({
+      phase: 2,
+      verdict: approved ? 'clear' : 'parks',
+      park: approved ? undefined : 'phase 2 would park',
+      runs: approved ? ['npm test', 'frob --check tests/'] : ['npm test'],
+      items: approved
+        ? []
+        : [
+            {
+              text: 'frob --check tests/',
+              reason: '`frob` is not a recognised command',
+              fp: FP,
+              approvable: true,
+            },
+          ],
+      waived: [],
+      setup: [],
+      missing: [],
+    });
+    mocks.runPrelude.mockImplementation(
+      (_slug: string, draft: { verifyAnswers?: { approve?: string[] } }) => {
+        const approved = (draft.verifyAnswers?.approve ?? []).includes(FP);
+        return Promise.resolve({
+          prelude: prelude({
+            rows: [row('verification.person-check', { value: 'halt', probe: 'verification' })],
+            probes: {
+              ...PROBES_OK,
+              verification: approved
+                ? {
+                    status: 'ok',
+                    ok: true,
+                    reason: '2 commands in 1 open phase run on their own, 1 by your approval',
+                    detail: {
+                      scope: null,
+                      reviews: [review(true)],
+                      answers: { approve: [{ fp: FP, text: 'frob --check tests/' }], waive: [] },
+                    },
+                  }
+                : {
+                    status: 'fail',
+                    ok: false,
+                    reason: '1 phase would stop for a person — phase 2: frob --check tests/',
+                    detail: { scope: null, reviews: [review(false)] },
+                  },
+            },
+            blocking: approved
+              ? []
+              : [
+                  {
+                    key: 'verification.person-check',
+                    why: '1 phase would stop for a person — phase 2: frob --check tests/',
+                  },
+                ],
+          }),
+        });
+      },
+    );
+    await mount();
+    const start = await screen.findByRole('button', { name: 'Start' });
+    await waitFor(() => expect(start.hasAttribute('disabled')).toBe(true));
+    fireEvent.click(await screen.findByRole('checkbox', { name: /Approve .*frob --check tests\// }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
+    );
+    // Once approved it is still shown — checked — so it can be taken back.
+    expect(
+      (
+        screen.getByRole('checkbox', { name: /Approve .*frob --check tests\// }) as HTMLInputElement
+      ).getAttribute('aria-checked') ?? 'true',
+    ).toMatch(/true/);
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
+    expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).verifyAnswers).toEqual({
+      approve: [FP],
+      waive: [],
+    });
+  });
+
+  it('a check no approval can carve is waived for this run instead — per phase', async () => {
+    const FP = 'e'.repeat(64);
+    mocks.runPrelude.mockImplementation((_slug: string, draft: { verifyAnswers?: { waive?: string[] } }) => {
+      const waived = (draft.verifyAnswers?.waive ?? []).includes(`3:${FP}`);
+      const item = {
+        text: 'git push origin main',
+        reason: 'looks like it mutates something',
+        fp: FP,
+        approvable: false,
+      };
+      return Promise.resolve({
+        prelude: prelude({
+          probes: {
+            ...PROBES_OK,
+            verification: {
+              status: waived ? 'ok' : 'fail',
+              ok: waived,
+              reason: waived
+                ? '1 command in 1 open phase run on their own, 1 set aside'
+                : '1 phase would stop',
+              detail: {
+                scope: null,
+                reviews: [
+                  {
+                    phase: 3,
+                    verdict: waived ? 'clear' : 'parks',
+                    runs: ['npm test'],
+                    items: waived ? [] : [item],
+                    waived: waived ? [item] : [],
+                    setup: [],
+                    missing: [],
+                  },
+                ],
+              },
+            },
+          },
+          blocking: waived ? [] : [{ key: 'verification.person-check', why: '1 phase would stop' }],
+        }),
+      });
+    });
+    await mount();
+    expect(screen.queryByRole('checkbox', { name: /Approve .*git push/ })).toBeNull();
+    fireEvent.click(
+      await screen.findByRole('checkbox', { name: /Waive for this run.*git push origin main/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
+    expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).verifyAnswers).toEqual({
+      approve: [],
+      waive: [`3:${FP}`],
+    });
   });
 
   it('a plan with no manifest says so, and axe finds nothing', async () => {

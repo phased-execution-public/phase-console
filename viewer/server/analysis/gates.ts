@@ -41,7 +41,7 @@ export type GateVocab = {
  * engine would have let an AI session clear.
  */
 export const GATES_ENV_FALLBACK: GateVocab = {
-  types: ['phase', 'phases', 'plan', 'cmd', 'date', 'deadline', 'by', 'manual', 'ai'],
+  types: ['phase', 'phases', 'plan', 'cmd', 'date', 'deadline', 'by', 'manual', 'ai', 'landed', 'pr-merged'],
   human: ['manual'],
   ai: ['ai'],
   default: 'ai',

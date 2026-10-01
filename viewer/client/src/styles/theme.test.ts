@@ -36,6 +36,26 @@ const STATUS_TOKENS = [
   '--status-skipped',
 ];
 
+/**
+ * Every custom property whose value reaches the amber hue, followed to its root
+ * through `var()`, the needs-you state itself aside. `--state` is the per-class
+ * indirection and is not a token of the palette.
+ */
+function tokensReachingAmber(): string[] {
+  const decl = new Map<string, string>();
+  for (const m of THEME.matchAll(/^\s*(--[\w-]+):\s*([^;]+);/gm)) {
+    if (m[1] !== '--state' && !decl.has(m[1])) decl.set(m[1], m[2]);
+  }
+  const reaches = (token: string, seen = new Set<string>()): boolean => {
+    if (token === '--status-needs-you') return true;
+    if (seen.has(token)) return false;
+    seen.add(token);
+    const value = decl.get(token) ?? '';
+    return [...value.matchAll(/var\((--[\w-]+)/g)].some(([, ref]) => reaches(ref, seen));
+  };
+  return [...decl.keys()].filter((t) => t !== '--status-needs-you' && reaches(t)).sort();
+}
+
 /** Shipped source only — a test may name a width in order to reject it. */
 function walk(dir: string, out: string[] = []): string[] {
   for (const name of readdirSync(dir)) {
@@ -155,13 +175,19 @@ describe('theme tokens', () => {
     expect([...nightC], 'one night L/C for every chromatic state').toHaveLength(1);
   });
 
-  it('reserves amber for the thing that needs a person', () => {
-    // `--accent` is the semantic name; the action colour and the focus ring are
-    // it, and it is the needs-you state. A component that wants "do this now"
-    // asks for `--action`; nothing asks for the amber literal.
+  it('reserves amber for the thing that needs a person — reached only through --accent', () => {
+    // Tokens 6.0 (control-tower phase 16): amber is a summons and nothing else.
+    // `--accent` is the ONE door to it and it is the needs-you state; the
+    // action colour (a primary button, "do this now") and the focus ring are
+    // high-contrast INK, because neither is a person being summoned.
     expect(THEME).toMatch(/--accent:\s*var\(--status-needs-you\)/);
-    expect(THEME).toMatch(/--action:\s*var\(--accent\)/);
-    expect(THEME).toMatch(/--focus:\s*var\(--accent\)/);
+    expect(THEME).toMatch(/--action:\s*var\(--ink\)/);
+    expect(THEME).toMatch(/--focus:\s*var\(--ink\)/);
+    // Follow every custom property to its root: the only tokens whose value
+    // reaches the amber hue are the needs-you state itself, the accent, and the
+    // aliases that exist to paint a needs-you state. (The 2.x `--line-*` and
+    // `--color-stuck`/`--color-gated` aliases went in control-tower phase 31.)
+    expect(tokensReachingAmber()).toEqual(['--accent', '--color-accent', '--color-needs-you']);
     // Only one token may sit at the amber hue: every other hue in the palette
     // is at least 40° away, so no second state can be mistaken for the accent.
     const hues = STATUS_TOKENS.map((token) => {
@@ -175,27 +201,42 @@ describe('theme tokens', () => {
     }
   });
 
-  it('keeps the legacy 2.x tokens as aliases, never as a second palette', () => {
-    // The views that predate the vocabulary still paint with `--line-*` and
-    // `.state-ready` & co. Until Phase 11 deletes them they must resolve — to
-    // the vocabulary's own tokens, not to a literal that could drift from it.
-    for (const legacy of [
-      '--line-done',
-      '--line-ready',
-      '--line-progress',
-      '--line-waiting',
-      '--line-blocked',
-      '--line-stuck',
-      '--line-gated',
-    ]) {
-      const line = THEME.split('\n').find((l) => l.trim().startsWith(`${legacy}:`)) ?? '';
-      expect(line, `${legacy} must alias a --status-* token`).toMatch(/var\(--status-[a-z-]+\)/);
+  it('never draws a focus mark in amber', () => {
+    // A focused control is not a person being summoned. The ring is `--focus`
+    // (ink), painted by `:focus-visible` in theme.css; a component that narrows
+    // it names `outline-focus`. Two named `outline-accent` instead — the shell's
+    // skip link, the first tab stop of every page, and the grid's row link —
+    // and only a real browser saw it (`e2e/status.spec.ts`). An outline is only
+    // ever a focus mark here; a ring is one under a focus variant.
+    const amber = new Set(
+      ['--status-needs-you', ...tokensReachingAmber()].map((t) => t.replace(/^--(?:color-)?/, '')),
+    );
+    const offenders: string[] = [];
+    for (const file of walk(SRC)) {
+      const body = readFileSync(file, 'utf8');
+      for (const [hit, variant, kind, value] of body.matchAll(
+        /\b((?:focus|focus-visible|focus-within):)?(outline|ring)-(\(--[\w-]+\)|\[var\(--[\w-]+\)\]|[a-z][\w-]*)/g,
+      )) {
+        if (kind === 'ring' && !variant) continue;
+        if (amber.has(value.replace(/^[([](?:var\()?--/, '').replace(/[)\]]+$/, ''))) {
+          offenders.push(`src/${file.replace(SRC, '')}: ${hit}`);
+        }
+      }
+      // And a stylesheet's own outline, spelled as a declaration.
+      for (const [hit, token] of body.matchAll(/outline(?:-color)?\s*:[^;{}]*var\((--[\w-]+)\)/g)) {
+        if (amber.has(token.replace(/^--(?:color-)?/, '')))
+          offenders.push(`src/${file.replace(SRC, '')}: ${hit}`);
+      }
     }
-    for (const cls of ['state-ready', 'state-in-progress', 'state-blocked', 'state-stuck', 'state-gated']) {
-      expect(THEME, `.${cls} must alias a --status-* token`).toMatch(
-        new RegExp(`\\.${cls}\\s*\\{\\s*--state:\\s*var\\(--status-[a-z-]+\\)`),
-      );
-    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('carries no 2.x alias — the line tokens, their colour names and the board-word classes are gone', () => {
+    // Control-tower phase 31 retired them: every view paints through the eight
+    // UI states, so an alias left behind would only be a second way to say one.
+    expect(THEME).not.toMatch(/--line-[a-z]/);
+    expect(THEME).not.toMatch(/--color-(?:ready|progress|blocked|stuck|gated)\b/);
+    expect(THEME).not.toMatch(/\.state-(?:ready|in-progress|blocked|stuck|gated)\b/);
   });
 
   it('sets a .state-<ui> class for each of the eight UI states', () => {

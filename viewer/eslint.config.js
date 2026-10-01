@@ -15,6 +15,9 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
+const STATUS_PRIMITIVE_MESSAGE =
+  'Draw a status through the typed family (@/components/ui/status) — StatusBadge and StatusDot are its primitive, imported only inside components/ui/status/**.';
+
 export default tseslint.config(
   {
     ignores: [
@@ -25,6 +28,8 @@ export default tseslint.config(
       // The service worker is a WebWorker program typechecked on its own
       // (tsconfig.sw.json); its globals are not the app's.
       'client/src/sw.ts',
+      'e2e/.results/**',
+      'e2e/.shots/**',
     ],
   },
   js.configs.recommended,
@@ -76,6 +81,46 @@ export default tseslint.config(
       '@typescript-eslint/ban-ts-comment': ['error', { 'ts-expect-error': 'allow-with-description' }],
       'no-console': ['warn', { allow: ['warn', 'error'] }],
       eqeqeq: ['error', 'smart'],
+      // The table engine has ONE door (control-tower phase 18). TanStack Table
+      // is the grid's row model and nothing else, loaded on demand through
+      // `components/data-table/engine.ts` so it never reaches first paint;
+      // a second importer would put it back on some page's static path, and
+      // `check-dist` would only notice after a build. The one exception is the
+      // override below.
+      // …and the status primitive has ONE family (control-tower phase 31). A page
+      // draws a status through `@/components/ui/status` — the typed badges read
+      // the status model, so a label, an icon and a paint cannot disagree — and
+      // `StatusBadge` / `StatusDot` are that family's primitive, imported only
+      // inside `components/ui/status/**` (the override below).
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@/components/ui',
+              importNames: ['StatusBadge', 'StatusDot', 'statusBadgeClass'],
+              message: STATUS_PRIMITIVE_MESSAGE,
+            },
+            {
+              name: '@tanstack/react-table',
+              message:
+                'Only components/data-table/engine.ts imports the table engine — reach the grid through @/components/data-table.',
+            },
+            {
+              name: '@tanstack/table-core',
+              message:
+                'Only components/data-table/engine.ts imports the table engine — reach the grid through @/components/data-table.',
+            },
+          ],
+          patterns: [
+            {
+              group: ['@tanstack/react-table/*', '@tanstack/table-core/*'],
+              message: 'Only components/data-table/engine.ts imports the table engine.',
+            },
+            { group: ['**/status-badge'], message: STATUS_PRIMITIVE_MESSAGE },
+          ],
+        },
+      ],
       'no-restricted-syntax': [
         'error',
         // The colour system: a literal colour in a component is invisible in
@@ -95,6 +140,21 @@ export default tseslint.config(
     },
   },
   {
+    // The table engine's one door — see `no-restricted-imports` above.
+    files: ['client/src/components/data-table/engine.ts'],
+    rules: { 'no-restricted-imports': 'off' },
+  },
+  {
+    // The status primitive's one family — see `no-restricted-imports` above: the
+    // family itself, the barrel that re-exports it, and the primitive's own tests.
+    files: [
+      'client/src/components/ui/status/**',
+      'client/src/components/ui/index.ts',
+      'client/src/components/ui/status-badge.test.tsx',
+    ],
+    rules: { 'no-restricted-imports': 'off' },
+  },
+  {
     // The one file where literal colours are CORRECT: the sixteen ANSI slots
     // of the terminal palette are an addressing scheme, not a design decision
     // (its own header says why). Everything that IS a design decision there is
@@ -109,6 +169,22 @@ export default tseslint.config(
     rules: {
       'no-restricted-syntax': 'off',
       '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-non-null-assertion': 'off',
+    },
+  },
+  {
+    // The real-browser harness: Node (the fixture, the specs) and the page (the
+    // probes Playwright ships into it) in one tree. `({}, info) =>` is how a
+    // Playwright hook asks for its test info, hence no-empty-pattern.
+    files: ['e2e/**/*.{ts,mjs}', 'playwright.config.ts'],
+    languageOptions: {
+      ecmaVersion: 2023,
+      sourceType: 'module',
+      globals: { ...globals.node, ...globals.browser },
+    },
+    rules: {
+      'no-console': 'off',
+      'no-empty-pattern': 'off',
       '@typescript-eslint/no-non-null-assertion': 'off',
     },
   },

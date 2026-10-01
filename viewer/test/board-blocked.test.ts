@@ -15,6 +15,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readMemoryBlock } from '../server/engine.ts';
+import { blockedByView, qaHeldBy } from '../server/service-core.ts';
 
 const ok = (stdout: string) => readMemoryBlock({ code: 0, stdout, stderr: '', ms: 1, timedOut: false });
 
@@ -55,4 +56,72 @@ test('an engine error still yields an empty, non-throwing board', () => {
   assert.equal(board.phased, false);
   assert.deepEqual(board.blockedBy, {});
   assert.deepEqual(board.qa, {});
+});
+
+/* ------------------------------------------------------------------ *
+ * PhaseView.blockedBy / qaHeld — the same line, projected per phase
+ * ------------------------------------------------------------------ */
+
+test('PhaseView.blockedBy is {phase, why}[] in the engine\'s own reason words', () => {
+  const board = ok([
+    'done: 1, 3',
+    'ready: ',
+    'waiting: 2, 4',
+    'blocked: 2<-1(qa:fail) 4<-2(not-done),3(qa:pending)',
+  ].join('\n'));
+  assert.deepEqual(blockedByView(board, 4), [{ phase: 2, why: 'not-done' }, { phase: 3, why: 'qa:pending' }]);
+  assert.deepEqual(blockedByView(board, 2), [{ phase: 1, why: 'qa:fail' }]);
+  assert.deepEqual(blockedByView(board, 1), [], 'a phase nothing holds has an empty list, never undefined');
+  // The HELD state is the other end of the same fact: which phases a verdict holds.
+  assert.deepEqual(qaHeldBy(board), { 1: [2], 3: [4] });
+});
+
+test('detail() puts blockedBy and qaHeld on the phase view itself', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { Service } = await import('../server/service.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-blocked-'));
+  try {
+    mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+    writeFileSync(join(root, 'docs', 'plans', 'demo.md'), [
+      '---', 'slug: demo', 'created: 2026-09-21', 'status: active', 'phases: 3', '---', '', '# demo', '',
+      '## Session budget', '', '> **QA gate:** on', '',
+      '## Phase graph', '',
+      '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |',
+      '|------:|-------|-----------|--------------------|-------|---------------|',
+      '| 1 | first | — | — | app | it works |',
+      '| 2 | second | 1 | — | app | it still works |',
+      '| 3 | third | 2 | — | app | it works again |', '',
+      '## Phases', '',
+      '### Phase 1 — first', '- **Size:** S', '- **Verification:** `true`', '',
+      '### Phase 2 — second', '- **Size:** S', '- **Verification:** `true`', '',
+      '### Phase 3 — third', '- **Size:** S', '- **Verification:** `true`', '',
+    ].join('\n'), 'utf8');
+    const env = { ...process.env, DOCS_ROOT: root };
+    const script = (name: string, ...args: string[]) => execFileSync('bash', [join(SKILL_DIR, 'scripts', name), ...args], {
+      cwd: root, env, stdio: 'pipe',
+    });
+    script('new-handoff.sh', 'demo', '1', 'first', 'complete');
+    // Written, as a finishing session writes it: a `complete` scaffold whose
+    // "What this phase did" is still the template reads in-progress (#46).
+    const handoff = join(root, 'docs', 'handoffs', 'demo', 'phase-01-first.md');
+    writeFileSync(handoff, readFileSync(handoff, 'utf8').replace('## What this phase did\n', '## What this phase did\nThe first phase shipped.\n'));
+    script('qa-record.sh', 'demo', '1', 'fail', '--report', 'docs/handoffs/demo/reports/p1.md');
+    const svc = new Service({ port: 0, host: '127.0.0.1', open: false, scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null } as never);
+    assert.equal(svc.open(root).ok, true);
+    const detail = await svc.detail('demo') as unknown as {
+      phases: { phase: number; blockedBy?: { phase: number; why: string }[]; qaHeld?: number[] }[];
+    };
+    const view = (n: number) => detail.phases.find((p) => p.phase === n)!;
+    assert.deepEqual(view(2).blockedBy, [{ phase: 1, why: 'qa:fail' }]);
+    assert.deepEqual(view(3).blockedBy, [{ phase: 2, why: 'not-done' }]);
+    assert.deepEqual(view(1).blockedBy, []);
+    assert.deepEqual(view(1).qaHeld, [2], 'phase 1\'s failed verdict holds phase 2');
+    assert.equal(view(2).qaHeld, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

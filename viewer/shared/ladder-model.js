@@ -447,6 +447,16 @@ export const RUNGS_BY_SITUATION = Object.freeze({
       false,
     ),
   ]),
+  // The CLI's own wall on a path it reserves for an interactive session (#43):
+  // empty on purpose. There is no rule to widen and no session that can make
+  // the edit, so the errand — naming the act and the path the session
+  // declared — is written at once and nothing spends.
+  'blocked-declared:protected-path': Object.freeze([]),
+  // Acts the plan keeps for a person (`--needs human-acts`, #54): empty on
+  // purpose. No automatic session may take them on; a person does them, or
+  // hands them to the session with "Delegate to the session" — a press, never
+  // a rung.
+  'blocked-declared:human-acts': Object.freeze([]),
   'blocked-declared:gate': Object.freeze([]),
   'blocked-declared:external': Object.freeze([
     R(
@@ -479,6 +489,18 @@ export const RUNGS_BY_SITUATION = Object.freeze({
       'Briefs a fresh agent at a stronger model/effort with the evidence and lets it fix and finish the phase. Costs a full session.',
       true,
       { escalate: 'model' },
+    ),
+  ]),
+  // A red FINAL verdict over a phase the board reads done (control-tower phase
+  // 62, #68): the phase is RE-OPENED, and gets exactly one fix — its own
+  // session, resumed with the failing commands. Then the errand.
+  'verify-red:reopened': Object.freeze([
+    R(
+      'resume-own-session',
+      'Resume with the failure',
+      "Resumes the phase's own session with the failing commands and their output, asking it to fix the cause and finish; its dependents wait meanwhile. Costs a session.",
+      true,
+      { mode: 'fix-verification' },
     ),
   ]),
   'done-unrecorded': Object.freeze([
@@ -587,7 +609,25 @@ export function rungKey(situation, rung) {
  * @property {string} rung
  * @property {Rung['params']} [params]
  * @property {string} [outcome]
+ * @property {RungCause} [cause]
+ * @property {{ at: string, by: string }} [forgiven]
+ * @property {string} [by]  `operator` — a person's press, in the PERSON slot (`PERSON_SLOT_BY`).
  */
+
+/**
+ * Who a PERSON-slot rung is recorded by (control-tower phase 53, #56, and
+ * #36's comment). A person's Retry — and a resume they asked for that boards
+ * fresh — boards the phase OUTSIDE the automatic ladder: the boarding reads no
+ * rung cap, and the record it leaves is the history of what a person did, so
+ * it counts toward no rung cap and never marks a remedy tried. Its dollars
+ * still count, like every record's: money that was spent was spent.
+ *
+ * Before this, a press was refused by the budget meant to stop the MACHINE:
+ * `retry` reset the record, the drive loop climbed the phase again on its
+ * next tick, found the phase-rung cap spent and parked it inside twelve
+ * seconds — `phase.ladder-refused` over a button that had answered 200.
+ */
+export const PERSON_SLOT_BY = 'operator';
 
 /**
  * The rungs of a situation's table not yet climbed on a phase, in climb order
@@ -626,6 +666,50 @@ export function untriedRungs(situationKeyOrId, history) {
 export const MAX_RUNG_INTERRUPTIONS = 2;
 
 /**
+ * WHY a settled rung ended the way it did — stamped on every settlement
+ * (control-tower phase 5, #36):
+ *
+ *   - `merit` — the rung ran and its result is a verdict about the remedy;
+ *   - `environment` — the machine defeated it: the API refused the run's
+ *     credential, the network was down, or a transient stop came before the
+ *     session's first turn. It says nothing about the remedy, so it does not
+ *     consume the same-rung-once rule or the rung caps (`countedRungs`) —
+ *     bounded by `MAX_ENV_RETRIES_PER_RUNG`;
+ *   - `never-ran` — the lane never spawned (`withdrawn`).
+ *
+ * A rung the outage defeated used to be recorded TRIED for the life of the
+ * phase, so the one `resource-wall:auth` rung was gone before anyone had
+ * signed back in, and the errand it left survived the fix.
+ */
+export const RUNG_FAILURE_CAUSES = Object.freeze(
+  /** @type {const} */ (['merit', 'environment', 'never-ran']),
+);
+
+/** @typedef {(typeof RUNG_FAILURE_CAUSES)[number]} RungCause */
+
+/**
+ * How many environment-caused records one rung may carry on one phase before
+ * it counts as tried after all. The rung comes back while the machine is the
+ * reason; at the fifth it is a rung that cannot run HERE, and the ladder moves
+ * on — the interruption bound's reasoning, with room for an outage to pass.
+ */
+export const MAX_ENV_RETRIES_PER_RUNG = 5;
+
+/**
+ * Did the machine end this attempt, rather than the work? The endings that
+ * say nothing about the remedy: a refused credential, an unreachable API, and
+ * a transient stop before the session's first turn (a stop after real turns is
+ * judged on what those turns did).
+ *
+ * @param {{ disposition?: string | null, turns?: number, costUsd?: number }} ending
+ * @returns {boolean}
+ */
+export function endedOnEnvironment(ending) {
+  if (ending.disposition === 'credential-refused' || ending.disposition === 'connectivity') return true;
+  return ending.disposition === 'retry' && !(ending.turns ?? 0) && !(ending.costUsd ?? 0);
+}
+
+/**
  * The records that COUNT — toward the same-rung-once rule and the numeric caps.
  *
  * Every record that ran (any outcome but `interrupted`) counts. An interrupted
@@ -633,18 +717,87 @@ export const MAX_RUNG_INTERRUPTIONS = 2;
  * times in a row (records of OTHER rungs in between do not break the run, a
  * record of this rung that ran does): from that point every record of the
  * streak counts, so the numeric caps see the spend that the loop really made.
- * Monotonic — adding a record never lowers the count.
+ *
+ * A record counts for nothing, and touches no interruption streak, when it
+ * is `withdrawn` (nothing happened), when it is `forgiven`
+ * (an operator's Retry, or an accounts change, re-armed it), when it sits in
+ * the person slot (`by: PERSON_SLOT_BY` — a press, not a remedy the machine
+ * chose), and an
+ * `environment` one — until its rung has `MAX_ENV_RETRIES_PER_RUNG` of them on
+ * this history, when every one of them counts, as tried and as spend.
+ * Monotonic in added records — adding a record never lowers the count;
+ * forgiving one does, which is what forgiving is for.
  *
  * @param {readonly RungRecordLike[]} history
  * @returns {RungRecordLike[]}
  */
+/**
+ * Was this rung's lane never spawned at all?
+ *
+ * The one rule both settlement doors read (`runner-base.ts`'s
+ * `settleRungsAfterAttempt` and the service's heal sweep), because either can
+ * be the one that finds the record — and a second copy of the rule would be a
+ * second policy, which is how the doors would come to disagree.
+ *
+ * The evidence is exactly what #16 pointed at: the record still reads
+ * `pending` — it never moved — AND it carries no attempt that began after the
+ * rung was opened. An `attemptStartedAt` from before the rung belongs to an
+ * earlier lane and says nothing about this one. That is the difference between
+ * "this remedy was tried and did not work" and "this remedy never got a turn",
+ * and the ladder has to be able to tell them apart or it spends a phase's whole
+ * table on boardings that never happened.
+ *
+ * @param {{status?: string, attemptStartedAt?: string}|undefined|null} record
+ * @param {{at: string}} rung
+ * @returns {boolean}
+ */
+export function rungWasWithdrawn(record, rung) {
+  if (!record || record.status !== 'pending') return false;
+  return !record.attemptStartedAt || record.attemptStartedAt <= rung.at;
+}
+
+/**
+ * Is this open rung a PERSON's Retry that is still owed (control-tower phase
+ * 91, #131)? A halt withdraws the queue — and the lane holding a retried phase
+ * with it — but a person's press is not the ladder's to withdraw: the run that
+ * resumes should board it first, not lose it. Owed while the rung sits in the
+ * person slot and the record still carries the person's boarding hint; the
+ * boarding that spends the hint settles the rung by what it did. Both
+ * settlement doors read this beside `rungWasWithdrawn`.
+ *
+ * @param {{boardingHint?: {by?: string}|null}|undefined|null} record
+ * @param {{by?: string}} rung
+ * @returns {boolean}
+ */
+export function personRetryOwed(record, rung) {
+  return rung.by === PERSON_SLOT_BY && record?.boardingHint?.by === PERSON_SLOT_BY;
+}
+
 export function countedRungs(history) {
   /** @type {Map<string, RungRecordLike[]>} */
   const streaks = new Map();
+  /** @type {Map<string, RungRecordLike[]>} */
+  const weather = new Map();
   /** @type {Set<RungRecordLike>} */
   const counted = new Set();
   for (const record of history) {
     const key = rungKey(record.situation, { vehicle: record.rung, params: record.params });
+    // A withdrawn rung never ran: it counts for nothing, consumes nothing, and
+    // does not interrupt an interruption streak either, because a streak is a
+    // record of what kept happening and this is a record of nothing happening.
+    // A forgiven one is the same, by a person's (or the accounts') word — and
+    // so is a person's own press (the person slot): the machine's budget is
+    // not spent by what somebody else chose to do.
+    if (record.outcome === 'withdrawn' || record.forgiven || record.by === PERSON_SLOT_BY) continue;
+    // The machine's doing, not the remedy's: held aside, and counted only once
+    // the rung has met the environment `MAX_ENV_RETRIES_PER_RUNG` times here.
+    if (record.cause === 'environment') {
+      const seen = weather.get(key) ?? [];
+      seen.push(record);
+      weather.set(key, seen);
+      if (seen.length >= MAX_ENV_RETRIES_PER_RUNG) for (const hit of seen) counted.add(hit);
+      continue;
+    }
     if (record.outcome !== 'interrupted') {
       counted.add(record);
       streaks.delete(key);

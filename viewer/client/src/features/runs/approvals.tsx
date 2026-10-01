@@ -40,25 +40,47 @@ export type Decide = (
 /** A pick on a relayed question (phase 14): which card, which question, which option. */
 export type Answer = (approval: Approval, key: string, label: string) => void;
 
+/** Not yet (control-tower phase 97, #140): move a card's deadline `minutes` later. */
+export type Extend = (id: string, minutes: number) => void;
+
+/**
+ * The Extend buttons — the server's `EXTEND_CHOICES_MIN`, which judges the
+ * number whatever a page sends. Half an hour to finish what you are doing; two
+ * hours for "I am away from the desk".
+ */
+const EXTEND_CHOICES = [30, 120] as const;
+
+const extendLabel = (minutes: number): string =>
+  minutes >= 60 ? `Extend ${minutes / 60} h` : `Extend ${minutes} min`;
+
+/** Minutes while it is minutes; hours once a card has more than an hour and a half to live. */
+const timeLeft = (ms: number): string =>
+  ms >= 90 * 60_000 ? `${Math.round(ms / 3_600_000)} h` : `${Math.ceil(ms / 60_000)} min`;
+
 export function ApprovalQueue({
   approvals,
   allowRun,
   onDecide,
+  onExtend,
   onAnswer,
 }: {
   approvals: Approval[];
   allowRun: boolean;
   onDecide: Decide;
+  /** Absent: a card offers no Extend. */
+  onExtend?: Extend;
   /** Absent: a question card shows its options and cannot be answered from here. */
   onAnswer?: Answer;
 }) {
   if (!approvals.length) return null;
   return (
-    <Card className="border-action/50">
+    // The queue IS the summons — a session is parked on every card in it — so its
+    // frame is amber through `--accent` (tokens 6.0: `--action` is ink).
+    <Card className="border-accent/50">
       <CardHeader className="flex-wrap items-center">
         <CardTitle className="flex items-center gap-2">
           Waiting on you
-          <span className="rounded-sm bg-action/15 px-1.5 py-0.5 font-mono text-sm text-action">
+          <span className="rounded-sm bg-accent/15 px-1.5 py-0.5 font-mono text-sm text-accent">
             {approvals.length}
           </span>
         </CardTitle>
@@ -69,7 +91,13 @@ export function ApprovalQueue({
           a.kind === 'question' && a.question ? (
             <QuestionCard key={a.id} approval={a} allowRun={allowRun} onAnswer={onAnswer} />
           ) : (
-            <ApprovalCard key={a.id} approval={a} allowRun={allowRun} onDecide={onDecide} />
+            <ApprovalCard
+              key={a.id}
+              approval={a}
+              allowRun={allowRun}
+              onDecide={onDecide}
+              onExtend={onExtend}
+            />
           ),
         )}
       </CardBody>
@@ -128,7 +156,8 @@ function QuestionCard({
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <strong className="text-sm">A session asks</strong>
         <span className="text-2xs text-ink-faint" aria-live="polite">
-          {approval.phase != null ? `phase ${approval.phase} · ` : ''}
+          {approval.slug ?? 'no plan named'} ·{' '}
+          {approval.phase != null ? `phase ${approval.phase}` : 'no phase named'} ·
           {deferred
             ? 'deferred — answered when its session resumes'
             : left > 0
@@ -182,10 +211,12 @@ function ApprovalCard({
   approval,
   allowRun,
   onDecide,
+  onExtend,
 }: {
   approval: Approval;
   allowRun: boolean;
   onDecide: Decide;
+  onExtend?: Extend;
 }) {
   const [reason, setReason] = useState('');
   const [rule, setRule] = useState(approval.suggestedRule ?? '');
@@ -204,11 +235,30 @@ function ApprovalCard({
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <strong className="text-sm">{approval.title}</strong>
         <span className="text-2xs text-ink-faint">
-          {approval.phase != null ? `phase ${approval.phase} · ` : ''}
-          {left > 0 ? `${Math.ceil(left / 60000)} min to answer` : 'expiring'}
+          {approval.slug ?? 'no plan named'} ·{' '}
+          {approval.phase != null ? `phase ${approval.phase}` : 'no phase named'} ·
+          {approval.converted
+            ? `stands until ${approval.expiresAt.slice(11, 16)}Z`
+            : left > 0
+              ? `${timeLeft(left)} to answer`
+              : 'expiring'}
         </span>
       </div>
       <p className="mt-1 max-w-prose text-sm text-ink-muted">{approval.detail}</p>
+      {/* What silence will do, said before it does it (#140): a timeout also
+          parked the run, and the card used to be the one place that never said so. */}
+      {approval.converted ? (
+        <p className="mt-1 max-w-prose text-2xs text-ink-muted" data-testid="standing">
+          Its session was told no when its hook call ended; the phase is parked on this card. Allow it to
+          resume the phase with this one call granted once.
+        </p>
+      ) : (
+        approval.onTimeout && (
+          <p className="mt-1 max-w-prose text-2xs text-ink-faint" data-testid="on-timeout">
+            If nobody answers, it {approval.onTimeout}.
+          </p>
+        )
+      )}
 
       {approval.tool?.input?.command && (
         <pre className="mt-2 overflow-x-auto rounded border border-rule bg-ground px-2 py-1.5 font-mono text-2xs">
@@ -236,6 +286,16 @@ function ApprovalCard({
         </p>
       )}
 
+      {/* The plan already spoke about publishing (#112): the row this call was
+          checked against, and why it did not cover it — so a person sees what
+          the plan allows before answering what it does not. */}
+      {approval.manifest && approval.manifest.answer !== 'allow' && (
+        <p className="mt-3 text-sm text-ink-muted" title={approval.manifest.value}>
+          Checked against this plan&rsquo;s permission.destructive row, which does not cover it:{' '}
+          {approval.manifest.why}.
+        </p>
+      )}
+
       <div className="mt-3 flex flex-wrap items-center gap-2">
         <label className="sr-only" htmlFor={`reason-${approval.id}`}>
           {placeholder}
@@ -251,12 +311,29 @@ function ApprovalCard({
           value={reason}
           onChange={(e) => setReason(e.target.value)}
         />
-        <Button variant="action" disabled={!allowRun} onClick={() => onDecide(approval.id, 'allow', reason)}>
+        {/* The one amber button on the page: a session is parked until a person answers. */}
+        <Button
+          variant="attention"
+          disabled={!allowRun}
+          onClick={() => onDecide(approval.id, 'allow', reason)}
+        >
           {yes}
         </Button>
         <Button variant="danger" disabled={!allowRun} onClick={() => onDecide(approval.id, 'deny', reason)}>
           {no}
         </Button>
+        {/* Not yet (#140): quieter than an answer, because it is not one. */}
+        {onExtend &&
+          EXTEND_CHOICES.map((minutes) => (
+            <Button
+              key={minutes}
+              size="sm"
+              disabled={!allowRun}
+              onClick={() => onExtend(approval.id, minutes)}
+            >
+              {extendLabel(minutes)}
+            </Button>
+          ))}
       </div>
 
       {!asking && approval.suggestedRule && (

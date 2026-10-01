@@ -20,6 +20,7 @@
  * subprocesses and object identities rather than asserting on rendered output.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
@@ -438,4 +439,239 @@ test('EC6: a watcher flush naming only a directory does not bump an unrelated pl
   } finally {
     lib.cleanup();
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * PR-2..5 (control-tower phase 55, #44) — the page never waits on the
+ * slowest script, and never shows an empty board for a live run.
+ * ------------------------------------------------------------------ */
+
+/**
+ * A scripts folder whose `phase-graph.sh --memory-block` hangs while `on()` —
+ * every other read, and every other script, is the real one. The hang is an
+ * `exec sleep`, so the ceiling's SIGKILL lands on the sleeping process itself.
+ */
+function slowBoards(t: { after(fn: () => void): void }): { dir: string; on(): void } {
+  const dir = mkdtempSync(join(tmpdir(), 'pc-readpath-slow-'));
+  const flag = join(dir, 'slow');
+  for (const name of readdirSync(SCRIPTS)) {
+    if (!name.endsWith('.sh')) continue;
+    const hang = name === 'phase-graph.sh'
+      ? `if [ -e ${JSON.stringify(flag)} ] && [ "$2" = "--memory-block" ]; then exec sleep 30; fi\n`
+      : '';
+    writeFileSync(join(dir, name), `#!/usr/bin/env bash\n${hang}exec bash ${JSON.stringify(join(SCRIPTS, name))} "$@"\n`, { mode: 0o755 });
+  }
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return { dir, on: () => writeFileSync(flag, '') };
+}
+
+/** Move a plan's revision the way a real edit does: write the file, tell the watcher. */
+function touchPlan(svc: unknown, root: string, slug: string): void {
+  const path = join(root, 'docs', 'plans', `${slug}.md`);
+  writeFileSync(path, `${readFileSync(path, 'utf8')}\n`);
+  (svc as { onChange(paths: string[]): void }).onChange([path]);
+}
+
+test('PR-3 (#44): the ceilings are per verb — a board read 45 s, a lint 180 s', () => {
+  assert.equal(engine.timeoutFor('phase-graph.sh', ['p', '--memory-block']), 45_000);
+  assert.equal(engine.timeoutFor('validate.sh', ['p']), 180_000);
+  assert.equal(engine.timeoutFor('phase-graph.sh', ['p', '--lint']), 180_000);
+});
+
+test('PR-4/5 (#44): a timed-out board read serves the LAST GOOD board marked stale with its age, never EMPTY_BOARD; the healer still sees the timeout; the log names the time and the load', async (t) => {
+  const { recent } = await import('../server/log.ts');
+  const lib = library();
+  t.after(lib.cleanup);
+  addPlan(lib.root, 'stale-board');
+  const slow = slowBoards(t);
+  const svc = service(t, lib.root, slow.dir);
+
+  const good = await svc.detail('stale-board');
+  assert.ok(good);
+  assert.equal(good.summary.boardStale, undefined, 'a board read that answered is not stale');
+  const goodStates = good.phases.map((p) => [p.phase, p.state]);
+  assert.deepEqual(goodStates, [[1, 'done'], [2, 'ready']]);
+
+  // The plan moves, and the machine is too busy to read it again.
+  touchPlan(svc, lib.root, 'stale-board');
+  slow.on();
+  engine.setEngineTimeouts({ board: 1500 });
+  t.after(() => engine.setEngineTimeouts(null));
+  const pending = svc.detail('stale-board');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.ok(svc.engineQueue().active >= 1, `the hanging read holds a slot: ${JSON.stringify(svc.engineQueue())}`);
+  assert.equal(svc.engineQueue().max, 8);
+  const stale = await pending;
+  assert.ok(stale);
+
+  assert.ok(stale.summary.boardStale, 'the page must be told its board is stale');
+  assert.ok(stale.summary.boardStale.at <= Date.now() && stale.summary.boardStale.ageMs >= 0);
+  assert.equal(stale.summary.engineError, undefined, 'the stale board is a board, not an error');
+  assert.deepEqual(stale.phases.map((p) => [p.phase, p.state]), goodStates,
+    'the last good board, never the empty one — which paints every phase `waiting`');
+
+  // The healer, plan health and the runs keep seeing the timeout: acting on an
+  // old board is how a finished phase gets boarded twice.
+  const healer = await svc.board('stale-board');
+  assert.equal(healer.timedOut, true);
+  assert.equal(healer.stale, undefined);
+  assert.match(healer.error ?? '', /timed out/);
+
+  const line = recent(200).find((e) => e.event === 'engine.board-timeout');
+  assert.ok(line, 'a timed-out board read must be logged');
+  const said = JSON.stringify(line);
+  assert.match(said, /"ms":\d+/, `the elapsed time: ${said}`);
+  assert.match(said, /"load":\[[\d.]+,[\d.]+,[\d.]+\]/, `the machine load: ${said}`);
+  assert.match(said, /"served":"last-good"/, said);
+});
+
+test('PR-4 (#44, #96): with no good board ever read, a timeout invents nothing — the summary is UNKNOWN with its error, never done 0 / 0 %', async (t) => {
+  const lib = library();
+  t.after(lib.cleanup);
+  addPlan(lib.root, 'never-read');
+  const slow = slowBoards(t);
+  const svc = service(t, lib.root, slow.dir);
+  slow.on();
+  engine.setEngineTimeouts({ board: 1000 });
+  t.after(() => engine.setEngineTimeouts(null));
+  const detail = await svc.detail('never-read');
+  assert.ok(detail);
+  assert.equal(detail.summary.boardStale, undefined);
+  assert.match(detail.summary.engineError ?? '', /timed out/);
+  // Control-tower phase 84 (#96): this case used to summarise as done 0 and
+  // 0 % — the empty board presented as a reading. It is unknown, and the
+  // numbers are absent rather than zero.
+  assert.equal(detail.summary.progress, 'unknown');
+  assert.equal(detail.summary.done, null);
+  assert.equal(detail.summary.percent, null);
+  assert.equal(detail.summary.lastGood, undefined, 'no reading was ever taken, so none is invented');
+});
+
+test('PR-2 (#44): the lint is served last-known, marked stale, while the moved revision\'s own is computed — then fresh', async (t) => {
+  const lib = library();
+  t.after(lib.cleanup);
+  addPlan(lib.root, 'stale-lint');
+  const svc = service(t, lib.root);
+  await svc.detail('stale-lint');
+  const known = await svc.lint('stale-lint');
+  assert.ok(known && !known.timedOut && !known.crashed);
+  const before = svc.store!.get('stale-lint')!.revision;
+
+  touchPlan(svc, lib.root, 'stale-lint');
+  assert.notEqual(svc.store!.get('stale-lint')!.revision, before);
+  const detail = await svc.detail('stale-lint');
+  assert.ok(detail?.lint, 'the last verdict must be served while the new one runs — not nothing');
+  assert.deepEqual(detail.lint.stale?.revision, before, 'marked stale, naming the revision it was computed for');
+  assert.equal(detail.lint.ok, known.ok);
+
+  await svc.lint('stale-lint');
+  const fresh = await svc.detail('stale-lint');
+  assert.ok(fresh?.lint);
+  assert.equal(fresh.lint.stale, undefined, 'once this revision\'s verdict lands it is served as it is');
+});
+
+/* ------------------------------------------------------------------ *
+ * IS-4 + IS-5 — the inbox's 304 costs nothing, and brotli is off the loop
+ * (control-tower phase 56, #75)
+ * ------------------------------------------------------------------ */
+
+type Reply = { status: number; headers: Record<string, string>; bytes: Buffer; ended: boolean };
+
+/** A request/response pair `handleApi` can answer, recording what it wrote. */
+function exchange(method: string, headers: Record<string, string> = {}) {
+  const out: Reply = { status: 0, headers: {}, bytes: Buffer.alloc(0), ended: false };
+  const req = { method, headers, on() { return this; }, [Symbol.asyncIterator]: async function* () {} };
+  const res = {
+    req,
+    headersSent: false,
+    writeHead(status: number, responseHeaders?: Record<string, string>) {
+      out.status = status;
+      out.headers = responseHeaders ?? {};
+      this.headersSent = true;
+      return this;
+    },
+    end(chunk?: unknown) {
+      out.bytes = chunk === undefined ? Buffer.alloc(0) : Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+      out.ended = true;
+    },
+    on() { return this; },
+  };
+  return { req, res, out };
+}
+
+async function getInbox(svc: unknown, headers: Record<string, string> = {}): Promise<Reply> {
+  const { handleApi } = await import('../server/api/routes.ts');
+  const { req, res, out } = exchange('GET', headers);
+  await handleApi({ service: svc } as never, req as never, res as never, new URL('http://127.0.0.1/api/inbox'));
+  return out;
+}
+
+test('IS-4: a conditional GET of the inbox is answered 304 from the input revisions, before any body is built', async (t) => {
+  const lib = library();
+  t.after(() => lib.cleanup());
+  addPlan(lib.root, 'inbox-304');
+  engine.invalidate();
+  const svc = service(t, lib.root);
+  const inner = svc as unknown as {
+    buildAttention(all: boolean): Promise<unknown>;
+    attentionEntity(all: boolean): Promise<unknown>;
+  };
+  const counts = { builds: 0, entities: 0 };
+  const build = inner.buildAttention.bind(svc);
+  inner.buildAttention = (all) => { counts.builds++; return build(all); };
+  const entity = inner.attentionEntity.bind(svc);
+  inner.attentionEntity = (all) => { counts.entities++; return entity(all); };
+
+  const first = await getInbox(svc);
+  assert.equal(first.status, 200);
+  const etag = first.headers.etag;
+  assert.ok(etag, 'the inbox carries a validator');
+  assert.ok(Array.isArray((JSON.parse(first.bytes.toString('utf8')) as { items: unknown[] }).items));
+
+  // Let anything the first read set off settle, then take the baseline.
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const again = await getInbox(svc);
+  const settled = again.headers.etag;
+  counts.builds = 0;
+  counts.entities = 0;
+
+  const cached = await getInbox(svc, { 'if-none-match': settled });
+  assert.equal(cached.status, 304);
+  assert.equal(cached.bytes.length, 0, 'a 304 carries no body');
+  assert.equal(cached.headers.etag, settled);
+  assert.equal(counts.builds, 0, 'the 304 built no inbox');
+  assert.equal(counts.entities, 0, 'the 304 serialised and hashed no body — it was decided from the revisions');
+
+  // A change moves the revision: the route must build to know, once, and the
+  // answer is judged against the NEW entity's validator (the view carries its
+  // own clock, so a rebuild is a new entity).
+  svc.emit('approval', { id: 'x' });
+  const rebuilt = await getInbox(svc, { 'if-none-match': settled });
+  assert.equal(counts.builds, 1, 'a moved revision is a build');
+  assert.equal(rebuilt.status === 304, rebuilt.headers.etag === settled);
+  const followUp = await getInbox(svc, { 'if-none-match': rebuilt.headers.etag });
+  assert.equal(followUp.status, 304, 'and the new validator is honoured at once');
+  assert.equal(counts.builds, 1, 'without building again');
+  void etag;
+});
+
+test('IS-5: brotli runs off the event loop — the send returns before the body is packed', async () => {
+  const { compress, sendBody, sendSettled } = await import('../server/http/compress.ts');
+  const { brotliDecompressSync } = await import('node:zlib');
+  const rows = Array.from({ length: 20_000 }, (_, i) => ({ slug: `plan-${i}`, title: `A plan title long enough to pack, number ${i}` }));
+  const body = Buffer.from(JSON.stringify(rows), 'utf8');
+  const { res, out } = exchange('GET', { 'accept-encoding': 'br' });
+
+  const sending = sendBody(res as never, 200, body, { 'content-type': 'application/json' });
+  assert.equal(out.ended, false, 'the response ended inside sendBody — brotli ran on the loop');
+  await sendSettled(res as never);
+  await sending;
+  assert.equal(out.ended, true);
+  assert.equal(out.headers['content-encoding'], 'br');
+  assert.equal(brotliDecompressSync(out.bytes).toString('utf8'), body.toString('utf8'));
+  assert.ok((await compress(body, 'br')).length < body.length);
+
+  // And nothing in the writer can pack synchronously any more.
+  const source = readFileSync(new URL('../server/http/compress.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /\b(brotliCompressSync|gzipSync|deflateSync)\s*\(/);
 });

@@ -8,11 +8,13 @@
  *
  * The rest of the file holds the properties the redesign exists for:
  *
- *   - **the opening view is the whole plan.** `fitScale` is bounded above and
- *     not below (a deep plan must be allowed to draw small), the content box
- *     carries no second allowance for labels, and every automatic move is
- *     clamped to the drawing — an unclamped "look at this station" is what
- *     opened the map on empty paper.
+ *   - **the opening view is the whole plan** — unless the whole plan would
+ *     draw below the touch floor; then it opens fit-to-width, with a minimap
+ *     under it (phase 30, `route-map.test.tsx`). `fitScale` is bounded above
+ *     and not below (Fit must still be able to show a deep plan small), the
+ *     content box carries no second allowance for labels, and every automatic
+ *     move is clamped to the drawing — an unclamped "look at this station" is
+ *     what opened the map on empty paper.
  *   - **no state is told apart by hue.** Five states, five different drawn
  *     glyphs, and the ring treatments that go with them. jsdom computes no
  *     styles, so what is asserted is the MARKUP that CSS paints by: the class
@@ -315,7 +317,7 @@ describe('what a station says', () => {
   const node = { phase: 4, title: 'Cutover', size: 'M', gated: false };
 
   it('leads with the phase, then the board word and the size', () => {
-    expect(stationFacts(node, 'stuck', undefined)).toEqual(['Phase 4 — Cutover', 'Needs you · size M']);
+    expect(stationFacts(node, 'stuck', undefined)).toEqual(['Phase 4 — Cutover', 'Stuck · size M']);
   });
 
   it('names what it waits on, and the gate it has to be let through', () => {
@@ -365,8 +367,11 @@ describe('<RouteMap>', () => {
     expect(screen.getByLabelText(/Phase 1: Foundations, Done/)).toBeInTheDocument();
     expect(screen.getByLabelText(/Phase 2: .*, Next up/)).toBeInTheDocument();
     expect(screen.getByLabelText(/Phase 3: Terminal, Waiting/)).toBeInTheDocument();
-    expect(screen.getByLabelText(/Phase 4: Cutover, Needs you/)).toBeInTheDocument();
-    for (const station of stations) expect(station).toHaveAttribute('tabindex', '0');
+    expect(screen.getByLabelText(/Phase 4: Cutover, Stuck/)).toBeInTheDocument();
+    // Focusable, every one — but ONE tab stop, and the arrow keys walk the
+    // rest (phase 30): seventy tab stops was seventy presses past the map.
+    for (const station of stations) expect(station).toHaveAttribute('tabindex');
+    expect(stations.filter((station) => station.getAttribute('tabindex') === '0')).toHaveLength(1);
   });
 
   it('is a GROUP of buttons, not an image that happens to contain forty of them', () => {
@@ -382,8 +387,11 @@ describe('<RouteMap>', () => {
     expect(container.querySelector('.station.state-done')).not.toBeNull();
     expect(container.querySelector('.station.state-queued')).not.toBeNull();
     expect(container.querySelector('.station.state-waiting')).not.toBeNull();
-    // `stuck` had aliased `blocked` in the old palette; it is its own line now.
-    expect(container.querySelector('.station.state-needs-you')).not.toBeNull();
+    // `stuck` is the status model's quiet wait (control-tower phase 31): the
+    // waiting paint, with its own word and its own alert glyph — amber is a
+    // summons, and a stuck handoff is resumed by the console, not by a person.
+    expect(container.querySelectorAll('.station.state-waiting')).toHaveLength(2);
+    expect(container.querySelector('.station.state-needs-you')).toBeNull();
     // …and each of them carries `route-mark`, which is what `--state` and every
     // glyph rule hang off — the legend draws the same class on the same shapes.
     for (const station of container.querySelectorAll('.station')) {
@@ -393,21 +401,25 @@ describe('<RouteMap>', () => {
 
   it('gives every state a DIFFERENT drawn glyph, so hue is never the only cue', () => {
     const { container } = render(<RouteMap route={FIVE} />);
-    const glyphOf = (state: string) =>
-      [...container.querySelectorAll(`.station.state-${state} .mark-chip .mark-glyph`)]
+    const drawn = [...container.querySelectorAll('.station')].map((station) =>
+      [...station.querySelectorAll('.mark-chip .mark-glyph')]
         .map((el) => el.getAttribute('d') ?? el.tagName)
-        .join('|');
-
-    const drawn = ['done', 'running', 'queued', 'waiting', 'needs-you'].map(glyphOf);
+        .join('|'),
+    );
+    expect(drawn).toHaveLength(5);
     for (const d of drawn) expect(d).not.toBe('');
-    // The property, stated as a property: five states, five distinct marks.
+    // The property, stated as a property: five board words, five distinct
+    // marks — `waiting` and `stuck` share a paint and still look different,
+    // because the glyph is the view's own icon.
     expect(new Set(drawn).size).toBe(drawn.length);
   });
 
   it('rings only the two states that are not merely a position in a queue', () => {
     const { container } = render(<RouteMap route={FIVE} />);
     expect(container.querySelector('.station.state-running .state-ring')).not.toBeNull();
-    expect(container.querySelector('.station.state-needs-you .state-ring')).not.toBeNull();
+    // A stuck phase is a quiet wait in the status model — no ring; only a
+    // needs-you view (from a run record) would carry one beside `running`.
+    expect(container.querySelector('.station.state-waiting .state-ring')).toBeNull();
     expect(container.querySelector('.station.state-queued .state-ring')).toBeNull();
     expect(container.querySelector('.station.state-done .state-ring')).toBeNull();
   });
@@ -577,7 +589,7 @@ describe('the legend teaches the map that is drawn', () => {
       'Console agent',
       'Terminal session',
       'Critical path',
-      'Session batch',
+      'Batch by hand',
     ]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
@@ -741,24 +753,32 @@ describe('route-map.css keeps its side of the token bargain', () => {
   const code = CSS.replace(/\/\*[\s\S]*?\*\//g, ' ');
 
   it('reads no hue outside the `.state-*` → `--state` bridge', () => {
-    // `StatusBadge` and theme.css's `.state-<ui>` classes are the only two
-    // places a status hue may be named. This file restated `--status-*` and
-    // `--line-done` about fifteen times, so a state added to the vocabulary
-    // painted everywhere except a map.
-    expect(code).not.toMatch(/--status-/);
-    // The map's own half of the file. Below it the guide strip paints an ACTOR
-    // (`machine` / `person`), which is a different axis and keeps its ink
-    // names; `--line-gated` and `--line-progress` stay named here too, because
-    // a gate's barrier and a session batch's line are ink, not state.
+    // A STATION paints `var(--state)`, set by theme.css's `.state-<ui>` class —
+    // `StatusBadge` and those classes are the only places a status hue is
+    // chosen. This file once restated `--status-done` and its 2.x aliases about
+    // fifteen times, so a state added to the vocabulary painted everywhere
+    // except a map. What the map draws that is NOT a station's state — the
+    // gate's barrier (a person decides), the machine's own marks (its actor
+    // chip, a live claim, a batch line) and the guide strip's actors — is ink,
+    // and names its token outright: design.md §3's third colour door.
+    const INK = /gate-chip|actor-chip|claim-ring\.live|train|band-label|guide-/;
+    const hued = [...code.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+      .map(([, sel, body]) => ({ sel: sel!.trim(), body: body! }))
+      .filter((rule) => /--status-/.test(rule.body));
+    expect(hued.length).toBeGreaterThan(0);
+    for (const rule of hued) expect(rule.sel, rule.sel).toMatch(INK);
+    // The map's own half of the file: no 2.x alias survives in it.
     const map = code.slice(0, code.indexOf('.guide-strip'));
-    expect(map).not.toMatch(/--line-(done|ready|waiting|blocked|stuck)\b/);
+    expect(map).not.toMatch(/--line-/);
     expect(map).toMatch(/\.route-mark\.state-done \.dot \{ fill: var\(--state\)/);
     expect(map).toMatch(/\.track-done \{ stroke: color-mix\(in oklab, var\(--state\)/);
   });
 
-  it('drops the rules no board word can reach', () => {
-    // `BOARD_STATE_UI` emits neither, so both were dead paint.
-    expect(code).not.toMatch(/state-verifying/);
+  it('drops the rules no state on the map can reach', () => {
+    // `BOARD_STATE_UI` never emits `failed`, so it was dead paint. `verifying`
+    // was too, until the plan page joined it from the run (phase 30): it is
+    // painted now, and `route-map.test.tsx` holds its dashed ring.
+    expect(code).toMatch(/\.route-mark\.state-verifying \.state-ring/);
     expect(code).not.toMatch(/state-failed/);
     // …and the one that named a class the map has never set.
     expect(code).not.toMatch(/\.station\.state-ready\b/);

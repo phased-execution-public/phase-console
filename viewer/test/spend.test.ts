@@ -447,3 +447,34 @@ test('nothing at all is a whole, renderable answer', () => {
   assert.deepEqual(view.byModel, []);
   assert.deepEqual(view.byDay, []);
 });
+
+/* ------------------------------------------------------------------ *
+ * What the spend figures read after the cost model changed (control-tower phase 46, #62)
+ * ------------------------------------------------------------------ */
+
+test('#62: a run re-priced from its ledger reads its corrected figure here — and its phases still sum to the run, residual 0', async () => {
+  const { repriceFromLedger } = await import('../server/runner/session-record.ts');
+  // ai-builder-v5-mcp P14's chain on one conversation: the attempt, then five
+  // resumes, each re-reporting everything before it. Booked as $156.57.
+  const totals = [9.96, 16.11, 21.53, 25.23, 26.01, 31.7];
+  const booked = totals.reduce((a, b) => a + b, 0);
+  const run = costRun('r1', booked + 3, {
+    14: { costUsd: booked, attempts: 1, endedAt: '2026-09-23T00:10:00Z' },
+    15: { costUsd: 3, attempts: 1, endedAt: '2026-09-23T00:20:00Z' },
+  });
+  const lines = [
+    ...totals.map((costUsd, i) => ({
+      seq: i + 1, time: '2026-09-22T21:00:00Z', event: 'phase.session', phase: 14,
+      data: { mode: i ? 'resume' : 'phase', sessionId: 'sess-b566122d', costUsd, costSource: 'result' },
+    })),
+    { seq: 9, time: '2026-09-23T00:15:00Z', event: 'phase.session', phase: 15, data: { mode: 'phase', sessionId: 'sess-other', costUsd: 3, costSource: 'result' } },
+  ];
+  const repriced = repriceFromLedger(run as never, lines);
+  assert.ok(repriced);
+  const view = planCost({ slug: 'demo', tz: TZ, runs: [run] });
+  assert.equal(view.totalUsd, 34.7, 'the conversation\'s final $31.70 and the other phase\'s $3');
+  assert.equal(view.attributedUsd, 34.7);
+  assert.equal(view.residualUsd, 0, 'the run and its phases were corrected by the same dollars');
+  const summary = spendSummary({ runs: [{ ...run, updatedAt: '2026-09-23T00:20:00Z' } as SpendRunView], tz: TZ }, Date.parse('2026-09-23T01:00:00Z'));
+  assert.equal(summary.runs[0]?.spentUsd, 34.7);
+});

@@ -14,11 +14,11 @@
  * chip per sortable column and a row that cannot wrap pushes the page sideways.
  */
 
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { MemoryRouterProvider } from '@/app/router';
 import { expectNoAxeViolations } from '@/test/axe';
-import { DataTable, type Column } from './table';
+import { DataTable, type Column } from '@/components/data-table';
 
 vi.mock('@/lib/media', () => ({
   usePhone: () => true,
@@ -141,6 +141,35 @@ describe('the card list', () => {
       </MemoryRouterProvider>,
     );
     expect(screen.getAllByText('alpha')).toHaveLength(1);
+  });
+
+  it('puts the search box first in the View sheet, above every facet', async () => {
+    // A phone has no toolbar box of its own, so the sheet's first control is
+    // the one a person reaches for first. Laid out in column order it came
+    // after every facet value — fifteen of them on the delivery ledger.
+    render(
+      <MemoryRouterProvider initial="#/plans" onNavigate={() => {}}>
+        <DataTable
+          label="Plans"
+          columns={[
+            { id: 'slug', head: 'Plan', identity: true, priority: 1, cell: (r) => r.slug },
+            { id: 'state', head: 'State', cell: () => 'open', value: () => 'open', filter: 'facet' },
+            { id: 'title', head: 'Title', cell: (r) => r.title, value: (r) => r.title, filter: 'text' },
+          ]}
+          rows={rows}
+          getRowKey={(row) => row.slug}
+          toolbar
+        />
+      </MemoryRouterProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: /^View/ }));
+    const panel = await screen.findByRole('dialog', { name: 'View' });
+    const search = within(panel).getByRole('searchbox', { name: 'Filter plans by title' });
+    const facet = within(panel).getByRole('group', { name: 'State' });
+    expect(search.compareDocumentPosition(facet) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Closed before the unmount: a sheet torn down open leaves its layer behind.
+    fireEvent.keyDown(panel, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 
   it('says when there is nothing, in the shape a card has', () => {

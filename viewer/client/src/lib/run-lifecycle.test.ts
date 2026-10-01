@@ -86,12 +86,13 @@ describe('one lifecycle', () => {
         'components/fleet-freeze.tsx',
         'features/runs/lane-controls.tsx',
         'features/runs/lane-setup.tsx',
-        // Phase 19's board: nine verbs on one card, and the surface the hook
-        // was extracted FOR. Named here rather than left to the negative guard
-        // because "the board does not roll its own" and "the board uses the
-        // shared one" are two different facts, and only the second says the
-        // controls work.
-        'features/runs/board.tsx',
+        // The board's strip (control-tower phase 19): one action on the glance
+        // and every other verb in place, all through the strip's ONE hook. The
+        // surface the hook was extracted FOR — named here rather than left to
+        // the negative guard because "the strip does not roll its own" and "the
+        // strip uses the shared one" are two different facts, and only the
+        // second says the controls work.
+        'features/runs/tower/strip.tsx',
       ]),
     );
   });
@@ -131,11 +132,10 @@ describe('one lane-fact vocabulary', () => {
     const users = FILES.filter(({ text }) => /from '@\/components\/lane-facts'/.test(text)).map(
       ({ path }) => path,
     );
-    expect(users.sort()).toEqual([
-      'components/pulse.tsx',
-      'features/runs/board.tsx',
-      'features/runs/live-strip.tsx',
-    ]);
+    // The board's lane rows moved into the strip's expanded detail (control-
+    // tower phase 19) — the same atoms, the lane's clock now labelled — and
+    // `LiveStrip` went with the Tower's situation line (phase 20).
+    expect(users.sort()).toEqual(['components/pulse.tsx', 'features/runs/tower/strip-detail.tsx']);
   });
 });
 
@@ -146,6 +146,16 @@ describe('one lane-fact vocabulary', () => {
 const run = (over: Partial<RunState> = {}) => ({ status: 'running', ...over }) as RunState;
 
 describe('lifecycleToast', () => {
+  it('Resume says which of its two acts the door did (control-tower phase 77, #102)', () => {
+    const running = { id: 'r1', status: 'running' } as unknown as RunState;
+    expect(
+      lifecycleToast('resume', 'demo', undefined, running, { resumed: { act: 'relaunched' } }).message,
+    ).toMatch(/started again — with its own settings/);
+    expect(
+      lifecycleToast('resume', 'demo', undefined, running, { resumed: { act: 'pause-cancelled' } }).message,
+    ).toBe('Pause cancelled — the run carries on');
+  });
+
   it('reports what the SERVER did, not what the click intended', () => {
     // A freeze that lands on nothing answers 200 with an unfrozen run. Saying
     // "frozen" there is the console lying about its own act, and it is the

@@ -73,7 +73,8 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = Object.freeze([
   {
     id: 'notifications',
     title: 'Notifications',
-    blurb: 'Every kind the console announces and where each one lands — console, device, webhook.',
+    blurb:
+      'Every kind the console announces and where each one lands — console, device, webhook — and when your turns are said again.',
   },
   {
     id: 'accounts',
@@ -122,7 +123,7 @@ export const SECTION_SEARCH_TERMS: Readonly<Record<string, string>> = Object.fre
   automation:
     'autopilot converge convergence ladder rungs budget dollars spend cap attempts sweep repo guard worktrees delegated gates boarding schedule quiet hours cron stalled thresholds resume at boot session hook mcp park recovery merged branches default skills',
   notifications:
-    'announce alerts routing kinds categories urgent silence mute push devices subscribe quiet hours do not disturb webhooks channels destinations bell inbox delivery',
+    'announce alerts routing kinds categories urgent silence mute push devices subscribe quiet hours do not disturb webhooks channels destinations bell inbox delivery reminders your turn human step snooze cadence',
   accounts: 'claude account login usage meter limit wall switch register rename remove sign in',
   mcp: 'mcp servers registry catalog tools credentials add remove unreachable policy require',
   permissions:

@@ -64,12 +64,13 @@ import {
 } from './inbox.ts';
 import { STALL_SIGNAL_META, inboxItemId, parseInboxItemId } from '../shared/attention-model.js';
 import { deriveEvidence } from '../shared/evidence-model.js';
+import { nothingReadySituation } from '../shared/halt-categories.js';
 import {
   planStats, portfolio, etaSamples, etaFrom, rateFor, phaseEtaFor, healthIssues, isClosedStatus, splitRepos,
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
-  type PhaseEta, type RateReading, type Forecast,
+  type PhaseEta, type RateReading, type Forecast, type EtaShape, type RemainingFloor,
 } from './analysis/stats.ts';
-import { mcpServersFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
+import { mcpServersFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize } from './parse/plan.ts';
 import {
   Runner, applySettings, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
@@ -86,7 +87,7 @@ import {
 import {
   accountRung, errandFor, ladderCaps, nextRung, rungsFor, settleRung, type Rung,
 } from './runner/ladder.ts';
-import type { McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
+import type { AccountChoice, McpDegradation, PhaseRecord as RunPhaseRecord } from './runner/state.ts';
 import { formatScope, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
   KIND_PROFILE, NO_HANDOFF_AUTO_RE, VERIFICATION_AUTO_RE, isRecoveryClass, recoveryActionsFor,
@@ -155,8 +156,24 @@ export type LiveListener = (event: string, data: unknown, id: number) => void;
 /** Enough backlog to cover a browser reconnect, not a history. */
 export const EVENT_BUFFER = 200;
 
-export type PlanSummary = PlanStats & {
+export type PlanSummary = Omit<PlanStats, 'done' | 'percent'> & {
+  /** Null when the board could not be read and no reading stands in for it (#96) — never a 0 that was not read. */
+  done: number | null;
+  percent: number | null;
+  /**
+   * `unknown` when this read of the board failed or timed out (control-tower
+   * phase 84, #96): the numbers beside it are the last good reading's, or null.
+   * Absent on a board that answered.
+   */
+  progress?: 'unknown';
+  /** The last good reading beside an unknown progress, and its age when served (#96). */
+  lastGood?: { done: number; phases: number; percent: number; at: number; ageMs: number };
   engineError?: string;
+  /**
+   * Set when this summary's board is the LAST GOOD one, served because the
+   * current read timed out (#44): when that read landed, and its age when served.
+   */
+  boardStale?: { at: number; ageMs: number };
   issueCounts: { error: number; warning: number; info: number };
   hasHandoffs: boolean;
   /**
@@ -258,6 +275,18 @@ export type PhaseView = {
    */
   qaRounds?: { count: number; latest: { round: number; result: string; report?: string } };
   /**
+   * The unmet dependencies holding this phase, each with the engine's own
+   * reason — `not-done`, or `qa:<verdict>` — from the board's `blocked:` line
+   * (`blockedByView`). Empty when nothing holds it.
+   */
+  blockedBy?: { phase: number; why: string }[];
+  /**
+   * The phases THIS phase's QA verdict holds (`qaHeldBy(board)[phase]`) — the
+   * HELD state, projected onto the view the one phase table reads. Absent when
+   * the verdict holds nothing.
+   */
+  qaHeld?: number[];
+  /**
    * This console's own verdict on the phase's diff (`review.ts`).
    *
    * Absent means nobody has reviewed it here — never "approved by default".
@@ -322,6 +351,21 @@ export type RouteView = {
   rows: number;
 };
 
+/**
+ * The sizing model as it reads one plan (control-tower phase 59, #83): the unit
+ * every session count on the page is in, the phases left forecast in sessions
+ * from measured sessions per phase, what a session of this console peaks at,
+ * and the repository's boot floor as its own line.
+ */
+export type PlanSizing = {
+  /** `1 phase ≥ 1 session` — the console's autopilot never batches. */
+  unit: string;
+  forecast: { sessions: number; phases: number; basis: 'measured' | 'shipped' };
+  forecastLine: string;
+  context: { floor: number; slope: number; boot: number; work: number; basis: 'measured' | 'shipped'; samples: number };
+  bootLine: string;
+};
+
 export type PlanDetail = {
   summary: PlanSummary;
   /**
@@ -340,6 +384,8 @@ export type PlanDetail = {
   phases: PhaseView[];
   route: RouteView;
   batches: SessionPlan | null;
+  /** The sizing model as it reads this plan — the unit, the forecast in sessions, a session's context (phase 59). */
+  sizing?: PlanSizing;
   boardText: string;
   lint: LintResult | null;
   handoffs: {
@@ -529,6 +575,23 @@ export class RecoveryBusyError extends Error {
 }
 
 /**
+ * Thrown by `recoverPhase` when this plan's own runner is live — "the console
+ * is busy with itself", typed so that nothing reads it as a verdict about the
+ * phase (control-tower phase 6, #15 ask 2). A watch landing that meets it is
+ * NOT a rejection: it is un-charged, never counted toward
+ * `MAX_WATCH_REJECTIONS`, and offered again — and a landing on a live run goes
+ * to `Runner.landWatch` in the first place, so this is the race's answer.
+ */
+export class RunBusyError extends Error {
+  readonly slug: string;
+  constructor(slug: string, what = 'a phase') {
+    super(`${slug} is in progress. Pause or stop it before recovering ${what}.`);
+    this.name = 'RunBusyError';
+    this.slug = slug;
+  }
+}
+
+/**
  * What `shared/evidence-model.js` answers: the claim, and whether anything
  * backs it. Declared here rather than imported from the client, because the
  * shared module is JS with JSDoc and the server has no typecheck pass to read
@@ -693,6 +756,24 @@ function actorOf(
 }
 
 /**
+ * One phase's unmet dependencies, each with the engine's reason word —
+ * `PhaseView.blockedBy` (#26/#27's server half, phase 10). Pure and structural,
+ * like `qaHeldBy` beside it.
+ */
+export function blockedByView(
+  board: { qa?: Record<number, string>; blockedBy?: Record<number, number[]> },
+  phase: number,
+): { phase: number; why: string }[] {
+  // A dep's reason is a fact about the DEP: the engine writes `qa:<verdict>`
+  // only for a done phase whose verdict gates, and `not-done` otherwise — so
+  // `board.qa` (keyed by the blocking phase) recovers it exactly.
+  return (board.blockedBy?.[phase] ?? []).map((dep) => ({
+    phase: dep,
+    why: board.qa?.[dep] ? `qa:${board.qa[dep]}` : 'not-done',
+  }));
+}
+
+/**
  * Which phases each recorded verdict is holding — `Board.qa` (the verdict that
  * is the problem, keyed by ITS phase) joined with `Board.blockedBy` (every
  * waiting phase's unsatisfied dependencies). Only the phases a verdict actually
@@ -745,6 +826,9 @@ export const INBOX_SOURCES = [
   // attach/detach/turn-end schedules the same debounced 400 ms tick a run
   // event does — one refetch per beat, deliberately accepted.
   'sessions',
+  // A person's turn moved (control-tower phase 42): a step declared, opened,
+  // checked, proven or settled is an inbox row appearing, changing or leaving.
+  'human-step',
 ];
 
 /**
@@ -757,6 +841,7 @@ export const AUTO_GRANT_REASONS = {
   plan: "auto-granted — this plan's policy answers permission asks automatically",
   global: 'auto-granted — this console is set to answer permission asks automatically',
   default: 'auto-granted — the console answers permission asks automatically (the default)',
+  manifest: "answered from this plan's permission.destructive row — the plan's own written answer, whatever auto-grant is set to",
 } as const;
 
 export type PhaseDiagnosis = {
@@ -956,12 +1041,76 @@ export async function gitRead(cwd: string, args: string[]): Promise<string> {
 /**
  * Every plan's finished-phase evidence, read once. See `Service.etaPool`.
  *
- * `all` is the portfolio fallback and is sorted by when each phase ENDED rather
- * than grouped by plan: it feeds an EMA, whose entire behaviour is the order of
- * its input, so stacking one plan's history after another's would make the
- * newest evidence whatever plan happened to sort last.
+ * `all` is the pool and is sorted by when each phase ENDED rather than grouped
+ * by plan: the shape is fitted on its NEWEST window, so stacking one plan's
+ * history after another's would make the newest evidence whatever plan
+ * happened to sort last. `missing` counts each plan's finished phases that are
+ * not measurements (EE-3); `shape` is `fitShape(all)`, read once per pool.
  */
-export type EtaPool = { bySlug: Map<string, EtaSample[]>; all: EtaSample[] };
+export type EtaPool = {
+  bySlug: Map<string, EtaSample[]>;
+  all: EtaSample[];
+  missing: Map<string, number>;
+  shape: EtaShape | null;
+};
+
+/**
+ * How long the pool's SHAPE stays good for a plan that has evidence of its own.
+ *
+ * The shape is the pool's per-size medians over its newest sixty measured
+ * phases — an aggregate one finished phase barely moves — while reading it
+ * costs a scan of every plan's runs. So a plan page with its own evidence
+ * re-reads it at most this often, instead of paying the whole portfolio's
+ * scan on every open (the cost the pool's 5 s cache alone would bring back).
+ */
+export const ETA_SHAPE_MS = 10 * 60_000;
+
+/**
+ * How often the sizing census re-reads this console's own sessions
+ * (`ServiceBase.sizingCensus`, control-tower phase 59, #83). The caps it derives
+ * are a two-week p99 and move slowly, and the read is every recent journal, so
+ * hourly: often enough that a cap is never a day behind what the sessions did,
+ * rarely enough that nobody pays for it.
+ */
+export const SIZING_CENSUS_MS = 60 * 60_000;
+
+/**
+ * How far back the census reads runs. The caps read two weeks of it
+ * (`CAP_WINDOW_MS`); the context model and the sessions per phase read their
+ * own newest few hundred, which a month of a busy console holds.
+ */
+export const SIZING_CENSUS_WINDOW_MS = 30 * 86_400_000;
+
+/**
+ * A plan's phases as the ETA reads them: each phase's weight (size plus MCP
+ * surcharge, from `weightOf`), its size tag — the class the per-size medians
+ * are taken over — and its declared `- **Wall-clock floor:**` in ms.
+ */
+export function etaPhaseFacts(
+  plan: Plan | undefined, weightOf: (phase: number) => number,
+): Map<number, { weight: number; size: PhaseSize; floorMs?: number }> {
+  const out = new Map<number, { weight: number; size: PhaseSize; floorMs?: number }>();
+  for (const row of plan?.graph ?? []) {
+    const phase = plan?.phases[row.phase];
+    const floorMin = phase?.wallClockFloorMin;
+    out.set(row.phase, {
+      weight: weightOf(row.phase),
+      size: phase?.size ?? 'M',
+      ...(floorMin ? { floorMs: floorMin * 60_000 } : {}),
+    });
+  }
+  return out;
+}
+
+/** The remaining phases that declare a wall-clock floor — what `etaFrom` lets replace the model where it is higher. */
+export function remainingFloors(
+  facts: ReadonlyMap<number, { weight: number; floorMs?: number }>, remaining: readonly number[],
+): RemainingFloor[] {
+  return remaining.flatMap((phase) => {
+    const fact = facts.get(phase);
+    return fact?.floorMs ? [{ weight: fact.weight, floorMs: fact.floorMs }] : [];
+  });
+}
 
 /**
  * How long a read of every plan's runs stays good for.
@@ -1094,8 +1243,13 @@ export type DriveVehicle =
    * raise to, the clock it will park on. None spawns anything itself — the
    * relaunch at the end of each is the run's ordinary door.
    */
-  /** Move the run to a registered account with headroom (`pickAccount`) and relaunch it. */
-  | { kind: 'switch-account'; accountId: string; from: string }
+  /**
+   * Move the run to a registered account with headroom (`switchRungDecision`)
+   * and relaunch it — or relaunch it where it is (`accountId === from`) when
+   * its own account has room now, `why` saying so (control-tower phase 78,
+   * #106). `reverts` names the person's switch a move back undoes.
+   */
+  | { kind: 'switch-account'; accountId: string; from: string; why?: string; reverts?: AccountChoice }
   /** Raise the run's budget once, by `budgetAutoRaisePct` within the per-run ladder cap, and relaunch it. */
   | { kind: 'raise-budget'; from: number; to: number; pct: number; cap: number }
   /**
@@ -1131,19 +1285,24 @@ export function situationOfHalt(halt: RunState['halt']): string {
     case 'run-preflight': return 'resource-wall:auth';
     // The run's own credential refused mid-run (RCV-1): the same wall, hit later.
     case 'credential-refused': return 'resource-wall:auth';
+    // The account now answers another identity (#131): the same wall's errand, a person's answer.
+    case 'identity-changed': return 'resource-wall:auth';
     case 'budget': return 'resource-wall:budget';
     case 'models-exhausted': return 'resource-wall:model';
     case 'mcp-preflight': return 'mcp-unavailable';
     case 'needs-human': case 'awaiting-person': case 'phase-blocked': return 'blocked-declared';
     case 'verify-failed': return 'verify-red';
+    // A verification its clock cut (#95): a person's judgement, nothing to climb.
+    case 'verify-timeout': return 'unknown';
     case 'no-handoff': return 'done-unrecorded';
     // The run-level parks LFC-1 named. `plan-deadlocked`'s holder is a phase
     // the board reads done whose verdict is `pending` or `fail`; the per-phase
     // classifier tells those apart, this reading names the family.
     case 'plan-deadlocked': return 'qa-pending';
-    // Every remaining phase is behind a person's door — a gate most often, an
-    // errand or a Retry otherwise; the halt reason names each.
-    case 'nothing-ready': return 'gated-manual';
+    // Read from its holders (control-tower phase 17, #48): held only by gates
+    // that clear themselves it is a wait, never `gated-manual`; a person's gate
+    // is; otherwise the first holder names it. No holders keeps the old word.
+    case 'nothing-ready': return nothingReadySituation(halt);
     // The operator's own stop is the answer: `superseded` raises nothing.
     case 'operator-stop': return 'superseded';
     // `interrupted-by-restart` is crash-shaped and falls through to `unknown`

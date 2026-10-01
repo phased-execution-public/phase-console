@@ -8,13 +8,16 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
-import { basename, join } from 'node:path';
-import { homedir } from 'node:os';
+import { basename, join, resolve } from 'node:path';
+import { availableParallelism, homedir, loadavg } from 'node:os';
+import { isSchedulingPolicy, loadGuardFactor, schedulingPolicy, type SchedulingPolicy } from '../shared/orchestration-model.js';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { census, consumeAutostartOnce, fleetProfile, instanceId, instanceUrl, profileFor, readAutostart } from '../shared/instances.mjs';
 import type { BootHoldKind, ShutdownClockSource } from '../shared/ops-vocab.js';
+import { burnPhrase, FORECAST_LEAD_HOURS } from '../shared/ops-vocab.js';
 import {
   INSTANCE,
   INSTANCE_STATE_DIR,
@@ -36,6 +39,7 @@ import {
 import {
   SessionRegistry,
   claimWindowEnds,
+  holdReleasedAt,
   correlate,
   parseHookPayload,
   sessionsByAccount,
@@ -45,7 +49,6 @@ import {
   type RunLink,
   type SessionEventLine,
   type SessionEventName,
-  presenceOf,
   type SessionRecord,
   type SessionView,
 } from './sessions/registry.ts';
@@ -67,15 +70,19 @@ import {
   convergeView,
   type ConvergeView,
   automaticResumes, waitClockPhases, waitClockVerdict, waitHoldWhy, WAIT_OVERDUE_GRACE_MS, evidenceFingerprint,
-  lockHeldByLiveRun } from './converge.ts';
-import { evaluateWait, parkedMsOf, RESUME_REFUSED_RECHECK_MS, WAIT_OVERDUE_ANNOUNCE_MS } from './runner/wait-budget.ts';
+  lockHasLiveLane, lockHeldByLiveRun } from './converge.ts';
+import { evaluateWait, hoursText, parkedMsOf, RESUME_REFUSED_RECHECK_MS, WAIT_OVERDUE_ANNOUNCE_MS } from './runner/wait-budget.ts';
 import { pollableRefs, probeWatchRef } from './watch-refs.ts';
-import { runEndedBadly, type ResumeTrigger } from '../shared/run-lifecycle.js';
-import { WatchScheduler, type WatchLandingOutcome } from './watch-scheduler.ts';
+import { hintedPhases, runEndedBadly, runResumable, type HintedPhase, type ResumeTrigger } from '../shared/run-lifecycle.js';
+import { WatchScheduler, phaseDoneOf, type WatchLandingOutcome } from './watch-scheduler.ts';
+import { VerifyWatch, type VerifyLookup } from './verify-watch.ts';
+import { proofsFile, readProofs } from './runner/proofs.ts';
+import { answerDeclaredProbe, DECLARED_PROBE_BUDGET_MS, type DeclaredProbeAnswer } from './declared-probe.ts';
 import type { WatchState as WatchStateView } from './watch-refs.ts';
-import { runSingleCommand } from './runner/verify.ts';
+import { judgeCommand, runSingleCommand } from './runner/verify.ts';
+import { shell } from './shell.ts';
 import { planWrite, runWrite } from './writes.ts';
-import { readFleetHold, writeFleetHold, clearFleetHold, type FleetHold } from './fleet-hold.ts';
+import { holdBinds, readFleetHold, writeFleetHold, clearFleetHold, type FleetHold } from './fleet-hold.ts';
 import {
   run,
   invalidate,
@@ -112,6 +119,7 @@ import {
   supervisor,
   writeStopMarker,
   type ExitPlan,
+  type RestartHow,
   type ShutdownContext,
   type StopMarker,
   type StopPlan,
@@ -138,7 +146,13 @@ import {
   type CategoryId,
 } from './push/index.ts';
 import { SpentTokens, mintActionToken, notificationButtons } from './push/actions.ts';
+import { humanStepPush, humanStepReminderPush, type HumanStepPush } from './push/catalogue.ts';
+import {
+  HUMAN_STEP_CLOCK_MS, HUMAN_STEPS_FILE, HumanStepLedger, declareHumanStep, type DeclareInput, type HumanStep,
+} from './human-steps.ts';
+import { KIND_META } from '../shared/human-step-model.js';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
+import { composeDigest, DIGEST_EVERY_MS, UNDELIVERED_KEEP, type DigestDetection, type DigestUndelivered } from './push/digest.ts';
 import { repoInfo, lastCommit, commitsTouching, type GitRepoInfo, type GitFileInfo } from './git.ts';
 import { findMemory, memoryIndexLines } from './memory.ts';
 import {
@@ -168,6 +182,7 @@ import {
   type InboxAck,
   type InboxFacts,
   type InboxIssueDraft,
+  type InboxSupervisorCard,
   type InboxMessage,
   type InboxReach,
   type InboxView,
@@ -191,6 +206,7 @@ import {
   type EtaSample,
   type PhaseEta,
   type RateReading,
+  type EtaShape,
 } from './analysis/stats.ts';
 import {
   detachRequestedIn,
@@ -202,6 +218,9 @@ import {
   landFor,
   mcpServersFor,
   personCheckFor,
+  permissionModeFor,
+  modelPolicyFor,
+  verifyTimeoutFor,
   type Plan,
   type PhaseDetail,
   type PhaseRow,
@@ -246,7 +265,7 @@ import type { Actor, McpDegradation, PhaseRecord as RunPhaseRecord } from './run
 import { policyPrefsOf } from './runner/policy.ts';
 import { credentialsHeld } from './credentials-probe.ts';
 import { asActor, describeActor, doorActor, viaOfTrigger, type StartActor } from './actor.ts';
-import { ceilingSentence, DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR, StartCeiling, type CeilingRefusal, type CeilingVerdict } from './start-ceiling.ts';
+import { ceilingSentence, DEFAULT_STARTS_PER_HOUR, DEFAULT_USD_PER_HOUR, probeCeiling, StartCeiling, type CeilingRefusal, type CeilingVerdict } from './start-ceiling.ts';
 import type { WaitBudget } from './runner/wait-budget.ts';
 import { formatScope, normalizeToken, parseScope, repoKeyOf, scopeOfRow, scopesIntersect } from '../shared/scope.js';
 import {
@@ -259,6 +278,7 @@ import {
 import { isLiveStatus } from '../shared/status-vocab.js';
 import { DELIVERY_ISSUE_ID, deliveryIssue, environmentReport, type EnvIssue } from './env-doctor.ts';
 import { probeDelivery, type DeliveryFacts } from './prelude.ts';
+import { claudeConfigDirs, copyCommit, sessionSkillCopy, skillCopyReport, type SkillCopyReport } from './skill-copy.ts';
 import { tailscaleStatus } from './tailscale.ts';
 import { CONSOLE_VERSION, Heartbeat, MachineLanes, instancesView, type HeartbeatFacts } from './fleet.ts';
 
@@ -269,9 +289,29 @@ import { CONSOLE_VERSION, Heartbeat, MachineLanes, instancesView, type Heartbeat
  */
 const IN_FLIGHT_RUNS_TTL_MS = 2_000;
 
+/**
+ * How long `storedRunById` believes "no plan holds this run id".
+ *
+ * A HIT is kept for the life of the process — a run id belongs to one plan for
+ * as long as its file exists — but a miss has to expire, or a token that
+ * arrives a second before its run's first save is answered `unknown` for ever.
+ * Short, because the only thing it costs to be wrong is one scan.
+ */
+const TOKEN_PLAN_MISS_MS = 30_000;
+
+/** How many run ids that map is worth remembering; oldest out first. */
+const TOKEN_PLAN_MAX = 256;
+
+import { spentBudgetPark } from './runner/runner-loop.ts';
+// Outside the region: the runner's `ladderSeenTtlMs` dep reads it in both trees (#161).
+import { LADDER_SEEN_TTL_MS } from './runner/runner-core.ts';
 import { accessLedger } from './api/access.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
+import { CLOCK_MODEL, COST_MODEL, remeasureFromLedger, repriceFromLedger, type CapTable } from './runner/session-record.ts';
+import { journalFile } from './runner/run-paths.ts';
+import { sizingCensus, type CensusLine, type CensusRun, type SizingCensus } from './analysis/sizing-model.ts';
+import { inferSessionScope, locateSessionLog, TranscriptReader, type InferredScope, type ScopeBasis } from './sessions/scope-inference.ts';
 import {
   FREEZE_ESCALATE_MS,
   escalatePersistedFreeze,
@@ -300,7 +340,6 @@ import {
   newRun,
   phaseRecord,
   pidAlive,
-  processState,
   pidHoldsWork,
   procIdentity,
   pruneRuns,
@@ -326,8 +365,10 @@ import {
   type RunState,
   type VerifySummary,
   consoleRunsDir,
-  settleStoredWaitTimeout, setRunState, DECLARATION_CONSUMED_EVENT,
+  clearRunFileCache,
+  setRunState,
 } from './runner/state.ts';
+import { adoptionHeld, crashLoop, readCrashLedger, setAdoptionHold } from './crash-ledger.ts';
 import {
   consumeOutcome,
   inboxOutcomePhase,
@@ -345,6 +386,7 @@ import {
   type OccupiedTree,
   managedRoots,
   radarPair,
+  treeDisk,
   worktreeHome,
   worktreesRoot,
   STAGING_BRANCH,
@@ -362,19 +404,21 @@ import {
   shellQuote,
   type AuthStatus,
 } from './runner/auth.ts';
-import { Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir, type AccountView } from './accounts/index.ts';
+import { Accounts, DEFAULT_ACCOUNT_ID, type AccountView, type RunIdentity } from './accounts/index.ts';
+import { ConnectivityProbe } from './connectivity-probe.ts';
 import { HEALTH_TTL_MS, Mcp, type McpServerView } from './mcp/index.ts';
 import { IDLE_POLL_MS as ISSUES_SWEEP_MS } from './issues/fetch.ts';
 import {
   RETENTION_SWEEP_MS,
   applyRetention,
   collectRetention,
+  keptTreeBytes,
   retentionReport,
   type RetentionReport,
 } from './retention.ts';
 import { IssuesStore, type IssueProvenance } from './issues/index.ts';
 import { pruneMcpConfigs } from './mcp/config.ts';
-import { pruneSettingsFiles, tokenFromSettingsFile, type Approval, type ApprovalEvent } from './runner/approvals.ts';
+import { pruneSettingsFiles, tokenFromSettingsFile, type Approval, type ApprovalEvent, type ManifestCheck } from './runner/approvals.ts';
 import { assertTranscriptLayout, cliVersion, portTranscript } from './accounts/transcripts.ts';
 import type { HeadroomVerdict } from './accounts/index.ts';
 import { FULL_FLAGS, installDesktopLauncher, launcherPlan } from './launcher.ts';
@@ -401,6 +445,7 @@ import {
   planPolicyPath,
   effectivePlanPolicyPath,
   notifyOutOfBand,
+  timeoutConsequence,
   carvedPolicy,
   suggestedRule,
   autoApproveFor,
@@ -471,7 +516,11 @@ import {
   type QaOutcome,
   type RecoveryAction,
   type RouteView,
+  SIZING_CENSUS_MS,
+  SIZING_CENSUS_WINDOW_MS,
 } from './service-core.ts';
+import { lockRows, readLockFiles, type LockFilter, type LockRow } from './locks.ts';
+import type { Lock } from './parse/folder.ts';
 
 import type { Service } from './service.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
@@ -497,6 +546,23 @@ function droppablePresence(event: RegistryChange): boolean {
 }
 
 /**
+ * A session of one of this console's runs whose hook calls are being refused
+ * 401 (#74) — a run-level fault while it lives, because the CLI does not block
+ * a tool on a failed hook. `count` is every refusal since `since`.
+ */
+export type HookFault = {
+  runId: string;
+  slug: string;
+  phase?: number;
+  sessionId: string;
+  hook: string;
+  reason: string;
+  count: number;
+  since: string;
+  lastAt: string;
+};
+
+/**
  * A live Claude session in this repository that holds no lock for the phase in
  * question — somebody the phase would collide with (REG-3). `scope` is what
  * the session is working in, as far as the console can tell: its `PE_SCOPE`,
@@ -513,10 +579,15 @@ export type SessionPeer = {
   plan: { slug: string; phase: number; strong: boolean } | null;
   /**
    * When this peer stops holding the phase (ms epoch): its claim window's end
-   * (`claimWindowEnds`). Absent for a session correlated to the phase itself,
-   * which holds it for as long as it lives.
+   * (`claimWindowEnds`), or — for a scope read from what it touched — a window
+   * after its last touch (`inferSessionScope`). Absent for a session
+   * correlated to the phase itself, which holds it for as long as it lives.
    */
   claimUntil?: number;
+  /** How its scope was read (control-tower phase 82, #119) — the queue and the card say it. */
+  basis?: ScopeBasis;
+  /** A few lines of what that reading rests on. */
+  evidence?: string[];
 };
 
 /** Why a console boots holding its automation — see `ServiceBase.bootHold`. */
@@ -550,6 +621,8 @@ export type RestartOutcome = {
   updating?: boolean;
   /** Pressed mid-run: it waits for the live sessions to finish, then updates and restarts. */
   waiting?: boolean;
+  /** Refused because the unit cannot be re-rendered (#71): the re-install a person runs instead. */
+  command?: string;
 };
 
 /**
@@ -626,6 +699,9 @@ export function trimOldest(collection: Map<string, unknown> | Set<string>, cap: 
  */
 const ADVISORY_ACK_FILE = join(INSTANCE_STATE_DIR, 'policy-advisory.json');
 
+/** Beside a plan's runs (`runDir`): the last board that answered, for the next process (#96). */
+const LAST_GOOD_BOARD_FILE = 'last-good-board.json';
+
 function readAdvisoryAcks(): Record<string, string> {
   try {
     const parsed = JSON.parse(readFileSync(ADVISORY_ACK_FILE, 'utf8')) as { acknowledged?: unknown };
@@ -697,6 +773,8 @@ export abstract class ServiceBase {
   abstract board(slug: string): Promise<Board>;
   /** A phase's wait budget through the engine — `ServiceLive.waitBudget`. */
   abstract waitBudget(slug: string, phase: number): Promise<WaitBudget>;
+  /** The `budget` announcer (control-tower phase 14, #40) — `ServiceLive.announceBudget`. */
+  protected abstract announceBudget(data: unknown): void;
   abstract continueMcpParkedPhase(
     slug: string,
     phase: number,
@@ -710,8 +788,15 @@ export abstract class ServiceBase {
   abstract convergeSlugs(): string[];
   abstract dayRungs(): RungRecord[];
   protected abstract disarmSessionInbox(): void;
+  /** The stored triggers (control-tower phase 98, #137): read at open, stopped at close — `ServiceRuns`. */
+  protected abstract startTriggers(): void;
+  protected abstract stopTriggers(): void;
   abstract emit(event: string, data: unknown): void;
   protected abstract emitAccounts(): void;
+  /** The identity behind an account changed — park every run bound to the previous one (`ServiceRuns`). */
+  protected abstract identityChanged(accountId: string, now: RunIdentity): number;
+  /** A login a run depends on can no longer be renewed — announce it with the fix (`ServiceRuns`). */
+  protected abstract loginAtRisk(view: Pick<AccountView, 'id' | 'email' | 'name'>, risk: { reason: string; fix: string }): boolean;
   protected abstract emitMcp(): void;
   /**
    * A queue holder's remaining work, synchronously — `ServiceRuns.etaHint`.
@@ -722,6 +807,8 @@ export abstract class ServiceBase {
    * nothing and the queue silently never gets an estimate.
    */
   protected abstract etaHint(slug: string): HolderEta | undefined;
+  /** A queue holder's remaining time — its PHASE's when known (`ServiceRuns.holderEta`, #63). */
+  protected abstract holderEta(slug: string, phase: number | null): HolderEta | undefined;
   protected abstract etaPool(): EtaPool;
   protected abstract evidenceDeps(slug: string): EvidenceDeps;
   protected abstract healMcpParks(serverId: string): Promise<void>;
@@ -754,7 +841,7 @@ export abstract class ServiceBase {
     meta?: ChangeMeta,
   ): void;
   protected abstract onRunnerEvent(event: string, data: unknown): void;
-  protected abstract planRate(slug: string, ownSamples?: EtaSample[]): RateReading;
+  protected abstract planRate(slug: string, ownSamples?: EtaSample[], ownMissing?: number): RateReading;
   protected abstract preRecoveryGate(
     slug: string,
     state: RunState,
@@ -762,10 +849,13 @@ export abstract class ServiceBase {
     opts?: { verb?: boolean },
   ): Promise<'proceed' | 'superseded' | 'resolved' | 'unchanged' | 'capped'>;
   /** The evidence fingerprint over this console's facts — the converge pass's function (phase 9). */
+  protected abstract accountsStampFor(): string | null;
   protected abstract fingerprintFor(
     slug: string, state: RunState, board: Record<number, string>, qa?: Parameters<typeof evidenceFingerprint>[4],
   ): string;
   protected abstract preflightAccount(accountId: string | undefined, forModel?: string): HeadroomVerdict;
+  /** How many registered accounts the breaker refuses, out of how many exist. */
+  protected abstract accountsUsable(): { unusable: number; total: number };
   abstract qaOutcome(link: {
     slug: string;
     phase: number;
@@ -806,6 +896,11 @@ export abstract class ServiceBase {
     override: { addendum?: string; options?: PhaseOptions; by?: string } | undefined,
     actor: StartActor,
   ): Promise<RunState | null>;
+  /** A person's Resume press — also what a standing approval card's Allow presses (#140). */
+  abstract pressResume(
+    slug: string, phase: number, mode: 'resume' | 'closeout',
+    opts: { instruction?: string; actor: StartActor },
+  ): Promise<import('./runner/state.ts').PressAnswer>;
   abstract sessionViews(): SessionView[];
 
   /**
@@ -873,9 +968,134 @@ export abstract class ServiceBase {
   protected boards = new Map<string, Cached<Board>>();
   protected qaModes = new Map<string, Cached<QaMode>>();
   protected lints = new Map<string, Cached<LintResult>>();
+  /**
+   * The last board, and the last lint verdict, that PROVED something — kept
+   * across revisions on purpose, which is why `forget()` never touches them: a
+   * page is served one, marked stale, where the current read timed out or has
+   * not landed yet (#44). One entry per plan; a board read that timed out also
+   * notes when, so its cached answer is retried after `BOARD_RETRY_MS`.
+   */
+  protected goodBoards = new Map<string, { at: number; board: Board }>();
+  protected boardTimeouts = new Map<string, number>();
+  /**
+   * When a plan's lint last timed out or could not run — the board's #44 rule
+   * for the lint (control-tower phase 81, #97): such a verdict proves nothing,
+   * and converge now asks the lint before relaunching a stop about the plan, so
+   * a reading that stayed cached for the revision would never be asked again.
+   */
+  protected lintTimeouts = new Map<string, number>();
+
+  /**
+   * The last good board this console — or the one before a restart — read for
+   * a plan, or null when none ever was (control-tower phase 84, #96). Memory
+   * first; else the copy `rememberGoodBoard` left on disk, because the map
+   * alone died with the process and a restarted console summarised an
+   * unreadable board as 0 %. A copy that does not parse as a board is none.
+   */
+  protected lastGoodBoard(slug: string): { at: number; board: Board } | null {
+    const hit = this.goodBoards.get(slug);
+    if (hit) return hit;
+    if (!this.root) return null;
+    try {
+      const raw = JSON.parse(readFileSync(join(runDir(this.root.path, slug), LAST_GOOD_BOARD_FILE), 'utf8')) as
+        { at?: unknown; board?: Partial<Board> };
+      const board = raw.board;
+      if (typeof raw.at !== 'number' || !board || !Array.isArray(board.done) || !Array.isArray(board.ready)
+        || !Array.isArray(board.waiting) || !board.states || typeof board.states !== 'object') return null;
+      const entry = { at: raw.at, board: board as Board };
+      this.goodBoards.set(slug, entry);
+      return entry;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Keep a board that answered — in memory, and on disk for the next process (#96). Never throws. */
+  protected rememberGoodBoard(slug: string, board: Board): void {
+    const entry = { at: Date.now(), board };
+    this.goodBoards.set(slug, entry);
+    if (!this.root) return;
+    try {
+      const dir = runDir(this.root.path, slug);
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, LAST_GOOD_BOARD_FILE);
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(entry));
+      renameSync(tmp, file);
+    } catch (error) {
+      log.warn('engine.board-persist-failed', { slug, error: (error as Error).message });
+    }
+  }
+  protected knownLints = new Map<string, { at: number; revision: number; lint: LintResult }>();
   protected sessionPlans = new Map<string, Cached<SessionPlan>>();
   protected portfolioCache: { generation: number; value: Portfolio } | null = null;
   protected etaPoolCache: { at: number; value: EtaPool } | null = null;
+  /** The pool's shape, kept longer than the pool (`ETA_SHAPE_MS`) — see `etaShape`. */
+  protected etaShapeCache: { at: number; value: EtaShape | null } | null = null;
+  /** The sizing census and the read that is refreshing it — see `sizingCensus`. */
+  protected sizingCensusCache: { at: number; value: SizingCensus } | null = null;
+  protected sizingCensusRead: Promise<void> | null = null;
+
+  /**
+   * What this console measured about its own sessions (control-tower phase 59,
+   * #83): the caps every spawn runs under (`deriveCapTable`), the context model
+   * and boot floor, and sessions per phase for the forecast. Read from the
+   * journals of the runs touched within `SIZING_CENSUS_WINDOW_MS`, in the
+   * background, at most once per `SIZING_CENSUS_MS` — a reader never waits for
+   * it, and until the first read lands every answer is the shipped one.
+   */
+  protected sizingCensus(): SizingCensus | null {
+    const now = Date.now();
+    const cached = this.sizingCensusCache;
+    if ((!cached || now - cached.at >= SIZING_CENSUS_MS) && !this.sizingCensusRead) {
+      this.sizingCensusRead = this.readSizingCensus(now)
+        .then((value) => { if (value) this.sizingCensusCache = { at: Date.now(), value }; })
+        .catch((error: unknown) => { log.warn('sizing.census-failed', { error: String(error) }); })
+        .finally(() => { this.sizingCensusRead = null; });
+    }
+    return cached?.value ?? null;
+  }
+
+  /** The measured caps the runner's spawns read (`RunnerDeps.sessionCaps`); null until the census lands. */
+  protected sessionCapTable(): CapTable | null {
+    return this.sizingCensus()?.caps ?? null;
+  }
+
+  protected async readSizingCensus(now: number): Promise<SizingCensus | null> {
+    const root = this.root?.ok ? this.root.path : null;
+    if (!root) return null;
+    const since = now - SIZING_CENSUS_WINDOW_MS;
+    const runs: CensusRun[] = [];
+    const plans = new Map<string, Plan>();
+    for (const record of this.store?.list() ?? []) {
+      const plan = record.plan;
+      if (!plan?.phased) continue;
+      plans.set(record.slug, plan);
+      let stored: ReturnType<typeof listRuns> = [];
+      try { stored = listRuns(root, record.slug); } catch { continue; }
+      for (const run of stored) {
+        const touched = Date.parse(run.updatedAt ?? '');
+        if (Number.isFinite(touched) && touched < since) continue;
+        let text: string;
+        try { text = await readFile(journalFile(root, record.slug, run.id), 'utf8'); } catch { continue; }
+        const lines: CensusLine[] = [];
+        for (const raw of text.split('\n')) {
+          if (!raw.includes('"phase.session"') && !raw.includes('"phase.tokens"') && !raw.includes('"phase.context-wrapup"')) continue;
+          try {
+            const entry = JSON.parse(raw) as CensusLine;
+            lines.push({ event: entry.event, phase: entry.phase, time: entry.time, data: entry.data });
+          } catch { /* a torn line is not a session */ }
+        }
+        runs.push({ slug: record.slug, phases: run.phases ?? {}, lines });
+      }
+    }
+    return sizingCensus(runs, (slug, phase) => {
+      const plan = plans.get(slug);
+      const size = plan?.phases[phase]?.size;
+      if (!plan || !size) return undefined;
+      return { size, weight: weightOf(size, this.sizing, mcpServersFor(plan, phase).length, this.mcpSizing) };
+    }, this.sizing, now);
+  }
 
   /**
    * The queue's *how long* answers, per plan, refreshed in the background.
@@ -915,6 +1135,27 @@ export abstract class ServiceBase {
     return [];
   }
 
+  /** The supervisor's standing cards for the inbox (control-tower phase 101) — none here; the Pro override feeds them. */
+  protected inboxSupervisorCards(): InboxSupervisorCard[] {
+    return [];
+  }
+
+  /**
+   * The manifest's answer for a card an automatic actor is about to settle
+   * (control-tower phase 84, #112). Nothing here — `Service` reads the plan's
+   * `permission.destructive` row; the base has no manifest to read.
+   */
+  protected manifestAnswerForCard(_approval: Approval): ManifestCheck | null {
+    return null;
+  }
+
+  /**
+   * Say once more what issue drafts still wait for a person (control-tower
+   * phase 84, #118) — the issues clock calls it. FREE default: the free tree
+   * has no drafts; `ServiceRuns`'s Pro region does the work.
+   */
+  protected reannounceIssueDrafts(): void {}
+
   /**
    * The sessions' messages to the OPERATOR, for the inbox (phase 15) — the
    * same FREE-default / Pro-override arrangement as the drafts above, and for
@@ -928,6 +1169,17 @@ export abstract class ServiceBase {
     return undefined;
   }
   protected listeners = new Set<LiveListener>();
+
+  /**
+   * How many event-stream clients this console is writing to.
+   *
+   * Reported as a gauge, because the retention that took this console down was
+   * in exactly these clients' write buffers and there was no sample anywhere
+   * that would have shown their number climbing.
+   */
+  sseClients(): number {
+    return this.listeners.size;
+  }
   protected repo: GitRepoInfo = { available: false, dirty: [] };
 
   /** Monotonic id per emitted event, so a client can say what it already saw. */
@@ -952,6 +1204,8 @@ export abstract class ServiceBase {
    * genuinely new ask — a later `at` — is a new notification.
    */
   protected notifiedErrand = new Set<string>();
+  /** Budget pushes already sent — one per budget per spend, one per warning key (control-tower phase 14). */
+  protected notifiedBudget = new Set<string>();
   protected notifiedQaHold = new Set<string>();
   /**
    * Stall episodes already announced, keyed `runId:phase:signal:attempt`.
@@ -983,6 +1237,8 @@ export abstract class ServiceBase {
       phase: number;
       runId?: string;
       signal: string;
+      /** The episode it was armed for — a wait chain's first call (control-tower phase 47). */
+      since?: string;
       title: string;
       body: string;
       at: number;
@@ -1020,6 +1276,12 @@ export abstract class ServiceBase {
   protected toolsSeen = new Set<string>();
 
   /**
+   * The runs already named as answered from a stored record (#21) — so
+   * `hook.run-stored` is written once per orphan and not once per tool call.
+   */
+  protected storedTokenNamed = new Set<string>();
+
+  /**
    * One runner per plan, created on demand and kept.
    *
    * Keyed by slug because that is what every control is addressed by, and
@@ -1055,6 +1317,8 @@ export abstract class ServiceBase {
    * the console's autonomy off.
    */
   readonly watchClock: WatchScheduler;
+  /** The `verify:` scheme's oracle — a phase's red lines, re-run on a new head (control-tower phase 88). */
+  readonly verifyWatch: VerifyWatch;
   /**
    * Settles when this `open()`'s boot work is done: queued runs re-adopted and
    * the convergence loop's boot pass over every plan complete. What a harness
@@ -1146,6 +1410,11 @@ export abstract class ServiceBase {
    * and by the MCP facade for its probe. Reads the two `ceiling*` prefs live.
    */
   readonly startCeiling: StartCeiling;
+  /**
+   * The MCP health probe's OWN budget (control-tower phase 100, #73): a probe
+   * is not a session, so it never spends the work-start ceiling above.
+   */
+  readonly probeCeiling: StartCeiling;
   protected mcpEmitTimer: NodeJS.Timeout | null = null;
   /**
    * The issue estate — every repository this console stands on, and its issues.
@@ -1157,7 +1426,15 @@ export abstract class ServiceBase {
    */
   readonly issues: IssuesStore;
   protected issuesSweepTimer: NodeJS.Timeout | null = null;
+  /** The digest's hourly clock (control-tower phase 97, #140). */
+  protected digestTimer: NodeJS.Timeout | null = null;
+  /** Notifications that reached no device since the channel last answered (#140, #108): the newest kept, all counted. */
+  protected undelivered: { kept: DigestUndelivered[]; lost: number } = { kept: [], lost: 0 };
   protected retentionTimer: NodeJS.Timeout | null = null;
+  /** The human-step ledger (control-tower phase 41), made on first use — `humanStepsNow`. */
+  protected humanStepLedger: HumanStepLedger | null = null;
+  /** The reminder clock's timer (control-tower phase 43) — `startHumanStepClock`. */
+  protected humanStepTimer: NodeJS.Timeout | null = null;
 
   /**
    * Presence events raised while this object was still being built.
@@ -1286,6 +1563,13 @@ export abstract class ServiceBase {
     // under suspicion cannot carry its own obituary.
     this.push.onUndelivered = ({ category, title, devices }) => {
       log.warn('push.undelivered', { category, title, devices });
+      // Kept to be said again once the channel answers (#140) — never the
+      // digest itself, which would only ever report its own absence.
+      if (category !== 'digest') {
+        this.undelivered.kept = [...this.undelivered.kept, { category, title, at: new Date().toISOString() }]
+          .slice(-UNDELIVERED_KEEP);
+        this.undelivered.lost += 1;
+      }
       if (this.pushHealthAnnounced.has('undelivered')) return;
       this.pushHealthAnnounced.add('undelivered');
       const outcomes = [...new Set(devices.map((d) => d.outcome))].join(', ');
@@ -1374,11 +1658,18 @@ export abstract class ServiceBase {
       // could not hold (SHD-7) — a deferral, never a drop.
       onPoll: () => {
         this.applyPresenceReconciliations();
+        this.sweepHeldTokens();
       },
     })
       .load()
       .start();
     this.approvals = new Approvals({
+      // #112: what the plan's `permission.destructive` row answers for a card,
+      // re-read when an automatic actor would settle it — see `Service`.
+      manifestAnswer: (approval) => this.manifestAnswerForCard(approval),
+      // T-15 and T-5 (control-tower phase 97, #140): the push and the
+      // notification inbox, with what the timeout will do.
+      warn: (approval, leadMs) => this.announceExpiring(approval, leadMs),
       notify: (approval) => {
         const where = `${approval.slug}${approval.phase != null ? ` phase ${approval.phase}` : ''}`;
         // A card born decided — a grant under a plan's publishing exception
@@ -1472,7 +1763,7 @@ export abstract class ServiceBase {
       approvals: this.approvals,
       runner: (runId) => this.runnerByRunId(runId),
       journal: (slug, runId, event, data, phase) => {
-        if (this.root?.ok) new Journal(this.root.path, slug, runId).append(event, data, phase);
+        if (this.root?.ok) Journal.for(this.root.path, slug, runId).append(event, data, phase);
       },
       announce: (category, message, context) => this.announce(category, message, context),
       tagFor: (...parts) => tagFor(...parts),
@@ -1546,10 +1837,13 @@ export abstract class ServiceBase {
       // A lock with no `scope=` line: recover what the plan says that phase
       // touches rather than reading it as `all`. See `SchedulerDeps.scopeFor`.
       scopeFor: (slug, phase) => this.scopeOf(slug, phase),
+      // The machine-load guard (control-tower phase 100, #135 G.27): read per
+      // scan, like `max`, so a factor moved in Settings lands on the next one.
+      load: () => this.loadSample(),
       // How much longer a holder's plan has — decoration on the queue page,
       // never an input to the decision. Synchronous off the memo above, so a
       // cold answer is `undefined` rather than an await inside the scan.
-      etaFor: (slug) => this.etaHint(slug),
+      etaFor: (slug, phase) => this.holderEta(slug, phase),
       // Presence beats the lease: a lock whose session the registry shows
       // ended stops blocking NOW; a live one is named as live on the queue.
       //
@@ -1621,7 +1915,7 @@ export abstract class ServiceBase {
       runs: () => this.watchableRuns(),
       journal: (slug, state, kind, data, phase) => {
         if (!this.root?.ok) return;
-        new Journal(this.root.path, slug, state.id).append(kind, data, phase);
+        Journal.for(this.root.path, slug, state.id).append(kind, data, phase);
       },
       save: (_slug, state) => {
         saveRun(state);
@@ -1657,6 +1951,26 @@ export abstract class ServiceBase {
           cwd: this.root?.path ?? process.cwd(),
           timeoutMs,
         }),
+      // …and judged WITHOUT running, at declaration (control-tower phase 88,
+      // #125): a ref the policy would refuse is refused while the session can
+      // still fix it, however `watchCmdRefs` is set.
+      judgeCommand: (command) => judgeCommand(command),
+      // `phase:<slug>/<N>` for a plan the pass did not load (#129): that plan's
+      // latest run record, then its board when no run holds the phase.
+      phaseDone: (slug, phase) => this.phaseDoneAnswer(slug, phase),
+      // `verify:<slug>/<N>`: the declaring phase's red lines on a new head.
+      verifyProbe: (target) => this.verifyWatch.probe(target),
+    });
+    this.verifyWatch = new VerifyWatch({
+      lookup: (slug, phase) => this.verifyLookup(slug, phase),
+      head: async (cwd) => {
+        const run = await shell('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
+          channel: 'shell', intent: 'watch-ref', timeout: 10_000, expectFailure: true,
+        });
+        const sha = run.ok ? run.stdout.trim() : '';
+        return /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
+      },
+      run: (command, cwd, timeoutMs) => runSingleCommand(command, { cwd, timeoutMs }),
     });
     // No flag: reading the issues of the repository you pointed this console at
     // is DISPLAY, exactly like `sessions/registry` and the repo browse surface.
@@ -1688,6 +2002,48 @@ export abstract class ServiceBase {
           tag: tagFor('usage-climbing', view.id, bucket, resetsAt),
         });
       },
+      // …and the forecast warns HOURS before the wall (control-tower phase 92,
+      // #141): an account serving live runs projected to wall inside the lead —
+      // what it walls at, when it resets, and who is burning it. Holding new
+      // admissions on the projection is the operator's opt-in.
+      forecastLeadMs: () => (this.prefs.usageForecastLeadHours ?? FORECAST_LEAD_HOURS) * 3_600_000,
+      onForecast: (view, bucket, forecast) => {
+        const name = view.email ?? view.name ?? view.id;
+        const wallsAt = forecast.wallsAt ? new Date(forecast.wallsAt) : null;
+        const resets = new Date(forecast.resetsAt);
+        const held = Number.isNaN(resets.getTime()) || !wallsAt ? null : Math.max(0, resets.getTime() - wallsAt.getTime());
+        const runs = (view.forecast?.burning ?? []).map((run) => `${run.slug} (phase${run.lanes.length === 1 ? '' : 's'} ${run.lanes.join(', ')})`);
+        this.announce('usage-climbing', {
+          title: `Usage walls in ${wallsAt ? `about ${hoursText(wallsAt.getTime() - Date.now())}` : 'under the lead'} — ${bucketLabel(bucket)}`,
+          body: `${name}: ${Math.round(forecast.pct)}% of the ${bucketLabel(bucket)} window, ${burnPhrase(forecast.burnPctPerHour) || 'climbing'}`
+            + ` · walls ≈${wallsAt ? wallsAt.toLocaleTimeString() : 'soon'}`
+            + ` · resets ${Number.isNaN(resets.getTime()) ? forecast.resetsAt : resets.toLocaleString()}`
+            + `${held !== null ? ` (${hoursText(held)} walled)` : ''}`
+            + `${runs.length ? ` · burning it: ${runs.join('; ')}` : ''}`,
+          tag: tagFor('usage-climbing', 'forecast', view.id, bucket, forecast.resetsAt),
+        });
+        if (this.prefs.usageForecastHold === true) {
+          this.scheduler.brake(view.id === DEFAULT_ACCOUNT_ID ? undefined : view.id, {
+            untilMs: Number.isNaN(resets.getTime()) ? null : resets.getTime(), pct: forecast.pct, window: bucket,
+          });
+        }
+      },
+      // Credits stopped carrying an account the operator let use them, or
+      // started again (control-tower phase 93, #146). A stop is the operator's
+      // to know — its runs are back on the plan's limits, by their own rules;
+      // a start lifts the brake a plan window put on the account.
+      onCredits: (view, change) => {
+        const name = view.email ?? view.name ?? view.id;
+        if (change.carrying) this.scheduler.releaseBrake(view.id === DEFAULT_ACCOUNT_ID ? undefined : view.id);
+        this.announce('limits', {
+          title: change.carrying ? `Credits carry ${name} again` : `Credits stopped — ${name}`,
+          body: change.carrying
+            ? `${name}: ${change.reason}. Runs on it are no longer held by its plan windows.`
+            : `${name} can no longer run past its plan windows on credit: ${change.reason}. `
+              + 'Its runs are back on the plan\'s limits — a switch, a wait or a pause, by their own rules.',
+          tag: tagFor('limits', 'credits', view.id),
+        });
+      },
       // A login that went from known-good to broken. Rides the `limits`
       // category (its catalogue copy claims sign-in failures), fires once per
       // transition — the poller's own refresh has already been tried.
@@ -1697,13 +2053,18 @@ export abstract class ServiceBase {
           title: `Sign in again — ${name}`,
           body:
             state === 'expired'
-              ? `${name}'s Claude login has expired and could not be refreshed. Sessions on it will ` +
-                'fail until someone signs in again — Settings → Claude accounts has the button.'
+              ? `The API refused ${name}'s Claude login. Sessions on it will fail until someone ` +
+                'signs in again — Settings → Claude accounts has the button.'
               : `${name} is signed out. Sign in again from Settings → Claude accounts before running ` +
                 'work as it.',
           tag: tagFor('limits', 'auth', view.id),
         });
       },
+      // The identity behind an account changed (control-tower phase 91, #131):
+      // every run bound to the previous one parks for a person.
+      onIdentityChange: (accountId, now) => { this.identityChanged(accountId, now); },
+      // A login a run depends on can no longer be renewed (#147 ask 4).
+      onLoginAtRisk: (view, risk) => { this.loginAtRisk(view, risk); },
     });
     // The poller's adaptive cadence, wired at last (ACT-3): an account one of
     // this console's runners is spending RIGHT NOW is read every ~90 s, the
@@ -1711,18 +2072,26 @@ export abstract class ServiceBase {
     // probe is late-bound like every other runner seam here.
     this.accounts.setActiveProbe((accountId) =>
       [...this.runners.values()].some((runner) => runner.isSpending(accountId)));
+    // Who is burning each account, for its forecast (control-tower phase 92, #141).
+    this.accounts.setBurningProbe((accountId) =>
+      [...this.runners.values()].flatMap((runner) => runner.burningOn(accountId)));
+    // Who is set to PAY as each account — the bar's paying mark (control-tower
+    // phase 13, #33) — whether or not a lane of it is spending this minute.
+    this.accounts.setPayingProbe((accountId) => this.payingAs(accountId));
+    this.probeCeiling = probeCeiling();
     this.startCeiling = new StartCeiling(() => ({
       startsPerHour: this.prefs.ceilingStartsPerHour ?? DEFAULT_STARTS_PER_HOUR,
       usdPerHour: this.prefs.ceilingUsdPerHour ?? DEFAULT_USD_PER_HOUR,
     }));
     this.mcp = new Mcp({
       onChange: () => this.emitMcp(),
-      // The probe is one of the fourteen automatic starts: counted against
-      // the instance's ceiling, refused past it (health goes stale, which is
-      // what it does overnight anyway), refused and announced by `admitStart`.
+      // The probe spends its OWN budget (control-tower phase 100, #73: "must
+      // not share the automatic-start ledger with work sessions"): refused past
+      // it — health goes stale, which is what it does overnight anyway — and
+      // never counted against the ceiling that stops a runaway work loop.
       ceiling: {
-        admit: (actor) => this.admitStart(actor, null, null),
-        charge: (actor) => this.startCeiling.charge(actor, null),
+        admit: (actor) => this.probeCeiling.admit(actor),
+        charge: (actor) => this.probeCeiling.charge(actor, null),
       },
       // A server's advertised tools changed under a plan that already trusted
       // it. This is the documented MCP supply-chain attack — a server that was
@@ -2014,6 +2383,20 @@ export abstract class ServiceBase {
   protected readonly radarZones = new Map<string, string[]>();
 
 
+  /**
+   * The live runs set to pay as an account (control-tower phase 13, #33) —
+   * the paying mark on its view, and the runs a machine-login re-sign-in
+   * would end. A run this console is driving, whatever its lanes are doing.
+   */
+  protected payingAs(accountId: string): { slug: string; runId: string }[] {
+    const out: { slug: string; runId: string }[] = [];
+    for (const [slug, runner] of this.runners) {
+      const state = runner.busy() ? runner.current() : null;
+      if (state && (state.accountId ?? DEFAULT_ACCOUNT_ID) === accountId) out.push({ slug, runId: state.id });
+    }
+    return out;
+  }
+
   protected liveRunIds(): Set<string> {
     const ids = new Set<string>();
     for (const runner of this.liveRunners()) {
@@ -2071,13 +2454,19 @@ export abstract class ServiceBase {
           // every word as the shipped default.
           retention: (runId) => loadRun(root, record.slug, runId)?.worktreeRetention ?? this.prefs.worktreeRetention,
           failed: (runId) => runEndedBadly(loadRun(root, record.slug, runId)),
+          // 🔴 #94: this sweep runs BEFORE any runner re-registers, so `live` is
+          // empty here by construction and "not live" read as "over" — a paused
+          // run's clean mirror mounts went at every restart. The stored run is
+          // the only witness that something will drive it again.
+          resumable: (runId) => runResumable(loadRun(root, record.slug, runId)),
         });
-        if (result.removed.length || result.kept.length) {
+        if (result.removed.length || result.kept.length || result.spared.length) {
           log.info('run.worktrees-swept', {
             slug: record.slug,
             removed: result.removed,
             kept: result.kept,
             runs: result.runs,
+            ...(result.spared.length ? { spared: result.spared } : {}),
           });
         }
       } catch (error) {
@@ -2110,6 +2499,68 @@ export abstract class ServiceBase {
   /** Runs whose surviving child's hook token could not be read back — `token-lost` for their cards. */
   protected tokenLostRuns = new Set<string>();
 
+  /** Hook calls refused from a session one of this console's runs launched (#74), keyed `runId session`. */
+  protected hookFaults = new Map<string, HookFault>();
+  /** Session ids a refused hook call named that belong to no run here — asked once each. */
+  private hookStrangers = new Set<string>();
+
+  /**
+   * A hook call answered 401 (#74). From a session one of this console's runs
+   * launched it is not noise: the CLI does not block a tool on a failed hook,
+   * so that session is working with no policy, no ask card and no wait guard.
+   * It is a RUN-level fault — journalled `run.hook-unauthorised` on its run
+   * once per session, and standing in the inbox as a health row while the
+   * session lives. Anything else stays the `hook.rejected` log line it was.
+   */
+  noteHookUnauthorised(hook: string, body: unknown, reason: string): void {
+    const raw = (body as { session_id?: unknown } | null)?.session_id;
+    const sessionId = typeof raw === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(raw) ? raw : '';
+    if (!sessionId || this.hookStrangers.has(sessionId)) return;
+    const known = [...this.hookFaults.values()].find((fault) => fault.sessionId === sessionId);
+    if (known) { known.count += 1; known.lastAt = new Date().toISOString(); return; }
+    const owner = this.sessions.get(sessionId)?.owner ?? '';
+    const ownerRun = /^autopilot\/([A-Za-z0-9_-]+)$/.exec(owner)?.[1];
+    let found: HookFault | null = null;
+    for (const [slug, runner] of this.runners) {
+      const state = runner.current();
+      if (!state) continue;
+      const record = Object.values(state.phases ?? {}).find((phase) => phase.sessionId === sessionId);
+      if (!record && state.id !== ownerRun) continue;
+      const at = new Date().toISOString();
+      found = { runId: state.id, slug, sessionId, hook, reason, count: 1, since: at, lastAt: at, ...(record ? { phase: record.phase } : {}) };
+      break;
+    }
+    if (!found) {
+      if (this.hookStrangers.size >= 256) this.hookStrangers.clear();
+      this.hookStrangers.add(sessionId);
+      return;
+    }
+    this.hookFaults.set(`${found.runId} ${sessionId}`, found);
+    const data = { sessionId, hook, reason, ...(this.approvals.liveToken(found.runId) ? { armed: true } : { armed: false }) };
+    try {
+      const runner = this.runners.get(found.slug);
+      if (runner?.current()?.id === found.runId) runner.note('run.hook-unauthorised', data, found.phase);
+      else if (this.root?.ok) Journal.for(this.root.path, found.slug, found.runId).append('run.hook-unauthorised', data, found.phase);
+    } catch { /* the journal is bookkeeping: the inbox row still stands */ }
+    this.emit('inbox', { at: new Date().toISOString() });
+  }
+
+  /** The standing hook faults, for the inbox — a session that has ended takes its row with it. */
+  protected hookFaultFacts(): HookFault[] {
+    for (const [key, fault] of [...this.hookFaults]) {
+      if (this.sessions.presence(fault.sessionId) === 'ended') this.hookFaults.delete(key);
+    }
+    return [...this.hookFaults.values()];
+  }
+
+  /**
+   * Retire the hook tokens kept past their loop (#74) once the last child
+   * holding one has gone. On the registry's 30 s poll.
+   */
+  protected sweepHeldTokens(): void {
+    for (const runId of this.approvals.sweepHeld(this.liveRunIds())) log.info('approvals.token-released', { runId });
+  }
+
   /**
    * What an earlier console left of its approvals (TRS-11), judged once the
    * runs can be read: a run whose child outlived that console gets its token
@@ -2120,6 +2571,15 @@ export abstract class ServiceBase {
    */
   protected recoverApprovals(): void {
     if (!this.root?.ok) return;
+    // Adoption is the act this hold exists to stop. A console in a crash loop
+    // adopting a surviving child's hook token is a console about to die again
+    // holding the only credential that child's next hook call can be answered
+    // with — and the measured loop did exactly that, twice, five minutes apart.
+    const held = adoptionHeld();
+    if (held) {
+      log.info('approvals.adoption-held', { hold: held });
+      return;
+    }
     const live = this.liveRunIds();
     for (const record of this.store?.list() ?? []) {
       let state: RunState | null = null;
@@ -2130,6 +2590,8 @@ export abstract class ServiceBase {
       const token = tokenFromSettingsFile(state.id);
       if (token && this.approvals.adoptToken(state.id, token)) {
         log.info('approvals.token-adopted', { runId: state.id, slug: record.slug, pids: alive.map((child) => child.pid) });
+        // …held by those children, so it is retired when the last one goes (#74).
+        this.approvals.release(state.id, alive.map((child) => ({ pid: child.pid, ...procIdentity(child) })));
       } else {
         this.tokenLostRuns.add(state.id);
         log.warn('approvals.token-lost', { runId: state.id, slug: record.slug, pids: alive.map((child) => child.pid) });
@@ -2153,8 +2615,61 @@ export abstract class ServiceBase {
    * does. A grant's twin is written by its one caller, which alone knows the
    * scope that answered (`phase.approval-auto-granted`).
    */
+  /**
+   * A card about to run out (control-tower phase 97, #140), said where an
+   * operator away from the console will see it: the push — on the card's own
+   * tag, so it replaces the card on a lock screen — and the notification
+   * inbox, both through `announce`. It names the card, its deadline and what
+   * its timeout will do, and carries Allow and Extend.
+   */
+  protected announceExpiring(approval: Approval, leadMs: number): void {
+    const where = `${approval.slug}${approval.phase != null ? ` phase ${approval.phase}` : ''}`;
+    this.announce(
+      'approval',
+      {
+        title: `Approval expires in ${Math.max(1, Math.round(leadMs / 60_000))} min — ${where}`,
+        body: `${approval.title} — ${approval.onTimeout ?? timeoutConsequence(approval)}`.slice(0, 400),
+        tag: tagFor('approval', approval.id),
+        detail: approval.detail,
+      },
+      {
+        slug: approval.slug,
+        phase: approval.phase,
+        runId: approval.runId,
+        approvalId: approval.id,
+        answer: {
+          item: inboxItemId({
+            kind: 'approval', slug: approval.slug, phase: approval.phase, runId: approval.runId, subject: approval.id,
+          }),
+          verbs: ['allow', 'extend'],
+        },
+      },
+      { replace: true },
+    );
+  }
+
   protected journalApproval(event: ApprovalEvent, approval: Approval): void {
     if (event === 'auto-granted' || approval.runId === 'unknown') return;
+    // The card's later moments (#140): a warning, an Extend, a card that stands.
+    const later = event === 'warned' ? 'phase.approval-expiring'
+      : event === 'extended' ? 'phase.approval-extended'
+        : event === 'standing' ? 'phase.approval-standing' : null;
+    if (later) {
+      const data: Record<string, unknown> = {
+        approvalId: approval.id, expiresAt: approval.expiresAt, onTimeout: approval.onTimeout ?? null,
+        ...(event === 'warned' ? { leadMs: approval.warned?.at(-1) ?? null } : {}),
+        ...(event === 'extended' ? { ...approval.extended?.at(-1), standsUntil: approval.standsUntil ?? null } : {}),
+        ...(event === 'standing' ? { convertedAt: approval.converted?.at ?? null } : {}),
+      };
+      try {
+        const runner = this.runnerByRunId(approval.runId);
+        if (runner) runner.note(later, data, approval.phase ?? undefined);
+        else if (this.root?.ok && approval.slug && approval.slug !== 'unknown') {
+          Journal.for(this.root.path, approval.slug, approval.runId).append(later, data, approval.phase ?? undefined);
+        }
+      } catch { /* the journal twin is bookkeeping: it never costs the card */ }
+      return;
+    }
     const name = event === 'raised' ? 'phase.approval-raised' : 'phase.approval-decided';
     const data: Record<string, unknown> = event === 'raised'
       ? {
@@ -2167,6 +2682,9 @@ export abstract class ServiceBase {
         approvalId: approval.id, kind: approval.kind, decision: approval.status, decidedBy: approval.decidedBy ?? null,
         waitedMs: Math.max(0, (Date.parse(approval.decidedAt ?? '') || Date.now()) - Date.parse(approval.createdAt)),
         ...(approval.recovered ? { recovered: true } : {}),
+        // The why a person decided with, which the card kept and this line
+        // dropped (control-tower phase 96, #142).
+        ...(approval.reason ? { reason: approval.reason.slice(0, 500) } : {}),
       };
     const phase = approval.phase ?? undefined;
     try {
@@ -2176,7 +2694,7 @@ export abstract class ServiceBase {
         return;
       }
       if (this.root?.ok && approval.slug && approval.slug !== 'unknown') {
-        new Journal(this.root.path, approval.slug, approval.runId).append(name, data, phase);
+        Journal.for(this.root.path, approval.slug, approval.runId).append(name, data, phase);
       }
     } catch { /* the journal twin is bookkeeping: it never costs the decision */ }
   }
@@ -2192,12 +2710,24 @@ export abstract class ServiceBase {
    * were simply immortal. Keyed on `liveRunIds()`, which is a fact about
    * processes rather than a status on disk.
    */
+  /**
+   * The supervisor chats whose `--mcp-config` a sweep must keep (control-tower
+   * phase 27) — none in a build without the chat, where no chat file is ever
+   * touched; the Pro service answers with the chats that have a live process.
+   */
+  protected liveChatIds(): string[] | undefined {
+    return undefined;
+  }
+
+  /** The console is closing — the Pro service ends its chats' processes here. */
+  protected closeChats(): void {}
+
   protected sweepRunSecrets(): void {
     // …and every run whose token this console adopted from a surviving child
     // (TRS-11): that child is still holding the file, and the file is the only
     // place its token can be read back from on the next restart.
     const keep = new Set([...this.liveRunIds(), ...this.approvals.armedRuns()]);
-    const removed = [...pruneMcpConfigs(keep), ...pruneSettingsFiles(keep)];
+    const removed = [...pruneMcpConfigs(keep, this.liveChatIds()), ...pruneSettingsFiles(keep)];
     if (removed.length) log.info('run.secrets-swept', { files: removed.length, kept: keep.size });
   }
 
@@ -2235,6 +2765,97 @@ export abstract class ServiceBase {
   }
 
   /**
+   * Bring every stored run booked under the old cost model to `COST_MODEL`,
+   * ONCE (control-tower phase 46, #62, CC-6/CC-7).
+   *
+   * Until 6.0 each spawn's reported `total_cost_usd` was booked whole, and a
+   * `--resume` reports the conversation's running total — so every resumed
+   * phase re-booked its earlier spend, and a stored run's `spentUsd` is what a
+   * Continue's budget and the spend pages read. `repriceFromLedger` re-books the
+   * run from its own journal's `phase.session` lines, takes off only the
+   * re-reported part, seeds each session's mark and stamps the model; the stamp
+   * is what makes a second boot a no-op. `run.cost-repriced {before, after}` is
+   * journalled on the run when its figure moved. A run this process is driving
+   * is left to its runner, whose own bookings are already deltas; one whose
+   * journal cannot be read is left for the next boot.
+   */
+  protected repriceStoredRuns(): void {
+    if (!this.root?.ok) return;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    const cents = (usd: number) => Math.round(usd * 100) / 100;
+    let repriced = 0;
+    for (const plan of this.store?.list() ?? []) {
+      let runs: ReturnType<typeof listRuns> = [];
+      try { runs = listRuns(root, plan.slug); } catch { continue; }
+      for (const state of runs) {
+        if ((state.costModel ?? 1) >= COST_MODEL || live.has(state.id)) continue;
+        try {
+          const journal = Journal.for(root, plan.slug, state.id);
+          const result = repriceFromLedger(state, journal.read());
+          if (!result) continue;
+          saveRun(state);
+          repriced += 1;
+          if (Math.abs(result.before - result.after) < 0.005) continue;
+          journal.append('run.cost-repriced', {
+            before: cents(result.before), after: cents(result.after), costModel: COST_MODEL, sessions: result.sessions,
+            phases: Object.fromEntries(Object.entries(result.phases)
+              .map(([phase, moved]) => [phase, { before: cents(moved.before), after: cents(moved.after) }])),
+          });
+        } catch (error) {
+          log.warn('run.reprice-failed', { slug: plan.slug, runId: state.id, error });
+        }
+      }
+    }
+    if (repriced) log.info('run.records-repriced', { runs: repriced, costModel: COST_MODEL });
+  }
+
+  /**
+   * Bring every stored run kept under the old clock model to `CLOCK_MODEL`,
+   * ONCE (control-tower phase 58, #66, EE-2).
+   *
+   * Until 6.0 only a phase's own attempts opened a window, so every resume,
+   * repair, QA round, closeout, landing and review worked the phase and left no
+   * time on its record — and the ETA, fitted on that record, learned a rate
+   * nobody worked at (a phase finished by its closeout read 12.8 s). The
+   * journal's `phase.session` lines carry each of those sessions' wall;
+   * `remeasureFromLedger` adds them as closed windows and stamps the model, so a
+   * second boot is a no-op. `run.clocks-remeasured {sessions, phases}` is
+   * journalled on the run when a figure moved. A run this process is driving is
+   * left to its runner, whose door now opens the windows itself; one whose
+   * journal cannot be read is left for the next boot.
+   */
+  protected remeasureStoredRuns(): void {
+    if (!this.root?.ok) return;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    let remeasured = 0;
+    for (const plan of this.store?.list() ?? []) {
+      let runs: ReturnType<typeof listRuns> = [];
+      try { runs = listRuns(root, plan.slug); } catch { continue; }
+      for (const state of runs) {
+        if ((state.clockModel ?? 1) >= CLOCK_MODEL || live.has(state.id)) continue;
+        try {
+          const journal = Journal.for(root, plan.slug, state.id);
+          const result = remeasureFromLedger(state, journal.read());
+          if (!result) continue;
+          saveRun(state);
+          remeasured += 1;
+          if (!Object.keys(result.phases).length) continue;
+          journal.append('run.clocks-remeasured', {
+            clockModel: CLOCK_MODEL, sessions: result.sessions,
+            phases: Object.fromEntries(Object.entries(result.phases)
+              .map(([phase, moved]) => [phase, { before: Math.round(moved.before), after: Math.round(moved.after) }])),
+          });
+        } catch (error) {
+          log.warn('run.remeasure-failed', { slug: plan.slug, runId: state.id, error });
+        }
+      }
+    }
+    if (remeasured) log.info('run.records-remeasured', { runs: remeasured, clockModel: CLOCK_MODEL });
+  }
+
+  /**
    * What the retention table would do right now, and what it found.
    *
    * The scan is shared by the sweep and by `GET /api/debug/retention`, so the
@@ -2254,6 +2875,10 @@ export abstract class ServiceBase {
         instanceDir: INSTANCE_STATE_DIR,
         runsDir: this.root?.ok ? consoleRunsDir(this.root.path) : null,
         live,
+        // Kept run worktrees (#75): the `project` root's trees, and every
+        // tree's size as last measured off the loop.
+        projectWorktrees: this.root?.ok ? join(worktreesRoot(this.root.path), 'runs') : null,
+        treeBytes: (dir) => keptTreeBytes(dir, treeDisk),
       }),
       loadPrefs().retention,
       Date.now(),
@@ -2335,10 +2960,75 @@ export abstract class ServiceBase {
    * why it is safe to leave this on with no flag. The first fetch of any
    * repository is an operator pressing Refresh.
    */
+  /**
+   * The digest's clock (control-tower phase 97, #140): hourly, and a tick with
+   * the category off composes nothing. Unref'd like every console clock.
+   */
+  protected startDigestClock(): void {
+    if (this.digestTimer) clearInterval(this.digestTimer);
+    this.digestTimer = setInterval(() => { this.digestTick(); }, DIGEST_EVERY_MS);
+    this.digestTimer.unref?.();
+  }
+
+  /**
+   * Compose and announce the digest, when its category is on (#140): every
+   * decision waiting with its deadline, every parked run, every detection, and
+   * what the channel failed to deliver. Nothing to say says nothing. Through
+   * `announce`, so the push, the notification inbox and the webhooks all have
+   * it and every gate the other categories obey holds.
+   */
+  digestTick(now = Date.now()): NotificationRecord | null {
+    if (!this.prefs.notify.digest) return null;
+    const digest = composeDigest({
+      now,
+      approvals: this.approvals.all()
+        .filter((card) => card.status === 'pending' && card.kind !== 'question')
+        .map((card) => ({ slug: card.slug, phase: card.phase, title: card.title, createdAt: card.createdAt, expiresAt: card.expiresAt })),
+      parks: this.runStates()
+        .filter((state) => state.status === 'parked' && state.halt)
+        .map((state) => ({ slug: state.slug, phase: state.halt?.phase ?? null, reason: state.halt?.reason ?? 'parked' })),
+      detections: this.digestDetections(),
+      undelivered: this.undelivered.kept,
+      undeliveredTotal: this.undelivered.lost,
+    });
+    if (!digest) return null;
+    this.undelivered = { kept: [], lost: 0 };
+    return this.announce('digest', { title: digest.title, body: digest.body.slice(0, 1_500), tag: tagFor('digest', String(now)) });
+  }
+
+  /**
+   * What other parts of the console have detected and want in the digest — a
+   * stalled lane, a session that stopped producing work. None yet: control-tower
+   * phase 101 builds the detections and fills this seam.
+   */
+  protected digestDetections(): DigestDetection[] {
+    return [];
+  }
+
+  /**
+   * The channel answered again (#140, #108): the notifications it failed to
+   * deliver meanwhile are said once, as a digest, with the first push that
+   * arrives. Only while the digest is on — it is the digest's promise.
+   */
+  protected digestCatchUp(): void {
+    if (!this.undelivered.lost || !this.prefs.notify.digest) return;
+    const lost = this.undelivered;
+    this.undelivered = { kept: [], lost: 0 };
+    const digest = composeDigest({
+      now: Date.now(), approvals: [], parks: [], detections: [], undelivered: lost.kept, undeliveredTotal: lost.lost,
+    });
+    if (digest) {
+      this.announce('digest', { title: digest.title, body: digest.body.slice(0, 1_500), tag: tagFor('digest', 'undelivered') });
+    }
+  }
+
   protected startIssuesSweepClock(): void {
     if (this.issuesSweepTimer) clearInterval(this.issuesSweepTimer);
     this.issuesSweepTimer = setInterval(() => {
       if (this.fleetHold()) return;
+      // A draft that has waited past its bound is said once more (#118). Local
+      // and cheap — a ledger read per plan — so it rides this clock.
+      this.reannounceIssueDrafts();
       void this.issues
         .sweep()
         .catch((error: unknown) => log.warn('issues.sweep-failed', { error: (error as Error).message }));
@@ -2355,19 +3045,75 @@ export abstract class ServiceBase {
   }
 
   /**
-   * The run a verified hook token belongs to.
+   * The run a verified hook token belongs to — the live one, else the run's own
+   * STORED record.
    *
-   * Null when the token names nothing this console drives — a run that ended
-   * between the child's call and this lookup. Answering `guarded` in that case
-   * is the fail-safe direction: the strictest profile, never a neighbour's.
+   * The live half alone was the whole lookup, and #21 is what that cost. A
+   * child that outlives its console keeps working and keeps calling this hook;
+   * the console adopts its token (`recoverApprovals`), so every call verifies —
+   * and then resolved to nothing, was answered under the strictest profile with
+   * no run context, and raised cards stamped `unknown` that nobody could
+   * attribute. Ninety calls in forty-five minutes, each one a fact the console
+   * was holding on disk and declining to read.
+   *
+   * So the record answers when no runner does: its own `permissionProfile`, its
+   * plan's policy overlay and `permission.destructive` row, its relay state,
+   * its slug and phase. Null now means what `hook.run-unknown` always claimed
+   * it meant — no record on this machine explains this token.
    */
-  protected runBytoken(runId?: string | null): RunState | null {
+  protected runForToken(runId?: string | null): RunState | null {
     if (!runId) return null;
     for (const runner of this.liveRunners()) {
       const state = runner.current();
       if (state?.id === runId) return state;
     }
+    return this.storedRunById(runId);
+  }
+
+  /**
+   * Which plan's runs hold a given run id — remembered, because this question
+   * is asked on a path that runs once per TOOL CALL.
+   *
+   * A run id belongs to exactly one plan for as long as its file exists, so a
+   * hit is kept for the life of the process and re-asked only when the file it
+   * names has gone (retention prunes). A MISS is re-asked on a short clock: the
+   * scan is one `loadRun` per open plan, and a stale token calling in a loop
+   * must not pay for all of them every time.
+   */
+  private readonly tokenPlan = new Map<string, { slug: string | null; at: number }>();
+
+  /** The stored record for a run id, across every plan this console has open. */
+  protected storedRunById(runId: string): RunState | null {
+    if (!this.root?.ok) return null;
+    const root = this.root.path;
+    const live = this.liveRunIds();
+    const memo = this.tokenPlan.get(runId);
+    if (memo?.slug) {
+      let state: RunState | null = null;
+      try { state = loadRun(root, memo.slug, runId, live); } catch { state = null; }
+      if (state) return state;
+      // The file is gone — pruned, or the plan was closed and swept. Ask again.
+      this.tokenPlan.delete(runId);
+    } else if (memo && Date.now() - memo.at < TOKEN_PLAN_MISS_MS) {
+      return null;
+    }
+    for (const record of this.store?.list() ?? []) {
+      let state: RunState | null = null;
+      try { state = loadRun(root, record.slug, runId, live); } catch { state = null; }
+      if (state) { this.rememberTokenPlan(runId, record.slug); return state; }
+    }
+    this.rememberTokenPlan(runId, null);
     return null;
+  }
+
+  private rememberTokenPlan(runId: string, slug: string | null): void {
+    this.tokenPlan.delete(runId);
+    this.tokenPlan.set(runId, { slug, at: Date.now() });
+    while (this.tokenPlan.size > TOKEN_PLAN_MAX) {
+      const oldest = this.tokenPlan.keys().next();
+      if (oldest.done) break;
+      this.tokenPlan.delete(oldest.value);
+    }
   }
 
   /** The runner driving a given run id, for controls that arrive by id. */
@@ -2466,6 +3212,24 @@ export abstract class ServiceBase {
     this.refreshDeliveryIssue();
   }
 
+  /** The last `skillCopy()` answer and when it was read — `/api/state` is polled, the disk is not the news. */
+  private skillCopyMemo: { at: number; report: SkillCopyReport } | null = null;
+
+  /**
+   * Which skill copy each Claude Code config dir's sessions load, against this
+   * console's commit (control-tower phase 98, #151) — `skill-copy.ts`, the one
+   * reader, cached for five seconds like `distRev()`. The doctor's row,
+   * `/api/state`'s field, the inbox's health row and the boot prompt all read
+   * this answer, so none of them can say a different thing about one copy.
+   */
+  skillCopy(): SkillCopyReport {
+    const now = Date.now();
+    if (this.skillCopyMemo && now - this.skillCopyMemo.at < 5_000) return this.skillCopyMemo.report;
+    const report = skillCopyReport({ configDirs: claudeConfigDirs(), consoleRev: distRev() });
+    this.skillCopyMemo = { at: now, report };
+    return report;
+  }
+
   /**
    * What the inbox's instance-health rows read (FLT-1 iv, FLT-6): this
    * console's delivery verdict and unread count, Tailscale under `--remote`
@@ -2508,6 +3272,7 @@ export abstract class ServiceBase {
       }));
     const facts: NonNullable<InboxFacts['fleet']> = {
       delivery: { ok: delivery.ok, reason: delivery.reason }, unread: this.notifications.unread(), remote, siblings,
+      crashed: this.crashedBoot,
     };
     return facts;
   }
@@ -2579,6 +3344,121 @@ export abstract class ServiceBase {
   }
 
   /**
+   * Every live run's hinted-not-queued phases (control-tower phase 86, #128
+   * #114) — `GET /api/queue`'s `hinted`, oldest hint first across runs. Read
+   * off each live runner's own state through the one shared reader
+   * (`hintedPhases`), never a copy of its rule.
+   */
+  queueHinted(): (HintedPhase & { slug: string; runId: string })[] {
+    const rows: (HintedPhase & { slug: string; runId: string })[] = [];
+    for (const runner of this.runners.values()) {
+      const state = runner.current();
+      if (!state) continue;
+      for (const row of hintedPhases(state)) rows.push({ slug: state.slug, runId: state.id, ...row });
+    }
+    return rows.sort((a, b) => Date.parse(a.since) - Date.parse(b.since) || a.slug.localeCompare(b.slug) || a.phase - b.phase);
+  }
+
+  /**
+   * Every lock claim this console can see, one row each, worst-first (#24) —
+   * `GET /api/locks`. Read off the lock FILES now, not the store's scan, so a
+   * row carries the branch and worktree the file says and a lapse is judged
+   * on this instant's clock with the holder's presence (`server/locks.ts`).
+   */
+  lockRows(filter: LockFilter = {}): LockRow[] {
+    return lockRows({
+      locks: () => this.lockFilesNow(),
+      title: (slug, phase) => {
+        const plan = this.store?.get(slug)?.plan;
+        return plan?.phases[phase]?.title || titleOf(plan?.graph ?? [], phase) || `Phase ${phase}`;
+      },
+      presence: (lock) => this.lockPresenceFor(lock),
+      queue: () => this.scheduler.snapshot().entries,
+      eta: (slug) => this.etaHint(slug),
+      now: () => Date.now(),
+    }, filter);
+  }
+
+  /** The lock files of every plan this console lists that is not closed, read now. */
+  protected lockFilesNow(): Lock[] {
+    // `handoffsDir` is only set when the folder existed at open; the first
+    // claim in a fresh docs root creates it, and that claim must still show.
+    const handoffsDir = this.root?.handoffsDir ?? (this.root?.docsDir ? join(this.root.docsDir, 'handoffs') : null);
+    if (!handoffsDir) return [];
+    const slugs = (this.store?.list() ?? []).filter((record) => !record.plan?.closed).map((record) => record.slug);
+    return readLockFiles(handoffsDir, slugs);
+  }
+
+  /**
+   * The one writer of `<instance state>/human-steps.ndjson` (control-tower
+   * phase 41) — every door that records a person's turn goes through it.
+   */
+  humanStepsNow(): HumanStepLedger {
+    // Every write is news to an open page (control-tower phase 42): the step,
+    // as it now reads, rides the `human-step` event — a patch, never a refetch.
+    return (this.humanStepLedger ??= new HumanStepLedger(join(INSTANCE_STATE_DIR, HUMAN_STEPS_FILE), undefined,
+      (step) => this.emit('human-step', { step })));
+  }
+
+  /**
+   * Record a declared human step and inform a person ONCE: the ledger line,
+   * one `needs-you` push naming the step's actions, the move to `notified`.
+   * The inbox row is derived from the ledger, so it is one by construction.
+   * Null when the declaration's step was not a step. Never throws — a person's
+   * turn that could not be written must not cost the park it rides.
+   */
+  recordHumanStep(input: DeclareInput): HumanStep | null {
+    try {
+      return declareHumanStep({ ledger: this.humanStepsNow(), announce: (step) => this.announceHumanStep(step) }, input);
+    } catch (error) {
+      log.warn('human-steps.ledger-unwritable', { slug: input.slug, phase: input.phase, error: (error as Error)?.message ?? String(error) });
+      return null;
+    }
+  }
+
+  /**
+   * The one push a human step gets — true when it was announced — and, from
+   * control-tower phase 43, each REMINDER (`n` > 0), under the same tag so a
+   * device holds one notification per step. *I did it* is a signed button
+   * (`answer`), bound to the step's inbox row.
+   */
+  protected announceHumanStep(step: HumanStep, n = 0): boolean {
+    const facts = { ...step, label: KIND_META[step.kind].label };
+    const push = n > 0 ? humanStepReminderPush(facts, n) : humanStepPush(facts);
+    const record = this.announce('needs-you', {
+      ...push.message, tag: tagFor('needs-you', step.slug, String(step.phase), `human-step-${step.id}`),
+    }, {
+      slug: step.slug, phase: step.phase, ...(step.runId ? { runId: step.runId } : {}), step: push.step,
+      answer: {
+        item: inboxItemId({ kind: 'human-step', slug: step.slug, phase: step.phase, runId: step.runId, subject: step.id }),
+        verbs: ['check'],
+      },
+    });
+    return record !== null;
+  }
+
+  /** The reminder clock's pass (control-tower phase 43) — `ServiceRecovery.humanStepClockTick`. */
+  protected abstract humanStepClockTick(now?: number): unknown;
+
+  /** An embedded terminal a human step opened has exited — its command's exit may prove the step. */
+  protected abstract humanStepTerminalExited(id: string, code: number): Promise<unknown>;
+
+  /**
+   * The reminder clock: once a minute, unref'd like every console clock. A
+   * pass that throws is logged and the clock keeps its schedule.
+   */
+  protected startHumanStepClock(): void {
+    if (this.humanStepTimer) clearInterval(this.humanStepTimer);
+    this.humanStepTimer = setInterval(() => {
+      try { this.humanStepClockTick(); } catch (error) {
+        log.warn('human-steps.clock-failed', { error: (error as Error)?.message ?? String(error) });
+      }
+    }, HUMAN_STEP_CLOCK_MS);
+    this.humanStepTimer.unref?.();
+  }
+
+
+  /**
    * Each phase of a plan, its declared scope, and what that scope collides with.
    *
    * Read straight off the same two sources admission uses — the Repos column
@@ -2608,22 +3488,51 @@ export abstract class ServiceBase {
   }
 
   /**
+   * THE presence of a session that claimed a phase (#49) — one answer for the
+   * inbox gate and the overdue resume (`declarerHold`), for admission and every
+   * other reader of a lock's session (`lockPresenceFor`), and for the runner's
+   * own check before a `--resume` (its `sessionPresence` dep). Readers asking
+   * the registry separately is how the inbox called a declarer gone while
+   * admission, two seconds later, queued the phase it re-boarded behind that
+   * same declarer's lock — and the run waited on itself until it was stopped.
+   *
+   * The registry's word, with ONE fact laid over it. `ended` is the hook's
+   * claim, and a `claude` that `/clear`s or resumes into a new session id ends
+   * the OLD id while the process — and the lock the old id claimed — carry on.
+   * The registry already answers such a record `unknown` when it can prove the
+   * process is the same one (`procStartedAt`, #73); one it cannot prove stays
+   * `ended` there, because a census must not revive a recycled pid. A claim is
+   * different: its lease bounds a wrong answer, and a wrong `ended` frees a
+   * live session's lock under it. So an `ended` record with no identity whose
+   * pid still runs reads `unknown` here — nobody vouches either way, and the
+   * lease decides.
+   */
+  protected declarerPresence(sessionId: string): { presence: Presence; pid?: number } {
+    const seen = this.sessions.presenceDetail(sessionId);
+    if (seen.presence !== 'ended' || !seen.pid) return seen;
+    // Identity was asked and answered: the process that ran it is gone.
+    if (this.sessions.get(sessionId)?.procStartedAt) return seen;
+    return this.sessions.pidLive(seen.pid) ? { presence: 'unknown', pid: seen.pid } : seen;
+  }
+
+  /**
    * Whether the session that wrote a declaration still holds its phase — the
    * presence read every resume of THAT session must pass first (REG-1).
    *
-   * A session the registry shows LIVE is still working: a hand session that
-   * declared its wait and carried on, or one that took the phase over. Arming a
-   * `--resume` of it would put a second `claude` on its transcript in its
-   * working tree — the one act nothing can undo. `unknown` (no record, a stale
-   * one, a stopped process) falls back to the lease: an unexpired lock naming
-   * that session says it still holds the phase. `ended`, or no session named at
-   * all, holds nothing. Returns what held it, or null.
+   * A session `declarerPresence` shows LIVE is still working: a hand session
+   * that declared its wait and carried on, or one that took the phase over.
+   * Arming a `--resume` of it would put a second `claude` on its transcript in
+   * its working tree — the one act nothing can undo. `unknown` (no record, a
+   * stale one, a stopped process, an ended id whose process still runs) falls
+   * back to the lease: an unexpired lock naming that session says it still
+   * holds the phase — the same lock admission would queue behind. `ended`, or
+   * no session named at all, holds nothing. Returns what held it, or null.
    */
   protected declarerHold(
     slug: string, phase: number, sessionId: string | undefined,
   ): { why: 'session-live' | 'session-lease'; sessionId: string; pid?: number; lock?: string } | null {
     if (!sessionId) return null;
-    const { presence, pid } = this.sessions.presenceDetail(sessionId);
+    const { presence, pid } = this.declarerPresence(sessionId);
     if (presence === 'live') return { why: 'session-live', sessionId, ...(pid ? { pid } : {}) };
     if (presence === 'ended') return null;
     const now = Date.now();
@@ -2652,7 +3561,13 @@ export abstract class ServiceBase {
    * vouching for that session, so the LEASE decides — which is exactly what
    * `unknown` means in `sessions/registry.ts`.
    */
-  protected lockPresenceFor(lock: { owner: string; session?: string }): Presence {
+  protected lockPresenceFor(lock: { owner: string; session?: string; slug?: string; phase?: number }): Presence {
+    // 🔴 A run's lane is LIVE while its run holds that phase's grant or has the
+    // lane's session running (control-tower phase 60, #82). It read `unknown`,
+    // so the lock twin of a live foreign lane was cappable while its grant was
+    // exempt: the two-hour cap parked healthy waits behind a refreshed lock,
+    // and the park note carried its stale lease.
+    if (this.lockHasLiveLane(lock)) return 'live';
     // `liveRunIds()` alone answered only for THIS console's runners, so every
     // lane of every other console on the same root fell through to the registry
     // — and got `ended`, because a lane's lock outlives its attempt's session.
@@ -2660,7 +3575,23 @@ export abstract class ServiceBase {
     // (S5-a). The run FILE settles it, through `runIsDead`, so both consoles
     // reach the same verdict from the same evidence.
     if (lockHeldByLiveRun(lock.owner, this.liveRunIds(), this.inFlightRuns())) return 'unknown';
-    return this.sessions.presenceOfLock(lock);
+    // The declarer's answer, not the registry's raw word (#49): the inbox gate
+    // reads this same function, so it cannot call a claim free that admission
+    // is about to queue behind.
+    return lock.session ? this.declarerPresence(lock.session).presence : 'unknown';
+  }
+
+  /**
+   * Is this an autopilot lane's lock whose run is working that phase right now
+   * — holding its grant in this console's scheduler, or with the lane's session
+   * alive in the run's own record (another console's lane)? See `lockPresenceFor`.
+   */
+  protected lockHasLiveLane(lock: { owner: string; slug?: string; phase?: number }): boolean {
+    const runId = autopilotRunId(lock.owner);
+    if (!runId || lock.phase == null) return false;
+    let grants: readonly { runId: string; slug: string; phase: number | null }[] = [];
+    try { grants = this.scheduler?.granted(runId) ?? []; } catch { grants = []; }
+    return lockHasLiveLane(lock, grants, this.inFlightRuns());
   }
 
   /**
@@ -2692,6 +3623,40 @@ export abstract class ServiceBase {
    * and saves it, and doing that to a second copy loaded from disk would race
    * the runner's own persist and lose whichever wrote first.
    */
+  /**
+   * What the console's own record says of `<slug>`'s phase N (control-tower
+   * phase 88, #129): the plan's live or latest run first; a phase no run of
+   * this console holds answers from the board — a hand-driven phase has no
+   * console §Verification to wait for. Null when neither can be read.
+   */
+  protected phaseDoneAnswer(slug: string, phase: number): { state: 'landed' | 'pending'; detail: string } | null {
+    if (!this.root?.ok) return null;
+    const state = this.runners.get(slug)?.current() ?? latestRun(this.root.path, slug, this.liveRunIds());
+    const answer = phaseDoneOf(state?.phases?.[String(phase)]);
+    if (answer) return answer;
+    const board = this.boards.get(slug)?.settled;
+    if (!board) return null;
+    return board.done.includes(phase)
+      ? { state: 'landed', detail: `phase ${phase} is done on the board (no run of it here)` }
+      : { state: 'pending', detail: `phase ${phase} is not done on the board` };
+  }
+
+  /** Where `verify:<slug>/<N>` re-runs the phase's red lines, and what it reads them from (#129). */
+  protected verifyLookup(slug: string, phase: number): VerifyLookup | null {
+    if (!this.root?.ok) return null;
+    const state = this.runners.get(slug)?.current() ?? latestRun(this.root.path, slug, this.liveRunIds());
+    const record = state?.phases?.[String(phase)];
+    if (!state || !record) return null;
+    const planned = this.store?.get(slug)?.plan?.phases[phase];
+    const tree = state.workRoot ?? state.root ?? this.root.path;
+    return {
+      record,
+      cwd: resolve(tree, record.verifiedIn ?? planned?.verifyIn?.trim() ?? '.'),
+      proofs: readProofs(proofsFile(this.root.path, slug), slug, phase),
+      planLines: extractCommands(planned?.verification).commands,
+    };
+  }
+
   protected watchableRuns(): { slug: string; state: RunState }[] {
     if (!this.root?.ok) return [];
     const out: { slug: string; state: RunState }[] = [];
@@ -2825,7 +3790,9 @@ export abstract class ServiceBase {
     const asking = scope.length ? [...scope] : ['all'];
     const out: OccupiedTree[] = [];
     for (const lock of this.liveLockFiles()) {
-      if (lockLapsed(lock, now, this.sessions.presenceOfLock(lock))) continue;
+      // The one answer admission reads (#49): a claim this census called free
+      // while admission queued behind it would hand its tree to a second run.
+      if (lockLapsed(lock, now, this.lockPresenceFor(lock))) continue;
       const by = `${lock.owner}, ${lock.slug} phase ${lock.phase}${lock.session ? ` [session ${lock.session}]` : ''}`;
       if (lock.tree) {
         out.push({ tree: lock.tree, by, owner: lock.owner });
@@ -2942,10 +3909,15 @@ export abstract class ServiceBase {
       // Working THIS phase (strongly or weakly): a peer while it lives. Anything
       // else might be about to claim it only until its claim window shuts.
       const onThisPhase = Boolean(plan && phase && plan.slug === phase.slug && plan.phase === phase.phase);
-      const claimUntil = onThisPhase ? null : claimWindowEnds(record);
+      // An operator said this terminal is not working here (#119).
+      if (holdReleasedAt(record, now)) continue;
+      const read = this.sessionScope(record, root, now);
+      const claimUntil = onThisPhase ? null : read.leaseUntil ?? claimWindowEnds(record);
       if (claimUntil != null && now >= claimUntil) continue;
-      const peerScope = this.scopeOfSession(record, root);
-      if (!scopesIntersect(peerScope, wanted)) continue;
+      // A session at work on THIS phase holds it whatever it touched; any other
+      // holds what it touched here, and nothing once that is nothing.
+      const peerScope = read.scope.length ? read.scope : onThisPhase ? [...wanted] : [];
+      if (!peerScope.length || !scopesIntersect(peerScope, wanted)) continue;
       out.push({
         sessionId: record.sessionId,
         pid: record.pid ?? null,
@@ -2956,37 +3928,120 @@ export abstract class ServiceBase {
         scope: peerScope,
         plan,
         ...(claimUntil != null ? { claimUntil } : {}),
+        basis: read.basis,
+        ...(read.evidence.length ? { evidence: read.evidence } : {}),
       });
     }
     return out;
   }
 
   /**
-   * What a session is working in, as far as the console can tell: the scope
-   * its environment declared (`PE_SCOPE`), else the REPOSITORY its cwd sits in
-   * under the root — a directory directly under the root that is a checkout of
-   * its own (a submodule: it has a `.git`), which is what a scope token names
-   * in a monorepo-of-submodules — else everything. A session in the root
-   * itself, in an ordinary subdirectory of a single repository, or in a
-   * worktree the console cannot map might touch anything, and the safe reading
-   * of "might" is "does".
+   * The transcripts the peer feed reads, incrementally (#119) — and the reader
+   * a lane's activity is read through, from the log's end (control-tower phase
+   * 95, #138).
    */
-  protected scopeOfSession(record: Pick<SessionRecord, 'scope' | 'cwd'>, root: string): string[] {
-    const declared = parseScope(record.scope ?? '');
-    if (declared.length) return declared;
-    const prefix = root.endsWith('/') ? root : `${root}/`;
-    if (!record.cwd.startsWith(prefix)) return ['all'];
-    const first = record.cwd.slice(prefix.length).split('/')[0] ?? '';
-    if (!first || first.startsWith('.') || !existsSync(join(prefix, first, '.git'))) return ['all'];
-    const token = normalizeToken(first);
-    return token ? [token] : ['all'];
+  protected readonly transcripts = new TranscriptReader();
+  /** Where each session's own log was found: a scan of `projects/*` is paid once, not per request. */
+  private readonly sessionLogs = new Map<string, string>();
+
+  /**
+   * Where a session's own JSONL log is (control-tower phase 95, #138): the path
+   * its presence hook reported (the registry's `transcript`), else the config
+   * dir of the account that recorded it, else any account this console knows,
+   * else the machine's own. Remembered while the file is there.
+   */
+  protected sessionLogOf(sessionId: string, accountId?: string): string | null {
+    const known = this.sessionLogs.get(sessionId);
+    if (known && existsSync(known)) return known;
+    const dirs = new Set<string>();
+    if (accountId) dirs.add(this.accounts.configDirFor(accountId));
+    for (const id of this.accounts.accountIds()) dirs.add(this.accounts.configDirFor(id));
+    dirs.add(this.accounts.configDirFor(undefined));
+    const found = locateSessionLog(sessionId, { registryPath: this.sessions.get(sessionId)?.transcript, configDirs: [...dirs] });
+    if (found) {
+      this.sessionLogs.set(sessionId, found);
+      if (this.sessionLogs.size > 256) this.sessionLogs.delete(this.sessionLogs.keys().next().value!);
+    }
+    return found;
+  }
+
+  /**
+   * What a session holds in `root`, and why — `inferSessionScope` over its
+   * declared `PE_SCOPE`, else what its transcript says it TOUCHED (control-tower
+   * phase 82, #119). The cwd alone used to decide: a session opened in the root
+   * was scope `all` for its whole life, whatever it worked on. Now the cwd is
+   * only the bounded unknown lease of a session that has touched nothing yet,
+   * and a session whose every touch is in another docs root holds nothing here.
+   */
+  protected sessionScope(record: SessionRecord, root: string, now = Date.now()): InferredScope {
+    return inferSessionScope({
+      root,
+      record,
+      touches: this.transcripts.read(record.transcript),
+      planScope: (slug, phase) => {
+        const plan = this.store?.get(slug)?.plan;
+        if (!plan) return undefined;
+        return phase == null ? [] : this.scopeOf(slug, phase) ?? [];
+      },
+      now,
+    });
   }
 
   /** What a phase's Repos column says it touches. Undefined for an unknown plan. */
+  /**
+   * The machine's 5-minute load against the guard's factor (control-tower
+   * phase 100, #135 G.27) — the same `os.loadavg()` the phase report and the
+   * supervisor read; the factor is null when the guard is off.
+   */
+  loadSample(): { avg5: number; cores: number; factor: number | null } {
+    return { avg5: loadavg()[1] ?? 0, cores: availableParallelism(), factor: loadGuardFactor(this.prefs) };
+  }
+
+  /** A plan's scheduling policy: its own, else the console's, else `seniority` (control-tower phase 100). */
+  schedulingPolicyFor(slug: string): SchedulingPolicy {
+    const own = this.prefs.schedulingPolicies?.[slug];
+    return schedulingPolicy(isSchedulingPolicy(own) ? own : this.prefs.schedulingPolicy);
+  }
+
+  /** The plan's critical path over a board, in order — what the `critical-path` policy promotes. */
+  criticalPathOf(slug: string, board: Board | null): number[] {
+    const plan = this.store?.get(slug)?.plan;
+    if (!plan || !board) return [];
+    const rows = plan.graph ?? [];
+    const sizes = new Map(rows.map((row) => [row.phase, plan.phases[row.phase]?.size ?? ('M' as const)]));
+    return criticalPath(indexGraph(rows), board, sizes, this.sizing, resolveBudget(plan.sessionBudget.targetModel, this.sizing)).phases;
+  }
+
+  /**
+   * Every lane a stopped run's record keeps for a phase stands again in the
+   * scheduler (control-tower phase 100): a reservation outlives the console.
+   * A live run's runner does the same for its own at its start.
+   */
+  protected registerStoredReservations(): void {
+    if (!this.root?.ok) return;
+    const live = this.liveRunIds();
+    for (const record of this.store?.list() ?? []) {
+      let state: RunState | null = null;
+      try { state = latestRun(this.root.path, record.slug, live); } catch { state = null; }
+      if (!state || live.has(state.id)) continue;
+      for (const phase of Object.values(state.phases)) {
+        const kept = phase?.queueControl?.reserve;
+        if (!kept || phase.status === 'done' || phase.status === 'skipped') continue;
+        this.scheduler.reserveLane({
+          slug: state.slug, runId: state.id, phase: phase.phase, at: kept.at, by: kept.by,
+          ...(kept.reason ? { reason: kept.reason } : {}), ...(kept.lane ? { lane: kept.lane } : {}),
+        });
+      }
+    }
+  }
+
   protected scopeOf(slug: string, phase: number): string[] | undefined {
     const row = this.store?.get(slug)?.plan?.graph.find((r) => r.phase === phase);
     return row ? scopeOfRow(row.repos) : undefined;
   }
+
+  /** One connectivity probe for every run this console starts (control-tower phase 80, #108). */
+  private outageProbe: ConnectivityProbe | null = null;
 
   private makeRunner(): Runner {
     const flags = this.flags;
@@ -2994,17 +4049,26 @@ export abstract class ServiceBase {
       scriptsDir: flags.scriptsDir,
       approvals: this.approvals,
       scheduler: this.scheduler,
+      // The plan's scheduling policy and its critical path (control-tower phase 100).
+      schedulingPolicy: (slug) => this.schedulingPolicyFor(slug),
+      criticalPath: (slug, board) => this.criticalPathOf(slug, board),
+      // What a lane waiting out an outage asks "is the API back?" — phase 76's
+      // probe, one per console, so a dozen waiting lanes cost one look a minute.
+      connectivity: (this.outageProbe ??= new ConnectivityProbe()),
       // The panic button, for the one auto-start the runner owns that the
       // scheduler cannot see — the park poke. See `RunnerDeps.fleetHold`.
       fleetHold: () => this.fleetHold(),
       maxParallel: () => this.flags.maxSessions,
-      // The registry's word on a lock's session, for the boarding belt-check:
-      // an ended session's claim is released and boarding goes on.
-      lockPresence: (lock) => this.sessions.presenceOfLock(lock),
+      // The word on a lock's session, for the boarding belt-check: an ended
+      // session's claim is released and boarding goes on. The SAME reader the
+      // scheduler's admission asks (`lockPresenceFor` → `declarerPresence`,
+      // #49) — it read the raw registry, so the belt-check could release as
+      // debris a claim admission had just queued behind.
+      lockPresence: (lock) => this.lockPresenceFor(lock),
       // A session's own presence, for the resume gate. This console's own lanes
       // never reach it as `live`: a lane's session has exited by the time
       // anything resumes it, and its pid probe says so (REG-1).
-      sessionPresence: (sessionId) => this.sessions.presenceDetail(sessionId),
+      sessionPresence: (sessionId) => this.declarerPresence(sessionId),
       // The peer belt-check at boarding (REG-3) — the same predicate admission
       // read, for the grant→spawn window.
       peers: (slug, phase, excluding) => (this.root?.ok ? this.peersInRepository(this.root.path, { slug, phase }, excluding) : []),
@@ -3038,6 +4102,9 @@ export abstract class ServiceBase {
       // healer reads, so the loop's climbs and the healer's count against one
       // budget.
       ladderCaps: () => ladderCaps(this.prefs),
+      // Every session's caps, measured from this console's own sessions
+      // (control-tower phase 59, #83); the shipped table until the census lands.
+      sessionCaps: () => this.sessionCapTable(),
       // The per-day cap's denominator. The runner cannot compute it — it sees
       // one run, and the cap is about the machine.
       dayHistory: () => this.dayRungs(),
@@ -3045,6 +4112,10 @@ export abstract class ServiceBase {
       // Opt-in, and absent means no: a phase with no §Verification parks
       // until an operator says the handoff alone is proof enough.
       allowUnverifiedPhases: () => this.prefs.allowUnverifiedPhases === true,
+      // A phase's reds are judged against what its lines read on the tree it
+      // boarded on (control-tower phase 83, #103): a red already there is
+      // inherited, never charged to it.
+      verifyBaseline: () => true,
       // Opt-in, and absent means no: a `human` gate is a person's until an
       // operator says otherwise for their own console.
       delegateHumanGates: () => this.prefs.delegateHumanGates === true,
@@ -3066,6 +4137,10 @@ export abstract class ServiceBase {
       // The plan is the only source for what proves a phase worked, exactly as
       // it is the only source for what the phase should do.
       verificationText: (slug, phase) => this.store?.get(slug)?.plan?.phases[phase]?.verification,
+      // A person's turn (control-tower phase 41): the ledger, the one push.
+      humanStep: (input) => this.recordHumanStep(input),
+      // A watchdog park arms a minted cmd: ref only when it will run (#121 item 3).
+      mintedCmdRefs: () => this.flags.allowRun && this.prefs.watchMintedCmdRefs === true,
       setupText: (slug, phase) => this.store?.get(slug)?.plan?.phases[phase]?.setup,
       // Raw-text presence check, distinct from the parsed field above: it is
       // what lets the park message tell "the plan omits it" apart from "the
@@ -3080,6 +4155,10 @@ export abstract class ServiceBase {
         const row = this.store?.get(slug)?.plan?.graph.find((r) => r.phase === phase);
         return row ? splitRepos(row.repos) : undefined;
       },
+      // …and the same cell as FULL paths, which is what the working tree is
+      // asked at (control-tower phase 45, #60): `shop/shop-web`, not the
+      // `shop` the name view truncates it to.
+      phaseRepoDirs: (slug, phase) => this.scopeOf(slug, phase),
       // The same cell, read as SCOPE: what admission decides on and what the
       // child is told it holds. Kept separate from `phaseRepos` above so a
       // cosmetic hint can never become the thing concurrency rests on.
@@ -3087,9 +4166,19 @@ export abstract class ServiceBase {
       // …and for what it should run as. These bullets have been in the plan
       // format from the start; until now nothing read them.
       phaseDefaults: (slug, phase) => {
-        const detail = this.store?.get(slug)?.plan?.phases[phase];
+        const plan = this.store?.get(slug)?.plan;
+        const detail = plan?.phases[phase];
         if (!detail) return undefined;
-        return { model: modelAlias(detail.model), effort: effortOf(detail.effort) };
+        // The permission mode is the phase's bullet, else the plan's line —
+        // one level to the runner (`resolvePermissionMode`'s `plan`), both
+        // read by `permissionModeFor` exactly as `--permission-mode N` prints.
+        const mode = permissionModeFor(plan, phase)?.value;
+        // …and the model policy the same way (#91): the bullet, else the line.
+        const modelPolicy = modelPolicyFor(plan, phase)?.value;
+        return {
+          model: modelAlias(detail.model), effort: effortOf(detail.effort),
+          ...(mode ? { permissionMode: mode } : {}), ...(modelPolicy ? { modelPolicy } : {}),
+        };
       },
       // What the PLAN says this phase needs — its §Session budget line unioned
       // with its own `**MCP:**` bullet. Read from the parsed plan rather than
@@ -3305,6 +4394,18 @@ export abstract class ServiceBase {
       // one by one, and the three knobs, read live from prefs so Settings
       // applies to the next wall rather than the next run.
       rankAccounts: (excluding, forModel) => this.accounts.rankAccounts(excluding, forModel),
+      // The console's commit and the skill a session of the run loads: the
+      // plugin copy of the config dir its account spawns under (#151).
+      consoleSkill: (accountId) => {
+        const copy = sessionSkillCopy(this.accounts.configDirFor(accountId));
+        return {
+          consoleRev: this.skillCopy().consoleRev,
+          skill: copy?.install ? { configDir: copy.configDir, commit: copyCommit(copy), installPath: copy.install.installPath } : null,
+        };
+      },
+      // The wall's own picker (control-tower phase 78, #100): the rank inside
+      // the pool, less every account that would wall before the reset.
+      switchCandidates: (excluding, forModel, opts) => this.accounts.switchCandidates(excluding, forModel, opts),
       autoAccountSwitch: () => this.prefs.autoAccountSwitch !== false,
       budgetAutoRaisePct: () => this.prefs.budgetAutoRaisePct ?? 25,
       mcpRequireTimeoutMs: () => this.prefs.mcpRequireTimeoutMs ?? DEFAULT_MCP_REQUIRE_TIMEOUT_MS,
@@ -3335,18 +4436,17 @@ export abstract class ServiceBase {
         // machine-wide, so a token account (no `.claude.json` to read) still
         // gets one (ACT-8).
         this.accounts.noteAuthProbe(accountId, status);
-        if (!status.loggedIn && accountId && accountId !== DEFAULT_ACCOUNT_ID) {
-          const meta = this.accounts.meta(accountId);
-          const fix =
-            meta?.kind === 'profile'
-              ? `sign it in with \`CLAUDE_CONFIG_DIR=${profileConfigDir(accountId)} claude auth login\`, ` +
-                'or from Settings → Claude accounts'
-              : 'paste a fresh `claude setup-token` for it in Settings → Claude accounts';
+        // Every kind, the machine login included (control-tower phase 13,
+        // #33): the account every console has without registering anything,
+        // and the one most runs spend, was the one this sentence skipped. The
+        // fix is the one `loginFix` sentence the account card speaks too.
+        if (!status.loggedIn) {
           return {
             ...status,
             detail:
               `the run is set to pay as ${this.accounts.labelFor(accountId)} and that login is ` +
-              `expired or signed out — ${fix}.${status.detail ? ` (${status.detail})` : ''}`,
+              `expired or signed out — ${this.accounts.signInFix(accountId)}, or sign it in from Settings → ` +
+              `Claude accounts.${status.detail ? ` (${status.detail})` : ''}`,
           };
         }
         return status;
@@ -3384,6 +4484,35 @@ export abstract class ServiceBase {
       // The quota door's verdict (ACT-2) — read from cache, never thrown; the
       // runner climbs or parks on it beside the auth door.
       accountHeadroom: (accountId, forModel) => this.preflightAccount(accountId, forModel),
+      // A session that spent under the account and ended well lifts its walls
+      // and cooling (#78, control-tower phase 54); the runner re-reads the
+      // phases it holds parked on them. The re-probe's poll is the same read
+      // the panels' Refresh asks for.
+      noteSpend: (accountId, model) => this.accounts.noteSpend(accountId, model),
+      refreshUsage: (accountId) => this.accounts.refreshUsage(accountId),
+      // What the drive loop's own `switch-account` rung weighs a target
+      // against the walled account with (control-tower phase 79, #98) — the
+      // same room the operator's switch reads, so neither moves a run onto less.
+      accountRoom: (accountId, forModel) => this.accounts.roomOf(accountId, forModel),
+      // Credits carry an account past its plan windows (control-tower phase
+      // 93, #146): the runner's 95 % decision and live wall read this bit, and
+      // each session's overage fields go back to the account it spends.
+      creditCarries: (accountId) => this.accounts.creditCarries(accountId),
+      noteSessionCredit: (accountId, info) => this.accounts.noteSessionCredit(accountId, info),
+      // How long the ladder pass trusts "unchanged since I climbed it" (#114):
+      // the healer's own cadence, read live. Zero is converge's OFF switch,
+      // never a zero expiry — that would re-climb every record on every tick.
+      ladderSeenTtlMs: () => {
+        const every = this.prefs.convergeEveryMs ?? 0;
+        return every > 0 ? every : LADDER_SEEN_TTL_MS;
+      },
+      // How many accounts the breaker refuses, out of how many there are — the
+      // one fact "halted, the API refused this credential" could not say, and
+      // the one that decides whether switching accounts is even an option.
+      accountsUsable: () => this.accountsUsable(),
+      // Who each account answers now (control-tower phase 91, #131): a run binds
+      // to it at start and compares it before every boarding.
+      identityOf: (accountId) => this.accounts.identityOf(accountId),
       // The healer's availability, for the loop's own exhaustion predicate
       // (LFC-2, phase 10): a rung the loop cannot drive but the healer can is
       // deferred; one neither can drive is exhausted, with the reasons.
@@ -3407,6 +4536,8 @@ export abstract class ServiceBase {
         });
       },
       accountKind: (accountId) => this.accounts.meta(accountId ?? DEFAULT_ACCOUNT_ID)?.kind,
+      // A person's switch undone by the machine (#106) is never silent.
+      onAccountSwitchReverted: (state, detail) => this.announceReversal(state, detail),
       onLiveWallEscalated: (state, phase, detail) => {
         const name = this.accounts.labelFor(state.accountId);
         this.announce('limits', {
@@ -3457,7 +4588,7 @@ export abstract class ServiceBase {
     if (verdict.ok) return verdict;
     const payload = { ...actor, ceiling: verdict.ceiling, limit: verdict.limit, count: verdict.count, until: verdict.until };
     if (slug && runId && this.root?.ok) {
-      try { new Journal(this.root.path, slug, runId).append('run.start-refused', payload); } catch { /* the log line below still says it */ }
+      try { Journal.for(this.root.path, slug, runId).append('run.start-refused', payload); } catch { /* the log line below still says it */ }
     }
     log.warn('start-ceiling.refused', { slug, runId, ...payload });
     if (this.startCeiling.shouldAnnounce(verdict)) {
@@ -3562,6 +4693,25 @@ export abstract class ServiceBase {
     return standing;
   }
 
+  /**
+   * A switch moved a run back onto the account a person had moved it away from
+   * (control-tower phase 78, #106) — announced under `limits`, whether the
+   * runner's own wall or the ladder's rung on a stopped run did it: a person's
+   * choice undone in silence is how #106 was found, by reading the journal.
+   */
+  protected announceReversal(
+    state: Pick<RunState, 'id' | 'slug'>,
+    detail: { from: string; to: string; choice: { at: string; by: string }; reason: string },
+  ): void {
+    this.announce('limits', {
+      title: `Account switch reversed — ${state.slug}`,
+      body: `${detail.choice.by} moved ${state.slug} off ${this.accounts.labelFor(detail.to)} at `
+        + `${new Date(detail.choice.at).toLocaleString()}; it is back on it now, because `
+        + `${this.accounts.labelFor(detail.from)} is walled (${detail.reason.slice(0, 160)}).`,
+      tag: tagFor('limits', 'switch-reverted', state.id, detail.choice.at),
+    }, { slug: state.slug, runId: state.id });
+  }
+
   protected announce(
     category: CategoryId,
     message: { title: string; body: string; tag: string; detail?: string },
@@ -3572,6 +4722,8 @@ export abstract class ServiceBase {
       approvalId?: string;
       sessionId?: string | null;
       sessionKind?: 'shell' | 'claude' | null;
+      /** Land on a Tower bay rather than the run — a supervisor's card (control-tower phase 102). */
+      bay?: 'needs-you' | null;
       /**
        * Answerable from the notification itself.
        *
@@ -3588,6 +4740,8 @@ export abstract class ServiceBase {
        * for every kind this console offers buttons for.
        */
       answer?: { item: string; verbs: readonly string[] };
+      /** A human step's payload block (control-tower phase 41) — `humanStepPush`. */
+      step?: HumanStepPush;
     } = {},
     opts: {
       /**
@@ -3623,6 +4777,10 @@ export abstract class ServiceBase {
     if (isPlanProgress(category) && this.isClosedPlan(context.slug)) return null;
 
     const url = routeFor(category, context);
+    // Minted before the record, so the bell drawer offers the same buttons
+    // the phone does, answered by the same one-shot token (phase 25).
+    const callback = context.answer ? mintActionToken(context.answer.item, context.answer.verbs) : null;
+    const buttons = callback ? notificationButtons(context.answer!.verbs) : [];
     const record = this.notifications.record({
       category,
       title: message.title,
@@ -3639,6 +4797,7 @@ export abstract class ServiceBase {
       // Carried onto the record, not only into the URL: this is what lets a
       // page mark its own notifications read when you open it.
       sessionId: context.sessionId ?? undefined,
+      ...(callback && buttons.length ? { actions: buttons, callback } : {}),
     });
 
     // The inbox badge and any open inbox follow the store live rather than
@@ -3652,9 +4811,6 @@ export abstract class ServiceBase {
     // Minted per notification, not per item: the nonce is what makes a single
     // notification's buttons spendable once, and two pushes about the same item
     // are two separate offers to answer it.
-    const callback = context.answer ? mintActionToken(context.answer.item, context.answer.verbs) : null;
-    const buttons = callback ? notificationButtons(context.answer!.verbs) : [];
-
     const payload = {
       title: message.title,
       body: message.body,
@@ -3664,6 +4820,7 @@ export abstract class ServiceBase {
       // Both or neither: a button with no token is a button that cannot be
       // pressed, and a token with no button is unreachable.
       ...(callback && buttons.length ? { actions: buttons, callback } : {}),
+      ...(context.step ? { step: context.step } : {}),
       notificationId: record.id,
     };
     const pushed = this.push.announce(
@@ -3673,6 +4830,8 @@ export abstract class ServiceBase {
       (report) => {
         this.notifications.delivery(record.id, { ...report, at: new Date().toISOString() });
         this.emit('notification:delivery', { id: record.id, ...report });
+        // A push that arrived is the channel answering again (#140).
+        if (report.outcome === 'sent') this.digestCatchUp();
       },
       opts.urgent === undefined && !opts.replace
         ? undefined
@@ -3773,6 +4932,7 @@ export abstract class ServiceBase {
       foreign: this.sessionViews(),
     });
 
+
     if (type !== 'exited') return;
     const code = session.exited?.code ?? 0;
     const failed = code !== 0 || session.exited?.signal != null;
@@ -3781,6 +4941,16 @@ export abstract class ServiceBase {
     // code lands back on the run record, and green settles via recheck.
     if (session.meta?.verify) {
       this.reflectVerifyCommand(session.meta.verify, code, this.terminals.outputTail(session.id));
+      return;
+    }
+
+    // A human step's terminal (control-tower phase 43): its command's exit is
+    // the step's proof when the step names none, and the moment to run the
+    // proof when it does. Nothing of what was typed in it is read.
+    if (session.meta?.humanStep) {
+      void this.humanStepTerminalExited(session.meta.humanStep.id, failed ? (code || 1) : 0).catch((error: unknown) => {
+        log.warn('human-steps.clock-failed', { id: session.meta?.humanStep?.id, error: (error as Error)?.message ?? String(error) });
+      });
       return;
     }
 
@@ -3952,8 +5122,18 @@ export abstract class ServiceBase {
     // …and not under a fleet freeze. See the twin gate in `service-recovery.ts`:
     // continuing a fixed run spawns a session, and the freeze makes no
     // exception for the recovery family.
-    if (outcome.fixed && synced?.status === 'parked' && link.slug && this.fleetHold()) {
+    if (outcome.fixed && synced?.status === 'parked' && link.slug && this.fleetHoldFor(link.slug)) {
       log.info('run.recovery-continue-frozen', { slug: link.slug, runId: synced.id });
+    } else if (outcome.fixed && synced?.status === 'parked' && link.slug && synced.autonomy === 'halt-on-everything') {
+      // The session vehicle's rule (control-tower phase 81, #105): a run the
+      // operator set to halt on everything is one they continue themselves —
+      // parked, and said so on the run's record.
+      const why = 'the run is halt-on-everything — the operator continues it';
+      if (this.root) {
+        Journal.for(this.root.path, link.slug, synced.id)
+          .append('run.recovery-parked', { phase: link.phase ?? null, why, by: 'pty-agent' }, link.phase);
+      }
+      log.info('run.recovery-parked', { slug: link.slug, runId: synced.id, phase: link.phase ?? null, why });
     } else if (
       outcome.fixed &&
       synced?.status === 'parked' &&
@@ -4135,6 +5315,14 @@ export abstract class ServiceBase {
     this.recoverApprovals();
     this.sweepRunSecrets();
     this.sweepOldRuns();
+    // Before anything reads a budget off a stored run: its dollars, re-priced
+    // once to the booked-delta model (control-tower phase 46, #62).
+    this.repriceStoredRuns();
+    // The lanes stopped runs keep for a phase (control-tower phase 100).
+    this.registerStoredReservations();
+    // …and before anything reads a phase's worked time: every session that
+    // worked it, re-measured once from the journal (control-tower phase 58, #66).
+    this.remeasureStoredRuns();
     // Every OTHER sink, after the run records and never before them: the global
     // byte cap is a floor under `pruneRuns`'s per-plan decision, not a second
     // opinion about it.
@@ -4152,9 +5340,15 @@ export abstract class ServiceBase {
     // does NOT tick at open: it refreshes only repositories somebody has
     // already fetched, so a console nobody has asked spends no GitHub quota.
     this.startIssuesSweepClock();
+    this.startDigestClock();
+    this.startHumanStepClock();
+    // Every plan's stored triggers (control-tower phase 98, #137): one already
+    // true fires now, and the rest watch what goes by.
+    this.startTriggers();
     // What this boot holds, read before anything below asks `convergeAutomatic()`
     // or re-adopts: the stop marker and the profile's `autostart` (SHD-5, FLT-9).
     this.settleBootHold();
+    this.announceCrashedBoot();
     // The convergence loop: the boot pass once the queued re-adoption is done (a
     // queued run must be live before the loop reads it), then the sweep clock.
     // The watch clock opens BEFORE the re-adoption when the loop runs, so an
@@ -4458,6 +5652,21 @@ export abstract class ServiceBase {
         why: 'the machine profile says this console does not start its work unattended (autostart: false) — nothing is re-adopted or converged until an operator releases it',
       };
     }
+    // The breaker. Three hard endings inside ten minutes is a loop, and a
+    // supervisor's ten-second restart is about to make it four — each one
+    // re-parking the live children of the runs the last console was driving.
+    //
+    // Read from the field rather than the ledger: `bootHold()` is called by
+    // every `GET /api/state`, and the ledger only changes when a BOOT writes to
+    // it — so asking the disk here would put a file read on the polled path, in
+    // a fix whose subject is a console doing exactly that.
+    const loop = this.crashLoopAtBoot;
+    if (loop) {
+      return {
+        kind: 'crash-loop', at: loop.since, by: 'this console',
+        why: `this console ended hard ${loop.boots} times since ${loop.since} — automation is held so a supervisor's restart cannot re-park the runs it was driving. Release it once the cause is understood.`,
+      };
+    }
     return null;
   }
 
@@ -4469,6 +5678,8 @@ export abstract class ServiceBase {
    */
   protected settleBootHold(): void {
     this.bootHoldSince = new Date().toISOString();
+    // Once per boot, before anything asks: see `crashLoopAtBoot`.
+    this.crashLoopAtBoot = crashLoop();
     this.bootHoldReleased = false;
     this.bootHoldSaid = false;
     // Read fresh: a marker cached by an earlier open is not one that vanished
@@ -4482,6 +5693,11 @@ export abstract class ServiceBase {
       log.info('boot.autostart-once', { instance: INSTANCE.id, spent, unit: unit?.label ?? null, disabled: unit?.ok ?? null });
     }
     const hold = this.bootHold();
+    // The latch the two park writers consult. It is set from ANY hold, not only
+    // the crash loop: a console told to stay off must not re-park a live run
+    // either, and the measured incident is what proves the read path needs its
+    // own answer rather than inheriting `readoptQueued`'s.
+    setAdoptionHold(hold ? hold.kind : null);
     if (hold && !this.bootHoldSaid) {
       this.bootHoldSaid = true;
       log.warn('boot.hold', { kind: hold.kind, by: hold.by, at: hold.at, why: hold.why });
@@ -4508,9 +5724,60 @@ export abstract class ServiceBase {
       this.stopMarkerCache = null;
     }
     this.bootHoldReleased = true;
+    // Let the read path speak again, and drop what it answered while held: a
+    // run it was asked about under the hold was deliberately left untouched,
+    // and the DEFERRED reconcile is what runs now.
+    setAdoptionHold(null);
+    clearRunFileCache();
     log.warn('boot.hold-released', { ...actor, kind: hold.kind, how: 'release', heldSince: hold.at, by: actor.by, heldBy: hold.by });
     await this.runHeldBoot({ trigger: 'button', operatorPress: true });
     return { ok: true, was: hold.kind };
+  }
+
+  /**
+   * What this console's own ledger says about how the last one ended, or null.
+   * Read once at boot: the ledger only changes when a boot writes to it.
+   */
+  protected crashedBoot: { at: string; boots: number; snapshot?: string | null } | null = null;
+
+  /**
+   * Whether this console booted into a crash loop, decided once.
+   *
+   * The ledger only changes when a boot appends to it, and this console's own
+   * boot is the last such event it will ever see — so the verdict is a fact
+   * about this process, not a question to re-ask on every request.
+   */
+  protected crashLoopAtBoot: { since: string; boots: number } | null = null;
+
+  /**
+   * Say ONCE per boot that the console before this one ended hard.
+   *
+   * It was a log line and nothing else, which is how a console crash-looped for
+   * five minutes — parking two live autopilot runs each time round — with
+   * nobody told. One push, one inbox row, and the row carries the snapshot's
+   * path when one was written.
+   */
+  protected announceCrashedBoot(): void {
+    const ledger = readCrashLedger();
+    const newest = ledger[ledger.length - 1];
+    if (!newest) return;
+    // Only THIS boot's own record: an older one is history the inbox has
+    // already shown, and re-announcing it every restart is how a person learns
+    // to ignore the category.
+    if (newest.pid !== process.pid) return;
+    const loop = this.crashLoopAtBoot;
+    this.crashedBoot = {
+      at: newest.at,
+      boots: loop?.boots ?? 1,
+      snapshot: newest.snapshot ?? null,
+    };
+    this.announce('health', {
+      title: loop ? 'Phase Console is in a crash loop' : 'Phase Console restarted after a hard stop',
+      body: loop
+        ? `Ended hard ${loop.boots} times since ${loop.since}. Automation is held until you release it.`
+        : 'The console before this one wrote no exit record — it was killed, ran out of heap, or the machine stopped.',
+      tag: tagFor('health', 'previous-run-crashed', newest.at),
+    });
   }
 
   /** The boot pass a hold skipped: the re-adoption, then the loop, its sweep and the watch clock. */
@@ -4542,6 +5809,17 @@ export abstract class ServiceBase {
   fleetHold(): FleetHold | null {
     if (this.fleetHoldCache === undefined) this.fleetHoldCache = readFleetHold();
     return this.fleetHoldCache;
+  }
+
+  /**
+   * The hold `slug`'s automatic starts wait on, or null: `fleetHold` read
+   * through `holdBinds`. Every automatic start that knows its plan asks this
+   * rather than `fleetHold()`, because a restart waiting for its lanes holds
+   * only the plans whose scope meets theirs (control-tower phase 48, #70).
+   */
+  fleetHoldFor(slug: string | null | undefined): FleetHold | null {
+    const hold = this.fleetHold();
+    return holdBinds(hold, slug) ? hold : null;
   }
 
 
@@ -4614,7 +5892,7 @@ export abstract class ServiceBase {
     // resume it leads to lands — it lived only in `console.log`, so the run's
     // own history could not say its resume was re-armed at all (SHD-6).
     if (armedBy === 'boot' && this.root?.ok) {
-      new Journal(this.root.path, slug, state.id).append('run.rearmed-wait', {
+      Journal.for(this.root.path, slug, state.id).append('run.rearmed-wait', {
         until, now: new Date().toISOString(), inMs: Math.max(0, delay), armedBy,
       });
     }
@@ -4637,7 +5915,7 @@ export abstract class ServiceBase {
     const first = !this.resumeAsks.has(runId);
     this.resumeAsks.set(runId, { slug, runId, phases, sessions, at: new Date().toISOString() });
     if (first && this.root?.ok) {
-      new Journal(this.root.path, slug, runId).append('run.resume-asked', { phases, reason: why, trigger });
+      Journal.for(this.root.path, slug, runId).append('run.resume-asked', { phases, reason: why, trigger });
     }
   }
 
@@ -4653,7 +5931,8 @@ export abstract class ServiceBase {
    *  1. the lateness and what the refs say NOW go on the run's journal
    *     (`run.wait-overdue`), with the watch clock open;
    *  2. each declared park's budget is re-read through `evaluateWait` — spent
-   *     is a `waiting-external-timeout` on that phase, never a boarding;
+   *     parks that phase on its refs with a `budgets` errand (`spentBudgetPark`,
+   *     control-tower phase 45), never a boarding and never a failure;
    *  3. a park whose declaring session is still RUNNING is not resumed over it
    *     (REG-1) — refused, recorded, re-checked shortly; an author the registry
    *     shows ended is recorded on the ruling;
@@ -4664,6 +5943,25 @@ export abstract class ServiceBase {
    * Answers whether it launched. One ruling per run at a time: the boot pass
    * and the convergence loop can meet the same clock.
    */
+  /**
+   * The ingest probe's door (control-tower phase 50, #86): ask a staged
+   * declaration's refs now, through the watch clock's own probe, and say
+   * whether one has already landed — `declared-probe.ts` holds the rules. A
+   * landing is journalled on the run the file names, else on the plan's
+   * latest run; with neither, the answer alone reaches the session.
+   */
+  probeDeclaration(body: { slug?: unknown; phase?: unknown; file?: unknown }): Promise<DeclaredProbeAnswer> {
+    return answerDeclaredProbe(body, {
+      root: this.root?.ok ? this.root.path : null,
+      probe: (slug, phase, refs) => this.watchClock.probeDeclared(slug, phase, refs, { budgetMs: DECLARED_PROBE_BUDGET_MS }),
+      journal: (slug, runId, kind, data, phase) => {
+        if (!this.root?.ok) return;
+        const id = runId ?? latestRun(this.root.path, slug, this.liveRunIds())?.id ?? null;
+        if (id) Journal.for(this.root.path, slug, id).append(kind, data, phase);
+      },
+    });
+  }
+
   async resumeOverdueWait(slug: string, runId: string, trigger: ResumeTrigger, opts: { count: boolean }): Promise<boolean> {
     if (!this.flags.allowRun || !this.root?.ok) return false;
     const key = `${slug}:${runId}`;
@@ -4672,7 +5970,7 @@ export abstract class ServiceBase {
     try {
       const armed = this.limitResumeTimers.get(slug);
       if (armed) { clearTimeout(armed.timer); this.limitResumeTimers.delete(slug); }
-      const frozen = this.fleetHold();
+      const frozen = this.fleetHoldFor(slug);
       if (frozen) { log.info('run.limit-resume-frozen', { slug, runId, by: frozen.by }); return false; }
       const root = this.root.path;
       const state = latestRun(root, slug, this.liveRunIds());
@@ -4684,7 +5982,7 @@ export abstract class ServiceBase {
       const now = Date.now();
       const until = state.waitUntil;
       const lateByMs = Math.max(0, now - Date.parse(until));
-      const journal = new Journal(root, slug, runId);
+      const journal = Journal.for(root, slug, runId);
       const parks = waitClockPhases(state);
 
       // 1. What the world says now — the refs, with the watch clock open.
@@ -4710,23 +6008,33 @@ export abstract class ServiceBase {
       });
       log.warn('run.wait-overdue', { slug, runId, until, lateByMs, trigger });
 
-      // 2. The budget, re-read through the one expression.
-      const halted: number[] = [];
+      // 2. The budget, re-read through the one expression. Spent is a BUDGET
+      //    event (control-tower phase 45, #59), never a failed phase or a
+      //    halt: the phase waits on its refs with no clock and a `budgets`
+      //    errand — the live runner's `parkOnSpentBudget`, through the same
+      //    pure `spentBudgetPark` — and a landing resumes it.
+      const spentParks: number[] = [];
       for (const record of parks) {
         if (record.declared?.status !== 'waiting-external') continue;
+        const budget = await this.waitBudget(slug, record.phase);
         const verdict = evaluateWait({
-          purpose: 'resume', now, parkedMs: parkedMsOf(record, now), waits: record.waits ?? 0,
-          budget: await this.waitBudget(slug, record.phase),
+          purpose: 'resume', now, parkedMs: parkedMsOf(record, now), waits: record.waits ?? 0, budget,
           ledger: record.declared.by === 'watchdog' ? 'watchdog' : 'session',
         });
         if (verdict.verdict !== 'timeout') continue;
-        const reason = `phase ${record.phase} was not resumed — ${verdict.reason}`;
-        const spent = settleStoredWaitTimeout(state, record.phase, reason, new Date(now).toISOString());
-        if (spent) journal.append(DECLARATION_CONSUMED_EVENT, { ...spent, next: 'waiting-external-timeout' }, record.phase);
-        journal.append('phase.halted', { reason, kind: 'waiting-external-timeout' }, record.phase);
-        halted.push(record.phase);
+        const spent = spentBudgetPark(state, record.phase, {
+          ledger: verdict.ledger, refusal: `phase ${record.phase} was not resumed — ${verdict.reason}`,
+          budget, at: new Date(now).toISOString(),
+        });
+        journal.append('phase.wait-budget-spent', { ...spent.data, trigger }, record.phase);
+        journal.append('phase.errand', { ...spent.errand }, record.phase);
+        // A spent budget announces as one (control-tower phase 14, #40).
+        if (spent.errand.budget) {
+          this.announceBudget({ slug, runId: state.id, phase: record.phase, state: 'spent', fact: spent.errand.budget });
+        }
+        spentParks.push(record.phase);
       }
-      const resumable = parks.filter((record) => !halted.includes(record.phase));
+      const resumable = parks.filter((record) => !spentParks.includes(record.phase));
 
       // 3. The author: a session still running is not resumed over (REG-1).
       for (const record of resumable) {
@@ -4763,7 +6071,8 @@ export abstract class ServiceBase {
         state.waitReason = null;
         setRunState(state, 'parked');
         state.stoppedBy = 'system';
-        state.finishedReason = `the wait budget ran out while this run was parked (phase ${halted.join(', ')}) — nothing was resumed.`;
+        state.finishedReason = `the wait budget ran out while this run was parked (phase ${spentParks.join(', ')}) — `
+          + 'it waits on its refs with no clock of its own; nothing was resumed.';
         saveRun(state);
         this.emit('run:state', { state });
         return false;
@@ -4815,7 +6124,7 @@ export abstract class ServiceBase {
     // rescheduled here and nothing is lost: the run keeps its `waitUntil` on
     // disk, so `thawFleet`'s re-arm pass finds it overdue and fires it once —
     // which is exit criterion 3's "the overdue wait fires once".
-    const frozen = this.fleetHold();
+    const frozen = this.fleetHoldFor(slug);
     if (frozen) {
       log.info('run.limit-resume-frozen', { slug, runId, by: frozen.by });
       return;
@@ -4856,7 +6165,7 @@ export abstract class ServiceBase {
     }
     try {
       log.info('run.limit-resume', { slug, runId, lateByMs: Math.max(0, lateByMs) });
-      new Journal(this.root.path, slug, runId).append('run.limit-resume', {
+      Journal.for(this.root.path, slug, runId).append('run.limit-resume', {
         until: state.waitUntil, lateByMs: Math.max(0, lateByMs), trigger: 'timer', overdue: false,
       });
       await this.startRun(slug, {
@@ -4907,8 +6216,14 @@ export abstract class ServiceBase {
     this.mcpHealthTimer = null;
     if (this.issuesSweepTimer) clearInterval(this.issuesSweepTimer);
     this.issuesSweepTimer = null;
+    if (this.digestTimer) clearInterval(this.digestTimer);
+    this.digestTimer = null;
+    if (this.humanStepTimer) clearInterval(this.humanStepTimer);
+    this.humanStepTimer = null;
     if (this.retentionTimer) clearInterval(this.retentionTimer);
     this.retentionTimer = null;
+    this.stopTriggers();
+    this.closeChats();
     this.converger.close();
     this.watchClock.close();
     this.watcher.stop();
@@ -5382,7 +6697,7 @@ export abstract class ServiceBase {
     for (const run of inventory.runs) {
       if (run.live) continue;
       try {
-        new Journal(this.root.path, run.slug, run.id).append('run.console-shutdown', {
+        Journal.for(this.root.path, run.slug, run.id).append('run.console-shutdown', {
           intent: context.intent,
           reason: context.reason,
           ...(context.mode ? { mode: context.mode } : {}),
@@ -5418,9 +6733,20 @@ export abstract class ServiceBase {
    * something a flag should be able to talk you into.
    */
   restart(
-    who: Actor | string, force = false, options: { update?: boolean; whenIdle?: boolean } = {},
+    who: Actor | string, force = false, options: { update?: boolean; whenIdle?: boolean; session?: string | null } = {},
   ): RestartOutcome {
     const actor = asActor(who, 'Service.restart');
+    // Asked from inside a run's own session — the CLI passes the session's id
+    // — it is that session's act, and its run is told (control-tower phase 48,
+    // #69): a phase whose last act is "update when idle" used to leave no line
+    // on its own journal, and the restart read as the operator's.
+    const session = this.restartSessionOf(options.session);
+    if (session) {
+      this.journalOnRun(session.slug, session.runId, 'run.restart-requested', {
+        ...actor, session: session.sessionId, update: options.update !== false,
+        whenIdle: options.whenIdle === true, force,
+      }, session.phase);
+    }
     const readiness = this.restartReadiness();
     if (!readiness.ok && (readiness.busy || !force)) {
       return { ok: false, reason: readiness.reason, supervisor: readiness.supervisor };
@@ -5428,17 +6754,54 @@ export abstract class ServiceBase {
     return this.carryOutRestart(actor, readiness.supervisor, force);
   }
 
-  /** The exit itself: logged, announced, and handed to the registered restarter. */
+  /**
+   * The live run session a restart request names, or null (control-tower
+   * phase 48, #69). Found by the session id the lane's record carries — the
+   * CLI sends `$PE_SESSION_ID`, which the runner put in that session's
+   * environment — so a request can only ever be attributed to a session this
+   * console is actually running.
+   */
+  protected restartSessionOf(
+    sessionId: string | null | undefined,
+  ): { sessionId: string; slug: string; runId: string; phase: number } | null {
+    if (!sessionId) return null;
+    for (const runner of this.liveRunners()) {
+      const state = runner.current();
+      if (!state) continue;
+      for (const record of Object.values(state.phases)) {
+        if (record.sessionId === sessionId) return { sessionId, slug: state.slug, runId: state.id, phase: record.phase };
+      }
+    }
+    return null;
+  }
+
+  /** One line on one run's own journal — a failure to write it is logged, never thrown into a restart. */
+  protected journalOnRun(slug: string, runId: string, event: string, data: Record<string, unknown>, phase?: number): void {
+    if (!this.root?.ok) return;
+    try {
+      Journal.for(this.root.path, slug, runId).append(event, data, phase);
+    } catch (error) {
+      log.warn('restart.journal-failed', { slug, runId, event, error: (error as Error).message });
+    }
+  }
+
+  /**
+   * The exit itself: logged, announced, and handed to the registered restarter.
+   * `expected` is what the unit is judged against when an update moved the
+   * copy — the node arguments the update shipped (#71).
+   */
   private carryOutRestart(
     actor: Actor, supervision: ReturnType<typeof supervisor>, force: boolean, note?: string,
+    expected?: readonly string[],
   ): RestartOutcome {
-    log.warn('restart.requested', { ...actor, supervisor: supervision.kind, force });
+    let how: RestartHow = {};
+    log.warn('restart.requested', { ...actor, supervisor: supervision.kind, force, ...(how.reload ? { reload: true } : {}) });
     this.announce('health', {
       title: 'Phase Console is restarting',
       body: `${describeActor(actor)} · ${note ? `${note} · ` : ''}${supervision.detail}`,
       tag: tagFor('health', 'restart', String(Date.now())),
     });
-    if (!requestRestart(`restart (${actor.by} via ${actor.via} from ${actor.origin})`)) {
+    if (!requestRestart(`restart (${actor.by} via ${actor.via} from ${actor.origin})`, how)) {
       return { ok: false, reason: 'this build has no restart verb registered — restart it by hand' };
     }
     return { ok: true, supervisor: supervision };
@@ -5497,3 +6860,4 @@ export abstract class ServiceBase {
     this.emit('warm', { plans: slugs.length, root });
   }
 }
+

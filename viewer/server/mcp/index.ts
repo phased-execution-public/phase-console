@@ -129,6 +129,13 @@ export type McpOptions = {
  */
 export const HEALTH_TTL_MS = 5 * 60_000;
 
+/**
+ * The health clock's longest wait while nobody reads its answers (#73): the
+ * five-minute cadence doubles per unread probe up to this, and a single read —
+ * a browser, a Refresh, a boarding — puts it back to `HEALTH_TTL_MS`.
+ */
+export const HEALTH_IDLE_MAX_MS = 60 * 60_000;
+
 export class Mcp {
   private readonly store = new McpStore();
   private readonly creds: McpCredentials;
@@ -144,6 +151,10 @@ export class Mcp {
   private inFlight: Promise<{ probed: boolean }> | null = null;
   /** What the last probe answered about ITSELF — for a preflight reading a cache the probe could not fill. */
   private lastProbe: { at: number; error?: string } | null = null;
+  /** When a reader last asked for the health answer (`consumed`). */
+  private consumedAt = Number.NEGATIVE_INFINITY;
+  /** Probes in a row the clock ran with the previous answer unread — the back-off's exponent. */
+  private idleProbes = 0;
 
   constructor(opts: McpOptions = {}) {
     this.opts = opts;
@@ -372,9 +383,42 @@ export class Mcp {
     const ids = this.store.enabledIds();
     if (!ids.length) return { probed: false };
     if (!opts.force && ids.every((id) => this.fresh(id))) return { probed: false };
+    const door = opts.door ?? 'mcp-health-probe';
+    if (door === 'mcp-health-probe' && !opts.force) {
+      if (!this.idleDue()) return { probed: false };
+      // The answer this probe replaces went unread: the next one waits longer.
+      if (this.unread()) this.idleProbes += 1;
+    }
 
-    this.inFlight = this.runProbe(ids, opts.cwd, opts.door ?? 'mcp-health-probe').finally(() => { this.inFlight = null; });
+    this.inFlight = this.runProbe(ids, opts.cwd, door).finally(() => { this.inFlight = null; });
     return this.inFlight;
+  }
+
+  /**
+   * Somebody READ the health answer — a browser asking for the MCP list, an
+   * operator's Refresh, a boarding preflight. The clock's pace follows it.
+   */
+  consumed(): void {
+    this.consumedAt = this.now();
+    this.idleProbes = 0;
+  }
+
+  /**
+   * The health clock's own question: is a probe due? Every `HEALTH_TTL_MS`
+   * while somebody reads the answers; while nobody has read the last one, the
+   * wait doubles with each unread probe, up to `HEALTH_IDLE_MAX_MS` (#73). The
+   * clock used to spawn a `claude` every five minutes for a week with nothing
+   * reading it — 1,689 of them, each charged to the start ceiling.
+   */
+  private idleDue(): boolean {
+    if (!this.lastProbe || !this.unread()) return true;
+    const wait = Math.min(HEALTH_TTL_MS * 2 ** this.idleProbes, HEALTH_IDLE_MAX_MS);
+    return this.now() - this.lastProbe.at >= wait;
+  }
+
+  /** Nobody has read the last answer since it was written. */
+  private unread(): boolean {
+    return this.lastProbe != null && this.consumedAt <= this.lastProbe.at;
   }
 
   /**
@@ -405,6 +449,8 @@ export class Mcp {
     if (!servers.length) {
       return { ok: settled, rows: [], blocking: [], unknown, disabled, unconfigured, probes: 0 };
     }
+    // A boarding is a reader of the health answer — the clock keeps its pace.
+    this.consumed();
 
     // The clock's cache, its TTL and its single flight — not a probe of this
     // preflight's own (SLF-3). `preflight` used to call `this.probe` bare, so
@@ -488,7 +534,8 @@ export class Mcp {
       return { probed: false };   // the cache goes stale, which is what it does overnight anyway
     }
     this.opts.ceiling?.charge(actor);
-    log.info('session.start', { ...actor, servers: servers.length });
+    // Its own event (control-tower phase 100, #73): a probe is not a session start.
+    log.info('mcp.probe.start', { ...actor, servers: servers.length });
     const doc = await buildMcpConfig(servers, this.creds);
     const started = this.now();
     const probe = await this.probe(doc, cwd ? { cwd } : {});

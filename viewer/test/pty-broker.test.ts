@@ -34,11 +34,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createConnection } from 'node:net';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { Broker } from '../server/pty/broker.ts';
 import { BrokerClient } from '../server/pty/client.ts';
 import { brokerPaths, frame } from '../server/pty/protocol.ts';
 import { Terminals } from '../server/terminal.ts';
@@ -539,4 +540,75 @@ test('a second broker on a live socket stands down instead of taking it over', a
   still.shutdownBroker();
   still.detach();
   client.detach();
+});
+
+/* ================================================================== *
+ * 9 — the spawn helper is healed before EVERY spawn, not once per load
+ * ================================================================== */
+
+/**
+ * node-pty ships `spawn-helper` without its executable bit, and an `npm ci`
+ * puts it back that way — npm 11 skips node-pty's install scripts. The broker
+ * used to heal it once, when it first loaded node-pty. A broker outlives the
+ * console that started it, so it also outlives the update that ran `npm ci`
+ * underneath it: every terminal opened after that failed `posix_spawnp failed`
+ * until something happened to restart the broker.
+ *
+ * The spawn is injected, because what is under test is what the broker does
+ * BEFORE it spawns — the fake records whether the helper was executable at the
+ * one moment that matters. The fake session ends as soon as it starts, so
+ * closing the broker has no process to signal.
+ */
+test('a spawn helper chmod-ed back to 0644 after the first spawn is healed before the next one', async (t) => {
+  const box = sandbox();
+  t.after(() => box.cleanup());
+
+  // A node-pty package root of the test's own, holding the helper the way the
+  // prebuild ships it: present, and not executable.
+  const ptyRoot = join(box.dir, 'node-pty');
+  const helper = join(ptyRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper');
+  mkdirSync(dirname(helper), { recursive: true });
+  writeFileSync(helper, '#!/bin/sh\n', { mode: 0o644 });
+  chmodSync(helper, 0o644);
+
+  const executableAtSpawn: boolean[] = [];
+  const fakeSpawn = () => {
+    executableAtSpawn.push((statSync(helper).mode & 0o111) !== 0);
+    return {
+      pid: 4242,
+      onData() {},
+      onExit(listener: (event: { exitCode: number }) => void) { listener({ exitCode: 0 }); },
+      write() {},
+      resize() {},
+      kill() {},
+    };
+  };
+
+  const paths = brokerPaths(box.dir);
+  const credential = 'c'.repeat(64);
+  writeFileSync(paths.token, `${credential}\n`, { mode: 0o600 });
+  const broker = new Broker({
+    socketPath: paths.socket, credential, spawn: fakeSpawn, spawnHelperRoot: ptyRoot, idleMs: 60_000,
+  });
+  assert.equal(await broker.listen(), 'listening');
+  const client = new BrokerClient(box.dir, BROKER);
+  try {
+    assert.ok(await client.connect({ start: false }), 'the in-process broker must admit its own credential');
+    const request = { file: '/bin/sh', args: [], cwd: box.dir, cols: 80, rows: 24, env: {} };
+
+    await client.spawn(request);
+    // The update path's `npm ci`, underneath a broker that is still running.
+    chmodSync(helper, 0o644);
+    await client.spawn(request);
+
+    assert.deepEqual(executableAtSpawn, [true, true],
+      'THE DEFECT: a helper made non-executable after the first spawn was spawned with as it was');
+    const healed = readFileSync(join(box.dir, 'pty-broker.log'), 'utf8')
+      .split('\n').filter((line) => line.includes('"broker.healed-spawn-helper"'));
+    assert.equal(healed.length, 2, 'each heal is written to the broker log, naming the helper');
+    assert.match(healed[1], new RegExp(helper.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    client.detach();
+    broker.close('test');
+  }
 });

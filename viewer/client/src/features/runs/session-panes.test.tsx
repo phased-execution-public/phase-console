@@ -24,6 +24,7 @@ import { forPhase } from './console';
 import { livePhases } from './tiles';
 import {
   QueuedPane,
+  ReplayNote,
   SessionPanes,
   crossLaneId,
   holderLabel,
@@ -32,6 +33,7 @@ import {
   lanesOf,
   queueEntryFor,
   resolveTab,
+  sessionHolderText,
   waitingLabel,
 } from './session-panes';
 
@@ -115,12 +117,20 @@ afterEach(() => {
  * `staleTime: Infinity` is the whole config, so seeded data is never refetched —
  * which keeps these cases about the live stream rather than about replay.
  */
-function mount(node: React.ReactElement, transcripts: Record<string, TranscriptEntry[]> = {}) {
+function mount(
+  node: React.ReactElement,
+  transcripts: Record<string, TranscriptEntry[]> = {},
+  run?: Pick<RunState, 'id' | 'phases'>,
+) {
   const client = new QueryClient(queryClientConfig);
+  // `demo#r1` is the run's merged replay; `demo#r1#6` is phase 6's own
+  // (control-tower phase 94, #133), which is what a lane pane reads.
   for (const [key, entries] of Object.entries(transcripts)) {
-    const [slug, runId] = key.split('#');
-    client.setQueryData([...keys.transcript(slug!), runId ?? 'latest'], entries);
+    const [slug, runId, phase] = key.split('#');
+    const base = [...keys.transcript(slug!), runId ?? 'latest'];
+    client.setQueryData(phase == null ? base : [...base, Number(phase)], entries);
   }
+  if (run) client.setQueryData(keys.run('demo'), { run, history: [] });
   return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
 }
 
@@ -135,7 +145,7 @@ function twoLanes(runId = 'r1') {
         <SessionPanes slug="demo" runId={runId} phase={7} live allowRun={false} />
       </div>
     </>,
-    { [`demo#${runId}`]: [] },
+    { [`demo#${runId}#6`]: [], [`demo#${runId}#7`]: [] },
   );
 }
 
@@ -411,6 +421,37 @@ describe('waitingLabel', () => {
   });
 });
 
+describe('a terminal session holding the queue (control-tower phase 82, #119)', () => {
+  const terminal = (over: Record<string, unknown> = {}) =>
+    holder({
+      kind: 'session',
+      slug: 'demo',
+      phase: null,
+      owner: 'session f118dfd4 (pid 78963)',
+      scope: ['app'],
+      session: 'f118dfd4-aaaa',
+      pid: 78963,
+      cwd: '/w/hub',
+      scopeBasis: 'touched',
+      ...over,
+    } as never);
+
+  it('names the terminal, its pid, the scope it holds and how that scope was read', () => {
+    expect(sessionHolderText(terminal())).toBe(
+      'your terminal session f118dfd4, pid 78963 — scope app (from what it edited)',
+    );
+    expect(sessionHolderText(terminal({ scopeBasis: 'unknown', scope: ['all'] }))).toBe(
+      'your terminal session f118dfd4, pid 78963 — scope all (nothing touched yet, so treated as that until its lease ends)',
+    );
+  });
+
+  it('is what the run card and the table cell say, never a bare "queued"', () => {
+    expect(waitingLabel(entry({ waitingOn: [terminal()] }))).toBe(
+      'queued — waiting on your terminal session f118dfd4, pid 78963 — scope app (from what it edited)',
+    );
+  });
+});
+
 describe('queueEntryFor', () => {
   it('matches on plan AND phase, never on either alone', () => {
     const entries = [entry(), entry({ id: 'q2', slug: 'other', phase: 4 })];
@@ -530,5 +571,82 @@ describe('resolveTab', () => {
     expect(resolveTab('p7', [lane(6), lane(7)])).toBe('p7');
     expect(resolveTab('p7', [lane(6)])).toBe('p6');
     expect(resolveTab('run', [lane(6)])).toBe('run');
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The replay is kept per phase (control-tower phase 94, #133)
+ * ------------------------------------------------------------------ */
+
+describe('a lane’s replay', () => {
+  const at = '2026-09-26T07:00:00.000Z';
+  const line = (seq: number, data: Record<string, unknown>): TranscriptEntry => ({
+    seq,
+    at,
+    event: 'stream',
+    data,
+  });
+
+  it('hydrates from its own phase’s replay', () => {
+    mount(
+      <div data-testid="pane-6">
+        <SessionPanes slug="demo" runId="r1" phase={6} live={false} allowRun={false} />
+      </div>,
+      { 'demo#r1#6': [line(41, { phase: 6, kind: 'text', text: 'six, replayed after a reload' })] },
+    );
+    expect(pane(6).getByText('six, replayed after a reload')).toBeInTheDocument();
+  });
+
+  it('shows the journal the server fell back to, and the line saying so', () => {
+    mount(
+      <div data-testid="pane-6">
+        <SessionPanes slug="demo" runId="r1" phase={6} live={false} allowRun={false} />
+      </div>,
+      {
+        'demo#r1#6': [
+          line(0, {
+            phase: 6,
+            kind: 'notice',
+            source: 'journal',
+            text: 'Nothing was replayed for phase 6 — these are its journal lines instead',
+          }),
+          line(12, {
+            phase: 6,
+            kind: 'notice',
+            source: 'journal',
+            text: 'phase.parked — usage window spent',
+          }),
+        ],
+      },
+    );
+    expect(pane(6).getByText(/Nothing was replayed for phase 6/)).toBeInTheDocument();
+    expect(pane(6).getByText('phase.parked — usage window spent')).toBeInTheDocument();
+  });
+
+  it('says when the replay nears its cap, from the phase record', () => {
+    const replay = { state: 'near-full' as const, bytes: 13.5 * 1024 * 1024, cap: 16 * 1024 * 1024, at };
+    mount(
+      <div data-testid="pane-6">
+        <SessionPanes slug="demo" runId="r1" phase={6} live allowRun={false} />
+      </div>,
+      { 'demo#r1#6': [] },
+      {
+        id: 'r1',
+        phases: { '6': { phase: 6, status: 'running', attempts: 1, costUsd: 0, replay } as PhaseRecord },
+      },
+    );
+    expect(pane(6).getByRole('status')).toHaveTextContent("Phase 6's replay is 84 % full (13.5 MB of 16 MB)");
+  });
+
+  it('says when the replay is full, and what a reload will show', () => {
+    render(
+      <ReplayNote
+        phase={9}
+        replay={{ state: 'full', bytes: 16 * 1024 * 1024 + 300, cap: 16 * 1024 * 1024, at }}
+      />,
+    );
+    expect(screen.getByRole('status')).toHaveTextContent(
+      "Phase 9's replay is full at 16 MB, so a reload shows it only up to that point.",
+    );
   });
 });

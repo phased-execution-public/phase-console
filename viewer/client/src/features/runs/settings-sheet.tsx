@@ -26,10 +26,19 @@
  * reads only the fields the mode shows, so a value seeded but not rendered
  * cannot leak into the body. Phase 6 pins both the field set and the payload.
  *
- * Everything it changes reaches the NEXT phase to board. The session already
- * running had its model and budget fixed in its own command line, and there is
- * no honest way to change those underneath it — so the sheet says so rather
- * than letting the operator infer it from a value that did not take.
+ * Not everything it changes waits for the next phase (control-tower phase 13,
+ * #31): the session already running had its model and budget fixed in its own
+ * command line, but the lane cap, the budgets the loop checks, the failure
+ * ceiling and the permission profile are read at the loop's next decision —
+ * `SETTING_EFFECTS` says which, per field, and the sheet says so rather than
+ * one sentence that was untrue of half the form.
+ *
+ * It opens while a lane is still working — the wedged run is the one where a
+ * budget most needs lowering — as a PATCH: the server refuses by name the
+ * fields a live lane holds and applies the rest. Each field says, beside its
+ * control, when a change to it lands (`SETTING_EFFECTS`), and the fields a
+ * working lane holds say they are refused before the press (phase 24). And it names the one choice
+ * it does not carry, who pays, with a link to where that is moved.
  */
 
 import { Slot } from '@radix-ui/react-slot';
@@ -37,6 +46,8 @@ import { useState, type ReactNode } from 'react';
 import { Button } from '@/components/ui';
 import type { PhaseView, PlanReviewer, RunState } from '@/lib/api';
 import { RunSetup } from '@/features/run-setup/run-setup';
+import { SETTING_EFFECT_LABELS, SETTING_VERBS } from '@shared/run-settings.js';
+import { lanesOf } from './session-panes';
 
 export function SettingsSheet({
   slug,
@@ -80,7 +91,12 @@ export function SettingsSheet({
 }) {
   const [open, setOpen] = useState(false);
   const resumable = Boolean(run) && !live && !stillWorking && run?.status !== 'finished';
-  const mode = live ? 'live' : resumable ? 'continue' : 'start';
+  // A lane still working is a run to PATCH, never one to continue over.
+  const patching = live || (stillWorking && Boolean(run));
+  const mode = patching ? 'live' : resumable ? 'continue' : 'start';
+  // A lane in flight holds its checkout and branch: the sheet names those
+  // fields refused beside their controls (control-tower phase 24, #31).
+  const laneWorking = stillWorking || lanesOf(run).some((lane) => !lane.queued);
 
   return (
     <>
@@ -107,25 +123,20 @@ export function SettingsSheet({
           planReviewers={planReviewers}
           {...(qaMode !== undefined ? { qaMode } : {})}
           {...(allowWrites !== undefined ? { allowWrites } : {})}
-          blocked={!allowRun || stillWorking}
-          {...(!allowRun
-            ? { blockedReason: 'Controls need --allow-run.' }
-            : stillWorking
-              ? {
-                  blockedReason:
-                    'Something is still running on this plan — a lane has a live session. ' +
-                    'Stop it, or wait for it, before continuing the run.',
-                }
-              : {})}
+          blocked={!allowRun}
+          laneWorking={patching && laneWorking}
+          {...(!allowRun ? { blockedReason: 'Controls need --allow-run.' } : {})}
           overlay={{
             open,
             onOpenChange: setOpen,
-            title: live ? 'Run settings' : resumable ? 'Continue this run' : 'Start a run',
-            description: live
-              ? 'Applies from the next phase to board. The session running now was started with its model and budget fixed in its own command line.'
-              : resumable
-                ? 'Picks up from the board, not from a saved position.'
-                : 'Fresh or half finished is the same button — the done-set decides where it begins.',
+            title: patching ? 'Run settings' : resumable ? 'Continue this run' : 'Start a run',
+            description: patching ? (
+              <SettingsNote stillWorking={!live && stillWorking} />
+            ) : resumable ? (
+              'Picks up from the board, not from a saved position.'
+            ) : (
+              'Fresh or half finished is the same button — the done-set decides where it begins.'
+            ),
           }}
           // Closing on success is the point of a sheet: the form said what it
           // did with a toast, and leaving it open invites a second submit of
@@ -134,6 +145,37 @@ export function SettingsSheet({
         />
       )}
     </>
+  );
+}
+
+/**
+ * What a patch does and when (control-tower phase 13, #31) — in the words of
+ * `SETTING_EFFECT_LABELS`, grouped the way `SETTING_EFFECTS` groups the form —
+ * and the one choice the sheet does not carry, linked to where it moves.
+ */
+export function SettingsNote({ stillWorking }: { stillWorking: boolean }) {
+  return (
+    <span className="flex flex-col gap-1">
+      <span>
+        {SETTING_EFFECT_LABELS.now}: the lane cap, the run's budget, the failure ceiling, autonomy and the
+        permission profile. {SETTING_EFFECT_LABELS['next-phase']}: model, effort, skills, servers and the
+        phase budget — the session running now keeps what it started with.
+      </span>
+      {stillWorking ? (
+        <span>
+          A lane is still working, so what it stands on — the branch strategy and the checkout — is refused by
+          name, and everything else is applied.
+        </span>
+      ) : null}
+      <span>
+        Who pays is moved by <em>{SETTING_VERBS.accountId}</em> on the run card, which checkpoints the live
+        sessions first —{' '}
+        <a href="#/settings/accounts" className="underline hover:text-action">
+          repair or add a login in Settings ▸ Accounts
+        </a>
+        .
+      </span>
+    </span>
   );
 }
 

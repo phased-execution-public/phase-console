@@ -19,12 +19,15 @@ import {
 } from '../shared/ladder-model.js';
 import {
   DEFAULT_LADDER_CAPS, LADDER_TIMED_PARK_MS, RUNGS_BY_SITUATION, RUNG_VEHICLES,
-  accountRung, capRefusal, chargeRung, errandFor, errandSaid, ladderCaps, lastSettledRung, nextRung, progressExtension, rungKey,
+  accountRung, capRefusal, chargeRung, errandFor, errandSaid, ladderCaps, lastSettledRung, nextRung, openRunRungs, progressExtension, rungKey,
   rungSettledPayload, rungsFor, sameErrand, settleRung, settleRungRecord, undrivableSentence,
   type RecoverySlot,
 } from '../server/runner/ladder.ts';
 import type { RungRecord } from '../server/runner/state.ts';
-import { keyedAsks } from '../server/runner/ladder.ts';
+import { keyedAsks, switchRungDecision } from '../server/runner/ladder.ts';
+import { PERSON_SLOT_BY, accountPersonRung, boardInPersonSlot, personSituationOf } from '../server/runner/ladder.ts';
+import { PERSON_SLOT_BY as SHARED_PERSON_SLOT_BY } from '../shared/ladder-model.js';
+import type { PhaseRecord } from '../server/runner/state.ts';
 import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { POLICY_DEFAULTS, decisionKeyOfSituation, isAutomaticAnswer, policyAnsweredPayload } from '../shared/policy-model.js';
 
@@ -112,20 +115,35 @@ test('caps refuse by attempts AND dollars — per phase, per run, per day', () =
   // Per-phase dollars.
   const phaseUsd = nextRung({ situation, history: [climbed('a', 'x', 100)] });
   assert.match(!phaseUsd.ok ? phaseUsd.reason : '', /phase's ladder budget is spent \(\$100\.00 of \$100\)/);
-  // Per-run rungs count every phase's rungs together.
-  const runRungs = nextRung({ situation, history: [], runHistory: Array.from({ length: 10 }, (_, i) => climbed('a', `r${i}`)) });
+  // Per-run rungs count every OPEN phase's rungs together (`openRunRungs`, #14).
+  const tenRungs = { 1: { rungs: Array.from({ length: 10 }, (_, i) => climbed('a', `r${i}`)) } };
+  const runRungs = nextRung({ situation, history: [], run: openRunRungs(tenRungs, () => false) });
   assert.match(!runRungs.ok ? runRungs.reason : '', /run's ladder budget is spent \(10 of 10 rungs\)/);
-  // Per-run dollars.
-  const runUsd = nextRung({ situation, history: [], runHistory: [climbed('a', 'x', 250), climbed('b', 'y', 150)] });
+  // …and not the rungs of a phase the board reads done.
+  assert.ok(nextRung({ situation, history: [], run: openRunRungs(tenRungs, (phase) => phase === 1) }).ok);
+  // Per-run dollars count every phase, done or not: money spent was spent.
+  const spent = { 1: { rungs: [climbed('a', 'x', 250)] }, 2: { rungs: [climbed('b', 'y', 150)] } };
+  const runUsd = nextRung({ situation, history: [], run: openRunRungs(spent, (phase) => phase === 1) });
   assert.match(!runUsd.ok ? runUsd.reason : '', /run's ladder budget is spent \(\$400\.00 of \$400\)/);
   // Per-day dollars, when the caller knows the day.
   const dayUsd = nextRung({ situation, history: [], dayHistory: [climbed('a', 'x', 600)] });
   assert.match(!dayUsd.ok ? dayUsd.reason : '', /today's ladder budget is spent/);
   // Under every cap it climbs; the caps are prefs.
-  assert.ok(nextRung({ situation, history: [climbed('a', 'x', 99.99)], runHistory: [climbed('a', 'x', 99.99)], dayHistory: [] }).ok);
+  assert.ok(nextRung({ situation, history: [climbed('a', 'x', 99.99)], run: openRunRungs({ 1: { rungs: [climbed('a', 'x', 99.99)] } }, () => false), dayHistory: [] }).ok);
   assert.ok(nextRung({ situation, history: [climbed('a', 'x'), climbed('b', 'y'), climbed('c', 'z')], caps: { perPhaseRungs: 4 } }).ok);
   // Unknown costs count as zero — a cap is never tripped by a missing number.
   assert.ok(nextRung({ situation, history: [{ situation: 'a', rung: 'x', at }] }).ok);
+});
+
+test('an environment record re-arms its rung and spends no rung cap — until the fifth (#36)', () => {
+  const situation = 'resource-wall:auth';
+  const outage = (n: number) => Array.from({ length: n }, () => ({ ...climbed(situation, 'switch-account'), cause: 'environment' as const }));
+  const back = nextRung({ situation, history: outage(3) });
+  assert.ok(back.ok && back.rung.vehicle === 'switch-account', 'the outage is over when the accounts say so, not when the table ran out');
+  assert.ok(nextRung({ situation: 'never-started', history: outage(4) }).ok, 'four records spend none of the three-rung phase cap');
+  const spent = nextRung({ situation, history: outage(5), caps: { perPhaseRungs: 10 } });
+  assert.equal(spent.ok, false);
+  assert.match(!spent.ok ? spent.reason : '', /every rung for resource-wall:auth has been tried/);
 });
 
 test('a vehicle this console cannot drive is skipped, and the reason says so when nothing else is left', () => {
@@ -742,7 +760,9 @@ test('RCV-6: a settlement journals situation, params and a numeric cost; two con
   assert.equal(settledA, a);
   assert.deepEqual(rungSettledPayload(a), {
     rung: 'resume-own-session', outcome: 'failed', situation: 'work-in-progress', params: { mode: 'continue' }, costUsd: 4,
-    note: 'the record reads failed',
+    // Every settlement says WHY since control-tower phase 5 (#36): nothing
+    // stamped another cause, so this one is a verdict on the remedy.
+    cause: 'merit', note: 'the record reads failed',
   });
   // Rung B climbs; ITS attempt's $9 is booked on B alone — A stays $4 (the
   // audit's 21 open rungs absorbed every later charge).
@@ -819,4 +839,137 @@ test('RCV-7: the undrivable sentence names each rung, its driver and what is in 
   ]);
   assert.match(two!, /Park and poll the refs.*; \*\*Park for a while\*\*/);
   assert.equal(undrivableSentence('never-started', []), null);
+});
+
+/* ------------------------------------------------------------------ *
+ * The person slot (control-tower phase 53, #56 and #36's comment)
+ * ------------------------------------------------------------------ */
+
+test('PR-4: a person-slot rung counts toward no rung cap and marks no remedy tried — its dollars still count (#56)', () => {
+  assert.equal(PERSON_SLOT_BY, SHARED_PERSON_SLOT_BY, 'one word, owned by the shared model and re-exported by identity');
+  assert.equal(PERSON_SLOT_BY, 'operator');
+  const machine = [
+    climbed('work-in-progress', 'resume-own-session', 4, { mode: 'continue' }),
+    climbed('work-in-progress', 'reboard-resume-brief', 5),
+    climbed('work-in-progress', 'unblock-session', 6),
+  ];
+  const press: RungRecord = { situation: 'work-in-progress', rung: 'reboard-fresh', at, costUsd: 7, outcome: 'failed', by: PERSON_SLOT_BY };
+  const history = [...machine, press];
+  assert.equal(countedRungs(history).length, 3, 'the press is not one of the machine\'s three');
+  assert.ok(!triedRungKeys(history).has(rungKey('work-in-progress', { vehicle: 'reboard-fresh' })),
+    'a person boarding it fresh is not the ladder having tried reboard-fresh');
+  // The machine's own cap reads only the machine's rungs: 3 of 4 leaves one.
+  assert.equal(nextRung({ situation: 'work-in-progress', history, caps: { perPhaseRungs: 4 } }).ok, true);
+  // …and the run-wide counter agrees (one counter for the climb and the heal gate).
+  assert.equal(openRunRungs({ 9: { attempts: 4, rungs: history } }, () => false).open, 3);
+  // Money that was spent was spent: $4 + $5 + $6 + $7 = $22 is over a $20 cap.
+  const usd = nextRung({ situation: 'work-in-progress', history, caps: { perPhaseRungs: 10, perPhaseUsd: 20 } });
+  assert.equal(usd.ok, false);
+  assert.equal(!usd.ok && usd.cap, 'phase-usd');
+  assert.equal(!usd.ok && usd.spent, 22);
+});
+
+test('PR-5: a person\'s Retry boards in the person slot — a fresh hint, a rung recorded by: operator, no cap read (#56)', () => {
+  const machine = [
+    climbed('work-in-progress', 'resume-own-session', 4, { mode: 'continue' }),
+    climbed('work-in-progress', 'reboard-resume-brief', 5),
+    climbed('work-in-progress', 'unblock-session', 6),
+  ];
+  const recoveries: Record<string, RecoverySlot> = {
+    9: {
+      attempts: 3, lastAt: at, rungs: [...machine],
+      errand: { phase: 9, situation: 'work-in-progress', tried: [], need: 'someone to finish the phase', how: 'Retry', at },
+    },
+  };
+  // The automatic ladder is spent — exactly the refusal #56 met a second after the press.
+  const spent = nextRung({ situation: 'work-in-progress', history: recoveries[9].rungs!, caps: { perPhaseRungs: 3 } });
+  assert.equal(!spent.ok && spent.cap, 'phase-rungs');
+
+  const record = { phase: 9, status: 'pending', attempts: 3, situation: { key: 'work-in-progress', at, why: [] } } as unknown as PhaseRecord;
+  assert.equal(personSituationOf(record), 'work-in-progress', 'the classifier\'s last word labels the press');
+  const { rung, hint } = boardInPersonSlot(recoveries, record, { situation: personSituationOf(record), at });
+  assert.equal(rung.by, PERSON_SLOT_BY);
+  assert.equal(rung.rung, 'reboard-fresh');
+  assert.equal(rung.outcome, 'running', 'open until its attempt ends, and settled like any rung');
+  assert.deepEqual(record.boardingHint, hint, 'the hint is what keeps the loop\'s own ladder pass off the phase');
+  assert.equal(hint.brief, 'fresh');
+  assert.equal(hint.rung, 'reboard-fresh');
+  assert.equal(hint.by, PERSON_SLOT_BY);
+  assert.equal(recoveries[9].errand, undefined, 'the standing errand goes: a person is working the phase again');
+  assert.equal(recoveries[9].attempts, 4, 'attempts and rungs stay in step for old readers');
+  // Settled either way, the press stays out of every count the caps read.
+  settleRung(recoveries[9], 'failed', 12);
+  assert.equal(countedRungs(recoveries[9].rungs!).length, 3);
+  const after = nextRung({ situation: 'work-in-progress', history: recoveries[9].rungs!, caps: { perPhaseRungs: 3 } });
+  assert.equal(!after.ok && after.spent, 3, 'the machine is still at three of three — the person slot spent none of them');
+
+  // A phase the classifier never read: labelled by what the record says.
+  assert.equal(personSituationOf({ attempts: 0 } as PhaseRecord), 'never-started');
+  assert.equal(personSituationOf({ attempts: 2 } as PhaseRecord), 'work-in-progress');
+  // The resume a person asked for, boarded fresh, sits in the same slot.
+  const fresh = accountPersonRung(recoveries, 11, { situation: 'work-in-progress', rung: 'reboard-resume-brief', at });
+  assert.equal(fresh.by, PERSON_SLOT_BY);
+  assert.equal(countedRungs(recoveries[11]!.rungs!).length, 0);
+});
+
+/* ------------------------------------------------------------------ *
+ * SH-4..6 — the `switch-account` rung judges LIVE meters and a person's
+ * choice (control-tower phase 78, #106)
+ * ------------------------------------------------------------------ */
+
+// A person moved the run off a 42 % account onto a fresh one; an hour later
+// converge read a STALE `resource-wall:usage` off a checkpoint and the rung
+// moved it back — from 5 % onto 64 % — then ping-ponged three times.
+const choice = { accountId: 'acct-5398', from: 'acct-84b6', at: '2026-09-24T17:49:32.000Z', by: 'operator' };
+
+test('SH-4: a usage wall re-judged on the run\'s CURRENT account — headroom now means a plain resume there, whoever is ranked higher', () => {
+  const stay = switchRungDecision({
+    from: 'acct-5398', wall: 'usage',
+    current: { ok: true, headroomPct: 95 },
+    candidates: [{ id: 'acct-84b6', headroomPct: 36 }],
+    choice,
+  });
+  assert.equal(stay.act, 'stay');
+  assert.equal(stay.act === 'stay' && stay.accountId, 'acct-5398');
+  assert.match(stay.act === 'stay' ? stay.why : '', /95 %/, 'the resume says what it read');
+  // The same with no person in the picture: live headroom is a resume, full stop.
+  assert.equal(switchRungDecision({ from: 'default', wall: 'usage', current: { ok: true, headroomPct: null }, candidates: [{ id: 'x', headroomPct: 90 }] }).act, 'stay');
+  // A live wall on it: now the rung moves.
+  const moved = switchRungDecision({ from: 'default', wall: 'usage', current: { ok: false, headroomPct: 0 }, candidates: [{ id: 'x', headroomPct: 90 }] });
+  assert.deepEqual(moved, { act: 'switch', accountId: 'x', reverts: null });
+  // A sign-in wall keeps its own rule (#36): the run's own account signed in
+  // again is a resume there, and only on that evidence.
+  assert.equal(switchRungDecision({ from: 'a', wall: 'auth', current: { ok: true, headroomPct: 80 }, candidates: [], cleared: true }).act, 'stay');
+  assert.equal(switchRungDecision({ from: 'a', wall: 'auth', current: { ok: true, headroomPct: 80 }, candidates: [] }).act, 'refuse');
+});
+
+test('SH-5: the rung never moves to an account with less headroom than the one the run is on', () => {
+  // 97 % five-hour is past the quota door (spent) but still 3 % of room; a
+  // candidate at 2 % is no improvement.
+  const worse = switchRungDecision({
+    from: 'a', wall: 'usage', current: { ok: false, headroomPct: 3 }, candidates: [{ id: 'b', headroomPct: 2 }],
+  });
+  assert.equal(worse.act, 'refuse');
+  assert.match(worse.act === 'refuse' ? worse.why : '', /less headroom/);
+  // The first candidate with MORE room is taken, whatever the order it came in.
+  const better = switchRungDecision({
+    from: 'a', wall: 'usage', current: { ok: false, headroomPct: 3 }, candidates: [{ id: 'b', headroomPct: 2 }, { id: 'c', headroomPct: 40 }],
+  });
+  assert.deepEqual(better, { act: 'switch', accountId: 'c', reverts: null });
+  // A candidate never read is not known to be worse — the rank's own rule for the unknown.
+  assert.equal(switchRungDecision({ from: 'a', wall: 'usage', current: { ok: false, headroomPct: 3 }, candidates: [{ id: 'n', headroomPct: null }] }).act, 'switch');
+  // Nothing to move to at all.
+  assert.equal(switchRungDecision({ from: 'a', wall: 'usage', current: { ok: false, headroomPct: 0 }, candidates: [] }).act, 'refuse');
+});
+
+test('SH-6: a person\'s switch is never reverted without a live wall on their choice — and a reversal is named, so it can be announced', () => {
+  // No live wall on the person's choice: stays, however stale the classifier's wall.
+  assert.equal(switchRungDecision({ from: choice.accountId, wall: 'usage', current: { ok: true, headroomPct: 90 }, candidates: [{ id: choice.from, headroomPct: 36 }], choice }).act, 'stay');
+  // A live wall on it: the rung may move — back to where the person moved it
+  // away from, when that is the account with room — and says it is a reversal.
+  const back = switchRungDecision({ from: choice.accountId, wall: 'usage', current: { ok: false, headroomPct: 0 }, candidates: [{ id: choice.from, headroomPct: 36 }], choice });
+  assert.deepEqual(back, { act: 'switch', accountId: choice.from, reverts: choice });
+  // Moving somewhere ELSE is not a reversal of the person.
+  const elsewhere = switchRungDecision({ from: choice.accountId, wall: 'usage', current: { ok: false, headroomPct: 0 }, candidates: [{ id: 'acct-346a', headroomPct: 90 }], choice });
+  assert.deepEqual(elsewhere, { act: 'switch', accountId: 'acct-346a', reverts: null });
 });

@@ -26,7 +26,24 @@ import { debugHref, listOf, sectionFor, DEBUG_SECTIONS } from './routes';
 import DebugPage from './index';
 import { DriveableEventSource } from './driveable-event-source';
 
-const { state, debugIndex, debugRuns, debugBundle, runTimeline, phaseDiagnosis } = vi.hoisted(() => ({
+const {
+  state,
+  debugIndex,
+  debugRuns,
+  debugBundle,
+  runTimeline,
+  phaseDiagnosis,
+  doctor,
+  debugLevel,
+  setDebugLevel,
+  accounts,
+  stateWith,
+} = vi.hoisted(() => ({
+  stateWith: vi.fn(),
+  doctor: vi.fn(),
+  debugLevel: vi.fn(),
+  setDebugLevel: vi.fn(),
+  accounts: vi.fn(),
   state: vi.fn(),
   debugIndex: vi.fn(),
   debugRuns: vi.fn(),
@@ -39,7 +56,20 @@ vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
   return {
     ...actual,
-    api: { ...actual.api, state, debugIndex, debugRuns, debugBundle, runTimeline, phaseDiagnosis },
+    api: {
+      ...actual.api,
+      state,
+      debugIndex,
+      debugRuns,
+      debugBundle,
+      runTimeline,
+      phaseDiagnosis,
+      doctor,
+      debugLevel,
+      setDebugLevel,
+      accounts,
+      stateWith,
+    },
   };
 });
 
@@ -204,6 +234,8 @@ beforeEach(() => {
     horizonAt: null,
   });
   phaseDiagnosis.mockResolvedValue(null);
+  debugLevel.mockResolvedValue({ level: 'info', source: 'env', levels: ['debug', 'info', 'warn', 'error'] });
+  accounts.mockResolvedValue({ accounts: [], allowAccounts: false });
 });
 
 /* ------------------------------------------------------------------ *
@@ -658,7 +690,9 @@ describe('what could not be read is never absorbed', () => {
       ],
     });
     mount('#/debug/delivery');
-    const rows = await screen.findAllByRole('button', { expanded: false });
+    // The ROW's toggle, by name: the ledger's View control is a collapsed
+    // button too, and it comes first.
+    const rows = await screen.findAllByRole('button', { name: /Show the rest of this row/, expanded: false });
     fireEvent.click(rows[0]);
     // The ROW's sentence, not the vocabulary card's: both say "quiet hours",
     // and matching on the shared phrase would pass with the row unopened.
@@ -772,5 +806,268 @@ describe('the journal section', () => {
     const note = await screen.findByTestId('phase-not-in-run');
     expect(note.textContent).toContain('run aaaa1111');
     expect(phaseDiagnosis).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Phase 25 — what the server already knew, drawn
+ * ------------------------------------------------------------------ */
+
+describe('the doctor leads with the check to fix first', () => {
+  const REPORT = {
+    instance: { id: 'abcd1234-repo', name: 'repo', root: '/repo', port: 4130, default: false },
+    mode: 'console' as const,
+    ok: false,
+    cliFloor: '2.1.268',
+    at: '2026-09-29T10:00:00.000Z',
+    rows: [
+      {
+        id: 'accounts',
+        label: 'Accounts',
+        status: 'ok' as const,
+        blocking: true,
+        reason: 'one account with headroom',
+      },
+      {
+        id: 'hooks',
+        label: 'Hooks',
+        status: 'fail' as const,
+        blocking: false,
+        reason: 'the presence hook is not installed',
+      },
+      {
+        id: 'mcp',
+        label: 'MCP servers',
+        status: 'skip' as const,
+        blocking: false,
+        reason: 'none registered',
+      },
+      {
+        id: 'gh',
+        label: 'GitHub CLI',
+        status: 'fail' as const,
+        blocking: true,
+        reason: 'gh is not signed in',
+      },
+    ],
+    firstFailing: {
+      id: 'gh',
+      label: 'GitHub CLI',
+      status: 'fail' as const,
+      blocking: true,
+      reason: 'gh is not signed in',
+    },
+  };
+
+  it('asks only when the reader does, then draws a probe badge per row with the first blocking failure first', async () => {
+    doctor.mockResolvedValue(REPORT);
+    mount('#/debug/health');
+    fireEvent.click(await screen.findByText('Run the doctor'));
+    expect(await screen.findByTestId('doctor-verdict')).toHaveTextContent(
+      'Blocked: GitHub CLI — fix that first.',
+    );
+    const rows = screen.getAllByTestId('doctor-row');
+    expect(rows.map((row) => row.getAttribute('data-row'))).toEqual(['gh', 'hooks', 'accounts', 'mcp']);
+    // The word is the probe vocabulary's, through OpsBadge — never a colour of this page's own.
+    const badges = rows.map((row) => row.querySelector('[data-status]'));
+    expect(badges.every(Boolean)).toBe(true);
+    expect(badges[0]!.getAttribute('data-status')).not.toBe(badges[2]!.getAttribute('data-status'));
+    expect(rows[1]).toHaveTextContent('advisory — a start still goes ahead');
+    expect(doctor).toHaveBeenCalledTimes(1);
+  });
+
+  it('says nothing blocks a start when every blocking row passed', async () => {
+    doctor.mockResolvedValue({ ...REPORT, ok: true, firstFailing: null, rows: [REPORT.rows[0]] });
+    mount('#/debug/health');
+    fireEvent.click(await screen.findByText('Run the doctor'));
+    expect(await screen.findByTestId('doctor-verdict')).toHaveTextContent('Nothing blocks a start.');
+  });
+});
+
+describe('the log filters round-trip through the URL: q, since and limit', () => {
+  it('reads all three from the URL and sends all three', async () => {
+    mount('#/debug?q=boom&since=2026-09-01T09:00:00.000Z&limit=2000');
+    await screen.findByText('the route threw');
+    expect(debugIndex).toHaveBeenCalledWith({ q: 'boom', since: '2026-09-01T09:00:00.000Z', limit: 2000 });
+    expect((screen.getByLabelText('How many rows to read') as HTMLSelectElement).value).toBe('2000');
+  });
+
+  it('writes the row count back into the URL, and a chip click carries all three forward', async () => {
+    const view = mount('#/debug?q=boom&since=2026-09-01T09:00:00.000Z');
+    await screen.findByText('the route threw');
+    fireEvent.change(screen.getByLabelText('How many rows to read'), { target: { value: '5000' } });
+    const written = view.lastNavigation();
+    expect(written).toContain('limit=5000');
+    expect(written).toContain('q=boom');
+
+    view.go(written);
+    await screen.findByText('the route threw');
+    fireEvent.click(screen.getByRole('button', { name: 'journal' }));
+    const carried = view.lastNavigation();
+    expect(carried).toContain('limit=5000');
+    expect(carried).toContain('q=boom');
+    expect(carried).toContain('since=2026-09-01T09%3A00%3A00.000Z');
+  });
+
+  it('drops a limit that is not a positive whole number rather than sending it', async () => {
+    mount('#/debug?limit=lots');
+    await screen.findByText('the route threw');
+    expect(debugIndex).toHaveBeenCalledWith({});
+  });
+});
+
+describe('this process: the generation, the restart and the log level', () => {
+  it('draws state.generation and a restart’s update with the restart vocabulary', async () => {
+    state.mockResolvedValue({
+      ...STATE,
+      generation: 42,
+      bootedAt: '2026-09-29T08:00:00.000Z',
+      distRev: 'abcdef1234567',
+      execArgv: ['--max-old-space-size=8192'],
+      restartUpdate: {
+        state: 'waiting',
+        startedAt: '2026-09-29T09:00:00.000Z',
+        by: 'operator',
+        detail: 'Restart when idle',
+        lanes: 2,
+        plans: ['demo'],
+      },
+    });
+    mount('#/debug/health');
+    const card = await screen.findByTestId('process');
+    expect(await within(card).findByText('42')).toBeTruthy();
+    expect(within(card).getByText('abcdef12')).toBeTruthy();
+    expect(within(card).getByText('--max-old-space-size=8192')).toBeTruthy();
+    const restart = within(card).getByTestId('restart-update');
+    expect(restart.querySelector('[data-status]')).toBeTruthy();
+    expect(restart).toHaveTextContent('Restart when idle — by operator');
+    expect(restart).toHaveTextContent('waiting on 2 live lanes (demo)');
+  });
+
+  it('says so when no restart has happened', async () => {
+    mount('#/debug/health');
+    expect(await screen.findByText('No restart or update since this process booted.')).toBeTruthy();
+  });
+
+  it('turns the log level for thirty minutes and says when it reverts', async () => {
+    setDebugLevel.mockResolvedValue({
+      level: 'debug',
+      source: 'override',
+      until: Date.parse('2026-09-29T10:30:00.000Z'),
+      levels: ['debug', 'info', 'warn', 'error'],
+    });
+    mount('#/debug/health');
+    const select = await screen.findByLabelText('This console’s log level');
+    fireEvent.change(select, { target: { value: 'debug' } });
+    await vi.waitFor(() =>
+      expect(setDebugLevel).toHaveBeenCalledWith({ level: 'debug', ttlMs: 30 * 60_000 }),
+    );
+    expect(await screen.findByText(/reverts by itself at/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Revert now' })).toBeTruthy();
+  });
+});
+
+describe('a retirement’s evidence, and its contradiction, on Debug ▸ Health', () => {
+  it('draws what a retirement stood on and the later read that contradicted it', async () => {
+    accounts.mockResolvedValue({
+      allowAccounts: true,
+      accounts: [
+        {
+          id: 'account-1',
+          kind: 'token',
+          name: 'work',
+          email: 'work@example.com',
+          entitlement: {
+            state: 'suspect',
+            via: 'probe',
+            evidence: {
+              source: 'text',
+              matched: 'credit balance is too low',
+              session: 'abcdef0123456789',
+              phase: 7,
+              slug: 'demo',
+            },
+            contradicted: {
+              at: '2026-09-29T09:00:00.000Z',
+              by: 'usage-poll',
+              reason: 'a usage read answered 200',
+            },
+          },
+        },
+      ],
+    });
+    mount('#/debug/health');
+    const card = await screen.findByTestId('retirements');
+    expect(within(card).getByText('work')).toBeTruthy();
+    expect(within(card).getByTestId('retirement-evidence')).toHaveTextContent(
+      'Was retired on from a session that spent nothing · “credit balance is too low” · session abcdef01 · phase 7 of demo',
+    );
+    expect(within(card).getByTestId('retirement-contradicted')).toHaveTextContent(
+      'by usage-poll — a usage read answered 200',
+    );
+  });
+
+  it('draws no card on a console with nothing retired', async () => {
+    mount('#/debug/health');
+    await screen.findByTestId('process');
+    expect(screen.queryByTestId('retirements')).toBeNull();
+  });
+});
+
+describe('Debug ▸ Access draws state.access — who this console has served', () => {
+  it('counts requests by scope and lists every phone login it has seen, newest first', async () => {
+    state.mockResolvedValue({
+      ...STATE,
+      access: {
+        served: { local: 120, remote: 7 },
+        lastRemoteAt: '2026-09-29T09:58:00.000Z',
+        identities: [
+          {
+            host: 'tablet.tail',
+            loginHash: 'cccc3333dddd4444',
+            first: '2026-09-20T08:00:00.000Z',
+            last: '2026-09-21T08:00:00.000Z',
+            count: 2,
+          },
+          {
+            host: 'phone.tail',
+            loginHash: 'aaaa1111bbbb2222',
+            first: '2026-09-28T08:00:00.000Z',
+            last: '2026-09-29T09:58:00.000Z',
+            count: 5,
+          },
+        ],
+      },
+    });
+    mount('#/debug/access');
+    const page = await screen.findByTestId('access');
+    expect(within(page).getByText('120 requests')).toBeTruthy();
+    expect(within(page).getByText('7 requests')).toBeTruthy();
+    const rows = within(page).getAllByTestId('access-identity');
+    expect(rows.map((row) => row.textContent)).toEqual([
+      expect.stringContaining('phone.tail'),
+      expect.stringContaining('tablet.tail'),
+    ]);
+  });
+
+  it('says only this machine has been served when no phone ever reached it', async () => {
+    state.mockResolvedValue({
+      ...STATE,
+      access: { served: { local: 3, remote: 0 }, lastRemoteAt: null, identities: [] },
+    });
+    mount('#/debug/access');
+    expect(await screen.findByText(/No phone has reached this console/)).toBeTruthy();
+  });
+});
+
+describe('the whole state, on request (GET /api/state?include=full)', () => {
+  it('copies the state with its projection widened, never on the page’s own read', async () => {
+    stateWith.mockResolvedValue({ ...STATE, runs: [] });
+    Object.assign(navigator, { clipboard: { writeText: vi.fn(async () => {}) } });
+    mount('#/debug/health');
+    const card = await screen.findByTestId('process');
+    expect(stateWith).not.toHaveBeenCalled();
+    fireEvent.click(within(card).getByRole('button', { name: /Copy the whole state/ }));
+    await vi.waitFor(() => expect(stateWith).toHaveBeenCalledWith(['full']));
   });
 });

@@ -999,7 +999,180 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
     else if (line.trim() === '<!--!pro:end-->') inPro = false;
     else if (inPro && /^\| `(?:phase|run|policy)\.[a-z0-9.-]+` \|/.test(line)) proRows += 1;
   }
-  assert.equal(kinds.length, 319 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
+  // 336 since control-tower phase 11 (what the plan file asks of a run): the
+  // plan-mode hold's five `phase.plan-*` lines (`presented`, `approved`,
+  // `rejected`, `host`, `hold-interrupted`) and `run.git-strategy-overridden`,
+  // all free rows — the two `runner.plan-*` log rows sit outside the count.
+  //
+  // 330 since control-tower phase 9 (the reliability block lands): no new
+  // kind — `phase.lint-unrun` (phase 4) had been written INSIDE a Pro region,
+  // while its record site is the free runner's (`runner/runner-attempt.ts`),
+  // so the Pro tree counted it as Pro and the free tree wrote an event its
+  // catalogue did not carry. The row moved out of the region; the free count
+  // is one higher and the Pro total is unchanged.
+  //
+  // 329 since control-tower phase 40 (admit on the branch): a run holding a
+  // shared repository on its branch until it settles (`run.tree-hold`) and
+  // giving it up when it does (`run.tree-released`). Both free — the hold
+  // lives in the free runner. A `branch` queue head is a new `headKind` of
+  // `phase.queued`, and the stamps a new field of `phase.verify` — neither a kind.
+  //
+  // 327 since control-tower phase 6 (the scope fence): a phase fenced behind a
+  // same-scope external wall (`phase.fenced`), the fence coming down
+  // (`phase.fence-lifted`), and a second declaration of one wall joining the
+  // first errand (`phase.errand-folded`). Three rows, all free — the fence and
+  // the fold live in the free runner and healer. The live-lane landing is a new
+  // `path` of `phase.resume-automatic` and a new `cause` of
+  // `phase.wait-resume`, a reservation a new field of `phase.admitted`, and a
+  // busy refusal a new field of `run.watch-resume-void` — none of them a kind.
+  //
+  // 324 since control-tower phase 5 (the ladder re-arms): an operator's Retry
+  // replenishing the phase's ladder (`phase.ladder-replenished`). ONE row: the
+  // accounts-changed retraction is a new `reason` of `phase.errand-cleared`,
+  // the wrap-up resume a new `path` of `phase.resume-automatic`, and a rung's
+  // `cause` a new field of `phase.rung-settled` — none of them a new kind.
+  //
+  // 323 since control-tower phase 7 (the process and its wire): the
+  // three-second heartbeat's own failure line (`run.progress-tick-failed`) —
+  // ONE row, because the frame it sends is `run:progress`, an SSE event and not
+  // a journal kind, and the two log names this phase also adds
+  // (`boot.adoption-hold`, `crash-ledger.write-failed`, `sse.slow-client`,
+  // `approvals.adoption-held`) are outside this count by construction, like the
+  // `accounts.*` family below.
+  //
+  // 322 since control-tower phase 3 (an outage is not a credential fault): the
+  // uncharged outage wait (`phase.connectivity-wait`), a second lane meeting a
+  // wall the run already halted on (`phase.credential-wall-seen`), and the
+  // clamp saying when it refused to count (`run.failure-streak-held`). Three,
+  // not four: `run.failure-streak-reset` already had a row — the operator's
+  // `clear-streak` verb is a second WRITER of an event that existed, and giving
+  // it a second row would have made this pin true by counting one kind twice.
+  // All three are free — the classifier, the runner and the breaker all are.
+  // `accounts.retired.reopened` and `accounts.certificate.corroborated` are a
+  // LOG family and outside this count by construction.
+  //
+  // 337 since control-tower phase 45 (a failure is a failed phase): the streak
+  // gaining a phase (`run.failure-charged`) — ONE row, free. A spent wait
+  // budget's park is a new WRITER of `phase.wait-budget-spent` (the runner,
+  // beside the inbox), a Recover over a superseded halt a new `step` of
+  // `run.plan-recover`, and a rescued command a new `retry` field of
+  // `phase.verify` — none of them a kind.
+  //
+  // 342 since control-tower phase 46 (a resume continues its phase): a booking
+  // its calls cannot explain (`phase.cost-mismatch`), a wrap-up notice that did
+  // not arrive (`phase.wrapup-undelivered`) and a stored run re-priced once at
+  // boot (`run.cost-repriced`) — plus the boot pass's two console-log lines,
+  // which carry the `run.` prefix beside their sibling `run.records-swept` and
+  // so are inside this count (`run.records-repriced`, `run.reprice-failed`).
+  // All five are free. A spawn's booked figure is a new `bookedUsd` field of
+  // `phase.session`, and a raise of an instructed resume a new `vehicle` of
+  // `phase.resume` — neither a kind.
+  //
+  // 344 since control-tower phase 48 (a drain that sees verification): a cut
+  // verification re-run on the next drive (`phase.reverify-after-restart`) and
+  // a restart asked from inside a run session (`run.restart-requested`) — both
+  // free. The restart hold's own pair on each held run (`run.restart-held`,
+  // `run.restart-released`) is Pro, and counted by `proRows`.
+  //
+  // 346 since control-tower phase 49 (children are accounted for): a token kept
+  // armed for a child that outlived its loop (`run.token-kept`) and a hook call
+  // refused from a session one of the runs launched (`run.hook-unauthorised`,
+  // the one kind `unauthorised` reads as an error for). Both free.
+  // 347 since control-tower phase 50 (declared waits): a declaration whose ref
+  // had already landed when it was declared, so nothing was parked
+  // (`phase.watch-already-landed`). Free.
+  // 348 since control-tower phase 51 (#48): a closed plan's run settled once by
+  // convergence and never woken again (`run.closed-plan`). Free.
+  // 350 since control-tower phase 53 (#54, #56): a person's delegation
+  // (`phase.delegated`) and the log line of a press's continue that failed
+  // (`run.press-continue-failed`). Free.
+  // 351 since control-tower phase 56 (#77): a lease refresh that gave no
+  // verdict (`phase.lock-refresh-unanswered`) is retried, never read as a
+  // takeover. Free.
+  // 358 since control-tower phase 54 (#57, #78, #91): the model a run names is
+  // the model it runs (`phase.model-held`, `phase.model-mismatch`,
+  // `run.model-resolved`), a usage wall re-read rather than trusted
+  // (`phase.wall-lifted`, `phase.wall-reread`, `run.walls-lifted`,
+  // `run.window-lifted`). All free.
+  // 361 since control-tower phases 58 and 59 (#65, #66, #83): a stored run
+  // re-measured at boot (`run.clocks-remeasured`, `run.records-remeasured`,
+  // `run.remeasure-failed`) and a session's token ledger (`phase.tokens`). 364
+  // since control-tower phase 60 (#64, #81, #82): the queue's episode close
+  // (`phase.queue-closed`), a holder change (`phase.queue-holder-changed`) and
+  // a phase serial behind its own run's lane (`phase.serial-behind`). All free.
+  // 370 since control-tower phase 62 (#68, #47): a red final verdict re-opens
+  // its phase (`phase.verification-failed`) and holds its dependents
+  // (`phase.verification-held`), a session's proofs are honoured or not
+  // (`phase.verify-proven`) and a disagreement is named
+  // (`phase.verify-disagreed`), and a final phase's checks run over a mirror
+  // whose idle branches are settled (`run.mirror-branches-settled`) and given
+  // back (`run.mirror-branches-restored`). All free.
+  // 371 since control-tower phase 63 (#85): the console mirrors a phase's lock
+  // to git outside the session's turn (`phase.lock-mirror`). Free.
+  // +3 from control-tower phase 83 (#95, #103): a §Verification its clock cut
+  // twice (`phase.verify-timeout`), the baseline a phase takes at boarding
+  // (`phase.verify-baseline`) and the reds it inherited from it
+  // (`phase.verify-inherited`). All free. (Phases 77, 78, 80 and 82 added rows
+  // of their own — 79's among them — without moving this pin; theirs to add.)
+  // 384 since control-tower phase 64, which added none: those ten rows, moved
+  // in by the phase whose §Verification runs this file once 77, 80 and 82 had
+  // finished. `docs-parity.test.ts` holds each of them to the code.
+  // +4 from control-tower phase 81 (#104, #105): the drive loop waiting out a
+  // busy engine (`run.engine-busy`) and the read that ended it
+  // (`run.engine-busy-cleared`), a driving recovery clearing a stop its own
+  // read disproved (`run.halt-cleared`), and a fixed run parked for a decision
+  // (`run.recovery-parked`). All free.
+  // +1 from control-tower phase 83's second part (#103, the fifth amendment):
+  // the reds a phase's verification inherited, journalled against the phase
+  // that owes them (`phase.verify-owed`). Free.
+  // +14 from control-tower phase 91: its own four — a run bound to its
+  // account's identity (`run.identity`), the change that parks it
+  // (`run.identity-changed`), a person's answer (`run.identity-accepted`) and a
+  // person's Retry kept through a halt (`phase.retry-kept`) — and ten rows
+  // phases 86 and 90 wrote in code without a catalogue row (`phase.seniority`,
+  // `phase.admission-held`, `phase.recovery-requeued`, `phase.errand-tree`,
+  // `phase.isolate-requested`, `run.isolate-requested`, `run.isolation-switched`,
+  // `run.isolation-switch-refused`, `run.checkout-rebuilt`,
+  // `run.mount-quarantined`), documented so docs-parity reads green. All free.
+  // +1 from control-tower phase 95: how far the active task's operation has
+  // got (`phase.progress`, #163). Free.
+  // +4 from control-tower phase 96 (#142): a person's note and its pinning
+  // (`run.note`, `run.note-pinned`), a bump written on its run
+  // (`phase.queue-bumped`) and a Resume press (`phase.resume-pressed`). Free.
+  // +5 from control-tower phase 97 (#140): a card's expiry warning, its Extend,
+  // a card that stands past its hook call and the call it then grants once
+  // (`phase.approval-expiring`, `phase.approval-extended`,
+  // `phase.approval-standing`, `phase.approval-granted-once`), and a timed-out
+  // card's park lifting with its phase (`run.park-lifted`). Free.
+  // +2 from control-tower phase 89 (#127, #103): the wrap-up's fast gate on a
+  // committed WIP (`phase.wip-gate`) and a clean checkout git refused, so the
+  // verification ran in place (`phase.verify-in-place`). Free.
+  // +1 from control-tower phase 92 (#100): the move back onto the account an
+  // automatic switch took the run off, once it reset (`run.account-switch-back`). Free.
+  // +1 more: the catalogue already held 418 free kinds at `f116c99e` while this
+  // pin read 417 (L-B was red there) — pinned here with phase 92's.
+  // +1 from control-tower phase 93 (#146): a warning past the alert threshold
+  // on an account credits carry past its plan windows (`run.usage-carried`). Free.
+  // +1 from control-tower phase 103, which added no kind: `phase.landing-threw`
+  // (phase 82, #117) had been written INSIDE the landing rows' Pro region, while
+  // its record site is the free runner's settle (`runner/runner-loop.ts`) — the
+  // `phase.lint-unrun` case again. The row moved out of the region; the free
+  // count is one higher and the Pro total is unchanged.
+  // +1 from control-tower phase 14 (#40): a budget at its warning line
+  // (`phase.budget-approaching`). Free.
+  // +1 from control-tower phase 41: a declared human step recorded
+  // (`phase.human-step`). Free.
+  // +8 from control-tower phase 43: the verbs and the clock on a human step
+  // (`phase.human-step-opened`, `-checked`, `-proven`, `-snoozed`,
+  // `-cannot`, `-dismissed`, `-expired`, `-reminded`). Free.
+  // +2 from control-tower phase 44: what the console notices of a person's
+  // turn (`phase.human-step-suspected`, `-converted`). Free.
+  // +6 from control-tower phase 99 (#135): an operator's word on a phase's
+  // place in the queue (`phase.queue-held`, `-released`, `-deferred`,
+  // `-withdrawn`, `-requeued`) and a plan's order (`run.queue-reordered`). Free.
+  // +5 from control-tower phase 100 (#135): an operator's word on a lane
+  // (`phase.lane-pinned`, `-unpinned`, `-reserved`, `-unreserved`, `-yielded`). Free.
+  assert.equal(kinds.length, 444 + proRows, `the catalogue has ${kinds.length} kinds (${proRows} Pro); the parser found a different number`);
 
   const segments = new Set(kinds.flatMap((kind) => kind.split(/[.-]/)));
   const dead = [...ERROR_SEGMENTS, ...WARN_SEGMENTS, ...RESOLVED_SEGMENTS]
@@ -1049,7 +1222,43 @@ test('L-B — the level vocabulary is checked against every kind in the catalogu
   // for both: a draft that quietly went nowhere is a finding a session was
   // told would be filed and nobody ever reads. (Exclusive bound, so it moves
   // to 54.)
-  assert.ok(tally.error > 0 && tally.error < 54, `${tally.error} kinds read as error — check the vocabulary`);
+  // 54 since control-tower phase 7: `run.progress-tick-failed` reads as error
+  // through `failed`, and loud is right — a heartbeat that throws leaves every
+  // surface that rides it frozen while the run carries on working, which is
+  // the exact symptom the event was added to remove. (Exclusive bound, so it
+  // moves to 55.)
+  // 56 since control-tower phase 46: `phase.cost-mismatch` reads as error
+  // through `mismatch` (the plan's name for it), and `run.reprice-failed`
+  // through `failed`. Loud is right for both even though neither blocks: a
+  // booking its own calls cannot explain is how the re-reported-total defect
+  // stayed invisible for a week, and a stored run the re-price could not reach
+  // keeps inflated dollars that budgets read. (Exclusive bound, so it moves
+  // to 57.)
+  // 57 since control-tower phase 49: `run.hook-unauthorised` reads as error
+  // through `unauthorised` — a run's own session whose every hook call is
+  // refused works on with no policy at all, which is the fault, not a
+  // warning about one. (Exclusive bound, so it moves to 58.)
+  // 58 since control-tower phase 53: `run.press-continue-failed` reads as
+  // error through `failed`. (Exclusive bound, so it moves to 59.)
+  // 59 since control-tower phase 54: `phase.model-mismatch` reads as error
+  // through `mismatch` — a pinned phase whose session started on another model
+  // is parked before it spends, and that park is the fault. (Exclusive bound,
+  // so it moves to 60.)
+  // 60 since control-tower phase 58: `run.remeasure-failed` reads as error
+  // through `failed` — a stored run the boot pass could not re-measure keeps
+  // the old clock the ETA would learn from. (Exclusive bound, so it moves to
+  // 61.) Phase 60's three queue lines read as neither error nor warn.
+  // 61 since control-tower phase 62: `phase.verification-failed` reads as
+  // error through `failed` — a phase the board called done is re-opened, and
+  // its dependents wait on it. (Exclusive bound, so it moves to 62.)
+  // 62 since control-tower phase 82: `phase.isolation-refused` reads as error
+  // through `refused`, like every refusal before it — a Repos cell outside the
+  // docs root refuses its phase a checkout of its own (F33). Moved by phase 64,
+  // whose §Verification runs this file. (Exclusive bound, so it moves to 63.)
+  // 63 since control-tower phase 91, which documented phase 90's
+  // `run.isolation-switch-refused` — a refusal, and so error through `refused`.
+  // (Exclusive bound, so it moves to 64.)
+  assert.ok(tally.error > 0 && tally.error < 64, `${tally.error} kinds read as error — check the vocabulary`);
   assert.ok(tally.warn > 0 && tally.warn < 80, `${tally.warn} kinds read as warn — check the vocabulary`);
 });
 

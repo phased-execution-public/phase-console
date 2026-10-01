@@ -2,7 +2,7 @@
 
 Contents: Slug · Task list · Commits · Branches · Memory · Status source of truth ·
 Phase dependencies (the DAG) · Session sizing & hygiene · Helper scripts · Locking ·
-Scoped concurrency · QA gating (opt-in) · Gates (human vs ai) · Rulings ·
+Scoped concurrency · QA gating (opt-in) · Gates (human vs ai) · Rulings · A person's turn · Issues ·
 Docs layout & repo split · Multi-repo commit atomicity
 
 ## Slug
@@ -153,12 +153,12 @@ Three boundaries the console draws around that, all deliberate:
 
 ## Session sizing & hygiene
 - **Right-size; don't reflexively split.** Aim for one coherent chunk of work per session, sized to the
-  running model's budget (~0.2 × window in phase weight; `references/sizing.md`). Several phases usually
-  share a session: any **ready** phase — sequential on the one just finished *or* an independent sibling —
-  that fits the **remaining budget** should be **batched** into the same session; it saves a full
-  bootstrap + closeout and keeps the prefix cache warm. Open a fresh session (`/clear`) when the budget is
-  spent, at a GATED phase, to switch model, or — with QA on — when the next phase depends on a
-  still-unrecorded verdict.
+  running model's budget (~0.2 × window in phase weight; `references/sizing.md`). **The console runs one
+  phase per session; batch only by hand.** Driving the phases yourself, any **ready** phase — sequential on
+  the one just finished *or* an independent sibling — that fits the **remaining budget** may be
+  **batched** into the same session; it saves a full bootstrap + closeout and keeps the prefix cache warm.
+  Open a fresh session (`/clear`) when the budget is spent, at a GATED phase, to switch model, or — with
+  QA on — when the next phase depends on a still-unrecorded verdict.
 - **Session budget is computed, not stored.** Like status, it's derived from the plan's `## Session budget`
   note + `references/sizing.md` + the model you're running — never a per-handoff field. `scripts/phase-graph.sh
   <slug> --session-plan <model>` proposes the grouping; you confirm it.
@@ -234,6 +234,54 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   **An operator can also release it out from under you** — the console's Locks view forces one, and the
   convergence loop releases the lock of a session it can prove is dead (`references/console-surface.md`).
   The lock is yours until phase-finish by convention, not by enforcement.
+- **Under an autopilot the lock's git mirror is the console's, not yours** (control-tower phase 63).
+  The console holds the grant and the lease already, and a `--git` claim pulled, committed and pushed
+  the docs root inside the session's turn — 107 s at the median on the hub monorepo, where 36 of 92
+  claims outran the CLI's 120 s Bash timeout and went to the background unread. So the runner exports
+  **`PE_LOCK_MIRROR=console`** to every session it spawns and to the boot prompts it asks for: the
+  prompt prints its `conflicts` and `claim` lines without `--git`, and `phase-lock.sh` skips a `--git`
+  passed anyway (claim, release or conflicts — one line on stderr, never a refusal, because older
+  prompts still print it). The console then runs **`phase-lock.sh <slug> mirror <N>`** itself, off the
+  turn: after its provisional claim and after every release, it commits where the lock stands now —
+  the file, or its deletion — as ONE commit of that path alone, and never pulls and never pushes; the
+  next push of the docs root carries it. A mirror that cannot land says `UNMIRRORED` and leaves the lock
+  on disk, where every reader on the machine looks anyway. **A person driving by hand keeps `--git`.**
+- **The docs root is declared scope** (control-tower phase 63, #88). Every phase writes its handoff,
+  INDEX, locks and ledgers under `docs/handoffs/<slug>/` whatever its Repos cell says, so the boot prompt
+  names that **per-slug token** beside the scope (`scope_root_token` / `rootScopeToken`; a phase scoped
+  `all` already covers it). It is declared, **never admitted on**: a plan's own lanes all write it, and
+  carving on it would serialise every phase of the plan. What orders those writes instead is the docs
+  root's **critical section** — a directory at `<git-dir>/pe-root-section`, taken with `mkdir` around
+  every commit and every rebase `phase-lock.sh` makes there and released before any push
+  (`PE_ROOT_SECTION_WAIT`, default 30 s, bounds the wait; a section whose writer's pid is gone — or,
+  should the pid have been reused, one older than `PE_ROOT_SECTION_STALE`, default 900 s — was left by a
+  writer that died and is broken, and a writer removes only a section it still owns). Every lock commit names its own path
+  (`git commit --only -- <path>`), so a file another session staged in the shared index never rides
+  along under a `phase-lock:` subject — commit your own handoff the same way, by path.
+- **A scope-drift line means the phase itself left its scope.** The console compares each repository
+  outside a phase's scope before and after it, and since phase 63 it credits a new commit only when it
+  is on the lane's branch or the lane's own session printed it (`[branch sha] subject`), and never when
+  it is a `phase-lock:` commit, another plan's (`docs/handoffs/<other>/`, `docs/plans/<other>.md`), or a
+  write inside the declared scope — the Repos tokens, the per-slug token and the plan's own documents
+  (`docs/plans/<slug>.md` and its `<slug>-…` companions). The line lists what it credited and counts
+  what it left out. Detection, not containment.
+- **The console's provisional claim names the lane's branch** (control-tower phase 82, #116). At grant
+  the runner claims the phase for a short lease with the PAIR only — the tree as `--worktree`, the
+  branch as `--branch` — so the lock's `branch=` line is the run branch (`pe/<slug>`) until the session
+  re-claims. It used to pass the repository key, a path, as a second `--branch`, which won: for that
+  window a same-branch sibling in another tree read as disjoint.
+- **A terminal session holds what it TOUCHED, never where it was opened** (control-tower phase 82,
+  #119). A hand session with no `PE_SCOPE` is read from its own transcript: the paths its
+  Edit/Write/MultiEdit/NotebookEdit calls named, the repositories it changed (a changing
+  `git -C <dir> …`), and the plans its `phase-lock.sh` / `phase-graph.sh` calls named — a plan of
+  another docs root (its `DOCS_ROOT=`) is evidence it works elsewhere, a lock call's `--scope` is its
+  own word. What it touched here it holds until the claim window (`PEER_CLAIM_WINDOW_MS`, 10 min) after
+  its LAST touch; a session whose every touch is elsewhere holds nothing; one that has touched nothing
+  holds what its cwd could reach only for the unknown lease — the same 10 min from its newest start —
+  and nothing after. The queue and the run card name the terminal (id, pid, scope, how it was read)
+  and offer **Release** (`POST /api/sessions/<id>/release {hours?}`, `--allow-run`), and the session's
+  own presence hook prints one notice when it starts blocking a run. Claim a lock when you do work a
+  phase: a lock is the one statement nothing has to infer.
 
 ## Scoped concurrency (working-tree safety)
 - **The invariant: never two live sessions whose scopes intersect. Same repo ⇒ serialized; `all` ⇒
@@ -260,7 +308,11 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   `phase-graph.sh <slug> --repos <N>` prints it. `all` and an *undeclared* cell touch everything. A path
   token nests segment-wise: `packages` ∩ `packages/cart-api` collide, `api` and `api-gateway` do not.
   Ambiguity always resolves toward colliding — a false conflict costs parallelism, a missed one corrupts a
-  tree.
+  tree. **The superproject's own name is not a free token** (control-tower phase 90, #154): it mounts
+  the whole root, every submodule under it, into an isolated run, and holds the phase against any run
+  that has the root repository on its branch. A phase that writes only in submodules — a closeout, a
+  docs pass — lists the submodules and leaves the root out (`references/plan-format.md` §Phase graph;
+  lint **F34**).
 - **A phase whose scope is `all` serialises the entire docs root while it holds its lock.** That is the
   rule working as designed, not a bug, but it is worth knowing before you write the cell: every other
   plan's phases queue behind it — across plans, not just within one — until the lease expires or it
@@ -279,7 +331,13 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   checkout" and forbids `git worktree add` explicitly); or, with the repository guard off, admission
   simply lets the overlapping run in. When a session genuinely cannot proceed without a branch somebody
   else holds, the instruction now is to work only in scoped files in the checkout it has, or to declare
-  `blocked --watch lock:<slug>/<N>` and stop — never to create a tree nothing will clean up. **A hand
+  `blocked --needs lock --watch lock:<holder-slug>/<holder-phase>` and stop — never to create a tree
+  nothing will clean up. **A watch is for somebody ELSE's lock** (#42): the lock that names the
+  declaring phase is the one its own session holds and its own closeout releases, so a watch on it
+  could only ever fire on the phase's own teardown. `phase-outcome.sh` refuses it (exit 2), the console
+  refuses it again at ingest from an older script, and a block whose only lock was its own parks for a
+  person. A block on a person (`--needs ambiguity`) takes no watch and no wait clock at all: nothing a
+  clock can see settles it, and its `phase.outcome` line says what it dropped. **A hand
   session that genuinely needs a second checkout** (a read-only QA round beside a build) takes one
   through `scripts/phase-lane.sh` — `create` puts it under `<root>/.worktrees/hand/<slug>/p<N>[-qa<r>]`
   on `pe/<slug>-p<N>[-qa<r>]` (or detached), locked; `merge` folds it back; `remove` cleans it up —
@@ -288,6 +346,38 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   whoever makes its tree, so on a plan that lanes its phases itself (`- **Worktrees:** on`) the
   script refuses a build lane and offers `--detach` or `--qa` beside the console's; the console's
   sweeps report a hand lane once as `run.worktrees-unmanaged` and never touch it.
+  **Under a console run** (control-tower phase 90, #154) a session the console spawned takes at most a
+  review tree (`--detach`) or a QA round's (`--qa`) — never a build lane, never a `merge`, never a
+  `pe/<slug>` checkout or `git switch -c` (`phase-lane.sh` refuses the first two when `PE_OWNER` is
+  the console's): the console owns the run's trees and branches. A hand tree of the plan standing on the run branch takes the branch the
+  run's own checkout needs — measured, a resumed session whose mirror had been pruned made one, and the
+  rebuild was refused `branch-in-use` until a person detached it. The console now detaches such a tree
+  in place at the run's next boundary (`run.isolation-reclaimed {detached: true}`; files and commits
+  untouched; another plan's tree is never moved), but the phases in between ran without isolation.
+- **Never clone, and never `git submodule update --init`, inside a run's checkout** (control-tower
+  phase 90, #139 #154). A repository the phase's scope does not name is not mounted in the run's
+  mirror — its directory there is EMPTY, which is what an unmounted submodule looks like — so read it
+  at the shared root, read-only; the boot prompt names that path. A clone or an init fills the
+  directory the console mounts into: the next rebuild met `already exists`, and a run lost its
+  isolation for eleven hours. The console denies `git clone` and `gh repo clone` into a run tree
+  (`run-tree-clone`, naming the root checkout to read instead), asks before `git submodule` inside one
+  (and allows it at the run root, where a refusal's own `git submodule update --init` advice runs), and
+  moves foreign content it finds at a mount to `<run>/stale-mounts/<ts>/<mount>` — by itself when it
+  is clean and pushed, after a person's **Repair checkout** when it is dirty or unpushed, and never
+  deletes either. A person's commands for a parked phase belong in an **errand tree** —
+  `POST /api/run/<slug>/errand-tree {phase}` makes `<root>/.worktrees/hand/<slug>/p<N>-errand`,
+  detached at the PUSHED run branch in every repository the run mounts, locked, and never pruned by
+  the console — not in the run's own mirror, which the console prunes on its own schedule. The errand
+  card names the tree once it exists, and `validate.sh` warns on a handoff `!` line that points into a
+  run tree.
+- **A scoped run finishes when its phases do** (`onlyPhases`, the console's "Run only this";
+  control-tower phase 90, #154). The run boards only the phases it was asked for and FINISHES when
+  those settle — `run.finished {onlyPhases}`, with a `finishedReason` naming the scope — whatever else
+  the plan has ready. It is never the plan's final run, so it opens no pull request, and its last
+  phase is not settled as a final one. That is why an unattended watchdog never scopes a run to move
+  one stuck phase: the run drives that phase and then stops driving the plan. The tools for one phase
+  are `resume-phase` (Retry) on the unscoped run, and `isolate-phase` for a phase held behind another
+  run's branch; a scoped run is for a person who wants exactly that.
 - **Run isolation is the console-managed version of that escape hatch, and it is a RUN setting, not a
   plan line.** An operator can give a whole work-branch run a checkout of its own, which is what lets two
   runs whose scopes intersect be admitted together (branch qualification, below, is the rule that permits
@@ -352,6 +442,17 @@ settings, the remediation ladder, freeze/thaw, ask/steer and the `?include=` pro
   must never fire between two console-managed trees. **The same slug+phase never carves**, whatever branches
   are involved and whatever the repository guard says: that wall is `sameUnitOfWork`, and it outranks both
   the branch and the guard.
+- **The lock is per PHASE; the branch is per RUN.** A new-branch run in the SHARED checkout leaves each
+  repository its sessions checked out on `pe/<slug>` there between its phases, when it holds no lock —
+  so the run HOLDS that repository until the run settles (a record under `<state>/trees/`, written after
+  the phase and removed at the settle, which returns the tree to the branch it was found on when that is
+  safe). `conflicts` reads those holds beside the locks: a repository of your scope standing on the
+  branch another open run holds is a `CONFLICT … run <id> — holds <repo> on <branch>` line, and the
+  console's scheduler queues its own phases on the same rule. Against a hold the claim rule flips once
+  (`claimsDisjoint` with `hold: true`, `claim_disjoint_hold`): the branch the tree already stands on is
+  no collision, and a different branch on the same ground always is. A checkout of your own
+  (`phase-lane.sh`, a mirror, an isolated run) is never held. Waiting on it: the holder's run settles,
+  or the tree leaves its branch.
 - **Handoff, INDEX and lock commits in the docs repo are NOT part of a phase's scope.** Every session
   writes there, and treating it as scope would serialise the whole system. Git's own `index.lock` plus a
   pull-rebase retry (≤3) is the serialization; the scripts do it, and a session that races a commit or push
@@ -550,6 +651,59 @@ where `<key>` is a decision key or a blocker class as its short form (`credentia
 `gate`, `external`, `lock`). The runner reads the key BEFORE the prose, so what a session needs is
 its own word rather than a regex's guess over its sentences; a key the manifest lacks is a defect
 report, not a routine ask. Never ask in prose: prose reaches nobody.
+
+## A person's turn — human steps (control-tower phase 41)
+
+When the work needs an act only a person can do — a sign-in that opens a browser and waits, a device
+code, a token to paste, a password at the machine, an approval on somebody else's dashboard — that is
+not a failure, not a stall and not a free-text errand. It is a **human step**: a typed record with a
+workflow. The console informs (ONE `human-step` inbox row, ONE `needs-you` push naming *Open* and
+*I did it*, and a device code when the kind has one), waits (the phase parks on a PERSON — an
+unbudgeted wait of kind `person`, situation `blocked-declared:human-acts`, no ladder rung ever spent
+on it), and — from phase 43 — lets the person open it again, proves it, and resumes the same session.
+
+A session declares one with `phase-outcome.sh <slug> <N> needs-human --needs <key> --step <kind>
+--title "<what>" [--open-url <http(s) link> | --open-command "<cmd>"] [--where host|any]
+[--proof <ref>] [--step-line "<step>"]… [--code <device code>] [--credential <id>]`, hands off
+`in-progress`, and stops. The sixteen kinds are `scripts/human-steps.env`'s. Three rules:
+
+- **Never run the sign-in yourself.** In a `-p` session it hangs on a browser or a prompt nobody sees.
+- **Never put a secret in a flag.** A value shaped like a token, a password, a one-time code or a URL
+  query secret is refused (exit 2, nothing written, the value never echoed); the person types it where
+  the step opens. A `secret-entry` step names only the registry id its secret is stored under.
+- **A session's step never opens by itself.** Only a plan's bullet may carry `auto-open: host`.
+
+What the console keeps is the ledger `<instance state>/human-steps.ndjson` — append-only, one line per
+move, last state wins, a torn last line dropped, rotated past 4 MB with the rotated copy still read —
+in eight states: `declared` → `notified` → `opened` → `checking` → `proven`, or `expired`, `cannot`,
+`dismissed`. No code, token, password or URL query secret reaches it, a journal line, a push payload,
+the log or a transcript: each of the five is redacted.
+
+**The console notices one, too (phase 44).** Run `gh auth login` (or any `SIGN_IN_SHAPES` member)
+anyway and the hook refuses it before it runs, with the declaration to make instead — kind, title,
+command and proof filled in; declare it and stop. A plan's `- **Human step:**` bullets are asked for
+at the launch door, their proofs run first, so a step already true never reaches the phase. A lane
+that falls silent after printing a sign-in link is offered to a person as a suspected step; nothing
+converts it by itself.
+
+## Issues — the label lifecycle (control-tower phase 90, #154)
+
+An issue a plan owns moves through three states, and each is written where every console and every
+person can read it:
+
+1. **`awaiting-plan`** — filed, and no plan owns it yet.
+2. **`plan:<slug>`** — an amendment planned it: the relabel, plus one comment naming the fixing phase.
+   A deferral relabels it `plan:<slug>-deferred`.
+3. **Closed** — by the fixing phase at its finish, or by the plan's landing phase.
+
+The fixing phase commits with **`Refs #N`**, never a closing keyword: its commit lands on the run
+branch, and a keyword would close the issue the day the branch merges, whoever reads it. Whether a
+phase may close its issue **before the fix is on `main`** is the plan's decision, in its
+`permission.destructive` and `issues` rows. Where it may, the close comment says so in words —
+"fixed on `<branch>`, not yet live" — with the sha and the test that proves it: every running console
+still shows the defect until the fix lands and the console updates, and an issue closed without that
+sentence reads as a claim that the bug is gone. Where it may not, the landing phase closes it once the
+fix is on `main`.
 
 ## Docs layout & repo split
 - **Work-state lives in the project repo** under `docs/` (its `.gitignore` tracks only `/docs/`):

@@ -20,6 +20,7 @@
  * real — the guards, the briefing resolution, the bookkeeping.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -36,7 +37,7 @@ const { consumeDeclaration, loadRun, newRun, phaseRecord, runDir, saveRun } = aw
 const { RECOVER_MAX_PER_PHASE } = await import('../server/runner/runner-core.ts');
 const { WatchScheduler } = await import('../server/watch-scheduler.ts');
 const { PhaseClaimedError } = await import('../server/service-core.ts');
-const { WATCH_REDELIVER_SERIES_MS, redeliverAfter } = await import('../server/watch-refs.ts');
+const { WATCH_REDELIVER_SERIES_MS, liveErrandHow, redeliverAfter } = await import('../server/watch-refs.ts');
 const { recent: recentLog } = await import('../server/log.ts');
 type RunState = import('../server/runner/state.ts').RunState;
 
@@ -338,18 +339,41 @@ test('the per-phase ceiling is `ladderPerPhaseRungs` and nothing shadows it', as
   } finally { at.cleanup(); }
 });
 
-test('the per-run cap counts every phase’s launches together', async () => {
-  const { root, cleanup } = scratch();
+test('the per-run cap counts every OPEN phase’s launches together — a done phase’s drop out (#14)', async () => {
+  // Stated rather than assumed: the ceiling is `ladderPerRunRungs`, which an
+  // operator sets. This used to lean on a hardcoded 5 in `maybeAutoRecover`
+  // that silently overrode that preference — so the test read as though it
+  // pinned the SUMMING (which is its point) while actually pinning the
+  // constant.
+  const summed = scratch();
   try {
-    const svc = service(root);
-    // Stated rather than assumed: the ceiling is `ladderPerRunRungs`, which an
-    // operator sets. This used to lean on a hardcoded 5 in `maybeAutoRecover`
-    // that silently overrode that preference — so the test read as though it
-    // pinned the SUMMING (which is its point) while actually pinning the
-    // constant.
+    const svc = service(summed.root);
     svc.prefs.ladderPerRunRungs = 5;
     const minted = stubMint(svc);
-    haltedRun(root, {
+    const sessions = stubSession(svc);
+    haltedRun(summed.root, {
+      recoveries: {
+        2: { attempts: 2, lastAt: new Date().toISOString() },
+        3: { attempts: 3, lastAt: new Date().toISOString() },
+      },
+    });
+
+    const out = await svc.maybeAutoRecover('alpha');
+    assert.equal(out.launched, false, 'two open phases’ five launches meet a cap of five');
+    assert.match(out.reason ?? '', /run.*budget|budget.*run/i);
+    assert.equal(minted.length + sessions.length, 0);
+  } finally { summed.cleanup(); }
+
+  // The same five, three of them on phase 1 — which the board reads done
+  // (`haltedRun` writes its handoff). Until #14 they counted for ever, so a
+  // run that had healed its early phases could never heal a later one.
+  const done = scratch();
+  try {
+    const svc = service(done.root);
+    svc.prefs.ladderPerRunRungs = 5;
+    const minted = stubMint(svc);
+    const sessions = stubSession(svc);
+    haltedRun(done.root, {
       recoveries: {
         1: { attempts: 3, lastAt: new Date().toISOString() },
         3: { attempts: 2, lastAt: new Date().toISOString() },
@@ -357,10 +381,9 @@ test('the per-run cap counts every phase’s launches together', async () => {
     });
 
     const out = await svc.maybeAutoRecover('alpha');
-    assert.equal(out.launched, false);
-    assert.match(out.reason ?? '', /run.*budget|budget.*run/i);
-    assert.equal(minted.length, 0);
-  } finally { cleanup(); }
+    assert.equal(out.launched, true, 'only the two on open phases count against the cap');
+    assert.equal(minted.length + sessions.length, 1);
+  } finally { done.cleanup(); }
 });
 
 test('a legacy attempt on the identical failure counts as the rung the old healer drove — the ladder escalates from it, never repeats it', async () => {
@@ -1809,7 +1832,10 @@ test('a declared needs-human park stands the ladder down: no rung, no-defect set
     const out = await svc.maybeAutoRecover('alpha');
     assert.equal(out.launched, false, 'testimony is not a failure — nothing is boarded against it');
     assert.match(out.reason ?? '', /declared needs-human/);
-    assert.match(out.reason ?? '', /watching its refs/,
+    // Named by what the watch clock will actually do with them (control-tower
+    // phase 6, #19 ask 4), as far as anything knows now: nothing has probed the
+    // ref yet, so it is not "live" (control-tower phase 88, #125).
+    assert.match(out.reason ?? '', /the console is asking, with no answer yet about gh:acme\/app#run\/33123610977/,
       'the refs are still named to the operator — the WATCH CLOCK is what checks them');
     assert.deepEqual(probes, [], 'and the healer itself does not poll: that is the scheduler\'s clock now');
 
@@ -1819,10 +1845,16 @@ test('a declared needs-human park stands the ladder down: no rung, no-defect set
     // park. `failed` here is what escalated the outage up the model ladder.
     assert.equal(slot.rungs!.at(-1)!.outcome, 'no-defect');
     assert.equal(slot.rungs!.length, 3, 'and no fourth rung was climbed');
-    // The overwritten errand heals back to the declaration's own words.
+    // The overwritten errand heals back to the declaration's own words. Its
+    // watch clause is derived wherever it is shown, never stored (`liveErrandHow`).
     assert.match(slot.errand!.situation, /^blocked-declared/);
     assert.equal(slot.errand!.need, OUTAGE);
-    assert.match(slot.errand!.how, /watching its refs/);
+    assert.equal(slot.errand!.watching, true);
+    assert.doesNotMatch(slot.errand!.how, /gh:acme/, 'the stored words carry no clause to go stale');
+    assert.match(
+      liveErrandHow(slot.errand!, after.phases['2']),
+      /The console is asking, with no answer yet about gh:acme\/app#run\/33123610977/,
+    );
   } finally { s.cleanup(); }
 });
 
@@ -1941,7 +1973,10 @@ test('autopilot-token-drain P4: the healer offers no own-session rung for a sess
     const unblock = resolve({ vehicle: 'unblock-session' }, { key: 'blocked-declared:unknown' }, cold, evidence, 'alpha', null);
     assert.deepEqual(unblock.vehicle, { kind: 'reboard', brief: 'unblock' }, 'the unblock boards fresh with its brief');
 
-    const warm = { ...cold, tokens: tokensEnded('sess-big', 681_000, 2 * 60_000) };
+    // Under the wrap-up line: since phase 46 a session that ended past
+    // (CONTEXT_WRAPUP_FRACTION − RESUME_WRAPUP_MARGIN) × its window — 550k of
+    // 1M — boards fresh however warm it is (`context-wrapup`).
+    const warm = { ...cold, tokens: tokensEnded('sess-big', 400_000, 2 * 60_000) };
     const resumed = resolve({ vehicle: 'resume-own-session', params: { mode: 'continue' } }, { key: 'work-in-progress' }, warm, evidence, 'alpha', null);
     assert.equal(resumed.vehicle?.kind, 'session', 'a warm session is resumed as before');
   } finally { s.cleanup(); }
@@ -2820,7 +2855,10 @@ test('RCV-9: a heal pass signs every phase.situation, a second pass over the sam
     await svc.maybeAutoRecover('beta', { trigger: 'timer' });
     const after = journalOf(root, 'beta', state.id).filter((l) => l.event === 'phase.situation');
     assert.equal(after.length, situations.length, 'an unchanged situation is not re-journalled');
-    assert.equal(gitCalls.filter((c) => c.includes('status --porcelain')).length, 1, 'and the second pass still asks git once');
+    // Since control-tower phase 51 (#84) the second pass reads nothing at all:
+    // three standing needs-human declarations whose asks stand, and nothing
+    // any of them names has moved — so none is classified, and git is not asked.
+    assert.equal(gitCalls.filter((c) => c.includes('status --porcelain')).length, 0, 'and the second pass re-reads no standing declaration');
   } finally { cleanup(); }
 });
 
@@ -3225,9 +3263,350 @@ test('P12-QA healer: a declared needs-human whose reason is the console\'s own w
     assert.match(out.reason ?? '', /declared needs-human/);
     assert.match(out.reason ?? '', /a person's to settle/);
     const slot = loadRun(s.root, 'alpha', state.id)!.recoveries!['2']!;
-    assert.equal(slot.errand!.situation, 'blocked-declared:permission');
-    assert.equal(slot.errand!.need, WALL);
-    assert.match(slot.errand!.how, /Settings ▸ Permissions/);
+    // #43: `.claude/**` is the CLI's own wall, not this console's — no rule
+    // here was recorded and none could widen it, so the remedy is a person's
+    // edit, never Settings ▸ Permissions (control-tower phase 39).
+    assert.equal(slot.errand!.situation, 'blocked-declared:protected-path');
+    assert.match(slot.errand!.need, /\.claude\/\*\*/, 'the errand names the path the session declared');
+    assert.match(slot.errand!.how, /Make that edit by hand/);
+    assert.doesNotMatch(slot.errand!.how, /Settings ▸ Permissions/);
     assert.doesNotMatch(slot.errand!.how, /watching its refs/);
   } finally { s.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * control-tower phase 81 (#105): a fixed rung continues a keep-going run
+ * ------------------------------------------------------------------ */
+
+/**
+ * Measured on hub 4123, 2026-09-24 17:09–17:34Z: a 72-phase run (`24fcba33`,
+ * `keep-going`) had its halt answered by a `plan-repair-agent` rung on P33 —
+ * the session closed P33 properly, declared `complete`, the rung settled
+ * `fixed`, `run.recovered` — and the run went to `parked` with "phase 33 was
+ * repaired by auto-recovery. Continue to carry on through the rest of the
+ * plan", three phases ready and the account in headroom. Nothing boarded until
+ * a person pressed Recover. The healer's continue was there all along; it read
+ * the run the moment `recoverPhase` RESOLVED — which is the moment the recovery
+ * was ARMED, the run reading `running` — so it never saw the end it waits for.
+ *
+ * RR-6: the continue waits for the recovery to settle, and then a fixed rung
+ * with the board done continues a keep-going run through `startRun({resumeRunId})`
+ * with the run's own settings, journalled; a `halt-on-everything` run parks,
+ * and says why.
+ * RR-7: a stale halt is cleared once the run drives: a recovery whose board
+ * read answers is not driving under "the engine could not read the plan".
+ */
+
+/**
+ * The pooled runner's recovery, faked the way the real one behaves: `recover()`
+ * answers the moment it is ARMED (the run reads `running`), and the recovery
+ * ends later — `finish` writes the run as the recovery left it. `end` waits for
+ * the arming, as a real recovery's ending does: `maybeAutoRecover` returns
+ * before `recoverPhase` has reached `recover()`, and an ending written first
+ * would be overwritten by the arming it preceded.
+ */
+function slowRecovery(svc: ReturnType<typeof service>, root: string, runId: string) {
+  const pooled = svc.runnerFor('alpha') as unknown as {
+    recover: (o: unknown) => Promise<unknown>; current: () => unknown; wait: () => Promise<void>;
+  };
+  let live: RunState | null = null;
+  let finish!: () => void;
+  const ended = new Promise<void>((resolve) => { finish = resolve; });
+  let armed!: () => void;
+  const arming = new Promise<void>((resolve) => { armed = resolve; });
+  pooled.recover = async () => {
+    live = { ...loadRun(root, 'alpha', runId)!, status: 'running' };
+    armed();
+    return live;
+  };
+  pooled.current = () => live;
+  pooled.wait = async () => { await ended; };
+  return {
+    end: (apply: (state: RunState) => void) => {
+      void arming.then(() => {
+        const state = loadRun(root, 'alpha', runId, null)!;
+        apply(state);
+        saveRun(state);
+        live = state;
+        finish();
+      });
+    },
+  };
+}
+
+/** What a successful recovery of phase 2 leaves: the phase closed, the stop retired, `parked` with the Continue sentence. */
+function fixedPhase2(root: string) {
+  return (state: RunState) => {
+    writeFileSync(join(root, 'docs', 'handoffs', 'alpha', 'phase-02-cart-api-endpoint.md'),
+      '---\nplan: docs/plans/alpha.md\nphase: 2\ntitle: cart api endpoint\nstatus: complete\n---\n# done\n', 'utf8');
+    state.status = 'parked';
+    state.halt = null;
+    state.resolved = null;
+    state.phases['2'].status = 'done';
+    state.finishedReason = 'phase 2 was closed by auto-recovery. Continue to carry on through the rest of the plan.';
+  };
+}
+
+async function until(check: () => boolean, ms = 4_000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (check()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return check();
+}
+
+test('RR-6: a rung that FIXED its phase continues a keep-going run by itself — once the recovery has settled, through startRun({resumeRunId}), journalled', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const state = haltedRun(root);
+    state.phases['2'].sessionId = 'sess-p2';
+    state.phases['2'].resumeSessionId = 'sess-p2';
+    saveRun(state);
+    const svc = service(root);
+    stubMint(svc);
+    const recovery = slowRecovery(svc, root, state.id);
+    const starts = stubStart(svc);
+
+    const out = await svc.maybeAutoRecover('alpha', { trigger: 'halt' });
+    assert.equal(out.launched, true, out.reason);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(starts.length, 0, 'nothing continues while the recovery is still driving');
+
+    recovery.end(fixedPhase2(root));
+    assert.ok(await until(() => starts.length === 1), 'the run carried on by itself once the rung settled fixed');
+    assert.equal(starts[0].resumeRunId, state.id, 'as the run it was — its own settings stand');
+    assert.equal((starts[0].actor as { door?: string }).door, 'recovery-continue');
+    const line = journalOf(root, 'alpha', state.id).find((l) => l.event === 'run.recovery-continue');
+    assert.ok(line, 'the continue is on the run\'s record, not only in the console log');
+    assert.equal(line.phase, 2);
+  } finally { cleanup(); }
+});
+
+test('RR-6: under halt-on-everything the fixed run PARKS — the operator asked to be the one who continues — and the journal says why', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const state = haltedRun(root, { autonomy: 'halt-on-everything' });
+    state.phases['2'].sessionId = 'sess-p2';
+    state.phases['2'].resumeSessionId = 'sess-p2';
+    saveRun(state);
+    const svc = service(root);
+    stubMint(svc);
+    const recovery = slowRecovery(svc, root, state.id);
+    const starts = stubStart(svc);
+
+    const out = await svc.maybeAutoRecover('alpha', { trigger: 'halt' });
+    assert.equal(out.launched, true, out.reason);
+    recovery.end(fixedPhase2(root));
+    assert.ok(await until(() => journalOf(root, 'alpha', state.id).some((l) => l.event === 'run.recovery-parked')),
+      'the park is a decision on the record');
+    assert.equal(starts.length, 0);
+    const line = journalOf(root, 'alpha', state.id).find((l) => l.event === 'run.recovery-parked')!;
+    assert.match(String(line.data.why), /halt-on-everything/);
+  } finally { cleanup(); }
+});
+
+test('RR-7: a recovery whose board read answers clears the stale plan-unreadable halt before its session drives — journalled', async () => {
+  const { chmodSync } = await import('node:fs');
+  const { Runner } = await import('../server/runner/runner.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-stale-halt-'));
+  const scripts = join(root, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
+  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+mode="\${2:-}"; arg="\${3:-}"
+case "$mode" in
+  --memory-block) echo "done: "; echo "ready: 1"; echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --boot-prompt) echo "BOOT phase $arg" ;;
+  --size) echo M ;;
+  *) exit 0 ;;
+esac
+`);
+  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
+  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
+  try {
+    const state = newRun({ slug: 'demo', root });
+    state.status = 'halted';
+    state.stoppedBy = 'system';
+    state.halt = { at: new Date().toISOString(), reason: 'the engine could not read the plan: the engine timed out reading this plan', kind: 'plan-unreadable' };
+    state.finishedReason = state.halt.reason;
+    const one = phaseRecord(state, 1);
+    one.status = 'interrupted';
+    one.attempts = 1;
+    saveRun(state);
+
+    let haltWhileDriving: unknown = 'never spawned';
+    let statusWhileDriving: string | undefined;
+    const journal: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const instance: InstanceType<typeof Runner> = new Runner({
+      scriptsDir: scripts, verificationText: () => '`true`',
+      onEvent: (event, data) => {
+        if (event === 'run:journal') journal.push({ event: String(data.event), data: (data.data ?? {}) as Record<string, unknown> });
+      },
+      spawn: async () => {
+        haltWhileDriving = instance.current()?.halt ?? null;
+        statusWhileDriving = instance.current()?.status;
+        return {
+          signal: { subtype: 'success', code: 0, text: '' },
+          sessionId: 'sess-repair', costUsd: 0.01, turns: 2, resultText: 'repaired', durationMs: 5, argv: [], injected: 0,
+        };
+      },
+    });
+    await instance.recover({ slug: 'demo', root, runId: state.id, phase: 1, mode: 'repair', instruction: 'repair the plan', by: 'auto-recovery' });
+    await instance.wait();
+
+    assert.equal(statusWhileDriving, 'running');
+    assert.equal(haltWhileDriving, null, 'the run drove with no halt the board had just contradicted');
+    const cleared = journal.find((line) => line.event === 'run.halt-cleared');
+    assert.ok(cleared, 'what was cleared is on the record');
+    assert.equal(cleared.data.kind, 'plan-unreadable');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('RR-6: a fixed rung whose phase the board does NOT read done parks — the continue asks the board, not the rung\'s word — and says so', async () => {
+  const { root, cleanup } = scratch();
+  try {
+    const state = haltedRun(root);
+    state.phases['2'].sessionId = 'sess-p2';
+    state.phases['2'].resumeSessionId = 'sess-p2';
+    saveRun(state);
+    const svc = service(root);
+    stubMint(svc);
+    const recovery = slowRecovery(svc, root, state.id);
+    const starts = stubStart(svc);
+
+    const out = await svc.maybeAutoRecover('alpha', { trigger: 'halt' });
+    assert.equal(out.launched, true, out.reason);
+    // The recovery says it closed phase 2 — and wrote no handoff, so the board
+    // still reads it open.
+    recovery.end((after) => {
+      after.status = 'parked';
+      after.halt = null;
+      after.phases['2'].status = 'done';
+      after.finishedReason = 'phase 2 was closed by auto-recovery. Continue to carry on through the rest of the plan.';
+    });
+    assert.ok(await until(() => journalOf(root, 'alpha', state.id).some((l) => l.event === 'run.recovery-parked')),
+      'the park is on the record');
+    assert.equal(starts.length, 0, 'nothing continues on a fix the board cannot see');
+    const line = journalOf(root, 'alpha', state.id).find((l) => l.event === 'run.recovery-parked')!;
+    assert.match(String(line.data.why), /board reads phase 2 ready, not done/);
+  } finally { cleanup(); }
+});
+
+test('KA-5/ID-3 (#131 #147): an expired-login stop resumes in place once the login answers again on the identity the run started on — on another identity the heal parks it for a person', async () => {
+  const s = scratch();
+  const svc = service(s.root);
+  const real = (svc as unknown as { accounts: Record<string, unknown> }).accounts;
+  try {
+    stubMint(svc);
+    const starts = stubStart(svc);
+    const at = new Date(Date.now() - 60_000).toISOString();
+    const bound = { account: 'default', key: 'k-admin', email: 'admin@example.com', org: 'The Market' };
+    let who = { ...bound };
+    // The facade, stubbed where it would read this machine's keychain: the
+    // login was renewed (keep-alive) and proved (a read, `auth status`), so the
+    // auth retirement it was stopped on has been answered since the wall.
+    (svc as unknown as { accounts: unknown }).accounts = Object.assign(Object.create(Object.getPrototypeOf(real)), real, {
+      entitlementOf: () => ({ state: 'entitled', via: 'credential', at: new Date().toISOString() }),
+      roomOf: () => ({ ok: true, headroomPct: 80, resetsAt: null }),
+      switchCandidates: () => ({ ranked: [], declined: [], wake: null }),
+      identityOf: () => who,
+      loginRestored: () => true,
+    });
+    const run = haltedRun(s.root, {
+      halt: { at, reason: 'the API refused the login (account: the machine login)', phase: 2, kind: 'credential-refused' },
+      identity: { ...bound, at },
+    } as never);
+    const record = run.phases['2'];
+    record.status = 'parked';
+    record.cause = { kind: 'credential-refused', class: 'auth', reason: 'the API refused the login', at } as never;
+    saveRun(run);
+
+    // Somebody else's login on the slot: nothing resumes, and the stop says why.
+    who = { account: 'default', key: 'k-info', email: 'info@example.com', org: 'The Market' };
+    const refused = await svc.maybeAutoRecover('alpha');
+    assert.equal(refused.launched, false, 'never on a changed identity');
+    assert.equal(starts.length, 0);
+    const parked = loadRun(s.root, 'alpha', run.id, null)!;
+    assert.equal(parked.halt?.kind, 'identity-changed', 'the stop is re-said as what it is');
+
+    // The same person's login, renewed: the run resumes where it is, with no press.
+    const again = haltedRun(s.root, {
+      halt: { at, reason: 'the API refused the login (account: the machine login)', phase: 2, kind: 'credential-refused' },
+      identity: { ...bound, at },
+    } as never);
+    again.phases['2'].status = 'parked';
+    again.phases['2'].cause = { kind: 'credential-refused', class: 'auth', reason: 'the API refused the login', at } as never;
+    saveRun(again);
+    who = { ...bound };
+    const resumed = await svc.maybeAutoRecover('alpha');
+    assert.equal(resumed.launched, true, resumed.reason);
+    assert.equal(resumed.rung, 'switch-account');
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].resumeRunId, again.id);
+  } finally {
+    (svc as unknown as { accounts: unknown }).accounts = real;
+    s.cleanup();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * AP-5 — a timed-out card's park lifts with its phase (control-tower phase 97, #140)
+ *
+ * vca P22's card auto-denied at 21:09Z and parked the run while P22's own
+ * session was still working; P22 completed at 23:29 with §Verification green,
+ * and the run sat parked with P10 ready until a watchdog retried it at 02:15.
+ * The park was about ONE call of ONE phase: when that phase completes, the
+ * question it stood for is gone. A park no card raised is untouched.
+ * ------------------------------------------------------------------ */
+
+test('AP-5: a park a timed-out approval card raised LIFTS when its phase completes — the run boards the next ready phase', async () => {
+  // Imported here, not at the file head: the harness brings its own state
+  // sandbox, and every test above runs on this file's.
+  const { boardHarness, journalled } = await import('./lane-harness.ts');
+  const h = boardHarness({
+    states: { 1: 'ready', 2: 'waiting' },
+    blocked: { 2: [1] },
+    onSpawn: (phase, _request, harness) => {
+      // The card times out while the phase's own session is still working.
+      if (phase === 1) {
+        assert.equal(harness.runner.park(
+          'an approval went unanswered: Bash — git push origin main', 1, 'awaiting-person', { approvalId: 'card-p1' },
+        ), true);
+      }
+      return undefined;
+    },
+  });
+  await h.runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' } as never);
+  await h.runner.wait();
+  const state = h.runner.current()!;
+  assert.deepEqual(h.spawned, [1, 2], 'phase 2 boarded once phase 1 completed');
+  assert.equal(state.halt, null, 'nothing is left of the park');
+  assert.notEqual(state.status, 'parked');
+  const lifted = journalled(h, 'run.park-lifted');
+  assert.equal(lifted.length, 1, 'journalled once');
+  assert.equal(lifted[0].phase, 1);
+  assert.equal(lifted[0].approvalId, 'card-p1');
+});
+
+test('AP-5: a park NO card raised is not lifted by its phase completing — the run stays parked', async () => {
+  const { boardHarness, journalled } = await import('./lane-harness.ts');
+  const h = boardHarness({
+    states: { 1: 'ready', 2: 'waiting' },
+    blocked: { 2: [1] },
+    onSpawn: (phase, _request, harness) => {
+      if (phase === 1) assert.equal(harness.runner.park('a person must look first', 1, 'awaiting-person'), true);
+      return undefined;
+    },
+  });
+  await h.runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' } as never);
+  await h.runner.wait();
+  const state = h.runner.current()!;
+  assert.deepEqual(h.spawned, [1], 'nothing boarded past the park');
+  assert.equal(state.status, 'parked');
+  assert.equal(state.halt?.kind, 'awaiting-person');
+  assert.equal(journalled(h, 'run.park-lifted').length, 0);
 });

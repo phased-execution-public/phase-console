@@ -199,13 +199,84 @@ export const SUB_KINDS = Object.freeze({
   // as `unknown` and spent an unblock session walking into the same wall.
   // `const`-typed so the runner's `BlockerSubKind` and the decision manifest's
   // `NEED_CLASSES` (`decisions-model.js`) DERIVE from it instead of spelling it.
+  // `protected-path` joined in control-tower phase 39 (#43): a permission wall
+  // the CLI raised on a path it reserves for an interactive session, which no
+  // rule on this console can widen. The classifier says it, never a session —
+  // see `CLASSIFIER_ONLY_SUB_KINDS`. `human-acts` joined in control-tower
+  // phase 53 (#54): the classifier's reading of a session's `--needs
+  // human-acts` — acts the plan keeps for a person — which used to fall
+  // through to the prose regexes and land in `unknown`.
   'blocked-declared': Object.freeze(
-    /** @type {const} */ (['lock', 'permission', 'credential', 'gate', 'external', 'unknown']),
+    /** @type {const} */ ([
+      'lock',
+      'permission',
+      'protected-path',
+      'credential',
+      'gate',
+      'external',
+      'human-acts',
+      'unknown',
+    ]),
   ),
   'resource-wall': Object.freeze(['usage', 'auth', 'budget', 'model']),
   'plan-broken': Object.freeze(['lint', 'unreadable', 'verification', 'issue']),
   'never-started': EXIT_SUB_KINDS,
+  // `reopened` joined in control-tower phase 62 (#68): a red FINAL verdict over
+  // a phase the board reads done. The console re-opens it rather than record a
+  // failure after "done", and the sub-kind is what gives it ONE fix rung where
+  // the bare `verify-red` has two — the phase already finished once, and a
+  // fresh stronger agent on work that wrote a complete handoff is a person's
+  // call, not the ladder's.
+  'verify-red': Object.freeze(['reopened']),
 });
+
+/**
+ * The `blocked-declared` sub-kinds only the CLASSIFIER says, never a session's
+ * `--needs`. `unknown` is what it says when it was not told. `protected-path`
+ * is its reading of a permission wall that belongs to the CLI rather than this
+ * console: a session declares that wall `--needs permission` and names the act
+ * and the path (phase 41 gives it a word of its own, a human-step kind).
+ * `human-acts` is its reading of the `human-acts` KEY: a session names the
+ * decision key itself, and a class spelled the same as a key would be two
+ * meanings for one word (control-tower phase 53, #54).
+ * `NEED_CLASSES` (`decisions-model.js`) is `SUB_KINDS['blocked-declared']`
+ * minus these.
+ */
+export const CLASSIFIER_ONLY_SUB_KINDS = Object.freeze(
+  /** @type {const} */ (['unknown', 'protected-path', 'human-acts']),
+);
+
+/**
+ * The directories the Claude Code CLI's OWN wall reserves for an interactive
+ * session. An unattended `claude -p` is refused an edit under one whatever the
+ * run's permission profile says, and no rule on this console can widen it.
+ * Measured for `.claude` (#43): the same two edits, refused four times across
+ * four unattended sessions, landed first try from an interactive one.
+ */
+export const CLI_PROTECTED_DIRS = Object.freeze(/** @type {const} */ (['.claude']));
+
+const PROTECTED_PATH_RE = new RegExp(
+  // A path token — its start, or a quote, a bracket, `=` or `:` before it —
+  // with one protected directory as a WHOLE segment, and something under it.
+  `(?:^|[\\s'"\`(=:])((?:[~\\w.\\-/]*/)?(?:${CLI_PROTECTED_DIRS.map((d) => d.replace(/\./g, '\\.')).join('|')})/[^\\s'"\`),;]+)`,
+);
+
+/**
+ * The protected path a declaration names, if it names one: read from the
+ * session's own `--rule`, then `--command`, then its reason, the structured
+ * fields first. A PATH is read out of the words, never a verdict — whether the
+ * wall was the CLI's is decided by the caller, from whether this console
+ * recorded a deny rule of its own.
+ * @param {...(string|null|undefined)} texts
+ * @returns {string|undefined}
+ */
+export function protectedPathOf(...texts) {
+  for (const text of texts) {
+    const match = PROTECTED_PATH_RE.exec(String(text ?? ''));
+    if (match) return match[1];
+  }
+  return undefined;
+}
 
 /**
  * Who the situation is for — the thing the UI colours by and the ladder
@@ -250,9 +321,11 @@ export const SITUATION_ACTOR = Object.freeze({
 /**
  * The sub-kinds whose actor DIFFERS from their parent's — and only those.
  *
- * Four tables are empty on purpose and each is a person's from the start: a
- * credential or a gate the session named, a policy refusal, a skill this
- * machine cannot load. Their parent situations are `machine` (the other
+ * Six tables are empty on purpose and each is a person's from the start: a
+ * credential or a gate the session named, an edit on a path the CLI keeps for
+ * an interactive session, an act the plan keeps for a person, a policy
+ * refusal, a skill this machine cannot load.
+ * Their parent situations are `machine` (the other
  * sub-kinds climb), so `nextRung` read them as a machine's with "no automatic
  * rung exists", `loop.md` called them a person's, and the errand's reason
  * disagreed with both (LFC-3's third clause). One table, three readers —
@@ -265,6 +338,12 @@ export const SITUATION_ACTOR = Object.freeze({
 export const SITUATION_SUB_ACTOR = Object.freeze({
   'blocked-declared:credential': 'person',
   'blocked-declared:gate': 'person',
+  // An edit only an interactive session may make: no rung, and nothing on
+  // this console can widen the wall (#43).
+  'blocked-declared:protected-path': 'person',
+  // Acts the plan keeps for a person (#54): no rung climbs them. A person
+  // does them, or hands them to the session — the Delegate act.
+  'blocked-declared:human-acts': 'person',
   'never-started:refusal': 'person',
   'never-started:skill-missing': 'person',
 });
@@ -386,4 +465,112 @@ export function parseSituationKey(key) {
 export function situationLabel(id, sub) {
   const base = /** @type {Record<string, string>} */ (SITUATION_LABELS)[id] ?? SITUATION_LABELS.unknown;
   return sub ? `${base} · ${sub}` : base;
+}
+
+/**
+ * @typedef {{ at: string, by: string, ok: boolean, resetsAt?: string }} WallLastReading
+ * @typedef {{ latest: string, reset: boolean, sentence: string, lastReading: WallLastReading | null }} WallReading
+ */
+
+/** `2 h 48 min`, `7 min` — a span as a wall's sentence states it. */
+function spanWords(ms) {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  const hours = Math.floor(minutes / 60);
+  return hours ? `${hours} h ${minutes % 60} min` : `${minutes} min`;
+}
+
+/** `12:50Z` — an instant as a wall's sentence names it. */
+function clockWords(iso) {
+  return `${iso.slice(11, 16)}Z`;
+}
+
+/**
+ * A usage-wall park, read NOW (control-tower phase 86, #132, #78's body). The
+ * sentence is derived from the ABSOLUTE reset (`usageWall.latest`) and the
+ * phase's current holder at every reading — never frozen at the park, which is
+ * how a card said "the window resets in 14 min" two hours after it had, over
+ * an account reading 25 %, while the real wait was a sibling's grant. Before
+ * the reset it counts down to "at the latest"; after it, it names what the
+ * phase is waiting for now. `lastReading` is the latest usage read that judged
+ * the wall (#78: the card shows it beside the "at the latest" time). Null for
+ * a record carrying no wall.
+ *
+ * @param {{ usageWall?: { latest?: string, lastReading?: WallLastReading } | null, status?: string,
+ *           serialBehind?: number | null, boardingHint?: { at?: string } | null,
+ *           waitingOn?: ReadonlyArray<{ owner?: string, slug?: string, phase?: number }> | null } | null | undefined} record
+ * @param {number} nowMs
+ * @returns {WallReading | null}
+ */
+export function wallReading(record, nowMs) {
+  const wall = record?.usageWall;
+  const latest = wall?.latest;
+  const at = latest ? Date.parse(latest) : NaN;
+  if (!wall || !latest || !Number.isFinite(at)) return null;
+  const reset = at <= nowMs;
+  const holder = record?.waitingOn?.[0];
+  const waiting = holder
+    ? `waiting for ${holder.owner || `${holder.slug ?? 'another plan'}${holder.phase != null ? ` P${holder.phase}` : ''}`}`
+    : record?.serialBehind != null
+      ? `waiting for phase ${record.serialBehind} of this run (same scope)`
+      : 'boarding at the next free lane, ahead of phases that never started';
+  const sentence = reset
+    ? `the usage window reset at ${clockWords(latest)} — ${waiting}`
+    : `a live wall with no account to move to — the window resets in ${spanWords(at - nowMs)} (${clockWords(latest)}) at the latest, sooner if the account shows headroom`;
+  const last = wall.lastReading;
+  return {
+    latest,
+    reset,
+    sentence,
+    lastReading:
+      last && typeof last.at === 'string'
+        ? {
+            at: last.at,
+            by: String(last.by),
+            ok: Boolean(last.ok),
+            ...(last.resetsAt ? { resetsAt: last.resetsAt } : {}),
+          }
+        : null,
+  };
+}
+
+/**
+ * `situation` with its first line replaced by the wall read NOW, when it is a
+ * usage wall's situation and there is a reading (`wallReading`) — the one rule
+ * `withWallReadings` and the phase diagnosis both apply (control-tower phase 86,
+ * #78): the classifier quotes the note written at the park. A copy.
+ *
+ * @template {{ key?: string, why?: string[] } | null | undefined} S
+ * @param {S} situation
+ * @param {WallReading | null | undefined} wall
+ * @returns {S}
+ */
+export function withWallWhy(situation, wall) {
+  if (!situation || !wall || situation.key !== 'resource-wall:usage') return situation;
+  return { ...situation, why: [wall.sentence, ...(situation.why ?? []).slice(1)] };
+}
+
+/**
+ * A run for a payload with every wall re-read NOW (`wallReading`): each record
+ * carrying a usage wall gains `wall`, and a `resource-wall:usage` situation's
+ * first line is replaced by the live sentence (`withWallWhy`). A copy — the run
+ * handed in may be a live runner's own state.
+ *
+ * @template {{ phases?: Record<string, any> } | null | undefined} R
+ * @param {R} run
+ * @param {number} nowMs
+ * @returns {R}
+ */
+export function withWallReadings(run, nowMs) {
+  if (!run || !run.phases) return run;
+  let touched = false;
+  const phases = Object.fromEntries(
+    Object.entries(run.phases).map(([key, record]) => {
+      const wall = wallReading(record, nowMs);
+      if (!wall) return [key, record];
+      touched = true;
+      const situation = withWallWhy(record.situation, wall);
+      return [key, { ...record, wall, ...(situation ? { situation } : {}) }];
+    }),
+  );
+  return touched ? { ...run, phases } : run;
 }

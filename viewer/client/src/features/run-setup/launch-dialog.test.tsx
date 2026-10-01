@@ -9,16 +9,16 @@
  * they are what the server validates — a field that quietly stopped being sent
  * would degrade to the preference without anyone seeing it.
  *
- * Since Phase 8 a `phase` launch is STAGED: its controls sit on four stages
- * under a stage bar, so a test that asks for the branch select goes to "How it
- * runs" first (`stage()`), exactly as a person would. The panels stay mounted
- * while hidden, so the queries below still find a control by its label; the
- * `stage()` calls are what prove the bar leads to it. A QA review and a
- * recovery are flat, and their tests are unchanged.
+ * Since control-tower phase 22 a `phase` launch is the QUICK VIEW: one screen
+ * of category tiles, each expanding in place onto its controls, one at a time.
+ * A folded tile's controls are not in the document at all, so a test that asks
+ * for the branch select opens the Git tile first (`tile()`), exactly as a
+ * person would — the `tile()` calls are what prove each control is reachable.
+ * A QA review and a recovery are flat, and their tests are unchanged.
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 import type { RunState } from '@/lib/api';
@@ -36,7 +36,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
   return { ...actual, api: { ...actual.api, state, skills, runStart, agentTicket, runPrelude } };
 });
 
-/** A prelude with nothing open — the Decisions stage answers, and Launch is not held. */
+/** A prelude with nothing open — the Decisions tile answers, and Launch is not held. */
 const EMPTY_PRELUDE = {
   slug: 'alpha',
   rows: [],
@@ -86,10 +86,19 @@ async function mount(
   );
 }
 
-/** Go to a stage by its name on the bar — what a person does to reach a control. */
-async function stage(name: RegExp) {
-  fireEvent.click(await screen.findByRole('tab', { name }));
+/** Open a tile by its name — Edit, or Answer on a summons — what a person does to reach a control. */
+async function tile(label: string) {
+  fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^(Edit|Answer) ${label}$`) }));
 }
+
+/** An expanded tile's controls. */
+const region = (label: string) => screen.getByRole('region', { name: label });
+
+/** The tiles the quick view draws, by label, in its order. */
+const tileLabels = () =>
+  within(screen.getByRole('list', { name: 'Settings by category' }))
+    .getAllByRole('heading', { level: 3 })
+    .map((h) => h.textContent!);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -124,61 +133,75 @@ describe('the field matrix', () => {
       },
       { reviewEachPhaseByDefault: true },
     );
-    await stage(/How it runs/);
-    expect((await screen.findByTestId('review-doubled')).textContent).toContain('Adversarial review');
+    await tile('Review and QA');
+    expect((await within(region('Review and QA')).findByTestId('review-doubled')).textContent).toContain(
+      'Adversarial review',
+    );
   });
 
-  it('a phase launch is staged, and carries the git section on "How it runs"', async () => {
+  it('a phase launch is the quick view, and carries the git section in its Git tile', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null });
-    // Five stages since 5.0.0 (phase 11), Decisions first and selected.
-    const tabs = await screen.findAllByRole('tab');
-    expect(tabs.map((t) => t.textContent)).toEqual([
-      'DecideDecisions',
-      'WhatWhat runs',
-      'HowHow it runs',
-      'MoneyMoney and stops',
-      'ReviewReview',
+    // One screen since control-tower phase 22 — no stage bar — and the tiles a
+    // one-phase launch has: no Scope, because it narrows nothing and chains nothing.
+    await screen.findByTestId('quick-view');
+    expect(screen.queryByRole('tablist')).toBeNull();
+    expect(tileLabels()).toEqual([
+      'Engine',
+      'Safety',
+      'Git',
+      'Money and stops',
+      'Review and QA',
+      'Tools',
+      'Accounts',
+      'Decisions',
     ]);
-    expect(screen.getByRole('tab', { name: /Decisions/ }).getAttribute('aria-selected')).toBe('true');
+    // No tile is open until a person opens one.
+    expect(screen.queryAllByRole('button', { expanded: true })).toEqual([]);
 
-    await stage(/How it runs/);
-    await screen.findByLabelText('Branch');
-    expect(screen.queryByText(/When the plan completes/)).toBeNull();
-    const branch = screen
-      .getAllByRole('combobox')
-      .find((el) => (el as HTMLSelectElement).value === 'default-branch')!;
+    await tile('Git');
+    const branch = (await within(region('Git')).findByLabelText('Branch')) as HTMLSelectElement;
+    expect(branch.value).toBe('default-branch');
+    expect(within(region('Git')).queryByText(/When the plan completes/)).toBeNull();
     fireEvent.change(branch, { target: { value: 'new-branch' } });
-    expect(await screen.findByText(/When the plan completes/)).toBeTruthy();
+    expect(await within(region('Git')).findByText(/When the plan completes/)).toBeTruthy();
   });
 
   it('the QA toggle appears only where the gate is off and writes are allowed', async () => {
-    await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'on' });
-    await stage(/How it runs/);
-    await screen.findByLabelText('Branch');
+    const gated = await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'on' });
+    await tile('Review and QA');
+    await within(region('Review and QA')).findByLabelText('Cloud review');
     expect(screen.queryByText(/Turn the QA gate on/)).toBeNull();
+    gated.unmount();
 
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'off', allowWrites: false });
-    const boxes = await screen.findAllByText(/Turn the QA gate on/);
+    await tile('Review and QA');
+    const boxes = await within(region('Review and QA')).findAllByText(/Turn the QA gate on/);
     expect(boxes.length).toBe(1);
-    const box = screen.getByRole('checkbox', { name: /Turn the QA gate on/, hidden: true });
+    const box = within(region('Review and QA')).getByRole('checkbox', { name: /Turn the QA gate on/ });
     expect(box).toBeDisabled();
     expect(box.getAttribute('title')).toMatch(/--allow-writes/);
   });
 
   it('the auto-recovery box needs --allow-agent, and follows the preference when it has it', async () => {
     // Without the flag: rendered, disabled, and the title names the flag.
-    await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null });
-    await stage(/Money and stops/);
-    const off = await screen.findByRole('checkbox', { name: /Auto-recover halts/ });
+    const without = await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null });
+    await tile('Money and stops');
+    const off = await within(region('Money and stops')).findByRole('checkbox', {
+      name: /Auto-recover halts/,
+    });
     expect(off).toBeDisabled();
     expect(off.getAttribute('title')).toMatch(/--allow-agent/);
+    without.unmount();
 
-    // With it: enabled and opening on the preference default (on).
+    // With it: enabled and opening on the preference default (on) — once the
+    // console's state, which carries the flag, has answered.
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null }, {}, { allowAgent: true });
-    const boxes = await screen.findAllByRole('checkbox', { name: /Auto-recover halts/, hidden: true });
-    const on = boxes[boxes.length - 1]!;
-    expect(on).not.toBeDisabled();
-    expect(on).toBeChecked();
+    await tile('Money and stops');
+    await waitFor(() => {
+      const on = within(region('Money and stops')).getByRole('checkbox', { name: /Auto-recover halts/ });
+      expect(on).not.toBeDisabled();
+      expect(on).toBeChecked();
+    });
   });
 
   it('opens on the Automation preferences, as the footer promises', async () => {
@@ -186,34 +209,34 @@ describe('the field matrix', () => {
       { kind: 'phase', slug: 'alpha', phase: 3, run: null },
       { attachDefaultSkills: true, gitMode: 'new-branch', openPrOnComplete: false },
     );
-    await stage(/How it runs/);
-    await screen.findByLabelText('Branch');
-    expect(screen.getByRole('button', { name: 'Attached' }).getAttribute('aria-pressed')).toBe('true');
-    expect(
-      screen.getAllByRole('combobox').find((el) => (el as HTMLSelectElement).value === 'new-branch'),
-    ).toBeTruthy();
+    await tile('Tools');
+    const attach = await within(region('Tools')).findByRole('button', { name: 'Attached' });
+    expect(attach.getAttribute('aria-pressed')).toBe('true');
+    await tile('Git');
+    const git = region('Git');
+    expect((within(git).getByLabelText('Branch') as HTMLSelectElement).value).toBe('new-branch');
     // `openPrOnComplete: false` is what an operator stored BEFORE `settle`
     // existed, and it asked for exactly what `keep` means. The dialog folds the
     // two the way every other reader does, so the select opens on `keep`
     // rather than on the shipped default that would undo their preference.
-    expect(
-      screen.getAllByRole('combobox').find((el) => (el as HTMLSelectElement).value === 'keep'),
-    ).toBeTruthy();
+    expect((within(git).getByLabelText('When the plan completes') as HTMLSelectElement).value).toBe('keep');
     // And a value that came from Settings says so — not "from defaults".
-    expect(screen.getAllByText('from Settings').length).toBeGreaterThan(0);
+    expect(within(git).getAllByText('from Settings').length).toBeGreaterThan(0);
   });
 });
 
 describe('the submits', () => {
   it('a phase launch sends exactly what the dialog shows, scoped to its phase', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: RUN, qaMode: 'off', allowWrites: true });
-    // The Decisions stage fills the account list from the prelude's resolved
-    // clause once it answers; wait for it so the payload below is the whole form.
-    await screen.findByDisplayValue('default:0');
-    await stage(/How it runs/);
-    await screen.findByLabelText('Branch');
-    fireEvent.click(screen.getByRole('button', { name: 'Off' })); // attach defaults on
-    fireEvent.click(screen.getByRole('checkbox', { name: /Turn the QA gate on/ })); // QA gate on
+    // The account list is filled from the prelude's resolved clause once it
+    // answers — in the Accounts tile, beside the account; wait for it so the
+    // payload below is the whole form. Opening a tile changes no value.
+    await tile('Accounts');
+    await within(region('Accounts')).findByDisplayValue('default:0');
+    await tile('Tools');
+    fireEvent.click(await within(region('Tools')).findByRole('button', { name: 'Off' })); // attach defaults on
+    await tile('Review and QA');
+    fireEvent.click(within(region('Review and QA')).getByRole('checkbox', { name: /Turn the QA gate on/ })); // QA gate on
     fireEvent.click(screen.getByRole('button', { name: 'Run phase 3' }));
     await waitFor(() =>
       expect(runStart).toHaveBeenCalledWith('alpha', {
@@ -241,7 +264,7 @@ describe('the submits', () => {
         // `off` could turn billed cloud reviews on and never take them back.
         ultraReview: 'off',
         autoRecover: false,
-        // The Decisions stage's answers (phase 11): the run's own words for
+        // The Decisions tile's answers (phase 11): the run's own words for
         // the manifest's rows, sent as shown — a resume ignores them and a
         // fresh start is refused without them.
         resumeOnRestart: true,
@@ -253,23 +276,26 @@ describe('the submits', () => {
     );
   });
 
-  it('the Launch button is on every stage of a desk, and it is the same button', async () => {
-    // A desk keeps the ticket beside the stages, so the operator has read the
-    // summary before pressing it on any stage.
+  it('the Launch button is under the quick view whichever tile is open, and it is the same button', async () => {
+    // The departure line above the tiles has already said what will happen,
+    // so the one Launch stays in the fixed footer while any tile is expanded.
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: RUN });
-    for (const name of [/What runs/, /How it runs/, /Money and stops/, /Review/]) {
-      await stage(name);
-      expect(screen.getByRole('button', { name: 'Run phase 3' })).toBeTruthy();
+    const launch = await screen.findByTestId('launch-submit');
+    expect(launch).toHaveAccessibleName('Run phase 3');
+    for (const label of tileLabels()) {
+      await tile(label);
+      expect(region(label)).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Run phase 3' })).toBe(launch);
     }
-    fireEvent.click(screen.getByRole('button', { name: 'Run phase 3' }));
+    fireEvent.click(launch);
     await waitFor(() => expect(runStart).toHaveBeenCalledTimes(1));
     expect((runStart.mock.calls[0]![1] as Record<string, unknown>).onlyPhases).toEqual([3]);
   });
 
   it('a continue resumes the run and never narrows it', async () => {
     await mount({ kind: 'continue', slug: 'alpha', run: RUN });
-    await stage(/How it runs/);
-    await screen.findByLabelText('Branch');
+    await tile('Git');
+    await within(region('Git')).findByLabelText('Branch');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await waitFor(() => expect(runStart).toHaveBeenCalled());
     const payload = runStart.mock.calls[0]![1] as Record<string, unknown>;
@@ -303,7 +329,7 @@ describe('a claimed phase', () => {
     claimedAt: Date.now() - 12 * 60_000,
   };
 
-  it('refuses to submit, and says who holds it — on every stage', async () => {
+  it('refuses to submit, and says who holds it — whichever tile is open', async () => {
     // The dialog agrees with the server rather than discovering the 409 after
     // the click. A dialog that submits into a refusal lied about its button.
     await mount({ kind: 'phase', slug: 'alpha', phase: 4, run: null, lock: HELD });
@@ -317,8 +343,9 @@ describe('a claimed phase', () => {
     fireEvent.click(submit);
     expect(runStart).not.toHaveBeenCalled();
 
-    // The banner sits above the stage bar, so a reader on the review still sees it.
-    await stage(/Review/);
+    // The banner sits above the quick view, so a reader down in the last tile still sees it.
+    await tile('Decisions');
+    expect(region('Decisions')).toBeTruthy();
     expect(screen.getByText(/is claimed by/)).toBeTruthy();
     expect(screen.getByRole('button', { name: /Run phase 4/ }).hasAttribute('disabled')).toBe(true);
   });
@@ -341,8 +368,8 @@ describe('a claimed phase', () => {
 
   it('an unclaimed phase shows no claim banner at all', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 4, run: null });
-    await stage(/How it runs/);
-    await screen.findByLabelText('Model');
+    await tile('Engine');
+    await within(region('Engine')).findByLabelText('Model');
     expect(screen.queryByText(/is claimed by/)).toBeNull();
     expect(screen.getByRole('button', { name: /Run phase 4/ }).hasAttribute('disabled')).toBe(false);
   });
@@ -351,21 +378,23 @@ describe('a claimed phase', () => {
 describe('the resolved QA gate is stated before launch', () => {
   it('says so when the PLAN turns QA on, whatever the console default is', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'on' });
-    await stage(/How it runs/);
-    expect(await screen.findByText(/declares .*QA gate.*on/)).toBeInTheDocument();
+    await tile('Review and QA');
+    expect(await within(region('Review and QA')).findByText(/declares .*QA gate.*on/)).toBeInTheDocument();
     expect(screen.queryByText(/Turn the QA gate on/)).toBeNull();
   });
 
   it('says so when the plan waives it', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'waived' });
-    await stage(/How it runs/);
-    expect(await screen.findByText(/do not hold dependents/)).toBeInTheDocument();
+    await tile('Review and QA');
+    expect(await within(region('Review and QA')).findByText(/do not hold dependents/)).toBeInTheDocument();
   });
 
   it('stays quiet when QA is simply off — the toggle speaks for itself', async () => {
     await mount({ kind: 'phase', slug: 'alpha', phase: 3, run: null, qaMode: 'off', allowWrites: true });
-    await stage(/How it runs/);
+    await tile('Review and QA');
     expect(screen.queryByText(/declares/)).toBeNull();
-    expect((await screen.findAllByText(/Turn the QA gate on/)).length).toBeGreaterThan(0);
+    expect(
+      (await within(region('Review and QA')).findAllByText(/Turn the QA gate on/)).length,
+    ).toBeGreaterThan(0);
   });
 });

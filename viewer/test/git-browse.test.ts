@@ -38,18 +38,19 @@ import type { RunState } from '../server/runner/state.ts';
 
 const SEP = '\x00';
 
+/** The environment every fixture `git` runs under. */
+function fixtureEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    LC_ALL: 'C',
+    GIT_AUTHOR_NAME: 'p8', GIT_AUTHOR_EMAIL: 'p8@example.invalid',
+    GIT_COMMITTER_NAME: 'p8', GIT_COMMITTER_EMAIL: 'p8@example.invalid',
+  };
+}
+
 /** `git`, throwing on failure — a broken FIXTURE must not read as a finding. */
 function git(cwd: string, ...args: string[]): string {
-  return String(execFileSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      LC_ALL: 'C',
-      GIT_AUTHOR_NAME: 'p8', GIT_AUTHOR_EMAIL: 'p8@example.invalid',
-      GIT_COMMITTER_NAME: 'p8', GIT_COMMITTER_EMAIL: 'p8@example.invalid',
-    },
-  })).trim();
+  return String(execFileSync('git', args, { cwd, encoding: 'utf8', env: fixtureEnv() })).trim();
 }
 
 const trash: string[] = [];
@@ -90,6 +91,47 @@ function advance(root: string, branch: string, count: number): void {
     git(root, 'commit', '-q', '-m', `${branch} ${n}`);
   }
   git(root, 'switch', '-q', here);
+}
+
+/**
+ * `count` commits on the branch HEAD stands on, each adding `bulk-<n>.txt`,
+ * with the branch `nameOf(n)` left at commit n, written by ONE `git
+ * fast-import`. The loop this replaces spawned three processes per commit,
+ * about a thousand per test, and took 120–160 s at load average 70. One of
+ * those spawns failing was enough to fail a whole gate (`git commit` 214 of
+ * 360 answered "fatal: could not parse HEAD" in control-tower phase 103's
+ * `verify-free`, and the test passed on the rerun). Committer dates climb one
+ * second per commit, starting a minute from now. Every bulk commit is
+ * therefore NEWER than anything `fixture()` made, which is the order the
+ * window tests depend on.
+ */
+function bulkCommits(root: string, count: number, nameOf: (n: number) => string): void {
+  const head = git(root, 'symbolic-ref', 'HEAD');
+  const tip = git(root, 'rev-parse', 'HEAD');
+  const start = Math.floor(Date.now() / 1000) + 60;
+  const stream: string[] = [];
+  for (let n = 0; n < count; n += 1) {
+    const subject = `bulk ${n}\n`;
+    const body = `${n}\n`;
+    stream.push(
+      `commit ${head}\nmark :${n + 1}\n`
+      + `committer p8 <p8@example.invalid> ${start + n} +0000\n`
+      + `data ${Buffer.byteLength(subject)}\n${subject}`
+      + (n === 0 ? `from ${tip}\n` : '')
+      + `M 100644 inline bulk-${n}.txt\ndata ${Buffer.byteLength(body)}\n${body}\n`
+      + `reset refs/heads/${nameOf(n)}\nfrom :${n + 1}\n\n`,
+    );
+  }
+  execFileSync('git', ['fast-import', '--quiet'], { cwd: root, env: fixtureEnv(), input: stream.join('') });
+  git(root, 'reset', '-q', '--hard');
+}
+
+/** Each of `names` as a branch at HEAD, written by ONE `git update-ref --stdin`. */
+function branchesAtHead(root: string, names: string[]): void {
+  const tip = git(root, 'rev-parse', 'HEAD');
+  execFileSync('git', ['update-ref', '--stdin'], {
+    cwd: root, env: fixtureEnv(), input: names.map((name) => `create refs/heads/${name} ${tip}\n`).join(''),
+  });
 }
 
 /* ================================================================== *
@@ -385,7 +427,7 @@ test('a tip set cut at the cap SAYS so — a partial graph must not read as comp
   // QA round 1's Low. `all` over a repository with more branches than the cap
   // silently dropped whole branches out of the walk and reported nothing.
   const { root } = fixture();
-  for (let n = 0; n < BRANCH_CAP + 3; n += 1) git(root, 'branch', `bulk/${n}`);
+  branchesAtHead(root, Array.from({ length: BRANCH_CAP + 3 }, (_, n) => `bulk/${n}`));
 
   const wide = await commitGraph(root, { all: true, limit: 5 });
   assert.equal(wide.tips.length, BRANCH_CAP);
@@ -403,12 +445,7 @@ test('the TRUNK survives a repository with more branches than the cap', async ()
   // default walk lost `main`'s history while reporting itself complete.
   const { root } = fixture();
   git(root, 'switch', '-q', '-c', 'feature/x');
-  for (let n = 0; n < BRANCH_CAP + 25; n += 1) {
-    writeFileSync(join(root, `bulk-${n}.txt`), `${n}\n`);
-    git(root, 'add', '-A');
-    git(root, 'commit', '-q', '-m', `bulk ${n}`);
-    git(root, 'branch', `bulk/${n}`);
-  }
+  bulkCommits(root, BRANCH_CAP + 25, (n) => `bulk/${n}`);
 
   assert.equal(await trunkOf(root), 'main', 'a stale trunk is still the trunk');
   const graph = await commitGraph(root, { limit: 5 });
@@ -425,14 +462,9 @@ test('the run branches survive a repository with more branches than the cap', as
   // `tipsTruncated: false` — a graph missing exactly the branches the Repo
   // destination exists to show, presented as complete.
   const { root } = fixture();          // `pe/demo` is created here, at the start
-  for (let n = 0; n < BRANCH_CAP + 60; n += 1) {
-    // Every one of these is NEWER than `pe/demo`, so the general window fills
-    // with them.
-    writeFileSync(join(root, `bulk-${n}.txt`), `${n}\n`);
-    git(root, 'add', '-A');
-    git(root, 'commit', '-q', '-m', `bulk ${n}`);
-    git(root, 'branch', `bulk/${n}`);
-  }
+  // Every one of these is NEWER than `pe/demo`, so the general window fills
+  // with them.
+  bulkCommits(root, BRANCH_CAP + 60, (n) => `bulk/${n}`);
 
   const narrow = await commitGraph(root, { limit: 5 });
   assert.ok(narrow.tips.includes('pe/demo'),
@@ -448,7 +480,7 @@ test('the run branches survive a repository with more branches than the cap', as
 
 test('more run branches than the cap DOES report a cut tip set', async () => {
   const { root } = fixture();
-  for (let n = 0; n < BRANCH_CAP + 3; n += 1) git(root, 'branch', `pe/bulk-${n}`);
+  branchesAtHead(root, Array.from({ length: BRANCH_CAP + 3 }, (_, n) => `pe/bulk-${n}`));
   const out = await commitGraph(root, { limit: 5 });
   assert.ok(out);
   assert.equal(out.tipsTruncated, true, 'the run-branch query hit its own cap');
@@ -463,7 +495,7 @@ test('the run-branch query’s OWN cap is what reports, not the tip-list cap bes
   // capped 300, so only the query's own flag can speak.
   const { root } = fixture();
   git(root, 'branch', '-m', 'main', 'release/2');
-  for (let n = 0; n < BRANCH_CAP + 3; n += 1) git(root, 'branch', `pe/bulk-${n}`);
+  branchesAtHead(root, Array.from({ length: BRANCH_CAP + 3 }, (_, n) => `pe/bulk-${n}`));
   git(root, 'switch', '-q', '--detach');
 
   assert.equal(await trunkOf(root), undefined, 'this repository has no trunk to add');
@@ -477,7 +509,7 @@ test('a named-ref walk is never called partial by a window it did not consult', 
   // QA round 4's Low: `?ref=X&all=1` ORed in the general window's truncation on
   // a walk that only ever looked at X.
   const { root } = fixture();
-  for (let n = 0; n < BRANCH_CAP + 3; n += 1) git(root, 'branch', `bulk/${n}`);
+  branchesAtHead(root, Array.from({ length: BRANCH_CAP + 3 }, (_, n) => `bulk/${n}`));
   const named = await commitGraph(root, { refs: ['pe/demo'], all: true, limit: 5 });
   assert.ok(named);
   assert.deepEqual(named.tips, ['pe/demo']);

@@ -23,7 +23,8 @@ import { ISSUE_MODES } from '../shared/issues-model.js';
 import { LAND_POLICIES, GITLINK_POLICIES, CONFLICT_POLICIES } from '../shared/landing-model.js';
 import { MESSAGING_WORDS } from '../shared/message-model.js';
 import { POLICY_DEFAULTS } from '../shared/policy-model.js';
-import { MCP_POLICIES } from '../shared/run-lifecycle.js';
+import { MCP_POLICIES, MODEL_POLICIES } from '../shared/run-lifecycle.js';
+import { PERMISSION_MODES } from '../shared/run-settings.js';
 import { ISOLATION_DIRECTIVES, WORKTREE_RETENTION } from '../shared/worktree-model.js';
 
 export type PlanField = {
@@ -53,6 +54,10 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: 'MCP servers every session needs, and any one phase needs (default none)' },
   { field: 'MCP policy', flags: ['--mcp-policy'], home: `**MCP policy:** ${MCP_POLICIES.join('|')}`,
     question: 'what a phase does when its server will not connect (default continue)' },
+  { field: 'Permission mode', flags: ['--permission-mode'], home: `**Permission mode:** ${PERMISSION_MODES.join('|')} and - **Permission mode:**`,
+    question: "the mode a phase's session starts in — plan presents first and waits for a person (default the run's, else acceptEdits)" },
+  { field: 'Model policy', flags: ['--model-policy'], home: `**Model policy:** ${MODEL_POLICIES.join('|')} and - **Model policy:**`,
+    question: 'whether a wall or a ladder rung may change the model — pinned keeps it, or waits (default ladder)' },
   { field: 'Credentials', flags: ['--credentials'], home: '**Credentials:** and - **Credentials:**',
     question: 'the logins the plan needs — gh, claude-login, env:NAME, keychain:SERVICE, file:PATH' },
   { field: 'Credential policy', flags: ['--credential-policy'], home: `**Credential policy:** ${MCP_POLICIES.join('|')}`,
@@ -69,6 +74,10 @@ export const PLAN_FIELDS: readonly PlanField[] = Object.freeze([
     question: "the longest a phase may stay parked on an external clock (default the console's)" },
   { field: 'Waits on', flags: ['--waits-on'], home: '- **Waits on:** <ref> · <max>',
     question: 'the external clocks a phase is known to wait on, each with its --watch ref' },
+  { field: 'Verify timeout', flags: ['--verify-timeout'], home: '**Verify timeout:** and - **Verify timeout:**',
+    question: "how long one §Verification command may run before its clock cuts it (default 3× the line's longest recent run, 30 min to 4 h)" },
+  { field: 'Wall-clock floor', flags: ['--floor'], home: '- **Wall-clock floor:** <duration>',
+    question: "the least wall-clock time a phase takes whatever its Size — a full gates.sh run, a CD wait (default none)" },
   { field: 'Decisions', flags: ['--decisions'], home: '## Decisions',
     question: 'the manifest itself — every row above answered, waived (with the reason) or owned' },
   { field: 'Setup', flags: ['--setup'], home: '**Setup (every phase):** and - **Setup:**',
@@ -116,8 +125,12 @@ export const STATE_FLAGS: Readonly<Record<string, string>> = Object.freeze({
   '--notes': 'composes what a phase is handed by the phases before it — their handoff notes, their deferral rulings and the messages addressed to it',
   '--qa-prompt': "composes the reviewer's brief from the fields above",
   '--boot-prompt': "composes a session's boot prompt from the fields above (Skills reaches a session only through it)",
+  '--boot-fanout': "composes a fan-out handoff's shared boot once and each phase's own block — the same prompts, written once (#115)",
   '--plan-status': 'the frontmatter status, written by close-plan.sh, never asked',
   '--closed': 'the predicate over that status',
+  // control-tower phase 41: asked once, by the manifest's `human-acts`
+  // question (MANIFEST_QUESTIONS below) — not a field of the wizard's own.
+  '--human-steps': "the `- **Human step:**` bullets as the step card reads them — asked by the manifest's human-acts question",
 });
 
 /** The question the wizard asks for each manifest key, in `DECISION_KEYS` order. */
@@ -132,7 +145,7 @@ export const MANIFEST_QUESTIONS: Readonly<Record<DecisionKey, string>> = Object.
   'verification.person-check': 'allow, halt, or an owner when a §Verification line is prose (- **Person-check:**)',
   'qa.exhausted': 'waive, halt, or an owner when the QA rounds run out (**QA exhausted:**; skip when QA is off)',
   waits: 'each expected external wait, its --watch ref and its maximum (**Wait budget:**, - **Waits on:**)',
-  'human-acts': 'steps denied to an agent, each with the ref that proves it landed (- **Human step:**)',
+  'human-acts': 'steps denied to an agent, each with the ref that proves it landed (- **Human step:** <kind> · <what> · proof: <ref>)',
   ambiguity: 'ruling, ask or halt when the plan did not decide (**When in doubt:**)',
   budgets: 'run, phase and turn ceilings in dollars',
   'resume.on-restart': "continue, hold or ask — the RUN's answer when the console restarts under it",
@@ -140,6 +153,7 @@ export const MANIFEST_QUESTIONS: Readonly<Record<DecisionKey, string>> = Object.
   stop: 'autonomy, and who is told when the run halts',
   relay: 'off or last-resort, the 60-second default, who is paged',
   announce: 'which categories push, to whom, on which origin',
+  'plan-approval': 'what a plan-mode phase does with the plan it presents: hold (a person approves) or continue (the console does)',
 });
 
 /** The recommended default the wizard names first for a manifest key, when one ships. */

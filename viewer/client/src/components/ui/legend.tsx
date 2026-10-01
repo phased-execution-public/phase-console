@@ -18,9 +18,12 @@
  *    stand-in dot. A legend of plain dots beside a map of glyphs is a legend
  *    that teaches the wrong thing. `mark` is how a surface says so; the default
  *    swatch is for the surfaces whose mark IS a dot.
- * 2. **The words come from the vocabulary.** `stateEntries` walks `UI_STATES`
- *    worst-first and reads `STATE_META`, so a ninth state appears in every
- *    tally the day it is added and nobody edits a chart.
+ * 2. **The words come from the palette.** `stateEntries` walks `UI_STATES`
+ *    worst-first and names each PAINT by the palette's own name (`uiLabel`),
+ *    so a ninth paint appears in every tally the day it is added and nobody
+ *    edits a chart. The counts are keyed by paint, and the caller reads each
+ *    paint off the status model (`describePhase(…).paint`): this file is first
+ *    paint and knows no status word.
  *
  * `stateTally` is the sentence half of the same fact — `12 phases · 9 done ·
  * 1 running` — and it exists so a bar's accessible name and the text printed
@@ -29,20 +32,23 @@
 
 import type { HTMLAttributes, ReactNode } from 'react';
 import { cn } from '@/lib/cn';
-import { STATE_META, UI_STATES, type UiState } from '@/lib/status-vocab';
+import { UI_STATES, uiLabel, type UiState } from '@/lib/status-vocab';
 
-/** How many phases (or runs, or anything) are in each UI state. */
+/** How many phases (or runs, or anything) wear each paint. */
 export interface LegendCounts extends Partial<Record<UiState, number>> {}
 
+/** A paint's name, as a legend and a tally say it: "needs you", "running". */
+const paintName = (paint: UiState) => uiLabel(paint).toLowerCase();
+
 export interface LegendEntry {
-  /** Stable across renders; the state name where there is one. */
+  /** Stable across renders; the paint's name where there is one. */
   key: string;
   label: string;
   /**
-   * The state this entry explains. Paints the default swatch, and is what a
+   * The paint this entry explains. Paints the default swatch, and is what a
    * caller passes when its mark is an ordinary dot.
    */
-  state?: UiState;
+  paint?: UiState;
   /** The surface's OWN mark, drawn at legend size. Wins over the swatch. */
   mark?: ReactNode;
   /** Shown after the label when the surface counts as well as paints. */
@@ -52,17 +58,17 @@ export interface LegendEntry {
 }
 
 /**
- * The default mark: a dot painted through `state-<ui>`, never a colour of its
- * own — the same token the bar beside it uses, which is what makes the two
+ * The default mark: a dot painted through `state-<paint>`, never a colour of
+ * its own — the same token the bar beside it uses, which is what makes the two
  * unable to disagree.
  */
-export function LegendSwatch({ state, className }: { state?: UiState; className?: string }) {
+export function LegendSwatch({ paint, className }: { paint?: UiState; className?: string }) {
   return (
     <span
       aria-hidden="true"
       className={cn(
         'size-2 shrink-0 rounded-full bg-state',
-        state ? `state-${state}` : '[--state:var(--ink-faint)]',
+        paint ? `state-${paint}` : '[--state:var(--ink-faint)]',
         className,
       )}
     />
@@ -110,7 +116,7 @@ export function Legend({
           className="flex items-center gap-1.5"
           {...(entry.title ? { title: entry.title } : {})}
         >
-          {entry.mark ?? <LegendSwatch {...(entry.state ? { state: entry.state } : {})} />}
+          {entry.mark ?? <LegendSwatch {...(entry.paint ? { paint: entry.paint } : {})} />}
           {entry.label}
           {entry.count != null && <span className="font-mono tabular-nums text-ink">{entry.count}</span>}
         </Item>
@@ -120,25 +126,25 @@ export function Legend({
 }
 
 /**
- * Legend entries for a set of counts, worst-first, zero-count states dropped.
+ * Legend entries for a set of counts, worst-first, zero-count paints dropped.
  *
- * This is the half that makes a new state free: the order and the words are the
- * vocabulary's, so nothing here has to be edited when one is added.
+ * This is the half that makes a new paint free: the order and the words are the
+ * palette's, so nothing here has to be edited when one is added.
  */
 export function stateEntries(
   counts: LegendCounts,
   opts: {
-    /** Keep a state whose count is zero — for a key that must show the full set. */
+    /** Keep a paint whose count is zero — for a key that must show the full set. */
     showZero?: boolean;
     /** Drop the numbers and leave a pure colour key. */
     countless?: boolean;
   } = {},
 ): LegendEntry[] {
-  return UI_STATES.filter((state) => opts.showZero || (counts[state] ?? 0) > 0).map((state) => ({
-    key: state,
-    label: STATE_META[state].label.toLowerCase(),
-    state,
-    ...(opts.countless ? {} : { count: counts[state] ?? 0 }),
+  return UI_STATES.filter((paint) => opts.showZero || (counts[paint] ?? 0) > 0).map((paint) => ({
+    key: paint,
+    label: paintName(paint),
+    paint,
+    ...(opts.countless ? {} : { count: counts[paint] ?? 0 }),
   }));
 }
 
@@ -160,10 +166,10 @@ export function stateTally(
   counts: LegendCounts,
   { total, label = 'phases' }: { total?: number; label?: string } = {},
 ): string {
-  const present = UI_STATES.filter((state) => (counts[state] ?? 0) > 0);
+  const present = UI_STATES.filter((paint) => (counts[paint] ?? 0) > 0);
   if (!present.length) return `no ${label}`;
-  const sum = present.reduce((acc, state) => acc + Math.max(0, counts[state] ?? 0), 0);
+  const sum = present.reduce((acc, paint) => acc + Math.max(0, counts[paint] ?? 0), 0);
   const denominator = Math.max(total ?? sum, sum, 1);
-  const parts = present.map((state) => `${counts[state]} ${STATE_META[state].label.toLowerCase()}`);
+  const parts = present.map((paint) => `${counts[paint]} ${paintName(paint)}`);
   return `${sum} of ${denominator} ${label}: ${parts.join(', ')}`;
 }

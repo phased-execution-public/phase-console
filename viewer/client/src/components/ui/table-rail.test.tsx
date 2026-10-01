@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { DataTable, railOffsets, trackOf, type Column } from './table';
+import { DataTable, railOffsets, trackOf, type Column } from '@/components/data-table';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SRC = join(here, '..', '..');
@@ -155,7 +155,10 @@ describe('exit criterion 2 — every table reaches DataTable or says why', () =>
     for (const path of walk(SRC)) {
       if (!path.endsWith('.tsx')) continue;
       const relative = path.slice(SRC.length + 1);
-      if (relative === 'components/ui/table.tsx') continue;
+      // The primitive's own render sites: the markup, and the grid built on it
+      // (moved to `components/data-table/` by control-tower phase 18).
+      if (relative === 'components/ui/table.tsx' || relative === 'components/data-table/data-table.tsx')
+        continue;
       const raw = readFileSync(path, 'utf8');
       const sites = [...stripComments(raw).matchAll(/<(?:Table|table)[\s>/]/g)].length;
       if (sites === 0) continue;

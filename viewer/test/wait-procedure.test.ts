@@ -96,6 +96,7 @@ function laned(profile: string) {
   const noted: Noted[] = [];
   const denials: { phase: number; command: string; matched: string }[] = [];
   (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({ id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: profile, phases: {} }),
     note: (event: string, data: Record<string, unknown>, phase?: number) => noted.push({ event, data, phase }),
@@ -174,7 +175,7 @@ test('(a) the QA duty tells a session to dispatch its reviewer in the FOREGROUND
   // The Stop hook's own QA block names the same way to wait.
   const stop = new Service(flags as never);
   const state = { id: 'r1', slug: 'demo', root: '/tmp/nowhere', activePhase: 2, phases: { 2: { phase: 2, sessionId: 's' } } };
-  (stop as unknown as { runners: Map<string, unknown> }).runners.set('demo', { busy: () => true, current: () => state, note: () => {} });
+  (stop as unknown as { runners: Map<string, unknown> }).runners.set('demo', { busy: () => true, current: () => state, isSpending: () => false, note: () => {} });
   (stop as unknown as { root: unknown }).root = { ok: true, path: '/tmp/nowhere' };
   (stop as unknown as { board: () => Promise<unknown> }).board = async () =>
     ({ phased: true, states: { 2: 'done' }, done: [], inProgress: [], stuck: [], ready: [], waiting: [], blockedBy: {}, qa: {} });
@@ -283,6 +284,7 @@ function serviceForStop(awaiting: ReturnType<typeof laneWith>) {
     phases: { 2: { phase: 2, sessionId: 'sess-stop', startedAt: '2026-01-01T00:00:00Z' } },
   };
   (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => state,
     note: () => {},
@@ -401,4 +403,28 @@ test('(d) a later result whose num_turns restarts is a new turn, and turns sum a
     { kind: 'background', op: 'ended', taskId: 'a1b2c3d4', status: 'completed' },
   ]);
   assert.equal(outcome.signal.backgroundTasks, undefined, 'a task that reported is not left open at exit');
+});
+
+/* ------------------------------------------------------------------ *
+ * (e) A spent wait budget says BUDGET first (control-tower phase 14, #40)
+ * ------------------------------------------------------------------ */
+
+test('BR-3: a wait the budget refuses opens on the budget and its arithmetic, never on the thing it waits on', async () => {
+  const { evaluateWait } = await import('../server/runner/wait-budget.ts');
+  const now = Date.parse('2026-09-29T10:00:00.000Z');
+  const verdict = evaluateWait({
+    now, requestedUntil: now + 90 * 60_000, parkedMs: 39.7 * 60_000, waits: 1, ledger: 'session', pollable: true,
+    budget: { budgetMs: 60 * 60_000, source: 'phase', countersignedUntil: null, refs: [] },
+  });
+  // Rule 7 grants what is left to a pollable declaration — so ask with less left than the floor.
+  const spent = evaluateWait({
+    now, requestedUntil: now + 90 * 60_000, parkedMs: 59.5 * 60_000, waits: 1, ledger: 'session', pollable: true,
+    budget: { budgetMs: 60 * 60_000, source: 'phase', countersignedUntil: null, refs: [] },
+  });
+  assert.equal(verdict.verdict, 'park', 'twenty minutes left is granted to a pollable wait (rule 7)');
+  assert.equal(spent.verdict, 'timeout');
+  const reason = (spent as { reason: string }).reason;
+  assert.match(reason, /^60m wait budget · 59\.5m accrued · 0\.5m left · asked for 90m — /);
+  assert.doesNotMatch(reason.split(' — ')[0], /CI|PR|deploy/, 'the first clause is the budget, not the build');
+  assert.match(reason, /Waits on:/, 'and it still names the line that raises it');
 });

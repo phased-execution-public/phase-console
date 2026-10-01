@@ -47,3 +47,4 @@ below is the long version, in the order it is worth reading.
 | [Versioning and releasing](releasing.md) | The two channels, how a change becomes an update, and what every change must carry with it. |
 | [viewer/README.md](../viewer/README.md) | The console's own technical documentation — architecture, API, deploy. |
 | [USAGE.md](../USAGE.md) | The loop in operational detail. |
+

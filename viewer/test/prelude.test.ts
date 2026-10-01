@@ -20,7 +20,8 @@ import { fileURLToPath } from 'node:url';
 import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { MANIFEST_BLOCKING } from '../shared/policy-model.js';
 import {
-  PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, resolvedManifest,
+  PreludeRefusal, manifestRows, preludeFor, probeAccounts, probeCredentials, probeDelivery, probeMcp, probeTrees, resolvedManifest,
+  gitStrategyLines, probeGitStrategy, GitStrategyRefusal, GIT_STRATEGY_ACKS, scopedSteps,
   type AccountFacts, type PreludeDeps,
 } from '../server/prelude.ts';
 import {
@@ -462,4 +463,161 @@ test('verification: a park the door cannot answer (no bullet, nothing it can nam
   }));
   assert.equal(prelude.probes.verification.status, 'ok');
   assert.ok((prelude.probes.verification.warnings ?? []).some((w) => /phase 3.*states no verification/.test(w)));
+});
+
+/* ---- probe 6: the shared trees (control-tower phase 40, #41, BA-7) ---- */
+
+test('trees: another run holding a scoped repository is named, and isolation is recommended when the console can grant it — never a block', async () => {
+  const held = [{ repo: 'app', branch: 'pe/beta', run: 'r-beta', slug: 'beta' }];
+  const prelude = await preludeFor('alpha', {}, deps({
+    trees: async () => ({ held, isolated: false, grantable: true }),
+  }));
+  assert.equal(prelude.probes.trees.status, 'ok');
+  assert.match(prelude.probes.trees.reason, /another run holds `app` on `pe\/beta` \(run r-beta of beta\)/);
+  assert.match(prelude.probes.trees.reason, /start this run isolated/);
+  assert.deepEqual(prelude.probes.trees.warnings, ['`app` on `pe/beta` (run r-beta of beta)']);
+  assert.equal(prelude.blocking.length, 0, 'a held tree queues phases; it never refuses the start');
+
+  const refused = probeTrees({ held, isolated: false, grantable: false, refusal: 'the plan scopes no repository' });
+  assert.match(refused.reason, /will queue until/);
+  assert.match(refused.reason, /isolation is not available here \(the plan scopes no repository\)/);
+  assert.doesNotMatch(refused.reason, /start this run isolated/, 'never recommends what the console cannot grant');
+
+  const isolated = probeTrees({ held, isolated: true, grantable: true });
+  assert.equal(isolated.status, 'ok');
+  assert.match(isolated.reason, /this run is isolated — it stands in trees of its own and is not held by it/);
+  assert.equal(isolated.warnings, undefined);
+
+  assert.deepEqual(probeTrees({ held: [], isolated: false, grantable: true }),
+    { status: 'ok', ok: true, reason: "no scoped repository stands on another run's branch" });
+  assert.equal(probeTrees(null).status, 'skip');
+  assert.equal((await preludeFor('alpha', {}, deps())).probes.trees.status, 'skip', 'no facts, no verdict');
+  const broken = await preludeFor('alpha', {}, deps({ trees: async () => { throw new Error('git is gone'); } }));
+  assert.equal(broken.probes.trees.status, 'skip');
+  assert.match(broken.probes.trees.reason, /could not be read: git is gone/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Probe 7 — the plan's git lines against the chosen strategy (control-tower phase 11, #18)
+ * ------------------------------------------------------------------ */
+
+const FACTS = {
+  gitMode: 'new-branch', runBranch: 'pe/demo', isolated: false, superproject: false,
+  planWorktrees: false, checkoutPhases: [] as number[],
+};
+
+test('probe 7 names a Branch line the new-branch strategy will not create — and only then', () => {
+  const named = gitStrategyLines({ ...FACTS, planBranch: 'feature/checkout' });
+  assert.deepEqual(named.map((line) => [line.kind, line.plan, line.honourable]), [['branch', 'feature/checkout', false]]);
+  assert.match(named[0]!.run, /`pe\/demo`/);
+  // The default idioms name no branch, prose naming the run branch agrees,
+  // and a run that imposes no branch of its own overrides nothing.
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: 'current branch (no new branch)' }), []);
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planBranch: '`pe/demo` — it EXISTS, adopted at launch' }), []);
+  assert.deepEqual(gitStrategyLines({ ...FACTS, gitMode: 'current', planBranch: 'feature/checkout' }), []);
+});
+
+test('probe 7: Worktrees: on is a per-lane ask a shared checkout cannot grant and a superproject never grants', () => {
+  const shared = gitStrategyLines({ ...FACTS, planWorktrees: true });
+  assert.deepEqual(shared.map((line) => [line.kind, line.honourable]), [['worktrees', true]]);
+  assert.match(shared[0]!.run, /shared-checkout run cannot grant/);
+  // Isolated in a plain repository: granted, no line.
+  assert.deepEqual(gitStrategyLines({ ...FACTS, planWorktrees: true, isolated: true }), []);
+  // A superproject: refused per lane even when the run is isolated — the mirror is the run-level answer.
+  const superproject = gitStrategyLines({ ...FACTS, planWorktrees: true, isolated: true, superproject: true });
+  assert.deepEqual(superproject.map((line) => [line.kind, line.honourable]), [['worktrees', false]]);
+  assert.match(superproject[0]!.run, /superproject never grants/);
+});
+
+test('probe 7: Checkout: main is inert under a shared checkout and names its phases', () => {
+  const lines = gitStrategyLines({ ...FACTS, checkoutPhases: [3, 7] });
+  assert.deepEqual(lines.map((line) => [line.kind, line.phases, line.honourable]), [['checkout', [3, 7], true]]);
+  assert.match(lines[0]!.plan, /phases 3, 7/);
+  assert.deepEqual(gitStrategyLines({ ...FACTS, checkoutPhases: [3], isolated: true }), [], 'a checkout of the run\'s own honours it');
+});
+
+test('probe 7 warns and never blocks; the start door asks for honour or override instead', async () => {
+  assert.deepEqual([...GIT_STRATEGY_ACKS], ['honour', 'override']);
+  const verdict = probeGitStrategy({ ...FACTS, planBranch: 'feature/x', checkoutPhases: [2] });
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.warnings?.length, 2);
+  assert.equal(probeGitStrategy(null).status, 'skip');
+  assert.equal(probeGitStrategy(FACTS).warnings, undefined);
+
+  const prelude = await preludeFor('demo', {}, deps({ gitStrategy: async () => ({ ...FACTS, planBranch: 'feature/x' }) }));
+  assert.equal(prelude.probes['git-strategy'].warnings?.length, 1);
+  assert.equal(prelude.blocking.length, 0, 'a git line is answered at the start door, never as a blocking row');
+  const refusal = new GitStrategyRefusal((prelude.probes['git-strategy'].detail as { lines: never[] }).lines, null);
+  assert.match(refusal.message, /"honour" or "override"/);
+});
+
+/* ------------------------------------------------------------------ *
+ * Probe 9 — the launch door asks for a person's turns (control-tower phase 44)
+ * ------------------------------------------------------------------ */
+
+const STEP_BROWSER = { kind: 'browser-login', what: 'Sign in to Vercel', open: 'vercel login', proof: 'cmd:"vercel whoami"', where: 'host' } as const;
+const STEP_APPROVAL = { kind: 'third-party-approval', what: 'An org owner approves the app', open: 'https://github.com/organizations/acme/settings/oauth_application_policy', proof: 'cmd:"gh api orgs/acme"', where: 'any', windowMinutes: 2880 } as const;
+const STEP_BARE = { kind: 'physical', what: 'Plug the test phone in', where: 'host' } as const;
+
+test('the launch door lists the plan-declared steps for the scoped phases — onlyPhases, else every phase not done', () => {
+  const steps: Record<number, readonly (typeof STEP_BROWSER | typeof STEP_APPROVAL | typeof STEP_BARE)[]> = {
+    1: [STEP_BROWSER], 2: [STEP_APPROVAL, STEP_BARE], 3: [],
+  };
+  const of = (phase: number) => (steps[phase] ?? []) as never[];
+  assert.deepEqual(scopedSteps(of, [1, 2, 3], { done: [1] }).map((s) => [s.phase, (s.step as { what: string }).what]),
+    [[2, STEP_APPROVAL.what], [2, STEP_BARE.what]], 'a done phase needs nobody');
+  assert.deepEqual(scopedSteps(of, [1, 2, 3], { onlyPhases: [1], done: [1] }).map((s) => s.phase), [1],
+    'a scoped run asks for its own phases, whatever the board says');
+  assert.deepEqual(scopedSteps(of, [1, 2, 3]).length, 3);
+});
+
+test('the launch door runs every proof AT ONCE, pre-clears the proven, and returns the rest with their open actions', async () => {
+  let inFlight = 0;
+  let peak = 0;
+  const asked: string[] = [];
+  const probeStep = async (ref: string) => {
+    asked.push(ref);
+    inFlight += 1;
+    peak = Math.max(peak, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    inFlight -= 1;
+    return ref.includes('vercel') ? { landed: true, read: 'landed — exit 0' } : { landed: false, read: 'pending — exit 1' };
+  };
+  const listed = [
+    { phase: 2, step: STEP_BROWSER }, { phase: 3, step: STEP_APPROVAL }, { phase: 3, step: STEP_BARE },
+  ] as never[];
+  const prelude = await preludeFor('demo', {}, deps({ humanSteps: async () => listed, probeStep }));
+  assert.equal(peak, 2, 'both proofs were out at the same time — the door does not probe one by one');
+  assert.deepEqual(asked.sort(), [STEP_APPROVAL.proof, STEP_BROWSER.proof].sort(), 'a step with no proof runs nothing');
+  const [browser, approval, bare] = prelude.humanSteps;
+  assert.equal(browser!.state, 'pre-cleared');
+  assert.deepEqual(browser!.open, { command: 'vercel login' });
+  assert.equal(approval!.state, 'needed');
+  assert.deepEqual(approval!.open, { url: STEP_APPROVAL.open }, 'an http(s) open value is a link to open');
+  assert.equal(approval!.read, 'pending — exit 1');
+  assert.equal(approval!.windowMinutes, 2880);
+  assert.equal(bare!.state, 'unchecked', 'no proof: only a person can say');
+  const verdict = prelude.probes['human-steps'];
+  assert.equal(verdict.ok, true);
+  assert.match(verdict.reason, /this run will need you 2 times \(1 more pre-cleared at the door\)/);
+  assert.equal(verdict.warnings?.length, 2);
+  assert.deepEqual(prelude.blocking, [], 'a person\'s turn is an ask at the door, never a refused start');
+  // It rides the stored manifest like every other probe.
+  assert.equal(resolvedManifest(prelude).probes['human-steps']?.status, 'ok');
+});
+
+test('the launch door: nothing declared skips; a probe that throws leaves the step unchecked, never blocking', async () => {
+  const none = await preludeFor('demo', {}, deps({ humanSteps: async () => [] }));
+  assert.equal(none.probes['human-steps'].status, 'skip');
+  assert.deepEqual(none.humanSteps, []);
+  const thrown = await preludeFor('demo', {}, deps({
+    humanSteps: async () => [{ phase: 2, step: STEP_BROWSER }] as never[],
+    probeStep: async () => { throw new Error('gh is not installed'); },
+  }));
+  assert.equal(thrown.humanSteps[0]!.state, 'unchecked');
+  assert.match(thrown.humanSteps[0]!.read ?? '', /could not run: gh is not installed/);
+  assert.deepEqual(thrown.blocking, []);
+  // A console with no plan in front of it (the doctor) asks nothing at all.
+  const doctor = await preludeFor('demo', {}, deps());
+  assert.equal(doctor.probes['human-steps'].status, 'skip');
 });

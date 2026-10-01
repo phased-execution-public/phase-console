@@ -62,6 +62,14 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
     "## Outstanding / blockers"; do
     assert_contains "$body" "$section"
   done
+  # Until the session writes what the phase did, the scaffold is not finished
+  # work, and the validator says so by name (#46)…
+  run pe_validate demo
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "handoff-scaffold-complete"
+  # …and once it has, the scaffold's sections are all the validator wants.
+  local f="$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md"
+  awk '{ print } /^## What this phase did/ { print "The root builds." }' "$f" > "$f.new" && mv "$f.new" "$f"
   run pe_validate demo
   [ "$status" -eq 0 ]
   assert_contains "$output" "VALIDATE OK"
@@ -85,8 +93,11 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
 
 @test "new-handoff: a note written into the scaffolded section is collected by --notes" {
   pe_newho demo 1 root complete >/dev/null
-  # Written the way a finishing session writes it: appended under the heading.
+  # Written the way a finishing session writes it: appended under the heading —
+  # with the body written too, since only a FINISHED handoff's notes are read
+  # and a scaffold whose "What this phase did" is empty is not finished (#46).
   awk '
+    /^## What this phase did/ { print; print "The root builds."; next }
     /^## Notes for later phases/ { print; print ""; print "- **Phase 2:** the parser is the left half'"'"'s."; next }
     { print }
   ' "$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md" > "$BATS_TEST_TMPDIR/h" \
@@ -106,11 +117,23 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   pe_newho demo 1 root complete >/dev/null
   local body; body="$(handoff phase-01-root.md)"
   # Phase 1 unblocks 2 and 3 — both, and neither collapsed into "the next one".
-  assert_contains "$body" "### Phase 2"
-  assert_contains "$body" "### Phase 3"
-  assert_contains "$body" "start Phase 2 in this fresh session"
-  assert_contains "$body" "start Phase 3 in this fresh session"
+  # A fan-out writes the shared boot ONCE and a block per phase (#115); the
+  # composition itself is pinned in handoff-fanout.bats.
+  assert_contains "$body" "### Phase 2 — Left"
+  assert_contains "$body" "### Phase 3 — Right"
+  assert_contains "$body" "start Phase <N> in this fresh session"
+  [ "$(printf '%s\n' "$body" | grep -c '^Waiting without polling')" -eq 1 ]
   refute_contains "$body" "{{NEXT_PROMPTS}}"
+}
+
+@test "new-handoff: one unblocked phase still gets its whole prompt, and names this handoff to read" {
+  cp "$PE_DIR/tests/fixtures/plans/linear.md" "$DOCS_ROOT/docs/plans/demo.md"
+  pe_newho demo 1 alpha complete >/dev/null
+  local body; body="$(handoff phase-01-alpha.md)"
+  assert_contains "$body" "start Phase 2 in this fresh session"
+  # The file lands last, but it is the first thing phase 2 reads (#115).
+  assert_contains "$body" "- docs/handoffs/demo/phase-01-alpha.md"
+  refute_contains "$body" "boot-shared"
 }
 
 @test "new-handoff: the final phase gets the closeout, not a boot prompt" {
@@ -121,6 +144,41 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   assert_contains "$body" "🏁 Final phase — closeout"
   assert_contains "$body" "End-to-end verification"
   refute_contains "$body" "start Phase"
+}
+
+@test "new-handoff: the closeout writes the plan's \`complete\` LAST — after the end-to-end verification and the all-done check (#153)" {
+  # `complete` is the word every reader acts on, so it is written only once
+  # every line before it ran green. The closeout used to open with "Set
+  # `status: complete`" and only then say "Run §End-to-end verification" —
+  # the order a finishing session follows, and the order the board then reads.
+  pe_newho demo 4 merge complete >/dev/null
+  local f="$DOCS_ROOT/docs/handoffs/demo/phase-04-merge.md"
+  local verify alldone flip
+  verify="$(grep -n 'End-to-end verification' "$f" | head -1 | cut -d: -f1)"
+  alldone="$(grep -n 'Confirm every phase is' "$f" | head -1 | cut -d: -f1)"
+  flip="$(grep -nF 'status: complete` in `docs/plans/demo.md' "$f" | head -1 | cut -d: -f1)"
+  [ -n "$verify" ]
+  [ -n "$alldone" ]
+  [ -n "$flip" ]
+  [ "$flip" -gt "$verify" ]
+  [ "$flip" -gt "$alldone" ]
+  # …and the line says why: a line not run is not a line green.
+  assert_contains "$(sed -n "${flip}p" "$f")" "owed, deferred or skipped"
+}
+
+@test "new-handoff: the batching hint is a person's — the console runs one phase per session (#153)" {
+  # A fan-out (the diamond's root unblocks 2 and 3)…
+  pe_newho demo 1 root complete >/dev/null
+  local body; body="$(handoff phase-01-root.md)"
+  assert_contains "$body" "The console runs one phase per session"
+  assert_contains "$body" "driving by hand"
+  # …and a lone next phase, sequential on this one: neither offers a supervised
+  # session another phase to continue into.
+  cp "$PE_DIR/tests/fixtures/plans/linear.md" "$DOCS_ROOT/docs/plans/lin.md"
+  pe_newho lin 1 alpha complete >/dev/null
+  body="$(cat "$DOCS_ROOT/docs/handoffs/lin/phase-01-alpha.md")"
+  assert_contains "$body" "The console runs one phase per session"
+  assert_contains "$body" "driving by hand"
 }
 
 @test "new-handoff: it refuses to overwrite, and --force repairs" {
@@ -137,12 +195,49 @@ handoff() { cat "$DOCS_ROOT/docs/handoffs/demo/$1"; }
   [ "$(grep -c 'phase-01-root.md' "$DOCS_ROOT/docs/handoffs/demo/INDEX.md")" -eq 1 ]
 }
 
-@test "new-handoff: status defaults to complete, and the board reads it back" {
+@test "new-handoff: status defaults to complete — and the board waits for the body before it reads it back" {
   pe_newho demo 1 root >/dev/null
   assert_contains "$(handoff phase-01-root.md)" "status: complete"
+  # An empty scaffold is not finished work (#46): nothing it unblocks is ready
+  # yet, and the lint names why.
+  run pg demo --ready
+  [ -z "$output" ]
+  run pg demo --lint
+  [ "$status" -ne 0 ]
+  assert_contains "$output" "handoff-scaffold-complete"
+  # The session writes what the phase did: now the board reads it done.
+  local f="$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md"
+  awk '{ print } /^## What this phase did/ { print "The root builds; two branches can start." }' "$f" > "$f.new" && mv "$f.new" "$f"
   run pg demo --ready
   assert_contains "$output" "2"
   assert_contains "$output" "3"
+  run pg demo --lint
+  refute_contains "$output" "handoff-scaffold-complete"
+}
+
+@test "new-handoff: --force … complete writes the body first and flips status last — a repair cut off never reads complete" {
+  pe_newho demo 1 root blocked >/dev/null
+  local dir="$DOCS_ROOT/docs/handoffs/demo"
+  # Cut the repair off after the body is written and before the flip: the
+  # INDEX refuses the row it will try to add.
+  grep -v 'phase-01-root.md' "$dir/INDEX.md" > "$dir/INDEX.tmp" && mv "$dir/INDEX.tmp" "$dir/INDEX.md"
+  chmod 444 "$dir/INDEX.md"
+  run pe_newho demo 1 root complete --force
+  chmod 644 "$dir/INDEX.md"
+  [ "$status" -ne 0 ]
+  assert_contains "$(handoff phase-01-root.md)" "status: blocked"
+  assert_contains "$(handoff phase-01-root.md)" "## ▶ Start next phase"
+  refute_contains "$(handoff phase-01-root.md)" "{{NEXT_PROMPTS}}"
+  # No draft is left behind for a reader to find.
+  [ -z "$(ls "$dir" | grep -F '.draft.' || true)" ]
+
+  # Uninterrupted, the same repair ends on the flip.
+  run pe_newho demo 1 root complete --force
+  [ "$status" -eq 0 ]
+  assert_contains "$(handoff phase-01-root.md)" "status: complete"
+  # The flip keeps the frontmatter line's comment and touches no other line.
+  [ "$(grep -c '^status:' "$dir/phase-01-root.md")" -eq 1 ]
+  assert_contains "$(grep '^status:' "$dir/phase-01-root.md")" "# complete | in-progress"
 }
 
 @test "new-handoff: with QA off no test-status.md is created" {

@@ -39,7 +39,7 @@
  * `HALT_KIND_SITUATION` is total over `HALT_KINDS` because a halt kind with no
  * situation is a stop nothing can classify, and the classifier's fallback for
  * one is `unknown` — which reads to a person as "the console has no idea",
- * from a console that has a twenty-five-word table saying exactly what happened.
+ * from a console that has a twenty-nine-word table saying exactly what happened.
  *
  * `inboxKind: null` is a real answer and means **raise nothing**: `superseded`
  * and `work-in-progress` are the board and a live session doing their jobs.
@@ -239,11 +239,20 @@ export const HALT_KIND_SITUATION = Object.freeze({
   'waiting-external-timeout': 'waiting-external',
   /** A declared ask for a person is a declared block — the sub-kind carries the flavour. */
   'needs-human': 'blocked-declared',
+  /** A plan held for a person's Approve (control-tower phase 11): a declared block, declared by the console. */
+  'plan-approval': 'blocked-declared',
   /** A card a person did not answer is the same block, standing longer: the question is the ask. */
   'awaiting-person': 'blocked-declared',
   'plan-lint': 'plan-broken',
   'plan-unreadable': 'plan-broken',
   'verification-preflight': 'plan-broken',
+  /**
+   * A §Verification its clock cut twice (control-tower phase 83, #95). Not
+   * `verify-red` — nothing failed — and not `plan-broken`: whether the limit is
+   * too short or the suite hangs is a person's to judge, and `unknown`'s empty
+   * rung list hands it to them at once instead of a session nothing would help.
+   */
+  'verify-timeout': 'unknown',
   'mcp-preflight': 'mcp-unavailable',
   budget: 'resource-wall',
   'models-exhausted': 'resource-wall',
@@ -275,6 +284,14 @@ export const HALT_KIND_SITUATION = Object.freeze({
   'operator-stop': 'superseded',
   /** The run's own credential refused — a wall, and the classifier's `auth` sub-kind names it. */
   'credential-refused': 'resource-wall',
+  /** The run's account answers another identity now (control-tower phase 91): the same resource, a person's choice. */
+  'identity-changed': 'resource-wall',
+  /**
+   * The run's own checkout refused (control-tower phase 90). No rung the
+   * ladder knows repairs a checkout — the errand's Repair checkout press or
+   * Drop isolation does — so the honest word, like `worktree-merge`'s.
+   */
+  'isolation-refused': 'unknown',
 });
 
 /**
@@ -364,4 +381,11 @@ export const INBOX_KIND_SOURCE = Object.freeze({
   // ledger — no situation raises either.
   'issue-draft': 'independent',
   message: 'independent',
+  // What the console's supervisor holds standing (control-tower phase 101) is
+  // raised by its own detect → remedy pass over the run table. No situation
+  // raises it.
+  supervisor: 'independent',
+  // A person's turn (control-tower phase 41) is read straight off the
+  // human-step ledger — the step is its own fact, and no situation raises it.
+  'human-step': 'independent',
 });

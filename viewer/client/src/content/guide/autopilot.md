@@ -89,8 +89,8 @@ always offers a way forward.
 
 ## Every warning carries its remedy
 
-A dashboard that lists problems and offers nothing is a dashboard you stop reading. Each card under
-**Waiting on you** carries the verb that answers it, and each verb works out what it needs rather
+A page that lists problems and offers nothing is a page you stop reading. Each card in the Tower's
+**Needs you** bay carries the verb that answers it, and each verb works out what it needs rather
 than asking you to retype it.
 
 | The card | The verb beside it |
@@ -169,7 +169,7 @@ person's Start, Retry or Continue is never refused by it.
 
 When every rung is spent, or the situation was yours from the start, the phase is parked with
 **one errand**: what is needed, how to give it, what was already tried. That card is the only thing
-the dashboard's *Waiting on you* shows besides permission cards and sign-ins — a halted run with no
+the Tower's **Needs you** bay shows besides permission cards and sign-ins — a halted run with no
 errand is the loop's to climb, not yours to stare at. Do the errand, then press **Recover &
 continue**: the board is re-read, what the errand settled stands down, and the run carries on.
 

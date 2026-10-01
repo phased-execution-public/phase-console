@@ -42,6 +42,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { count } from './counters.ts';
 import { gitTraceDir, gitTraceEnv } from './git-trace.ts';
 import { log } from './log.ts';
+import { groupSignal } from './runner/signals.ts';
 import { envCarrier } from './trace.ts';
 
 /**
@@ -95,6 +96,12 @@ const DEFAULT_KEEP = 64 * 1024;
 /** What rides the log line — much smaller than what the caller gets back. */
 const LINE_TAIL = 2 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
+/**
+ * How long a group killed at its ceiling gets to close its pipes before the
+ * seam answers without them. SIGKILL is not refusable, so this is only ever
+ * spent on a process the kernel cannot end yet.
+ */
+const CLOSE_GRACE_MS = 500;
 
 /**
  * Keep the first and last `keep/2` bytes, and say how much went missing.
@@ -191,15 +198,23 @@ export async function shell(file: string, argv: readonly string[], options: Shel
   // is the one that says what went wrong.
   const err = new BoundedCapture(keep);
 
+  const ceiling = options.timeout ?? DEFAULT_TIMEOUT_MS;
   const run = await new Promise<ShellRun>((resolve) => {
     let settled = false;
     let timedOut = false;
-    let child: ChildProcess;
+    let child: ChildProcess | undefined;
+    // The command's OWN exit, recorded the moment it happens. `close` waits for
+    // every holder of the pipes as well, and a grandchild the command left
+    // behind is one of them — so the exit is the command's answer and `close`
+    // is only the moment all of its output has been read.
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+    let grace: NodeJS.Timeout | undefined;
 
     const finish = (partial: Omit<ShellRun, 'stdout' | 'stderr' | 'ms' | 'truncatedBytes' | 'timedOut'>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(grace);
       resolve({
         ...partial,
         stdout: out.text(),
@@ -209,13 +224,44 @@ export async function shell(file: string, argv: readonly string[], options: Shel
         timedOut,
       });
     };
+    const answer = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (timedOut) {
+        finish({ ok: false, code: null, signal, error: new Error(`timed out after ${ceiling}ms`) });
+        return;
+      }
+      finish({ ok: code === 0, code, signal });
+    };
 
     // A timer rather than spawn's own `timeout`: we need to know that WE killed
     // it, which the option cannot tell us apart from the process dying on its own.
+    //
+    // The ceiling ends the whole JOB — the process group, through the one
+    // signal door (`runner/signals.ts`) — because killing the direct child
+    // alone left a grandchild holding the pipe, and the call (with the engine
+    // slot under it) open until that grandchild let go: 6.89x the ceiling, one
+    // lock claim for 310 s (#75, #77). And the verdict waits ONE loop pass: a
+    // starved loop delivers this timer and an exit that had already happened
+    // in the same pass, timers first, and a verdict taken inside the timer
+    // called that answer a timeout.
     const timer = setTimeout(() => {
-      timedOut = true;
-      try { child?.kill('SIGKILL'); } catch { /* already gone */ }
-    }, options.timeout ?? DEFAULT_TIMEOUT_MS);
+      setImmediate(() => {
+        if (settled) return;
+        const pid = child?.pid;
+        if (exited) {
+          // It answered before its ceiling; what still holds its pipes is
+          // something it left behind. End that, and keep the answer.
+          if (pid) groupSignal(pid, 'SIGKILL');
+          answer(exited.code, exited.signal);
+          return;
+        }
+        timedOut = true;
+        if (pid) groupSignal(pid, 'SIGKILL');
+        // `close` normally follows at once and carries the last output; a
+        // process the kernel cannot kill yet (a `du` in uninterruptible disk
+        // sleep) must not hold the call, so the seam answers without it.
+        grace = setTimeout(() => answer(null, 'SIGKILL'), CLOSE_GRACE_MS);
+      });
+    }, ceiling);
 
     try {
       child = spawn(file, [...argv], {
@@ -232,6 +278,9 @@ export async function shell(file: string, argv: readonly string[], options: Shel
           ...envCarrier(),
         },
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Its own process group, so the ceiling can address everything it
+        // started (`-pid`). Nothing reads a terminal here: stdin is ignored.
+        detached: true,
       });
     } catch (error) {
       finish({ ok: false, code: null, signal: null, error: error as Error });
@@ -241,18 +290,8 @@ export async function shell(file: string, argv: readonly string[], options: Shel
     child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
     child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
     child.on('error', (error) => finish({ ok: false, code: null, signal: null, error }));
-    child.on('close', (code, signal) => {
-      if (timedOut) {
-        finish({
-          ok: false,
-          code: null,
-          signal,
-          error: new Error(`timed out after ${options.timeout ?? DEFAULT_TIMEOUT_MS}ms`),
-        });
-        return;
-      }
-      finish({ ok: code === 0, code, signal });
-    });
+    child.on('exit', (code, signal) => { exited = { code, signal }; });
+    child.on('close', (code, signal) => answer(code, signal));
   });
 
   record(file, argv, options, run);

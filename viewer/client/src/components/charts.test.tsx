@@ -4,7 +4,7 @@
  * The property under test is the one the port exists to establish: **a chart
  * cannot be painted a colour the design system does not have.** The legacy
  * charts took a `color` string per segment and every call site passed
- * `var(--line-…)` by hand — which worked, and would equally have accepted
+ * a `var(--…)` token by hand — which worked, and would equally have accepted
  * `#ff0000`. Here the palette is a closed set of tone names, so the guard is a
  * scan of the rendered output for any literal colour at all.
  *
@@ -242,10 +242,10 @@ describe('the charts as charts', () => {
     // `var(--status-${state})` would interpolate an undeclared property for a
     // new engine word and paint the segment invisible — which reads as "this
     // phase does not exist" rather than "we do not know what this is". The
-    // vocabulary's unknown state is `waiting`: never amber, never green.
+    // status model's first-class Unknown paints `skipped`: never amber, never green.
     const { container } = render(<RouteStrip phases={[{ phase: 1, state: 'quantum-superposition' }]} />);
     const segment = container.querySelector<HTMLElement>('[title^="P1"]')!;
-    expect(segment.style.background).toBe(toneVar('waiting'));
+    expect(segment.style.background).toBe(toneVar('skipped'));
   });
 
   it('gives a strip one segment per phase and names the progress', () => {
@@ -303,7 +303,7 @@ describe('the charts as charts', () => {
     // Same fallback the route strip makes: the unknown state says "we do not
     // know what this is", where an interpolated `var(--status-<new word>)`
     // would say nothing at all by painting the segment invisible.
-    expect(container.querySelector<HTMLElement>('[title^="P3"]')!.style.background).toBe(toneVar('waiting'));
+    expect(container.querySelector<HTMLElement>('[title^="P3"]')!.style.background).toBe(toneVar('skipped'));
   });
 
   it('reads a run phase with the runner vocabulary, not the plan one', () => {
@@ -323,14 +323,10 @@ describe('the charts as charts', () => {
     const fills = [...container.querySelector('[role="img"]')!.children].map(
       (c) => (c as HTMLElement).style.background,
     );
-    // `parked` is a queue of questions, not a failure — it needs a person,
-    // never red; `awaiting-verification` likewise; `skipped` is its own word.
-    expect(fills).toEqual([
-      toneVar('failed'),
-      toneVar('needs-you'),
-      toneVar('needs-you'),
-      toneVar('skipped'),
-    ]);
+    // Through the status model: `parked` is a stop, a quiet wait — amber comes
+    // from an open inbox item, never from the word — and never red;
+    // `awaiting-verification` asks for a person's sign-off; `skipped` is its own word.
+    expect(fills).toEqual([toneVar('failed'), toneVar('waiting'), toneVar('needs-you'), toneVar('skipped')]);
   });
 
   it('counts a run strip by what actually finished', () => {

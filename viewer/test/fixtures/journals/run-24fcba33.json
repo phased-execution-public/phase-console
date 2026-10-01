@@ -1,0 +1,79 @@
+{
+  "_fixture": "The #16 sequence, rebuilt with neutral names: a rung the heal opened for phase 5 while a same-scope sibling (phase 6) held the grant, and the park that withdrew the queue before phase 5 ever spawned. Phase 5's record never moved past `pending` and carries no `attemptStartedAt` — the proof that no attempt happened — yet the rung settled `failed` (\"the record reads pending\"), exhausting the one-rung `never-started` table and leaving an errand that outlived the condition. Read directly by void-rung.test.ts; it sits outside a slug directory on purpose, so the corpus readers in journal-fixture.ts do not sweep it into the measured-corpus gates.",
+  "id": "24fcba33",
+  "slug": "storefront-audit-remediation",
+  "root": "/home/operator/work/hub",
+  "status": "parked",
+  "autonomy": "keep-going",
+  "model": "opus[1m]",
+  "effort": "max",
+  "qaMaxRounds": 5,
+  "phaseBudgetUsd": null,
+  "runBudgetUsd": null,
+  "spentUsd": 41.8823,
+  "maxConsecutiveFailures": 2,
+  "consecutiveFailures": 0,
+  "autoRecover": true,
+  "createdAt": "2026-09-20T09:14:02.118Z",
+  "updatedAt": "2026-09-20T15:17:57.512Z",
+  "activePhase": null,
+  "child": null,
+  "waitUntil": null,
+  "halt": {
+    "at": "2026-09-20T15:16:10.904Z",
+    "reason": "phase 6 needs you — the storefront deploy key is not on this machine",
+    "phase": 6,
+    "kind": "blocked-declared"
+  },
+  "phases": {
+    "4": {
+      "phase": 4,
+      "status": "parked",
+      "attemptStartedAt": "2026-09-20T13:58:41.002Z",
+      "declared": {
+        "status": "needs-human",
+        "reason": "the storefront deploy key is not on this machine",
+        "at": "2026-09-20T14:45:05.331Z"
+      },
+      "note": "declared needs-human"
+    },
+    "5": {
+      "phase": 5,
+      "status": "pending",
+      "note": "the run was stopped while this phase waited for its scope"
+    },
+    "6": {
+      "phase": 6,
+      "status": "parked",
+      "attemptStartedAt": "2026-09-20T14:46:56.771Z",
+      "declared": {
+        "status": "needs-human",
+        "reason": "the storefront deploy key is not on this machine",
+        "at": "2026-09-20T15:16:10.904Z"
+      }
+    }
+  },
+  "recoveries": {
+    "5": {
+      "attempts": 1,
+      "lastAt": "2026-09-20T14:46:41.219Z",
+      "rungs": [
+        {
+          "situation": "never-started",
+          "rung": "reboard-fresh",
+          "at": "2026-09-20T14:46:41.219Z",
+          "outcome": "running"
+        }
+      ],
+      "errand": {
+        "phase": 5,
+        "situation": "never-started",
+        "at": "2026-09-20T15:17:57.456Z",
+        "tried": ["reboard-fresh → failed"],
+        "need": "The phase to be run — it never started and the ladder could not board it.",
+        "how": "Press Retry, or boot it by hand from its boot prompt.",
+        "decisionKey": "budgets"
+      }
+    }
+  }
+}

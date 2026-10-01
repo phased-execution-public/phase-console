@@ -31,36 +31,45 @@
  * fact gets.
  */
 
-import { AlertTriangle, Lock } from 'lucide-react';
-import { Chip, Progress, StateChip, StatusBadge } from '@/components/ui';
+import { AlertTriangle, Hand, Lock } from 'lucide-react';
+import { PlanStatusBadge, ViewBadge, type WordOf } from '@/components/ui/status';
+import { Badge, Progress } from '@/components/ui';
 import { closedTitle } from '@/lib/closure';
 import { cn } from '@/lib/cn';
 import { planHref } from '@shared/routes.js';
-import { FOCUS_KEYS, nowHref } from '@/app/routes';
-import { runStatusTitle, runUiState } from '@/lib/status-vocab';
+import { progressReading } from '@shared/plan-vocab.js';
+import { runsBayHref } from '@/app/routes';
+import { runStatusTitle } from '@/lib/status-vocab';
 import { concerns, type PlanRow } from './model';
 
 /* ------------------------------------------------------------------ *
  * Shared pieces
  * ------------------------------------------------------------------ */
 
-/** What the autopilot is doing to this plan, when it has ever done anything. */
+/**
+ * What the autopilot is doing to this plan, when it has ever done anything —
+ * the run's view in context (`describeRun`: a closed plan settles it, an open
+ * summons for it is amber), with the phase it is on beside it.
+ */
 export function RunChip({ row, className }: { row: PlanRow; className?: string }) {
   if (!row.run) return null;
-  const { status, activePhase } = row.run;
+  const { view, word, activePhase } = row.run;
   return (
     // `tap-area` and not a taller badge: the chip's own height is what makes a
     // card's badge row read as one line of state, and the target is the thing
     // that has to reach the floor, not the paint. It is the only route from a
     // plan card to the run it names.
-    <a href={planHref(row.slug, 'run')} className={cn('tap-area shrink-0 rounded-sm', className)}>
-      <StatusBadge
-        state={runUiState(status)}
-        label={`${status}${activePhase != null ? ` P${activePhase}` : ''}`}
-        mono
-        pulse={status === 'running'}
-        title={runStatusTitle(status)}
-      />
+    <a
+      href={planHref(row.slug, 'run')}
+      className={cn('tap-area inline-flex shrink-0 items-center gap-1 rounded-sm', className)}
+    >
+      <ViewBadge view={view} pulse={word === 'running'} title={runStatusTitle(word)} />
+      {activePhase != null && (
+        <>
+          {' '}
+          <span className="font-mono text-2xs tabular-nums text-ink-muted">P{activePhase}</span>
+        </>
+      )}
     </a>
   );
 }
@@ -75,6 +84,15 @@ export function Track({ row, className }: { row: PlanRow; className?: string }) 
   // live work: an amber "ready" notch on an abandoned plan is the track saying
   // "this one could move today", which is the single thing closure denies. What
   // is left reads as unlaid grey — which is exactly what it is.
+  // A board the engine could not read is unknown (#96), never a bar at 0 %.
+  const reading = progressReading(row);
+  if (!reading.known) {
+    return (
+      <span className={cn('font-mono text-2xs text-warn', className)} title={reading.title}>
+        {reading.text}
+      </span>
+    );
+  }
   const live = !row.isClosed;
   return (
     <Progress
@@ -112,20 +130,22 @@ export function repoLabel(repos: string[]): { text: string; title: string } {
  * Non-terminal words (`proposal`, `backlog`) keep the plain rendering.
  */
 export function ClosedChip({ row }: { row: PlanRow }) {
+  // PAINTED, since control-tower phase 23: the plan vocabulary's own badge, so
+  // a status line nobody knows draws as Unknown instead of as a grey word.
   if (!row.isClosed) {
     return (
-      <Chip title={"The plan's own frontmatter status — set by hand when a plan is finished or shelved."}>
-        {row.status}
-      </Chip>
+      <span title={"The plan's own frontmatter status — set by hand when a plan is finished or shelved."}>
+        <PlanStatusBadge status={row.status as WordOf<'plan'>} />
+      </span>
     );
   }
   return (
     // `PlanRow` already carries `status`, `closedOn` and `closedReason`, which
     // is all `closedTitle` reads — no adapter needed.
-    <Chip title={closedTitle(row)}>
+    <span title={closedTitle(row)} className="inline-flex items-center gap-1 text-ink-faint">
       <Lock size={11} className="shrink-0" aria-hidden />
-      {row.status}
-    </Chip>
+      <PlanStatusBadge status={row.status as WordOf<'plan'>} />
+    </span>
   );
 }
 
@@ -142,15 +162,17 @@ export function ClosedChip({ row }: { row: PlanRow }) {
 export function ConcernChip({ row }: { row: PlanRow }) {
   const [worst] = concerns(row).filter((concern) => concern.key !== 'needs-you');
   if (!worst) return null;
+  // A caution asks nothing of a person, so it is never amber: red for what is
+  // broken, the quiet neutral for what is merely worth knowing (6.0).
   return (
-    <Chip tone={worst.tone === 'bad' ? 'bad' : 'warn'} className="min-w-0 max-w-full">
+    <Badge tone={worst.tone === 'bad' ? 'bad' : 'neutral'} className="min-w-0 max-w-full">
       {worst.tone === 'bad' ? (
         <AlertTriangle size={11} className="shrink-0" aria-hidden />
       ) : (
         <Lock size={11} className="shrink-0" aria-hidden />
       )}
       <span className="truncate">{worst.text}</span>
-    </Chip>
+    </Badge>
   );
 }
 
@@ -167,15 +189,14 @@ export function ConcernChip({ row }: { row: PlanRow }) {
  */
 export function NeedsYouChip({ row }: { row: PlanRow }) {
   if (!row.needsYou) return null;
+  // A summons — open inbox items waiting on a person — and so the one amber on
+  // the row (`accent` IS the needs-you paint).
   return (
-    <a href={nowHref(FOCUS_KEYS.inbox)} className="tap-area shrink-0 rounded-sm">
-      <StateChip
-        state="stuck"
-        board
-        mono
-        label={`${row.needsYou} waiting`}
-        className="[@media(hover:none)]:min-h-(--tap-min)"
-      />
+    <a href={runsBayHref('needs-you')} className="tap-area shrink-0 rounded-sm">
+      <Badge tone="accent" mono className="[@media(hover:none)]:min-h-(--tap-min)">
+        <Hand size={11} strokeWidth={2.25} className="shrink-0" aria-hidden />
+        {row.needsYou} waiting
+      </Badge>
     </a>
   );
 }

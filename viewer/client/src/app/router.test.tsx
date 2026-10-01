@@ -56,11 +56,16 @@ describe('the route table', () => {
     }
   });
 
-  it('sends the empty hash and any unknown head to Now', () => {
-    expect(DEFAULT_HEAD).toBe('now');
-    expect(resolveHead(undefined)).toBe('now');
-    expect(resolveHead('')).toBe('now');
-    expect(resolveHead('nope')).toBe('now');
+  it('sends the empty hash and any unknown head to Runs, the home since 6.0', () => {
+    // Control-tower phase 21: the Tower answers "does anything need me?", so
+    // it is where an address that says nothing — or nothing this build knows —
+    // lands. Now is a redirect onto it.
+    expect(DEFAULT_HEAD).toBe('runs');
+    expect(resolveHead(undefined)).toBe('runs');
+    expect(resolveHead('')).toBe('runs');
+    expect(resolveHead('nope')).toBe('runs');
+    expect(ROUTE_TABLE.runs!.kind).toBe('page');
+    expect(ROUTE_TABLE.now!.kind).toBe('redirect');
   });
 });
 
@@ -77,22 +82,48 @@ describe('the aliases', () => {
   });
 
   it('carries what the old URL said with it', () => {
-    expect(redirectTarget(route('#/dashboard'))).toBe('now');
+    expect(redirectTarget(route('#/dashboard'))).toBe('#/runs');
     // The search term becomes the palette's.
-    expect(redirectTarget(route('#/search?q=cart%20api'))).toBe('#/now?k=cart+api');
+    expect(redirectTarget(route('#/search?q=cart%20api'))).toBe('#/runs?k=cart+api');
     // Both halves of a guide address survive.
-    expect(redirectTarget(route('#/guide/mobile?card=tailscale'))).toBe('#/now?help=mobile&card=tailscale');
+    expect(redirectTarget(route('#/guide/mobile?card=tailscale'))).toBe('#/runs?help=mobile&card=tailscale');
     expect(redirectTarget(route('#/stats?plan=alpha'))).toBe('insights?plan=alpha');
     // The announcements are ONE PANEL of the drawer now, and the redirect names
     // it: this address always meant the log of what was said, never the list of
     // what is still waiting, and letting the drawer's own default decide would
     // have quietly changed what the old link opens.
-    expect(redirectTarget(route('#/notifications'))).toBe('#/now?bell=1&panel=announcements');
-    // Phase 8: the departures board and the Pulse are two SECTIONS of Now, so
-    // each keeps its meaning in `?focus=` rather than landing on the top of a
-    // page that answers four questions.
-    expect(redirectTarget(route('#/ready'))).toBe('#/now?focus=next');
-    expect(redirectTarget(route('#/pulse'))).toBe('#/now?focus=lanes');
+    expect(redirectTarget(route('#/notifications'))).toBe('#/runs?bell=1&panel=announcements');
+    // The departures board and the Pulse were two SECTIONS of Now (phase 8),
+    // and each is a BAY of the Tower now (6.0): the address keeps its meaning
+    // in `?bay=` — the same translation `#/now?focus=` takes, in one hop.
+    expect(redirectTarget(route('#/ready'))).toBe('#/runs?bay=ready');
+    expect(redirectTarget(route('#/pulse'))).toBe('#/runs?bay=live');
+  });
+
+  it('lands Now on the Tower, each band on the bay that answers its question (6.0)', () => {
+    // Control-tower phase 21: Now's bands were absorbed into the Tower by phase
+    // 20, so its address becomes the Tower's and its `?focus=` becomes the bay
+    // that holds the same things. Push payloads minted by older servers carry
+    // `#/now` (the digest) and `#/ready`; both still land where they meant.
+    expect(redirectTarget(route('#/now'))).toBe('#/runs');
+    expect(redirectTarget(route('#/'))).toBeNull(); // the empty hash is the default head, not a redirect
+    expect(redirectTarget(route('#/now?focus=inbox'))).toBe('#/runs?bay=needs-you');
+    expect(redirectTarget(route('#/now?focus=lanes'))).toBe('#/runs?bay=live');
+    expect(redirectTarget(route('#/now?focus=next'))).toBe('#/runs?bay=ready');
+    // The fourth band was the plans in flight — Plans answers that one.
+    expect(redirectTarget(route('#/now?focus=plans'))).toBe('#/plans');
+    // A focus this build never had is ignored, never guessed at.
+    expect(redirectTarget(route('#/now?focus=portfolio'))).toBe('#/runs');
+    // An overlay rides along: `?k=`, `?help=` and `?bell=` sit ON a page, and
+    // the page they sat on moved.
+    expect(redirectTarget(route('#/now?k=cart'))).toBe('#/runs?k=cart');
+    expect(redirectTarget(route('#/now?focus=inbox&bell=1&panel=inbox'))).toBe(
+      '#/runs?bay=needs-you&bell=1&panel=inbox',
+    );
+    expect(redirectTarget(route('#/now?focus=plans&help=run'))).toBe('#/plans?help=run');
+    // The ledger's address is untouched: `?view=table` still opens it.
+    expect(redirectTarget(route('#/runs?view=table'))).toBeNull();
+    expect(redirectTarget(route('#/now?view=table'))).toBe('#/runs?view=table');
   });
 
   it('sends a retired plan TAB where it went, keeping what the address meant', () => {
@@ -110,8 +141,20 @@ describe('the aliases', () => {
     expect(redirectTarget(route('#/plan/a%2Fb/raw'))).toBe('#/plan/a%2Fb/source?view=raw');
   });
 
+  it('folds the three phase lists into views of the one table, carrying the rest of the address', () => {
+    // 6.0 (control-tower phase 23): Route, QA and Handoffs were three lists of
+    // the same phases and are views of the Phases tab. The server still mints
+    // `#/plan/:slug/route`, so that one is load-bearing.
+    expect(redirectTarget(route('#/plan/demo/route'))).toBe('#/plan/demo/phases?view=map');
+    expect(redirectTarget(route('#/plan/demo/handoffs'))).toBe('#/plan/demo/phases?view=handoffs');
+    // An open report sheet survives the move — `?report=` rides along.
+    expect(redirectTarget(route('#/plan/demo/qa?report=3%3A2'))).toBe(
+      '#/plan/demo/phases?view=qa&report=3%3A2',
+    );
+  });
+
   it('leaves a LIVE plan tab, and the phase/handoff detail routes, exactly where they are', () => {
-    for (const tail of ['route', 'phases', 'run', 'handoffs', 'source', 'phase/3', 'handoff/2']) {
+    for (const tail of ['phases', 'run', 'source', 'phase/3', 'handoff/2']) {
       expect(redirectTarget(route(`#/plan/demo/${tail}`)), tail).toBeNull();
     }
     // And the bare plan address is not a redirect either.
@@ -126,7 +169,7 @@ describe('the aliases', () => {
     // The bare one is built by `bellHref`, which mints a whole hash; the other
     // is a bare path like every other entry in the table. `navigate()` accepts
     // both, and the difference is which builder owns the URL.
-    expect(redirectTarget(route('#/notifications'))).toBe('#/now?bell=1&panel=announcements');
+    expect(redirectTarget(route('#/notifications'))).toBe('#/runs?bell=1&panel=announcements');
     expect(redirectTarget(route('#/notifications/settings'))).toBe('settings/notifications');
   });
 
@@ -145,6 +188,11 @@ describe('every old deep link still resolves', () => {
   // `routeFor` builds with an id.
   const OLD = [
     '#/',
+    '#/now',
+    '#/now?focus=inbox',
+    '#/now?focus=lanes',
+    '#/now?focus=next',
+    '#/now?focus=plans',
     '#/dashboard',
     '#/ready',
     '#/pulse',
@@ -186,8 +234,18 @@ describe('what the navigation lights up', () => {
     // light up nothing at all, because `terminal` was not a nav entry.
     expect(destinationFor('terminal')).toBe('sessions');
     expect(destinationFor('agent')).toBe('sessions');
-    expect(destinationFor('terminal')).not.toBe('now');
-    expect(destinationFor('agent')).not.toBe('now');
+    expect(destinationFor('terminal')).not.toBe('runs');
+    expect(destinationFor('agent')).not.toBe('runs');
+  });
+
+  it('lights Runs for every address Now answered, and for the empty hash', () => {
+    // Now is not a destination any more; its old heads keep a lit nav entry
+    // while their redirect runs, and it is the entry that took their questions.
+    for (const head of ['now', 'ready', 'pulse', 'dashboard', 'notifications', 'search', 'guide']) {
+      expect(destinationFor(head), head).toBe('runs');
+    }
+    expect(destinationFor(undefined)).toBe('runs');
+    expect(DESTINATIONS as readonly string[]).not.toContain('now');
   });
 
   it('retires both terminal heads into Sessions, keeping the session id', () => {
@@ -285,3 +343,4 @@ describe('?lane=pN — the third query reader, beside focus and panel', () => {
     expect(laneOf(route(href))).toBe(9);
   });
 });
+

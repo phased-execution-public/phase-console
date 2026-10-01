@@ -85,15 +85,17 @@ describe('RunSetup is the only launch form', () => {
   it('every settings patch outside the form is a ONE-TAP verb, named field by field', () => {
     // A settings PATCH is not a launch. Two surfaces make them without being a
     // second form: the run page's "clear the phase scope" and "back to
-    // Guarded", and phase 19's orchestration board, whose cards carry the
-    // queue-priority select, the advisory's one-tap apply, and the isolation
-    // drop. Both are allowed BY SHAPE, not by filename — every call's payload
-    // is written out below, so a third surface, a new field, or one of these
-    // quietly growing into a form fails this.
+    // Guarded", and the orchestration board — its advisory's one-tap apply —
+    // with its run strips (control-tower phase 19), whose expanded detail
+    // carries the queue-priority select and the isolation drop. Allowed BY
+    // SHAPE, not by filename — every call's payload is written out below, so a
+    // fourth surface, a new field, or one of these quietly growing into a form
+    // fails this.
     const others = offenders(/\bapi\.runSettings\b/, [
       'features/run-setup/run-setup.tsx',
       'features/runs/run-page.tsx',
       'features/runs/board.tsx',
+      'features/runs/tower/strip-detail.tsx',
     ]);
     expect(others).toEqual([]);
 
@@ -108,15 +110,15 @@ describe('RunSetup is the only launch form', () => {
       '{ onlyPhases: [] }',
       "{ permissionProfile: 'guarded' }",
     ]);
-    // The board's three, and each is one field. ⚠️ `isolation: 'queue'` is a
-    // DROP: isolation is one-way mid-run (phase 5 — a raise is ignored by
+    // The board's advisory: one raise, the rest levelled.
+    expect(patches('features/runs/board.tsx')).toEqual(["{ priority: 'high' }", "{ priority: 'normal' }"]);
+    // The strip's two, each one field. ⚠️ `isolation: 'queue'` is a DROP:
+    // isolation is one-way mid-run (phase 5 — a raise is ignored by
     // `applySettings` and 409s at the route), so a patch here that ever reads
     // `'worktree'` is a control that can only fail.
-    expect(patches('features/runs/board.tsx')).toEqual([
+    expect(patches('features/runs/tower/strip-detail.tsx')).toEqual([
       '{ priority: next }',
       "{ isolation: 'queue' }",
-      "{ priority: 'high' }",
-      "{ priority: 'normal' }",
     ]);
   });
 

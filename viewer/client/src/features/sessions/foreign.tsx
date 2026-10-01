@@ -39,8 +39,9 @@
 import { ExternalLink, Play, Users } from 'lucide-react';
 import { phaseHref } from '@shared/routes.js';
 import type { ForeignSession } from '@/lib/api';
-import { endedLabel, foreignVehicle, turnsLabel } from '@/features/now/model';
-import { Button, Chip, ConfirmButton, KeyValue, RelativeTime, StatusBadge, StatusDot } from '@/components/ui';
+import { endedLabel, foreignVehicle, turnsLabel } from '@/features/runs/lanes-model';
+import { Button, Badge, ConfirmButton, KeyValue, RelativeTime } from '@/components/ui';
+import { AttentionMark, OpsBadge } from '@/components/ui/status';
 
 /** The refusal the server gives for the same request — said here first, verbatim. */
 export const AGENT_FLAG_REFUSAL = 'Agent sessions are disabled. Restart with --allow-agent to enable them.';
@@ -184,18 +185,14 @@ export function ForeignSessionPage({
           <div className="flex flex-wrap items-center gap-2">
             <Users size={16} className="shrink-0 text-ink-muted" aria-hidden />
             <h1 className="font-display text-lg text-ink">{title}</h1>
-            <span className="flex items-center gap-1.5 text-sm text-ink-muted">
-              <StatusDot
-                state={ended ? 'done' : session.presence === 'live' ? 'running' : 'waiting'}
-                pulse={session.presence === 'live'}
-              />
-              {session.presence}
-            </span>
+            <OpsBadge vocab="presence" word={session.presence} pulse={session.presence === 'live'} />
             {session.waiting && (
-              <StatusBadge
-                state="needs-you"
-                label={session.waiting.kind === 'permission' ? 'needs permission' : 'needs input'}
-              />
+              <>
+                <AttentionMark level="needs-you" />
+                <span className="text-sm text-ink-muted">
+                  {session.waiting.kind === 'permission' ? 'needs permission' : 'needs input'}
+                </span>
+              </>
             )}
           </div>
           <p className="text-sm text-ink-muted">
@@ -220,7 +217,7 @@ export function ForeignSessionPage({
                   >
                     {session.plan.slug} · P{session.plan.phase}
                     <ExternalLink size={12} aria-hidden />
-                    {!session.plan.strong && <Chip>correlated by owner + clock</Chip>}
+                    {!session.plan.strong && <Badge>correlated by owner + clock</Badge>}
                   </a>,
                 ]
               : null,

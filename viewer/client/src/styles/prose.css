@@ -65,7 +65,7 @@
   .md ul,
   .md ol {
     margin: 0.7em 0;
-    padding-left: 1.35em;
+    padding-inline-start: 1.35em;
   }
   .md ul { list-style: disc; }
   .md ol { list-style: decimal; }
@@ -122,8 +122,9 @@
 
   .md blockquote {
     margin: 0.9em 0;
-    padding: 0.15em 0 0.15em 0.9em;
-    border-left: 3px solid var(--rule-strong);
+    padding: 0.15em 0;
+    padding-inline-start: 0.9em;
+    border-inline-start: 3px solid var(--rule-strong);
     color: var(--ink-faint);
   }
 
@@ -175,7 +176,7 @@
   .md td {
     border: 1px solid var(--rule);
     padding: 0.35em 0.6em;
-    text-align: left;
+    text-align: start;
     vertical-align: top;
   }
   .md th {

@@ -46,8 +46,12 @@ import {
 } from '../shared/message-model.js';
 import {
   ISSUE_MODES, DEFAULT_ISSUES, ISSUE_ACTIONS, ISSUE_STATES, ISSUE_BUDGETS,
-  ISSUE_FIELDS, issueFingerprint,
+  ISSUE_FIELDS, OPERATOR_ISSUE_SCOPE, issueFingerprint,
 } from '../shared/issues-model.js';
+import {
+  HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_OPEN_STATES, HUMAN_STEP_WHERE, HUMAN_STEP_AUTO_OPEN,
+  HUMAN_STEP_BIRTHS, HUMAN_STEP_BULLET_KEYS, KIND_META, SECRET_PATTERNS, SECRET_QUERY_KEYS, SIGN_IN_SHAPES,
+} from '../shared/human-step-model.js';
 import {
   ISOLATION_DIRECTIVES, WORKTREE_RETENTION, DEFAULT_RETENTION, WORKTREE_LOCK_PREFIXES,
   DEFAULT_ISOLATION_FOR_NEW_BRANCH, retentionOf, retentionTtlHours,
@@ -235,6 +239,37 @@ test('scripts/issues.env is issues-model.js, word for word', () => {
   assert.equal(fromBash('issues.env', 'DEFAULT_ISSUES'), DEFAULT_ISSUES);
   assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_PHASE'), String(ISSUE_BUDGETS.phase));
   assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_RUN'), String(ISSUE_BUDGETS.run));
+  // The operator door's meters and ledger scope (control-tower phase 12).
+  assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_TICKET'), String(ISSUE_BUDGETS.ticket));
+  assert.equal(fromBash('issues.env', 'ISSUE_BUDGET_OPERATOR_DAY'), String(ISSUE_BUDGETS.operatorDay));
+  assert.equal(fromBash('issues.env', 'OPERATOR_ISSUE_SCOPE'), OPERATOR_ISSUE_SCOPE);
+});
+
+test('scripts/human-steps.env is human-step-model.js, word for word (control-tower phase 41)', () => {
+  const pairs: [string, readonly string[]][] = [
+    ['HUMAN_STEP_KINDS', HUMAN_STEP_KINDS],
+    ['HUMAN_STEP_STATES', HUMAN_STEP_STATES],
+    ['HUMAN_STEP_OPEN_STATES', HUMAN_STEP_OPEN_STATES],
+    ['HUMAN_STEP_WHERE', HUMAN_STEP_WHERE],
+    ['HUMAN_STEP_AUTO_OPEN', HUMAN_STEP_AUTO_OPEN],
+    ['HUMAN_STEP_BIRTHS', HUMAN_STEP_BIRTHS],
+    ['HUMAN_STEP_BULLET_KEYS', HUMAN_STEP_BULLET_KEYS],
+    ['HUMAN_STEP_SECRET_PATTERNS', SECRET_PATTERNS],
+    ['HUMAN_STEP_SECRET_QUERY_KEYS', SECRET_QUERY_KEYS],
+  ];
+  for (const [name, list] of pairs) {
+    const bash = fromBash('human-steps.env', name);
+    assert.ok(bash.length > 0, `${name}: bash read an empty list — a typo in human-steps.env`);
+    assert.equal(bash, list.join(' '), `${name} drifted between human-steps.env and human-step-model.js`);
+  }
+  // Every shape holds a space, so the bash twin keeps them `|`-separated.
+  assert.equal(fromBash('human-steps.env', 'SIGN_IN_SHAPES'), SIGN_IN_SHAPES.join('|'), 'SIGN_IN_SHAPES drifted');
+  // KIND_META's default `where`, as bash's `kind:where` pairs, in the kinds' order.
+  assert.equal(
+    fromBash('human-steps.env', 'HUMAN_STEP_DEFAULT_WHERE'),
+    HUMAN_STEP_KINDS.map((kind) => `${kind}:${KIND_META[kind].where}`).join(' '),
+    'HUMAN_STEP_DEFAULT_WHERE drifted from KIND_META',
+  );
 });
 
 test('every key the readers look for is present in each new .env', () => {
@@ -250,6 +285,11 @@ test('every key the readers look for is present in each new .env', () => {
       'MESSAGE_STATES', 'MESSAGE_VIAS', 'MESSAGE_REFUSALS', 'MESSAGING_WORDS', 'DEFAULT_MESSAGING',
     ],
     'issues.env': ['ISSUE_MODES', 'DEFAULT_ISSUES', 'ISSUE_ACTIONS', 'ISSUE_STATES', 'ISSUE_FIELDS'],
+    'human-steps.env': [
+      'HUMAN_STEP_KINDS', 'HUMAN_STEP_STATES', 'HUMAN_STEP_OPEN_STATES', 'HUMAN_STEP_WHERE', 'HUMAN_STEP_AUTO_OPEN',
+      'HUMAN_STEP_BIRTHS', 'HUMAN_STEP_BULLET_KEYS', 'HUMAN_STEP_DEFAULT_WHERE', 'HUMAN_STEP_SECRET_PATTERNS',
+      'HUMAN_STEP_SECRET_QUERY_KEYS', 'SIGN_IN_SHAPES',
+    ],
   };
   for (const [file, keys] of Object.entries(wanted)) {
     const text = readFileSync(join(SCRIPTS, file), 'utf8');
@@ -305,7 +345,8 @@ test('an issue fingerprint is stable, and different issues differ', () => {
   assert.equal(issueFingerprint(draft), issueFingerprint({ ...draft, body: 'a different body' }),
     'the BODY is not part of the identity — a session rewording the same finding must dedupe');
   assert.match(issueFingerprint(draft), /^[0-9a-f]{12}$/, 'a short hex digest, like a ruling id');
-  assert.deepEqual(ISSUE_BUDGETS, { phase: 3, run: 10 }, 'the option table names these numbers');
+  // The operator door's two meters joined in control-tower phase 12 (#30).
+  assert.deepEqual(ISSUE_BUDGETS, { phase: 3, run: 10, ticket: 1, operatorDay: 10 }, 'the option table names these numbers');
 });
 
 test('worktree retention reads its words and its ttl', () => {

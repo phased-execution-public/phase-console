@@ -56,6 +56,14 @@ export type ProbeOptions = {
    */
   startedAt?: string | number | Date;
   /**
+   * How far apart `startedAt` and the kernel's start time may be — default
+   * `START_SLACK_MS`, sized for a timestamp taken AROUND a spawn. A caller
+   * whose `startedAt` was itself read off `ps -o lstart=` (the session
+   * registry, #73) compares one kernel value with itself and passes a second
+   * or two: a short-lived process's recycled pid is otherwise inside the slack.
+   */
+  slackMs?: number;
+  /**
    * What the caller believes it started, matched against `ps -o comm=`.
    * A mismatch means the pid was recycled and the answer is `gone`.
    */
@@ -310,7 +318,7 @@ function judge(sample: Sample, options: ProbeOptions): ProcessState {
     const claimed = typeof raw === 'number' ? raw
       : raw instanceof Date ? raw.getTime()
       : Date.parse(String(raw));
-    if (Number.isFinite(claimed) && Math.abs(claimed - sample.startedMs) > START_SLACK_MS) return 'gone';
+    if (Number.isFinite(claimed) && Math.abs(claimed - sample.startedMs) > (options.slackMs ?? START_SLACK_MS)) return 'gone';
   }
   return sample.state;
 }
@@ -428,6 +436,20 @@ export function pidHoldsWork(pid: number, options?: ProbeOptions): boolean {
  * "it is using nothing" are different facts and this returns the first as
  * absence, which is the same posture the rest of this file takes.
  */
+/**
+ * When the kernel says this pid's process started, from a FRESH sample — or
+ * null when nothing sampled it lately (`warmPids` fills the cache). The half of
+ * the `(pid, start-time)` identity a caller can RECORD, so a later probe can
+ * tell the same process from a stranger holding its recycled pid. Fresh only,
+ * because an old sample of this pid may describe the process it was recycled
+ * FROM, and recording that would vouch for the wrong one.
+ */
+export function processStartedMs(pid: number): number | null {
+  const sample = cache.get(pid);
+  if (!sample || Date.now() - sample.at >= CACHE_MS) return null;
+  return sample.startedMs;
+}
+
 export function processResources(pid: number): ProcessResources | null {
   const sample = cache.get(pid);
   if (!sample || sample.rss === undefined || sample.pcpu === undefined) return null;

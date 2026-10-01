@@ -39,9 +39,10 @@ import { loadGateVocab, gateKindOf } from '../server/analysis/gates.ts';
 import { parseQaRounds, parseTestStatus } from '../server/parse/folder.ts';
 import { nextQaRound } from '../server/qa-round.ts';
 import {
-  parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor,
+  parsePlan, mcpServersFor, credentialsFor, credentialPolicyFor, personCheckFor, waitBudgetFor, waitsOnFor, verifyTimeoutFor,
+  humanStepsFor, humanStepLine,
   landFor, gitlinkFor, issuesFor, isolationFor, baseBranchOf, conflictPolicyOf, messagingOf, clashZonesOf,
-  type Plan,
+  permissionModeFor, modelPolicyFor, type Plan,
 } from '../server/parse/plan.ts';
 import { mergeDecisions, formatDecisionsTsv, parseDecisionsTsv } from '../shared/decisions-model.js';
 import { readDecisions, readCredentials, readWaitBudget, readWaitsOn } from '../server/engine.ts';
@@ -97,15 +98,27 @@ type Corpus = {
  * `in-progress` and `stuck` to the corpus, so `deriveBoard`'s status reading and
  * the engine's `phase_status` are compared on all five words rather than two.
  */
-const SYNTHETIC_HANDOFFS: { slug: string; phase: number; status: string }[] = [
+const SYNTHETIC_HANDOFFS: { slug: string; phase: number; status: string; what?: 'scaffold' | 'written' | 'fenced' }[] = [
   { slug: 'linear', phase: 1, status: 'complete' },
   { slug: 'diamond', phase: 1, status: 'complete' },
   { slug: 'diamond', phase: 2, status: 'in-progress' },
   { slug: 'outoforder', phase: 1, status: 'complete' },
   { slug: 'outoforder', phase: 4, status: 'blocked' },
+  // `complete` over a "What this phase did" that is still the template reads
+  // in-progress in BOTH readers (control-tower phase 51, #46) — and the same
+  // section written, or holding only a fenced block, reads done in both.
+  { slug: 'linear', phase: 2, status: 'complete', what: 'scaffold' },
+  { slug: 'diamond', phase: 3, status: 'complete', what: 'written' },
+  { slug: 'outoforder', phase: 2, status: 'complete', what: 'fenced' },
 ];
 
-function handoffBody(slug: string, phase: number, status: string): string {
+const WHAT_IT_DID = {
+  scaffold: ['## What this phase did', '<!-- 1–3 sentences + bullets', '     of what shipped. -->', '', '## State now (verified)', 'all green', ''],
+  written: ['## What this phase did', '<!-- 1–3 sentences + bullets of what shipped. -->', 'Shipped the right half.', ''],
+  fenced: ['## What this phase did', '```', '## not a heading', '```', ''],
+};
+
+function handoffBody(slug: string, phase: number, status: string, what?: keyof typeof WHAT_IT_DID): string {
   return [
     '---',
     `plan: docs/plans/${slug}.md`,
@@ -119,6 +132,7 @@ function handoffBody(slug: string, phase: number, status: string): string {
     'Written by `viewer/test/engine-parity.test.ts` into a throwaway DOCS_ROOT so',
     'the fixture corpus exercises every board state. Never committed.',
     '',
+    ...(what ? WHAT_IT_DID[what] : []),
   ].join('\n');
 }
 
@@ -140,12 +154,12 @@ function fixtureCorpus(): Corpus & { slugs: string[]; cleanup: () => void } {
     copyFileSync(join(FIXTURES, file), join(plans, file));
     slugs.push(file.replace(/\.md$/, ''));
   }
-  for (const { slug, phase, status } of SYNTHETIC_HANDOFFS) {
+  for (const { slug, phase, status, what } of SYNTHETIC_HANDOFFS) {
     if (!slugs.includes(slug)) continue;
     const dir = join(root, 'docs', 'handoffs', slug);
     mkdirSync(dir, { recursive: true });
     const name = `phase-${String(phase).padStart(2, '0')}-synthesized.md`;
-    writeFileSync(join(dir, name), handoffBody(slug, phase, status));
+    writeFileSync(join(dir, name), handoffBody(slug, phase, status, what));
   }
   // The decision manifest's mutable twin, in the exact shape decisions.sh
   // writes, for the one fixture that carries a `## Decisions` table: a
@@ -262,7 +276,9 @@ async function forEachPlan(
 function handoffState(record: PlanRecord, phase: number): 'done' | 'in-progress' | 'stuck' | 'not-started' {
   const handoff = record.handoffs.find((h) => h.phase === phase);
   if (!handoff) return 'not-started';
-  if (handoff.status === 'complete') return 'done';
+  // A `complete` scaffold is still in progress — the parser's `scaffold` flag
+  // against the engine's `scaffold_files` (#46).
+  if (handoff.status === 'complete') return handoff.scaffold ? 'in-progress' : 'done';
   if (handoff.status === 'in-progress') return 'in-progress';
   if (handoff.status === 'blocked') return 'stuck';
   return 'not-started';
@@ -350,6 +366,63 @@ test('every plan classifies the same way as the engine', async () => {
       }
     }
   });
+});
+
+/*
+ * The 72-phase scale fixture (control-tower phase 55, #58) is kept OUT of the
+ * corpus above, in `tests/fixtures/scale/`: every directive test in this file
+ * forks the engine once per phase per flag, and its 72 phases made the file
+ * three to four times slower under load for coverage the divergence fixtures
+ * already give. What it adds is SIZE, and size is a board question — so it is
+ * read once, here: the memoised engine (one pre-parsed pass, the scaffold scan
+ * filled once in the parent shell) must classify a big plan exactly as the JS
+ * re-derivation does, on all five words. Its QA gating is held by
+ * `tests/unit/plan-read-scale.bats`, since `deriveBoard` does not model a
+ * phase's own `- **QA:**` bullet.
+ */
+test('a 72-phase plan classifies the same way as the engine — the memoised read (#58)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-parity-scale-'));
+  try {
+    mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+    copyFileSync(join(SKILL_DIR, 'tests', 'fixtures', 'scale', 'scale-72.md'), join(root, 'docs', 'plans', 'scale-72.md'));
+    const dir = join(root, 'docs', 'handoffs', 'scale-72');
+    mkdirSync(dir, { recursive: true });
+    const handoffs: [number, string, keyof typeof WHAT_IT_DID | undefined][] = [
+      ...Array.from({ length: 21 }, (_, i): [number, string, 'written'] => [i + 1, 'complete', 'written']),
+      [40, 'complete', 'written'],
+      [30, 'in-progress', undefined],
+      [31, 'blocked', undefined],
+      // A `complete` scaffold reads in-progress in both — through the scan the
+      // engine now fills once, before the per-phase subshells inherit it.
+      [50, 'complete', 'scaffold'],
+    ];
+    for (const [phase, status, what] of handoffs) {
+      writeFileSync(join(dir, `phase-${String(phase).padStart(2, '0')}-synthesized.md`), handoffBody('scale-72', phase, status, what));
+    }
+
+    const store = new Store(checkRoot(root));
+    store.scan();
+    const record = store.get('scale-72');
+    assert.ok(record?.plan?.phased, 'the scale fixture parses as a phased plan');
+    assert.equal(record.plan.graph.length, 72);
+
+    const board = readMemoryBlock(answered(
+      await run({ scriptsDir: SCRIPTS, root }, 'phase-graph.sh', ['scale-72', '--memory-block']),
+      'scale-72 --memory-block',
+    ));
+    const derived = deriveBoard(record);
+    const mismatches = record.plan.graph
+      .map((row) => row.phase)
+      .filter((phase) => derived[phase] !== board.states[phase])
+      .map((phase) => `p${phase}: JS "${derived[phase]}" vs engine "${board.states[phase]}"`);
+    assert.deepEqual(mismatches, [], `scale-72 parity mismatches:\n  ${mismatches.join('\n  ')}`);
+    const seen = new Set(Object.values(board.states));
+    for (const state of ['done', 'in-progress', 'stuck', 'ready', 'waiting'] as const) {
+      assert.ok(seen.has(state), `scale-72: no phase was ever "${state}"`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('deps, size and gated flags match the engine phase by phase', async () => {
@@ -604,6 +677,112 @@ test('the two engines agree about a phase\'s wait budget, its source, and the re
     }
     assert.deepEqual(problems, [], `${corpus.name} wait-budget mismatches:\n  ${problems.join('\n  ')}`);
     if (!corpus.live) assert.ok(carrying >= 4, 'the fixture corpus must carry the waits fixture, or this proves nothing');
+  });
+});
+
+test('the two engines agree about a phase\'s human steps, per phase and in the bare listing (control-tower phase 41)', async () => {
+  // `engine()` trims the whole stdout, which eats the empty trailing fields of
+  // the LAST step; compare line by line, each trimmed at its end.
+  const norm = (t: string) => t.split('\n').map((l) => l.trimEnd()).filter(Boolean).join('\n');
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const steps = await engine(corpus, [slug, '--human-steps', String(phase)], `${slug} p${phase} --human-steps`);
+      const js = humanStepsFor(plan, phase).map(humanStepLine).join('\n');
+      if (norm(steps) !== norm(js)) problems.push(`${slug} p${phase}: human steps JS ${JSON.stringify(js)} vs engine ${JSON.stringify(steps)}`);
+    });
+    for (const record of samplePlans(corpus)) {
+      const plan = record.plan!;
+      const all = await engine(corpus, [record.slug, '--human-steps'], `${record.slug} --human-steps`);
+      const js = plan.graph
+        .flatMap((row) => humanStepsFor(plan, row.phase).map((step) => `${row.phase}\t${humanStepLine(step)}`))
+        .join('\n');
+      if (norm(all) !== norm(js)) problems.push(`${record.slug}: bare --human-steps JS ${JSON.stringify(js)} vs engine ${JSON.stringify(all)}`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} human-step mismatches:\n  ${problems.join('\n  ')}`);
+    // The fixture spells every field, the defaults, case and bold, so the
+    // agreement above is not vacuous.
+    if (!corpus.live) {
+      const store = new Store(checkRoot(corpus.root));
+      store.scan();
+      const plan = store.get('human-steps')!.plan!;
+      assert.deepEqual(humanStepsFor(plan, 1), []);
+      // The bare listing for THIS fixture — `samplePlans` may not pick it.
+      const all = await engine(corpus, ['human-steps', '--human-steps'], 'human-steps --human-steps');
+      const js = plan.graph
+        .flatMap((row) => humanStepsFor(plan, row.phase).map((step) => `${row.phase}\t${humanStepLine(step)}`))
+        .join('\n');
+      assert.equal(norm(all), norm(js));
+      assert.equal(norm(all).split('\n').length, 7, 'seven steps across phases 2-5');
+      assert.deepEqual(humanStepsFor(plan, 2), [{
+        kind: 'browser-login', what: 'sign the gh CLI in to the org', where: 'host', open: 'gh auth login --web',
+        proof: 'cmd:"gh auth status"', windowMinutes: 2880, autoOpen: 'host',
+      }]);
+      assert.deepEqual(humanStepsFor(plan, 3).map((s) => [s.kind, s.where, s.windowMinutes]),
+        [['device-code', 'any', undefined], ['third-party-approval', 'any', 4320]]);
+      assert.equal(humanStepsFor(plan, 4)[0].credential, 'npm-token');
+      assert.equal(humanStepsFor(plan, 4)[1].proof, undefined, 'a step with no proof is still a step (F38 advises)');
+      assert.deepEqual(humanStepsFor(plan, 5).map((s) => [s.kind, s.where, s.windowMinutes, s.autoOpen]),
+        [['os-permission', 'host', 90, undefined], ['person-check', 'any', undefined, 'host']]);
+    }
+  });
+});
+
+test('the two engines agree about a phase\'s verify timeout and its source (control-tower phase 83)', async () => {
+  // The runner reads the limit through the engine (`--verify-timeout`) and the
+  // restart drain through the JS parser: a phase the runner gives 90 minutes
+  // and the drain expects in 30 is a restart that cuts a suite mid-run.
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    let carrying = 0;
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const line = await engine(corpus, [slug, '--verify-timeout', String(phase)], `${slug} p${phase} --verify-timeout`);
+      const js = verifyTimeoutFor(plan, phase);
+      const jsLine = js ? `${js.minutes}\t${js.source}` : '';
+      if (line !== jsLine) problems.push(`${slug} p${phase}: verify timeout JS "${jsLine}" vs engine "${line}"`);
+      if (js) carrying += 1;
+    });
+    for (const record of samplePlans(corpus)) {
+      const planWide = await engine(corpus, [record.slug, '--verify-timeout'], `${record.slug} --verify-timeout`);
+      const js = verifyTimeoutFor(record.plan!);
+      const jsLine = js ? `${js.minutes}\t${js.source}` : '';
+      if (planWide !== jsLine) problems.push(`${record.slug}: plan verify timeout JS "${jsLine}" vs engine "${planWide}"`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} verify-timeout mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) assert.ok(carrying >= 4, 'the fixture corpus must carry the verify-timeout fixture, or this proves nothing');
+  });
+});
+
+test('the two engines agree about a phase\'s wall-clock floor, per phase and in the bare listing', async () => {
+  // `wallClockFloorMin` is a plain field on `PhaseDetail`, not a resolved
+  // phase-over-plan value like `waitBudgetFor` above — there is no plan-wide
+  // floor to fall back to — so the JS side of the comparison is a direct read.
+  await forEachCorpus(async (corpus) => {
+    const problems: string[] = [];
+    let carrying = 0;
+    await forEachPhase(everyPhase(corpus), async ({ slug, plan, phase }) => {
+      const floor = await engine(corpus, [slug, '--floor', String(phase)], `${slug} p${phase} --floor`);
+      const js = plan.phases[phase]?.wallClockFloorMin;
+      const jsLine = js === undefined ? '' : String(js);
+      if (floor !== jsLine) problems.push(`${slug} p${phase}: floor JS "${jsLine}" vs engine "${floor}"`);
+      if (js !== undefined) carrying += 1;
+    });
+    for (const record of samplePlans(corpus)) {
+      const { slug } = record;
+      const plan = record.plan!;
+      const bare = await engine(corpus, [slug, '--floor'], `${slug} --floor`);
+      const jsLines = plan.graph
+        .map((row) => row.phase)
+        .filter((phase) => plan.phases[phase]?.wallClockFloorMin !== undefined)
+        .sort((a, b) => a - b)
+        .map((phase) => `${phase}\t${plan.phases[phase]!.wallClockFloorMin}`)
+        .join('\n');
+      if (bare !== jsLines) problems.push(`${slug}: bare --floor JS "${jsLines}" vs engine "${bare}"`);
+    }
+    assert.deepEqual(problems, [], `${corpus.name} wall-clock-floor mismatches:\n  ${problems.join('\n  ')}`);
+    if (!corpus.live) {
+      assert.ok(carrying >= 2, 'the fixture corpus must carry the wall-clock-floor fixture, or this proves nothing');
+    }
   });
 });
 
@@ -1034,6 +1213,11 @@ test('the two parsers agree about landing, isolation and issues — the word AND
     ['--gitlink', (plan, phase) => gitlinkFor(plan, phase)],
     ['--issues', (plan, phase) => issuesFor(plan, phase)],
     ['--isolation', (plan, phase) => isolationFor(plan, phase)],
+    // control-tower phase 11: the second arm that may print nothing — a plan
+    // that never names a mode leaves the question to the run's default.
+    ['--permission-mode', (plan, phase) => permissionModeFor(plan, phase)],
+    // control-tower phase 54 (#91): the third — silence leaves it to the run.
+    ['--model-policy', (plan, phase) => modelPolicyFor(plan, phase)],
   ];
   await forEachCorpus(async (corpus) => {
     const problems: string[] = [];
@@ -1065,6 +1249,8 @@ test('the two parsers agree about the plan-wide directives — base branch, conf
         ['--conflict-policy', `${conflictPolicyOf(plan).value}\t${conflictPolicyOf(plan).source}`],
         ['--messaging', `${messagingOf(plan).value}\t${messagingOf(plan).source}`],
         ['--clash-zones', clashZonesOf(plan).join(', ')],
+        ['--permission-mode', ((r) => (r ? `${r.value}\t${r.source}` : ''))(permissionModeFor(plan))],
+        ['--model-policy', ((r) => (r ? `${r.value}\t${r.source}` : ''))(modelPolicyFor(plan))],
       ];
       for (const [flag, fromJs] of cases) {
         const fromEngine = await engine(corpus, [slug, flag], `${slug} ${flag}`);
@@ -1093,6 +1279,9 @@ test('the fixture corpus is real, and covers the divergences this suite exists f
     'nested-verification.md', 'sibling-verification.md',  // both §Verification shapes
     'decisions.md', 'credentials.md',  // the decision manifest (with an undeclared gate) and the credential directives
     'landing.md', 'messaging.md', 'issues.md',  // the 5.1.0 directives: plan-only, phase-only, both, and silence
+    'permission-mode.md',         // the permission-mode line and bullets: override, a typo, camelCase in any case
+    'model-policy.md',            // the model-policy line and bullets: override, a typo, bold and case (#91)
+    'human-steps.md',             // the Human step bullet: every field, defaults, case and bold (phase 41)
   ]) {
     assert.ok(files.includes(required), `fixture ${required} is missing from the parity corpus`);
   }

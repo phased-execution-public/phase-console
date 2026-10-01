@@ -154,11 +154,15 @@ test('SEV-6 — an events log is pruned WITH its record, never left behind', () 
 });
 
 test('SEV-7 — the events file is not mistaken for a session record on load', () => {
-  const { reg, dir } = registry();
+  // The fixture's clock, not the wall's: `load()` prunes a record silent for a
+  // week, so on the real clock this fixture — dated 2026-09-18 — loaded as ZERO
+  // sessions from 2026-09-25 on, a red nothing in the code had caused (#159).
+  const now = () => new Date('2026-09-18T12:00:05.000Z');
+  const { reg, dir } = registry({ now });
   reg.ingest(hook());
 
   const warnings: string[] = [];
-  const fresh = new SessionRegistry({ dir, onWarn: (event: string) => warnings.push(event) } as never);
+  const fresh = new SessionRegistry({ dir, now, onWarn: (event: string) => warnings.push(event) } as never);
   fresh.load();
   assert.deepEqual(warnings, [], `the loader read the NDJSON as a record: ${warnings.join(', ')}`);
   assert.equal(fresh.list().length, 1, 'exactly one session, not two');

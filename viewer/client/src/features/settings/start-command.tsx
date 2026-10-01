@@ -17,7 +17,7 @@
  */
 
 import { useConsoleState } from '@/lib/queries';
-import { Card, CardBody, CardHeader, CardTitle, Chip, CopyButton } from '@/components/ui';
+import { Card, CardBody, CardHeader, CardTitle, Badge, CopyButton } from '@/components/ui';
 
 /**
  * The SEVEN capability switches, in the order every doc lists them.
@@ -133,9 +133,9 @@ export function StartCommandCard() {
             <p className="text-sm text-ink-muted">
               This console is currently missing{' '}
               {missing.map((label) => (
-                <Chip key={label} className="mr-1">
+                <Badge key={label} className="mr-1">
                   {label}
-                </Chip>
+                </Badge>
               ))}
               — the command changes nothing until a console restarts with it.
             </p>

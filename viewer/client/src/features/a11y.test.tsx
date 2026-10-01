@@ -227,6 +227,15 @@ const ROUTES: [RegExp, unknown][] = [
   [/^\/api\/plans/, PLANS],
   [/^\/api\/stats/, PORTFOLIO],
   [/^\/api\/spend/, SPEND],
+  // A person's turn (control-tower phase 42): the ledger the step card reads.
+  [
+    /^\/api\/human-steps/,
+    {
+      steps: [],
+      reminders: { series: [900_000, 3_600_000, 21_600_000, 86_400_000], quiet: null },
+      can: { openHost: false, terminal: false, resume: false },
+    },
+  ],
   [/^\/api\/inbox/, INBOX],
   [/^\/api\/approvals/, []],
   [/^\/api\/runs\/scopes/, { scopes: [] }],
@@ -332,7 +341,6 @@ afterEach(() => {
 
 /** Every destination, the route it renders at, and a string proving it painted. */
 const DESTINATIONS: { id: string; route: string[]; query?: Record<string, string>; settled: RegExp }[] = [
-  { id: 'now', route: ['now'], settled: /needs you|running now|next up|nothing/i },
   { id: 'plans', route: ['plans'], settled: /demo/i },
   { id: 'runs', route: ['runs'], settled: /run|nothing/i },
   { id: 'sessions', route: ['sessions'], settled: /session|nothing|new/i },
@@ -449,4 +457,61 @@ describe('axe — every settings section', () => {
       TIMEOUT,
     );
   }
+});
+
+/**
+ * A person's turn (control-tower phase 42): the step card joins the halt
+ * card's family, and a card drawn on the Tower, in the bell and on the
+ * phone's answer page is walked here in both its variants — the device code,
+ * the WHERE badge, the one action and the folds all included.
+ */
+describe('the human-step card', () => {
+  it(
+    'has no accessibility violations, full or folded to its row',
+    async () => {
+      const { humanStepView } = await import('@shared/human-step-model.js');
+      const { HumanStepCard } = await import('@/components/human-step-card');
+      const { TooltipProvider } = await import('@/components/ui');
+      const item = {
+        id: 'human-step:demo:2:s1',
+        kind: 'human-step' as const,
+        severity: 'needs-you' as const,
+        slug: 'demo',
+        phase: 2,
+        title: 'Your turn — enter a device code for demo phase 2',
+        need: 'Pair the deploy CLI',
+        how: '',
+        since: '2026-08-22T11:00:00Z',
+        actions: [],
+        href: '/plan/demo/phase/2',
+        humanStep: humanStepView({
+          kind: 'device-code',
+          title: 'Pair the deploy CLI',
+          stepId: 's1',
+          openUrl: 'https://example.com/device',
+          code: 'ABCD-1234',
+          lines: ['Open the link on any device.', 'Type the code shown here.'],
+          check: true,
+        }),
+      };
+      const client = new QueryClient(queryClientConfig);
+      const { container } = render(
+        <QueryClientProvider client={client}>
+          <TooltipProvider>
+            <ul>
+              <li>
+                <HumanStepCard item={item} />
+              </li>
+              <li>
+                <HumanStepCard item={item} variant="row" />
+              </li>
+            </ul>
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+      await screen.findAllByTestId('step-primary');
+      await expectNoAxeViolations(container);
+    },
+    TIMEOUT,
+  );
 });

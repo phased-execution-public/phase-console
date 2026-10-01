@@ -20,16 +20,18 @@
  */
 
 import {
-  Chip,
+  Badge,
   Duration,
   Inspector,
   InspectorSection,
   KeyValue,
   MonoId,
   RelativeTime,
-  StatusBadge,
 } from '@/components/ui';
+import { useQuery } from '@tanstack/react-query';
+import { ViewBadge } from '@/components/ui/status';
 import { TaskLine } from '@/features/runs/task-summary';
+import { api } from '@/lib/api';
 import { KIND_LABEL, type SessionRow } from './list';
 
 export function SessionInspector({
@@ -67,8 +69,9 @@ export function SessionInspector({
       description={row.detail}
       meta={
         <>
-          {row.state && <StatusBadge state={row.state} label={row.note ?? (row.live ? 'live' : 'ended')} />}
-          <Chip tone="neutral">{KIND_LABEL[row.kind]}</Chip>
+          {row.view && <ViewBadge view={row.view} />}
+          {row.note && <Badge tone="neutral">{row.note}</Badge>}
+          <Badge tone="neutral">{KIND_LABEL[row.kind]}</Badge>
           {/* Two different ids, and the distinction is load-bearing: `id` is a
               pty THIS console owns and can close, `sessionId` is a Claude
               conversation that may be running on another machine entirely. A
@@ -167,6 +170,48 @@ export function SessionInspector({
           <TaskLine tasks={row.tasks} className="flex" />
         </InspectorSection>
       ) : null}
+
+      {row.sessionId ? <HookEvents sessionId={row.sessionId} enabled={open} /> : null}
     </Inspector>
+  );
+}
+
+/**
+ * The raw hook events behind the record (control-tower phase 25): the registry
+ * says what is true NOW; `GET /api/sessions/<id>/events` says how it got that
+ * way — the only form in which a presence bug is arguable. Read while the
+ * inspector is open, newest last, as the hook sent them.
+ */
+function HookEvents({ sessionId, enabled }: { sessionId: string; enabled: boolean }) {
+  const { data, error } = useQuery({
+    queryKey: ['sessions', sessionId, 'events'],
+    queryFn: () => api.sessionEvents(sessionId),
+    enabled,
+  });
+  const events = data?.events ?? [];
+  return (
+    <InspectorSection heading="What its hooks said">
+      {error ? (
+        <p className="text-xs text-ink-muted">The hook events could not be read: {error.message}</p>
+      ) : events.length === 0 ? (
+        <p className="text-xs text-ink-muted">No hook event is recorded for this session.</p>
+      ) : (
+        <ol
+          className="flex flex-col gap-0.5 font-mono text-2xs"
+          aria-label="Hook events"
+          data-testid="hook-events"
+        >
+          {events.map((line, index) => (
+            <li key={`${line.at}:${index}`} className="flex justify-between gap-2">
+              <span className="text-ink">{line.event}</span>
+              <span className="text-ink-faint">
+                {new Date(line.at).toLocaleTimeString()}
+                {line.lateMs > 1000 ? ` · ${Math.round(line.lateMs / 1000)} s late` : ''} · {line.via}
+              </span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </InspectorSection>
   );
 }

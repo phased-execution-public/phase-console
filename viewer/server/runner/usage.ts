@@ -21,6 +21,14 @@ export type CallUsage = { input: number; cacheWrite: number; cacheRead: number; 
 /** A session's calls, folded. `lastContext` is the newest call's; the four token fields are sums. */
 export type TokenCounters = {
   calls: number;
+  /**
+   * The FIRST call's context (control-tower phase 59, #83): for a fresh session,
+   * its boot — the system prompt, tools, CLAUDE.md, rules, memory and boot
+   * prompt, read before any work. Kept for a resumed session too, where it is
+   * the conversation re-read, and never taken as a boot there
+   * (`analysis/sizing-model.ts` `bootFloorOf`). Zero on a line written before it.
+   */
+  firstContext: number;
   lastContext: number;
   peakContext: number;
   input: number;
@@ -94,8 +102,17 @@ export type TokenAttempt = TokenCounters & {
 /** How many sessions a phase record keeps counters for; older ones stay in the journal. */
 export const MAX_TOKEN_ATTEMPTS = 20;
 
-/** A threshold the console acted on, on the record: which session, at what context, when. */
-export type ContextMark = { sessionId: string | null; at: string; context: number; window: number; delivered?: boolean };
+/**
+ * A threshold the console acted on, on the record: which session, at what
+ * context, when. For the wrap-up, whether the steer reached the session, how
+ * many usage events it was tried on, and — while it has not — the steer's own
+ * refusal (control-tower phase 46, #79: it was marked spent "whether or not it
+ * arrived", and the reason was thrown away).
+ */
+export type ContextMark = {
+  sessionId: string | null; at: string; context: number; window: number;
+  delivered?: boolean; attempts?: number; reason?: string;
+};
 
 /** The newest `partial` declared for a phase, on the record: which session, why, when. */
 export type PartialMark = { sessionId: string | null; reason: string | null; at: string };
@@ -113,11 +130,23 @@ export const RESUME_FRESH_MIN_CONTEXT = 250_000;
 export const RESUME_CACHE_COLD_MS = 55 * 60_000;
 /** A session that declared `partial` for one of these said itself that it is spent. */
 export const RESUME_FRESH_PARTIAL_REASONS: readonly string[] = ['budget', 'context'];
+/*
+ * How far below the wrap-up line a session may have ended and still be resumed,
+ * as a fraction of its window (control-tower phase 46, #79). A resume re-reads
+ * the whole conversation and adds the instruction, so a session that ended at or
+ * past `CONTEXT_WRAPUP_FRACTION − this` × its window starts inside the wrap-up
+ * zone and runs to the checkpoint: many-plans P15 was resumed "cache-warm" at
+ * 578,475 of 1M, told to wrap up six seconds later, and checkpointed at 801,938.
+ */
+export const RESUME_WRAPUP_MARGIN = 0.05;
 
 export type ResumeChoice = 'resume' | 'fresh';
 export type ResumePolicyReason =
-  | 'context-checkpoint' | 'partial-budget' | 'partial-context' | 'account-changed' | 'cache-cold'
-  | 'cache-warm' | 'small' | 'unmeasured';
+  | 'context-checkpoint' | 'partial-budget' | 'partial-context' | 'context-wrapup' | 'account-changed' | 'cache-cold'
+  | 'cache-warm' | 'small' | 'unmeasured'
+  // The supervisor chat's two (control-tower phase 27): past the context rule a
+  // chat starts a visible new thread, and an idle one is resumed however cold.
+  | 'context-rule' | 'cold-exempt';
 
 /** The policy's answer, in the shape `phase.resume-policy` journals it. */
 export type ResumePolicy = {
@@ -141,13 +170,27 @@ export type ResumeFacts = {
 /**
  * Resume `sessionId`, or board fresh with the resume brief? Fresh when the
  * console checkpointed that session, when it declared `partial --reason
- * budget|context`, or when it ended at ≥ RESUME_FRESH_MIN_CONTEXT and is cold or
- * under another account. `paying` is the account that would pay for the resume,
- * or null when the caller cannot say — the account is then not judged. A session
- * with no counters is resumed as it always was.
+ * budget|context`, when it ended at ≥ RESUME_FRESH_MIN_CONTEXT and is cold or
+ * under another account, or when it ended at or past its window's wrap-up line
+ * less `RESUME_WRAPUP_MARGIN` (`context-wrapup` — judged against the session's
+ * own window, so a 200k session past its line is fresh even under the "small"
+ * size). `paying` is the account that would pay for the resume, or null when the
+ * caller cannot say — the account is then not judged. A session with no
+ * counters is resumed as it always was.
+ */
+/**
+ * **The documented cold-rule exemption** (control-tower phase 27, §Architecture
+ * 8): `exempt: 'cold'` is the supervisor chat's, and nothing else passes it. A
+ * chat is the operator's own conversation, not a phase with a brief to board
+ * fresh from — a fresh boot would lose the thread, not save a bootstrap — so
+ * it is resumed however long it sat idle. The context rule still holds, and
+ * holds harder: a chat that ended at ≥ RESUME_FRESH_MIN_CONTEXT, warm or cold,
+ * starts a visible NEW THREAD (`context-rule`) rather than re-reading it all
+ * on every message; one under another account starts one too, since its
+ * transcript is not ported.
  */
 export function resumePolicy(
-  record: ResumeFacts, sessionId: string, opts: { now: number; paying: string | null },
+  record: ResumeFacts, sessionId: string, opts: { now: number; paying: string | null; exempt?: 'cold' },
 ): ResumePolicy {
   const entry = [...(record.tokens ?? [])].reverse().find((row) => row.sessionId === sessionId);
   const ended = entry ? Date.parse(entry.endedAt) : NaN;
@@ -163,10 +206,78 @@ export function resumePolicy(
     return { choice: 'fresh', reason: partial.reason === 'budget' ? 'partial-budget' : 'partial-context', ...measured };
   }
   if (!entry) return { choice: 'resume', reason: 'unmeasured', ...measured };
-  if (entry.lastContext < RESUME_FRESH_MIN_CONTEXT) return { choice: 'resume', reason: 'small', ...measured };
+  const window = typeof entry.window === 'number' && entry.window > 0 ? entry.window : null;
+  const pastWrapup = window !== null && entry.lastContext >= (CONTEXT_WRAPUP_FRACTION - RESUME_WRAPUP_MARGIN) * window;
+  if (opts.exempt === 'cold') {
+    if (entry.lastContext >= RESUME_FRESH_MIN_CONTEXT) return { choice: 'fresh', reason: 'context-rule', ...measured };
+    if (accountChanged) return { choice: 'fresh', reason: 'account-changed', ...measured };
+    if (pastWrapup) return { choice: 'fresh', reason: 'context-wrapup', ...measured };
+    const cold = idleMs !== null && idleMs >= RESUME_CACHE_COLD_MS;
+    return { choice: 'resume', reason: cold ? 'cold-exempt' : 'small', ...measured };
+  }
+  if (entry.lastContext < RESUME_FRESH_MIN_CONTEXT) {
+    return pastWrapup ? { choice: 'fresh', reason: 'context-wrapup', ...measured } : { choice: 'resume', reason: 'small', ...measured };
+  }
   if (accountChanged) return { choice: 'fresh', reason: 'account-changed', ...measured };
   if (idleMs !== null && idleMs >= RESUME_CACHE_COLD_MS) return { choice: 'fresh', reason: 'cache-cold', ...measured };
+  if (pastWrapup) return { choice: 'fresh', reason: 'context-wrapup', ...measured };
   return { choice: 'resume', reason: 'cache-warm', ...measured };
+}
+
+/* ---- what a session's own calls are worth (control-tower phase 46, #62, CC-5) ---- */
+
+/*
+ * USD per token, by model family, for the four counters a call reports. Only
+ * what was MEASURED: the audit week priced every non-resumed Opus session
+ * (`opus` n = 77, `opus[1m]` n = 49) at a median of exactly 1.000 × what the CLI
+ * reported, with these rates — a cache write at twice input (the one-hour
+ * cache), a read at a tenth. A family with no measured row is not priced, and
+ * an unpriced session is simply not corroborated: a guessed price would journal
+ * a mismatch for every session it got wrong.
+ */
+export const TOKEN_PRICES_USD: Readonly<Record<string, Readonly<{ input: number; cacheWrite: number; cacheRead: number; output: number }>>> = Object.freeze({
+  opus: Object.freeze({ input: 5e-6, cacheWrite: 10e-6, cacheRead: 0.5e-6, output: 25e-6 }),
+});
+
+/** The family a model id or alias belongs to, when one of `TOKEN_PRICES_USD` names it. */
+function priceFamily(model: string | null | undefined): string | null {
+  const id = (model ?? '').toLowerCase();
+  return Object.keys(TOKEN_PRICES_USD).find((family) => id.includes(family)) ?? null;
+}
+
+/** A session's own calls, priced — null when its model's family has no measured row. */
+export function priceUsage(model: string | null | undefined, counters: Pick<TokenCounters, 'input' | 'cacheWrite' | 'cacheRead' | 'output'>): number | null {
+  const family = priceFamily(model);
+  if (!family) return null;
+  const rate = TOKEN_PRICES_USD[family];
+  return counters.input * rate.input + counters.cacheWrite * rate.cacheWrite
+    + counters.cacheRead * rate.cacheRead + counters.output * rate.output;
+}
+
+/*
+ * When a booked figure disagrees with its priced usage: by more than a quarter
+ * of the priced figure AND by more than half a dollar — the absolute floor keeps
+ * a two-call session's rounding from reading as a finding. The audit's
+ * per-session scatter around the fit was well inside both; a re-reported total
+ * is many times outside them (P14's 7-call resume: $26.01 booked, $1.65 priced).
+ */
+export const COST_MISMATCH_TOLERANCE = 0.25;
+export const COST_MISMATCH_FLOOR_USD = 0.5;
+
+/**
+ * Does a booked figure disagree with its priced usage past tolerance? `over`
+ * when it books more than the calls explain, `under` when less. A session that
+ * started a subagent pays for calls the stream never shows this console (a
+ * subagent's context is its own), so an excess is explained there — a shortfall
+ * never is. Null when it agrees, or when there is nothing priced to compare.
+ */
+export function costMismatch(input: { booked: number; priced: number | null; delegated: boolean }): { direction: 'over' | 'under'; ratio: number } | null {
+  const { booked, priced } = input;
+  if (priced === null || !Number.isFinite(priced) || !Number.isFinite(booked)) return null;
+  const gap = booked - priced;
+  if (Math.abs(gap) <= Math.max(COST_MISMATCH_FLOOR_USD, COST_MISMATCH_TOLERANCE * priced)) return null;
+  if (gap > 0 && input.delegated) return null;
+  return { direction: gap > 0 ? 'over' : 'under', ratio: priced > 0 ? Math.round((booked / priced) * 100) / 100 : 0 };
 }
 
 /** `612k`, `1M`, `1.25M` — a token count for a sentence. */
@@ -204,7 +315,7 @@ export function isCacheRebuild(call: CallUsage): boolean {
 }
 
 export function newTokenCounters(): TokenCounters {
-  return { calls: 0, lastContext: 0, peakContext: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, rebuilds: 0 };
+  return { calls: 0, firstContext: 0, lastContext: 0, peakContext: 0, input: 0, cacheWrite: 0, cacheRead: 0, output: 0, rebuilds: 0 };
 }
 
 /**
@@ -217,7 +328,7 @@ export type UsageTracker = {
   counters: TokenCounters;
   resumed: boolean;
   /** Recent calls by message id, so a call's later content blocks are not counted again. */
-  seen: Map<string, { call: CallUsage; build: boolean; rebuild: boolean }>;
+  seen: Map<string, { call: CallUsage; build: boolean; rebuild: boolean; first: boolean }>;
 };
 
 /**
@@ -244,8 +355,10 @@ export function foldUsage(
   const before = id ? tracker.seen.get(id) : undefined;
   if (!before) {
     // The first call of a session that continued nothing is the build.
-    const build = counters.calls === 0 && !tracker.resumed;
+    const first = counters.calls === 0;
+    const build = first && !tracker.resumed;
     const rebuild = !build && isCacheRebuild(usage);
+    if (first) counters.firstContext = usage.context;
     counters.calls += 1;
     counters.input += usage.input;
     counters.cacheWrite += usage.cacheWrite;
@@ -255,7 +368,7 @@ export function foldUsage(
     counters.peakContext = Math.max(counters.peakContext, usage.context);
     if (rebuild) counters.rebuilds += 1;
     if (id) {
-      tracker.seen.set(id, { call: usage, build, rebuild });
+      tracker.seen.set(id, { call: usage, build, rebuild, first });
       if (tracker.seen.size > MAX_SEEN_CALLS) tracker.seen.delete(tracker.seen.keys().next().value!);
     }
     return { changed: true, rebuild, call: usage };
@@ -276,9 +389,11 @@ export function foldUsage(
   counters.output += call.output - prev.output;
   counters.lastContext = call.context;
   counters.peakContext = Math.max(counters.peakContext, call.context);
+  // A later block of the first call: the boot, now known better.
+  if (before.first) counters.firstContext = call.context;
   const rebuild = before.rebuild || (!before.build && isCacheRebuild(call));
   if (rebuild && !before.rebuild) counters.rebuilds += 1;
-  tracker.seen.set(id!, { call, build: before.build, rebuild });
+  tracker.seen.set(id!, { call, build: before.build, rebuild, first: before.first });
   return { changed: true, rebuild, call };
 }
 

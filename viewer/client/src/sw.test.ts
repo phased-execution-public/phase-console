@@ -25,6 +25,15 @@
  */
 
 import { beforeAll, describe, expect, test, vi } from 'vitest';
+import {
+  ANSWER_RECEIPTS,
+  STEP_OPEN_ACTION,
+  actionOf,
+  actionRequest,
+  notificationOptions,
+  stepOf,
+  stepTarget,
+} from '../../shared/sw-push.js';
 
 const ORIGIN = 'https://console.test';
 const SW_URL = `${ORIGIN}/sw.js`;
@@ -171,5 +180,74 @@ describe('the guards above the routing', () => {
   test('an unparseable URL is stood aside from, not thrown on', () => {
     expect(() => dispatchFetch('not a url at all')).not.toThrow();
     expect(intercepted('not a url at all')).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * A person's turn, from the lock screen (control-tower phase 42)
+ * ------------------------------------------------------------------ */
+
+describe('a human step’s push', () => {
+  const STEP_PUSH = {
+    title: 'Your turn: enter a device code — alpha phase 3',
+    body: 'Pair the deploy CLI — code ABCD-1234.',
+    url: '/#/plan/alpha/run',
+    actions: [{ action: 'check', title: 'I did it' }],
+    callback: 'tok.sig',
+    step: {
+      id: 'human-step-1',
+      kind: 'device-code',
+      where: 'any',
+      actions: [
+        { action: 'open', title: 'Open' },
+        { action: 'check', title: 'I did it' },
+      ],
+      code: 'ABCD-1234',
+    },
+  };
+
+  test('carries Open and the signed I did it, and the step rides the notification', () => {
+    const options = notificationOptions(STEP_PUSH as never);
+    expect((options as { actions?: unknown }).actions).toEqual([
+      { action: STEP_OPEN_ACTION, title: 'Open' },
+      { action: 'check', title: 'I did it' },
+    ]);
+    expect((options.data as { step: unknown }).step).toEqual({
+      id: 'human-step-1',
+      kind: 'device-code',
+      where: 'any',
+      code: 'ABCD-1234',
+    });
+  });
+
+  test('Open is never posted as an answer; I did it posts the token through the one route', () => {
+    const data = notificationOptions(STEP_PUSH as never).data as never;
+    expect(actionOf(STEP_OPEN_ACTION, data)).toBeNull();
+    expect(actionOf('check', data)).toBe('check');
+    const { url, init } = actionRequest('tok.sig', 'check');
+    expect(url).toBe('/api/push/action');
+    expect(JSON.parse(String(init.body))).toEqual({ token: 'tok.sig', action: 'check', by: 'notification' });
+    expect(ANSWER_RECEIPTS.check).toMatch(/running the proof/);
+  });
+
+  test('a tap lands on the step’s card — under the console’s own mount, never another origin', () => {
+    const origin = 'http://127.0.0.1:4123';
+    const data = notificationOptions(STEP_PUSH as never).data as { url: string; step: { id: string } };
+    expect(stepTarget(data, origin)).toBe(`${origin}/#/approve?step=human-step-1`);
+    expect(stepTarget({ ...data, url: '/c/abc-hub/#/plan/alpha/run' }, origin)).toBe(
+      `${origin}/c/abc-hub/#/approve?step=human-step-1`,
+    );
+    expect(stepTarget({ ...data, url: 'https://evil.test/#/x' }, origin)).toBe(
+      `${origin}/#/approve?step=human-step-1`,
+    );
+  });
+
+  test('a step of a kind this worker does not know is a plain link', () => {
+    const odd = { ...STEP_PUSH, step: { ...STEP_PUSH.step, kind: 'teleport' } };
+    const options = notificationOptions(odd as never);
+    expect((options.data as { step?: unknown }).step).toBeUndefined();
+    // Only what the server signed; no Open it could not honour.
+    expect((options as { actions?: unknown }).actions).toEqual([{ action: 'check', title: 'I did it' }]);
+    expect(stepOf(odd as never)).toBeNull();
   });
 });

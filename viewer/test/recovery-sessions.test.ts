@@ -27,6 +27,7 @@
  * prompt tests are pure. Nothing here spawns `claude`.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -609,6 +610,7 @@ function drives(
   svc: ReturnType<typeof service>, slug: string, runId: string, status = 'running',
 ): void {
   (svc as never as { runners: Map<string, unknown> }).runners.set(slug, {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({ slug, status, id: runId }),
     note: () => {},
@@ -1030,7 +1032,9 @@ async function driveRepair(opts: {
       verificationText: () => 'run those commands.',
       // The settings file is the whole point of the mode — arming it needs a
       // broker and an origin, exactly as a live run has.
-      approvals: { arm: () => 'test-token', disarm: () => {} },
+      // `release`/`heldTokens` are the loop's ending (#74): the recovery's
+      // `.finally` releases the run token like every other ending.
+      approvals: { arm: () => 'test-token', disarm: () => {}, release: () => 'disarmed', heldTokens: () => [] },
       origin: 'http://127.0.0.1:4123',
     } as never);
 

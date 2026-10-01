@@ -50,6 +50,11 @@ import {
   type IssuesPayload,
   type DebugIndexParams,
   type RestartReadiness,
+  type PhaseRecord,
+  type RunDetail,
+  type RunState,
+  type HumanStepRecord,
+  type HumanStepsList,
 } from './api';
 import { isClosed } from './closure';
 // The module, not the barrel: `components/ui/index.ts` pulls every primitive in,
@@ -141,9 +146,15 @@ export const keys = {
   debugRuns: (slug: string) => ['debug', 'runs', slug] as const,
   debugBundle: (params: unknown) => ['debug', 'bundle', params] as const,
   debugRetention: () => ['debug', 'retention'] as const,
+  /** `GET /api/doctor` — the same report `phase-console doctor` prints. */
+  doctor: () => ['doctor'] as const,
+  debugLevel: () => ['debug', 'level'] as const,
+  planLint: (slug: string) => ['plan', slug, 'lint'] as const,
+  planWork: (slug: string) => ['plan', slug, 'work'] as const,
   terminal: () => ['terminal'] as const,
   /** The session-presence registry — every Claude session the hook reported for this instance. */
   sessionRegistry: () => ['sessions', 'registry'] as const,
+  locks: () => ['locks'] as const,
   converge: () => ['converge'] as const,
   /** Is the session-presence hook in `~/.claude/settings.json`? */
   hooksStatus: () => ['hooks-status'] as const,
@@ -168,12 +179,14 @@ export const keys = {
    *
    * Everything else about a plan hangs off its prefix so one event refreshes the
    * lot — but these two must not. The transcript is a one-shot replay of up to
-   * 4 MB that live events supersede the moment it lands, and a diagnosis costs a
+   * 400 lines that live events supersede the moment it lands, and a diagnosis costs a
    * `git status` and two script runs. Under the run prefix, every `run:phase`
    * would refetch both; the console would re-hydrate from the network several
    * times a minute to learn nothing it was not already being told.
    */
   transcript: (slug: string) => ['transcript', slug] as const,
+  /** A live phase's own view — its report and its session's activity (control-tower phase 95). */
+  phaseNow: (slug: string) => ['phase-now', slug] as const,
   diagnosis: (slug: string, phase: number | string) => ['diagnosis', slug, String(phase)] as const,
   /**
    * The journal, and — like the transcript above — deliberately NOT under
@@ -229,6 +242,8 @@ export const keys = {
    * ended up counting the wrong one.
    */
   inbox: (all?: boolean) => (all == null ? (['inbox'] as const) : (['inbox', all] as const)),
+  /** The human-step ledger (`GET /api/human-steps`) — every step with its moves. */
+  humanSteps: () => ['human-steps'] as const,
   auth: () => ['auth'] as const,
   accounts: () => ['accounts'] as const,
   mcp: () => ['mcp'] as const,
@@ -301,7 +316,14 @@ export const keys = {
    * so: an inbox verb can approve a permission, recover a run, unblock a phase
    * and clear a badge in one press.
    */
-  afterInboxAct: (): KeyBundle => [keys.inbox(), keys.runs(), keys.plans(), keys.approvals(), keys.state()],
+  afterInboxAct: (): KeyBundle => [
+    keys.inbox(),
+    keys.runs(),
+    keys.plans(),
+    keys.approvals(),
+    keys.state(),
+    keys.humanSteps(),
+  ],
 
   /** A preference was saved. Prefs live on `/api/state` and nowhere else. */
   afterPrefs: (): KeyBundle => [keys.state()],
@@ -337,6 +359,15 @@ export type KeyBundle = readonly QueryKey[];
  */
 export const CACHE_GC_TIME = 24 * 60 * 60 * 1000;
 
+/**
+ * A failed read is asked once more — unless its answer says asking again
+ * cannot help. (`_error`: the free tree reads only the count.)
+ */
+export function retryOnce(failures: number, _error: unknown): boolean {
+  return failures < 1;
+}
+
+
 export const queryClientConfig: QueryClientConfig = {
   defaultOptions: {
     queries: {
@@ -347,7 +378,7 @@ export const queryClientConfig: QueryClientConfig = {
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
       refetchInterval: false,
-      retry: 1,
+      retry: retryOnce,
     },
   },
 };
@@ -378,12 +409,89 @@ type Effect = {
   streamOnly?: true;
 };
 
+/**
+ * A step as it now reads, written into the ledger's list — the card's state
+ * word, its status line and its datums move in the tick. Fields the event
+ * does not carry (the moves, the window's end) are kept from what the list
+ * held; the inbox rows are re-read by the same event, since a settled step is
+ * a row that leaves.
+ */
+export function patchHumanStep(client: QueryClient, raw: unknown): void {
+  const step = raw as HumanStepRecord | undefined;
+  if (!step?.id) return;
+  client.setQueryData(keys.humanSteps(), (prev: HumanStepsList | undefined) =>
+    prev
+      ? {
+          ...prev,
+          steps: [
+            ...prev.steps.filter((known) => known.id !== step.id),
+            { ...prev.steps.find((known) => known.id === step.id), ...step },
+          ],
+        }
+      : prev,
+  );
+}
+
 /** The unread badge travels on the event itself; refetching /api/state to learn
  *  a number the payload already carries is a round trip for nothing. */
 const patchUnread: Effect['patch'] = (client, data) => {
   if (typeof data.unread !== 'number') return;
   client.setQueryData(keys.state(), (prev: ConsoleState | undefined) =>
     prev ? { ...prev, unread: data.unread as number } : prev,
+  );
+};
+
+/**
+ * Fold a live lane's progress into the two caches that render it.
+ *
+ * A WRITE and no invalidation, deliberately: the frame carries the phase's
+ * status, its attempt, its task counts, this session's dollars and its context,
+ * which is everything the summary surfaces print. Refetching a run object to
+ * learn numbers the payload already holds would be a round trip every three
+ * seconds per lane — the cost this event exists to avoid.
+ *
+ * Both caches, because they are two views of one fact: `['run', slug]` is the
+ * run page and the plan's Run tab, `['runs']` is the list. A patch that reached
+ * only one would leave the other stale in exactly the way this closes.
+ */
+const patchProgress: Effect['patch'] = (client, data) => {
+  const slug = typeof data.slug === 'string' ? data.slug : null;
+  const phase = typeof data.phase === 'number' ? data.phase : null;
+  if (!slug || phase === null) return;
+
+  const fold = (run: RunState | null | undefined): RunState | null | undefined => {
+    if (!run || (typeof data.runId === 'string' && run.id !== data.runId)) return run;
+    const record = run.phases?.[String(phase)];
+    if (!record) return run;
+    return {
+      ...run,
+      phases: {
+        ...run.phases,
+        [String(phase)]: {
+          ...record,
+          status: (data.status as PhaseRecord['status']) ?? record.status,
+          attempts: typeof data.attempt === 'number' ? data.attempt : record.attempts,
+          ...(data.attemptStartedAt ? { attemptStartedAt: data.attemptStartedAt as string } : {}),
+          live: {
+            ...record.live,
+            ...(data.tasks ? { tasks: data.tasks as NonNullable<PhaseRecord['live']>['tasks'] } : {}),
+            ...(typeof data.spentUsd === 'number' ? { spentUsd: data.spentUsd } : {}),
+            ...(typeof data.contextTokens === 'number' ? { contextTokens: data.contextTokens } : {}),
+            // The labelled clocks as of this frame (#28) — a LIVE overlay, like the rest.
+            ...(data.phaseClocks && typeof data.phaseClocks === 'object'
+              ? { phaseClocks: data.phaseClocks as NonNullable<PhaseRecord['live']>['phaseClocks'] }
+              : {}),
+          },
+        },
+      },
+    };
+  };
+
+  client.setQueryData(keys.run(slug), (prev: RunDetail | undefined) =>
+    prev ? { ...prev, run: fold(prev.run) ?? prev.run } : prev,
+  );
+  client.setQueryData(keys.runs(), (prev: RunState[] | undefined) =>
+    Array.isArray(prev) ? prev.map((run) => (run.slug === slug ? (fold(run) ?? run) : run)) : prev,
   );
 };
 
@@ -515,7 +623,8 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
   // to sit stale (observed live: entries [] while a real manual lock held
   // the phase) because nothing here invalidated it.
   changed: {
-    invalidate: [keys.plans(), keys.stats(), keys.state(), keys.queue(), keys.runs()],
+    // `locks` too: a claim, a refresh or a release is a `.locks/` change (#24).
+    invalidate: [keys.plans(), keys.stats(), keys.state(), keys.queue(), keys.runs(), keys.locks()],
     slugScoped: 'plan',
   },
   /*
@@ -666,6 +775,13 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
      would refetch the whole run object per line. Invalidating nothing here is
      the point, not an omission. */
   'run:stream': { streamOnly: true },
+  /* ---- …and the slow half of it ----
+     One frame per live lane per three seconds, only when what a surface renders
+     has changed, applied as a cache WRITE. Between phase boundaries this is the
+     only thing that moves the Runs list, the plan's Run tab and the boards, and
+     it does it with zero fetches: the event already carries every field it
+     changes, which is exactly the argument `plan:lint` makes below. */
+  'run:progress': { patch: patchProgress },
   // The journal is what the trace is projected from, so a new line means the
   // picture has moved — and it is the ONLY signal that says so, since the
   // spans come from four files and only this one announces itself. The live
@@ -675,11 +791,22 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
   // so a row carrying both a `patch` and that flag would run neither. The flag
   // only ever meant "this row has no cache effect", and now it has one.)
   // The ROW is in both trees — `EVENT_EFFECTS` is total over `SseEvent`, so a
-  // row a marker swallows is a TS2741 only the free tree's typecheck sees. Only
-  // the `patch` is marked: the free row is `{ invalidate: [] }`, a no-op, which
-  // is exactly what a tree with no Debug ▸ Timeline needs from it.
+  // row a marker swallows is a TS2741 only the free tree's typecheck sees — and
+  // since control-tower phase 95 so is its `patch`, which refreshes a live
+  // phase's Now panel in both editions. Only the two debug invalidations inside
+  // it are marked: a tree with no Debug ▸ Timeline has nothing to refresh there.
   'run:journal': {
     invalidate: [],
+    patch: (client, data) => {
+      const slug = typeof data.slug === 'string' ? data.slug : null;
+      if (!slug) return;
+      // A line that moves a live phase's report refreshes its Now panel — the
+      // task list, a progress count, a verification, a session (control-tower
+      // phase 95, #163). Not every line: a busy run journals many a minute.
+      if (typeof data.event !== 'string' || NOW_EVENTS.has(data.event)) {
+        void client.invalidateQueries({ queryKey: keys.phaseNow(slug) });
+      }
+    },
   },
 
   /* ---- the repository's conflict radar (phase 7) ---- */
@@ -688,6 +815,14 @@ export const EVENT_EFFECTS: Record<SseEvent, Effect> = {
   // section shows the same trees. Phase 9's repository-wide landscape lands
   // under the second key, so this row already points at it.
   'repo:radar': { invalidate: [keys.runs(), keys.repo()] },
+
+  /* ---- a person's turn ----
+     The step rides the event (control-tower phase 42), so its card's status
+     line and every inbox row drawing it are patched in place; the inbox is
+     re-read as well, because a step that settled is a row that leaves — and
+     with it the run's summons, which is what moves its strip out of Needs
+     you with no reload. */
+  'human-step': { invalidate: [keys.inbox()], patch: (client, data) => patchHumanStep(client, data.step) },
 
   /* ---- the lint, arriving after the page ----
      A cache WRITE and no invalidation: the plan detail the browser is holding
@@ -827,6 +962,16 @@ export function useSessionRegistry(enabled = true) {
   return useQuery({ queryKey: keys.sessionRegistry(), queryFn: api.sessionRegistry, enabled });
 }
 
+/**
+ * Every phase claim this console can see (#24). A claim changing is a docs
+ * change and invalidates this; a lease LAPSING changes no file, so the list
+ * also re-reads on a half-minute clock.
+ */
+export function useLocks(enabled = true) {
+  return useQuery({ queryKey: keys.locks(), queryFn: api.locks, enabled, refetchInterval: 30_000 });
+}
+
+
 /** The session-presence hook's presence in `~/.claude/settings.json`. */
 
 /** The convergence loop's standing and its last pass per plan (`GET /api/converge`). */
@@ -960,6 +1105,20 @@ export function usePlan(slug: string | undefined, include?: readonly string[]) {
     queryFn: () => api.plan(slug!, { include }),
     enabled: Boolean(slug),
     placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The engine pool, polled every second while `enabled` — only while a plan
+ * page's own read is still pending, so "computing the board (N queued)" can
+ * say why the page is empty (#44). Nothing polls it otherwise.
+ */
+export function useEngineQueue(enabled: boolean) {
+  return useQuery({
+    queryKey: ['engine-queue'] as const,
+    queryFn: () => api.engineQueue(),
+    enabled,
+    refetchInterval: enabled ? 1000 : false,
   });
 }
 
@@ -1109,6 +1268,10 @@ export function usePrelude(slug: string | undefined, draft: PreludeDraft, enable
     draft.onlyPhases ?? [],
     draft.autonomy ?? '',
     draft.verifyAnswers ?? null,
+    // Probes 6 and 7 judge the draft's checkout (control-tower phase 22): a
+    // branch or isolation changed on the form is a different question.
+    draft.gitMode ?? '',
+    draft.isolation ?? '',
   ]);
   return useQuery({
     queryKey: keys.prelude(slug ?? '', key),
@@ -1300,10 +1463,68 @@ export function useRunScopes(slug: string | undefined, enabled = true) {
  * arrives on the live stream, and re-reading it would only re-deliver events the
  * console already folded. A missing replay is not an error worth showing.
  */
-export function useTranscript(slug: string | undefined, id: string | undefined, enabled = true) {
+/**
+ * A session replay. With `phase`, that phase's own replay (control-tower phase
+ * 94, #133) under its own key; without, the whole run's, merged in order.
+ */
+/** The journal lines that move a live phase's report (see `run:journal` above). */
+const NOW_EVENTS = new Set([
+  'phase.tasks',
+  'phase.progress',
+  'phase.session',
+  'phase.verify',
+  'phase.start',
+  'phase.stall',
+  'phase.queued',
+]);
+
+/**
+ * A live phase's report — doing, done and left, waiting on, why slow, when
+ * (control-tower phase 95, #163). Refreshed by the journal lines that move it,
+ * and every half minute besides: the open call and the session's last words
+ * move without a journal line.
+ */
+export function usePhaseReport(slug: string | undefined, phase: number | undefined, enabled = true) {
   return useQuery({
-    queryKey: [...keys.transcript(slug ?? ''), id ?? 'latest'],
-    queryFn: () => api.runTranscript(slug!, id),
+    queryKey: [...keys.phaseNow(slug ?? ''), String(phase), 'report'],
+    queryFn: () => api.phaseReport(slug!, phase!),
+    enabled: Boolean(slug) && phase != null && enabled,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+}
+
+/**
+ * A phase's last events, from its session's own log (control-tower phase 95,
+ * #138). Polled while shown: a session's tool calls are not journal lines.
+ */
+export function usePhaseActivity(
+  slug: string | undefined,
+  phase: number | undefined,
+  enabled = true,
+  limit = 20,
+) {
+  return useQuery({
+    queryKey: [...keys.phaseNow(slug ?? ''), String(phase), 'activity', limit],
+    queryFn: () => api.phaseActivity(slug!, phase!, limit),
+    enabled: Boolean(slug) && phase != null && enabled,
+    refetchInterval: 15_000,
+    retry: false,
+  });
+}
+
+export function useTranscript(
+  slug: string | undefined,
+  id: string | undefined,
+  enabled = true,
+  phase?: number,
+) {
+  return useQuery({
+    queryKey:
+      phase == null
+        ? [...keys.transcript(slug ?? ''), id ?? 'latest']
+        : [...keys.transcript(slug ?? ''), id ?? 'latest', phase],
+    queryFn: () => api.runTranscript(slug!, id, undefined, phase),
     enabled: Boolean(slug) && enabled,
     retry: false,
   });
@@ -2070,5 +2291,27 @@ export function useDebugBundle(params: { slug?: string } = {}, enabled = false) 
     queryFn: () => api.debugBundle(params),
     enabled,
     staleTime: DEBUG_STALE,
+  });
+}
+
+/**
+ * The doctor runs the start's probes — `gh`, the CLI, the hooks — so it is
+ * read when the Health section asks, and a minute's answer is reused.
+ */
+export function useDoctor(enabled = true) {
+  return useQuery({ queryKey: keys.doctor(), queryFn: api.doctor, enabled, staleTime: 60_000 });
+}
+
+export function useDebugLevel() {
+  return useQuery({ queryKey: keys.debugLevel(), queryFn: api.debugLevel, staleTime: DEBUG_STALE });
+}
+
+/** Change or revert this console's log level; the answer is the new state. */
+export function useSetDebugLevel() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (next: { level: string; ttlMs: number } | null) =>
+      next ? api.setDebugLevel(next) : api.revertDebugLevel(),
+    onSuccess: (state) => client.setQueryData(keys.debugLevel(), state),
   });
 }

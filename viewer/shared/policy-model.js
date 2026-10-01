@@ -58,6 +58,7 @@ export const POLICY_CLASSES = Object.freeze(
     'manual-gate',
     'credential-block',
     'permission-block',
+    'protected-path-block',
     'gate-block',
     'external-block',
     'lock-block',
@@ -124,6 +125,7 @@ export const DECISION_ANSWERS = Object.freeze({
   stop: null,
   relay: RELAY_MODES,
   announce: null,
+  'plan-approval': Object.freeze(['hold', 'continue']),
 });
 
 /**
@@ -149,6 +151,10 @@ export const POLICY_DEFAULTS = Object.freeze({
   // Nothing was ever filed before there was a word for it, so `off` is not a
   // policy choice here — it is the behaviour every existing plan already has.
   issues: 'off',
+  // A plan a session presents is held for a person unless the plan says
+  // otherwise (control-tower phase 11, #34) — the one answer that lets a
+  // plan-mode phase mean what its author wrote.
+  'plan-approval': 'hold',
 });
 
 /**
@@ -245,6 +251,18 @@ export const POLICY_TABLE = Object.freeze([
     blurb: 'A session blocked by a permission rule: one rung, widen the rule, offered as a card.',
   },
   {
+    class: 'protected-path-block',
+    decisionKey: 'human-acts',
+    journal: 'phase.errand',
+    // The acts a plan keeps for a person joined the edit the CLI keeps for one
+    // (control-tower phase 53, #54): one row, the same manifest key.
+    situations: ['blocked-declared:protected-path', 'blocked-declared:human-acts'],
+    automatic: [],
+    blurb:
+      "An edit the CLI's own wall reserves for an interactive session, or an act the plan keeps for a person: " +
+      'always a person\'s, as an errand naming the act — or handed to the session with "Delegate to the session".',
+  },
+  {
     class: 'gate-block',
     decisionKey: 'gates',
     journal: 'phase.gated',
@@ -325,6 +343,9 @@ export const POLICY_TABLE = Object.freeze([
     situations: [
       'plan-broken',
       'verify-red',
+      // Phase 62's re-opened red (a complete handoff over a red final
+      // verification) raises its own ask; it is the same plan-health question.
+      'verify-red:reopened',
       'done-unrecorded',
       'superseded',
       'unknown',
@@ -556,8 +577,27 @@ export function sanitisePolicyPrefs(value) {
  */
 export function destructiveExceptions(value) {
   if (typeof value !== 'string' || !value) return [];
-  // Clauses end at `;` or `.` OUTSIDE backticks — a rule may carry either
-  // (`Bash(./scripts/publish.sh:*)`); a comma continues a list of rules.
+  /** @type {Set<string>} */
+  const rules = new Set();
+  for (const clause of clausesOf(value)) {
+    const found = /(?:^|,)\s*allow\b(.*)$/i.exec(clause);
+    if (!found) continue;
+    for (const [, raw] of found[1].matchAll(/`([^`]+)`/g)) {
+      const token = raw.trim();
+      if (!token) continue;
+      rules.add(/^[A-Za-z][\w-]*\(.*\)$/.test(token) ? token : `Bash(${token}:*)`);
+    }
+  }
+  return [...rules];
+}
+
+/**
+ * A row's clauses. They end at `;` or `.` OUTSIDE backticks — a rule may carry
+ * either (`Bash(./scripts/publish.sh:*)`); a comma continues a list of rules.
+ * @param {string} value
+ * @returns {string[]}
+ */
+function clausesOf(value) {
   /** @type {string[]} */
   const clauses = [];
   let current = '';
@@ -572,18 +612,328 @@ export function destructiveExceptions(value) {
     current += char;
   }
   clauses.push(current);
+  return clauses;
+}
+
+/**
+ * The branch names a trunk goes by. A push to one is never answered from a
+ * `permission.destructive` row, whatever the row says (control-tower phase 84,
+ * #112): a row that names `main` names it for another repository as often as
+ * not ("hub `main` pathspec pushes"), and a trunk push is the one publish that
+ * nothing quietly undoes — it stays a person's card.
+ */
+export const TRUNK_BRANCHES = Object.freeze(/** @type {const} */ (['main', 'master', 'trunk']));
+
+/** A word that turns the phrase after it into a refusal: "never push to", "deny pushes to". */
+const PUSH_NEGATION =
+  /\b(?:never|not|no|nor|deny|denies|denied|refuse[sd]?|forbid(?:s|den)?|without|except)\b[^`]{0,12}$/i;
+
+/** A branch name as a row writes one: no space, no refspec colon, no glob, not an option. */
+const BRANCH_NAME = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/;
+
+/**
+ * The branches a `permission.destructive` value names as ones a session may
+ * push to (control-tower phase 84, #112).
+ *
+ * The value is prose, and the one mistake that matters is reading a refusal as
+ * a permission, so the grammar is narrow: after "push to" / "pushes to" /
+ * "push of" (the verb may close a backticked `git push`), either "the run
+ * branch" — which is `ctx.runBranch`, when the caller knows it — or a run of
+ * backticked names joined by `+`, `,`, `and`, `or` or `&`. A negation just
+ * before the phrase ("never push to", "deny pushes to") names nothing, and a
+ * trunk (`TRUNK_BRANCHES`) is never read. So vca-refactor's "may publish:
+ * branch pushes to `pe/vca-refactor` + `fix/vca-backend-gaps`, hub `main`
+ * pathspec pushes" names the two branches and not the other repository's trunk.
+ * @param {string | null | undefined} value
+ * @param {{ runBranch?: string | null }} [ctx]
+ * @returns {string[]}
+ */
+export function destructivePushBranches(value, ctx = {}) {
+  if (typeof value !== 'string' || !value) return [];
   /** @type {Set<string>} */
-  const rules = new Set();
-  for (const clause of clauses) {
-    const found = /(?:^|,)\s*allow\b(.*)$/i.exec(clause);
-    if (!found) continue;
-    for (const [, raw] of found[1].matchAll(/`([^`]+)`/g)) {
-      const token = raw.trim();
-      if (!token) continue;
-      rules.add(/^[A-Za-z][\w-]*\(.*\)$/.test(token) ? token : `Bash(${token}:*)`);
+  const out = new Set();
+  for (const clause of clausesOf(value)) {
+    const plain = clause.replace(/\*\*/g, '');
+    const phrase = /\bpush(?:es)?`?\s+(?:to|of)\s+/gi;
+    for (let hit = phrase.exec(plain); hit; hit = phrase.exec(plain)) {
+      if (PUSH_NEGATION.test(plain.slice(0, hit.index))) continue;
+      const rest = plain.slice(hit.index + hit[0].length);
+      if (/^(?:the\s+)?run\s+branch\b/i.test(rest)) {
+        if (ctx.runBranch) out.add(ctx.runBranch);
+        continue;
+      }
+      const list = /^`([^`]+)`((?:\s*(?:\+|,|&|\band\b|\bor\b)\s*`[^`]+`)*)/i.exec(rest);
+      if (!list) continue;
+      for (const raw of [list[1], ...[...list[2].matchAll(/`([^`]+)`/g)].map((m) => m[1])]) {
+        const name = raw.trim().replace(/^refs\/heads\//, '');
+        if (BRANCH_NAME.test(name) && !TRUNK_BRANCHES.includes(/** @type {never} */ (name))) out.add(name);
+      }
     }
   }
-  return [...rules];
+  return [...out];
+}
+
+/**
+ * The words a push segment may carry beside its remote and refspecs. Anything
+ * else — a force, a delete, `--all`/`--mirror`/`--tags`, `--no-verify` (which
+ * skips the gate hook), an option this list does not know — is a person's card.
+ */
+const PUSH_QUIET_OPTIONS = new Set([
+  '-u',
+  '--set-upstream',
+  '-q',
+  '--quiet',
+  '-v',
+  '--verbose',
+  '--porcelain',
+  '--progress',
+  '--no-progress',
+  '--atomic',
+]);
+
+/** Why a push option is not covered, by its shape. */
+function pushOptionRefusal(word) {
+  if (/^(?:-f|--force(?:-with-lease|-if-includes)?)(?:=.*)?$/.test(word)) return 'it is a force push';
+  if (word === '-d' || word === '--delete') return 'it deletes a remote branch';
+  if (['--all', '--mirror', '--tags', '--follow-tags', '--prune'].includes(word))
+    return `\`${word}\` pushes more than the branch the row names`;
+  if (word === '--no-verify') return '`--no-verify` skips the push hook';
+  return `it carries \`${word}\`, which the row does not cover`;
+}
+
+/**
+ * Commands a push may keep company with and still be answered from the row:
+ * each only READS (or prints), so the compound publishes exactly what the push
+ * segment does. `git` is judged by its sub-command below; `cd` moves nothing.
+ */
+const READ_ONLY_COMMANDS = new Set([
+  'echo',
+  'printf',
+  'true',
+  'false',
+  ':',
+  'grep',
+  'egrep',
+  'fgrep',
+  'head',
+  'tail',
+  'cat',
+  'wc',
+  'sort',
+  'uniq',
+  'cut',
+  'tr',
+  'date',
+  'pwd',
+  'ls',
+  'test',
+  '[',
+  'cd',
+]);
+const READ_ONLY_GIT = new Set([
+  'status',
+  'log',
+  'show',
+  'diff',
+  'rev-parse',
+  'rev-list',
+  'ls-remote',
+  'describe',
+]);
+
+/**
+ * One shell command as the segments a person reads — split at `;`, `&&`, `||`,
+ * `|`, `&` and newlines outside quotes, each a list of words with quotes and
+ * redirections taken off. A substitution or a subshell (`$(…)`, backticks,
+ * `<(…)`, a bare parenthesis) cannot be vouched for, and refuses.
+ * @param {string} command
+ * @returns {{ segments: string[][] } | { refused: string }}
+ */
+function shellSegments(command) {
+  /** @type {string[][]} */
+  const segments = [];
+  /** @type {string[]} */
+  let words = [];
+  let word = '';
+  let inWord = false;
+  /** @type {null | "'" | '"'} */
+  let quote = null;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = '';
+    inWord = false;
+  };
+  const endSegment = () => {
+    endWord();
+    if (words.length) segments.push(words);
+    words = [];
+  };
+  for (let i = 0; i < command.length; i += 1) {
+    const char = command[i];
+    const next = command[i + 1];
+    if (quote) {
+      if (char === quote) {
+        quote = null;
+        continue;
+      }
+      if (quote === '"' && (char === '`' || (char === '$' && next === '(')))
+        return { refused: 'a substitution the row cannot vouch for' };
+      word += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      inWord = true;
+      continue;
+    }
+    if (
+      char === '`' ||
+      (char === '$' && next === '(') ||
+      ((char === '<' || char === '>') && next === '(') ||
+      char === '(' ||
+      char === ')'
+    ) {
+      return { refused: 'a substitution the row cannot vouch for' };
+    }
+    if (char === '\\' && next !== undefined) {
+      word += next;
+      inWord = true;
+      i += 1;
+      continue;
+    }
+    if (char === ';' || char === '\n') {
+      endSegment();
+      continue;
+    }
+    if (char === '|') {
+      endSegment();
+      if (next === '|') i += 1;
+      continue;
+    }
+    if (char === '&') {
+      if (next === '&') {
+        endSegment();
+        i += 1;
+        continue;
+      }
+      // `2>&1`, `>&2`, `&>file` belong to a redirection, not a boundary.
+      if (next === '>' || /[<>]$/.test(word)) {
+        word += char;
+        inWord = true;
+        continue;
+      }
+      endSegment();
+      continue;
+    }
+    if (/\s/.test(char)) {
+      endWord();
+      continue;
+    }
+    word += char;
+    inWord = true;
+  }
+  if (quote) return { refused: 'an unterminated quote' };
+  endSegment();
+  // Redirections leave the words: `>`, `>>`, `2>`, `&>`, `<` with their target, or glued to it.
+  return {
+    segments: segments
+      .map((list) => {
+        /** @type {string[]} */
+        const kept = [];
+        for (let i = 0; i < list.length; i += 1) {
+          const w = list[i];
+          if (/^(?:\d*|&)(?:>>?|<)&?\d*$/.test(w)) {
+            if (!/&\d+$/.test(w)) i += 1;
+            continue;
+          }
+          if (/^(?:\d*|&)(?:>>?|<)/.test(w)) continue;
+          kept.push(w);
+        }
+        return kept;
+      })
+      .filter((list) => list.length),
+  };
+}
+
+/**
+ * Whether a `permission.destructive` row answers ONE Bash command that pushes
+ * (control-tower phase 84, #112) — and, when it does not, why not, in words a
+ * person can check against the row.
+ *
+ * `allow` only when every segment of the command is either a plain push of
+ * branches the row names (`destructivePushBranches`) — no force, no delete, no
+ * trunk, an explicit refspec — or a read-only neighbour (`echo $?`, `grep`,
+ * `git status`, `git stash list`, `head`…) with its redirections. So the
+ * vca-refactor push with its log redirect and its `git status -sb | head -1`
+ * tail is answered; the same push beside `rm -rf build` is a card.
+ * @param {string} command
+ * @param {string | null | undefined} value  the row's value
+ * @param {{ runBranch?: string | null }} [ctx]
+ * @returns {{ answer: 'allow' | null; why: string; branch?: string; branches: string[] }}
+ */
+export function manifestPushVerdict(command, value, ctx = {}) {
+  const branches = destructivePushBranches(value, ctx);
+  const no = (why) => ({ answer: /** @type {null} */ (null), why, branches });
+  if (!branches.length) return no('the row names no branch this plan may push to');
+  const split = shellSegments(typeof command === 'string' ? command : '');
+  if ('refused' in split) return no(`the command carries ${split.refused}`);
+  /** @type {string[]} */
+  const pushed = [];
+  for (const segment of split.segments) {
+    let words = segment;
+    if (words[0] === 'git' && words[1] === '-C' && words.length > 2) words = ['git', ...words.slice(3)];
+    if (words[0] === 'git' && words[1] === 'push') {
+      const args = words.slice(2);
+      /** @type {string[]} */
+      const positional = [];
+      for (const arg of args) {
+        if (arg.startsWith('-')) {
+          if (PUSH_QUIET_OPTIONS.has(arg)) continue;
+          return no(pushOptionRefusal(arg));
+        }
+        positional.push(arg);
+      }
+      const refspecs = positional.slice(1);
+      if (!refspecs.length)
+        return no("the push names no branch — a bare push goes wherever the checkout's upstream points");
+      for (const refspec of refspecs) {
+        if (refspec.startsWith('+')) return no('it is a force push (a `+` refspec)');
+        const colon = refspec.indexOf(':');
+        // `:branch` — an empty SOURCE — is git's delete form, not a push of it.
+        if (colon === 0) return no('it deletes a remote branch (a refspec with an empty source)');
+        const destination = (colon > 0 ? refspec.slice(colon + 1) : refspec).replace(/^refs\/heads\//, '');
+        if (destination === 'HEAD' || !destination) return no('the push names no branch');
+        if (TRUNK_BRANCHES.includes(/** @type {never} */ (destination)))
+          return no(`it pushes to ${destination}, a trunk — always a person's call`);
+        if (!branches.includes(destination))
+          return no(
+            `it pushes to ${destination}, which the row does not name (it names ${branches.join(', ')})`,
+          );
+        pushed.push(destination);
+      }
+      continue;
+    }
+    if (words[0] === 'git') {
+      if (READ_ONLY_GIT.has(words[1])) continue;
+      if (words[1] === 'stash' && words[2] === 'list') continue;
+      if (
+        words[1] === 'branch' &&
+        words.slice(2).every((w) => ['-a', '-r', '-v', '-vv', '--show-current', '--list'].includes(w))
+      )
+        continue;
+      if (words[1] === 'remote' && words.slice(2).every((w) => w === '-v')) continue;
+      return no(`a command beside the push the row does not cover: git ${words[1] ?? ''}`.trim());
+    }
+    if (READ_ONLY_COMMANDS.has(words[0])) continue;
+    return no(`a command beside the push the row does not cover: ${words[0]}`);
+  }
+  if (!pushed.length) return no('the command pushes nothing the row names');
+  return {
+    answer: 'allow',
+    why: `the row names ${[...new Set(pushed)].join(', ')} as a branch this plan may push`,
+    branch: pushed[0],
+    branches,
+  };
 }
 
 /**

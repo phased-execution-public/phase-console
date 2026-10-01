@@ -17,7 +17,7 @@
  */
 
 import { LAND_LABELS } from '@shared/landing-model.js';
-import { Chip, type ChipTone } from '@/components/ui';
+import { Badge, type BadgeTone } from '@/components/ui';
 import type { PhaseLanding, PhaseView } from '@/lib/api';
 
 /** The engine's step, as a sentence — finer than the ledger's word, and what a person waits on. */
@@ -50,7 +50,7 @@ export function landingStepText(landing: PhaseLanding): string {
  * engine set the phase aside and drove on. `conflict` under any other step
  * and `failed` are what they say.
  */
-export function landingTone(landing: Pick<PhaseLanding, 'state' | 'step'>): ChipTone {
+export function landingTone(landing: Pick<PhaseLanding, 'state' | 'step'>): BadgeTone {
   if (landing.step === 'parked') return 'accent';
   const { state } = landing;
   if (state === 'landed' || state === 'pr-merged' || state === 'integrated') return 'ok';
@@ -73,14 +73,14 @@ const LAND_SOURCE_TITLE: Record<NonNullable<PhaseView['land']>['source'], string
 export function LandChip({ land }: { land: PhaseView['land'] | undefined }) {
   if (!land || land.source === 'default') return null;
   return (
-    <Chip
+    <Badge
       tone="neutral"
       mono
       data-testid="land-chip"
       title={`${LAND_LABELS[land.value] ?? land.value}\n${LAND_SOURCE_TITLE[land.source]}`}
     >
       Land: {land.value}
-    </Chip>
+    </Badge>
   );
 }
 
@@ -88,8 +88,8 @@ export function LandChip({ land }: { land: PhaseView['land'] | undefined }) {
 export function LandingStateChip({ landing }: { landing: PhaseLanding | undefined }) {
   if (!landing) return null;
   return (
-    <Chip tone={landingTone(landing)} mono data-testid="landing-state-chip" title={landingStepText(landing)}>
+    <Badge tone={landingTone(landing)} mono data-testid="landing-state-chip" title={landingStepText(landing)}>
       {landing.state}
-    </Chip>
+    </Badge>
   );
 }

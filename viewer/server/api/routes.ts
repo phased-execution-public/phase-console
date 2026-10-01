@@ -11,15 +11,21 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
 import { HookPayloadError, HookRateError, PhaseClaimedError, RecoveryBusyError, type Service } from '../service.ts';
-import { PreludeRefusal } from '../prelude.ts';
-import { RELAY_MODES, type RelayMode } from '../../shared/run-settings.js';
+import { GIT_STRATEGY_ACKS, GitStrategyRefusal, PreludeRefusal } from '../prelude.ts';
+import { AGENT_INTENTS, RELAY_MODES, SETTING_VERBS, type RelayMode } from '../../shared/run-settings.js';
+import { withPhaseClocks } from '../../shared/phase-clocks.js';
+import { withWallReadings } from '../../shared/situation-model.js';
+import { parseLockFilter } from '../locks.ts';
 import { DECISION_KEYS } from '../../shared/decisions-model.js';
-import type { AccountRequirement } from '../runner/state.ts';
+import type { AccountRequirement, PressAnswer } from '../runner/state.ts';
 import { classify as classifyAccess } from './access.ts';
 import { actorOfRequest } from './actor.ts';
+import { createSseWriter } from './sse.ts';
 import { PolicyRuleError } from '../runner/approvals.ts';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
 import { pressActor } from '../actor.ts';
+import { RUN_SWITCH_WORDS } from '../../shared/verb-model.js';
+import { liveVerifying, slimRun } from '../runs-projection.ts';
 import { agentEnabled, checkRoot, gitDoorRefusal, listDirs } from '../config.ts';
 import { fromAutomation } from '../../shared/automation-model.js';
 import { buildAgentLaunch, type ResumeTarget } from '../agent.ts';
@@ -34,21 +40,25 @@ import { QA_FIX_STRATEGIES, type QaFixStrategy } from '../../shared/run-settings
 import { PUSH_ACTION_TTL_MS, readActionToken } from '../push/actions.ts';
 import { MODEL_FALLBACK as MODELS } from '../runner/errors.ts';
 import { isKnownModel } from '../runner/models.ts';
+import { transcriptQuery } from '../runner/transcript.ts';
+import { activityQuery } from '../sessions/scope-inference.ts';
 import { planWrite, runWrite, openInEditor, WriteError, type WriteRequest } from '../writes.ts';
 import { TERMINAL_PATH, type LaunchSpec } from '../terminal.ts';
 import { tailscaleStatus } from '../tailscale.ts';
 import { ACCOUNT_ID_RE, DEFAULT_ACCOUNT_ID, ProbeInFlightError } from '../accounts/index.ts';
 import { searchCatalog } from '../mcp/index.ts';
 import { MCP_ID_RE } from '../mcp/store.ts';
-import { isMcpPolicy, isOnLimitPolicy, type PhaseOptions } from '../runner/state.ts';
+import { isMcpPolicy, isModelPolicy, isOnLimitPolicy, type PhaseOptions } from '../runner/state.ts';
 import { METRICS_CONTENT_TYPE } from '../analysis/metrics.ts';
 import { debugFor, runBundleDeps } from '../debug/deps.ts';
 import { parseSince, runBundle } from '../debug/bundle.ts';
 import { isRunId, isSlug, parseDebugQuery } from '../debug/index.ts';
 import type { DebugEntry } from '../debug/sources.ts';
-import { sendBody } from '../http/compress.ts';
-import { RUN_PRIORITIES, type RunPriority } from '../../shared/orchestration-model.js';
-import { AUTONOMY_MODES, ULTRA_REVIEW_MODES, type UltraReviewMode } from '../../shared/run-lifecycle.js';
+import { compress, etagMatches, sendBody, sendSettled } from '../http/compress.ts';
+import { LANE_VERBS, QUEUE_VERBS, RUN_PRIORITIES, type RunPriority } from '../../shared/orchestration-model.js';
+import {
+  AUTONOMY_MODES, SWITCH_WHEN, ULTRA_REVIEW_MODES, undrivenPhases, type SwitchWhen, type UltraReviewMode,
+} from '../../shared/run-lifecycle.js';
 import { PLAN_INCLUDES, STATE_INCLUDES, parseInclude } from '../../shared/projection.js';
 import {
   ISOLATED, ISOLATION_MODES, SETTLE_STRATEGIES, retentionOf,
@@ -57,8 +67,11 @@ import {
 import { CONFLICT_POLICIES, LAND_POLICIES, type ConflictPolicy, type LandPolicy } from '../../shared/landing-model.js';
 import { ISSUE_MODES, type IssueMode } from '../../shared/issues-model.js';
 import { MESSAGING_WORDS, type MessagingWord } from '../../shared/message-model.js';
-import { branchExists, issuesModeLoosens } from '../runner/runner-core.ts';
+import {
+  branchExists, issuesModeLoosens, lockedSettingRefusals, type RefusedSetting, type RunSettingsPatch,
+} from '../runner/runner-core.ts';
 import { QA_DIRECTIVES } from '../../shared/plan-vocab.js';
+import { withLiveErrands } from '../watch-refs.ts';
 
 export type ApiContext = { service: Service };
 
@@ -107,6 +120,36 @@ function json(res: ServerResponse, status: number, body: unknown): void {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': cacheControl(res, status),
   }, { revalidate: true });
+}
+
+/**
+ * A run verb's answer: the run it acted on, or 409 with `refusal` when there
+ * was none to act on (control-tower phase 53). `200 {run: null}` read exactly
+ * like success to every client, which is how a button came to "work" while
+ * doing nothing at all.
+ */
+function answerRun(res: ServerResponse, run: unknown, refusal: string): void {
+  if (run) json(res, 200, { run });
+  else json(res, 409, { error: refusal });
+}
+
+/**
+ * A press's answer (control-tower phase 53, #54 #55 #56): the run and what it
+ * `launched`, or the refusal's status with its reason — and the session that
+ * holds the phase when that is why, so the client can open it.
+ */
+function answerPress(res: ServerResponse, answer: PressAnswer & { rulingId?: string }): void {
+  if (answer.ok) {
+    // `launched` only when the phase boarded at this admission; `queued` with
+    // its position otherwise (control-tower phase 86, RS-5).
+    json(res, 200, {
+      run: answer.run,
+      ...('launched' in answer ? { launched: answer.launched } : { queued: answer.queued }),
+      ...(answer.rulingId ? { rulingId: answer.rulingId } : {}),
+    });
+    return;
+  }
+  json(res, answer.status, { error: answer.error, ...(answer.sessionId ? { sessionId: answer.sessionId } : {}) });
 }
 
 function text(res: ServerResponse, status: number, body: string): void {
@@ -171,6 +214,7 @@ function guardWrite(req: IncomingMessage, service: Service): string | null {
  * `--allow-run` spawns agent sessions that edit a repository unattended, so it
  * is a separate flag and a separate guard rather than a wider reading of one.
  */
+
 function guardRun(req: IncomingMessage, service: Service): string | null {
   return guardMutation(req, service.flags.allowRun
     ? null
@@ -383,6 +427,17 @@ function numberOrNull(value: unknown): number | null {
 }
 
 /**
+ * A run's own rung cap as the start door reads it (#14): absent or blank is
+ * "you did not say", `null` is a clear — kept, because on a Continue it hands
+ * the run back to the console's preference — and anything else is the number
+ * `intProblem` has already held to its range.
+ */
+function rungCapOf(value: unknown): number | null | undefined {
+  if (value === undefined || value === '') return undefined;
+  return value === null ? null : Number(value);
+}
+
+/**
  * The phase a run control was aimed at, when it named one.
  *
  * Absent means "whatever is running", which is what every control meant before
@@ -450,6 +505,24 @@ function modelProblem(value: unknown, field = 'model'): string | null {
 function effortProblem(value: unknown, field = 'effort'): string | null {
   if (value === undefined || value === null || value === '') return null;
   if (!isEffort(value)) return `${field} must be one of: ${EFFORTS.join(', ')}.`;
+  return null;
+}
+
+/**
+ * A run-level permission mode from a browser, or the reason it is not one
+ * (control-tower phase 11, #34). Refused, never dropped — the per-phase select
+ * once dropped words silently and a phase boarded under a mode nobody chose.
+ * `bypass` plus a mode is refused too: bypass is the ABSENCE of a mode, and
+ * `spawn.ts` would quietly let the profile win over the word.
+ */
+function permissionModeProblem(value: unknown, profile: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (!(PERMISSION_MODES as readonly unknown[]).includes(value)) {
+    return `permissionMode must be one of: ${PERMISSION_MODES.join(', ')}.`;
+  }
+  if (profile === 'bypass') {
+    return 'permissionMode cannot be combined with the bypass profile: bypass runs with no permission mode at all.';
+  }
   return null;
 }
 
@@ -601,7 +674,21 @@ function ultraReviewMode(value: unknown): UltraReviewMode | undefined {
     : undefined;
 }
 
+/**
+ * The API's one door. A body worth compressing is packed off the event loop
+ * (control-tower phase 56, #75), so a route's `json(…)` may return before its
+ * response has ended; this resolves only once it has — which is what every
+ * caller of the old synchronous writer could assume.
+ */
 export async function handleApi(
+  ctx: ApiContext, req: IncomingMessage, res: ServerResponse, url: URL,
+): Promise<boolean> {
+  const handled = await routeApi(ctx, req, res, url);
+  await sendSettled(res);
+  return handled;
+}
+
+async function routeApi(
   ctx: ApiContext, req: IncomingMessage, res: ServerResponse, url: URL,
 ): Promise<boolean> {
   const { service } = ctx;
@@ -616,8 +703,13 @@ export async function handleApi(
     // the run ends.
     if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
     if (!service.approvals.verify(req.headers.authorization)) {
-      log.warn('hook.rejected', { reason: service.approvals.armed() ? 'bad token' : 'no run is armed' });
+      const reason = service.approvals.armed() ? 'bad token' : 'no run is armed';
+      const refused = await readBody(req).catch(() => null);
+      log.warn('hook.rejected', { reason });
       json(res, 401, { error: 'bad or expired run token' });
+      // A refusal from a session one of our runs launched is a run-level
+      // fault, not a log line (#74) — the CLI does not block a tool on it.
+      service.noteHookUnauthorised('pre-tool-use', refused, reason);
       return true;
     }
     // Authentication is unchanged — `verify` above still decides that. This
@@ -654,8 +746,11 @@ export async function handleApi(
       return true;
     }
     if (!service.approvals.verify(req.headers.authorization)) {
-      log.warn('hook.rejected', { reason: service.approvals.armed() ? 'bad token' : 'no run is armed' });
+      const reason = service.approvals.armed() ? 'bad token' : 'no run is armed';
+      const refused = await readBody(req).catch(() => null);
+      log.warn('hook.rejected', { reason });
       json(res, 401, { error: 'bad or expired run token' });
+      service.noteHookUnauthorised('permission-request', refused, reason);
       return true;
     }
     const permissionRunId = service.approvals.runIdFor(req.headers.authorization);
@@ -670,12 +765,40 @@ export async function handleApi(
     // deliberately does not apply.
     if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
     if (!service.approvals.verify(req.headers.authorization)) {
-      log.warn('hook.rejected', { reason: service.approvals.armed() ? 'bad token' : 'no run is armed' });
+      const reason = service.approvals.armed() ? 'bad token' : 'no run is armed';
+      const refused = await readBody(req).catch(() => null);
+      log.warn('hook.rejected', { reason });
       json(res, 401, { error: 'bad or expired run token' });
+      service.noteHookUnauthorised('stop', refused, reason);
       return true;
     }
     const stopRunId = service.approvals.runIdFor(req.headers.authorization);
     json(res, 200, await service.decideStop(await readBody(req), stopRunId));
+    return true;
+  }
+
+  /* ---------------- the ingest probe (control-tower phase 50, #86) ---------------- */
+  if (path === '/hooks/declaration') {
+    // The caller is `phase-outcome.sh`, run by a session on this machine,
+    // supervised or not — so no run token (a hand session has none) and no
+    // console header. The presence hook's trust model: loopback, and never
+    // through the `--remote` proxy. What it may ask is bounded by the service,
+    // which reads the refs from the staged file in ITS OWN state directory and
+    // never from this body (`declared-probe.ts`): the door makes the console
+    // ask sooner what its timer would have asked anyway.
+    if (req.method !== 'POST') { json(res, 405, { error: 'POST only' }); return true; }
+    const remote = req.socket?.remoteAddress ?? '';
+    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === '';
+    const access = Array.isArray(service.flags.remoteHosts)
+      ? classifyAccess(req, service.flags)
+      : { ok: true as const, scope: 'local' as const };
+    if (!loopback || !access.ok || access.scope !== 'local') {
+      log.warn('hook.rejected', { reason: !loopback ? 'not loopback' : 'not local', hook: 'declaration' });
+      json(res, 403, { error: 'a declaration is probed for a session on this machine only' });
+      return true;
+    }
+    const answer = await service.probeDeclaration(await readBody(req));
+    json(res, answer.status, answer);
     return true;
   }
 
@@ -703,10 +826,14 @@ export async function handleApi(
       // A starting session is told who else is in its repository (REG-3 iv):
       // the hook copies `peers` into the session's additionalContext.
       const peers = record.lastEvent?.event === 'SessionStart' ? service.sessionPeersSentence(record) : null;
+      // …and, once per run, that the queue waits on it (control-tower phase
+      // 82, #119): the hook prints `notice` to the person in the session.
+      const notice = record.lastEvent?.event === 'SessionEnd' ? null : service.sessionBlockingNotice(record);
       json(res, 200, {
         ok: true,
         session: { sessionId: record.sessionId, presence: service.sessions.presence(record.sessionId) },
         ...(peers ? { peers } : {}),
+        ...(notice ? { notice } : {}),
       });
     } catch (error) {
       if (error instanceof HookPayloadError) json(res, 400, { error: error.message });
@@ -729,30 +856,34 @@ export async function handleApi(
     // Declared before `stop` can run: a client that vanishes between the header
     // and the first write makes `send` call `stop` immediately, and reaching a
     // `const` declared further down would be a ReferenceError inside the very
-    // handler whose job is to survive dead clients.
+    // handler whose job is to survive dead clients. The writer is built here for
+    // the same reason — `stop` closes it.
     let ping: NodeJS.Timeout | undefined;
     let off: (() => void) | undefined;
+    /**
+     * A browser that navigated away, slept, or crashed leaves a socket that
+     * fails under the next write; one that stopped READING leaves a socket that
+     * accepts every write and holds it. The writer answers both — the first by
+     * retiring this listener, the second by capping what it may hold first.
+     */
+    const writer = createSseWriter(res, { label: 'events', onDrop: () => stop() });
     const stop = () => {
       if (closed) return;
       closed = true;
       if (ping) clearInterval(ping);
+      writer.close();
       off?.();
     };
 
-    /**
-     * A browser that navigated away, slept, or crashed leaves a socket that
-     * fails under the next write. Unhandled, that is an uncaught exception per
-     * dead client — so a write failure just retires this listener.
-     */
     const send = (chunk: string): void => {
       if (closed || res.writableEnded || res.destroyed) { stop(); return; }
-      try {
-        res.write(chunk);
-      } catch (error) {
-        if (!isClientDisconnect(error)) log.warn('sse.write', { error });
-        stop();
-      }
+      writer.send(chunk);
     };
+
+    // Partial `run:stream` frames are opt-in, per run. A surface that renders a
+    // transcript asks for them; every other listener moves on `run:progress`
+    // instead and never buffers a byte of output it will not paint.
+    writer.subscribe(url.searchParams.get('stream'));
 
     // Replay anything the client missed while reconnecting. Browsers resend the
     // last id automatically, so a dropped connection costs no events — which
@@ -766,11 +897,12 @@ export async function handleApi(
       replayed: missed.length,
     })}\n\n`);
     for (const item of missed) {
-      send(`id: ${item.id}\nevent: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`);
+      writer.event(item.event, item.data, item.id);
     }
 
     off = service.onEvent((event, data, id) => {
-      send(`id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (closed) return;
+      writer.event(event, data, id);
     });
     ping = setInterval(() => send(': ping\n\n'), 25_000);
     // The client may already have gone during the replay above, in which case
@@ -791,9 +923,17 @@ export async function handleApi(
   const [head, ...rest] = segments;
 
   try {
+
     /* ---------------- session + source directory ---------------- */
     if (head === 'state' && req.method === 'GET') {
       json(res, 200, service.state(parseInclude(url.searchParams.get('include'), STATE_INCLUDES)));
+      return true;
+    }
+    // `GET /api/engine`: the engine pool now — reads running, reads queued behind
+    // them, the slot count. A plan page asks while its own read waits, so it can
+    // say "computing the board (N queued)" instead of looking dead (#44).
+    if (head === 'engine' && rest.length === 0 && req.method === 'GET') {
+      json(res, 200, service.engineQueue());
       return true;
     }
 
@@ -817,6 +957,20 @@ export async function handleApi(
         sessionId: rest[0],
         events: service.sessionEvents(rest[0] ?? '', Number.isFinite(limit) && limit > 0 ? limit : undefined),
       });
+      return true;
+    }
+    // `POST /api/sessions/<id>/release` {hours?}: an operator says a terminal
+    // session is not working in this repository (control-tower phase 82, #119)
+    // — for `hours`, or for as long as it lives. The queue stops waiting on it
+    // at once. Behind `--allow-run`: it decides what the autopilot may board.
+    if (head === 'sessions' && rest[1] === 'release' && req.method === 'POST') {
+      const refusal = guardRun(req, service);
+      if (refusal) { json(res, 403, { error: refusal }); return true; }
+      const body = (await readBody(req).catch(() => ({}))) as { hours?: unknown; by?: unknown };
+      const hours = typeof body?.hours === 'number' ? body.hours : undefined;
+      const record = service.releaseSessionHold(rest[0] ?? '', { hours, by: actorOfRequest(req, service.flags, body).by });
+      if (!record) { json(res, 404, { error: `no session ${rest[0] ?? ''} in this console's registry` }); return true; }
+      json(res, 200, { ok: true, sessionId: record.sessionId, holdReleased: record.holdReleased });
       return true;
     }
     // `GET /api/converge`: the convergence loop's standing — on or off for this
@@ -1100,6 +1254,60 @@ export async function handleApi(
       return true;
     }
 
+    /* ---------------- a person's turn: the human-step verbs ----------------
+     *
+     * Control-tower phase 43. Reading is ungated — the steps carry no secret,
+     * because nothing secret reaches the ledger. Every verb is a mutation with
+     * the cross-site check and is attributed; `open` on the MACHINE is behind
+     * `--allow-terminal` or `--allow-agent` (asked inside the service, which
+     * answers the full URL for confirmation before anything opens), and a
+     * command step's embedded terminal is behind the terminal's own gate.
+     *
+     *   GET  /api/human-steps[?open=1]
+     *   POST /api/human-steps/:id/open     {where?: 'here'|'host', what?: 'url'|'command', confirm?: <the url>}
+     *   POST /api/human-steps/:id/check    {secret?} — a secret-entry step's form, behind --allow-accounts
+     *   POST /api/human-steps/:id/snooze   {minutes?}
+     *   POST /api/human-steps/:id/cannot   {reason}
+     *   POST /api/human-steps/:id/dismiss  {note?}
+     *   POST /api/human-steps/suspected    {slug, phase} — phase 44: a silent lane's suspected
+     *        person's turn made a step on a person's request (the inbox's silent row posts it)
+     */
+    if (head === 'human-steps') {
+      if (req.method === 'GET' && rest.length === 0) {
+        json(res, 200, service.humanStepsView({ open: url.searchParams.get('open') === '1' }));
+        return true;
+      }
+      if (req.method === 'POST' && rest.length === 1 && rest[0] === 'suspected') {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+        const result = service.convertSuspectedStep(body, { by: actorOfRequest(req, service.flags, body).by });
+        if (result.ok) { json(res, 200, result); return true; }
+        const { status, ...rest2 } = result;
+        json(res, status, rest2);
+        return true;
+      }
+      if (req.method === 'POST' && rest.length === 2) {
+        const refusal = guardCsrf(req);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+        const [id, verb] = rest;
+        const by = actorOfRequest(req, service.flags, body).by;
+        const result = verb === 'open' ? await service.openHumanStep(id, body, { by })
+          : verb === 'check' ? await service.checkHumanStep(id, { by, ...('secret' in body ? { secret: body.secret } : {}) })
+            : verb === 'snooze' ? service.snoozeHumanStep(id, body, { by })
+              : verb === 'cannot' ? service.cannotHumanStep(id, body, { by })
+                : verb === 'dismiss' ? service.dismissHumanStep(id, body, { by })
+                  : { ok: false as const, status: 404, error: `a step has no verb ${verb}` };
+        if (result.ok) { json(res, 200, result); return true; }
+        const { status, ...rest2 } = result;
+        json(res, status, rest2);
+        return true;
+      }
+      json(res, 405, { error: 'GET /api/human-steps, POST /api/human-steps/suspected, or POST /api/human-steps/:id/<open|check|snooze|cannot|dismiss>' });
+      return true;
+    }
+
     /* ---------------- push notifications ---------------- */
     if (head === 'push') {
       // Reading the catalogue and the public key is harmless. Everything that
@@ -1319,9 +1527,13 @@ export async function handleApi(
         // `whenIdle` lets a press made mid-run wait for the live sessions
         // instead of being refused. Both are answered at once with 202 — the
         // process goes down only once the update, or the wait, is over.
+        // `session` is the id of the run session asking, when a session asks —
+        // the CLI sends `$PE_SESSION_ID` — so the restart is attributed to it
+        // and written onto its run (control-tower phase 48, #69).
         const outcome = service.restart(actor, body.force === true, {
           update: body.update !== false,
           ...(body.whenIdle === true ? { whenIdle: true } : {}),
+          ...(typeof body.session === 'string' && body.session ? { session: body.session.slice(0, 128) } : {}),
         });
         json(res, outcome.ok ? (outcome.updating || outcome.waiting ? 202 : 200) : 409, outcome);
         return true;
@@ -1404,7 +1616,7 @@ export async function handleApi(
         // beats a 403 about a flag that was never the point.
         if (kind !== 'claude' && body.intent != null && body.intent !== '') {
           json(res, 400, {
-            error: "intent ('plan', 'recovery', 'qa') is a claude-session field — send kind: 'claude'.",
+            error: `intent (${AGENT_INTENTS.join(', ')}) is a claude-session field — send kind: 'claude'.`,
           });
           return true;
         }
@@ -1504,7 +1716,8 @@ export async function handleApi(
           // it — never a session quietly briefed on fewer issues than were
           // chosen. Resolution is skipped entirely for a non-plan ticket, whose
           // validator refuses the field anyway.
-          const issues = body.intent === 'plan' && Array.isArray(body.issues) && body.issues.length
+          let resolvesIssues = body.intent === 'plan';
+          const issues = resolvesIssues && Array.isArray(body.issues) && body.issues.length
             ? await service.issues.resolve(body.issues.map((ref) => String(ref)))
             : undefined;
 
@@ -1726,9 +1939,33 @@ export async function handleApi(
           json(res, 200, await service.beginAccountLogin({
             ...(accountId ? { accountId } : {}),
             ...(name ? { name } : {}),
+            // The person's answer to the machine-login warning (phase 13, #131).
+            ...(body.confirm !== undefined ? { confirm: body.confirm } : {}),
           }));
         } catch (error) {
           json(res, 400, { error: (error as Error).message });
+        }
+        return true;
+      }
+      // Replace a token account's credential, keeping its id (control-tower
+      // phase 13, #33) — the repair that used to mint a second account.
+      // Registration-class, like adding one. 404 for no such account, 400 for
+      // a request that will never work (no token, or an account with no token
+      // to replace — a login is signed in again, through `login`).
+      if (req.method === 'PUT' && rest.length === 2 && rest[1] === 'credential') {
+        const refusal = guardAccounts(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const id = rest[0] ?? '';
+        if (!ACCOUNT_ID_RE.test(id)) { json(res, 400, { error: 'Not an account id.' }); return true; }
+        const body = await readBody(req);
+        const token = typeof body.token === 'string' ? body.token.trim() : '';
+        if (!token) { json(res, 400, { error: 'Paste the new token from `claude setup-token`.' }); return true; }
+        try {
+          const view = await service.replaceTokenAccount(id, token);
+          if (!view) { json(res, 404, { error: 'No such account.' }); return true; }
+          json(res, 200, { account: view });
+        } catch (error) {
+          json(res, (error as { status?: number }).status ?? 400, { error: (error as Error).message });
         }
         return true;
       }
@@ -1804,7 +2041,12 @@ export async function handleApi(
         try {
           json(res, 200, { account: await service.addTokenAccount(name, token) });
         } catch (error) {
-          json(res, 400, { error: (error as Error).message });
+          // 409 for a name an account already has, pointing at it (phase 13,
+          // #33): a re-paste minted a second account for one identity.
+          const existing = (error as { existing?: unknown }).existing;
+          json(res, (error as { status?: number }).status ?? 400, {
+            error: (error as Error).message, ...(existing ? { existing } : {}),
+          });
         }
         return true;
       }
@@ -1817,7 +2059,30 @@ export async function handleApi(
           const removed = await service.removeAccount(id);
           json(res, removed ? 200 : 404, removed ? { removed: true } : { error: 'No such account.' });
         } catch (error) {
-          json(res, 400, { error: (error as Error).message });
+          // 409 when the request is fine and the moment is not — a live run
+          // paying as this account, or a live session signed into its config
+          // directory (#22). 400 stays what it was: a request that will never
+          // work.
+          json(res, (error as { status?: number }).status ?? 400, { error: (error as Error).message });
+        }
+        return true;
+      }
+      // "Use credits past plan limits" (control-tower phase 93, #146): 409
+      // with the account's own reason when its credit state says no.
+      if (req.method === 'POST' && rest.length === 2 && rest[1] === 'overage') {
+        const refusal = guardAccounts(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const id = rest[0] ?? '';
+        if (!ACCOUNT_ID_RE.test(id)) { json(res, 400, { error: 'Not an account id.' }); return true; }
+        const body = await readBody(req);
+        if (typeof body.allowed !== 'boolean') { json(res, 400, { error: 'allowed must be true or false.' }); return true; }
+        const capUsd = typeof body.capUsd === 'number' && Number.isFinite(body.capUsd) && body.capUsd >= 0 ? body.capUsd : null;
+        try {
+          const result = await service.setAccountOverage(id, body.allowed, capUsd);
+          if (!result.ok) { json(res, /^no account /.test(result.reason) ? 404 : 409, { error: result.reason }); return true; }
+          json(res, 200, { account: result.account });
+        } catch (error) {
+          json(res, (error as { status?: number }).status ?? 400, { error: (error as Error).message });
         }
         return true;
       }
@@ -2210,20 +2475,21 @@ export async function handleApi(
 
         let closed = false;
         let timer: NodeJS.Timeout | undefined;
+        // The same writer `/events` uses, for the same reason: this tail writes
+        // 200 rows every two seconds to whoever is holding the Debug page open,
+        // and a page nobody is reading is the cheapest way there is to fill a
+        // write buffer nobody drains.
+        const writer = createSseWriter(res, { label: 'debug-tail', onDrop: () => stop() });
         const stop = () => {
           if (closed) return;
           closed = true;
           if (timer) { clearInterval(timer); timer = undefined; }
+          writer.close();
           try { res.end(); } catch { /* already gone */ }
         };
         const send = (chunk: string): void => {
           if (res.writableEnded || res.destroyed) { stop(); return; }
-          try {
-            res.write(chunk);
-          } catch (error) {
-            if (!isClientDisconnect(error)) log.warn('debug.tail-write', { error: String(error) });
-            stop();
-          }
+          writer.send(chunk);
         };
 
         // The newest row already on screen. Everything strictly newer than
@@ -2316,7 +2582,22 @@ export async function handleApi(
     if (head === 'inbox') {
       // Reads are unguarded like the rest of the read API.
       if (req.method === 'GET') {
-        json(res, 200, await service.attention(url.searchParams.get('all') === '1'));
+        const all = url.searchParams.get('all') === '1';
+        const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': cacheControl(res, 200) };
+        // A 304 decided from the inbox's input revisions, before any body is
+        // built or hashed (#75) — the tabs that ask on every beat are answered
+        // for the cost of comparing two strings.
+        const held = service.inboxEtag(all);
+        if (held && etagMatches(req.headers['if-none-match'], held)) {
+          await sendBody(res, 200, Buffer.alloc(0), headers, { revalidate: true, etag: held });
+          return true;
+        }
+        const entity = await service.attentionEntity(all);
+        await sendBody(res, 200, entity.body, headers, {
+          revalidate: true,
+          etag: entity.etag,
+          packed: (encoding) => (entity.packed[encoding] ??= compress(entity.body, encoding)),
+        });
         return true;
       }
 
@@ -2735,30 +3016,119 @@ export async function handleApi(
       // every admission change, and a board read per queued plan on those
       // paths would charge every reader for what one page asked for. Here,
       // asking is the request. See `ServiceRuns.queueAdvice`.
-      json(res, 200, { ...service.queueSnapshot(), advice: await service.queueAdvice() });
+      //
+      // `hinted` (control-tower phase 86, #128 #114): the phases a re-board
+      // asked for that no scheduler entry holds yet — serial behind their own
+      // run's lane, or waiting for one of its lanes — each with its hint time.
+      // They are not the scheduler's to list; without this they were on no page.
+      //
+      // Widened (control-tower phase 99, #135 A, I, J): every entry with its
+      // plan, phase, title, class, clocks, holder in words, account and the
+      // REASON it sits where it does, in the order it will board; `lanes` and
+      // who each holds up (a lane polling its own job named so, #67);
+      // `hinted` and `withdrawn` each with the press that moves it; `audit`,
+      // every queue change with who and why. Everything the queue page draws,
+      // so the CLI and the supervisor read what a person sees.
+      json(res, 200, { ...service.queueView(), advice: await service.queueAdvice() });
       return true;
     }
+
 
     /* ---------------- one entry to the front of its class ----------------
      * Run-class, not write-class: it changes what STARTS, which is the same
      * authority `start` and `stop` need and a different one from editing a
      * file in the repository. See `Scheduler.bump` for why it is by entry id
      * and why it never crosses a class boundary. */
-    if (head === 'queue' && req.method === 'POST' && rest[0] === 'bump') {
+    /* ---------------- an operator's word on one phase's place ----------------
+     * `POST /api/queue/<verb>` (control-tower phase 99, #135 B, E, J) — one of
+     * `QUEUE_VERBS`: bump, hold, release, defer {until}, withdraw, requeue
+     * {position?: 'front'}, reorder {slug, phases}. The target is an entry
+     * (`entryId`) or any phase of a run (`{slug, phase}` — a terminal knows the
+     * phase, never the scheduler's id; control-tower phase 98, #144). Durable:
+     * the mark is on the phase's record, so it outlives the entry. 404, not
+     * 200-with-a-false, for an entry that has since boarded — "we moved
+     * nothing" and "we moved it" must not be the same response. */
+    if (head === 'queue' && req.method === 'POST' && rest.length === 1 && (QUEUE_VERBS as readonly string[]).includes(rest[0] ?? '')) {
       const refusal = guardRun(req, service);
       if (refusal) { json(res, 403, { error: refusal }); return true; }
       const body = await readBody(req);
-      const entryId = typeof body.entryId === 'string' ? body.entryId : '';
-      if (!entryId) { json(res, 400, { error: 'pass {entryId} — the queue entry to move' }); return true; }
-      // 404, not 200-with-a-false: an entry id from a page that has been open
-      // a while names something that has since been admitted or cancelled, and
-      // "we moved nothing" and "we moved it" must not be the same response.
-      const moved = service.bumpQueueEntry(entryId);
-      if (!moved) {
-        json(res, 404, { error: `no queued entry ${entryId} — it may have started already` });
+      const phase = Number(body.phase);
+      const out = service.queueControl(rest[0] ?? '', {
+        ...(typeof body.entryId === 'string' && body.entryId ? { entryId: body.entryId } : {}),
+        ...(typeof body.slug === 'string' && body.slug ? { slug: body.slug } : {}),
+        ...(body.phase !== undefined && Number.isSafeInteger(phase) ? { phase } : {}),
+      }, actorOfRequest(req, service.flags, body), {
+        ...(typeof body.until === 'string' ? { until: body.until } : {}),
+        ...(body.position === 'front' ? { position: 'front' as const } : {}),
+        ...(Array.isArray(body.phases) ? { phases: body.phases.map(Number) } : {}),
+      });
+      if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
+      json(res, 200, { ...service.queueSnapshot(), change: { verb: rest[0], slug: out.slug, phase: out.phase, changed: out.changed } });
+      return true;
+    }
+
+    /* ---------------- the scheduling policy and the load guard ----------------
+     * `POST /api/queue/policy {policy?, slug?, loadFactor?, reason?}` (control-
+     * tower phase 100, #135 F.24, G.27, J.32): the console's policy, a plan's
+     * own (`slug`; `policy: null` gives it back), the load guard's factor.
+     * Run-class, like the queue verbs: it changes what STARTS. */
+    if (head === 'queue' && req.method === 'POST' && rest.length === 1 && rest[0] === 'policy') {
+      const refusal = guardRun(req, service);
+      if (refusal) { json(res, 403, { error: refusal }); return true; }
+      const body = await readBody(req);
+      const out = service.setSchedulingPolicy({
+        ...('policy' in body ? { policy: body.policy === null ? null : String(body.policy) } : {}),
+        ...(typeof body.slug === 'string' && body.slug ? { slug: body.slug } : {}),
+        ...(body.loadFactor !== undefined ? { loadFactor: typeof body.loadFactor === 'string' ? Number(body.loadFactor) : body.loadFactor as number } : {}),
+      }, actorOfRequest(req, service.flags, body));
+      if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
+      json(res, 200, { policy: service.schedulingPolicies(), load: service.loadGuard() });
+      return true;
+    }
+
+    /* ---------------- an operator's word on a LANE ----------------
+     * `POST /api/lane/<verb>` (control-tower phase 100, #135 B.8, D.15–16,
+     * J.32; #150 ask 2) — one of `LANE_VERBS`, each naming `{slug, phase}`:
+     * pin / unpin and reserve / unreserve are marks on the phase's record
+     * (the queue door's), yield `{to?}` hands a live lane over, and phase 90's
+     * isolate-phase / isolate are the same table's other two rows. */
+    if (head === 'lane' && req.method === 'POST' && rest.length === 1) {
+      const verb = rest[0] ?? '';
+      if (!(LANE_VERBS as readonly string[]).includes(verb)) {
+        json(res, 404, { error: `no lane verb ${verb} — one of ${LANE_VERBS.join(', ')}` });
         return true;
       }
-      json(res, 200, service.queueSnapshot());
+      const refusal = guardRun(req, service);
+      if (refusal) { json(res, 403, { error: refusal }); return true; }
+      const body = await readBody(req);
+      const actor = actorOfRequest(req, service.flags, body);
+      const slug = typeof body.slug === 'string' ? body.slug : '';
+      const phase = Number(body.phase);
+      const target = { ...(slug ? { slug } : {}), ...(body.phase !== undefined && Number.isSafeInteger(phase) ? { phase } : {}) };
+      if (verb === 'isolate') {
+        answerRun(res, service.isolateRun(slug, actor.by), `No shared-checkout run of ${slug} to switch to its own checkout.`);
+        return true;
+      }
+      if (verb === 'isolate-phase') {
+        const answer = await service.isolatePhase(slug, phase, actor.by);
+        if (answer.ok) json(res, 200, { run: answer.run });
+        else json(res, answer.status, { error: answer.error });
+        return true;
+      }
+      if (verb === 'yield') {
+        // `{slug, phase}`, or the CLI's `<slug>/<N>`.
+        const spelled = typeof body.to === 'string' ? /^([\w.-]+)[/:](\d+)$/.exec(body.to.trim()) : null;
+        const to = spelled ? { slug: spelled[1], phase: spelled[2] }
+          : body.to && typeof body.to === 'object' ? body.to as { slug?: unknown; phase?: unknown } : null;
+        const named = to && typeof to.slug === 'string' && Number.isSafeInteger(Number(to.phase)) ? { slug: to.slug, phase: Number(to.phase) } : undefined;
+        const out = service.yieldLane(target, named, actor);
+        if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
+        json(res, 200, { ...service.queueSnapshot(), yield: out });
+        return true;
+      }
+      const out = service.queueControl(verb, target, actor);
+      if (!out.ok) { json(res, out.status, { error: out.error }); return true; }
+      json(res, 200, { ...service.queueSnapshot(), change: { verb, slug: out.slug, phase: out.phase, changed: out.changed } });
       return true;
     }
 
@@ -2818,6 +3188,12 @@ export async function handleApi(
      * Release reads the owner out of the lock file rather than asking a person
      * to retype it — see `Service.releaseLock`. Write-class, because it removes
      * a file inside the repository. */
+    // #24: every lock claim this console can see, one row each, worst-first —
+    // `?held=1`, `?lapsed=1`, `?scope=<repo>` narrow it (`server/locks.ts`).
+    if (head === 'locks' && req.method === 'GET' && rest.length === 0) {
+      json(res, 200, { rows: service.lockRows(parseLockFilter(url.searchParams)) });
+      return true;
+    }
     if (head === 'locks' && req.method === 'POST' && rest[0] === 'release') {
       const refusal = guardWrite(req, service);
       if (refusal) { json(res, 403, { error: refusal }); return true; }
@@ -2850,7 +3226,37 @@ export async function handleApi(
     }
 
     /* ---------------- runs + approvals ---------------- */
-    if (head === 'runs' && req.method === 'GET') { json(res, 200, await service.allRuns()); return true; }
+    if (head === 'runs' && req.method === 'GET') {
+      // Bounded (control-tower phase 98, #75's 2026-09-24T17:08:10Z comment):
+      // `?latest=1` answers each plan's LATEST run only — `&slug=` one plan's —
+      // in the slim projection (status, halt, children, liveness, one word per
+      // phase), which is what `run status`, `run wait` and the long poll read.
+      // `?view=slim` is the same shape over every run. The whole list below is
+      // unchanged for the pages that draw it — 4.9 MB on the hub.
+      const q = url.searchParams;
+      if (q.get('latest') === '1') {
+        const slug = q.get('slug');
+        const slugs = slug ? [slug] : service.planSlugs();
+        json(res, 200, slugs.map((one) => service.slimRunFor(one)).filter((run) => run !== null));
+        return true;
+      }
+      if (q.get('view') === 'slim') {
+        json(res, 200, (await service.allRuns()).map((one) => slimRun(one, service.runLiveness(one.slug, one))));
+        return true;
+      }
+      const clockedAt = Date.now();
+      // `undriven` (control-tower phase 79, #114): the phases the board reads in
+      // progress that nothing of this live run drives — the Runs page's card.
+      // Every usage wall is read NOW (control-tower phase 86, #132): its
+      // sentence and card come from the absolute reset and the current holder.
+      json(res, 200, (await service.allRuns()).map((one) => ({
+        ...withLiveErrands(withWallReadings(withPhaseClocks(one, clockedAt), clockedAt)),
+        undriven: undrivenPhases(one),
+        // The console's own lanes, live ones only (control-tower phase 89, #68).
+        verifying: liveVerifying(one),
+      })));
+      return true;
+    }
 
     // Signing in. The GET is a read of `claude auth status` — memoised, free,
     // and safe to poll. The POST opens a terminal, so it is a run-class action.
@@ -2869,6 +3275,16 @@ export async function handleApi(
 
     if (head === 'approvals') {
       if (req.method === 'GET') { json(res, 200, service.approvals.all()); return true; }
+      // Extend (control-tower phase 97, #140): `{minutes}` later, inside the
+      // hook's window; past it the card stands. The broker judges the number.
+      if (req.method === 'POST' && rest[0] && rest[1] === 'extend') {
+        const refusal = guardRun(req, service);
+        if (refusal) { json(res, 403, { error: refusal }); return true; }
+        const body = await readBody(req);
+        const answer = service.extendApproval(rest[0], Number(body.minutes), actorOfRequest(req, service.flags, body).by);
+        json(res, answer.ok ? 200 : answer.status, answer);
+        return true;
+      }
       if (req.method === 'POST' && rest[0]) {
         const refusal = guardRun(req, service);
         if (refusal) { json(res, 403, { error: refusal }); return true; }
@@ -2878,12 +3294,14 @@ export async function handleApi(
         // other value is just an answer — a typo must not widen anything.
         const scope = body.remember === 'plan' ? 'plan'
           : body.remember === 'global' ? 'global' : null;
+        const actor = actorOfRequest(req, service.flags, body);
         const answered = service.decideApproval(
           rest[0], decision,
-          actorOfRequest(req, service.flags, body).by,
+          actor.by,
           typeof body.reason === 'string' ? body.reason.slice(0, 500) : undefined,
           scope && typeof body.rule === 'string' && body.rule
             ? { scope, rule: body.rule.slice(0, 200) } : undefined,
+          actor,
         );
         json(res, answered.ok ? 200 : 404, answered);
         return true;
@@ -2921,8 +3339,33 @@ export async function handleApi(
           json(res, 200, service.runLedger(slug, rest[2]));
           return true;
         }
+        // One phase, read live (control-tower phase 95). `activity`: the last
+        // events of its live (or latest) session, from that session's OWN log
+        // and from its end — whatever the replay's size (#138); marked
+        // untrusted, because it is a model's words. `report`: what it is
+        // doing, done and left, waiting on, why slow and when — composed by
+        // rules, every figure naming its source (#163). `?run=` reads a named run.
+        if (verb === 'phase' && (rest[3] === 'activity' || rest[3] === 'report')) {
+          const phase = Number(rest[2]);
+          if (!rest[2] || !/^\d+$/.test(rest[2]) || !Number.isSafeInteger(phase)) {
+            json(res, 400, { error: 'a phase number is required' });
+            return true;
+          }
+          if (rest[3] === 'activity') {
+            json(res, 200, service.phaseActivity(slug, phase, activityQuery(url.searchParams)));
+          } else {
+            const { run } = activityQuery(url.searchParams);
+            const report = service.phaseReport(slug, phase, run ? { run } : {});
+            json(res, 'error' in report ? 404 : 200, report);
+          }
+          return true;
+        }
+        // `?phase=N` reads that phase's own replay file (control-tower phase
+        // 94, #133); without it, the run's files merged. Either way from the
+        // END, with a bounded `limit` — `?limit=abc` used to mean the whole file.
         if (verb === 'transcript') {
-          json(res, 200, service.runTranscript(slug, rest[2], Number(url.searchParams.get('limit') ?? 400)));
+          const { limit, phase } = transcriptQuery(url.searchParams);
+          json(res, 200, service.runTranscript(slug, rest[2], limit, phase));
           return true;
         }
         // Why a phase is not done, in one payload: the command output, the
@@ -2981,6 +3424,10 @@ export async function handleApi(
               ...(only.length ? { onlyPhases: only } : {}),
               ...(autonomy ? { autonomy } : {}),
               ...(verifyAnswers ? { verifyAnswers } : {}),
+              // The draft's checkout, when the client says (probe 6) — absent
+              // reads as the launch door's own defaults.
+              ...(q.get('gitMode') ? { gitMode: q.get('gitMode')! } : {}),
+              ...(q.get('isolation') ? { isolation: q.get('isolation')! } : {}),
             });
             json(res, 200, { prelude });
           } catch (error) {
@@ -2992,15 +3439,46 @@ export async function handleApi(
           json(res, 200, { rulings: service.runRulings(slug) });
           return true;
         }
+        // The long poll (control-tower phase 98, #137 item 4, #144): answers
+        // when `for` holds or `timeout` seconds pass, whichever is first — one
+        // request where a script held an SSE stream or polled every 20 s.
+        // Unauthenticated like every read; a client that goes away ends it.
+        if (verb === 'wait') {
+          const q = url.searchParams;
+          const timeout = q.get('timeout');
+          const stop = new AbortController();
+          req.on?.('close', () => stop.abort());
+          const answer = await service.waitFor(slug, q.get('for') ?? '', timeout === null || timeout === '' ? null : Number(timeout), stop.signal);
+          json(res, answer.status, answer.body);
+          return true;
+        }
+        // The plan a plan-mode phase presented (control-tower phase 17, #34):
+        // what the halt card's reader draws beside Approve and Reject.
+        if (verb === 'plan-text') {
+          const phase = Number(url.searchParams.get('phase'));
+          if (!Number.isInteger(phase) || phase < 1) { json(res, 400, { error: 'plan-text needs ?phase=N' }); return true; }
+          const answer = service.planText(slug, phase);
+          if (!answer.ok) json(res, answer.status, { error: answer.error });
+          else json(res, 200, answer);
+          return true;
+        }
+        // The plan's stored triggers, armed first (control-tower phase 98, #137).
+        if (verb === 'triggers') {
+          json(res, 200, { triggers: service.listTriggers(slug) });
+          return true;
+        }
         // `eta` rides along rather than getting an endpoint of its own: it is
         // derived from exactly this run plus the plan's board, and a second
         // request could be answered against a board that had moved on.
         // `phaseEta` is the same estimate per open lane; the run is read once
         // and handed to it, so the three figures cannot describe different runs.
         const current = await service.runFor(slug);
+        // #28: every phase carries its labelled clocks, and `durationMs` is
+        // `workedMs` — a projection onto a copy, never onto a live state.
+        const clockedAt = Date.now();
         json(res, 200, {
-          run: current,
-          history: await service.runsFor(slug),
+          run: withLiveErrands(withWallReadings(withPhaseClocks(current, clockedAt), clockedAt)),
+          history: (await service.runsFor(slug)).map((one) => withPhaseClocks(one, clockedAt)),
           eta: await service.runEta(slug),
           phaseEta: service.runPhaseEta(slug, current),
           // Per live lane: last output, last tool call, turns since one,
@@ -3045,6 +3523,21 @@ export async function handleApi(
         if (refusal) { json(res, 403, { error: refusal }); return true; }
         const body = await readBody(req);
 
+        // `POST /api/run/:slug/phase/:n/errand-answered {note}` — "Done —
+        // continue" (control-tower phase 88, #124): a person answers the errand
+        // the phase is parked on; the answer is recorded, the stale ask spent,
+        // and the phase re-boarded with the note, as a Resume would board it.
+        if (verb === 'phase' && rest[3] === 'errand-answered') {
+          const phase = Number(rest[2]);
+          if (!rest[2] || !/^\d+$/.test(rest[2]) || !Number.isSafeInteger(phase) || phase < 1) {
+            json(res, 400, { error: 'a phase number is required' });
+            return true;
+          }
+          const note = typeof body.note === 'string' ? body.note.slice(0, 8_000) : '';
+          answerPress(res, await service.answerErrand(slug, phase, note, pressActor(actorOfRequest(req, service.flags, body))));
+          return true;
+        }
+
         switch (verb) {
           case 'start': {
             // Everything the operator can get wrong, answered before a run
@@ -3054,6 +3547,10 @@ export async function handleApi(
             // looked healthy, and simply was not the run that was asked for.
             const problem = modelProblem(body.model)
               ?? effortProblem(body.effort)
+              ?? permissionModeProblem(body.permissionMode, body.permissionProfile)
+              ?? (body.gitStrategyAck === undefined || body.gitStrategyAck === null || body.gitStrategyAck === ''
+                || (GIT_STRATEGY_ACKS as readonly unknown[]).includes(body.gitStrategyAck)
+                ? null : `gitStrategyAck must be one of: ${GIT_STRATEGY_ACKS.join(', ')}.`)
               // QA's own tier is judged exactly as hard as the builder's, and
               // for the same reason: an unknown model would go straight to argv
               // and an unknown effort would be dropped, so the reviewing would
@@ -3066,10 +3563,15 @@ export async function handleApi(
               // arbitrary but finite, because "keep reviewing forever" is the
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
+              ?? intProblem(body.approvalTimeoutMinutes, 'approvalTimeoutMinutes', 1, 59)
               // The per-repository threshold (phase 15): a whole number, and
               // a ceiling that is merely finite — the console's own cap clamps
               // it at admission, so the door need not know that number.
               ?? intProblem(body.maxConcurrentPerRepo, 'maxConcurrentPerRepo', 1, 99)
+              // The run's own ladder rung caps (control-tower phase 5, #14):
+              // zero is a legal cap (nothing climbs), a negative is not a cap.
+              ?? intProblem(body.ladderPerRunRungs, 'ladderPerRunRungs', 0, 1000)
+              ?? intProblem(body.ladderPerPhaseRungs, 'ladderPerPhaseRungs', 0, 100)
               ?? phaseOptionsProblem(body.phaseOptions);
             if (problem) { json(res, 400, { error: problem }); return true; }
 
@@ -3118,6 +3620,17 @@ export async function handleApi(
               // on an unknown effort and carries on at its own default, so a
               // typo would quietly run every phase of a plan at the wrong one.
               effort: isEffort(body.effort) ? body.effort : undefined,
+              // The run's DEFAULT permission mode (control-tower phase 11) —
+              // checked above, so only a mode reaches here.
+              permissionMode: (PERMISSION_MODES as readonly unknown[]).includes(body.permissionMode)
+                ? body.permissionMode as (typeof PERMISSION_MODES)[number] : undefined,
+              // The launch form's answer to the prelude's git-strategy rows
+              // (#18). This is the one door a person presses, so it is the
+              // one that must answer: while a row stands and this is absent,
+              // the start is a 409 naming the rows (`GitStrategyRefusal`).
+              gitStrategyAck: (GIT_STRATEGY_ACKS as readonly unknown[]).includes(body.gitStrategyAck)
+                ? body.gitStrategyAck as (typeof GIT_STRATEGY_ACKS)[number] : undefined,
+              gitStrategyAckRequired: true,
               // Lanes this run may hold at once. Clamped to the console's own
               // ceiling as well as validated, because `--max-sessions` is a
               // machine-level promise about this host and a run may not
@@ -3129,10 +3642,18 @@ export async function handleApi(
                 || body.maxConsecutiveFailures === null || body.maxConsecutiveFailures === ''
                 ? undefined
                 : Number(body.maxConsecutiveFailures),
-              // Flipped with the run defaults (see `runner/state.ts` newRun).
-              autonomy: body.autonomy === 'halt-on-everything' ? 'halt-on-everything' : 'keep-going',
-              phaseBudgetUsd: numberOrNull(body.phaseBudgetUsd),
-              runBudgetUsd: numberOrNull(body.runBudgetUsd),
+              // Only the two words mean anything, and silence is `undefined`
+              // (control-tower phase 77, #102): a fresh run takes `newRun`'s
+              // `keep-going`, and a RESUME keeps its own — the door used to
+              // write `keep-going` over a `halt-on-everything` run the body
+              // never mentioned.
+              autonomy: body.autonomy === 'halt-on-everything' || body.autonomy === 'keep-going'
+                ? body.autonomy : undefined,
+              // Presence, not value, for the same reason: `null` is a choice
+              // ("no ceiling") and travels as one, and an absent budget on a
+              // resume is the run's own — never a ceiling silently removed.
+              phaseBudgetUsd: 'phaseBudgetUsd' in body ? numberOrNull(body.phaseBudgetUsd) : undefined,
+              runBudgetUsd: 'runBudgetUsd' in body ? numberOrNull(body.runBudgetUsd) : undefined,
               resumeRunId: typeof body.resumeRunId === 'string' ? body.resumeRunId : undefined,
               onlyPhases: phaseList(body.onlyPhases),
               phaseOptions: phaseOptions(body.phaseOptions, service),
@@ -3144,9 +3665,15 @@ export async function handleApi(
               // the side that keeps plans moving.
               mcpPolicy: isMcpPolicy(body.mcpPolicy) ? body.mcpPolicy : undefined,
               // Anything unrecognised is `guarded`. A typo must not be the
-              // reason a run takes the guard rails off.
+              // reason a run takes the guard rails off. SILENCE on a resume is
+              // the run's own profile (control-tower phase 77, #102): filling
+              // it with the console default turned a `bypass` run `guarded`
+              // for a person who only pressed Continue.
               permissionProfile: isPermissionProfile(body.permissionProfile)
-                ? body.permissionProfile : DEFAULT_PERMISSION_PROFILE,
+                ? body.permissionProfile
+                : body.permissionProfile == null && typeof body.resumeRunId === 'string' && body.resumeRunId
+                  ? undefined
+                  : DEFAULT_PERMISSION_PROFILE,
               // Same posture for the git strategy: only the two exact literals
               // mean anything; everything else is `undefined`, which lets the
               // stored preference decide. A typo must never mint a branch.
@@ -3209,6 +3736,8 @@ export async function handleApi(
               // what every run before these existed did.
               qaModel: typeof body.qaModel === 'string' && body.qaModel ? body.qaModel : undefined,
               qaEffort: isEffort(body.qaEffort) ? body.qaEffort : undefined,
+              ...(body.approvalTimeoutMinutes === undefined || body.approvalTimeoutMinutes === null
+                || body.approvalTimeoutMinutes === '' ? {} : { approvalTimeoutMinutes: Number(body.approvalTimeoutMinutes) }),
               qaMaxRounds: body.qaMaxRounds === undefined || body.qaMaxRounds === null || body.qaMaxRounds === ''
                 ? undefined
                 : Number(body.qaMaxRounds),
@@ -3220,12 +3749,20 @@ export async function handleApi(
                 ? body.qaFixStrategy as QaFixStrategy : undefined,
               qaRoundBudgetUsd: body.qaRoundBudgetUsd === undefined
                 ? undefined : numberOrNull(body.qaRoundBudgetUsd),
+              // The run's own rung caps — beat the console's preference (#14).
+              // `null` travels as null: on a Continue it CLEARS the run's cap
+              // (the settings door's reading), and a fresh run reads it as silence.
+              ladderPerRunRungs: rungCapOf(body.ladderPerRunRungs),
+              ladderPerPhaseRungs: rungCapOf(body.ladderPerPhaseRungs),
               // Checked against the instance's own registry, never passed
               // through — this value becomes a child's environment. Unknown
               // ids (a removed account, a typo) read as "the machine login";
               // `auto` resolves in the service against the cached meters.
               accountId: accountChoice(body.accountId, service),
               onLimit: isOnLimitPolicy(body.onLimit) ? body.onLimit : undefined,
+              // #91: `pinned` or `ladder`, and nothing else — a typo is "you did
+              // not say", and the plan's line or `ladder` decides.
+              modelPolicy: isModelPolicy(body.modelPolicy) ? body.modelPolicy : undefined,
               // Phase 15's seven, read by the posture every word above takes:
               // only a member of the owner's vocabulary means anything, and
               // everything else is `undefined` — "you did not say" — so the
@@ -3310,12 +3847,15 @@ export async function handleApi(
             // 409 rather than 400: the request is well formed, there is simply
             // nothing listening — and the difference is what tells the console
             // to say "no session is running" instead of "bad request".
-            const by = actorOfRequest(req, service.flags, body).by;
+            const actor = actorOfRequest(req, service.flags, body);
+            const by = actor.by;
             const key = idempotencyKey(req, body);
+            // A steer takes a reason (control-tower phase 96, #142); an ask does
+            // not — its question IS what it says, and why somebody asked is the question.
             const sent = verb === 'ask'
               ? service.askRun(slug, String(body.question ?? ''), by, key, targetPhase(body))
               : service.steerRun(
-                slug, String(body.instruction ?? body.question ?? ''), by, key, targetPhase(body),
+                slug, String(body.instruction ?? body.question ?? ''), by, key, targetPhase(body), actor.reason,
               );
             json(res, sent.ok ? 200 : 409, sent);
             return true;
@@ -3342,8 +3882,38 @@ export async function handleApi(
             json(res, answered.ok ? 200 : answered.status === 404 ? 409 : answered.status, answered);
             return true;
           }
-          case 'pause': json(res, 200, { run: service.pauseRun(slug, actorOfRequest(req, service.flags, body)) }); return true;
-          case 'resume': json(res, 200, { run: service.resumePause(slug) }); return true;
+          // A verb that found nothing to act on REFUSES, with the reason
+          // (control-tower phase 53, #54–#56): each of these answered `200
+          // {run: null}` — indistinguishable from working — when no run of the
+          // plan was there to take it.
+          case 'pause': {
+            const run = service.pauseRun(slug, actorOfRequest(req, service.flags, body));
+            answerRun(res, run, `Nothing to pause: no run of ${slug} is driving, or its recovery cannot be paused — stop it instead.`);
+            return true;
+          }
+          case 'resume': {
+            // A pause the loop has not reached is taken back; one that has
+            // SETTLED is lifted — the run started again with its own
+            // settings (control-tower phase 77, #102). Either way the answer
+            // says which, and a run with no pause is refused with the reason.
+            const answer = await service.resumeRun(slug, pressActor(actorOfRequest(req, service.flags, body)));
+            if (answer.ok) json(res, 200, { run: answer.run, resumed: answer.resumed });
+            else json(res, answer.status, { error: answer.error });
+            return true;
+          }
+          // A person's answer to an identity park (control-tower phase 91,
+          // #131): `continue` on the login the account answers now, or `move`
+          // to a registered account that answers the identity the run started
+          // on (`accountId`, else the first that does). Both resume the run.
+          case 'identity': {
+            const choice = body.choice === 'continue' || body.choice === 'move' ? body.choice : null;
+            if (!choice) { json(res, 400, { error: 'pass {"choice": "continue"} or {"choice": "move", "accountId"?: "<id>"}' }); return true; }
+            const accountId = typeof body.accountId === 'string' && body.accountId ? body.accountId.slice(0, 64) : undefined;
+            const answer = await service.answerIdentity(slug, choice, pressActor(actorOfRequest(req, service.flags, body)), accountId);
+            if (answer.ok) json(res, 200, { run: answer.run ?? null, accountId: answer.accountId });
+            else json(res, answer.status ?? 409, { error: answer.reason });
+            return true;
+          }
           // Their own verbs and NOT `settings` fields, for the reason
           // `switch-account` is one: a hold is an act with a moment and an
           // author, not a value the next phase reads. Beside Pause/Resume
@@ -3351,22 +3921,35 @@ export async function handleApi(
           // settles the run at the next boundary, hold refuses the next
           // ADMISSION and lets the running phases finish.
           case 'hold': {
-            json(res, 200, {
-              run: service.holdRun(slug, actorOfRequest(req, service.flags, body).by),
-            });
+            answerRun(res, service.holdRun(slug, actorOfRequest(req, service.flags, body)), `No run of ${slug} to hold.`);
             return true;
           }
-          case 'release': json(res, 200, { run: service.releaseRun(slug) }); return true;
+          case 'release': answerRun(res, service.releaseRun(slug, actorOfRequest(req, service.flags, body)), `No run of ${slug} to release.`); return true;
           // Its own verb, not a `settings` field: settings say what the NEXT
           // phase uses; this acts now — a live session is checkpointed and the
           // phase re-attempted under the other account without waiting.
           case 'switch-account': {
             const choice = accountChoice(body.accountId, service) ?? DEFAULT_ACCOUNT_ID;
+            // `when` (control-tower phase 78, #107): `now` — the default —
+            // or `boundary`, which cuts no live lane. A word the verb does not
+            // know is refused rather than read as `now`: a typo must never be
+            // the reason a live session was killed.
+            if (body.when !== undefined && !(SWITCH_WHEN as readonly unknown[]).includes(body.when)) {
+              json(res, 400, { error: `when must be one of ${SWITCH_WHEN.join(', ')}` });
+              return true;
+            }
             // ACT-11: the client never sent `by`, and the default was the
             // literal `'console'` — twenty of twenty-one lifetime switches
             // read as the console's own. The actor is the request's now.
-            const outcome = service.switchAccountRun(slug, choice, actorOfRequest(req, service.flags, body));
-            json(res, outcome.ok ? 200 : 409, outcome);
+            // `dry: true` (control-tower phase 25) previews the lanes it would
+            // checkpoint and the ones it would leave to finish, and acts on nothing.
+            const outcome = service.switchAccountRun(slug, choice, actorOfRequest(req, service.flags, body), {
+              ...(body.when !== undefined ? { when: body.when as SwitchWhen } : {}),
+              ...(body.dry === true ? { dry: true } : {}),
+            });
+            // A refusal carries `error` beside `reason`, the shape every other
+            // refusal here has — the client reads `error` (control-tower phase 53).
+            json(res, outcome.ok ? 200 : 409, outcome.ok ? outcome : { ...outcome, error: outcome.reason });
             return true;
           }
           // Freeze/thaw act on a live child, so unlike pause they have no
@@ -3410,16 +3993,63 @@ export async function handleApi(
           case 'unresolve': {
             const runId = typeof body.runId === 'string' ? body.runId.slice(0, 64) : '';
             if (!runId) { json(res, 400, { error: 'a runId is required' }); return true; }
+            const actor = actorOfRequest(req, service.flags, body);
             const run = verb === 'resolve'
               ? service.resolveRun(slug, runId, {
                 note: typeof body.note === 'string' ? body.note.slice(0, 500) : undefined,
-                by: actorOfRequest(req, service.flags, body).by,
+                by: actor.by,
+                actor,
               })
               : service.unresolveRun(slug, runId);
             json(res, run ? 200 : 404, run ? { run } : { error: `no run ${runId} of ${slug}` });
             return true;
           }
-          case 'skip': json(res, 200, { run: service.skipPhase(slug, Number(body.phase)) }); return true;
+          // Notes on a run (control-tower phase 96, #142): `{text, pinned?,
+          // phase?}` writes one, `{id, pinned}` pins or unpins it. Behind the
+          // run flag like every verb here, and for the steer's reason: a pinned
+          // note is read into the boot prompt of every phase that boards after it.
+          case 'notes': {
+            const actor = actorOfRequest(req, service.flags, body);
+            if (typeof body.id === 'string') {
+              if (typeof body.pinned !== 'boolean') { json(res, 400, { error: 'pass {"id": "<note>", "pinned": true|false}' }); return true; }
+              const out = service.pinRunNote(slug, body.id.slice(0, 64), body.pinned, actor);
+              json(res, out.ok ? 200 : out.status, out.ok ? { note: out.note, run: out.run } : { error: out.error });
+              return true;
+            }
+            const phase = body.phase === undefined || body.phase === null ? undefined : Number(body.phase);
+            if (phase !== undefined && !(Number.isInteger(phase) && phase > 0)) {
+              json(res, 400, { error: 'phase must be a phase number' });
+              return true;
+            }
+            if (typeof body.text !== 'string') { json(res, 400, { error: 'pass {"text": "…", "pinned"?: true, "phase"?: N}' }); return true; }
+            const out = service.noteRun(slug, { text: body.text, pinned: body.pinned === true, ...(phase !== undefined ? { phase } : {}) }, actor);
+            json(res, out.ok ? 200 : out.status, out.ok ? { note: out.note, run: out.run } : { error: out.error });
+            return true;
+          }
+          case 'skip': answerRun(res, service.skipPhase(slug, Number(body.phase)), `No run of ${slug} holds phase ${Number(body.phase)} to skip.`); return true;
+          // Zero the consecutive-failure streak, and nothing else. Its own verb
+          // rather than a corner of Retry because the thing that is wrong is
+          // the COUNTER — an outage spent it, there is no phase to retry, and
+          // a run at 3 of a maximum 2 had no way back at all (#37).
+          // Raise the budget that stopped the work, where it was declared, and
+          // retry — one press (control-tower phase 14, #40). A wait writes the
+          // plan, so it answers 403 without --allow-writes; the dollars and the
+          // ladder's rungs are the run's own settings. Body: {budget, phase?,
+          // add? | to?, scope?: 'phase' | 'plan', reason?}.
+          case 'raise-budget': {
+            const raised = await service.raiseBudget(slug, {
+              budget: body.budget, phase: body.phase, add: body.add, to: body.to, scope: body.scope,
+            }, actorOfRequest(req, service.flags, body));
+            if (!raised.ok) { json(res, raised.status, { error: raised.error }); return true; }
+            json(res, 200, raised);
+            return true;
+          }
+          case 'clear-streak': {
+            const cleared = service.clearFailureStreak(slug, actorOfRequest(req, service.flags, body));
+            if (!cleared.ok) { json(res, cleared.status, { error: cleared.error }); return true; }
+            json(res, 200, { run: cleared.run, was: cleared.was });
+            return true;
+          }
           case 'retry': {
             // Retry-with-edits: an addendum for the boot prompt and/or settings
             // for this one attempt. Both optional — a bare `{phase}` is the
@@ -3436,13 +4066,14 @@ export async function handleApi(
             if (problem) { json(res, 400, { error: problem }); return true; }
             const addendum = typeof body.addendum === 'string' ? body.addendum.slice(0, ADDENDUM_MAX) : undefined;
             const actor = actorOfRequest(req, service.flags, body);
-            json(res, 200, {
-              run: await service.retryPhase(slug, Number(body.phase), {
-                ...(addendum ? { addendum } : {}),
-                options: onePhaseOptions(body.options, service),
-                by: actor.by,
-              }, pressActor(actor)),
-            });
+            // The act it caused, or a refusal (control-tower phase 53, #56):
+            // `launched` names the run and the fresh session boarding in the
+            // person slot, outside the automatic ladder.
+            answerPress(res, await service.pressRetry(slug, Number(body.phase), {
+              ...(addendum ? { addendum } : {}),
+              options: onePhaseOptions(body.options, service),
+              by: actor.by,
+            }, pressActor(actor)));
             return true;
           }
           // One verb rather than "set the policy, then retry these three
@@ -3561,13 +4192,9 @@ export async function handleApi(
           // or ask the phase's own session to finish what it started. Every one
           // of these ends in the same three checks, so none of them can mark a
           // phase done that the board does not agree about.
-          case 'recheck':
-          case 'closeout':
-          case 'resume-phase': {
-            const mode = verb === 'resume-phase' ? 'resume' : verb;
+          case 'recheck': {
             try {
-              const run = await service.recoverPhase(slug, Number(body.phase), mode, {
-                instruction: typeof body.instruction === 'string' ? body.instruction.slice(0, 8_000) : undefined,
+              const run = await service.recoverPhase(slug, Number(body.phase), 'recheck', {
                 by: actorOfRequest(req, service.flags, body).by,
               });
               json(res, 200, { run });
@@ -3576,6 +4203,103 @@ export async function handleApi(
                 error: (error as Error)?.message ?? 'the phase could not be recovered',
                 ...(error instanceof RecoveryBusyError ? { sessionId: error.sessionId } : {}),
               });
+            }
+            return true;
+          }
+          // The two that board a session answer with the one they boarded
+          // (control-tower phase 53, #54, #55): the phase's own session when it
+          // can be resumed, else a FRESH session carrying the resume brief and
+          // the instruction — never a 200 over a recovery that launched nothing.
+          // One act where there were two (control-tower phase 98, #137 item 3):
+          // board this phase at the next boundary with these words, ahead of
+          // every other candidate — the pause and the resume-phase in one press.
+          case 'board-at-boundary': {
+            answerPress(res, await service.boardAtBoundary(slug, Number(body.phase), {
+              ...(typeof body.instruction === 'string' ? { instruction: body.instruction.slice(0, 8_000) } : {}),
+              actor: pressActor(actorOfRequest(req, service.flags, body)),
+            }));
+            return true;
+          }
+          // Stored triggers (control-tower phase 98, #137): `{when, verb, body?,
+          // every?, expiresAt?, note?}` arms one; `/:id/cancel` cancels it.
+          case 'triggers': {
+            const actor = actorOfRequest(req, service.flags, body);
+            if (rest[2]) {
+              if (rest[3] !== 'cancel') { json(res, 404, { error: 'a trigger takes /cancel' }); return true; }
+              const out = service.cancelTrigger(slug, String(rest[2]).slice(0, 32), actor);
+              json(res, out.ok ? 200 : out.status, out.ok ? { trigger: out.trigger } : { error: out.error });
+              return true;
+            }
+            const out = service.armTrigger(slug, {
+              when: body.when, verb: body.verb ?? body.then, body: body.body, every: body.every, mode: body.mode,
+              expiresAt: body.expiresAt, note: body.note,
+            }, actor);
+            json(res, out.ok ? 200 : out.status, out.ok ? { trigger: out.trigger } : { error: out.error });
+            return true;
+          }
+          case 'closeout':
+          case 'resume-phase': {
+            answerPress(res, await service.pressResume(slug, Number(body.phase), verb === 'closeout' ? 'closeout' : 'resume', {
+              ...(typeof body.instruction === 'string' ? { instruction: body.instruction.slice(0, 8_000) } : {}),
+              actor: pressActor(actorOfRequest(req, service.flags, body)),
+            }));
+            return true;
+          }
+          // Checkout survives sessions (control-tower phase 90, #123 #139 #150):
+          // the parked refusal's repair, the two escapes from a run-long branch
+          // hold, and a stable tree for a person's errand.
+          case 'repair-checkout': {
+            const answer = await service.repairCheckout(slug, pressActor(actorOfRequest(req, service.flags, body)));
+            if (answer.ok) json(res, 200, { run: answer.run });
+            else json(res, answer.status, { error: answer.error });
+            return true;
+          }
+          case 'isolate': {
+            answerRun(res, service.isolateRun(slug, actorOfRequest(req, service.flags, body).by),
+              `No shared-checkout run of ${slug} to switch to its own checkout.`);
+            return true;
+          }
+          case 'isolate-phase': {
+            const answer = await service.isolatePhase(slug, Number(body.phase), actorOfRequest(req, service.flags, body).by);
+            if (answer.ok) json(res, 200, { run: answer.run });
+            else json(res, answer.status, { error: answer.error });
+            return true;
+          }
+          case 'errand-tree': {
+            const answer = await service.errandTree(slug, Number(body.phase), actorOfRequest(req, service.flags, body).by);
+            if (answer.ok) json(res, 200, { tree: answer.tree, adopted: answer.adopted });
+            else json(res, answer.status, { error: answer.error });
+            return true;
+          }
+          // "Delegate to the session" (control-tower phase 53, #54): the acts a
+          // phase declared for a person (`--needs human-acts`) handed to its
+          // session — a ruling naming who delegated, and a resume with the words.
+          case 'delegate': {
+            const phase = Number(body.phase);
+            if (!Number.isInteger(phase) || phase < 1) { json(res, 400, { error: 'a phase number is required' }); return true; }
+            const words = typeof body.instruction === 'string' ? body.instruction.slice(0, 8_000) : '';
+            answerPress(res, await service.delegatePhase(slug, phase, words, pressActor(actorOfRequest(req, service.flags, body))));
+            return true;
+          }
+          case 'plan-approval': {
+            // A person's answer to a plan a plan-mode phase presented
+            // (control-tower phase 11, #34): approve resumes the SAME session
+            // in acceptEdits, reject records why and leaves the phase parked.
+            const decision = body.decision === 'approve' || body.decision === 'reject' ? body.decision : null;
+            const phase = Number(body.phase);
+            if (!decision || !Number.isInteger(phase) || phase < 1) {
+              json(res, 400, { error: 'plan-approval needs {phase, decision: "approve" | "reject"}.' });
+              return true;
+            }
+            try {
+              const result = await service.decidePlan(
+                slug, phase, decision, actorOfRequest(req, service.flags, body).by,
+                typeof body.reason === 'string' && body.reason.trim() ? body.reason.slice(0, 2_000) : undefined,
+              );
+              if (!result.ok) json(res, result.status, { error: result.error });
+              else json(res, 200, result);
+            } catch (error) {
+              json(res, 409, { error: (error as Error)?.message ?? 'the plan could not be decided' });
             }
             return true;
           }
@@ -3588,6 +4312,7 @@ export async function handleApi(
             // checked is a value that quietly changes the rest of the run.
             const problem = modelProblem(body.model)
               ?? effortProblem(body.effort)
+              ?? permissionModeProblem(body.permissionMode, body.permissionProfile)
               // QA's own tier is judged exactly as hard as the builder's, and
               // for the same reason: an unknown model would go straight to argv
               // and an unknown effort would be dropped, so the reviewing would
@@ -3600,7 +4325,10 @@ export async function handleApi(
               // arbitrary but finite, because "keep reviewing forever" is the
               // behaviour this budget exists to end.
               ?? intProblem(body.qaMaxRounds, 'qaMaxRounds', 1, 20)
+              ?? intProblem(body.approvalTimeoutMinutes, 'approvalTimeoutMinutes', 1, 59)
               ?? intProblem(body.maxConcurrentPerRepo, 'maxConcurrentPerRepo', 1, 99)
+              ?? intProblem(body.ladderPerRunRungs, 'ladderPerRunRungs', 0, 1000)
+              ?? intProblem(body.ladderPerPhaseRungs, 'ladderPerPhaseRungs', 0, 100)
               ?? phaseOptionsProblem(body.phaseOptions);
             if (problem) { json(res, 400, { error: problem }); return true; }
 
@@ -3639,6 +4367,18 @@ export async function handleApi(
                 return true;
               }
             }
+            // The run's account pool, after launch (control-tower phase 77,
+            // #101): checked against the registry exactly as `start` checks it.
+            // A list naming nothing this console knows is refused by name —
+            // stored, an empty pool would read as "every account".
+            const pool = accountRequirements(body.accounts, service);
+            if (Array.isArray(body.accounts) && !pool?.length) {
+              json(res, 400, {
+                error: 'accounts must name at least one account this console knows — '
+                  + '[{id, minHeadroomPct}], where "default" is the machine login.',
+              });
+              return true;
+            }
             // …and `issuesMode` may only TIGHTEN: loosening it would let the
             // sessions already boarded file on the repository under a word
             // nobody launched them with.
@@ -3653,13 +4393,19 @@ export async function handleApi(
               }
             }
 
-            const run = service.configureRun(slug, {
+            const patch: RunSettingsPatch = {
               ...(typeof body.model === 'string' && body.model ? { model: body.model } : {}),
               // `''` is not a failed check here — it is the operator asking for
               // this machine's own default, which `newRun` stores as no key at
               // all. An unknown value never reaches this line any more; it 400s
               // above, where it can still be explained.
               ...('effort' in body ? { effort: isEffort(body.effort) ? body.effort : '' } : {}),
+              // The run's default permission mode, read at the next boarding;
+              // `''` clears it back to `acceptEdits` (control-tower phase 11).
+              ...('permissionMode' in body
+                ? { permissionMode: (PERMISSION_MODES as readonly unknown[]).includes(body.permissionMode)
+                  ? body.permissionMode as (typeof PERMISSION_MODES)[number] : '' as const }
+                : {}),
               // Both already understood by `applySettings`; only the door was
               // missing, so a browser could not change either mid-run.
               ...('maxParallel' in body
@@ -3735,6 +4481,9 @@ export async function handleApi(
                 ? { qaEffort: isEffort(body.qaEffort) ? body.qaEffort : '' } : {}),
               ...(body.qaMaxRounds === undefined || body.qaMaxRounds === null || body.qaMaxRounds === ''
                 ? {} : { qaMaxRounds: Number(body.qaMaxRounds) }),
+              // `null` or '' puts the card back on the hook call's hour (#140).
+              ...('approvalTimeoutMinutes' in body
+                ? { approvalTimeoutMinutes: body.approvalTimeoutMinutes ? Number(body.approvalTimeoutMinutes) : null } : {}),
               // Both directions mid-run, like `qaModel`/`qaEffort` above: a
               // value off the vocabulary clears the override rather than
               // setting one, and `null` on the round budget is a real value
@@ -3748,6 +4497,7 @@ export async function handleApi(
               ...(body.qaRoundBudgetUsd === undefined
                 ? {} : { qaRoundBudgetUsd: numberOrNull(body.qaRoundBudgetUsd) }),
               ...(isOnLimitPolicy(body.onLimit) ? { onLimit: body.onLimit } : {}),
+              ...(isModelPolicy(body.modelPolicy) ? { modelPolicy: body.modelPolicy } : {}),
               // Phase 15's seven. The two refusals have already 409'd above,
               // so what reaches `applySettings` here is a move it may make or
               // the no-op of re-asserting what the run is. Presence, not
@@ -3758,18 +4508,77 @@ export async function handleApi(
               ...('maxConcurrentPerRepo' in body
                 ? { maxConcurrentPerRepo: body.maxConcurrentPerRepo === null || body.maxConcurrentPerRepo === ''
                     ? null : Number(body.maxConcurrentPerRepo) } : {}),
+              // Raised (or cleared) mid-run — the verb a spent cap's errand
+              // names, and the one phase 14's raise announces (#14).
+              ...('ladderPerRunRungs' in body
+                ? { ladderPerRunRungs: body.ladderPerRunRungs === null || body.ladderPerRunRungs === ''
+                    ? null : Number(body.ladderPerRunRungs) } : {}),
+              ...('ladderPerPhaseRungs' in body
+                ? { ladderPerPhaseRungs: body.ladderPerPhaseRungs === null || body.ladderPerPhaseRungs === ''
+                    ? null : Number(body.ladderPerPhaseRungs) } : {}),
               ...('worktreeRetention' in body ? { worktreeRetention: retentionWord(body.worktreeRetention) ?? null } : {}),
               ...(LAND_POLICIES.includes(body.landing as never) ? { landing: body.landing as LandPolicy } : {}),
               ...(CONFLICT_POLICIES.includes(body.conflictPolicy as never)
                 ? { conflictPolicy: body.conflictPolicy as ConflictPolicy } : {}),
               ...(MESSAGING_WORDS.includes(body.messaging as never) ? { messaging: body.messaging as MessagingWord } : {}),
               ...(ISSUE_MODES.includes(body.issuesMode as never) ? { issuesMode: body.issuesMode as IssueMode } : {}),
-            }, actorOfRequest(req, service.flags, body).by);
+              // Three of the prelude's answers, after launch (control-tower
+              // phase 77, #101): a boolean, a relay word, a pool — anything
+              // else is "you did not say", the posture every word above takes.
+              ...(typeof body.resumeOnRestart === 'boolean' ? { resumeOnRestart: body.resumeOnRestart } : {}),
+              ...((RELAY_MODES as readonly string[]).includes(body.relay as string) ? { relay: body.relay as RelayMode } : {}),
+              ...(pool?.length ? { accounts: pool } : {}),
+            };
+            // What the patch cannot carry is refused BY NAME, in one 409, and
+            // the rest applied (control-tower phase 13, #31): the sheet opens
+            // while a lane is wedged, and a person must be told which of their
+            // changes did not land. Two kinds — a field a live lane holds
+            // (`lockedSettingRefusals`: only a real move, never a re-assertion),
+            // and the account, which is its own verb.
+            const refused: RefusedSetting[] = lockedSettingRefusals(await service.runFor?.(slug) ?? null, patch);
+            for (const { field } of refused) delete patch[field as keyof RunSettingsPatch];
+            if ('accountId' in body) {
+              refused.push({
+                field: 'accountId',
+                verb: SETTING_VERBS.accountId,
+                why: `a run's account moves through its own verb, ${SETTING_VERBS.accountId} `
+                  + `(POST /api/run/${slug}/${SETTING_VERBS.accountId}), which checkpoints the live sessions first`,
+              });
+            }
+            // The plan's QA gate (#31): written here, before the patch, by the
+            // one QA writer — refused by name without the person's
+            // confirmation or `--allow-writes`, and journalled with the patch
+            // when it moved.
+            // The derived actor, whole — `reason` included (phase 96's note).
+            const actor = actorOfRequest(req, service.flags, body);
+            let before: Record<string, unknown> | undefined;
+            if (typeof body.qa === 'boolean') {
+              const moved = await service.setRunQa(slug, body.qa, { confirm: body.confirm, by: actor.by });
+              if (!moved.ok) refused.push({ field: 'qa', why: moved.why });
+              else if (moved.from !== moved.to) {
+                patch.qa = body.qa;
+                before = { qa: moved.from };
+              }
+            }
+            const run = refused.length && !Object.keys(patch).length
+              ? await service.runFor?.(slug) ?? null
+              : service.configureRun(slug, patch, actor, before ? { before } : {});
+            if (refused.length) {
+              json(res, 409, {
+                error: `${refused.map((row) => `${row.field} was not applied — ${row.why}`).join('; ')}. `
+                  + 'Everything else in the patch was applied.',
+                refused,
+                run,
+              });
+              return true;
+            }
             json(res, 200, { run });
             return true;
           }
           default:
-            json(res, 404, { error: `No run verb "${verb}"` });
+            // The table is the list (control-tower phase 98): a word it does not
+            // hold is no verb of this console's, whoever sent it.
+            json(res, 404, { error: `No run verb "${verb}" — the table's are ${RUN_SWITCH_WORDS.join(', ')}` });
             return true;
         }
       }
@@ -3807,7 +4616,8 @@ export async function handleApi(
     // 409 for a claimed phase: the request is well formed and the caller did
     // nothing wrong — somebody else is simply working that phase. 500 would
     // read as a console fault and send the operator looking for the wrong bug.
-    const status = error instanceof PhaseClaimedError || error instanceof RecoveryBusyError || error instanceof PreludeRefusal ? 409
+    const status = error instanceof PhaseClaimedError || error instanceof RecoveryBusyError || error instanceof PreludeRefusal
+      || error instanceof GitStrategyRefusal ? 409
       : error instanceof WriteError ? 400
         : 500;
     json(res, status, {
@@ -3820,6 +4630,11 @@ export async function handleApi(
       // every unanswered row so the form can name them all, not the first.
       ...(error instanceof PreludeRefusal
         ? { unanswered: error.unanswered, prelude: error.prelude }
+        : {}),
+      // …and for the plan's git lines (control-tower phase 11, #18): every
+      // line this launch does not honour, so the form can offer the choice.
+      ...(error instanceof GitStrategyRefusal
+        ? { gitStrategy: { lines: error.lines, ack: error.ack } }
         : {}),
       // The same 409-with-sessionId shape `resolveRecovery` refusals use, so
       // the client navigates to the live session instead of erroring.

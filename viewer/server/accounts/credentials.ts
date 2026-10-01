@@ -340,6 +340,12 @@ export type ClaudeOauth = {
   /** Epoch milliseconds, when the CLI recorded one. */
   expiresAt?: number;
   subscriptionType?: string;
+  /**
+   * The blob holds a refresh token, so the CLI renews the access token at the
+   * next session under this login (control-tower phase 76, #111). Whether it
+   * does, never the token itself: nothing here refreshes — the CLI owns that write.
+   */
+  canRefresh?: boolean;
 };
 
 function parseOauth(raw: string): ClaudeOauth | null {
@@ -350,6 +356,7 @@ function parseOauth(raw: string): ClaudeOauth | null {
     return {
       accessToken: oauth.accessToken,
       ...(typeof oauth.expiresAt === 'number' ? { expiresAt: oauth.expiresAt } : {}),
+      ...(typeof oauth.refreshToken === 'string' && oauth.refreshToken ? { canRefresh: true } : {}),
       ...(typeof oauth.subscriptionType === 'string' && oauth.subscriptionType
         ? { subscriptionType: oauth.subscriptionType }
         : {}),

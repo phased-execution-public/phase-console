@@ -13,8 +13,9 @@
  * than a console that crashed because its registry was read-only.
  */
 
-import { mkdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, realpathSync, watch, type FSWatcher } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
 
 import { HEARTBEAT_MS } from '../shared/fleet-model.js';
 import {
@@ -28,6 +29,7 @@ import {
   releaseLaneToken,
 } from '../shared/instances.mjs';
 import { SKILL_DIR } from './config.ts';
+import { requestShutdown } from './lifecycle.ts';
 import { log } from './log.ts';
 
 /** The package version this console was loaded from — read once, `null` when unreadable. */
@@ -40,6 +42,33 @@ export const CONSOLE_VERSION: string | null = (() => {
   }
 })();
 
+/** `<dir>/package.json` exists — this console's own code is still where it was started from. */
+function packageRootPresent(dir: string): boolean {
+  return existsSync(join(dir, 'package.json'));
+}
+
+/**
+ * Is `dir` inside the OS temp directory — realpath-compared on both sides,
+ * because macOS resolves `/var` to `/private/var` and a lexical prefix
+ * compare would miss every match (#155). This is the fact that separates a
+ * Pro-package test's `npm install -g --prefix <tmp>` from every console this
+ * doctor must never treat as throwaway: a real checkout's `SKILL_DIR` never
+ * lives under `os.tmpdir()`/`$TMPDIR`, whatever the plan library it happens
+ * to have open (`--root`) is rooted at.
+ */
+export function fromTempPrefix(dir: string, tmpRoot: string = tmpdir()): boolean {
+  try {
+    const real = realpathSync(dir);
+    const tmp = realpathSync(tmpRoot);
+    return real === tmp || real.startsWith(tmp + sep);
+  } catch {
+    // A root that cannot even be realpath'd is not "safely permanent" either,
+    // but `beat()` already asks `rootPresent` first and acts on THAT — this
+    // catch only protects a caller that asks in the other order.
+    return false;
+  }
+}
+
 /** What a beat reports about this console, read fresh on every beat. */
 export type HeartbeatFacts = {
   port: number;
@@ -50,26 +79,56 @@ export type HeartbeatFacts = {
   build: { version: string | null; rev: string | null };
 };
 
+/** `Heartbeat`'s constructor options — the real filesystem/clock by default, injectable for a test (#155 PS-2). */
+export type HeartbeatOpts = {
+  intervalMs?: number;
+  env?: NodeJS.ProcessEnv;
+  /** This console's own package root; `SKILL_DIR` unless a test names a fake one. */
+  skillDir?: string;
+  /** `<skillDir>/package.json` exists. Defaults to a real fs check. */
+  rootPresent?: (dir: string) => boolean;
+  /** `skillDir` is inside the OS temp directory. Defaults to the real realpath-compared check. */
+  fromTempPrefix?: (dir: string) => boolean;
+  /** What a beat calls when the root is gone. Defaults to `requestShutdown` from `lifecycle.ts`. */
+  onRootGone?: (reason: string) => void;
+};
+
 /**
  * The beat: `lastSeenAt` into this console's registry row every `HEARTBEAT_MS`,
  * with the facts a fleet reader shows beside it. Unref'd, so it never holds a
  * process up; `stop()` on close; `stopped()` is the clean exit's own record.
+ *
+ * Two more facts gate the beat itself, both about the same question — does
+ * this console's own CODE still exist where it was started from (#155):
+ *
+ *   - a console whose `SKILL_DIR/package.json` has gone missing WHILE it ran
+ *     (its checkout was deleted out from under it) asks for a clean shutdown
+ *     rather than going on serving from a directory nobody can read any more;
+ *   - a console started from a temporary prefix (a Pro-package test's
+ *     `npm install -g --prefix <tmp>`) never writes a beat at all, so it can
+ *     never be read as a live sibling by a census a leaked server would
+ *     otherwise keep answering into for as long as it survives.
  */
 export class Heartbeat {
   private timer: NodeJS.Timeout | null = null;
   private failures = 0;
+  private rootGoneLogged = false;
   private readonly id: string;
   private readonly facts: () => HeartbeatFacts;
-  private readonly opts: { intervalMs?: number; env?: NodeJS.ProcessEnv };
+  private readonly opts: HeartbeatOpts;
+  private readonly skillDir: string;
+  private readonly rootPresent: (dir: string) => boolean;
+  private readonly suppressed: boolean;
+  private readonly onRootGone: (reason: string) => void;
 
-  constructor(
-    id: string,
-    facts: () => HeartbeatFacts,
-    opts: { intervalMs?: number; env?: NodeJS.ProcessEnv } = {},
-  ) {
+  constructor(id: string, facts: () => HeartbeatFacts, opts: HeartbeatOpts = {}) {
     this.id = id;
     this.facts = facts;
     this.opts = opts;
+    this.skillDir = opts.skillDir ?? SKILL_DIR;
+    this.rootPresent = opts.rootPresent ?? packageRootPresent;
+    this.suppressed = (opts.fromTempPrefix ?? fromTempPrefix)(this.skillDir);
+    this.onRootGone = opts.onRootGone ?? ((reason) => { requestShutdown(reason, { mode: 'exit' }); });
   }
 
   start(): void {
@@ -80,6 +139,21 @@ export class Heartbeat {
   }
 
   beat(): void {
+    // #155: a console running from a temporary prefix never joins the census
+    // — its identity will not outlive the prefix, and a sibling reading it as
+    // a live peer meanwhile is exactly the leak this guards against.
+    if (this.suppressed) return;
+    if (!this.rootPresent(this.skillDir)) {
+      if (!this.rootGoneLogged) {
+        this.rootGoneLogged = true;
+        log.warn('fleet.root-gone', { id: this.id, skillDir: this.skillDir });
+      }
+      // Idempotent (service-base.ts's requestShutdown already guards a second
+      // call while one drain is in flight), so a beat before the process
+      // actually exits keeps asking rather than giving up after one try.
+      this.onRootGone(`this console's own root is gone — ${this.skillDir} no longer holds a package.json`);
+      return;
+    }
     try {
       const facts = this.facts();
       const row = beatInstance(
@@ -107,9 +181,10 @@ export class Heartbeat {
     this.timer = null;
   }
 
-  /** The clean exit, written by the console that is exiting (FLT-5). */
+  /** The clean exit, written by the console that is exiting (FLT-5) — never for a console that had never registered. */
   stopped(): void {
     this.stop();
+    if (this.suppressed) return;
     try {
       markInstanceStopped(this.id, this.opts.env);
     } catch (error) {

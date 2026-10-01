@@ -29,6 +29,7 @@
  * brief tests are pure. Nothing here spawns `claude`.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -541,6 +542,7 @@ test('a review is refused while the autopilot is driving', async () => {
     // an overlapping SCOPE is, because a review runs the phase's tests in the
     // tree the run is editing.
     (svc as never as { runners: Map<string, unknown> }).runners.set('alpha', {
+      isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
       busy: () => true,
       current: () => ({ slug: 'alpha', status: 'running', id: 'run-1' }),
       note: () => {},

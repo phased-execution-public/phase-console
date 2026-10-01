@@ -20,6 +20,7 @@
  * feature exists to end, reintroduced by its own fix.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';

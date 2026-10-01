@@ -35,6 +35,9 @@ import { TabBar } from './tab-bar';
  *   to the document but leaves the rubber band, so a flick past the last card
  *   still bounces a strip of empty ground above the tab bar.
  * - **The tab bar is a grid ROW**, hidden only while a software keyboard is up.
+ * - **A desk's grid has a third column, `auto`** — the supervisor's dock
+ *   (control-tower phase 28), zero wide whenever nothing is in it: a closed
+ *   dock, a narrower desk (where the dock is a sheet), a build without one.
  */
 export function ShellLayout({
   state,
@@ -114,8 +117,8 @@ export function ShellLayout({
           event.preventDefault();
           main.current?.focus({ preventScroll: true });
         }}
-        className="sr-only rounded bg-surface px-3 py-2 text-sm text-ink outline-2 outline-accent
-          focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-(--z-toast)"
+        className="sr-only rounded bg-surface px-3 py-2 text-sm text-ink outline-2 outline-focus
+          focus:not-sr-only focus:absolute focus:start-3 focus:top-3 focus:z-(--z-toast)"
       >
         Skip to content
       </a>
@@ -127,7 +130,7 @@ export function ShellLayout({
           phone
             ? // rows: header · the only scrolling region · tab bar
               'is-phone grid-rows-[auto_minmax(0,1fr)_auto]'
-            : 'grid-cols-[auto_minmax(0,1fr)]',
+            : 'grid-cols-[auto_minmax(0,1fr)_auto]',
         )}
       >
         {phone ? (

@@ -13,6 +13,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { describe, expect, it } from 'vitest';
 import type { ReactNode } from 'react';
 import { NOTE_ORDER, RunStatusStack, looksLikeAuthFailure, runNotes } from './status-strip';
+import { stopReason, toRows } from './model';
+import { bindingHoldOf } from '@/components/fleet-freeze';
+import { SHUTDOWN_CONTINUES } from '@shared/orchestration-model.js';
 import { StatusStack, TooltipProvider } from '@/components/ui';
 import { keys } from '@/lib/queries';
 import type { RunGitView, RunState } from '@/lib/api';
@@ -283,7 +286,11 @@ describe('runNotes — ordering', () => {
     const [stopped] = runNotes({ run: run({ status: 'halted', halt }), live: false, allowRun: true });
     expect(stopped.severity).toBe('error');
     expect(stopped.title).toBe('Halted.');
-    expect(stopped.action).toBeTruthy();
+    // The remedy is the halt card's now (control-tower phase 17): the card is
+    // the body, live while the run heals (history, nothing offered) and not
+    // live once it has stopped.
+    expect((healing.body as React.ReactElement<{ live: boolean }>).props.live).toBe(true);
+    expect((stopped.body as React.ReactElement<{ live: boolean }>).props.live).toBe(false);
   });
 });
 
@@ -497,27 +504,27 @@ describe('the halt card action — the shared model decides who leads', () => {
     }).find((n) => n.id === 'halt');
 
   it("a session-shaped halt leads with the phase's own session", () => {
-    mount(<>{noteFor(halted('no-handoff'))?.action}</>);
+    mount(<>{noteFor(halted('no-handoff'))?.body}</>);
+    // The card's recommended button is the model's first verb.
+    expect(screen.getByTestId('halt-recommended').textContent).toContain('Finish in its own session');
     const buttons = screen.getAllByRole('button').map((b) => b.textContent ?? '');
-    expect(buttons[0]).toContain('Finish in its own session');
     expect(buttons.some((b) => b.includes('Close out with a new agent'))).toBe(true);
   });
 
   it('phase-blocked NEVER offers the closeout that looped on it', () => {
-    mount(<>{noteFor(halted('phase-blocked'))?.action}</>);
+    mount(<>{noteFor(halted('phase-blocked'))?.body}</>);
     expect(screen.queryByRole('button', { name: 'Finish in its own session' })).toBeNull();
-    const buttons = screen.getAllByRole('button').map((b) => b.textContent ?? '');
-    expect(buttons[0]).toContain('Resume with an instruction');
+    expect(screen.getByTestId('halt-recommended').textContent).toContain('Resume with an instruction');
   });
 
   it('a plan-shaped halt offers the plan repair, not a phase resume', () => {
-    mount(<>{noteFor(halted('plan-lint'))?.action}</>);
+    mount(<>{noteFor(halted('plan-lint'))?.body}</>);
     expect(screen.queryByRole('button', { name: 'Finish in its own session' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Repair the plan with a new agent' })).toBeEnabled();
   });
 
   it('without --allow-run the session remedy is disabled and names the flag', () => {
-    mount(<>{noteFor(halted('no-handoff'))?.action}</>, { allowRun: false });
+    mount(<>{noteFor(halted('no-handoff'))?.body}</>, { allowRun: false });
     const closeout = screen.getByRole('button', { name: 'Finish in its own session' });
     expect(closeout).toBeDisabled();
   });
@@ -660,10 +667,158 @@ describe('runNotes — which wait this is', () => {
     expect(text(state, { live: false })).toMatch(/another account/i);
   });
 
+  it('reads a wait the console stopped under as the wait it is — what, when, and never "Stopped" (#148)', () => {
+    // Nobody paused this run: the console restarted under a park, kept the
+    // clock, and re-arms it by itself (control-tower phase 88).
+    const state = run({
+      status: 'paused',
+      stoppedBy: 'system',
+      pause: null,
+      waitUntil: '2026-08-25T02:40:42.850Z',
+      waitReason: 'external',
+      phases: {
+        '28': {
+          phase: 28,
+          status: 'waiting',
+          parkedUntil: '2026-08-25T02:40:42.850Z',
+          watch: ['gh:acme/web#run/17843290511'],
+        },
+      },
+    } as unknown as Partial<RunState>);
+    expect(ids(state, { live: false })).toEqual(['limit-paused']);
+    const said = text(state, { live: false });
+    expect(said).not.toMatch(/Stopped/);
+    expect(said).toMatch(/^Waiting on phase 28 · gh:acme\/web#run\/17843290511 · resumes/);
+    expect(said).toMatch(/resumes by itself/i);
+    expect(said).not.toMatch(/another account/i);
+
+    // A usage window the console stopped under still offers the other account.
+    const window = run({
+      status: 'paused',
+      stoppedBy: 'system',
+      pause: null,
+      waitUntil: '2026-08-25T02:40:42.850Z',
+      waitReason: 'usage-limit',
+      accountId: 'max-2',
+    } as Partial<RunState>);
+    expect(text(window, { live: false })).toMatch(/^Waiting on max-2's usage window/);
+    expect(text(window, { live: false })).toMatch(/another account/i);
+  });
+
   it('keeps the usage-limit reading for a record written before the field existed', () => {
     // Every run on disk today has a clock and no reason. The old sentence is
     // the right default for them: a limit is what the clock nearly always was.
     const state = run({ status: 'paused', waitUntil: '2026-08-25T02:40:42.850Z' });
     expect(text(state, { live: false })).toMatch(/usage limit/i);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * A freeze is named wherever the card would promise continuation (#93)
+ * ------------------------------------------------------------------ */
+
+describe('a stop the console’s shutdown wrote, under a hold that outlived it', () => {
+  // The sentence the runner stores when the console goes away under a run —
+  // true only while nothing that outlives the process holds the run.
+  const STOPPED = run({
+    status: 'paused',
+    stoppedBy: 'system',
+    finishedReason: `the console shut down while this run was working — ${SHUTDOWN_CONTINUES}`,
+  } as Partial<RunState>);
+  const FROZE_AT = '2026-09-24T09:57:43.000Z';
+
+  it('names the freeze — who, when, and the thaw — instead of "it continues by itself", and wears a warning', () => {
+    const ended = runNotes({
+      run: STOPPED,
+      live: false,
+      allowRun: true,
+      fleetHold: { at: FROZE_AT, by: 'operator' },
+    }).find((n) => n.id === 'ended')!;
+    expect(String(ended.body)).toBe(
+      `the console shut down while this run was working — frozen console-wide by operator at ${FROZE_AT} — thaw to continue`,
+    );
+    expect(String(ended.body)).not.toMatch(/continues by itself/);
+    expect(ended.severity).toBe('warn');
+  });
+
+  it('keeps the promise once the hold lifts — and under a restart’s own hold, which lifts with the process', () => {
+    for (const fleetHold of [
+      null,
+      undefined,
+      { at: FROZE_AT, by: 'a restart by mo', scope: 'restart' as const },
+    ]) {
+      const ended = runNotes({ run: STOPPED, live: false, allowRun: true, fleetHold }).find(
+        (n) => n.id === 'ended',
+      )!;
+      expect(String(ended.body)).toMatch(/continues by itself once the console is back/);
+      expect(ended.severity).toBe('info');
+    }
+  });
+
+  it('names a machine hold as the supervisor’s, released there', () => {
+    const ended = runNotes({
+      run: STOPPED,
+      live: false,
+      allowRun: true,
+      fleetHold: { at: FROZE_AT, by: 'the supervisor', scope: 'machine' },
+    }).find((n) => n.id === 'ended')!;
+    expect(String(ended.body)).toMatch(
+      /held machine-wide by the supervisor at .* — release the hold to continue/,
+    );
+  });
+
+  it('the fleet table’s reason reads the same stored sentence through the same hold', () => {
+    const hold = bindingHoldOf({ fleet: { frozen: true, at: FROZE_AT, by: 'operator' } });
+    expect(stopReason(STOPPED, hold)).toMatch(/frozen console-wide by operator at .* — thaw to continue/);
+    expect(toRows([STOPPED], hold)[0]!.reason).toBe(stopReason(STOPPED, hold));
+    expect(stopReason(STOPPED, bindingHoldOf({ fleet: { frozen: false, at: null, by: null } }))).toMatch(
+      /continues by itself/,
+    );
+    // A machine hold rides beside the console's own freeze; the freeze answers first.
+    expect(
+      bindingHoldOf({
+        fleet: { frozen: false, at: null, by: null, hold: { at: FROZE_AT, by: 'the supervisor' } },
+      }),
+    ).toEqual({ at: FROZE_AT, by: 'the supervisor', scope: 'machine' });
+    expect(bindingHoldOf(undefined)).toBeNull();
+  });
+});
+
+describe('runNotes — an identity park (control-tower phase 91, #131)', () => {
+  it('offers both ways on — continue on the new login, or move to the person the run started on — and answers through the identity verb', async () => {
+    const { api } = await import('@/lib/api');
+    const calls: [string, string][] = [];
+    const original = api.runIdentity;
+    (api as unknown as { runIdentity: typeof api.runIdentity }).runIdentity = async (slug, choice) => {
+      calls.push([slug, choice]);
+      return { run: null } as never;
+    };
+    try {
+      const halt = {
+        at: '2026-09-25T12:17:00Z',
+        reason: 'the machine login changed identity — it is now info@example.com',
+        phase: 2,
+        kind: 'identity-changed',
+      };
+      const state = run({
+        status: 'halted',
+        halt,
+        identity: {
+          account: 'default',
+          key: 'k-admin',
+          email: 'admin@example.com',
+          at: '2026-09-25T11:51:00Z',
+        },
+      });
+      const [note] = runNotes({ run: state, live: false, allowRun: true });
+      expect(note.id).toBe('halt');
+      mount(<>{note.body}</>);
+      expect(screen.getByRole('button', { name: 'Move to admin@example.com’s profile' })).toBeTruthy();
+      screen.getByRole('button', { name: 'Continue on the new login' }).click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(calls).toEqual([[state.slug, 'continue']]);
+    } finally {
+      (api as unknown as { runIdentity: typeof api.runIdentity }).runIdentity = original;
+    }
   });
 });

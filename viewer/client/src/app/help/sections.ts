@@ -16,8 +16,8 @@
  *
  * The split is a budget decision, not a tidiness one: the help sheet is mounted
  * in the composition root, so anything this module imports is in the ENTRY
- * chunk. The eleven `?raw` bodies are ~40 KB of string nobody reads until they
- * open the guide.
+ * chunk. The `?raw` bodies are ~60 KB of string nobody reads until they open
+ * the guide.
  */
 
 import { GUIDE_SECTIONS } from '@shared/route-meta.js';
@@ -50,11 +50,29 @@ export const SECTIONS: readonly GuideSection[] = [
     kind: 'route',
   },
   {
+    id: 'quick-start',
+    label: 'Quick start',
+    lede: 'From a plan on disk to a running phase — the one screen that starts it, and what to watch.',
+    kind: 'route',
+  },
+  {
     id: 'running',
     label: 'Launch',
     lede: 'Every way to start the console — and the eight switches that decide what it may do.',
     // A menu, not a journey: you pick ONE of these ways in, you do not walk
     // them in order.
+    kind: 'topic',
+  },
+  {
+    id: 'destinations',
+    label: 'Getting around',
+    lede: 'Every page on the rail, what each answers, and what opens over any page.',
+    kind: 'topic',
+  },
+  {
+    id: 'tower',
+    label: 'Tower',
+    lede: 'The Runs home: what needs you, what is moving, what waits and what is next — each strip with its one action.',
     kind: 'topic',
   },
   {
@@ -70,6 +88,12 @@ export const SECTIONS: readonly GuideSection[] = [
     kind: 'topic',
   },
   {
+    id: 'halts',
+    label: 'Halts',
+    lede: 'Why a run stops by itself, the one sentence each halt says, and the one press that brings it back.',
+    kind: 'topic',
+  },
+  {
     id: 'sessions',
     label: 'Sessions',
     lede: 'Work that outlives the browser — plus the recovery and QA sessions the console starts for you, and the shutdown button.',
@@ -79,6 +103,12 @@ export const SECTIONS: readonly GuideSection[] = [
     id: 'notifications',
     label: 'Alerts',
     lede: 'One switch per category, governing every way a message could reach you — and how the inbox gets back to zero.',
+    kind: 'topic',
+  },
+  {
+    id: 'your-turn',
+    label: 'Your turn',
+    lede: 'A sign-in, a code or a look only you can do — and doing it from any device.',
     kind: 'topic',
   },
   {

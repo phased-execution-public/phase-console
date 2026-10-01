@@ -1,0 +1,133 @@
+{
+  "spike": "ExitPlanMode behind the console PreToolUse hook (control-tower phase 11)",
+  "cli": "2.1.280",
+  "date": "2026-09-23",
+  "model": "sonnet",
+  "cost_usd": 0.6146,
+  "verdict": "needs-host",
+  "reading": "ExitPlanMode is offered ONLY to a session with a permission host (--permission-prompt-tool). On the floor (--permission-prompts none) and with no host at all the CLI disables it and the hook never sees it; the session writes its plan to <config>/plans/<name>.md and ends its turn with the plan as its result text. With the host armed the hook receives {plan, planFilePath}; a deny reaches the model as a tool error prefixed \"PreToolUse:ExitPlanMode hook error: \" and the session ended its turn at once. Resuming the SAME session id under --permission-mode acceptEdits carried the plan out.",
+  "arms": {
+    "floor": {
+      "flags": [
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none"
+      ],
+      "initPermissionMode": "plan",
+      "offered": [],
+      "hookTools": [
+        "Bash",
+        "Write"
+      ],
+      "toolError": "<tool_use_error>Error: No such tool available: ExitPlanMode. ExitPlanMode is disabled for this session, in subagents as well as here.</tool_use_error>",
+      "result": {
+        "subtype": "success",
+        "permission_denials": []
+      }
+    },
+    "no-host": {
+      "flags": [
+        "--permission-mode",
+        "plan"
+      ],
+      "offered": [],
+      "hookTools": [
+        "Bash",
+        "Write"
+      ]
+    },
+    "host": {
+      "flags": [
+        "--permission-mode",
+        "plan",
+        "--permission-prompt-tool",
+        "mcp__pcrelay__hold",
+        "--mcp-config",
+        "<relay host>",
+        "--strict-mcp-config"
+      ],
+      "offered": [
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode"
+      ],
+      "hookTools": [
+        "Write",
+        "ExitPlanMode"
+      ],
+      "planWrite": {
+        "tool_name": "Write",
+        "permission_mode": "plan",
+        "file_path": "<config>/plans/plan-a-change-add-steady-quill.md"
+      },
+      "hookBody": {
+        "session_id": "bfae9cef-7c2c-4d10-ab30-26a2133665d4",
+        "transcript_path": "<config>/projects/-private-tmp-p11-spike-repo/bfae9cef-7c2c-4d10-ab30-26a2133665d4.jsonl",
+        "cwd": "<spikes>/repo",
+        "prompt_id": "d98886f2-6cf1-4eee-a633-145c6065a2a5",
+        "permission_mode": "plan",
+        "effort": {
+          "level": "high"
+        },
+        "hook_event_name": "PreToolUse",
+        "tool_name": "ExitPlanMode",
+        "tool_input": {
+          "plan": "# Add subtract(a, b) to math.js\n\n## Context\n`math.js` currently only exports `add(a, b)`. The user wants a matching `subtract(a, b)` function added alongside it, and the README updated to mention it so the module's documented API stays in sync with its code.\n\n## Changes\n\n**math.js** — add a `subtract` export right after `add`, following the same style:\n```js\nexport function add(a, b) {\n  return a + b;\n}\n\nexport function subtract(a, b) {\n  return a - b;\n}\n```\n\n**README.md** — currently just a two-line stub (`# Demo` / `A tiny project.`) with no existing API docs section. Add a brief mention of the available functions, e.g.:\n```md\n# Demo\n\nA tiny project.\n\n## Math functions\n\n- `add(a, b)` — returns the sum of `a` and `b`\n- `subtract(a, b)` — returns the difference of `a` and `b`\n```\n\n## Verification\n- Visually confirm `math.js` exports both functions with consistent style.\n- Since there's no test runner configured in this tiny project, verify manually via `node -e \"import('./math.js').then(m => console.log(m.subtract(5,3)))\"` (or equivalent) to confirm `subtract(5, 3)` returns `2`.\n",
+          "planFilePath": "<config>/plans/plan-a-change-add-steady-quill.md"
+        },
+        "tool_use_id": "toolu_012C7zYhhfj755vCFQz4tVys"
+      },
+      "denyReply": {
+        "hookSpecificOutput": {
+          "hookEventName": "PreToolUse",
+          "permissionDecision": "deny",
+          "permissionDecisionReason": "SPIKE: the console has captured your plan and handed it to a person for approval. Do not call ExitPlanMode again and do not start the work. End your turn now; you will be resumed when the plan is approved."
+        }
+      },
+      "toolResult": {
+        "type": "tool_result",
+        "content": "PreToolUse:ExitPlanMode hook error: SPIKE: the console has captured your plan and handed it to a person for approval. Do not call ExitPlanMode again and do not start the work. End your turn now; you will be resumed when the plan is approved.",
+        "is_error": true,
+        "tool_use_id": "toolu_012C7zYhhfj755vCFQz4tVys"
+      },
+      "lastText": "Plan is written and awaiting approval. I'll pause here until you approve it.",
+      "result": {
+        "subtype": "success",
+        "is_error": false,
+        "num_turns": 6,
+        "permission_denials": [
+          {
+            "tool_name": "ExitPlanMode",
+            "tool_use_id": "toolu_012C7zYhhfj755vCFQz4tVys",
+            "tool_input": {
+              "plan": "# Add subtract(a, b) to math.js\n\n## Context\n`math.js` currently only exports `add(a, b)`. The user wants a matching `subtract(a, b)` function added alongside it, and the README updated to mention it so the module's documented API stays in sync with its code.\n\n## Changes\n\n**math.js** — add a `subtract` export right after `add`, following the same style:\n```js\nexport function add(a, b) {\n  return a + b;\n}\n\nexport function subtract(a, b) {\n  return a - b;\n}\n```\n\n**README.md** — currently just a two-line stub (`# Demo` / `A tiny project.`) with no existing API docs section. Add a brief mention of the available functions, e.g.:\n```md\n# Demo\n\nA tiny project.\n\n## Math functions\n\n- `add(a, b)` — returns the sum of `a` and `b`\n- `subtract(a, b)` — returns the difference of `a` and `b`\n```\n\n## Verification\n- Visually confirm `math.js` exports both functions with consistent style.\n- Since there's no test runner configured in this tiny project, verify manually via `node -e \"import('./math.js').then(m => console.log(m.subtract(5,3)))\"` (or equivalent) to confirm `subtract(5, 3)` returns `2`.\n",
+              "planFilePath": "<config>/plans/plan-a-change-add-steady-quill.md"
+            }
+          }
+        ]
+      }
+    },
+    "resume": {
+      "flags": [
+        "--resume",
+        "<the host arm session id>",
+        "--permission-mode",
+        "acceptEdits",
+        "--permission-prompts",
+        "none"
+      ],
+      "sameSession": true,
+      "initPermissionMode": "acceptEdits",
+      "hookTools": [
+        "Edit:acceptEdits",
+        "Edit:acceptEdits"
+      ],
+      "result": {
+        "subtype": "success",
+        "num_turns": 3,
+        "permission_denials": []
+      }
+    }
+  }
+}

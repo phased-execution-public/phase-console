@@ -18,7 +18,7 @@
  * every row of a forty-phase board.
  */
 
-import { Chip } from '@/components/ui';
+import { Badge } from '@/components/ui';
 import { usePhaseNotes } from '@/lib/queries';
 import type { NoteKind, PhaseNote } from '@/lib/api';
 
@@ -43,7 +43,7 @@ function NoteRow({ note }: { note: PhaseNote }) {
   const copy = KIND_COPY[note.kind];
   return (
     <li className="flex gap-2 text-sm">
-      <Chip title={copy.hint}>{copy.label}</Chip>
+      <Badge title={copy.hint}>{copy.label}</Badge>
       <div className="min-w-0">
         <p className="break-words">{note.text}</p>
         <p className="text-xs text-muted-foreground">

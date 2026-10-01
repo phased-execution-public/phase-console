@@ -195,3 +195,61 @@ test('S9-a: stamped names sort oldest-first as plain strings', () => {
   assert.deepEqual(['phase-08-20260809T235959Z.json', 'phase-08.json'].sort(),
     ['phase-08-20260809T235959Z.json', 'phase-08.json']);
 });
+
+/* ------------------------------------------------------------------ *
+ * The ARMED file — the last word of the session that wrote it (#21 §3)
+ * ------------------------------------------------------------------ */
+
+const { Runner } = await import('../server/runner/runner.ts');
+const { Journal } = await import('../server/runner/journal.ts');
+const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+const { outcomeFileFor } = await import('../server/runner/outcome.ts');
+type RunState = import('../server/runner/state.ts').RunState;
+
+/** A run whose phase 2 session declared `status` and exited, leaving the file behind. */
+function declaredAndGone(status: string): { runner: unknown; state: RunState; file: string } {
+  const root = mkdtempSync(join(tmpdir(), 'pc-armed-'));
+  const state = newRun({ slug: 'alpha', root });
+  state.status = 'parked';
+  const record = phaseRecord(state, 2);
+  record.status = 'running';
+  record.sessionId = 'sess-2';
+  record.startedAt = new Date().toISOString();
+  saveRun(state);
+  const file = outcomeFileFor(root, 'alpha', state.id, 2);
+  writeFileSync(file, `${JSON.stringify({
+    version: 1, slug: 'alpha', phase: 2, status,
+    reason: 'said so before it exited', watch: [],
+    written_at: new Date().toISOString(), session_id: 'sess-2',
+  })}\n`, 'utf8');
+  const runner = new Runner({ scriptsDir: '/nonexistent', verificationText: () => undefined });
+  Object.assign(runner as object, { state, journal: new Journal(root, 'alpha', state.id) });
+  (runner as unknown as { spawnSession: unknown }).spawnSession = () => {
+    throw new Error('the rung spawned a session over a phase that had already declared');
+  };
+  return { runner, state, file };
+}
+
+test('OR-5: an armed `complete` is APPLIED, not re-run — the resume rung never spawns', async () => {
+  const { runner, state, file } = declaredAndGone('complete');
+  const answer = await (runner as { resumeWithInstruction(p: number, i: string): Promise<unknown> })
+    .resumeWithInstruction(2, 'carry on where you left off');
+  assert.equal(answer, null, 'the rung reported a refusal for a phase that had already finished');
+  assert.equal(existsSync(file), false, 'the declaration was applied but the file was left to be read twice');
+  assert.notEqual(state.phases['2'].status, 'running',
+    'the record was flipped back to running over a session that had already declared');
+});
+
+test('OR-5: an armed `partial` is left for the resume it is asking for', async () => {
+  // The three declarations a resume EXISTS for are not applied here: `partial`,
+  // `blocked` and `needs-human` are asking for exactly this rung. The file is
+  // still read and journalled — that is what `takeArmedOutcome` does for every
+  // status — so the word is never destroyed unread.
+  const { runner } = declaredAndGone('partial');
+  await assert.rejects(
+    () => (runner as { resumeWithInstruction(p: number, i: string): Promise<unknown> })
+      .resumeWithInstruction(2, 'carry on where you left off'),
+    /spawned a session/,
+    'a `partial` stopped the resume it was asking for',
+  );
+});

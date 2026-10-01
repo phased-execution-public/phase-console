@@ -33,9 +33,14 @@
  *
  * ## What is real, and what is honestly zero
  *
- * `runs[].spentUsd` / `budgetUsd` are exact: the runner adds every session's
- * `total_cost_usd` to `RunState.spentUsd` the moment the spawn resolves, and
- * `runBudgetUsd` already reflects the one auto-raise.
+ * `runs[].spentUsd` / `budgetUsd` are exact: the runner books every spawn into
+ * `RunState.spentUsd` the moment it resolves, and `runBudgetUsd` already
+ * reflects the one auto-raise. "Every spawn" means its OWN spend — the CLI's
+ * `total_cost_usd` less the session's high-water mark (`bookSpend`), since a
+ * `--resume` reports the whole conversation's running total. Until control-tower
+ * phase 46 it was booked whole, 9–11 % of the audit week's ledger re-reported; a
+ * run stored before then is re-priced once at boot (`costModel: 2`) before this
+ * module reads it.
  *
  * `settledUsd` is an approximation with a name: it sums `PhaseRecord.costUsd`
  * on the day the phase ENDED. That figure is cumulative over every attempt and
@@ -52,10 +57,10 @@
  * zero for the rest — the split is worth knowing before reading the number.
  * `accountRung` still opens a rung with no cost, because what a rung costs is
  * not knowable when it is climbed. The cost arrives later: `runner/ladder.ts`
- * `chargeRung` adds each attempt's own `outcome.costUsd` to the newest OPEN
- * rung as that attempt ends — `runner/runner-attempt.ts` (the phase attempt
- * and the closeout), `runner/runner-loop.ts` (the PR session) and
- * `runner/runner-control.ts` (an instructed resume) — and it is a no-op unless
+ * `chargeRung` adds each spawn's booked cost to the newest OPEN rung as that
+ * session ends — from the spawn door's `bookSpend`, for every session but a
+ * landing (the phase attempt, the closeout, a QA round, a repair, an instructed
+ * resume, the PR and review sessions) — and it is a no-op unless
  * the ladder is what reboarded the phase, so an ordinary first boarding is not
  * charged to anything. That is why the dollar caps in `nextRung` now have a
  * column to sum, and why `ladderPerDayUsd` can refuse a rung, which it never
@@ -126,6 +131,8 @@ export type SpendRunView = {
   updatedAt?: string;
   phases?: Record<string, PhaseCostRecordView | undefined>;
   recoveries?: Record<string, { rungs?: readonly RungView[] } | undefined>;
+  /** The run's blocked wall-clock by holder class (control-tower phase 60, #64) — the metrics' `run_blocked_seconds_total`. */
+  blockedMs?: Partial<Record<string, number>>;
 };
 
 export type SpendFacts = {
@@ -356,12 +363,14 @@ export function spendSummary(facts: SpendFacts, now: Date | number): SpendView {
 /**
  * ## Where a plan's money actually is, and why the total has to be checked
  *
- * Every site that ends a session books the same dollars three times, on
- * purpose: `state.spentUsd += cost` (the RUN's total), `record.costUsd += cost`
- * (the PHASE's), and `chargeRung(...)` (the ladder rung that caused the
- * attempt, when one did). Four sites do it — `runner-attempt.ts` twice (the
- * phase attempt and the closeout), `runner-loop.ts` (the PR session) and
- * `runner-control.ts` (an instructed resume) — and all four pair the first two.
+ * Every session's dollars are booked three times, on purpose, and in ONE
+ * place — `RunnerBase.bookSpend`, at the spawn door every session goes through
+ * (control-tower phase 46, #62): `state.spentUsd` (the RUN's total),
+ * `record.costUsd` (the PHASE's), and `chargeRung(...)` (the ladder rung that
+ * caused the attempt, when one did; never for a landing). The first two are
+ * always paired. What is booked is the spawn's rise over its session's
+ * high-water mark, not the CLI's `total_cost_usd` — that is the conversation's
+ * running total, and eight separate sites used to add it whole on every resume.
  *
  * So in a healthy run `Σ phases[].costUsd` EQUALS `run.spentUsd`, and the
  * ladder figure is a **subset of both**, never a third column to add on. That

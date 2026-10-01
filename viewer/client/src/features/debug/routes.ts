@@ -31,7 +31,12 @@ export const DEBUG_SECTIONS = [
   {
     id: 'health',
     label: 'Health',
-    blurb: 'The environment, the watch clock, the metrics — and the bundle.',
+    blurb: 'The doctor, this process, the environment, the watch clock, the metrics — and the bundle.',
+  },
+  {
+    id: 'access',
+    label: 'Access',
+    blurb: 'Who this console has served — this machine, and every phone that reached it.',
   },
 ] as const;
 

@@ -24,3 +24,8 @@ viewer/server/**/*.js
 # invisible. A shared exclusion belongs in the tracked file.
 evals/
 
+
+# The real-browser harness (viewer/e2e): the tour's pictures are for a person to
+# READ, never to diff, and Playwright's own results are one run's leavings.
+viewer/e2e/.shots/
+viewer/e2e/.results/

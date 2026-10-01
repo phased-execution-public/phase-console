@@ -157,6 +157,14 @@ Launch را غیرفعال می‌کند و خودش را نام می‌برد؛
 می‌کند — و تا آن کنسول جواب می‌دهد، این فرمان کاری نمی‌کند.
 
 
+**خواندنِ یک اجرا از شل.** <span dir="ltr">`phase-console run status <slug>`</span> آخرین اجرا را در شکلی
+کوچک چاپ می‌کند (همان کلمهٔ وضعیتی که هر صفحه نشان می‌دهد — `waiting` برای اجرایی که روی ساعتی خوابیده
+که کسی متوقفش نکرده — توقف، مسیرها، یک کلمه برای هر فاز)؛ `run runs`، `run queue`، `run accounts`،
+`run approvals`، <span dir="ltr">`run journal <slug>`</span>، <span dir="ltr">`run triggers <slug>`</span>،
+<span dir="ltr">`run tail <slug> <N>`</span> و <span dir="ltr">`run explain <slug> <N>`</span> بقیه را
+می‌خوانند، و `explain` اول خلاصهٔ گزارشِ فاز را چاپ می‌کند. `phase-console doctor` پروسه‌های کنسولی را که
+ریشهٔ نصبشان دیگر وجود ندارد فهرست می‌کند، و `doctor --stop-strays` دقیقاً همان‌ها را متوقف می‌کند.
+
 ## چیزها کجا زندگی می‌کنند (دو جا)
 
 - **خودِ اسکیل** (همین مخزن — کلون‌شده در `~/.claude/skills/phased-execution`، نصب‌شده به‌صورت پلاگین،
@@ -170,5 +178,10 @@ Launch را غیرفعال می‌کند و خودش را نام می‌برد؛
   ماشینی بتواند pull کند و طرحِ نیمه‌تمام را ادامه دهد.
 
 رویه‌ی کامل: `SKILL.md` و `references/` آن.
+
+## مجوز
+
+نسخهٔ رایگان متن‌باز است و تحتِ مجوزِ MIT منتشر می‌شود، در
+[phased-execution-public/phase-console](https://github.com/phased-execution-public/phase-console).
 
 </div>

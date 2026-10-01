@@ -240,11 +240,12 @@ test('REG-6: a probe-shaped record — turns 0, sub-minute, no owner — weakly 
   assert.deepEqual(correlate(flagged, [{ ...lock, session: 'p1' }], t(4_000_000)), { slug: 'alpha', phase: 2, strong: true });
 });
 
-test('SLF-2 / REG-6: the probe\'s payload registers as the console\'s (`agent`), flagged, and stays out of views', () => {
-  // The probe now spawns with `PE_OWNER=console/mcp-probe` and
-  // `PHASE_CONSOLE_PROBE=1`, and the hook forwards both. It is a record — it
-  // ends with a real SessionEnd — but never `foreign`, never in the operator's
-  // list, and never weakly correlated.
+test('SLF-2 / REG-6, then #73: a probe\'s payload is parsed, and registers NOTHING — no record, no file, no view', () => {
+  // SLF-2 made the probe name itself (`PE_OWNER=console/mcp-probe`,
+  // `PHASE_CONSOLE_PROBE=1`) and the registry kept it, flagged and hidden.
+  // #73: kept, it was 307 of 319 records and came back "stuck" on recycled
+  // pids. A probe is not a session: its own hook drops it, and a hook older
+  // than that rule, which still forwards the flag, is refused here.
   const parsed = parseHookPayload({ session_id: 'probe-1', event: 'SessionStart', cwd: '/w', owner: 'console/mcp-probe', probe: 1, user: 'sam', host: 'laptop' });
   assert.ok(parsed);
   assert.equal(parsed!.probe, true);
@@ -252,19 +253,16 @@ test('SLF-2 / REG-6: the probe\'s payload registers as the console\'s (`agent`),
   assert.equal(parseHookPayload({ session_id: 'x', event: 'SessionStart', cwd: '/w', probe: 0 })!.probe, undefined);
   const { dir, cleanup } = scratch();
   try {
-    const reg = new SessionRegistry({ dir, now: () => new Date(at(0)), pidAlive: null }).load();
-    reg.ingest(parsed!);
+    const changes: string[] = [];
+    const reg = new SessionRegistry({ dir, now: () => new Date(at(0)), pidAlive: null, onChange: (r, e) => changes.push(`${e}:${r.sessionId}`) }).load();
+    const answer = reg.ingest(parsed!);
+    assert.equal(answer.sessionId, 'probe-1', 'the POST is still answered');
     reg.ingest(payload({ event: 'SessionStart', user: 'sam', host: 'laptop', at: T0 }));
-    const probe = reg.get('probe-1')!;
-    assert.equal(probe.kind, 'agent', 'console/… is the console\'s own, never foreign');
-    assert.equal(probe.probe, true);
-    assert.deepEqual(reg.views().map((v) => v.sessionId), ['s1'], 'the operator\'s list leaves the probe out');
-    assert.deepEqual(reg.views([], [], { probes: true }).map((v) => v.sessionId).sort(), ['probe-1', 's1'], '…unless asked');
-    // The flag survives the file.
-    const again = new SessionRegistry({ dir, now: () => new Date(at(5_000)), pidAlive: null }).load();
-    assert.equal(again.get('probe-1')?.probe, true);
-    assert.equal(again.get('probe-1')?.kind, 'agent');
-    reg.close(); again.close();
+    assert.equal(reg.get('probe-1'), undefined, 'no record');
+    assert.equal(existsSync(join(dir, 'probe-1.json')), false, 'no file');
+    assert.deepEqual(changes, ['SessionStart:s1'], 'no change event');
+    assert.deepEqual(reg.views([], [], { probes: true }).map((v) => v.sessionId), ['s1'], 'not even when asked');
+    reg.close();
   } finally { cleanup(); }
 });
 
@@ -1104,11 +1102,18 @@ test('ACC-10.7 (FLT-8): an event from a directory under neither of two consoles 
 // ended, the process says it did not, and nobody can vouch for it — so lease
 // rules apply and nothing is released.
 test('PRS-1: endedAt with the process still RUNNING is unknown, never ended', () => {
-  const live: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99 };
+  const live: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99, procStartedAt: at(-5_000) };
   const cleared = { ...live, endedAt: at(10) };
   const now = Date.parse(T0) + 60_000;
   assert.equal(presenceOf(cleared, now, () => true), 'unknown', '/clear on a live process');
   assert.equal(presenceOf(cleared, now, () => 'running'), 'unknown');
+  // …and only the SAME process (#73): the probe is asked with the recorded
+  // start time, and a record that has none has nothing to match — a live pid
+  // alone is a recycled pid as often as it is the session.
+  const asked: (string | undefined)[] = [];
+  presenceOf(cleared, now, (_pid, startedAt) => { asked.push(startedAt); return true; });
+  assert.deepEqual(asked, [at(-5_000)]);
+  assert.equal(presenceOf({ ...cleared, procStartedAt: undefined }, now, () => true), 'ended');
 });
 
 test('PRS-1: endedAt with the process GONE is still ended', () => {
@@ -1133,7 +1138,7 @@ test('PRS-1: endedAt with NO probe, or no pid, is ended exactly as before', () =
 });
 
 test('PRS-1: a stopped process under endedAt is unknown too', () => {
-  const rec: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99, endedAt: at(10) };
+  const rec: SessionRecord = { sessionId: 's1', kind: 'foreign', cwd: '/w', startedAt: T0, lastSeen: T0, turns: 0, pid: 99, endedAt: at(10), procStartedAt: at(-5_000) };
   const now = Date.parse(T0) + 60_000;
   assert.equal(presenceOf(rec, now, () => 'stopped'), 'unknown');
   assert.equal(presenceOf(rec, now, () => 'zombie'), 'unknown');

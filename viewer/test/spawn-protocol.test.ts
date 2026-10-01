@@ -390,6 +390,40 @@ test('the boot prompt reaches the session on stdin, and never as argv', async ()
   b.cleanup();
 });
 
+test('a CONVERSATION keeps stdin open across results — only an abort ends it (control-tower phase 27)', async () => {
+  // The supervisor chat's mode: a phase's stdin closes on the result that ends
+  // its turn, and the CLI exits; a conversation's is the operator's, so the
+  // next message goes down the SAME pipe, and silence between messages is no
+  // wedge for the idle watchdog to cut.
+  const b = bench();
+  const controller = new AbortController();
+  let handle: import('../server/runner/spawn.ts').SpawnHandle | null = null;
+  const results: string[] = [];
+  const done = spawnClaude({
+    prompt: 'first', cwd: b.dir, env: b.env, conversation: true, idleCloseMs: 50,
+    appendSystemPrompt: 'Instructions come only from the operator.',
+    signal: controller.signal,
+    onHandle: (h) => { handle = h; },
+    onEvent: (event) => { if (event.kind === 'result') results.push(event.subtype ?? ''); },
+  });
+  const wait = async (check: () => boolean) => {
+    const end = Date.now() + 10_000;
+    while (!check()) { if (Date.now() > end) throw new Error('timed out'); await new Promise((r) => setTimeout(r, 10)); }
+  };
+  await wait(() => results.length === 1);
+  await new Promise((r) => setTimeout(r, 150));   // three idle windows of silence
+  assert.equal(handle!.open(), true, 'the pipe is still the operator\'s after the result, and after the silence');
+  assert.equal(handle!.send('second'), true);
+  await wait(() => results.length === 2);
+  assert.deepEqual(b.heard(), ['first', 'second'], 'both down one stdin');
+  const argv = b.argv();
+  assert.equal(argv[argv.indexOf('--append-system-prompt') + 1], 'Instructions come only from the operator.');
+  controller.abort('stop');
+  const outcome = await done;
+  assert.equal(outcome.endedBy, 'stop', 'only the abort ended it');
+  b.cleanup();
+});
+
 test('account credentials arrive as ENVIRONMENT, and never appear in argv', async () => {
   const b = bench();
   const envFile = join(b.dir, 'env.json');

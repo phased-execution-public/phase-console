@@ -37,7 +37,7 @@ import { join } from 'node:path';
 const { SKILL_DIR } = await import('../server/config.ts');
 const { Service } = await import('../server/service.ts');
 const {
-  planConvergence, executeConvergence, ConvergeScheduler, stoppedByOperator, runIsDead, evidenceFingerprint,
+  planConvergence, executeConvergence, convergePlan, ConvergeScheduler, stoppedByOperator, runIsDead, evidenceFingerprint,
   CHANGE_DEBOUNCE_MS, HALT_DELAY_MS, MAX_BOOT_RESUMES, MIN_SWEEP_MS, WAIT_OVERDUE_GRACE_MS, PRESS_ONLY_HALT_KINDS,
 } = await import('../server/converge.ts');
 const { newRun, phaseRecord, saveRun, loadRun, journalFile, consoleStoppedNote } = await import('../server/runner/state.ts');
@@ -223,6 +223,55 @@ test('planner: an orphaned session still alive is waited for; once it is gone th
   assert.match(gone.actions[0].kind === 'relaunch' ? gone.actions[0].why.join(' ') : '', /outlived the earlier console has ended/);
 });
 
+test('planner: an orphan finished cleanly advances the run even under resumeOnRestart: false (#23)', () => {
+  // `resumeOnRestart` was answered at launch as "if the console restarts
+  // mid-phase, may it resume my INTERRUPTED session?". An orphan that ran to
+  // its exit criteria and wrote its handoff was not interrupted, and holding
+  // the whole run for a press at that point asks a person to approve nothing.
+  const orphan = (): RunState => run({
+    status: 'parked', resumeOnRestart: false,
+    halt: { at: '', reason: 'a session from an earlier console is still running (pid 4242, phase 2)', kind: 'orphaned-session', phase: 2 },
+    children: { 2: { pid: 4242, phase: 2, startedAt: '' } },
+  }, [{ phase: 2, status: 'running', sessionId: 'sess-2' }]);
+
+  // The case the gate WAS written for, unchanged: the child is gone and its
+  // phase is still open, so a person is asked.
+  const openPhase = planConvergence(facts({
+    runs: [orphan()], pidAlive: () => false, board: { 1: 'done', 2: 'in-progress', 3: 'waiting' },
+  }));
+  assert.deepEqual(kinds(openPhase), ['errand'], 'a lane whose phase is still open is still a person\'s');
+
+  // It finished: the board reads its phase done, and the run continues.
+  const finished = planConvergence(facts({
+    runs: [orphan()], pidAlive: () => false, board: { 1: 'done', 2: 'done', 3: 'ready' },
+  }));
+  assert.deepEqual(kinds(finished), ['relaunch']);
+  const action = finished.actions[0];
+  assert.deepEqual(
+    action.kind === 'relaunch' ? action.closedByOrphan : null, [2],
+    'nothing marks the phase as closed by the orphan, so the record cannot explain why no press was needed',
+  );
+
+  // …and the same when the board has not caught up yet but the orphan's own
+  // declaration is still sitting in its armed outcome file (#21 §3).
+  const declared = planConvergence(facts({
+    runs: [orphan()], pidAlive: () => false, board: { 1: 'done', 2: 'in-progress', 3: 'waiting' },
+    declaredOutcome: () => 'complete',
+  }));
+  assert.deepEqual(kinds(declared), ['relaunch'], 'a `complete` declaration is the same fact the board will carry in a moment');
+
+  // A run that never said no keeps every path it had.
+  const resuming = planConvergence(facts({
+    runs: [run({
+      status: 'parked',
+      halt: { at: '', reason: 'a session from an earlier console is still running (pid 4242, phase 2)', kind: 'orphaned-session', phase: 2 },
+      children: { 2: { pid: 4242, phase: 2, startedAt: '' } },
+    }, [{ phase: 2, status: 'running', sessionId: 'sess-2' }])],
+    pidAlive: () => false, board: { 1: 'done', 2: 'done', 3: 'ready' },
+  }));
+  assert.deepEqual(kinds(resuming), ['relaunch']);
+});
+
 test('planner: debris — an autopilot claim of a dead run is released; a live run\'s, an orphan-alive run\'s and a person\'s are kept', () => {
   const dead = run({ status: 'halted' }, [{ phase: 2, status: 'failed' }]);
   const live = run({ status: 'running' });
@@ -346,6 +395,58 @@ test('planner: clearing a gate is a change — the healer is asked again about a
     skipWhy(planConvergence(facts({ runs: [halted], lastNoop: noGatePrint, gateStamp: null }))),
     /nothing has changed/,
   );
+});
+
+test('accountsStamp: a breaker clearance is evidence to the healer, and a meter poll is not (#36)', async () => {
+  // The latch #36 measured, in the fingerprint's terms: clearing a retired
+  // account changes neither the run, its records, nor the board word — the
+  // gate stamp's shape exactly — so "found nothing to climb" held for two and a
+  // half hours against an account a person had just cleared.
+  const { Accounts } = await import('../server/accounts/index.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'pc-accounts-stamp-'));
+  let clock = NOW;
+  const accounts = new Accounts({
+    platform: 'linux', exec: async () => ({ stdout: '' }), follow: false,
+    registryDir: join(dir, 'registry'), learnedFile: join(dir, 'learned.json'), accountsDir: join(dir, 'accounts'),
+    now: () => clock,
+  } as never);
+  try {
+    const fingerprint = accounts.fingerprintOf('default');
+    // One read first: whatever the breaker says about a never-read credential,
+    // the question here is what the SECOND read does.
+    accounts.learned.noteRead(fingerprint, { successAt: new Date(clock).toISOString() });
+    const entitled = accounts.breakerStamp();
+    clock += 90_000;
+    accounts.learned.noteRead(fingerprint, { successAt: new Date(clock).toISOString() });
+    assert.equal(accounts.breakerStamp(), entitled, 'a meter poll moves the read clock, never the breaker');
+
+    accounts.retire('default', undefined, 'the organisation refused the credential', 'classifier', 'org-policy');
+    const retired = accounts.breakerStamp();
+    assert.notEqual(retired, entitled, 'a retirement is a change');
+    accounts.clearRetired('default', 'operator');
+    const cleared = accounts.breakerStamp();
+    assert.notEqual(cleared, retired, 'and so is the person clearing it');
+
+    // The fingerprint carries it: same run, same records, same board, a new stamp.
+    const halted = run(
+      { status: 'halted', halt: { at: '', reason: 'the API refused the run\'s credential', phase: 2, kind: 'credential-refused' } },
+      [{ phase: 2, status: 'parked' }],
+    );
+    const board = facts().board!;
+    assert.notEqual(
+      evidenceFingerprint(halted, board, [], null, null, NOW, retired),
+      evidenceFingerprint(halted, board, [], null, null, NOW, cleared),
+    );
+    const before = planConvergence(facts({ runs: [halted], accountsStamp: retired }));
+    assert.equal(before.actions[0].kind, 'heal');
+    const print = before.actions[0].kind === 'heal' ? before.actions[0].fingerprint : '';
+    assert.match(skipWhy(planConvergence(facts({ runs: [halted], lastNoop: print, accountsStamp: retired }))), /nothing has changed/);
+    const after = planConvergence(facts({ runs: [halted], lastNoop: print, accountsStamp: cleared }));
+    assert.equal(after.actions[0].kind, 'heal', 'a clearance re-asks the healer');
+  } finally {
+    accounts.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 /* ------------------------------------------------------------------ *
@@ -1223,7 +1324,7 @@ test('ACC-5.1 (RCV-3): a run halted failure-streak is relaunched by no trigger b
   assert.ok(kinds(byClock).includes('heal'));
   const byPress = planConvergence(facts({ runs: [refused], board: { 1: 'ready', 2: 'ready', 3: 'waiting' }, trigger: 'button' }));
   assert.ok(kinds(byPress).includes('relaunch'), `credential-refused by button: ${kinds(byPress).join(',')}`);
-  assert.deepEqual([...PRESS_ONLY_HALT_KINDS], ['failure-streak', 'credential-refused']);
+  assert.deepEqual([...PRESS_ONLY_HALT_KINDS], ['failure-streak', 'credential-refused', 'identity-changed']);
 });
 
 test('planner: a parked run with nothing ready is NOT relaunched — it would only re-park', () => {
@@ -1949,4 +2050,46 @@ test('PRS-1: a cleared session\'s lock (endedAt, process alive ⇒ unknown) is n
     'converge releases nothing for the cleared session');
   assert.equal(debris.some((a) => a.kind === 'release-debris' && a.session === 'cleared-1'), false,
     'and names it nowhere');
+});
+
+/* ------------------------------------------------------------------ *
+ * A stop about the plan is answered by the plan (control-tower phase 81, #97)
+ * ------------------------------------------------------------------ */
+
+test('#97: the lint is read only for a stop about the plan — a verify-failed halt costs no validate.sh, a plan-lint one is asked once', async () => {
+  const lintClean = { ok: true, issues: [], summary: 'VALIDATE OK: alpha', timedOut: false, crashed: false };
+  for (const [kind, expected] of [['verify-failed', 0], ['plan-lint', 1], ['plan-unreadable', 1]] as const) {
+    const state = run({
+      status: 'halted', stoppedBy: 'system',
+      halt: { at: new Date(NOW).toISOString(), reason: `a ${kind} stop`, phase: 2, kind },
+    }, [{ phase: 2, status: 'failed', attempts: 1 }]);
+    let asked = 0;
+    const deps = stubDeps(state, {
+      board: async () => ({ 1: 'done', 2: 'done', 3: 'ready' }),
+      lint: async () => { asked += 1; return lintClean; },
+    });
+    const report = await convergePlan(deps, 'alpha', 'change');
+    assert.equal(asked, expected, `${kind}: ${JSON.stringify(report.actions)}`);
+    if (kind !== 'verify-failed') {
+      assert.equal(deps.started.length, 1, `${kind}: a clean lint relaunches through converge's one door`);
+      const actor = (deps.started[0] as { actor: Record<string, unknown> }).actor;
+      assert.equal(actor.door, 'converge-relaunch');
+      assert.match(String(actor.trigger), /lints clean/);
+    }
+  }
+});
+
+test('#97: a plan-lint stop a person dismissed is pinned for the clocks — and relaunched by their own press once the plan lints clean', () => {
+  const dismissed = run({
+    status: 'halted', stoppedBy: 'system',
+    halt: { at: new Date(NOW).toISOString(), reason: 'phase 2 left the plan failing validate.sh', phase: 2, kind: 'plan-lint' },
+    resolved: { at: new Date(NOW).toISOString(), auto: false, reason: 'dismissed by the operator' },
+  }, [{ phase: 2, status: 'done' }]);
+  const lint = { ok: true, issues: [], summary: 'VALIDATE OK: alpha', timedOut: false, crashed: false };
+  const board = { 1: 'done', 2: 'done', 3: 'ready' };
+  const timer = planConvergence({ ...facts({ runs: [dismissed], board }), lint });
+  assert.deepEqual(kinds(timer), ['skip'], skipWhy(timer));
+  assert.match(skipWhy(timer), /a person dismissed it/);
+  const pressed = planConvergence({ ...facts({ runs: [dismissed], board, trigger: 'button' }), lint });
+  assert.deepEqual(kinds(pressed), ['relaunch'], JSON.stringify(pressed.actions));
 });

@@ -14,9 +14,13 @@ vi.mock('@/lib/media', () => ({
   isPhone: () => true,
 }));
 
-const { recheck, recover, retry } = vi.hoisted(() => ({
+const { recheck, recover, retry, resumePhase, delegate, toast } = vi.hoisted(() => ({
   recheck: vi.fn(async () => ({ run: null })),
   retry: vi.fn(async () => ({ run: null })),
+  // A press answers with what it launched (control-tower phase 53).
+  resumePhase: vi.fn(async (): Promise<Record<string, unknown>> => ({ run: null })),
+  delegate: vi.fn(async (): Promise<Record<string, unknown>> => ({ run: null })),
+  toast: vi.fn(),
   recover: vi.fn(async () => ({
     outcome: 'resumed',
     detail: 'The board had moved past the stop — the run continues from here.',
@@ -26,7 +30,21 @@ const { recheck, recover, retry } = vi.hoisted(() => ({
 }));
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, runRecheck: recheck, runRecover: recover, runRetry: retry } };
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      runRecheck: recheck,
+      runRecover: recover,
+      runRetry: retry,
+      runResumePhase: resumePhase,
+      runDelegate: delegate,
+    },
+  };
+});
+vi.mock('@/components/ui', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui')>();
+  return { ...actual, toast };
 });
 
 import { RecoveryActions } from './recovery-actions';
@@ -378,5 +396,85 @@ describe('the ladder on Ways forward', () => {
       (o) => o.value,
     );
     expect(options).toEqual(['', 'only-this-one']);
+  });
+});
+
+describe('a press says what it launched (control-tower phase 53)', () => {
+  const HUMAN_ACTS = {
+    record: { status: 'parked', resumable: true },
+    run: {
+      status: 'parked',
+      halt: { reason: "phase 2 needs a person: the merge is the owner's", kind: 'needs-human', phase: 2 },
+    },
+    situation: { id: 'blocked-declared', sub: 'human-acts' },
+  } as const;
+
+  it('leads a phase parked on human acts with Delegate, and sends the words to its own endpoint', async () => {
+    mount(<RecoveryActions target={{ slug: 'demo', phase: 2 }} ctx={HUMAN_ACTS} />);
+    const first = screen.getAllByRole('button')[0];
+    expect(first).toHaveAccessibleName('Delegate to the session');
+    fireEvent.click(first);
+    const words = screen.getByRole('textbox', { name: 'Your words to the session' });
+    // The words are optional: Delegate's own instruction already hands the acts over.
+    const submit = screen.getByRole('button', { name: 'Delegate the acts' });
+    expect(submit).toBeEnabled();
+    fireEvent.change(words, { target: { value: 'Merge it; I trust the gate.' } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(delegate).toHaveBeenCalledWith('demo', 2, 'Merge it; I trust the gate.'));
+    expect(resumePhase).not.toHaveBeenCalled();
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    const [message, kind] = toast.mock.calls.at(-1)!;
+    expect(kind).toBe('ok');
+    expect(message).toMatch(/^Delegated — the phase's session resumes/);
+  });
+
+  it('a resume that boarded FRESH says so, and why — not "resuming the session"', async () => {
+    resumePhase.mockResolvedValueOnce({
+      run: null,
+      launched: {
+        runId: 'r1',
+        phase: 2,
+        session: null,
+        brief: 'resume',
+        why: 'it ended at 681k tokens of context',
+      },
+    });
+    mount(
+      <RecoveryActions
+        target={{ slug: 'demo', phase: 2 }}
+        ctx={{ record: { status: 'failed', resumable: true }, situation: { id: 'work-in-progress' } }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Resume with an instruction' }));
+    const box = screen.getByRole('textbox', { name: 'Your instruction' });
+    const submit = screen.getByRole('button', { name: 'Resume with this' });
+    expect(submit).toBeDisabled();
+    fireEvent.change(box, { target: { value: 'Finish the parser.' } });
+    fireEvent.click(submit);
+    await waitFor(() => expect(resumePhase).toHaveBeenCalledWith('demo', 2, 'Finish the parser.'));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    expect(toast.mock.calls.at(-1)![0]).toBe(
+      'Boarded fresh with the resume brief and your instruction — its session was not resumed: it ended at 681k tokens of context.',
+    );
+  });
+
+  it('a delegation the server refuses reads its reason, not a success', async () => {
+    const { ApiError } = await import('@/lib/api');
+    delegate.mockRejectedValueOnce(
+      new ApiError(
+        'Phase 2 of demo is not parked on acts kept for a person',
+        409,
+        '/api/run/demo/delegate',
+        {},
+      ),
+    );
+    mount(<RecoveryActions target={{ slug: 'demo', phase: 2 }} ctx={HUMAN_ACTS} />);
+    fireEvent.click(screen.getAllByRole('button')[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Delegate the acts' }));
+    await waitFor(() => expect(toast).toHaveBeenCalled());
+    expect(toast.mock.calls.at(-1)).toEqual([
+      'Phase 2 of demo is not parked on acts kept for a person',
+      'error',
+    ]);
   });
 });

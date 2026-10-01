@@ -2,6 +2,7 @@ import type { HTMLAttributes } from 'react';
 import { cn } from '@/lib/cn';
 import { useNow } from '@/lib/clock';
 import { elapsed } from '@/lib/format';
+import type { UiState } from '@/lib/status-vocab';
 
 /**
  * A heartbeat: when a lane was last heard from, and whether that is recent
@@ -41,7 +42,9 @@ export function Heartbeat({
       : silent
         ? `silent ${elapsed(silence)}`
         : `${elapsed(silence)} ago`;
-  const state = beating ? 'running' : silent ? 'waiting' : 'queued';
+  // The dot's paint, from the beat itself: alive is running, a silence past the
+  // threshold is waiting, and no beat at all is the quiet queued.
+  const paint: UiState = beating ? 'running' : silent ? 'waiting' : 'queued';
   return (
     <span
       role="status"
@@ -50,7 +53,7 @@ export function Heartbeat({
       className={cn(
         'inline-flex items-center gap-1.5 font-mono text-2xs tabular-nums',
         silent ? 'text-waiting' : 'text-ink-muted',
-        `state-${state}`,
+        `state-${paint}`,
         className,
       )}
       {...props}

@@ -364,3 +364,53 @@ test('a payload from a server older than action tokens still answers its card', 
   await Promise.all(waits);
   assert.deepEqual(posted, ['/api/approvals/ap-7']);
 });
+
+/* ------------------------------------------------------------------ *
+ * A person's turn it does not know (control-tower phase 42)
+ * ------------------------------------------------------------------ */
+
+test('a human step it does not know is a plain link: shown, and a tap opens the payload’s own url', async () => {
+  const { handlers, scope } = loadWorker();
+  const shown: Array<[string, Record<string, unknown>]> = [];
+  const opened: string[] = [];
+  const posted: string[] = [];
+  const self = scope.self as {
+    registration: { showNotification: (t: string, o: object) => void };
+    clients: { openWindow: (url: string) => Promise<void> };
+  };
+  self.registration.showNotification = (title, options) =>
+    void shown.push([title, options as Record<string, unknown>]);
+  self.clients.openWindow = async (url) => void opened.push(url);
+  scope.fetch = async (url: string) => {
+    posted.push(url);
+    return { ok: true };
+  };
+
+  handlers.push({
+    data: {
+      json: () => ({
+        title: 'Your turn: enter a device code — alpha phase 3',
+        body: 'Pair the deploy CLI — code ABCD-1234.',
+        url: '/#/plan/alpha/run',
+        step: { id: 'human-step-1', kind: 'device-code', where: 'any', code: 'ABCD-1234' },
+      }),
+    },
+    waitUntil: (p: unknown) => p,
+  });
+  assert.equal(shown.length, 1);
+  const [title, options] = shown[0];
+  assert.equal(title, 'Your turn: enter a device code — alpha phase 3');
+  assert.equal(options.body, 'Pair the deploy CLI — code ABCD-1234.');
+  // No Open button it could not honour — nothing the payload did not sign.
+  assert.equal(options.actions, undefined);
+
+  let done: unknown;
+  handlers.notificationclick({
+    action: '',
+    notification: { close: () => {}, data: (options as { data: unknown }).data },
+    waitUntil: (p: unknown) => void (done = p),
+  });
+  await done;
+  assert.deepEqual(opened, [`${ORIGIN}/#/plan/alpha/run`]);
+  assert.deepEqual(posted, []);
+});

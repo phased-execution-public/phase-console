@@ -70,4 +70,35 @@ describe('SituationSummary', () => {
     expect(SITUATIONS).toBe(SHARED);
     for (const id of SITUATIONS) expect(SITUATION_LABELS[id].length).toBeGreaterThan(2);
   });
+
+  it('a usage wall read now stands in for the line the classifier quoted from the park — never both (control-tower phase 86, #78)', () => {
+    render(
+      <SituationSummary
+        situation={{
+          id: 'resource-wall',
+          sub: 'usage',
+          key: 'resource-wall:usage',
+          label: situationLabel('resource-wall', 'usage'),
+          actor: 'wait',
+          blurb: 'A usage wall.',
+          why: ['a usage limit: checkpointed at the park — resets in 14 min', 'the run is waiting'],
+        }}
+        wall={{
+          latest: '2026-09-25T12:50:00.000Z',
+          reset: true,
+          sentence: 'the usage window reset at 12:50Z — waiting for demo P20 (grant)',
+          lastReading: {
+            at: '2026-09-25T12:40:00.000Z',
+            by: 'reading',
+            ok: false,
+            resetsAt: '2026-09-25T12:50:00.000Z',
+          },
+        }}
+      />,
+    );
+    expect(screen.queryByText(/checkpointed at the park/)).toBeNull();
+    expect(screen.getByText(/the usage window reset at 12:50Z — waiting for demo P20/)).toBeTruthy();
+    expect(screen.getByTestId('situation-why').textContent).toContain('the run is waiting');
+    expect(screen.getByTestId('situation-wall').textContent).toContain('by reading');
+  });
 });

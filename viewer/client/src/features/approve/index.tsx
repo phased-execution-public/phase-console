@@ -38,14 +38,18 @@ import { useMemo, useState } from 'react';
 import { CheckCheck } from 'lucide-react';
 import { useWindowLeft } from '@/lib/clock';
 import { INBOX_KIND_LABELS, SEVERITY_UI } from '@shared/attention-model.js';
-import { Button, Empty, RelativeTime, Skeleton, StatusBadge } from '@/components/ui';
+import { Button, Empty, RelativeTime, Skeleton } from '@/components/ui';
+import { SeverityBadge } from '@/components/ui/status';
 import { useAttentionInbox } from '@/lib/queries';
-import { useInboxActions } from '@/features/now/inbox-row';
-import { nowHref, toHash } from '@/app/routes';
+import { useInboxActions } from '@/components/inbox-row';
+import { runsHref, toHash } from '@/app/routes';
 import { plural } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { InboxAction, InboxItem } from '@/lib/api';
 import { MicField } from './mic-field';
+import { HaltCategoryMark } from '@/components/halt-mark';
+import { HumanStepCard } from '@/components/human-step-card';
+import { useRoute } from '@/app/router';
 
 /**
  * Can this console press it?
@@ -68,7 +72,16 @@ export function actionable(items: readonly InboxItem[]): InboxItem[] {
 export default function ApprovePage() {
   const { data, isLoading, isError, refetch } = useAttentionInbox();
   const { perform, busy } = useInboxActions();
-  const items = useMemo(() => actionable(data?.items ?? []), [data]);
+  // A step's push lands here with `?step=<id>` (control-tower phase 42): that
+  // card comes first, whole, and scrolled to — one tap from the lock screen.
+  const focus = useRoute().query.step ?? null;
+  const items = useMemo(() => {
+    const list = actionable(data?.items ?? []);
+    if (!focus) return list;
+    const at = list.findIndex((item) => item.humanStep?.stepId === focus);
+    return at > 0 ? [list[at]!, ...list.slice(0, at), ...list.slice(at + 1)] : list;
+  }, [data, focus]);
+  const focusGone = Boolean(focus && data && !items.some((item) => item.humanStep?.stepId === focus));
   const waiting = (data?.items ?? []).filter((item) => item.severity !== 'fyi' && !item.ack).length;
 
   if (isLoading) {
@@ -100,10 +113,16 @@ export default function ApprovePage() {
             so this page has one answer rather than two: an overlay that hangs
             12.5px past its host is a hazard wherever the host has a neighbour,
             and the header's does reach the first card. The box carries it. */}
-        <a href={nowHref()} className="tap-row w-fit text-2xs text-ink-muted underline underline-offset-2">
+        <a href={runsHref()} className="tap-row w-fit text-2xs text-ink-muted underline underline-offset-2">
           Open the console
         </a>
       </header>
+
+      {focusGone && (
+        <p data-testid="approve-step-gone" className="text-2xs text-ink-muted">
+          That step is no longer waiting on you — it was done, withdrawn or handed back.
+        </p>
+      )}
 
       {items.length === 0 ? (
         <Empty
@@ -118,15 +137,25 @@ export default function ApprovePage() {
           // console, which can. An empty screen is an invitation to act.
           action={
             <Button asChild>
-              <a href={nowHref()}>Open the console</a>
+              <a href={runsHref()}>Open the console</a>
             </Button>
           }
         />
       ) : (
         <ul className="flex list-none flex-col gap-3 p-0">
-          {items.map((item) => (
-            <ApproveCard key={item.id} item={item} perform={perform} busy={busy} />
-          ))}
+          {items.map((item) =>
+            item.humanStep ? (
+              <StepCard
+                key={item.id}
+                item={item}
+                perform={perform}
+                busy={busy}
+                focused={item.humanStep.stepId != null && item.humanStep.stepId === focus}
+              />
+            ) : (
+              <ApproveCard key={item.id} item={item} perform={perform} busy={busy} />
+            ),
+          )}
         </ul>
       )}
 
@@ -144,6 +173,41 @@ export default function ApprovePage() {
  * One card
  * ------------------------------------------------------------------ */
 
+/**
+ * A person's turn, whole, on the phone (control-tower phase 42): the same card
+ * the desk draws — the code large, the one action first, Open again, the
+ * proof's words — because the whole step must be doable from here.
+ */
+function StepCard({
+  item,
+  perform,
+  busy,
+  focused,
+}: {
+  item: InboxItem;
+  perform: (item: InboxItem, action: InboxAction, says?: string) => void;
+  busy?: string | undefined;
+  focused: boolean;
+}) {
+  // The focused card is drawn FIRST, so it is where the page opens — no scroll.
+  return (
+    <li
+      data-testid="approve-card"
+      data-kind={item.kind}
+      data-step-focus={focused || undefined}
+      className="flex flex-col gap-2 rounded-lg border border-needs-you/45 bg-surface p-3"
+    >
+      <HumanStepCard item={item} perform={perform} {...(busy ? { busy } : {})} />
+      <a
+        href={toHash(item.href)}
+        className="tap-row w-fit text-2xs text-ink-muted underline underline-offset-2"
+      >
+        Open where it lives
+      </a>
+    </li>
+  );
+}
+
 export function ApproveCard({
   item,
   perform,
@@ -155,8 +219,11 @@ export function ApproveCard({
 }) {
   const [said, setSaid] = useState('');
   const actions = pressable(item);
-  const ui = SEVERITY_UI[item.severity] ?? 'queued';
-  const where = [item.slug, item.phase != null ? `phase ${item.phase}` : null].filter(Boolean).join(' · ');
+  const paint = SEVERITY_UI[item.severity] ?? 'queued';
+  // Which plan and which phase, ALWAYS (#21): a card an orphaned session
+  // raised used to arrive with neither, and "allow it" meant nothing without
+  // knowing whose it was. A card that cannot say names that it cannot.
+  const where = `${item.slug ?? 'no plan named'} · ${item.phase != null ? `phase ${item.phase}` : 'no phase named'}`;
   // One box per card, not per button: `Allow` and `Deny` on the same card both
   // take `reason`, and two boxes asking the same question is a card nobody
   // reads. The first action that takes words decides the label.
@@ -167,11 +234,14 @@ export function ApproveCard({
     <li
       data-testid="approve-card"
       data-kind={item.kind}
-      className={cn(`state-${ui}`, 'flex flex-col gap-2 rounded-lg border border-state/45 bg-surface p-3')}
+      className={cn(`state-${paint}`, 'flex flex-col gap-2 rounded-lg border border-state/45 bg-surface p-3')}
     >
       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <StatusBadge state={ui} label={INBOX_KIND_LABELS[item.kind] ?? item.kind} />
-        {where && <span className="text-2xs text-ink-muted">{where}</span>}
+        <SeverityBadge severity={item.severity}>{INBOX_KIND_LABELS[item.kind] ?? item.kind}</SeverityBadge>
+        {item.category && <HaltCategoryMark category={item.category.word} />}
+        <span className="text-2xs text-ink-muted" data-testid="approve-where">
+          {where}
+        </span>
         {windowLeft === null ? (
           <RelativeTime at={item.since} className="ml-auto text-2xs text-ink-muted" />
         ) : (

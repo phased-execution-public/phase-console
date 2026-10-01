@@ -44,7 +44,8 @@ usage() {
 usage: scripts/gates.sh [--quick] [--list] [--ci] [--build] [--keep-going] [--install-hook] [--help]
   (no flag)       the full matrix: bash engine, engine parity, server suite, the three
                   timing-sensitive files with one retry, client suite, both typechecks,
-                  lint, format, build gate, scrub, pack + tarball assertions
+                  lint, format, build gate, the real-browser tour, scrub, pack + tarball
+                  assertions
   --quick         typecheck-server typecheck-client lint-client format-check scrub
   --list          print the stages this invocation would run, one per line
   --ci            run `npm ci` in viewer/ before the suites
@@ -70,7 +71,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-FULL_STAGES="bash-engine npm-ci engine-parity server-suite terminal spawn-protocol runner-parallel client-suite typecheck-server typecheck-client lint-client format-check build scrub pack"
+FULL_STAGES="bash-engine npm-ci engine-parity server-suite terminal spawn-protocol runner-parallel client-suite typecheck-server typecheck-client lint-client format-check build e2e scrub pack"
 QUICK_STAGES="typecheck-server typecheck-client lint-client format-check scrub"
 
 # The stages this invocation runs, in order, one per word.
@@ -119,8 +120,31 @@ stage_build() {
   if [ "$BUILD" -eq 1 ]; then
     (cd "$VIEWER" && npm run build && npm run check:dist)
   else
-    (cd "$VIEWER" && npm run verify:dist)
+    # --keep: the scratch build is what the e2e stage tours next.
+    (cd "$VIEWER" && npm run verify:dist -- --keep)
   fi
+}
+# The real-browser harness (viewer/e2e): a sandboxed console, toured in
+# Chromium over four viewports and held to e2e/baseline.json — which is empty
+# since 6.0, so any finding fails. After `build`, and ON that build: dist mode
+# (`PHASE_CONSOLE_DIST_DIR`) has the console serve the production client under
+# its real CSP, with no Vite in front, because that is the client a person
+# meets (control-tower phase 31). `--build` tours client/dist; the default
+# tours the scratch build verify:dist kept, and removes it afterwards.
+e2e_dist_dir() {
+  if [ "$BUILD" -eq 1 ]; then echo "$VIEWER/client/dist"; else echo "$VIEWER/client/.dist-verify"; fi
+}
+stage_e2e() {
+  local dist rc
+  dist="$(e2e_dist_dir)"
+  if [ ! -f "$dist/index.html" ]; then
+    echo "gates.sh: the e2e stage tours a production build and $dist holds none — the build stage runs first" >&2
+    return 1
+  fi
+  (cd "$VIEWER" && npm run typecheck:e2e && PHASE_CONSOLE_DIST_DIR="$dist" npm run test:e2e)
+  rc=$?
+  [ "$BUILD" -eq 1 ] || rm -rf "$VIEWER/client/.dist-verify"
+  return "$rc"
 }
 stage_scrub()            { (cd "$ROOT" && bash .github/scripts/scrub.sh); }
 stage_pack()             { (cd "$ROOT" && bash .github/scripts/pack-and-assert.sh); }
@@ -139,7 +163,38 @@ preflight() {
     echo "gates.sh: viewer/client/dist is not built and the pack stage reads it — run \`npm --prefix viewer run build\` once, or pass --build" >&2
     return 2
   fi
+  local missing
+  if [ "$QUICK" -eq 0 ] && missing="$(e2e_browser_missing)"; then
+    echo "gates.sh: the e2e stage needs Playwright's $missing, which is not installed — run \`npm --prefix viewer exec -- playwright install chromium\` once" >&2
+    return 2
+  fi
   return 0
+}
+
+# Prints the browser the pinned Playwright drives headless (name-revision) and
+# succeeds when it is NOT installed where Playwright looks: PLAYWRIGHT_BROWSERS_PATH
+# ("0" meaning inside node_modules), else the per-user cache. Silent failure when it
+# is there — or when Playwright itself is not installed yet (--ci installs it, and
+# the stage then says what is missing in Playwright's own words).
+e2e_browser_missing() {
+  local json="$VIEWER/node_modules/playwright-core/browsers.json"
+  [ -f "$json" ] || return 1
+  PC_JSON="$json" PC_CORE="$VIEWER/node_modules/playwright-core" node -e '
+    const { existsSync, readFileSync } = require("node:fs");
+    const { join } = require("node:path");
+    const os = require("node:os");
+    const b = JSON.parse(readFileSync(process.env.PC_JSON, "utf8")).browsers
+      .find((x) => x.name === "chromium-headless-shell");
+    if (!b) process.exit(1);
+    const env = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    const cache = env === "0" ? join(process.env.PC_CORE, ".local-browsers")
+      : env ? env
+      : process.platform === "darwin" ? join(os.homedir(), "Library", "Caches", "ms-playwright")
+      : join(process.env.XDG_CACHE_HOME || join(os.homedir(), ".cache"), "ms-playwright");
+    const dir = join(cache, "chromium_headless_shell-" + b.revision);
+    if (existsSync(join(dir, "INSTALLATION_COMPLETE"))) process.exit(1);
+    process.stdout.write("chromium-headless-shell-" + b.revision + " (" + dir + ")");
+  '
 }
 
 # Where a green full run is recorded. Empty outside a git checkout.

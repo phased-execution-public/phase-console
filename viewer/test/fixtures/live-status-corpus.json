@@ -106,5 +106,1464 @@
         "status": "blocked"
       }
     }
-  ]
+  ],
+  "audit": {
+    "about": "The status-badge audit's live cases from the two consoles on the operator machine (4123 hub, 4130 pe-hub), captured 2026-09-23 for control-tower phase 16. Slugs, run ids, paths and every free-text field are scrubbed; statuses, halts, stop attribution, resolution, timestamps and per-phase record statuses are kept verbatim. The audit of 2026-09-21 counted 19 paused-on-closed-plan (hub), 4 stale stops on closed plans and 8 finished runs holding failures; the re-measurement found 19 + 2 (hub + pe-hub), 2 + 2 and 10.",
+    "capturedAt": "2026-09-23T15:30:00.000Z",
+    "measured": {
+      "measuredOn": "2026-09-21",
+      "paused-on-closed-plan": 19,
+      "stale-stop-on-closed-plan": 4,
+      "finished-holding-failures": 8
+    },
+    "counts": {
+      "paused-on-closed-plan": 21,
+      "stale-stop-on-closed-plan": 4,
+      "finished-holding-failures": 10
+    },
+    "cases": [
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0002",
+          "slug": "plan-02",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-05T06:00:19.996Z",
+          "updatedAt": "2026-09-12T02:06:12.762Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0003",
+          "slug": "plan-03",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "waitReason": "scope",
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-16T10:42:31.696Z",
+          "updatedAt": "2026-09-20T11:15:37.809Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "18": {
+              "status": "done"
+            },
+            "19": {
+              "status": "done"
+            },
+            "20": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0005",
+          "slug": "plan-05",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-22T11:09:01.852Z",
+          "updatedAt": "2026-09-23T12:58:20.322Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0006",
+          "slug": "plan-06",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-27T19:40:36.446Z",
+          "updatedAt": "2026-08-31T22:25:46.429Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            },
+            "11": {
+              "status": "done"
+            },
+            "12": {
+              "status": "done"
+            },
+            "13": {
+              "status": "done"
+            },
+            "14": {
+              "status": "done"
+            },
+            "15": {
+              "status": "done"
+            },
+            "16": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0008",
+          "slug": "plan-08",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-24T02:20:35.687Z",
+          "updatedAt": "2026-09-23T12:58:20.336Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0009",
+          "slug": "plan-09",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-22T21:54:55.118Z",
+          "updatedAt": "2026-09-23T12:58:20.147Z",
+          "phases": {
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "11": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "superseded",
+        "run": {
+          "id": "c0rp0011",
+          "slug": "plan-11",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-01T02:15:24.169Z",
+          "updatedAt": "2026-09-02T00:31:51.115Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "failed"
+            },
+            "12": {
+              "status": "done"
+            },
+            "14": {
+              "status": "pending"
+            },
+            "15": {
+              "status": "pending"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0013",
+          "slug": "plan-13",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-05T11:11:45.683Z",
+          "updatedAt": "2026-09-20T16:39:56.524Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0014",
+          "slug": "plan-14",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-05T19:57:30.941Z",
+          "updatedAt": "2026-09-01T00:23:23.475Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            },
+            "11": {
+              "status": "done"
+            },
+            "12": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0015",
+          "slug": "plan-15",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "waitReason": "scope",
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-16T10:51:12.201Z",
+          "updatedAt": "2026-09-18T01:30:52.385Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0016",
+          "slug": "plan-16",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "system",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-02T10:53:41.342Z",
+          "updatedAt": "2026-09-23T12:58:20.344Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            },
+            "11": {
+              "status": "done"
+            },
+            "12": {
+              "status": "failed"
+            },
+            "13": {
+              "status": "done"
+            },
+            "14": {
+              "status": "done"
+            },
+            "15": {
+              "status": "done"
+            },
+            "16": {
+              "status": "done"
+            },
+            "17": {
+              "status": "done"
+            },
+            "18": {
+              "status": "done"
+            },
+            "19": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0017",
+          "slug": "plan-17",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-05T20:10:24.093Z",
+          "updatedAt": "2026-09-12T00:49:19.748Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0021",
+          "slug": "plan-21",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": {
+            "kind": "nothing-ready"
+          },
+          "createdAt": "2026-09-06T17:23:37.496Z",
+          "updatedAt": "2026-09-16T01:47:57.799Z",
+          "phases": {
+            "5": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0022",
+          "slug": "plan-21",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-05T17:20:02.031Z",
+          "updatedAt": "2026-09-23T12:58:20.358Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0023",
+          "slug": "plan-22",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-10T02:38:39.397Z",
+          "updatedAt": "2026-09-23T12:58:20.364Z",
+          "phases": {
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "superseded",
+        "run": {
+          "id": "c0rp0024",
+          "slug": "plan-23",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-08T04:48:02.844Z",
+          "updatedAt": "2026-09-23T12:58:20.370Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "pending"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0025",
+          "slug": "plan-24",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-02T20:37:50.263Z",
+          "updatedAt": "2026-08-31T22:25:46.447Z",
+          "phases": {
+            "14": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0026",
+          "slug": "plan-25",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-03T22:59:46.726Z",
+          "updatedAt": "2026-08-31T22:25:46.456Z",
+          "phases": {
+            "1": {
+              "status": "failed"
+            },
+            "2": {
+              "status": "failed"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0031",
+          "slug": "plan-28",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-08T20:36:55.698Z",
+          "updatedAt": "2026-08-31T22:25:46.461Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "pe-hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0032",
+          "slug": "plan-11",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "system",
+          "resolved": true,
+          "halt": null,
+          "createdAt": "2026-09-02T02:56:52.210Z",
+          "updatedAt": "2026-09-23T13:37:03.383Z",
+          "phases": {
+            "11": {
+              "status": "done"
+            },
+            "13": {
+              "status": "done"
+            },
+            "14": {
+              "status": "done"
+            },
+            "15": {
+              "status": "done"
+            },
+            "16": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "paused-on-closed-plan",
+        "console": "pe-hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0034",
+          "slug": "plan-30",
+          "status": "paused",
+          "lifecycle": {
+            "state": "paused"
+          },
+          "stoppedBy": "operator",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-05T13:05:42.953Z",
+          "updatedAt": "2026-09-23T13:37:03.445Z",
+          "phases": {
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            },
+            "11": {
+              "status": "failed"
+            },
+            "12": {
+              "status": "done"
+            },
+            "13": {
+              "status": "done"
+            },
+            "14": {
+              "status": "done"
+            },
+            "15": {
+              "status": "done"
+            },
+            "16": {
+              "status": "done"
+            },
+            "23": {
+              "status": "done"
+            },
+            "24": {
+              "status": "parked"
+            },
+            "26": {
+              "status": "done"
+            },
+            "28": {
+              "status": "done"
+            }
+          },
+          "recoveries": {
+            "24": {
+              "errand": true
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "stale-stop-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0010",
+          "slug": "plan-10",
+          "status": "parked",
+          "lifecycle": {
+            "state": "parked"
+          },
+          "resolved": true,
+          "halt": {
+            "kind": "nothing-ready"
+          },
+          "createdAt": "2026-08-03T20:08:13.613Z",
+          "updatedAt": "2026-09-16T01:47:57.810Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "pending"
+            },
+            "6": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "stale-stop-on-closed-plan",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0012",
+          "slug": "plan-12",
+          "status": "interrupted",
+          "lifecycle": {
+            "state": "halted"
+          },
+          "stoppedBy": "operator",
+          "resolved": true,
+          "halt": null,
+          "createdAt": "2026-08-30T11:08:15.182Z",
+          "updatedAt": "2026-08-31T22:04:43.498Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "stale-stop-on-closed-plan",
+        "console": "pe-hub",
+        "planStatus": "superseded",
+        "run": {
+          "id": "c0rp0033",
+          "slug": "plan-29",
+          "status": "parked",
+          "lifecycle": {
+            "state": "parked"
+          },
+          "stoppedBy": "system",
+          "resolved": true,
+          "halt": {
+            "kind": "nothing-ready"
+          },
+          "createdAt": "2026-09-16T02:31:22.257Z",
+          "updatedAt": "2026-09-23T13:37:03.324Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "done"
+            },
+            "10": {
+              "status": "done"
+            },
+            "11": {
+              "status": "done"
+            },
+            "12": {
+              "status": "done"
+            },
+            "13": {
+              "status": "done"
+            },
+            "14": {
+              "status": "done"
+            },
+            "15": {
+              "status": "done"
+            },
+            "16": {
+              "status": "done"
+            },
+            "17": {
+              "status": "done"
+            },
+            "18": {
+              "status": "done"
+            },
+            "19": {
+              "status": "gated"
+            },
+            "21": {
+              "status": "done"
+            },
+            "22": {
+              "status": "done"
+            },
+            "23": {
+              "status": "done"
+            }
+          },
+          "recoveries": {
+            "19": {
+              "errand": true
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "stale-stop-on-closed-plan",
+        "console": "pe-hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0035",
+          "slug": "plan-30",
+          "status": "interrupted",
+          "lifecycle": {
+            "state": "halted"
+          },
+          "stoppedBy": "system",
+          "resolved": true,
+          "halt": {
+            "kind": "interrupted-by-restart"
+          },
+          "createdAt": "2026-09-02T05:00:58.582Z",
+          "updatedAt": "2026-09-23T06:58:38.814Z",
+          "phases": {
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "failed"
+            },
+            "17": {
+              "status": "done"
+            },
+            "18": {
+              "status": "done"
+            },
+            "19": {
+              "status": "done"
+            },
+            "20": {
+              "status": "done"
+            },
+            "21": {
+              "status": "done"
+            },
+            "22": {
+              "status": "done"
+            },
+            "23": {
+              "status": "done"
+            },
+            "25": {
+              "status": "done"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0001",
+          "slug": "plan-01",
+          "status": "finished",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-07T05:23:16.631Z",
+          "updatedAt": "2026-08-22T15:40:04.785Z",
+          "phases": {
+            "1": {
+              "status": "failed"
+            },
+            "2": {
+              "status": "done"
+            },
+            "3": {
+              "status": "done"
+            },
+            "4": {
+              "status": "interrupted"
+            },
+            "5": {
+              "status": "gated"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0004",
+          "slug": "plan-04",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-21T06:47:08.821Z",
+          "updatedAt": "2026-09-23T12:56:09.587Z",
+          "phases": {
+            "1": {
+              "status": "done"
+            },
+            "2": {
+              "status": "parked"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "failed"
+            },
+            "10": {
+              "status": "pending"
+            },
+            "11": {
+              "status": "pending"
+            }
+          },
+          "recoveries": {
+            "2": {
+              "errand": true
+            },
+            "10": {
+              "errand": true
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0007",
+          "slug": "plan-07",
+          "status": "finished",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-14T08:48:52.059Z",
+          "updatedAt": "2026-08-22T15:40:04.793Z",
+          "phases": {
+            "12": {
+              "status": "done"
+            },
+            "13": {
+              "status": "done"
+            },
+            "15": {
+              "status": "parked"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0018",
+          "slug": "plan-18",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "waitReason": "external",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-12T16:08:27.737Z",
+          "updatedAt": "2026-09-16T06:10:08.483Z",
+          "phases": {
+            "8": {
+              "status": "done"
+            },
+            "11": {
+              "status": "interrupted"
+            },
+            "15": {
+              "status": "interrupted"
+            },
+            "21": {
+              "status": "interrupted"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "active",
+        "run": {
+          "id": "c0rp0019",
+          "slug": "plan-19",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "waitReason": "external",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-09-14T10:04:01.114Z",
+          "updatedAt": "2026-09-22T09:06:49.040Z",
+          "phases": {
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "8": {
+              "status": "pending"
+            },
+            "10": {
+              "status": "interrupted"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0020",
+          "slug": "plan-20",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-03T02:37:56.544Z",
+          "updatedAt": "2026-09-23T12:56:09.593Z",
+          "phases": {
+            "6": {
+              "status": "interrupted"
+            },
+            "7": {
+              "status": "interrupted"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0027",
+          "slug": "plan-26",
+          "status": "finished",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-04T18:49:54.755Z",
+          "updatedAt": "2026-08-22T15:40:04.878Z",
+          "phases": {
+            "2": {
+              "status": "parked"
+            },
+            "3": {
+              "status": "parked"
+            }
+          }
+        },
+        "overtaken": false
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0028",
+          "slug": "plan-26",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-04T18:38:12.057Z",
+          "updatedAt": "2026-09-23T12:56:09.605Z",
+          "phases": {
+            "2": {
+              "status": "parked"
+            },
+            "3": {
+              "status": "parked"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "complete",
+        "run": {
+          "id": "c0rp0029",
+          "slug": "plan-26",
+          "status": "finished",
+          "lifecycle": {
+            "state": "finished"
+          },
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-04T17:30:01.307Z",
+          "updatedAt": "2026-09-23T12:56:09.664Z",
+          "phases": {
+            "1": {
+              "status": "failed"
+            },
+            "2": {
+              "status": "parked"
+            },
+            "3": {
+              "status": "parked"
+            }
+          }
+        },
+        "overtaken": true
+      },
+      {
+        "group": "finished-holding-failures",
+        "console": "hub",
+        "planStatus": "abandoned",
+        "run": {
+          "id": "c0rp0030",
+          "slug": "plan-27",
+          "status": "finished",
+          "resolved": false,
+          "halt": null,
+          "createdAt": "2026-08-22T01:37:14.869Z",
+          "updatedAt": "2026-08-23T13:30:24.393Z",
+          "phases": {
+            "4": {
+              "status": "done"
+            },
+            "5": {
+              "status": "done"
+            },
+            "6": {
+              "status": "done"
+            },
+            "7": {
+              "status": "done"
+            },
+            "8": {
+              "status": "done"
+            },
+            "9": {
+              "status": "parked"
+            },
+            "10": {
+              "status": "pending"
+            }
+          },
+          "recoveries": {
+            "5": {
+              "errand": true
+            },
+            "9": {
+              "errand": true
+            },
+            "10": {
+              "errand": true
+            }
+          }
+        },
+        "overtaken": false
+      }
+    ],
+    "planStatuses": [
+      {
+        "raw": null,
+        "seen": "no status line — 16 plan files across the two docs roots"
+      },
+      {
+        "raw": "✅ GO — gate proven end to end on the real box (the rest of the sentence scrubbed)",
+        "seen": "a sentence with a check-mark emoji where the word belongs"
+      },
+      {
+        "raw": "** `fail` if any check fails, else `warn` if any warns, else `pass`.",
+        "seen": "a markdown line the frontmatter read picked up"
+      },
+      {
+        "raw": "prepared-awaiting-outreach",
+        "seen": "a word outside the vocabulary"
+      },
+      {
+        "raw": "complete",
+        "seen": "a closed plan"
+      },
+      {
+        "raw": "active",
+        "seen": "an open plan"
+      }
+    ]
+  }
 }

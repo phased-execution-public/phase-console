@@ -15,6 +15,11 @@
  * The prelude is asked of the server (`GET /api/run/:slug/prelude`) with the
  * draft's answers, so what this stage shows is what the start door will judge
  * — one computation, not a client-side imitation of it.
+ *
+ * The live settings sheet shows three of these controls too (control-tower
+ * phase 77, #101) — restarts, the relay, the account pool — and nothing else:
+ * a run already through the door has no prelude to ask, so there are no probes,
+ * no manifest and nothing that could hold the Apply button.
  */
 
 import { Badge, Button, Checkbox, Input, SectionHeading, field as fieldClass } from '@/components/ui';
@@ -25,6 +30,7 @@ import { RELAY_MODES } from '@shared/run-settings.js';
 import { DECISION_STATES } from '@shared/decisions-model.js';
 import { SelectField, SetupField } from './fields';
 import { useSetupForm } from './form-context';
+import { runsPrelude } from './modes';
 import { parseAccounts, parsePhases } from './schema';
 
 const RELAY_LABELS: Record<(typeof RELAY_MODES)[number], string> = {
@@ -32,12 +38,16 @@ const RELAY_LABELS: Record<(typeof RELAY_MODES)[number], string> = {
   'last-resort': 'Last resort — a person is paged first; after 60 s the console answers by rule',
 };
 
+/** Every probe the stage lists, in the prelude's order — 6 and 7 since control-tower phase 22. */
 const PROBE_LABELS: Record<keyof Prelude['probes'], string> = {
   accounts: 'Accounts',
   mcp: 'MCP servers',
   credentials: 'Credentials',
   delivery: 'Delivery channel',
   verification: 'Verification commands',
+  trees: 'Shared checkout',
+  'git-strategy': 'Plan git lines',
+  'human-steps': 'Your turns',
 };
 
 const MARK: Record<ProbeVerdict['status'], string> = { ok: '✓', fail: '✗', skip: '–' };
@@ -54,6 +64,8 @@ export function preludeDraft(values: {
   onlyPhases?: string;
   autonomy?: string;
   verifyAnswers?: { approve: string[]; waive: string[] };
+  gitMode?: string;
+  isolation?: string;
 }) {
   const accounts = parseAccounts(values.accounts) ?? [];
   const onlyPhases = values.onlyPhases ? (parsePhases(values.onlyPhases) ?? []) : [];
@@ -76,6 +88,11 @@ export function preludeDraft(values: {
     ...(values.model ? { model: values.model } : {}),
     ...(values.permissionProfile ? { profile: values.permissionProfile } : {}),
     ...(values.mcpPolicy ? { mcpPolicy: values.mcpPolicy } : {}),
+    // Probes 6 and 7 (control-tower phases 40 and 11) judge THIS draft's
+    // checkout: without them the prelude reads the run as not isolated, and
+    // the git lines against the console's default branch strategy.
+    ...(values.gitMode ? { gitMode: values.gitMode } : {}),
+    ...(values.gitMode === 'new-branch' && values.isolation ? { isolation: values.isolation } : {}),
   };
 }
 
@@ -86,7 +103,7 @@ export function preludeDraft(values: {
  */
 export function useDraftPrelude() {
   const f = useSetupForm();
-  const asks = f.on('resumeOnRestart') || f.on('relay') || f.on('accounts');
+  const asks = runsPrelude(f.mode) && (f.on('resumeOnRestart') || f.on('relay') || f.on('accounts'));
   return usePrelude(
     f.context.slug,
     preludeDraft({
@@ -121,7 +138,9 @@ export function Decisions() {
 export function DecisionsSection() {
   const f = useSetupForm();
   const { data: prelude, isLoading, error } = useDraftPrelude();
-  if (!f.on('resumeOnRestart') && !f.on('relay') && !f.on('accounts')) return null;
+  if (!f.on('resumeOnRestart') && !f.on('relay')) return null;
+  // A launch passes the door; a live run already did, and edits its answers.
+  const door = runsPrelude(f.mode);
 
   const rows: PreludeRow[] = prelude?.rows ?? [];
   const blocking = prelude?.blocking ?? [];
@@ -163,7 +182,7 @@ export function DecisionsSection() {
 
       <section className="flex flex-col gap-3">
         <SectionHeading as="h3" tone="muted">
-          What the door requires
+          {door ? 'What the door requires' : 'Restarts, questions and accounts'}
         </SectionHeading>
         {f.on('resumeOnRestart') && (
           <label className="tap-row flex flex-wrap items-start gap-2 text-sm">
@@ -187,185 +206,173 @@ export function DecisionsSection() {
             label="Relay questions to a person"
             hint="The relay row. Off until phase 14 arms it; last resort pages a person and, unanswered after the window, answers by the rule table."
             source={f.src('relay')}
+            effect={f.fx('relay')}
             value={f.values.relay}
             options={RELAY_MODES.map((mode) => [mode, RELAY_LABELS[mode]] as const)}
             onChange={(next) => f.set('relay', next as (typeof RELAY_MODES)[number])}
           />
         )}
-        {f.on('accounts') && (
-          <SetupField
-            label="Accounts it may spend (id:minimum headroom %)"
-            hint={
-              <>
-                In order, each with the five-hour headroom it must show before a phase boards — the plan’s{' '}
-                <code>**Accounts:**</code> clause when it has one, else the machine login. The accounts probe
-                below refuses the start when every one of them is retired, signed out or under its minimum.
-              </>
-            }
-            source={f.src('accounts')}
-            error={f.errors.accounts}
-          >
-            <Input
-              className={fieldClass}
-              value={f.values.accounts}
-              placeholder="default:20, work:10"
-              onChange={(event) => f.set('accounts', event.target.value)}
-            />
-          </SetupField>
-        )}
+        {/* The plan's git lines (#18) are answered in the Git tile's reconcile
+            panel, and the account pool beside the account (control-tower
+            phase 22) — each where its question is. */}
       </section>
 
-      <section className="flex flex-col gap-3">
-        <SectionHeading as="h3" tone="muted">
-          What the probes found
-        </SectionHeading>
-        {isLoading && !prelude && <p className="text-xs text-ink-muted">Asking the console…</p>}
-        {error && (
-          <p className="text-xs text-failed">The prelude could not be read: {(error as Error).message}</p>
-        )}
-        {prelude && (
-          <ul className="flex flex-col gap-1 text-sm" aria-label="Probe verdicts">
-            {(Object.keys(PROBE_LABELS) as (keyof Prelude['probes'])[]).map((id) => {
-              const verdict = prelude.probes[id];
-              // A console older than probe 5 does not answer it.
-              if (!verdict) return null;
-              return (
-                <li key={id} className="flex flex-wrap items-baseline gap-x-2">
-                  <span
-                    aria-hidden
-                    className={cn(
-                      'font-mono',
-                      verdict.status === 'ok' && 'text-done',
-                      verdict.status === 'fail' && 'text-failed',
-                      verdict.status === 'skip' && 'text-ink-muted',
-                    )}
+      {door && (
+        <>
+          <section className="flex flex-col gap-3">
+            <SectionHeading as="h3" tone="muted">
+              What the probes found
+            </SectionHeading>
+            {isLoading && !prelude && <p className="text-xs text-ink-muted">Asking the console…</p>}
+            {error && (
+              <p className="text-xs text-failed">The prelude could not be read: {(error as Error).message}</p>
+            )}
+            {prelude && (
+              <ul className="flex flex-col gap-1 text-sm" aria-label="Probe verdicts">
+                {(Object.keys(PROBE_LABELS) as (keyof Prelude['probes'])[]).map((id) => {
+                  const verdict = prelude.probes[id];
+                  // A console older than probe 5 does not answer it.
+                  if (!verdict) return null;
+                  return (
+                    <li key={id} className="flex flex-wrap items-baseline gap-x-2">
+                      <span
+                        aria-hidden
+                        className={cn(
+                          'font-mono',
+                          verdict.status === 'ok' && 'text-done',
+                          verdict.status === 'fail' && 'text-failed',
+                          verdict.status === 'skip' && 'text-ink-muted',
+                        )}
+                      >
+                        {MARK[verdict.status]}
+                      </span>
+                      <span className="text-ink">{PROBE_LABELS[id]}</span>
+                      <span className="text-ink-muted">
+                        <span className="sr-only">{verdict.status}: </span>
+                        {verdict.reason}
+                      </span>
+                      {verdict.warnings?.length ? (
+                        <ul className="w-full list-disc pl-8 text-2xs text-ink-muted">
+                          {verdict.warnings.map((w) => (
+                            <li key={w}>{w}</li>
+                          ))}
+                        </ul>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+            {prelude && deliveryFailed && f.on('acknowledgedWaivers') && (
+              <label className="tap-row flex flex-wrap items-start gap-2 text-sm">
+                <Checkbox
+                  className="mt-1"
+                  checked={acknowledged.has('announce')}
+                  onCheckedChange={(next) => toggleAck('announce', next === true)}
+                />
+                <span className="min-w-0 flex-1">
+                  Start anyway with no delivery channel
+                  <span className="block text-2xs text-ink-muted">
+                    Nobody will hear this run’s announcements — no subscribed device, no notify command, no
+                    webhook. Acknowledging records the <code>announce</code> row as waived for this run.
+                  </span>
+                </span>
+              </label>
+            )}
+          </section>
+
+          {prelude && f.on('verifyAnswers') && <VerificationAnswers verdict={prelude.probes.verification} />}
+
+          {prelude && (
+            <section className="flex flex-col gap-3">
+              <SectionHeading as="h3" tone="muted">
+                The manifest
+              </SectionHeading>
+              {!prelude.manifestPresent && (
+                <p className="text-xs text-ink-muted">
+                  This plan writes no <code>## Decisions</code> section, so every row below is the console’s
+                  own answer — the launch form’s, the plan’s other lines, or the shipped default. Only a row
+                  the plan writes can hold a start.
+                </p>
+              )}
+              <ul className="flex flex-col divide-y divide-rule text-sm" aria-label="Decision manifest">
+                {rows.map((row) => (
+                  <li
+                    key={`${row.key}:${row.state}`}
+                    className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 py-1.5"
                   >
-                    {MARK[verdict.status]}
-                  </span>
-                  <span className="text-ink">{PROBE_LABELS[id]}</span>
-                  <span className="text-ink-muted">
-                    <span className="sr-only">{verdict.status}: </span>
-                    {verdict.reason}
-                  </span>
-                  {verdict.warnings?.length ? (
-                    <ul className="w-full list-disc pl-8 text-2xs text-ink-muted">
-                      {verdict.warnings.map((w) => (
-                        <li key={w}>{w}</li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </li>
-              );
-            })}
-          </ul>
-        )}
-        {prelude && deliveryFailed && f.on('acknowledgedWaivers') && (
-          <label className="tap-row flex flex-wrap items-start gap-2 text-sm">
-            <Checkbox
-              className="mt-1"
-              checked={acknowledged.has('announce')}
-              onCheckedChange={(next) => toggleAck('announce', next === true)}
-            />
-            <span className="min-w-0 flex-1">
-              Start anyway with no delivery channel
-              <span className="block text-2xs text-ink-muted">
-                Nobody will hear this run’s announcements — no subscribed device, no notify command, no
-                webhook. Acknowledging records the <code>announce</code> row as waived for this run.
-              </span>
-            </span>
-          </label>
-        )}
-      </section>
-
-      {prelude && f.on('verifyAnswers') && <VerificationAnswers verdict={prelude.probes.verification} />}
-
-      {prelude && (
-        <section className="flex flex-col gap-3">
-          <SectionHeading as="h3" tone="muted">
-            The manifest
-          </SectionHeading>
-          {!prelude.manifestPresent && (
-            <p className="text-xs text-ink-muted">
-              This plan writes no <code>## Decisions</code> section, so every row below is the console’s own
-              answer — the launch form’s, the plan’s other lines, or the shipped default. Only a row the plan
-              writes can hold a start.
-            </p>
+                    <code className="text-ink">{row.key}</code>
+                    {(DECISION_STATES as readonly string[]).includes(row.state) ? (
+                      <Badge tone={stateTone(row.state)}>{row.state}</Badge>
+                    ) : (
+                      <span className="text-2xs text-ink-muted break-all">{row.state}</span>
+                    )}
+                    {row.blocking === 'yes' && <Badge tone="neutral">blocks a start</Badge>}
+                    <span className="text-2xs text-ink-muted">
+                      {row.origin === 'plan'
+                        ? 'from the plan'
+                        : row.origin === 'run'
+                          ? 'from this launch'
+                          : 'the shipped default'}
+                      {row.owner && row.state === 'outstanding' ? ` · owed by ${row.owner}` : ''}
+                    </span>
+                    <span className="w-full text-xs text-ink-muted break-words">{row.value || '—'}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
           )}
-          <ul className="flex flex-col divide-y divide-rule text-sm" aria-label="Decision manifest">
-            {rows.map((row) => (
-              <li
-                key={`${row.key}:${row.state}`}
-                className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 py-1.5"
+
+          {prelude && waivedRows.length > 0 && f.on('acknowledgedWaivers') && (
+            <section className="flex flex-col gap-2">
+              <SectionHeading as="h3" tone="muted">
+                Acknowledged waivers
+              </SectionHeading>
+              <p className="text-xs text-ink-muted">
+                The plan waived these rows. Each needs a reader’s acknowledgement before the run starts.
+              </p>
+              {waivedRows.map((row) => (
+                <label key={row.key} className="tap-row flex flex-wrap items-start gap-2 text-sm">
+                  <Checkbox
+                    className="mt-1"
+                    checked={acknowledged.has(row.key)}
+                    onCheckedChange={(next) => toggleAck(row.key, next === true)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <code>{row.key}</code> — waived
+                    <span className="block text-2xs text-ink-muted break-words">
+                      {row.value || 'no reason given'}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </section>
+          )}
+
+          {f.on('manifestOverride') && blocking.length > 0 && (
+            <section className="flex flex-col gap-2">
+              <SetupField
+                label="Start anyway, recorded as"
+                hint={
+                  <>
+                    The one way past a blocking row, and it is recorded: <code>run.manifest-override</code>{' '}
+                    names who signed it and which rows were open. Type your name to enable Launch; leave it
+                    empty to answer the rows instead.
+                  </>
+                }
+                source={f.src('manifestOverride')}
+                effect={f.fx('manifestOverride')}
               >
-                <code className="text-ink">{row.key}</code>
-                {(DECISION_STATES as readonly string[]).includes(row.state) ? (
-                  <Badge tone={stateTone(row.state)}>{row.state}</Badge>
-                ) : (
-                  <span className="text-2xs text-ink-muted break-all">{row.state}</span>
-                )}
-                {row.blocking === 'yes' && <Badge tone="neutral">blocks a start</Badge>}
-                <span className="text-2xs text-ink-muted">
-                  {row.origin === 'plan'
-                    ? 'from the plan'
-                    : row.origin === 'run'
-                      ? 'from this launch'
-                      : 'the shipped default'}
-                  {row.owner && row.state === 'outstanding' ? ` · owed by ${row.owner}` : ''}
-                </span>
-                <span className="w-full text-xs text-ink-muted break-words">{row.value || '—'}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-
-      {prelude && waivedRows.length > 0 && f.on('acknowledgedWaivers') && (
-        <section className="flex flex-col gap-2">
-          <SectionHeading as="h3" tone="muted">
-            Acknowledged waivers
-          </SectionHeading>
-          <p className="text-xs text-ink-muted">
-            The plan waived these rows. Each needs a reader’s acknowledgement before the run starts.
-          </p>
-          {waivedRows.map((row) => (
-            <label key={row.key} className="tap-row flex flex-wrap items-start gap-2 text-sm">
-              <Checkbox
-                className="mt-1"
-                checked={acknowledged.has(row.key)}
-                onCheckedChange={(next) => toggleAck(row.key, next === true)}
-              />
-              <span className="min-w-0 flex-1">
-                <code>{row.key}</code> — waived
-                <span className="block text-2xs text-ink-muted break-words">
-                  {row.value || 'no reason given'}
-                </span>
-              </span>
-            </label>
-          ))}
-        </section>
-      )}
-
-      {f.on('manifestOverride') && blocking.length > 0 && (
-        <section className="flex flex-col gap-2">
-          <SetupField
-            label="Start anyway, recorded as"
-            hint={
-              <>
-                The one way past a blocking row, and it is recorded: <code>run.manifest-override</code> names
-                who signed it and which rows were open. Type your name to enable Launch; leave it empty to
-                answer the rows instead.
-              </>
-            }
-            source={f.src('manifestOverride')}
-          >
-            <Input
-              className={fieldClass}
-              value={f.values.manifestOverride}
-              placeholder="your name"
-              onChange={(event) => f.set('manifestOverride', event.target.value)}
-            />
-          </SetupField>
-        </section>
+                <Input
+                  className={fieldClass}
+                  value={f.values.manifestOverride}
+                  placeholder="your name"
+                  onChange={(event) => f.set('manifestOverride', event.target.value)}
+                />
+              </SetupField>
+            </section>
+          )}
+        </>
       )}
     </div>
   );

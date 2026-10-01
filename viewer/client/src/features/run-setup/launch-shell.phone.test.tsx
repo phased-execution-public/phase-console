@@ -1,6 +1,10 @@
 /**
- * The launch flow on a phone: a full-screen sheet, the stage bar and the
- * buttons fixed, Launch on the review only, Next between the stages.
+ * The launch flow on a phone (control-tower phase 22): a full-screen sheet
+ * whose footer — Cancel and the one Launch — is fixed outside the scroller,
+ * over the quick view. The tiles are one column of rows, each a door that
+ * pushes its controls as a sub-view inside the same scroller, and "All
+ * settings" comes back. No stage bar, no Next, no Back: Launch is on every
+ * screen, the pushed sub-view included.
  *
  * Its own file because `lib/media.ts` caches each media query the first time
  * it is asked, per module — so the phone answer has to be installed before
@@ -9,7 +13,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 
@@ -59,6 +63,19 @@ const EMPTY_PRELUDE = {
   at: '2026-09-14T00:00:00.000Z',
 };
 
+/** The nine tiles a start draws, in the order it draws them. */
+const TILES = [
+  'Scope',
+  'Engine',
+  'Safety',
+  'Git',
+  'Money and stops',
+  'Review and QA',
+  'Tools',
+  'Accounts',
+  'Decisions',
+];
+
 async function mount() {
   mocks.state.mockResolvedValue({ prefs: {}, defaultSkills: [], allowRun: true });
   mocks.runPrelude.mockResolvedValue({ prelude: EMPTY_PRELUDE });
@@ -76,6 +93,9 @@ async function mount() {
   await screen.findByRole('dialog');
 }
 
+/** A row's one button — Edit, or Answer on a summons. */
+const row = (label: string) => screen.getByRole('button', { name: new RegExp(`^(Edit|Answer) ${label}$`) });
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.skills.mockResolvedValue([]);
@@ -84,44 +104,70 @@ beforeEach(() => {
 });
 
 describe('the phone layout', () => {
-  it('is a full-screen sheet sized by --app-height, with the stage bar and the buttons outside the scroller', async () => {
+  it('is a full-screen sheet sized by --app-height, with no stage bar and the buttons outside the scroller', async () => {
     await mount();
     const dialog = screen.getByRole('dialog');
     expect(dialog.className).toContain('h-(--app-height)');
     expect(dialog.className).toContain('inset-x-0 top-0');
     expect(dialog.className).not.toMatch(/dvh/);
-    // The bar and the footer are the frame's, not the body's.
+    // One screen since control-tower phase 22: nothing to step through.
+    expect(screen.queryByRole('tablist')).toBeNull();
+    // The quick view scrolls; Cancel and Launch are the frame's, not the body's.
     const body = dialog.querySelector('.overflow-y-auto')!;
-    expect(body.contains(screen.getByRole('tablist'))).toBe(false);
+    expect(body.contains(screen.getByTestId('quick-view'))).toBe(true);
     expect(body.contains(screen.getByRole('button', { name: 'Cancel' }))).toBe(false);
+    expect(body.contains(screen.getByTestId('launch-submit'))).toBe(false);
     // No ticket pane on a phone.
     expect(screen.queryByRole('complementary')).toBeNull();
   });
 
-  it('shows Launch on the review only, and Next between the stages', async () => {
+  it('shows Launch on the list and in a pushed sub-view, with no Next or Back anywhere', async () => {
     await mount();
-    expect(screen.queryByRole('button', { name: 'Start' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
-    // Opens on Decisions (phase 11); one Next reaches What runs, two reach How.
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getByRole('tab', { name: /What/ }).getAttribute('aria-selected')).toBe('true');
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getByRole('tab', { name: /How/ }).getAttribute('aria-selected')).toBe('true');
-    expect(screen.getByRole('button', { name: 'Back' })).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getByRole('tab', { name: /Review/ }).getAttribute('aria-selected')).toBe('true');
+    // The departure line above the tiles has already said what Launch does.
+    const launch = screen.getByTestId('launch-submit');
+    expect(launch).toHaveAccessibleName('Start');
     expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Start' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
+
+    // A row pushes its tile's controls: the list steps aside, inside the same scroller.
+    fireEvent.click(row('Money and stops'));
+    const sub = screen.getByTestId('tile-subview');
+    expect(screen.queryByRole('list', { name: 'Settings by category' })).toBeNull();
+    expect(within(sub).getByRole('region', { name: 'Money and stops' })).toBeTruthy();
+    expect(within(sub).getByLabelText('Budget for the run ($)')).toBeTruthy();
+    expect(screen.getByRole('dialog').querySelector('.overflow-y-auto')!.contains(sub)).toBe(true);
+    // The same Launch, still in the fixed footer — and still no stepping.
+    expect(screen.getByTestId('launch-submit')).toBe(launch);
+    expect(screen.queryByRole('button', { name: 'Next' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Back' })).toBeNull();
+
+    // "All settings" brings the list back.
+    fireEvent.click(within(sub).getByRole('button', { name: 'All settings' }));
+    expect(screen.queryByTestId('tile-subview')).toBeNull();
+    expect(screen.getByRole('list', { name: 'Settings by category' })).toBeTruthy();
   });
 
-  it('reads the short stage names, and every stage is one tap away', async () => {
+  it('lays the tiles out as one column of thumb-high rows, and every tile is one tap away', async () => {
     await mount();
-    const tabs = screen.getAllByRole('tab');
-    expect(tabs).toHaveLength(5);
-    fireEvent.click(screen.getByRole('tab', { name: /Money/ }));
-    expect(screen.getByRole('tab', { name: /Money/ }).getAttribute('aria-selected')).toBe('true');
-    // Every tab is thumb-high on a coarse pointer, by class.
-    for (const tab of tabs) expect(tab.className).toContain('[@media(hover:none)]:min-h-(--tap-min)');
+    const list = screen.getByRole('list', { name: 'Settings by category' });
+    // One column: a phone's tiles are rows, never the desk's grid.
+    expect(list.className).toContain('flex-col');
+    expect(list.className).not.toContain('grid');
+    const labels = (Array.from(list.children) as HTMLElement[]).map((tile) => {
+      // The whole row is the door — one button, thumb-high on a coarse pointer, by class.
+      const [door, ...rest] = within(tile).getAllByRole('button');
+      expect(rest).toHaveLength(0);
+      expect(door!.className).toContain('tap-row');
+      return door!.getAttribute('aria-label')!.replace(/^(Edit|Answer) /, '');
+    });
+    expect(labels).toEqual(TILES);
+    // Each row opens its own tile, and "All settings" is the one tap back.
+    for (const label of TILES) {
+      fireEvent.click(row(label));
+      const sub = screen.getByTestId('tile-subview');
+      expect(within(sub).getByRole('region', { name: label })).toBeTruthy();
+      fireEvent.click(within(sub).getByRole('button', { name: 'All settings' }));
+    }
+    expect(screen.getByRole('list', { name: 'Settings by category' })).toBeTruthy();
   });
 });

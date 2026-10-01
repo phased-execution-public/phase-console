@@ -158,12 +158,46 @@ function writeConfigDoc(name: string, doc: McpConfigDoc): string {
  * Best effort by design: a file we cannot delete is logged, never thrown. This
  * runs on the boot path and inside a `finally`, and neither is a place to fail
  * a run over a permissions problem on a temporary file.
+ *
+ * A supervisor chat's file (`chat-<id>.json`, control-tower phase 27) has its
+ * OWN predicate, because no run owns it and the run sweep would delete it
+ * under a live chat: with `chats` — the ids of the chats this console still
+ * holds — every other chat's file goes; without it, no chat file is touched.
  */
-export function pruneMcpConfigs(keep: Iterable<string>): string[] {
+export function pruneMcpConfigs(keep: Iterable<string>, chats?: Iterable<string>): string[] {
+  const runs = [...keep];
+  const live = chats === undefined ? null : new Set(chats);
   return sweepConfigs((name) => {
     if (name.startsWith('probe-')) return true;
-    return ![...keep].some((runId) => ownedBy(name, runId));
+    if (name.startsWith(CHAT_PREFIX)) return live !== null && !live.has(chatIdOf(name) ?? '');
+    return !runs.some((runId) => ownedBy(name, runId));
   });
+}
+
+const CHAT_PREFIX = 'chat-';
+
+/** A chat's config file — the supervisor chat's tools host and nothing else (control-tower phase 27). */
+export function chatConfigName(chatId: string): string {
+  return `${CHAT_PREFIX}${chatId}.json`;
+}
+
+function chatIdOf(name: string): string | null {
+  const match = /^chat-([0-9a-z]{1,32})\.json$/.exec(name);
+  return match ? match[1]! : null;
+}
+
+/**
+ * Write a chat's `--mcp-config`: 0600, like every other, and always handed to
+ * the CLI WITH `--strict-mcp-config` — its tools host is the whole set, never
+ * a union with the machine's own servers.
+ */
+export function writeChatConfigFile(chatId: string, doc: McpConfigDoc): string {
+  return writeConfigDoc(chatConfigName(chatId), doc);
+}
+
+/** Remove one chat's file — the chat ended. */
+export function dropChatConfig(chatId: string): string[] {
+  return sweepConfigs((name) => name === chatConfigName(chatId));
 }
 
 /**
@@ -203,7 +237,7 @@ function sweepConfigs(shouldDelete: (name: string) => boolean): string[] {
   }
   const removed: string[] = [];
   for (const name of names) {
-    if (!name.startsWith('run-') && !name.startsWith('probe-')) continue;
+    if (!name.startsWith('run-') && !name.startsWith('probe-') && !name.startsWith(CHAT_PREFIX)) continue;
     if (!shouldDelete(name)) continue;
     try {
       unlinkSync(join(MCP_CONFIG_DIR, name));

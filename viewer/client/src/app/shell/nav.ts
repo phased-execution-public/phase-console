@@ -1,25 +1,24 @@
 import {
   Bug,
   FileText,
-  Gauge,
   GitBranch,
   LineChart,
-  Play,
   Settings,
   TerminalSquare,
+  TowerControl,
   type LucideIcon,
 } from 'lucide-react';
 import { DESTINATIONS } from '@shared/route-meta.js';
 import type { ConsoleState } from '@/lib/api';
 
 /**
- * Where you can go, defined once — and in 4.0 that is **eight places**.
+ * Where you can go, defined once — and in 6.0 that is **seven places**.
  *
  * The 2.x nav had thirteen entries and still could not answer "does anything
- * need me?" without visiting three of them. The eight below are the questions an
- * operator actually has, in the order they have them; everything else in the
- * URL space is either a page one of these has absorbed (`#/ready` and
- * `#/pulse` became Now's Next up and Running now in Phase 8; `#/mcp` became a
+ * need me?" without visiting three of them. The seven below are the questions
+ * an operator actually has, in the order they have them; everything else in the
+ * URL space is either a page one of these has absorbed (Now's four bands are
+ * the Tower's bays since 6.0 and `#/now` a redirect onto it; `#/mcp` became a
  * Settings section in Phase 11) or an overlay that rides on top of whatever is
  * on screen (the palette, the help sheet, the announcements drawer).
  * `app/routes.ts` `destinationFor` is what keeps those older heads lighting the
@@ -28,14 +27,12 @@ import type { ConsoleState } from '@/lib/api';
  * **Three bands, and the band is the meaning.** *The work* is what is moving
  * right now; *the record* is what it did — the tree it changed, the numbers it
  * made, the trace it left; *the console* is the machine itself. The rail draws a
- * hairline between them and the More sheet heads them, because a list of eight
- * flat entries is a list you re-read every time. 4.0 adds `repo` and `debug`,
- * both to the middle band.
+ * hairline between them and the More sheet heads them, because a list of seven
+ * flat entries is a list you re-read every time.
  *
- * `tab: true` marks the four that get a bottom-bar slot on a phone — and that is
- * exactly the WORK band, which is why the split needs no second rule. The record
- * and the console live in the More sheet, so every destination is one or two
- * taps away from anywhere.
+ * The phone's tab bar is its own list, `TAB_BAR`: the work band, and in the
+ * slot Now freed, Insights. Everything else lives in the More sheet, so every
+ * destination is one or two taps away from anywhere.
  */
 
 /**
@@ -65,8 +62,6 @@ export interface NavItem {
   note: string;
   /** Which count decorates it, if any. Must be a `ShellCounts` key. */
   badge?: 'needsYou' | 'ready' | 'approvals' | 'sessions';
-  /** In the phone tab bar. */
-  tab?: boolean;
   /**
    * A server capability this destination needs before it is worth offering.
    *
@@ -86,15 +81,16 @@ export interface NavItem {
 
 export const NAV: readonly NavItem[] = [
   {
-    id: 'now',
-    label: 'Now',
-    icon: Gauge,
+    id: 'runs',
+    label: 'Runs',
+    // The Tower (§Architecture 5's codename), drawn as one: the home since 6.0.
+    icon: TowerControl,
     band: 'work',
-    note: 'What needs you, what is running, what is next',
-    // The one count that is a call to action rather than a census. It is the
-    // accent hue everywhere else in the app, for the same reason.
+    note: 'What needs you, what is running, what is next — and every run there has been',
+    // The one count that is a call to action rather than a census — Now's
+    // until 6.0, the Tower's since it answers "does anything need me?". It is
+    // the attention hue everywhere else in the app, for the same reason.
     badge: 'needsYou',
-    tab: true,
   },
   {
     id: 'plans',
@@ -103,19 +99,6 @@ export const NAV: readonly NavItem[] = [
     band: 'work',
     note: 'Every plan in this source, and where each one is',
     badge: 'ready',
-    tab: true,
-  },
-  {
-    id: 'runs',
-    label: 'Runs',
-    icon: Play,
-    band: 'work',
-    note: 'Every run on this console — its status and its cost',
-    // Deliberately unbadged. The approvals count is exactly what `needsYou`
-    // counts, and painting one number on two entries is the "same state on
-    // four surfaces" this redesign exists to end. Runs answers *what is
-    // running and what did it cost*; *does anything need me* is Now's.
-    tab: true,
   },
   {
     id: 'sessions',
@@ -127,7 +110,6 @@ export const NAV: readonly NavItem[] = [
     // no longer answerable by remembering. It is not the accent hue — a session
     // working away is not an alarm.
     badge: 'sessions',
-    tab: true,
     requires: ['allowTerminal', 'allowAgent'],
   },
   {
@@ -180,27 +162,54 @@ if (NAV.map((item) => item.id).join() !== (DESTINATIONS as readonly string[]).jo
  * and can change on a restart.
  */
 export function visibleNav(state: ConsoleState | undefined): NavItem[] {
-  return NAV.filter(
-    (item) =>
-      (!item.requires || item.requires.some((flag) => state?.[flag] === true)) &&
-      (!item.requiresReach || state?.fleet?.reachable === true),
-  );
+  return NAV.filter((item) => offered(item, state));
+}
+
+function offered(item: NavItem, state: ConsoleState | undefined): boolean {
+  if (item.requires && !item.requires.some((flag) => state?.[flag] === true)) return false;
+  if (item.requiresReach && state?.fleet?.reachable !== true) return false;
+  return true;
 }
 
 /**
- * The phone tab bar: whichever of the four this console offers, plus More.
+ * The phone tab bar, in order — its first `TAB_SLOTS` entries, then More.
+ *
+ * Runs leads: it is the home since 6.0, and the slot Now held went to the one
+ * destination of the record a phone reaches for, Insights. In the Pro tree that
+ * fourth slot is the Supervisor's (§Architecture 8, control-tower phase 28) —
+ * `#/chat`, named below in a `!pro:` region ahead of Insights: the bar is the
+ * first four DECLARED, so the Supervisor takes the slot and Insights moves to
+ * More there, while the Free tree keeps Insights where it is.
+ */
+export const TAB_BAR: readonly string[] = [
+  'runs',
+  'plans',
+  'sessions',
+  'insights',
+];
+
+/** Five buttons is what a 390px bar fits with a thumb-sized target each: four and More. */
+const TAB_SLOTS = 4;
+
+/**
+ * The phone tab bar: whichever of `TAB_BAR`'s first four this console offers,
+ * plus More.
  *
  * Sessions is the only gated one, and it is gated here too — a tab that opens a
  * page saying "this console has no terminal and no agent" is a slot spent on
- * nothing, and the bar has four of them.
+ * nothing. It takes its slot with it rather than promoting the next entry: the
+ * four are cut from the list as DECLARED, before anything is filtered out, and
+ * a bar whose contents change between machines is worse than a shorter bar.
  */
 export function tabItems(state: ConsoleState | undefined): NavItem[] {
-  return visibleNav(state).filter((item) => item.tab);
+  const offered = visibleNav(state);
+  return TAB_BAR.slice(0, TAB_SLOTS).flatMap((id) => offered.filter((item) => item.id === id));
 }
 
-/** Everything the tab bar does not show — the More sheet's list. */
+/** Everything the tab bar does not show — the More sheet's list, in nav order. */
 export function sheetItems(state: ConsoleState | undefined): NavItem[] {
-  return visibleNav(state).filter((item) => !item.tab);
+  const tabs = new Set(tabItems(state).map((item) => item.id));
+  return visibleNav(state).filter((item) => !tabs.has(item.id));
 }
 
 /**

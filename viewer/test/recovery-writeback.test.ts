@@ -20,6 +20,7 @@
  * Nothing here spawns `claude`; the recovery outcome is stubbed where needed.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -143,6 +144,7 @@ function drives(
   queued: { phase: number; outcome: string; by: string }[] = [],
 ): void {
   (svc as never as { runners: Map<string, unknown> }).runners.set(slug, {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({ slug, status: 'running', id: runId }),
     note: () => {},
@@ -362,6 +364,7 @@ test('an idle pooled runner’s in-memory state is the object that moves', () =>
     // The pool still holds the Runner whose loop halted; runFor() prefers its
     // current() over disk, so THIS object must be the one the sync rewrites.
     (svc as never as { runners: Map<string, unknown> }).runners.set('alpha', {
+      isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
       busy: () => false,
       current: () => held,
       note: () => {},

@@ -69,3 +69,35 @@ describe('the floor under a scoped estimate', () => {
     expect(screen.queryByText(/must run in order/)).toBeNull();
   });
 });
+
+describe('the pooled reading (control-tower phase 58)', () => {
+  const pooled = {
+    ...STATS,
+    rate: {
+      basis: 'portfolio',
+      floorMs: 42 * 60_000,
+      slopeMsPerWeight: 36,
+      ratePerWeight: 99,
+      samples: 60,
+      missing: 2,
+      spread: 0.8,
+      clock: 'working',
+    },
+  } as unknown as Portfolio;
+
+  it('states the band as the factor it is, both ways, and where it comes from', () => {
+    // `spread` runs the same FACTOR above and below the point, so a `±` percent
+    // misstates the lower end; the band is read from how the measured phases
+    // fell around the model, never from how many there were.
+    render(<EtaPanel stats={pooled} mediumWeight={40_000} />);
+    expect(
+      screen.getByText('÷1.8 to ×1.8 of the estimate — where three in four measured phases fell'),
+    ).toBeTruthy();
+    expect(screen.queryByText(/±/)).toBeNull();
+  });
+
+  it('counts what it weighted and names what it left out', () => {
+    render(<EtaPanel stats={pooled} mediumWeight={40_000} />);
+    expect(screen.getByText('60 measured phases weighted, 2 left out — no usable measurement')).toBeTruthy();
+  });
+});

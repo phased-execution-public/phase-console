@@ -264,3 +264,37 @@ test('a halt with nothing queued does not write for nothing', () => {
 
   assert.equal(runner.durableWrites, before, 'no withdrawal, no extra write');
 });
+
+/* ================================================================== *
+ * C. The queue clock survives the withdrawal (control-tower phase 60, #81)
+ * ================================================================== */
+
+test('a withdrawal closes each queued phase’s episode with its length and why, and keeps the entry’s age', () => {
+  const { runner, state, events } = probe(2);
+  const since = new Date(Date.now() - 45 * 60_000).toISOString();
+  for (const phase of [14, 15]) {
+    const record = state.phases[String(phase)]!;
+    record.queuedAt = since;
+    record.queueSince = since;
+    record.queueReserving = true;
+  }
+
+  runner.park('nobody answered the approval');
+
+  const closed = events
+    .filter((e) => e.event === 'run:journal' && e.data.event === 'phase.queue-closed')
+    .map((e) => ({ phase: e.data.phase, ...(e.data.data as Record<string, unknown>) }));
+  assert.equal(closed.length, 2, 'one close per queued phase');
+  for (const line of closed) {
+    assert.equal(line.outcome, 'withdrawn');
+    assert.equal(line.why, 'park');
+    assert.ok((line.ms as number) >= 45 * 60_000, 'the wait is measured, not discarded');
+  }
+  for (const phase of [14, 15]) {
+    const record = state.phases[String(phase)]!;
+    assert.ok((record.queuedMs ?? 0) >= 45 * 60_000, `phase ${phase}'s queued time is cumulative`);
+    assert.equal(record.queuedAt, undefined, 'no episode left open');
+    assert.equal(record.queueSince, since, 'the next entry is born this old');
+    assert.equal(record.queueReserving, true, 'and with the reservation it had earned');
+  }
+});

@@ -17,6 +17,7 @@
  * an engine that answers the five commands this path actually asks.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';

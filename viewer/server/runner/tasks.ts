@@ -70,6 +70,14 @@ export type TaskEvent = {
 };
 
 /**
+ * How far the active task's long operation has got — a `progress` line on the
+ * same channel (`phase-outcome.sh <slug> <N> progress`, control-tower phase 95,
+ * #163). `after` is how many task events of the same read came before it, so
+ * the runner can name the task that was active when it was said.
+ */
+export type ProgressLine = { label: string; done: number; of: number; at: string; after: number };
+
+/**
  * The most one read may take off the file at a time.
  *
  * Bounded rather than capped: what is not read this time is read next time,
@@ -114,18 +122,17 @@ function text(value: unknown): string | undefined {
  * Null is always safe: a line this cannot place simply does not exist, exactly
  * as `readOutcome` degrades to "the session declared nothing".
  */
-function parseLine(line: string, expect: { slug: string; phase: number; notBefore?: string }): TaskEvent | null {
+/** The line as JSON, when it is ours: version 1, this plan and phase, written by THIS attempt. */
+function lineOf(line: string, expect: { slug: string; phase: number; notBefore?: string }): Record<string, unknown> | null {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(line) as Record<string, unknown>;
   } catch {
     return null;
   }
-  if (parsed.version !== 1 || parsed.type !== 'task') return null;
+  if (!parsed || parsed.version !== 1) return null;
   if (parsed.slug !== expect.slug) return null;
   if (parsed.phase !== expect.phase) return null;
-  const op = parsed.op;
-  if (typeof op !== 'string' || !TASK_OPS.includes(op)) return null;
   if (typeof parsed.written_at !== 'string' || !parsed.written_at) return null;
   // The same whole-second floor `readOutcome` learned: the script writes
   // `written_at` with `date -u +%Y-%m-%dT%H:%M:%SZ` while `notBefore` is a
@@ -137,6 +144,23 @@ function parseLine(line: string, expect: { slug: string; phase: number; notBefor
     if (!Number.isFinite(wrote)) return null;
     if (Number.isFinite(floor) && wrote < Math.floor(floor / 1000) * 1000) return null;
   }
+  return parsed;
+}
+
+/** A `progress` line the script would have written — anything else is refused whole. */
+function parseProgress(parsed: Record<string, unknown>, after: number): ProgressLine | null {
+  const { label, done, of } = parsed;
+  if (typeof label !== 'string' || !label.trim()) return null;
+  if (!Number.isSafeInteger(done) || !Number.isSafeInteger(of)) return null;
+  if ((of as number) < 1 || (done as number) < 0 || (done as number) > (of as number)) return null;
+  return { label: label.slice(0, MAX_TASK_TEXT), done: done as number, of: of as number, at: String(parsed.written_at), after };
+}
+
+function parseLine(line: string, expect: { slug: string; phase: number; notBefore?: string }): TaskEvent | null {
+  const parsed = lineOf(line, expect);
+  if (!parsed || parsed.type !== 'task') return null;
+  const op = parsed.op;
+  if (typeof op !== 'string' || !TASK_OPS.includes(op)) return null;
   return {
     op: op as TaskEvent['op'],
     ...(text(parsed.id) ? { taskId: text(parsed.id) } : {}),
@@ -157,18 +181,18 @@ export function readTaskEvents(
   path: string,
   expect: { slug: string; phase: number; notBefore?: string },
   from = 0,
-): { events: TaskEvent[]; at: number } {
+): { events: TaskEvent[]; progress: ProgressLine[]; at: number } {
   let size: number;
   try {
     size = statSync(path).size;
   } catch {
-    return { events: [], at: from };
+    return { events: [], progress: [], at: from };
   }
   // A file that SHRANK is a different file — a retry armed a fresh path, or the
   // run directory was cleaned. Start again rather than reading from an offset
   // that now points into the middle of somebody else's line.
   const start = size < from ? 0 : from;
-  if (size <= start) return { events: [], at: start };
+  if (size <= start) return { events: [], progress: [], at: start };
 
   const want = Math.min(size - start, MAX_TAIL_BYTES);
   let buf: Buffer;
@@ -179,21 +203,28 @@ export function readTaskEvents(
     const read = readSync(fd, buf, 0, want, start);
     if (read < want) buf = buf.subarray(0, read);
   } catch {
-    return { events: [], at: start };
+    return { events: [], progress: [], at: start };
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch { /* best-effort */ } }
   }
 
   const cut = buf.lastIndexOf(0x0a);
-  if (cut < 0) return { events: [], at: start };
+  if (cut < 0) return { events: [], progress: [], at: start };
 
   const events: TaskEvent[] = [];
+  const progress: ProgressLine[] = [];
   for (const line of buf.subarray(0, cut + 1).toString('utf8').split('\n')) {
     if (!line) continue;
+    if (line.includes('"type":"progress"')) {
+      const parsed = lineOf(line, expect);
+      const said = parsed?.type === 'progress' ? parseProgress(parsed, events.length) : null;
+      if (said) progress.push(said);
+      continue;
+    }
     const event = parseLine(line, expect);
     if (event) events.push(event);
   }
-  return { events, at: start + cut + 1 };
+  return { events, progress, at: start + cut + 1 };
 }
 
 /** Fold a batch onto a list. Returns the same array when nothing changed. */

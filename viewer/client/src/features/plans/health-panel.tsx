@@ -25,25 +25,20 @@
  * restated.
  */
 
+import { HaltRow } from '@/components/halt-card';
+import { haltSentence } from '@shared/halt-categories.js';
 import { Bot, TriangleAlert } from 'lucide-react';
-import {
-  Banner,
-  Button,
-  Card,
-  CardBody,
-  CardHeader,
-  CardTitle,
-  Chip,
-  StatusBadge,
-  Tile,
-} from '@/components/ui';
-import { useAuth, useConsoleState, useConverge, useRun, useVerifyPreflight } from '@/lib/queries';
+import { Badge, Banner, Button, Card, CardBody, CardHeader, CardTitle, Tile } from '@/components/ui';
+import { RunStatusBadge } from '@/components/ui/status';
+import { keys, useAuth, useConsoleState, useConverge, useRun, useVerifyPreflight } from '@/lib/queries';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
 import { money, plural, weight } from '@/lib/format';
 import { isClosed } from '@/lib/closure';
 import { PREFLIGHT_LABEL, PREFLIGHT_TONE } from '@/lib/preflight';
 import { looksLikeAuthFailure } from '@/lib/failures';
 import { WAYS_FORWARD, classifyRun, recoveryKey } from '@/lib/recovery';
-import { isLiveStatus, runStatusTitle, runUiState } from '@/lib/status-vocab';
+import { isLiveStatus, runStatusTitle } from '@/lib/status-vocab';
 import { PlanPulse } from '@/components/pulse';
 import { RecoveryActions, type RecoveryCtx } from '@/components/recovery-actions';
 import { phaseHref, planHref } from '@shared/routes.js';
@@ -55,7 +50,18 @@ function excerpt(text: string | undefined, max = 160): string | undefined {
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
-export function HealthPanel({ detail }: { detail: PlanDetail }) {
+/**
+ * Which part of the panel to draw. The Phases tab draws it in two, around its
+ * table (control-tower phase 23): `trouble` — what is wrong, the ways forward
+ * and what boarding will find — ABOVE it, so a halted run is still the first
+ * thing on the tab, and nothing at all for a healthy plan; `context` — the
+ * heartbeat, the autopilot and what is left — BELOW it, because the table is
+ * where the plan is up to, and the whole panel above it had put the table a
+ * screen and a half down. Absent draws the whole panel.
+ */
+export type HealthPart = 'trouble' | 'context';
+
+export function HealthPanel({ detail, part }: { detail: PlanDetail; part?: HealthPart }) {
   const slug = detail.summary.slug;
   const { data: state } = useConsoleState();
   const { data: detailRun } = useRun(slug, state?.autopilot !== false);
@@ -136,12 +142,24 @@ export function HealthPanel({ detail }: { detail: PlanDetail }) {
   }
   if (lintFailed) offer('lint', { slug }, { planIssues: true } as RecoveryCtx);
 
+  const context = part !== 'trouble';
+  const trouble = part !== 'context';
+  const findings = preflight?.phases ?? [];
+  // Above the table a healthy plan gets nothing — not even an empty grid's gap.
+  if (part === 'trouble' && !troubled && !findings.length) return null;
+  // Drawn apart, each part fills its own rows: the autopilot card has nothing
+  // beside it below the table, and "Something's wrong" takes the width its
+  // way forward leaves above it.
+  const autopilotSpan = !troubled || part === 'context' ? 'sm:col-span-2 lg:col-span-3' : undefined;
+  const wrongSpan =
+    part === 'trouble' ? (offers.length > 0 ? 'lg:col-span-2' : 'sm:col-span-2 lg:col-span-3') : undefined;
+
   return (
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       {/* The heartbeat first: while anything is live, queued or parked, the
-          route tab leads with WHICH phases, in WHAT vehicle, for HOW LONG —
-          the panel renders nothing when the plan is idle. */}
-      {run && (
+          panel leads with WHICH phases, in WHAT vehicle, for HOW LONG — it
+          renders nothing when the plan is idle. */}
+      {context && run && (
         <PlanPulse
           className="sm:col-span-2 lg:col-span-3"
           slug={slug}
@@ -155,66 +173,74 @@ export function HealthPanel({ detail }: { detail: PlanDetail }) {
           }))}
         />
       )}
-      <Card className={!troubled ? 'sm:col-span-2 lg:col-span-3' : undefined}>
-        <CardHeader>
-          <CardTitle>Autopilot</CardTitle>
-          {run ? (
-            <StatusBadge
-              state={runUiState(run.status)}
-              label={run.status}
-              mono
-              title={runStatusTitle(run.status)}
-              pulse={run.status === 'running'}
-            />
-          ) : (
-            <Chip>not running</Chip>
-          )}
-        </CardHeader>
-        <CardBody className="flex flex-col gap-2">
-          <p className="text-sm text-ink-muted">
+      {context && (
+        <Card className={autopilotSpan}>
+          <CardHeader>
+            <CardTitle>Autopilot</CardTitle>
             {run ? (
-              live ? (
-                <>
-                  {run.activePhase != null ? `Driving phase ${run.activePhase}` : 'Between phases'}
-                  {' · '}
-                  {run.model}
-                  {run.spentUsd ? <> · {money(run.spentUsd)} spent</> : null}
-                </>
-              ) : (
-                (excerpt(run.finishedReason ?? run.halt?.reason) ?? 'Stopped, without a note.')
-              )
+              // The run in its plan's context: a closed plan settles a run that
+              // never finished, and the clock decides a stale stop is dormant.
+              <RunStatusBadge
+                run={run}
+                ctx={{ planClosed: closed }}
+                title={runStatusTitle(run.status)}
+                pulse={run.status === 'running'}
+              />
             ) : (
-              'Nothing has been run for this plan yet — the run tab starts one.'
+              <Badge>not running</Badge>
             )}
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" asChild>
-              <a href={planHref(slug, 'run')}>
-                <Bot size={13} aria-hidden /> Open autopilot
-              </a>
-            </Button>
-            {/* The one-press plan recovery, on the plan itself: confirm against
+          </CardHeader>
+          <CardBody className="flex flex-col gap-2">
+            {run && !live && run.halt ? (
+              // The stop, in the halt card's family and one sentence (phase 17).
+              <HaltRow run={run} />
+            ) : (
+              <p className="text-sm text-ink-muted">
+                {run ? (
+                  live ? (
+                    <>
+                      {run.activePhase != null ? `Driving phase ${run.activePhase}` : 'Between phases'}
+                      {' · '}
+                      {run.model}
+                      {run.spentUsd ? <> · {money(run.spentUsd)} spent</> : null}
+                    </>
+                  ) : (
+                    (excerpt(run.finishedReason) ?? 'Stopped, without a note.')
+                  )
+                ) : (
+                  'Nothing has been run for this plan yet — the run tab starts one.'
+                )}
+              </p>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" asChild>
+                <a href={planHref(slug, 'run')}>
+                  <Bot size={13} aria-hidden /> Open autopilot
+                </a>
+              </Button>
+              {/* The one-press plan recovery, on the plan itself: confirm against
                 the board, stand down what it settled, recover or continue what
                 is real. Renders only for a stopped, unresolved run. */}
-            {run && !live && <RecoveryActions target={{ slug, runId: run.id }} ctx={{ run }} max={1} />}
-            {run?.gitMode === 'new-branch' && (
-              <Chip title="This run works on its own branch and, unless turned off, opens a PR when the plan completes.">
-                work branch{run.openPr === false ? '' : ' · PR'}
-              </Chip>
-            )}
-          </div>
-        </CardBody>
-      </Card>
+              {run && !live && <RecoveryActions target={{ slug, runId: run.id }} ctx={{ run }} max={1} />}
+              {run?.gitMode === 'new-branch' && (
+                <Badge title="This run works on its own branch and, unless turned off, opens a PR when the plan completes.">
+                  work branch{run.openPr === false ? '' : ' · PR'}
+                </Badge>
+              )}
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
-      {troubled && (
-        <Card>
+      {trouble && troubled && (
+        <Card className={wrongSpan}>
           <CardHeader>
             <CardTitle>Something's wrong</CardTitle>
           </CardHeader>
           <CardBody className="flex flex-col gap-2">
             {(runClass || parkedRun) && run && (
               <Banner severity={parkedRun ? 'warn' : 'error'}>
-                Run {run.status}. {excerpt(run.halt?.reason ?? run.finishedReason) ?? ''}
+                Run {run.status}. {(run.halt ? haltSentence(run.halt) : excerpt(run.finishedReason)) ?? ''}
               </Banner>
             )}
             {stuck.length > 0 && (
@@ -228,11 +254,12 @@ export function HealthPanel({ detail }: { detail: PlanDetail }) {
             {lintFailed && (
               <Banner severity="warn">{detail.lint!.summary || 'The plan fails validation.'}</Banner>
             )}
+            {lintFailed && <LintAgain slug={slug} />}
           </CardBody>
         </Card>
       )}
 
-      {troubled && offers.length > 0 && (
+      {trouble && troubled && offers.length > 0 && (
         <Card>
           <CardHeader>
             <CardTitle>{WAYS_FORWARD}</CardTitle>
@@ -250,8 +277,8 @@ export function HealthPanel({ detail }: { detail: PlanDetail }) {
         </Card>
       )}
 
-      <PreflightCard slug={slug} phases={preflight?.phases ?? []} />
-      <WorkLeft detail={detail} />
+      {trouble && <PreflightCard slug={slug} phases={findings} />}
+      {context && <WorkLeft detail={detail} />}
     </div>
   );
 }
@@ -308,7 +335,7 @@ function PreflightCard({
             <div className="flex min-w-0 flex-1 flex-col gap-1">
               {warnings.map((warning, i) => (
                 <div key={i} className="flex min-w-0 flex-wrap items-baseline gap-x-2">
-                  <Chip tone={PREFLIGHT_TONE[warning.kind]}>{PREFLIGHT_LABEL[warning.kind]}</Chip>
+                  <Badge tone={PREFLIGHT_TONE[warning.kind]}>{PREFLIGHT_LABEL[warning.kind]}</Badge>
                   {/* `break-words` is load-bearing, not tidiness. A `human-check`
                       message quotes the held-back command verbatim, and a
                       `bash -c '! grep -rnE "A|B|C" path/'` has no space in it
@@ -363,57 +390,136 @@ function WorkLeft({ detail }: { detail: PlanDetail }) {
   // plan" for exactly that reason.
   if (closed || (!s.remainingWeight && !criticalPath.length && !groups.length)) return null;
 
+  // Every line in this card is read, not glanced at — the unit, the path, what
+  // the bottleneck holds up, the best next phase — so it is muted ink, never
+  // the metadata's faint, which fails AA at these sizes in both themes (the
+  // e2e register). A tile's hint is faint by default; these are its answer.
+  const answer = (text: string) => <span className="text-ink-muted">{text}</span>;
+
   return (
     <Card className="sm:col-span-2 lg:col-span-3">
       <CardHeader>
         <CardTitle>What is left</CardTitle>
-        {groups.length > 0 && (
-          <span className="text-xs text-ink-faint">
-            batched at {weight(s.budget)} — <code className="font-mono">--session-plan</code>
-          </span>
-        )}
+        <span className="text-xs text-ink-muted">
+          {/* The unit first (#83): the autopilot never batches, so a batch below is a person's. */}
+          {detail.sizing?.unit ?? '1 phase ≥ 1 session'}
+          {groups.length > 0 && (
+            <>
+              {' '}
+              · batches by hand at {weight(s.budget)} — <code className="font-mono">--session-plan</code>
+            </>
+          )}
+        </span>
+        <WorkForecast slug={s.slug} />
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
         <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
           <Tile
             label="Work left"
             value={weight(s.remainingWeight)}
-            hint={`≈ ${plural(s.remainingSessions, 'session')} at ${weight(s.budget)}`}
+            hint={answer(`≈ ${plural(s.remainingSessions, 'session')}, measured per phase`)}
           />
           <Tile
             label="Critical path"
             value={String(criticalPath.length)}
-            hint={
+            hint={answer(
               criticalPath.length
                 ? `P${criticalPath.join(' → P')} · min ${plural(s.minimumSessions, 'session')}`
-                : 'nothing left'
-            }
+                : 'nothing left',
+            )}
           />
           <Tile
             label="Bottleneck"
             value={s.bottleneck ? `P${s.bottleneck.phase}` : '—'}
-            hint={s.bottleneck ? `holds up ${plural(s.bottleneck.blocks, 'phase')}` : 'nothing is blocking'}
+            hint={answer(
+              s.bottleneck ? `holds up ${plural(s.bottleneck.blocks, 'phase')}` : 'nothing is blocking',
+            )}
           />
           <Tile
             label="Ready now"
             value={String(ready.length)}
-            state={ready.length > 0 ? 'state-ready' : undefined}
-            hint={s.nextBest ? `best next: P${s.nextBest.phase} (unblocks ${s.nextBest.unblocks})` : 'none'}
+            state={ready.length > 0 ? 'state-queued' : undefined}
+            hint={answer(
+              s.nextBest ? `best next: P${s.nextBest.phase} (unblocks ${s.nextBest.unblocks})` : 'none',
+            )}
           />
         </div>
+
+        {detail.sizing && <p className="text-2xs text-ink-muted">{detail.sizing.bootLine}</p>}
 
         {groups.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {groups.map((group) => (
-              <Chip key={group.index} title={group.note ?? ''}>
+              <Badge key={group.index} title={group.note ?? ''}>
                 <b>S{group.index}</b>&nbsp;{group.phases.map((p) => `P${p}`).join(' + ')}
                 &nbsp;<span className="text-ink-faint">{group.weight}</span>
                 {group.gated ? ' · gated' : ''}
-              </Chip>
+              </Badge>
             ))}
           </div>
         )}
       </CardBody>
     </Card>
+  );
+}
+
+/**
+ * The lint, run again on a person's press (control-tower phase 25): the page
+ * shows the verdict cached with the plan, and a plan edited a minute ago
+ * deserves the engine's word now, not a reload. `GET /api/plans/<slug>/lint`
+ * had no caller.
+ */
+export function LintAgain({ slug }: { slug: string }) {
+  const lint = useQuery({ queryKey: keys.planLint(slug), queryFn: () => api.planLint(slug), enabled: false });
+  const verdict = lint.data;
+  return (
+    <div className="mt-2 flex flex-col gap-1" data-testid="lint-again">
+      <div>
+        <Button size="sm" variant="ghost" disabled={lint.isFetching} onClick={() => void lint.refetch()}>
+          {lint.isFetching ? 'Linting…' : 'Lint the plan again'}
+        </Button>
+      </div>
+      {lint.isFetched && !lint.isFetching ? (
+        <p className="text-xs text-ink-muted" role="status">
+          {lint.error
+            ? `The lint could not run: ${lint.error.message}`
+            : !verdict
+              ? 'This plan has no phase graph to lint.'
+              : verdict.crashed
+                ? 'The engine could not run the lint — this proves nothing about the plan.'
+                : verdict.ok
+                  ? 'The lint passes now.'
+                  : `Still failing: ${verdict.summary || `${verdict.issues.length} issues`}`}
+        </p>
+      ) : null}
+      {verdict && !verdict.ok && verdict.issues.length ? (
+        <ul className="list-inside list-disc text-2xs text-ink-muted">
+          {verdict.issues.slice(0, 8).map((issue) => (
+            <li key={issue}>{issue}</li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * What is left, in the unit the console runs — sessions (phase 59's model),
+ * from `GET /api/plans/<slug>/work`, which had no caller (control-tower phase 25).
+ */
+export function WorkForecast({ slug }: { slug: string }) {
+  const work = useQuery({
+    queryKey: keys.planWork(slug),
+    queryFn: () => api.planWork(slug),
+    staleTime: 60_000,
+  });
+  const left = work.data;
+  if (!left || !left.phases) return null;
+  return (
+    <p className="text-xs text-ink-muted" data-testid="work-forecast">
+      {`${plural(left.phases, 'phase')} left — about ${Math.max(1, Math.round(left.sessions))} session${
+        Math.round(left.sessions) === 1 ? '' : 's'
+      } at this plan’s measured size.`}
+    </p>
   );
 }

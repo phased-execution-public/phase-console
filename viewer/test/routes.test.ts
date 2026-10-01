@@ -107,6 +107,8 @@ function fakeService(over: Record<string, unknown> = {}) {
   const configured: Record<string, unknown>[] = [];
   return {
     flags: { allowWrites: true, allowRun: true, maxSessions: 4 },
+    // A refused hook call is reported to the service (#74); the fake just listens.
+    noteHookUnauthorised: () => {},
     store: { get: () => ({}), list: () => [] },
     accounts: { has: () => false },
     startRun: async (slug: string, options: Record<string, unknown>) => {
@@ -358,10 +360,26 @@ test('spend answers with no source directory open, and takes no flag', async () 
   assert.deepEqual((out.body as { series: unknown[] }).series, []);
 });
 
+/**
+ * The inbox route serves the service's memoised ENTITY and asks it for a 304
+ * first (control-tower phase 56) â€” so a stub answers those two from whatever
+ * `attention` it was given, exactly as the service builds them.
+ */
+function inboxStub(attention: (all: boolean) => Promise<unknown>) {
+  return {
+    attention,
+    inboxEtag: () => null,
+    attentionEntity: async (all: boolean) => {
+      const body = Buffer.from(JSON.stringify(await attention(all)), 'utf8');
+      return { etag: '"stub"', body, packed: {} };
+    },
+  };
+}
+
 test('the attention inbox answers with no source directory open', async () => {
   // Above the wall on purpose: a sign-in, an unreachable MCP server and a dead
   // watcher all need a person whether or not a plan directory is open.
-  const service = fakeService({ store: null, attention: async () => ({ items: [], counts: {} }) });
+  const service = fakeService({ store: null, ...inboxStub(async () => ({ items: [], counts: {} })) });
   const out = await call(service, 'GET', '/api/inbox');
   assert.equal(out.status, 200);
   assert.deepEqual((out.body as { items: unknown[] }).items, []);
@@ -369,7 +387,7 @@ test('the attention inbox answers with no source directory open', async () => {
 
 test('?all=1 is passed through to the builder', async () => {
   const seen: boolean[] = [];
-  const service = fakeService({ store: null, attention: async (all: boolean) => { seen.push(all); return { items: [] }; } });
+  const service = fakeService({ store: null, ...inboxStub(async (all: boolean) => { seen.push(all); return { items: [] }; }) });
   await call(service, 'GET', '/api/inbox');
   await call(service, 'GET', '/api/inbox?all=1');
   assert.deepEqual(seen, [false, true]);
@@ -1800,8 +1818,10 @@ test('POST /hooks/permission-request authenticates on the per-run token ALONE â€
     const approvals = new Approvals(() => {}, join(dir, 'pending.json'));
     const token = approvals.arm('r1');
     const seen: { body: Record<string, unknown>; runId: unknown }[] = [];
+    const refusedCalls: { hook: string; body: unknown; reason: string }[] = [];
     const service = fakeService({
       approvals,
+      noteHookUnauthorised: (hook: string, body: unknown, reason: string) => refusedCalls.push({ hook, body, reason }),
       decidePermissionRequest: async (body: Record<string, unknown>, runId: unknown) => {
         seen.push({ body, runId });
         return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'allow' } } };
@@ -1819,9 +1839,11 @@ test('POST /hooks/permission-request authenticates on the per-run token ALONE â€
     assert.equal(seen[0].body.tool_name, 'Bash');
 
     const bad = await call(service, 'POST', '/hooks/permission-request', {
-      header: true, extraHeaders: { authorization: `Bearer ${'x'.repeat(43)}` },
+      header: true, body: { session_id: 'sess-1' }, extraHeaders: { authorization: `Bearer ${'x'.repeat(43)}` },
     });
     assert.equal(bad.status, 401, 'the console header does not stand in for the token');
+    // TL-3 (#74): the refusal, with the session it came from, reaches the service.
+    assert.deepEqual(refusedCalls, [{ hook: 'permission-request', body: { session_id: 'sess-1' }, reason: 'bad token' }]);
     const none = await call(service, 'POST', '/hooks/permission-request', { header: true });
     assert.equal(none.status, 401);
     assert.equal((await call(service, 'GET', '/hooks/permission-request', { header: false })).status, 405);

@@ -70,7 +70,7 @@ export function Stepper({
       <span
         aria-hidden
         className="pointer-events-none absolute bottom-[calc(0.5rem+3px)] h-px bg-track"
-        style={{ left: `${50 / count}%`, right: `${50 / count}%` }}
+        style={{ insetInline: `${50 / count}%` }}
       />
       {steps.map((step) => (
         <TabsPrimitive.Trigger

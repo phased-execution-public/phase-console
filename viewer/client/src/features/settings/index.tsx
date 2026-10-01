@@ -42,6 +42,7 @@ import { AccountsCard } from './accounts';
 import { AnnouncementsPointer, RoutingCard } from './routing';
 import { DevicesCard } from './devices';
 import { WebhooksCard } from './webhooks';
+import { RemindersCard } from './notifications';
 
 // The two heavy halves. The permissions editor is a form over a rule grammar;
 // the MCP section carries a catalog, a search and an add dialog. Neither is on
@@ -170,6 +171,7 @@ function NotificationsSection() {
           parser that forgives it. */}
       <AnnouncementsPointer href={bellHref('now', PANEL_KEYS.announcements)} />
       <RoutingCard />
+      <RemindersCard />
       <DevicesCard />
       <WebhooksCard />
     </SettingsSectionFrame>

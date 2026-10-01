@@ -23,7 +23,8 @@ import { shell } from './shell.ts';
 
 export type WriteAction =
   | 'new-plan' | 'new-handoff' | 'qa-record' | 'gate-approve' | 'lock-claim' | 'lock-release'
-  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote' | 'landing-record';
+  | 'close-plan' | 'reopen-plan' | 'open-editor' | 'qa-mode' | 'decisions-promote' | 'landing-record'
+  | 'wait-budget';
 
 export type WriteRequest = {
   action: WriteAction;
@@ -61,6 +62,14 @@ export type WriteRequest = {
    * WRITER's words — what the engine reads back is `QA_MODES`.
    */
   mode?: string;
+  /**
+   * The wait budget to write (`wait-budget`, control-tower phase 14): the
+   * WHOLE budget in minutes — the caller adds the raise — for one phase's
+   * `Waits on:` max (`phase`) or the plan's `Wait budget:` line (no phase),
+   * and the refs a phase with no `Waits on:` bullet yet should name.
+   */
+  minutes?: number;
+  refs?: string[];
   /**
    * The ruling to promote (`decisions-promote`): its ledger id, the decision
    * key its row goes under, and the ledger it is read from — passed to the
@@ -140,6 +149,9 @@ function requireSlug(slug?: string): string {
   if (!slug || !SLUG.test(slug)) throw new WriteError('Slug must be kebab-case: lowercase letters, digits and dashes.');
   return slug;
 }
+
+/** The largest wait budget the writer accepts — thirty days; a longer one is a typo, not a wait. */
+const WAIT_BUDGET_MAX_MIN = 30 * 24 * 60;
 
 function requirePhase(phase?: number): number {
   if (!Number.isInteger(phase) || (phase as number) < 1 || (phase as number) > 999) {
@@ -318,6 +330,33 @@ export function planWrite(request: WriteRequest, opts: { root: string; docsDir?:
         description: mode === 'inherit'
           ? `Let phase ${phase} of ${slug} inherit the plan's QA regime`
           : `Turn QA ${mode} for phase ${phase} of ${slug}`,
+      };
+    }
+
+    case 'wait-budget': {
+      // A spent wait budget is raised WHERE IT WAS DECLARED (control-tower
+      // phase 14, #40): the engine re-reads the plan on every board, so a
+      // run-local override would be silently lost on the next read. The
+      // writer (`wait-budget.sh`) edits the phase's `Waits on:` max or the
+      // plan's `Wait budget:` line and proves it by the engine's read-back.
+      const slug = requireSlug(request.slug);
+      const minutes = request.minutes;
+      if (typeof minutes !== 'number' || !Number.isInteger(minutes) || minutes < 1 || minutes > WAIT_BUDGET_MAX_MIN) {
+        throw new WriteError(`A wait budget is a whole number of minutes between 1 and ${WAIT_BUDGET_MAX_MIN}.`);
+      }
+      const refs = (request.refs ?? []).map((ref) => String(ref).trim()).filter(Boolean);
+      for (const ref of refs) {
+        if (/[\u0060\n\u00b7]/.test(ref) || ref.startsWith('-')) throw new WriteError(`Not a ref the plan can name: ${ref}`);
+      }
+      if (request.phase == null) {
+        if (refs.length) throw new WriteError('Refs name one phase\'s waits: give the phase.');
+        return { script: 'wait-budget.sh', args: [slug, `${minutes}m`], description: `Set the wait budget of ${slug} to ${minutes}m` };
+      }
+      const phase = requirePhase(request.phase);
+      return {
+        script: 'wait-budget.sh',
+        args: [slug, '--phase', String(phase), ...refs.flatMap((ref) => ['--ref', ref]), `${minutes}m`],
+        description: `Set phase ${phase} of ${slug} to wait at most ${minutes}m`,
       };
     }
 

@@ -21,14 +21,28 @@
  *   3. It survives the run. A checkpoint is rewritten in place; the journal is
  *      append-only, so a finished run stays readable months later.
  *
- * ## Every bar is bracketed by two journal entries
+ * ## Every bar is held to a journal line
  *
- * Nothing here is inferred from a duration field. A bar opens on an event and
- * closes on an event, and the one exception is stated rather than hidden: a bar
- * still open when the journal ends is closed at the horizon and flagged
- * `open`, which the client draws hatched. That is the difference between "this
- * phase worked for 40 minutes" and "this phase has been working for 40 minutes
- * so far", and a Gantt that cannot tell them apart is worse than no Gantt.
+ * Nothing here is modelled. A bar opens on an event and closes on an event —
+ * or, for the two things the runner journals only when they END, it is
+ * measured back from that line's own clock: a `working` bar is a session, from
+ * `phase.session`'s time back its `ms`, and an automatic `verifying` bar is the
+ * verdict, from `phase.verify`'s time back the sum of its commands' `ms`. A
+ * bracketed guess (an opener to a closer) stands only where no measurement
+ * does — a session still running, or a journal from before `ms` existed.
+ *
+ * Until control-tower phase 61 (#76) everything between a boarding and a
+ * terminal line was `working`, so a phase settled by reconcile, a halted,
+ * parked or stopped run and every automatic proof were drawn as work — 903
+ * hours of it on hub against 134 hours of sessions. Now queueing, a run that
+ * was down (with its cause) and verification are drawn as themselves, and a
+ * stretch nothing claims is a gap: the phase was in nobody's hands.
+ *
+ * One exception is stated rather than hidden: a bar still open when the
+ * journal ends is closed at the horizon and flagged `open`, which the client
+ * draws hatched. That is the difference between "this phase worked for 40
+ * minutes" and "this phase has been working for 40 minutes so far", and a
+ * Gantt that cannot tell them apart is worse than no Gantt.
  *
  * ## Truncation is reported, never smoothed
  *
@@ -49,6 +63,14 @@
  * fail to start", which nobody compares; the outer one is the thing that
  * produces an outcome, a verification and a bill.
  *
+ * Since control-tower phase 89 (#130) a boarding ends when its SESSION does —
+ * a declared `partial`, `blocked`, `needs-human` or `waiting-external`, or a
+ * phase-level halt, ends it at the session's end rather than leaving it open
+ * for the next boarding to settle across the queue wait — and it carries the
+ * phase-wide number its first session took: `phase.start`'s `attempt`, the
+ * number `phase.session`, `phase.tokens` and `record.attempts` carry. A
+ * boarding whose inner loop spawned twice is followed by attempt 3.
+ *
  * A boarding's money and turns come from the `phase.session` entries inside it
  * — the ONE event carrying an attempt's own `costUsd` rather than the phase's
  * cumulative total. `record.costUsd` accumulates across attempts by design
@@ -61,15 +83,29 @@
  */
 
 import type { JournalEntry } from '../runner/journal.ts';
+import { PHASE_WORK_MODES } from '../../shared/phase-clocks.js';
+import type { OutcomeStatus } from '../../shared/run-lifecycle.js';
 
 /* ------------------------------------------------------------------ *
  * The shapes the client draws
  * ------------------------------------------------------------------ */
 
-/** What a lane was doing. Four states, because they have four different fixes. */
-export type BarKind = 'working' | 'verifying' | 'waiting' | 'frozen';
+/**
+ * What a lane was doing. Six states, because they have six different fixes.
+ *
+ * `working` is a SESSION — a `claude -p` child that was running — and nothing
+ * else (control-tower phase 61, #76): the audit replayed hub's journals through
+ * the four-state projection and drew 903 working hours against 134 hours of
+ * sessions, because the time a phase spent queued, parked, proved, or held by a
+ * run that had gone down was all painted as work. `queued` is a queue episode,
+ * `down` the run itself stopped (halted, parked, paused, stopped, shut down)
+ * while this phase was in flight, with its cause on the bar's `note`, and
+ * `verifying` every §Verification — the automatic one too, measured from the
+ * verdict's own commands.
+ */
+export type BarKind = 'working' | 'verifying' | 'queued' | 'waiting' | 'down' | 'frozen';
 
-export const BAR_KINDS: readonly BarKind[] = ['working', 'verifying', 'waiting', 'frozen'];
+export const BAR_KINDS: readonly BarKind[] = ['working', 'verifying', 'queued', 'waiting', 'down', 'frozen'];
 
 export type TimelineBar = {
   kind: BarKind;
@@ -80,6 +116,7 @@ export type TimelineBar = {
   attempt: number;
   /** Still open when the journal ends: drawn hatched, never as a finished bar. */
   open: boolean;
+  /** Why — a `down` bar's cause (`halted: plan-lint`, `stopped by operator`). */
   note?: string;
 };
 
@@ -97,7 +134,10 @@ export type MarkKind =
   | 'session'
   | 'ask'
   | 'policy'
-  | 'start';
+  | 'start'
+  // Control-tower phase 96 (#142): a person's note — on its phase's lane when
+  // that phase has one on this run, else on the axis.
+  | 'note';
 
 /**
  * The mark vocabulary, as a value.
@@ -107,11 +147,14 @@ export type MarkKind =
  * none. `docs-parity.test.ts` holds the two to each other.
  */
 export const MARK_KINDS: readonly MarkKind[] = [
-  'board', 'verify', 'rung', 'park', 'wall', 'outcome', 'session', 'ask', 'policy', 'start',
+  'board', 'verify', 'rung', 'park', 'wall', 'outcome', 'session', 'ask', 'policy', 'start', 'note',
 ];
 
 /** A session's ending — its one `phase.session` line (zero-touch phase 4's shape). */
 const SESSION_END = 'phase.session';
+
+/** What a session's calls cost in context — the series' other half. */
+const TOKENS = 'phase.tokens';
 
 /** Somebody was asked, or answered: a question, a card, a relayed window (phases 13 and 14). */
 const ASK = new Set([
@@ -125,6 +168,9 @@ const POLICY_ANSWERED = 'phase.policy-answered';
 
 /** A start of the run — run-level, so it is drawn on the axis rather than in a lane (phase 7's actor). */
 const RUN_START = 'run.start';
+
+/** A person's note on the run or one of its phases (control-tower phase 96). */
+const RUN_NOTE = 'run.note';
 
 export type TimelineMark = {
   kind: MarkKind;
@@ -145,13 +191,41 @@ export type TimelineLane = {
   totalMs: number;
   workingMs: number;
   verifyingMs: number;
+  queuedMs: number;
   waitingMs: number;
+  downMs: number;
   frozenMs: number;
+  /**
+   * Session and verification time on CLOSED bars — what this phase measurably
+   * took, and the only weight the critical path is allowed (#76). An open bar
+   * is a claim still being made, not a measurement.
+   */
+  measuredMs: number;
   attempts: number;
   /** The journal's tail cut this lane's opening off — bars begin mid-flight. */
   partial: boolean;
   /** On the measured critical path. */
   critical: boolean;
+};
+
+/**
+ * One value over one attempt window, on the SAME axis as the bars.
+ *
+ * The question an operator has at minute 40 of a phase — *is this one burning
+ * faster than the last three?* — had no picture anywhere: the Gantt answers
+ * "when did each phase hold the lane" and nothing answers "what did it cost to
+ * hold it". Both facts were already journalled; only the axis was missing.
+ */
+export type TimelineSeriesPoint = {
+  phase: number;
+  /** The boarding this window is, 1-based — the same number `TimelineBar.attempt` carries. */
+  attempt: number;
+  /** Milliseconds from the axis's left edge, so the client does no date maths. */
+  startMs: number;
+  endMs: number;
+  value: number;
+  /** The window is still open: `value` is what it has spent SO FAR. */
+  open: boolean;
 };
 
 export type RunTimeline = {
@@ -170,7 +244,7 @@ export type RunTimeline = {
   spanMs: number;
   lanes: TimelineLane[];
   marks: TimelineMark[];
-  /** Phases on the longest dependency chain, weighted by MEASURED lane time. */
+  /** Phases on the longest dependency chain, weighted by each lane's `measuredMs`. */
   criticalPath: number[];
   criticalMs: number;
   /** The journal was read as a tail: early lanes may be `partial`. */
@@ -183,6 +257,26 @@ export type RunTimeline = {
    * `run.settings` and friends.
    */
   unmapped: number;
+  /**
+   * Cost and context on the bars' own axis, one point per attempt window.
+   *
+   * `cost` sums the `phase.session` entries inside each window — the one event
+   * carrying an attempt's OWN dollars rather than the phase's running total —
+   * and `tokens` takes the peak context any session in it reached. An OPEN
+   * window is the live lane's figure rather than the journal's, because the
+   * journal only learns what a session spent when it ends, and "$0.00 so far"
+   * about a session that has been working for forty minutes is the one reading
+   * that is certainly wrong.
+   */
+  series: { cost: TimelineSeriesPoint[]; tokens: TimelineSeriesPoint[] };
+  /**
+   * ISO — when this projection was taken.
+   *
+   * The axis is honest about its right edge (`horizonAt`) and was not honest
+   * about its own age: a cached or slow answer drew "now" wherever the reader
+   * assumed it was. A series that moves needs a stamp that moves with it.
+   */
+  asOf: string;
 };
 
 /* ------------------------------------------------------------------ *
@@ -195,21 +289,139 @@ export type RunTimeline = {
 /** Opens a boarding. */
 const BOARD = 'phase.start';
 
-/** Ends a boarding, and with it whatever bar was open. */
+/**
+ * Ends a boarding, and with it whatever bar was open. `phase.verification-failed`
+ * is the attempt a red FINAL verdict re-opened (control-tower phase 62, #68):
+ * the phase is not done and boards again for its fix, but THIS boarding ended
+ * red, exactly as `phase.failed` ends one.
+ */
 const TERMINAL = new Set([
   'phase.done', 'phase.failed', 'phase.stopped', 'phase.skip', 'phase.gated', 'phase.not-started',
+  'phase.verification-failed',
 ]);
+
+/**
+ * A settle the BOARD vouches for: the record was corrected against it (#76).
+ * Terminal like the six above — before phase 61 it was not, so a phase closed
+ * by reconcile kept its bar open and growing to "now" (tfar P1: 71 hours drawn
+ * for a 51-minute phase).
+ */
+const RECONCILED = 'phase.reconciled';
 
 /** The phase is parked on something outside itself. */
 const PARK_START = new Set([
   'phase.waiting', 'phase.mcp-preflight-parked', 'phase.verify-preflight-parked',
+  // A §Verification its clock cut twice parks for a person (control-tower
+  // phase 83, #95) — parked on its verification, like the preflight's park.
+  'phase.verify-timeout',
 ]);
 
-const PARK_END = new Set(['phase.wait-resume', 'phase.resume']);
+/** A session starts again: a parked phase boards, a `--resume`, a closeout. */
+const PARK_END = new Set(['phase.wait-resume', 'phase.resume', 'phase.closeout']);
 
-/** Verification is running: `awaiting-verification` opens it, `verify` closes it. */
+/**
+ * The person-check path's verification: `awaiting-verification` opens it,
+ * `verify` closes it. The AUTOMATIC one has no opener — the runner writes only
+ * its verdict — so it is measured back from the verdict's own commands.
+ */
 const VERIFY_START = 'phase.awaiting-verification';
 const VERIFY_END = 'phase.verify';
+
+/**
+ * A queue episode (control-tower phase 60): `phase.queued` opens it and
+ * `phase.queue-closed` ends it — where it was last seen, for a `restarted`
+ * close. `phase.admitted` ends one too, for journals written before the close
+ * line existed.
+ */
+const QUEUE_OPEN = 'phase.queued';
+const QUEUE_CLOSE = 'phase.queue-closed';
+const ADMITTED = 'phase.admitted';
+
+/**
+ * Where a queue episode ended. A `restarted` close is written by the NEXT
+ * console, so the episode ended where it was last seen waiting — `since` +
+ * `ms` — not at that boot. `openedMs` and `closedMs` are on the axis `t0`
+ * measures from (absolute when it is 0).
+ */
+function queueEndMs(entry: JournalEntry, openedMs: number, closedMs: number, t0 = 0): number {
+  if (entry.data?.outcome !== 'restarted') return closedMs;
+  const since = Date.parse(String(entry.data.since ?? ''));
+  const ms = num(entry.data.ms);
+  return Number.isFinite(since) && ms !== null ? Math.min(closedMs, Math.max(openedMs, since - t0 + ms)) : closedMs;
+}
+
+/**
+ * A session's declared outcome, journalled when the runner reads it — and
+ * the declared statuses that END the boarding it was declared in (control-
+ * tower phase 89, #130). The session said how it stopped; what the console
+ * does next — a park, a queue, the wrap-up's fresh boarding, a halt — happens
+ * after the boarding. Before this they ended nothing, so a boarding that
+ * declared `partial` or `blocked` stayed `open` until the NEXT `phase.start`
+ * settled it `superseded` at that boarding's time: hub's P43 read 5 h 43 min
+ * for a 57-minute session. `complete` and `no-defect` are deliberately absent —
+ * after either the console's §Verification still runs inside the boarding, and
+ * `phase.done` or `phase.verification-failed` ends it.
+ */
+const DECLARED = 'phase.outcome';
+const DECLARED_ENDS: ReadonlySet<string> = new Set<OutcomeStatus>(['partial', 'blocked', 'needs-human', 'waiting-external']);
+
+/**
+ * A phase-level stop (`Runner.settlePhase`). It ends a BOARDING (`attemptsOf`)
+ * and nothing on the lane: the lane is the phase's time on the run, and after
+ * a halt it goes on drawing what the run does with the phase — the run going
+ * down with it, its queue, its next boarding.
+ */
+const HALTED = 'phase.halted';
+
+/**
+ * How a boarding ended when its SESSION's ending is what ended it (#130): a
+ * declared status from `DECLARED_ENDS` names itself, and `phase.halted` is
+ * `halted`. Null for every other line — and for a declaration read from the
+ * ARMED outcome file (`via: 'armed-file'`), which speaks for an EARLIER
+ * session and is journalled when the next spawn arms the file, inside the
+ * boarding after the one it is about.
+ */
+function sessionEnding(entry: JournalEntry): string | null {
+  if (entry.event === HALTED) return 'halted';
+  if (entry.event !== DECLARED || entry.data?.via === 'armed-file') return null;
+  const status = entry.data?.status;
+  return typeof status === 'string' && DECLARED_ENDS.has(status) ? status : null;
+}
+
+/**
+ * The run went DOWN: nothing it holds moves until a start lifts it. Written by
+ * the run, not by a lane — so each takes down every lane in flight, and each
+ * lane keeps the first cause it was taken down by. (`run.waiting-external` and
+ * a `run.parked` can name a phase; the run is down all the same.)
+ */
+const STOP_REQUESTED = 'run.stop-requested';
+const RUN_DOWN = new Set([
+  'run.halt', 'run.parked', 'run.paused', STOP_REQUESTED, 'run.console-shutdown', 'run.waiting-external',
+]);
+
+/** The run came back up: a start of it, or a wait clock resuming it. */
+const RUN_UP = new Set([RUN_START, 'run.limit-resume']);
+
+/**
+ * The session modes that are a phase's WORK — every mode but the pull-request
+ * session, which opens the run's pull request and is anchored on a phase only
+ * because every session needs one (phase 58's rule, from its one owner).
+ */
+const WORK_MODES: ReadonlySet<string> = new Set(PHASE_WORK_MODES);
+
+/**
+ * Where two claims about one stretch of a lane overlap, the stronger paints it.
+ *
+ * A freeze outranks a session because a stopped process is not working; a
+ * session outranks everything the run or the queue says, because it is the
+ * one measured fact — a stop that reaches a session still running does not
+ * end its work until the session says it ended; and a declared park outranks
+ * the run being down, because the phase's own reason is the truer one.
+ */
+const PRIORITY: Record<BarKind, number> = { frozen: 6, working: 5, verifying: 4, queued: 3, waiting: 2, down: 1 };
+
+/** A lane's own kinds — what an ATTEMPT window spans. Queueing and down time belong to no boarding's bill. */
+const ATTEMPT_KINDS: ReadonlySet<BarKind> = new Set<BarKind>(['working', 'verifying', 'waiting', 'frozen']);
 
 /** An operator freeze (SIGSTOP) — recorded against the lane it stopped. */
 const FREEZE_START = 'run.frozen';
@@ -242,8 +454,32 @@ const RUNG = RUNG_EVENTS;
  * The rule for adding a name here: it must be an event a reader has ALREADY
  * decided the timeline should not draw. An event nobody has thought about
  * belongs in `unmapped`, which is exactly the point of the counter.
+ *
+ * `phase.serial-behind` is the third (control-tower phase 61): a phase behind
+ * a live lane of its OWN run is ready, not queued — phase 60 made that the
+ * rule — so its stretch is deliberately no bar at all, never a `queued` one.
  */
-export const KNOWN_NO_BAR = new Set(['phase.resources', 'phase.suspect']);
+export const KNOWN_NO_BAR = new Set([
+  'phase.resources', 'phase.suspect', 'phase.serial-behind',
+  // A person's bump of a queued phase and press of Resume (control-tower phase
+  // 96): acts with an author and a why, which the journal reader shows; the
+  // queue episode and the boarding they lead to are what the bars draw.
+  'phase.queue-bumped', 'phase.resume-pressed',
+  // Notes on a verification the `phase.verify` line already draws, and a hold
+  // on a phase that has not boarded (control-tower phase 62).
+  'phase.verify-proven', 'phase.verify-disagreed', 'phase.verification-held',
+  // The baseline a phase took at boarding, the reds it inherited from it and
+  // what their owners owe (control-tower phase 83, #103): notes on the
+  // verification, not stretches.
+  'phase.verify-baseline', 'phase.verify-inherited', 'phase.verify-owed',
+  // What became of the run once a rung fixed this phase (control-tower phase
+  // 81, #105): a continue is drawn by the `run.start` that follows it, and a
+  // park by the run's own stop — the line itself is the decision's reason.
+  'run.recovery-continue', 'run.recovery-parked',
+  // The wrap-up's fast gate on the committed WIP and a verification run in
+  // place (control-tower phase 89): notes on a verification, not stretches.
+  'phase.wip-gate', 'phase.verify-in-place',
+]);
 
 /* ------------------------------------------------------------------ *
  * Projection
@@ -251,17 +487,95 @@ export const KNOWN_NO_BAR = new Set(['phase.resources', 'phase.suspect']);
 
 const timeOf = (entry: JournalEntry): number => Date.parse(entry.time);
 
+/**
+ * One claim about a stretch of a lane. Claims may overlap — a stop lands while
+ * a session is still running, a freeze lands inside one — and `paint` settles
+ * each stretch by `PRIORITY`, so the projection never has to guess an order.
+ */
+type Span = {
+  kind: BarKind;
+  startMs: number;
+  endMs: number;
+  attempt: number;
+  open: boolean;
+  note?: string;
+  /**
+   * A `working` stretch bracketed by an opener and a closer rather than
+   * measured: the only evidence for a session still running, or for one a
+   * journal from before `phase.session` carried `ms`. A measured session it
+   * overlaps REPLACES it — the boarding's preflight is not the session.
+   */
+  provisional?: boolean;
+};
+
 /** One lane, mid-projection. */
 type Building = {
   phase: number;
-  bars: TimelineBar[];
-  open: { kind: BarKind; startMs: number } | null;
+  spans: Span[];
+  /** The one bracketed state open now: a session in flight, a person's proof, a park, a freeze. */
+  ctx: { kind: BarKind; startMs: number; attempt: number } | null;
+  /** A queue episode still open. Parallel to `ctx`: the painter decides what shows. */
+  queue: { startMs: number; attempt: number } | null;
+  /** The run is down with this lane in flight, since when and why. */
+  down: { startMs: number; attempt: number; note: string } | null;
   attempt: number;
+  /** Boarded and not yet settled — the lanes a run going down takes down with it. */
+  inFlight: boolean;
   firstMs: number;
   lastMs: number;
-  /** Saw a boarding before anything else — otherwise the tail cut us off. */
-  sawBoard: boolean;
+  /**
+   * Whether the first span this lane opened began at a boarding or a queue
+   * line; `null` until one opens. Anything else first means the tail cut the
+   * lane's beginning off.
+   */
+  began: boolean | null;
+  /** Each attempt's settle, so its window ends where the phase left the lane. */
+  settled: Map<number, number>;
 };
+
+/** Settles overlapping claims into bars: each stretch goes to its strongest claim. */
+function paint(spans: readonly Span[]): TimelineBar[] {
+  const cuts = [...new Set(spans.flatMap((span) => [span.startMs, span.endMs]))].sort((a, b) => a - b);
+  const bars: TimelineBar[] = [];
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    const from = cuts[i]!;
+    const to = cuts[i + 1]!;
+    let best: Span | null = null;
+    for (const span of spans) {
+      if (span.startMs > from || span.endMs < to) continue;
+      if (!best || PRIORITY[span.kind] > PRIORITY[best.kind]) best = span;
+    }
+    if (!best) continue;                           // a gap: nothing was claimed, so nothing is drawn
+    const last = bars.at(-1);
+    if (last && last.endMs === from && last.kind === best.kind && last.attempt === best.attempt
+      && last.open === best.open && last.note === best.note) {
+      last.endMs = to;
+      continue;
+    }
+    bars.push({
+      kind: best.kind, startMs: from, endMs: to, attempt: best.attempt, open: best.open,
+      ...(best.note ? { note: best.note } : {}),
+    });
+  }
+  return bars;
+}
+
+/** Why the run went down, in the words a bar's tooltip can carry. */
+function downCause(entry: JournalEntry): string {
+  const data = entry.data ?? {};
+  const word = (key: string): string | null => {
+    const value = data[key];
+    return typeof value === 'string' && value.trim() ? value.trim().slice(0, 120) : null;
+  };
+  switch (entry.event) {
+    case 'run.halt': return word('kind') ? `halted: ${word('kind')}` : 'halted';
+    case 'run.parked': return word('reason') ? `parked: ${word('reason')}` : 'parked';
+    case 'run.paused': return 'paused';
+    case 'run.stop-requested': return word('by') ? `stopped by ${word('by')}` : 'stopped';
+    case 'run.console-shutdown': return word('intent') ? `console shut down (${word('intent')})` : 'console shut down';
+    default: return 'waiting on an outside clock';
+  }
+}
 
 export type ProjectOptions = {
   /** The right edge for a run still going. Defaults to the last entry. */
@@ -270,6 +584,15 @@ export type ProjectOptions = {
   deps?: ReadonlyMap<number, readonly number[]>;
   /** The read was a tail, not the whole file. */
   truncated?: boolean;
+  /**
+   * What the LIVE lanes report right now, for the open windows.
+   *
+   * The journal cannot answer for a session still running — `phase.session` is
+   * written when one ENDS — so without this every open bar's cost point would
+   * read zero for as long as the attempt lasts, which is exactly the minute an
+   * operator is asking about.
+   */
+  live?: readonly { phase: number; spentUsd?: number; contextTokens?: number }[];
 };
 
 /**
@@ -279,6 +602,112 @@ export type ProjectOptions = {
  * from an entry's own `time`, which is what makes exit criterion 1 checkable
  * — the bars can be held to the journal rather than to a second model of it.
  */
+/**
+ * Cost and context per attempt window, on the bars' own axis.
+ *
+ * Both facts were already in the journal and neither had a picture. `cost`
+ * sums the `phase.session` entries that fall inside a window — the one event
+ * carrying an attempt's OWN dollars, since `record.costUsd` accumulates across
+ * attempts by design — and `tokens` takes the highest context any session in
+ * it reached, because a window's peak is what says whether it was near the
+ * wall and a mean says nothing at all.
+ *
+ * An OPEN window takes the live lane's figures instead. The journal learns
+ * what a session spent when it ENDS, so an open window read from it alone is
+ * always `$0.00`, which is the one number that is certainly wrong about a
+ * session that has been working for forty minutes.
+ */
+type SeriesWindow = { phase: number; attempt: number; startMs: number; endMs: number; open: boolean };
+
+/**
+ * A lane's attempt windows: each boarding's own bars, ending where the phase
+ * settled. Queued and down bars belong to no boarding's bill — a window drawn
+ * across a thirty-hour stop would spread one attempt's dollars over the stop.
+ */
+function attemptWindows(lane: TimelineLane, settled: ReadonlyMap<number, number>): SeriesWindow[] {
+  const byAttempt = new Map<number, SeriesWindow>();
+  for (const bar of lane.bars) {
+    if (!ATTEMPT_KINDS.has(bar.kind)) continue;
+    const held = byAttempt.get(bar.attempt);
+    if (held) {
+      held.startMs = Math.min(held.startMs, bar.startMs);
+      held.endMs = Math.max(held.endMs, bar.endMs);
+      held.open = held.open || bar.open;
+    } else {
+      byAttempt.set(bar.attempt, {
+        phase: lane.phase, attempt: bar.attempt, startMs: bar.startMs, endMs: bar.endMs, open: bar.open,
+      });
+    }
+  }
+  for (const window of byAttempt.values()) {
+    const end = settled.get(window.attempt);
+    if (end !== undefined && !window.open && end > window.endMs) window.endMs = end;
+  }
+  return [...byAttempt.values()];
+}
+
+function projectSeries(
+  windows: SeriesWindow[],
+  entries: readonly JournalEntry[],
+  t0: number,
+  live: readonly { phase: number; spentUsd?: number; contextTokens?: number }[],
+): { cost: TimelineSeriesPoint[]; tokens: TimelineSeriesPoint[] } {
+  type Window = SeriesWindow;
+  windows.sort((a, b) => a.phase - b.phase || a.attempt - b.attempt);
+
+  const find = (phase: number, atMs: number): Window | undefined =>
+    windows.find((w) => w.phase === phase && atMs >= w.startMs && atMs <= w.endMs)
+    // A session that ended a breath after its last bar still belongs to it.
+    ?? [...windows].reverse().find((w) => w.phase === phase && atMs >= w.startMs);
+
+  const cost = new Map<Window, number>();
+  const tokens = new Map<Window, number>();
+  for (const entry of entries) {
+    const phase = typeof entry.phase === 'number' ? entry.phase : null;
+    if (phase === null) continue;
+    const atMs = timeOf(entry) - t0;
+    if (!Number.isFinite(atMs)) continue;
+    const window = find(phase, atMs);
+    if (!window) continue;
+    if (entry.event === SESSION_END) {
+      const usd = (entry.data as { costUsd?: unknown } | undefined)?.costUsd;
+      if (typeof usd === 'number' && Number.isFinite(usd)) {
+        cost.set(window, (cost.get(window) ?? 0) + usd);
+      }
+    } else if (entry.event === TOKENS) {
+      const data = entry.data as { peakContext?: unknown; lastContext?: unknown } | undefined;
+      const peak = typeof data?.peakContext === 'number' ? data.peakContext
+        : typeof data?.lastContext === 'number' ? data.lastContext : null;
+      if (peak !== null && Number.isFinite(peak)) {
+        tokens.set(window, Math.max(tokens.get(window) ?? 0, peak));
+      }
+    }
+  }
+
+  const liveFor = new Map(live.map((lane) => [lane.phase, lane]));
+  const point = (window: Window, value: number): TimelineSeriesPoint => ({
+    phase: window.phase, attempt: window.attempt,
+    startMs: window.startMs, endMs: window.endMs, value, open: window.open,
+  });
+
+  return {
+    cost: windows
+      .map((window) => {
+        const booked = cost.get(window) ?? 0;
+        const now = window.open ? liveFor.get(window.phase)?.spentUsd : undefined;
+        return point(window, typeof now === 'number' ? booked + now : booked);
+      })
+      .filter((p) => p.value > 0 || p.open),
+    tokens: windows
+      .map((window) => {
+        const seen = tokens.get(window) ?? 0;
+        const now = window.open ? liveFor.get(window.phase)?.contextTokens : undefined;
+        return point(window, typeof now === 'number' ? Math.max(seen, now) : seen);
+      })
+      .filter((p) => p.value > 0 || p.open),
+  };
+}
+
 export function projectTimeline(
   entries: readonly JournalEntry[],
   options: ProjectOptions = {},
@@ -289,6 +718,7 @@ export function projectTimeline(
     return {
       startedAt: null, endedAt: null, horizonAt: at, spanMs: 0, lanes: [], marks: [],
       criticalPath: [], criticalMs: 0, truncated: Boolean(options.truncated), unmapped: 0,
+      series: { cost: [], tokens: [] }, asOf: at,
     };
   }
 
@@ -303,36 +733,119 @@ export function projectTimeline(
   const horizon = finished ? lastMs : Math.max(lastMs, options.now ?? lastMs);
 
   const lanes = new Map<number, Building>();
+  const phaseNotes: TimelineMark[] = [];
   const marks: TimelineMark[] = [];
   let unmapped = 0;
 
   const laneOf = (phase: number, atMs: number): Building => {
     let lane = lanes.get(phase);
     if (!lane) {
-      lane = { phase, bars: [], open: null, attempt: 0, firstMs: atMs, lastMs: atMs, sawBoard: false };
+      lane = {
+        phase, spans: [], ctx: null, queue: null, down: null, attempt: 0, inFlight: false,
+        firstMs: atMs, lastMs: atMs, began: null, settled: new Map(),
+      };
       lanes.set(phase, lane);
     }
     return lane;
   };
 
-  /** Close whatever is open, discarding a zero-width bar nobody can see. */
-  const close = (lane: Building, atMs: number): void => {
-    if (!lane.open) return;
-    const endMs = Math.max(lane.open.startMs, atMs);
-    if (endMs > lane.open.startMs) {
-      lane.bars.push({ kind: lane.open.kind, startMs: lane.open.startMs, endMs, attempt: lane.attempt, open: false });
-    }
-    lane.open = null;
+  /** Record a claim, discarding a zero-width one nobody can see. */
+  const claim = (lane: Building, span: Span): void => {
+    if (span.endMs > span.startMs) lane.spans.push(span);
   };
 
-  const open = (lane: Building, kind: BarKind, atMs: number): void => {
-    close(lane, atMs);
-    lane.open = { kind, startMs: atMs };
+  /** The first span a lane opens says whether we saw its beginning. */
+  const begin = (lane: Building, clean: boolean): void => {
+    if (lane.began === null) lane.began = clean;
+  };
+
+  const closeCtx = (lane: Building, atMs: number, open = false): void => {
+    if (!lane.ctx) return;
+    const { kind, startMs, attempt } = lane.ctx;
+    claim(lane, { kind, startMs, endMs: Math.max(startMs, atMs), attempt, open, ...(kind === 'working' ? { provisional: true } : {}) });
+    lane.ctx = null;
+  };
+
+  const openCtx = (lane: Building, kind: BarKind, atMs: number, clean = false): void => {
+    begin(lane, clean);
+    closeCtx(lane, atMs);
+    lane.ctx = { kind, startMs: atMs, attempt: lane.attempt };
+  };
+
+  const closeQueue = (lane: Building, atMs: number, open = false): void => {
+    if (!lane.queue) return;
+    const { startMs, attempt } = lane.queue;
+    claim(lane, { kind: 'queued', startMs, endMs: Math.max(startMs, atMs), attempt, open });
+    lane.queue = null;
+  };
+
+  const closeDown = (lane: Building, atMs: number, open = false): void => {
+    if (!lane.down) return;
+    const { startMs, attempt, note } = lane.down;
+    claim(lane, { kind: 'down', startMs, endMs: Math.max(startMs, atMs), attempt, open, note });
+    lane.down = null;
+  };
+
+  /** The phase left the lane: everything it held ends here. */
+  const settle = (lane: Building, atMs: number): void => {
+    closeCtx(lane, atMs);
+    closeQueue(lane, atMs);
+    closeDown(lane, atMs);
+    lane.inFlight = false;
+    lane.settled.set(lane.attempt, atMs);
   };
 
   for (const entry of usable) {
     const atMs = timeOf(entry) - t0;
     const phase = typeof entry.phase === 'number' ? entry.phase : undefined;
+
+    if (RUN_DOWN.has(entry.event)) {
+      // The run is down, and every lane still in the air goes down with it —
+      // under the FIRST cause, since a park that follows a halt did not take
+      // anything down that was still up. A queue is withdrawn (phase 60 writes
+      // the close line too; whichever lands first closes it).
+      const note = downCause(entry);
+      for (const lane of lanes.values()) {
+        if (!lane.inFlight && !lane.queue && !lane.ctx) continue;
+        closeQueue(lane, atMs);
+        // A stop ends a frozen child too — continued and then killed — so its
+        // freeze ends here, not whenever somebody next looks at the run.
+        if (entry.event === STOP_REQUESTED && lane.ctx?.kind === 'frozen') closeCtx(lane, atMs);
+        lane.down ??= { startMs: atMs, attempt: lane.attempt, note };
+      }
+      continue;
+    }
+
+    if (RUN_UP.has(entry.event)) {
+      for (const lane of lanes.values()) {
+        // A session a previous console never reported: a new START proves that
+        // console's loop is gone, and the lane's last line is the last moment
+        // anything saw it alive. It ended there, and the run was down until now.
+        if (entry.event === RUN_START && lane.ctx && (lane.ctx.kind === 'working' || lane.ctx.kind === 'verifying')) {
+          const seen = Math.max(lane.ctx.startMs, Math.min(lane.lastMs, atMs));
+          closeCtx(lane, seen);
+          if (seen < atMs) lane.down ??= { startMs: seen, attempt: lane.attempt, note: 'no console' };
+        }
+        closeDown(lane, atMs);
+      }
+      if (entry.event !== RUN_START) continue;
+    }
+
+    if (entry.event === RUN_NOTE) {
+      // A note is a tick, never a bar, and never a reason to open a lane: a
+      // note about a phase that has not boarded on this run would otherwise
+      // invent one. Where it is drawn is decided once every lane is known.
+      const data = entry.data ?? {};
+      const by = typeof data.by === 'string' && data.by ? data.by : 'operator';
+      const text = typeof data.text === 'string' ? data.text.trim() : '';
+      const mark: TimelineMark = {
+        kind: 'note', atMs, label: `${data.pinned === true ? 'pinned · ' : ''}${by}: ${text}`.slice(0, 160),
+        ...(phase !== undefined ? { phase } : {}),
+      };
+      marks.push(mark);
+      if (phase !== undefined) phaseNotes.push(mark);
+      continue;
+    }
 
     if (phase === undefined) {
       // Run-level entries have no lane and are not candidates for one, so they
@@ -355,47 +868,108 @@ export function projectTimeline(
     lane.lastMs = Math.max(lane.lastMs, atMs);
 
     if (entry.event === BOARD) {
-      // A boarding ends a park as well as any stale bar: the phase is running
-      // again, whatever it was doing before.
-      close(lane, atMs);
+      // A boarding ends a park, a queue and a down stretch as well as any stale
+      // bar: the phase is running again, whatever it was doing before.
+      closeQueue(lane, atMs);
+      closeDown(lane, atMs);
       lane.attempt++;
-      if (lane.bars.length === 0) lane.sawBoard = true;
-      lane.open = { kind: 'working', startMs: atMs };
+      lane.inFlight = true;
+      openCtx(lane, 'working', atMs, true);
       marks.push({ kind: 'board', atMs, phase, label: labelOf(entry, `attempt ${lane.attempt}`) });
       continue;
     }
 
-    if (entry.event === VERIFY_START) { open(lane, 'verifying', atMs); continue; }
+    if (entry.event === QUEUE_OPEN) {
+      // A re-sighting of the same episode keeps the entry it already has.
+      begin(lane, true);
+      lane.queue ??= { startMs: atMs, attempt: lane.attempt };
+      continue;
+    }
+
+    if (entry.event === QUEUE_CLOSE || entry.event === ADMITTED) {
+      // A `restarted` close is written by the NEXT console: the episode ended
+      // where it was last seen waiting, `since` + `ms`, not at that boot.
+      closeQueue(lane, lane.queue ? queueEndMs(entry, lane.queue.startMs, atMs, t0) : atMs);
+      continue;
+    }
+
+    if (entry.event === SESSION_END) {
+      // The session ledger on the axis (phase 19): where each session ended,
+      // how, and what it said it cost — `unknown` rather than $0 when it never said.
+      const data = entry.data ?? {};
+      const cost = data.costSource !== 'none' && typeof data.costUsd === 'number'
+        ? ` · $${data.costUsd.toFixed(2)}`
+        : ' · cost unknown';
+      marks.push({
+        kind: 'session', atMs, phase, ok: data.isError !== true,
+        label: `${String(data.mode ?? 'session')} · ended by ${String(data.endedBy ?? 'exit')}${cost}`,
+      });
+      // …and the bar (#76): a session IS the work, and its line says exactly
+      // when it ended and how long it ran. The bracket its opener started is
+      // replaced, not extended — the boarding's preflight was not the session.
+      if (typeof data.mode === 'string' && !WORK_MODES.has(data.mode)) continue;
+      const ms = num(data.ms);
+      if (ms !== null && ms > 0) {
+        begin(lane, false);
+        if (lane.ctx?.kind === 'working') lane.ctx = null;
+        claim(lane, { kind: 'working', startMs: Math.max(0, atMs - ms), endMs: atMs, attempt: lane.attempt, open: false });
+      } else if (lane.ctx?.kind === 'working') {
+        // A line from before `ms` was journalled: the bracket is all there is.
+        closeCtx(lane, atMs);
+      }
+      continue;
+    }
+
+    if (entry.event === VERIFY_START) { openCtx(lane, 'verifying', atMs); continue; }
 
     if (entry.event === VERIFY_END) {
-      close(lane, atMs);
-      // The phase is still in the lane after verifying — it writes a handoff,
-      // records an outcome — so working resumes until something terminal.
-      lane.open = { kind: 'working', startMs: atMs };
+      if (lane.ctx?.kind === 'verifying') {
+        closeCtx(lane, atMs);
+      } else {
+        // The automatic proof: the runner writes only its verdict, and the
+        // verdict carries every command's own time. They ran one after another
+        // and ended here, so that is where the bar goes. Nothing reopens after
+        // it — the session that wrote the handoff had already ended.
+        const ran = Array.isArray(entry.data?.ran) ? entry.data.ran as Record<string, unknown>[] : [];
+        const spent = ran.reduce((total, row) => total + Math.max(0, num(row?.ms) ?? 0), 0);
+        const fromMs = Math.max(0, atMs - spent);
+        if (lane.ctx?.kind === 'working') closeCtx(lane, fromMs);
+        if (spent > 0) {
+          begin(lane, false);
+          claim(lane, { kind: 'verifying', startMs: fromMs, endMs: atMs, attempt: lane.attempt, open: false });
+        }
+      }
       const ok = entry.data?.ok === true;
       marks.push({ kind: 'verify', atMs, phase, ok, label: ok ? 'verification passed' : 'verification failed' });
       continue;
     }
 
     if (PARK_START.has(entry.event)) {
-      open(lane, 'waiting', atMs);
+      openCtx(lane, 'waiting', atMs);
       marks.push({ kind: 'park', atMs, phase, label: labelOf(entry, 'parked') });
       continue;
     }
 
-    if (PARK_END.has(entry.event)) { close(lane, atMs); lane.open = { kind: 'working', startMs: atMs }; continue; }
+    if (PARK_END.has(entry.event)) { closeDown(lane, atMs); openCtx(lane, 'working', atMs); continue; }
 
-    if (entry.event === FREEZE_START) { open(lane, 'frozen', atMs); continue; }
+    if (entry.event === FREEZE_START) { openCtx(lane, 'frozen', atMs); continue; }
 
-    if (entry.event === FREEZE_END) { close(lane, atMs); lane.open = { kind: 'working', startMs: atMs }; continue; }
+    if (entry.event === FREEZE_END) { openCtx(lane, 'working', atMs); continue; }
 
     if (TERMINAL.has(entry.event)) {
-      close(lane, atMs);
+      settle(lane, atMs);
       marks.push({
         kind: 'outcome', atMs, phase,
         ok: entry.event === 'phase.done',
         label: entry.event.replace(/^phase\./, ''),
       });
+      continue;
+    }
+
+    if (entry.event === RECONCILED) {
+      settle(lane, atMs);
+      const outcome = typeof entry.data?.outcome === 'string' ? entry.data.outcome : '';
+      marks.push({ kind: 'outcome', atMs, phase, ok: outcome === 'done', label: `reconciled ${outcome}`.trim() });
       continue;
     }
 
@@ -413,20 +987,6 @@ export function projectTimeline(
 
     if (WALL.has(entry.event)) {
       marks.push({ kind: 'wall', atMs, phase, label: labelOf(entry, 'usage wall') });
-      continue;
-    }
-
-    if (entry.event === SESSION_END) {
-      // The session ledger on the axis (phase 19): where each session ended,
-      // how, and what it said it cost — `unknown` rather than $0 when it never said.
-      const data = entry.data ?? {};
-      const cost = data.costSource !== 'none' && typeof data.costUsd === 'number'
-        ? ` · $${data.costUsd.toFixed(2)}`
-        : ' · cost unknown';
-      marks.push({
-        kind: 'session', atMs, phase, ok: data.isError !== true,
-        label: `${String(data.mode ?? 'session')} · ended by ${String(data.endedBy ?? 'exit')}${cost}`,
-      });
       continue;
     }
 
@@ -449,41 +1009,62 @@ export function projectTimeline(
     if (!KNOWN_NO_BAR.has(entry.event)) unmapped++;
   }
 
+  // A note about a phase with no lane on this run ticks the axis, and says
+  // which phase it was about.
+  for (const mark of phaseNotes) {
+    if (mark.phase === undefined || lanes.has(mark.phase)) continue;
+    mark.label = `phase ${mark.phase} · ${mark.label}`.slice(0, 160);
+    delete mark.phase;
+  }
+
+  const windows: SeriesWindow[] = [];
   const built: TimelineLane[] = [...lanes.values()]
     .map((lane) => {
-      // A bar still open when the journal ends is open, not finished.
-      if (lane.open) {
-        const endMs = Math.max(lane.open.startMs, horizon - t0);
-        lane.bars.push({
-          kind: lane.open.kind, startMs: lane.open.startMs, endMs, attempt: lane.attempt, open: true,
-        });
-        lane.open = null;
-      }
+      // Whatever is still open when the journal ends is open, not finished.
+      const horizonMs = horizon - t0;
+      closeCtx(lane, horizonMs, true);
+      closeQueue(lane, horizonMs, true);
+      closeDown(lane, horizonMs, true);
+      // A bracket a measured session overlaps was never the session's edge.
+      const measured = lane.spans.filter((span) => span.kind === 'working' && !span.provisional);
+      const bars = paint(lane.spans.filter((span) => !span.provisional
+        || !measured.some((m) => m.startMs < span.endMs && span.startMs < m.endMs)));
       const sum = (kind: BarKind): number =>
-        lane.bars.filter((bar) => bar.kind === kind).reduce((total, bar) => total + (bar.endMs - bar.startMs), 0);
-      const workingMs = sum('working');
-      const verifyingMs = sum('verifying');
-      const waitingMs = sum('waiting');
-      const frozenMs = sum('frozen');
-      return {
+        bars.filter((bar) => bar.kind === kind).reduce((total, bar) => total + (bar.endMs - bar.startMs), 0);
+      const out: TimelineLane = {
         phase: lane.phase,
-        bars: lane.bars,
-        startMs: lane.bars.length ? Math.min(...lane.bars.map((bar) => bar.startMs)) : lane.firstMs,
-        endMs: lane.bars.length ? Math.max(...lane.bars.map((bar) => bar.endMs)) : lane.lastMs,
-        totalMs: workingMs + verifyingMs + waitingMs + frozenMs,
-        workingMs, verifyingMs, waitingMs, frozenMs,
+        bars,
+        startMs: bars.length ? Math.min(...bars.map((bar) => bar.startMs)) : lane.firstMs,
+        endMs: bars.length ? Math.max(...bars.map((bar) => bar.endMs)) : lane.lastMs,
+        totalMs: bars.reduce((total, bar) => total + (bar.endMs - bar.startMs), 0),
+        workingMs: sum('working'),
+        verifyingMs: sum('verifying'),
+        queuedMs: sum('queued'),
+        waitingMs: sum('waiting'),
+        downMs: sum('down'),
+        frozenMs: sum('frozen'),
+        measuredMs: bars
+          .filter((bar) => !bar.open && (bar.kind === 'working' || bar.kind === 'verifying'))
+          .reduce((total, bar) => total + (bar.endMs - bar.startMs), 0),
         attempts: lane.attempt,
-        partial: !lane.sawBoard,
+        partial: lane.began !== true,
         critical: false,
       };
+      windows.push(...attemptWindows(out, lane.settled));
+      return out;
     })
     .sort((a, b) => a.phase - b.phase);
 
+  // Weighted by what each phase measurably took (#76) — never by a bar left
+  // open, which on a halted run nobody restarted would grow for as long as
+  // anyone kept looking at it.
   const critical = options.deps
-    ? criticalLane(options.deps, new Map(built.map((lane) => [lane.phase, lane.totalMs])))
+    ? criticalLane(options.deps, new Map(built.map((lane) => [lane.phase, lane.measuredMs])))
     : { phases: [], ms: 0 };
   const onPath = new Set(critical.phases);
   for (const lane of built) lane.critical = onPath.has(lane.phase);
+
+  const series = projectSeries(windows, usable, t0, options.live ?? []);
 
   return {
     startedAt: new Date(t0).toISOString(),
@@ -494,6 +1075,8 @@ export function projectTimeline(
     marks: marks.sort((a, b) => a.atMs - b.atMs || (a.phase ?? 0) - (b.phase ?? 0)),
     criticalPath: critical.phases,
     criticalMs: critical.ms,
+    series,
+    asOf: new Date(options.now ?? lastMs).toISOString(),
     truncated: Boolean(options.truncated),
     unmapped,
   };
@@ -567,17 +1150,31 @@ export type AttemptVerification = { command: string; ok: boolean; code: number; 
 
 export type AttemptSummary = {
   phase: number;
-  /** 1-based boarding index within this journal. */
+  /**
+   * The phase's attempt number: its `phase.start`'s `attempt` — the number its
+   * first session takes, and the one `phase.session`, `phase.tokens` and
+   * `record.attempts` carry (control-tower phase 89, #130). A journal written
+   * before `phase.start` carried it numbers its boardings 1, 2, 3.
+   */
   attempt: number;
   startedAt: string;
-  /** `null` while the boarding is still in the lane. */
+  /**
+   * `null` while the boarding is still in the lane. A boarding its session's
+   * own ending ended (#130) ended when that session did: its newest
+   * `phase.session` line, or the verdict of a §Verification the console ran
+   * after it — the instant the record's `attemptWindows` close on.
+   */
   endedAt: string | null;
+  /** The boarding's wall clock, less any time the phase spent queued inside it (#130). */
   durationMs: number;
   /**
    * How the boarding left the lane: the terminal event's own name (`done`,
-   * `failed`, `gated`, …), `parked` for a boarding that filed a wait, or
-   * `open` for one still running. Never invented — `open` is a fact about the
-   * journal, not a guess about the phase.
+   * `failed`, `gated`, …); the status its session declared when that ended
+   * the work (`partial`, `blocked`, `needs-human`, `waiting-external`);
+   * `halted` for a phase-level halt; `parked` for a boarding that filed a wait;
+   * `superseded` for one the next boarding displaced with nothing ending it;
+   * or `open` for one still running. Never invented — `open` is a fact about
+   * the journal, not a guess about the phase.
    */
   outcome: string;
   model: string | null;
@@ -602,6 +1199,8 @@ export type AttemptSummary = {
     ran: AttemptVerification[];
     notRun: number;
     skipped: number;
+    /** The trees that verdict read (`phase.verify` `trees`, phase 40) — its `{repo, branch, head}` line (phase 24, #41). */
+    trees: { repo: string; branch: string | null; head: string | null; role?: string }[];
   } | null;
   /** The session's closing words, when it left any. */
   said: string | null;
@@ -613,10 +1212,15 @@ const str = (value: unknown): string | null => (typeof value === 'string' && val
 /**
  * A phase's boardings, oldest first.
  *
- * A boarding runs from its `phase.start` to whichever comes first: a terminal
- * event, a park, or the next `phase.start`. That last clause is what makes the
- * function total — a journal whose tail was cut mid-boarding still yields a
- * well-formed list, with the unfinished one marked `open`.
+ * A boarding runs from its `phase.start` to whichever comes first: its
+ * session's own ending (a declared status that stops the work, or a
+ * phase-level halt — settled at the session's end, #130), a terminal event, a
+ * park, or the next `phase.start`. That last clause is what makes the function
+ * total — a journal whose tail was cut mid-boarding still yields a well-formed
+ * list, with the unfinished one marked `open`. A boarding that has settled
+ * stays settled: the lines between it and the next boarding (the resume the
+ * wrap-up armed, the park after a declared wait, the halt after a declared
+ * block) are not placed, and the next `phase.start` settles nothing.
  */
 export function attemptsOf(entries: readonly JournalEntry[], phase: number): AttemptSummary[] {
   const mine = entries.filter((entry) => entry.phase === phase && Number.isFinite(timeOf(entry)));
@@ -625,6 +1229,8 @@ export function attemptsOf(entries: readonly JournalEntry[], phase: number): Att
   let cost = 0;
   let turns = 0;
   let sawSession = false;
+  /** Where the open boarding's work last ended: its newest session, or a verdict after it. */
+  let workEndedAt: string | null = null;
   /**
    * Rungs journalled while no boarding is open.
    *
@@ -635,14 +1241,27 @@ export function attemptsOf(entries: readonly JournalEntry[], phase: number): Att
    * is held and attaches to the next one.
    */
   let pending: string[] = [];
+  /**
+   * The phase's queue episodes — the ones the lane draws as `queued` bars —
+   * and the one still open. Time spent queued is no attempt's (#130): a
+   * boarding's clock is its wall time less every episode inside it.
+   */
+  const queued: { fromMs: number; toMs: number }[] = [];
+  let queueFromMs: number | null = null;
+
+  /** A boarding's clock over `[startedAt, toMs]`: the wall less the queue inside it, an open episode running to `toMs`. */
+  const clockOf = (startedAt: string, toMs: number): number => {
+    const fromMs = Date.parse(startedAt);
+    const episodes = queueFromMs === null ? queued : [...queued, { fromMs: queueFromMs, toMs }];
+    const waited = episodes.reduce((total, e) => total + Math.max(0, Math.min(e.toMs, toMs) - Math.max(e.fromMs, fromMs)), 0);
+    return Math.max(0, toMs - fromMs - waited);
+  };
 
   const settle = (endedAt: string | null, outcome: string): void => {
     if (!current) return;
     current.endedAt = endedAt;
     current.outcome = outcome;
-    current.durationMs = endedAt
-      ? Math.max(0, Date.parse(endedAt) - Date.parse(current.startedAt))
-      : current.durationMs;
+    current.durationMs = endedAt ? clockOf(current.startedAt, Date.parse(endedAt)) : current.durationMs;
     current.costUsd = sawSession ? cost : null;
     current.turns = sawSession ? turns : null;
     out.push(current);
@@ -650,13 +1269,35 @@ export function attemptsOf(entries: readonly JournalEntry[], phase: number): Att
   };
 
   for (const entry of mine) {
+    // A queue episode is the phase's, whether or not a boarding is open: it
+    // opens before a boarding, between two, and — rarely — inside one.
+    if (entry.event === QUEUE_OPEN) {
+      queueFromMs ??= timeOf(entry);                // a re-sighting keeps the episode it has
+      continue;
+    }
+    if (entry.event === QUEUE_CLOSE || entry.event === ADMITTED) {
+      if (queueFromMs !== null) {
+        queued.push({ fromMs: queueFromMs, toMs: queueEndMs(entry, queueFromMs, timeOf(entry)) });
+        queueFromMs = null;
+      }
+      continue;
+    }
+
     if (entry.event === BOARD) {
-      // A boarding with no terminal event ran until this one displaced it.
+      // A boarding nothing ended ran until this one displaced it.
       settle(entry.time, 'superseded');
-      cost = 0; turns = 0; sawSession = false;
+      // …and a boarding ends a queue, as it does on the lane.
+      if (queueFromMs !== null) {
+        queued.push({ fromMs: queueFromMs, toMs: timeOf(entry) });
+        queueFromMs = null;
+      }
+      cost = 0; turns = 0; sawSession = false; workEndedAt = null;
+      // The number the runner journalled (#130), else — a journal from before
+      // it did — one past the boarding before.
+      const numbered = num(entry.data?.attempt);
       current = {
         phase,
-        attempt: out.length + 1,
+        attempt: numbered !== null && Number.isInteger(numbered) && numbered > 0 ? numbered : (out.at(-1)?.attempt ?? 0) + 1,
         startedAt: entry.time,
         endedAt: null,
         durationMs: 0,
@@ -692,6 +1333,7 @@ export function attemptsOf(entries: readonly JournalEntry[], phase: number): Att
       current.said = str(entry.data?.said) ?? current.said;
       current.model = str(entry.data?.model) ?? current.model;
       current.effort = str(entry.data?.effort) ?? current.effort;
+      workEndedAt = entry.time;
       continue;
     }
 
@@ -716,18 +1358,38 @@ export function attemptsOf(entries: readonly JournalEntry[], phase: number): Att
         })),
         notRun: Array.isArray(entry.data?.notRun) ? entry.data.notRun.length : 0,
         skipped: Array.isArray(entry.data?.skipped) ? entry.data.skipped.length : 0,
+        trees: (Array.isArray(entry.data?.trees) ? entry.data.trees as Record<string, unknown>[] : [])
+          .filter((tree) => typeof tree?.repo === 'string')
+          .map((tree) => ({
+            repo: String(tree.repo),
+            branch: str(tree.branch),
+            head: str(tree.head),
+            ...(typeof tree.role === 'string' ? { role: tree.role } : {}),
+          })),
       };
+      // The console's §Verification runs inside the boarding, after its session.
+      workEndedAt = entry.time;
       continue;
     }
 
     if (PARK_START.has(entry.event)) { settle(entry.time, 'parked'); continue; }
     if (TERMINAL.has(entry.event)) { settle(entry.time, entry.event.replace(/^phase\./, '')); continue; }
+    // A settle the board vouches for ends the boarding like any terminal line (#76).
+    if (entry.event === RECONCILED) { settle(entry.time, 'reconciled'); continue; }
+    // The session's own ending (#130): a declared status that stops the work,
+    // or a phase-level halt. Whichever lands first names the attempt — the
+    // runner journals a declaration as it reads it, before it routes it, so
+    // P50's `blocked` precedes the `phase.halted` the ladder's deferral wrote,
+    // and what the session said happened is what the attempt reads. It ended
+    // when its work did, not when the console finished deciding about it.
+    const ended = sessionEnding(entry);
+    if (ended) { settle(workEndedAt ?? entry.time, ended); continue; }
   }
 
   // Whatever is still running is reported as running, with the clock it has.
   if (current) {
     const last = mine.at(-1);
-    current.durationMs = last ? Math.max(0, timeOf(last) - Date.parse(current.startedAt)) : 0;
+    current.durationMs = last ? clockOf(current.startedAt, timeOf(last)) : 0;
     current.costUsd = sawSession ? cost : null;
     current.turns = sawSession ? turns : null;
     out.push(current);

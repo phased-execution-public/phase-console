@@ -284,15 +284,24 @@ function readKeepAlive(label: string, env: NodeJS.ProcessEnv): boolean | null {
  * budget — so it registers the verb here rather than exporting a function the
  * API would have to import from the entry point.
  */
-let restarter: ((reason: string) => void) | null = null;
+let restarter: ((reason: string, how: RestartHow) => void) | null = null;
 
-export function onRestartRequest(handler: (reason: string) => void): void {
+/**
+ * How the exit is carried out when an exit alone would not do (control-tower
+ * phase 48, #71). `reload` starts launchd's reload of a unit whose node
+ * arguments were re-rendered and answers whether it started: when it did, the
+ * restarter waits for the bootout's SIGTERM — this process's ordinary drain —
+ * rather than exiting onto the definition launchd still holds.
+ */
+export type RestartHow = { reload?: () => boolean };
+
+export function onRestartRequest(handler: (reason: string, how: RestartHow) => void): void {
   restarter = handler;
 }
 
-export function requestRestart(reason: string): boolean {
+export function requestRestart(reason: string, how: RestartHow = {}): boolean {
   if (!restarter) return false;
-  try { restarter(reason); } catch (error) { log.error('restart.failed', { reason, error }); return false; }
+  try { restarter(reason, how); } catch (error) { log.error('restart.failed', { reason, error }); return false; }
   return true;
 }
 
@@ -647,6 +656,13 @@ export async function runShutdownHandlers(
  * nothing is looked up, so the successor can never disagree with the console
  * that spawned it.
  *
+ * `process.execArgv` is part of that argv and is the half `process.argv` does
+ * not carry: node strips its own flags before handing the array over, so a
+ * console started with `--max-old-space-size=6144` restarted itself onto V8's
+ * default and met the same heap limit an hour later — the successor silently
+ * less able than the console that spawned it, which is the one thing a restart
+ * must never be.
+ *
  * Pure, so a test can assert the command without starting anything.
  */
 export type SelfRestartPlan = { file: string; args: string[]; cwd: string; command: string };
@@ -655,8 +671,9 @@ export function selfRestartPlan(
   argv: readonly string[] = process.argv,
   execPath: string = process.execPath,
   cwd: string = process.cwd(),
+  execArgv: readonly string[] = process.execArgv,
 ): SelfRestartPlan {
-  const args = argv.slice(1);
+  const args = [...execArgv, ...argv.slice(1)];
   return { file: execPath, args, cwd, command: [basename(execPath), ...args].join(' ') };
 }
 
@@ -707,3 +724,4 @@ export function reexec(plan: SelfRestartPlan, spawn: Spawner): boolean {
     return false;
   }
 }
+

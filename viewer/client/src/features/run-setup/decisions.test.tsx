@@ -1,14 +1,18 @@
 /**
- * The Decisions stage (phase 11 — ZTD-2, gate ACC-1.2): an outstanding
- * blocking row disables Launch and names itself; the four answers the door
- * requires are on the stage; acknowledging a waived row (or the missing
- * channel) clears its block; a signed override re-enables Launch and rides the
- * payload; the manifest and the probes render as the console resolved them.
+ * The Decisions tile (phase 11 — ZTD-2, gate ACC-1.2; a quick-view tile since
+ * control-tower phase 22): an outstanding blocking row disables Launch, names
+ * itself and makes the tile the summons; the answers the door requires are in
+ * the tile, and the account pool beside the account, in Accounts;
+ * acknowledging a waived row (or the missing channel) clears its block; a
+ * signed override re-enables Launch and rides the payload; the manifest and
+ * the probes render as the console resolved them; and the door's advice that
+ * this run take a checkout of its own (probe 6) is a banner with its action.
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ISOLATED } from '@shared/worktree-model.js';
 import { queryClientConfig } from '@/lib/queries';
 import { expectNoAxeViolations } from '@/test/axe';
 
@@ -73,7 +77,7 @@ async function mount() {
   const client = new QueryClient(queryClientConfig);
   const { RunSetup } = await import('./run-setup');
   const Setup = RunSetup as unknown as (p: Record<string, unknown>) => React.ReactElement;
-  render(
+  const view = render(
     <QueryClientProvider client={client}>
       <Setup
         mode="start"
@@ -86,9 +90,16 @@ async function mount() {
     </QueryClientProvider>,
   );
   await screen.findByRole('button', { name: 'Start' });
+  return view;
 }
 
-const panel = () => screen.getByRole('tabpanel');
+/** Press a tile's verb — Edit, or Answer while the tile is the summons. */
+const tile = async (label: string) =>
+  fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^(Edit|Answer) ${label}$`) }));
+/** An expanded tile's controls. */
+const region = (label: string) => screen.getByRole('region', { name: label });
+/** The one Launch, in the dialog's fixed footer. */
+const launch = () => screen.getByTestId('launch-submit');
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -152,33 +163,48 @@ beforeEach(() => {
   mocks.isolationPreflight.mockResolvedValue({ available: true, kind: 'checkout', multiRepo: false });
 });
 
-describe('the Decisions stage', () => {
-  it('opens first with the four answers the door requires, the manifest and the probes', async () => {
-    mocks.runPrelude.mockResolvedValue({ prelude: prelude() });
+describe('the Decisions tile', () => {
+  it('holds the answers the door requires, the manifest and the probes — and the pool sits beside the account', async () => {
+    mocks.runPrelude.mockResolvedValue({
+      prelude: prelude({
+        rows: [
+          row('credentials', { value: '`gh`; credential policy: require', blocking: 'yes' }),
+          // The plan's own `**Accounts:**` clause — what the pool is seeded from.
+          row('accounts', { value: '`default:20`' }),
+          row('gates', { value: 'delegated', origin: 'default', source: 'default' }),
+        ],
+      }),
+    });
     await mount();
-    expect(screen.getByRole('tab', { name: /Decisions/ }).getAttribute('aria-selected')).toBe('true');
-    const stage = panel();
-    expect(within(stage).getByText('What the door requires')).toBeTruthy();
+    // Nothing is open, so the tile is not the summons: its verb is Edit.
+    await tile('Decisions');
+    const decisions = region('Decisions');
+    expect(within(decisions).getByText('What the door requires')).toBeTruthy();
     expect(
-      within(stage).getByRole('checkbox', { name: /If the console restarts, continue this run/ }),
+      within(decisions).getByRole('checkbox', { name: /If the console restarts, continue this run/ }),
     ).toBeTruthy();
-    expect(within(stage).getByLabelText('Relay questions to a person')).toBeTruthy();
-    // The account list is seeded from the prelude's resolved clause — the
-    // plan's `default:20` — and reads as the plan's word, not a change.
-    const accounts = await within(stage).findByDisplayValue('default:20');
-    expect(accounts).toBeTruthy();
-    expect(within(stage).getAllByText('from the plan').length).toBeGreaterThan(0);
+    expect(within(decisions).getByLabelText('Relay questions to a person')).toBeTruthy();
     // The manifest, row by row, with its state and where it came from.
-    const manifest = within(stage).getByRole('list', { name: 'Decision manifest' });
+    const manifest = await within(decisions).findByRole('list', { name: 'Decision manifest' });
     expect(within(manifest).getByText('credentials')).toBeTruthy();
     expect(within(manifest).getByText('blocks a start')).toBeTruthy();
+    expect(within(manifest).getAllByText('from the plan').length).toBeGreaterThan(0);
     expect(within(manifest).getByText('the shipped default')).toBeTruthy();
     // The probes.
-    const probes = within(stage).getByRole('list', { name: 'Probe verdicts' });
+    const probes = within(decisions).getByRole('list', { name: 'Probe verdicts' });
     expect(within(probes).getByText(/1 of 1 credential held/)).toBeTruthy();
     expect(within(probes).getByText(/no MCP server named/)).toBeTruthy();
+    // The account pool is asked beside the account since control-tower phase
+    // 22, not here. It is seeded from the prelude's resolved clause — the
+    // plan's `default:20` — and reads as the plan's word, not a change.
+    expect(within(decisions).queryByLabelText(/Accounts it may spend/)).toBeNull();
+    await tile('Accounts');
+    const pool = await within(region('Accounts')).findByDisplayValue('default:20');
+    expect(pool).toHaveAccessibleName('Accounts it may spend (id:minimum headroom %)');
+    expect(pool).toHaveAccessibleDescription(/from the plan$/);
     // Nothing is open: Launch is live, and the payload carries the answers.
-    const start = screen.getByRole('button', { name: 'Start' });
+    const start = launch();
+    expect(start).toHaveAccessibleName('Start');
     expect(start.hasAttribute('disabled')).toBe(false);
     fireEvent.click(start);
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
@@ -189,7 +215,38 @@ describe('the Decisions stage', () => {
     expect('manifestOverride' in body).toBe(false);
   });
 
-  it('an outstanding blocking row disables Launch and names it — on every stage', async () => {
+  it('Launch waits for the prelude’s first answer — a fresh start sends the account list it resolves', async () => {
+    // Pressed before the prelude answered, the start door refused the launch
+    // with a 400 — "accounts is required" — because the button was live while
+    // the field it fills was still empty (control-tower phase 33, the tower
+    // rehearsal's quick start).
+    let answer: (value: unknown) => void = () => {};
+    mocks.runPrelude.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    await mount();
+    expect(launch()).toBeDisabled();
+    expect(launch().getAttribute('title')).toMatch(/decisions/i);
+    fireEvent.click(launch());
+    expect(mocks.runStart).not.toHaveBeenCalled();
+    answer({ prelude: prelude() });
+    await waitFor(() => expect(launch()).not.toBeDisabled());
+    fireEvent.click(launch());
+    await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
+    const body = mocks.runStart.mock.calls[0]![1] as Record<string, unknown>;
+    expect(body.accounts).toEqual([{ id: 'default', minHeadroomPct: 20 }]);
+  });
+
+  it('a prelude that could not be read holds nothing — the door then says what is missing', async () => {
+    mocks.runPrelude.mockRejectedValue(new Error('the prelude could not be read'));
+    await mount();
+    await waitFor(() => expect(launch()).not.toBeDisabled());
+  });
+
+  it('a blocking decision turns the Decisions tile into the summons and disables Launch with its reason', async () => {
     mocks.runPrelude.mockResolvedValue({
       prelude: prelude({
         rows: [row('credentials', { state: 'outstanding', blocking: 'yes', owner: 'the operator' })],
@@ -197,20 +254,52 @@ describe('the Decisions stage', () => {
       }),
     });
     await mount();
-    const start = await screen.findByRole('button', { name: 'Start' });
+    // The tile is the summons: its verb is Answer, its row says so, and it is the only one.
+    const answer = await screen.findByRole('button', { name: 'Answer Decisions' });
+    const summons = answer.closest('li[data-category]')!;
+    expect(summons.getAttribute('data-category')).toBe('decisions');
+    expect(summons.getAttribute('data-summons')).toBe('true');
+    expect(within(summons as HTMLElement).getByText('1 open')).toBeTruthy();
+    expect(document.querySelectorAll('li[data-summons]')).toHaveLength(1);
+    // The finding is a banner above the tiles, naming the row.
+    const banner = (await screen.findByText('Launch waits for a decision.')).closest('[role="status"]')!;
+    expect(banner.textContent).toMatch(/credentials — outstanding — owed by the operator/);
+    // Launch is held, and its title says why.
+    const start = launch();
+    expect(start).toBeDisabled();
+    expect(start.getAttribute('title')).toContain('Decision outstanding: credentials');
+    // The banner's own action opens the summons.
+    fireEvent.click(within(banner as HTMLElement).getByRole('button', { name: 'Answer' }));
+    expect(within(region('Decisions')).getByTestId('decisions-blocking')).toBeTruthy();
+  });
+
+  it('an outstanding blocking row disables Launch and names it — whichever tile is open', async () => {
+    mocks.runPrelude.mockResolvedValue({
+      prelude: prelude({
+        rows: [row('credentials', { state: 'outstanding', blocking: 'yes', owner: 'the operator' })],
+        blocking: [{ key: 'credentials', why: 'outstanding — owed by the operator' }],
+      }),
+    });
+    await mount();
+    const start = launch();
     await waitFor(() => expect(start.hasAttribute('disabled')).toBe(true));
     expect(start.getAttribute('title')).toMatch(
       /Decision outstanding: credentials — outstanding — owed by the operator/,
     );
-    const banner = await screen.findByTestId('decisions-blocking');
+    await tile('Decisions');
+    const banner = await within(region('Decisions')).findByTestId('decisions-blocking');
     expect(banner.textContent).toMatch(
       /One decision is still open — Launch is disabled until each is answered/,
     );
     expect(banner.textContent).toMatch(/credentials — outstanding — owed by the operator/);
-    // The footer names it on the other stages too, and nothing is posted.
-    fireEvent.click(screen.getByRole('tab', { name: /Review/ }));
-    expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(true);
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    // The footer names it with another tile open too, and nothing is posted.
+    await tile('Engine');
+    expect(screen.queryByRole('region', { name: 'Decisions' })).toBeNull();
+    expect(
+      screen.getByText('Decision outstanding: credentials — outstanding — owed by the operator'),
+    ).toBeTruthy();
+    expect(launch().hasAttribute('disabled')).toBe(true);
+    fireEvent.click(launch());
     expect(mocks.runStart).not.toHaveBeenCalled();
   });
 
@@ -222,16 +311,18 @@ describe('the Decisions stage', () => {
       }),
     });
     await mount();
-    const start = await screen.findByRole('button', { name: 'Start' });
-    await waitFor(() => expect(start.hasAttribute('disabled')).toBe(true));
-    fireEvent.change(screen.getByLabelText('Start anyway, recorded as'), {
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(true));
+    await tile('Decisions');
+    fireEvent.change(within(region('Decisions')).getByLabelText('Start anyway, recorded as'), {
       target: { value: 'the operator' },
     });
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(false));
+    expect(within(region('Decisions')).getByTestId('decisions-blocking').textContent).toMatch(
+      /recorded as an override/,
     );
-    expect(screen.getByTestId('decisions-blocking').textContent).toMatch(/recorded as an override/);
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    // Signed, nothing is waiting any more: the banner above the tiles is gone.
+    expect(screen.queryByText('Launch waits for a decision.')).toBeNull();
+    fireEvent.click(launch());
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
     expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).manifestOverride).toEqual({
       by: 'the operator',
@@ -271,18 +362,19 @@ describe('the Decisions stage', () => {
       });
     });
     await mount();
-    const start = await screen.findByRole('button', { name: 'Start' });
+    const start = launch();
     await waitFor(() => expect(start.hasAttribute('disabled')).toBe(true));
     expect(start.getAttribute('title')).toMatch(/Decision outstanding: relay/);
-    fireEvent.click(await screen.findByRole('checkbox', { name: /relay — waived/ }));
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Start' }).getAttribute('title')).toMatch(/announce/),
+    await tile('Decisions');
+    fireEvent.click(await within(region('Decisions')).findByRole('checkbox', { name: /relay — waived/ }));
+    await waitFor(() => expect(launch().getAttribute('title')).toMatch(/announce/));
+    fireEvent.click(
+      within(region('Decisions')).getByRole('checkbox', { name: /Start anyway with no delivery channel/ }),
     );
-    fireEvent.click(screen.getByRole('checkbox', { name: /Start anyway with no delivery channel/ }));
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(false));
+    // Acknowledged, the silent run is no longer a finding above the tiles.
+    expect(screen.queryByText('Nobody will hear this run.')).toBeNull();
+    fireEvent.click(launch());
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
     expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).acknowledgedWaivers).toEqual([
       'relay',
@@ -352,19 +444,17 @@ describe('the Decisions stage', () => {
       },
     );
     await mount();
-    const start = await screen.findByRole('button', { name: 'Start' });
-    await waitFor(() => expect(start.hasAttribute('disabled')).toBe(true));
-    fireEvent.click(await screen.findByRole('checkbox', { name: /Approve .*frob --check tests\// }));
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(true));
+    await tile('Decisions');
+    fireEvent.click(
+      await within(region('Decisions')).findByRole('checkbox', { name: /Approve .*frob --check tests\// }),
     );
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(false));
     // Once approved it is still shown — checked — so it can be taken back.
     expect(
-      (
-        screen.getByRole('checkbox', { name: /Approve .*frob --check tests\// }) as HTMLInputElement
-      ).getAttribute('aria-checked') ?? 'true',
-    ).toMatch(/true/);
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+      within(region('Decisions')).getByRole('checkbox', { name: /Approve .*frob --check tests\// }),
+    ).toBeChecked();
+    fireEvent.click(launch());
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
     expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).verifyAnswers).toEqual({
       approve: [FP],
@@ -413,14 +503,15 @@ describe('the Decisions stage', () => {
       });
     });
     await mount();
-    expect(screen.queryByRole('checkbox', { name: /Approve .*git push/ })).toBeNull();
-    fireEvent.click(
-      await screen.findByRole('checkbox', { name: /Waive for this run.*git push origin main/ }),
-    );
-    await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'Start' }).hasAttribute('disabled')).toBe(false),
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+    await tile('Decisions');
+    const waive = await within(region('Decisions')).findByRole('checkbox', {
+      name: /Waive for this run.*git push origin main/,
+    });
+    // No approval can carve it, so none is offered beside the waiver.
+    expect(within(region('Decisions')).queryByRole('checkbox', { name: /Approve .*git push/ })).toBeNull();
+    fireEvent.click(waive);
+    await waitFor(() => expect(launch().hasAttribute('disabled')).toBe(false));
+    fireEvent.click(launch());
     await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
     expect((mocks.runStart.mock.calls[0]![1] as Record<string, unknown>).verifyAnswers).toEqual({
       approve: [],
@@ -436,15 +527,102 @@ describe('the Decisions stage', () => {
       }),
     });
     await mount();
+    await tile('Decisions');
     // The prelude is asked after mount; wait for its note (the text is split
     // around the `<code>` span, so match on the paragraph).
     await waitFor(() =>
       expect(
-        within(panel()).getAllByText(
+        within(region('Decisions')).getAllByText(
           (_, node) => node?.tagName === 'P' && /This plan writes no/.test(node.textContent ?? ''),
         ).length,
       ).toBeGreaterThan(0),
     );
     await expectNoAxeViolations(document.body);
   }, 30_000);
+
+  it('the launch door’s isolation recommendation is a banner with its action', async () => {
+    // Probe 6 (control-tower phase 40): another run holds a tree this plan
+    // needs, and the console could give this run trees of its own.
+    const trees = (grantable: boolean) => ({
+      status: 'ok',
+      ok: true,
+      reason:
+        'another run holds `api` on `pe/other` (run r9 of other) — start this run isolated and both drive at once',
+      detail: {
+        held: [{ repo: 'api', branch: 'pe/other', run: 'r9', slug: 'other' }],
+        isolated: false,
+        grantable,
+      },
+    });
+    mocks.runPrelude.mockResolvedValue({
+      prelude: prelude({ probes: { ...PROBES_OK, trees: trees(true) } }),
+    });
+    const view = await mount();
+    const banner = (await screen.findByText('Another run holds a tree this plan needs.')).closest(
+      '[role="status"]',
+    ) as HTMLElement;
+    expect(banner.textContent).toMatch(/another run holds `api` on `pe\/other` \(run r9 of other\)/);
+    // It advises; it does not hold Launch.
+    expect(launch()).not.toBeDisabled();
+    fireEvent.click(within(banner).getByRole('button', { name: 'Give this run its own checkout' }));
+    // The press is the answer, shown where it lives: a work branch, in a checkout of its own.
+    const git = region('Git');
+    expect((within(git).getByLabelText('Branch') as HTMLSelectElement).value).toBe('new-branch');
+    expect(within(git).getByRole('checkbox', { name: /Give this run its own checkout/ })).toBeChecked();
+    fireEvent.click(launch());
+    await waitFor(() => expect(mocks.runStart).toHaveBeenCalledTimes(1));
+    const body = mocks.runStart.mock.calls[0]![1] as Record<string, unknown>;
+    expect(body.gitMode).toBe('new-branch');
+    expect(body.isolation).toBe(ISOLATED);
+    view.unmount();
+
+    // A plan the console cannot isolate still hears the finding — with no
+    // button that would ask for what the door refuses.
+    mocks.runPrelude.mockResolvedValue({
+      prelude: prelude({ probes: { ...PROBES_OK, trees: trees(false) } }),
+    });
+    await mount();
+    const refused = (await screen.findByText('Another run holds a tree this plan needs.')).closest(
+      '[role="status"]',
+    ) as HTMLElement;
+    expect(within(refused).queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Give this run its own checkout' })).toBeNull();
+  });
+
+  it('a checkout changed on the form is judged again by the door, so the advice clears once taken', async () => {
+    // Probes 6 and 7 judge THIS draft's checkout — `preludeDraft` sends
+    // `gitMode` and `isolation` for exactly that — so moving either has to
+    // re-ask the prelude. Here the console answers an isolated draft as isolated.
+    mocks.runPrelude.mockImplementation((_slug: string, draft: { gitMode?: string; isolation?: string }) => {
+      const isolated = draft.gitMode === 'new-branch' && draft.isolation === ISOLATED;
+      return Promise.resolve({
+        prelude: prelude({
+          probes: {
+            ...PROBES_OK,
+            trees: {
+              status: 'ok',
+              ok: true,
+              reason: isolated
+                ? 'this run takes checkouts of its own'
+                : 'another run holds `api` on `pe/other` (run r9 of other)',
+              detail: {
+                held: [{ repo: 'api', branch: 'pe/other', run: 'r9', slug: 'other' }],
+                isolated,
+                grantable: true,
+              },
+            },
+          },
+        }),
+      });
+    });
+    await mount();
+    fireEvent.click(await screen.findByRole('button', { name: 'Give this run its own checkout' }));
+    await waitFor(() =>
+      expect(mocks.runPrelude).toHaveBeenLastCalledWith(
+        'alpha',
+        expect.objectContaining({ gitMode: 'new-branch', isolation: ISOLATED }),
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText('Another run holds a tree this plan needs.')).toBeNull());
+  });
 });

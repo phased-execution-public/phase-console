@@ -81,7 +81,9 @@ test('downstream reach and critical path measure the work that is left', () => {
   // 1 is done so it costs nothing; the heaviest remaining chain is 2 → 4.
   assert.deepEqual(path.phases, [2, 4]);
   assert.equal(path.weight, sizing.L + sizing.M);
-  assert.equal(path.sessions, 1);
+  // In the console's unit (control-tower phase 59): an L and an M are their
+  // measured sessions — 1.93 + 1.66 — never 130K over a 200K budget's one.
+  assert.equal(path.sessions, 4);
 });
 
 test('budgets resolve the way the engine resolves them', () => {

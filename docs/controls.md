@@ -32,10 +32,10 @@ plain language at plan time, or edit the file yourself afterwards.
 | Give a run its own checkout, so two plans in one repo drive at once | the launch form ▸ *Give this run its own checkout* (needs the work branch) | the console |
 | Say what a finished branch becomes | the launch form ▸ *When the plan completes* — PR · merge queue · integration · keep | the console |
 | Cut this run's branch from a chosen base, cap the runs beside it, say what becomes of its checkouts | the launch form ▸ *Branch and checkout* ▸ **Base branch** · **Runs beside it in the repository** · **When the run settles, its checkouts** — each speaks only where the plan's `**Base branch:**` / `**Repo capacity:**` / `**Worktree retention:**` line is silent, and each opens on the Settings ▸ Automation default; the base is refused (`409`) once the branch exists, the cap is clamped to the console's own | the console · the plan |
-| Read where every lane was cut from | the run page's phase table and the Now page's lane row ▸ the branch chip's title — *Cut from `<ref>` at `<sha>` (which git arm; who declared it)*, from the run record's `base` | the console |
-| See that a lane's tree is locked | the Now page's lane row ▸ **locked** chip — the `git worktree lock` reason the runner fastened, on git's word (`ChildRef.locked`); absent means no lock this console holds | the console |
+| Read where every lane was cut from | the run page's phase table and the Tower's live strip ▸ the branch chip's title — *Cut from `<ref>` at `<sha>` (which git arm; who declared it)*, from the run record's `base` | the console |
+| See that a lane's tree is locked | the Tower's live strip ▸ **locked** chip — the `git worktree lock` reason the runner fastened, on git's word (`ChildRef.locked`); absent means no lock this console holds | the console |
 | Bring a stack up before a phase can be proved | `- **Setup:**` in that `### Phase N` block (or one `**Setup (every phase):**` line in §Session budget) | the plan |
-| How long a session may sit on its OWN background job before the console parks it | Settings ▸ Automation ▸ `stallLocalJobMs` (45 min shipped) | the console |
+| How long a session may sit on its OWN background job before the console parks it — measured on the wait CHAIN (calls of one probe, each within `WAIT_CHAIN_GAP_MS`, 3 min, of the last), so the wait procedure's 10-minute slices add up; silent until then, one push when it passes | Settings ▸ Automation ▸ `stallLocalJobMs` (45 min shipped) | the console |
 | Bound the console's own checkouts (cap, setup command, `.env` copy, branch reclaim) | Settings ▸ Automation (shown only while isolation is on) | the console |
 | Delete a run's `pe/*` branches once their PR has merged | Settings ▸ Automation | the console |
 | Open a PR when the plan completes | Settings ▸ Automation ▸ Open a PR (needs the work branch) | the console |
@@ -56,6 +56,27 @@ plain language at plan time, or edit the file yourself afterwards.
 | Let the console push a finished phase's branch | start it with `--allow-publish` AND let the plan's `permission.destructive` row allow `git push` — both, or the landing parks with `phase.landing-push-refused`; `phase-console doctor` has a `publish` row saying whether a push is possible at all | the start command · the plan's `## Decisions` |
 
 
+### Changing a run's settings mid-run
+
+`POST /api/run/<slug>/settings` patches a run in flight or a stored one, and each field lands when
+`SETTING_EFFECTS` (`viewer/shared/run-settings.js`) says — not all of them at the next phase. *Takes
+effect now* is the loop's next decision: an admission (`maxParallel`, `maxConcurrentPerRepo`,
+`onlyPhases`, `priority`, `runBudgetUsd`), a failure count, a wall (`onLimit`, `accounts`), a rung,
+or the permission hook's next call (`permissionProfile`). *From the next phase to board* is a
+session's spawn — its model, effort, skills, servers, mode, budget cap — so the session running now
+keeps what it started with. *At the next phase-finish* is the reviewers, QA's dispatch and the
+landing; *when the run settles* is `settle` and `openPr`; `resumeOnRestart` waits for the console's
+next boot. The sheet prints each field's word beside it.
+
+The plan's QA gate is patchable too (`qa`): on needs the body's `confirm: "creates-test-status"` and
+`--allow-writes`, creates `test-status.md` with every phase that finished before it recorded `waived`,
+and writes the plan's `**QA gate:** on`; off writes the line `off`. The sheet opens while a lane is
+still working. What a patch cannot carry is refused BY NAME in one `409` — `refused: [{field, why,
+verb?}]` beside the run as it now is — and everything else in it is applied: `gitMode` and
+`isolation` while a lane is in flight (re-asserting the value the run already has is never refused),
+`qa` without its confirmation, and `accountId`, which moves through its own verb, `switch-account`.
+Every patch, live or stored, journals `run.reconfigured {patch, before}` with who asked.
+
 ### Who a press is recorded as
 
 Every verb that reaches the console over HTTP — a button, `curl`, the CLI — is recorded under an actor
@@ -71,6 +92,35 @@ derived from the request itself (`actorOfRequest`), never from a name the client
 The app sends no `by` of its own, so a press in the browser reads as `operator` locally and as the
 signed-in login through the proxy. Shut down, Stay off, Release, the ruling routes, the account
 clearance and the account check all carry this actor into their log lines and journal rows.
+
+### What a press answers
+
+Every verb answers with the act it caused, or refuses with the reason — never `200` and nothing
+(control-tower phase 53, #54–#56):
+
+- **Retry, Finish in its own session, Resume with an instruction and Delegate** answer
+  `{run, launched}`: the run, the phase, the session it resumed — `null` when it boarded a FRESH one —
+  the brief, and `why` the phase's own session was not resumed. A refusal is a `409` with the sentence,
+  and the session holding the phase when a live recovery is the reason.
+- **A resume the policy will not resume** (a session too large and cold, checkpointed, or declared
+  `partial --reason budget|context`) boards a fresh session with the resume brief, your instruction and
+  the policy's reason. It used to answer `200` and launch nothing.
+- **A person's press sits in the person slot.** Retry — and a resume or closeout boarded fresh — is
+  accounted OUTSIDE the automatic ladder: journalled `phase.rung {slot: 'person', by: operator}`, it
+  never reads a rung cap and never counts toward one, so the ladder cannot re-park the phase it just
+  boarded. Its dollars still count.
+- **Delegate to the session** is the lead action for a phase parked `needs-human --needs human-acts` —
+  acts the plan keeps for a person. It resumes the phase's session (or boards it fresh) with an
+  instruction that the acts are the session's now, and writes a `deviation` ruling under `human-acts`
+  naming you (`phase.delegated`). It does not move the permission wall: an act the policy refuses comes
+  back as `blocked --needs permission`, and the widen card answers that. Free tier.
+- **Pause, Resume (a pause taken back), Hold, Release and Skip** answer `409` when there is no run to
+  act on, instead of `200 {run: null}`.
+- **Switch account** refuses a target the quota door refuses — retired, a learned wall, a spent
+  window — with a `409` before anything is checkpointed. On a live run the switch is journalled, added
+  to the run's account pool and saved at once, so it survives the loop's next write.
+- **`POST /api/prefs` with a `null` value** returns that key to its shipped default — the one way to take
+  an override back. A key with no shipped default is still dropped.
 
 ## Console automation defaults
 
@@ -102,8 +152,8 @@ what the autopilot may do **by itself** once a phase stops short, and how much o
 | When an MCP server is unavailable | Continue and warn | The phase boards without the servers that would not answer, its prompt names them and tells it to record the gap under **Outstanding** as an errand, and you are told once per run per server. `Park the phase` is the older behaviour — use it when the work genuinely cannot proceed, remembering that a run whose ready phases have all parked has nothing left to start. Settable per run in the launch dialog and per phase in the run's phase matrix; a plan's own `**MCP policy:** require` outranks both the run choice and this preference. |
 | Auto-recover halted runs | on | New runs opt into the ladder (`autoRecoverByDefault`): a stopped phase is classified and climbed by itself, within the caps below; off, every stop is yours. |
 | Continue runs a recovery fixed | on | When a recovery leaves the board reading fixed, the run resumes by itself (`autoContinueRecovery`). |
-| Rungs per phase · Spend per phase | 3 · $100 | The ladder's per-phase caps (`ladderPerPhaseRungs`, `ladderPerPhaseUsd`) — how many rungs one phase may climb and what they may cost before its errand is written. |
-| Rungs per run · Spend per run | 10 · $400 | The per-run caps (`ladderPerRunRungs`, `ladderPerRunUsd`); the one automatic budget raise stays inside the USD cap. |
+| Rungs per phase · Spend per phase | 3 · $100 | The ladder's per-phase caps (`ladderPerPhaseRungs`, `ladderPerPhaseUsd`) — how many rungs one phase may climb and what they may cost before its errand is written. A rung the ENVIRONMENT ended — the API refused the run's credential, the network was down, a transient stop came before the session's first turn — is recorded with `cause: environment` and spends neither the rung count nor the same-rung-once rule (it comes back when the machine does, at most five times on one phase); its dollars still count. |
+| Rungs per run · Spend per run | 10 · $400 | The per-run caps (`ladderPerRunRungs`, `ladderPerRunUsd`); the one automatic budget raise stays inside the USD cap. The rung cap counts only the phases the board does NOT read done — a rung spent on a phase that has since closed stops being charged to the ones still open — while the dollar cap counts every rung the run paid for. A run can carry its own `ladderPerRunRungs` and `ladderPerPhaseRungs` (*Recovery rungs per run* and *per phase* in the launch dialog's Stops — on a start, a Continue, or the run's settings mid-run), which beat these; `0` is a cap under which nothing climbs, and emptying the box on a run that exists hands it back to these. A spent cap's errand names the setting, the arithmetic and how much of it sat on done phases. |
 | Spend per day | $600 | Across every run this console drives in a day (`ladderPerDayUsd`). |
 | Sweep every | 5 min | How often the convergence loop re-reads every open plan even when nothing happened (`convergeEveryMs`; 0 turns the timer off — boot, a docs change and the minute after a stop always run a pass). |
 | Park on a required MCP server for | 30 min | A phase parked by the `require` policy continues without the server after this long, an errand recorded (`mcpRequireTimeoutMs`; 0 waits for it to heal, however long). |
@@ -155,7 +205,11 @@ Two deliberate exemptions:
   though: a recovery press over exactly the evidence the last recovery of that phase ran under (the
   board, the handoff, the locks, the gate) is refused as `unchanged`, and one past six recoveries of a
   phase in a run as `capped` (`RECOVER_MAX_PER_PHASE`) — both journalled `run.recover.refused`, the
-  sentence naming the recovery it repeats. Retry starts the phase over and clears the count.
+  sentence naming the recovery it repeats. Retry starts the phase over and clears the count — and
+  **replenishes the phase's ladder**: the interruptions and environment-caused rungs it counted are
+  forgiven (`phase.ladder-replenished`), so a remedy the console's own restarts or an outage burned
+  is climbable again. A rung that ran and failed on its merits stays tried, and no dollar is given
+  back.
 - **A live phase is never interrupted.** The schedule decides whether a session may START; a session
   already running when quiet hours begin runs to its own end. Stopping work mid-edit to keep a
   timetable would leave a working tree nobody owns.
@@ -191,6 +245,21 @@ request that asked:
   phase's refusal would; any answer — a usage limit included, since the API took the credential and then
   counted — promotes `unknown` to `entitled`; a session that could not answer moves nothing. 409 while a
   check is already running for it.
+
+An account whose login broke is repaired where it was diagnosed, whatever its kind — also behind
+`--allow-accounts`:
+
+- `POST /api/accounts/login {accountId}` — signs a profile in again in the embedded terminal, and the
+  machine login with the CLI's own `claude auth login` and no `CLAUDE_CONFIG_DIR` (the command comes
+  back to copy when there is no terminal). While a live run pays as the machine login it answers
+  `mode: "warn"` with the runs and the identity they are bound to, and runs nothing until the body
+  carries `confirm: "ends-live-sessions"`. For a token it answers `mode: "replace-token"`.
+- `PUT /api/accounts/<id>/credential {token}` — replaces a token account's credential and keeps its id
+  and name; what the machine learned about the old token goes with it. Adding a token under a name an
+  account already has is a `409` whose `existing` names that account.
+
+Every account's view carries `meter` (`ok` · `broken` · `unsupported` · `none`) and `paying` — the
+live runs set to pay as it.
 
 
 ### Relayed questions and relay rules
@@ -294,6 +363,74 @@ automatic door (the convergence loop, a watch landing, a boot re-adoption, the h
 the streak forward, and a run that stopped on a spent streak is refused the loop's own relaunch
 (`run.relaunch-refused`) until somebody presses. The fourth and largest size is the whole console at
 once — the next section.
+
+**The budget, and what may spend it.** The counter means *this plan keeps failing* — it is the run's
+one "stop, something is wrong with the work" bound, which is why `failure-streak` is a halt only a
+person's press relaunches. So since 5.2.0 exactly one function raises it (`chargeFailure`), and two
+things never do: a **refused credential** and a **connectivity** stop. Neither is a claim about the
+plan — the run is being refused entry, or the machine cannot reach the API at all — and letting them
+spend the budget both destroyed the signal and converted a transient fault into a second, independent
+press-only halt. (Measured: one network event charged three failures in 39 seconds and left a run at
+**3 of a maximum 2**.) The counter can also no longer exceed its maximum, and a second lane meeting a
+wall the run has already halted on charges nothing and raises no second errand. What it refused to
+count is journalled (`run.failure-streak-held`), because a number that quietly stopped moving is how
+"3 of 2" went unexplained for a day.
+
+**What the streak counts: failed PHASES, not endings** (control-tower phase 45). The streak is the
+ordered set of *distinct* phases whose ending was a **merit** failure since the last phase that settled
+done — `MERIT_FAILURE_CAUSES` in `shared/run-lifecycle.js`: a §Verification whose final attempt is red
+(`verify-red`), the plan left failing its lint (`plan-lint`), a person marking the manual checks failed
+(`checks-failed`), a session that ended with no handoff and **nothing on disk** (`no-handoff`), a phase
+declared blocked (`declared-blocked`), and a session whose every attempt failed (`crash`). The number
+on the card is that set's size, and the halt names it in order — "2 phases failed in a row: phase 3,
+then phase 5". Each charge is journalled `run.failure-charged` with the set. Never charged:
+
+- **a command rescued by its retry** — a command's verdict is its last attempt, and one function
+  (`verificationVerdict`) decides both the verification's `ok` and the halt, so a verification that
+  reads green can no longer halt its phase `verify-failed` (every verify-failed halt of one measured
+  week was that contradiction);
+- **a second ending of a phase already in the set** — the same phase blocked twice is one failure;
+- **a spent wait budget** — a budget event, not a failure: the phase waits on its refs with a
+  `budgets` errand (see [session-budget.md](session-budget.md)), and neither fails nor spends a rung;
+- **an ending the board contradicts** — a red verdict over a handoff the board already reads complete
+  settles done with the red on the record, and a phase the board later closes leaves the set;
+- **no handoff with work on disk** (`no-handoff-worked`) and **the network** (`connectivity`) — the
+  first is unfinished paperwork the ladder's work-in-progress rungs answer, the second the weather;
+- **a declared block the watch clock can end** (`declared-wait`) — a `blocked` declaration naming a
+  ref the console polls is a wait: the runner parks the phase `waiting` on it (its `poll-park`, on the
+  wait budget and window a `waiting-external` gets), and its landing resumes the phase's own session;
+- **a second charge on one root cause** — a charge names what it is blamed on (the blamed commit,
+  else the refs a block watched), and a sibling stopped by the same cause is held, not counted: the
+  halt says each counted phase's cause, "phase 5 (on commit 1c8164e9)".
+
+**Recover & continue over a superseded stop.** A run halted on a phase the board now shows done —
+the commonest `failure-streak` shape, since its anchor is a phase this run adjudicated and reconcile
+rightly leaves such a record alone — is cleared and continued by the one press
+(`run.plan-recover {step: 'superseded'}`), rather than answered "nothing to launch" over a halted run
+with ready phases.
+
+**Clearing it.** `POST /api/run/<slug>/clear-streak` zeroes the count and nothing else — its own verb,
+because when an outage spends the budget there is no phase to retry and Retry was the only thing that
+cleared it. The stopped run's "Why this is stopped" card draws the streak as *n of max* beside the
+control, and says so when **every** registered account is unusable (`halt.accounts`), so "switch to
+another account" is never advice you cannot take. Answers `409` on a finished run: a settled run's
+record is not editable. Journalled `run.failure-streak-reset {was, by, via}`.
+
+**Raising a budget** (control-tower phase 14, #40). Every budget that can stop work — a phase's wait,
+a phase's or the run's dollars, the recovery ladder's cap, the failure streak — announces under the
+`budget` notification category at 80% (`phase.budget-approaching`, once per budget per attempt) and
+when it is spent, and the card's first line says **budget** with the arithmetic (`60m wait budget ·
+39.7m accrued · 20.3m left · asked for 90m`) rather than the sentence of whatever it stopped.
+`POST /api/run/<slug>/raise-budget {budget, phase?, add? | to?, scope?}` raises it in one press:
+`wait` writes the plan where the budget was declared — the phase's `Waits on:` max, or with
+`scope: "plan"` the plan's `Wait budget:` — through `scripts/wait-budget.sh`, so it needs
+`--allow-writes` (403 otherwise); `phase-usd`, `run-usd` and `ladder` patch the run's own setting
+(`phaseBudgetUsd`, `runBudgetUsd`, `ladderPerRunRungs` — or the cap errand's `ladderPerPhaseRungs`).
+Either way it journals `run.budget-raised {budget, was, now, by, via: raise-budget}`, answers the
+hold the budget left (the spent-wait stamp, which re-arms the watch; the budget errand; a budget
+halt) and retries — the phase it held, or the run it halted. The streak is never raised: this verb
+answers `400` naming `clear-streak`. The card offers +30m, +60m and any amount for a wait, a dollar
+step for a cost cap and rungs for a cap, beside Clear the streak.
 
 ## Freezing the whole console
 
@@ -611,7 +748,7 @@ queued plan — as a suggested order, computed when you ask and never acted on.
 
 
 Nothing on it is a new control: the columns, the lane rows, the holder facts, the branch chip, the
-meters and every lifecycle door are the same primitives the run and Now pages use, which is why a
+meters and every lifecycle door are the same primitives the run page and the Tower use, which is why a
 verb cannot behave one way here and another way there.
 
 ## Steering which plan goes first
@@ -633,9 +770,26 @@ Start; a hold refuses the next admission and nothing else, so a Release puts it 
 the queue. Held entries name who held them on the queue page, and never age into a reservation —
 standing aside must not turn a plan into an obstacle.
 
-**Bump** moves one queued entry to the front of its class. It never crosses a class boundary (the
-priority control is what says that out loud), and it is one-shot: the mark lives on that queue
-entry and dies with it, so a phase that queues again later starts from its class's tail.
+**Bump** moves one phase to the front of its class. It never crosses a class boundary (the
+priority control is what says that out loud). Since control-tower phase 99 (#135) it is DURABLE:
+the mark lives on the phase's own record, not on the queue entry, so a pause, a retry, a wrap-up, a
+relaunch or a restart re-creates the entry already bumped, and the run's own boarding order puts
+the phase first among its siblings; it is spent when the phase boards. Two bumps order by when they
+were given, the most recent first.
+
+**The queue page** (`#/queue`, linked from the Tower's board header) is the whole queue of one
+console: every entry in the order it will board, with why it sits there — a dependency, an aged-out
+reservation, its class, a bump, or first come first served — what it waits on (a lane polling its own
+job is named so), its class, account and clocks; the live lanes and who each holds up; the phases a
+re-board asked for that no entry holds yet (Queue it bumps one); the withdrawn phases (Re-queue);
+and the audit strip — every change, newest first, with who and why. Beside Bump, one phase at a time:
+**Hold** keeps it queued with its age, never admitted, until **Release**; **Defer** is a hold that
+ends by itself at a time; **Withdraw** takes it out — its run boards its other phases and names it
+until you **Re-queue** it. Type the reason once at the top of the page and every press records it.
+Every one is `POST /api/queue/<verb>` — `bump`, `hold`, `release`, `defer {until}`, `withdraw`,
+`requeue {position?: 'front'}`, `reorder {slug, phases}` (the listed phases first, in that order) —
+naming an entry by `entryId` or a phase by `{slug, phase}`, each journalled on its run with the
+actor and the reason.
 
 **Start after `<slug>`** (launch only) chains a run behind another plan: it boards nothing until
 that plan's latest run *ends* — finished, paused, parked, halted or stopped, whichever comes — and
@@ -643,9 +797,10 @@ the chain survives a console restart because it lives on the run's checkpoint. T
 it as *waiting for `<slug>` to settle*. The slug is not validated: one that names no plan settles
 at once, rather than refusing to start a run whose predecessor you are about to create.
 
-`GET /api/queue` carries **ordering advice** alongside the entries — remaining plan weight and an
-ETA per queued plan, computed when you ask and never stored. Nothing on the server reads it back:
-it is the figure to look at before deciding to use one of the four controls above.
+`GET /api/queue` carries everything the queue page draws — the widened entries, `lanes`, `hinted`,
+`withdrawn` and `audit` — and **ordering advice** alongside them: remaining plan weight and an ETA
+per queued plan, computed when you ask and never stored. Nothing on the server reads the advice
+back: it is the figure to look at before deciding to use one of the controls above.
 
 **Run-level beats plan prose for console-minted sessions.** When a run uses the work branch and the
 plan's own `**Branch:**` line names a different branch, the session is told to use the run's branch
@@ -683,6 +838,7 @@ scripts/phase-graph.sh <slug> --gate-status N    # evaluate the gate (approval c
 scripts/gate-approve.sh <slug> N --by <who>      # record a clearance (--revoke restores the gate)
 scripts/phase-graph.sh <slug> --notes N          # what earlier phases LEFT for phase N: source<TAB>kind<TAB>id<TAB>at<TAB>text
 scripts/phase-graph.sh <slug> --boot-prompt N    # the copy-paste prompt for phase N (notes block included)
+scripts/phase-graph.sh <slug> --boot-fanout "N M" # a fan-out's shared boot once + each phase's own block (#115)
 scripts/phase-graph.sh <slug> --session-plan opus   # proposed session grouping
 scripts/phase-graph.sh <slug> --qa-mode          # off | on <reason> | waived <reason>
 scripts/phase-graph.sh <slug> --qa-result N      # the recorded verdict
@@ -702,9 +858,9 @@ prints a `🔒 CLOSED` banner in place of the ready/waiting/batching lines. `val
 | Script | What it does |
 |---|---|
 | `new-plan.sh <slug>` | Scaffold `docs/plans/<slug>.md` from the template. |
-| `new-handoff.sh <slug> <N> <title> [status] [--qa] [--force]` | Scaffold the phase handoff, update `INDEX.md`, auto-fill dependencies and generate a boot prompt per unblocked phase. |
+| `new-handoff.sh <slug> <N> <title> [status] [--qa] [--force]` | Scaffold the phase handoff, update `INDEX.md`, auto-fill dependencies and write the next phase's boot prompt — for a fan-out, the shared boot once and a block per unblocked phase. |
 | `handoff-status.sh <slug>` | The INDEX, per-file status, and the live board. |
-| `next-phase-prompt.sh <slug> <N\|none>` | End-of-phase banner, board, batching advice, and a boot prompt for every newly ready phase. |
+| `next-phase-prompt.sh <slug> <N\|none> [--phase M]` | End-of-phase banner, board, batching advice, and the boot for every newly ready phase (a fan-out's shared boot once); `--phase M` composes phase M's full prompt. |
 | `phase-lock.sh <slug> claim\|release\|status\|list\|conflicts <N> [--owner <id>] [--scope <csv>] [--session <id>] [--force] [--git]` | Claim, release or inspect a phase lock; `conflicts` asks across every plan whether a live session shares your scope. `--session` (default `$PE_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`) names the session in the lock, so the console can release it the moment that session ends. |
 | `phase-lane.sh <slug> create\|merge\|remove <N> [--qa <round>] [--detach] [--repo <token>] [--owner <id>] [--force]` · `phase-lane.sh list [<slug>]` | A hand session's own checkout, made where the console keeps its own: a locked worktree of the phase's repository under `<root>/.worktrees/hand/<slug>/p<N>[-qa<r>]` on `pe/<slug>-p<N>[-qa<r>]` (or detached), folded back with ff-then-`--no-ff`, removed with `worktree remove` + `branch -d` — never a sibling folder of the project. |
 | `phase-outcome.sh <slug> <N> complete\|waiting-external\|blocked\|needs-human\|partial\|no-defect [--reason …] [--needs KEY] [--rule …] [--command …] [--wait-minutes M \| --until ISO] [--watch ref]` | Declare how a session ended, machine-readably — the runner's channel (`PE_OUTCOME_FILE`); unsupervised, it lands in the console's inbox and is picked up the same way. `--needs <key>` is REQUIRED on `blocked` and `needs-human` (a decision key of the plan's manifest, or `credential` / `permission` / `gate` / `external` / `lock`) and is what the classifier reads before the prose. `--wait-minutes`/`--until` are accepted only with the three that PARK (`waiting-external`, `blocked`, `needs-human`). `no-defect` is "I looked, and there was nothing to fix". `--watch` is repeatable (at most 8: `gh:<repo>#run/<id>` · `gh:<repo>#pr/<n>` · `date:<ISO>` · `lock:<slug>/<phase>` · `cmd:"<command>"`); a ref of no shape the console polls is warned about on stderr ("will never be checked") and journalled `phase.watch-unpollable`. What the console does with the words: a `waiting-external` window is judged against the phase's wait budget (`--wait-budget` above: its `Waits on:` bullet, else the plan's `Wait budget:`, else the console's 8 h) — granted inside it, and a declared window past it refused with the arithmetic unless the plan countersigned a `date:` reaching that far; a `blocked` or `needs-human` clock is capped at 7 days (`DECLARED_CLOCK_MAX_MS`) and the cap journalled. Each word is acted on at most 4 times per phase (`DECLARATIONS_MAX_PER_PHASE`; past it `phase.declaration-refused`, and Retry clears the count), `waiting-external` being bounded by its own park count instead; unsupervised, a second `partial` inside 5 minutes collapses into the first (`DECLARATION_COOLDOWN_MS`). |
@@ -721,6 +877,7 @@ prints a `🔒 CLOSED` banner in place of the ready/waiting/batching lines. `val
 |---|---|
 | `phase-console install-hooks \| uninstall-hooks \| hooks-status [--settings <file>]` | Add, remove or report the four session-presence entries in `~/.claude/settings.json` (or the file `--settings` names) — merged, never clobbered, idempotent. `hooks-status` exits 0 when they are installed and 1 when not. |
 | `phase-console doctor [instance] [--json]` | The report described in [the control surface](#the-control-surface-at-a-glance): the prelude's probes and the machine rows, from the console on the instance's port or, with none, from disk (`mode: offline`). Exit 1 names the first failing row that blocks; `--json` prints the report as `GET /api/doctor` serves it. |
+| `phase-console report [instance] --since <iso> [--until <iso>] [--replay] [--json]` | The week in numbers, read from the instance's state directory with no console needed: how much of each run's working life it sat stopped and who ended each stop, the stops today's rules would not make, failure-streak and verify-failed halts, phantom spend, the queue, the holder and phase ETAs, stall cards on finished lanes, resumes cut by the closeout cap, phases closed with an unrun verification, the model each phase ran on, and what re-reading the context cost (cache-read volume, the mean context a call re-read, the boot prefix's share) — then the plan-acceptance targets judged on them. `--replay` re-derives the streak, spend, ETA and holder numbers with today's models over the same journals. It never writes, and ships in both editions. |
 | `phase-console sessions ingest [instance] [--root DIR] [--json] [--quiet] [--peers-of <session>]` | Drain an instance's session-presence inbox through the registry's own code with no console up: every event applied with its lateness, one older than the history horizon applied as history, one older than a week refused. It never drains under a console — when the instance's own console answers on its port, or the port answers too slowly to tell, it says so and does nothing, because a running console drains its own inbox. Prints `drained <name>: N applied (N as history), N refused, N left`; `--peers-of` adds one `peers=<sentence>` line, the live sessions in the root without that one. One drain at a time across processes. |
 
 
@@ -749,5 +906,6 @@ surprise.
 
 
 
----
 
+
+---

@@ -39,7 +39,7 @@
 
 import { GitBranch, GitCommitHorizontal, GitMerge, Tag } from 'lucide-react';
 import type { RepoCommit, RepoGraph } from '@/lib/api';
-import { Chip, TD, TR } from '@/components/ui';
+import { Badge, TD, TR, type BadgeTone } from '@/components/ui';
 import { cn } from '@/lib/cn';
 import { relativeTime } from '@/lib/format';
 import { decorateRef, packLanes, type DecoratedRef, type GraphLink, type GraphRow } from './lanes';
@@ -63,7 +63,7 @@ const LANE_TONES = [
   'var(--color-accent)',
   'var(--color-done)',
   'var(--color-running)',
-  'var(--color-gated)',
+  'var(--color-needs-you)',
   'var(--color-verifying)',
   'var(--color-needs-you)',
 ] as const;
@@ -80,11 +80,11 @@ const x = (lane: number) => lane * LANE_W + LANE_W / 2;
  * execution looks like from the repository's side. Everything else is a chip in
  * the ordinary ink — a person's branch is not news here.
  */
-const REF_TONE: Record<DecoratedRef['kind'], 'accent' | 'ok' | 'neutral' | 'warn'> = {
+const REF_TONE: Record<DecoratedRef['kind'], BadgeTone> = {
   trunk: 'ok',
   run: 'accent',
   lane: 'accent',
-  tag: 'warn',
+  tag: 'accent',
   head: 'neutral',
   branch: 'neutral',
 };
@@ -101,7 +101,7 @@ const REF_TITLE: Record<DecoratedRef['kind'], string> = {
 export function RefChip({ decorated }: { decorated: DecoratedRef }) {
   const { kind, name, run } = decorated;
   return (
-    <Chip
+    <Badge
       tone={REF_TONE[kind]}
       mono
       data-testid="ref-chip"
@@ -116,7 +116,7 @@ export function RefChip({ decorated }: { decorated: DecoratedRef }) {
     >
       {kind === 'tag' ? <Tag size={10} aria-hidden /> : <GitBranch size={10} aria-hidden />}
       {name}
-    </Chip>
+    </Badge>
   );
 }
 

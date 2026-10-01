@@ -33,10 +33,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+import { execFileSync } from 'node:child_process';
+
 import { PERMISSION_MODES } from '../server/runner/spawn.ts';
 import {
   PERMISSION_MODES as OWNER_MODES,
   PERMISSION_PROFILES,
+  DEFAULT_PERMISSION_MODE,
 } from '../shared/run-settings.js';
 
 const MODES_SRC = readFileSync(
@@ -93,4 +96,32 @@ test('the run PROFILE words are not CLI modes, which is why they must be transla
       `${choice} must be a permission PROFILE`,
     );
   }
+});
+
+// ── control-tower phase 11 (#34): the plan file names a mode, so bash reads one ──
+
+const PERMISSION_ENV = fileURLToPath(new URL('../../scripts/permission.env', import.meta.url));
+
+/** One variable out of `scripts/permission.env`, exactly as `phase-graph.sh` would read it. */
+function fromBash(name: string): string {
+  return execFileSync('bash', ['-c', `. "${PERMISSION_ENV}"; printf '%s' "$${name}"`], { encoding: 'utf8' });
+}
+
+test('scripts/permission.env is PERMISSION_MODES, word for word — the drift test', () => {
+  // `phase-graph.sh --permission-mode` and lint F31 accept exactly the words
+  // this file lists; the console hands the resolved word to the CLI. A mode
+  // added on one side only would be a plan the lint passes and the CLI refuses,
+  // or one the CLI takes and the lint fails.
+  const bash = fromBash('PERMISSION_MODES');
+  assert.ok(bash.length > 0, 'PERMISSION_MODES: bash read an empty list — a typo in permission.env');
+  assert.equal(bash, OWNER_MODES.join(' '), 'PERMISSION_MODES drifted between permission.env and run-settings.js');
+  assert.equal(fromBash('DEFAULT_PERMISSION_MODE'), DEFAULT_PERMISSION_MODE);
+  assert.ok((OWNER_MODES as readonly string[]).includes(DEFAULT_PERMISSION_MODE), 'the default is a mode');
+});
+
+test('bypass is a PROFILE, never a mode a plan may name', () => {
+  // `bypassPermissions` is supplied by the `bypass` profile (`spawn.ts`), and
+  // a plan line naming it would be a plan widening its own permissions.
+  assert.ok(!(OWNER_MODES as readonly string[]).includes('bypassPermissions'));
+  assert.doesNotMatch(fromBash('PERMISSION_MODES'), /bypass/i);
 });

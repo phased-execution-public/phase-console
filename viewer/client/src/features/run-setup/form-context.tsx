@@ -1,9 +1,9 @@
 /**
- * The form, as the stages see it.
+ * The form, as the tiles and sections see it.
  *
  * `RunSetup` owns the values, the seed, the provenance, the validation and the
- * one submit; the stages and sections are arrangement. Rather than thread
- * thirty props through four stages and twelve sections, the form publishes
+ * one submit; the quick view and the sections are arrangement. Rather than
+ * thread thirty props through nine tiles and twelve sections, the form publishes
  * ONE object through context and every section asks for it. The object is
  * data plus the four verbs a control needs (`set`, `on`, `src`, `submit`) —
  * nothing here decides what a field means.
@@ -18,12 +18,13 @@ import type {
   PlanReviewer,
   SkillInfo,
 } from '@/lib/api';
-import type { Source } from './fields';
+import type { CategoryId } from './categories';
+import type { FieldEffect, Source } from './fields';
 import type { PressField, ToggleField } from './fields';
 import type { RunSetupContext, RunSetupMode } from './modes';
+import type { PresetId } from './presets';
 import type { RunSetupField, RunSetupValues } from './schema';
 import type { Origins } from './seed';
-import type { StageId } from './stages';
 
 export interface SetupForm {
   mode: RunSetupMode;
@@ -47,6 +48,11 @@ export interface SetupForm {
   live: (field: RunSetupField) => boolean;
   /** Where the field's current value came from — undefined on the defaults page. */
   src: (field: RunSetupField) => Source | undefined;
+  /**
+   * When a change to the field lands — on a live run's settings sheet only
+   * (control-tower phase 24, #31); undefined on every other mode.
+   */
+  fx: (field: RunSetupField) => FieldEffect | undefined;
   /** The boolean idiom for this mode: a checkbox on a launch, a pressed button on the defaults page. */
   Bool: typeof ToggleField | typeof PressField;
 
@@ -84,6 +90,11 @@ export interface SetupForm {
   canAutoRecover: boolean;
   isolationPreflight: IsolationPreflight | undefined;
   concurrencyMax?: number;
+  /**
+   * This console's own rung caps (Settings ▸ the ladder card) — what an empty
+   * "Recovery rungs" box falls back to, so its hint names the number.
+   */
+  ladderCaps?: { perRun: number; perPhase: number };
 
   /* ---- the submit ---- */
   blocked: boolean;
@@ -93,8 +104,17 @@ export interface SetupForm {
   submitLabel: string;
   submit: () => void;
   footerNote?: ReactNode;
-  /** Go to a stage — present only in the staged overlay; the review's "Change" links read it. */
-  goStage?: (stage: StageId) => void;
+  /**
+   * The quick view's one expanded tile, and the verb that opens one (null
+   * folds it) — present only in the staged overlay; the tiles' Edit and the
+   * review's Change links read them (control-tower phase 22).
+   */
+  openCategory?: CategoryId | null;
+  goCategory?: (id: CategoryId | null) => void;
+  /** The preset row: the choices this launch offers, the one on screen, and the verb that lays one over the seed. */
+  presets?: readonly PresetId[];
+  preset?: PresetId | null;
+  choosePreset?: (id: PresetId) => void;
 }
 
 const SetupFormContext = createContext<SetupForm | null>(null);

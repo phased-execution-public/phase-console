@@ -8,10 +8,11 @@
  * date is early by more than the estimate itself, and being early is exactly
  * the direction nobody checks.
  *
- * So the two properties pinned here are: the duty cycle is MEASURED from the
- * plan's own completions and stretches the estimate, and when it cannot be
- * measured the forecast SAYS SO in its assumptions rather than quietly
- * assuming 100%.
+ * So the properties pinned here are: the duty cycle is MEASURED from the plan's
+ * RECENT completions (a bounded window, control-tower phase 58, #66) and
+ * stretches the estimate; when it cannot be measured, or measures a plan that
+ * mostly sat, the forecast has NO date and says why; and every figure names
+ * its clock.
  */
 
 // Redirects XDG_STATE_HOME/XDG_CONFIG_HOME before anything resolves them.
@@ -21,32 +22,36 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  dutyCycle, etaFrom, forecastFrom, rateFor,
+  DUTY_MIN_RATIO, DUTY_WINDOW, dutyCycle, etaFrom, forecastFrom, rateFor,
   type EtaEstimate, type EtaSample,
 } from '../server/analysis/stats.ts';
 
 const HOUR = 3_600_000;
-const NOW = Date.parse('2026-08-24T12:00:00Z');
+const DAY = 24 * HOUR;
+const NOW = Date.parse('2026-08-20T12:00:00Z');
 
 /** A completion: `durationMs` of work, ending at `at`. */
 const sample = (at: string, hours: number, weight = 40_000): EtaSample =>
-  ({ weight, durationMs: hours * HOUR, at });
+  ({ weight, durationMs: hours * HOUR, at, size: 'M' });
 
-/** A plan that worked 1 h out of every 4 h of wall-clock: four completions, 3 h apart. */
-const QUARTER_DUTY: EtaSample[] = [
+/** A plan that worked 1 h out of every 3 h of wall-clock: four completions, 3 h apart. */
+const THIRD_DUTY: EtaSample[] = [
   sample('2026-08-20T00:00:00Z', 1),
   sample('2026-08-20T03:00:00Z', 1),
   sample('2026-08-20T06:00:00Z', 1),
   sample('2026-08-20T09:00:00Z', 1),
 ];
 
+const etaOf = (samples: EtaSample[], basisSamples = samples): EtaEstimate =>
+  etaFrom(rateFor(basisSamples, basisSamples), { weight: 160_000, phases: 4 })!;
+
 /* ------------------------------------------------------------------ *
  * dutyCycle
  * ------------------------------------------------------------------ */
 
 test('the duty cycle is measured over the window BETWEEN completions, so the first sample is not double-counted', () => {
-  const duty = dutyCycle(QUARTER_DUTY);
-  assert.equal(duty.assumed, false);
+  const duty = dutyCycle(THIRD_DUTY, NOW);
+  assert.equal(duty.known, true);
   assert.equal(duty.samples, 4);
   // 9 h elapsed between first and last completion; 3 h of work inside it (the
   // first sample's own hour happened BEFORE the window opened).
@@ -55,119 +60,135 @@ test('the duty cycle is measured over the window BETWEEN completions, so the fir
   assert.equal(duty.ratio, 1 / 3);
 });
 
-test('one completion is a duration with no window around it — the fallback is stated, not silent', () => {
-  const duty = dutyCycle([sample('2026-08-20T00:00:00Z', 1)]);
-  assert.equal(duty.assumed, true);
-  assert.equal(duty.ratio, 1);
-  assert.equal(duty.samples, 0);
+test('EE-4: the window is RECENT and bounded — an old completion does not stretch the pace', () => {
+  const old = sample('2026-06-01T00:00:00Z', 1);
+  const withOld = dutyCycle([old, ...THIRD_DUTY], NOW);
+  assert.equal(withOld.ratio, 1 / 3, 'a completion months back is outside the window');
+  assert.equal(withOld.samples, 4);
+  // …and only the newest DUTY_WINDOW completions are read at all.
+  const many = Array.from({ length: DUTY_WINDOW + 6 }, (_, i) =>
+    sample(new Date(Date.parse('2026-08-19T00:00:00Z') + i * 2 * HOUR).toISOString(), 1));
+  assert.equal(dutyCycle(many, NOW).samples, DUTY_WINDOW);
+});
+
+test('EE-5: fewer than three recent completions is not a pace — unknown, not an assumed 100 %', () => {
+  const one = dutyCycle([sample('2026-08-20T00:00:00Z', 1)], NOW);
+  assert.equal(one.known, false);
+  assert.equal(one.reason, 'too-few');
+  const two = dutyCycle(THIRD_DUTY.slice(0, 2), NOW);
+  assert.equal(two.known, false);
+  assert.equal(two.reason, 'too-few');
+});
+
+test('EE-5: a window that is mostly idle reads unknown rather than stretching the estimate by it', () => {
+  // Three one-minute completions a day apart: a duty cycle near 0.0007.
+  const idle = [
+    sample('2026-08-18T00:00:00Z', 0.1),
+    sample('2026-08-19T00:00:00Z', 0.1),
+    sample('2026-08-20T00:00:00Z', 0.1),
+  ];
+  const duty = dutyCycle(idle, NOW);
+  assert.equal(duty.known, false);
+  assert.equal(duty.reason, 'idle-history');
+  assert.ok(duty.ratio < DUTY_MIN_RATIO);
+  const forecast = forecastFrom(etaOf(idle, THIRD_DUTY), duty, NOW)!;
+  assert.equal(forecast.calendar, 'unknown');
+  assert.equal(forecast.expected, undefined, 'no date off an idle-history ratio');
+});
+
+test('EE-5: a plan with no completion in the last week has no recent pace', () => {
+  const duty = dutyCycle(THIRD_DUTY, NOW + 10 * DAY);
+  assert.equal(duty.known, false);
+  assert.equal(duty.reason, 'stale');
 });
 
 test('a duty cycle can never exceed 1, however many lanes ran at once', () => {
-  // Two phases finishing a minute apart after four hours each: concurrent
-  // lanes. An unclamped ratio would be 240, shrinking the forecast to nothing.
-  const duty = dutyCycle([
-    sample('2026-08-20T00:00:00Z', 4),
-    sample('2026-08-20T00:01:00Z', 4),
-  ]);
-  assert.equal(duty.ratio, 1);
-  assert.equal(duty.assumed, false, 'it WAS measured — it was measured as saturated');
-});
-
-test('a window of zero width is not a measurement, however much work is inside it', () => {
-  // Two completions recorded at the SAME instant. Dividing by that window
-  // gives Infinity, which the clamp turns into a confident-looking 1.0 — so
-  // the guard has to run first, and the answer has to say it was assumed.
-  const duty = dutyCycle([
-    sample('2026-08-20T00:00:00Z', 2),
-    sample('2026-08-20T00:00:00Z', 2),
-  ]);
-  assert.equal(duty.assumed, true, 'a ratio from a zero-width window is not evidence');
-  assert.equal(duty.ratio, 1);
+  const parallel = [
+    sample('2026-08-20T00:00:00Z', 1),
+    sample('2026-08-20T01:00:00Z', 5),
+    sample('2026-08-20T02:00:00Z', 5),
+  ];
+  assert.equal(dutyCycle(parallel, NOW).ratio, 1);
 });
 
 test('undated or zero-duration samples are not evidence about elapsed time', () => {
-  assert.equal(dutyCycle([]).assumed, true);
-  assert.equal(dutyCycle([{ weight: 1, durationMs: 0, at: '2026-08-20T00:00:00Z' }]).assumed, true);
-  assert.equal(dutyCycle([{ weight: 1, durationMs: HOUR }, { weight: 1, durationMs: HOUR }]).assumed, true);
+  const duty = dutyCycle([
+    { weight: 40_000, durationMs: HOUR },
+    { weight: 40_000, durationMs: 0, at: '2026-08-20T00:00:00Z' },
+    sample('2026-08-20T03:00:00Z', 1),
+  ], NOW);
+  assert.equal(duty.known, false);
 });
 
 /* ------------------------------------------------------------------ *
  * forecastFrom
  * ------------------------------------------------------------------ */
 
-/** A 4-hour working estimate with a ±50% band. */
-function eta(): EtaEstimate {
-  const value = etaFrom(rateFor(QUARTER_DUTY), { weight: 160_000, phases: 4 });
-  assert.ok(value, 'the fixture must produce an estimate');
-  return value;
-}
-
 test('the forecast stretches the WORKING estimate by the measured duty cycle', () => {
-  const value = eta();
-  const forecast = forecastFrom(value, dutyCycle(QUARTER_DUTY), NOW);
-  assert.ok(forecast);
-
-  // At a one-third duty cycle a four-hour job takes twelve hours of calendar.
-  assert.equal(Date.parse(forecast.earliest) - NOW, value.lowMs * 3);
-  assert.equal(Date.parse(forecast.latest) - NOW, value.highMs * 3);
-  assert.equal(forecast.workingLowMs, value.lowMs, 'the working figure is reported, not hidden');
-  assert.equal(forecast.workingHighMs, value.highMs);
-  // The naive date — the one this whole module exists to avoid — would be here.
-  assert.ok(Date.parse(forecast.latest) > NOW + value.highMs);
+  const eta = etaOf(THIRD_DUTY);
+  const forecast = forecastFrom(eta, dutyCycle(THIRD_DUTY, NOW), NOW)!;
+  assert.equal(forecast.calendar, 'known');
+  assert.equal(forecast.workingLowMs, eta.lowMs);
+  assert.equal(forecast.workingHighMs, eta.highMs);
+  // ÷ (1/3), to the millisecond a Date keeps.
+  assert.ok(Math.abs(Date.parse(forecast.earliest!) - NOW - eta.lowMs * 3) <= 1);
+  assert.ok(Math.abs(Date.parse(forecast.latest!) - NOW - eta.highMs * 3) <= 1);
 });
 
 test('expected sits between earliest and latest', () => {
-  const forecast = forecastFrom(eta(), dutyCycle(QUARTER_DUTY), NOW);
-  assert.ok(forecast);
-  assert.ok(Date.parse(forecast.earliest) <= Date.parse(forecast.expected));
-  assert.ok(Date.parse(forecast.expected) <= Date.parse(forecast.latest));
+  const forecast = forecastFrom(etaOf(THIRD_DUTY), dutyCycle(THIRD_DUTY, NOW), NOW)!;
+  const [e, x, l] = [forecast.earliest!, forecast.expected!, forecast.latest!].map(Date.parse);
+  assert.ok(e! <= x! && x! <= l!);
 });
 
-test('an unmeasurable duty cycle produces a date that SAYS it will be early', () => {
-  const forecast = forecastFrom(eta(), dutyCycle([]), NOW);
-  assert.ok(forecast);
-  assert.equal(Date.parse(forecast.latest) - NOW, forecast.workingHighMs, 'no stretch applied');
-  const stated = forecast.assumptions.join('\n');
-  assert.match(stated, /assumed 100%/);
-  assert.match(stated, /it will be early/);
+test('an unknown duty cycle gives no date at all, and the assumptions say why', () => {
+  const duty = dutyCycle([sample('2026-08-20T00:00:00Z', 1)], NOW);
+  const forecast = forecastFrom(etaOf(THIRD_DUTY), duty, NOW)!;
+  assert.equal(forecast.calendar, 'unknown');
+  assert.equal(forecast.earliest, undefined);
+  assert.equal(forecast.latest, undefined);
+  assert.equal(forecast.label, 'calendar time unknown');
+  assert.match(forecast.assumptions.join('\n'), /Duty cycle: unknown — fewer than three/);
 });
 
 test('every assumption the date rests on is IN the answer — the whole point of the field', () => {
-  const forecast = forecastFrom(eta(), dutyCycle(QUARTER_DUTY), NOW);
-  assert.ok(forecast);
-  const stated = forecast.assumptions.join('\n');
-  // Four claims a reader must be shown, because each one can make the date wrong.
-  assert.match(stated, /Rate:/, 'where the rate came from');
-  assert.match(stated, /Work left:/, 'how much is left, and that it comes from the size tags');
-  assert.match(stated, /Duty cycle: 33%/, 'the measured stretch, as a number');
-  assert.match(stated, /one after another/, 'that concurrency is not modelled');
-  assert.match(stated, /widens with FEWER completed phases/, "that the band is a sample count, not a variance");
+  const forecast = forecastFrom(etaOf(THIRD_DUTY), dutyCycle(THIRD_DUTY, NOW), NOW)!;
+  const text = forecast.assumptions.join('\n');
+  assert.match(text, /Rate: /);
+  assert.match(text, /4 measured phases weighted/);
+  assert.match(text, /Model: each phase takes .+ plus \d+ ms per unit of weight/);
+  assert.match(text, /Work left: 160000 weight across 4 phases/);
+  assert.match(text, /Duty cycle: 33%/);
+  assert.match(text, /one after another/);
+  assert.match(text, /spread of the measured phases/);
+});
+
+test('finished phases with no usable measurement are named in the assumptions, not dropped', () => {
+  const rate = rateFor(THIRD_DUTY, THIRD_DUTY, { missing: 2 });
+  const eta = etaFrom(rate, { weight: 40_000, phases: 1 })!;
+  const forecast = forecastFrom(eta, dutyCycle(THIRD_DUTY, NOW), NOW)!;
+  assert.equal(forecast.missing, 2);
+  assert.match(forecast.assumptions[0]!, /2 finished phases have no usable measurement/);
 });
 
 test('the basis rides along, so a heuristic date cannot be read as a measured one', () => {
-  const heuristic = etaFrom(rateFor([], []), { weight: 40_000, phases: 1 });
-  assert.ok(heuristic);
-  assert.equal(heuristic.basis, 'heuristic');
-  const forecast = forecastFrom(heuristic, dutyCycle([]), NOW);
-  assert.ok(forecast);
+  const eta = etaFrom(rateFor([], []), { weight: 40_000, phases: 1 })!;
+  const forecast = forecastFrom(eta, dutyCycle(THIRD_DUTY, NOW), NOW)!;
   assert.equal(forecast.basis, 'heuristic');
-  assert.match(forecast.assumptions.join('\n'), /placeholder, not a forecast/);
+  assert.match(forecast.assumptions[0]!, /placeholder/);
 });
 
 test('no remaining work means no date — "finishes today" on a finished plan is a units error', () => {
-  assert.equal(forecastFrom(null, dutyCycle(QUARTER_DUTY), NOW), null);
-  assert.equal(etaFrom(rateFor(QUARTER_DUTY), { weight: 0, phases: 0 }), null);
+  assert.equal(forecastFrom(null, dutyCycle(THIRD_DUTY, NOW), NOW), null);
 });
 
-test('the label is zone-free, so it is safe to print anywhere', () => {
-  const forecast = forecastFrom(eta(), dutyCycle(QUARTER_DUTY), NOW);
-  assert.ok(forecast);
-  // A duration, never a date: the server does not know the reader's zone, and
-  // a UTC date printed to somebody nine hours east names the wrong day.
-  assert.match(forecast.label, /out$/);
-  assert.doesNotMatch(forecast.label, /\d{4}-\d{2}-\d{2}/);
+test('the label is zone-free and names the calendar, so it is safe to print anywhere', () => {
+  const forecast = forecastFrom(etaOf(THIRD_DUTY), dutyCycle(THIRD_DUTY, NOW), NOW)!;
+  assert.equal(forecast.clock, 'calendar');
+  assert.match(forecast.label, /^~.+ on the calendar$/);
+  assert.doesNotMatch(forecast.label, /Z|GMT|UTC|\d{4}-\d\d/);
 });
 
 test('an unreadable clock is refused rather than turned into 1970', () => {
-  assert.equal(forecastFrom(eta(), dutyCycle(QUARTER_DUTY), Number.NaN), null);
+  assert.equal(forecastFrom(etaOf(THIRD_DUTY), dutyCycle(THIRD_DUTY, NOW), Number.NaN), null);
 });

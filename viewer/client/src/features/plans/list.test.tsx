@@ -120,7 +120,8 @@ describe('building a row', () => {
       NOW,
     );
     expect(row.run?.id).toBe('new');
-    expect(row.run?.ui).toBe('running');
+    expect(row.run?.view.paint).toBe('running');
+    expect(row.run?.view.label).toBe('Running');
   });
 
   it('counts an unreadable plan as an error even when the issue list is empty', () => {
@@ -915,13 +916,16 @@ describe('the plans page', () => {
     // date, and they are exactly the ones that must still read as closed.
     const closedRow = (await screen.findByText('Walked away')).closest('tr');
     expect(closedRow).toBeTruthy();
-    expect(within(closedRow as HTMLElement).getByText('abandoned')).toBeTruthy();
+    // Painted by the plan vocabulary's own badge since control-tower phase 23,
+    // which says the word in its own casing and carries it as `data-status`.
+    expect(within(closedRow as HTMLElement).getByText(/abandoned/i)).toBeTruthy();
+    expect((closedRow as HTMLElement).querySelector('[data-status="abandoned"]')).toBeTruthy();
 
     // The control: the open plan beside it must NOT be badged, so the assertion
     // above cannot pass by the badge rendering on every row. (The table has no
     // status column, so its status word appears nowhere else.)
     const openRow = screen.getByText('Still going').closest('tr');
-    expect(within(openRow as HTMLElement).queryByText('active')).toBeNull();
+    expect(within(openRow as HTMLElement).queryByText(/^active$/i)).toBeNull();
   });
 
   it('keeps quiet when the filters are only trimming the edges', async () => {
@@ -1023,7 +1027,8 @@ describe('the plans page', () => {
     runs.mockResolvedValue([run({ slug: 'alpha', status: 'running', activePhase: 2 })]);
     const { default: PlansView } = await import('./index');
     mount(<PlansView />);
-    const link = await screen.findByRole('link', { name: /running P2/ });
+    // The run's own view, as the status model words it, and the phase it is on.
+    const link = await screen.findByRole('link', { name: /Running P2/ });
     expect(link.getAttribute('href')).toBe('#/plan/alpha/run');
   });
 
@@ -1045,9 +1050,9 @@ describe('the plans page', () => {
   });
 
   it('lights no filter amber until one of them is narrowing the view', async () => {
-    // `--action` is the console's one rationed colour and it means "act on
-    // this". A control that is amber in its default position has spent it
-    // saying nothing — which is why the closed toggle had to turn round with
+    // `--action` is rationed and means "act on this" (ink since tokens 6.0).
+    // A control lit in its default position has spent it saying nothing —
+    // which is why the closed toggle had to turn round with
     // its default: "Hide finished" when showing was the default, "Show closed"
     // now that hiding is. Pressed still means the same thing on every filter —
     // *you have changed the default view*.
@@ -1055,16 +1060,18 @@ describe('the plans page', () => {
     const { container } = mount(<PlansView />);
     await screen.findByText('Alpha plan');
 
-    const amber = () =>
+    // Since tokens 6.0 the lit filter is the ink-solid `action` fill — still
+    // rationed, no longer amber (amber is a summons, and a filter is not one).
+    const lit = () =>
       [...container.querySelectorAll('button')]
-        .filter((b) => b.className.includes('bg-action/12'))
+        .filter((b) => /(?:^|\s)bg-action(?:\s|$)/.test(b.className))
         .map((b) => b.textContent?.trim());
     // The segmented sort control is the exception: `ButtonGroup` lights its
     // own pressed member, and one order is always in force.
-    expect(amber().filter((label) => label !== 'Recent')).toEqual([]);
+    expect(lit().filter((label) => label !== 'Recent')).toEqual([]);
 
     fireEvent.click(screen.getByRole('button', { name: /^Show closed/ }));
-    expect(amber()).toContain('Show closed');
+    expect(lit()).toContain('Show closed');
   });
 
   it('says the source is empty rather than rendering a blank list', async () => {

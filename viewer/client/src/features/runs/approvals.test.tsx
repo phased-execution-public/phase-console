@@ -119,3 +119,54 @@ describe('<ApprovalQueue> question card', () => {
     expect(screen.queryByText('A session asks')).toBeNull();
   });
 });
+
+describe('<ApprovalQueue> permission card — its deadline (control-tower phase 97, #140)', () => {
+  const tool = (over: Partial<Approval> = {}): Approval =>
+    card({
+      id: 't1',
+      kind: 'tool',
+      title: 'Bash: git push origin main',
+      detail: 'Phase 3 of demo wants to use Bash.',
+      question: undefined,
+      expiresAt: new Date(Date.now() + 40 * 60_000).toISOString(),
+      onTimeout:
+        'auto-denies at 21:09Z; the run then parks until this phase completes or someone presses Retry',
+      ...over,
+    });
+
+  it('says what its timeout will do, before it does it', () => {
+    render(<ApprovalQueue approvals={[tool()]} allowRun onDecide={vi.fn()} onExtend={vi.fn()} />);
+    expect(screen.getByTestId('on-timeout').textContent).toBe(
+      'If nobody answers, it auto-denies at 21:09Z; the run then parks until this phase completes or someone presses Retry.',
+    );
+  });
+
+  it('offers Extend 30 min and Extend 2 h, and sends the minutes', () => {
+    const onExtend = vi.fn();
+    render(<ApprovalQueue approvals={[tool()]} allowRun onDecide={vi.fn()} onExtend={onExtend} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Extend 30 min' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Extend 2 h' }));
+    expect(onExtend.mock.calls).toEqual([
+      ['t1', 30],
+      ['t1', 120],
+    ]);
+  });
+
+  it('a card that outlived its hook call says it stands, and what allowing it does', () => {
+    render(
+      <ApprovalQueue
+        approvals={[
+          tool({ converted: { at: new Date().toISOString() }, expiresAt: '2026-09-28T09:09:00.000Z' }),
+        ]}
+        allowRun
+        onDecide={vi.fn()}
+        onExtend={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/stands until 09:09Z/)).toBeTruthy();
+    expect(screen.getByTestId('standing').textContent).toMatch(
+      /resume the phase with this one call granted once/,
+    );
+    expect(screen.queryByTestId('on-timeout')).toBeNull();
+  });
+});

@@ -4,10 +4,13 @@
  * Not the NOTIFICATION inbox: `./notifications`'s `InboxPage` / `InboxQuery`
  * are the log of what the console announced. This is the list of what needs a
  * person right now — errands, approvals, gates, sign-ins — each carrying the
- * actions that would clear it. `server/inbox.ts` builds it; `features/now`
- * renders it, on the page and in the bell drawer.
+ * actions that would clear it. `server/inbox.ts` builds it; `components/
+ * inbox-row.tsx` renders it — in the Tower's Needs-you bay and in the bell
+ * drawer.
  */
 
+import type { HaltCategory } from '@shared/halt-categories.js';
+import type { HumanStepView } from '@shared/human-step-model.js';
 import { request, post, q } from './client';
 
 /** What kind of thing is asking. */
@@ -27,7 +30,9 @@ export type InboxKind =
   | 'question'
   | 'policy'
   | 'issue-draft'
-  | 'message';
+  | 'message'
+  | 'supervisor'
+  | 'human-step';
 
 /** How loudly: `urgent` interrupts, `needs-you` waits for a person, `fyi` informs. */
 export type InboxSeverity = 'urgent' | 'needs-you' | 'fyi';
@@ -81,6 +86,33 @@ export type InboxItem = {
    * about the machine rather than any one console.
    */
   console?: { id: string; name: string } | null;
+  /** The halt family of what stopped the work, word and label (control-tower phase 17). */
+  category?: { word: HaltCategory; label: string };
+  /**
+   * A person's turn (control-tower phase 44): every row that asks a person for
+   * an act carries the same view, so ONE card draws them all
+   * (`components/human-step-card.tsx`). The row's `actions` still answer it.
+   */
+  humanStep?: HumanStepView;
+  /**
+   * A supervisor card's own facts (control-tower phase 102): its situation,
+   * detection category, evidence, the verb Accept presses or the command an
+   * escalation needs, and the cap that held it. Only on a `supervisor` row.
+   */
+  supervisor?: InboxSupervisorView;
+};
+
+/** What a `supervisor` row carries of its card — `server/inbox.ts` `InboxSupervisorView`. */
+export type InboxSupervisorView = {
+  card: 'suggestion' | 'escalation';
+  situation: string;
+  category: string;
+  verb: string | null;
+  why: string;
+  evidence: readonly string[];
+  command?: string;
+  then?: string | null;
+  cap?: { cap: string; limit: number; count: number };
 };
 
 export type InboxView = {

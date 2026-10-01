@@ -38,9 +38,20 @@ import {
   type RunSetupValues,
 } from './schema';
 import { PERMISSION_MODES, PERMISSION_PROFILES, PROFILE_LABELS } from '@shared/run-settings.js';
+import { DEFAULT_MODEL_POLICY } from '@shared/run-lifecycle.js';
 
 export type RunSetupMode =
-  'defaults' | 'plan' | 'start' | 'continue' | 'phase' | 'recovery' | 'qa' | 'qa-fix' | 'session' | 'live';
+  | 'defaults'
+  | 'plan'
+  | 'start'
+  | 'continue'
+  | 'phase'
+  | 'recovery'
+  | 'qa'
+  | 'qa-fix'
+  | 'session'
+  | 'live'
+  | 'fix';
 
 /** What a mode needs to know that is not a form value. */
 export interface RunSetupContext {
@@ -88,14 +99,23 @@ const RUN_FIELDS = [
   // The Decisions stage (phase 11): the prelude's required answers, first.
   'resumeOnRestart',
   'relay',
+  // control-tower phase 11 (#18): the launch's answer to the plan's git lines.
+  'gitStrategyAck',
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
   'verifyAnswers',
   'model',
   'effort',
+  // control-tower phase 54 (#91): whether that model may move at all.
+  'modelPolicy',
+  // control-tower phase 11 (#34): the run's DEFAULT permission mode.
+  'permissionMode',
   'autonomy',
   'permissionProfile',
+  // control-tower phase 97 (#140): how long an approval card waits for a person —
+  // on both doors, so an operator who will be away can shorten it mid-run.
+  'approvalTimeoutMinutes',
   'accountId',
   'onLimit',
   'phaseBudgetUsd',
@@ -128,6 +148,12 @@ const RUN_FIELDS = [
   'qaMaxRounds',
   'qaModel',
   'qaEffort',
+  // The QA-fix gap (control-tower phase 22): how a recovery's fix session
+  // boards and what one round may spend, said at launch for the whole run —
+  // the server has read both on the start door since 5.1.0; only the form
+  // did not offer them.
+  'qaFixStrategy',
+  'qaRoundBudgetUsd',
   'attachDefaultSkills',
   'skills',
   'mcpServers',
@@ -135,44 +161,54 @@ const RUN_FIELDS = [
   'autoRecover',
   'maxParallel',
   'maxConsecutiveFailures',
+  // The run's own rung caps (#14) — on both doors, so a live run shows them:
+  // a spent cap's errand names the setting, and raising it is the way through.
+  'ladderPerRunRungs',
+  'ladderPerPhaseRungs',
   'onlyPhases',
   'phaseOptions',
 ] as const;
 
 /**
- * A live run: everything above minus the fields a patch may never carry.
+ * How a launch passed the door (phase 11) — START-only every one: the git
+ * answer, the waiver acknowledgements, the override and the verification
+ * answers. A patch cannot re-answer a door the run already walked through.
  *
- * `startAfter` joins `qa` and `accountId` here. A chain says where a run
- * BEGINS, and a run already mid-plan cannot un-begin — offering the control on
- * a live run would show a value the settings door does not read.
+ * The prelude's other three — `resumeOnRestart`, `relay`, `accounts` — are NOT
+ * here since control-tower phase 77 (#101): they answer questions about the
+ * run's future, and a run launched with the wrong one stranded at every
+ * console restart with no control that could change it. The live sheet shows
+ * them and the settings door reads them. (A narrow `phase` launch carries all
+ * of them, because a phase launch on a finished run is a fresh start.)
  */
-/**
- * The prelude's five (phase 11) — START-only every one: they are the run's
- * answers to the decision manifest, and a settings patch cannot re-answer what
- * the door was refused on. A narrow `phase` launch carries the three the door
- * REQUIRES too, because a phase launch on a finished run is a fresh start.
- */
-const PRELUDE_FIELDS = [
-  'resumeOnRestart',
-  'relay',
-  'accounts',
+const DOOR_ONLY_FIELDS = [
+  'gitStrategyAck',
   'acknowledgedWaivers',
   'manifestOverride',
   'verifyAnswers',
 ] as const;
 
+/**
+ * A live run: everything above minus the fields a patch may never carry.
+ *
+ * `startAfter` joins `accountId` here. A chain says where a run BEGINS, and a
+ * run already mid-plan cannot un-begin — offering the control on a live run
+ * would show a value the settings door does not read. `qa` LEFT in
+ * control-tower phase 13 (#31): the plan's gate is patchable behind the
+ * person's confirmation, so a reviewer can be switched on, not only tuned.
+ */
 const LIVE_FIELDS = RUN_FIELDS.filter(
   (field) =>
-    field !== 'qa' &&
     field !== 'accountId' &&
     field !== 'startAfter' &&
-    !PRELUDE_FIELDS.includes(field as (typeof PRELUDE_FIELDS)[number]),
+    !DOOR_ONLY_FIELDS.includes(field as (typeof DOOR_ONLY_FIELDS)[number]),
 ) as readonly RunSetupField[];
 
 /** The dialog's narrow launch, unchanged: choices, not configuration. */
 const PHASE_FIELDS = [
   'resumeOnRestart',
   'relay',
+  'gitStrategyAck',
   'accounts',
   'acknowledgedWaivers',
   'manifestOverride',
@@ -314,14 +350,38 @@ export const MODES: Readonly<Record<RunSetupMode, ModeSpec>> = Object.freeze({
     submit: 'Start authoring',
     door: 'launch',
   },
+  /**
+   * Fix ONE issue with no plan (control-tower phase 12, #29): the launcher's
+   * session minus its first message — the server composes the prompt from the
+   * issue, so a box for one would be a box whose words go nowhere. The mode is
+   * offered and seeded at the run default (accept edits); whatever is chosen is
+   * what the ticket sends.
+   */
+  fix: {
+    fields: ['model', 'effort', 'permissionProfile', 'accountId', 'skills'],
+    submit: 'Start the fix',
+    door: 'launch',
+    sessionPermissions: true,
+  },
   session: {
     fields: ['model', 'effort', 'permissionProfile', 'accountId', 'prompt', 'skills'],
     submit: 'Start session',
     door: 'launch',
     sessionPermissions: true,
   },
-  live: { fields: LIVE_FIELDS, submit: 'Apply from next phase', door: 'runSettings' },
+  // Not "from the next phase": half the fields land at once (`SETTING_EFFECTS`).
+  live: { fields: LIVE_FIELDS, submit: 'Apply changes', door: 'runSettings' },
 });
+
+/**
+ * Does this mode's launch pass the run-start prelude (phase 11)? Only a start
+ * through the run door does: its probes, its manifest and a blocking row gate
+ * the launch. The live sheet edits three of the prelude's answers on a run that
+ * already passed it (control-tower phase 77), and asks it nothing.
+ */
+export function runsPrelude(mode: RunSetupMode): boolean {
+  return MODES[mode].door === 'runStart';
+}
 
 /** Does this mode show that field? The single question every renderer asks. */
 export function shows(mode: RunSetupMode, field: RunSetupField): boolean {
@@ -338,6 +398,13 @@ const dollars = (text: string): number | null => (text.trim() === '' ? null : Nu
 
 /** `''` is "this console's own default" and is left off the payload entirely. */
 const whole = (text: string): number | undefined => (text.trim() === '' ? undefined : Number(text));
+
+/**
+ * `''` is "this console's own cap", read as null: both run doors take null as
+ * CLEAR, so a cap emptied on a run that exists hands it back to the preference.
+ * Left off the payload instead, it could never be given back.
+ */
+const cap = (text: string): number | null => (text.trim() === '' ? null : Number(text));
 
 /**
  * What a run door is told.
@@ -358,6 +425,10 @@ export function buildRunPayload(
 
   if (on('model')) payload.model = values.model;
   if (on('effort')) payload.effort = values.effort;
+  // `ladder` is the absence the server assumes; sticky once the run answered it.
+  if (on('modelPolicy') && (values.modelPolicy !== DEFAULT_MODEL_POLICY || run?.modelPolicy)) {
+    payload.modelPolicy = values.modelPolicy;
+  }
 
   // Sent only when it says something: `default` with no account on the run is
   // the absence the server already assumes, and `wait` likewise. Both stay
@@ -452,7 +523,10 @@ export function buildRunPayload(
     if (n !== undefined) payload.maxConcurrentPerRepo = n;
     else if (mode === 'live') payload.maxConcurrentPerRepo = null;
   }
-  if (on('qa') && values.qa) payload.qa = true;
+  // A launch writes `qa` only when ON. A live sheet writes it either way — it
+  // shows the gate as it is, so `false` is a person turning it off — and the
+  // server treats a word the gate already has as no move (phase 13).
+  if (on('qa') && (mode === 'live' || values.qa)) payload.qa = values.qa;
   // QA's own three. `''` is "say nothing", which lets the reviewer keep
   // inheriting the builder's model and effort and the round budget keep its
   // shipped default — the same rule `maxParallel` below uses, and the reason
@@ -483,6 +557,17 @@ export function buildRunPayload(
     const n = whole(values.maxConsecutiveFailures);
     if (n !== undefined) payload.maxConsecutiveFailures = n;
   }
+  // The run's own rung caps (#14). A number sets one. An empty box is the
+  // console's own cap: a fresh start says so by saying nothing, and a payload
+  // that reaches a run that EXISTS — a live patch, a continue — sends the
+  // `null` both doors read as a clear.
+  const existing =
+    mode === 'live' || (MODES[mode].door === 'runStart' && resumeTarget(mode, run) !== undefined);
+  for (const field of ['ladderPerRunRungs', 'ladderPerPhaseRungs'] as const) {
+    if (!on(field)) continue;
+    const n = cap(values[field]);
+    if (n !== null || existing) payload[field] = n;
+  }
   if (on('phaseOptions') && Object.keys(values.phaseOptions).length) {
     payload.phaseOptions = values.phaseOptions;
   }
@@ -494,6 +579,21 @@ export function buildRunPayload(
   // blocking list, never the client's.
   if (on('resumeOnRestart')) payload.resumeOnRestart = values.resumeOnRestart;
   if (on('relay')) payload.relay = values.relay;
+  // The launch's answer to the plan's git lines (control-tower phase 11, #18) —
+  // sent only when given, so a start with nothing to answer is byte-identical.
+  if (on('gitStrategyAck') && values.gitStrategyAck) payload.gitStrategyAck = values.gitStrategyAck;
+  // The run's default permission mode (#34), only when it names a CLI mode: the
+  // agent ticket's derived word (`bypass`) is not one, and silence keeps the
+  // plan's line — then `acceptEdits` — in charge.
+  if (on('permissionMode') && (PERMISSION_MODES as readonly string[]).includes(values.permissionMode)) {
+    payload.permissionMode = values.permissionMode;
+  }
+  // An approval card's wait (#140), only when one is said: silence keeps the
+  // hook call's own hour, which is the default and the ceiling.
+  if (on('approvalTimeoutMinutes')) {
+    const n = whole(values.approvalTimeoutMinutes);
+    if (n !== undefined) payload.approvalTimeoutMinutes = n;
+  }
   if (on('accounts')) {
     const accounts = parseAccounts(values.accounts);
     if (accounts?.length) payload.accounts = accounts;

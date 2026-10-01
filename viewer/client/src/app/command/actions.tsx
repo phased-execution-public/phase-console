@@ -33,7 +33,7 @@ import {
   type Route,
 } from '@/app/routes';
 import type { ConsoleState, PlanSummary, RunState } from '@/lib/api';
-import { STATE_META, runUiState } from '@/lib/status-vocab';
+import { runStatusWord } from '@/lib/status-vocab';
 
 /**
  * The palette's command registry.
@@ -180,7 +180,7 @@ export function planActions(context: CommandContext): CommandAction[] {
             ? `${plan.slug} · ${ready.length} ready`
             : plan.slug,
       keywords: plan.slug,
-      run: (ctx) => ctx.go(planHref(plan.slug, 'route')),
+      run: (ctx) => ctx.go(planHref(plan.slug)),
     });
     // `/api/plans` sends the queue as bare NUMBERS — the titles live in the
     // plan detail, which the palette does not fetch. A row that says "phase 4"
@@ -202,15 +202,20 @@ export function planActions(context: CommandContext): CommandAction[] {
   return out;
 }
 
-/** Every run, by the plan it is driving, with what it is doing right now. */
+/**
+ * Every run, by the plan it is driving, with what it is doing right now — its
+ * own word (`halted`, `waiting`), the way the plan rows above say `ready`. The
+ * palette is first paint, so it prints the word rather than drawing it: the
+ * status model and its badges belong to the pages.
+ */
 export function runActions(context: CommandContext): CommandAction[] {
   return (context.runs ?? []).map<CommandAction>((run) => {
-    const meta = STATE_META[runUiState(run.status)];
+    const word = runStatusWord(run);
     return {
       id: `run:${run.slug}`,
       group: GROUPS.runs,
       label: run.slug,
-      hint: run.activePhase ? `${meta.label} · phase ${run.activePhase}` : meta.label,
+      hint: run.activePhase ? `${word} · phase ${run.activePhase}` : word,
       keywords: `${run.status} ${run.model} run autopilot`,
       run: (ctx) => ctx.go(runHref(run.slug)),
     };

@@ -11,6 +11,7 @@
 #        phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]
 #                         [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]
 #                         [--needs KEY] [--remember plan|global]
+#        phase-outcome.sh <slug> <phase> verified --command TEXT --exit N [--in DIR]
 #   status: complete | waiting-external | blocked | needs-human | partial | no-defect
 #   no-defect "I looked, and there was nothing to fix" — the REPAIR family's
 #             word, declared by a session the console sent to mend one specific
@@ -38,6 +39,23 @@
 #             the manifest lacks", a defect report, not 39 % of asks.
 #   --rule / --command  optional structured fields for a permission block —
 #             the rule that refused and the command it refused — beside --needs.
+#   --step KIND  needs-human ONLY (control-tower phase 41): the ask is a HUMAN
+#             STEP — a typed act only a person can do — rather than a free-text
+#             errand. KIND is one of scripts/human-steps.env HUMAN_STEP_KINDS;
+#             its fields ride the JSON as `step`:
+#               --title TEXT             what the person must do (required)
+#               --open-url URL | --open-command CMD   what to open: an http(s)
+#                                        link, or a command for the terminal
+#               --where host|any         where it can be done (default: the kind's)
+#               --proof REF              the watch ref that proves it was done
+#               --step-line TEXT         a numbered step, repeatable (max 12)
+#               --code CODE              device-code only: the short code to show
+#               --credential ID          secret-entry only (required): the
+#                                        registry id the secret is stored under
+#             A value shaped like a secret — a token, a password, a one-time
+#             code, a URL query secret — is REFUSED (exit 2, nothing written):
+#             codes and secrets never enter a declaration. A step a session
+#             declares never opens by itself; only a plan's may (`auto-open`).
 #   --watch   repeatable (max 8); free-form refs. The console polls these on its
 #             own timer (viewer/server/watch-scheduler.ts) and resumes THIS
 #             session when one lands:
@@ -81,6 +99,31 @@
 #             not); with no console answering, exit 1 and the Settings page
 #             named, nothing dropped silently.
 #
+# `verified` is the third shape, and like a ruling it is never an outcome: it
+# records what the session's OWN §Verification proved — the command, its exit
+# status and the tree it ran against (control-tower phase 62, #68) — so the
+# console's pass after the session re-runs only what was NOT proven at an
+# equivalent tree: the same tree, or one where only paperwork changed since
+# (docs/handoffs/**, .locks/**, CHANGELOG.md). The tree is the WORKING tree's
+# content, committed or not — the git index copied, every change added, written
+# as a tree object — because a session tests and then commits, and a proof
+# pinned to HEAD would go stale the moment the commit it proved landed. The
+# session's own index is never touched. --in names where the command ran
+# (default: here); outside a git working tree there is nothing to prove against,
+# and the script says so (exit 2). ONE NDJSON line to $PE_PROOFS_FILE (the runner
+# injects it) or, unsupervised, to <state>/phase-console/runs/<instance id>/<slug>/proofs.ndjson
+# — the same per-plan file the console reads. Record each command as you run it,
+# red ones too: a red proof is not a proof, and the console runs that one itself.
+#
+# `progress` is the fourth shape, and like the other two it is never an outcome:
+# how far the ACTIVE task's long operation has got — `--label <what> --done <n>
+# --of <m>` ("iOS sweep vendor", 45 of 68) — control-tower phase 95, #163. It is
+# ONE NDJSON line on the task channel, $PE_TASKS_FILE, which the runner tails
+# while the session works, so it is journalled as `phase.progress` on the task
+# in progress at the next tool result rather than at exit; unsupervised it goes
+# to the console's inbox task file for the phase. --done and --of are whole
+# numbers, 1 <= --of, --done <= --of; a malformed call writes nothing (exit 2).
+#
 # Writes ONE atomic JSON file to $PE_OUTCOME_FILE (tmp+mv) — the runner injects
 # that path into every session it supervises and consumes the file on exit.
 # Without $PE_OUTCOME_FILE (no runner supervising this session) the file goes to
@@ -95,7 +138,13 @@
 # The session id rides along as "session_id" when the session knows it
 # ($PE_SESSION_ID, runner-injected; else $CLAUDE_CODE_SESSION_ID, which Claude
 # Code exports to its own subprocesses) so the console can resume THAT session.
-# Exit: 0 written/printed · 2 usage
+# A declaration that parks (waiting-external, blocked, needs-human) and names
+# --watch refs is first STAGED and the console asked whether a ref has already
+# landed (POST /hooks/declaration, ≤ 20 s — control-tower phase 50, #86). If one
+# has, nothing is written, nothing parks, and the exit is 3: carry on with the
+# phase. No console answering, or none landed: written as above, exit 0.
+# Exit: 0 written/printed · 1 a ruling not remembered · 2 usage, or a --watch ref refused
+# (too long, not self-contained, or refused by the console at declaration) · 3 already landed — continue
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -103,10 +152,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/instance.sh"
 # The decision manifest's vocabulary — the OWNER is viewer/shared/decisions-model.js,
 # decisions.env its bash twin (held equal by viewer/test/decisions-model.test.ts).
-DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce"
+DECISION_KEYS="permission.policy permission.destructive issues credentials accounts mcp gates verification.person-check qa.exhausted waits human-acts ambiguity budgets resume.on-restart plan-health stop relay announce plan-approval"
 NEED_CLASSES="lock permission credential gate external"
+# Why a --watch naming the declaring phase's OWN lock is refused (#42): the
+# console claims that lock for the session and releases it at its closeout, so
+# the watch fired on the phase's own teardown and resumed a session for work
+# that never existed. Word for word the console's `OWN_LOCK_WATCH_REFUSAL`
+# (viewer/shared/run-lifecycle.js), which refuses the same ref at ingest for a
+# file an older script wrote; own-lock-watch.test.ts holds the two together.
+OWN_LOCK_WATCH_REFUSAL="a lock: watch is for somebody else's lock: this one names the declaring phase's own lock, which its own closeout releases, so the watch would fire on its own teardown (#42). Name the lock phase-lock.sh conflicts reported instead, or declare --needs lock with no watch and the console queues the phase behind whoever holds it; a phase blocked on a person takes no watch at all."
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/decisions.env" ] && . "$SCRIPT_DIR/decisions.env"
+# A person's turn (control-tower phase 41) — the OWNER is
+# viewer/shared/human-step-model.js, twin scripts/human-steps.env.
+HUMAN_STEP_KINDS="browser-login device-code one-time-code secret-entry claude-login mcp-login os-prompt os-permission third-party-approval physical person-check decision protected-path interactive-prompt captcha email-link"
+HUMAN_STEP_WHERE="host any"
+HUMAN_STEP_DEFAULT_WHERE="browser-login:host device-code:any one-time-code:host secret-entry:any claude-login:host mcp-login:host os-prompt:host os-permission:host third-party-approval:any physical:host person-check:any decision:any protected-path:host interactive-prompt:host captcha:any email-link:any"
+HUMAN_STEP_SECRET_PATTERNS=''
+HUMAN_STEP_SECRET_QUERY_KEYS=''
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/human-steps.env" ] && . "$SCRIPT_DIR/human-steps.env"
 
 usage() {
   echo 'usage: phase-outcome.sh <slug> <phase> <complete|waiting-external|blocked|needs-human|partial|no-defect>' >&2
@@ -114,8 +179,13 @@ usage() {
   echo '                        [--needs KEY] [--rule TEXT] [--command TEXT]' >&2
   echo '   --wait-minutes/--until: waiting-external | blocked | needs-human' >&2
   echo '   --needs KEY: REQUIRED on blocked | needs-human — a decision key from scripts/decisions.env' >&2
+  echo '   --step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any] [--proof REF]' >&2
+  echo '        [--step-line TEXT]... [--code CODE] [--credential ID]: needs-human only — a human step' >&2
   echo "               ($DECISION_KEYS) or a blocker class as its short form ($NEED_CLASSES)" >&2
-  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · cmd:"<command>"' >&2
+  echo '   --watch schemes: gh:<repo>#run/<id> · gh:<repo>#pr/<n> · date:<ISO> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"' >&2
+  echo '       phase:<slug>/<N> lands when the console reads sibling phase N done — the way to wait on a sibling;' >&2
+  echo '       verify:<slug>/<this phase> lands when your own red §Verification lines pass again on a new head;' >&2
+  echo '       a cmd: ref is self-contained (absolute paths, no $, no cd, at most 1000 characters) and exits 0 only once the thing has happened' >&2
   echo '       phase-outcome.sh <slug> <phase> ruling --what TEXT [--why TEXT]' >&2
   echo '                        [--kind ambiguity|deviation|deferral] [--cost-if-wrong TEXT]' >&2
   echo '                        [--for <N|next|all>] [--needs KEY] [--remember plan|global]' >&2
@@ -123,6 +193,10 @@ usage() {
   echo '   --needs KEY on a ruling: the decision key it answers (stamped as decisionKey)' >&2
   echo '   --remember plan: write the ruling as a ## Decisions row (source ruling) and ack it' >&2
   echo '   --remember global: ask the owning console to set its policy.<key> answer to --what' >&2
+  echo '       phase-outcome.sh <slug> <phase> verified --command TEXT --exit N [--in DIR]' >&2
+  echo '   verified: record what your own §Verification proved — the console re-runs only what you did not prove' >&2
+  echo '       phase-outcome.sh <slug> <phase> progress --label TEXT --done N --of M' >&2
+  echo '   progress: how far the active task'"'"'s long operation has got (journalled as phase.progress)' >&2
   exit 2
 }
 
@@ -142,7 +216,9 @@ mode=outcome
 case "$status" in
   complete|waiting-external|blocked|needs-human|partial|no-defect) : ;;
   ruling) mode=ruling ;;
-  *) echo "invalid status: $status (want complete|waiting-external|blocked|needs-human|partial|no-defect, or ruling)" >&2; exit 2 ;;
+  verified) mode=proof ;;
+  progress) mode=progress ;;
+  *) echo "invalid status: $status (want complete|waiting-external|blocked|needs-human|partial|no-defect, or ruling, verified or progress)" >&2; exit 2 ;;
 esac
 
 # JSON string sanitizer, bash 3.2 + BSD sed: control chars (newlines included)
@@ -151,6 +227,50 @@ esac
 # passing around, so the refs are folded as they arrive).
 _json_str() {
   printf '%s' "$1" | tr '\000-\037' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# The redaction floor at the door (control-tower phase 41): is this value
+# shaped like a secret? The shapes are human-steps.env's, matched as
+# case-insensitive EREs — the same list `looksLikeSecret` in
+# viewer/shared/human-step-model.js reads — plus a URL query parameter whose
+# name says its value is one (an OAuth `code`, an `access_token`, a signature).
+_looks_like_secret() {  # _looks_like_secret <text> → 0 when it carries a secret
+  local text="$1" pat q pair name value found=1
+  [ -z "$text" ] && return 1
+  set -f
+  shopt -s nocasematch
+  for pat in $HUMAN_STEP_SECRET_PATTERNS; do
+    if [[ $text =~ $pat ]]; then found=0; break; fi
+  done
+  shopt -u nocasematch
+  if [ "$found" -ne 0 ]; then
+    case "$text" in
+      *'?'*|*'#'*)
+        q="${text#*[?#]}"
+        q="$(printf '%s' "$q" | tr '#' '&')"
+        local IFS='&'
+        for pair in $q; do
+          name="${pair%%=*}"
+          [ "$name" = "$pair" ] && continue
+          value="${pair#*=}"
+          [ -z "$value" ] && continue
+          name="$(printf '%s' "$name" | tr 'A-Z' 'a-z')"
+          case " $HUMAN_STEP_SECRET_QUERY_KEYS " in *" $name "*) found=0; break ;; esac
+        done
+        ;;
+    esac
+  fi
+  set +f
+  return "$found"
+}
+
+# Refuse a flag whose value carries a secret — exit 2, nothing written, and the
+# value is never echoed back (the terminal is a sink too).
+_screen_secret() {  # _screen_secret <flag> <value>
+  if _looks_like_secret "$2"; then
+    echo "$1 refused: its value is shaped like a secret (a token, a password, a one-time code or a URL query secret). A human step never carries one — say what to do and where; the person types the secret where the step opens, never into a declaration." >&2
+    exit 2
+  fi
 }
 
 # Why the console would never poll a --watch ref, or nothing when it would — the
@@ -168,26 +288,147 @@ _watch_problem() {  # _watch_problem <ref>
       printf '%s' "${1#*:}" | sed 's/^[[:space:]]*//' | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}' \
         || printf '%s' 'not an ISO8601 instant (date:2026-09-20T06:00:00Z)'
       ;;
-    lock:*)
-      printf '%s' "${1#lock:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/0*[1-9][0-9]*$' \
-        || printf '%s' 'a lock: ref is lock:<slug>/<phase>'
+    lock:*|phase:*|verify:*)
+      printf '%s' "${1#*:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/0*[1-9][0-9]*$' \
+        || printf '%s' "a ${1%%:*}: ref is ${1%%:*}:<slug>/<phase>"
       ;;
     cmd:*)
-      body="$(printf '%s' "${1#cmd:}" | sed "s/^[[:space:]]*//; s/[[:space:]]*\$//; s/^\"\\(.*\\)\"\$/\\1/; s/^'\\(.*\\)'\$/\\1/" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-      [ -n "$body" ] || printf '%s' 'a cmd: ref names no command'
+      [ -n "$(_cmd_body "$1")" ] || printf '%s' 'a cmd: ref names no command'
       ;;
     *)
-      printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · cmd:"<command>"'
+      printf '%s' 'no watch scheme — the console polls gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"'
       ;;
   esac
 }
+
+# The command a cmd: ref runs — the ref's own quote pair is punctuation, exactly
+# as `watch-refs.ts` `parseWatchRef` strips it.
+_cmd_body() {  # _cmd_body <ref>
+  printf '%s' "${1#cmd:}" | sed "s/^[[:space:]]*//; s/[[:space:]]*\$//; s/^\"\\(.*\\)\"\$/\\1/; s/^'\\(.*\\)'\$/\\1/" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# Does every quote in <text> close? Backslash escapes outside single quotes, as
+# the shell the console runs it in reads them (control-tower phase 88, #125).
+_quotes_balanced() {  # _quotes_balanced <text>
+  local s="$1" i=0 n="${#1}" c q=""
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    if [ -z "$q" ]; then
+      case "$c" in \\) i=$((i + 1)) ;; "'") q="'" ;; '"') q='"' ;; esac
+    elif [ "$q" = "'" ]; then
+      [ "$c" = "'" ] && q=""
+    else
+      case "$c" in \\) i=$((i + 1)) ;; '"') q="" ;; esac
+    fi
+    i=$((i + 1))
+  done
+  [ -z "$q" ]
+}
+
+# The first word of <command> that is a path relative to the session's working
+# directory, or nothing. The console runs a cmd: ref from ITS root, so such a
+# path names another file, or none (#152). Read as words with the quotes
+# dropped; a flag, a URL, an assignment, `owner/repo` after -R/--repo and a sed
+# expression are not paths. The JS twin is `watch-refs.ts` `relativePathIn`.
+_relative_path_in() {  # _relative_path_in <command>
+  local words word prev="" found=""
+  words="$(printf '%s' "$1" | tr "\"'" '  ')"
+  set -f
+  for word in $words; do
+    case "$prev" in -R|--repo) prev="$word"; continue ;; esac
+    prev="$word"
+    case "$word" in
+      ./*|../*) found="$word"; break ;;
+      /*|\~*|-*|*://*|*=*|s/*|y/*) continue ;;
+      */*) ;;
+      *) continue ;;
+    esac
+    case "$word" in *[!A-Za-z0-9._/@+-]*) continue ;; esac
+    if printf '%s' "$word" | grep -Eq '/.*/|\.[A-Za-z0-9]{1,8}$'; then found="$word"; break; fi
+  done
+  set +f
+  [ -n "$found" ] && printf '%s' "$found"
+  return 0
+}
+
+# Why the console could not run a cmd: ref AS WRITTEN — the shapes that exit 2
+# here rather than park on a ref nothing can land (control-tower phase 88, #125,
+# #152). A cmd: ref is self-contained: absolute paths, no shell variable, no
+# substitution, every quote closed. The console's own policy is asked too, at
+# declaration (`_probe_declaration`), and its refusal also exits 2.
+_cmd_ref_problem() {  # _cmd_ref_problem <ref>
+  local body rel
+  body="$(_cmd_body "$1")"
+  case "$body" in
+    *'$'*) printf '%s' 'it carries a shell variable or substitution ($) — the console runs a cmd: ref in a shell of its own, where your session'"'"'s variables do not exist; write the value out'; return 0 ;;
+    *'`'*) printf '%s' 'it carries a command substitution (a backtick) whose inner command the console cannot judge'; return 0 ;;
+  esac
+  if ! _quotes_balanced "$body"; then
+    printf '%s' 'its quoting does not balance (a quote never closes) — the console would refuse it as unreadable; close every quote'
+    return 0
+  fi
+  rel="$(_relative_path_in "$body")"
+  [ -n "$rel" ] && printf '%s' "it names a relative path ($rel) — the console runs a cmd: ref from its own root, not your working directory; write the absolute path"
+  return 0
+}
+
+# Advice for a well-formed ref the console has a better scheme for — printed,
+# never refused: a handoff's status is console state (`phase:`), and a workflow
+# run is a `gh:` ref (#129, #87's optional ask).
+_cmd_ref_hints() {  # _cmd_ref_hints <ref>
+  local body hit repo sha wf lookup
+  body="$(_cmd_body "$1")"
+  hit="$(printf '%s' "$body" | sed -nE 's#.*docs/handoffs/([A-Za-z0-9][A-Za-z0-9._-]*)/phase-0*([1-9][0-9]*)-.*#\1/\2#p' | head -1)"
+  case "$body" in *grep*) [ -n "$hit" ] && echo "warning: --watch \"$1\" greps a handoff the console reads itself — --watch phase:$hit lands when the console's record of that phase reads done (after its own §Verification), and a board change re-probes it at once" >&2 ;; esac
+  case "$body" in
+    *'gh run list'*'--commit'*)
+      repo="$(printf '%s' "$body" | sed -nE 's/.*(-R|--repo)[ =]([^ ]+).*/\2/p' | head -1)"
+      sha="$(printf '%s' "$body" | sed -nE 's/.*--commit[ =]([^ ]+).*/\1/p' | head -1)"
+      wf="$(printf '%s' "$body" | sed -nE 's/.*(--workflow|-w)[ =]([^ ]+).*/\2/p' | head -1)"
+      lookup="gh run list${repo:+ -R $repo}${wf:+ --workflow $wf} --commit $sha --json databaseId -q '.[0].databaseId'"
+      echo "note: --watch \"$1\" asks gh through a command; a gh: ref watches the run itself and lands when it completes — gh:${repo:-<owner/repo>}#run/<id>, the id from: $lookup" >&2
+      ;;
+  esac
+  return 0
+}
+
+# Does <ref> name THIS phase's own lock — lock:<slug>/<phase>, leading zeros
+# and surrounding blanks allowed, exactly the grammar `_watch_problem` accepts?
+_own_lock_ref() {  # _own_lock_ref <ref>
+  case "$1" in lock:*) _names_own_phase "$1" ;; *) return 1 ;; esac
+}
+
+# Does a well-formed <scheme>:<slug>/<phase> ref name THIS phase?
+_names_own_phase() {  # _names_own_phase <ref>
+  local body
+  body="$(printf '%s' "${1#*:}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  printf '%s' "$body" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/0*[1-9][0-9]*$' || return 1
+  [ "${body%/*}" = "$slug" ] && [ "$((10#${body##*/}))" -eq "$phase" ]
+}
+
+# The longest --watch ref this script records (control-tower phase 88, #125). A
+# realistic two-check AWS or gh proof is 250–400 characters; the old silent cut
+# at 200 split one mid-word. A longer ref is refused, never cut.
+WATCH_REF_MAX=1000
 
 reason=""; wait_minutes=""; until_iso=""
 needs=""; rule=""; command_text=""
 watch_count=0; watch_json=""
 what=""; why=""; kind=""; cost=""; remember=""; by_word=""; for_whom=""
+exit_code=""; in_dir=""
+label=""; done_n=""; of_n=""; progress_flags=""
+step_kind=""; step_title=""; step_open_url=""; step_open_command=""; step_where=""; step_proof=""
+step_lines_json=""; step_line_count=0; step_code=""; step_credential=""; step_flags=""
 while [ $# -gt 0 ]; do
   case "$1" in
+    --label|--done|--of)
+      # Validated here rather than by ${2:?}: an empty or missing value is a
+      # malformed call, and a malformed call is exit 2 with nothing written.
+      [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
+      case "$1" in --label) label="$2" ;; --done) done_n="$2" ;; --of) of_n="$2" ;; esac
+      progress_flags="${progress_flags}x"; shift 2 ;;
+    --exit)         exit_code="${2:?--exit needs the exit status}"; shift 2 ;;
+    --in)           in_dir="${2:?--in needs a directory}"; shift 2 ;;
     --reason)       reason="${2:?--reason needs text}"; shift 2 ;;
     --needs)        needs="${2:?--needs needs a decision key}"; shift 2 ;;
     --rule)         rule="${2:?--rule needs text}"; shift 2 ;;
@@ -201,10 +442,57 @@ while [ $# -gt 0 ]; do
     --by)           by_word="${2:?--by needs a name}"; shift 2 ;;
     --wait-minutes) wait_minutes="${2:?--wait-minutes needs a number}"; shift 2 ;;
     --until)        until_iso="${2:?--until needs an ISO8601 time}"; shift 2 ;;
+    --step)         step_kind="${2:?--step needs a kind}"; shift 2 ;;
+    --title)        step_title="${2:?--title needs text}"; step_flags=1; shift 2 ;;
+    --open-url)     step_open_url="${2:?--open-url needs a link}"; step_flags=1; shift 2 ;;
+    --open-command) step_open_command="${2:?--open-command needs a command}"; step_flags=1; shift 2 ;;
+    --where)        step_where="${2:?--where needs host or any}"; step_flags=1; shift 2 ;;
+    --proof)        step_proof="${2:?--proof needs a ref}"; step_flags=1; shift 2 ;;
+    --code)         step_code="${2:?--code needs the code}"; step_flags=1; shift 2 ;;
+    --credential)   step_credential="${2:?--credential needs an id}"; step_flags=1; shift 2 ;;
+    --step-line)
+      line_text="${2:?--step-line needs text}"; step_flags=1
+      _screen_secret --step-line "$line_text"
+      if [ "$step_line_count" -lt 12 ]; then
+        step_lines_json="${step_lines_json:+$step_lines_json,}\"$(_json_str "$(printf '%s' "$line_text" | cut -c1-300)")\""
+        step_line_count=$((step_line_count + 1))
+      else
+        echo "ignoring --step-line beyond the 12th" >&2
+      fi
+      shift 2 ;;
     --watch)
       ref="${2:?--watch needs a ref}"
+      if _own_lock_ref "$ref"; then
+        echo "--watch $ref refused: $OWN_LOCK_WATCH_REFUSAL" >&2
+        exit 2
+      fi
       if [ "$watch_count" -lt 8 ]; then
-        ref="$(printf '%s' "$ref" | cut -c1-200)"
+        # Never cut (control-tower phase 88, #125): a ref shortened here was a
+        # different ref — the #125 one lost its closing quote — and the console
+        # refused it after the session had gone. Too long is exit 2, now.
+        if [ "${#ref}" -gt "$WATCH_REF_MAX" ]; then
+          echo "--watch refused: the ref is ${#ref} characters and the limit is $WATCH_REF_MAX characters — nothing was written; shorten it (a script at an absolute path is one short ref)" >&2
+          exit 2
+        fi
+        case "$ref" in
+          phase:*)
+            if _names_own_phase "$ref"; then
+              echo "--watch $ref refused: a phase cannot wait for its own completion — name the SIBLING phase this one waits on (phase:<slug>/<N>)" >&2
+              exit 2
+            fi ;;
+          verify:*)
+            if [ -z "$(_watch_problem "$ref")" ] && ! _names_own_phase "$ref"; then
+              echo "--watch $ref refused: a verify: ref re-runs the DECLARING phase's own red §Verification lines — write verify:$slug/$phase" >&2
+              exit 2
+            fi ;;
+          cmd:*)
+            problem="$(_cmd_ref_problem "$ref")"
+            if [ -n "$problem" ]; then
+              echo "--watch $ref refused: $problem. Nothing was written." >&2
+              exit 2
+            fi
+            _cmd_ref_hints "$ref" ;;
+        esac
         # Recorded either way — the reason still helps a person — but a ref no
         # scheme can parse is a ref nothing will ever probe, and saying so now,
         # while the session can still fix it, beats a park that silently runs on
@@ -221,8 +509,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# The two shapes share one option loop and are then held apart, so a flag that
-# belongs to the other one is an error rather than a silent no-op.
+# The shapes share one option loop and are then held apart, so a flag that
+# belongs to another one is an error rather than a silent no-op.
+if [ "$mode" = progress ]; then
+  if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
+     || [ -n "$rule" ] || [ -n "$command_text" ] || [ -n "$needs" ] || [ -n "$what$why$kind$cost$for_whom$remember$by_word" ] \
+     || [ -n "$exit_code$in_dir" ]; then
+    echo 'progress takes --label, --done and --of only' >&2; exit 2
+  fi
+  [ -n "$label" ] || { echo '--label is required for progress: say what is being measured' >&2; exit 2; }
+  case "$done_n" in ''|*[!0-9]*) echo "--done needs a whole number, got: ${done_n:-nothing}" >&2; exit 2 ;; esac
+  case "$of_n" in ''|*[!0-9]*) echo "--of needs a whole number, got: ${of_n:-nothing}" >&2; exit 2 ;; esac
+  done_n=$((10#$done_n)); of_n=$((10#$of_n))
+  [ "$of_n" -ge 1 ] || { echo '--of must be at least 1' >&2; exit 2; }
+  [ "$done_n" -le "$of_n" ] || { echo "--done ($done_n) is more than --of ($of_n)" >&2; exit 2; }
+  label="$(printf '%s' "$label" | tr '\n\t' '  ' | cut -c1-200)"
+elif [ -n "$progress_flags" ]; then
+  echo "--label/--done/--of only make sense with progress, not $status" >&2; exit 2
+fi
 if [ "$mode" = ruling ]; then
   if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
      || [ -n "$rule" ] || [ -n "$command_text" ]; then
@@ -271,6 +575,21 @@ elif [ -n "$what" ] || [ -n "$why" ] || [ -n "$kind" ] || [ -n "$cost" ] || [ -n
   echo "--what/--why/--kind/--cost-if-wrong/--for/--remember/--by only make sense with ruling, not $status" >&2; exit 2
 fi
 
+# The proof shape owns --exit and --in and needs --command; every outcome flag
+# is refused on it (the ruling flags already were, just above).
+if [ "$mode" = proof ]; then
+  if [ -n "$reason" ] || [ -n "$wait_minutes" ] || [ -n "$until_iso" ] || [ "$watch_count" -gt 0 ] \
+     || [ -n "$rule" ] || [ -n "$needs" ]; then
+    echo '--reason/--watch/--wait-minutes/--until/--rule/--needs belong to an outcome status, not to verified' >&2; exit 2
+  fi
+  [ -n "$command_text" ] || { echo '--command is required for verified: the command as your §Verification writes it' >&2; exit 2; }
+  case "$exit_code" in
+    ''|*[!0-9]*) echo "--exit needs the command's exit status as a number, got: ${exit_code:-nothing}" >&2; exit 2 ;;
+  esac
+elif [ -n "$exit_code" ] || [ -n "$in_dir" ]; then
+  echo "--exit/--in only make sense with verified, not $status" >&2; exit 2
+fi
+
 if [ -n "$wait_minutes" ] && [ -n "$until_iso" ]; then
   echo '--wait-minutes and --until are mutually exclusive' >&2; exit 2
 fi
@@ -295,6 +614,63 @@ case "$status" in
     fi
     ;;
 esac
+# A human step (control-tower phase 41): a needs-human ask with a type. Every
+# field is held here, before anything is written — an unknown kind, a missing
+# title, a link that is not http(s), a code on the wrong kind, a secret in any
+# value — because a declaration the console must repair is one a person never
+# sees in time.
+if [ -n "$step_kind" ] || [ -n "$step_flags" ]; then
+  [ "$mode" = outcome ] || { echo "--step and its fields belong to a needs-human declaration, not to $status" >&2; exit 2; }
+  [ -n "$step_kind" ] || { echo '--title/--open-url/--open-command/--where/--proof/--step-line/--code/--credential need --step <kind>' >&2; exit 2; }
+  [ "$status" = needs-human ] || { echo "--step is valid only with needs-human (a person's turn), not $status" >&2; exit 2; }
+  step_kind="$(printf '%s' "$step_kind" | tr 'A-Z' 'a-z')"
+  case " $HUMAN_STEP_KINDS " in
+    *" $step_kind "*) : ;;
+    *) echo "unknown --step kind: $step_kind (want one of: $HUMAN_STEP_KINDS)" >&2; exit 2 ;;
+  esac
+  [ -n "$step_title" ] || { echo "--title is required with --step: say what the person must do" >&2; exit 2; }
+  if [ -n "$step_open_url" ] && [ -n "$step_open_command" ]; then
+    echo '--open-url and --open-command are one or the other: a step opens a link OR runs a command' >&2; exit 2
+  fi
+  if [ -n "$step_open_url" ]; then
+    printf '%s' "$step_open_url" | grep -qiE '^https?://[^[:space:]/?#]+[^[:space:]]*$' \
+      || { echo "--open-url must be an http or https link; anything else is never opened" >&2; exit 2; }
+  fi
+  if [ -z "$step_where" ]; then
+    for pair in $HUMAN_STEP_DEFAULT_WHERE; do
+      [ "${pair%%:*}" = "$step_kind" ] && step_where="${pair#*:}"
+    done
+  fi
+  step_where="$(printf '%s' "$step_where" | tr 'A-Z' 'a-z')"
+  case " $HUMAN_STEP_WHERE " in
+    *" $step_where "*) : ;;
+    *) echo "unknown --where: $step_where (want one of: $HUMAN_STEP_WHERE)" >&2; exit 2 ;;
+  esac
+  if [ -n "$step_code" ]; then
+    [ "$step_kind" = device-code ] || { echo "--code belongs to a device-code step, not $step_kind" >&2; exit 2; }
+    printf '%s' "$step_code" | grep -qE '^[A-Z0-9]{4,9}(-[A-Z0-9]{4,9})?$' \
+      || { echo '--code must be a short device code (ABCD-1234); a longer value is not one' >&2; exit 2; }
+  fi
+  if [ "$step_kind" = secret-entry ]; then
+    [ -n "$step_credential" ] || { echo '--credential <id> is required with --step secret-entry: the registry id the secret is stored under' >&2; exit 2; }
+  elif [ -n "$step_credential" ]; then
+    echo "--credential belongs to a secret-entry step, not $step_kind" >&2; exit 2
+  fi
+  if [ -n "$step_credential" ]; then
+    printf '%s' "$step_credential" | grep -qE '^[a-z0-9][a-z0-9._-]{0,63}$' \
+      || { echo "--credential must be a registry id (a-z, 0-9, . _ -, at most 64): $step_credential" >&2; exit 2; }
+  fi
+  if [ -n "$step_proof" ]; then
+    [ "${#step_proof}" -le "$WATCH_REF_MAX" ] || { echo "--proof is longer than $WATCH_REF_MAX characters" >&2; exit 2; }
+    proof_problem="$(_cmd_ref_problem "$step_proof")"
+    [ -z "$proof_problem" ] || { echo "--proof refused: $proof_problem" >&2; exit 2; }
+  fi
+  _screen_secret --title "$step_title"
+  _screen_secret --open-url "$step_open_url"
+  _screen_secret --open-command "$step_open_command"
+  _screen_secret --proof "$step_proof"
+  _screen_secret --reason "$reason"
+fi
 rule="$(printf '%s' "$rule" | cut -c1-200)"
 command_text="$(printf '%s' "$command_text" | cut -c1-500)"
 # The clock belongs to the three statuses that PARK. `complete` has nothing to
@@ -367,6 +743,85 @@ now="${PE_NOW:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 # decision was made in.
 session="${PE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
 session="$(printf '%s' "$session" | tr -cd 'A-Za-z0-9._-' | cut -c1-128)"
+
+# ---- progress: one line on the task channel, and nothing else happens ------
+if [ "$mode" = progress ]; then
+  session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
+  line="{\"version\":1,\"type\":\"progress\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"label\":\"$(_json_str "$label")\",\"done\":$done_n,\"of\":$of_n,\"written_at\":\"$(_json_str "$now")\"${session_json}}"
+  if [ -n "${PE_TASKS_FILE:-}" ]; then
+    target="$PE_TASKS_FILE"
+  else
+    target="$(pe_runs_dir "$(pe_instance_root)" "$slug")/tasks/phase-$(printf '%02d' "$phase").ndjson"
+    echo "note: PE_TASKS_FILE is not set (no runner is supervising this session) — recorded for the console at $target" >&2
+  fi
+  if mkdir -p "$(dirname "$target")" 2>/dev/null && printf '%s\n' "$line" >> "$target" 2>/dev/null; then
+    echo "progress recorded: $slug phase $phase — $label $done_n/$of_n"
+  else
+    echo "note: $target could not be written — printing the progress line only" >&2
+    printf '%s\n' "$line"
+  fi
+  exit 0
+fi
+
+# ---- verified: one appended proof line, and nothing else happens -----------
+# The tree is computed in a PRIVATE index — the real one copied (so only what
+# changed is re-hashed), every change added, the result written as a tree
+# object. The session's own index, its staged work and HEAD are never touched;
+# the objects written are ordinary unreferenced ones git collects in its time.
+if [ "$mode" = proof ]; then
+  where="${in_dir:-.}"
+  top="$(git -C "$where" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -z "$top" ]; then
+    echo "not recorded: $where is not inside a git working tree, so there is no tree to prove against" >&2
+    exit 2
+  fi
+  # A linked worktree's index lives under the main repository's git dir, which
+  # `--git-path` knows; it answers relative to where it was asked.
+  real_index="$(cd "$top" && git rev-parse --git-path index 2>/dev/null || true)"
+  case "$real_index" in ''|/*) : ;; *) real_index="$top/$real_index" ;; esac
+  scratch="$(mktemp "${TMPDIR:-/tmp}/pe-proof-index.XXXXXX")"
+  # `-p` keeps the index file's mtime, and that is load-bearing: git trusts an
+  # entry's stat data only when the entry is OLDER than the index file, and
+  # re-reads the content of one that is not (its racy-clean check). A copy with a
+  # fresh mtime makes a file rewritten at the same size in the same second it was
+  # staged look unchanged, and the tree would name what was staged, not what ran.
+  if [ -n "$real_index" ] && [ -f "$real_index" ]; then cp -p "$real_index" "$scratch"; else rm -f "$scratch"; fi
+  tree=""
+  if GIT_INDEX_FILE="$scratch" git -C "$top" add -A >/dev/null 2>&1; then
+    tree="$(GIT_INDEX_FILE="$scratch" git -C "$top" write-tree 2>/dev/null || true)"
+  fi
+  rm -f "$scratch"
+  if [ -z "$tree" ]; then
+    echo "not recorded: git could not write the working tree of $top as a tree object" >&2
+    exit 2
+  fi
+  head_sha="$(git -C "$top" rev-parse -q --verify HEAD 2>/dev/null || true)"
+  # Folded exactly as the console folds a §Verification command before it
+  # compares (`commandFingerprint`): markdown wrapping is not a new command.
+  command_text="$(printf '%s' "$command_text" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ //; s/ $//')"
+  head_json="$( [ -n "$head_sha" ] && printf ',"head":"%s"' "$head_sha" || true )"
+  session_json="$( [ -n "$session" ] && printf ',"session_id":"%s"' "$session" || true )"
+  line="{\"version\":1,\"type\":\"proof\",\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"command\":\"$(_json_str "$command_text")\",\"code\":$((10#$exit_code)),\"tree\":\"$tree\"${head_json},\"at\":\"$(_json_str "$now")\"${session_json}}"
+  if [ -n "${PE_PROOFS_FILE:-}" ]; then
+    ledger="$PE_PROOFS_FILE"
+    if mkdir -p "$(dirname "$ledger")" 2>/dev/null && printf '%s\n' "$line" >> "$ledger" 2>/dev/null; then
+      echo "proof recorded: $slug phase $phase — exit $((10#$exit_code)) at tree ${tree:0:12}  ->  $ledger"
+    else
+      echo "note: $ledger could not be written — printing the proof only; the console will run this command itself" >&2
+      printf '%s\n' "$line"
+    fi
+  else
+    root="$(pe_instance_root)"
+    ledger="$(pe_runs_dir "$root" "$slug")/proofs.ndjson"
+    if mkdir -p "$(dirname "$ledger")" 2>/dev/null && printf '%s\n' "$line" >> "$ledger" 2>/dev/null; then
+      echo "note: PE_PROOFS_FILE is not set (no runner is supervising this session) — recorded for the console at $ledger" >&2
+    else
+      echo "note: PE_PROOFS_FILE is not set and $ledger could not be written — printing the proof only" >&2
+    fi
+    printf '%s\n' "$line"
+  fi
+  exit 0
+fi
 
 # ---- ruling: one appended NDJSON line, and nothing else happens ------------
 # Deliberately before the outcome machinery rather than folded into it: a
@@ -485,6 +940,19 @@ reason_line="$( [ -n "$reason" ] && printf '\n  "reason": "%s",' "$(_json_str "$
 needs_line="$( [ -n "$needs" ] && printf '\n  "needs": "%s",' "$(_json_str "$needs")" || true )"
 rule_line="$( [ -n "$rule" ] && printf '\n  "rule": "%s",' "$(_json_str "$rule")" || true )"
 command_line="$( [ -n "$command_text" ] && printf '\n  "command": "%s",' "$(_json_str "$command_text")" || true )"
+step_line=""
+if [ -n "$step_kind" ]; then
+  step_line="
+  \"step\": {\"kind\": \"$step_kind\", \"title\": \"$(_json_str "$(printf '%s' "$step_title" | cut -c1-300)")\""
+  [ -n "$step_open_url" ] && step_line="$step_line, \"open_url\": \"$(_json_str "$step_open_url")\""
+  [ -n "$step_open_command" ] && step_line="$step_line, \"open_command\": \"$(_json_str "$(printf '%s' "$step_open_command" | cut -c1-500)")\""
+  step_line="$step_line, \"where\": \"$step_where\""
+  [ -n "$step_proof" ] && step_line="$step_line, \"proof\": \"$(_json_str "$step_proof")\""
+  [ "$step_line_count" -gt 0 ] && step_line="$step_line, \"lines\": [$step_lines_json]"
+  [ -n "$step_code" ] && step_line="$step_line, \"code\": \"$step_code\""
+  [ -n "$step_credential" ] && step_line="$step_line, \"credential\": \"$step_credential\""
+  step_line="$step_line},"
+fi
 resume_line="$( [ -n "$resume_after" ] && printf '\n  "resume_after": "%s",' "$(_json_str "$resume_after")" || true )"
 session_line="$( [ -n "$session" ] && printf '\n  "session_id": "%s",' "$session" || true )"
 # The trace this session belongs to (5.1.0). A declaration is the one thing the
@@ -500,10 +968,73 @@ json="{
   \"version\": 1,
   \"slug\": \"$(_json_str "$slug")\",
   \"phase\": $phase,
-  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${resume_line}${session_line}${trace_line}${span_line}
+  \"status\": \"$status\",${reason_line}${needs_line}${rule_line}${command_line}${step_line}${resume_line}${session_line}${trace_line}${span_line}
   \"watch\": [$watch_json],
   \"written_at\": \"$(_json_str "$now")\"
 }"
+
+# ---- the ingest probe (control-tower phase 50, #86) ---------------------------
+# A declaration that PARKS and names refs is staged under a temporary name, and
+# the console is asked now — while this session is still here to hear it —
+# whether one of its refs has ALREADY landed: 5 of 30 declared refs were true
+# when declared, and each still cost a park, a probe and a resume. On "landed"
+# the staged file is removed, nothing parks, the console's sentence is printed
+# and the exit is 3 (ALREADY_LANDED_EXIT, viewer/server/declared-probe.ts): the
+# session carries on with its phase. Anything else — a pending answer, a
+# refusal, no console, no curl — moves the staged file into place and the
+# declaration parks exactly as it always did. The console reads the refs from
+# the staged file, never from this request. PHASE_OUTCOME_PROBE=0 skips it.
+landed_sentence=""
+refused_sentence=""
+# 0 when a ref has already landed, 2 when the console REFUSED one (control-tower
+# phase 88, #125: its policy would never run it, so nothing would ever resume
+# the phase — exit 2 while the session can still fix it), 1 for anything else.
+_probe_declaration() {  # _probe_declaration <staged file>
+  local url code reply_file reply
+  [ "${PHASE_OUTCOME_PROBE:-1}" != 0 ] || return 1
+  case "$status" in waiting-external|blocked|needs-human) ;; *) return 1 ;; esac
+  [ -n "$watch_json" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  url="$(pe_console_url "$(pe_docs_root)" 2>/dev/null || true)"
+  [ -n "$url" ] || return 1
+  reply_file="$(mktemp "${TMPDIR:-/tmp}/pe-probe.XXXXXX" 2>/dev/null)" || return 1
+  # 25 s against the console's 20 s budget: its answer, not curl's clock, ends it.
+  code="$(curl -sS -o "$reply_file" -w '%{http_code}' --connect-timeout 2 --max-time 25 \
+      -X POST "$url/hooks/declaration" -H 'content-type: application/json' \
+      --data "{\"slug\":\"$(_json_str "$slug")\",\"phase\":$phase,\"file\":\"$(_json_str "$1")\"}" 2>/dev/null || true)"
+  reply="$(cut -c1-4000 "$reply_file" 2>/dev/null || true)"; rm -f "$reply_file"
+  [ "$code" = 200 ] || return 1
+  case "$reply" in
+    *'"verdict":"landed"'*) ;;
+    *'"verdict":"refused"'*)
+      refused_sentence="$(printf '%s' "$reply" | sed -n 's/.*"sentence":"\([^"]*\)".*/\1/p' | head -1)"
+      [ -n "$refused_sentence" ] || refused_sentence="refused — the console would never run a watched ref as written, so nothing would ever resume this phase: fix the ref and declare again."
+      return 2 ;;
+    *) return 1 ;;
+  esac
+  landed_sentence="$(printf '%s' "$reply" | sed -n 's/.*"sentence":"\([^"]*\)".*/\1/p' | head -1)"
+  [ -n "$landed_sentence" ] || landed_sentence="already landed — continue: a watched ref has already landed. Nothing was parked; carry on with the phase."
+  return 0
+}
+_say_landed() {
+  printf '%s\n' "$landed_sentence"
+  echo "note: exit 3 — nothing was parked and nothing will resume this phase; the wait is over, so carry on (do not stop)" >&2
+  exit 3
+}
+_say_refused() {
+  echo "--watch $refused_sentence" >&2
+  echo "note: exit 2 — nothing was written and nothing parked; fix the ref (or drop it) and declare again" >&2
+  exit 2
+}
+# Ask, then act on the answer: landed → exit 3, refused → exit 2, else carry on.
+_probe_or_carry_on() {  # _probe_or_carry_on <staged file>
+  local rc=1
+  _probe_declaration "$1" && rc=0 || rc=$?
+  [ "$rc" = 1 ] && return 0
+  rm -f "$1" 2>/dev/null || true
+  [ "$rc" = 0 ] && _say_landed
+  _say_refused
+}
 
 if [ -n "${PE_OUTCOME_FILE:-}" ]; then
   # The unsupervised branch below has always degraded honestly — mkdir, and on
@@ -516,7 +1047,10 @@ if [ -n "${PE_OUTCOME_FILE:-}" ]; then
   mkdir -p "$(dirname "$PE_OUTCOME_FILE")" 2>/dev/null || true
   # A subshell, so the SHELL's own "No such file or directory" for a redirect it
   # cannot open is suppressed too — that message is the shell's, not printf's.
-  if ( printf '%s\n' "$json" > "$tmp" ) 2>/dev/null && mv "$tmp" "$PE_OUTCOME_FILE" 2>/dev/null; then
+  staged=0
+  ( printf '%s\n' "$json" > "$tmp" ) 2>/dev/null && staged=1
+  [ "$staged" = 1 ] && _probe_or_carry_on "$tmp"
+  if [ "$staged" = 1 ] && mv "$tmp" "$PE_OUTCOME_FILE" 2>/dev/null; then
     echo "outcome recorded: $slug phase $phase = $status  ->  $PE_OUTCOME_FILE"
   else
     rm -f "$tmp" 2>/dev/null || true
@@ -539,7 +1073,12 @@ else
   target="$inbox/phase-$(printf '%02d' "$phase")-$(printf '%s' "$now" | tr -d ':-').json"
   if mkdir -p "$inbox" 2>/dev/null; then
     tmp="$target.tmp.$$"
-    if printf '%s\n' "$json" > "$tmp" 2>/dev/null && mv "$tmp" "$target" 2>/dev/null; then
+    staged=0
+    printf '%s\n' "$json" > "$tmp" 2>/dev/null && staged=1
+    # The inbox's watcher reads `phase-NN-<stamp>.json` only, so the staged
+    # name is invisible to it until the `mv` — no ingest can race the probe.
+    [ "$staged" = 1 ] && _probe_or_carry_on "$tmp"
+    if [ "$staged" = 1 ] && mv "$tmp" "$target" 2>/dev/null; then
       echo "note: PE_OUTCOME_FILE is not set (no runner is supervising this session) — recorded for the console at $target" >&2
     else
       rm -f "$tmp" 2>/dev/null || true

@@ -48,6 +48,8 @@ import {
   parsePayload,
   readRequest,
   resubscribeRequest,
+  STEP_OPEN_ACTION,
+  stepTarget,
 } from '../../shared/sw-push.js';
 
 const MANIFEST = self.__WB_MANIFEST ?? [];
@@ -199,8 +201,11 @@ self.addEventListener('notificationclick', (event) => {
     notificationId?: string | null;
     actions?: { action: string; title: string }[] | null;
     callback?: string | null;
+    step?: { id?: string } | null;
   };
-  const target = clickTarget(info, self.location.origin);
+  // A person's turn lands on its card — the body's tap and *Open* alike — one
+  // tap from the lock screen to the whole step (control-tower phase 42).
+  const target = info.step ? stepTarget(info, self.location.origin) : clickTarget(info, self.location.origin);
   // Which button, checked against the ones this notification actually offered.
   const verb = actionOf(event.action, info);
   const decision = decisionOf(event.action);
@@ -225,12 +230,15 @@ self.addEventListener('notificationclick', (event) => {
       // operator's phone can hold a subscription older than any of this, so the
       // worker keeps understanding it. Neither is tried unless a real button was
       // pressed; tapping the body of the notification just opens the console.
+      // *Open* on a step is the worker's own button: it answers nothing.
       const answer =
-        verb && info.callback
-          ? actionRequest(info.callback, verb)
-          : decision && info.approvalId
-            ? decisionRequest(info.approvalId, decision)
-            : null;
+        event.action === STEP_OPEN_ACTION && info.step
+          ? null
+          : verb && info.callback
+            ? actionRequest(info.callback, verb)
+            : decision && info.approvalId
+              ? decisionRequest(info.approvalId, decision)
+              : null;
 
       if (answer) {
         let answered = false;

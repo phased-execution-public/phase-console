@@ -15,13 +15,17 @@
 
 import type { PreflightWarning } from '@/lib/api';
 
-export const PREFLIGHT_TONE: Readonly<Record<PreflightWarning['kind'], 'bad' | 'warn' | 'neutral'>> =
-  Object.freeze({
-    'nothing-runnable': 'bad',
-    'missing-lead': 'warn',
-    'human-check': 'neutral',
-    'cwd-unpinned': 'neutral',
-  });
+/**
+ * The badge tone of each kind: the certainty red, the three predictions the
+ * quiet neutral — none of them amber, because a prediction asks nothing of a
+ * person yet (6.0: amber is a summons).
+ */
+export const PREFLIGHT_TONE: Readonly<Record<PreflightWarning['kind'], 'bad' | 'neutral'>> = Object.freeze({
+  'nothing-runnable': 'bad',
+  'missing-lead': 'neutral',
+  'human-check': 'neutral',
+  'cwd-unpinned': 'neutral',
+});
 
 export const PREFLIGHT_LABEL: Readonly<Record<PreflightWarning['kind'], string>> = Object.freeze({
   'nothing-runnable': 'will park',

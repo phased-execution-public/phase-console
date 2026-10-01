@@ -32,7 +32,7 @@ import { Runner } from '../server/runner/runner.ts';
 import { Approvals } from '../server/runner/approvals.ts';
 import { recoveryActions } from '../server/service.ts';
 import { resumeOffer } from '../server/service-runs.ts';
-import { loadRun, newRun, runDir, saveRun } from '../server/runner/state.ts';
+import { loadRun, newRun, phaseRecord, runDir, saveRun } from '../server/runner/state.ts';
 import { RECOVER_MAX_PER_PHASE } from '../server/runner/runner-core.ts';
 import { laneNames } from '../server/runner/worktree.ts';
 import { MAX_FAILURE_CONTEXT_BYTES } from '../server/runner/failure-context.ts';
@@ -1104,4 +1104,53 @@ test('O1: the actions the payload offers agree with its own resumable flag', () 
     !actions.some((a) => a.id === 'closeout'),
     'a closeout resumes the session — never offered for one the policy refuses',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * A stale halt is cleared only on evidence (control-tower phase 81, #105)
+ * ------------------------------------------------------------------ */
+
+test('RR-7 guard: a recovery whose own board read FAILS keeps the plan-unreadable stop — only a read that answers disproves it', async () => {
+  const h = harness();
+  try {
+    const state = newRun({ slug: 'demo', root: h.root });
+    state.status = 'halted';
+    state.stoppedBy = 'system';
+    state.halt = {
+      at: new Date().toISOString(), kind: 'plan-unreadable',
+      reason: 'the engine could not read the plan: the engine timed out reading this plan',
+    };
+    const one = phaseRecord(state, 1);
+    one.status = 'interrupted';
+    one.attempts = 1;
+    saveRun(state);
+
+    const journal: string[] = [];
+    let haltWhileDriving: unknown = 'never spawned';
+    let runner: ReturnType<typeof makeRunner> | null = null;
+    const spawn = async () => {
+      haltWhileDriving = runner!.current()?.halt?.kind ?? null;
+      return {
+        signal: { subtype: 'success' as const, code: 0, text: 'done' },
+        sessionId: 'sid-repair', costUsd: 0, turns: 1, resultText: 'repaired', durationMs: 1, argv: [],
+      };
+    };
+    runner = makeRunner(h, spawn as never, GREEN, {
+      onEvent: (event: string, data: Record<string, unknown>) => {
+        if (event === 'run:journal') journal.push(String(data.event));
+      },
+    });
+    // The engine is still too busy to answer this recovery's read.
+    (runner as unknown as { board: () => Promise<unknown> }).board = async () => ({
+      phased: false, states: {}, done: [], inProgress: [], stuck: [], ready: [], waiting: [],
+      blockedBy: {}, qa: {}, error: 'the engine timed out reading this plan', timedOut: true,
+    });
+    await runner.recover({
+      slug: 'demo', root: h.root, runId: state.id, phase: 1, mode: 'repair', instruction: 'repair the plan', by: 'auto-recovery',
+    });
+    await runner.wait();
+
+    assert.equal(haltWhileDriving, 'plan-unreadable', 'nothing disproved the stop, so it still stands while the session drives');
+    assert.ok(!journal.includes('run.halt-cleared'), 'and nothing claims it was cleared');
+  } finally { h.cleanup(); }
 });

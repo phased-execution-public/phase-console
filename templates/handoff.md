@@ -49,14 +49,20 @@ memory: {{MEMORY_KEY}}
 
 ## ▶ Start next phase(s) (paste into fresh sessions)
 
-<!-- AUTO-FILLED by scripts/new-handoff.sh from the plan's phase graph: one fenced
-     boot prompt per phase that THIS phase unblocks (there may be several — run ONE
-     session at a time; the finishing session may batch straight into one of them
-     while the budget lasts — or none if downstream still waits on other deps).
-     Re-generate anytime with:
-       scripts/next-phase-prompt.sh {{SLUG}} {{PHASE}}
+<!-- AUTO-FILLED by scripts/new-handoff.sh from the plan's phase graph: the boot
+     prompt of the phase THIS phase unblocks — or, when it unblocks several, the
+     shared boot ONCE and a block per phase with only what is that phase's own
+     (a booting session reads the shared boot and its own block, never a
+     sibling's). None if downstream still waits on other deps. The console runs
+     one phase per session, so a supervised session stops after its handoff;
+     only a person driving by hand may batch straight into a ready phase while
+     the budget lasts. Compose one
+     phase's full prompt at launch with:
+       bash "${PE_SCRIPTS:-<skill-root>/scripts}"/next-phase-prompt.sh {{SLUG}} {{PHASE}} --phase <N>
      and check live state with:
-       scripts/phase-graph.sh {{SLUG}} -->
+       bash "${PE_SCRIPTS:-<skill-root>/scripts}"/phase-graph.sh {{SLUG}}
+     ($PE_SCRIPTS is the console's scripts in any session it starts; never write a
+     skill copy's own path here — it pins the next session to that copy.) -->
 {{NEXT_PROMPTS}}
 
 ## Outstanding / blockers

@@ -402,6 +402,11 @@ describe('comments', () => {
       side: 'new',
       body: 'this can be null here',
     });
+    // And the hunk and the line's own code travel with it (phase 25's gap:
+    // `side`, `hunk` and `code` are what the follow-up quotes back).
+    expect((body as { hunk?: unknown }).hunk).toEqual(expect.any(String));
+    expect((body as { code?: unknown }).code).toEqual(expect.any(String));
+    expect((body as { hunk: string }).hunk.length).toBeGreaterThan(0);
   });
 
   it('anchors a comment on a REMOVED line to the old side, not the new one', async () => {

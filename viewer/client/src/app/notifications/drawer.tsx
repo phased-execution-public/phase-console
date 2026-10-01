@@ -9,7 +9,7 @@ import {
   Banner,
   Button,
   Checkbox,
-  Chip,
+  Badge,
   ConfirmButton,
   CountBadge,
   Empty,
@@ -19,10 +19,10 @@ import {
   SheetContent,
   Skeleton,
 } from '@/components/ui';
-import { InboxRow, useInboxActions } from '@/features/now/inbox-row';
-import { useSelection } from '@/features/now/selection';
-import { SelectionBar } from '@/features/now/selection-bar';
-import { needsYouCount, partitionAsks } from '@/features/now/model';
+import { InboxRow, useInboxActions } from '@/components/inbox-row';
+import { useSelection } from '@/app/notifications/selection';
+import { SelectionBar } from '@/app/notifications/selection-bar';
+import { needsYouCount, partitionAsks } from '@/features/runs/lanes-model';
 import { useNavigate } from '@/app/router';
 import {
   OVERLAY_KEYS,
@@ -745,50 +745,53 @@ function DrawerRow({
           />
         </span>
       )}
-      {/* A real link so it can be opened in a background tab; the click also
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* A real link so it can be opened in a background tab; the click also
           marks it read, which a bare href cannot do. */}
-      <a
-        href={toHash(item.url)}
-        onClick={(event) => {
-          if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
-          event.preventDefault();
-          onOpen();
-        }}
-        className="min-w-0 flex-1 px-3 py-2 hover:bg-surface-raised focus-visible:bg-surface-raised"
-      >
-        <div className="flex items-baseline justify-between gap-2">
-          <strong className={`min-w-0 truncate text-sm ${item.read ? 'text-ink-muted' : 'text-ink'}`}>
-            {item.title}
-          </strong>
-          {/* `live={false}`: the log runs to hundreds of rows and none of their
+        <a
+          href={toHash(item.url)}
+          onClick={(event) => {
+            if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return;
+            event.preventDefault();
+            onOpen();
+          }}
+          className="min-w-0 flex-1 px-3 py-2 hover:bg-surface-raised focus-visible:bg-surface-raised"
+        >
+          <div className="flex items-baseline justify-between gap-2">
+            <strong className={`min-w-0 truncate text-sm ${item.read ? 'text-ink-muted' : 'text-ink'}`}>
+              {item.title}
+            </strong>
+            {/* `live={false}`: the log runs to hundreds of rows and none of their
               clocks ever moves — one shared interval would repaint the lot to
               change nothing. */}
-          <RelativeTime at={item.at} live={false} className="shrink-0 text-2xs text-ink-faint" />
-        </div>
-        <p className="mt-0.5 text-sm text-ink-muted">{item.body}</p>
-        <div className="mt-1 flex flex-wrap gap-1.5">
-          <Chip>{item.category}</Chip>
-          {item.resolved ? (
-            <Chip title={`Resolved on its own ${item.resolved.reason ? `— ${item.resolved.reason}` : ''}`}>
-              resolved itself
-            </Chip>
-          ) : (
-            item.urgent && <Chip tone="warn">urgent</Chip>
-          )}
-          <Chip
-            tone={summary.failed ? 'bad' : delivered.length ? 'ok' : 'neutral'}
-            title={
-              delivered.length
-                ? delivered
-                    .map((d) => `${d.label}: ${d.outcome}${d.detail ? ` (${d.detail})` : ''}`)
-                    .join('\n')
-                : 'No device was subscribed when this was announced'
-            }
-          >
-            {summary.text}
-          </Chip>
-        </div>
-      </a>
+            <RelativeTime at={item.at} live={false} className="shrink-0 text-2xs text-ink-faint" />
+          </div>
+          <p className="mt-0.5 text-sm text-ink-muted">{item.body}</p>
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            <Badge>{item.category}</Badge>
+            {item.resolved ? (
+              <Badge title={`Resolved on its own ${item.resolved.reason ? `— ${item.resolved.reason}` : ''}`}>
+                resolved itself
+              </Badge>
+            ) : (
+              item.urgent && <Badge tone="accent">urgent</Badge>
+            )}
+            <Badge
+              tone={summary.failed ? 'bad' : delivered.length ? 'ok' : 'neutral'}
+              title={
+                delivered.length
+                  ? delivered
+                      .map((d) => `${d.label}: ${d.outcome}${d.detail ? ` (${d.detail})` : ''}`)
+                      .join('\n')
+                  : 'No device was subscribed when this was announced'
+              }
+            >
+              {summary.text}
+            </Badge>
+          </div>
+        </a>
+        {item.callback && item.actions?.length && !item.resolved ? <NotificationActions item={item} /> : null}
+      </div>
       <button
         type="button"
         onClick={onClear}
@@ -798,5 +801,45 @@ function DrawerRow({
         <X className="size-4" aria-hidden />
       </button>
     </article>
+  );
+}
+
+/**
+ * The buttons the phone's notification offered, offered here too (control-tower
+ * phase 25): pressed through `POST /api/push/action` with the notification's
+ * own one-shot token, so an answer given here is the answer — a phone's later
+ * press is told it was already answered, and the other way round.
+ */
+export function NotificationActions({ item }: { item: NotificationRecord }) {
+  const [said, setSaid] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  if (said) {
+    return (
+      <p className="px-3 pb-2 text-2xs text-ink-muted" role="status" data-testid="notification-answered">
+        {said}
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-1.5 px-3 pb-2" data-testid="notification-actions">
+      {(item.actions ?? []).map((one) => (
+        <Button
+          key={one.action}
+          size="sm"
+          variant="ghost"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            api
+              .pushAction(item.callback!, one.action)
+              .then(() => setSaid(`${one.title} — answered.`))
+              .catch((error: Error) => setSaid(error.message))
+              .finally(() => setBusy(false));
+          }}
+        >
+          {one.title}
+        </Button>
+      ))}
+    </div>
   );
 }

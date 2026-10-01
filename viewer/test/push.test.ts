@@ -10,6 +10,7 @@
  * pass.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync } from 'node:fs';

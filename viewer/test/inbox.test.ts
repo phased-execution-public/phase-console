@@ -2136,6 +2136,39 @@ test('instance health: unread on a console that can reach nobody is itself a nee
   assert.equal(buildInbox(nothingUnread, NOW).items.length, 0);
 });
 
+test('CL-5 instance health: a console that ended hard says so where a person looks, and a loop says it is holding', () => {
+  // It was one `previous-run-crashed` line in a log, and that is how a console
+  // crash-looped for five minutes — parking two live autopilot runs each time
+  // round while their `claude` children carried on unsupervised — with nobody
+  // told. The row is the fix: a person who never opens a log still learns.
+  const base = { delivery: { ok: true, reason: '1 subscribed device' }, unread: 0, remote: null, siblings: [] };
+
+  const once = {
+    fleet: { ...base, crashed: { at: '2026-09-21T03:37:28.937Z', boots: 1, snapshot: null } },
+  } satisfies InboxFacts;
+  const one = buildInbox(once, NOW).items.filter((item) => item.kind === 'health');
+  assert.equal(one.length, 1);
+  assert.equal(one[0]!.severity, 'needs-you');
+  assert.equal(one[0]!.since, '2026-09-21T03:37:28.937Z', 'the row ages from the crash, not from now');
+  assert.match(one[0]!.title, /ended hard/);
+  assert.match(one[0]!.need, /unsupervised/, 'the cost is the surviving child, and the row says so');
+
+  const looping = {
+    fleet: { ...base, crashed: { at: '2026-09-21T03:37:28.937Z', boots: 3, snapshot: '/state/diag/Heap.1.heapsnapshot' } },
+  } satisfies InboxFacts;
+  const loop = buildInbox(looping, NOW).items.filter((item) => item.kind === 'health');
+  assert.equal(loop.length, 1);
+  assert.match(loop[0]!.title, /ended hard 3 times — automation is held/);
+  assert.match(loop[0]!.need, /re-parked as orphaned until you release it/, 'and what the hold is doing');
+  assert.match(loop[0]!.how, /Heap\.1\.heapsnapshot/, 'naming the snapshot is the whole point of writing one');
+
+  assert.equal(
+    buildInbox({ fleet: { ...base, crashed: null } } satisfies InboxFacts, NOW).items.length,
+    0,
+    'a console that has not crashed raises nothing',
+  );
+});
+
 test('instance health: under --remote, Tailscale stopped and Serve pointing elsewhere are each a needs-you naming what to do', () => {
   const stopped = {
     fleet: { delivery: { ok: true, reason: 'x' }, unread: 0, siblings: [], remote: { running: false, detail: 'Stopped', forOurPort: false, hosts: ['console.example.ts.net'] } },
@@ -2394,4 +2427,78 @@ test('a message of a closed plan raises nothing, and an acked row hides', () => 
   const id = inboxItemId({ kind: 'message', slug: 'demo', phase: 4, runId: 'r1', subject: 'aaaaaaaaaaaa' });
   const acked = buildInbox({ messages: [ASK], acks: { [id]: { at: '2026-09-21T10:30:00.000Z' } } }, NOW);
   assert.deepEqual(acked.items, []);
+});
+
+/* ------------------------------------------------------------------ *
+ * One answer about the declarer (#49, control-tower phase 52)
+ * ------------------------------------------------------------------ */
+
+test('#49: a claim the one presence reader calls unknown is never offered for release — not even with a lane queued behind it', () => {
+  // The run-006df40b shape: a hand `claude` whose OLD session id the hook ended
+  // on a `/clear`, while its process — and the lease it claimed — carried on.
+  // `lockPresence` is `lockPresenceFor`'s answer (the service builds it through
+  // `declarerPresence`, the reader admission and the outcome inbox share), and
+  // for that shape it is `unknown`: the lease decides, and a person is not
+  // handed a button that frees a live session's claim under it.
+  const lock = { slug: 'tamagui-upgrade', phase: 4, owner: 'mo@hand', expired: false, session: 's-cleared' };
+  const queue = {
+    live: 0,
+    queued: 1,
+    entries: [{
+      slug: 'tamagui-upgrade', phase: 4, since: NOW - 60_000,
+      waitingOn: [{ kind: 'lock', slug: 'tamagui-upgrade', phase: 4, owner: 'mo@hand' }],
+    }],
+  };
+  const rows = (presence: 'live' | 'ended' | 'unknown') => buildInbox(facts({
+    locks: [lock],
+    lockPresence: { 'tamagui-upgrade:4': presence },
+    queue,
+  } as Partial<InboxFacts>), NOW).items.filter((item) => item.kind === 'lock');
+
+  assert.deepEqual(rows('unknown'), [], 'a claim nobody can call ended is a queue to wait in');
+  assert.deepEqual(rows('live'), []);
+  // Only the one reader's `ended` makes it debris — and in the way, it asks.
+  const ended = rows('ended');
+  assert.equal(ended.length, 1);
+  assert.equal(ended[0].id, inboxItemId({ kind: 'lock', slug: 'tamagui-upgrade', phase: 4, subject: 'ended' }));
+  assert.equal(ended[0].severity, 'needs-you', 'a lane is queued behind it');
+  assert.ok(ended[0].actions.some((action) => action.verb === 'release'));
+});
+
+test('the crash loop is a row with its family and the one press that releases it (control-tower phase 17, #20)', () => {
+  const fleet = { delivery: { ok: true, reason: '1 subscribed device' }, unread: 0, remote: null, siblings: [] };
+  const looped = buildInbox(
+    { fleet: { ...fleet, crashed: { at: '2026-09-29T09:00:00.000Z', boots: 3 } }, flags: { allowRun: true } } as InboxFacts,
+    NOW,
+  ).items.find((item) => item.kind === 'health' && item.title.includes('ended hard'));
+  assert.ok(looped, 'the loop raises its row');
+  assert.deepEqual(looped.category, { word: 'environment', label: 'Environment and network' });
+  assert.deepEqual(
+    looped.actions.map((action) => [action.verb, action.endpoint, action.method]),
+    [['release-hold', '/api/automation/hold/release', 'POST']],
+  );
+  // A lone hard stop holds nothing, so it offers nothing to release.
+  const once = buildInbox({ fleet: { ...fleet, crashed: { at: '2026-09-29T09:00:00.000Z', boots: 1 } } } as InboxFacts, NOW)
+    .items.find((item) => item.kind === 'health' && item.title.includes('ended hard'));
+  assert.deepEqual(once?.actions, []);
+});
+
+test('a person\'s turn is ONE family (control-tower phase 44): every row asking a person for an act carries the humanStep view, and no other row does', async () => {
+  const { HUMAN_STEP_FOLDS } = await import('../shared/human-step-model.js');
+  const { items } = buildInbox(facts(), NOW, { all: true });
+  const byKind = (kind: string) => items.filter((item) => item.kind === kind);
+  for (const [kind, fold] of [['sign-in', 'sign-in'], ['mcp-auth', 'mcp-auth'], ['gate', 'gate'], ['qa', 'qa']] as const) {
+    const rows = byKind(kind);
+    assert.ok(rows.length > 0, `the fixture raises a ${kind} row`);
+    for (const row of rows) {
+      assert.equal(row.humanStep?.kind, HUMAN_STEP_FOLDS[fold], `${kind}: ${row.title}`);
+      assert.equal(row.humanStep?.fold, fold);
+      assert.ok(row.humanStep?.label && row.humanStep.icon, 'the kind\'s own label and icon ride the view');
+    }
+  }
+  // Not a person's act: a lock, the console's health, a tool's permission card.
+  for (const kind of ['lock', 'health']) {
+    for (const row of byKind(kind)) assert.equal(row.humanStep, undefined, `${kind}: ${row.title}`);
+  }
+  for (const row of byKind('approval')) assert.equal(row.humanStep, undefined, 'the fixture\'s approval is a tool card');
 });

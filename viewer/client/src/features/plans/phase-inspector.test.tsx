@@ -134,7 +134,7 @@ describe('the phase inspector', () => {
 
     expect(await screen.findByText('Put the nav on the 4.0 system.')).toBeInTheDocument();
     // The live word, not the one the sheet's own fetch happened to return.
-    expect(screen.getByText('Running')).toBeInTheDocument();
+    expect(screen.getByText('In progress')).toBeInTheDocument();
     expect(screen.queryByText('Waiting')).toBeNull();
     expect(screen.getByText(/^L · weight/)).toBeInTheDocument();
   });

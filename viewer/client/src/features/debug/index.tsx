@@ -30,6 +30,7 @@ import LogSection from './log-section';
 import JournalSection from './journal-section';
 import DeliverySection from './delivery-section';
 import HealthSection from './health-section';
+import AccessSection from './access-section';
 
 const SUBTITLE = 'Logs, journals and diagnostics — what the console saw';
 
@@ -47,6 +48,7 @@ const SECTION_BODY: Record<DebugSection, React.ComponentType<{ route: ViewProps[
   journal: JournalSection,
   delivery: DeliverySection,
   health: HealthSection,
+  access: AccessSection,
 };
 
 /**

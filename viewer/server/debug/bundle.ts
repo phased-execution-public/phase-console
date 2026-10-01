@@ -33,6 +33,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
+import { transcriptPhase } from '../runner/run-paths.ts';
 import { tarGz, type TarMember } from './tar.ts';
 import { scrubText, scrubValue } from './sources.ts';
 
@@ -426,7 +427,18 @@ export async function runBundle(request: BundleRequest, deps: BundleDeps): Promi
   // the file is the run RECORD, and the archive is already of one run.
   members.push(member('record.json', recordText));
   const journal = addText('journal.ndjson', join(dir, `run-${runId}.jsonl`), { narrow: true });
-  addText('transcript.ndjson', join(dir, `run-${runId}.log.jsonl`), { narrow: true });
+  // The replay is one file per PHASE since control-tower phase 94 (#133). The
+  // run's own file holds the lines that name no phase — and every line of a run
+  // written before the split — so it is named `missing` only when there is no
+  // replay at all, which is the fact a reader of the bundle needs.
+  const replays = safeList(dir)
+    .map((name) => ({ name, phase: transcriptPhase(name, runId) }))
+    .filter((one): one is { name: string; phase: number } => typeof one.phase === 'number')
+    .sort((a, b) => a.phase - b.phase);
+  if (existsSync(join(dir, `run-${runId}.log.jsonl`)) || !replays.length) {
+    addText('transcript.ndjson', join(dir, `run-${runId}.log.jsonl`), { narrow: true });
+  }
+  for (const one of replays) addText(`transcripts/p${one.phase}.ndjson`, join(dir, one.name), { narrow: true });
   addText('git-trace.ndjson', join(dir, `run-${runId}.git.ndjson`), { narrow: true });
   addText('rulings.ndjson', join(dir, 'rulings.ndjson'), { narrow: true });
   addText('messages.ndjson', join(dir, 'messages.ndjson'), { narrow: true });

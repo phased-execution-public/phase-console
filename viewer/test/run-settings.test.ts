@@ -29,7 +29,8 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '../shared/run-settings.js';
+import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS, planModelOf } from '../shared/run-settings.js';
+import { parsePlan } from '../server/parse/plan.ts';
 import { DEFAULT_LAND, DEFAULT_CONFLICT, DEFAULT_BASE_BRANCH } from '../shared/landing-model.js';
 import { DEFAULT_MESSAGING } from '../shared/message-model.js';
 import { DEFAULT_ISSUES } from '../shared/issues-model.js';
@@ -303,4 +304,136 @@ test('the shipped defaults are the owners\' words, not copies', () => {
   assert.equal(DEFAULT_ISSUES, 'off');
   assert.equal(DEFAULT_RETENTION, 'keep-on-failure');
   assert.equal(DEFAULT_BASE_BRANCH, 'origin/HEAD');
+});
+
+/* ------------------------------------------------------------------ *
+ * The ladder's rung caps, per run (control-tower phase 5, #14)
+ * ------------------------------------------------------------------ */
+
+const RUNG_CAPS = ['ladderPerRunRungs', 'ladderPerPhaseRungs'] as const;
+
+test('the per-run rung caps are on BOTH door lists', () => {
+  for (const field of RUNG_CAPS) {
+    assert.ok((RUN_START_FIELDS as readonly string[]).includes(field), `start reads ${field}`);
+    assert.ok((RUN_SETTINGS_FIELDS as readonly string[]).includes(field), `settings reads ${field}`);
+  }
+});
+
+test('a run records a rung cap it was given, a patch moves it both ways, and a clear inherits the preference', () => {
+  const silent = newRun({ slug: 'demo', root: '/tmp/demo' });
+  for (const field of RUNG_CAPS) assert.equal(field in silent, false, `${field} is absent when nobody said it`);
+  const chosen = newRun({ slug: 'demo', root: '/tmp/demo', ladderPerRunRungs: 40, ladderPerPhaseRungs: 5 });
+  assert.equal(chosen.ladderPerRunRungs, 40);
+  assert.equal(chosen.ladderPerPhaseRungs, 5);
+  applySettings(chosen, { ladderPerRunRungs: 60 });
+  assert.equal(chosen.ladderPerRunRungs, 60, 'raised mid-run — the verb phase 14 announces');
+  applySettings(chosen, { ladderPerRunRungs: null, ladderPerPhaseRungs: 0 });
+  assert.equal('ladderPerRunRungs' in chosen, false, 'null clears it: the console\'s preference speaks again');
+  assert.equal(chosen.ladderPerPhaseRungs, 0, 'zero is a legal cap: nothing climbs');
+});
+
+test('the start and settings doors read the rung caps, and refuse a cap that is not a whole number', async () => {
+  const service = fakeService();
+  const out = await call(service, 'POST', '/api/run/demo/start', { ladderPerRunRungs: '40', ladderPerPhaseRungs: 4 });
+  assert.equal(out.status, 200, err(out));
+  assert.equal(service._started[0].options.ladderPerRunRungs, 40);
+  assert.equal(service._started[0].options.ladderPerPhaseRungs, 4);
+
+  // A Continue is this door too, and an emptied box on it is a CLEAR — so a
+  // null travels to the runner as null, where a fresh run reads it as silence.
+  const cleared = fakeService();
+  const clear = await call(cleared, 'POST', '/api/run/demo/start', { resumeRunId: 'r1', ladderPerRunRungs: null });
+  assert.equal(clear.status, 200, err(clear));
+  assert.equal(cleared._started[0].options.ladderPerRunRungs, null, 'a clear travels as null');
+  assert.equal(cleared._started[0].options.ladderPerPhaseRungs, undefined, 'an absent cap stays absent');
+
+  const bad = await call(fakeService(), 'POST', '/api/run/demo/start', { ladderPerRunRungs: -2 });
+  assert.equal(bad.status, 400);
+  assert.match(err(bad), /ladderPerRunRungs/);
+
+  const patched = fakeService({ runFor: async () => ({ id: 'r1', ladderPerRunRungs: 20 }) });
+  const set = await call(patched, 'POST', '/api/run/demo/settings', { ladderPerRunRungs: 30, ladderPerPhaseRungs: null });
+  assert.equal(set.status, 200, err(set));
+  assert.equal(patched._configured[0].ladderPerRunRungs, 30);
+  assert.equal(patched._configured[0].ladderPerPhaseRungs, null, 'a clear travels as null');
+});
+
+/* ------------------------------------------------------------------ *
+ * The prelude's three answers, changeable after launch (control-tower
+ * phase 77, #101) — RS-5
+ * ------------------------------------------------------------------ */
+
+const PRELUDE_ANSWERS = ['resumeOnRestart', 'relay', 'accounts'] as const;
+
+test('RS-5: resumeOnRestart, relay and accounts are on BOTH door lists', () => {
+  for (const field of PRELUDE_ANSWERS) {
+    assert.ok((RUN_START_FIELDS as readonly string[]).includes(field), `start reads ${field}`);
+    assert.ok((RUN_SETTINGS_FIELDS as readonly string[]).includes(field), `settings reads ${field} — a launch answer nobody can change strands the run`);
+  }
+});
+
+test('RS-5: a patch moves resumeOnRestart and relay both ways, and replaces the account pool', () => {
+  const state = newRun({
+    slug: 'demo', root: '/tmp/demo', resumeOnRestart: false, relay: 'last-resort',
+    accounts: [{ id: 'default', minHeadroomPct: 20 }, { id: 'acct-b', minHeadroomPct: 10 }],
+  });
+  applySettings(state, { resumeOnRestart: true, relay: 'off' });
+  assert.equal(state.resumeOnRestart, true);
+  assert.equal(state.relay, 'off');
+  applySettings(state, { resumeOnRestart: false });
+  assert.equal(state.resumeOnRestart, false, 'false is an answer, stored as one');
+  applySettings(state, { accounts: [{ id: 'default', minHeadroomPct: 5 }] });
+  assert.deepEqual(state.accounts, [{ id: 'default', minHeadroomPct: 5 }]);
+  applySettings(state, { accounts: [] });
+  assert.deepEqual(state.accounts, [{ id: 'default', minHeadroomPct: 5 }], 'an empty pool is no answer: the run keeps its own');
+  // The run's own account stays in its pool: the manifest names what the record names.
+  state.accountId = 'acct-b';
+  applySettings(state, { accounts: [{ id: 'default', minHeadroomPct: 5 }] });
+  assert.deepEqual(state.accounts, [{ id: 'default', minHeadroomPct: 5 }, { id: 'acct-b', minHeadroomPct: 0 }]);
+});
+
+test('RS-5: the settings door reads the three, and refuses a pool of unknown accounts by name', async () => {
+  const service = fakeService({ accounts: { has: (id: string) => id === 'acct-b' } });
+  const set = await call(service, 'POST', '/api/run/demo/settings', {
+    resumeOnRestart: false, relay: 'last-resort', accounts: [{ id: 'acct-b', minHeadroomPct: 15 }, 'default'],
+  });
+  assert.equal(set.status, 200, err(set));
+  assert.equal(service._configured[0].resumeOnRestart, false);
+  assert.equal(service._configured[0].relay, 'last-resort');
+  assert.deepEqual(service._configured[0].accounts, [{ id: 'acct-b', minHeadroomPct: 15 }, { id: 'default', minHeadroomPct: 0 }]);
+
+  const words = fakeService();
+  await call(words, 'POST', '/api/run/demo/settings', { relay: 'sometimes', resumeOnRestart: 'yes' });
+  assert.equal('relay' in words._configured[0], false, 'a word off the vocabulary is "you did not say"');
+  assert.equal('resumeOnRestart' in words._configured[0], false, 'only a boolean is an answer');
+
+  const nobody = fakeService();
+  const refused = await call(nobody, 'POST', '/api/run/demo/settings', { accounts: [{ id: 'acct-gone', minHeadroomPct: 5 }] });
+  assert.equal(refused.status, 400);
+  assert.match(err(refused), /accounts/);
+  assert.equal(nobody._configured.length, 0, 'nothing was patched');
+});
+
+/* ------------------------------------------------------------------ *
+ * A "(1M window)" written after the model name (control-tower phase 13, #91)
+ * ------------------------------------------------------------------ */
+
+test('a "(1M window)" after the model name reads as `[1m]` — the bullet, the Target model line, and nothing that is not a window', () => {
+  assert.equal(planModelOf('claude-opus-5-5 (1M window)'), 'claude-opus-5-5[1m]');
+  assert.equal(planModelOf('`claude-opus-5-5` (1M window)'), 'claude-opus-5-5[1m]');
+  assert.equal(planModelOf('`opus` (Opus 5.5, 1M context)'), 'opus[1m]');
+  assert.equal(planModelOf('claude-opus-5-5[1m] (1M window)'), 'claude-opus-5-5[1m]', 'never doubled');
+  // Not a window: no parenthetical right after the name, or no 1M in it.
+  assert.equal(planModelOf('claude-opus-5-5 — a 1M window would be nice'), 'claude-opus-5-5');
+  assert.equal(planModelOf('claude-opus-5-5 (200K window)'), 'claude-opus-5-5');
+  assert.equal(planModelOf('claude-opus-5-5 (v1.1M)'), 'claude-opus-5-5');
+  assert.equal(planModelOf('claude-opus-5-5 (21M tokens)'), 'claude-opus-5-5');
+
+  const plan = parsePlan(
+    '# p\n\n## Session budget\n\n> **Target model:** `claude-opus-5-5` (1M window) · **Budget:** ~200K\n\n'
+      + '## Phase graph\n\n| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |\n'
+      + '|---|---|---|---|---|---|\n| 1 | a | — | — | app | x |\n',
+    'p', '/tmp/p.md',
+  );
+  assert.equal(plan.sessionBudget.targetModel, 'claude-opus-5-5[1m]', 'the plan\'s own line keeps the window it named');
 });

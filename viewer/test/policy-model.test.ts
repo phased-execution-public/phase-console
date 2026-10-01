@@ -1,5 +1,5 @@
 /**
- * The policy table (phase 11, ZTD-10 / QRL-3): 18 classes, each tied to one
+ * The policy table (phase 11, ZTD-10 / QRL-3): 19 classes, each tied to one
  * manifest key; every ask the ladder can raise governed by exactly one class;
  * every journal name in the table a real row of `docs/journal-events.md`;
  * the answer vocabularies the plan format documents; the resolution order
@@ -22,7 +22,7 @@ import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import { SITUATIONS, SUB_KINDS, situationKey } from '../shared/situation-model.js';
 import {
   DECISION_ANSWERS, MANIFEST_BLOCKING, OWNER_KEYS, POLICY_CLASSES, POLICY_DEFAULTS, POLICY_SOURCES, POLICY_TABLE,
-  answerOf, decisionKeyOfSituation, destructiveExceptions, isAnswerWord, isAutomaticAnswer, policyRowOf, resolvePolicy,
+  TRUNK_BRANCHES, answerOf, decisionKeyOfSituation, destructiveExceptions, destructivePushBranches, isAnswerWord, isAutomaticAnswer, policyRowOf, resolvePolicy,
   sanitisePolicyPrefs,
 } from '../shared/policy-model.js';
 import { keyedAsks } from '../server/runner/ladder.ts';
@@ -30,10 +30,10 @@ import { keyedAsks } from '../server/runner/ladder.ts';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
 
-test('18 classes, each with one manifest key, in the audit\'s order; the vocabularies are what the plan format documents', () => {
-  assert.equal(POLICY_TABLE.length, 18);
+test('19 classes, each with one manifest key, in the audit\'s order; the vocabularies are what the plan format documents', () => {
+  assert.equal(POLICY_TABLE.length, 19);
   assert.deepEqual(POLICY_TABLE.map((r) => r.class), [...POLICY_CLASSES]);
-  assert.equal(new Set(POLICY_CLASSES).size, 18);
+  assert.equal(new Set(POLICY_CLASSES).size, 19);
   for (const row of POLICY_TABLE) {
     assert.ok((DECISION_KEYS as readonly string[]).includes(row.decisionKey), `${row.class} → ${row.decisionKey}`);
     assert.ok(row.blurb.length > 20, `${row.class} blurb`);
@@ -198,4 +198,13 @@ test('TRS-4: destructiveExceptions reads only a clause OPENED by allow — a ref
   ]) {
     assert.deepEqual(destructiveExceptions(value as never), [], `${JSON.stringify(value)} grants no exception`);
   }
+});
+
+test('#112 (control-tower phase 84): a row names push branches narrowly — never a trunk, never after a refusal — and the clause split still reads its exceptions', () => {
+  assert.deepEqual([...TRUNK_BRANCHES], ['main', 'master', 'trunk']);
+  const row = 'deny; allow `Bash(gh pr create:*)`; may publish: branch pushes to `pe/demo` + `main`, and never push to `release/1.0`';
+  assert.deepEqual(destructivePushBranches(row), ['pe/demo'], 'the trunk and the refused branch are not read');
+  assert.deepEqual(destructiveExceptions(row), ['Bash(gh pr create:*)'], 'the exception reader is unchanged by the shared splitter');
+  assert.deepEqual(destructivePushBranches('deny — may publish: branch pushes to `pe/demo`'), ['pe/demo'],
+    'a policy word far from the phrase does not negate it');
 });

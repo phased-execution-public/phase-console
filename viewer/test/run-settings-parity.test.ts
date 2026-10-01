@@ -33,6 +33,7 @@ import {
   PHASE_OPTION_FIELDS,
   RUN_SETTINGS_FIELDS,
   RUN_START_FIELDS,
+  SETTING_VERBS,
   START_ONLY_FIELDS,
 } from '../shared/run-settings.js';
 
@@ -125,8 +126,11 @@ function fieldsRead(block: string): Set<string> {
   return found;
 }
 
-/** Not settings: the audit attribution the route stamps on a patch. */
-const NOT_A_SETTING = new Set(['by']);
+/**
+ * Not settings: the audit attribution the route stamps on a patch, and the
+ * person's acknowledgement a QA patch carries (`QA_CONFIRM`, phase 13).
+ */
+const NOT_A_SETTING = new Set(['by', 'confirm']);
 
 test('shared/run-settings.js lists exactly what POST /start reads', () => {
   const read = fieldsRead(caseBlock(ROUTES, 'start'));
@@ -145,6 +149,8 @@ test('shared/run-settings.js lists exactly what POST /settings reads', () => {
   const declared = new Set(RUN_SETTINGS_FIELDS);
   for (const name of read) {
     if (NOT_A_SETTING.has(name)) continue;
+    // Read only to be refused by the verb that moves it (phase 13, #31).
+    if (name in SETTING_VERBS) continue;
     assert.ok(declared.has(name), `\`settings\` reads body.${name}, which RUN_SETTINGS_FIELDS does not list`);
   }
   for (const name of declared) {
@@ -160,7 +166,22 @@ test('the start-only fields are the four a patch must never carry', () => {
   // `startAfter` joined the three in console-concurrent-plans P17. A chain
   // says where a run BEGINS, and a run already mid-plan cannot un-begin: the
   // settings door reading one would either do nothing or claim to.
-  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'accounts', 'acknowledgedWaivers', 'manifestOverride', 'qa', 'relay', 'resumeOnRestart', 'resumeRunId', 'startAfter', 'verifyAnswers']);
+  //
+  // `gitStrategyAck` joined them in control-tower phase 11 (#18): the launch's
+  // answer to the plan git lines it will not honour is asked before anything
+  // spawns, and a run already running has spawned.
+  //
+  // `resumeOnRestart`, `relay` and `accounts` LEFT in control-tower phase 77
+  // (#101): they are the prelude's answers, but answers about the run's
+  // future — what a restart does, who answers a question, which accounts pay
+  // — and a run launched with the wrong one stranded at every restart with no
+  // door to change it.
+  //
+  // `qa` LEFT in control-tower phase 13 (#31): it was start-only beside three
+  // live QA fields, for a side effect rather than an impossibility — turning
+  // it on writes `test-status.md` — so the settings door takes it behind the
+  // person's confirmation (`QA_CONFIRM`) and `--allow-writes`.
+  assert.deepEqual([...START_ONLY_FIELDS].sort(), ['accountId', 'acknowledgedWaivers', 'gitStrategyAck', 'manifestOverride', 'resumeRunId', 'startAfter', 'verifyAnswers']);
 });
 
 test('PHASE_OPTION_FIELDS matches the route filter that keeps a phase honest', () => {

@@ -8,6 +8,14 @@
 load ../helpers/test_helper
 
 setup() {
+  # FIRST, and before the exports below: five cases here compare the file
+  # against an exact JSON literal, and a supervised session exports PE_TRACE_ID
+  # and PE_SPAN_ID, which phase-outcome.sh correctly folds in as `trace`/`span`
+  # (cases 41-43 assert exactly that). Without this the suite is green from a
+  # terminal and red from inside a run — the one place it is most likely to be
+  # run. `setup_docs` scrubs for the suites that use it; this one builds its own
+  # environment, so it asks for itself.
+  scrub_pe_env
   export PE_NOW="2026-08-10T21:10:03Z"
   export PE_OUTCOME_FILE="$BATS_TEST_TMPDIR/outcome.json"
   # The ruling ledger the runner would inject. Append-only, unlike the outcome
@@ -86,6 +94,23 @@ ledger_file() { # <slug>
   assert_contains "$output" 'warning: --watch "date:soon" will never be checked: not an ISO8601 instant'
   [[ "$output" != *'warning: --watch "gh:acme/app#run/42"'* ]]
   grep -q '"watch": \["gh:acme/app#run/42", "config/fleet-pin.yaml:app-prod", "date:soon"\]' "$PE_OUTCOME_FILE"
+}
+
+@test "outcome: a --watch on the declaring phase's OWN lock is refused with the console's sentence, and nothing is written (#42)" {
+  run pe_outcome demo 8 blocked --needs lock --reason "lock held by me" --watch "lock:demo/08"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "--watch lock:demo/08 refused: a lock: watch is for somebody else's lock"
+  assert_contains "$output" "a phase blocked on a person takes no watch at all."
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  run pe_outcome demo 8 waiting-external --reason "soak" --watch "lock: demo/8 "
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: a --watch on ANOTHER phase's lock is the lock wait it always was (#42)" {
+  run pe_outcome demo 8 blocked --needs lock --reason "lock held by someone/else" --watch "lock:demo/3" --watch "lock:other-plan/8"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_OUTCOME_FILE")" '"watch": ["lock:demo/3", "lock:other-plan/8"],'
 }
 
 @test "outcome: reason newlines and quotes are sanitised for JSON" {
@@ -168,7 +193,7 @@ ledger_file() { # <slug>
   # one's). The assertion is a count on purpose: `decisions-model.test.ts` holds
   # bash and JS to the same MEMBERS, and this holds the shell half to the number,
   # so a key added to one language alone fails on both sides.
-  [ "$(printf '%s' "$DECISION_KEYS" | wc -w | tr -d ' ')" = "18" ]
+  [ "$(printf '%s' "$DECISION_KEYS" | wc -w | tr -d ' ')" = "19" ]
   run pe_outcome demo 8 blocked --needs "${DECISION_KEYS##* }" --reason x
   [ "$status" -eq 0 ]
 }
@@ -665,4 +690,295 @@ ledger_file() { # <slug>
   run pe_outcome demo 5 partial --reason budget
   [ "$status" -eq 0 ]
   ! grep -q '"span"' "$PE_OUTCOME_FILE"
+}
+
+# ---- the ingest probe (control-tower phase 50, #86) --------------------------
+# A declaration that parks and names refs is STAGED, and the console asked
+# whether one has already landed. `curl` is a fake here: it records what it was
+# asked, whether the staged file existed while it was asked, and answers what
+# the test says. The real door is `declare-already-landed.test.ts`.
+fake_console() { # <http code> <body>
+  local bin="$BATS_TEST_TMPDIR/fakebin"
+  mkdir -p "$bin"
+  cat > "$bin/curl" <<'CURL'
+#!/bin/bash
+out=""; data=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --data) data="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "$data" >> "$FAKE_CURL_LOG"
+file="$(printf '%s' "$data" | sed -n 's/.*"file":"\([^"]*\)".*/\1/p')"
+[ -f "$file" ] && echo "staged-present" >> "$FAKE_CURL_LOG"
+printf '%s' "$FAKE_CURL_BODY" > "$out"
+printf '%s' "$FAKE_CURL_CODE"
+CURL
+  chmod +x "$bin/curl"
+  export PATH="$bin:$PATH" FAKE_CURL_LOG="$BATS_TEST_TMPDIR/curl.log" FAKE_CURL_CODE="$1" FAKE_CURL_BODY="$2"
+  export PHASE_OUTCOME_PROBE=1 PHASE_CONSOLE_URL="http://127.0.0.1:1"
+  : > "$FAKE_CURL_LOG"
+}
+LANDED='{"status":200,"verdict":"landed","ref":"gh:acme/app#run/1","detail":"completed: success","sentence":"already landed — continue: gh:acme/app#run/1 (completed: success). Nothing was parked; carry on with the phase from what landed.","refs":[]}'
+
+@test "outcome: a watched ref that has ALREADY landed parks nothing — exit 3, the console's sentence, no file" {
+  fake_console 200 "$LANDED"
+  run pe_outcome demo 5 waiting-external --wait-minutes 30 --watch "gh:acme/app#run/1"
+  [ "$status" -eq 3 ]
+  assert_contains "$output" "already landed — continue: gh:acme/app#run/1 (completed: success)"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  [ -z "$(ls "$BATS_TEST_TMPDIR" | grep '\.tmp\.' || true)" ]
+  grep -q '"file":"[^"]*/outcome\.json\.tmp\.[0-9][0-9]*"' "$FAKE_CURL_LOG"
+  grep -qx 'staged-present' "$FAKE_CURL_LOG"
+}
+
+@test "outcome: pending, a refusal or no console writes the declaration as before, exit 0" {
+  fake_console 200 '{"status":200,"verdict":"pending","refs":[]}'
+  run pe_outcome demo 5 waiting-external --wait-minutes 30 --watch "gh:acme/app#run/1"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_OUTCOME_FILE")" '"status": "waiting-external"'
+  rm -f "$PE_OUTCOME_FILE"
+  # A refusal is never a landing, whatever its body says.
+  fake_console 404 "$LANDED"
+  run pe_outcome demo 5 blocked --needs lock --reason "held" --watch "lock:other/2"
+  [ "$status" -eq 0 ]
+  [ -f "$PE_OUTCOME_FILE" ]
+  rm -f "$PE_OUTCOME_FILE"
+  fake_console 000 ''
+  run pe_outcome demo 5 needs-human --needs credential --reason "sign in" --watch 'cmd:"true"'
+  [ "$status" -eq 0 ]
+  [ -f "$PE_OUTCOME_FILE" ]
+  [ -z "$(ls "$BATS_TEST_TMPDIR" | grep '\.tmp\.' || true)" ]
+}
+
+@test "outcome: only a parking declaration with refs asks — and PHASE_OUTCOME_PROBE=0 asks nothing" {
+  fake_console 200 "$LANDED"
+  run pe_outcome demo 5 partial --reason context
+  [ "$status" -eq 0 ]
+  run pe_outcome demo 5 waiting-external --wait-minutes 30
+  [ "$status" -eq 0 ]
+  PHASE_OUTCOME_PROBE=0 run pe_outcome demo 5 waiting-external --wait-minutes 30 --watch "gh:acme/app#run/1"
+  [ "$status" -eq 0 ]
+  [ ! -s "$FAKE_CURL_LOG" ]
+}
+
+@test "outcome: the unsupervised inbox asks too — landed leaves no inbox file behind" {
+  unset PE_OUTCOME_FILE
+  fake_console 200 "$LANDED"
+  run pe_outcome demo 5 waiting-external --wait-minutes 30 --watch "gh:acme/app#run/1"
+  [ "$status" -eq 3 ]
+  [ -z "$(ls "$(inbox_dir demo)" 2>/dev/null || true)" ]
+  grep -q '"file":"[^"]*/outcomes/phase-05-[0-9TZ]*\.json\.tmp\.[0-9][0-9]*"' "$FAKE_CURL_LOG"
+}
+
+# ── verified: the session's own proof (control-tower phase 62, #68) ──────────
+# The console used to re-run a phase's whole §Verification after the session
+# exited, with no record of what the session had just proved at which tree: in
+# 21 phases of one week it re-ran a suite (398 min) after 640 min of in-turn
+# suite waiting. A session now records each command it ran — the command, its
+# exit status and the TREE it ran against — and the console re-runs only what
+# was not proven at an equivalent tree. The tree is the WORKING tree's content,
+# committed or not: a session tests, then commits, and a proof pinned to HEAD
+# would be stale the moment the commit it proved landed.
+
+proof_repo() {
+  REPO="$BATS_TEST_TMPDIR/repo"
+  mkdir -p "$REPO/src"
+  git -C "$REPO" init -q -b main
+  git -C "$REPO" config user.email t@example.invalid
+  git -C "$REPO" config user.name t
+  printf 'a\n' > "$REPO/src/a.ts"
+  git -C "$REPO" add -A && git -C "$REPO" commit -qm init
+}
+
+# What the script must name: the working tree's content as a tree object. Built
+# here from an EMPTY index — every file hashed, no stat data trusted — so it is
+# the ground truth the script's faster index-copy route has to agree with.
+working_tree() { # <repo>
+  local idx
+  idx="$(mktemp)"
+  rm -f "$idx"
+  GIT_INDEX_FILE="$idx" git -C "$1" add -A
+  GIT_INDEX_FILE="$idx" git -C "$1" write-tree
+  rm -f "$idx"
+}
+
+proofs_file() { # <slug>
+  local id
+  id="$(printf '%s' "$DOCS_ROOT" | shasum -a 256 | cut -c1-8)-$(basename "$DOCS_ROOT")"
+  printf '%s/phase-console/runs/%s/%s/proofs.ndjson' "$XDG_STATE_HOME" "$id" "$1"
+}
+
+@test "verified: ONE proof line — the command folded, its exit, and the working tree it ran against" {
+  proof_repo
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson"
+  # Uncommitted on purpose: the proof is about what RAN.
+  printf 'b\n' > "$REPO/src/a.ts"
+  tree="$(working_tree "$REPO")"
+  head="$(git -C "$REPO" rev-parse HEAD)"
+  run pe_outcome demo 5 verified --command "npm   test" --exit 0 --in "$REPO"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "proof recorded: demo phase 5"
+  expected="{\"version\":1,\"type\":\"proof\",\"slug\":\"demo\",\"phase\":5,\"command\":\"npm test\",\"code\":0,\"tree\":\"$tree\",\"head\":\"$head\",\"at\":\"2026-08-10T21:10:03Z\"}"
+  [ "$(cat "$PE_PROOFS_FILE")" = "$expected" ]
+  # The session's own index is untouched — nothing staged behind its back.
+  [ -z "$(git -C "$REPO" diff --cached --name-only)" ]
+  # …and a second proof appends.
+  run pe_outcome demo 5 verified --command "bash tests/run-tests.sh" --exit 1 --in "$REPO/src"
+  [ "$status" -eq 0 ]
+  [ "$(wc -l < "$PE_PROOFS_FILE" | tr -d ' ')" = "2" ]
+  assert_contains "$(tail -1 "$PE_PROOFS_FILE")" '"command":"bash tests/run-tests.sh","code":1,'
+}
+
+@test "verified: a file rewritten at the same size in the second it was checked out is named as it RAN" {
+  proof_repo
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson"
+  # A fresh checkout's index trusts its entries' stat data; a same-size rewrite
+  # in the same second matches it on every field git reads. Git re-reads such an
+  # entry only while it is not older than the INDEX FILE — so the private copy
+  # must keep the index file's mtime, or a second later the tree names the
+  # checkout rather than what ran (a copy without it named the stale tree here).
+  lane="$BATS_TEST_TMPDIR/lane"
+  git -C "$REPO" worktree add -q -b lane "$lane"
+  printf 'z\n' > "$lane/src/a.ts"
+  sleep 1.1
+  run pe_outcome demo 5 verified --command "npm test" --exit 0 --in "$lane"
+  [ "$status" -eq 0 ]
+  assert_contains "$(cat "$PE_PROOFS_FILE")" "\"tree\":\"$(working_tree "$lane")\""
+}
+
+@test "verified: --command and a numeric --exit are required; the other shapes' flags are refused" {
+  proof_repo
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson"
+  run pe_outcome demo 5 verified --exit 0 --in "$REPO"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 5 verified --command "npm test" --in "$REPO"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 5 verified --command "npm test" --exit green --in "$REPO"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 5 verified --command "npm test" --exit 0 --reason "x" --in "$REPO"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 5 verified --command "npm test" --exit 0 --what "x" --in "$REPO"
+  [ "$status" -eq 2 ]
+  # --exit and --in belong to a proof alone.
+  run pe_outcome demo 5 complete --exit 0
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_PROOFS_FILE" ]
+}
+
+@test "verified: outside a git working tree it exits 2 and writes nothing — there is no tree to prove against" {
+  export PE_PROOFS_FILE="$BATS_TEST_TMPDIR/proofs.ndjson"
+  mkdir -p "$BATS_TEST_TMPDIR/plain"
+  run pe_outcome demo 5 verified --command "npm test" --exit 0 --in "$BATS_TEST_TMPDIR/plain"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "not inside a git working tree"
+  [ ! -f "$PE_PROOFS_FILE" ]
+}
+
+@test "verified: without PE_PROOFS_FILE the line goes to this root's proofs ledger AND stdout; the session id rides along" {
+  proof_repo
+  unset PE_PROOFS_FILE
+  export PE_SESSION_ID="sess-42"
+  run pe_outcome demo 5 verified --command "npm test" --exit 0 --in "$REPO"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" '"type":"proof"'
+  assert_contains "$output" 'PE_PROOFS_FILE is not set'
+  f="$(proofs_file demo)"
+  [ -f "$f" ]
+  assert_contains "$(cat "$f")" '"command":"npm test","code":0,'
+  assert_contains "$(cat "$f")" '"session_id":"sess-42"'
+}
+
+# ── the ref is checked where it is declared (control-tower phase 88) ─────────
+# #125: a 200-character cut silently split a two-check `cmd:` ref mid-word, the
+# console refused what was left three seconds later, and the errand went on
+# saying it was being watched. #152: a ref carrying the SESSION's shell variable
+# (`'$L'`) or a path relative to the session's cwd can never land in the
+# console, which runs it from its own root. A ref is now refused while the
+# session can still fix it — never cut, never silently kept.
+
+@test "outcome: a --watch ref is never cut — 999 characters are kept verbatim, over 1,000 exits 2 naming the limit (WF-1, #125)" {
+  long="cmd:\"test -f /tmp/p88/$(printf 'a%.0s' $(seq 1 960))\""
+  [ "${#long}" -lt 1000 ]
+  run pe_outcome demo 8 waiting-external --wait-minutes 30 --watch "$long"
+  [ "$status" -eq 0 ]
+  grep -qF "$(printf '%s' "$long" | sed 's/"/\\"/g')" "$PE_OUTCOME_FILE"
+  rm -f "$PE_OUTCOME_FILE"
+  over="cmd:\"test -f /tmp/p88/$(printf 'b%.0s' $(seq 1 1000))\""
+  run pe_outcome demo 8 waiting-external --wait-minutes 30 --watch "$over"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "1000 characters"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: a cmd: ref the console could not read — unbalanced quoting, a substitution — exits 2 at declaration (WF-2, #125)" {
+  # The #125 ref as the old cut left it: its opening quote never closes.
+  run pe_outcome demo 27 needs-human --needs permission --reason "applies" \
+    --watch 'cmd:"AWS_PROFILE=production aws iam get-user --user-nam'
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "quot"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  run pe_outcome demo 27 waiting-external --wait-minutes 30 --watch "cmd:\"grep -q 'done /tmp/p27/log\""
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 27 waiting-external --wait-minutes 30 --watch 'cmd:"test -f `cat /tmp/p27/name`"'
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
+}
+
+@test "outcome: a cmd: ref with a shell variable or a relative path exits 2 — the console runs it from its own root (SK-4, #152)" {
+  run pe_outcome demo 10 waiting-external --wait-minutes 30 --watch "cmd:\"grep -q 'ios done' '\$L' 2>/dev/null\""
+  [ "$status" -eq 2 ]
+  assert_contains "$output" 'shell variable'
+  run pe_outcome demo 10 waiting-external --wait-minutes 30 --watch 'cmd:"test -f ./out/sweep.rc"'
+  [ "$status" -eq 2 ]
+  assert_contains "$output" 'relative path'
+  run pe_outcome demo 10 waiting-external --wait-minutes 30 --watch "cmd:\"grep -q '^status: complete' docs/handoffs/demo/phase-43-perf.md\""
+  [ "$status" -eq 2 ]
+  assert_contains "$output" 'relative path'
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  # Self-contained refs pass untouched: absolute paths, a repo slug, a URL.
+  run pe_outcome demo 10 waiting-external --wait-minutes 30 \
+    --watch 'cmd:"test -f /tmp/p27/het-verify.rc && test -f /tmp/p27/aws-verify.rc"' \
+    --watch "cmd:\"gh pr view 12 -R acme/app --json state -q .state | grep -qx MERGED\"" \
+    --watch 'cmd:"curl -sf https://phase-console-site.vercel.app/api/health/license"'
+  [ "$status" -eq 0 ]
+  [[ "$output" != *warning* ]]
+}
+
+@test "outcome: the console's refused answer at declaration exits 2 with its reason, and nothing is written (WF-3, #125)" {
+  fake_console 200 '{"status":200,"verdict":"refused","ref":"cmd:\"npm ci\"","detail":"npm ci writes node_modules","sentence":"refused — cmd:npm ci: npm ci writes node_modules. The console would never run it, so nothing would ever resume this phase: fix the ref and declare again.","refs":[]}'
+  run pe_outcome demo 5 waiting-external --wait-minutes 30 --watch 'cmd:"npm ci"'
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "npm ci writes node_modules"
+  [ ! -f "$PE_OUTCOME_FILE" ]
+  [ -z "$(ls "$BATS_TEST_TMPDIR" | grep '\.tmp\.' || true)" ]
+}
+
+@test "outcome: a cmd: ref wrapping gh run list … --commit is offered a gh: ref in its place (WF-4, #87)" {
+  run pe_outcome demo 14 waiting-external --wait-minutes 60 \
+    --watch "cmd:\"gh run list -R acme/app --workflow deploy.yml --commit cb590f0e --json status -q '.[0].status' | grep -qx completed\""
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'gh:acme/app#run/<id>'
+  assert_contains "$output" 'gh run list -R acme/app --workflow deploy.yml --commit cb590f0e --json databaseId'
+}
+
+@test "outcome: a cmd:grep over a handoff is warned about and offered phase: — and phase:/verify: are schemes (PW-4, #129)" {
+  run pe_outcome demo 50 blocked --needs external --reason "waits on 43" \
+    --watch "cmd:\"grep -q '^status: complete' $DOCS_ROOT/docs/handoffs/demo/phase-43-perf-ii.md\""
+  [ "$status" -eq 0 ]
+  assert_contains "$output" 'phase:demo/43'
+  rm -f "$PE_OUTCOME_FILE"
+  run pe_outcome demo 50 blocked --needs external --reason "waits on 43" --watch "phase:demo/43" --watch "verify:demo/50"
+  [ "$status" -eq 0 ]
+  [[ "$output" != *warning* ]]
+  assert_contains "$(cat "$PE_OUTCOME_FILE")" '"watch": ["phase:demo/43", "verify:demo/50"],'
+  rm -f "$PE_OUTCOME_FILE"
+  # A phase cannot wait for its own completion; verify: names the declaring phase.
+  run pe_outcome demo 50 blocked --needs external --reason "x" --watch "phase:demo/50"
+  [ "$status" -eq 2 ]
+  run pe_outcome demo 50 blocked --needs external --reason "x" --watch "verify:demo/43"
+  [ "$status" -eq 2 ]
+  [ ! -f "$PE_OUTCOME_FILE" ]
 }

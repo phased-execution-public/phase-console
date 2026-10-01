@@ -90,6 +90,7 @@ test('P8\'s resumed attempt folds to 7 calls, 2 rebuilds and a 635k peak', () =>
   const sum = (k: 0 | 1 | 2 | 3) => P8_RESUME.reduce((total, row) => total + row[k], 0);
   assert.deepEqual(tracker.counters, {
     calls: 7,
+    firstContext: 564_547, // the resume's first call: a re-read, recorded, never taken as a boot (phase 59)
     lastContext: 635_509,
     peakContext: 635_509,
     input: sum(0),
@@ -253,7 +254,9 @@ test('the stream: one usage event per API call of the phase\'s own conversation,
     assert.equal(usages[1].totals.calls, 1);
     assert.equal(usages[1].totals.output, 409);
     assert.deepEqual(usages[2].totals, {
-      calls: 2, lastContext: 125_096, peakContext: 125_096,
+      // The boot (control-tower phase 59): the first call's context, which
+      // `noteTokens` spreads into `phase.tokens` with the rest.
+      calls: 2, firstContext: 111_781, lastContext: 125_096, peakContext: 125_096,
       input: 4, cacheWrite: 114_968, cacheRead: 121_905, output: 1_392, rebuilds: 0,
     });
     assert.deepEqual(outcome.tokens, usages[2].totals, 'the outcome carries what the stream last said');

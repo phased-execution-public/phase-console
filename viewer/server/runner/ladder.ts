@@ -21,9 +21,9 @@
  * `shared/ladder-model.js` so the client renders the same rungs by identity.
  */
 
-import type { Errand, RungRecord } from './state.ts';
+import type { AccountChoice, BoardingHint, Errand, PhaseRecord, RungRecord } from './state.ts';
 import {
-  SITUATIONS, SITUATION_ACTOR, actorFor, situationKey, situationLabel, parseSituationKey,
+  SITUATIONS, SITUATION_ACTOR, actorFor, situationKey, situationLabel, parseSituationKey, protectedPathOf,
 } from '../../shared/situation-model.js';
 import {
   decisionKeyOfSituation, isAutomaticAnswer, policyRowOf, policyAnsweredPayload, POLICY_DEFAULTS,
@@ -43,6 +43,13 @@ import {
   countedRungs,
   triedRungKeys,
   untriedRungs,
+  rungWasWithdrawn,
+  personRetryOwed,
+  RUNG_FAILURE_CAUSES,
+  MAX_ENV_RETRIES_PER_RUNG,
+  endedOnEnvironment,
+  LADDER_CAP_PREFS,
+  PERSON_SLOT_BY,
 } from '../../shared/ladder-model.js';
 
 /**
@@ -50,11 +57,18 @@ import {
  * re-exported so a server caller never grows a private copy of the rule that
  * let one rung climb nineteen times (`shared/ladder-model.js`
  * `MAX_RUNG_INTERRUPTIONS`). Beside them the drivability column (phase 10,
- * LFC-2/RCV-10): who drives each vehicle, and the tables nobody does.
+ * LFC-2/RCV-10): who drives each vehicle, and the tables nobody does — and
+ * the causes a settled rung carries, with the bound on the environment one
+ * (control-tower phase 5).
  */
-export { countedRungs, triedRungKeys, untriedRungs, RUNG_DRIVERS, RUNG_DRIVER_LABELS, VEHICLE_DRIVERS, drivableBy, operatorOnlyTables };
+export {
+  countedRungs, triedRungKeys, untriedRungs, rungWasWithdrawn, personRetryOwed, RUNG_DRIVERS, RUNG_DRIVER_LABELS, VEHICLE_DRIVERS, drivableBy,
+  operatorOnlyTables, RUNG_FAILURE_CAUSES, MAX_ENV_RETRIES_PER_RUNG, endedOnEnvironment, PERSON_SLOT_BY,
+};
+export type RungCause = (typeof RUNG_FAILURE_CAUSES)[number];
 export type RungDriver = (typeof RUNG_DRIVERS)[number];
 import type { SettledRungOutcome } from '../../shared/run-lifecycle.js';
+import { budgetFact, budgetHeadline, type BudgetFact } from '../../shared/budget-model.js';
 
 export type SituationId = (typeof SITUATIONS)[number];
 
@@ -125,6 +139,67 @@ export function ladderCaps(prefs: {
   };
 }
 
+/**
+ * The caps THIS run climbs under: the console's preferences, with the run's
+ * own rung caps over them where it has them (control-tower phase 5, #14 ask
+ * 6). The run's word is a claim about one run's work — "this plan has seventy
+ * phases" — so it beats the console-wide number, the way `qaMaxRounds` does;
+ * a missing or unusable value is silence, and the preference speaks.
+ */
+export function runLadderCaps(
+  run: { ladderPerRunRungs?: number | null; ladderPerPhaseRungs?: number | null } | null | undefined,
+  prefs: Parameters<typeof ladderCaps>[0],
+): LadderCaps {
+  return { ...ladderCaps(prefs), ...runCapOverrides(run) };
+}
+
+/** Just the run's own rung caps, for a caller whose preference caps arrive another way (the runner's `deps.ladderCaps`). */
+export function runCapOverrides(
+  run: { ladderPerRunRungs?: number | null; ladderPerPhaseRungs?: number | null } | null | undefined,
+): Partial<LadderCaps> {
+  const own = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 0;
+  return {
+    ...(own(run?.ladderPerRunRungs) ? { perRunRungs: run!.ladderPerRunRungs! } : {}),
+    ...(own(run?.ladderPerPhaseRungs) ? { perPhaseRungs: run!.ladderPerPhaseRungs! } : {}),
+  };
+}
+
+/**
+ * What the run-wide caps are spent by — the ONE counter (control-tower phase
+ * 5, #14 ask 4). `open` is `countedRungs` over each phase the board does NOT
+ * read done, summed phase by phase (the interruption and environment bounds
+ * are per phase, so a flattened history would pool them); `onDonePhases` is
+ * the same count on the phases that are done — spent, and no longer charged;
+ * `usd` is every record's dollars, done phases included, because money that
+ * was spent was spent.
+ *
+ * Nineteen zero-turn rungs on a phase closed two weeks earlier used to be
+ * charged against every later phase of run 31285928, and the healer's gate
+ * read a SECOND number — raw `Σ slot.attempts` — that agreed with the climb's
+ * only by coincidence. Both now read this.
+ */
+export type RunRungCount = { open: number; onDonePhases: number; usd: number };
+
+export function openRunRungs(
+  recoveries: Readonly<Record<string, { attempts?: number; rungs?: readonly RungRecord[] } | undefined>> | null | undefined,
+  isDone: (phase: number) => boolean,
+): RunRungCount {
+  const count: RunRungCount = { open: 0, onDonePhases: 0, usd: 0 };
+  for (const [key, slot] of Object.entries(recoveries ?? {})) {
+    const rungs = slot?.rungs ?? [];
+    count.usd += usd(rungs);
+    // A slot written before rungs were recorded holds only `attempts`: those
+    // launches were spent, and still count — `accountRung` moves the two
+    // together, so for anything this build wrote the padding is zero.
+    const legacy = Math.max(0, (slot?.attempts ?? 0) - rungs.length);
+    const counted = countedRungs(rungs).length + legacy;
+    const phase = Number(key);
+    if (Number.isFinite(phase) && isDone(phase)) count.onDonePhases += counted;
+    else count.open += counted;
+  }
+  return count;
+}
+
 /* ------------------------------------------------------------------ *
  * Choosing the next rung
  * ------------------------------------------------------------------ */
@@ -134,8 +209,12 @@ export type NextRungInput = {
   situation: string;
   /** Every rung already climbed on THIS phase, any situation. */
   history: readonly RungRecord[];
-  /** Every rung climbed on this RUN, all phases (the per-run caps). */
-  runHistory?: readonly RungRecord[];
+  /**
+   * The run-wide count the per-run caps read — `openRunRungs` over the run's
+   * recoveries and the board, and nothing else (#14). Absent = this phase's
+   * own history is the whole run, which is what a single-phase caller means.
+   */
+  run?: RunRungCount;
   /** Every rung climbed by this console TODAY, all runs (the per-day cap). Absent = unknown = uncounted. */
   dayHistory?: readonly RungRecord[];
   caps?: Partial<LadderCaps>;
@@ -233,8 +312,13 @@ export function nextRung(input: NextRungInput): NextRung {
   // The DOLLAR caps below deliberately still count every record: an
   // interrupted rung's `costUsd` is booked when its attempt ends, and money
   // that was spent was spent whatever the rung then settled as.
+  //
+  // The RUN count is `openRunRungs`'s (control-tower phase 5, #14): counted
+  // rungs on the phases the board does not read done. Rungs spent on a phase
+  // that has since closed stop being charged to the phases still open.
   const phaseRungs = countedRungs(input.history).length;
-  const runRungs = countedRungs(input.runHistory ?? input.history).length;
+  const run = input.run ?? { open: phaseRungs, onDonePhases: 0, usd: usd(input.history) };
+  const runRungs = run.open;
   if (phaseRungs >= caps.perPhaseRungs) {
     return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'phase-rungs', spent: phaseRungs, limit: caps.perPhaseRungs, reason: `the phase's ladder budget is spent (${phaseRungs} of ${caps.perPhaseRungs} rungs)` };
   }
@@ -245,7 +329,7 @@ export function nextRung(input: NextRungInput): NextRung {
   if (runRungs >= caps.perRunRungs) {
     return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'run-rungs', spent: runRungs, limit: caps.perRunRungs, reason: `the run's ladder budget is spent (${runRungs} of ${caps.perRunRungs} rungs)` };
   }
-  const runUsd = usd(input.runHistory ?? input.history);
+  const runUsd = run.usd;
   if (runUsd >= caps.perRunUsd) {
     return { ok: false, exhausted: true, key, refusal: 'ladder-budget-spent', cap: 'run-usd', spent: runUsd, limit: caps.perRunUsd, reason: `the run's ladder budget is spent ($${runUsd.toFixed(2)} of $${caps.perRunUsd})` };
   }
@@ -327,11 +411,67 @@ export function accountRung(
 }
 
 /**
+ * The situation a person's press is recorded under: the classifier's last word
+ * on the phase when it has one, else what the record itself says — a phase that
+ * has run is work in progress, one that never has is never-started. Only the
+ * record's label rides on it; a person-slot rung counts toward nothing.
+ */
+export function personSituationOf(record: Pick<PhaseRecord, 'situation' | 'attempts'>): string {
+  return record.situation?.key ?? ((record.attempts ?? 0) > 0 ? 'work-in-progress' : 'never-started');
+}
+
+/**
+ * Record a person's press as a rung in the PERSON slot (control-tower phase 53,
+ * #56): `accountRung`'s bookkeeping — `attempts`/`lastAt` in step, the standing
+ * errand gone, because a person is working the phase again — stamped
+ * `by: PERSON_SLOT_BY`, which `countedRungs` reads as counting toward no rung
+ * cap and never marking a remedy tried. It is settled like any rung when its
+ * attempt ends, so its dollars and its outcome stay on the phase's record.
+ */
+export function accountPersonRung(
+  recoveries: Record<string, RecoverySlot | undefined>,
+  phase: number,
+  entry: { situation: string; rung: RungVehicle; at: string; note?: string },
+): RungRecord {
+  const slot = (recoveries[String(phase)] ??= { attempts: 0, lastAt: entry.at });
+  const record = accountRung(slot, entry);
+  record.by = PERSON_SLOT_BY;
+  return record;
+}
+
+/**
+ * A person's Retry, boarded in the person slot (#56, and #36's comment): the
+ * rung recorded `by: operator`, and a `fresh` boarding hint on the record. The
+ * hint is what keeps the drive loop's own ladder pass off the phase — a hinted
+ * record is never climbed — so the phase boards on the loop's next tick under
+ * normal admission instead of being re-classified, found at its rung cap, and
+ * parked again a second after the button answered. Nothing here reads a cap.
+ *
+ * Call it AFTER `resetForRetry` (which drops any earlier hint), with the
+ * situation read BEFORE it.
+ */
+export function boardInPersonSlot(
+  recoveries: Record<string, RecoverySlot | undefined>,
+  record: PhaseRecord,
+  opts: { situation: string; at: string },
+): { rung: RungRecord; hint: BoardingHint } {
+  const rung = accountPersonRung(recoveries, record.phase, {
+    situation: opts.situation, rung: 'reboard-fresh', at: opts.at, note: "a person's Retry",
+  });
+  const hint: BoardingHint = {
+    situation: opts.situation, rung: 'reboard-fresh', brief: 'fresh', at: opts.at, by: PERSON_SLOT_BY,
+  };
+  record.boardingHint = hint;
+  return { rung, hint };
+}
+
+/**
  * Book spend against the newest OPEN rung without deciding how it ended.
  *
  * Separate from `settleRung` because the two facts arrive at different
  * moments and from different deciders. What a rung COST is known the instant
- * its attempt ends — it is that attempt's `outcome.costUsd`. Whether the rung
+ * its attempt ends — it is what the spawn door booked for that session
+ * (`outcome.bookedUsd`, never the CLI's running total). Whether the rung
  * FIXED anything is known later, and by someone else: the service's healer
  * re-reads the board once the run stops. Folding the two together is why the
  * cost half never happened. `Runner.climb` accounted every rung and then had
@@ -361,10 +501,11 @@ export function settleRung(
   outcome: NonNullable<RungRecord['outcome']>,
   costUsd?: number,
   note?: string,
+  cause?: RungCause,
 ): RungRecord | null {
   const open = [...(slot.rungs ?? [])].reverse().find((r) => r.outcome === 'running' || r.outcome == null) ?? null;
   if (!open) return null;
-  return settleRungRecord(slot, open, outcome, costUsd, note);
+  return settleRungRecord(slot, open, outcome, costUsd, note, cause);
 }
 
 /**
@@ -380,8 +521,14 @@ export function settleRungRecord(
   outcome: NonNullable<RungRecord['outcome']>,
   costUsd?: number,
   note?: string,
+  /** Why, when the settler knows better than the default (`merit`) — an outage, a wall. */
+  cause?: RungCause,
 ): RungRecord {
   open.outcome = outcome;
+  // WHY, on every settlement (control-tower phase 5, #36): a void rung never
+  // ran; a cause an arm stamped before this — the credential wall, the outage
+  // — stands; anything else is a verdict on the remedy.
+  open.cause = outcome === 'withdrawn' ? 'never-ran' : (cause ?? open.cause ?? 'merit');
   if (typeof costUsd === 'number' && Number.isFinite(costUsd)) open.costUsd = (open.costUsd ?? 0) + costUsd;
   if (note) open.note = note;
   if (outcome === 'fixed') { slot.fixed = true; slot.lastOutcome = 'fixed'; delete slot.lastReason; }
@@ -411,7 +558,7 @@ export function settleRungRecord(
  */
 export function rungSettledPayload(record: RungRecord): {
   rung: string; outcome: string; situation: string; params: Rung['params'] | null; costUsd: number;
-  note?: string; turns?: number; endedBy?: string; cardId?: string;
+  cause?: RungCause; note?: string; turns?: number; endedBy?: string; cardId?: string;
 } {
   return {
     rung: record.rung,
@@ -419,6 +566,7 @@ export function rungSettledPayload(record: RungRecord): {
     situation: record.situation,
     params: record.params ?? null,
     costUsd: typeof record.costUsd === 'number' && Number.isFinite(record.costUsd) ? record.costUsd : 0,
+    ...(record.cause ? { cause: record.cause } : {}),
     ...(record.note ? { note: record.note } : {}),
     ...(typeof record.turns === 'number' ? { turns: record.turns } : {}),
     ...(record.endedBy ? { endedBy: record.endedBy } : {}),
@@ -437,6 +585,157 @@ export function rungSettledPayload(record: RungRecord): {
 export function capRefusal(next: NextRung): { cap: LadderCap; spent: number; limit: number; reason: string } | null {
   if (next.ok || next.refusal !== 'ladder-budget-spent' || !next.cap) return null;
   return { cap: next.cap, spent: next.spent ?? 0, limit: next.limit ?? 0, reason: next.reason };
+}
+
+/** The setting that raises each cap — the preference key, which is also the run's own field for the two rung caps. */
+export type LadderCapSetting = (typeof LADDER_CAP_PREFS)[keyof typeof LADDER_CAP_PREFS];
+
+const CAP_SETTING: Readonly<Record<LadderCap, LadderCapSetting>> = Object.freeze({
+  'phase-rungs': LADDER_CAP_PREFS.perPhaseRungs,
+  'phase-usd': LADDER_CAP_PREFS.perPhaseUsd,
+  'run-rungs': LADDER_CAP_PREFS.perRunRungs,
+  'run-usd': LADDER_CAP_PREFS.perRunUsd,
+  'day-usd': LADDER_CAP_PREFS.perDayUsd,
+});
+
+/**
+ * The errand a spent CAP writes (control-tower phase 5, #14 ask 5) — the
+ * truth about a refusal that is not about the phase at all.
+ *
+ * It used to be the SITUATION's errand: "Someone to finish the phase — the
+ * ladder's sessions did not carry it to its exit criteria", with `tried: []`
+ * (no ladder session had ever run for that phase), keyed `budgets` (a
+ * free-text row the caps never read, so no answer lifted the park), and no
+ * word about which cap or why. This one says which cap refused, the
+ * arithmetic, how much of it sat on phases already done, the setting that
+ * raises it, and whether a Retry of this phase would forgive anything — and
+ * carries no decision key, because no manifest answer changes a cap.
+ */
+export function capErrand(
+  next: NextRung,
+  facts: { phase: number; tried: readonly (RungRecord | string)[]; at?: string; onDonePhases?: number; replenishes?: boolean },
+): Errand {
+  const cap = capRefusal(next);
+  const key = next.key;
+  const at = facts.at ?? new Date().toISOString();
+  const tried = facts.tried.map((t) => (typeof t === 'string' ? t : rungLabel(t)));
+  if (!cap) {
+    // Not a cap's refusal: the caller asked the wrong builder, and the
+    // situation's own errand is the honest answer.
+    return errandFor(key, facts.tried, facts.phase, at);
+  }
+  const setting = CAP_SETTING[cap.cap];
+  const scope = cap.cap.startsWith('phase') ? "this phase's" : cap.cap.startsWith('run') ? "the run's" : "today's";
+  const money = cap.cap.endsWith('usd');
+  const amount = (n: number) => (money ? `$${n.toFixed(2)}` : String(n));
+  const done = facts.onDonePhases ?? 0;
+  const replenishes = facts.replenishes === true;
+  const runWide = cap.cap === 'run-rungs' || cap.cap === 'run-usd';
+  const need = `${scope[0].toUpperCase()}${scope.slice(1)} ladder budget is spent — ${amount(cap.spent)} of ${amount(cap.limit)}`
+    + `${money ? '' : ' rungs'}`
+    + (runWide && done ? `, and ${done} more counted rung${done === 1 ? '' : 's'} sit on phases already done, which no longer count` : '')
+    + '. That is a cap on automatic recovery, not a verdict on this phase: '
+    + (tried.length ? `the ladder tried ${tried.join(', ')} here.` : 'no ladder session has run for this phase.');
+  const how = `Raise \`${setting}\` — `
+    + (setting === LADDER_CAP_PREFS.perRunRungs || setting === LADDER_CAP_PREFS.perPhaseRungs
+      ? "for this run in the run's settings, or for every run under Settings ▸ Automation"
+      : 'under Settings ▸ Automation')
+    + ' — then Continue.'
+    + (replenishes
+      ? ' Retry on this phase also forgives the rungs the environment and the console\'s own restarts cost it.'
+      : ' A Retry of this phase would not lift it: nothing it forgives is what the cap counted.');
+  return {
+    phase: facts.phase,
+    situation: key,
+    tried,
+    need,
+    how,
+    at,
+    cap: cap.cap,
+    spent: cap.spent,
+    limit: cap.limit,
+    onDonePhases: done,
+    setting,
+    replenishes,
+    // The same cap as a `BudgetFact` (control-tower phase 14, #40): the one
+    // shape the `budget` push, the card and its raise read. Its need already
+    // leads with the budget and the arithmetic, so it stays as written.
+    budget: budgetFact({
+      budget: 'ladder', phase: facts.phase, limit: cap.limit, spent: cap.spent, unit: money ? 'usd' : 'rungs',
+      spentOn: tried.map((what) => ({ what })), setting, at,
+    }),
+  };
+}
+
+/**
+ * The errand for a phase a BUDGET stopped (control-tower phase 14, #40): the
+ * budget's headline — which budget, the arithmetic — is its first line, and
+ * the sentence of whatever the budget stopped is gone from it. A phase parked
+ * on a spent wait budget once read "The external thing the session is waiting
+ * on (CI, a PR, a deploy window) to land", which sent an operator to check a
+ * healthy build while the only thing wrong was a number in the plan. The
+ * situation's `how` stays unless the caller has a better one; the fact rides
+ * the errand as `budget`, which is what the push and the card's raise read.
+ */
+export function budgetFirst(errand: Errand, fact: BudgetFact, how?: string): Errand {
+  return { ...errand, need: budgetHeadline(fact, 'spent'), ...(how ? { how } : {}), budget: fact };
+}
+
+/**
+ * Re-arm the records `which` picks: each is stamped `forgiven {at, by}`, which
+ * `countedRungs` reads as counting for nothing — the same-rung-once rule and
+ * every rung cap — while its dollars stay in every sum. Answers the records it
+ * forgave now (a record already forgiven, withdrawn or still open is left).
+ */
+export function forgiveRungs(
+  slot: Pick<RecoverySlot, 'rungs'> | null | undefined,
+  which: (record: RungRecord) => boolean,
+  at: string,
+  by: string,
+): RungRecord[] {
+  const forgiven: RungRecord[] = [];
+  for (const record of slot?.rungs ?? []) {
+    if (record.forgiven || record.outcome === 'withdrawn' || record.outcome === 'running' || record.outcome == null) continue;
+    if (!which(record)) continue;
+    record.forgiven = { at, by };
+    forgiven.push(record);
+  }
+  return forgiven;
+}
+
+/**
+ * What an operator's Retry forgives (#14 ask 3, `docs/controls.md`): the
+ * records the console's own restarts and the environment cost the phase —
+ * every interruption and every environment-caused record. Never a verdict:
+ * a remedy that ran and failed on its merits stays tried.
+ */
+export function retryForgives(record: RungRecord): boolean {
+  return record.outcome === 'interrupted' || record.cause === 'environment';
+}
+
+/**
+ * The one shape `phase.ladder-replenished` carries, from either Retry door (the
+ * live runner's and the stored run's): how many records were forgiven, of
+ * which kind, and by whom. Dollars are never in it — they were not forgiven.
+ */
+export function replenishedPayload(forgiven: readonly RungRecord[], by: string): {
+  forgiven: number; interrupted: number; environment: number; by: string;
+} {
+  return {
+    forgiven: forgiven.length,
+    interrupted: forgiven.filter((r) => r.outcome === 'interrupted').length,
+    environment: forgiven.filter((r) => r.cause === 'environment').length,
+    by,
+  };
+}
+
+/**
+ * What a usable account arriving forgives (#36 ask 3): the rungs climbed for
+ * a resource wall — the ones whose remedy IS an account action — whatever an
+ * older build wrote on them. The wall is what defeated them, and it has moved.
+ */
+export function accountWallForgives(record: RungRecord): boolean {
+  return parseSituationKey(record.situation).id === 'resource-wall';
 }
 
 /**
@@ -587,6 +886,14 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
     need: "A tool the run's permission policy refused — the session named the act and the path it was denied.",
     how: "If the act is one you would let an unattended agent do, widen the policy for this plan (Settings ▸ Permissions, or the plan's autopilot.json) and Retry; otherwise do that step by hand, then Resume the session with an instruction. Never strike a deny rule to get a phase through.",
   },
+  'blocked-declared:protected-path': {
+    need: "An edit the CLI's own wall reserves for an interactive session — a path such as `.claude/**`, which no unattended session may change whatever this console allows.",
+    how: 'Make that edit by hand in this checkout, or open an interactive session here and make it; commit it on the run branch, then Retry — the session resumes with the edit in place. No policy on this console can allow it.',
+  },
+  'blocked-declared:human-acts': {
+    need: 'The acts the plan keeps for a person — the session named them (a merge, a sign-off, a production step) and stopped rather than do them.',
+    how: "Do them by hand and Retry; or press Delegate to the session, which records that you handed them over and resumes the session with your words — the run's permission policy still applies to every act.",
+  },
   'blocked-declared:gate': {
     need: 'The approval or sign-off the session said it is waiting for.',
     how: 'Give it (or clear the gate), then Retry.',
@@ -602,6 +909,10 @@ const ASKS: Readonly<Record<string, Ask>> = Object.freeze({
   'verify-red': {
     need: 'The phase\'s §Verification to pass — the ladder\'s sessions could not make it green.',
     how: 'Read What failed on the phase page, fix it (or fix the verification command if it is wrong), then Re-check or Retry.',
+  },
+  'verify-red:reopened': {
+    need: "The phase's §Verification to pass — its handoff reads complete, but the verification the console ran is red, and the one fix session did not make it green. Its dependents wait on it.",
+    how: 'Read What failed on the phase page, fix the cause (or the command, if the command is wrong), then Re-check — a green verification closes the phase and releases its dependents.',
   },
   'done-unrecorded': {
     need: 'A complete handoff for work that verifies green.',
@@ -674,6 +985,37 @@ export function keyedAsks(): Readonly<Record<string, KeyedAsk>> {
 
 export { policyAnsweredPayload, policyRowOf };
 
+/** One line of a declared act, whitespace folded, never longer than a card can hold. */
+const actLine = (text: string): string => text.replace(/\s+/g, ' ').trim().slice(0, 200);
+
+/**
+ * The need and the how of a permission wall this console holds no rule for,
+ * from the session's own declaration. A `protected-path` wall names the path
+ * and the only two doors there are; a plain one says the rule was not this
+ * console's, so there is no card to approve.
+ */
+function declaredWall(
+  key: string, declared: { rule?: string; command?: string; reason?: string }, ask: Ask,
+): Ask {
+  const path = protectedPathOf(declared.rule, declared.command, declared.reason);
+  const act = declared.command ? `\`${actLine(declared.command)}\`` : null;
+  const rule = declared.rule ? `\`${actLine(declared.rule)}\`` : null;
+  if (key === 'blocked-declared:protected-path') {
+    return {
+      need: `The edit ${act ?? 'the session declared'}${path ? ` on \`${path}\`` : ''} — a path the CLI's own wall `
+        + 'reserves for an interactive session, so no unattended session may make it.',
+      how: ask.how,
+    };
+  }
+  return {
+    need: `The session was refused ${act ?? 'an act'}${rule ? ` (it named the rule ${rule})` : ''}`
+      + `${path ? ` on \`${path}\`` : ''} — and this console recorded no deny rule of its own for it, so the wall `
+      + 'was not one this console can widen.',
+    how: 'If an unattended session may do that act, allow it in the plan\'s permissions and Retry; otherwise do '
+      + 'that step by hand, then Resume the session with an instruction.',
+  };
+}
+
 export function errandFor(
   situationKeyOrId: string,
   tried: readonly (RungRecord | string)[] = [],
@@ -697,6 +1039,14 @@ export function errandFor(
    * errand is a person's, as it always was.
    */
   policy?: ResolvedPolicy | null,
+  /**
+   * What the session itself declared for a permission wall — the act
+   * (`--command`), the rule it named (`--rule`), its reason (#43). Read only
+   * when this console recorded NO rule of its own (`denied` absent): then the
+   * wall was the CLI's, and the errand quotes the act and the path the session
+   * named instead of "a tool" with nothing to widen.
+   */
+  declared?: { rule?: string; command?: string; reason?: string } | null,
 ): Errand {
   const { id, sub } = parseSituationKey(situationKeyOrId);
   const key = situationKey(id, sub);
@@ -711,6 +1061,10 @@ export function errandFor(
   const mine: string[] = [];
   const earlier: string[] = [];
   for (const t of tried) {
+    // A WITHDRAWN rung never ran (control-tower phase 86, #14): a boarding the
+    // console superseded before its first turn, or a lane that never spawned.
+    // Telling a person it was tried is the defect #14's comment measured.
+    if (typeof t !== 'string' && t.outcome === 'withdrawn') continue;
     const own = typeof t === 'string' || t.situation === key || !t.situation;
     (own ? mine : earlier).push(rungLabel(t));
   }
@@ -763,7 +1117,13 @@ export function errandFor(
             + '(Settings ▸ Permissions shows and reverses the strike), or do that step by hand and Resume the '
             + 'session with an instruction. A deny rule struck here is struck for every future run of this plan.',
         }
-        : ask;
+        // A wall this console recorded no rule for (#43): the errand names
+        // what the session declared — the act, the rule it quoted, the path —
+        // and says plainly that there is nothing here to widen.
+        : (key === 'blocked-declared:permission' || key === 'blocked-declared:protected-path')
+          && (declared?.command || declared?.rule || protectedPathOf(declared?.reason))
+          ? declaredWall(key, declared!, ask)
+          : ask;
   return {
     phase,
     situation: key,
@@ -778,7 +1138,19 @@ export function errandFor(
     // quoting a refusal is that the operator reads what the model actually
     // said, not a paraphrase of it.
     ...(said?.trim() ? { said: said.replace(/\s+/g, ' ').slice(0, 600) } : {}),
+    ...(key === 'blocked-declared:protected-path' ? { step: protectedStep(declared) } : {}),
   };
+}
+
+/**
+ * Phase 39's protected path as a human step (control-tower phase 44): the act
+ * the session named — its `--command`, else its `--rule` — and the path under
+ * the CLI's own wall, each only when the declaration said it.
+ */
+function protectedStep(declared?: { rule?: string; command?: string; reason?: string } | null): NonNullable<Errand['step']> {
+  const path = protectedPathOf(declared?.rule, declared?.command, declared?.reason);
+  const act = declared?.command || declared?.rule;
+  return { kind: 'protected-path', ...(act ? { act: actLine(act) } : {}), ...(path ? { path } : {}) };
 }
 
 /**
@@ -895,6 +1267,73 @@ export function progressExtension(
 export function lastSettledRung(slot: Pick<RecoverySlot, 'rungs'> | null | undefined): RungRecord | null {
   return [...(slot?.rungs ?? [])].reverse()
     .find((r) => Boolean(r.outcome) && r.outcome !== 'running' && r.outcome !== 'interrupted') ?? null;
+}
+
+/** What the `switch-account` rung knows when it decides (`switchRungDecision`). */
+export type SwitchRungFacts = {
+  /** The account the run is on now. */
+  from: string;
+  /** Which wall the rung answers: `usage` (a window) or `auth` (a sign-in). */
+  wall: string;
+  /** The run's account judged NOW, from its live meters (`Accounts.roomOf`). */
+  current: { ok: boolean; headroomPct: number | null };
+  /** The horizon-aware picker's accounts, inside the pool, best first, each with its room now. */
+  candidates: readonly { id: string; headroomPct: number | null }[];
+  /** The last switch a person made on the run (`RunState.accountChoice`). */
+  choice?: AccountChoice | null;
+  /** A sign-in wall the run's OWN account has since cleared (#36's evidence). */
+  cleared?: boolean;
+};
+
+export type SwitchRungDecision =
+  | { act: 'stay'; accountId: string; why: string }
+  | { act: 'switch'; accountId: string; reverts: AccountChoice | null }
+  | { act: 'refuse'; code: 'no-candidate' | 'less-headroom'; why: string };
+
+/**
+ * What the `switch-account` rung does (control-tower phase 78, #106), decided
+ * from LIVE evidence rather than the wall a stored checkpoint remembers.
+ *
+ * A person moved control-tower off a 42 % account onto a fresh one; an hour
+ * later converge classified a phase `resource-wall:usage` from a checkpoint an
+ * EARLIER attempt had written, and the rung moved the run back — from 5 % onto
+ * 64 % — then ping-ponged. Three rules, in order:
+ *
+ *  1. A usage wall is re-judged on the run's CURRENT account: room now means
+ *     the wall is not live, and the rung is a plain resume there, whoever ranks
+ *     higher (SH-4). A sign-in wall keeps its own rule: a resume on the run's
+ *     own account only when that account has cleared it since (#36).
+ *  2. Never onto less headroom (SH-5): the first candidate with MORE room than
+ *     the current account is taken; a candidate never read is not known to be
+ *     worse, the rank's own rule for the unknown.
+ *  3. A move back onto the account a person moved the run AWAY from is named a
+ *     reversal (`reverts`), so the caller journals and announces it (SH-6). It
+ *     can only happen under a live wall on the person's choice — rule 1 stays
+ *     on any account with room — so a person's switch is never reverted on
+ *     stale evidence, however old it is.
+ */
+export function switchRungDecision(facts: SwitchRungFacts): SwitchRungDecision {
+  const { from, current } = facts;
+  if (facts.wall === 'auth' ? facts.cleared === true && current.ok : current.ok) {
+    return {
+      act: 'stay', accountId: from,
+      why: facts.wall === 'auth'
+        ? `${from} signed in again and has room — the run resumes there`
+        : `${from} reads no live wall${current.headroomPct == null ? '' : ` (${Math.round(current.headroomPct)} % left)`} — `
+          + 'the wall this rung answers is stale, so the run resumes where it is',
+    };
+  }
+  if (!facts.candidates.length) return { act: 'refuse', code: 'no-candidate', why: `no account has room to take the run off ${from}` };
+  const pick = facts.candidates.find((candidate) => candidate.headroomPct == null || current.headroomPct == null
+    || candidate.headroomPct > current.headroomPct);
+  if (!pick) {
+    return {
+      act: 'refuse', code: 'less-headroom',
+      why: `every account that could take the run has less headroom than ${from} (${Math.round(current.headroomPct ?? 0)} % left) — a switch would only move the wall closer`,
+    };
+  }
+  const reverts = facts.choice && pick.id === facts.choice.from ? facts.choice : null;
+  return { act: 'switch', accountId: pick.id, reverts };
 }
 
 export { SITUATIONS, SITUATION_ACTOR, situationKey, situationLabel, parseSituationKey };

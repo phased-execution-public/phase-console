@@ -9,7 +9,7 @@
  */
 
 import { type QA_RESULT_WORDS } from '../../../shared/plan-vocab.js';
-import { planHref } from '../../../shared/routes.js';
+import { planViewHref } from '../../../shared/routes.js';
 import { PROFILE_LABELS } from '../../../shared/run-settings.js';
 
 /** What `qa-record.sh` writes, plus the parser's word for a row it could not read. */
@@ -105,7 +105,9 @@ export function qaReportRound(path: string): number {
  * A query, not a route, like every other overlay: open ⟺ the URL says so.
  */
 export function qaReportHref(slug: string, phase: number, round?: number): string {
-  return `${planHref(slug, 'qa')}?report=${phase}${round && round > 1 ? `:${round}` : ''}`;
+  // The QA view of the phase table (6.0): the retired `qa` tab's address
+  // redirects there too, carrying `report`, so an old link opens the same sheet.
+  return planViewHref(slug, 'qa', `report=${phase}${round && round > 1 ? `:${round}` : ''}`);
 }
 
 /** What `?report=` names, or null for anything that is not a phase (and an optional round). */

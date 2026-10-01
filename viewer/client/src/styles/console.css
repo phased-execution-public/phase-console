@@ -42,7 +42,7 @@
 
 .live-k {
   color: var(--ink-faint);
-  text-align: right;
+  text-align: end;
   user-select: none;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -67,30 +67,37 @@
   box-shadow: inset 2px 0 0 0 var(--accent);
   border-radius: 2px;
 }
+/* A shadow's offset has no logical spelling, and the band is the line's LEADING
+   edge — the same edge `k-steer` and `k-subagent` rule below — so under RTL the
+   offset flips by hand. `:dir()` follows the direction the line inherits, not
+   the document's alone. */
+.live-line.is-linked:dir(rtl) {
+  box-shadow: inset -2px 0 0 0 var(--accent);
+}
 
 .live-line.k-tool .live-k,
-.live-line.k-tool .live-t { color: var(--line-progress); }
+.live-line.k-tool .live-t { color: var(--status-running); }
 
 .live-line.k-verify .live-k,
-.live-line.k-verify .live-t { color: var(--line-done); }
+.live-line.k-verify .live-t { color: var(--status-done); }
 
-.live-line.k-phase .live-k { color: var(--line-done); }
+.live-line.k-phase .live-k { color: var(--status-done); }
 .live-line.k-phase .live-t { color: var(--ink); }
 
-.live-line.k-runner .live-t { color: var(--line-ready); }
+.live-line.k-runner .live-t { color: var(--status-queued); }
 
 .live-line.k-retry .live-k,
-.live-line.k-retry .live-t { color: var(--line-ready); }
+.live-line.k-retry .live-t { color: var(--status-queued); }
 
 .live-line.k-limits .live-k,
-.live-line.k-limits .live-t { color: var(--line-ready); }
+.live-line.k-limits .live-t { color: var(--status-queued); }
 
 .live-line.k-stderr .live-k,
 .live-line.k-stderr .live-t,
 .live-line.k-tool-fail .live-k,
 .live-line.k-tool-fail .live-t,
 .live-line.k-idle .live-k,
-.live-line.k-idle .live-t { color: var(--line-blocked); }
+.live-line.k-idle .live-t { color: var(--status-failed); }
 
 .live-line.k-init .live-t { color: var(--ink-faint); }
 
@@ -107,17 +114,17 @@
 /* A subagent speaks in its own margin — the visual half of what `parent` does
    in the fold. */
 .live-line.k-subagent {
-  border-left: 2px solid var(--rule);
-  padding-left: 0.25rem;
-  margin-left: 2px;
+  border-inline-start: 2px solid var(--rule);
+  padding-inline-start: 0.25rem;
+  margin-inline-start: 2px;
 }
 .live-line.k-subagent .live-k,
-.live-line.k-subagent .live-t { color: var(--line-progress); }
+.live-line.k-subagent .live-t { color: var(--status-running); }
 
 /* The operator's own words, and the session's reply to them. */
 .live-line.k-injected .live-k,
 .live-line.k-steer .live-k,
-.live-line.k-answer .live-k { color: var(--line-ready); }
+.live-line.k-answer .live-k { color: var(--status-queued); }
 
 .live-line.k-injected .live-t,
 .live-line.k-steer .live-t {
@@ -129,9 +136,9 @@
 
 .live-line.k-steer,
 .live-line.k-answer {
-  border-left: 2px solid var(--line-ready);
-  padding-left: 0.25rem;
-  margin-left: 2px;
+  border-inline-start: 2px solid var(--status-queued);
+  padding-inline-start: 0.25rem;
+  margin-inline-start: 2px;
 }
 
 /* The session ended: a rule, because it is the end of something. */
@@ -147,7 +154,7 @@
   user-select: none;
   padding-top: 2px;
 }
-.live-tick.is-delivered { color: var(--line-done); }
+.live-tick.is-delivered { color: var(--status-done); }
 
 /*
  * One thumb, one column: the kind gutter is the first thing to give.

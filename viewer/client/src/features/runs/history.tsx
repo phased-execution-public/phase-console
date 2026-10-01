@@ -10,20 +10,11 @@
  * machine and none on another.
  */
 
-import {
-  Card,
-  CardBody,
-  CardHeader,
-  CardTitle,
-  DataTable,
-  MonoId,
-  RelativeTime,
-  StatusBadge,
-  type Column,
-} from '@/components/ui';
+import { Card, CardBody, CardHeader, CardTitle, MonoId, RelativeTime } from '@/components/ui';
+import { RunStatusBadge } from '@/components/ui/status';
+import { DataTable, type Column } from '@/components/data-table';
 import { money } from '@/lib/format';
 import { runHref } from '@/app/routes';
-import { runStatusTitle, runUiState } from '@/lib/status-vocab';
 import type { RunState } from '@/lib/api';
 
 const COLUMNS: Column<RunState>[] = [
@@ -45,9 +36,9 @@ const COLUMNS: Column<RunState>[] = [
     priority: 1,
     min: 128,
     card: 'meta',
-    cell: (r) => (
-      <StatusBadge state={runUiState(r.status)} label={r.status} mono title={runStatusTitle(r.status)} />
-    ),
+    // The typed badge (control-tower phase 24): the run's word through the
+    // status model — its icon beside it, its reason on hover.
+    cell: (r) => <RunStatusBadge run={r} />,
   },
   {
     id: 'updated',

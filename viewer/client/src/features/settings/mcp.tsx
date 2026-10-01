@@ -36,7 +36,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   ConfirmButton,
   Dialog,
   DialogContent,
@@ -307,8 +307,8 @@ function ServerCard({ server, allowed }: { server: McpServerView; allowed: boole
         </CardTitle>
         <div className="flex flex-wrap items-center gap-2">
           <StatusChip server={server} />
-          <Chip>{server.transport}</Chip>
-          {server.toolCount ? <Chip>{server.toolCount} tools</Chip> : null}
+          <Badge>{server.transport}</Badge>
+          {server.toolCount ? <Badge>{server.toolCount} tools</Badge> : null}
         </div>
       </CardHeader>
 
@@ -522,17 +522,17 @@ function ServerCard({ server, allowed }: { server: McpServerView; allowed: boole
  * list reports pending and connects on its first tool call, which is normal.
  */
 function StatusChip({ server }: { server: McpServerView }) {
-  if (!server.enabled) return <Chip>switched off</Chip>;
+  if (!server.enabled) return <Badge>switched off</Badge>;
   switch (server.status) {
     case 'connected':
-      return <Chip tone="ok">connected</Chip>;
+      return <Badge tone="ok">connected</Badge>;
     case 'needs-auth':
-      return <Chip tone="bad">needs sign-in</Chip>;
+      return <Badge tone="bad">needs sign-in</Badge>;
     case 'failed':
-      return <Chip tone="bad">will not connect</Chip>;
+      return <Badge tone="bad">will not connect</Badge>;
     case 'pending':
-      return <Chip>connects on first use</Chip>;
+      return <Badge>connects on first use</Badge>;
     default:
-      return <Chip>not checked</Chip>;
+      return <Badge>not checked</Badge>;
   }
 }

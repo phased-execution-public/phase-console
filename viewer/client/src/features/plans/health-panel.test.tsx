@@ -9,7 +9,7 @@
  */
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const hooks = vi.hoisted(() => ({
@@ -30,6 +30,12 @@ vi.mock('@/lib/queries', async (importOriginal) => {
     useConsoleState: hooks.state,
     useVerifyPreflight: hooks.preflight,
   };
+});
+
+const { planLint, planWork } = vi.hoisted(() => ({ planLint: vi.fn(), planWork: vi.fn() }));
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>();
+  return { ...actual, api: { ...actual.api, planLint, planWork } };
 });
 
 vi.mock('@/components/pulse', () => ({ PlanPulse: () => <div data-testid="pulse" /> }));
@@ -82,6 +88,8 @@ beforeEach(() => {
   hooks.converge.mockReturnValue({ data: { reports: [] } });
   hooks.auth.mockReturnValue({ data: undefined });
   hooks.preflight.mockReturnValue({ data: undefined });
+  planWork.mockResolvedValue(null);
+  planLint.mockResolvedValue({ ok: true, issues: [], summary: 'LINT OK', timedOut: false, crashed: false });
 });
 
 describe('HealthPanel', () => {
@@ -183,5 +191,87 @@ describe('HealthPanel', () => {
     hooks.preflight.mockReturnValue({ data: { phases: [] } });
     mount(<HealthPanel detail={detail()} />);
     expect(screen.queryByText('Before it boards')).toBeNull();
+  });
+});
+
+/*
+ * The Phases tab draws the panel in two parts around its table (control-tower
+ * phase 23): what is wrong and what boarding will find ABOVE it, so a halted
+ * run is still the first thing on the tab; the heartbeat, the autopilot and
+ * what is left BELOW it, because the table is where the plan is up to — and
+ * the whole panel above it had put the table a screen and a half down.
+ */
+describe('HealthPanel in two parts', () => {
+  const halted = () =>
+    hooks.run.mockReturnValue({
+      data: {
+        run: {
+          id: 'run-1',
+          slug: 'demo',
+          status: 'halted',
+          model: 'opus',
+          spentUsd: 0,
+          halt: { phase: 2, reason: 'verification red on phase 2' },
+          phases: {},
+        },
+      },
+    });
+
+  it('the part above the table says nothing at all about a healthy plan', () => {
+    const { container } = mount(<HealthPanel detail={detail()} part="trouble" />);
+    expect(container.textContent).toBe('');
+  });
+
+  it('a halted run leads above the table, and the rest of the panel reads below it', () => {
+    halted();
+    const above = mount(<HealthPanel detail={detail()} part="trouble" />);
+    expect(screen.getByText("Something's wrong")).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /recover demo/ }).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('pulse')).toBeNull();
+    expect(screen.queryByText('Autopilot')).toBeNull();
+    expect(screen.queryByText('What is left')).toBeNull();
+    above.unmount();
+
+    mount(<HealthPanel detail={detail()} part="context" />);
+    expect(screen.queryByText("Something's wrong")).toBeNull();
+    expect(screen.getByTestId('pulse')).toBeTruthy();
+    expect(screen.getByText('Autopilot')).toBeTruthy();
+    expect(screen.getByText('What is left')).toBeTruthy();
+  });
+
+  it('what boarding will find is above the table too', () => {
+    hooks.preflight.mockReturnValue({
+      data: { phases: [{ phase: 2, warnings: [{ kind: 'nothing-runnable', message: 'nothing to run' }] }] },
+    });
+    mount(<HealthPanel detail={detail()} part="trouble" />);
+    expect(screen.getByText('Before it boards')).toBeTruthy();
+    expect(screen.queryByText('What is left')).toBeNull();
+  });
+});
+
+describe('the plan header reads the engine again (phase 25)', () => {
+  it('lints a failing plan again on a press — GET /api/plans/<slug>/lint — and says what it found', async () => {
+    planLint.mockResolvedValue({
+      ok: false,
+      issues: ['F2: phase 4 depends on phase 9, which does not exist'],
+      summary: '1 error',
+      timedOut: false,
+      crashed: false,
+    });
+    mount(<HealthPanel detail={detail({ lint: { ok: false, summary: 'F2 undefined dependency' } })} />);
+    expect(planLint).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Lint the plan again' }));
+    await waitFor(() => expect(planLint).toHaveBeenCalledWith('demo'));
+    expect(await screen.findByText('Still failing: 1 error')).toBeTruthy();
+    expect(screen.getByText('F2: phase 4 depends on phase 9, which does not exist')).toBeTruthy();
+  });
+
+  it('forecasts what is left in sessions from GET /api/plans/<slug>/work', async () => {
+    planWork.mockResolvedValue({ weight: 120, sessions: 2.4, phases: 2 });
+    mount(<HealthPanel detail={detail()} />);
+    expect(await screen.findByTestId('work-forecast')).toHaveTextContent(
+      '2 phases left — about 2 sessions at this plan’s measured size.',
+    );
+    expect(planWork).toHaveBeenCalledWith('demo');
   });
 });

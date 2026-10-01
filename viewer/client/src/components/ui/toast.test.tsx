@@ -46,7 +46,13 @@ describe('Toaster + toast()', () => {
     const okItem = (await screen.findByText('Copied')).closest('li') as HTMLElement;
     const warnItem = (await screen.findByText(/older code/)).closest('li') as HTMLElement;
     expect(okItem.className).not.toBe(warnItem.className);
-    expect(warnItem.className).toContain('border-action');
+    // Since tokens 6.0 a kind is a note severity (`shared/status-model.js`
+    // `NOTE_ROWS`): painted through its state class, never amber, and drawn
+    // with its own icon, so severity is never colour alone.
+    expect(warnItem.className).toContain('state-queued');
+    expect(okItem.className).toContain('state-done');
+    expect(warnItem.querySelector('svg[aria-label="Caution"]')).not.toBeNull();
+    expect(okItem.querySelector('svg[aria-label="Done"]')).not.toBeNull();
   });
 
   it('an action toast renders its button and the action fires', async () => {

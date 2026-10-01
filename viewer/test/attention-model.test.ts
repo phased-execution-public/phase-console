@@ -80,7 +80,8 @@ test('INBOX_KINDS is the InboxKind union, same words, same order', () => {
     union,
     'shared/attention-model.js and client/src/lib/api/inbox.ts have drifted — the union order is also the inbox sort tie-break, so a reorder is a behaviour change',
   );
-  assert.equal(union.length, 16, union.join(','));
+  // 18 since control-tower phase 41: `human-step`, a person's turn.
+  assert.equal(union.length, 18, union.join(','));
   assert.ok(Object.isFrozen(INBOX_KINDS), 'a vocabulary is frozen');
 });
 
@@ -90,8 +91,10 @@ test('conflict, question, policy, issue-draft and then message were APPENDED —
   // append-only contract is what makes a new kind free; this is the assertion
   // that keeps it true. `question` (zero-touch phase 14), `policy` (phase 19)
   // and `issue-draft` (many-plans-one-repo phase 12) went on the end, in that
-  // order, and `message` (phase 15) after them.
-  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'message');
+  // order, and `message` (phase 15) after them; `supervisor` (control-tower
+  // phase 101) and `human-step` (control-tower phase 41) after that.
+  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 1], 'human-step');
+  assert.equal(INBOX_KINDS[INBOX_KINDS.length - 2], 'supervisor');
   assert.deepEqual(
     INBOX_KINDS.slice(0, 15),
     ['errand', 'approval', 'gate', 'sign-in', 'mcp-auth', 'qa', 'lock', 'health', 'stall', 'ruling', 'session-ask', 'conflict', 'question', 'policy', 'issue-draft'],

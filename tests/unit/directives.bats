@@ -270,3 +270,209 @@ NOTE
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
+
+# --------------------------------------------------------------------------
+# --model-policy (control-tower phase 54, #91): the model a run names is the
+# model it runs. Like --isolation, silence is the third state — the RUN's
+# `modelPolicy` answers, and `ladder` below it — so the engine never invents
+# a default here.
+# --------------------------------------------------------------------------
+
+@test "--model-policy: the plan's line, a phase's bullet over it, a typo falling through" {
+  setup_docs model-policy model-policy
+  run pg model-policy --model-policy
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf 'pinned\tplan')" ]
+  run pg model-policy --model-policy 1
+  [ "$output" = "$(printf 'pinned\tplan')" ]
+  run pg model-policy --model-policy 2
+  [ "$output" = "$(printf 'ladder\tphase')" ]
+  # `frozen` is not a policy: the reader falls THROUGH to the plan's word.
+  run pg model-policy --model-policy 3
+  [ "$output" = "$(printf 'pinned\tplan')" ]
+  # Bold and capitals are the same word.
+  run pg model-policy --model-policy 4
+  [ "$output" = "$(printf 'pinned\tphase')" ]
+}
+
+@test "--model-policy: a plan that never says answers NOTHING — the run decides" {
+  setup_docs landing landing
+  run pg landing --model-policy 1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run pg landing --model-policy
+  [ -z "$output" ]
+}
+
+@test "--model-policy: an unknown phase is a usage error, not an answer" {
+  setup_docs model-policy model-policy
+  run pg model-policy --model-policy 9
+  [ "$status" -eq 2 ]
+}
+
+# --------------------------------------------------------------------------
+# --floor [N]: a phase's `- **Wall-clock floor:** <duration>` bullet, in
+# MINUTES, rounded up. Unlike --waits-on/--model-policy, an unknown phase is
+# not a usage error here — it answers nothing, exit 0, the same as --checkout:
+# the flag is a bullet reader, not a graph question.
+# --------------------------------------------------------------------------
+
+@test "--floor N: minutes for a plain spelling, trailing prose ignored" {
+  # checkout.md phase 1: "95 min — a full gates.sh run".
+  setup_docs checkout checkout
+  run pg checkout --floor 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "95" ]
+}
+
+@test "--floor N: multiple groups are summed (1h 30m = 90)" {
+  # checkout.md phase 3: "1h 30m".
+  setup_docs checkout checkout
+  run pg checkout --floor 3
+  [ "$status" -eq 0 ]
+  [ "$output" = "90" ]
+}
+
+@test "--floor N: an unreadable value prints nothing, even unbolded" {
+  # checkout.md phase 4: the bullet marker is an asterisk and the value is
+  # "soon" — no leading duration, so it is silence like the bare grammar says.
+  setup_docs checkout checkout
+  run pg checkout --floor 4
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--floor N: a phase without the bullet prints nothing" {
+  # checkout.md phase 2 carries no bullets at all.
+  setup_docs checkout checkout
+  run pg checkout --floor 2
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--floor N: an unknown phase reads as no floor, not a usage error" {
+  setup_docs checkout checkout
+  run pg checkout --floor 99
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--floor N: further spellings — whole hours, decimal hours, and zero is silence too" {
+  setup_docs checkout checkout
+  cat > "$DOCS_ROOT/docs/plans/checkout.md" <<'EOF'
+---
+slug: checkout
+---
+
+# Floor grammar coverage
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | A | — | — | r | x |
+| 2 | B | 1 | — | r | x |
+| 3 | C | 1 | — | r | x |
+
+## Phases
+
+### Phase 1 — A
+- **Wall-clock floor:** 2 h
+- **Verification:**
+  - `true`
+
+### Phase 2 — B
+- **Wall-clock floor:** 1.5 hours
+- **Verification:**
+  - `true`
+
+### Phase 3 — C
+- **Wall-clock floor:** 0 min
+- **Verification:**
+  - `true`
+EOF
+  run pg checkout --floor 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "120" ]
+  run pg checkout --floor 2
+  [ "$status" -eq 0 ]
+  [ "$output" = "90" ]
+  run pg checkout --floor 3
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--floor: the bare form lists only phases with a floor, N<TAB>minutes, in phase order" {
+  # checkout.md declares floors on phases 1 (95) and 3 (90) only.
+  setup_docs checkout checkout
+  run pg checkout --floor
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '1\t95\n3\t90')" ]
+}
+
+@test "--floor: a plan with no readable floor anywhere prints nothing, status 0" {
+  setup_docs landing landing
+  run pg landing --floor
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+# --------------------------------------------------------------------------
+# --verify-timeout [N]: how long ONE §Verification command may run before the
+# console cuts it (control-tower phase 83, #95). The `--wait-budget` shape:
+# `minutes<TAB>phase|plan`, the phase's own `- **Verify timeout:**` bullet over
+# the plan's `**Verify timeout:**` line, and silence when neither says — the
+# console then scales the limit from the line's measured history, which is not
+# the plan's to state. The JS twin is `verifyTimeoutFor` in parse/plan.ts.
+# --------------------------------------------------------------------------
+
+@test "--verify-timeout N: a phase with no bullet takes the plan's line, tagged plan" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout 1
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '45\tplan')" ]
+}
+
+@test "--verify-timeout N: a phase's own bullet wins, tagged phase, trailing prose ignored" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout 2
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '90\tphase')" ]
+}
+
+@test "--verify-timeout N: hours in minutes, and the bold is optional" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout 3
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '120\tphase')" ]
+}
+
+@test "--verify-timeout N: an unreadable bullet falls through to the plan's line" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout 4
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '45\tplan')" ]
+}
+
+@test "--verify-timeout: the bare form is the plan's line alone; decoy prose is never it" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(printf '45\tplan')" ]
+}
+
+@test "--verify-timeout: a plan that says nothing prints nothing, status 0" {
+  setup_docs landing landing
+  run pg landing --verify-timeout 1
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  run pg landing --verify-timeout
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "--verify-timeout N: an unknown phase is a usage error, not an answer" {
+  setup_docs verify-timeout verify-timeout
+  run pg verify-timeout --verify-timeout 9
+  [ "$status" -eq 2 ]
+}

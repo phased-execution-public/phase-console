@@ -3,7 +3,7 @@ import { MarkdownInline, plainText } from '@/components/markdown';
 import { QaVerdict } from '@/components/qa-launcher';
 import { ReviewVerdictChip } from './review-panel';
 import { ScopeChips } from '@/components/scope-chips';
-import { Chip, KeyValue, RelativeTime } from '@/components/ui';
+import { Badge, KeyValue, RelativeTime } from '@/components/ui';
 import type { PhaseEta, PhaseLock, PhaseView } from '@/lib/api';
 import { countdown, relativeTime, weight } from '@/lib/format';
 import { boardStateTitle, lockTitle } from '@/lib/status-vocab';
@@ -77,16 +77,18 @@ export const LockChip = memo(function LockChip({
 
   if (lock.expired) {
     return (
-      <Chip tone="warn" title={title}>
+      <Badge tone="accent" title={title} className="max-w-full whitespace-normal break-words">
         stale claim{compact ? '' : ` · ${lock.owner}`}
-      </Chip>
+      </Badge>
     );
   }
   return (
-    <Chip tone="busy" title={title}>
+    // An owner is an id of any length (`autopilot/<run>`, a host): the chip
+    // breaks rather than running past a 360px card (control-tower phase 31).
+    <Badge tone="live" title={title} className="max-w-full whitespace-normal break-words">
       held{compact ? '' : ` by ${lock.owner}`}
       {left && left !== '—' ? ` · ${left}` : ''}
-    </Chip>
+    </Badge>
   );
 });
 
@@ -214,10 +216,10 @@ export const SizeCell = memo(function SizeCell({
 }) {
   return (
     <div className="flex flex-col items-start gap-1">
-      <Chip mono title={`weight ${weight(phase.weight)}`}>
+      <Badge mono title={`weight ${weight(phase.weight)}`}>
         {phase.size}
-      </Chip>
-      {eta?.label && <span className="text-2xs whitespace-nowrap text-ink-faint">{eta.label}</span>}
+      </Badge>
+      {eta?.label && <span className="text-2xs whitespace-nowrap text-ink-muted">{eta.label}</span>}
     </div>
   );
 });
@@ -245,13 +247,13 @@ export const FlagsCell = memo(function FlagsCell({
   const chips: ReactNode[] = [];
   if (phase.gated) {
     const kind = phase.gateKind && phase.gateKind !== 'none' ? `·${phase.gateKind}` : '';
-    chips.push(<Chip key="gated" tone="gate" title={boardStateTitle('gated')}>{`gated${kind}`}</Chip>);
+    chips.push(<Badge key="gated" tone="accent" title={boardStateTitle('gated')}>{`gated${kind}`}</Badge>);
   }
   if (phase.analysis?.onCriticalPath) {
     chips.push(
-      <Chip key="crit" title="On the longest remaining chain">
+      <Badge key="crit" title="On the longest remaining chain">
         critical
-      </Chip>,
+      </Badge>,
     );
   }
   if (showQa && phase.qa) {
@@ -261,13 +263,13 @@ export const FlagsCell = memo(function FlagsCell({
   }
   if (phase.reviewHold?.length) {
     chips.push(
-      <Chip
+      <Badge
         key="review-hold"
-        tone="gate"
+        tone="accent"
         title={`Held by this console: P${phase.reviewHold.join(', P')} requested changes. The engine's board does not know.`}
       >
         review hold
-      </Chip>,
+      </Badge>,
     );
   }
   if (phase.review) {
@@ -281,9 +283,9 @@ export const FlagsCell = memo(function FlagsCell({
   }
   if (phase.handoff) {
     chips.push(
-      <Chip key="handoff" title={`Handoff: ${phase.handoff.status}`}>
+      <Badge key="handoff" title={`Handoff: ${phase.handoff.status}`}>
         handoff {phase.handoff.status}
-      </Chip>,
+      </Badge>,
     );
   }
   if (!chips.length) return <span className="text-2xs text-ink-faint">—</span>;

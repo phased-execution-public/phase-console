@@ -1,13 +1,16 @@
 import { Lock } from 'lucide-react';
-import { Banner, Chip, KeyValue, Progress, StateChip } from '@/components/ui';
+import { Badge, Banner, KeyValue, Progress, RelativeTime } from '@/components/ui';
+import { PhaseStatusBadge, PlanStatusBadge, type WordOf } from '@/components/ui/status';
 import { MarkdownInline } from '@/components/markdown';
 import { WriteMenu } from '@/components/write-menu';
+import { QaModeControl } from '@/components/qa-mode-control';
 import { useConsoleState } from '@/lib/queries';
 import { closedTitle, isClosed } from '@/lib/closure';
 import { cn } from '@/lib/cn';
-import { etaLabel, etaTitle, money, plural, weight } from '@/lib/format';
+import { duration, etaLabel, etaTitle, money, plural, weight } from '@/lib/format';
 import { insightsHref, plansHref } from '@/app/routes';
-import { phaseHref, planHref } from '@shared/routes.js';
+import { phaseHref, planViewHref } from '@shared/routes.js';
+import { QA_DISPLAY_WORDS, progressReading } from '@shared/plan-vocab.js';
 import type { PlanDetail } from '@/lib/api';
 
 /**
@@ -18,31 +21,68 @@ import type { PlanDetail } from '@/lib/api';
  * called `navigate()` — invisible to a middle click, a long press, or anything
  * that wanted to open a phase in a second tab.
  */
+/** A verdict word, as the roll-up says it — "2 failing, 1 pending" (#27). */
+const rollupWord = (word: string): string =>
+  word === 'fail' ? 'failing' : word === 'pass' ? 'passed' : word;
+
 /**
- * The QA status in one line: the regime with the engine's reason, the verdict
- * counts, and which phases a verdict is holding — linked to the QA tab where
- * the switches and the reports are. The cell used to be one bare word.
+ * The QA header card (control-tower phase 23, #27): the plan's switch with the
+ * reason the engine gave, the roll-up of every verdict on file, what those
+ * verdicts are holding, and the way to the QA view of the table. It was one
+ * line of the key-value list — a bare word, and a link to a tab that is now a
+ * view.
  */
-function QaHeadline({ detail }: { detail: PlanDetail }) {
+function QaHeaderCard({ detail }: { detail: PlanDetail }) {
   const s = detail.summary;
+  const { data: state } = useConsoleState();
   const counts = new Map<string, number>();
   for (const row of detail.qa) counts.set(row.result, (counts.get(row.result) ?? 0) + 1);
+  // In the display order the plan vocabulary keeps — worst first.
+  const rollup = (QA_DISPLAY_WORDS as readonly string[])
+    .filter((word) => counts.get(word))
+    .map((word) => `${counts.get(word)} ${rollupWord(word)}`);
   const holding = Object.entries(detail.qaHeld ?? {}).filter(([, held]) => held.length);
   return (
-    <span className="inline-flex flex-wrap items-baseline gap-x-2" data-testid="qa-headline">
-      <a href={planHref(s.slug, 'qa')} className="text-action hover:underline">
-        {s.qaMode}
-      </a>
-      {s.qaModeReason && <span className="text-ink-faint">({s.qaModeReason})</span>}
-      {[...counts.entries()].map(([result, n]) => (
-        <span key={result} className="text-ink-muted">
-          {n} {result}
-        </span>
-      ))}
+    <section
+      aria-label="QA gate"
+      data-testid="qa-header-card"
+      className="flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border border-rule bg-surface px-3 py-2 text-xs"
+    >
+      <QaModeControl
+        slug={s.slug}
+        mode={s.qaMode}
+        {...(s.qaModeReason ? { reason: s.qaModeReason } : {})}
+        allowWrites={Boolean(state?.allowWrites)}
+        {...(state?.scriptsDir ? { scriptsDir: state.scriptsDir } : {})}
+      />
+      <span className="text-ink-muted" data-testid="qa-rollup">
+        {rollup.length ? rollup.join(', ') : 'no verdict recorded yet'}
+      </span>
       {holding.length > 0 && (
         <span className="text-warn">
-          holds {holding.map(([by, held]) => `P${held.join(', P')} (P${by})`).join('; ')}
+          holding {holding.map(([by, held]) => `P${held.join(', P')} (by P${by})`).join('; ')}
         </span>
+      )}
+      <a href={planViewHref(s.slug, 'qa')} className="text-action hover:underline">
+        QA by phase
+      </a>
+    </section>
+  );
+}
+
+/**
+ * When work on the plan began, to the minute, and how long it has been going
+ * (#28) — `created` is a bare date, and a span of "0 days" said nothing.
+ * UTC, marked as such: two operators in two zones read one instant.
+ */
+function Started({ startedAt, spanMs }: { startedAt: string; spanMs?: number | undefined }) {
+  return (
+    <span data-testid="plan-started">
+      <time dateTime={startedAt}>
+        {startedAt.slice(0, 10)} {startedAt.slice(11, 16)}Z
+      </time>
+      {typeof spanMs === 'number' && spanMs > 0 && (
+        <span className="text-ink-muted"> · over {duration(spanMs)}</span>
       )}
     </span>
   );
@@ -50,6 +90,7 @@ function QaHeadline({ detail }: { detail: PlanDetail }) {
 
 export function PlanHeader({ detail }: { detail: PlanDetail }) {
   const s = detail.summary;
+  const reading = progressReading(s);
   const budget = detail.plan?.sessionBudget;
   const closed = isClosed(s);
   const { data: state } = useConsoleState();
@@ -99,11 +140,12 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
               )}
             </span>
           ) : (
-            s.status && <Chip>{s.status}</Chip>
+            // Painted, not printed (control-tower phase 23): a plan's status is
+            // a word of the plan vocabulary, and a word nobody knows draws as
+            // Unknown rather than as grey text that looks like one.
+            s.status && <PlanStatusBadge status={s.status as WordOf<'plan'>} />
           )}
-          {s.kind !== 'plan' && (
-            <Chip tone="warn">{s.kind === 'document' ? 'document' : 'orphan handoffs'}</Chip>
-          )}
+          {s.kind !== 'plan' && <Badge>{s.kind === 'document' ? 'document' : 'orphan handoffs'}</Badge>}
         </div>
         {/* Renders nothing at all on a read-only console — the rail already
             says the session cannot write, and repeating it here is noise. */}
@@ -117,19 +159,38 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
             {/* Only `done` is painted on a closed plan — the rest is grey.
                 An amber ready notch means "this could move today", which is
                 the one claim closure withdraws. Same rule as `plans/row.tsx`. */}
-            <span className="w-[min(20rem,40vw)]">
-              <Progress
-                total={s.phases}
-                done={s.done}
-                inProgress={closed ? 0 : s.inProgress.length}
-                ready={closed ? 0 : s.ready.length}
-                stuck={closed ? 0 : s.stuck.length}
-              />
+            {/* An unreadable board is UNKNOWN (#96): no bar — a bar is a
+                claim about what is done — and the words say what was last
+                read, and when. Never the 0 % an empty board would draw. */}
+            {reading.known && (
+              <span className="w-[min(20rem,40vw)]">
+                <Progress
+                  total={s.phases}
+                  done={s.done ?? 0}
+                  inProgress={closed ? 0 : s.inProgress.length}
+                  ready={closed ? 0 : s.ready.length}
+                  stuck={closed ? 0 : s.stuck.length}
+                />
+              </span>
+            )}
+            <span
+              className={cn('font-mono text-2xs', reading.known ? 'text-ink-faint' : 'text-warn')}
+              title={reading.title}
+            >
+              {reading.text}
+              {reading.known &&
+                closed &&
+                (s.done ?? 0) < s.phases &&
+                ` · ${s.phases - (s.done ?? 0)} never ran`}
             </span>
-            <span className="font-mono text-2xs text-ink-faint">
-              {s.done}/{s.phases} · {s.percent}%
-              {closed && s.done < s.phases && ` · ${s.phases - s.done} never ran`}
-            </span>
+            {s.boardStale && (
+              <span
+                className="text-2xs text-warn"
+                title="The engine timed out reading this plan; this is the last board it did read."
+              >
+                Stale board, read <RelativeTime at={s.boardStale.at} />
+              </span>
+            )}
           </>
         )}
         {/* `summary.ready` stays populated on a closed plan (the engine reports
@@ -146,9 +207,14 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
               P{phase} ready
             </a>
           ))}
+        {/* The board's own word for each phase in flight, as the status model
+            draws it — `In progress`, never a word folded here. */}
         {!closed &&
           s.inProgress.map((phase) => (
-            <StateChip key={phase} state="in-progress" board label={`P${phase} on track`} />
+            <span key={phase} className="inline-flex items-center gap-1">
+              <span className="font-mono text-2xs text-ink-muted">P{phase}</span>
+              <PhaseStatusBadge board="in-progress" />
+            </span>
           ))}
       </div>
 
@@ -168,7 +234,7 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
           // (`current branch \`main\` in both repos`); rendering it inline is
           // the same treatment the phase titles get.
           budget?.branch ? ['Branch', <MarkdownInline text={budget.branch} />] : null,
-          ['QA', <QaHeadline detail={detail} />],
+          s.startedAt ? ['Started', <Started startedAt={s.startedAt} spanMs={s.spanMs} />] : null,
           // Weight and sessions are what is left to DO; the estimate beside them
           // is how long that has actually been taking. The two answer the
           // question people ask as one — "how much further" — and the page could
@@ -179,7 +245,7 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
                 <span>
                   {weight(s.remainingWeight)} ≈ {plural(s.remainingSessions, 'session')}
                   {eta && (
-                    <span className="text-ink-faint" title={etaTitle(eta)}>
+                    <span className="text-ink-muted" title={etaTitle(eta)}>
                       {' · '}
                       {etaLabel(eta.lowMs, eta.highMs, eta.basis)}
                     </span>
@@ -195,12 +261,16 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
             ? [
                 'Cost',
                 <span>
-                  <a href={insightsHref(s.slug)} className="text-action hover:underline">
+                  {/* `relative`: a positioned link hit-tests above the inline
+                      text after it. Unpositioned, the finish-date span took the
+                      link's last pixel — both right corners lost, the e2e
+                      register's touch-wins at 360 and at 768. */}
+                  <a href={insightsHref(s.slug)} className="relative text-action hover:underline">
                     {money(detail.cost.totalUsd)}
                   </a>
                   {detail.cost.partialPhases.length > 0 && (
                     <span
-                      className="text-ink-faint"
+                      className="text-ink-muted"
                       title={`P${detail.cost.partialPhases.join(', P')} recorded no cost for a session that ran`}
                     >
                       {' '}
@@ -210,13 +280,20 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
                   {detail.forecast && (
                     // The assumptions live on the Insights card; the title is
                     // the pointer to them, never a substitute — a date with its
-                    // caveats only on hover is a date quoted without them.
-                    <span className="text-ink-faint" title={detail.forecast.assumptions.join('\n\n')}>
-                      {' · finishes ~'}
-                      {new Date(detail.forecast.expected).toLocaleDateString(undefined, {
-                        month: 'short',
-                        day: 'numeric',
-                      })}
+                    // caveats only on hover is a date quoted without them. No
+                    // measurable duty cycle means no date at all, not a guess.
+                    <span className="text-ink-muted" title={detail.forecast.assumptions.join('\n\n')}>
+                      {detail.forecast.calendar === 'known' && detail.forecast.expected ? (
+                        <>
+                          {' · finishes ~'}
+                          {new Date(detail.forecast.expected).toLocaleDateString(undefined, {
+                            month: 'short',
+                            day: 'numeric',
+                          })}
+                        </>
+                      ) : (
+                        ' · finish date unknown'
+                      )}
                     </span>
                   )}
                 </span>,
@@ -228,11 +305,7 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
                 <span>
                   <span className="font-mono">{detail.git.sha}</span>
                   {detail.git.relativeDate ? ` · ${detail.git.relativeDate}` : ''}
-                  {detail.git.dirty ? (
-                    <Chip tone="warn" className="ml-2">
-                      uncommitted
-                    </Chip>
-                  ) : null}
+                  {detail.git.dirty ? <Badge className="ml-2">uncommitted</Badge> : null}
                 </span>,
               ]
             : null,
@@ -246,9 +319,9 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
                 // `frontend-design:frontend-design` ran 6px past `<main>`'s clip
                 // edge at 360. Arbitrary content wraps; a vocabulary does not.
                 budget.skills.map((skill) => (
-                  <Chip key={skill} mono className="mr-1 max-w-full break-all whitespace-normal">
+                  <Badge key={skill} mono className="mr-1 max-w-full break-all whitespace-normal">
                     {skill}
-                  </Chip>
+                  </Badge>
                 )),
               ]
             : null,
@@ -276,12 +349,26 @@ export function PlanHeader({ detail }: { detail: PlanDetail }) {
         </Banner>
       )}
 
+      <QaHeaderCard detail={detail} />
+
       {s.engineError && <Banner severity="warn">Engine: {s.engineError}</Banner>}
       {detail.lint?.timedOut && <Banner severity="info">{detail.lint.summary}</Banner>}
-      {detail.lint && !detail.lint.ok && (
+      {/* COULD NOT RUN (#17): a reading that proves nothing about the plan,
+          either way — said as that, and never painted as a failure. */}
+      {detail.lint?.crashed && (
+        <Banner severity="info">
+          <span data-testid="lint-could-not-run">Plan health could not run — {detail.lint.summary}</span>
+        </Banner>
+      )}
+      {detail.lint && !detail.lint.ok && !detail.lint.crashed && (
         <Banner severity="error">
           <div className="min-w-0">
             <strong>{detail.lint.summary}</strong>
+            {detail.lint.stale && (
+              <p className="text-2xs">
+                From the last check that finished, <RelativeTime at={detail.lint.stale.at} />.
+              </p>
+            )}
             <ul className="mt-1 list-disc pl-5">
               {detail.lint.issues.map((issue, i) => (
                 <li key={i}>{issue}</li>

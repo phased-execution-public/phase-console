@@ -8,6 +8,17 @@
 # Skill root, resolved from this helper's location: tests/helpers/ -> skill root.
 PE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PE_SCRIPTS="$PE_DIR/scripts"
+
+# A session Phase Console supervises runs this suite with the console's own
+# variables exported, and they steer the scripts under test: `PE_LOCK_MIRROR=
+# console` turns every `--git` claim file-only (five locking-git tests went red
+# under a supervised run — control-tower phase 31), and the owner, session,
+# scope, branch, worktree and channel files would stand in for the ones a test
+# means to exercise. A test sets what it needs; nothing leaks in.
+unset PE_LOCK_MIRROR PE_OWNER PE_SESSION_ID PE_SCOPE PE_BRANCH PE_WORKTREE \
+  PE_OUTCOME_FILE PE_TASKS_FILE PE_RULINGS_FILE PE_PROOFS_FILE PE_ISSUES_FILE \
+  PE_MESSAGES_FILE PE_MSG_TOKEN PE_TRACE_ID PE_SPAN_ID \
+  PE_MCP_SERVERS PE_ACCOUNTS PE_CREDENTIALS CLAUDE_CODE_SESSION_ID
 SYS_BASH="/bin/bash"
 
 # --- runners (each forces the 3.2 system bash) --------------------------------
@@ -49,9 +60,21 @@ pe_close()    { DOCS_ROOT="${DOCS_ROOT:?set DOCS_ROOT first}" PE_TODAY="${PE_TOD
 # written WITHOUT a scope. The suite must describe the scripts, not the shell it
 # happens to run in, so the ambient values are dropped here; a test that wants
 # one sets it itself.
+#
+# The TRACE pair is the same rule and it cost five false failures before it was
+# added: the runner exports PE_TRACE_ID and PE_SPAN_ID into every session it
+# spawns, phase-outcome.sh folds them into the declaration as `trace`/`span`
+# (correctly — three cases assert exactly that), and five other cases compare an
+# exact JSON literal that carries neither. So the suite was green from a terminal
+# and red from inside a run, which is the one place it is most likely to be run.
+# TRACEPARENT rides with them: it is the W3C spelling of the same context.
 scrub_pe_env() {
   unset PE_SCOPE PE_OWNER PE_SESSION_ID PE_OUTCOME_FILE PE_RULINGS_FILE PE_TASKS_FILE PE_MCP_SERVERS \
-    PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID
+    PE_MESSAGES_FILE PE_MSG_TOKEN PE_ISSUES_FILE PE_ISSUES_MODE PE_TRACE_ID PE_SPAN_ID TRACEPARENT PE_PROOFS_FILE \
+    PE_LOCK_MIRROR
+  # A declaration never asks a real console (phase-outcome.sh's ingest probe, control-tower
+  # phase 50): an unregistered root resolves to port 4123, the operator's own console.
+  export PHASE_OUTCOME_PROBE=0
 }
 
 # --- fixtures / scaffolding ---------------------------------------------------
@@ -67,6 +90,16 @@ setup_docs() {
 
 # Write a minimal handoff with a given status for state tests.
 # usage: write_handoff <slug> <N> <title> <status>   (status: complete|in-progress|blocked|pending)
+# What a finishing session writes into a scaffold before anything counts it
+# done: one sentence under "What this phase did". A `complete` handoff whose
+# section is still the template reads in-progress on the board and fails the
+# lint (control-tower phase 51, #46).
+write_body() {  # write_body <slug> <handoff file name>
+  local f="$DOCS_ROOT/docs/handoffs/$1/$2"
+  awk '{ print } /^## What this phase did/ && !w { print "Shipped what the phase set out to."; w = 1 }' "$f" > "$f.body" \
+    && mv "$f.body" "$f"
+}
+
 write_handoff() {
   local slug="$1" n="$2" title="$3" status="$4" pad f
   pad="$(printf '%02d' "$n")"

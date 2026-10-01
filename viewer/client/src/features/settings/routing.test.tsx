@@ -334,3 +334,48 @@ describe('where each kind lands', () => {
     expect(within(firehose).getByText('off by default')).toBeTruthy();
   });
 });
+
+describe('the budget kind (control-tower phase 14, #40)', () => {
+  /**
+   * The catalogue's own row (`server/push/catalogue.ts`): on, and not urgent —
+   * a spent budget holds the work rather than stopping it dead, and the remedy
+   * is a raise. The card has no list of its own; it draws whatever the server
+   * serves, so this is the row as the server serves it.
+   */
+  const BUDGET = {
+    id: 'budget',
+    label: 'Budget spent or running low',
+    detail: 'A budget that can stop work reached 80% or ran out. Not urgent: a spent budget holds the work.',
+    byDefault: true,
+    urgent: false,
+  };
+  const WITH_BUDGET = [...CATEGORIES, BUDGET];
+
+  beforeEach(() => {
+    push.mockResolvedValue({ publicKey: '', devices: [], categories: WITH_BUDGET });
+    webhooks.mockResolvedValue({ allowWebhooks: false, hooks: [], categories: WITH_BUDGET });
+  });
+
+  it('has a switch of its own, on for a console that never wrote it, and marked neither urgent nor off', async () => {
+    await mount({});
+    const box = await screen.findByRole('checkbox', { name: 'Budget spent or running low' });
+    expect(box).toHaveAttribute('aria-checked', 'true');
+    const row = box.parentElement!;
+    expect(within(row).queryByText('urgent')).toBeNull();
+    expect(within(row).queryByText('off by default')).toBeNull();
+  });
+
+  it('writes notify.budget and nothing else', async () => {
+    await mount({ approval: true, halted: true, changed: false });
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Budget spent or running low' }));
+    await waitFor(() => expect(savePrefs).toHaveBeenCalledWith({ notify: { budget: false } }));
+  });
+
+  it('silenced, it is counted but raises no stops-dead warning', async () => {
+    await mount({ approval: true, halted: true, changed: false, budget: false });
+    const box = await screen.findByRole('checkbox', { name: 'Budget spent or running low' });
+    expect(box).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(/4 kinds · 2 silenced/)).toBeTruthy();
+    expect(screen.queryByText(/is off\./)).toBeNull();
+  });
+});

@@ -272,7 +272,19 @@ export interface Portfolio {
   stalled: { slug: string; days: number; ready: number[] }[];
   busiest: { slug: string; completions: number }[];
   /** How fast a phase has actually been going lately, pooled across every plan. */
-  rate?: { ratePerWeight: number; basis: EtaBasis; samples: number; spread: number };
+  rate?: {
+    ratePerWeight: number;
+    /** The affine floor: working time any phase takes before its weight counts. */
+    floorMs: number;
+    /** The affine slope, milliseconds per unit of weight. */
+    slopeMsPerWeight: number;
+    basis: EtaBasis;
+    samples: number;
+    spread: number;
+    /** Finished phases with no usable measurement, reported beside the count. */
+    missing: number;
+    clock: 'working';
+  };
 }
 
 /* ---------------- the directory picker ---------------- */
@@ -341,6 +353,12 @@ export interface RestartUpdateView {
   by: string;
   detail: string;
   result?: SelfUpdateResultView;
+  /** A held restart's drain: when it expects the live lanes to end, and the cap it will not wait past. */
+  expectedEnd?: string;
+  capAt?: string;
+  /** How many live lanes the drain waits on, and whose plans they are. */
+  lanes?: number;
+  plans?: string[];
 }
 
 /**
@@ -355,8 +373,36 @@ export interface RestartOutcome {
   waiting?: boolean;
 }
 
+/**
+ * `GET /api/instances` — the machine's console registry as THIS console reads
+ * it (`server/fleet.ts` `census`), and `GET /api/fleet/profile` — the machine
+ * profile and what this console takes from it, each field's source named.
+ */
+export interface InstancesView {
+  rows?: { id: string; name: string; port?: number; liveness?: string; provenance?: string }[];
+  [key: string]: unknown;
+}
+
+export interface FleetProfileView {
+  profile: Record<string, unknown>;
+  console: {
+    id: string;
+    name: string;
+    remoteHosts: string[];
+    remoteUsers: string[];
+    notifyCommand: boolean;
+    maxSessions: number;
+    machineMaxSessions: number | null;
+    autostart: boolean | 'once';
+    sources?: Record<string, string>;
+    overridden: string[];
+  };
+}
+
 /** The console's own fetchers — merged into `api` by `./index`. */
 export const systemApi = {
+  instances: () => request<InstancesView>('/api/instances'),
+  fleetProfile: () => request<FleetProfileView>('/api/fleet/profile'),
   /** This machine's tailnet — devices, and whether `serve` points here. */
   tailscale: () => request<TailscaleStatus>('/api/tailscale'),
   stats: () => request<Portfolio>('/api/stats'),

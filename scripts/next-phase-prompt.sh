@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # End-of-phase output for Mode 3 (phase-finish): a stop banner, the live DAG board,
-# and a copy-paste boot prompt for EVERY phase that is now unblocked — not just the
-# next number. Delegates all graph logic to phase-graph.sh (the engine).
+# and the boot for EVERY phase that is now unblocked — not just the next number:
+# one phase's whole copy-paste prompt, or, for a fan-out, the shared boot once and
+# each phase's own block (#115), with `--phase N` composing any one of them whole.
+# Delegates all graph logic to phase-graph.sh (the engine).
 #
-# Usage: next-phase-prompt.sh <slug> <completed-phase|none> [unused]
+# Usage: next-phase-prompt.sh <slug> <completed-phase|none> [--phase N]
+#   --phase N        : print only phase N's full prompt, composed now from the plan
+#                      (`--boot-prompt N`, framed for copying) — what a fan-out's
+#                      shared boot and block stand for, put together at launch.
 #   slug             : plan/handoff/memory slug
 #   completed-phase  : the phase that just finished (its deps-unblocking is computed
 #                      via the engine's --ready-after, so it counts as done even before
@@ -14,6 +19,14 @@ set -euo pipefail
 
 slug="${1:?usage: next-phase-prompt.sh <slug> <completed-phase|none>}"
 completed="${2:?completed-phase number (or 'none') required}"
+shift 2
+only=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --phase) only="${2:?--phase needs a phase number}"; shift 2 ;;
+    *)       shift ;;   # the old third positional, documented as unused
+  esac
+done
 
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="$SKILL_DIR/scripts/phase-graph.sh"
@@ -41,9 +54,7 @@ memory_key="${memory_key:-project_${slug}}"
 print_closeout() {
   local qa_mode
   qa_mode="$(bash "$ENGINE" "$slug" --qa-mode 2>/dev/null || echo off)"
-  printf '\n🏁  All phases complete.\n'
-  printf '   Close the plan (this is what stops it appearing as outstanding work):\n'
-  printf '     %s/close-plan.sh %s --status complete --reason "<what shipped>"\n\n' "$CMD" "$slug"
+  printf '\n🏁  All phases complete.\n\n'
   case "$qa_mode" in
     on*)
       printf 'Final full-plan QA (this plan runs QA: %s) — dispatch a FRESH qa-full QA subagent\n' "$qa_mode"
@@ -59,10 +70,15 @@ print_closeout() {
       printf 'QA gate: %s — do NOT dispatch a qa-full subagent; run the verification yourself.\n\n' "$qa_mode"
       ;;
   esac
+  # The close is LAST (#153): a closed plan reads finished to every reader, so
+  # closing it before its end-to-end proof ran claims what nothing has shown.
   printf 'Remaining steps:\n'
   printf '  1. Run §End-to-end verification in  docs/plans/%s.md  (always — QA on or off)\n' "$slug"
   printf '  2. Check memory %s for outstanding user gates (push / prod deploy).\n' "$memory_key"
-  printf '  3. /clear — this project is done.\n\n'
+  printf '  3. Close the plan, only once every line is green (this is what stops it appearing as\n'
+  printf '     outstanding work):\n'
+  printf '     %s/close-plan.sh %s --status complete --reason "<what shipped>"\n' "$CMD" "$slug"
+  printf '  4. /clear — this project is done.\n\n'
 }
 
 # A closed plan hands off to nobody. Printing boot prompts for one would invite a
@@ -71,6 +87,24 @@ if closed="$(bash "$ENGINE" "$slug" --closed 2>/dev/null)"; then
   printf '\n🔒  %s is closed (%s) — no next phase.\n\n' "$slug" "${closed#closed }"
   printf 'Nothing here is outstanding work. To resume this plan:\n'
   printf '  %s/close-plan.sh %s --reopen\n\n' "$CMD" "$slug"
+  exit 0
+fi
+
+# One phase's full prompt, composed at launch (#115) — the copy a fan-out's
+# shared boot and block stand for. The engine refuses a phase the plan lacks.
+if [ -n "$only" ]; then
+  prompt="$(bash "$ENGINE" "$slug" --boot-prompt "$only")" || exit $?
+  gmark=""
+  if [ "$(bash "$ENGINE" "$slug" --gated "$only" 2>/dev/null || echo no)" = yes ]; then
+    case "$(bash "$ENGINE" "$slug" --gate-kind "$only" 2>/dev/null || echo human)" in
+      ai)   gmark=" — 🔒 GATED·ai (session clears the gate first)" ;;
+      auto) gmark=" — 🔒 GATED·auto (confirm --gate-status is clear)" ;;
+      *)    gmark=" — 🔒 GATED·human (operator must approve first)" ;;
+    esac
+  fi
+  printf '\n── START COPY — Phase %s%s ─────────────────────────────────\n' "$only" "$gmark"
+  printf '%s\n' "$prompt"
+  printf '── END COPY ────────────────────────────────────────────────────\n\n'
   exit 0
 fi
 
@@ -134,13 +168,15 @@ if [ "$n_ready" -gt 1 ]; then
     printf '   Shared scope (SERIALIZE — never two live sessions on these):%s\n' "$overlap"
   fi
   printf '   Check before you start either way:\n   %s/phase-lock.sh %s conflicts <N> --scope "<csv>" --git\n' "$CMD" "$slug"
-  printf '   If the remaining session budget allows (your live context meter — references/sizing.md),\n'
-  printf '   you MAY also continue into ONE of them in THIS session (not a 🔒GATED one — those always\n'
-  printf '   start fresh after their gates are confirmed). Commit before switching sessions; never\n'
-  printf '   `git stash` to hand off.\n'
+  printf '   Driving by hand, if the remaining session budget allows (your live context meter —\n'
+  printf '   references/sizing.md), you MAY also continue into ONE of them in THIS session (not a\n'
+  printf '   🔒GATED one — those always start fresh after their gates are confirmed). Under Phase\n'
+  printf '   Console (PE_OUTCOME_FILE set) stop after your handoff — it runs one phase per session.\n'
+  printf '   Commit before switching sessions; never `git stash` to hand off.\n'
 else
-  # Single next phase: continue into it in THIS session whenever it fits the remaining
-  # budget (only gates, a model switch, or a spent budget force a fresh session).
+  # Single next phase: by hand, continue into it in THIS session whenever it fits the
+  # remaining budget (only gates, a model switch, or a spent budget force a fresh
+  # session). The console never batches — it boards every phase in a session of its own.
   sz="$(bash "$ENGINE" "$slug" --size "$ready" 2>/dev/null || echo M)"
   rdeps=" $(bash "$ENGINE" "$slug" --deps "$ready" 2>/dev/null || true) "
   gated_next="$(bash "$ENGINE" "$slug" --gated "$ready" 2>/dev/null || echo no)"
@@ -167,15 +203,29 @@ else
         ;;
     esac
   elif [ "$seq" = yes ]; then
-    printf '\n▶  Next ready phase: %s  (size %s, sequential on Phase %s) — BATCH-FRIENDLY.\n' "$ready" "$sz" "$completed"
-    printf '   If it fits the remaining session budget (references/sizing.md), just continue into it in\n'
-    printf '   THIS session — saves a bootstrap and keeps the cache warm. Otherwise /clear and paste the\n'
-    printf '   prompt below into a fresh session.\n'
+    printf '\n▶  Next ready phase: %s  (size %s, sequential on Phase %s) — batch-friendly BY HAND.\n' "$ready" "$sz" "$completed"
+    printf '   Driving by hand, if it fits the remaining session budget (references/sizing.md), just\n'
+    printf '   continue into it in THIS session — saves a bootstrap and keeps the cache warm. Otherwise\n'
+    printf '   /clear and paste the prompt below into a fresh session.\n'
   else
     printf '\n▶  Next ready phase: %s  (size %s, independent of the phase just finished).\n' "$ready" "$sz"
-    printf '   It may still share THIS session if the remaining budget allows (references/sizing.md);\n'
-    printf '   otherwise /clear and start it fresh with the prompt below.\n'
+    printf '   Driving by hand, it may still share THIS session if the remaining budget allows\n'
+    printf '   (references/sizing.md); otherwise /clear and start it fresh with the prompt below.\n'
   fi
+  # The console never batches: it boards every phase in a session of its own.
+  printf '   Under Phase Console (PE_OUTCOME_FILE set) stop after your handoff — the console runs one\n'
+  printf '   phase per session and starts the next itself.\n'
+fi
+
+# A fan-out: the shared boot once and each phase's own block, as the handoff
+# writes it — eight whole prompts printed as a session's last message were
+# ~1,100 lines of copies of each other (#115).
+if [ "$n_ready" -gt 1 ]; then
+  printf '   Compose one phase'\''s full prompt when you start it — never assemble it by hand:\n'
+  printf '     %s/next-phase-prompt.sh %s %s --phase <N>\n\n' "$CMD" "$slug" "$completed"
+  bash "$ENGINE" "$slug" --boot-fanout "$ready"
+  echo
+  exit 0
 fi
 
 for p in $ready; do

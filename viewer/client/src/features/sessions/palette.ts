@@ -5,7 +5,7 @@
  * the reason is worth stating: the sixteen ANSI slots are an *addressing
  * scheme*, not a design decision. A program writes `\e[31m` meaning "slot 1",
  * and the emulator decides what slot 1 looks like. There is no design token
- * that can carry that — `--line-blocked` is "a blocked phase", not "red as
+ * that can carry that — `--status-failed` is "a failed phase", not "red as
  * `ls` means it".
  *
  * Everything that *is* a design decision — the background, the foreground, the

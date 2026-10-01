@@ -1,6 +1,8 @@
-import { cva, type VariantProps } from 'class-variance-authority';
+import { cva } from 'class-variance-authority';
 import type { HTMLAttributes, ReactNode } from 'react';
+import { NOTE_ROWS, NOTE_SEVERITIES, type NoteSeverity } from '@shared/status-notes.js';
 import { cn } from '@/lib/cn';
+import { NOTE_ICONS } from './status/note-icons';
 
 /**
  * One place for "the app needs to tell you something about this screen".
@@ -16,22 +18,44 @@ import { cn } from '@/lib/cn';
  * the ordering rule.
  */
 
-export const noteVariants = cva('flex items-start gap-2 rounded border px-3 py-2 text-sm', {
-  variants: {
-    severity: {
-      error: 'border-blocked/55 bg-blocked/8 text-blocked',
-      warn: 'border-action/55 bg-action/8 text-ink',
-      info: 'border-progress/45 bg-progress/8 text-ink',
-      ok: 'border-done/45 bg-done/8 text-ink',
+/**
+ * A note's severity is one of the model's `NOTE_SEVERITIES` (worst first), and
+ * `NOTE_ROWS` says how each is painted and drawn — the stack keeps no table of
+ * its own. Paint rides the `.state-<paint>` indirection, so a caution is the
+ * neutral blue-grey with its warning icon and never amber: a caution is not a
+ * summons.
+ */
+export type Severity = NoteSeverity;
+
+export const noteVariants = cva(
+  'flex items-start gap-2 rounded border border-state/50 bg-state/8 px-3 py-2 text-sm text-ink',
+  {
+    variants: {
+      severity: Object.fromEntries(
+        NOTE_SEVERITIES.map((severity) => [severity, `state-${NOTE_ROWS[severity].paint}`]),
+      ) as Record<Severity, string>,
     },
+    defaultVariants: { severity: 'info' },
   },
-  defaultVariants: { severity: 'info' },
-});
+);
 
-export type Severity = NonNullable<VariantProps<typeof noteVariants>['severity']>;
+/** Worst first — an error must never sort below a hint. The rank IS the owner's order. */
+const rank = (severity: Severity) => NOTE_SEVERITIES.indexOf(severity);
 
-/** Worst first — an error must never sort below a hint. */
-const ORDER: Record<Severity, number> = { error: 0, warn: 1, info: 2, ok: 3 };
+/** The severity's own icon, so a note never says how serious it is by colour alone. */
+export function NoteIcon({ severity, className }: { severity: Severity; className?: string }) {
+  const Icon = NOTE_ICONS[NOTE_ROWS[severity].icon];
+  if (!Icon) return null;
+  return (
+    <Icon
+      size={14}
+      strokeWidth={2.25}
+      aria-label={NOTE_ROWS[severity].label}
+      role="img"
+      className={cn('mt-0.5 shrink-0 text-state', className)}
+    />
+  );
+}
 
 /**
  * How a caller's notes get ordered.
@@ -62,7 +86,13 @@ export function Banner({
   ...props
 }: { severity?: Severity } & HTMLAttributes<HTMLDivElement>) {
   return (
-    <div role="status" className={cn(noteVariants({ severity }), className)} {...props}>
+    <div
+      role="status"
+      data-severity={severity ?? 'info'}
+      className={cn(noteVariants({ severity }), className)}
+      {...props}
+    >
+      <NoteIcon severity={severity ?? 'info'} />
       {children}
     </div>
   );
@@ -81,7 +111,7 @@ export function StatusStack({
   className?: string;
 }) {
   if (!notes.length) return null;
-  const sorted = order === 'given' ? notes : [...notes].sort((a, b) => ORDER[a.severity] - ORDER[b.severity]);
+  const sorted = order === 'given' ? notes : [...notes].sort((a, b) => rank(a.severity) - rank(b.severity));
   const shown = sorted.slice(0, max);
   const hidden = sorted.length - shown.length;
 

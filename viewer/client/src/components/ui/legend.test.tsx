@@ -15,7 +15,7 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import { expectNoAxeViolations } from '@/test/axe';
-import { STATE_META, UI_STATES } from '@/lib/status-vocab';
+import { UI_STATES, uiLabel } from '@/lib/status-vocab';
 import { Legend, stateEntries, stateTally } from './legend';
 import { StackBar, RouteStrip, RunStrip } from '@/components/charts';
 import { RouteMap } from '@/components/dag';
@@ -29,7 +29,7 @@ describe('the legend primitive', () => {
     const { container } = render(
       <Legend
         entries={[
-          { key: 'a', label: 'Running', state: 'running' },
+          { key: 'a', label: 'Running', paint: 'running' },
           { key: 'b', label: 'Critical path', mark: <span data-testid="real-mark" /> },
         ]}
       />,
@@ -45,8 +45,8 @@ describe('the legend primitive', () => {
     render(
       <Legend
         entries={[
-          { key: 'a', label: 'done', state: 'done', count: 9 },
-          { key: 'b', label: 'running', state: 'running' },
+          { key: 'a', label: 'done', paint: 'done', count: 9 },
+          { key: 'b', label: 'running', paint: 'running' },
         ]}
       />,
     );
@@ -60,9 +60,9 @@ describe('the legend primitive', () => {
   });
 
   it('is a list either way — `inline` only changes which elements carry it', () => {
-    const block = render(<Legend entries={[{ key: 'a', label: 'done', state: 'done' }]} />);
+    const block = render(<Legend entries={[{ key: 'a', label: 'done', paint: 'done' }]} />);
     expect(block.container.querySelector('ul')).toBeInTheDocument();
-    const inline = render(<Legend inline entries={[{ key: 'a', label: 'done', state: 'done' }]} />);
+    const inline = render(<Legend inline entries={[{ key: 'a', label: 'done', paint: 'done' }]} />);
     // A `<ul>` cannot go inside a `<span>` or a strip's bar, and the semantics
     // must survive the swap rather than being dropped with the element.
     expect(inline.container.querySelector('ul')).toBeNull();
@@ -81,8 +81,9 @@ describe('the entries and the sentence come off the vocabulary', () => {
     const entries = stateEntries({ done: 4, 'needs-you': 1, running: 2, skipped: 0 });
     expect(entries.map((e) => e.key)).toEqual(['needs-you', 'running', 'done']);
     expect(entries.map((e) => e.count)).toEqual([1, 2, 4]);
-    // The label is the vocabulary's, not the chart's.
-    expect(entries[0]!.label).toBe(STATE_META['needs-you'].label.toLowerCase());
+    // The label is the palette's name for the paint, not the chart's.
+    expect(entries[0]!.label).toBe(uiLabel('needs-you').toLowerCase());
+    expect(entries[0]!.paint).toBe('needs-you');
   });
 
   it('a state nobody has written a chart for still counts and names itself', () => {

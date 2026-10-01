@@ -19,7 +19,7 @@ A plan's `## Decisions` section holds one row per **key** of a closed vocabulary
 | `waits` | | dev-lead | outstanding | yes | plan | to be bounded before phase 6 |
 | `qa.exhausted` | QA is off on this plan | operator | waived | no | plan | decision 4 |
 
-The eighteen keys, and what each answers:
+The nineteen keys, and what each answers:
 
 | key | what it decides |
 |---|---|
@@ -41,6 +41,7 @@ The eighteen keys, and what each answers:
 | `stop` | `autonomy`, and who is told when the run halts |
 | `relay` | `off` (shipped) or `last-resort`. `last-resort` arms only on a phase session, at a CLI whose `system/init.claude_code_version` reads at or above 2.1.268 (else that session keeps `--permission-prompts none` and the run journals `run.relay-refused`): a question a session raises is held 60 s for a person, then answered at 55 s by a relay rule, else its sole `(Recommended)` option, else its first — never a multi-select, a destructive option, a deny-list match, a stopped run, a repeated question or a phase's ninth, which go to a person ([The relay](#the-relay)) |
 | `announce` | which categories push, to whom, on which origin |
+| `plan-approval` | what happens when a plan-mode phase presents its plan through `ExitPlanMode`: `hold` (the default) parks the phase `plan-approval` with an errand whose inbox row carries Approve — the same session resumes in `acceptEdits` — and Reject; `continue` lets the console approve it at once, the plan kept in the run journal as the record of what the session said it would do |
 
 Each row also says who **owns** it, its **state** — `answered` (a value stands), `outstanding`
 (somebody still owes it; the owner says who), `waived` (it does not apply here, the reason as its
@@ -165,6 +166,7 @@ shipped default — the console deciding in your name is something you can see, 
 | `manual-gate` | `gates` | — | A manual gate: delegated to the session that can evidence it, else the operator approves it. | `phase.gate-delegated` |
 | `credential-block` | `credentials` | — | A credential the plan named: `require` refuses the phase at boarding, `continue` runs it and reports the gap. | `phase.credential-preflight` |
 | `permission-block` | `permission.policy` | — | A session blocked by a permission rule: one rung, widen the rule, offered as a card. | `phase.widen-decided` |
+| `protected-path-block` | `human-acts` | — | An edit the CLI's own wall reserves for an interactive session (`.claude/**`): no rule here can widen it, so it is always a person's, as an errand naming the act and the path. Since control-tower phase 53 the same row answers a session's `--needs human-acts` (`blocked-declared:human-acts`): an errand naming the acts, or a person's **Delegate to the session**. | `phase.errand` |
 | `gate-block` | `gates` | — | A session waiting on an approval: the `gates` row; an undeclared gate is a lint failure, not an ask. | `phase.gated` |
 | `external-block` | `waits` | — | An external clock: the row's window, the cap told to the session; no watch ref means refused. | `phase.waiting` |
 | `lock-block` | `waits` | `window` | A peer holds the scope: queue behind it and name it; never force-release a live session. | `phase.queued` |

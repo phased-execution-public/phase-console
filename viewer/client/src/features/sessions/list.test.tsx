@@ -17,10 +17,10 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { ForeignSession, TerminalSession } from '@/lib/api';
-import type { NowLane } from '@/features/now/model';
+import type { NowLane } from '@/features/runs/lanes-model';
 import { SessionList, sessionRows } from './list';
 import { ForeignSessionPage } from './foreign';
-import { endedLabel, turnsLabel } from '@/features/now/model';
+import { endedLabel, turnsLabel } from '@/features/runs/lanes-model';
 
 const NOW = Date.parse('2026-08-22T12:00:00Z');
 const at = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString();
@@ -242,9 +242,14 @@ describe('status, attention and time on the rows', () => {
       foreign: [foreign({ sessionId: 'f1', presence: 'ended', endedAt: at(2), lastSeen: at(1) })],
       now: NOW,
     });
-    expect(rows.find((r) => r.kind === 'lane')?.state).toBe('queued');
-    expect(rows.find((r) => r.kind === 'shell')?.state).toBe('failed');
-    expect(rows.find((r) => r.kind === 'foreign')?.state).toBe('done');
+    // Each kind speaks its own vocabulary of the ONE model (control-tower phase 24).
+    expect(rows.find((r) => r.kind === 'lane')?.view).toMatchObject({ vocab: 'phase', word: 'queued' });
+    expect(rows.find((r) => r.kind === 'shell')?.view).toMatchObject({
+      vocab: 'terminal',
+      word: 'failed',
+      paint: 'failed',
+    });
+    expect(rows.find((r) => r.kind === 'foreign')?.view).toMatchObject({ vocab: 'presence', word: 'ended' });
   });
 
   it('marks a lane parked on a pending approval as needing permission, and sorts it above the merely live', () => {
@@ -262,7 +267,8 @@ describe('status, attention and time on the rows', () => {
     });
     const waiting = rows[0];
     expect(waiting.label).toContain('P2');
-    expect(waiting.state).toBe('needs-you');
+    // The word stays the phase's; the summons is the attention the row carries.
+    expect(waiting.view).toMatchObject({ vocab: 'phase', word: 'running' });
     expect(waiting.attention).toEqual({ kind: 'permission', since: at(1) });
     expect(rows[1].attention).toBeUndefined();
   });
@@ -277,7 +283,7 @@ describe('status, attention and time on the rows', () => {
       ],
       now: NOW,
     });
-    expect(rows[0].state).toBe('needs-you');
+    expect(rows[0].view).toMatchObject({ vocab: 'presence', word: 'live' });
     expect(rows[0].attention).toEqual({ kind: 'input', since: at(2) });
     expect(rows[0].note).toBe('Claude is waiting for your input');
   });

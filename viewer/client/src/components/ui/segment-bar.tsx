@@ -4,14 +4,17 @@ import { UI_STATES, type UiState } from '@/lib/status-vocab';
 import { stateTally } from './legend';
 
 /**
- * A proportional bar over the UI states: how many phases are done, running,
+ * A proportional bar over the eight paints: how many phases are done, running,
  * next up, waiting, needing you — in the width of a table cell.
  *
- * Every segment is painted by its state's token through `.state-<ui>` (never
- * a colour of its own), drawn worst-first so the amber sits at the left edge
- * where a glance lands, and the whole thing is one `role="img"` whose name
- * reads the counts out in words — a proportional bar is not a progress bar,
- * and "37 %" would be the least useful of its numbers.
+ * The counts are keyed by PAINT, which the caller reads off the status model
+ * (`describePhase(…).paint`, `describeWord('board', w).paint`): this primitive
+ * is first paint and knows no status word. Every segment is painted by its
+ * paint's token through `.state-<paint>` (never a colour of its own), drawn
+ * worst-first so the amber sits at the left edge where a glance lands, and the
+ * whole thing is one `role="img"` whose name reads the counts out in words — a
+ * proportional bar is not a progress bar, and "37 %" would be the least useful
+ * of its numbers.
  */
 export interface SegmentCounts extends Partial<Record<UiState, number>> {}
 
@@ -30,7 +33,7 @@ export function SegmentBar({
   label?: string;
   height?: 'sm' | 'md';
 } & HTMLAttributes<HTMLSpanElement>) {
-  const segments = UI_STATES.map((state) => ({ state, value: Math.max(0, counts[state] ?? 0) })).filter(
+  const segments = UI_STATES.map((paint) => ({ paint, value: Math.max(0, counts[paint] ?? 0) })).filter(
     (s) => s.value > 0,
   );
   const sum = segments.reduce((acc, s) => acc + s.value, 0);
@@ -51,11 +54,11 @@ export function SegmentBar({
       )}
       {...props}
     >
-      {segments.map((s) => (
+      {segments.map(({ paint, value }) => (
         <span
-          key={s.state}
-          className={cn('block min-w-0 bg-state', `state-${s.state}`)}
-          style={{ width: `${(s.value / denominator) * 100}%` }}
+          key={paint}
+          className={cn('block min-w-0 bg-state', `state-${paint}`)}
+          style={{ width: `${(value / denominator) * 100}%` }}
         />
       ))}
     </span>

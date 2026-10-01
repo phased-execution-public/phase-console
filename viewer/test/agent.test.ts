@@ -19,9 +19,10 @@ import { homedir, hostname, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
-  buildAgentLaunch, phasedExecutionSkillId, planPrompt, resumedLabel,
+  AGENT_INTENTS as SERVER_INTENTS, buildAgentLaunch, phasedExecutionSkillId, planPrompt, resumedLabel,
   MAX_AGENT_PROMPT_BYTES, MAX_BRIEF_BYTES, type PlanFacts,
 } from '../server/agent.ts';
+import { AGENT_INTENTS } from '../shared/run-settings.js';
 import { MANIFEST_QUESTIONS, PLAN_FIELDS, STATE_FLAGS, accountedFlags } from '../server/plan-fields.ts';
 import { DECISION_KEYS } from '../shared/decisions-model.js';
 import { POLICY_DEFAULTS } from '../shared/policy-model.js';
@@ -95,7 +96,7 @@ test('every off-list value is refused by name, and nothing is guessed', () => {
     [{ prompt: 'x'.repeat(MAX_AGENT_PROMPT_BYTES + 1) }, /too long/],
     [{ resume: 'not-a-uuid' }, /uuid/],
     [{ resume: '00000000-0000-4000-8000-000000000000', prompt: 'hi' }, /mutually exclusive/],
-    [{ intent: 'chaos' }, /must be 'plan'/],
+    [{ intent: 'chaos' }, /intent, when given, must be one of: plan, recovery, qa/],
     [{ intent: 'plan' }, /needs a brief/],
     [{ intent: 'plan', brief: 'b'.repeat(MAX_BRIEF_BYTES + 1) }, /too long/],
     [{ intent: 'plan', brief: 'x', prompt: 'y' }, /composes its own prompt/],
@@ -516,5 +517,53 @@ test('the wizard asks the launch words as one block, in the order the plan autho
   // Every run field has a question: the form's word is never the only place it was ever chosen.
   for (const field of ['Base branch', 'Repo capacity', 'Worktree retention', 'Landing', 'On conflict', 'Messaging', 'Issues']) {
     assert.ok(text.includes(`. ${field} — `), `${field} is asked`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * control-tower phase 11 (#34) — plan mode is a choice of its own
+ * ------------------------------------------------------------------ */
+
+test('EC3 — bypass plus a mode is still refused, and an authoring ticket keeps its plan-mode DEFAULT', () => {
+  // The one interlock that stays: bypass is the ABSENCE of a mode, never a value of one.
+  const both = buildAgentLaunch({ intent: 'qa', permissionProfile: 'bypass', permissionMode: 'plan' }, CTX);
+  assert.equal(both.ok, false);
+  if (!both.ok) assert.match(both.error, /bypass IS the permission mode — send one or the other, not both/);
+
+  // An authoring ticket is still plan mode when it says nothing…
+  const quiet = buildAgentLaunch({ kind: 'claude', intent: 'plan', brief: 'Plan the migration.' }, CTX);
+  assert.equal(quiet.ok, true);
+  if (quiet.ok) {
+    const at = quiet.launch.args.indexOf('--permission-mode');
+    assert.ok(at >= 0, 'the flag is passed');
+    assert.equal(quiet.launch.args[at + 1], 'plan', 'the default is plan mode');
+  }
+  // …and an explicit mode still wins over that default, as it always did.
+  const chosen = buildAgentLaunch({ kind: 'claude', intent: 'plan', brief: 'Plan the migration.', permissionMode: 'acceptEdits' }, CTX);
+  assert.equal(chosen.ok, true);
+  if (chosen.ok) {
+    const at = chosen.launch.args.indexOf('--permission-mode');
+    assert.equal(chosen.launch.args[at + 1], 'acceptEdits');
+  }
+  // A ticket that is not authoring gets no mode it did not ask for.
+  const plain = buildAgentLaunch({ kind: 'claude', prompt: 'hello' }, CTX);
+  assert.equal(plain.ok, true);
+  if (plain.ok) assert.ok(!plain.launch.args.includes('--permission-mode'));
+});
+
+test('the intents are the shared owner\'s list, read by identity (control-tower phase 12)', () => {
+  // `===`: the composer validates against the owner's OBJECT, not a copy that
+  // happens to match it today.
+  assert.equal(SERVER_INTENTS, AGENT_INTENTS);
+  const refused = buildAgentLaunch({ intent: 'nope' }, CTX);
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.error, `intent, when given, must be one of: ${AGENT_INTENTS.join(', ')}.`);
+  }
+  // Every member is a word the composer knows: whatever else it refuses a bare
+  // request for, it is never "not an intent".
+  for (const intent of AGENT_INTENTS) {
+    const built = buildAgentLaunch({ intent }, CTX);
+    if (!built.ok) assert.doesNotMatch(built.error, /must be one of/, intent);
   }
 });

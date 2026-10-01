@@ -47,6 +47,7 @@ import { METRIC_FAMILIES, PHASE_STATES } from '../server/analysis/metrics.ts';
 import { BAR_KINDS, MARK_KINDS } from '../server/analysis/timeline.ts';
 import { MANIFEST, PATCH_DIR } from '../server/landing.ts';
 import { sanitiseSchedule } from '../shared/schedule-policy.js';
+import { HALT_CATEGORIES } from '../shared/halt-categories.js';
 import { ENTITLEMENT_STATES } from '../shared/ops-vocab.js';
 import {
   WEBHOOK_PAYLOAD_FIELDS, WEBHOOK_BACKOFF_BASE_MS, WEBHOOK_BACKOFF_MAX_MS, WEBHOOK_TIMEOUT_MS,
@@ -62,6 +63,7 @@ import {
 import { RUNGS_BY_SITUATION, RUNG_DRIVERS } from '../shared/ladder-model.js';
 import { BOARD_BUCKETS, BOARD_OVERLAY_STATES, BOARD_STATE_UI, PHASE_ACTORS, UI_STATES } from '../shared/status-vocab.js';
 import { TASK_STATUSES } from '../shared/task-model.js';
+import { GUIDE_SECTIONS } from '../shared/route-meta.js';
 import { RUN_PRIORITIES } from '../shared/orchestration-model.js';
 import { SITUATIONS } from '../shared/situation-model.js';
 import { RULING_KINDS } from '../shared/attention-model.js';
@@ -103,10 +105,19 @@ const imagesIn = (body: string): Set<string> =>
  * 1. EN <-> FA sibling parity
  * ------------------------------------------------------------------ */
 
+/**
+ * The pairs a Persian reader is promised. Until 6.0 that was the three READMEs/USAGE; control-tower
+ * phase 32 widened it ONCE, to every help-sheet guide — each `GUIDE_SECTIONS` id has a `<id>.fa.md`
+ * beside its English body, held to the same four shapes below. `docs/*.fa.md` is deliberately not a
+ * pair (the plan's §Deferred): the reference docs change every phase, and a twin that lags is a
+ * translation that lies. `guide-coverage.test.ts` asserts each twin exists and is Persian.
+ */
+const GUIDE_DIR = 'viewer/client/src/content/guide';
 const SIBLINGS: ReadonlyArray<readonly [string, string]> = [
   ['README.md', 'README.fa.md'],
   ['USAGE.md', 'USAGE.fa.md'],
   ['viewer/README.md', 'viewer/README.fa.md'],
+  ...GUIDE_SECTIONS.map((id) => [`${GUIDE_DIR}/${id}.md`, `${GUIDE_DIR}/${id}.fa.md`] as const),
 ];
 
 test('every FA sibling mirrors its English original section for section', () => {
@@ -174,7 +185,10 @@ const CATEGORY_COUNT_WORDS: Record<string, number> = {
   two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8,
   nine: 9, ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
   sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
-  'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24, 'twenty-five': 25,
+  'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24, 'twenty-five': 25, 'twenty-six': 26,
+  'twenty-seven': 27,
+  'twenty-eight': 28,
+  'twenty-nine': 29,
 };
 
 test('docs/phone.md documents every push category, and the right number of them', () => {
@@ -266,7 +280,8 @@ test('docs/phone.md names exactly the buttons a notification can carry', () => {
       `docs/phone.md never lists the '${label}' button, which the console does offer`,
     );
   }
-  const rows = section.split('\n').filter((line) => /^\| \*\*\w+\*\* \|/.test(line));
+  // A label may be words (`Extend 2 h`, control-tower phase 97), not only one.
+  const rows = section.split('\n').filter((line) => /^\| \*\*[\w ]+\*\* \|/.test(line));
   assert.equal(
     rows.length,
     Object.keys(PUSH_ACTION_VERBS).length,
@@ -371,7 +386,10 @@ test('the guide documents every capability flag, and states the right count', ()
 test('the guide sends readers only to settings sections that exist', () => {
   const nav = read('viewer/client/src/features/settings/nav.tsx');
   const titles = [...nav.matchAll(/title: '([^']+)'/g)].map((m) => m[1]);
-  assert.equal(titles.length, 8, `expected 8 settings sections, nav.tsx has ${titles.length}`);
+  // Eight in every tree, and License (control-tower phase 72) inside a Pro fence
+  // the free tree strips — so nine here and eight there.
+  const sections = titles.includes('License') ? 9 : 8;
+  assert.equal(titles.length, sections, `expected ${sections} settings sections, nav.tsx has ${titles.length}`);
 
   const guideDir = `${root}viewer/client/src/content/guide/`;
   const docs = [
@@ -383,7 +401,7 @@ test('the guide sends readers only to settings sections that exist', () => {
       const head = section.trim();
       assert.ok(
         titles.some((t) => head === t || head.startsWith(`${t} `)),
-        `${name} addresses "Settings ▸ ${head}", which is not one of the eight sections `
+        `${name} addresses "Settings ▸ ${head}", which is not one of the ${titles.length} sections `
           + `(${titles.join(' · ')}). A card inside one is addressed "Settings ▸ <section> ▸ <card>".`,
       );
     }
@@ -564,7 +582,7 @@ test('the guide names every bar and mark the timeline can draw, and no invented 
   }
   // …and the reverse: a bar-shaped word the reference offers that cannot appear.
   for (const word of listed) {
-    if (!/^(working|verifying|waiting|frozen)$/.test(word)) continue;
+    if (!/^(working|verifying|queued|waiting|down|frozen)$/.test(word)) continue;
     assert.ok(
       (BAR_KINDS as readonly string[]).includes(word),
       `the reference offers a "${word}" bar, which the projection never emits`,
@@ -978,9 +996,13 @@ test('the UNDOCUMENTED_FLAGS allowance never outlives the flags it excuses', () 
  * phase 2, before any of them is emitted, so that the first line of phase 5
  * that writes `git.command` fails `docs-parity` until it also writes the row —
  * rather than the scan being widened later, by which time there are forty
- * undocumented names and widening it is a chore somebody defers.
+ * undocumented names and widening it is a chore somebody defers. `trigger`
+ * joins them in control-tower phase 98 (#137): a stored trigger's own
+ * lifecycle — armed, fired, expired, cancelled — is a subsystem the same way.
+ * So is `supervisor` (control-tower phase 101, #145): detected, suggested,
+ * acted, escalated and policy-changed are the supervisor's own journal lines.
  */
-const EVENT_LITERAL = /'((?:phase|run|policy|git|http|engine|shell|msg|issue|retention)\.[a-z0-9][a-z0-9.-]*)'/g;
+const EVENT_LITERAL = /'((?:phase|run|policy|git|http|engine|shell|msg|issue|retention|trigger|supervisor)\.[a-z0-9][a-z0-9.-]*)'/g;
 /**
  * `debug` joins the three levels whose first argument is a documented name.
  *
@@ -1250,6 +1272,7 @@ function evidenceShapes(prefix: 'V'): number {
 }
 
 const SPELLED_COUNTS: SpelledCount[] = [
+  { file: 'viewer/shared/halt-categories.js', find: /in one of (\w+) words/, expect: [HALT_CATEGORIES.length], what: 'HALT_CATEGORIES' },
   { file: 'viewer/shared/issues-model.js', find: /(\w+) states because each one is a different thing/, expect: [ISSUE_STATES.length], what: 'ISSUE_STATES' },
   { file: 'viewer/shared/message-model.js', find: /(\w+) kinds and not (\w+), because a note/, expect: [MESSAGE_KINDS.length, MESSAGE_KINDS.length - 1], what: 'MESSAGE_KINDS' },
   { file: 'viewer/shared/message-model.js', find: /the same ([\w-]+)-word vocabulary a run's admission class/, expect: [MESSAGE_PRIORITIES.length], what: 'MESSAGE_PRIORITIES (= RUN_PRIORITIES)' },
@@ -1508,3 +1531,53 @@ test('ACC-7.5 (REG-8): every notification_type the CLI documents is mapped, answ
     assert.ok(loop.includes(word), `docs/loop.md's presence section names ${word}`);
   }
 });
+
+// control-tower phase 11 (#34, #18): what a plan file may ask of a run is
+// written where a plan author reads it — the two Permission-mode spellings,
+// and the two git lines a launch may not be able to honour.
+test('plan-format.md documents the Permission-mode spellings, the per-lane Worktrees ask and the inert Checkout', async () => {
+  const { PERMISSION_MODES } = await import('../shared/run-settings.js');
+  const text = read('references/plan-format.md');
+  assert.match(text, /`` \*\*Permission mode:\*\* plan `` to §Session budget/, 'the plan-wide line');
+  assert.match(text, /`` - \*\*Permission mode:\*\* acceptEdits `` on a phase/, 'the per-phase bullet');
+  assert.match(text, /the bullet \*\*overrides\*\* the line/);
+  for (const mode of PERMISSION_MODES) assert.ok(text.includes(`\`${mode}\``), `plan-format.md names the mode ${mode}`);
+  assert.match(text, /\*\*F31\*\* `permission-mode-unknown`/);
+  assert.match(text, /`Worktrees: on` is a per-LANE ask/);
+  assert.match(text, /\*\*shared checkout cannot grant\*\*/);
+  assert.match(text, /\*\*superproject never grants\*\*/);
+  assert.match(text, /\*\*`Checkout: main` is inert under a shared checkout\*\*/);
+});
+
+// control-tower phase 29 (#32 gap 2): where the chart library line sits is
+// WRITTEN DOWN, and it names every chart and every visx module this tree
+// installs — so a sixth module or an eighth chart cannot arrive unexplained.
+test('design.md records the figures-and-marks decision: every chart, every visx module installed, every one refused', () => {
+  const text = read('viewer/docs/design.md');
+  const start = text.indexOf('## 8.2 Figures and marks');
+  assert.ok(start >= 0, 'design.md has a "Figures and marks" section');
+  const next = text.indexOf('\n## ', start + 1);
+  const section = text.slice(start, next < 0 ? undefined : next);
+
+  const charts = read('viewer/client/src/components/charts.tsx');
+  const members = (list: string) =>
+    [...(new RegExp(`${list} = Object\\.freeze\\(\\[([^\\]]*)\\]`).exec(charts)?.[1] ?? '').matchAll(/'([A-Za-z]+)'/g)].map(
+      (match) => match[1],
+    );
+  const named = [...members('CHART_FIGURES'), ...members('CHART_MARKS')];
+  assert.equal(named.length, 7, 'charts.tsx still declares four figures and three marks');
+  for (const name of named) assert.ok(section.includes(`\`${name}\``), `the section names ${name}`);
+
+  const pkg = JSON.parse(read('viewer/package.json')) as {
+    dependencies?: Record<string, string>;
+    devDependencies?: Record<string, string>;
+  };
+  const visx = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }).filter((dep) => dep.startsWith('@visx/'));
+  assert.ok(visx.length > 0, 'package.json installs the visx modules the figures draw with');
+  for (const dep of visx) assert.ok(section.includes(`\`${dep}\``), `the section says why ${dep} was taken`);
+  for (const refused of ['@visx/zoom', '@visx/responsive', '@visx/tooltip', '@visx/xychart']) {
+    assert.ok(!visx.includes(refused), `${refused} is not installed`);
+    assert.ok(section.includes(`\`${refused}\``), `the section says why ${refused} was not taken`);
+  }
+});
+

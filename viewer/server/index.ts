@@ -23,8 +23,9 @@ import {
   probeConsole, resolvePort,
   staticRoot, staticRootDir, VIEWER_DIR,
 } from './config.ts';
+import { releaseBootMarker, settleBootMarkers, writeBootMarker } from './crash-ledger.ts';
 import {
-  configureLog, installExitLogging, isClientDisconnect, log, noteExit, previousRunEndedCleanly,
+  configureLog, installExitLogging, isClientDisconnect, log, noteExit, notePreviousRun,
 } from './log.ts';
 import {
   bootout, markDegraded, onRestartRequest, onShutdownRequest, reexec, runShutdownHandlers,
@@ -83,8 +84,19 @@ if (election.lost) {
 
 // Logging comes up before anything else can fail, so the first fault is on record.
 configureLog(flags.logFile);
-const cleanLastTime = previousRunEndedCleanly();
+// How the console before this one ended: settled from the boot marker it left,
+// never from the log (`crash-ledger.ts` says why). Before this launch knows the
+// port is its own, which is safe — a duplicate meets the live console's marker
+// and records nothing — and before `service.open` asks the breaker, so every
+// hard ending found here is already on the ledger. A log line alone is what let
+// a console crash-loop for five minutes parking live runs with nobody told (#20).
+const previousBoots = await settleBootMarkers();
+notePreviousRun(previousBoots.endedCleanly);
 installExitLogging();
+// The marker goes where the exit record is written: a process that got as far
+// as its exit record did not end hard. Only this process's own — a launch the
+// port refused wrote none, and removes none.
+process.on('exit', () => { releaseBootMarker(); });
 log.info('start', {
   pid: process.pid,
   node: process.version,
@@ -92,11 +104,14 @@ log.info('start', {
   allowWrites: flags.allowWrites,
   // false here means the last run was killed or died hard — the single most
   // useful fact when someone reports "it just stopped".
-  ...(cleanLastTime === false ? { previousRunCrashed: true } : {}),
+  ...(previousBoots.endedCleanly === false ? { previousRunCrashed: true } : {}),
 });
-if (cleanLastTime === false) {
+for (const ended of previousBoots.crashed) {
   log.warn('previous-run-crashed', {
-    note: 'the last run wrote no exit record — SIGKILL, OOM or a hard stop',
+    note: 'the console before this one left its boot marker and is gone — SIGKILL, OOM or a hard stop',
+    pid: ended.pid,
+    startedAt: ended.startedAt,
+    port: ended.port,
   });
 }
 
@@ -105,6 +120,7 @@ if (cleanLastTime === false) {
 if (wideBind) log.warn('wide-bind', { host: flags.host });
 
 const service = new Service(flags);
+
 
 // The client is the built Vite output (`client/dist`), and the check is made PER
 // REQUEST, not at startup, so `npm run build` cuts a live console over without a
@@ -259,6 +275,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   }
   // Served — counted by scope, and a remote identity recorded once (FLT-10).
   accessLedger.note(verdict, req.headers.host);
+
 
   try {
     if (await handleApi({ service }, req, res, url)) return;
@@ -542,6 +559,11 @@ accessLedger.wire({
 
 server.listen(flags.port, flags.host, () => {
   claimInstance(flags.port);
+  // From here this process OWNS the port, so from here a hard ending of it is
+  // one the next boot must notice. Not a moment sooner: a launch that has not
+  // bound yet may be about to be refused, and a refused launch's ending is not
+  // this instance's to count.
+  writeBootMarker(flags.port);
   // The beat starts with the bind: from here the registry row says `running`
   // to every reader, and a clean exit below says `stopped` (FLT-5).
   service.heartbeat.start();
@@ -671,14 +693,16 @@ async function shutdown(reason: string, successor: SelfRestartPlan | null = null
  */
 let askedThroughApi = false;
 
-onRestartRequest((reason) => {
+onRestartRequest((reason, how) => {
   askedThroughApi = true;
   requested = { reason, intent: 'restart', via: 'exit' };
   // Under launchd or systemd the supervisor brings the console back; where
   // nothing does, the process starts its own successor with the arguments it
   // was started with — every capability included — right before it exits.
   const successor = supervisor().kind === 'none' ? selfRestartPlan() : null;
-  setTimeout(() => void shutdown(reason, successor, { intent: 'restart', via: 'exit' }), 250).unref();
+  setTimeout(() => {
+    void shutdown(reason, successor, { intent: 'restart', via: 'exit' });
+  }, 250).unref();
 });
 
 /**

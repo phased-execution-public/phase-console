@@ -16,7 +16,6 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
   KeyValue,
   PageError,
   Spinner,
@@ -67,10 +66,10 @@ export default function BranchSection({ route }: { route: ViewProps['route'] }) 
               {open.current && <Badge tone="accent">checked out</Badge>}
               {open.trunk && <Badge tone="ok">trunk</Badge>}
               {open.run && (
-                <Chip tone="accent" mono>
+                <Badge tone="accent" mono>
                   {open.run.slug}
                   {open.run.phase === undefined ? '' : ` · p${open.run.phase}`}
-                </Chip>
+                </Badge>
               )}
             </>
           }

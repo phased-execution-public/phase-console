@@ -93,7 +93,7 @@ test('the tail is incremental: the offset advances only over complete lines', ()
 
   // Nothing new: the same offset, no events, no re-fold. This is what keeps a
   // console restart from doubling every task on a list it already holds.
-  assert.deepEqual(readTaskEvents(file, forDemo, first.at), { events: [], at: first.at });
+  assert.deepEqual(readTaskEvents(file, forDemo, first.at), { events: [], progress: [], at: first.at });
 
   publish(file, 'demo', 8, 'create', '--subject', 'two');
   const second = readTaskEvents(file, forDemo, first.at);
@@ -110,7 +110,7 @@ test('a write caught mid-append is re-read whole, never parsed as a truncated re
   // The writer, halfway through its line.
   appendFileSync(file, '{"version":1,"type":"task","slug":"demo","phase":8,"op":"crea');
   const torn = readTaskEvents(file, forDemo, first.at);
-  assert.deepEqual(torn, { events: [], at: first.at }, 'the partial line is left for next time');
+  assert.deepEqual(torn, { events: [], progress: [], at: first.at }, 'the partial line is left for next time');
 
   // …and now it finishes.
   appendFileSync(file, 'te","id":"p8.task2","status":"pending","subject":"two","written_at":"2026-08-24T00:10:00Z"}\n');

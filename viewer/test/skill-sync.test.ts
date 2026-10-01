@@ -41,10 +41,20 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { unattendedDirective } from '../server/runner/runner-core.ts';
+import { contextWrapupNotice, unattendedDirective, VERIFY_TIMEOUT_MS } from '../server/runner/runner-core.ts';
 import { DEFAULT_WAIT_BUDGET_MS, WAIT_MAX_PER_PHASE } from '../server/runner/wait-budget.ts';
+import {
+  CONTEXT_CHECKPOINT_FRACTION, CONTEXT_WINDOW_1M, CONTEXT_WRAPUP_FRACTION, RESUME_WRAPUP_MARGIN,
+  newTokenCounters, resumePolicy,
+} from '../server/runner/usage.ts';
+import { parsePlan, verifyTimeoutFor } from '../server/parse/plan.ts';
+import { loadSizing } from '../server/analysis/graph.ts';
+import { FORECAST_UNIT, shippedContextModel } from '../server/analysis/sizing-model.ts';
 import { fileURLToPath } from 'node:url';
 
+import { localNudgeAfterMs } from '../server/runner/liveness.ts';
+import { parseWatchRef, WATCH_REF_MAX, WATCH_SCHEMES } from '../server/watch-refs.ts';
+import { STALL_DEFAULTS, STALL_LOCAL_JOB_MS } from '../shared/attention-model.js';
 import { SITUATIONS, EXIT_SUB_KINDS } from '../shared/situation-model.js';
 import { RUNG_VEHICLES } from '../shared/ladder-model.js';
 import { MECHANISMS, HALT_KINDS, RECOVERY_CLASSES, ACTION_VOCAB } from '../shared/recovery-model.js';
@@ -575,8 +585,316 @@ test('the unattended contract states the wait ceiling beside the flag it bounds 
   assert.match(shipped, new RegExp(`at most ${WAIT_MAX_PER_PHASE} waits \\(WAIT_MAX_PER_PHASE\\)`), 'the per-phase cap, by name and value');
   assert.match(shipped, new RegExp(`${DEFAULT_WAIT_BUDGET_MS / 3_600_000}\\.0 h parked in total`), 'the budget\'s value');
   assert.match(shipped, /the console default/, 'and where it came from');
-  assert.match(shipped, /REFUSED with a\s+`waiting-external-timeout` halt, never shortened/, 'and what happens past it');
+  // …and what happens past it (control-tower phase 45, #59): a watched ref is
+  // given what is left, and a spent budget is a park for a person, never a halt.
+  assert.match(shipped, /Past what is left, a wait naming a --watch ref the console\s+can poll is given what is left/);
+  assert.match(shipped, /parks on a\s+spent budget with a `budgets` errand — never a failure/);
+  assert.doesNotMatch(shipped, /waiting-external-timeout/, 'no halt is promised any more');
   // The phase's own allowance is what the session reads when the plan set one.
   const planned = unattendedDirective('/skill/scripts', 'soak', 16, { budgetMs: 72 * 3_600_000, source: 'phase' });
   assert.match(planned, /72 h parked in total\s+\(this phase's `Waits on:` bullet\)/);
+});
+
+/* ------------------------------------------------------------------ *
+ * 8. The closeout, the verification clock and the session count (#153)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Control-tower phase 89 (#153): three parts of the closeout and sizing
+ * guidance disagreed with the console, and each is a sentence a session
+ * EXECUTES. Mode 3 forbade `complete` on a red line and said nothing about a
+ * line not run at all, so a shop plan's P66 flipped its handoff and INDEX row
+ * before its last §Verification line ("owed at idle"): the board read it done
+ * and its dependant queued ahead of it for two hours. SKILL.md promised a
+ * §Verification command "as long as the plan needs" while the console cut one
+ * at 30 minutes (vca P10's hour-long device sweep, exit 124). And the intro and
+ * step 6 taught batching phases into one session, which the console never does,
+ * beside no word of the context lines it does act on.
+ */
+
+/** Formatting is voice, not rule: backticks and bold are folded away, and so is line wrapping. */
+const plain = (text: string): string => text.replace(/[`*]/g, '').replace(/\s+/g, ' ');
+
+/** `body` from the first `from` up to the first `to` after it — both must be there. */
+const between = (body: string, from: string, to: string): string => {
+  const start = body.indexOf(from);
+  const end = start < 0 ? -1 : body.indexOf(to, start + from.length);
+  assert.ok(start >= 0 && end > start, `lost the span from '${from}' to '${to}'`);
+  return body.slice(start, end);
+};
+
+/** Does `a` occur within `span` characters of `b`? A rule is one sentence, not two facts a page apart. */
+const near = (text: string, a: string, b: string, span = 240): boolean => {
+  for (let at = text.indexOf(a); at >= 0; at = text.indexOf(a, at + 1)) {
+    if (text.slice(Math.max(0, at - span), at + a.length + span).includes(b)) return true;
+  }
+  return false;
+};
+
+/** SKILL.md's Mode 3 — the closeout — through step 6. */
+const mode3Section = (): string => between(read('SKILL.md'), '### Mode 3', '## Helper scripts');
+
+/** SKILL.md's account of the machinery a supervised session runs inside. */
+const consoleSection = (): string => between(read('SKILL.md'), '## Running under Phase Console', '## Modes');
+
+/** The plan's own words (exit criterion 9), pinned as a phrase: the claim is the conclusion. */
+const ONE_PHASE = 'the console runs one phase per session; batch only by hand';
+
+test('CO-1: `complete` and the INDEX flip come LAST — a line owed, deferred or skipped is in-progress or partial', () => {
+  // The rule is stated in words two owners hold: the handoff statuses and the
+  // outcome protocol's. A rule written in a word the code no longer has is the
+  // same drift in another shape.
+  for (const word of ['complete', 'in-progress']) {
+    assert.ok((HANDOFF_STATUSES as readonly string[]).includes(word), `'${word}' is no longer a handoff status`);
+  }
+  assert.ok(outcomeStatuses().includes('partial'), 'phase-outcome.sh no longer accepts `partial`');
+
+  for (const [where, body] of [
+    ['SKILL.md Mode 3', mode3Section()],
+    ['references/handoff-format.md', read('references/handoff-format.md')],
+  ] as const) {
+    const text = plain(body);
+    assert.ok(text.includes('owed, deferred or skipped'), `${where} never says that a line not run is not green`);
+    for (const word of ['in-progress', 'partial']) {
+      assert.ok(
+        near(text, 'owed, deferred or skipped', word),
+        `${where}: a line owed, deferred or skipped must leave the phase \`${word}\`, in the same sentence`,
+      );
+    }
+    assert.match(
+      text, /\bcomplete\b[^.]{0,60}\bINDEX\b[^.]{0,60}\bLAST\b[^.]{0,80}every §Verification line ran green/,
+      `${where} must write \`complete\` and the INDEX flip LAST, after every §Verification line ran green`,
+    );
+  }
+
+  // The checklist a finishing session publishes is where the order is read at
+  // the moment it applies — so its handoff step says it too.
+  const checklist = between(mode3Section(), '1. VERIFY', '```');
+  assert.match(
+    checklist, /^3\. Write the handoff[^\n]*`complete`[^\n]*\blast\b/im,
+    'Mode 3 checklist step 3 must put `complete` last',
+  );
+});
+
+test('CO-2: §Verification runs on the console\'s clock — and `Verify timeout:` is shown for a device sweep', () => {
+  for (const doc of SESSION_DOCS()) {
+    assert.ok(
+      !/as long as the plan needs/i.test(read(doc)),
+      `${doc} still promises a §Verification command "as long as the plan needs"`,
+    );
+  }
+
+  const surface = consoleSection();
+  const text = plain(surface);
+  // The default is the console's constant, not a number typed here.
+  const minutes = VERIFY_TIMEOUT_MS / 60_000;
+  assert.ok(
+    near(text, `${minutes} minutes`, '§Verification'),
+    `SKILL.md must say the console cuts a §Verification command at ${minutes} minutes unless told otherwise`,
+  );
+
+  // The example bullet, lifted out of SKILL.md itself…
+  const example = /`(- \*\*Verify timeout:\*\* [^`]+)`/.exec(surface)?.[1];
+  assert.ok(example, 'SKILL.md shows no `- **Verify timeout:** …` bullet');
+  assert.ok(near(text, plain(example), 'device sweep'), 'the `Verify timeout:` example is given for a device sweep');
+
+  // …is a line the console actually reads as that phase's limit, and one that
+  // raises it past the default — an example under the default would teach nothing.
+  const plan = parsePlan([
+    '# x', '', '## Phase graph', '',
+    '| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |',
+    '|------:|-------|-----------|--------------------|-------|---------------|',
+    '| 1 | A device sweep | — | — | r | x |', '',
+    '## Phases', '', '### Phase 1 — A device sweep', example, '- **Verification:**', '  - `true`', '',
+  ].join('\n'), 'x', 'docs/plans/x.md');
+  const limit = verifyTimeoutFor(plan, 1);
+  assert.equal(limit?.source, 'phase', `the console does not read \`${example}\` as the phase's own limit`);
+  assert.ok(limit!.minutes * 60_000 > VERIFY_TIMEOUT_MS, `\`${example}\` does not raise the limit past the default`);
+});
+
+test('CO-3: one phase per session, batch only by hand — the context lines, and the measured sizing model', () => {
+  const skill = read('SKILL.md');
+  const intro = plain(between(skill, '# Phased Execution', '## Three artifacts'));
+  assert.ok(intro.includes(ONE_PHASE), `the intro must say "${ONE_PHASE}"`);
+  const step6 = plain(between(skill, '6. **Stop & hand off', '## Helper scripts'));
+  assert.ok(step6.includes(ONE_PHASE), `Mode 3 step 6 must say "${ONE_PHASE}"`);
+  assert.ok(
+    plain(between(mode3Section(), '1. VERIFY', '```')).includes(`6. Stop & hand off — ${ONE_PHASE}`),
+    'the checklist\'s step 6 must say it too',
+  );
+  assert.ok(plain(skill).includes(FORECAST_UNIT), `SKILL.md must state the forecast's unit, ${FORECAST_UNIT}`);
+  // The sentences that taught batching as the rule, exactly as they drifted.
+  const BATCHING_AS_THE_RULE = [
+    /several adjacent phases usually/i, /Several phases usually\s+share a session/i,
+    /usually\s+several phases batched per session/i, /should share one session/i,
+    /Batch \(continue in THIS session\) — the efficient default/, /Stop & hand off, or batch/,
+  ];
+  for (const doc of SESSION_DOCS()) {
+    for (const pattern of BATCHING_AS_THE_RULE) {
+      assert.ok(!pattern.test(read(doc)), `${doc} still teaches batching as what a session does: ${pattern}`);
+    }
+  }
+
+  // The context lines, in the numbers the console acts on (runner/usage.ts).
+  const times = (fraction: number): string => `${Number(fraction.toFixed(2))}×`;
+  const wrap = times(CONTEXT_WRAPUP_FRACTION);
+  const checkpoint = times(CONTEXT_CHECKPOINT_FRACTION);
+  const fresh = times(CONTEXT_WRAPUP_FRACTION - RESUME_WRAPUP_MARGIN);
+  const surface = plain(consoleSection());
+  assert.ok(near(surface, wrap, 'wrap up'), `SKILL.md must state the ${wrap} context wrap-up`);
+  // What the wrap-up asks for is what the console's own notice asks for.
+  const declared = /partial --reason \w+/.exec(contextWrapupNotice(600_000, CONTEXT_WINDOW_1M))?.[0];
+  assert.ok(declared, 'the wrap-up notice no longer asks for a `partial` declaration');
+  assert.ok(near(surface, declared, wrap), `SKILL.md's ${wrap} wrap-up must ask for \`${declared}\``);
+  assert.ok(near(surface, checkpoint, 'checkpoints'), `SKILL.md must state the ${checkpoint} checkpoint`);
+  assert.ok(near(surface, fresh, 'FRESH'), `SKILL.md must state that a session ended at or past ${fresh} boards FRESH`);
+  // …and the documented line is where the resume policy really turns: a warm
+  // session on the same account, ended at it, is boarded fresh; just under, resumed.
+  const endedAt = (context: number) => resumePolicy({
+    tokens: [{
+      ...newTokenCounters(), lastContext: context, mode: 'phase', sessionId: 's', resumed: false,
+      model: 'opus[1m]', window: CONTEXT_WINDOW_1M, account: 'default', endedAt: '2026-09-26T00:00:00.000Z',
+    }],
+  }, 's', { now: Date.parse('2026-09-26T00:01:00.000Z'), paying: 'default' });
+  const line = Math.round(Number(fresh.slice(0, -1)) * CONTEXT_WINDOW_1M);
+  assert.deepEqual(
+    [endedAt(line).choice, endedAt(line).reason], ['fresh', 'context-wrapup'],
+    `a session ended at ${fresh} of its window is not boarded fresh — the documented line is not the policy's`,
+  );
+  assert.equal(endedAt(line - 10_000).choice, 'resume', `a warm session just under ${fresh} is not resumed`);
+
+  // references/sizing.md carries the measured model (phase 59's), and nothing
+  // in it weighs a session at a multiple of its phases' weight any more.
+  const sizingDoc = read('references/sizing.md');
+  assert.ok(plain(sizingDoc).includes(ONE_PHASE), `references/sizing.md must say "${ONE_PHASE}"`);
+  assert.match(sizingDoc, /### The session model: a floor paid once, plus a slope/, 'sizing.md lost the session model');
+  const sizing = loadSizing(`${root}scripts`);
+  assert.equal(
+    sizing.targetPct, CONTEXT_WRAPUP_FRACTION * 100,
+    'the share of the window sizing.env sizes a session to is not the console\'s own wrap-up line',
+  );
+  // What one 1M-window session holds, from the shipped model — the number the
+  // file quotes wherever it says how much weight fits.
+  const model = shippedContextModel(sizing);
+  const fits = Math.round(((CONTEXT_WINDOW_1M * sizing.targetPct) / 100 - model.floor) / model.slope / 1000);
+  const quoted = [...sizingDoc.matchAll(/(?:≈|about )(\d+)K of weight/g)].map((m) => Number(m[1]));
+  assert.ok(quoted.length > 0, 'sizing.md never says how much weight one session holds');
+  for (const k of quoted) {
+    assert.equal(k, fits, `sizing.md says ${k}K of weight fits a session; the model says ${fits}K`);
+  }
+  // The one place the old multiple may appear is the sentence that says it was replaced.
+  const current = sizingDoc.replace(/The model it replaced — "[^"]*" —/g, '');
+  assert.ok(
+    !/≈\s*600K real/.test(current),
+    'the budget table still converts ~200K of weight into 600K of real context',
+  );
+  assert.ok(
+    !/≈\s*~?600K real/.test(read('scripts/sizing.env')),
+    'scripts/sizing.env still rates BUDGET_BIG as ~600K of real context — the multiple phase 59 retired',
+  );
+  assert.ok(
+    !/~?3\s*×\s*(?:the\s+)?(?:summed\s+)?weight/i.test(current),
+    'sizing.md still weighs a session at 3 × its weight outside the sentence that retires it',
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * SK — the waiting guidance says what the console does (control-tower
+ * phase 88, #152). The skill told sessions to wait in ways the console
+ * punishes: a nudge "after five minutes" the console gives at ten, a park
+ * "far longer" that is 45 minutes, nothing on what a `cmd:` ref may hold, no
+ * way to wait on a sibling phase, and a limit ("at most 12 runs") the watch
+ * clock no longer has. Every number below is read from the code.
+ * ------------------------------------------------------------------ */
+
+/** A duration the way the documents say one. */
+const inMinutes = (ms: number): string => `${ms / 60_000} minutes`;
+
+/** SKILL.md's §Helper scripts entry for `phase-outcome.sh`. */
+const outcomeEntry = (): string =>
+  between(read('SKILL.md'), '- `scripts/phase-outcome.sh <slug> <N>', '- `scripts/decisions.sh');
+
+/**
+ * The watch schemes a text documents, asked of the console's own parser: every
+ * backticked `<scheme>:…` sample, its placeholders filled, is handed to
+ * `parseWatchRef`, and what comes back is the scheme the console reads it as.
+ * A sample the parser refuses documents nothing.
+ */
+const documentedSchemes = (text: string): Set<string> => {
+  const fill: Record<string, string> = {
+    repo: 'acme/web', 'owner/repo': 'acme/web', id: '17843290511', n: '4', ISO8601: '2026-09-27T06:00:00Z',
+    ISO: '2026-09-27T06:00:00Z', slug: 'demo', phase: '3', N: '3', command: '/usr/bin/true',
+  };
+  const kinds = new Set<string>();
+  for (const [, sample] of text.matchAll(/`((?:gh|date|lock|phase|verify|cmd):[^`]+)`/g)) {
+    const target = parseWatchRef(sample!.replace(/<([^<>]+)>/g, (whole, name: string) => fill[name] ?? whole));
+    if (target) kinds.add(target.kind);
+  }
+  return kinds;
+};
+
+test('SK-1: the nudge and the park on a session\'s own job are stated in the console\'s numbers, by name', () => {
+  const text = plain(consoleSection());
+  const nudge = inMinutes(localNudgeAfterMs(STALL_DEFAULTS.stallExternalWaitMs));
+  const park = inMinutes(STALL_LOCAL_JOB_MS);
+  assert.ok(near(text, nudge, 'nudge'), `SKILL.md must say a wait on your own job is nudged at ${nudge}`);
+  assert.ok(near(text, park, 'parks the phase'), `SKILL.md must say that wait parks the phase at ${park}`);
+  assert.ok(near(text, park, 'stallLocalJobMs'), 'the park names the setting that moves it');
+  for (const doc of SESSION_DOCS()) {
+    const body = plain(read(doc));
+    assert.ok(!/after five minutes draws one nudge/i.test(body), `${doc} still nudges a wait on your own job at five minutes`);
+    assert.ok(!/cannot place\s+far longer parks/i.test(body), `${doc} still parks it "far longer", with no number`);
+  }
+});
+
+test('SK-2: never background a long suite and wait on it in-turn — record proofs, leave long lines to §Verification, declare the wait before the park', () => {
+  const text = plain(consoleSection());
+  const park = inMinutes(STALL_LOCAL_JOB_MS);
+  assert.ok(
+    near(text, 'never start a long suite in the background and wait on it in-turn', park),
+    'SKILL.md must forbid backgrounding a long suite and waiting on it in-turn, beside the park it earns',
+  );
+  assert.ok(near(text, 'Record the proofs you already have', 'leave the long lines to §Verification'),
+    'SKILL.md must say what to do instead: record proofs, leave long lines to §Verification');
+  assert.ok(near(text, 'declare waiting-external with a --watch ref', `BEFORE ${park}`),
+    `SKILL.md must say an unavoidable wait is declared with a watch BEFORE ${park}`);
+});
+
+test('SK-3: a cmd: probe is self-contained, phase: waits on a sibling, verify: on your own red lines — and every scheme the console parses is documented', () => {
+  const skill = plain(outcomeEntry());
+  const limit = `${WATCH_REF_MAX.toLocaleString('en-US')} characters`;
+  for (const rule of ['absolute paths', 'no shell variables', 'no cd', 'exit 0 only when the thing has happened']) {
+    assert.ok(near(skill, 'self-contained', rule), `the phase-outcome.sh entry must say a cmd: probe has ${rule}`);
+  }
+  assert.ok(near(skill, limit, 'never cuts'), `the entry must state the ${limit} limit and that nothing is cut`);
+  assert.ok(near(skill, 'phase:<slug>/<N>', 'sibling'), 'phase: must be named as the way to wait on a sibling');
+  assert.ok(near(skill, 'phase:<slug>/<N>', 'grep'), 'phase: must be preferred over a cmd: grep of a handoff');
+  assert.ok(near(skill, 'verify:<slug>/<N>', 'red'), 'verify: must be named for your own red lines');
+  // The console section's rule 5 carries the same two, where a waiting session reads first.
+  const rule5 = plain(consoleSection());
+  assert.ok(near(rule5, 'phase:<slug>/<N>', 'sibling'), 'the waiting rules must name phase: for a sibling');
+
+  // Every scheme the console parses, in both places a session looks it up.
+  for (const [where, text] of [['SKILL.md §phase-outcome.sh', outcomeEntry()], ['references/plan-format.md', read('references/plan-format.md')]] as const) {
+    const documented = documentedSchemes(text);
+    for (const scheme of WATCH_SCHEMES) {
+      assert.ok(documented.has(scheme), `${where} documents no ${scheme} ref the console would parse`);
+    }
+  }
+  // The plan-format table says what lands AND what un-lands a phase: ref.
+  const table = plain(between(read('references/plan-format.md'), '| Ref | Lands when |', '\n\n'));
+  assert.ok(near(table, 'phase:', 'reopened'), 'the watch-ref table must say a re-opened phase un-lands its phase: ref');
+});
+
+test('SK-4: the stale limits are gone — no "at most 12 runs", no wait that ends in a halt, no ref cut at 200', () => {
+  for (const doc of SESSION_DOCS()) {
+    const body = plain(read(doc));
+    assert.ok(!/at most 12 runs/i.test(body), `${doc} still caps a cmd: watch at 12 runs`);
+    assert.ok(!/waiting-external-timeout/.test(body),
+      `${doc} still names the waiting-external-timeout halt — a spent wait budget parks for a person`);
+    assert.ok(!/\b200 char/i.test(body) && !/cut(?:s)? (?:at|to) 200\b/i.test(body),
+      `${doc} still says a watch ref is cut at 200 characters`);
+  }
+  // …and the script refuses what the skill forbids, rather than cutting it.
+  assert.ok(near(plain(outcomeEntry()), 'exits 2', '$'), 'the entry must say a `$` in a cmd: ref exits 2');
 });

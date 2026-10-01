@@ -147,7 +147,24 @@ const GH_CALLERS = [
 ];
 
 /** Is this argv, in this file, one the allow-list grants? */
+/**
+ * The one `gh api` this console may make: `watch-refs.ts` reading a file's RAW
+ * contents at a commit (`repos/<repo>/contents/<path>?ref=<sha>` with
+ * `Accept: application/vnd.github.raw`) — a GET, in that file alone. `api` is
+ * a WRITE head everywhere else because a flag turns it into one, so the
+ * allowance carries none of them: no `-X`/`--method`, no `-f`/`-F`/`--field`/
+ * `--raw-field`, no `--input`.
+ */
+const RAW_READ_FILE = 'watch-refs.ts';
+const RAW_ACCEPT = 'Accept: application/vnd.github.raw';
+const API_WRITE_FLAGS = ['-X', '--method', '-f', '-F', '--field', '--raw-field', '--input'];
+function rawContentRead(argv: { file: string; args: string[] }): boolean {
+  return argv.file === RAW_READ_FILE && argv.args[0] === 'api' && argv.args.includes(RAW_ACCEPT)
+    && argv.args.every((a) => !API_WRITE_FLAGS.includes(a));
+}
+
 function allowed(argv: { file: string; args: string[] }): boolean {
+  if (rawContentRead(argv)) return true;
   const lists: string[][] = [...ALLOWED_GH];
   return lists.some(([head, verb]) => argv.args[0] === head && argv.args[1] === verb);
 }
@@ -216,6 +233,7 @@ test('no writing gh subcommand appears in any file that spawns gh — the writer
   const banned = new Set(WRITE_VERBS);
   const offences = GH_ARGVS
     .filter((argv) => argv.args.some((a) => banned.has(a)))
+    .filter((argv) => !rawContentRead(argv))
     .map((argv) => `${argv.file}:${argv.line} ${JSON.stringify(argv.args)}`);
 
   assert.deepEqual(offences, [], 'a writing gh subcommand reached an argument list');

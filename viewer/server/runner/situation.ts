@@ -31,7 +31,7 @@
 
 import {
   SITUATIONS, SITUATION_ACTOR, SITUATION_BLURBS, SITUATION_LABELS, SUB_KINDS,
-  actorFor, classifyExitSaid, isSituation, parseSituationKey, refusalCauseOf, situationKey, situationLabel,
+  actorFor, classifyExitSaid, isSituation, parseSituationKey, protectedPathOf, refusalCauseOf, situationKey, situationLabel,
 } from '../../shared/situation-model.js';
 import { subKindOfNeed } from '../../shared/decisions-model.js';
 import type { PhaseRecord, RunState } from './state.ts';
@@ -108,7 +108,7 @@ export type PhaseEvidence = {
     resumable?: boolean;
     startedAt?: string | null;
     endedAt?: string | null;
-    verification?: { ok: boolean; failed?: number; ran?: number; skipped?: number } | null;
+    verification?: { ok: boolean; failed?: number; ran?: number; skipped?: number; timedOut?: number } | null;
     closeout?: { at: string; ok: boolean; note?: string } | null;
     note?: string | null;
     said?: string | null;
@@ -118,12 +118,18 @@ export type PhaseEvidence = {
     watch?: string[];
     waits?: number;
     /** The outcome the session declared, as the record persists it (`PhaseRecord.declared`). */
-    declared?: { status: string; reason?: string; watch?: string[]; needs?: string; at?: string } | null;
+    declared?: { status: string; reason?: string; watch?: string[]; needs?: string; rule?: string; command?: string; at?: string } | null;
     costUsd?: number;
     turns?: number;
     /** A lane of THIS console is driving the phase right now. */
     live?: boolean;
     mcpDegraded?: string[];
+    /**
+     * This run RE-OPENED the phase: its §Verification's final verdict was red
+     * while the board read it done (`PhaseRecord.reopened`, control-tower
+     * phase 62) — the commands that failed.
+     */
+    reopened?: { failed: string[] } | null;
     /**
      * How this PHASE stopped, when it stopped for a phase-level reason
      * (`PhaseRecord.halt`). Read in preference to the run's halt: since the
@@ -160,7 +166,9 @@ export type PhaseEvidence = {
    * `needs` is the decision key a `blocked`/`needs-human` named with
    * `--needs` — read BEFORE the prose by `blockerSubKind`'s caller (ZTD-3).
    */
-  declared: { status: string; reason?: string; watch?: string[]; needs?: string; writtenAt?: string } | null;
+  declared: {
+    status: string; reason?: string; watch?: string[]; needs?: string; rule?: string; command?: string; writtenAt?: string;
+  } | null;
   /** The gate as the engine answers it (`--gate-status`): kind `clear|manual|ai|blocked|OVERDUE|…`. */
   gate: { clear: boolean; kind: string; detail?: string } | null;
   /**
@@ -187,6 +195,14 @@ export type PhaseEvidence = {
   registry: { live: boolean; sessionId?: string; owner?: string; peer?: true; pid?: number; cwd?: string } | null;
   qa: { mode: string; result?: string } | null;
   auth: { signedIn: boolean | null; note?: string } | null;
+  /**
+   * The run's CURRENT account, judged NOW from its live meters (control-tower
+   * phase 79, #106): `ok` when the quota door would let it board. A usage wall
+   * a checkpoint remembers is an EARLIER attempt's — often on another account
+   * — and one read off the note alone moved a run from a 5 % account back onto
+   * a 64 % one. Absent when nothing could ask (a harness, a stopped read).
+   */
+  account?: { id: string; ok: boolean; resetsAt?: string } | null;
   /** When the evidence was gathered (ISO). */
   at: string;
 };
@@ -216,6 +232,12 @@ export type EvidenceDeps = {
   /** Handed the run too, so the phase's OWN sessions are never read as its peers. */
   registry?: (slug: string, phase: number, run?: RunState | null) => PhaseEvidence['registry'];
   auth?: () => Promise<PhaseEvidence['auth']> | PhaseEvidence['auth'];
+  /**
+   * The run's own account, live (`PhaseEvidence.account`). Handed the run — the
+   * account is the RUN's, and a switch moves it — and the phase, whose own model
+   * is the one it boards under (a per-model wall walls only that model).
+   */
+  account?: (run: RunState | null, phase: number) => Promise<PhaseEvidence['account']> | PhaseEvidence['account'];
   declared?: (slug: string, phase: number) => PhaseEvidence['declared'];
   /**
    * The directories (relative to `root`) the phase's SCOPE names and that exist
@@ -252,13 +274,31 @@ export function gitIn(root: string): (args: string[]) => Promise<string | null> 
  * ignored for the same reason. `did: null` when git could not answer (not a
  * repository, no git) — "I could not look" is a different fact from
  * "nothing is there", and the classifier treats them differently.
+ *
+ * **Nested submodules are asked too** (control-tower phase 45, #60). A scope
+ * directory that is itself a superproject — `shop`, holding `shop-api` and
+ * `shop-web` — has its own status ignore its submodules and its own log
+ * carry none of their commits, so a phase whose every commit landed in
+ * `shop/shop-web` read "clean tree, 0 commits", was halted no-handoff
+ * and re-boarded from scratch ($38, 5 h). Each scope directory's initialized
+ * submodules, recursively, are now asked the same two questions in their own
+ * trees, and their answers count. The root itself is not recursed: a docs hub's
+ * submodules are every plan's repositories, which is the false witness above.
  */
 export async function workEvidence(
   git: (args: string[]) => Promise<string | null>,
   startedAt?: string | null,
   dirs: string[] = ['.'],
 ): Promise<WorkEvidence> {
-  const where = dirs.length ? dirs : ['.'];
+  const scoped = dirs.length ? dirs : ['.'];
+  const where: string[] = [];
+  for (const dir of scoped) {
+    if (!where.includes(dir)) where.push(dir);
+    if (dir === '.') continue;
+    for (const nested of await nestedSubmodules(git, dir)) {
+      if (!where.includes(nested)) where.push(nested);
+    }
+  }
   let readable = 0;
   let dirty = 0;
   let commits = 0;
@@ -282,6 +322,30 @@ export async function workEvidence(
   if (!readable) return { did: null, why: 'the working tree could not be read' };
   if (dirty || commits) return { did: true, why: notes.join('; '), dirty, commits };
   return { did: false, why: notes.join('; ') + (startedAt ? '' : ' (no start time to count commits from)'), dirty, commits };
+}
+
+/**
+ * The initialized submodules under `dir`, recursively, as paths joined onto it
+ * (`shop` → `shop/shop-api`, `shop/shop-api/vendor/x`). An
+ * uninitialized one (`-` in `git submodule status`) has no tree to ask; a
+ * directory git cannot answer for has none at all.
+ */
+export async function nestedSubmodules(
+  git: (args: string[]) => Promise<string | null>, dir: string,
+): Promise<string[]> {
+  const out = await git(['-C', dir, 'submodule', 'status', '--recursive']);
+  if (!out) return [];
+  const paths: string[] = [];
+  for (const line of out.split('\n')) {
+    // ` <sha> <path> (<describe>)`, `+<sha> …` moved, `U<sha> …` conflicted,
+    // `-<sha> <path>` never initialized.
+    const match = /^([ +U-])[0-9a-f]+ (.+?)(?: \(.*\))?$/.exec(line);
+    if (!match || match[1] === '-') continue;
+    const path = match[2].trim();
+    if (!path || path.startsWith('/') || path.split('/').includes('..')) continue;
+    paths.push(`${dir.replace(/\/+$/, '')}/${path}`);
+  }
+  return paths;
 }
 
 /**
@@ -381,13 +445,14 @@ export async function collectEvidence(
     return asked;
   };
   const dirs = await Promise.resolve(deps.repos?.(slug, phase) ?? []).catch((): string[] => []);
-  const [lock, qa, health, gate, auth, work] = await Promise.all([
+  const [lock, qa, health, gate, auth, work, account] = await Promise.all([
     Promise.resolve(deps.lock?.(slug, phase) ?? null).catch(() => null),
     Promise.resolve(deps.qa?.(slug, phase) ?? null).catch(() => null),
     memo(cache?.health, slug, () => Promise.resolve(deps.health?.(slug) ?? []).catch(() => [])),
     memo(cache?.gate, `${slug}:${phase}`, () => Promise.resolve(deps.gate?.(slug, phase) ?? null).catch(() => null)),
     Promise.resolve(deps.auth?.() ?? null).catch(() => null),
     workEvidence(git, record?.startedAt ?? null, dirs).catch((): WorkEvidence => ({ did: null, why: 'the working tree could not be read' })),
+    Promise.resolve().then(() => deps.account?.(run, phase) ?? null).catch(() => null),
   ]);
   // Synchronous and cheap on both builders (a plan lookup / a record read), so
   // it does not join the Promise.all above.
@@ -422,6 +487,10 @@ export async function collectEvidence(
           ...(record.declared.reason ? { reason: record.declared.reason } : {}),
           ...(record.declared.watch?.length ? { watch: record.declared.watch } : {}),
           ...(record.declared.needs ? { needs: record.declared.needs } : {}),
+          // The act and the path a permission block named (#43): what its
+          // errand quotes, and what tells the CLI's own wall from this one's.
+          ...(record.declared.rule ? { rule: record.declared.rule } : {}),
+          ...(record.declared.command ? { command: record.declared.command } : {}),
           ...(record.declared.at ? { writtenAt: record.declared.at } : {}),
         }
         : null),
@@ -437,6 +506,7 @@ export async function collectEvidence(
     registry: deps.registry?.(slug, phase, run) ?? null,
     qa,
     auth,
+    ...(account ? { account } : {}),
     at: now.toISOString(),
   };
 }
@@ -456,6 +526,8 @@ export function recordEvidence(record: PhaseRecord): NonNullable<PhaseEvidence['
         failed: record.verification.ran?.filter((r) => !r.ok).length ?? 0,
         ran: record.verification.ran?.length ?? 0,
         skipped: record.verification.skipped?.length ?? 0,
+        // The commands its clock cut (control-tower phase 83, #95) — not reds.
+        ...(record.verification.timedOut?.length ? { timedOut: record.verification.timedOut.length } : {}),
       }
       : null,
     closeout: record.closeout ? { at: record.closeout.at, ok: record.closeout.ok, note: record.closeout.note } : null,
@@ -473,6 +545,7 @@ export function recordEvidence(record: PhaseRecord): NonNullable<PhaseEvidence['
     costUsd: record.costUsd,
     ...(record.turns != null ? { turns: record.turns } : {}),
     ...(record.mcpDegraded?.length ? { mcpDegraded: record.mcpDegraded.map((d) => d.id) } : {}),
+    ...(record.reopened ? { reopened: { failed: record.reopened.failed } } : {}),
   };
 }
 
@@ -558,7 +631,7 @@ export function situation(id: SituationId, why: string[], sub?: string): Situati
     key: situationKey(id, sub),
     label: situationLabel(id, sub),
     blurb: SITUATION_BLURBS[id],
-    // Sub-kind applied: the four empty sub-tables are a person's (LFC-3).
+    // Sub-kind applied: the six empty sub-tables are a person's (LFC-3).
     actor: actorFor(id, sub),
     why,
   };
@@ -566,6 +639,32 @@ export function situation(id: SituationId, why: string[], sub?: string): Situati
 
 /** The sub-kind of a declared blocker, from what the session wrote and what it watches. */
 export type BlockerSubKind = (typeof SUB_KINDS)['blocked-declared'][number];
+
+/**
+ * The `blocked-declared` sub-kind of a declaration: the session's own `--needs`
+ * word first, this console's deny record second, the prose last — plus the one
+ * refinement #43 added. A permission wall this console recorded NO rule for,
+ * over a path the CLI reserves for an interactive session (`protectedPathOf`),
+ * is `protected-path`: nothing here can widen it, and a person has to make the
+ * edit. The classifier and the runner's needs-human errand both ask this, so a
+ * card and the situation line cannot name two different walls.
+ */
+export function declaredSubKind(
+  declared: { needs?: string; reason?: string; rule?: string; command?: string; watch?: string[]; step?: unknown } | null | undefined,
+  opts: { denied?: boolean; text?: string; refs?: string[] } = {},
+): BlockerSubKind {
+  // A declared HUMAN STEP (control-tower phase 41) is a person's act, whatever
+  // `--needs` word rode with it: `human-acts` — person, no rungs — so no
+  // session is ever spent on what only a person can do (phase 11, ruling 3).
+  if (declared?.step) return 'human-acts';
+  const text = opts.text ?? declared?.reason ?? '';
+  const sub = subKindOfNeed(declared?.needs)
+    ?? (opts.denied ? 'permission' : blockerSubKind(text, opts.refs ?? declared?.watch ?? []));
+  if (sub === 'permission' && !opts.denied && protectedPathOf(declared?.rule, declared?.command, text)) {
+    return 'protected-path';
+  }
+  return sub;
+}
 
 export function blockerSubKind(text: string, refs: string[] = []): BlockerSubKind {
   const lower = text ?? '';
@@ -603,7 +702,7 @@ export function classifySituation(e: PhaseEvidence): Situation {
   // (`e.declared`, a session the console did not spawn), then the RECORD's
   // persisted copy — the only witness after a restart. Park-shaped statuses
   // only; a stale `complete`/`partial` in the map says nothing about a park.
-  const parkShaped = (d: { status: string; reason?: string; watch?: string[]; needs?: string } | null | undefined) =>
+  const parkShaped = (d: { status: string; reason?: string; watch?: string[]; needs?: string; rule?: string; command?: string } | null | undefined) =>
     (d && ['waiting-external', 'blocked', 'needs-human'].includes(d.status) ? d : null);
   const declaredNow = parkShaped(e.declared) ?? parkShaped(rec?.declared);
 
@@ -614,6 +713,15 @@ export function classifySituation(e: PhaseEvidence): Situation {
 
   /* 1–2. QA verdicts on a phase the board reads done, then superseded. */
   if (e.board === 'done') {
+    // …unless this run RE-OPENED it (control-tower phase 62, #68): the board is
+    // reading the very handoff the red verification was about, so its `done`
+    // is not new evidence. One fix rung, then an errand (`verify-red:reopened`).
+    if (rec?.reopened) {
+      return situation('verify-red', [
+        'the board reads done, but the §Verification the console ran is red — the phase was re-opened',
+        `failed: ${rec.reopened.failed.join(', ').slice(0, 200) || 'a command'}`,
+      ], 'reopened');
+    }
     // `on`, not "anything but off". `waived` is a gate the operator RELEASED —
     // the verdicts stay recorded and reported, they simply stop holding
     // dependents — so a done phase under a waiver is settled work like any
@@ -846,7 +954,16 @@ export function classifySituation(e: PhaseEvidence): Situation {
   // `allowed_warning`, `rejected`; chapter 09 row 34). This arm used to test
   // `limited`, which the CLI never sends and nothing here writes (SES-9).
   const rejected = e.run?.limits?.status === 'rejected';
-  if ((e.run?.status === 'waiting' && e.run.waitUntil) || USAGE_RE.test(haltReason) || USAGE_RE.test(note) || rejected) {
+  const usageEvidence = Boolean((e.run?.status === 'waiting' && e.run.waitUntil) || USAGE_RE.test(haltReason) || USAGE_RE.test(note) || rejected);
+  // …re-judged on the run's CURRENT account, live (control-tower phase 79,
+  // #106). Every line of evidence above is something an earlier moment wrote —
+  // a checkpoint note, a halt, the run's own sleep, the CLI's last `limits`
+  // event — and the wall it describes was often on another account. When the
+  // account the run is on has room NOW, that wall is stale: the phase is
+  // whatever the arms below make of it (a resume in place, not a switch), and
+  // the account that has room is named in its why.
+  const wallLifted = usageEvidence && e.account?.ok === true;
+  if (usageEvidence && !wallLifted) {
     return situation('resource-wall', [
       e.run?.waitUntil
         ? `the run is waiting on the usage window until ${e.run.waitUntil}`
@@ -871,7 +988,7 @@ export function classifySituation(e: PhaseEvidence): Situation {
     // (`:unknown` 267 times, each an unblock session into the same wall).
     const denied = rec?.toolDenied && rec.toolDenied.rule !== 'in-turn-wait' ? rec.toolDenied : null;
     const sub = haltKind === 'waiting-external-timeout' ? 'external'
-      : (subKindOfNeed(declaredNow?.needs) ?? (denied ? 'permission' : blockerSubKind(text, refs)));
+      : declaredSubKind(declaredNow, { denied: Boolean(denied), text, refs });
     const why = [
       hstatus === 'blocked' ? 'the handoff reads blocked'
         : e.board === 'stuck' ? 'the board reads stuck (a handoff that is not complete)'
@@ -885,9 +1002,24 @@ export function classifySituation(e: PhaseEvidence): Situation {
       ...(denied && sub === 'permission'
         ? [`the console refused ${denied.tool}${denied.command ? ` \`${denied.command.slice(0, 120)}\`` : ''} under rule ${denied.rule}`]
         : []),
+      ...(sub === 'protected-path'
+        ? [`no rule of this console refused it — the CLI's own wall on ${protectedPathOf(declaredNow?.rule, declaredNow?.command, text)}`]
+        : []),
       `sub-kind ${sub}`,
     ];
     return situation('blocked-declared', why, sub);
+  }
+
+  /* 10b. A verification its clock cut (control-tower phase 83, #95). Not red:
+   * the console retried it at twice the limit already, and whether the limit
+   * is short or the suite hangs is a person's to judge. `unknown`'s empty rung
+   * list hands it to them at once, rather than spend a session on a suite no
+   * session can make faster. */
+  if (haltKind === 'verify-timeout' || (rec?.verification?.timedOut && haltKind !== 'verify-failed')) {
+    return situation('unknown', [
+      `§Verification timed out — ${rec?.verification?.timedOut ?? 1} command(s) ran past their limit twice; `
+        + 'raise the phase\'s `Verify timeout:` or look for a hang, then Re-check',
+    ]);
   }
 
   /* 11. Red verification. */
@@ -916,6 +1048,7 @@ export function classifySituation(e: PhaseEvidence): Situation {
     return situation('work-in-progress', [
       ...(hstatus === 'in-progress' || e.board === 'in-progress' ? ['a handoff exists and reads in-progress'] : []),
       ...(e.work.did === true ? [e.work.why] : []),
+      ...(wallLifted ? [liftedWall(e)] : []),
       ...(rec?.status === 'running' || rec?.status === 'verifying' ? [`the record reads ${rec.status}`] : []),
       ...(e.handoff.outstanding ? [`Outstanding: ${e.handoff.outstanding.replace(/\s+/g, ' ').slice(0, 160)}`] : []),
     ]);
@@ -970,6 +1103,12 @@ export function classifySituation(e: PhaseEvidence): Situation {
  * Summary
  * ------------------------------------------------------------------ */
 
+/** The why for a usage wall the run's own account has since outlived (#106). */
+function liftedWall(e: PhaseEvidence): string {
+  return `the usage wall on the record is stale — ${e.account?.id ?? 'the run\'s account'} has room on its live meters now, `
+    + 'so the phase resumes where it is';
+}
+
 /** The evidence as short lines for a panel or a journal — every field that is known, nothing invented. */
 export function summariseEvidence(e: PhaseEvidence): string[] {
   const out: string[] = [`board: ${e.board}`];
@@ -1003,5 +1142,6 @@ export function summariseEvidence(e: PhaseEvidence): string[] {
   }
   if (e.qa && e.qa.mode !== 'off') out.push(`qa: ${e.qa.mode}${e.qa.result ? ` — ${e.qa.result}` : ' — no verdict'}`);
   if (e.auth && e.auth.signedIn === false) out.push(`auth: signed out${e.auth.note ? ` (${e.auth.note})` : ''}`);
+  if (e.account) out.push(`account: ${e.account.id} ${e.account.ok ? 'has room' : `walled${e.account.resetsAt ? ` until ${e.account.resetsAt}` : ''}`}`);
   return out;
 }

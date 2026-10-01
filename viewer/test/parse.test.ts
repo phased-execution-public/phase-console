@@ -145,7 +145,10 @@ test('plan parse reads the graph, phases, sizes, gates and budget', () => {
   assert.equal(plan.graph[2].title, 'Relay');          // bold cell survives
   assert.equal(plan.graph[1].repos, 'api');
 
-  assert.equal(plan.sessionBudget.targetModel, 'claude-opus-5');
+  // "`claude-opus-5` (1M window)" keeps the window it names — the board sizes
+  // sessions against the window the plan asked for (`service-core.ts`, the
+  // model reading; the assertion predated it).
+  assert.equal(plan.sessionBudget.targetModel, 'claude-opus-5[1m]');
   assert.equal(plan.sessionBudget.qaGate, 'on');
   assert.deepEqual(plan.sessionBudget.skills, ['api-conventions', 'design-system']);
   assert.match(plan.sessionBudget.branch ?? '', /current branch/);
@@ -713,6 +716,34 @@ test('detachRequestedIn is the run-level Checkout question, scoped to onlyPhases
   assert.equal(asks('- **Checkout:** main', [1]), false, 'scoped out: the bullet is on phase 2');
   assert.equal(asks('- **Checkout:** main', [2]), true);
   assert.equal(asks('- **Checkout:** main', []), true, 'an empty scope means every phase counts');
+});
+
+/* ------------------------------------------------------- the Wall-clock floor bullet */
+
+test('the Wall-clock floor bullet is read in every shape a person writes it, and left undefined for silence', () => {
+  const floor = (line: string) => checkoutPlan(line).phases[2]?.wallClockFloorMin;
+
+  assert.equal(floor('- **Wall-clock floor:** 95 min'), 95);
+  assert.equal(floor('- **Wall-clock floor:** 2 h'), 120);
+  assert.equal(floor('- **Wall-clock floor:** 1h 30m'), 90, 'multiple groups are summed');
+  assert.equal(floor('- **Wall-clock floor:** 1.5 hours'), 90, 'a decimal number rounds up to the minute');
+  assert.equal(floor('- **Wall-clock floor:** 0.5 m'), 1, 'a fractional minute still rounds up');
+  assert.equal(floor('- **Wall-clock floor:** 1 d'), 1440);
+  // Bold-optional and case-insensitive, unlike Checkout — this reader matches
+  // the engine's `wall_clock_floor_directive`, which never required the bold.
+  assert.equal(floor('* wall-clock floor: 95 min'), 95, 'the bullet marker may be an asterisk, the label lower-case');
+  assert.equal(floor('- **Wall-clock floor:** 95 min — a full gates.sh run'), 95,
+    'trailing prose after the duration is ignored');
+
+  // Silence: no readable leading duration, or a total of zero minutes.
+  assert.equal(floor('- **Wall-clock floor:** soon'), undefined, 'no leading duration is unreadable');
+  assert.equal(floor('- **Wall-clock floor:** 0 min'), undefined, 'zero minutes is silence too');
+  assert.equal(floor(''), undefined, 'no bullet reads as undefined, never zero');
+  assert.equal(checkoutPlan('- **Wall-clock floor:** 95 min').phases[1]?.wallClockFloorMin, undefined,
+    'a neighbour phase does not inherit the bullet');
+
+  // Separate from Size: a phase with only a Size tag has no floor.
+  assert.equal(checkoutPlan('- **Size:** L').phases[2]?.wallClockFloorMin, undefined);
 });
 
 /* ------------------------------------------------------------------ *

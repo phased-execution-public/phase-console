@@ -5,7 +5,7 @@
 **یک اسکیلِ [Claude Code](https://claude.com/claude-code) برای اجرای کارهایی که در یک نشست جا نمی‌شوند —
 به‌شکلِ یک گرافِ وابستگی از نشست‌های هم‌اندازه، به‌همراهِ یک کنسولِ وبِ محلی برای تماشای آن.**
 
-![Skill](https://img.shields.io/badge/Claude%20Code-Agent%20Skill-d97757?style=flat-square) ![Platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20WSL2-3fb68b?style=flat-square) ![Dependencies](https://img.shields.io/badge/runtime%20dependencies-none-3fb68b?style=flat-square) ![License](https://img.shields.io/badge/license-MIT-7A8B92?style=flat-square)
+![Skill](https://img.shields.io/badge/Claude%20Code-Agent%20Skill-d97757?style=flat-square) ![Platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20WSL2-3fb68b?style=flat-square) ![Dependencies](https://img.shields.io/badge/runtime%20dependencies-none-3fb68b?style=flat-square) ![License](https://img.shields.io/badge/license-free%20edition%3A%20MIT-7A8B92?style=flat-square)
 
 [English](README.md) · **فارسی**
 
@@ -26,7 +26,7 @@ Phase graph — checkout-rewrite   (3/7 done)
 
 READY NOW:   4 5
 WAITING:     6(←4), 7(←6)
-SUGGESTED BATCHES (budget ~200K, joined phases share a session): [4 5]  [6]  [7]
+SUGGESTED BATCHES (budget ~200K, by hand — the console runs 1 phase ≥ 1 session): [4 5]  [6]  [7]
 ```
 
 <div dir="rtl">
@@ -111,7 +111,6 @@ Do not turn on a flag I did not agree to, and do not start a phase run to
 "test" it — a run edits my repository.
 ```
 
-
 <div dir="rtl">
 
 ---
@@ -182,6 +181,12 @@ header is trustworthy only because nothing but the proxy can reach the port.
 
 به Claude Code و `bash` و `git` نیاز دارد. کنسول علاوه بر آن Node ‏22.18+ (یا ‏23.6+) می‌خواهد و
 **هیچ وابستگیِ اجرایی** ندارد. انتشارها تگِ `vX.Y.Z` هستند با یک GitHub Release که تاربالِ بسته‌بندی‌شده را دارد، و دستی بریده می‌شوند —
-[CHANGELOG](CHANGELOG.md). مجوز MIT — [LICENSE](LICENSE).
+[CHANGELOG](CHANGELOG.md).
+
+## مجوز
+
+نسخهٔ رایگانِ Phase Console متن‌باز است و تحتِ مجوزِ MIT منتشر می‌شود: کد و
+[متنِ مجوزش](https://github.com/phased-execution-public/phase-console/blob/main/LICENSE) در
+[phased-execution-public/phase-console](https://github.com/phased-execution-public/phase-console) است.
 
 </div>

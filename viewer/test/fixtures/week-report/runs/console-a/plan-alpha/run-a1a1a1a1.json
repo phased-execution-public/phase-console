@@ -1,0 +1,64 @@
+{
+  "id": "a1a1a1a1",
+  "slug": "plan-alpha",
+  "status": "finished",
+  "maxConsecutiveFailures": 2,
+  "phases": {
+    "1": {
+      "phase": 1,
+      "status": "done",
+      "startedAt": "2026-01-05T08:00:00.000Z",
+      "attemptStartedAt": "2026-01-05T08:00:00.000Z",
+      "endedAt": "2026-01-05T09:00:00.000Z",
+      "attemptEndedAt": "2026-01-05T09:00:00.000Z"
+    },
+    "2": {
+      "phase": 2,
+      "status": "done",
+      "startedAt": "2026-01-05T09:00:00.000Z",
+      "attemptStartedAt": "2026-01-05T13:00:00.000Z",
+      "endedAt": "2026-01-05T14:00:00.000Z",
+      "attemptEndedAt": "2026-01-05T14:00:00.000Z"
+    },
+    "3": {
+      "phase": 3,
+      "status": "done",
+      "startedAt": "2026-01-05T10:00:00.000Z",
+      "attemptStartedAt": "2026-01-05T14:00:00.000Z",
+      "endedAt": "2026-01-05T15:00:00.000Z",
+      "attemptEndedAt": "2026-01-05T15:00:00.000Z"
+    },
+    "4": {
+      "phase": 4,
+      "status": "done",
+      "startedAt": "2026-01-05T15:00:00.000Z",
+      "attemptStartedAt": "2026-01-05T18:00:00.000Z",
+      "endedAt": "2026-01-05T19:00:00.000Z",
+      "attemptEndedAt": "2026-01-05T19:00:00.000Z"
+    },
+    "5": {
+      "phase": 5,
+      "status": "done",
+      "startedAt": "2026-01-05T19:00:00.000Z",
+      "attemptStartedAt": "2026-01-05T19:00:00.000Z",
+      "endedAt": "2026-01-05T21:00:00.000Z",
+      "attemptEndedAt": "2026-01-05T21:00:00.000Z"
+    },
+    "6": {
+      "phase": 6,
+      "status": "done",
+      "startedAt": "2026-01-05T21:00:00.000Z",
+      "attemptStartedAt": "2026-01-06T00:30:00.000Z",
+      "endedAt": "2026-01-06T01:30:00.000Z",
+      "attemptEndedAt": "2026-01-06T01:30:00.000Z"
+    },
+    "7": {
+      "phase": 7,
+      "status": "done",
+      "startedAt": "2026-01-06T04:00:00.000Z",
+      "attemptStartedAt": "2026-01-06T04:00:00.000Z",
+      "endedAt": "2026-01-06T05:00:00.000Z",
+      "attemptEndedAt": "2026-01-06T05:00:00.000Z"
+    }
+  }
+}

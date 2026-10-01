@@ -70,8 +70,15 @@ export type LedgerSession = {
   /** The console ended it, rather than the session finishing its turn. */
   consoleEnded: boolean;
   isError: boolean;
+  /** Every prompt's turns, summed — the session's total. */
   turns: number | null;
   turnsSource: string | null;
+  /**
+   * The session's largest one prompt (control-tower phase 89, #62's SIZ-7) —
+   * the figure `maxTurns` binds, since the CLI enforces the cap per prompt.
+   * `null` on a line written before it: unknown, never the sum.
+   */
+  promptTurns: number | null;
   /** `null` when the session never reported a cost — unknown, never $0. */
   costUsd: number | null;
   costSource: string | null;
@@ -90,6 +97,12 @@ export type LedgerRung = {
   /** Who can drive that vehicle (`RUNG_DRIVERS`), or null for a word this build does not know. */
   driver: string | null;
   outcome: string;
+  /**
+   * Why a rung that did not fix ended the way it did (`RUNG_FAILURE_CAUSES`,
+   * control-tower phase 5) — `environment` when the machine defeated it,
+   * `never-ran` for a lane that never spawned. Null on a line that carries none.
+   */
+  cause: string | null;
   situation: string;
   costUsd: number;
   note: string | null;
@@ -216,6 +229,7 @@ export function projectLedger(
           isError: data.isError === true,
           turns: num(data.turns),
           turnsSource: str(data.turnsSource),
+          promptTurns: num(data.promptTurns),
           costUsd: costSource === 'none' ? null : cost,
           costSource,
           ms: num(data.ms),
@@ -233,6 +247,7 @@ export function projectLedger(
           rung,
           driver: drivableBy(rung) ?? null,
           outcome: str(data.outcome) ?? 'running',
+          cause: str(data.cause),
           situation: str(data.situation) ?? '',
           costUsd: num(data.costUsd) ?? 0,
           note: str(data.note),

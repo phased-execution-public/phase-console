@@ -76,19 +76,42 @@ const FORECAST: Forecast = {
   earliest: '2026-08-26T00:00:00Z',
   expected: '2026-08-28T00:00:00Z',
   latest: '2026-08-30T00:00:00Z',
+  clock: 'calendar',
+  calendar: 'known',
   basis: 'plan',
   samples: 6,
+  missing: 0,
   remainingPhases: 4,
   remainingWeight: 160_000,
   workingLowMs: 7_200_000,
   workingHighMs: 14_400_000,
-  duty: { ratio: 0.25, samples: 6, assumed: false, workingMs: 3_600_000, elapsedMs: 14_400_000 },
+  duty: { ratio: 0.25, samples: 6, known: true, workingMs: 3_600_000, elapsedMs: 14_400_000 },
   assumptions: [
-    'Rate: measured from this plan’s own completed phases (6 completed phases behind it).',
+    'Rate: measured from this plan’s own completed phases (6 measured phases weighted).',
     'Duty cycle: 25% — measured, phases ran for 1 h of the 4 h between this plan’s first and last completion.',
     'Phases are assumed to run one after another. Concurrent lanes finish sooner than this.',
   ],
-  label: '~8 h–1 d out',
+  label: '~8 h–1 d on the calendar',
+};
+
+/** The same forecast with no measurable duty cycle — no date, working estimate stands. */
+const UNKNOWN_FORECAST: Forecast = {
+  clock: 'calendar',
+  calendar: 'unknown',
+  basis: 'plan',
+  samples: 6,
+  missing: 0,
+  remainingPhases: 4,
+  remainingWeight: 160_000,
+  workingLowMs: 7_200_000,
+  workingHighMs: 14_400_000,
+  duty: { ratio: 1, samples: 0, known: false, reason: 'too-few', workingMs: 0, elapsedMs: 0 },
+  assumptions: [
+    'Rate: measured from this plan’s own completed phases (6 measured phases weighted).',
+    'Duty cycle: unknown — fewer than three of this plan’s phases finished in the recent window.',
+    'Phases are assumed to run one after another. Concurrent lanes finish sooner than this.',
+  ],
+  label: 'calendar time unknown',
 };
 
 const ROUTE = { segments: ['insights'], query: { plan: 'demo' }, path: 'insights?plan=demo' };
@@ -103,6 +126,12 @@ function mount() {
     ),
   );
 }
+
+/**
+ * The per-phase rows are the card's numbers, folded as a chart's are
+ * (control-tower phase 26): one press on the fold opens them.
+ */
+const openPhases = () => fireEvent.click(screen.getByRole('button', { name: /^The phases/ }));
 
 /** The plan detail, with only the fields this page reads. */
 const detail = (over: Record<string, unknown> = {}) => ({
@@ -223,6 +252,7 @@ describe('the plan cost card', () => {
     await screen.findByText('What this plan cost');
     // The row exists (the phase really ran) and is flagged.
     expect(screen.getByText(/recorded no cost for a session that ran/)).toBeTruthy();
+    openPhases();
     expect(screen.getAllByText(/^P3$/).length).toBeGreaterThan(0);
     // On the ROW, not merely in the banner above it: the row is where the
     // figure is read, and `$0.00` beside no marker is the whole defect.
@@ -239,7 +269,23 @@ describe('the plan cost card', () => {
     }
     // And keeps working time and calendar time apart: only one of them shrinks
     // when you run more lanes.
-    expect(screen.getByText(/of actual running/)).toBeTruthy();
+    expect(screen.getByText(/of work/)).toBeTruthy();
+  });
+
+  it('shows no date and shows its label when the calendar is unknown', async () => {
+    // A duty cycle with nothing to measure has no date at all — never one
+    // rendered off an idle ratio. The working estimate still stands.
+    plan.mockResolvedValue(detail({ forecast: UNKNOWN_FORECAST }));
+    await mount();
+    await screen.findByText('Finish date');
+    expect(screen.getAllByText('unknown').length).toBeGreaterThan(0);
+    expect(screen.getByText('calendar time unknown')).toBeTruthy();
+    expect(screen.queryByText('Earliest')).toBeNull();
+    expect(screen.queryByText('Expected')).toBeNull();
+    expect(screen.queryByText('Latest')).toBeNull();
+    for (const line of UNKNOWN_FORECAST.assumptions) {
+      expect(screen.getByText(line)).toBeTruthy();
+    }
   });
 
   it('warns when the per-phase figures do not reconcile with the run totals', async () => {
@@ -279,6 +325,7 @@ describe('the plan cost card', () => {
     );
     await mount();
     await screen.findByText('Per phase');
+    openPhases();
     const order = () =>
       screen
         .getAllByRole('listitem')
@@ -307,6 +354,7 @@ describe('the plan cost card', () => {
     plan.mockResolvedValue(detail({ cost: { ...COST, phases, partialPhases: [] } }));
     await mount();
     await screen.findByText('Per phase');
+    openPhases();
 
     const listed = () =>
       screen

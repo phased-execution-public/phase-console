@@ -26,9 +26,9 @@ export function Progress({
   const pct = (n: number) => (total ? `${(n / total) * 100}%` : '0%');
   const parts = [
     ['bg-done', done],
-    ['bg-progress', inProgress],
-    ['bg-stuck', stuck],
-    ['bg-ready', ready],
+    ['bg-running', inProgress],
+    ['bg-needs-you', stuck],
+    ['bg-queued', ready],
   ] as const;
 
   return (

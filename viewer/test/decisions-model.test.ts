@@ -56,7 +56,7 @@ test('scripts/decisions.env is the JS owner, word for word — every list', () =
 });
 
 test('the vocabulary is closed and its members are well-formed', () => {
-  assert.equal(DECISION_KEYS.length, 18, 'chapter 13 §1.1\'s seventeen keys, plus `issues` (5.1.0)');
+  assert.equal(DECISION_KEYS.length, 19, 'chapter 13 §1.1\'s seventeen keys, plus `issues` (5.1.0) and `plan-approval` (control-tower phase 11)');
   assert.ok(
     (DECISION_KEYS as readonly string[]).includes('issues'),
     'whether a session may open an issue is a decision a run needs and nobody was asking',
@@ -220,8 +220,18 @@ test('the TSV wire shape round-trips, and tabs in a value never become a seventh
 
 test('subKindOfNeed: a class is its own sub-kind, a key answers through its class, the rest fall to prose', async () => {
   const { subKindOfNeed } = await import('../shared/decisions-model.js');
-  const { SUB_KINDS } = await import('../shared/situation-model.js');
-  assert.deepEqual([...NEED_CLASSES], SUB_KINDS['blocked-declared'].filter((k) => k !== 'unknown'), 'derived, never re-spelled');
+  const { CLASSIFIER_ONLY_SUB_KINDS, SUB_KINDS } = await import('../shared/situation-model.js');
+  // `human-acts` (control-tower phase 53, #54) is the classifier's reading of
+  // the KEY of the same spelling — a class and a key must never share a word.
+  assert.deepEqual([...CLASSIFIER_ONLY_SUB_KINDS], ['unknown', 'protected-path', 'human-acts']);
+  assert.equal(subKindOfNeed('human-acts'), 'human-acts', 'the key a session names lands on its own sub-kind, never unknown');
+  assert.ok(!(NEED_CLASSES as readonly string[]).includes('human-acts'), 'and it is no --needs class: the key is');
+  assert.deepEqual(
+    [...NEED_CLASSES],
+    SUB_KINDS['blocked-declared'].filter((k) => !(CLASSIFIER_ONLY_SUB_KINDS as readonly string[]).includes(k)),
+    'derived, never re-spelled',
+  );
+  assert.equal(subKindOfNeed('protected-path'), null, 'the classifier\'s word, never a session\'s');
   assert.equal(subKindOfNeed('credential'), 'credential');
   assert.equal(subKindOfNeed('credentials'), 'credential');
   assert.equal(subKindOfNeed('permission.policy'), 'permission');

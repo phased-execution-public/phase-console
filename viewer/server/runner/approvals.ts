@@ -31,9 +31,10 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import { log } from '../log.ts';
+import { processState } from '../pid.ts';
 import { toolStanding } from '../../shared/cli-tools.js';
 import { POLICY_ADVISORY_KINDS } from '../../shared/ops-vocab.js';
 import { POLL_STATUS_TOOLS } from '../../shared/poll-loop.js';
@@ -42,6 +43,11 @@ import {
   DEFAULT_PERMISSION_PROFILE, PERMISSION_PROFILES, PROFILE_LABELS,
 } from '../../shared/run-settings.js';
 import type { QuestionAnsweredBy, RelayMechanism } from '../../shared/relay-model.js';
+import {
+  KIND_META, REDACTED, SIGN_IN_SHAPES, SIGN_IN_STEPS, SIGN_IN_UNATTENDED, redactSecrets,
+  type HumanStepKind, type HumanStepWhere,
+} from '../../shared/human-step-model.js';
+import { splitStatements, type Statement } from './liveness.ts';
 
 /* ------------------------------------------------------------------ *
  * The two lists
@@ -104,6 +110,123 @@ export const SHARED_STATE_ASK = [
   'Bash(git checkout:*)',
   'Bash(git switch:*)',
 ];
+
+/**
+ * The rule name a clone into a run's worktree is denied under (control-tower
+ * phase 90, #139). Not a `DEFAULT_DENY` prefix rule: the verb is harmless
+ * anywhere else, and only the TARGET PATH makes it the wall — so it is decided
+ * by `treeGuard`, which reads the path, and reported under this name.
+ */
+export const RUN_TREE_CLONE_RULE = 'run-tree-clone';
+
+/** Where a shell segment runs: `git -C <dir>` beats the cwd the segment inherited. */
+function gitDirOf(words: string[], cwd: string): string {
+  const at = words.indexOf('-C');
+  return at >= 0 && words[at + 1] ? resolve(cwd, words[at + 1]!) : cwd;
+}
+
+/** `git clone` options that take a separate value — skipped when finding the URL and the target. */
+const CLONE_VALUED = new Set([
+  '-b', '--branch', '-o', '--origin', '-c', '--config', '--depth', '--reference', '--reference-if-able',
+  '--separate-git-dir', '--template', '-j', '--jobs', '--shallow-since', '--shallow-exclude', '-u',
+  '--upload-pack', '--filter', '--server-option', '--bundle-uri',
+]);
+
+/**
+ * The PATH-aware half of the session guard (control-tower phase 90, #139).
+ *
+ * Measured: a session read seven repositories by `git clone`-ing them into the
+ * EMPTY mount paths of its run's mirror, and the next rebuild of that mirror
+ * failed on `already exists` — the run lost its isolation for eleven hours. The
+ * prefix rules cannot see a path, so this reads each segment's own:
+ *
+ *  - `git clone` / `gh repo clone` whose TARGET lands inside a run worktree
+ *    (`runTrees`, the console's managed roots) → **deny**, naming where to
+ *    read instead;
+ *  - `git submodule …` inside a run worktree → **ask** (a card naming the
+ *    path — `update --init` there is how a mirror's mounts turn into clones);
+ *    in the run ROOT, outside every run tree → **allow**, which is what keeps
+ *    the refusal text that says "run `git submodule update --init` in the run
+ *    root" true.
+ *
+ * Null when nothing here applies — the ordinary classification stands.
+ */
+export function treeGuard(
+  toolName: string, input: unknown,
+  ctx: { cwd?: string | null; runRoot?: string | null; runTrees: readonly string[] },
+): { verdict: 'deny' | 'ask' | 'allow'; rule: string; reason: string } | null {
+  if (toolName !== 'Bash' || !ctx.cwd || !ctx.runTrees.length) return null;
+  const command = (input as { command?: unknown } | null)?.command;
+  if (typeof command !== 'string') return null;
+  const inside = (path: string, root: string): boolean => path === root || path.startsWith(`${root}${sep}`);
+  const runTrees = ctx.runTrees.map((tree) => resolve(tree));
+  const inRunTree = (path: string): string | undefined => runTrees.find((tree) => inside(path, tree));
+  const root = ctx.runRoot ? resolve(ctx.runRoot) : null;
+  let cwd = resolve(ctx.cwd);
+  let submodule: 'ask' | 'allow' | null = null;
+  let where = '';
+  for (const segment of command.split(/&&|\|\||[;\n|]/).map((part) => part.trim().replace(/^\(+|\)+$/g, '')).filter(Boolean)) {
+    const words = segment.split(/\s+/).filter(Boolean);
+    if (words[0] === 'cd' && words[1]) { cwd = resolve(cwd, words[1]); continue; }
+    const gitAt = words[0] === 'git' ? 0 : -1;
+    if (gitAt === 0) {
+      const dir = gitDirOf(words, cwd);
+      const verbAt = words.findIndex((word, i) => i > 0 && !word.startsWith('-') && words[i - 1] !== '-C' && words[i - 1] !== '-c');
+      const verb = verbAt > 0 ? words[verbAt] : undefined;
+      if (verb === 'clone') {
+        const positional: string[] = [];
+        for (let i = verbAt + 1; i < words.length; i++) {
+          const word = words[i]!;
+          if (word.startsWith('-')) { if (CLONE_VALUED.has(word)) i++; continue; }
+          positional.push(word);
+        }
+        const url = positional[0];
+        const target = positional[1] ?? (url ? basename(url).replace(/\.git$/, '') : undefined);
+        if (target) {
+          const at = isAbsolute(target) ? resolve(target) : resolve(dir, target);
+          const tree = inRunTree(at);
+          if (tree) {
+            return {
+              verdict: 'deny', rule: RUN_TREE_CLONE_RULE,
+              reason: `a clone into ${at} lands inside a run worktree (${tree}), which is the console's own checkout — `
+                + 'a clone at a mount path breaks the run\'s isolation. Read another repository at the shared root'
+                + `${root ? ` (${root}/<repo>)` : ''}, read-only; never clone into a run tree.`,
+            };
+          }
+        }
+      }
+      if (verb === 'submodule') {
+        if (inRunTree(dir)) { submodule = 'ask'; where = dir; } else if (root && inside(dir, root) && submodule !== 'ask') { submodule = 'allow'; where = dir; }
+      }
+    }
+    if (words[0] === 'gh' && words[1] === 'repo' && words[2] === 'clone') {
+      const positional = words.slice(3).filter((word) => !word.startsWith('-'));
+      const target = positional[1] ?? (positional[0] ? basename(positional[0]).replace(/\.git$/, '') : undefined);
+      if (target) {
+        const at = isAbsolute(target) ? resolve(target) : resolve(cwd, target);
+        const tree = inRunTree(at);
+        if (tree) {
+          return {
+            verdict: 'deny', rule: RUN_TREE_CLONE_RULE,
+            reason: `\`gh repo clone\` into ${at} lands inside a run worktree (${tree}) — read the repository at the `
+              + `shared root${root ? ` (${root}/<repo>)` : ''}, read-only; never clone into a run tree.`,
+          };
+        }
+      }
+    }
+  }
+  if (submodule === 'ask') {
+    return {
+      verdict: 'ask', rule: 'Bash(git submodule:*)',
+      reason: `\`git submodule\` in ${where} runs inside a run worktree — \`update --init\` there turns its mounts into `
+        + 'clones the next rebuild cannot use. A person decides.',
+    };
+  }
+  if (submodule === 'allow') {
+    return { verdict: 'allow', rule: 'Bash(git submodule:*)', reason: `\`git submodule\` in the run root (${where}), outside every run tree` };
+  }
+  return null;
+}
 
 /**
  * Filing, commenting on and closing an issue — outward-facing acts, like a push.
@@ -222,7 +345,11 @@ export type AutopilotPolicy = {
  * is the guard's own (`shared/poll-loop.js`), never a copy.
  */
 export const HOOK_TOOLS = [
-  'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'AskUserQuestion', ...POLL_STATUS_TOOLS,
+  'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'AskUserQuestion',
+  // control-tower phase 11 (#34): a plan-mode session presenting its plan.
+  // Offered only to a session with a permission host (`PLAN_CLASS`).
+  'ExitPlanMode',
+  ...POLL_STATUS_TOOLS,
 ];
 
 /** Tools whose *path* rules Claude Code does not consult at all. */
@@ -640,6 +767,150 @@ export function wrappedPayloads(command: string): string[] {
 }
 
 /**
+ * THE SIGN-IN GUARD (control-tower phase 44, §Architecture 12's third birth
+ * channel): the interactive sign-in a supervised Bash call would start.
+ *
+ * In a `-p` session `gh auth login`, `az login` or `npx wrangler login` waits
+ * on a browser or a prompt nobody sees, and the turn hangs until the Bash
+ * timeout cuts it — a person's turn spent as a stall. So the PreToolUse hook
+ * denies it before it runs (`Service.decideToolUse`) and names the step the
+ * session should declare instead (`signInRefusal`).
+ *
+ * Read statement by statement with the in-turn-wait guard's own splitter, so a
+ * here-doc body is data (a test that MENTIONS `gh auth login` is not a
+ * sign-in) while a group, a pipe or `&&` hides nothing. Each statement's lead
+ * is peeled of env assignments, the CLI's wrappers, `sudo`, a package
+ * runner (`npx`, `bunx`, `pnpm dlx`/`exec`, `yarn dlx`/`exec`) and a path, then
+ * matched against `SIGN_IN_SHAPES` at a word boundary — `gh auth status` and
+ * `firebase login:list` are status verbs, not sign-ins. A shape followed by a
+ * flag of `SIGN_IN_UNATTENDED` reads its credential without a person and is
+ * left alone.
+ */
+export type SignInCall = {
+  /** The shape it starts with, as `SIGN_IN_SHAPES` spells it. */
+  shape: string;
+  /** The statement that matched, peeled and folded, at most 200 characters. */
+  command: string;
+  /** The human step the session should declare instead. */
+  step: { kind: HumanStepKind; title: string; openCommand: string; where: HumanStepWhere; proof?: string };
+};
+
+const SIGN_IN_ENV = /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|[^\s'"]*)\s+)+/;
+const SIGN_IN_RUNNER = /^(?:(?:npx|bunx)(?:\s+(?:-y|--yes|-q|--quiet|--package(?:=\S+|\s+\S+)|-p\s+\S+))*|(?:pnpm|yarn)\s+(?:dlx|exec)|bun\s+x)\s+/;
+const SIGN_IN_SUDO = /^sudo(?:\s+-\S+)*\s+/;
+const SIGN_IN_DEPTH = 4;
+/** A statement that is a compound (`if`, a loop, `case`): its body is split again on its own separators. */
+const SIGN_IN_COMPOUND = /^(?:if|while|until|for|select|case)\b/;
+/** Words a compound's parts may begin with that are not the command. */
+const SIGN_IN_KEYWORD = /^(?:!|if|elif|then|do|else|while|until|time)\s+/;
+/** A flag that makes any command answer and exit — never a sign-in. */
+const SIGN_IN_ANSWERS = /(?:^|\s)(?:--help|-h|--version)(?:\s|$)/;
+
+export function signInCall(command: unknown): SignInCall | null {
+  if (typeof command !== 'string' || !command.trim()) return null;
+  let statements: Statement[];
+  try { statements = splitStatements(command); } catch { return null; }
+  return signInIn(statements, 0);
+}
+
+function signInIn(statements: readonly Statement[], depth: number): SignInCall | null {
+  for (const statement of statements) {
+    if (statement.inner && depth < SIGN_IN_DEPTH) {
+      let inner: Statement[] = [];
+      try { inner = splitStatements(statement.inner); } catch { inner = []; }
+      const found = signInIn(inner, depth + 1);
+      if (found) return found;
+    }
+    // A line continuation is one line to the shell, so it is one to the guard.
+    const text = statement.text.replace(/\\\n\s*/g, ' ');
+    const parts = SIGN_IN_COMPOUND.test(text.trim())
+      ? text.split(/;|\n|&&|\|\||\|/)
+      : [text];
+    for (const part of parts) {
+      const found = signInLead(part);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function signInLead(text: string): SignInCall | null {
+  // The statement's first line is its command; a here-doc body below it is data.
+  let lead = (text.split('\n')[0] ?? '').replace(/\s+/g, ' ').trim();
+  for (let pass = 0; pass < 4; pass += 1) {
+    const before = lead;
+    lead = lead.replace(SIGN_IN_KEYWORD, '').replace(SIGN_IN_ENV, '').replace(SIGN_IN_SUDO, '');
+    lead = stripWrappers(lead) ?? lead;
+    lead = lead.replace(SIGN_IN_RUNNER, '');
+    lead = lead.replace(/^[^\s]*\/(?=[^\s/]+(?:\s|$))/, '');
+    if (lead === before) break;
+  }
+  const shape = SIGN_IN_SHAPES.find((s) => lead === s || lead.startsWith(`${s} `));
+  if (!shape) return null;
+  const rest = ` ${lead.slice(shape.length)} `;
+  if (SIGN_IN_UNATTENDED.some((flag) => rest.includes(` ${flag} `) || rest.includes(` ${flag}=`))) return null;
+  if (SIGN_IN_ANSWERS.test(rest)) return null;
+  const meta = SIGN_IN_STEPS[shape] ?? { kind: 'browser-login' as const };
+  return {
+    shape,
+    command: lead.slice(0, 200),
+    step: {
+      kind: meta.kind,
+      title: `${KIND_META[meta.kind].label}: ${shape}`,
+      openCommand: shape,
+      where: KIND_META[meta.kind].where,
+      ...(meta.proof ? { proof: meta.proof } : {}),
+    },
+  };
+}
+
+/**
+ * The refused command as the journal keeps it: redacted like every sink, and a
+ * password given on the command line (`docker login -p …`, `--password …`)
+ * masked too — the one secret shape a sign-in carries that the floor's
+ * patterns do not name.
+ */
+export function signInJournalCommand(command: string): string {
+  return redactSecrets(command.replace(/\s+/g, ' '))
+    .replace(/(\s(?:-p|--password|--passwd)(?:=|\s+))(?!\[redacted\])\S+/gi, `$1${REDACTED}`)
+    .slice(0, 400);
+}
+
+/** A value quoted for the shell the session will paste it into — single quotes, embedded ones escaped. */
+const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * The denial's words: why, the declaration to make INSTEAD (whole, ready to
+ * paste — the step's kind, title, command, where and proof), and the one
+ * honest alternative, a non-interactive flag. A deny a session cannot act on
+ * is a deny it will try to route around.
+ */
+export function signInRefusal(call: SignInCall, outcome: string): string {
+  const declare = [
+    `${outcome} needs-human --needs human-acts`,
+    `--step ${call.step.kind}`,
+    `--title ${shellQuote(call.step.title)}`,
+    `--open-command ${shellQuote(call.step.openCommand)}`,
+    `--where ${call.step.where}`,
+    ...(call.step.proof ? [`--proof ${shellQuote(call.step.proof)}`] : []),
+    '--reason',
+    shellQuote(`${call.shape} needs a person`),
+  ].join(' ');
+  return `the console does not let a supervised session start an interactive sign-in (\`${call.shape}\`): `
+    + 'in a -p session it waits on a browser or a prompt nobody sees, and the turn hangs until the Bash timeout '
+    + 'cuts it. It is a person\'s turn, not a command — write the handoff `in-progress`, then declare it as a '
+    + `human step and stop:\n  ${declare}\n`
+    + (call.step.proof
+      ? ''
+      : 'It names no --proof: the console\'s command judge does not run this tool\'s status verb, so a person\'s '
+        + '*I did it* proves it — a --proof the watch refuses could never land.\n')
+    + 'The console asks a person (the inbox and a push, with the command ready in its terminal), watches the '
+    + 'proof, and resumes THIS session saying what was proven. If the tool can sign in without a person, run it '
+    + `with its non-interactive flag instead (${SIGN_IN_UNATTENDED.slice(0, 3).join(', ')}, …) and a credential `
+    + 'the session already holds.';
+}
+
+/**
  * The QUESTION CLASS (zero-touch-console phase 13, TRS-1): calls that are a
  * question for a person rather than a request for permission.
  *
@@ -655,6 +926,26 @@ export function wrappedPayloads(command: string): string[] {
  * in the ordinary grammar, so a later question-shaped tool is one entry.
  */
 export const QUESTION_CLASS = ['AskUserQuestion'];
+
+/**
+ * The plan class (control-tower phase 11, #34): a session in plan mode handing
+ * its plan over — `ExitPlanMode`, whose input is `{plan, planFilePath}`.
+ *
+ * A question's twin, not a permission's: no profile word, no written allow
+ * rule and no auto-grant answers it, so it is consulted right after the wall
+ * and the question class and answered `hold` on every profile. What answers a
+ * plan hold is `Service.holdPlan`: the plan is captured, and the plan's
+ * `plan-approval` decision either lets it through (`continue`) or parks the
+ * phase for a person (`hold`, the default). The CLI offers the tool only to a
+ * session that has a permission host (spike `fixtures/spikes/exit-plan-mode.json`),
+ * which is why a plan-mode phase boards with the relay's host.
+ */
+export const PLAN_CLASS = ['ExitPlanMode'];
+
+/** The `PLAN_CLASS` rule this call matches, or null. */
+export function planRule(toolName: string, input: unknown): string | null {
+  return firstMatch(PLAN_CLASS, toolName, input);
+}
 
 /**
  * What the classifier answers: the three words the hook has always used, and
@@ -737,6 +1028,9 @@ export function classifyTool(
   // operator's own allow list can reach (TRS-1). A question is not a
   // permission, so no permission word answers it.
   if (hits(QUESTION_CLASS)) return 'hold';
+  // …and a plan presented for approval, on every profile for the same reason:
+  // handing a plan to a person is not a permission a profile may grant.
+  if (hits(PLAN_CLASS)) return 'hold';
   // Then what this operator deliberately allowed, which is the only thing that
   // can outrank the built-in ask list. See `AutopilotPolicy.always`.
   if (hits(policy.always ?? [])) return 'allow';
@@ -1507,6 +1801,8 @@ export type Approval = {
    * Absent on a card from before 5.0.0.
    */
   matched?: string | null;
+  /** The manifest row this call was checked against (#112) — see `ManifestCheck`. Absent when no row applies. */
+  manifest?: ManifestCheck;
   createdAt: string;
   expiresAt: string;
   /**
@@ -1523,6 +1819,30 @@ export type Approval = {
   /** Set on a recovered card nothing can answer any more: the reason, and the words for it. */
   unanswerable?: { reason: UnanswerableReason; detail: string };
   /**
+   * What this card's timeout will do, said on the card from the moment it is
+   * raised (control-tower phase 97, #140) — `timeoutConsequence`. It used to be
+   * said only afterwards, in `TIMEOUT_REASON`. Absent on a card from before 6.0.
+   */
+  onTimeout?: string;
+  /**
+   * The last moment the hook call holding this card can still carry an answer
+   * (#140): its timeout was fixed in the session's hook config at spawn, and
+   * past it the call fails open. No Extend moves it. Absent on a card no hook
+   * holds — a verification card, a standing offer.
+   */
+  hookDeadline?: string;
+  /**
+   * Set by an Extend asked past `hookDeadline` (#140): the hook is told no at
+   * its limit, and the card then STANDS — answerable — until this instant.
+   */
+  standsUntil?: string;
+  /** Set when a hook's card outlived its call and became a standing card: when the hook was told no (#140). */
+  converted?: { at: string };
+  /** Every Extend, oldest first (#140): who, by how much, and the deadline it moved to. */
+  extended?: { at: string; by: string; minutes: number; to: string }[];
+  /** The expiry warnings given for the current deadline, as ms before it (#140). An Extend clears them. */
+  warned?: number[];
+  /**
    * `kind: 'question'` only — a question a session raised on a run whose relay
    * is armed (phase 14): the questions, the answers, the deferral. The window is
    * the card's own `expiresAt`; the relay answers 5 s before it.
@@ -1532,7 +1852,23 @@ export type Approval = {
 
 type Settled = { decision: CardDecision; by: string; reason?: string };
 
-type Waiting = { approval: Approval; settle: (decision: CardDecision, by: string, reason?: string) => void; timer: NodeJS.Timeout };
+type Waiting = {
+  approval: Approval;
+  settle: (decision: CardDecision, by: string, reason?: string) => void;
+  /** What the deadline does: settle `deny` by `timeout`, or turn a hook's card into a standing one (#140). */
+  expire: () => void;
+  timer: NodeJS.Timeout | null;
+  /** The expiry warnings still to fire for the current deadline (#140). */
+  warnings: NodeJS.Timeout[];
+};
+
+/** Stop every clock a card has — its deadline and its warnings. */
+function clearClocks(entry: Waiting): void {
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = null;
+  for (const warning of entry.warnings) clearTimeout(warning);
+  entry.warnings = [];
+}
 
 /**
  * How long a standing `widen-rule` card waits for a person before it reads as
@@ -1579,6 +1915,53 @@ const ANSWER_BY_MS = (HOOK_TIMEOUT_SECONDS - 20) * 1000;
  */
 export const TIMEOUT_REASON = 'nobody answered in time — the phase is parked, not failed; '
   + 'retry the phase to be asked again';
+
+/**
+ * When an operator is warned that a card is about to run out (control-tower
+ * phase 97, #140): fifteen minutes before its deadline, then five. vca P22's
+ * card auto-denied at 21:09Z with its countdown on the run page alone. A lead
+ * longer than what is left of a card is skipped rather than fired at once — a
+ * card raised with twelve minutes to live gets the five-minute warning only.
+ */
+export const EXPIRY_WARNINGS_MS: readonly number[] = Object.freeze([15 * 60_000, 5 * 60_000]);
+
+/** The Extend buttons (#140): half an hour, and two hours — the "I am away" choice. */
+export const EXTEND_CHOICES_MIN: readonly number[] = Object.freeze([30, 120]);
+
+/** The most one Extend may ask for: a standing card's own twelve hours. */
+export const EXTEND_MAX_MIN = WIDEN_ANSWER_BY_MS / 60_000;
+
+/**
+ * Said to the session when its card outlived the hook call (#140). An Extend
+ * asked past the hook's hard limit cannot keep the call open — so at the limit
+ * the session is told no, and the card stands, still answerable.
+ */
+export const STANDING_REASON = 'the card outlived this hook call and stands — the phase is parked, not failed; '
+  + 'if a person allows it, the phase resumes and this call is granted once';
+
+/** `21:09Z` — the card's own clock, in the words a lock screen shows. */
+function clockOf(iso: string): string {
+  return `${iso.slice(11, 16)}Z`;
+}
+
+/**
+ * What a card's timeout will do, said ON the card before it happens (#140).
+ * The operator of vca P22 was never told that a timeout would also park the
+ * run; `TIMEOUT_REASON` said so only after the fact, to the session.
+ */
+export function timeoutConsequence(
+  approval: Pick<Approval, 'kind' | 'expiresAt'> & Partial<Pick<Approval, 'standing' | 'standsUntil'>>,
+): string {
+  const at = clockOf(approval.expiresAt);
+  if (approval.standing) return `reads as denied at ${at} — the phase stays parked on its errand until someone retries it`;
+  if (approval.kind === 'question') return `answered by rule at ${at} unless you answer first`;
+  if (approval.kind !== 'tool') return `goes unanswered at ${at} — the phase parks (not failed) until someone retries it`;
+  if (approval.standsUntil) {
+    return `the session is told no at ${at}, when its hook call ends; the card then stands until `
+      + `${clockOf(approval.standsUntil)} and, if allowed, resumes the phase with a one-time grant`;
+  }
+  return `auto-denies at ${at}; the run then parks until this phase completes or someone presses Retry`;
+}
 
 /* ------------------------------------------------------------------ *
  * Telling someone, when nobody is looking at the tab
@@ -1685,10 +2068,69 @@ export type ApprovalHooks = {
    * when the relay took it; false (or no hook) settles it the old way.
    */
   questionEnding?: (approval: Approval, why: string) => boolean;
+  /**
+   * Does a process launched under a run's token still live? `pid.ts`'s probe
+   * with the holder's identity by default; injected in tests.
+   */
+  holderAlive?: (holder: TokenHolder) => boolean;
+  /**
+   * What the plan's `permission.destructive` row answers for this card's call,
+   * re-read at the moment an AUTOMATIC actor would settle it (control-tower
+   * phase 84, #112) — so a timeout or a script never says `deny` to a push the
+   * plan permits in writing. The service reads the run's manifest; null when
+   * no row applies.
+   */
+  manifestAnswer?: (approval: Approval) => ManifestCheck | null;
+  /**
+   * A card is about to run out (control-tower phase 97, #140): `leadMs` before
+   * its deadline — one of `warnLeadsMs` — and still unanswered. The service
+   * announces it (push and the notification inbox) with what the timeout will
+   * do. Fired once per lead per deadline; an Extend re-arms them.
+   */
+  warn?: (approval: Approval, leadMs: number) => void;
 };
 
-/** The three moments a card has on the run's journal. */
-export type ApprovalEvent = 'raised' | 'decided' | 'auto-granted';
+/**
+ * The manifest row a publishing call was checked against, and what it
+ * answered (control-tower phase 84, #112). On a granted card it is the row the
+ * grant came from; on a card a person must answer it names the row and WHY it
+ * did not match — a force push, another branch, a trunk — so the person sees
+ * the plan already spoke and what it did not cover.
+ */
+export type ManifestCheck = {
+  key: 'permission.destructive';
+  /** The publishing rule the call matched (`Bash(git push:*)`). */
+  rule: string;
+  /** The row's value as read, clipped to 200 characters. */
+  value: string;
+  /** `plan` (the plan's rows) · `run` (the run's stored manifest) · the row's own source. */
+  source: string;
+  /** `allow` when the row covers this exact call; null when it does not. */
+  answer: 'allow' | null;
+  why: string;
+  /** The branch the row named that the push goes to, on an `allow` for a push. */
+  branch?: string;
+};
+
+/**
+ * The actors that settle a card with nobody's judgement behind it: the
+ * answer window, an unlabelled script, the relay, auto-grant. None of them may
+ * decide `deny` on a card the manifest answers (#112) — a watchdog script and
+ * the timeout between them denied every push vca-refactor's row permitted.
+ * A person's `deny` still stands: the manifest is a permission, not an order.
+ */
+export const AUTOMATIC_ACTORS: readonly string[] = Object.freeze(['timeout', 'script', 'relay', 'auto-grant']);
+
+/**
+ * A process launched under a run's hook token — a lane's or a recovery's
+ * `claude` — by the identity the probe checks (`procIdentity`). The token is
+ * baked into the child's `--settings` at spawn and cannot be reloaded, so it
+ * must stay armed for as long as this process lives (#74).
+ */
+export type TokenHolder = { pid: number; startedAt?: string };
+
+/** The moments a card has on the run's journal — its warnings, an Extend and a card that stands since #140. */
+export type ApprovalEvent = 'raised' | 'decided' | 'auto-granted' | 'warned' | 'extended' | 'standing';
 
 /**
  * How many cards this console has raised, and since when (TRS-5).
@@ -1755,8 +2197,20 @@ export class Approvals {
    * all, showing nothing wrong anywhere.
    */
   private tokens = new Map<string, { bytes: Buffer; text: string }>();
+  /** Runs whose token outlived their loop, and the processes still holding it (#74) — see `release`. */
+  private held = new Map<string, TokenHolder[]>();
+  private holderAlive: ((holder: TokenHolder) => boolean) | null;
+  private manifestAnswer: ((approval: Approval) => ManifestCheck | null) | null;
   private counter = 0;
   private notify: (approval: Approval) => void;
+  private warn: (approval: Approval, leadMs: number) => void;
+  /** When, before a deadline, a card warns (#140). A field so a test can speak in milliseconds. */
+  warnLeadsMs: readonly number[] = EXPIRY_WARNINGS_MS;
+  /**
+   * How long a hook's call can carry an answer, from the card's raise (#140) —
+   * the hook's own timeout less the broker's margin. A field for the same reason.
+   */
+  hookWindowMs = ANSWER_BY_MS;
   private resolved: (approval: Approval) => void;
   private recordHook: (event: ApprovalEvent, approval: Approval) => void;
   /** Late-bound: the relay is built after the broker. See `ApprovalHooks.questionEnding`. */
@@ -1779,6 +2233,9 @@ export class Approvals {
     this.resolved = named.resolved ?? (() => {});
     this.recordHook = named.record ?? (() => {});
     this.questionEnding = named.questionEnding ?? null;
+    this.holderAlive = named.holderAlive ?? null;
+    this.manifestAnswer = named.manifestAnswer ?? null;
+    this.warn = named.warn ?? (() => {});
     this.file = file;
     this.countsFile = join(dirname(file), 'counter.json');
     this.tally = this.readCounts();
@@ -1797,6 +2254,12 @@ export class Approvals {
       this.recoveredAtBoot.push(filed);
     }
     if (this.recoveredAtBoot.length) writePending([], file);
+  }
+
+  /** The manifest's answer for a card, or null — a hook that throws answers nothing. */
+  private manifestCheck(approval: Approval): ManifestCheck | null {
+    if (approval.kind !== 'tool' || !this.manifestAnswer) return null;
+    try { return this.manifestAnswer(approval); } catch { return null; }
   }
 
   /** Keep the on-disk copy in step with what is genuinely outstanding. */
@@ -1909,8 +2372,7 @@ export class Approvals {
    * still means everything, which is what a console shutdown wants.
    */
   disarm(runId?: string | null): void {
-    if (runId) this.tokens.delete(runId);
-    else this.tokens.clear();
+    if (runId) { this.tokens.delete(runId); this.held.delete(runId); } else { this.tokens.clear(); this.held.clear(); }
     // Anything still waiting is answered rather than left hanging: a session
     // blocked on a dead broker would sit there until the hook timed out. Only
     // this run's cards, though — another run's are still answerable, and
@@ -1931,6 +2393,54 @@ export class Approvals {
       }
       this.settle(id, 'deny', 'run ended', 'the run ended before this was decided');
     }
+  }
+
+  /**
+   * A loop's ending, for its run's token (#74): retire it — UNLESS a child
+   * launched under it still lives, in which case it stays armed for that child
+   * and `sweepHeld` retires it once the last one has gone.
+   *
+   * `disarm()` alone used to be every loop's ending, and it is wrong the moment
+   * a loop ends under a child it did not stop: a recovery's resumed session
+   * went on for an hour after its run parked, and every PreToolUse call it made
+   * was answered 401 — which the CLI does not treat as a refusal, so it ran with
+   * no policy, no ask card and no wait guard at all.
+   */
+  release(runId: string, holders: readonly TokenHolder[]): 'kept' | 'disarmed' {
+    const alive = holders.filter((holder) => this.holderLives(holder));
+    if (alive.length && this.tokens.has(runId)) {
+      this.held.set(runId, alive);
+      return 'kept';
+    }
+    this.disarm(runId);
+    return 'disarmed';
+  }
+
+  /**
+   * Retire every kept token whose holders have all gone; the run ids retired.
+   * A run a loop drives again (`driving`) owns its token once more, and is
+   * left to that loop's own ending.
+   */
+  sweepHeld(driving: ReadonlySet<string> = new Set()): string[] {
+    const retired: string[] = [];
+    for (const [runId, holders] of [...this.held]) {
+      if (driving.has(runId)) { this.held.delete(runId); continue; }
+      const alive = holders.filter((holder) => this.holderLives(holder));
+      if (alive.length) { this.held.set(runId, alive); continue; }
+      this.disarm(runId);
+      retired.push(runId);
+    }
+    return retired;
+  }
+
+  /** The runs whose token outlived their loop, with the pids holding it. */
+  heldTokens(): { runId: string; pids: number[] }[] {
+    return [...this.held].map(([runId, holders]) => ({ runId, pids: holders.map((holder) => holder.pid) }));
+  }
+
+  private holderLives(holder: TokenHolder): boolean {
+    if (this.holderAlive) return this.holderAlive(holder);
+    return processState(holder.pid, holder.startedAt ? { startedAt: holder.startedAt } : {}) !== 'gone';
   }
 
   /** Constant-time, so a wrong token leaks nothing about the right one. */
@@ -1981,10 +2491,32 @@ export class Approvals {
    * ends the same way a fresh one does.
    */
   private enqueue(approval: Approval, after?: (settled: Settled) => void): void {
-    const settle = (decision: CardDecision, by: string, reason?: string) => {
+    // The hook is answered ONCE. Almost always that is the card's decision; a
+    // card that outlived its call (#140) answered the hook when it stood, and
+    // its later decision reaches the service through `resolved` alone.
+    let hookAnswered = false;
+    const answerHook = (settled: Settled) => {
+      if (hookAnswered) return;
+      hookAnswered = true;
+      after?.(settled);
+    };
+    const settle = (asked: CardDecision, askedBy: string, askedReason?: string) => {
       const entry = this.waiting.get(approval.id);
       if (!entry) return;
-      clearTimeout(entry.timer);
+      let decision = asked;
+      let by = askedBy;
+      let reason = askedReason;
+      // #112: an automatic actor never denies what the plan permits in writing.
+      // Re-read now, not at raise time — the row may have been amended while
+      // the card waited, and a card restored after a restart carries no check.
+      const check = decision === 'deny' && AUTOMATIC_ACTORS.includes(by) ? this.manifestCheck(approval) : null;
+      if (check?.answer === 'allow') {
+        approval.manifest = check;
+        decision = 'allow';
+        reason = `answered from the plan's permission.destructive row — ${check.why}; ${by} does not overrule the plan`;
+        by = 'manifest';
+      }
+      clearClocks(entry);
       this.waiting.delete(approval.id);
       approval.status = decision;
       approval.decidedAt = new Date().toISOString();
@@ -1999,7 +2531,32 @@ export class Approvals {
       });
       this.fire('decided', approval);
       try { this.resolved(approval); } catch { /* a listener must never block a decision */ }
-      after?.({ decision, by, reason });
+      answerHook({ decision, by, reason });
+    };
+    const expire = () => {
+      if (!this.waiting.has(approval.id)) return;
+      // An Extend asked past the hook's hard limit (#140). The call cannot be
+      // held open past it — its timeout was fixed at spawn — so the session is
+      // told no NOW (silence would fail open), and the card itself stands on a
+      // standing card's clock, answerable. Unless the plan's manifest answers
+      // the call: the timeout's own settle turns that into `allow`, as ever.
+      if (approval.standsUntil && !approval.standing && this.manifestCheck(approval)?.answer !== 'allow') {
+        approval.standing = true;
+        approval.converted = { at: new Date().toISOString() };
+        approval.expiresAt = approval.standsUntil;
+        delete approval.warned;
+        approval.onTimeout = timeoutConsequence(approval);
+        const entry = this.waiting.get(approval.id)!;
+        this.armClocks(entry);
+        this.flush();
+        log.info('approval.standing', {
+          id: approval.id, runId: approval.runId, phase: approval.phase, until: approval.expiresAt,
+        });
+        this.fire('standing', approval);
+        answerHook({ decision: 'deny', by: 'standing', reason: STANDING_REASON });
+        return;
+      }
+      settle('deny', 'timeout', TIMEOUT_REASON);
     };
     // Unreferenced: the listening socket is what keeps this process alive, and
     // a pending approval must never be the reason it cannot exit.
@@ -2008,13 +2565,91 @@ export class Approvals {
     // nothing is saying yes, unsupervised, to the one call nobody watched.
     // What changes is what happens next — `by: 'timeout'` parks the run
     // instead of letting the session treat a refusal as a verdict and work
-    // around it. See `Service.decideToolUse`.
-    const timer = setTimeout(
-      () => settle('deny', 'timeout', TIMEOUT_REASON),
-      Math.max(0, Date.parse(approval.expiresAt) - Date.now()),
-    ).unref();
-    this.waiting.set(approval.id, { approval, settle, timer });
+    // around it. See `Service.decideToolUse`. Unless the plan's manifest
+    // answers the card (#112): the settle closure re-reads it, and a push the
+    // plan permits in writing resolves to `allow` by `manifest`, parking nothing.
+    const entry: Waiting = { approval, settle, expire, timer: null, warnings: [] };
+    this.waiting.set(approval.id, entry);
+    this.armClocks(entry);
     this.flush();
+  }
+
+  /**
+   * (Re)start a card's clocks from its `expiresAt` (#140): the deadline, and a
+   * warning at each lead still ahead of it and not yet given. An Extend and a
+   * card turning standing both come back through here.
+   */
+  private armClocks(entry: Waiting): void {
+    clearClocks(entry);
+    const due = Date.parse(entry.approval.expiresAt);
+    const now = Date.now();
+    entry.timer = setTimeout(entry.expire, Math.max(0, due - now)).unref();
+    for (const lead of this.warnLeadsMs) {
+      const at = due - lead;
+      if (at <= now || entry.approval.warned?.includes(lead)) continue;
+      entry.warnings.push(setTimeout(() => this.warnOf(entry, lead), at - now).unref());
+    }
+  }
+
+  /** One expiry warning (#140): recorded on the card, journalled, handed to the service to announce. */
+  private warnOf(entry: Waiting, leadMs: number): void {
+    const { approval } = entry;
+    if (this.waiting.get(approval.id) !== entry) return;
+    (approval.warned ??= []).push(leadMs);
+    this.flush();
+    log.info('approval.expiry-warning', {
+      id: approval.id, runId: approval.runId, phase: approval.phase, leadMs, expiresAt: approval.expiresAt,
+    });
+    this.fire('warned', approval);
+    try { this.warn(approval, leadMs); } catch { /* a notifier must never cost the card */ }
+  }
+
+  /**
+   * Extend a card (control-tower phase 97, #140): move its deadline `minutes`
+   * later — from the later of its deadline and now — and re-arm its warnings.
+   *
+   * Inside a hook's window the deadline simply moves. Past it the hook cannot
+   * follow (its timeout was fixed in the session's hook config at spawn, and a
+   * late answer fails open), so the deadline stops AT the hook's hard limit and
+   * the card is marked to stand for a standing card's twelve hours from there:
+   * `expire` then tells the session no and keeps the card answerable. A
+   * standing card moves on its own clock, never more than twelve hours ahead.
+   * A relayed question is refused — its window is the relay's.
+   */
+  extend(
+    id: string, minutes: number, by: string,
+  ): { ok: true; approval: Approval; standing: boolean } | { ok: false; status: number; error: string } {
+    const entry = this.waiting.get(id);
+    if (!entry) return { ok: false, status: 404, error: 'no such pending approval' };
+    const { approval } = entry;
+    if (approval.kind === 'question') {
+      return { ok: false, status: 409, error: 'a relayed question is answered by rule when its window closes — Extend does not apply' };
+    }
+    if (!Number.isInteger(minutes) || minutes < 1 || minutes > EXTEND_MAX_MIN) {
+      return { ok: false, status: 400, error: `minutes must be a whole number from 1 to ${EXTEND_MAX_MIN}` };
+    }
+    const now = Date.now();
+    const wanted = Math.max(Date.parse(approval.expiresAt), now) + minutes * 60_000;
+    const limit = approval.hookDeadline && !approval.standing ? Date.parse(approval.hookDeadline) : null;
+    let to = wanted;
+    if (limit !== null && wanted > limit) {
+      to = limit;
+      approval.standsUntil = new Date(limit + WIDEN_ANSWER_BY_MS).toISOString();
+    } else if (approval.standing) {
+      to = Math.min(wanted, now + WIDEN_ANSWER_BY_MS);
+    }
+    approval.expiresAt = new Date(to).toISOString();
+    (approval.extended ??= []).push({ at: new Date(now).toISOString(), by, minutes, to: approval.expiresAt });
+    delete approval.warned;
+    approval.onTimeout = timeoutConsequence(approval);
+    this.armClocks(entry);
+    this.flush();
+    log.info('approval.extended', {
+      id, by, minutes, runId: approval.runId, phase: approval.phase, expiresAt: approval.expiresAt,
+      ...(approval.standsUntil ? { standsUntil: approval.standsUntil } : {}),
+    });
+    this.fire('extended', approval);
+    return { ok: true, approval: { ...approval }, standing: Boolean(approval.standing || approval.standsUntil) };
   }
 
   /**
@@ -2027,13 +2662,19 @@ export class Approvals {
     answerByMs = ANSWER_BY_MS,
   ): { approval: Approval; decided: Promise<Settled> } {
     const id = `${Date.now().toString(36)}-${++this.counter}`;
+    const now = Date.now();
+    // A tool card is a live hook call: its hard limit rides the card (#140),
+    // and no deadline — the one it is born with included — passes it.
+    const hookDeadline = request.kind === 'tool' && !request.standing ? now + this.hookWindowMs : null;
     const approval: Approval = {
       ...request,
       id,
-      createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + answerByMs).toISOString(),
+      createdAt: new Date(now).toISOString(),
+      expiresAt: new Date(hookDeadline === null ? now + answerByMs : Math.min(now + answerByMs, hookDeadline)).toISOString(),
       status: 'pending',
+      ...(hookDeadline === null ? {} : { hookDeadline: new Date(hookDeadline).toISOString() }),
     };
+    approval.onTimeout = timeoutConsequence(approval);
     const decided = new Promise<Settled>((resolve) => { this.enqueue(approval, resolve); });
     this.count('raised', approval.createdAt);
     log.info('approval.requested', { id, runId: approval.runId, phase: approval.phase, title: approval.title });
@@ -2418,13 +3059,20 @@ export function writeSettingsFile(runId: string, settings: Record<string, unknow
  * moved from a process listing to a permanent one. Best effort, never throws.
  */
 export function pruneSettingsFiles(keep: Iterable<string>): string[] {
-  const live = new Set([...keep].map((runId) => `run-${runId}.json`));
+  const live = new Set([...keep].flatMap((runId) => [`run-${runId}.json`, `run-${runId}${PLAN_HOST_SETTINGS_SUFFIX}.json`]));
   return sweepSettings((name) => !live.has(name));
 }
 
-/** One run's settings file. The runner's own sweep — see `dropMcpConfigsFor`. */
+/**
+ * The settings variant a plan-mode session loads (control-tower phase 11):
+ * `run-<id>-plan.json` beside the run's own, carrying the relay's
+ * `PermissionRequest` hook. See `RunnerControl.planHostSettingsPath`.
+ */
+export const PLAN_HOST_SETTINGS_SUFFIX = '-plan';
+
+/** One run's settings files (its own and its plan-host variant). The runner's own sweep — see `dropMcpConfigsFor`. */
 export function dropSettingsFileFor(runId: string): string[] {
-  return sweepSettings((name) => name === `run-${runId}.json`);
+  return sweepSettings((name) => name === `run-${runId}.json` || name === `run-${runId}${PLAN_HOST_SETTINGS_SUFFIX}.json`);
 }
 
 function sweepSettings(shouldDelete: (name: string) => boolean): string[] {

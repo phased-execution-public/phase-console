@@ -46,7 +46,8 @@ export const MESSAGE_KINDS = Object.freeze(/** @type {const} */ (['note', 'ask',
  *
  * `session` — a Claude session id, the only address that names a process.
  * `phase`   — a phase of this plan, whoever is running it now.
- * `next`    — the phase that runs after this one, whenever that is.
+ * `next`    — the phase that runs after this one, whenever that is; with a
+ *             target, `next:<slug>/<N>`, the NEXT ATTEMPT of phase N.
  * `all`     — every live session of this run.
  * `run`     — the run itself (its journal and its inbox), nobody in particular.
  * `repo`    — every session working in one repository, across plans.
@@ -63,10 +64,17 @@ export const MESSAGE_SCHEMES = Object.freeze(
  * `now` — interrupt the recipient's turn if the transport allows it.
  * `next-turn` — wait for a turn boundary; the polite default for a note.
  * `boot` — hold it until the recipient's phase BOARDS, which is the only way
- *          to address a phase that has not started.
+ *          to address a phase that has not started. A phase that is LIVE
+ *          gets it now, in the session that is running.
+ * `next-attempt` — hold it for the phase's NEXT session, even while one is
+ *          live: a retry, a wrap-up resume, a re-board, a relaunch. Marked
+ *          delivered only once that session has started (control-tower phase
+ *          98, #137). What `next:<slug>/<N>` means.
  * @typedef {(typeof MESSAGE_DELIVER)[number]} MessageDeliver
  */
-export const MESSAGE_DELIVER = Object.freeze(/** @type {const} */ (['now', 'next-turn', 'boot']));
+export const MESSAGE_DELIVER = Object.freeze(
+  /** @type {const} */ (['now', 'next-turn', 'boot', 'next-attempt']),
+);
 
 /**
  * How loudly — `high` is what a `needs-you` announcement is made of.

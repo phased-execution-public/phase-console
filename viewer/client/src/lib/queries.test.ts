@@ -16,8 +16,8 @@
  * it is never awaited.
  */
 
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render } from '@testing-library/react';
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { createElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -31,6 +31,9 @@ vi.mock('@/components/ui/toast', async (importOriginal) => {
 
 import { SSE_EVENTS } from './sse';
 import { EVENT_EFFECTS, keys, queryClientConfig, shellCounts, toastError, useApiMutation } from './queries';
+import type { RunState } from './api';
+import { nowLanes } from '@/features/runs/lanes-model';
+import { Strip } from '@/features/runs/tower/strip';
 
 describe('SSE → Query bridge', () => {
   it('has an effect for every event the server can emit', () => {
@@ -45,7 +48,7 @@ describe('SSE → Query bridge', () => {
     expect(extra, `phantom events: ${extra.join(', ')}`).toEqual([]);
   });
 
-  it('carries every wire name, run events included — 28 free, two more Pro', () => {
+  it('carries every wire name, run events included — 29 free, five more Pro', () => {
     // 28 since 2026-09-18: `restart`, a restart's update moving — every tab's
     // Restart card and banner hear it, not only the tab that pressed.
     expect(SSE_EVENTS).toContain('restart');
@@ -83,8 +86,8 @@ describe('SSE → Query bridge', () => {
     // landed — the count read 26 against 27 names, so this suite was red from
     // that commit until phase 13 noticed.)
     expect(SSE_EVENTS).toContain('repo:radar');
-    // The two Pro names, declared in a `!pro:` region of `sse.ts` — so the free
-    // tree carries 28 names and this tree 30, and the count below is written
+    // The Pro names, declared in a `!pro:` region of `sse.ts` — so the free
+    // tree carries 29 names and this tree 32, and the count below is written
     // to hold BOTH (this suite runs in the free tree too, under `verify-free`).
     // Phase 10's mailbox, given a reader in phase 13: its own event for
     // `run:rulings`' reason, the mailbox is per PLAN and outlives every run of
@@ -93,7 +96,14 @@ describe('SSE → Query bridge', () => {
     // page both move on it, and nothing else on the wire does.
     const proNames: string[] = [];
     for (const name of proNames) expect(SSE_EVENTS).toContain(name);
-    expect(SSE_EVENTS).toHaveLength(28 + proNames.length);
+    // `run:progress` (control-tower phase 7) is the 29th: the one event that
+    // arrives BETWEEN phase boundaries, and the reason a surface can move
+    // while a phase works.
+    expect(SSE_EVENTS).toContain('run:progress');
+    // `human-step` (control-tower phase 42) is the 30th: a person's turn moved,
+    // and the step rides the event.
+    expect(SSE_EVENTS).toContain('human-step');
+    expect(SSE_EVENTS).toHaveLength(30 + proNames.length);
     // The runner prefixes its own events (`server/runner/runner.ts` emits
     // `run:` + event). Listening for `phase` instead of `run:phase` is the
     // mistake this pins down.
@@ -294,7 +304,15 @@ describe('keys.after* — the named invalidation bundles', () => {
   });
 
   it('an inbox verb is the widest bundle, and honestly so', () => {
-    expect(keys.afterInboxAct()).toEqual([['inbox'], ['runs'], ['plans'], ['approvals'], ['state']]);
+    // `human-steps` (control-tower phase 42): a step row's verb moves the ledger the card reads.
+    expect(keys.afterInboxAct()).toEqual([
+      ['inbox'],
+      ['runs'],
+      ['plans'],
+      ['approvals'],
+      ['state'],
+      ['human-steps'],
+    ]);
     expect(keys.afterRunLaunch()).toEqual([['runs'], ['plans'], ['stats'], ['state']]);
     expect(keys.afterPrefs()).toEqual([['state']]);
   });
@@ -436,5 +454,127 @@ describe('useApiMutation', () => {
     });
     expect(spy).toHaveBeenCalled();
     expect(seen.current!.isPending).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * run:progress reaches the strip (control-tower phase 19, #25)
+ * ------------------------------------------------------------------ */
+
+describe('a run:progress frame patches the strip, with no refetch', () => {
+  it('moves the strip’s clock, its word and its in-flight spend from the frame alone', async () => {
+    const now = Date.now();
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const run = {
+      id: 'run-strip01',
+      slug: 'console-speed',
+      root: '/repo',
+      status: 'running',
+      model: 'opus',
+      autonomy: 'keep-going',
+      spentUsd: 4.2,
+      runBudgetUsd: 25,
+      createdAt: iso(now - 3_600_000),
+      updatedAt: iso(now - 60_000),
+      activePhase: 6,
+      children: { 6: { pid: 106, phase: 6, sessionId: 's6', startedAt: iso(now - 14 * 60_000) } },
+      phases: {
+        6: {
+          phase: 6,
+          status: 'running',
+          attempts: 1,
+          costUsd: 0,
+          attemptStartedAt: iso(now - 14 * 60_000),
+          startedAt: iso(now - 14 * 60_000),
+          liveness: {
+            phase: 6,
+            lastOutputAt: iso(now - 5_000),
+            turnsSinceLastTool: 0,
+            commitsSinceStart: 0,
+            treeDirty: false,
+          },
+        },
+      },
+    } as unknown as RunState;
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(keys.state(), { allowRun: true });
+    client.setQueryData(keys.runs(), [run]);
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ events: [], untrusted: true }), {
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+
+    // The board's own shape: the runs list from the cache, folded to lanes, one strip per run.
+    function Board() {
+      const { data } = useQuery<RunState[]>({
+        queryKey: keys.runs(),
+        queryFn: () => Promise.reject(new Error('the strip must not refetch')),
+        enabled: false,
+      });
+      const runs = data ?? [];
+      const lanes = nowLanes(runs);
+      return createElement(
+        'div',
+        null,
+        runs.map((r) =>
+          createElement(Strip, {
+            key: r.id,
+            run: r,
+            lanes: lanes.filter((l) => l.runId === r.id),
+            allowRun: true,
+          }),
+        ),
+      );
+    }
+    render(createElement(QueryClientProvider, { client }, createElement(Board)));
+    expect(screen.getByTestId('strip-clock').textContent).toMatch(/^running 14m/);
+    expect(screen.getByTestId('strip-cost').textContent).toBe('$4.20/$25.00');
+
+    // A new attempt boards; this session has spent $2.50 so far.
+    // (The cache notifies its observers on the next tick — hence `waitFor`.)
+    const frame = (status: string) => ({
+      slug: 'console-speed',
+      runId: 'run-strip01',
+      phase: 6,
+      status,
+      attempt: 2,
+      attemptStartedAt: iso(now - 30_000),
+      spentUsd: 2.5,
+      phaseClocks: {
+        sinceFirstBoardedMs: 14 * 60_000,
+        sinceThisAttemptMs: 30_000,
+        workedMs: 14 * 60_000,
+        queuedMs: null,
+        attemptWindows: [
+          { attempt: 1, startedAt: iso(now - 14 * 60_000), endedAt: iso(now - 60_000) },
+          { attempt: 2, startedAt: iso(now - 30_000) },
+        ],
+        timeToFirstToolMs: null,
+      },
+    });
+    await act(async () => EVENT_EFFECTS['run:progress'].patch!(client, frame('running')));
+    // The frame's window is the clock's anchor: the new attempt, not the old one's 14 minutes.
+    await waitFor(() => expect(screen.getByTestId('strip-clock').textContent).toMatch(/^running 3\ds$/));
+    expect(screen.getByTestId('strip-cost').textContent).toBe('$6.70/$25.00');
+
+    // The session hands over to the console's check: the word on the glance moves with it.
+    await act(async () => EVENT_EFFECTS['run:progress'].patch!(client, frame('verifying')));
+    await waitFor(() => expect(screen.getByTestId('strip-clock').textContent).toMatch(/^verifying /));
+
+    expect(invalidate).not.toHaveBeenCalled();
+    // Nothing asked for the run again — the only requests a strip may make are its lane's activity
+    // line and its why line's sources (control-tower phase 102): the phase's own report and, in
+    // the Pro tree, the supervisor's read. None of them is the run.
+    const allowed = (url: string) =>
+      url.includes('/activity') ||
+      url.endsWith('/report') ||
+      false;
+    const asked = fetch.mock.calls.map(([url]) => String(url)).filter((url) => !allowed(url));
+    expect(asked).toEqual([]);
+    fetch.mockRestore();
   });
 });

@@ -78,10 +78,11 @@ export function TabBar({
             <span className="relative">
               <item.icon size={19} aria-hidden />
               {count > 0 && (
-                // `-top-1 -right-2.5` puts the bubble's own edge against the
-                // glyph's corner instead of over its top-right stroke — at
-                // `-top-2 -right-3` a two-digit count sat ON the Now icon.
-                <span className="pointer-events-none absolute -top-1 -right-2.5">
+                // Anchored by its START edge, 5 px inside the 19 px glyph, so a
+                // wide "9+" grows away from the glyph rather than over it: a
+                // right-anchored bubble sat on the Runs tower (6.0's e2e shot),
+                // as `-top-2 -right-3` once sat on the Now icon.
+                <span className="pointer-events-none absolute -top-1.5 start-3.5">
                   <NavBadge count={count} hot={hot} cap={9} className="ring-2 ring-ground-deep" />
                 </span>
               )}

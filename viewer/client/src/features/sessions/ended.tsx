@@ -56,7 +56,7 @@ export function EndedBanner({
 
   return (
     <div className="flex flex-wrap items-center gap-2 border-b border-rule bg-surface px-3 py-2 text-sm text-ink-muted">
-      <span className={failed ? 'text-blocked' : undefined}>
+      <span className={failed ? 'text-failed' : undefined}>
         This session {exitSummary(session)}
         {session.exitedAt ? ` ${relativeTime(session.exitedAt)}` : ''}.
       </span>

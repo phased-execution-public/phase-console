@@ -19,6 +19,7 @@ import { type RunState, automationPrefs } from '@/lib/api';
 import { DEFAULTS } from '@/features/runs/defaults';
 import { runPriority } from '@shared/orchestration-model.js';
 import { isolationMode, settleOf } from '@shared/worktree-model.js';
+import { DEFAULT_MODEL_POLICY } from '@shared/run-lifecycle.js';
 import type { Source } from './fields';
 import type { LaunchMemory } from './launch-memory';
 import { REMEMBERED_FIELDS } from './launch-memory';
@@ -134,11 +135,13 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
     return [values, origins];
   }
 
-  if (mode === 'session' || mode === 'plan') {
+  if (mode === 'session' || mode === 'plan' || mode === 'fix') {
     values.model = DEFAULTS.model;
     values.effort = DEFAULTS.effort;
-    values.permissionProfile = 'guarded';
-    values.permissionMode = '';
+    // A fix opens at the run default the server would apply — accept edits —
+    // so the form shows the mode the session will get (control-tower phase 12).
+    values.permissionProfile = mode === 'fix' ? 'trusted' : 'guarded';
+    values.permissionMode = mode === 'fix' ? 'acceptEdits' : '';
     // The wizard's ticket has no attach flag, so a ticked box means the names
     // ride inside `skills` — `buildLaunch` does the merge.
     values.attachDefaultSkills = prefs.attachDefaultSkills && defaultSkills.length > 0;
@@ -149,6 +152,7 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   // start | continue | phase | live — the run answers for itself where it can.
   values.model = run?.model ?? DEFAULTS.model;
   values.effort = run?.effort ?? (run ? '' : DEFAULTS.effort);
+  values.modelPolicy = run?.modelPolicy ?? DEFAULT_MODEL_POLICY;
   values.autonomy = run?.autonomy ?? DEFAULTS.autonomy;
   // Absent has always meant `guarded` on disk for an EXISTING run; a run that
   // does not exist yet opens on the client default.
@@ -210,7 +214,9 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   // word rather than a boolean.)
   values.ultracode = Boolean(run?.ultracode);
   values.ultraReview = run?.ultraReview ?? 'off';
-  values.qa = false;
+  // A live run's sheet shows the plan's gate as it IS (control-tower phase 13,
+  // #31): the box turns it on or off; every launch still starts unticked.
+  values.qa = mode === 'live' ? /^on\b/.test(input.qaMode ?? '') : false;
   // A run that EXISTS answers for itself, empty list included: `state.skills`
   // is deleted when empty, so an absent list on a real run means the operator
   // turned them all off — re-seeding the machine defaults over that would make
@@ -225,6 +231,19 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   values.autoRecover = run ? Boolean(run.autoRecover) : prefs.autoRecoverByDefault;
   values.maxParallel = run?.maxParallel ? String(run.maxParallel) : '';
   values.maxConsecutiveFailures = run?.maxConsecutiveFailures ? String(run.maxConsecutiveFailures) : '';
+  values.approvalTimeoutMinutes = run?.approvalTimeoutMinutes ? String(run.approvalTimeoutMinutes) : '';
+  // The QA-fix pair (control-tower phase 22): a run answers for itself — the
+  // live sheet sends the round budget whenever it shows it, so a sheet that
+  // opened empty over a run's own ceiling would clear it on Apply. Empty on a
+  // fresh start: the strategy's silence is `resume`, the budget's no ceiling.
+  values.qaFixStrategy = run?.qaFixStrategy ?? '';
+  values.qaRoundBudgetUsd = run?.qaRoundBudgetUsd == null ? '' : String(run.qaRoundBudgetUsd);
+  // The run's own rung caps — never the preference, which an empty box already
+  // means. Tested as numbers, not truthiness: 0 is a cap, and a live patch
+  // sends an empty box as `null`, which would CLEAR it.
+  values.ladderPerRunRungs = typeof run?.ladderPerRunRungs === 'number' ? String(run.ladderPerRunRungs) : '';
+  values.ladderPerPhaseRungs =
+    typeof run?.ladderPerPhaseRungs === 'number' ? String(run.ladderPerPhaseRungs) : '';
   // CLEARED for a continue, not seeded from the run — client-11.
   //
   // The dialog's own description promises "the scope is cleared — a continue
@@ -247,6 +266,11 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
   // answers. A waiver is acknowledged per launch, never carried over.
   values.resumeOnRestart = run?.resumeOnRestart ?? true;
   values.relay = run?.relay ?? 'off';
+  // The run's default permission mode (control-tower phase 11): its own, or
+  // none — the plan's line, then `acceptEdits`, answers a fresh start.
+  values.permissionMode = run?.permissionMode ?? '';
+  // Answered per launch, like a waiver: a resume keeps what its launch answered.
+  values.gitStrategyAck = '';
   values.accounts = run ? formatAccounts(run.accounts) : '';
   values.acknowledgedWaivers = [];
   values.manifestOverride = '';
@@ -295,6 +319,7 @@ export function seedFor(mode: RunSetupMode, input: SeedInput): [RunSetupValues, 
 export const RUN_SEEDED = [
   'model',
   'effort',
+  'modelPolicy',
   'autonomy',
   'permissionProfile',
   'accountId',
@@ -325,11 +350,17 @@ export const RUN_SEEDED = [
   'autoRecover',
   'maxParallel',
   'maxConsecutiveFailures',
+  'approvalTimeoutMinutes',
+  'qaFixStrategy',
+  'qaRoundBudgetUsd',
+  'ladderPerRunRungs',
+  'ladderPerPhaseRungs',
   'onlyPhases',
   'phaseOptions',
   'resumeOnRestart',
   'relay',
   'accounts',
+  'permissionMode',
 ] as const satisfies readonly RunSetupField[];
 
 /**

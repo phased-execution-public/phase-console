@@ -294,29 +294,96 @@ test('criterion 1: a refusal is journalled once, EVER — across declarations, n
   scheduler.close();
 });
 
-test('criterion 1: a cmd: ref is bounded — it runs a command, it does not just read one', async () => {
-  // The other four schemes read something; this one RUNS something, every five
-  // minutes, for as long as the phase is parked — which is days (QA F11).
+test('criterion 1 (#19): a cmd: ref backs off 5 m, 15 m, 1 h, 6 h — and watches a wait measured in days', async () => {
+  // The other four schemes read something; this one RUNS something, for as
+  // long as the phase is parked — which is days (QA F11). Until control-tower
+  // phase 6 that was bounded by a count: twelve runs at five minutes, then
+  // `refused` for ever — one hour of watching, while the measured wall (an
+  // organisation's plan) took a day to lift. The cadence is the bound now.
+  const clock = new FakeClock();
+  const state = waitingRun(['cmd:"gh api repos/acme/app/rulesets --silent"']);
+  // The budget the park stamped on the declaration: three days, the plan's.
+  state.phases[1].declared!.budget = { ms: 3 * 86_400_000, source: 'phase' };
+  const ranAt: number[] = [];
+  const scheduler = new WatchScheduler({
+    clock,
+    runs: () => [{ slug: 'alpha', state }],
+    probe: async (t) => { ranAt.push(clock.time); return { ref: t.ref, state: 'pending', detail: 'exit 1' }; },
+  });
+  scheduler.open();
+  // The scheduler's OWN timer, for two and a half days.
+  await clock.advance(2.5 * 86_400_000);
+  const gaps = ranAt.slice(1).map((t, i) => t - ranAt[i]);
+  // Since control-tower phase 50 (#87) the back-off waits for the declared
+  // window to end: inside this one-hour window the step is held to a sixth of
+  // it (ten minutes), and after it the steps count from the window's end.
+  assert.deepEqual(gaps.slice(0, 11), [
+    300_000, 600_000, 600_000, 600_000, 600_000, 600_000, 600_000,
+    900_000, 3_600_000, 21_600_000, 21_600_000,
+  ], 'every ten minutes inside the window, then five minutes, fifteen, an hour, six hours from its end');
+  assert.ok(gaps.slice(9).every((gap) => gap === 21_600_000), 'and six hours from then on');
+  assert.ok(ranAt.length > 12, `past the old terminal twelve (${ranAt.length} runs) — still watching`);
+  const row = state.phases[1].watchState!.refs[0];
+  assert.equal(row.state, 'pending', 'not refused: the wait is inside its budget');
+  assert.equal(row.runs, ranAt.length, 'the count is on the row, not in memory');
+  assert.equal(row.nextDueAt, ranAt[ranAt.length - 1] + 21_600_000, 'the row says when it runs next');
+  assert.equal(state.phases[1].watchRetired, undefined);
+  scheduler.close();
+});
+
+test('criterion 1 (#19): a cmd: ref stops at the end of the phase\'s wait budget — a state, not a silence', async () => {
+  const clock = new FakeClock();
+  const state = waitingRun(['cmd:"gh api repos/acme/app/rulesets --silent"']);
+  state.phases[1].declared!.budget = { ms: 86_400_000, source: 'plan' };
+  let runs = 0;
+  const journal: string[] = [];
+  const scheduler = new WatchScheduler({
+    clock,
+    runs: () => [{ slug: 'alpha', state }],
+    journal: (_s, _st, kind) => { journal.push(kind); },
+    probe: async (t) => { runs += 1; return { ref: t.ref, state: 'pending', detail: 'exit 1' }; },
+  });
+  scheduler.open();
+  await clock.advance(2 * 86_400_000);
+  // Inside the hour-long window every ten minutes (1, 6, 16 … 56 min — #87),
+  // then 66, 81 and 141 min counted from its end, then every six hours: 8 h
+  // 21 m, 14 h 21 m, 20 h 21 m — the next (26 h 21 m) is past the one-day budget.
+  assert.equal(runs, 13, 'the command runs until the budget is spent, and not after');
+  const row = state.phases[1].watchState!.refs[0];
+  assert.equal(row.state, 'refused', 'the operator sees a state');
+  assert.match(row.detail!, /wait budget/);
+  assert.match(row.detail!, /will not run it again/);
+  assert.equal(row.nextDueAt, undefined, 'a refused row has no clock');
+  assert.deepEqual(state.phases[1].watchRetired, ['cmd:"gh api repos/acme/app/rulesets --silent"'],
+    'retired on the record — only an operator\'s Retry un-retires');
+  assert.equal(journal.filter((kind) => kind === 'phase.watch-refused').length, 1, 'said once');
+  scheduler.close();
+});
+
+test('criterion 1 (#19): a 200-run backstop stays — a runaway still ends in a state', async () => {
   const clock = new FakeClock();
   const state = waitingRun(['cmd:"gh run list"']);
+  // A record at the backstop, due now (a budget nobody meant, a console that
+  // never stamped one) — the ref is refused without being run again.
+  state.phases[1].watchState = {
+    at: new Date(NOW).toISOString(),
+    refs: [{
+      ref: 'cmd:"gh run list"', scheme: 'cmd', state: 'pending', checkedAt: new Date(NOW).toISOString(),
+      runs: MAX_CMD_RUNS_PER_PHASE, nextDueAt: NOW - 1,
+    }],
+  };
   let runs = 0;
   const scheduler = new WatchScheduler({
     clock,
     runs: () => [{ slug: 'alpha', state }],
-    probe: async (t) => { runs += 1; return { ref: t.ref, state: 'pending', detail: 'exit 1' }; },
+    probe: async (t) => { runs += 1; return { ref: t.ref, state: 'pending' }; },
   });
   scheduler.open();
-  for (let i = 0; i < MAX_CMD_RUNS_PER_PHASE + 4; i += 1) {
-    await scheduler.tick();
-    clock.time += WATCH_POLL_MS.cmd;
-  }
-  assert.equal(runs, MAX_CMD_RUNS_PER_PHASE, 'the command stops being run');
+  await scheduler.tick();
+  assert.equal(runs, 0, 'not run a two-hundred-and-first time');
   const row = state.phases[1].watchState!.refs[0];
-  assert.equal(row.state, 'refused', 'and the operator sees a state, not a silence');
-  assert.match(row.detail!, /will not run it again/);
-  assert.equal(row.runs, MAX_CMD_RUNS_PER_PHASE, 'the count is on the row, not in memory');
-  // …and the exhausted ref is RETIRED, not merely re-labelled (SLF-8): the row
-  // stays for the operator to read, the ref is never a probe target again.
+  assert.equal(row.state, 'refused');
+  assert.match(row.detail!, /200 times without landing/);
   assert.deepEqual(state.phases[1].watchRetired, ['cmd:"gh run list"']);
   scheduler.close();
 });
@@ -335,7 +402,8 @@ test('criterion 1: a cmd: probe that ran NOTHING does not spend the budget', asy
     probe: async (t) => ({ ref: t.ref, state: 'unknown', detail: 'cmd refs are not being run' }),
   });
   scheduler.open();
-  for (let i = 0; i < MAX_CMD_RUNS_PER_PHASE + 6; i += 1) {
+  // Eighteen passes — the old cap and six more — well inside the budget.
+  for (let i = 0; i < 18; i += 1) {
     await scheduler.tick();
     clock.time += WATCH_POLL_MS.cmd;
   }
@@ -1239,6 +1307,54 @@ test('WAI-6: an operator-stopped run\'s dead clock is SETTLED — `pending`, the
     // Idempotent: a second load settles nothing more and writes nothing more.
     loadRun(root, 'alpha', stored.id);
     assert.equal(journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled').length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('SK-3 (#53): a settlement is written once per clock — a stale copy written back over it is settled again, and said once', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-sk3-'));
+  try {
+    // The measured shape: a run PARKED by a sibling's needs-human, its waiting
+    // record's clock passed with nothing to fire it, and the settled record
+    // came back `waiting` twice more (a copy saved over the settle) — three
+    // `phase.wait-settled` lines for one clock, 10, 11 and 59 minutes late.
+    const dead = new Date(Date.now() - 20 * 60_000).toISOString();
+    const stored = storedWait(root, { status: 'parked', stoppedBy: 'system', parkedUntil: dead });
+    const settledLines = () => journalLines(root, 'alpha', stored.id).filter((l) => l.event === 'phase.wait-settled');
+    const first = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(first.phases[4].status, 'pending');
+    assert.equal(settledLines().length, 1);
+    assert.equal(settledLines()[0].data?.why, 'clock-unarmed');
+    // The stale copy — still `waiting`, still carrying the clock — written back.
+    saveRun(stored);
+    const second = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(second.phases[4].status, 'pending', 'the stale copy is settled again: it must not stand');
+    saveRun(stored);
+    loadRun(root, 'alpha', stored.id);
+    assert.equal(settledLines().length, 1, 'and the settlement is said ONCE for that clock');
+    // A NEW clock for the same phase is a new wait, and its settlement is said.
+    const later = new Date(Date.now() - 19 * 60_000).toISOString();
+    stored.phases[4].parkedUntil = later;
+    saveRun(stored);
+    loadRun(root, 'alpha', stored.id);
+    assert.deepEqual(settledLines().map((l) => l.data?.clock), [dead, later]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('SK-2 (#53): a clock a park carried goes with the record it was carried for', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-sk2-'));
+  try {
+    const dead = new Date(Date.now() - 20 * 60_000).toISOString();
+    const stored = storedWait(root, { status: 'parked', stoppedBy: 'system', parkedUntil: dead });
+    stored.waitUntil = dead;
+    stored.waitReason = 'external';
+    saveRun(stored);
+    const loaded = loadRun(root, 'alpha', stored.id)!;
+    assert.equal(loaded.phases[4].status, 'pending');
+    assert.equal(loaded.waitUntil, null, 'no run goes on painting a clock no record holds');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

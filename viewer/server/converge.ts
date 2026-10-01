@@ -46,8 +46,10 @@ import {
   CONSOLE_STOPPED_NOTE, IN_FLIGHT, childrenOf, resetForRetry, pidAlive as realPidAlive,
   processState as realProcessState, waitClockOf, waitReasonOf, type ProcessState,
   type Errand, type PhaseRecord, type RunState,
+  setRunState,
 } from './runner/state.ts';
 import { log } from './log.ts';
+import { holdBinds } from './fleet-hold.ts';
 import { doorActor, viaOfTrigger, type StartActor } from './actor.ts';
 import { WATCH_INELIGIBLE_ROW_STATES, watchEligible } from './watch-refs.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
@@ -55,6 +57,9 @@ import type {
   ConvergeTrigger as ConvergeTriggerWord, ResumePath, ResumeTrigger,
 } from '../shared/run-lifecycle.js';
 import { resumeAtBootMode } from '../shared/automation-model.js';
+import { isClosedPlanStatus } from '../shared/plan-vocab.js';
+import { isPlanHalt, PRESS_ONLY_HALT_KINDS } from '../shared/recovery-model.js';
+import type { LintResult } from './engine.ts';
 
 /* ------------------------------------------------------------------ *
  * Vocabulary
@@ -92,8 +97,36 @@ export const MAX_BOOT_RESUMES = 3;
  * meets the same wall at the preflight and parks again (RCV-1). The heal
  * pass still classifies their phases and climbs, bounded by RCV-9's
  * fingerprint; only the run-level relaunch is a person's.
+ *
+ * `identity-changed` (control-tower phase 91, #131): the run's account now
+ * answers somebody else's login, and whether to spend it is a person's choice
+ * — so is the relaunch. One `credential-refused` is not a person's any more:
+ * an EXPIRED or SIGNED-OUT login's, once the login works again on the same
+ * identity (`loginLapseAnswered`, operator decision 12). Organisation, billing
+ * and policy refusals stay here (RCV-1 kept).
  */
-export const PRESS_ONLY_HALT_KINDS: readonly string[] = Object.freeze(['failure-streak', 'credential-refused']);
+export { PRESS_ONLY_HALT_KINDS };
+
+/**
+ * Is this run's stop an expired or signed-out login that works again
+ * (control-tower phase 91, #147, operator decision 12)? The halt is
+ * `credential-refused`, the phase it stopped on carries the runner's `auth`
+ * cause — a lapse or a sign-out, never an organisation, billing or policy
+ * refusal — and the service's fact says the run's own account answered
+ * `claude auth status` and a usage read since the stop, on the identity the
+ * run is bound to. Only then is the relaunch the clock's as well as a person's.
+ */
+export function loginLapseAnswered(run: RunState, facts: Pick<ConvergeFacts, 'loginRestored'>): boolean {
+  if (run.halt?.kind !== 'credential-refused') return false;
+  const phase = run.halt.phase;
+  const cause = phase != null ? run.phases[String(phase)]?.cause : undefined;
+  if (cause?.kind !== 'credential-refused' || cause.class !== 'auth') return false;
+  try {
+    return Boolean(facts.loginRestored?.(run));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * How far past its own `waitUntil` a sleeping run may read before the loop
@@ -147,6 +180,16 @@ export type ConvergeFacts = {
    */
   processState?: (pid: number) => ProcessState;
   /**
+   * What a phase's ARMED outcome file says, when a declaration is still in it
+   * (#21 §3, #23).
+   *
+   * An orphan declares and exits like any other session, and its file outlives
+   * it — so "did this lane finish?" is answerable a commit before the board
+   * says so. Absent means the board alone answers, which is the conservative
+   * direction: a person is asked where they might not have needed to be.
+   */
+  declaredOutcome?: (runId: string, phase: number) => string | null;
+  /**
    * The session registry's word on the session a lock names (Phase 5):
    * `ended` — its SessionEnd arrived or its process is gone, so the lock is
    * debris NOW whatever the lease says; `live` — a person is in it; `unknown`
@@ -170,6 +213,48 @@ export type ConvergeFacts = {
    * board word.
    */
   qa?: Record<number, string> | null;
+  /**
+   * The accounts breaker, as a stamp (`Accounts.breakerStamp`): each
+   * account's effective entitlement word and when it was written, and its
+   * live walls. In the FACTS for `gateStamp`'s reason exactly — clearing a
+   * retired account changes neither the run, its records, nor the board word,
+   * so without this the healer's "found nothing to climb" latched for two and
+   * a half hours against an account a person had just cleared (#36). A meter
+   * poll moves none of it. Null when the console has no accounts facade.
+   */
+  accountsStamp?: string | null;
+  /**
+   * The evaluated verdict of every AUTOMATIC gate on the latest run's
+   * outstanding phases (#48): `clear`, or the engine's kind word (`blocked`,
+   * `OVERDUE`, `unevaluated`). In the FACTS for `gateStamp`'s reason, one plan
+   * further out: a `plan <slug>:<N>` gate clears when ANOTHER plan's phases
+   * verify, which moves nothing this run, its records, its board, its locks or
+   * its own `gate-status.md` read — so the healer's latch held for ever, and
+   * the phase it gated was never re-boarded. Absent: no gate was read.
+   */
+  gates?: Record<number, string> | null;
+  /**
+   * The plan's frontmatter `status:` (#48, CG-4). A CLOSED plan's run is never
+   * woken, re-armed or re-boarded: the gates above are exactly what would wake
+   * one, and a superseded plan's parked run woken by a gate that cleared the
+   * day before re-publishes whatever it was built to publish. Absent: open.
+   */
+  planStatus?: string | null;
+  /**
+   * The plan's lint (`validate.sh`), read only when the latest run is stopped
+   * on a stop about the plan (`PLAN_HALT_KINDS`) — the one fact that answers
+   * such a stop (control-tower phase 81, #97). Cached per plan revision by the
+   * service, so the pass after the plan changes on disk is the one that asks it
+   * afresh. Absent, timed out or crashed: nothing is decided on it.
+   */
+  lint?: LintResult | null;
+  /**
+   * Has the login this run stopped on come back (control-tower phase 91,
+   * #147)? Asked only of a run halted `credential-refused` on an `auth` cause:
+   * true once the run's own account answered `claude auth status` and a usage
+   * read after the halt, on the identity the run is bound to. Absent: never.
+   */
+  loginRestored?: (run: RunState) => boolean;
   /**
    * The fingerprint of the latest run's open records at the last pass that
    * healed nothing. The same evidence yields the same answer, so the healer —
@@ -201,6 +286,13 @@ export type ConvergeAction =
      * `phase.resume-automatic` by the executor (LFC-7).
      */
     counted?: { phase: number; path: ResumePath; sessionId?: string }[];
+    /**
+     * The phases an ORPHAN closed cleanly before it ended (#23) — the reason
+     * this launch needed no press under `resumeOnRestart: false`. Journalled
+     * `phase.reconciled {closedBy:'orphan'}` by the executor, so the record
+     * explains itself rather than leaving a relaunch nobody authorised.
+     */
+    closedByOrphan?: number[];
     /** A wait whose clock went by while nothing ran: the launch is the overdue ruling, not a bare start. */
     wait?: { until: string; lateByMs: number; phases: number[] };
     /** Launched on the operator's `continue` — spent by this launch, so the next restart asks again. */
@@ -208,8 +300,18 @@ export type ConvergeAction =
   }
   /** A person is asked, once, with what is needed and how to give it. `phase` null = run level. */
   | { kind: 'errand'; runId: string; phase: number | null; errand: Errand; why: string }
-  /** Classify the open phases and climb the ladder — the healer. */
-  | { kind: 'heal'; runId: string; fingerprint: string; why: string }
+  /**
+   * Classify the open phases and climb the ladder — the healer. `gates` is the
+   * pass's gate verdicts, handed on so the healer's per-phase evidence reads
+   * the same verdict the pass did (#84).
+   */
+  | { kind: 'heal'; runId: string; fingerprint: string; why: string; gates?: Record<number, string> }
+  /**
+   * The plan is CLOSED (CG-4): stop the run where it stands and pin it —
+   * `halted`, `stoppedBy: 'system'`, `resolved` — journalled `run.closed-plan`
+   * once. Nothing else is ever planned for it while the plan stays closed.
+   */
+  | { kind: 'settle-closed'; runId: string; status: string; why: string }
   /**
    * A console restart stopped this run, and the operator has not said whether
    * to pick it up. Nothing is launched and no errand is written: the run waits,
@@ -297,6 +399,30 @@ export function lockHeldByLiveRun(
   return run != null && !runIsDead(run, live, pidAlive);
 }
 
+/**
+ * Is this an autopilot LANE's lock whose run is working that phase right now
+ * (control-tower phase 60, #82) — holding the phase's grant in this console's
+ * scheduler, or with the lane's session alive in the run's own record (another
+ * console's lane)? Such a lock is `live`: a person-shaped claim nobody may cap.
+ * Before this it read `unknown`, so the lock twin of a live foreign lane was
+ * cappable while its grant was exempt, and the two-hour cap parked healthy
+ * waits behind a lock that was being refreshed the whole time.
+ */
+export function lockHasLiveLane(
+  lock: { owner: string; slug?: string; phase?: number },
+  grants: readonly { runId: string; slug: string; phase: number | null }[],
+  runs: readonly RunState[],
+  pidAlive: (pid: number) => boolean = realPidAlive,
+): boolean {
+  const runId = autopilotRunId(lock.owner);
+  if (!runId || lock.phase == null) return false;
+  if (grants.some((grant) => grant.runId === runId && grant.phase === lock.phase && (!lock.slug || grant.slug === lock.slug))) {
+    return true;
+  }
+  const run = runs.find((candidate) => candidate.id === runId);
+  return run != null && childrenOf(run).some((child) => child.phase === lock.phase && pidAlive(child.pid));
+}
+
 /** The run a plan is "on" — the same answer `latestRun` gives: the one still open, else the newest. */
 export function latestOf(runs: readonly RunState[]): RunState | null {
   return runs.find((run) => run.status !== 'finished') ?? runs[0] ?? null;
@@ -347,6 +473,77 @@ export function endedSessionLocks(
 }
 
 /**
+ * The phases a run's evidence is made of: every phase the board or the run's
+ * records know of that the board does not read `done`, inside the run's own
+ * scope (`onlyPhases`). A never-boarded phase is here through the board.
+ */
+export function outstandingPhases(run: RunState, board: Record<number, string>): number[] {
+  const asked = run.onlyPhases?.length ? new Set(run.onlyPhases) : null;
+  const known = new Set<number>([...Object.keys(board).map(Number), ...Object.values(run.phases).map((r) => r.phase)]);
+  return [...known]
+    .filter((p) => Number.isFinite(p) && board[p] !== 'done' && (!asked || asked.has(p)))
+    .sort((a, b) => a - b);
+}
+
+/**
+ * ONE phase's own evidence (control-tower phase 51, #84): its record, its board
+ * word, the locks on it, its watch refs and its gate verdict. The healer
+ * dedupes a phase's situation line on this and nothing wider — the run-wide
+ * string it compared against moved whenever ANY phase, lock or stamp did, so
+ * every candidate was re-journalled on every such move (657 lines on one
+ * console in a week) — and the run's fingerprint below is made of these.
+ *
+ * A declaration is part of the record term by what it NAMES (status, the
+ * decision it needs, its reason, its refs, when it was made), so a standing
+ * needs-human park is re-examined when the session re-declares or a ref's
+ * state moves, and not because a sibling's did.
+ */
+export function phaseEvidence(
+  run: RunState, phase: number, board: Record<number, string>, locks: readonly LockView[], gate?: string | null,
+): unknown[] {
+  const r = run.phases[String(phase)];
+  const d = r?.declared;
+  // `halt.at` is here for the same reason `run.halt.at` is: since the halt-kind
+  // split a phase-level ending writes `record.halt` and leaves the RUN's status
+  // untouched, so a phase that just failed its verification would otherwise
+  // change nothing this reads — and the loop skipped it with "nothing has
+  // changed", for ever.
+  // `errandAnswered.at`: a person's "Done — continue" moves nothing else here
+  // once the declaration it spent is gone — and a Recover that skipped with
+  // "nothing has changed" re-halted P27 on the ask it answered (#124).
+  const record = r
+    ? [r.status, r.attempts, r.endedAt ?? '', (r.note ?? '').slice(0, 120), r.halt?.at ?? '',
+      d ? [d.status, d.needs ?? '', d.reason ?? '', d.at, (d.watch ?? []).join(' ')] : '',
+      r.errandAnswered?.at ?? '']
+    : '';
+  // WHO holds it, and whether the hold has lapsed — never `leaseUntil` itself.
+  // That value is a TIMER: a live lane refreshes its claim every ten minutes
+  // (`LEASE_REFRESH_MS`), which is evidence that a process is alive and never
+  // that it is PROGRESSING. A holder appearing or releasing, a takeover, and a
+  // lease running out (`expired`, derived against the read clock) all survive.
+  const held = locks
+    .filter((l) => l.phase === phase)
+    .map((l) => [l.owner, l.expired ? 1 : 0])
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  // A ref's STATE, never its schedule: a probe that found nothing moves only
+  // the ref's clock, and the healer stands down on a watched park whatever that
+  // clock says — the watch scheduler, not this, is what acts when one lands.
+  const refs = r && watchEligible(r)
+    ? (r.watchState?.refs ?? [])
+      .filter((row) => !WATCH_INELIGIBLE_ROW_STATES.has(row.state))
+      .map((row) => [row.ref, row.state])
+    : [];
+  return [phase, board[phase] ?? '', record, held, refs, gate ?? ''];
+}
+
+/** `phaseEvidence` as the string a record's `situation.fingerprint` holds. */
+export function phaseFingerprint(
+  run: RunState, phase: number, board: Record<number, string>, locks: readonly LockView[], gate?: string | null,
+): string {
+  return JSON.stringify(phaseEvidence(run, phase, board, locks, gate));
+}
+
+/**
  * The evidence the healer would read, as a string: the same evidence gives the
  * same verdict, and a verdict of "nothing to climb" need not be re-derived —
  * and re-journalled — every five minutes. Locks are part of it (a holder
@@ -359,46 +556,26 @@ export function endedSessionLocks(
  * reads — not the run, not its records, not the board word — so the healer kept
  * skipping with "nothing has changed" against a gate a person had just
  * approved.
+ *
+ * It is built PER PHASE (control-tower phase 51, #84 #48): the run's own terms,
+ * then `phaseEvidence` for each OUTSTANDING phase, then the plan-wide stamps.
+ * A done phase's record, its locks and its board word are no longer part of
+ * it — they are evidence about nothing the healer can climb, and they were
+ * where most of the passes that launched nothing came from — and each
+ * outstanding phase's gate verdict now is.
  */
 export function evidenceFingerprint(
   run: RunState, board: Record<number, string>, locks: readonly LockView[], gateStamp?: string | null,
   qa?: Record<number, string> | null, now: number = Date.now(),
+  /** The accounts breaker's stamp — see `ConvergeFacts.accountsStamp`. */
+  accountsStamp?: string | null,
+  /** The pass's gate verdicts — see `ConvergeFacts.gates`. */
+  gates?: Record<number, string> | null,
 ): string {
-  const phases = Object.values(run.phases)
-    .sort((a, b) => a.phase - b.phase)
-    // `halt.at` is here for the same reason `run.halt.at` is: since the
-    // halt-kind split a phase-level ending writes `record.halt` and leaves the
-    // RUN's status untouched, so a phase that just failed its verification
-    // changed nothing else this function reads — and the loop skipped it with
-    // "nothing has changed", for ever.
-    .map((r) => [r.phase, r.status, r.attempts, r.endedAt ?? '', (r.note ?? '').slice(0, 120), board[r.phase] ?? '', r.halt?.at ?? '']);
-  // WHO holds what, and whether it has lapsed — never `leaseUntil` itself.
-  //
-  // That value is a TIMER. A live lane refreshes its own claim every ten
-  // minutes (`LEASE_REFRESH_MS`), which moved `leaseUntil` forward, which
-  // changed this fingerprint, which told the healer "something has changed" —
-  // from a lane that had done nothing at all. The keepalive exists so a long
-  // phase cannot silently lose its claim mid-work; it is evidence that a
-  // process is alive and never evidence that it is PROGRESSING, and the two
-  // are exactly what a squatting session makes indistinguishable. The comment
-  // above has always said "the clock is not" part of the evidence; this is the
-  // clock.
-  //
-  // The transitions that genuinely matter all survive: a holder appearing or
-  // releasing changes the list, a takeover changes `owner`, and a lease running
-  // out changes `expired` — which `parse/folder.ts` derives from `leaseUntil`
-  // against the read clock, so the lapse still registers the tick it happens.
-  const held = locks
-    .map((l) => [l.phase, l.owner, l.expired ? 1 : 0])
-    .sort((a, b) => Number(a[0]) - Number(b[0]));
-  // The WHOLE board, not just the phases this run happens to hold a record for.
-  // `phases` above samples `board[r.phase]`, so a phase that was never boarded
-  // going `waiting` -> `ready` — which is precisely the event meaning "this run
-  // can move again" — did not register at all, and the loop that exists to
-  // notice it skipped with "nothing has changed".
-  const words = Object.keys(board)
-    .map(Number).filter(Number.isFinite).sort((a, b) => a - b)
-    .map((p) => [p, board[p]]);
+  // The outstanding phases, from the board AND the records: a phase that was
+  // never boarded going `waiting` -> `ready` is precisely the event meaning
+  // "this run can move again", and it has no record to be seen through.
+  const phases = outstandingPhases(run, board).map((p) => phaseEvidence(run, p, board, locks, gates?.[p]));
   // And the QA verdicts, for the same reason the gate stamp is here: recording
   // pass or waived for the phase whose verdict wedged the plan moves neither
   // the run, nor its records, nor that phase's board word — it reads `done`
@@ -412,18 +589,23 @@ export function evidenceFingerprint(
   // here that measures something outside this console.
   //
   // The rule the lease taught is intact: a value that moves while nothing
-  // happens must not enter this string. `min(nextDueAt)` does not move while
-  // nothing happens — it moves when the watch scheduler probes a ref and
-  // reschedules it, which IS an event. But a ref that has come DUE and has not
+  // happens must not enter this string. A ref that has come DUE and has not
   // been probed yet is exactly the case the latch used to swallow: nothing
   // about the run, the board, the locks or the schedule has changed, and the
   // healer skipped with "nothing has changed" against a workflow run that had
   // finished (measured: filters p12, two days parked on a `gh run rerun`). So
   // while something is overdue the term becomes the current MINUTE, which
-  // advances — the latch cannot hold across the sweep — and goes back to being
-  // the stable schedule the moment the probe lands. At most one extra pass per
-  // minute per plan, and only while a probe is genuinely late.
+  // advances — the latch cannot hold across the sweep — and goes back to empty
+  // the moment the probe lands. At most one extra pass per minute per plan,
+  // and only while a probe is genuinely late.
+  //
+  // The schedule itself (`min(nextDueAt)`) is no longer a term (phase 51,
+  // #84): it moved on every probe that found NOTHING, and a heal pass after
+  // such a probe can only stand down again — a watched park is the watch
+  // scheduler's to resume. A ref that LANDS moves its state, which is in its
+  // phase's evidence.
   let soonest: number | null = null;
+  let fenceNext: number | null = null;
   for (const record of Object.values(run.phases)) {
     // Only phases the scheduler will actually probe. A row left on a phase that
     // has since gone `done` or `running` is never advanced by anybody, so its
@@ -432,6 +614,16 @@ export function evidenceFingerprint(
     // which is the exact "permanent spin" the latch's own comment below exists
     // to stop (QA F3). One list, two readers: `watch-scheduler.ts` skips these
     // phases and this skips their rows.
+    // A FENCE's own clock (control-tower phase 6, #19): the wall behind it
+    // lifts at its wait budget's end, and nothing else about the run changes
+    // at that instant — so the soonest FUTURE end is a term of its own, and
+    // its passing changes this string once, which is the heal pass that lifts
+    // the fence. A past end is not "due" for ever: a heal that cannot run
+    // (auto-recovery off) must not buy a pass a minute.
+    for (const holder of record.waitingOn ?? []) {
+      if (holder.kind !== 'fence' || typeof holder.until !== 'number' || holder.until <= now) continue;
+      if (fenceNext === null || holder.until < fenceNext) fenceNext = holder.until;
+    }
     if (!watchEligible(record)) continue;
     for (const row of record.watchState?.refs ?? []) {
       if (row.nextDueAt === undefined) continue;
@@ -442,10 +634,9 @@ export function evidenceFingerprint(
       if (soonest === null || row.nextDueAt < soonest) soonest = row.nextDueAt;
     }
   }
-  const watch = soonest === null ? ''
-    : soonest <= now ? `due@${Math.floor(now / 60_000)}`
-      : `next@${Math.floor(soonest / 60_000)}`;
-  return JSON.stringify([run.id, run.status, run.halt?.at ?? '', run.halt?.reason ?? '', run.resolved?.at ?? '', phases, held, gateStamp ?? '', words, verdicts, watch]);
+  const watch = soonest !== null && soonest <= now ? `due@${Math.floor(now / 60_000)}` : '';
+  const fence = fenceNext === null ? '' : `fence@${Math.floor(fenceNext / 60_000)}`;
+  return JSON.stringify([run.id, run.status, run.halt?.at ?? '', run.halt?.reason ?? '', run.resolved?.at ?? '', phases, gateStamp ?? '', verdicts, watch, accountsStamp ?? '', fence]);
 }
 
 export function resumeErrand(
@@ -696,6 +887,24 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   if (run.status === 'finished') return skip(run.id, 'the run is finished');
   if (run.status === 'queued') return skip(run.id, 'the run is queued — admission owns it');
   if (IN_FLIGHT.includes(run.status)) return skip(run.id, `the run reads ${run.status} under another process — not ours to touch`);
+  // A CLOSED plan's run is never woken, re-armed or re-boarded (CG-4) — not by
+  // a gate that cleared, not by a wait clock that went by, not by a press. It
+  // is settled once, and every later pass finds it settled. Above the clock on
+  // purpose: an overdue wait is a resume like any other. (Measured at the
+  // plan's second amendment: a superseded plan's run sat parked on a `cmd`
+  // gate that had cleared the day before; the gate wake below would have
+  // re-published a release from it.)
+  const closedStatus = facts.planStatus && isClosedPlanStatus(facts.planStatus) ? facts.planStatus : null;
+  if (closedStatus) {
+    if (run.resolved && run.status !== 'waiting' && run.status !== 'paused') {
+      return skip(run.id, `the plan is ${closedStatus} — its run is settled`);
+    }
+    actions.push({
+      kind: 'settle-closed', runId: run.id, status: closedStatus,
+      why: `the plan is ${closedStatus} — a closed plan's run is never woken, re-armed or re-boarded`,
+    });
+    return plan;
+  }
   // A run sleeping on a wait clock. While the clock is AHEAD the armed timer
   // owns the resume; once it is PAST — with a minute's grace for the timer's
   // own fire — a run still sleeping proves the timer is gone (a restart
@@ -727,6 +936,40 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   }
 
   const pressed = facts.trigger === 'button';
+  /* A stop about the PLAN is answered by the plan (control-tower phase 81, #97).
+   *
+   * A `plan-lint` stop is anchored on the phase whose handoff broke the lint,
+   * and that phase reads done by construction, so the board could only ever
+   * "supersede" it — which pinned the run below with the plan still red, and
+   * kept it pinned once the plan was fixed. The lint is what decides: clean
+   * relaunches, red keeps the run down and says what validate.sh said, and a
+   * lint that could not run decides nothing. Above the resolved pin, because an
+   * AUTOMATIC "superseded" is exactly the misreading this answers; and above
+   * "the board opened up" below, which relaunched such a stop with nothing
+   * asking the lint. A person's dismissal and an operator's stop still pin it —
+   * until their own press. */
+  const planHalt = run.status === 'halted' && isPlanHalt(run.halt?.kind) ? run.halt : null;
+  if (planHalt && (pressed || (!stoppedByOperator(run) && (!run.resolved || run.resolved.auto)))) {
+    const lint = facts.lint;
+    if (!lint || lint.timedOut || lint.crashed) {
+      return skip(run.id, `the ${planHalt.kind} stop waits on the plan's lint, which could not run`
+        + `${lint?.timedOut ? ' (it timed out)' : ''} — the next pass asks again`);
+    }
+    if (!lint.ok) {
+      return skip(run.id, `the plan still fails validate.sh: ${lint.summary.slice(0, 200)} — `
+        + `the ${planHalt.kind} stop stands until it lints clean`);
+    }
+    if (!facts.board) return skip(run.id, 'the board could not be read — nothing is decided on an empty board');
+    const asked = run.onlyPhases?.length ? new Set(run.onlyPhases) : null;
+    const open = Object.entries(facts.board)
+      .filter(([phase, word]) => word !== 'done' && (!asked || asked.has(Number(phase))));
+    if (!open.length) return skip(run.id, 'the plan lints clean and nothing remains on the board for this run');
+    actions.push({
+      kind: 'relaunch', runId: run.id, reboard: [], rearm: [],
+      why: [`the plan lints clean again — the ${planHalt.kind} stop is answered`],
+    });
+    return plan;
+  }
   if (!pressed && run.resolved) return skip(run.id, `the stop is resolved (${run.resolved.auto ? 'the board settled it' : 'a person dismissed it'}) — pinned`);
   if (!pressed && stoppedByOperator(run)) return skip(run.id, 'the operator stopped it — pinned until they continue it');
   // A halt only a person's press relaunches (RCV-3, RCV-1): the failure
@@ -737,16 +980,39 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   // still reach the HEALER below — the phases' own situations are classified
   // and their ladders climb, once per evidence — only the run-level relaunch
   // branches are closed to everything but `button`.
+  const lapseAnswered = !pressed && run.status === 'halted' && loginLapseAnswered(run, facts);
   const pressOnly = !pressed && run.status === 'halted'
-    && PRESS_ONLY_HALT_KINDS.includes(run.halt?.kind ?? '');
+    && PRESS_ONLY_HALT_KINDS.includes(run.halt?.kind ?? '') && !lapseAnswered;
   if (!facts.board) return skip(run.id, 'the board could not be read — nothing is decided on an empty board');
   const board = facts.board;
+  // The expired or signed-out login it stopped on works again, on the same
+  // identity (control-tower phase 91, #147): the stop is answered, and the run
+  // goes on without a press — its preflight judges the account afresh.
+  if (lapseAnswered && Object.values(board).some((word) => word !== 'done')) {
+    actions.push({
+      kind: 'relaunch', runId: run.id, reboard: [], rearm: [],
+      why: ['the login it stopped on works again — `claude auth status` and a usage read both succeeded since, on the identity the run started on'],
+    });
+    return plan;
+  }
 
   /* An orphaned session — a child that outlived the console that started it —
    * is the one parked shape with something still writing. While its pid lives
    * the loop waits; once it is gone the run can be started again, and the
    * runner's `adopt` settles the records it left. */
   const orphan = run.status === 'parked' && run.halt?.kind === 'orphaned-session';
+  /**
+   * The lanes an orphan left that ended CLEANLY (#23).
+   *
+   * `resumeOnRestart` was answered at launch as "if the console restarts
+   * mid-phase, may it resume my INTERRUPTED session?" — a question about work
+   * that was cut in half. A child that ran to its exit criteria, wrote
+   * `status: complete` in its handoff and declared through `PE_OUTCOME_FILE`
+   * was not interrupted: the board already reads its phase `done`, and holding
+   * the whole run for a press at that point asks a person to approve nothing.
+   * So this exempts the orphan from the restart gate — and only the orphan.
+   */
+  const orphanClosed: number[] = [];
   if (orphan) {
     // The four-valued probe when a caller supplies one; otherwise derived from
     // the boolean seam, so every existing caller (and every test that injects
@@ -771,6 +1037,14 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
           + 'nothing will resume it on its own. Continue or stop it from the run\'s halt card.'
         : `${stopped.length} sessions from an earlier console are STOPPED, not running — nothing will `
           + 'resume them on their own. Continue or stop them from the run\'s halt card.');
+    }
+    // Every lane gone, and every one of them finished: the board says so, or
+    // the lane's own armed declaration does (#21 §3 — the file survives its
+    // writer, and the board catches up a commit later). ALL of them, because
+    // one lane still open is a run that was interrupted.
+    if (states.length && states.every(({ child }) => board[child.phase] === 'done'
+      || facts.declaredOutcome?.(run.id, child.phase) === 'complete')) {
+      orphanClosed.push(...states.map(({ child }) => child.phase));
     }
   }
 
@@ -827,7 +1101,10 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
   const counted: { phase: number; path: ResumePath; sessionId?: string }[] = [];
   const why: string[] = [];
   const decision = facts.resumeDecision?.(run.id) ?? null;
-  if ((!pressOnly && killed.length) || orphan || (!pressOnly && systemStop && remaining.length)) {
+  // The orphan is exempt from the restart gate exactly when it finished (#23);
+  // a lane whose phase is still open is what the gate was written for.
+  const orphanGated = orphan && !orphanClosed.length;
+  if ((!pressOnly && killed.length) || orphanGated || (!pressOnly && systemStop && remaining.length)) {
     // Three answers, and the middle one is the default. `ask` neither launches
     // nor writes an errand — an errand is a job for a person, and "shall I
     // carry on?" is a question. It is asked once per console boot, in the app,
@@ -954,6 +1231,7 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     actions.push({
       kind: 'relaunch', runId: run.id, reboard, rearm, why,
       ...(counted.length ? { counted } : {}),
+      ...(orphanClosed.length ? { closedByOrphan: orphanClosed } : {}),
       ...(decision === 'continue' ? { decided: true as const } : {}),
     });
     return plan;
@@ -977,10 +1255,43 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     && !stoppedByOperator(run) && !run.resolved && !pressOnly) {
     const readyNow = remaining.filter((p) => board[p] === 'ready');
     const boarded = new Set(Object.keys(run.phases).map(Number));
-    if (readyNow.length && readyNow.some((p) => !boarded.has(p))) {
+    const neverBoarded = readyNow.some((p) => !boarded.has(p));
+    /* …and a BOARDED phase whose record reads `gated` and whose gate the
+     * engine now answers clear (#48). `gated` is settled to the runner — a
+     * bare start never picks it up again — and its board word is whatever its
+     * handoff says (`in-progress` for a phase that ran before its gate was
+     * added), never necessarily `ready`, so the branch above could not see it.
+     * The re-board is asked for by name and counted like every automatic
+     * resume: a gate that reads clear here and blocked at boarding is bounded
+     * by the same per-phase cap as any other wake. */
+    const gateCleared = remaining.filter((p) => run.phases[String(p)]?.status === 'gated' && facts.gates?.[p] === 'clear');
+    if (neverBoarded || gateCleared.length) {
+      const reboard: ReboardRequest[] = [];
+      const counted: { phase: number; path: ResumePath; sessionId?: string }[] = [];
+      for (const phase of gateCleared) {
+        const record = run.phases[String(phase)]!;
+        const count = automaticResumes(run, phase);
+        if (automaticResumeGate({ prefs: facts.prefs, decision: null, restartCaused: false, count, run }) === 'capped') {
+          actions.push({
+            kind: 'errand', runId: run.id, phase,
+            errand: resumeErrand(phase, at, 'capped', record.resumeSessionId),
+            why: `resumed ${count} times automatically`,
+          });
+          return plan;
+        }
+        const sessionId = record.resumeSessionId;
+        reboard.push({
+          phase, situation: 'waiting-external', rung: sessionId ? 'resume-own-session' : 'reboard-fresh',
+          ...(sessionId ? { sessionId } : {}), by: 'converge',
+        });
+        counted.push({ phase, path: 'gate-cleared', ...(sessionId ? { sessionId } : {}) });
+      }
+      const why: string[] = [];
+      if (neverBoarded) why.push(`the board has ready work again (phase ${readyNow.join(', ')}) and this run never boarded it`);
+      if (gateCleared.length) why.push(`the gate on phase ${gateCleared.join(', ')} now reads clear`);
       actions.push({
-        kind: 'relaunch', runId: run.id, reboard: [], rearm: [],
-        why: [`the board has ready work again (phase ${readyNow.join(', ')}) and this run never boarded it`],
+        kind: 'relaunch', runId: run.id, reboard, rearm: [], why,
+        ...(counted.length ? { counted } : {}),
       });
       return plan;
     }
@@ -990,7 +1301,7 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
    * from before `stoppedBy` existed — goes to the healer: classify the open
    * phases, climb one rung, drive it through the runner. Once per evidence. */
   if (run.status === 'halted' || run.status === 'interrupted' || run.status === 'parked' || run.status === 'paused') {
-    const fingerprint = evidenceFingerprint(run, board, facts.locks, facts.gateStamp, facts.qa);
+    const fingerprint = evidenceFingerprint(run, board, facts.locks, facts.gateStamp, facts.qa, undefined, facts.accountsStamp, facts.gates);
     // The latch is the scheduler's for this process, else the RUN's — persisted
     // by the last heal that found nothing, so a restart does not heal the same
     // evidence again (SLF-7).
@@ -998,7 +1309,10 @@ export function planConvergence(facts: ConvergeFacts): ConvergePlan {
     if (!pressed && latch === fingerprint) {
       return skip(run.id, 'nothing has changed since the last pass found nothing to climb');
     }
-    actions.push({ kind: 'heal', runId: run.id, fingerprint, why: `the run reads ${run.status}${run.halt ? ` — ${run.halt.reason.slice(0, 100)}` : ''}` });
+    actions.push({
+      kind: 'heal', runId: run.id, fingerprint, why: `the run reads ${run.status}${run.halt ? ` — ${run.halt.reason.slice(0, 100)}` : ''}`,
+      ...(facts.gates ? { gates: facts.gates } : {}),
+    });
     return plan;
   }
   return skip(run.id, `the run reads ${run.status} — nothing to converge`);
@@ -1031,9 +1345,25 @@ export type ConvergeDeps = {
   laneFree?: () => boolean;
   /** `gate-status.md`'s stamp for the plan — see `ConvergeFacts.gateStamp`. */
   gateStamp?: (slug: string) => string | null;
+  /** The accounts breaker's stamp — see `ConvergeFacts.accountsStamp`. */
+  accountsStamp?: () => string | null;
   /** The board's QA verdicts — see `ConvergeFacts.qa`. */
   qa?: (slug: string) => Promise<Record<number, string> | null> | Record<number, string> | null;
+  /**
+   * The verdicts of the AUTOMATIC gates among `phases` (the latest run's
+   * outstanding ones) — see `ConvergeFacts.gates`. Read FRESH: a cross-plan
+   * gate moves with another plan's files, so an answer cached on this plan's
+   * revision is exactly the stale one #48 was about. A phase with no automatic
+   * gate is simply absent from the answer.
+   */
+  gates?: (slug: string, phases: number[]) => Promise<Record<number, string>> | Record<number, string>;
+  /** The plan's lint — see `ConvergeFacts.lint`. Asked only for a stop about the plan. */
+  lint?: (slug: string) => Promise<LintResult | null> | LintResult | null;
+  /** The plan's frontmatter status — see `ConvergeFacts.planStatus`. */
+  planStatus?: (slug: string) => string | null;
   prefs: () => { resumeAtBoot?: boolean | string };
+  /** `ConvergeFacts.loginRestored` — the service's `loginRestoredFor` (control-tower phase 91). */
+  loginRestored?: (run: RunState) => boolean;
   resumeDecision?: (runId: string) => 'continue' | 'dismiss' | null;
   /** Register that this run is waiting on the operator's boot answer. */
   /**
@@ -1057,6 +1387,16 @@ export type ConvergeDeps = {
    * a process to wait for, it is a process nothing will ever resume.
    */
   processState?: (pid: number) => ProcessState;
+  /**
+   * What a phase's ARMED outcome file says, when a declaration is still in it
+   * (#21 §3, #23).
+   *
+   * An orphan declares and exits like any other session, and its file outlives
+   * it — so "did this lane finish?" is answerable a commit before the board
+   * says so. Absent means the board alone answers, which is the conservative
+   * direction: a person is asked where they might not have needed to be.
+   */
+  declaredOutcome?: (slug: string, runId: string, phase: number) => string | null;
   /** The session registry's presence for a lock's session — see `ConvergeFacts.presence`. */
   presence?: (lock: LockView) => Presence;
   /**
@@ -1065,7 +1405,7 @@ export type ConvergeDeps = {
    * `phase.situation` and `phase.rung` with them, and writes no situation
    * line for a phase whose situation the same fingerprint already produced.
    */
-  heal: (slug: string, pass?: { trigger: ConvergeTrigger; fingerprint: string }) => Promise<HealResult>;
+  heal: (slug: string, pass?: { trigger: ConvergeTrigger; fingerprint: string; gates?: Record<number, string> }) => Promise<HealResult>;
   startRun: (slug: string, options: {
     actor: StartActor; resumeRunId: string; reboard?: ReboardRequest[]; onlyPhases?: number[]; skills?: string[];
   }) => Promise<unknown>;
@@ -1191,6 +1531,14 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
         const at = new Date(deps.now?.() ?? Date.now()).toISOString();
         /** The highest per-phase resume count this launch reached — the counter `run.start` names. */
         let counted = 0;
+        // Why this launch needed no press (#23). Written BEFORE the edit, so a
+        // relaunch that fails to start still leaves the reason on the record:
+        // the phase was closed by the session that outlived the console, and
+        // the run's `resumeOnRestart: false` was never about that.
+        for (const phase of action.closedByOrphan ?? []) {
+          deps.journal(slug, action.runId, 'phase.reconciled',
+            { by: 'the board', outcome: 'done', closedBy: 'orphan', trigger }, phase);
+        }
         const edited = deps.editRun(slug, action.runId, (state) => {
           for (const phase of action.rearm) {
             const record = state.phases[String(phase)];
@@ -1207,8 +1555,12 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
           // per-phase bound and journalled with what woke it and which path it
           // took (LFC-7). A wait's resumes are counted by its own vehicle
           // (`resumeWait`), which knows whether the ruling let it launch.
+          // A re-board the plan COUNTED under its own path (a gate that
+          // cleared) is counted there, once — it is not a killed lane.
+          const ownPath = new Set((action.counted ?? []).map((entry) => entry.phase));
           const resumes: { phase: number; path: ResumePath; sessionId: string | null; brief?: string }[] = [
-            ...action.reboard.map((ask) => ({ phase: ask.phase, path: 'killed-lane' as const, sessionId: ask.sessionId ?? null, brief: ask.brief })),
+            ...action.reboard.filter((ask) => !ownPath.has(ask.phase))
+              .map((ask) => ({ phase: ask.phase, path: 'killed-lane' as const, sessionId: ask.sessionId ?? null, brief: ask.brief })),
             ...(action.counted ?? []).map((entry) => ({ phase: entry.phase, path: entry.path, sessionId: entry.sessionId ?? null })),
             ...(action.wait && !deps.resumeWait
               ? action.wait.phases.map((phase) => ({
@@ -1272,9 +1624,35 @@ export async function executeConvergence(plan: ConvergePlan, deps: ConvergeDeps)
         break;
       }
 
+      case 'settle-closed': {
+        // Stopped where it stands and pinned: `halted` is a status nothing
+        // resumes by itself, `resolved` is what every later pass reads as
+        // settled, and a wait clock is dropped so no re-arm finds it.
+        let was: string | null = null;
+        const edited = deps.editRun(slug, action.runId, (state) => {
+          was = state.status;
+          if (state.status !== 'halted' && state.status !== 'interrupted') setRunState(state, 'halted');
+          state.stoppedBy = 'system';
+          state.waitUntil = null;
+          state.resolved = {
+            at: new Date(deps.now?.() ?? Date.now()).toISOString(), auto: true,
+            reason: `the plan is ${action.status} — a closed plan's run is not driven again`,
+          };
+          delete state.errand;
+        });
+        deps.journal(slug, action.runId, 'run.closed-plan', { status: action.status, was, trigger, by: 'converge' });
+        touched.add(action.runId);
+        outcomes.push({ action, ok: Boolean(edited) });
+        break;
+      }
+
       case 'heal': {
         let result: HealResult;
-        try { result = await deps.heal(slug, { trigger, fingerprint: action.fingerprint }); } catch (error) {
+        try {
+          result = await deps.heal(slug, {
+            trigger, fingerprint: action.fingerprint, ...(action.gates ? { gates: action.gates } : {}),
+          });
+        } catch (error) {
           result = { launched: false, reason: (error as Error)?.message ?? String(error) };
         }
         if (result.launched) { launched = true; noop = null; } else noop = action.fingerprint;
@@ -1310,20 +1688,51 @@ export async function convergePlan(
   const runs = await deps.runs(slug);
   // No runs: nothing to converge, and no board read spent finding that out.
   const board = runs.length ? await deps.board(slug) : null;
+  const live = deps.live();
+  // The automatic gates' verdicts, for the latest run's outstanding phases
+  // only, and only when a pass could act on them: a live run's own loop reads
+  // its gates at boarding, and a finished one has nothing outstanding. A phase
+  // the board still reads `waiting` cannot board whatever its gate says, and
+  // turning `ready` is itself a change of its evidence — its gate is read on
+  // that pass, so reading it now would only spend a `cmd` gate's command.
+  const latest = latestOf(runs);
+  const planStatus = deps.planStatus?.(slug) ?? null;
+  let gates: Record<number, string> | null = null;
+  if (deps.gates && board && latest && !live.has(latest.id) && latest.status !== 'finished' && !isClosedPlanStatus(planStatus)) {
+    const outstanding = outstandingPhases(latest, board).filter((p) => board[p] !== 'waiting');
+    if (outstanding.length) {
+      try { gates = await deps.gates(slug, outstanding); } catch { gates = null; }
+    }
+  }
+  // The lint, for a stop about the plan only (control-tower phase 81, #97):
+  // every other pass leaves `validate.sh` unasked.
+  let lint: LintResult | null = null;
+  if (deps.lint && latest && !live.has(latest.id) && latest.status === 'halted' && isPlanHalt(latest.halt?.kind)
+    && !isClosedPlanStatus(planStatus)) {
+    try { lint = await deps.lint(slug); } catch { lint = null; }
+  }
   const facts: ConvergeFacts = {
     slug, now, trigger, board, runs,
-    live: deps.live(),
+    live,
+    gates,
+    ...(lint ? { lint } : {}),
+    planStatus,
     locks: deps.locks(slug),
     ...(deps.laneFree ? { laneFree: deps.laneFree } : {}),
     gateStamp: deps.gateStamp?.(slug) ?? null,
+    accountsStamp: deps.accountsStamp?.() ?? null,
     qa: (deps.qa ? await deps.qa(slug) : null) ?? null,
     prefs: deps.prefs(),
     // The operator's boot answer. This dep existed and was never forwarded, so
     // answering "continue" re-registered the same question and launched
     // nothing — an ask with no way to say yes.
     ...(deps.resumeDecision ? { resumeDecision: deps.resumeDecision } : {}),
+    ...(deps.loginRestored ? { loginRestored: deps.loginRestored } : {}),
     ...(deps.pidAlive ? { pidAlive: deps.pidAlive } : {}),
     ...(deps.presence ? { presence: deps.presence } : {}),
+    ...(deps.declaredOutcome
+      ? { declaredOutcome: (runId: string, phase: number) => deps.declaredOutcome!(slug, runId, phase) }
+      : {}),
     lastNoop,
   };
   const plan = planConvergence(facts);
@@ -1369,7 +1778,7 @@ export type ConvergeSchedulerDeps = {
    * hands, and a Recover & continue that silently did nothing would be the
    * console lying to the person holding it. It journals why instead.
    */
-  fleetHold?: () => { at: string; by?: string } | null | undefined;
+  fleetHold?: () => { at: string; by?: string; plans?: readonly string[] } | null | undefined;
 };
 
 type Pending = { handle: unknown; dueAt: number; trigger: ConvergeTrigger };
@@ -1519,9 +1928,11 @@ export class ConvergeScheduler {
     //
     // The operator's press goes through — see `ConvergeSchedulerDeps.fleetHold`.
     if (trigger !== 'button') {
-      let hold: { at: string; by?: string } | null | undefined;
+      let hold: { at: string; by?: string; plans?: readonly string[] } | null | undefined;
       try { hold = this.deps.fleetHold?.(); } catch { hold = null; }
-      if (hold) {
+      // A restart waiting for its lanes binds only the plans that meet their
+      // scope (control-tower phase 48, #70); every other plan converges.
+      if (hold && holdBinds(hold, slug)) {
         log.info('converge.frozen', { slug, trigger, by: hold.by ?? null, at: hold.at });
         return Promise.resolve(null);
       }

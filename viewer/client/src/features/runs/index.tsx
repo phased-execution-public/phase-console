@@ -49,14 +49,16 @@ import {
   useApprovals,
   useAuth,
   useConsoleState,
+  useConverge,
   usePlans,
   useQueue,
   useRuns,
 } from '@/lib/queries';
 import { usePrefs } from '@/lib/prefs';
 import { relativeTime } from '@/lib/format';
-import { Button, Card, Chip, Empty, PageError, Skeleton, toast } from '@/components/ui';
-import { ApprovalQueue, type Answer, type Decide } from './approvals';
+import { Button, Badge, Empty, PageError, Skeleton, toast } from '@/components/ui';
+import { ApprovalQueue, type Answer, type Decide, type Extend } from './approvals';
+import { UndrivenCard } from './undriven';
 
 /**
  * What answering one approval card takes, named off the callback's own type —
@@ -76,24 +78,17 @@ import { LanePane } from './pane-host';
 import { SessionPanes, crossLaneId, laneOf, type Lane } from './session-panes';
 import { AuthCard, StaleServerNote, looksLikeAuthFailure } from './status-strip';
 import { Page } from '@/components/page';
-import { Controls } from './fleet-toolbar';
-import { LiveStrip } from './live-strip';
-import { BoardToggle, RunsBoard } from './board';
-import { plansHref, runsHref, runsViewOf, type RunsView, type Route } from '@/app/routes';
+import { bindingHoldOf, type FleetHoldView } from '@/components/fleet-freeze';
+import { BoardToggle } from './board';
+import { Tower } from './tower/tower';
+import { useTower } from './tower/use-tower';
+import { plansHref, runsBayOf, runsHref, runsViewOf, type RunsView, type Route } from '@/app/routes';
 import { useNavigate } from '@/app/router';
-import { nowLanes } from '@/features/now/model';
+import { nowLanes } from '@/features/runs/lanes-model';
 import { isClosed } from '@/lib/closure';
 import {
-  NO_FILTERS,
-  applyFilters,
-  isSortId,
-  outcomeCounts,
   partitionClosed,
-  planOptions,
-  sortRows,
   toRows,
-  type Filters,
-  type SortId,
 } from './model';
 
 export default function RunsView({ route }: { route?: Route }) {
@@ -117,7 +112,10 @@ export default function RunsView({ route }: { route?: Route }) {
   const VIEWS: RunsView[] = [
     'board',
   ];
-  const asked: RunsView = (route ? runsViewOf(route) : undefined) ?? prefs.runsView;
+  // `?bay=` names a bay of the Tower, so it asks for the Tower for this visit
+  // exactly as `?view=board` does (control-tower phase 20).
+  const bay = route ? runsBayOf(route) : undefined;
+  const asked: RunsView = (route ? runsViewOf(route) : undefined) ?? (bay ? 'board' : prefs.runsView);
   const view: RunsView = VIEWS.includes(asked) ? asked : 'board';
   const go = useNavigate();
 
@@ -139,11 +137,13 @@ export default function RunsView({ route }: { route?: Route }) {
   // `FleetTiles`. Held here so the tiles stay a pure render of what they are
   // given, which is what lets them be tested without a query client.
   const { data: queue } = useApprovals(enabled);
+  // What an empty Needs-you bay says about the loop's next look (Now said it
+  // until 6.0) — read only while the Tower is the shape on screen.
+  const { data: converge } = useConverge(enabled && view === 'board');
   const { data: auth } = useAuth(enabled);
 
   const [watchId, setWatchId] = useState<string | undefined>();
   const [tab, setTab] = useState<string | undefined>();
-  const [local, setLocal] = useState({ query: '', plan: '' });
 
   // The run worth watching: whichever one you picked, else the live one, else
   // the most recent. `useRuns` returns them newest-first, so `[0]` is the
@@ -225,6 +225,22 @@ export default function RunsView({ route }: { route?: Route }) {
     (id, decision, reason, remember, rule) => answerCard({ id, decision, reason, remember, rule }),
     [answerCard],
   );
+  // Not yet (control-tower phase 97, #140). The toast says which of the two
+  // things happened: the deadline moved, or the card will stand past its hook.
+  const { mutate: extendCard } = useApiMutation<
+    { id: string; minutes: number },
+    Awaited<ReturnType<typeof api.extend>>
+  >({
+    fn: ({ id, minutes }) => api.extend(id, minutes),
+    invalidates: keys.afterInboxAct(),
+    onDone: (result, { minutes }) => {
+      if (!result?.ok) toast(result?.error ?? 'the card could not be extended', 'warn');
+      else if (result.standing)
+        toast('Extended — past its hook call the card stands; allowing it then resumes the phase', 'ok');
+      else toast(`Extended ${minutes >= 60 ? `${minutes / 60} h` : `${minutes} min`}`, 'ok');
+    },
+  });
+  const extend: Extend = useCallback((id, minutes) => extendCard({ id, minutes }), [extendCard]);
   // A pick on a relayed question (phase 14) — the same invalidation bundle as a
   // card's answer, since it takes a card down too.
   const pick = useApiMutation<
@@ -252,7 +268,11 @@ export default function RunsView({ route }: { route?: Route }) {
 
   /* ---------------- the fleet ---------------- */
 
-  const all = useMemo(() => toRows(runs ?? []), [runs]);
+  // A stopped run's promise to continue is read through the hold binding the
+  // console now — a freeze is named instead of "it continues by itself" (#93).
+  // Keyed by its words, so a poll that re-reads the same hold keeps the rows.
+  const holdKey = JSON.stringify(bindingHoldOf(state));
+  const all = useMemo(() => toRows(runs ?? [], JSON.parse(holdKey) as FleetHoldView | null), [runs, holdKey]);
   // The plans list feeds two different needs here: the repo chips below, and
   // the closure cut — runs of a closed plan are history, not fleet, and are
   // hidden until the toolbar's "Show closed plans" reveals them.
@@ -262,17 +282,10 @@ export default function RunsView({ route }: { route?: Route }) {
     [summaries],
   );
   const cut = useMemo(() => partitionClosed(all, closedSlugs), [all, closedSlugs]);
-  // Everything downstream — chips, counts, tiles, grouping, the hidden note —
-  // reads the closure-cut base, so no number counts a row the table hides.
+  // Everything downstream — the ledger's filters, tiles and groups, and the
+  // count of what the cut holds back — reads the closure-cut base, so no
+  // number counts a row the table hides.
   const base = prefs.runsShowClosed ? all : cut.open;
-  const filters: Filters = useMemo(
-    () => ({ ...local, outcome: prefs.runsOutcome ?? '' }),
-    [local, prefs.runsOutcome],
-  );
-  const sortId: SortId = isSortId(prefs.runsSort) ? prefs.runsSort : 'updated';
-  const visible = useMemo(() => sortRows(applyFilters(base, filters), sortId), [base, filters, sortId]);
-  const counts = useMemo(() => outcomeCounts(base), [base]);
-  const plans = useMemo(() => planOptions(base), [base]);
 
   /**
    * Change the shape, and stop the address arguing with the preference.
@@ -291,11 +304,20 @@ export default function RunsView({ route }: { route?: Route }) {
     [setPrefs, route, go],
   );
 
-  const onFilters = (patch: Partial<Filters>) => {
-    const { outcome, ...rest } = patch;
-    if (outcome !== undefined) setPrefs({ runsOutcome: outcome });
-    if (Object.keys(rest).length) setLocal((current) => ({ ...current, ...rest }));
-  };
+  /**
+   * The Tower's ONE fold (control-tower phase 20) — the bays below and the
+   * situation line in the page's header read the same model. The inbox is read
+   * whichever shape is showing (the shell's bell already holds it); the Ready
+   * bay's plan details, one engine read each, only while the Tower is drawn.
+   */
+  const tower = useTower({
+    runs: runs ?? [],
+    lanes: stripLanes,
+    entries: admission?.entries,
+    plans: summaries ?? [],
+    enabled,
+    details: enabled && view === 'board',
+  });
 
   /* ---------------- the branches ---------------- */
 
@@ -328,29 +350,27 @@ export default function RunsView({ route }: { route?: Route }) {
   }
 
   return (
+    // The situation line is the header's since 6.0 (control-tower phase 21):
+    // it sits above this title on every page, so the page does not say it twice.
     <Page
       title="Runs"
-      subtitle={
-        active
-          ? `${active.slug} is running — phase ${active.activePhase ?? '?'}`
-          : 'Nothing running right now'
-      }
-      actions={approvals.length ? <Chip tone="warn">{approvals.length} waiting on you</Chip> : undefined}
+      actions={approvals.length ? <Badge tone="accent">{approvals.length} waiting on you</Badge> : undefined}
     >
       <div className="flex flex-col gap-4">
-        {/* The vital signs, one glance high — a status line, not a workload
-            item, which is why it sits above even the approval queue: its
-            needs-you chip points DOWN at the queue and the fleet. */}
-        <LiveStrip lanes={stripLanes} />
-
         {/* Then, always: a session parked with its hand up is the first thing
             on this page that is waiting on a person. */}
         <ApprovalQueue
           approvals={approvals}
           allowRun={allowRun}
           onDecide={decide}
+          onExtend={extend}
           onAnswer={answerQuestion}
         />
+
+        {/* Beside it, the other ask only a person answers: a phase the board
+            reads in progress that nothing of its live run drives (#114). */}
+        <UndrivenCard runs={runs ?? []} allowRun={allowRun} />
+
 
         {looksLikeAuthFailure(active ?? null, auth) && (
           <AuthCard
@@ -363,6 +383,48 @@ export default function RunsView({ route }: { route?: Route }) {
           />
         )}
 
+        {base.length || cut.closed.length || (view === 'board' && tower.model.ready.length) ? (
+          <section className="flex flex-col gap-3" aria-label="This console's runs">
+            {/* The switch, in BOTH shapes — a toggle only reachable from one
+                side of itself is a trap door. The Tower draws it at the end of
+                its own toolbar row. */}
+            {view !== 'board' && (
+              <div className="flex items-center justify-end">
+                <BoardToggle view={view} onView={onView} />
+              </div>
+            )}
+            {view === 'board' && (
+              <Tower
+                model={tower.model}
+                state={state}
+                entries={admission?.entries}
+                advice={admission?.advice}
+                allowRun={allowRun}
+                focus={bay}
+                readyLoading={tower.readyLoading}
+                switcher={<BoardToggle view={view} onView={onView} />}
+                totalRuns={all.length}
+                converge={converge}
+              />
+            )}
+            {/* The ledger is the Pro tree's second shape (control-tower phase
+                21: `DataTable`'s `runs-ledger`); the free tree has only the
+                Tower, so this is one whole marker region. */}
+          </section>
+        ) : (
+          <Empty
+            title="No runs yet"
+            body="Open a plan and use its Autopilot tab to start one. Runs are recorded outside the repository, so nothing here shows up in git status."
+            action={
+              <Button size="sm" variant="action" asChild>
+                <a href={plansHref()}>Pick a plan to run</a>
+              </Button>
+            }
+          />
+        )}
+
+        {/* The sessions themselves, below the Tower: the bays answer "does
+            anything need me", and a transcript is what you read once you know. */}
         {consoleOpen ? (
           <div className="flex flex-col gap-3">
             {replaying ? (
@@ -408,91 +470,6 @@ export default function RunsView({ route }: { route?: Route }) {
           </div>
         ) : (
           <IdleConsole run={watching} onOpen={() => setPrefs({ runsConsole: true })} />
-        )}
-
-        {base.length || cut.closed.length ? (
-          <section className="flex flex-col gap-3" aria-label="This console's runs">
-            {/* The switch, in BOTH shapes — a toggle only reachable from one
-                side of itself is a trap door. */}
-            <div className="flex items-center justify-end">
-              <BoardToggle view={view} onView={onView} />
-            </div>
-            {view === 'board' ? (
-              <RunsBoard
-                runs={runs ?? []}
-                state={state}
-                entries={admission?.entries}
-                advice={admission?.advice}
-                allowRun={allowRun}
-                totalRuns={all.length}
-              />
-            ) : (
-              <>
-                <Card className="p-3">
-                  <Controls
-                    sortId={sortId}
-                    onSort={(id) => setPrefs({ runsSort: id })}
-                    filters={filters}
-                    onFilters={onFilters}
-                    grouped={Boolean(prefs.runsGroup)}
-                    onGrouped={(value) => setPrefs({ runsGroup: value })}
-                    counts={counts}
-                    plans={plans}
-                    hidden={base.length - visible.length}
-                    showClosed={Boolean(prefs.runsShowClosed)}
-                    onShowClosed={(value) => setPrefs({ runsShowClosed: value })}
-                    hiddenClosed={prefs.runsShowClosed ? 0 : cut.closed.length}
-                  />
-                </Card>
-                {/* Two conditionals rather than one ternary, so the Pro half is
-                    a whole marker region: exactly one of them still renders,
-                    and the free tree keeps the empty state it would otherwise
-                    have lost with the table. */}
-                {!visible.length && (
-                  <Empty
-                    title="No run matches"
-                    body={
-                      base.length
-                        ? `This console holds ${base.length} run${base.length === 1 ? '' : 's'}. Widen the filters to see them.`
-                        : `${cut.closed.length} run${cut.closed.length === 1 ? '' : 's'} belong${cut.closed.length === 1 ? 's' : ''} to closed plans.`
-                    }
-                    action={
-                      base.length ? (
-                        <button
-                          type="button"
-                          className="text-sm text-action hover:underline"
-                          onClick={() => {
-                            setLocal({ query: '', plan: '' });
-                            setPrefs({ runsOutcome: NO_FILTERS.outcome });
-                          }}
-                        >
-                          Clear the filters
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="text-sm text-action hover:underline"
-                          onClick={() => setPrefs({ runsShowClosed: true })}
-                        >
-                          Show closed plans
-                        </button>
-                      )
-                    }
-                  />
-                )}
-              </>
-            )}
-          </section>
-        ) : (
-          <Empty
-            title="No runs yet"
-            body="Open a plan and use its Autopilot tab to start one. Runs are recorded outside the repository, so nothing here shows up in git status."
-            action={
-              <Button size="sm" variant="action" asChild>
-                <a href={plansHref()}>Pick a plan to run</a>
-              </Button>
-            }
-          />
         )}
       </div>
     </Page>

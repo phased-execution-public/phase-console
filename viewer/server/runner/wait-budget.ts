@@ -35,7 +35,11 @@
  */
 
 import type { PhaseRecord } from './state.ts';
+import type { PhaseOutcome } from './outcome.ts';
 import type { WaitAuthor as WaitAuthorWord } from '../../shared/run-lifecycle.js';
+import {
+  BUDGET_WARN_PCT, budgetArithmetic, budgetFact, type BudgetFact, type BudgetKind,
+} from '../../shared/budget-model.js';
 
 /* ---- the knobs (console-runtime; bash never reads them) ------------------ */
 
@@ -185,7 +189,42 @@ export type WaitEntry = {
   /** When the park ended — resumed, superseded, closed. Absent while it holds. */
   resumedAt?: string;
   by: WaitAuthor;
+  /**
+   * A park on refs read from this console's own state alone (`spendsWaitBudget`
+   * false, control-tower phase 87): shown in the history, never summed into the
+   * budget — the thing waited on is another phase's work, which the queue, not
+   * the clock, decides.
+   */
+  unbudgeted?: true;
+  /**
+   * What the park waits on, when it is not somebody else's clock: `person` —
+   * a declared human step (control-tower phase 41, `parkOnStep`). Always
+   * UNBUDGETED: a person's time is not the external-wait budget's to charge.
+   */
+  kind?: 'person';
 };
+
+/**
+ * Watch-ref schemes read from THIS console's own state (control-tower phase
+ * 87, #126): `phase:<slug>/<N>` — a sibling phase's completion — and
+ * `verify:<slug>/<N>` — a phase's own red lines going green — both parsed and
+ * probed by phase 88. Waiting on one spends no wait budget: #126 measured P41's
+ * eight hours running down while the sibling it waited on had not yet had a
+ * lane, and the budget ended before the sibling began. A `cmd:` ref keeps its
+ * budget — it RUNS something on every pass — as do `gh:`, `date:` and `lock:`.
+ */
+export const BUDGET_FREE_SCHEMES = Object.freeze(['phase', 'verify'] as const);
+
+/**
+ * Does a park on these refs spend the phase's wait budget? True unless every
+ * ref is read from console state (`BUDGET_FREE_SCHEMES`) — and true for a park
+ * naming none, whose clock is the only thing ending it.
+ */
+export function spendsWaitBudget(refs: readonly string[] | null | undefined): boolean {
+  const list = (refs ?? []).map((ref) => ref.trim()).filter(Boolean);
+  if (!list.length) return true;
+  return list.some((ref) => !(BUDGET_FREE_SCHEMES as readonly string[]).includes(ref.slice(0, Math.max(0, ref.indexOf(':')))));
+}
 
 /** Where a phase's allowance came from. */
 export type WaitBudgetSource = 'phase' | 'plan' | 'default';
@@ -225,6 +264,18 @@ export type WaitAsk = {
   defaultWindowMs?: number;
   /** The declaration's own `date:` refs, as `[ref, instant]` — a date later than the window extends the park to it. */
   dates?: readonly (readonly [string, number])[];
+  /**
+   * Does the declaration name at least one ref the watch clock can POLL
+   * (`pollableRefs(...).length > 0`)? Then a window past the budget is granted
+   * what is left rather than refused (rule 7): the ref's landing, not the
+   * window, is what ends the wait. Passed in, so this leaf imports nothing.
+   */
+  pollable?: boolean;
+  /**
+   * Does the declaration wait on console state alone (`spendsWaitBudget`
+   * false)? Then the park is granted as asked and spends nothing (rule 0).
+   */
+  unbudgeted?: boolean;
 };
 
 export type WaitGrant = {
@@ -234,7 +285,11 @@ export type WaitGrant = {
   requestedSource: 'declared' | 'default';
   /** Milliseconds granted from `now`. */
   granted: number;
-  /** True only when a DEFAULT window was shortened to what was left — never a declared one. */
+  /**
+   * True when the window was shortened to what was left of the budget: a
+   * DEFAULT window (rule 6), or a declared one naming a pollable ref (rule 7,
+   * control-tower phase 45) — never a declared window nothing can end sooner.
+   */
   capped: boolean;
   budgetMs: number;
   budgetSource: WaitBudgetSource;
@@ -276,6 +331,7 @@ export type WaitVerdict = WaitGrant | WaitRefusal | WaitResume;
 /* ---- the one expression ------------------------------------------------- */
 
 const HOUR = 60 * 60_000;
+const MINUTE = 60_000;
 
 /** Hours for a sentence: one decimal under ten, whole above. */
 export function hoursText(ms: number): string {
@@ -309,7 +365,14 @@ const SOURCE_WORDS: Record<WaitBudgetSource, string> = {
  *     at or after the ask) is granted as asked.
  *  6. Past it with no countersign, a DEFAULT window is shortened to what is
  *     left (`capped`) — the session named no window to cut.
- *  7. Past it, a DECLARED window is refused with the arithmetic. Never cut.
+ *  7. Past it, a DECLARED window naming a POLLABLE ref is granted
+ *     `min(asked, remaining)` (`capped`) — the ref's landing decides, not the
+ *     window (control-tower phase 45, #59: an all-or-nothing refusal halted one
+ *     phase three times while the builds it waited on finished inside the
+ *     remainder). With no pollable ref, or less than the floor left, it is
+ *     refused with the arithmetic — and a refusal is a BUDGET event: the runner
+ *     parks the phase `waiting` on its refs with a `budgets` errand
+ *     (`parkOnSpentBudget`), never a failure.
  *
  * At resume (`purpose: 'resume'`) only the allowance is asked: a declared park
  * whose parked time is past the budget — the console's own outage counts, it is
@@ -363,6 +426,15 @@ export function evaluateWait(ask: WaitAsk): WaitVerdict {
     };
   }
   const wanted = requested - ask.now;
+  // Rule 0 (control-tower phase 87, #126): a wait on this console's own state
+  // (a sibling's completion, a phase's red lines) is granted as asked and
+  // spends nothing — its end is the queue's to decide, not the clock's.
+  if (ask.unbudgeted) {
+    return {
+      verdict: 'park', until: requested, granted: wanted, capped: false, ...base,
+      ...(extendedBy ? { extendedBy } : {}),
+    };
+  }
   if (budgetRemainingMs >= floor && wanted <= budgetRemainingMs) {
     return {
       verdict: 'park', until: requested, granted: wanted, capped: false, ...base,
@@ -380,18 +452,34 @@ export function evaluateWait(ask: WaitAsk): WaitVerdict {
     const until = ask.now + budgetRemainingMs;
     return { verdict: 'park', ...base, until, granted: budgetRemainingMs, capped: true };
   }
+  if (ask.pollable && budgetRemainingMs >= floor) {
+    const until = ask.now + budgetRemainingMs;
+    return {
+      verdict: 'park', ...base, until, granted: budgetRemainingMs, capped: true,
+      ...(extendedBy ? { extendedBy } : {}),
+    };
+  }
   const asked = declaredInstant || extendedBy
     ? `asked to wait until ${new Date(requested).toISOString()} (${hoursText(wanted)} from now)`
     : `needs another ${hoursText(wanted)} parked`;
+  // The arithmetic FIRST (control-tower phase 14, #40): every surface that
+  // quotes this refusal — the errand, the park note, the push — now opens on
+  // the budget and its numbers rather than on the thing it stopped.
+  const arithmetic = budgetArithmetic({
+    budget: 'wait', limit: budgetMs / MINUTE, spent: parkedMs / MINUTE, asked: wanted / MINUTE,
+  });
   return {
     verdict: 'timeout', ledger: 'budget', ...base,
     ...(extendedBy ? { overriddenRef: extendedBy } : {}),
-    reason: `the phase ${asked}`
+    reason: `${arithmetic} — the phase ${asked}`
       + (extendedBy ? ` — its declaration names \`${extendedBy}\`` : '')
       + `; its wait budget is ${hoursText(budgetMs)} (${SOURCE_WORDS[ask.budget.source]}) with `
-      + `${hoursText(parkedMs)} already parked, so ${hoursText(budgetRemainingMs)} remain. The console `
-      + 'does not cut a declared window short: extend this phase with `- **Waits on:** <ref> · <max>` '
-      + '(or `**Wait budget:**` in §Session budget), then Retry.',
+      + `${hoursText(parkedMs)} already parked, so ${hoursText(budgetRemainingMs)} remain`
+      + (ask.pollable
+        ? ' — the budget is spent, so the phase waits on its refs with no clock of its own. Raise it with '
+        : '. The console does not cut a declared window short when no ref it can watch would end it sooner: '
+          + 'name one with `--watch`, or raise the budget with ')
+      + '`- **Waits on:** <ref> · <max>` on this phase (or `**Wait budget:**` in §Session budget), then Retry.',
   };
 }
 
@@ -434,7 +522,7 @@ export function parkedMsOf(
   if (!history?.length) return Math.max(0, record.parkedMs ?? 0);
   let total = Math.max(0, record.parkedMsCarried ?? 0);
   history.forEach((entry, index) => {
-    if (consoleOwnPark(entry)) return;
+    if (consoleOwnPark(entry) || entry.unbudgeted) return;
     total += entryMs(entry, now, index === history.length - 1 && record.status === 'waiting');
   });
   return total;
@@ -526,7 +614,225 @@ export function waitBudgetFrom(
     : { budgetMs: DEFAULT_WAIT_BUDGET_MS, source: 'default', countersignedUntil, refs };
 }
 
+/**
+ * The instant this phase's wait budget runs out for the declaration it is
+ * parked on, or null when it is parked on none.
+ *
+ * The budget is a TOTAL over the phase's declared parks, so the end is the
+ * declaration's own instant plus what the budget still had then — the parked
+ * time spent BEFORE it is `parkedMsOf` read at that instant. The budget is the
+ * one the park stamped on the declaration (`declared.budget`, read through the
+ * engine at park time); a declaration written before that stamp existed reads
+ * the console default, which is what its park was judged against anyway.
+ *
+ * Synchronous on purpose: the watch clock (`cmd:` refs run until this instant,
+ * control-tower phase 6) and the scope fence (it lifts at this instant) both
+ * ask it on a pass that must not wait on an engine. The declared window ends
+ * here too (`declaredWindowOf`, control-tower phase 87). None for a declaration
+ * waiting on console state alone (`spendsWaitBudget`), which spends no budget.
+ */
+export function waitBudgetEndOf(
+  record: Pick<PhaseRecord, 'declared' | 'waitHistory' | 'parkedMs' | 'parkedMsCarried' | 'status'>,
+): number | null {
+  const declared = record.declared;
+  if (!declared?.at) return null;
+  if (declared.watch?.length && !spendsWaitBudget(declared.watch)) return null;
+  const at = Date.parse(declared.at);
+  if (!Number.isFinite(at)) return null;
+  const budgetMs = typeof declared.budget?.ms === 'number' && declared.budget.ms > 0
+    ? declared.budget.ms : DEFAULT_WAIT_BUDGET_MS;
+  return at + Math.max(0, budgetMs - parkedMsOf(record, at));
+}
+
 /** The budget when the engine could not be asked — the console default, nothing countersigned. */
 export const DEFAULT_WAIT_BUDGET: WaitBudget = Object.freeze({
   budgetMs: DEFAULT_WAIT_BUDGET_MS, source: 'default', countersignedUntil: null, refs: [],
 }) as WaitBudget;
+
+/* ------------------------------------------------------------------ *
+ * What a declaration may NOT ask for (#42)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The `--needs` words that mean a PERSON settles the block: a judgement, which
+ * no ref can prove and no clock can bring forward (#42's third ask). A phase
+ * declaring one takes no watch and no wait clock — it parks, and a person
+ * answers. `ambiguity` is the one a run meets today; phase 41's human-step
+ * kinds are where the others get words of their own.
+ */
+export const PERSON_NEEDS = Object.freeze(['ambiguity'] as const);
+
+/**
+ * Is `ref` a `lock:` ref naming the declaring phase's OWN lock? The grammar is
+ * `phase-outcome.sh`'s (`lock:<slug>/<phase>`, leading zeros allowed), so a ref
+ * the script let through and one written by hand read the same.
+ */
+export function isOwnLockRef(ref: string, slug: string, phase: number): boolean {
+  const match = /^lock:([A-Za-z0-9][A-Za-z0-9._-]*)\/0*([1-9][0-9]*)$/.exec(String(ref ?? '').trim());
+  return !!match && match[1] === slug && Number(match[2]) === phase;
+}
+
+export type ScreenedDeclaration = {
+  /** The declaration as it may be acted on: own-lock refs gone, a person-block's watch and clock gone. */
+  outcome: PhaseOutcome;
+  /** The refs refused because they name the declarer's own lock (`OWN_LOCK_WATCH_REFUSAL`). */
+  ownLock: string[];
+  /** A block on a person (`PERSON_NEEDS`) — it takes no watch and no wait clock. */
+  person: boolean;
+  /** What a person-block asked for and does not get, when it asked for anything. */
+  dropped?: { watch: string[]; resumeAfter: string | null };
+};
+
+/**
+ * Screen a declaration before anything acts on it — one rule for the three
+ * doors a declaration comes through (the runner's own file, the live twin, the
+ * unsupervised inbox), so a declaration an older script wrote is refused
+ * exactly as `phase-outcome.sh` now refuses it at the flag.
+ *
+ *   - A `lock:` ref naming the declarer's own lock is refused (#42's first ask):
+ *     the console holds that lock for the phase and releases it at the
+ *     session's closeout, so the watch would fire on the phase's own teardown.
+ *     `outcome.refused` carries it, so the router can tell a lock block that
+ *     named only itself from one behind somebody else.
+ *   - A `blocked`/`needs-human` on a person keeps no watch and no clock (#42's
+ *     third ask): nothing it could watch would answer a judgement.
+ */
+export function screenDeclaration(outcome: PhaseOutcome, slug: string, phase: number): ScreenedDeclaration {
+  const ownLock = outcome.watch.filter((ref) => isOwnLockRef(ref, slug, phase));
+  const watch = outcome.watch.filter((ref) => !ownLock.includes(ref));
+  const person = (outcome.status === 'blocked' || outcome.status === 'needs-human')
+    && (PERSON_NEEDS as readonly string[]).includes(outcome.needs ?? '');
+  const { resume_after: resumeAfter, ...rest } = outcome;
+  const next: PhaseOutcome = person
+    ? { ...rest, watch: [] }
+    : { ...outcome, watch };
+  if (ownLock.length) next.refused = [...(outcome.refused ?? []), ...ownLock];
+  const dropped = person && (watch.length || resumeAfter)
+    ? { watch, resumeAfter: resumeAfter ?? null }
+    : undefined;
+  return { outcome: next, ownLock, person, ...(dropped ? { dropped } : {}) };
+}
+
+/**
+ * What a screened declaration's `phase.outcome` line adds: the refs refused
+ * (`refused`), and — for a block on a person — `person: true`, that it takes
+ * no watch and no clock (`watch: []`, `resumeAfter: null` beside it), and what
+ * it asked for that it did not get (`dropped`). Nothing for a declaration the
+ * screen did not touch, so every other line keeps its old shape.
+ */
+export function screenedFields(screened: ScreenedDeclaration): Record<string, unknown> {
+  return {
+    ...(screened.ownLock.length ? { refused: [...screened.ownLock] } : {}),
+    ...(screened.person
+      ? { person: true, clock: 'none — a person settles this; no watch, no wait clock', ...(screened.dropped ? { dropped: screened.dropped } : {}) }
+      : {}),
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Budget facts (control-tower phase 14, #40)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The wait budget as a `BudgetFact`: the limit, the parked time that counts
+ * against it and each park it went on — so "245m accrued, 205m of it while the
+ * run was halted" is a line a person can read rather than a sum they cannot.
+ * `askedMs` is the window the phase asked for when it met the line.
+ */
+export function waitBudgetFact(
+  record: Pick<PhaseRecord, 'phase' | 'waitHistory' | 'parkedMs' | 'parkedMsCarried' | 'status'>,
+  budget: Pick<WaitBudget, 'budgetMs' | 'source'>,
+  opts: { now: number; askedMs?: number | null; at?: string },
+): BudgetFact {
+  const history = record.waitHistory ?? [];
+  const spentOn = history.flatMap((entry, index) => {
+    if (consoleOwnPark(entry) || entry.unbudgeted) return [];
+    const ms = entryMs(entry, opts.now, index === history.length - 1 && record.status === 'waiting');
+    const from = entry.parkedFrom.slice(11, 16);
+    const to = (entry.resumedAt ?? entry.parkedUntil).slice(11, 16);
+    return [{ what: `parked ${from}–${to} UTC (${entry.by})`, amount: ms / MINUTE }];
+  });
+  if ((record.parkedMsCarried ?? 0) > 0) {
+    spentOn.unshift({ what: 'earlier parks, folded', amount: (record.parkedMsCarried ?? 0) / MINUTE });
+  }
+  return budgetFact({
+    budget: 'wait',
+    phase: record.phase,
+    limit: budget.budgetMs / MINUTE,
+    spent: parkedMsOf(record, opts.now) / MINUTE,
+    asked: typeof opts.askedMs === 'number' ? opts.askedMs / MINUTE : null,
+    spentOn,
+    source: budget.source,
+    at: opts.at ?? new Date(opts.now).toISOString(),
+  });
+}
+
+/**
+ * Will this grant carry the phase past `BUDGET_WARN_PCT` of its wait budget —
+ * and how far into the park? `crossesInMs` is 0 when it is past the line
+ * already; null when the park ends under it, or the budget is already gone
+ * (that is a spent budget, said by the refusal, not a warning). Said at the
+ * GRANT, the moment the console knows, so a long CI wait can be extended
+ * before it parks on a spent budget rather than after.
+ */
+export function waitApproaching(opts: { parkedMs: number; grantedMs: number; budget: Pick<WaitBudget, 'budgetMs'> }):
+  { crossesInMs: number } | null {
+  const budgetMs = opts.budget.budgetMs;
+  if (!(budgetMs > 0)) return null;
+  const parked = Math.max(0, opts.parkedMs);
+  if (parked >= budgetMs) return null;
+  const line = (budgetMs * BUDGET_WARN_PCT) / 100;
+  if (parked + Math.max(0, opts.grantedMs) < line) return null;
+  return { crossesInMs: Math.max(0, line - parked) };
+}
+
+/** The run's dollars as a `BudgetFact` — what each phase spent, the dearest first. */
+export function runBudgetFact(
+  state: { runBudgetUsd?: number | null; spentUsd: number; phases: Record<string, { costUsd?: number }> },
+  at?: string,
+): BudgetFact {
+  const spentOn = Object.entries(state.phases)
+    .map(([phase, record]) => ({ what: `phase ${phase}`, amount: record.costUsd ?? 0 }))
+    .filter((row) => row.amount > 0)
+    .sort((a, b) => b.amount - a.amount);
+  return budgetFact({
+    budget: 'run-usd', phase: null, limit: state.runBudgetUsd ?? 0, spent: state.spentUsd, spentOn,
+    setting: 'runBudgetUsd', ...(at ? { at } : {}),
+  });
+}
+
+/** One phase's dollars against its cap as a `BudgetFact`, each session's share named. */
+export function phaseBudgetFact(
+  phase: number, capUsd: number, spentUsd: number,
+  sessions: readonly { what: string; amount: number }[] = [], at?: string,
+): BudgetFact {
+  return budgetFact({
+    budget: 'phase-usd', phase, limit: capUsd, spent: spentUsd, spentOn: [...sessions],
+    setting: 'phaseBudgetUsd', ...(at ? { at } : {}),
+  });
+}
+
+/** The failure streak as a `BudgetFact`: the phases that failed in a row, in order. */
+export function streakFact(
+  state: { maxConsecutiveFailures: number; consecutiveFailures: number; failureStreak?: number[] },
+  phase?: number | null, at?: string,
+): BudgetFact {
+  return budgetFact({
+    budget: 'streak', phase: typeof phase === 'number' ? phase : null,
+    limit: state.maxConsecutiveFailures, spent: state.consecutiveFailures,
+    spentOn: (state.failureStreak ?? []).map((p) => ({ what: `phase ${p}` })),
+    ...(at ? { at } : {}),
+  });
+}
+
+/**
+ * Claim the one warning a budget gets per `key` (the attempt and the limit it
+ * was measured against): true the first time, false after — so a budget warns
+ * once per attempt, and once more after a raise moves its limit. The stamp
+ * rides the record, so a restart does not warn twice.
+ */
+export function claimBudgetWarning(holder: { budgetWarned?: Record<string, string> }, budget: BudgetKind, key: string): boolean {
+  if (holder.budgetWarned?.[budget] === key) return false;
+  holder.budgetWarned = { ...(holder.budgetWarned ?? {}), [budget]: key };
+  return true;
+}

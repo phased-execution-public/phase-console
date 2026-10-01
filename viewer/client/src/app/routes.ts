@@ -9,8 +9,9 @@
  *
  * Three ideas hold the 3.0 URL space together:
  *
- * 1. **Eight destinations, many heads.** `DESTINATIONS` is what the rail and
- *    the tab bar offer — six in 3.0, plus `repo` and `debug` in 4.0.
+ * 1. **Seven destinations, many heads.** `DESTINATIONS` is what the rail and
+ *    the tab bar offer — six in 3.0, plus `repo` and `debug` in 4.0, less `now`
+ *    in 6.0, when the Tower on `#/runs` became the home and Now a redirect.
  *    `ROUTE_HEADS` is every head that still resolves — which is a much longer
  *    list, because a head that ever appeared in a bookmark, a push payload or a
  *    handoff never stops working. `destinationFor()` is the mapping between
@@ -36,13 +37,15 @@
  *    for free, which is what lets `#/search?q=…`, `#/guide/:section` and
  *    `#/notifications` retire into them without losing a single old link.
  *
- * 4. **`?focus=` and `?panel=` say WHERE ON a page, not which page.** Now is
- *    four bands and the bell drawer is two panels, so an address that could
+ * 4. **`?bay=` and `?panel=` say WHERE ON a page, not which page.** The Tower
+ *    is six bays and the bell drawer is two panels, so an address that could
  *    only name the route lost the half of the old page's meaning that mattered:
  *    `#/ready` was never "the home page", it was "the part of it about what to
  *    start next". Both are plain query values on the destination — see
- *    `FOCUS_KEYS` and `PANEL_KEYS` — which keeps them deep-linkable, reloadable
- *    and, unlike a hash fragment, composable with the overlays above.
+ *    `runsBayOf` and `PANEL_KEYS` — which keeps them deep-linkable, reloadable
+ *    and, unlike a hash fragment, composable with the overlays above. Now's
+ *    `?focus=` was the same device for its four bands; `FOCUS_KEYS` survives
+ *    only to translate an old address into the bay that took its question.
  */
 
 import {
@@ -63,6 +66,7 @@ import {
   sessionsHref,
   toHash,
 } from '@shared/routes.js';
+import { BAYS } from '@shared/bays.js';
 
 /** A parsed hash. The shape every page receives and every helper here reads. */
 export interface Route {
@@ -96,12 +100,15 @@ export {
  */
 const DESTINATION_OF: Record<string, string> = {
   plan: 'plans',
-  ready: 'now',
-  pulse: 'now',
-  notifications: 'now',
-  dashboard: 'now',
-  search: 'now',
-  guide: 'now',
+  // Everything Now answered is the Tower's since 6.0 (control-tower phase 21),
+  // Now included: its head keeps Runs lit for the instant its redirect runs.
+  now: 'runs',
+  ready: 'runs',
+  pulse: 'runs',
+  notifications: 'runs',
+  dashboard: 'runs',
+  search: 'runs',
+  guide: 'runs',
   stats: 'insights',
   mcp: 'settings',
   // Both retired INTO Sessions in Phase 10. They stay mapped rather than
@@ -112,7 +119,7 @@ const DESTINATION_OF: Record<string, string> = {
   agent: 'sessions',
 };
 
-/** Which of the eight a head belongs to — `undefined` for the chromeless picker. */
+/** Which of the seven a head belongs to — `undefined` for the chromeless picker. */
 export function destinationFor(head: string | undefined): string | undefined {
   if (!head) return DEFAULT_HEAD;
   if (head === 'source') return undefined;
@@ -131,14 +138,19 @@ const enc = encodeURIComponent;
  * Every one of these is a head whose destination EXISTS today. See the header.
  */
 export const REDIRECTS: Record<string, (route: Route) => string> = {
-  // Now is the home page; `dashboard` is what it used to be called.
-  dashboard: () => 'now',
+  // 6.0 (control-tower phase 21): the Tower on `#/runs` absorbed Now's bands in
+  // phase 20, so Now's address is the Tower's — each `?focus=` becomes the bay
+  // that holds the same things, and whatever else rode on the address (an
+  // overlay, above all) rides on. See `nowRedirect`.
+  now: (route) => nowRedirect(route),
+  // `dashboard` is what Now was called before 3.0, so it goes where Now goes.
+  dashboard: (route) => nowRedirect(route),
   // The search page is the palette now. `?q=` was its term; `?k=` is the
   // palette's, and it opens pre-filled with it.
-  search: (route) => paletteHref(route.query.q ?? '', 'now'),
+  search: (route) => paletteHref(route.query.q ?? '', DEFAULT_HEAD),
   // The guide page is the help sheet. `#/guide/mobile?card=tailscale` keeps
   // both halves of its address.
-  guide: (route) => helpHref(route.segments[1], route.query.card, 'now'),
+  guide: (route) => helpHref(route.segments[1], route.query.card, DEFAULT_HEAD),
   // Statistics is Insights; `?plan=` is the one parameter it carried.
   stats: (route) => (route.query.plan ? `insights?plan=${enc(route.query.plan)}` : 'insights'),
   // The announcements are the bell drawer. The settings half of the old page is
@@ -146,11 +158,13 @@ export const REDIRECTS: Record<string, (route: Route) => string> = {
   // — `redirectTarget` below is what enforces that. `panel` names the half of
   // the drawer this address always meant: the LOG of what was announced, not
   // the list of what is still waiting.
-  notifications: () => bellHref('now', PANEL_KEYS.announcements),
-  // The departures board is Now's Next up section, and the Pulse is its
-  // Running now. Both kept their whole meaning by keeping their `?focus=`.
-  ready: () => nowHref(FOCUS_KEYS.next),
-  pulse: () => nowHref(FOCUS_KEYS.lanes),
+  notifications: () => bellHref(DEFAULT_HEAD, PANEL_KEYS.announcements),
+  // The departures board was Now's Next up and the Pulse its Running now
+  // (phase 8); both are bays of the Tower since 6.0. They take the same
+  // translation Now's own address does, in one hop — the server still mints
+  // `#/ready` into every "ready" push.
+  ready: (route) => nowRedirect(route, FOCUS_KEYS.next),
+  pulse: (route) => nowRedirect(route, FOCUS_KEYS.lanes),
   // Phase 10: two pages became one, and a session's KIND is read off the
   // record rather than out of the URL — so both deep links keep their id and
   // land on the same page. With no id each meant "start one of my kind", which
@@ -232,7 +246,16 @@ export function planTabRedirect(route: Route): string | null {
   if (!to) return null;
   if (to.head === 'insights') return insightsHref(slug);
   if (!to.tab) return null;
-  return planHref(slug, to.tab) + (to.view ? `?view=${enc(to.view)}` : '');
+  // The rest of the address rides along (control-tower phase 23): `#/plan/x/qa?report=4`
+  // is an open report sheet, and a redirect that kept the view and dropped the
+  // sheet would land somewhere near what was asked for rather than on it.
+  const query = [
+    ...(to.view ? [`view=${enc(to.view)}`] : []),
+    ...Object.entries(route.query ?? {})
+      .filter(([key]) => key !== 'view')
+      .map(([key, value]) => `${enc(key)}=${enc(value)}`),
+  ];
+  return planHref(slug, to.tab) + (query.length ? `?${query.join('&')}` : '');
 }
 
 /**
@@ -264,6 +287,58 @@ export function redirectTarget(route: Route): string | null {
   return to ? to(route) : null;
 }
 
+/* ---------------- Now, retired into the Tower ---------------- */
+
+/**
+ * Now's four bands, as its `?focus=` spelled them — kept so an old address can
+ * be translated, never to build a new one.
+ *
+ * The vocabulary is closed for the reason it always was: a value nobody
+ * recognises is a silently ignored deep link, the defect class of
+ * `#/plan/x/autopilot` (a tab registered as `run` that every approval
+ * notification opened wrong for the life of that feature).
+ */
+export const FOCUS_KEYS = { inbox: 'inbox', lanes: 'lanes', next: 'next', plans: 'plans' } as const;
+
+export type FocusKey = (typeof FOCUS_KEYS)[keyof typeof FOCUS_KEYS];
+
+/** Which of Now's bands this route asks for, or `undefined`. An unknown value is ignored. */
+export function focusOf(route: Route): FocusKey | undefined {
+  const value = route.query.focus;
+  return (Object.values(FOCUS_KEYS) as string[]).includes(value ?? '') ? (value as FocusKey) : undefined;
+}
+
+/**
+ * Where each of Now's bands went (control-tower phases 20–21): its inbox is the
+ * Needs-you bay, its lanes the Live bay, its Next up the Ready-to-start bay —
+ * and its fourth, the plans in flight, is the Plans destination's whole list.
+ */
+const FOCUS_HOME: Record<FocusKey, { head: string; bay?: RunsBay }> = {
+  inbox: { head: 'runs', bay: 'needs-you' },
+  lanes: { head: 'runs', bay: 'live' },
+  next: { head: 'runs', bay: 'ready' },
+  plans: { head: 'plans' },
+};
+
+/**
+ * `#/now[?focus=…]` in 6.0's address space — the Tower, on the bay that took
+ * the band's question, with every other query value carried as it was.
+ *
+ * `focus` names the band when the address itself does not: `#/ready` and
+ * `#/pulse` meant a band of Now, and take the same translation in one hop
+ * rather than chaining through `#/now` (a redirect onto a redirect is a loop
+ * waiting to be written — `router.test.tsx`). Carrying the rest is the
+ * overlay rule: `?k=`, `?help=` and `?bell=` sit ON a page, and the page they
+ * sat on moved.
+ */
+function nowRedirect(route: Route, focus: FocusKey | undefined = focusOf(route)): string {
+  const home = focus ? FOCUS_HOME[focus] : { head: DEFAULT_HEAD };
+  const query: Record<string, string> = home.bay ? { bay: home.bay } : {};
+  for (const [key, value] of Object.entries(route.query ?? {})) if (key !== 'focus') query[key] = value;
+  const search = new URLSearchParams(query).toString();
+  return `#/${home.head}${search ? `?${search}` : ''}`;
+}
+
 /* ---------------- how a page is framed ---------------- */
 
 /**
@@ -279,28 +354,11 @@ export const CHROMELESS_HEADS: ReadonlySet<string> = new Set(['source']);
  * the fold on every SSE reconnect. Any view rendered under these heads must be
  * flex-aware (`h-full min-h-0`).
  */
-export const FULL_HEIGHT_HEADS: ReadonlySet<string> = new Set(['sessions']);
+export const FULL_HEIGHT_HEADS: ReadonlySet<string> = new Set([
+  'sessions',
+]);
 
 /* ---------------- href builders ---------------- */
-
-/**
- * Now, optionally scrolled to one of its bands.
- *
- * The vocabulary is closed and it is here rather than in the page, because the
- * redirects above build these URLs and a value the page did not recognise
- * would be a silently ignored deep link — the same defect class as
- * `#/plan/x/autopilot`, a tab that was registered as `run` and that every
- * approval notification opened wrong for the life of that feature.
- */
-export const FOCUS_KEYS = { inbox: 'inbox', lanes: 'lanes', next: 'next', plans: 'plans' } as const;
-
-export type FocusKey = (typeof FOCUS_KEYS)[keyof typeof FOCUS_KEYS];
-
-/** Which band this route asks for, or `undefined`. An unknown value is ignored. */
-export function focusOf(route: Route): FocusKey | undefined {
-  const value = route.query.focus;
-  return (Object.values(FOCUS_KEYS) as string[]).includes(value ?? '') ? (value as FocusKey) : undefined;
-}
 
 /**
  * Which half of the bell drawer.
@@ -364,9 +422,34 @@ export function runsViewOf(route: Route): RunsView | undefined {
   return (Object.values(RUNS_VIEWS) as string[]).includes(value ?? '') ? (value as RunsView) : undefined;
 }
 
-export const nowHref = (focus?: FocusKey): string => (focus ? `#/now?focus=${enc(focus)}` : '#/now');
+/**
+ * Which bay of the Tower `#/runs` opens on — `?bay=needs-you`, `live`,
+ * `waiting`, `queued`, `ready` or `settled` (control-tower phase 20).
+ *
+ * The FIFTH reader of the `focusOf` shape, and its vocabulary is closed the
+ * same way — but it is not written here: the words ARE the Tower's bays
+ * (`BAYS`, the leaf `shared/bays.js` — never `status-model.js`, which first
+ * paint must not carry), so an address can name exactly the bays
+ * the page draws and a bay added there is addressable the same day. The named
+ * bay is scrolled to and, when it is folded (Settled), opened. It implies the
+ * Tower: `?bay=` on a stored `table` preference draws the Tower for that visit,
+ * exactly as `?view=board` does. An unknown value is ignored, never guessed at.
+ * Now's `?focus=inbox`, `lanes` and `next` land here since phase 21
+ * (`nowRedirect`).
+ */
+export type RunsBay = (typeof BAYS)[number];
+
+export function runsBayOf(route: Route): RunsBay | undefined {
+  const value = route.query.bay;
+  return (BAYS as readonly string[]).includes(value ?? '') ? (value as RunsBay) : undefined;
+}
+
+export const runsBayHref = (bay: RunsBay): string => `#/runs?bay=${enc(bay)}`;
+
 export const runsHref = (view?: RunsView): string => (view ? `#/runs?view=${enc(view)}` : '#/runs');
 export const plansHref = (): string => '#/plans';
+/** The whole queue of this console (control-tower phase 99, #135). */
+export const queueHref = (): string => '#/queue';
 export const insightsHref = (plan?: string): string => (plan ? `#/insights?plan=${enc(plan)}` : '#/insights');
 export const settingsHref = (section?: string): string =>
   section ? `#/settings/${enc(section)}` : '#/settings';
@@ -408,15 +491,15 @@ function overlayHref(
 }
 
 /** `?k=` — the command palette, pre-filled with `term`. */
-export const paletteHref = (term = '', base: string | Route = 'now'): string =>
+export const paletteHref = (term = '', base: string | Route = DEFAULT_HEAD): string =>
   overlayHref(OVERLAY_KEYS.palette, term, base);
 
 /** `?help=<section>&card=<card>` — the help sheet. */
-export const helpHref = (section?: string, card?: string, base: string | Route = 'now'): string =>
+export const helpHref = (section?: string, card?: string, base: string | Route = DEFAULT_HEAD): string =>
   overlayHref(OVERLAY_KEYS.help, section ?? '', base, { card });
 
 /** `?bell=1[&panel=…]` — the drawer, optionally on one of its two panels. */
-export const bellHref = (base: string | Route = 'now', panel?: PanelKey): string =>
+export const bellHref = (base: string | Route = DEFAULT_HEAD, panel?: PanelKey): string =>
   overlayHref(OVERLAY_KEYS.bell, '1', base, panel ? { panel } : undefined);
 
 /** The same route with every overlay closed — what Escape and a backdrop mean. */
@@ -444,3 +527,4 @@ export function openOverlay(route: Route): 'palette' | 'help' | 'bell' | null {
   if (route.query[OVERLAY_KEYS.bell] != null) return 'bell';
   return null;
 }
+

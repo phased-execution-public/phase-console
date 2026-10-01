@@ -1,24 +1,25 @@
 /**
- * Stage 1 — What runs.
+ * What runs.
  *
- * The plan, the phases ready now, the sessions the engine batches them into,
+ * The plan, the phases ready now, the sessions a person could batch them into by hand,
  * the scopes they touch, the gates that will hold and the claims this run
- * would queue behind — and then the two controls that narrow or chain it.
- * Facts first, controls after: the operator reads what the board says before
- * deciding whether to change it.
+ * would queue behind. Since control-tower phase 22 it is the quick view's
+ * fold under the departure line; the two controls that narrow or chain it are
+ * the Scope tile's.
  *
  * L0 is the ready set and one line of counts; L1 is every open phase behind
  * "All N open phases" and every batch behind "All N sessions".
  */
 
-import { Chip, Disclosure, SectionHeading, StateChip } from '@/components/ui';
+import { Badge, Disclosure, SectionHeading } from '@/components/ui';
+import { PhaseStatusBadge, type WordOf } from '@/components/ui/status';
 import type { PhaseView } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { countdown, plural } from '@/lib/format';
 import { phaseHref } from '@shared/routes.js';
 import { gateWho, liveClaim, useLaunchFacts } from './facts';
 import { useSetupForm } from './form-context';
-import { ScopeChip, ScopeSection } from './sections';
+import { ScopeChip } from './sections';
 
 /** How many rows the glance shows before folding the rest. */
 const GLANCE = 6;
@@ -116,8 +117,9 @@ export function WhatRuns() {
             Sessions
           </SectionHeading>
           <p className="text-2xs text-ink-muted">
-            How the engine batches what is left{facts.budget ? ` at ${facts.budget} a session` : ''} — a
-            suggestion the runner follows one phase at a time.
+            How a person could batch what is left by hand
+            {facts.budget ? `, at ${facts.budget} a session` : ''}. The autopilot runs 1 phase ≥ 1 session and
+            never batches.
           </p>
           <BatchList batches={batches.slice(0, 4)} />
           {batches.length > 4 && (
@@ -157,16 +159,6 @@ export function WhatRuns() {
               );
             })}
           </ul>
-        </section>
-      )}
-
-      {/* The controls that change the above. */}
-      {(f.on('onlyPhases') || f.on('startAfter')) && (
-        <section className="flex flex-col gap-2 border-t border-rule pt-4">
-          <SectionHeading as="h3" tone="muted">
-            Narrow or chain it
-          </SectionHeading>
-          <ScopeSection />
         </section>
       )}
     </div>
@@ -213,13 +205,17 @@ function PhaseList({
             )}
             <span className="min-w-24 flex-1 break-words">{p.title}</span>
             <span className="flex min-w-0 flex-wrap items-center gap-1">
-              <StateChip state={p.state} pulse={Boolean(p.live)} />
+              {/* The board word as the status model draws it; the pulse only
+                  over an observed live fact, never over the word. A gate and a
+                  claim are waits, not summons — the inbox is where a person is
+                  asked (6.0). */}
+              <PhaseStatusBadge board={p.state as WordOf<'board'>} pulse={Boolean(p.live)} />
               {who && (
-                <Chip tone="gate" title={p.gates ?? undefined}>
+                <Badge tone="wait" title={p.gates ?? undefined}>
                   gate · {who}
-                </Chip>
+                </Badge>
               )}
-              {claim && <Chip tone="warn">claimed</Chip>}
+              {claim && <Badge tone="wait">claimed</Badge>}
               {repos.map((repo) => (
                 <ScopeChip key={repo}>{repo}</ScopeChip>
               ))}
@@ -239,7 +235,7 @@ function BatchList({ batches, className }: { batches: LaunchBatch[]; className?:
           <span className="shrink-0 text-ink-muted">Session {group.index}</span>
           <span className="font-mono text-2xs text-ink">P{group.phases.join(', P')}</span>
           <span className="font-mono text-2xs tabular-nums text-ink-muted">{group.weight}</span>
-          {group.gated && <Chip tone="gate">gated</Chip>}
+          {group.gated && <Badge tone="wait">gated</Badge>}
           {group.note && <span className="min-w-0 break-words text-2xs text-ink-muted">{group.note}</span>}
         </li>
       ))}

@@ -36,7 +36,7 @@ import {
 } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 
-import { CLAUDE_COMM, processState, type ProcessState } from '../pid.ts';
+import { CLAUDE_COMM, processState, processStartedMs, processStateAsync, type ProcessState } from '../pid.ts';
 import type { Presence, PresenceEndSource } from '../../shared/run-lifecycle.js';
 
 /* ------------------------------------------------------------------ *
@@ -246,8 +246,16 @@ export type HookPayload = {
 export type SessionRecord = {
   sessionId: string;
   kind: SessionKind;
-  /** The console's own probe — see `HookPayload.probe`. */
+  /** The console's own probe — see `HookPayload.probe`. Never stored since #73; a legacy record is pruned. */
   probe?: true;
+  /**
+   * ISO — when the kernel says `pid`'s process started, read by the registry
+   * itself (`pid.ts`) while the event that named the pid was fresh. With
+   * `pid` it is the process's IDENTITY (#73): an ended record whose pid now
+   * belongs to another process is ended, whatever `kill(0)` says. Cleared
+   * whenever the pid changes (a `--resume` in a new process).
+   */
+  procStartedAt?: string;
   /** The login's config dir — see `HookPayload.config_dir`. */
   configDir?: string;
   /** An env credential outranks `configDir` — see `HookPayload.auth_env`. */
@@ -292,6 +300,13 @@ export type SessionRecord = {
   endedAt?: string;
   /** Who said it ended: the session's own SessionEnd, or the probe finding its process gone. */
   endedBy?: PresenceEndSource;
+  /**
+   * An operator's release of this session's hold on the queue (control-tower
+   * phase 82, #119) — "not touching this repository" (no `until`: while it
+   * lives) or "release for N hours". The peer feed skips a released session, so
+   * nothing queues behind it; its own lock, if it ever claims one, still holds.
+   */
+  holdReleased?: { at: string; by: string; until?: string };
   /** ISO — when the probe noticed an inferred end (`endedBy: 'probe'` only). */
   endedDetectedAt?: string;
   reason?: string;
@@ -483,6 +498,15 @@ export const PEER_CLAIM_WINDOW_MS = 10 * 60_000;
  * would give a person coming back to a session no window at all. No readable
  * start is no evidence of a recent one: `-Infinity`, shut.
  */
+/** Is this session's hold released at `nowMs` (#119)? A release with no `until` lasts as long as the session. */
+export function holdReleasedAt(record: Pick<SessionRecord, 'holdReleased'>, nowMs: number): boolean {
+  const released = record.holdReleased;
+  if (!released) return false;
+  if (!released.until) return true;
+  const until = Date.parse(released.until);
+  return Number.isFinite(until) && nowMs < until;
+}
+
 export function claimWindowEnds(record: Pick<SessionRecord, 'startedAt' | 'resumedAt'>): number {
   const starts = [record.startedAt, record.resumedAt]
     .map((iso) => (iso ? Date.parse(iso) : Number.NaN))
@@ -858,8 +882,28 @@ export function applyEvent(prev: SessionRecord | undefined, p: HookPayload, nowI
 /**
  * A probe of a session's process. `boolean` is the old shape and still works
  * (`false` ⇒ gone); `ProcessState` is the one that can say `stopped`.
+ * `startedAt` is the record's `procStartedAt` when it asks about IDENTITY: a
+ * process that started at another time is a stranger, and answers `gone`.
  */
-export type PresenceProbe = (pid: number) => boolean | ProcessState;
+export type PresenceProbe = (pid: number, startedAt?: string) => boolean | ProcessState;
+
+/**
+ * How late an event may be ingested and still have its pid's start time read
+ * for it. The hook fires FROM the session's process, so on a fresh event the
+ * pid is that process; an inbox drop drained hours later may name a pid the
+ * kernel has since handed to somebody else, and recording that stranger's
+ * start time would vouch for it.
+ */
+export const IDENTITY_FRESH_MS = 10_000;
+
+/**
+ * How far a recorded start time and the kernel's may differ and still be one
+ * process. Both are `ps -o lstart=` readings of the same kernel field, so they
+ * agree to the second; `pid.ts`'s default slack (two minutes, for timestamps
+ * taken around a spawn) would call a probe that lived three seconds and a pid
+ * recycled a minute later the same process.
+ */
+export const IDENTITY_SLACK_MS = 2_000;
 
 /** Three-valued, by the rules in the header. `probe` absent ⇒ the process is not consulted. */
 export function presenceOf(
@@ -876,10 +920,16 @@ export function presenceOf(
   // typing. So ask, and only when nobody can vouch either way does the hook's
   // word stand: no pid, no probe, or a probe that threw. `unknown` says exactly
   // what is true — the two witnesses disagree — and unknown releases nothing.
+  //
+  // But the fact has to be about the SAME process (#73). A pid alone is not an
+  // identity: the kernel recycles it, and an ended probe session whose pid now
+  // belonged to a `ugrep` read `unknown`, then "stuck", for hours. So an ended
+  // record comes back only when its recorded start time still matches — and a
+  // record with no start time has nothing to match, so the end stands.
   if (record.endedAt) {
-    if (!record.pid || !probe) return 'ended';
+    if (!record.pid || !probe || !record.procStartedAt) return 'ended';
     let answer: boolean | ProcessState;
-    try { answer = probe(record.pid); } catch { return 'ended'; }
+    try { answer = probe(record.pid, record.procStartedAt); } catch { return 'ended'; }
     const state: ProcessState = answer === true ? 'running' : answer === false ? 'gone' : answer;
     return state === 'gone' ? 'ended' : 'unknown';
   }
@@ -1044,8 +1094,16 @@ export type RegistryOptions = {
   /** `INSTANCE_STATE_DIR/sessions` — records as `<id>.json`, the hook's drops under `inbox/`. */
   dir: string;
   now?: () => Date;
-  /** The liveness probe; `null` switches the process check off (tests). */
-  pidAlive?: ((pid: number) => boolean) | null;
+  /**
+   * The liveness probe; `null` switches the process check off (tests). Asked
+   * with the record's `procStartedAt` when identity matters (an ended record).
+   */
+  pidAlive?: ((pid: number, startedAt?: string) => boolean) | null;
+  /**
+   * When a live pid's process started, in epoch ms, or null when it cannot be
+   * read now — `pid.ts`'s `processStartedMs` by default. Injected in tests.
+   */
+  procStart?: (pid: number) => number | null;
   /**
    * Every change to a record: an ingested event, a prune, a throttled
    * heartbeat, and a wait cleared by no hook — progress past the ask
@@ -1235,6 +1293,11 @@ export class SessionRegistry {
       }
       return prev ?? applyEvent(undefined, { ...payload, notification_type: undefined, message: undefined }, this.now().toISOString());
     }
+    // A console probe is not a session (#73): nothing is registered for it —
+    // no record, no event line, no change. Its own hook drops it first
+    // (`PE_SESSION_KIND=probe`); this is a hook script older than that rule,
+    // which still forwards the probe flag. Answered, never stored.
+    if (payload.probe) return applyEvent(undefined, payload, this.now().toISOString());
     const appliedAt = this.now();
     const at = payload.at && Number.isFinite(Date.parse(payload.at)) ? Date.parse(payload.at) : appliedAt.getTime();
     const lateMs = Math.max(0, appliedAt.getTime() - at);
@@ -1253,6 +1316,10 @@ export class SessionRegistry {
       payload: scrubPayload(payload),
     }, payload.session_id);
     const next = applyEvent(prev, payload, appliedAt.toISOString());
+    // A start time belongs to ONE process: a new pid (a `--resume` in a new
+    // process) takes the old one's identity away before it can vouch for it.
+    if (prev?.pid && next.pid !== prev.pid) delete next.procStartedAt;
+    this.stampIdentity(next, lateMs);
     const history = via !== 'post' && lateMs > INBOX_HISTORY_HORIZON_MS;
     next.lastEvent = {
       event: payload.event, at: new Date(at).toISOString(), appliedAt: appliedAt.toISOString(), lateMs, via,
@@ -1262,6 +1329,29 @@ export class SessionRegistry {
     this.persist(next);
     this.opts.onChange?.(next, payload.event, { via, lateMs, history });
     return next;
+  }
+
+  /**
+   * Record the session process's start time, once, while the event that named
+   * its pid is fresh (#73) — the `(pid, start-time)` identity the ended-record
+   * rule in `presenceOf` needs. A cold sample cache is warmed and the stamp
+   * lands a moment later; the process is the hook's own parent, so it is there.
+   */
+  private stampIdentity(record: SessionRecord, lateMs: number): void {
+    if (!record.pid || record.procStartedAt || lateMs > IDENTITY_FRESH_MS || this.opts.pidAlive === null) return;
+    const read = this.opts.procStart ?? processStartedMs;
+    const ms = read(record.pid);
+    if (ms != null) { record.procStartedAt = new Date(ms).toISOString(); return; }
+    if (this.opts.procStart) return;
+    const { sessionId, pid } = record;
+    void processStateAsync(pid).then(() => {
+      const current = this.records.get(sessionId);
+      if (this.closed || !current || current.pid !== pid || current.procStartedAt) return;
+      const later = processStartedMs(pid);
+      if (later == null) return;
+      current.procStartedAt = new Date(later).toISOString();
+      this.persist(current);
+    }).catch(() => { /* no stamp is the conservative answer: an ended record stays ended */ });
   }
 
   /**
@@ -1284,6 +1374,24 @@ export class SessionRegistry {
    * session" is the module's rule and a heartbeat carries no cwd to invent one
    * with. Returns whether a record was there to advance.
    */
+  /**
+   * Release a session's hold on the queue (#119): `hours` bounds it, absent is
+   * for as long as the session lives. Null for a session the registry does not
+   * know — the caller answers 404 rather than recording a release of nothing.
+   */
+  releaseHold(sessionId: string, opts: { by: string; hours?: number }): SessionRecord | null {
+    const record = this.records.get(sessionId);
+    if (!record) return null;
+    const now = this.now();
+    const hours = opts.hours != null && Number.isFinite(opts.hours) && opts.hours > 0 ? Math.min(opts.hours, 24 * 7) : null;
+    record.holdReleased = {
+      at: now.toISOString(), by: opts.by,
+      ...(hours != null ? { until: new Date(now.getTime() + hours * 3_600_000).toISOString() } : {}),
+    };
+    this.persist(record);
+    return record;
+  }
+
   heartbeat(sessionId: string, opts: { turnEnded?: boolean } = {}): boolean {
     const record = this.records.get(sessionId);
     if (!record) return false;
@@ -1507,8 +1615,14 @@ export class SessionRegistry {
     } catch { /* already gone */ }
   }
 
-  /** Is the process that owns an inbox tmp still alive? The registry's one probe, else `pid.ts`'s. */
-  private pidLive(pid: number): boolean {
+  /**
+   * Is this pid a running process? The registry's one probe, else `pid.ts`'s —
+   * asked for the owner of an inbox tmp, and by `declarerPresence` (#49) for
+   * the process behind an ended session that may still hold its claim. No
+   * identity: a caller that has a start time to match is asking a different
+   * question (`presenceOf`).
+   */
+  pidLive(pid: number): boolean {
     if (!Number.isFinite(pid) || pid <= 0) return false;
     if (this.opts.pidAlive === null) return false;
     if (this.opts.pidAlive) return this.opts.pidAlive(pid);
@@ -1559,7 +1673,9 @@ export class SessionRegistry {
     for (const record of [...this.records.values()]) {
       const endedAgo = record.endedAt ? nowMs - Date.parse(record.endedAt) : null;
       const silentFor = nowMs - Date.parse(record.lastSeen);
-      if ((endedAgo != null && endedAgo > RETAIN_ENDED_MS) || silentFor > RETAIN_SILENT_MS) {
+      // A probe's record is a record that should never have been (#73): the
+      // ones a console before that rule wrote go at the first prune.
+      if (record.probe || (endedAgo != null && endedAgo > RETAIN_ENDED_MS) || silentFor > RETAIN_SILENT_MS) {
         this.records.delete(record.sessionId);
         this.beatAt.delete(record.sessionId);
         this.eventBytes.delete(record.sessionId);
@@ -1695,13 +1811,15 @@ export class SessionRegistry {
     // says so — a recycled pid called `running` "merely leaves a run parked
     // until a person looks", where a false `gone` starts a second session
     // beside a live one. Identity belongs in a `(pid, procStartedAt)` tuple
-    // the way `state.ts` carries it for children; the registry has no process
-    // start time to compare against yet (`SessionRecord.startedAt` is the
-    // SESSION's clock, not the process's, and using it here would repeat the
-    // bug orphans-P3 fixed).
+    // the way `state.ts` carries it for children — and since #73 the registry
+    // records one (`stampIdentity`, the kernel's own start time, never
+    // `SessionRecord.startedAt`, which is the SESSION's clock and would repeat
+    // the bug orphans-P3 fixed). It is asked only about an ENDED record, where
+    // a false `gone` merely lets the hook's own word stand.
     const probe: PresenceProbe | undefined = this.opts.pidAlive === null
       ? undefined
-      : (this.opts.pidAlive ?? ((pid: number) => processState(pid)));
+      : (this.opts.pidAlive
+        ?? ((pid: number, startedAt?: string) => processState(pid, startedAt ? { startedAt, slackMs: IDENTITY_SLACK_MS } : {})));
     const presence = presenceOf(record, nowMs, probe);
     // A death the PROBE found is a death, and it is written down.
     //

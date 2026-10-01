@@ -7,7 +7,7 @@
  * they cannot disagree — what differs is only how much room each fact gets.
  */
 
-import { Card, Chip, RelativeTime, StateChip } from '@/components/ui';
+import { Badge, Card, RelativeTime } from '@/components/ui';
 import { etaLabel, etaTitle } from '@/lib/format';
 import { phaseHref, planHref } from '@shared/routes.js';
 import { concerns, type PlanRow } from './model';
@@ -33,8 +33,11 @@ export function PlanCard({ row, index }: { row: PlanRow; index: number }) {
           kept 113px and its slug truncated under it: the card's whole subject
           reduced to `mm-full-options …` so that two chips could stay whole on
           the same line. With a floor the cluster wraps beneath instead, which
-          is what a card has room to do and a table row does not. */}
-      <div className="flex min-w-0 flex-wrap items-start gap-2">
+          is what a card has room to do and a table row does not. The wrapped
+          cluster sits a full `gap-y-4` below the name: the run chip's touch
+          target overhangs its paint by ~12px, and at `gap-2` it took the
+          bottom of the name's link (control-tower phase 31). */}
+      <div className="flex min-w-0 flex-wrap items-start gap-x-2 gap-y-4">
         <a href={planHref(row.slug)} className="min-w-56 flex-1 hover:text-action">
           <span className="block truncate font-display text-lg leading-snug">{row.title}</span>
           {/* A plan with no `# title` heading gets its slug as the title from
@@ -48,7 +51,7 @@ export function PlanCard({ row, index }: { row: PlanRow; index: number }) {
           {/* First, and ahead of the run badge: a person being asked outranks a
               process reporting. */}
           <NeedsYouChip row={row} />
-          {!row.isPlan && <Chip>{row.kind === 'orphan-handoffs' ? 'handoffs only' : row.kind}</Chip>}
+          {!row.isPlan && <Badge>{row.kind === 'orphan-handoffs' ? 'handoffs only' : row.kind}</Badge>}
           {row.isPlan && row.status !== 'active' && row.status !== 'unknown' && <ClosedChip row={row} />}
           <RunChip row={row} />
         </div>
@@ -66,13 +69,13 @@ export function PlanCard({ row, index }: { row: PlanRow; index: number }) {
       <div className="mt-2 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
         {ready.length > 0 ? (
           ready.slice(0, 4).map((phase) => (
+            // A door into the phase, captioned, not a status: the plan header
+            // draws the same "P4 ready" links, and the track above paints the
+            // phase's status (control-tower phase 31).
             <a key={phase} href={phaseHref(row.slug, phase)} className="rounded-sm">
-              <StateChip
-                state="ready"
-                label={`P${phase} ready`}
-                mono
-                className="hover:bg-action/12 [@media(hover:none)]:min-h-(--tap-min)"
-              />
+              <Badge mono className="hover:bg-action/12 [@media(hover:none)]:min-h-(--tap-min)">
+                {`P${phase} ready`}
+              </Badge>
             </a>
           ))
         ) : (

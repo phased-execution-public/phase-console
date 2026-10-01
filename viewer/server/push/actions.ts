@@ -71,6 +71,12 @@ export const PUSH_ACTION_VERBS = Object.freeze({
   allow: 'Allow',
   deny: 'Deny',
   approve: 'Approve',
+  // An approval card's expiry warning (control-tower phase 97, #140): the
+  // long Extend, the one someone away from the console reaches for.
+  extend: 'Extend 2 h',
+  // A person's turn (control-tower phase 43): *I did it* ANSWERS the step —
+  // the console runs its proof, and only a proof that lands resumes anything.
+  check: 'I did it',
 } as const);
 
 export type PushActionVerb = keyof typeof PUSH_ACTION_VERBS;

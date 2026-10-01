@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-import { debugIndexPath, type DebugEntry, type DebugIndexParams } from '@/lib/api';
+import { debugTailPath, type DebugEntry, type DebugIndexParams } from '@/lib/api';
 import { consolePath } from '@/lib/base';
 
 /**
@@ -55,7 +55,7 @@ export type TailState = {
  * stream down and rebuild it on every keystroke in the search box.
  */
 export function useDebugTail(params: DebugIndexParams, enabled: boolean): TailState {
-  const path = debugIndexPath('/api/debug/tail', params);
+  const path = debugTailPath(params);
   const [entries, setEntries] = useState<DebugEntry[]>([]);
   const [status, setStatus] = useState<TailState['status']>('off');
   const [behind, setBehind] = useState(false);

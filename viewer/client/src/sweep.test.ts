@@ -19,6 +19,7 @@ import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { LIVE_RUN_STATUSES } from '@shared/status-vocab.js';
+import { DESTINATIONS } from '@shared/route-meta.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 /** This file sits AT the root of the tree it guards. */
@@ -79,9 +80,26 @@ describe('the 3.0 sweep', () => {
   });
 
   it('gives every destination a features/ module of its own', () => {
-    for (const destination of ['now', 'plans', 'runs', 'sessions', 'insights', 'settings']) {
-      expect(existsSync(join(SRC, 'features', destination, 'index.tsx')), destination).toBe(true);
+    // Read off the shared list rather than a copy of it: a destination added
+    // there without a page is the dead nav entry this guard exists to catch.
+    // A destination that is Pro through and through keeps its page under
+    // `features/<id>/pro/` — the supervisor chat (control-tower phase 28) —
+    // so the free tree drops the folder whole.
+    for (const destination of DESTINATIONS) {
+      const page = ['index.tsx', 'pro/index.tsx'].some((rel) =>
+        existsSync(join(SRC, 'features', destination, rel)),
+      );
+      expect(page, destination).toBe(true);
     }
+  });
+
+  it('has no Now left — 6.0 folded it into Runs, and its address is a redirect', () => {
+    // Control-tower phase 21. Not "no index" — no folder: the pieces the Tower,
+    // the drawer and Sessions still share moved to where they are used, and a
+    // `features/now/` holding them would read as a page that is not there.
+    expect(existsSync(join(SRC, 'features', 'now'))).toBe(false);
+    expect(offenders(/from '@\/features\/now\//)).toEqual([]);
+    expect(DESTINATIONS).not.toContain('now');
   });
 
   /**

@@ -233,6 +233,83 @@ describe('settings', () => {
     expect(await screen.findByText(/predates the static-root report/i)).toBeTruthy();
   });
 
+  // control-tower phase 98 (#151): the ONE skill copy sessions load, and a warning when
+  // it is at another commit than the console that launches them.
+  const copy = (configDir: string, commit: string) => ({
+    configDir,
+    install: {
+      id: 'phased-execution@phased-execution-public',
+      scope: 'user',
+      installPath: `${configDir}/plugins/cache/phased-execution-public/phased-execution/${commit.slice(0, 12)}`,
+      version: commit.slice(0, 12),
+      commit,
+    },
+    skillDir: null,
+  });
+  const NEW = '8bd2f800320d9ca5519a791a83affb65bd4de561';
+  const OLD = '77e57a59b79b1f2c3d4e5f60718293a4b5c6d7e8';
+
+  it('names the skill copy sessions load — its commit and path — and says it is the console’s own', async () => {
+    const same = copy('/home/op/.claude', NEW);
+    state.mockResolvedValue({
+      ...BASE_STATE,
+      home: '/home/op',
+      skillCopy: {
+        plugin: 'phased-execution@phased-execution-public',
+        consoleRev: NEW,
+        copies: [same],
+        drift: [],
+        update: 'phase-console update-plugin',
+      },
+    });
+    const { default: SettingsView } = await import('./index');
+    mount(<SettingsView route={at('instance')} />);
+    expect(await screen.findByText(/the console’s own commit/)).toBeTruthy();
+    expect(screen.getByText('~/.claude')).toBeTruthy();
+    expect(
+      screen.getByText('~/.claude/plugins/cache/phased-execution-public/phased-execution/8bd2f800320d'),
+    ).toBeTruthy();
+    expect(screen.queryByTestId('skill-drift')).toBeNull();
+  });
+
+  it('warns when a config dir’s copy is at another commit than the console, and names the fix', async () => {
+    const behind = copy('/home/op/.claude-a', OLD);
+    state.mockResolvedValue({
+      ...BASE_STATE,
+      home: '/home/op',
+      skillCopy: {
+        plugin: 'phased-execution@phased-execution-public',
+        consoleRev: NEW,
+        copies: [copy('/home/op/.claude', NEW), behind],
+        drift: [behind],
+        update: 'phase-console update-plugin',
+      },
+    });
+    const { default: SettingsView } = await import('./index');
+    mount(<SettingsView route={at('instance')} />);
+    const banner = await screen.findByTestId('skill-drift');
+    expect(banner.textContent).toMatch(/another commit than this console/);
+    expect(banner.textContent).toContain('~/.claude-a');
+    expect(within(banner).getByText('phase-console update-plugin')).toBeTruthy();
+    expect(screen.getByText(/another commit than this console$/)).toBeTruthy();
+  });
+
+  it('says there is no plugin copy rather than inventing one', async () => {
+    state.mockResolvedValue({
+      ...BASE_STATE,
+      skillCopy: {
+        plugin: 'phased-execution@phased-execution-public',
+        consoleRev: NEW,
+        copies: [],
+        drift: [],
+        update: 'phase-console update-plugin',
+      },
+    });
+    const { default: SettingsView } = await import('./index');
+    mount(<SettingsView route={at('instance')} />);
+    expect(await screen.findByText(/no plugin copy installed/)).toBeTruthy();
+  });
+
   it('offers no rule editor on a read-only console', async () => {
     const { default: SettingsView } = await import('./index');
     mount(<SettingsView route={at('permissions')} />);

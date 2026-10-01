@@ -10,9 +10,11 @@ import {
   type CREDENTIAL_CLASSES,
   type ENTITLEMENT_STATES,
   type LEAVE_KINDS,
+  type METER_STATES,
   type PROBE_STATUSES,
 } from '../../../../shared/ops-vocab.js';
 import type { RunState } from './runs';
+import type { SwitchWhen } from '@shared/run-lifecycle.js';
 
 /* ---------------- Claude accounts ---------------- */
 
@@ -21,6 +23,10 @@ export interface UsageBucket {
   utilization: number;
   /** ISO 8601. */
   resetsAt: string;
+  /** ISO — when the read behind this bucket was made; the server's view sets it (#109). */
+  polledAt?: string;
+  /** Older than twice the poll interval, past its own reset, or never read successfully (#109). */
+  stale?: boolean;
 }
 
 export interface AccountUsage {
@@ -49,10 +55,31 @@ export interface EntitlementView {
   detail?: string;
   /** `cooling` only: ISO — when the account is a candidate again. */
   until?: string;
-  /** `retired` only: which credential class refused. */
+  /** `retired` and `suspect`: which credential class refused. */
   class?: (typeof CREDENTIAL_CLASSES)[number];
   /** Who wrote the word — `classifier`, `live-wall`, `preflight`, `operator`, `poller`, `probe`, … */
   by?: string;
+  /**
+   * `retired` and `suspect` (control-tower phase 54, #57): what the verdict
+   * stood on — `api` (a kind or a sentence on the CLI's error channel) or
+   * `text` (a session that spent nothing), the words that matched, and whose
+   * stop it was.
+   */
+  evidence?: RetirementEvidence;
+  /** `suspect` only: the retirement it demoted. */
+  retired?: { at?: string; by?: string; reason?: string };
+  /** `suspect` only: the green read or check that contradicts the retirement. */
+  contradicted?: { at: string; by: string; reason: string };
+}
+
+/** A retirement's evidence, as the breaker keeps it (#57). */
+export interface RetirementEvidence {
+  source: 'api' | 'text';
+  matched: string;
+  session?: string;
+  phase?: number;
+  slug?: string;
+  runId?: string;
 }
 
 /**
@@ -93,7 +120,51 @@ export interface TombstoneView {
   entitlement: EntitlementView;
 }
 
+/**
+ * One window's forecast (control-tower phase 92, #141): the burn a line through
+ * the last hour's readings measures, and when it walls the window — null when
+ * it is flat, unmeasured, or resets first.
+ */
+export interface BucketForecast {
+  pct: number;
+  burnPctPerHour: number | null;
+  trend: 'climbing' | 'flat' | 'unknown';
+  wallsAt: string | null;
+  resetsAt: string;
+  samples: number;
+  spanMs: number;
+}
+
+/** An account's forecast: every live window, the soonest projected wall, and the runs burning it. */
+export interface AccountForecast {
+  buckets: Record<string, BucketForecast>;
+  wallsAt: string | null;
+  bucket: string | null;
+  burning: { slug: string; runId: string; lanes: number[] }[];
+}
+
 /** One registered Claude identity, redacted: never a token, never a path, never a raw orgId. */
+/**
+ * An account's credits as the console acts on them (control-tower phase 93,
+ * #146) — the server's `CreditView`: the operator's "use credits past plan
+ * limits" (`allowed`, off by default), the account's own credit state
+ * (`available`, null when unknown), and `carrying`, both at once.
+ */
+export interface CreditView {
+  allowed: boolean;
+  available: boolean | null;
+  carrying: boolean;
+  reason: string;
+  used: number | null;
+  limit: number | null;
+  cap: number | null;
+  remaining: number | null;
+  currency: string | null;
+  capUsd?: number;
+  onCredit: boolean;
+  readAt?: string;
+}
+
 export interface AccountView {
   id: string;
   kind: (typeof ACCOUNT_KINDS)[number];
@@ -109,11 +180,15 @@ export interface AccountView {
   plan?: string;
   /** Profiles only: whether `claude auth login` has completed in it. */
   signedIn?: boolean;
-  /** Where the login stands. `unknown` is a setup-token's honest answer; `unusable` is a retired credential. */
+  /** Where the login stands — a setup-token's is read from its age since phase 91; `unusable` is a retired credential. */
   authState?: (typeof AUTH_STATES)[number];
   /** The breaker's word (phase 15's dashboard renders it); optional so an older server's list still renders. */
   entitlement?: EntitlementView;
   usage?: AccountUsage;
+  /** Each window's forecast and who is burning the account (control-tower phase 92); absent from an older server. */
+  forecast?: AccountForecast;
+  /** Its credits and whether they carry its runs past its plan windows (control-tower phase 93); absent from an older server. */
+  credits?: CreditView;
   /** ISO — the last meter read that failed, from the machine-wide learned store. */
   lastErrorAt?: string;
   /** ISO — the last meter read that SUCCEEDED on any console on this machine. */
@@ -130,6 +205,14 @@ export interface AccountView {
   pollEveryMs?: number;
   /** The rank's verdict on this account right now. */
   breaker?: AccountStanding;
+  /** Token accounts: when the setup-token stops working — a year after it was added (control-tower phase 91). */
+  tokenExpiresAt?: string;
+  /** Login-backed accounts: the unattended path, offered — a long-lived token does not lapse between sessions (#147). */
+  unattended?: string;
+  /** What its meter can say whatever its buckets (control-tower phase 13, #33); absent from an older server. */
+  meter?: (typeof METER_STATES)[number];
+  /** The live runs set to pay as this account (phase 13); absent from an older server. */
+  paying?: { slug: string; runId: string }[];
 }
 
 export interface AccountsState {
@@ -152,10 +235,16 @@ export interface AccountLoginStart {
   accountId: string;
   /** The exact command, for the operator to run themselves when nothing opened. */
   command: string;
-  /** `embedded` = a pty on the Agent page; `external` = Terminal.app opened; `command` = copy-paste. */
-  mode: 'embedded' | 'external' | 'command';
+  /**
+   * `embedded` = a pty on the Agent page; `external` = Terminal.app opened; `command` = copy-paste;
+   * `replace-token` = a token account, whose credential is replaced rather than signed in (phase 13);
+   * `warn` = the machine login while a live run pays as it — nothing ran, `warning` says why (#131).
+   */
+  mode: 'embedded' | 'external' | 'command' | 'replace-token' | 'warn';
   terminal?: { sessionId: string; token: string; expiresAt: number };
   detail?: string;
+  warning?: string;
+  runs?: string[];
 }
 
 /** The account fetchers — merged into `api` by `./index`. */
@@ -173,8 +262,25 @@ export const accountsApi = {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
     }),
-  accountLogin: (body: { accountId?: string; name?: string } = {}) =>
+  /**
+   * "Use credits past plan limits" for one account (control-tower phase 93,
+   * #146) — the server verifies it from the account's own credit state and
+   * answers 409 with the reason when credits cannot carry it.
+   */
+  accountOverage: (id: string, allowed: boolean, capUsd?: number) =>
+    post<{ account: AccountView }>(`/api/accounts/${q(id)}/overage`, {
+      allowed,
+      ...(capUsd === undefined ? {} : { capUsd }),
+    }),
+  accountLogin: (body: { accountId?: string; name?: string; confirm?: string } = {}) =>
     post<AccountLoginStart>('/api/accounts/login', body),
+  /** Replace a token account's credential, keeping its id and name (control-tower phase 13, #33). */
+  accountReplaceToken: (id: string, token: string) =>
+    request<{ account: AccountView }>(`/api/accounts/${q(id)}/credential`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ token }),
+    }),
   /**
    * The operator's clearance of a RETIRED account — the one transition out of
    * the breaker's `retired`, for the credential and every account in its
@@ -190,11 +296,32 @@ export const accountsApi = {
    */
   accountProbeEntitlement: (id: string) =>
     post<AccountProbeResult>(`/api/accounts/${q(id)}/probe-entitlement`, {}),
-  /** Acts NOW: a live session is checkpointed and re-attempted under the account. */
-  runSwitchAccount: (slug: string, accountId: string) =>
-    post<{ ok: boolean; reason?: string; run?: RunState | null }>(`/api/run/${q(slug)}/switch-account`, {
-      accountId,
-    }),
+  /**
+   * Acts NOW: a live session that is still working is checkpointed and
+   * re-attempted under the account; one only closing out finishes where it is
+   * (`deferred`). `when: 'boundary'` checkpoints no live lane at all — each
+   * finishes on the account it started on, and everything after is on the new
+   * one. The queue moves with the run either way.
+   */
+  runSwitchAccount: (slug: string, accountId: string, when?: SwitchWhen) =>
+    post<{
+      ok: boolean;
+      reason?: string;
+      run?: RunState | null;
+      checkpointed?: number;
+      deferred?: number[];
+      rekeyed?: number;
+    }>(`/api/run/${q(slug)}/switch-account`, { accountId, ...(when ? { when } : {}) }),
+  /**
+   * What that switch would do, doing none of it (`dry: true`, control-tower
+   * phase 25): the live lanes it would checkpoint now, and the ones it would
+   * leave to finish. The same refusals as the switch itself.
+   */
+  runSwitchPreview: (slug: string, accountId: string, when?: SwitchWhen) =>
+    post<{ ok: boolean; reason?: string; wouldCheckpoint?: number[]; deferred?: number[] }>(
+      `/api/run/${q(slug)}/switch-account`,
+      { accountId, dry: true, ...(when ? { when } : {}) },
+    ),
   /**
    * "I signed in over there — look again." Re-reads an account's identity AND
    * awaits a fresh usage poll, so the answer is the new numbers rather than

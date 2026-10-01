@@ -27,39 +27,41 @@
  * way through it.
  */
 
+import { haltSentence } from '@shared/halt-categories.js';
 import { isLive } from './defaults';
-import {
-  STATE_META,
-  UI_STATES,
-  UI_STATE_HELP,
-  isUiState,
-  runUiState,
-  waitReasonOf,
-  type UiState,
-} from '@/lib/status-vocab';
+import { runStatusWord, waitReasonOf } from '@/lib/status-vocab';
 import type { PhaseRecord, RunResolution, RunState } from '@/lib/api';
-import { defineFilters, defineSorts, matchesWords, words } from '@/lib/list-model';
-
-/**
- * The states the fleet is filtered and counted by: the status vocabulary's
- * own eight, worst first, each with its label and its one-line meaning. A
- * run's twelve statuses collapse onto these through `runUiState` — there is
- * no second table of "outcomes" here any more.
- */
-export const FLEET_STATES: readonly { id: UiState; label: string; hint: string }[] = UI_STATES.map((id) => ({
-  id,
-  label: STATE_META[id].label,
-  hint: UI_STATE_HELP[id].means,
-}));
+import { heldStopReason } from '@shared/orchestration-model.js';
+import { describeRun, waitNote, type StatusView } from '@shared/status-model.js';
+import type { FleetHoldView } from '@/components/fleet-freeze';
+import { defineSorts } from '@/lib/list-model';
 
 export interface RunRow {
+  /** The plan's issue drafts waiting on a person (#118) — on the plan's newest run only. */
+  pendingDrafts?: number;
   /** The raw halt — kind included, for the shared recovery model. */
   halt?: RunState['halt'] | null;
   id: string;
   slug: string;
   status: string;
-  /** The run's status through the vocabulary — what the row is painted and filtered as. */
-  ui: UiState;
+  /**
+   * The word the row PRINTS — `status`, except a `paused` run asleep on a clock
+   * nobody paused, which reads `waiting` (`runStatusWord`, #148). `status` stays
+   * the stored word for everything that acts on it.
+   */
+  word: string;
+  /**
+   * What a waiting run waits on and when it resumes — "on phase 28 · gh:… ·
+   * resumes 08:57Z" (`waitNote`, #148) — printed beside the word; absent for
+   * a run that is not waiting.
+   */
+  waitNote?: string;
+  /**
+   * The run as the status model reads it (`describeRun`) — what the row is
+   * painted as, what its badge says, and whether it still asks for attention
+   * (a stale stop settles as dormant, a person's wait is amber).
+   */
+  view: StatusView;
   live: boolean;
   /** Something is frozen — the whole run, or one lane of it. */
   frozen: boolean;
@@ -118,10 +120,17 @@ export function phasesOf(run: RunState): PhaseRecord[] {
  * operator needs — and the old table showed neither. Everything below those two
  * is derived from state the run is carrying anyway, because a row that says only
  * `interrupted` has told you the least useful true thing about itself.
+ *
+ * `hold` is the hold binding the console now (`bindingHoldOf`): a stored
+ * "it continues by itself" is read through it, so a frozen console's runs name
+ * the freeze instead of promising what the freeze prevents (#93).
  */
-export function stopReason(run: RunState): string {
-  if (run.halt?.reason) return run.halt.reason;
-  if (run.finishedReason) return run.finishedReason;
+export function stopReason(run: RunState, hold?: FleetHoldView | null): string {
+  // A halt reads in the halt card's one sentence (control-tower phase 17); the
+  // runner's own words are the card's, one press away.
+  const sentence = haltSentence(run.halt);
+  if (sentence) return run.halt?.phase != null ? `${sentence} (phase ${run.halt.phase})` : sentence;
+  if (run.finishedReason) return heldStopReason(run.finishedReason, hold);
 
   if (run.freeze) {
     const where = run.freeze.phase != null ? `phase ${run.freeze.phase}` : 'mid-phase';
@@ -139,6 +148,10 @@ export function stopReason(run: RunState): string {
     const reason = waitReasonOf(run);
     if (reason === 'external') return `waiting on external work until ${run.waitUntil}`;
     if (reason === 'person') return `waiting for a person to answer a card, until ${run.waitUntil}`;
+    if (reason === 'connectivity') return `waiting for the network until ${run.waitUntil}`;
+    // The machine, not the plan (#104): the engine timed out reading it.
+    if (reason === 'engine-busy')
+      return `the machine is too busy to read the plan — reading it again at ${run.waitUntil}`;
     return `waiting for the usage window until ${run.waitUntil}`;
   }
 
@@ -158,18 +171,23 @@ export function stopReason(run: RunState): string {
   }
 }
 
-export function toRows(runs: readonly RunState[]): RunRow[] {
+export function toRows(runs: readonly RunState[], hold?: FleetHoldView | null): RunRow[] {
   return runs.map((run) => {
     const phases = phasesOf(run);
     const worked = phases.reduce((sum, p) => sum + (p.durationMs ?? 0), 0);
     const budget = run.runBudgetUsd ?? null;
     const spent = run.spentUsd ?? 0;
 
+    const waiting = waitNote(run as Parameters<typeof waitNote>[0]);
+    const view = describeRun(run as Parameters<typeof describeRun>[0]);
     return {
+      ...(run.pendingDrafts ? { pendingDrafts: run.pendingDrafts } : {}),
+      ...(waiting ? { waitNote: waiting } : {}),
       id: run.id,
       slug: run.slug,
       status: run.status,
-      ui: runUiState(run.status),
+      word: runStatusWord(run),
+      view,
       live: isLive(run.status),
       frozen: run.status === 'frozen' || Boolean(run.freeze),
 
@@ -196,7 +214,7 @@ export function toRows(runs: readonly RunState[]): RunRow[] {
       failures: run.consecutiveFailures ?? 0,
       maxFailures: run.maxConsecutiveFailures ?? 0,
 
-      reason: stopReason(run),
+      reason: stopReason(run, hold),
       resolution: run.resolved ?? null,
       halt: run.halt ?? null,
     };
@@ -251,25 +269,9 @@ export const { SORTS, isSortId, sortRows } = orders;
 export type SortId = (typeof SORTS)[number]['id'];
 
 /* ------------------------------------------------------------------ *
- * Filtering
+ * The closure cut
  * ------------------------------------------------------------------ */
 
-export interface Filters extends Record<string, unknown> {
-  /** Free text over the plan slug and the run id. */
-  query: string;
-  /** One UI state (`runUiState`), or every state. A value the vocabulary does not know reads as every state. */
-  outcome: string;
-  /** One plan, or every plan. */
-  plan: string;
-}
-
-/**
- * Everything, to start with.
- *
- * Deliberately not "hide finished": the fleet's default reading is the whole
- * record. A page that opened already filtered would make a run somebody is
- * looking for appear to have never happened.
- */
 /**
  * Split the fleet by its plan's closure — the view gate ABOVE the filters, so
  * counts, chips, tiles and grouping all sit downstream of one cut and cannot
@@ -292,75 +294,9 @@ export function partitionClosed(
   return { open, closed };
 }
 
-/**
- * What the fleet's filters mean.
- *
- * Mechanism from `lib/list-model.ts` again — `NO_FILTERS`, the pass and the
- * active count came from one `interface`, one constant and one `filter` that
- * agreed only by inspection. `query` prepares its words ONCE per pass rather
- * than re-splitting the string for every one of several hundred rows.
- *
- * `outcome` is `inert` on anything the status vocabulary does not know, which
- * is the rule the hand-written pass had inline: a stored outcome from a build
- * where that word existed must read as "every state", never as "no rows".
- */
-const filters = defineFilters<RunRow, Filters>({
-  query: {
-    initial: '',
-    prepare: words,
-    keep: (row, terms) => matchesWords(`${row.slug} ${row.id}`, terms as string[]),
-  },
-  outcome: {
-    initial: '',
-    inert: (value) => !isUiState(value),
-    keep: (row, value) => row.ui === value,
-    // Not counted: the outcome chips stay ON the toolbar in both shapes, and
-    // the number this feeds is the badge on the button that HIDES the rest.
-    // Counting a control the operator can already see would say two filters
-    // are folded away when only one is.
-    counts: false,
-  },
-  plan: { initial: '', keep: (row, value) => row.slug === value },
-});
-
-export const { NO_FILTERS, applyFilters, activeCount } = filters;
-
-/** How many runs each UI state holds — the filter chips' own counts. */
-export function outcomeCounts(rows: readonly RunRow[]): Record<UiState, number> {
-  const counts = Object.fromEntries(UI_STATES.map((id) => [id, 0])) as Record<UiState, number>;
-  for (const row of rows) counts[row.ui]++;
-  return counts;
-}
-
-/** Every plan the fleet has ever run, busiest first. */
-export function planOptions(rows: readonly RunRow[]): { slug: string; runs: number }[] {
-  const counts = new Map<string, number>();
-  for (const row of rows) counts.set(row.slug, (counts.get(row.slug) ?? 0) + 1);
-  return [...counts]
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .map(([slug, runs]) => ({ slug, runs }));
-}
-
 /* ------------------------------------------------------------------ *
- * Grouping and totals
+ * Totals
  * ------------------------------------------------------------------ */
-
-export interface Group {
-  key: string;
-  rows: RunRow[];
-}
-
-/** Rows keep the order the sort gave them; grouping only says where headings fall. */
-export function groupRows(rows: readonly RunRow[], grouped: boolean): Group[] {
-  if (!grouped) return [{ key: '', rows: [...rows] }];
-  const groups = new Map<string, RunRow[]>();
-  for (const row of rows) {
-    const list = groups.get(row.slug);
-    if (list) list.push(row);
-    else groups.set(row.slug, [row]);
-  }
-  return [...groups].map(([key, list]) => ({ key, rows: list }));
-}
 
 /**
  * What the visible fleet adds up to.
@@ -376,7 +312,9 @@ export function fleetTotals(rows: readonly RunRow[]) {
   let worked = 0;
   for (const row of rows) {
     if (row.live) live++;
-    if (row.ui === 'needs-you') attention++;
+    // Anything the model says still asks for a look — a stop, a person's wait,
+    // a summons — and not a stop gone dormant, a pause you took, or a live loop.
+    if (row.view.attention !== 'none') attention++;
     spent += row.spentUsd;
     worked += row.workedMs ?? 0;
   }

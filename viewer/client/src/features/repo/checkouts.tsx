@@ -25,8 +25,10 @@
 
 import { useMemo } from 'react';
 import { FolderGit2 } from 'lucide-react';
-import { Badge, Chip, DataTable, Empty } from '@/components/ui';
-import type { BadgeTone, Column } from '@/components/ui';
+import { Badge, Empty } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
+import { OpsBadge } from '@/components/ui/status';
+import type { Column } from '@/components/data-table';
 import type { RepoCheckout, RepoCheckouts } from '@/lib/api';
 import { homePath } from '@/lib/format';
 
@@ -48,20 +50,11 @@ export const ROLE_BLURB: Readonly<Record<RepoCheckout['role'], string>> = Object
   debris: 'Under the console’s state directory, and no surviving run record claims it.',
 });
 
-const ROLE_TONE: Readonly<Record<RepoCheckout['role'], BadgeTone>> = Object.freeze({
-  root: 'neutral',
-  run: 'accent',
-  lane: 'accent',
-  staging: 'ok',
-  operator: 'neutral',
-  debris: 'wait',
-});
-
 /** The `via` column, and it is the evidence column — see the file lead. */
 export function ViaChip({ checkout }: { checkout: RepoCheckout }) {
   if (checkout.via === 'record') {
     return (
-      <Chip
+      <Badge
         tone="ok"
         data-testid="via-chip"
         data-via="record"
@@ -70,19 +63,19 @@ export function ViaChip({ checkout }: { checkout: RepoCheckout }) {
         }, run ${checkout.run.runId}${checkout.run.status ? `, ${checkout.run.status}` : ''}.`}
       >
         record
-      </Chip>
+      </Badge>
     );
   }
   if (checkout.via === 'branch') {
     return (
-      <Chip
-        tone="warn"
+      <Badge
+        tone="accent"
         data-testid="via-chip"
         data-via="branch"
         title="Read from the branch name alone. No record claims this tree — a killed console's orphan, or a checkout somebody made by hand. Not evidence."
       >
         by name
-      </Chip>
+      </Badge>
     );
   }
   return (
@@ -92,20 +85,21 @@ export function ViaChip({ checkout }: { checkout: RepoCheckout }) {
   );
 }
 
-/** `live` exists only on a `record` row, and that asymmetry is the useful part. */
+/**
+ * `live` exists only on a `record` row, and that asymmetry is the useful part.
+ * Drawn as the session-presence words — a runner driving the tree is `live`,
+ * one that stopped is `ended` — with the run's own status on the title.
+ */
 function liveness(checkout: RepoCheckout) {
   if (checkout.via !== 'record') return null;
   return checkout.run.live ? (
-    <Badge tone="accent" title="A runner is driving this checkout right now.">
-      live
-    </Badge>
+    <OpsBadge vocab="presence" word="live" title="A runner is driving this checkout right now." />
   ) : (
-    <Badge
-      tone="neutral"
+    <OpsBadge
+      vocab="presence"
+      word="ended"
       title={`The run has stopped${checkout.run.status ? ` (${checkout.run.status})` : ''}.`}
-    >
-      stopped
-    </Badge>
+    />
   );
 }
 
@@ -182,10 +176,10 @@ function checkoutColumns(
       priority: 1,
       min: 104,
       cellClassName: 'align-top',
+      // The role's word and icon from the model (`checkout-role`), its sentence
+      // on the title — never a hue alone.
       cell: (checkout) => (
-        <Badge tone={ROLE_TONE[checkout.role]} title={ROLE_BLURB[checkout.role]}>
-          {checkout.role}
-        </Badge>
+        <OpsBadge vocab="checkout-role" word={checkout.role} title={ROLE_BLURB[checkout.role]} />
       ),
     },
     {

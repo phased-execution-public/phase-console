@@ -89,6 +89,9 @@ export function SheetContent({
             footer == null && 'pb-safe',
           ],
           side === 'right' && [
+            // Physical on purpose: `right` is an edge callers ask for by name, so
+            // it stays glued to that edge (`styles/logical.test.ts` holds it as an
+            // exception). Mirroring it under RTL is a rename to `end`, not a respelling.
             'right-0 top-0 h-(--app-height) w-[min(28rem,calc(100%-2rem))]',
             'border-l border-rule data-[state=open]:animate-fade',
           ],

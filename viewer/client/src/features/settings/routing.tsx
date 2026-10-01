@@ -41,7 +41,16 @@ import { useConsoleState, usePush, useSavePrefs, useWebhooks } from '@/lib/queri
 import { currentEndpoint } from '@/lib/push';
 import { settingsHref } from '@/app/routes';
 import { plural } from '@/lib/format';
-import { Banner, Card, CardBody, CardHeader, CardSkeleton, CardTitle, Checkbox, Chip } from '@/components/ui';
+import {
+  Banner,
+  Card,
+  CardBody,
+  CardHeader,
+  CardSkeleton,
+  CardTitle,
+  Checkbox,
+  Badge,
+} from '@/components/ui';
 
 /**
  * The kinds that mean "nothing proceeds until you look". Turning one off is a
@@ -176,11 +185,11 @@ export function RoutingCard() {
                 <label htmlFor={boxId} className="min-w-0 flex-1 cursor-pointer">
                   <span className="text-sm text-ink">{category.label}</span>
                   {category.urgent && (
-                    <Chip tone="warn" className="ml-1.5">
+                    <Badge tone="accent" className="ml-1.5">
                       urgent
-                    </Chip>
+                    </Badge>
                   )}
-                  {!category.byDefault && <Chip className="ml-1.5">off by default</Chip>}
+                  {!category.byDefault && <Badge className="ml-1.5">off by default</Badge>}
                   <span className="mt-0.5 block text-2xs text-ink-muted">{category.detail}</span>
                   <RoutingLine
                     on={on}

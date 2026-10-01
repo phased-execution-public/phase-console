@@ -99,6 +99,20 @@ if [ "$verb" = "merge" ] && [ "$detach" = 1 ]; then
   echo "merge takes no --detach: a detached lane holds no branch to merge — cherry-pick its commits by sha" >&2
   exit 2
 fi
+# Under a CONSOLE run the console owns the run's trees and branches (control-
+# tower phase 90, #154), and its sessions carry `PE_OWNER=autopilot/<run>`. A
+# build lane is a second tree of the phase the console did not make, and
+# `merge` needs `pe/<slug>` checked out — the branch the run's own checkout
+# needs: a resumed session's hand tree on it once refused its run the mirror
+# (`branch-in-use`). A review tree (--detach) and a QA round's tree commit
+# nothing onto the run branch, and the boot prompt offers exactly those.
+case "${PE_OWNER:-}" in
+  autopilot/*)
+    if [ "$verb" = merge ] || { [ "$verb" = create ] && [ "$detach" = 0 ] && [ -z "$qa" ]; }; then
+      echo "a session the console spawned (PE_OWNER=$PE_OWNER) does not $verb a build lane: the console owns the run's trees and branches — commit in the checkout it gave you, and take a review tree (create --detach) or a QA round's (create --qa <round>) if you need a second one" >&2
+      exit 1
+    fi ;;
+esac
 
 root="$(pe_docs_root)"
 root_p="$(cd "$root" 2>/dev/null && pwd -P)" || { echo "not a directory: $root" >&2; exit 2; }

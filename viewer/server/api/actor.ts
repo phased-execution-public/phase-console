@@ -39,6 +39,12 @@ export function agentClassOf(userAgent: string | string[] | undefined): AgentCla
 export const ACTOR_LABEL_MAX = 64;
 
 /**
+ * The longest `reason` a body may give a verb (control-tower phase 96, #142) —
+ * a sentence, the same bound a dismissal's note has always had.
+ */
+export const ACTOR_REASON_MAX = 500;
+
+/**
  * The derived actor for one HTTP request.
  *
  * `by` is the body's label when it offers one, else the proxy's login, else
@@ -47,11 +53,16 @@ export const ACTOR_LABEL_MAX = 64;
  * without it `classify()` never checks the header, so nothing has vouched
  * for it, and a loopback caller could write any name it liked into the
  * record.
+ *
+ * `reason` is the body's own why, when it gives one (control-tower phase 96,
+ * #142) — the one field here the caller writes in full, because it is the
+ * caller's to say. It rides the actor so every journal line that spreads the
+ * actor carries it; absent, rather than empty, when there is none.
  */
 export function actorOfRequest(
   req: Pick<IncomingMessage, 'headers'>,
   flags: Partial<Pick<Flags, 'remoteHosts'>>,
-  body: { by?: unknown } | null | undefined = undefined,
+  body: { by?: unknown; reason?: unknown } | null | undefined = undefined,
 ): Actor {
   const offered = typeof body?.by === 'string' ? body.by.trim().slice(0, ACTOR_LABEL_MAX) : '';
   const host = hostnameOf(req.headers.host);
@@ -64,6 +75,7 @@ export function actorOfRequest(
   const via: ActorVia = agent === 'cli' ? 'cli' : 'api';
   const origin = loopback ? 'local' : host;
   const by = offered || remoteUser || (agent === 'browser' || agent === 'cli' ? 'operator' : 'script');
-  return { by, via, origin, remoteUser };
+  const reason = typeof body?.reason === 'string' ? body.reason.trim().slice(0, ACTOR_REASON_MAX) : '';
+  return { by, via, origin, remoteUser, ...(reason ? { reason } : {}) };
 }
 

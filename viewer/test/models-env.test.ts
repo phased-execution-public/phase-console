@@ -26,8 +26,9 @@ import { join } from 'node:path';
 import { SKILL_DIR } from '../server/config.ts';
 import {
   MODELS_ENV_FALLBACK, budgetClassOf, canonicalModelId, is1m, isKnownModel,
-  loadModelsEnv, modelFamily, offeredModels,
+  loadModelsEnv, modelFamily, offeredModels, sameModel,
 } from '../server/runner/models.ts';
+import { DEFAULT_MODEL_POLICY, MODEL_POLICIES } from '../shared/run-lifecycle.js';
 import { MODEL_FALLBACK, nextModel, fallbackChain } from '../server/runner/errors.ts';
 import { loadSizing, resolveBudget } from '../server/analysis/graph.ts';
 
@@ -41,12 +42,37 @@ test('the shipped fallback is identical to scripts/models.env', () => {
   assert.deepEqual([...file.big].sort(), [...MODELS_ENV_FALLBACK.big].sort());
   assert.deepEqual([...file.oneMCapable], [...MODELS_ENV_FALLBACK.oneMCapable]);
   assert.equal(file.oneM, MODELS_ENV_FALLBACK.oneM);
+  assert.deepEqual([...file.policies], [...MODELS_ENV_FALLBACK.policies]);
+});
+
+test('MP-7: the model policies are ONE list — models.env\'s is the owner\'s (control-tower phase 54, #91)', () => {
+  assert.deepEqual([...loadModelsEnv(scripts).policies], [...MODEL_POLICIES]);
+  assert.ok(MODEL_POLICIES.includes(DEFAULT_MODEL_POLICY));
+});
+
+test('MP-7: the canonical ids follow the lineup the CLI reports — a drift test against its own init frames (#91)', () => {
+  // `cli-models.json` is what the CLI's `system/init` frame reported for each
+  // alias on this machine. models.env mapped `opus` to claude-opus-5 for a day
+  // and a half after the CLI had moved it to claude-opus-5-5 — this is the
+  // test that would have said so.
+  const measured = JSON.parse(readFileSync(new URL('./fixtures/cli-models.json', import.meta.url), 'utf8')) as {
+    resolved: Record<string, string>; before: Record<string, string>;
+  };
+  const env = loadModelsEnv(scripts);
+  for (const [alias, reported] of Object.entries(measured.resolved)) {
+    assert.ok(sameModel(alias, reported, env), `models.env pins ${alias} to ${canonicalModelId(alias, env)}; the CLI reports ${reported}`);
+  }
+  // …and it is a test that can fail: the old lineup does not pass it.
+  const stale = { ...env, ids: new Map([...env.ids, ['opus', 'claude-opus-5'], ['fable', 'claude-fable-5']]) };
+  assert.equal(sameModel('opus', measured.resolved.opus, stale), false);
+  assert.equal(sameModel('fable[1m]', measured.resolved['fable[1m]'], stale), false);
+  for (const [alias, reported] of Object.entries(measured.before)) assert.ok(sameModel(alias, reported, stale));
 });
 
 test('every key the reader looks for is actually present in the file', () => {
   const text = readFileSync(join(scripts, 'models.env'), 'utf8');
   for (const key of ['MODEL_ALIASES', 'MODEL_IDS', 'MODEL_MODES', 'MODEL_1M_SUFFIX',
-    'MODEL_1M_CAPABLE', 'MODEL_BIG']) {
+    'MODEL_1M_CAPABLE', 'MODEL_BIG', 'MODEL_POLICIES']) {
     assert.match(text, new RegExp(`^${key}="`, 'm'), `${key} is missing from models.env`);
   }
 });
@@ -99,8 +125,8 @@ test('the ladder is still the ladder — MODEL_FALLBACK is strongest first', () 
 });
 
 test('canonicalModelId expands an alias and leaves a full id alone', () => {
-  assert.equal(canonicalModelId('opus'), 'claude-opus-5');
-  assert.equal(canonicalModelId('opus[1m]'), 'claude-opus-5[1m]');
+  assert.equal(canonicalModelId('opus'), 'claude-opus-5-5');
+  assert.equal(canonicalModelId('opus[1m]'), 'claude-opus-5-5[1m]');
   assert.equal(canonicalModelId('claude-haiku-4-5-20251001'), 'claude-haiku-4-5-20251001');
   assert.equal(canonicalModelId('gpt-4'), 'gpt-4', 'unknown names are returned untouched');
 });

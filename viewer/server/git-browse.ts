@@ -70,7 +70,12 @@ import {
 } from './runner/worktree.ts';
 import type { JournalEntry } from './runner/journal.ts';
 import type { RunState } from './runner/state.ts';
-import { detachedRef, type SettleStrategy } from '../shared/worktree-model.js';
+import {
+  detachedRef,
+  type CheckoutRole,
+  type SettleKind,
+  type SettleStrategy,
+} from '../shared/worktree-model.js';
 import { shell } from './shell.ts';
 
 /* ------------------------------------------------------------------ *
@@ -993,7 +998,9 @@ export async function branchList(dir: string, opts: {
  * `pe/integration`, every plan's folded work — reported `debris`, and an
  * orphaned run tree reported `staging`. Found by P8's QA round 1 (High).
  */
-export type CheckoutRole = 'root' | 'run' | 'lane' | 'staging' | 'operator' | 'debris';
+// The words are owned by `shared/worktree-model.js` (`CHECKOUT_ROLES`), which
+// the Repo destination paints through `shared/status-model.js` (phase 26).
+export type { CheckoutRole };
 
 /**
  * A checkout, attributed.
@@ -1315,23 +1322,9 @@ export async function refHead(dir: string, ref: string): Promise<string | undefi
  * Surface 5 — settle history
  * ------------------------------------------------------------------ */
 
-export type SettleKind =
-  /** The run's branch had its fate decided. */
-  | 'settled'
-  /** A settle was asked for and is waiting on something. */
-  | 'pending'
-  /** The strategy could not be taken — a mirror run's one-tree settle. */
-  | 'unsupported'
-  /** A lane's commits reached the run branch — or a phase's landing policy took it. */
-  | 'landed'
-  /** The console pushed a phase's branch — the one publication it makes (5.1, `pushRef`). */
-  | 'pushed'
-  /** A lane's commits did NOT reach it; the integration was abandoned. */
-  | 'failed'
-  /** A checkout was given back — released, reclaimed or swept. */
-  | 'released'
-  /** A branch already contained by the trunk was deleted. */
-  | 'pruned';
+// The words, one line of meaning each, are owned by `shared/worktree-model.js`
+// (`SETTLE_KINDS`), which the Repo destination paints (control-tower phase 26).
+export type { SettleKind };
 
 export type SettleEvent = {
   slug: string;

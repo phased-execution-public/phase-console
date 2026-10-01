@@ -90,6 +90,15 @@ describe('the start-only fields never reach a settings patch', () => {
     }
   });
 
+  it('a `live` payload carries the QA gate either way — it shows the gate as it is (phase 13, #31)', () => {
+    const ctx = { slug: 'demo', run: { id: 'r1', status: 'running' } as never };
+    expect(shows('live', 'qa')).toBe(true);
+    expect(buildRunPayload('live', { ...EMPTY, qa: false }, ctx).qa).toBe(false);
+    expect(buildRunPayload('live', { ...EMPTY, qa: true }, ctx).qa).toBe(true);
+    // A launch still writes it only when ON.
+    expect('qa' in buildRunPayload('start', { ...EMPTY, qa: false }, { slug: 'demo' })).toBe(false);
+  });
+
   it('and a `live` payload carries none of them either', () => {
     const payload = buildRunPayload(
       'live',

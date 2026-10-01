@@ -108,6 +108,11 @@ export const SSE_EVENTS = [
   // news to every run in it. Transitions only, so a quiet repository is
   // silent on the wire.
   'repo:radar',
+  // A person's turn moved (control-tower phase 42): a step was declared,
+  // opened, checked, proven or settled. The step, as it now reads, rides the
+  // event, so the card's status line and the strip's summons are a cache
+  // write — a proof landing on the phone moves the desk's strip in the tick.
+  'human-step',
   // A plan's structural lint finished. `/api/plans/<slug>` no longer awaits it:
   // `validate.sh` walks every handoff, and on the 22-handoff plan somebody was
   // actually working on that was 11.27 s the page paid before it could paint a
@@ -115,6 +120,14 @@ export const SSE_EVENTS = [
   // written straight into the plan's cache, so it is a push and never a reason
   // to go and ask again.
   'plan:lint',
+  // A live lane moved, at most once every three seconds and only when what a
+  // surface renders actually changed. The firehose (`run:stream`) deliberately
+  // invalidates nothing, and the events that DO invalidate fire at phase
+  // boundaries — twenty to seventy minutes apart on a real plan — so every
+  // cache-backed surface was correct at boot and then again an hour later.
+  // This is the one event between those boundaries, and it is applied as a
+  // PATCH: it carries what it changes, so it costs no round trip at all.
+  'run:progress',
   // A restart's update moved (2026-09-18): it began, it answered, the restart
   // followed or did not. Every tab's Restart card and banner hear it, not only
   // the one whose button was pressed.

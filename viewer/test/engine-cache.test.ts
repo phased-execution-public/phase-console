@@ -93,3 +93,48 @@ test('invalidate(slug) still matches after the root joined the key — that is w
     drop();
   }
 });
+
+/*
+ * EC-L (control-tower phase 55, #44) — a lock write keeps the engine's answers.
+ *
+ * Every cached engine answer hangs from the plan's revision, and a live run
+ * claims, refreshes and releases a lock every few minutes. When a lock moved
+ * the revision, each of those writes dropped every cached answer of the plan
+ * an autopilot was working — the plan a person is most likely to open. No
+ * script the revision keys reads `.locks/`, so the key must not move for one.
+ */
+test('EC-L: a .locks/** write keeps the revision, so the engine cache still answers; a handoff write moves it', async () => {
+  const { Store } = await import('../server/store.ts');
+  const { checkRoot } = await import('../server/config.ts');
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  invalidate();
+  const { a, drop } = roots();
+  try {
+    const slug = 'ec-lock';
+    mkdirSync(join(a, 'docs', 'plans'), { recursive: true });
+    mkdirSync(join(a, 'docs', 'handoffs', slug, '.locks'), { recursive: true });
+    writeFileSync(join(a, 'docs', 'plans', `${slug}.md`),
+      '# ec-lock\n\n## Phase graph\n\n| Phase | Title | Depends on | Repos |\n|--:|--|--|--|\n| 1 | one | — | app |\n');
+    const store = new Store(checkRoot(a));
+    store.scan();
+    const before = store.get(slug)!.revision;
+    const key = { slug, revision: before };
+    const first = await run({ scriptsDir: SCRIPTS, root: a }, 'phase-graph.sh', [slug, '--qa-mode'], key);
+
+    const lock = join(a, 'docs', 'handoffs', slug, '.locks', 'phase-01.lock');
+    writeFileSync(lock, 'slug=ec-lock\nphase=1\nowner=autopilot/test\nclaimed_at=1790241174\nlease_until=4102444800\nscope=app\n');
+    store.refresh([lock]);
+    const after = store.get(slug)!;
+    assert.equal(after.revision, before, 'a lock write moved the revision — every cached answer of the plan drops with it');
+    assert.equal(after.locks.length, 1, 'the store must still read the lock it was told about — detail() shows it');
+    const second = await run({ scriptsDir: SCRIPTS, root: a }, 'phase-graph.sh', [slug, '--qa-mode'], { slug, revision: after.revision });
+    assert.equal(second, first, 'the same revision must answer from the cache, with no second engine run');
+
+    const handoff = join(a, 'docs', 'handoffs', slug, 'phase-01-one.md');
+    writeFileSync(handoff, '---\nphase: 1\nstatus: in-progress\n---\n');
+    store.refresh([handoff]);
+    assert.notEqual(store.get(slug)!.revision, before, 'a handoff is what the engine reads: its write must move the revision');
+  } finally {
+    drop();
+  }
+});

@@ -86,7 +86,7 @@ import { STALL_SIGNAL_KIND, factsFor, splitSituation } from './fact-map.js';
 /**
  * @typedef {'errand'|'approval'|'gate'|'sign-in'|'mcp-auth'|'qa'|'lock'
  *   |'health'|'stall'|'ruling'|'session-ask'|'conflict'|'question'|'policy'
- *   |'issue-draft'|'message'} InboxKind
+ *   |'issue-draft'|'message'|'supervisor'|'human-step'} InboxKind
  */
 
 /**
@@ -176,6 +176,23 @@ export const INBOX_KINDS = Object.freeze(
      * `session-ask`'s reason.
      */
     'message',
+    /**
+     * What the console's SUPERVISOR holds standing (control-tower phase 101,
+     * #145): a suggestion — one remedy a person may Accept, which presses the
+     * verb it names as that person — or an escalation, an operator-only act
+     * carrying its exact `phase-console run …` command. `needs-you` while its
+     * cause holds. Appended at the end for `session-ask`'s reason.
+     */
+    'supervisor',
+    /**
+     * A person's turn (control-tower phase 41): a HUMAN STEP a session, the
+     * plan or the console declared — a sign-in, a code, a secret, an approval
+     * only a person can give — one row per step still open in the ledger
+     * (`server/human-steps.ts`). `needs-you` until it is proven, expires, or a
+     * person says they cannot. Its verbs are phase 43's. Appended at the end
+     * for `session-ask`'s reason.
+     */
+    'human-step',
   ]),
 );
 
@@ -202,6 +219,8 @@ export const INBOX_KIND_LABELS = Object.freeze({
   policy: 'Policy answered',
   'issue-draft': 'Issue draft',
   message: 'Message',
+  supervisor: 'Supervisor',
+  'human-step': 'Your turn',
 });
 
 /**
@@ -524,11 +543,11 @@ export function sortInbox(items) {
 
 /**
  * @typedef {'session-silent'|'session-retrying'|'queued-behind-lock'|'park-overdue'
- *   |'plan-idle'|'verify-hanging'} StallKind
+ *   |'plan-idle'|'verify-hanging'|'undriven'} StallKind
  */
 
 /**
- * The six ways something can be nominally in flight and not moving.
+ * The seven ways something can be nominally in flight and not moving.
  *
  * DECLARED, NOT DETECTED. Phase 5 writes the detector (it needs the run
  * records, the scheduler snapshot and the session registry, none of which
@@ -547,6 +566,7 @@ export const STALL_KINDS = Object.freeze(
     'park-overdue',
     'plan-idle',
     'verify-hanging',
+    'undriven',
   ]),
 );
 
@@ -606,6 +626,13 @@ export const STALL_META = Object.freeze({
     blurb:
       "A §Verification command still running after a quarter of an hour — the runtime half of lint F16, which warns at plan time about a check that waits on an external clock (`gh run watch`, a `--watch` flag, a long sleep). Runnable, unfinishable inside a session's turn.",
     afterMs: 15 * MINUTE,
+    severity: 'needs-you',
+  }),
+  undriven: Object.freeze({
+    label: 'Undriven',
+    blurb:
+      'A phase the board reads in progress (or stuck) that nothing of its live run drives — no lane, no queue entry, no boarding hint, no park, no errand (control-tower phase 79, #114). The board\'s word reads as "someone is on it"; measured, four phases sat like this for 13–23 hours inside runs that were green on every surface. Half an hour, because the drive loop re-judges a phase it skipped every convergence cadence and should have picked it up long before; a ladder that DEFERRED it to a healer that only climbs a stopped run raises at once.',
+    afterMs: 30 * MINUTE,
     severity: 'needs-you',
   }),
 });
@@ -874,6 +901,72 @@ export const STALL_ESCALATE_MS = 45 * MINUTE;
 export const LOCAL_JOB_GRACE_MS = 10 * MINUTE;
 
 export const STALL_LOCAL_JOB_MS = 45 * MINUTE;
+
+/**
+ * How close two Bash calls of one probe must be to be ONE wait — the gap of a
+ * wait chain (control-tower phase 47, #67).
+ *
+ * The wait procedure grants a session one foreground call bounded by the Bash
+ * timeout, so a long local job is waited on in slices of about 10 minutes,
+ * each a call of its own. Judged per call, no clock above 10 minutes could
+ * ever be reached: the nudge almost never fired, the 45-minute park never
+ * did, and every slice raised a fresh card (measured: 32 cards and 0 parks
+ * over one 5.86-hour hold). Calls of one probe signature (`probeSignature`,
+ * `runner/liveness.ts`) that start within this long of the previous one's end
+ * are one chain, and the chain's age is what the rungs read. 3 minutes: a
+ * compliant session re-issues its poll within seconds, and one that spends
+ * longer on other work between two polls has moved on.
+ */
+export const WAIT_CHAIN_GAP_MS = 3 * MINUTE;
+
+/**
+ * What an `external-wait` card is called when the wait is on the session's
+ * OWN job (`scope: 'local'`): a card's title follows its scope (#67). In the
+ * autopilot week 230 of 234 such cards were titled "waiting on an external
+ * clock" over a body that said "a background job this session started".
+ */
+export const LOCAL_WAIT_LABEL = 'Waiting on its own job';
+
+/**
+ * WHICH silence a live lane is in (#28) — `LaneLiveness.silence.kind`.
+ *
+ * The detector already tells these apart (`runner/liveness.ts`
+ * `evaluateStall`); a lane row used to print one bare "silent 12m" for all of
+ * them, and they have different remedies:
+ * - `no-output` — nothing on the wire at all since the last productive event.
+ * - `unproductive` — heard from (API retries, keepalive) but producing
+ *   nothing; the clock is the productive one, NOT the last output.
+ * - `in-tool` — a tool call is out and nothing has come back yet.
+ * - `own-job` — waiting on work of its own: its turn ended on a background
+ *   agent or monitor, or an open call waits on a job it started. Measured
+ *   against `STALL_LOCAL_JOB_MS`, with `LOCAL_JOB_GRACE_MS` (ten minutes) as
+ *   the grace before a nudge.
+ * - `external-wait` — an open call waiting on somebody else's clock, against
+ *   `STALL_DEFAULTS.stallExternalWaitMs`.
+ * Every other kind runs against `STALL_DEFAULTS.stallSilentMs`. The numbers
+ * stay here, in this file; the lane only says which of them applies.
+ *
+ * @typedef {'no-output'|'unproductive'|'in-tool'|'own-job'|'external-wait'} SilenceKind
+ */
+/** @type {readonly SilenceKind[]} */
+export const SILENCE_KINDS = Object.freeze(
+  /** @type {const} */ (['no-output', 'unproductive', 'in-tool', 'own-job', 'external-wait']),
+);
+
+/**
+ * What each silence is CALLED on a lane row (control-tower phase 23, #28) —
+ * printed with its clock and the threshold it is measured against, never as a
+ * bare figure: "no output 4m · flagged at 10m" and "waiting on its own job 12m"
+ * have different remedies, and one elapsed number cannot say which applies.
+ * @type {Readonly<Record<SilenceKind, string>>}
+ */
+export const SILENCE_LABELS = Object.freeze({
+  'no-output': 'no output',
+  unproductive: 'no productive output',
+  'in-tool': 'inside a tool call',
+  'own-job': 'waiting on its own job',
+  'external-wait': 'waiting on an outside clock',
+});
 
 /**
  * How long after an auto-nudge a still-silent lane is recycled.

@@ -1,21 +1,25 @@
 import * as ToastPrimitive from '@radix-ui/react-toast';
 import { useSyncExternalStore } from 'react';
 import { cva } from 'class-variance-authority';
+import { NOTE_ROWS, NOTE_SEVERITIES, type NoteSeverity } from '@shared/status-notes.js';
 import { cn } from '@/lib/cn';
+import { NoteIcon } from './status-stack';
 
 /**
  * Toasts.
  *
- * The four kinds are real variants, not one grey box with different words —
- * `warn` in particular did not exist before, so "the console is running older
- * code than is on disk" arrived looking exactly like "Copied". A toast that
- * cannot show severity is a toast nobody reads.
+ * The kinds are real variants, not one grey box with different words — `warn`
+ * in particular did not exist before, so "the console is running older code
+ * than is on disk" arrived looking exactly like "Copied". A toast that cannot
+ * show severity is a toast nobody reads. Since 6.0 a toast's kind IS a note
+ * severity (`shared/status-notes.js`), painted and drawn from the same rows as
+ * a banner, with the severity's icon rather than a colour-only dot.
  *
  * The store is module-level so anything — a mutation handler, an SSE listener,
  * a keyboard shortcut — can raise one without being inside a provider.
  */
 
-export type ToastKind = 'ok' | 'warn' | 'error' | 'info';
+export type ToastKind = NoteSeverity;
 
 /**
  * A toast that wants something. Almost none do — this exists for the update
@@ -70,27 +74,17 @@ export function useToasts(): ToastRecord[] {
 }
 
 const toastVariants = cva(
-  'pointer-events-auto flex items-start gap-2 rounded border px-3 py-2 text-sm shadow-card ' +
-    'bg-surface-raised data-[state=open]:animate-rise',
+  'pointer-events-auto flex items-start gap-2 rounded border border-state/55 px-3 py-2 text-sm text-ink ' +
+    'shadow-card bg-surface-raised data-[state=open]:animate-rise',
   {
     variants: {
-      kind: {
-        ok: 'border-done/50 text-ink',
-        warn: 'border-action/60 text-ink',
-        error: 'border-blocked/55 text-blocked',
-        info: 'border-progress/45 text-ink',
-      },
+      kind: Object.fromEntries(
+        NOTE_SEVERITIES.map((kind) => [kind, `state-${NOTE_ROWS[kind].paint}`]),
+      ) as Record<ToastKind, string>,
     },
     defaultVariants: { kind: 'ok' },
   },
 );
-
-const DOT: Record<ToastKind, string> = {
-  ok: 'bg-done',
-  warn: 'bg-action',
-  error: 'bg-blocked',
-  info: 'bg-progress',
-};
 
 /**
  * Mounted once by the shell. The viewport sits above everything (`--z-toast`)
@@ -120,7 +114,7 @@ export function Toaster() {
           }}
           className={cn(toastVariants({ kind: item.kind }))}
         >
-          <span className={cn('mt-1.5 size-[7px] shrink-0 rounded-full', DOT[item.kind])} aria-hidden />
+          <NoteIcon severity={item.kind} />
           <ToastPrimitive.Description className="min-w-0 flex-1">{item.message}</ToastPrimitive.Description>
           {item.action && (
             <ToastPrimitive.Action
@@ -141,8 +135,8 @@ export function Toaster() {
           'pointer-events-none fixed inset-x-0 z-(--z-toast) m-0 flex list-none flex-col gap-2 p-3',
           'bottom-[calc(100%-var(--app-height,100%)+var(--bottom-bars,0px))]',
           'pb-[calc(0.75rem+env(safe-area-inset-bottom,0px))]',
-          // Above the tab bar on a phone; bottom-right on a desktop.
-          'md:inset-x-auto md:right-0 md:w-[min(24rem,calc(100vw-1.5rem))]',
+          // Above the tab bar on a phone; the bottom END corner on a desktop.
+          'md:inset-x-auto md:end-0 md:w-[min(24rem,calc(100vw-1.5rem))]',
         )}
       />
     </ToastPrimitive.Provider>

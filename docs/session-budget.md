@@ -25,9 +25,25 @@ is one model planning and another executing.
 ## 2 · How much work fits one session
 
 The **budget** is measured in summed phase *weight*, not raw context, and defaults to **~0.2 × the
-model's effective window**. That lands a full session near ~60% real window use — clear of
-auto-compaction (~83%) and clear of the late-window quality zone. Override it if your session's
-effective window is smaller than the model's maximum:
+model's effective window**, so a session's context target — 60 % of the window, the console's own
+wrap-up line — is 3 × its budget. What a session's context actually IS comes from a measured model,
+never from a multiple of its weight (control-tower phase 59, #83):
+
+```
+peak context ≈ boot floor + work floor + slope × weight      (shipped: 121K + 198K + 2.17 × weight)
+```
+
+- the **boot floor** is the first API call's context — the system prompt, tools, CLAUDE.md, rules,
+  memory and the boot prompt, read before any work. It is per REPOSITORY (121K on one console of the
+  machine that measured it, 89K on the other), and `--session-plan` reports it as its own line,
+  because it is the part a repository can shrink;
+- the **work floor** is what every phase session adds above its boot whatever its size;
+- the **slope** is what the phase's own weight adds.
+
+`boot + work` is the per-session floor, paid ONCE by every session: a batch of phases fits when
+`floor + slope × Σweight` stays under the target. The old "≈ 3 × weight" was under 107 of 108
+measured phases; the model above sits within 10 % of the median peak for every tag. Override the
+budget if your session's effective window is smaller than the model's maximum:
 
 ```bash
 scripts/phase-graph.sh checkout-rewrite --session-plan 40000   # a raw budget in tokens
@@ -43,37 +59,61 @@ Tag a phase and the engine can group phases into sessions for you:
 | `M` *(default)* | ~15–50K | a typical feature across a few files with some exploration |
 | `L` | ~50–120K | a substantial subsystem, heavy exploration, large diffs |
 
-Untagged phases are treated as `M`. A phase whose weight exceeds one session's budget is really two
-phases — split it.
+Untagged phases are treated as `M`. A phase whose predicted peak exceeds the target on its own is
+really two phases — split it.
 
-**What a size buys.** On the console the tag is also the cap a phase's session runs under when its
-run sets no per-phase dollar budget (`phaseBudgetUsd`):
+**What caps a session.** On the console every session carries a dollar and a turn cap
+(`--max-budget-usd`, `--max-turns`), and they are MEASURED, not chosen: each mode's p99 over the
+console's own `phase.session` lines of the last two weeks, plus 50 %, rounded up — re-derived hourly
+as sessions accrue (`deriveCapTable`, `viewer/server/runner/session-record.ts`). A mode with fewer
+than twenty sessions in the window takes the table shipped with the release, measured the same way:
 
-| Tag | Dollars | Turns |
-|---|---|---|
-| `S` | $25 | 150 |
-| `M` | $60 | 300 |
-| `L` | $120 | 600 |
+| Mode | Dollars | Turns | Measured over (shipped) |
+|---|---|---|---|
+| `phase` | $120 | 490 | p99 $77.81 over 274 sessions · p99 322 turns over 321, 2026-09-16 → 2026-09-25 |
+| `resume` | the phase's | 120 | p99 74 turns over 27 — the resume floor |
 
-That is about three times the most any measured session spent, so it bounds a runaway without
-cutting a long phase (`SESSION_CAPS_BY_SIZE`, `viewer/server/runner/session-record.ts`). Every
-session the spawn door starts carries both, as `--max-budget-usd` and `--max-turns`. A phase attempt
-or a resume gets the whole row (or the whole `phaseBudgetUsd`); a side session — a closeout, a
-repair, a reviewer — gets a quarter of those dollars, never under $1, unless its caller set its own
-(a QA round's `qaRoundBudgetUsd`), and a turn cap of its own: 90 for a repair (`REPAIR_MAX_TURNS`), 60 for paperwork and bounded reviews
-(`CLOSEOUT_MAX_TURNS`). A cap that bites is not a failure: the same session resumes under double
-that cap, and the `phase.session` line names which policy set each cap.
+The size tag no longer sets a cap: measured, it did not separate an M's spend from an L's (p90: M 252
+turns and $51.6, L 264 and $50.4), and the per-size rows it set — "about three times the most any
+measured session spent" — sat under routine M work and never bound an L. A cap binds on a runaway and
+never on the p90, and every `phase.session` records each cap's derivation (percentile, headroom,
+window, samples) so drift shows in the ledger. A run's `phaseBudgetUsd` still replaces the dollars.
+Dollars: a phase attempt, and a session that continues the phase's work, get the phase's whole
+dollars (or the whole `phaseBudgetUsd`); a side session — a closeout, a repair, a reviewer — gets a
+quarter of those dollars, never under $1, unless its caller set its own (a QA round's
+`qaRoundBudgetUsd`). Turns, by session (`capsFor`, held to this table by
+`viewer/test/resume-caps.test.ts`):
 
-## 4 · Whether phases share a session
+| Session | Turn cap |
+|---|---|
+| a phase attempt (`phase`) | the phase's measured cap |
+| a resume with an instruction (`resume`), a wait-resume (`wait-resume`) | the phase's cap minus the turns the phase already spent, never under 120 (`RESUME_MIN_TURNS`) |
+| a repair (`repair`) | 90 (`REPAIR_MAX_TURNS`) |
+| a closeout or closeout brief (`closeout`), a QA round (`qa`), a landing (`landing`), a PR (`pr`) or review (`review`) session | 60 (`CLOSEOUT_MAX_TURNS`) |
+
+A side session's own measurement can raise its cap above those constants, never lower it. A session
+that continues the phase does the phase's work, so it runs under what is left of the phase's
+allowance; its floor is the audit week's p90 continuation stint (83 turns, over 22 stints) with about
+45 % headroom. A cap that bites is not a failure: the same session resumes under double that cap — a
+resume included — and the `phase.session` line names which policy set each cap.
+
+## 4 · How many sessions a plan takes, and whether phases share one
 
 ```bash
 scripts/phase-graph.sh checkout-rewrite --session-plan opus
 ```
 
-It walks the *remaining* phases in dependency order and groups them while every dependency is already
-satisfied and the summed weight fits the budget. It always cuts at gated phases, at unmet
-dependencies, and at QA boundaries. Treat it as a suggestion — Claude confirms it against the live
-context meter.
+Under the console the unit is **`1 phase ≥ 1 session`**: the autopilot boards every phase in a session
+of its own and never batches, and a phase that wraps its context takes more. So `--session-plan`
+states that unit first and forecasts the phases left from MEASURED sessions per phase, by size and by
+whether a phase wraps (`sizing.env`'s `SESSIONS_*` and `WRAP_*`: an S 1.71, an M 1.66, an L 1.93) —
+never a weight over a budget, which forecast 0.35–0.67 sessions a phase against a measured 1.1–5.0. It
+prints the plan's weight as a generated line — quote it rather than type a sum.
+
+Its batches are for a person driving phases by hand: it walks the *remaining* phases in dependency
+order and groups them while every dependency is already satisfied and `floor + slope × Σweight`
+stays under the target. It always cuts at gated phases, at unmet dependencies, and at QA boundaries.
+Treat them as a suggestion — Claude confirms it against the live context meter.
 
 ## 5 · Whether QA runs
 
@@ -189,9 +229,12 @@ Some rows resolve from lines in this section — `**Credentials:**` + `**Credent
 `**Accounts:**`, `**Permissions:**`, `**May publish:**`, `**QA exhausted:**`, `**When in doubt:**`,
 `**Wait budget:**` — and from per-phase bullets (`- **Credentials:**`, `- **Waits on:**`,
 `- **Human step:**`, `- **Person-check:**`). Answers that arrive later go to a twin the engine
-merges over the table, written only by `scripts/decisions.sh`.
+merges over the table, written only by `scripts/decisions.sh`. The human-step bullet has one grammar
+since control-tower phase 41 — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
+<ref> · where: host|any · window: <duration> [· auto-open: host]`, one of sixteen kinds — and the
+5.1.0 `<who, what, proof ref>` spelling it replaced fails the lint by name (F37).
 
-**The wait budget is a total, and a declared window is never cut.** `**Wait budget:** 48h` is the
+**The wait budget is a total, and spending it is never a failure.** `**Wait budget:** 48h` is the
 TOTAL wall-clock one phase may spend parked across every wait it declares — not a window per wait;
 with the line absent the console's default is 8 h. A phase's `- **Waits on:** <ref>[, <ref>…] · <max>`
 overrides it for that phase alone, and a `date:` ref among its refs countersigns a wait up to that
@@ -200,9 +243,14 @@ already spent parked, read from each park's own stamps — at park and again at 
 
 - a window that fits what is left parks;
 - a window past what is left, but inside the plan's countersign, parks;
-- a window past both is **refused**: a `waiting-external-timeout` halt that states the arithmetic and
-  names the two lines that would allow it. The console never shortens a declared window in silence —
-  only a park that named no window at all (the 30-minute default) is shortened to what is left.
+- a window past both that names a `--watch` ref the console can poll is granted what is left: the
+  ref's landing decides, not the window — as does a park that named no window at all (the 30-minute
+  default), which is shortened to what is left;
+- a window past both that names no such ref is **refused**, and a refusal is a budget event, not a
+  failure: the phase parks `waiting` on its refs with no clock of its own and a `budgets` errand that
+  states the arithmetic and names the two lines that would give it more. Nothing is failed and the
+  failure streak is not charged; a landing still resumes the session, and raising the budget and
+  pressing Retry gives it a clock again.
 
 One phase may declare at most four waits (`WAIT_MAX_PER_PHASE`); the console's own watchdog parks
 spend a separate allowance and never touch this one.

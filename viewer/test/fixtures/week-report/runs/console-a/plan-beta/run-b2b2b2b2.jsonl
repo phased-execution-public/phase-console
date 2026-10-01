@@ -1,0 +1,54 @@
+{"seq":1,"time":"2026-01-02T00:00:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":2,"time":"2026-01-02T00:00:00.000Z","event":"phase.start","phase":1,"data":{}}
+{"seq":3,"time":"2026-01-02T01:00:00.000Z","event":"phase.session","phase":1,"data":{"mode":"phase","sessionId":"s-b1","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":4,"time":"2026-01-02T01:00:00.000Z","event":"phase.verify","phase":1,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":5,"time":"2026-01-02T01:00:00.000Z","event":"phase.done","phase":1,"data":{}}
+{"seq":6,"time":"2026-01-02T01:00:00.000Z","event":"phase.start","phase":2,"data":{}}
+{"seq":7,"time":"2026-01-02T03:00:00.000Z","event":"phase.session","phase":2,"data":{"mode":"phase","sessionId":"s-b2","costUsd":4,"costSource":"result","ms":7200000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":8,"time":"2026-01-02T03:00:00.000Z","event":"phase.verify","phase":2,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":9,"time":"2026-01-02T03:00:00.000Z","event":"phase.done","phase":2,"data":{}}
+{"seq":10,"time":"2026-01-02T03:00:00.000Z","event":"phase.start","phase":3,"data":{}}
+{"seq":11,"time":"2026-01-02T03:30:00.000Z","event":"phase.session","phase":3,"data":{"mode":"phase","sessionId":"s-b3","costUsd":1,"costSource":"result","ms":1800000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":12,"time":"2026-01-02T03:30:00.000Z","event":"phase.verify","phase":3,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":13,"time":"2026-01-02T03:30:00.000Z","event":"phase.done","phase":3,"data":{}}
+{"seq":14,"time":"2026-01-02T03:30:00.000Z","event":"phase.start","phase":4,"data":{}}
+{"seq":15,"time":"2026-01-02T05:00:00.000Z","event":"phase.session","phase":4,"data":{"mode":"phase","sessionId":"s-b4","costUsd":3,"costSource":"result","ms":5400000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":16,"time":"2026-01-02T05:00:00.000Z","event":"phase.verify","phase":4,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":17,"time":"2026-01-02T05:00:00.000Z","event":"phase.done","phase":4,"data":{}}
+{"seq":18,"time":"2026-01-02T05:00:00.000Z","event":"run.finished","data":{}}
+{"seq":19,"time":"2026-01-05T07:00:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":20,"time":"2026-01-05T07:00:00.000Z","event":"phase.start","phase":5,"data":{}}
+{"seq":21,"time":"2026-01-05T08:00:00.000Z","event":"phase.session","phase":5,"data":{"mode":"phase","sessionId":"s-b5","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":22,"time":"2026-01-05T08:00:00.000Z","event":"phase.tokens","phase":5,"data":{"mode":"phase","sessionId":"s-b5","calls":48,"peakContext":120000,"cacheRead":5000000,"cacheWrite":100000,"input":400,"output":10000}}
+{"seq":23,"time":"2026-01-05T08:00:00.000Z","event":"phase.verify","phase":5,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":24,"time":"2026-01-05T08:00:00.000Z","event":"phase.done","phase":5,"data":{}}
+{"seq":25,"time":"2026-01-05T08:00:00.000Z","event":"phase.start","phase":6,"data":{}}
+{"seq":26,"time":"2026-01-05T08:00:00.000Z","event":"phase.queued","phase":8,"data":{"scope":"app","headKind":"grant","waitingOn":[{"slug":"plan-gamma","phase":2,"owner":"autopilot/c3c3c3c3","overlaps":["app"],"eta":{"label":"~30 min–1 h of work left"}}]}}
+{"seq":27,"time":"2026-01-05T09:00:00.000Z","event":"phase.session","phase":6,"data":{"mode":"phase","sessionId":"s-b6","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":28,"time":"2026-01-05T09:00:00.000Z","event":"phase.halted","phase":6,"data":{"kind":"no-handoff","reason":"no handoff"}}
+{"seq":29,"time":"2026-01-05T09:00:00.000Z","event":"phase.queue-closed","phase":8,"data":{"outcome":"admitted","ms":3600000,"waitedMs":3600000}}
+{"seq":30,"time":"2026-01-05T09:00:00.000Z","event":"phase.admitted","phase":8,"data":{"scope":"app","waitedMs":3600000}}
+{"seq":31,"time":"2026-01-05T09:00:00.000Z","event":"phase.start","phase":8,"data":{}}
+{"seq":32,"time":"2026-01-05T10:00:00.000Z","event":"phase.session","phase":8,"data":{"mode":"phase","sessionId":"s-b8","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":33,"time":"2026-01-05T10:00:00.000Z","event":"phase.verify","phase":8,"data":{"ok":false,"ran":[{"command":"npm test","code":1,"ms":180000},{"command":"npm test","code":1,"ms":180000}]}}
+{"seq":34,"time":"2026-01-05T10:00:00.000Z","event":"phase.halted","phase":8,"data":{"kind":"verify-failed","reason":"npm test failed"}}
+{"seq":35,"time":"2026-01-05T10:00:00.000Z","event":"run.halt","data":{"kind":"failure-streak","reason":"2 phases failed in a row: phase 6, then phase 8"}}
+{"seq":36,"time":"2026-01-05T11:00:00.000Z","event":"run.start","data":{"by":"operator"}}
+{"seq":37,"time":"2026-01-05T11:00:00.000Z","event":"phase.start","phase":6,"data":{}}
+{"seq":38,"time":"2026-01-05T11:00:00.000Z","event":"phase.queued","phase":7,"data":{"scope":"app","headKind":"grant","waitingOn":[{"slug":"plan-beta","phase":6,"owner":"autopilot/b2b2b2b2","overlaps":["app"]}]}}
+{"seq":39,"time":"2026-01-05T12:00:00.000Z","event":"phase.session","phase":6,"data":{"mode":"closeout","sessionId":"s-b6b","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"error_max_turns","terminalReason":"max_turns","maxTurns":{"value":60,"source":"closeout"}}}
+{"seq":40,"time":"2026-01-05T12:00:00.000Z","event":"phase.verify","phase":6,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":41,"time":"2026-01-05T12:00:00.000Z","event":"phase.done","phase":6,"data":{}}
+{"seq":42,"time":"2026-01-05T12:00:00.000Z","event":"phase.start","phase":7,"data":{}}
+{"seq":43,"time":"2026-01-05T13:00:00.000Z","event":"phase.session","phase":7,"data":{"mode":"phase","sessionId":"s-b7","costUsd":3,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":44,"time":"2026-01-05T13:00:00.000Z","event":"run.halt","data":{"kind":"plan-lint","reason":"phase 6 left the plan failing validate.sh: "}}
+{"seq":45,"time":"2026-01-05T13:30:00.000Z","event":"run.start","data":{"door":"converge-heal","by":"heal"}}
+{"seq":46,"time":"2026-01-05T13:30:00.000Z","event":"phase.start","phase":7,"data":{}}
+{"seq":47,"time":"2026-01-05T14:30:00.000Z","event":"phase.session","phase":7,"data":{"mode":"resume","sessionId":"s-b7","costUsd":5,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"},"resumed":true,"bookedUsd":2}}
+{"seq":48,"time":"2026-01-05T14:30:00.000Z","event":"phase.verify","phase":7,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":49,"time":"2026-01-05T14:30:00.000Z","event":"phase.done","phase":7,"data":{}}
+{"seq":50,"time":"2026-01-05T14:30:00.000Z","event":"phase.start","phase":8,"data":{}}
+{"seq":51,"time":"2026-01-05T15:30:00.000Z","event":"phase.session","phase":8,"data":{"mode":"phase","sessionId":"s-b8b","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":52,"time":"2026-01-05T15:30:00.000Z","event":"phase.verify","phase":8,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":53,"time":"2026-01-05T15:30:00.000Z","event":"phase.done","phase":8,"data":{}}
+{"seq":54,"time":"2026-01-05T22:00:00.000Z","event":"run.usage-window","data":{"kind":"limits","status":"allowed","window":"five_hour","utilization":0.2}}

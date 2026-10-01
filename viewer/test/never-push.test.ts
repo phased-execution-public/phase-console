@@ -58,6 +58,7 @@ import { dirname, join, relative } from 'node:path';
 
 import { argvLiterals } from './argv-scan.ts';
 import { PUSH_ARGV } from '../shared/landing-model.js';
+import { manifestPushVerdict } from '../shared/policy-model.js';
 import { PUSH_REF, pushRef } from '../server/runner/worktree.ts';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -163,11 +164,20 @@ const FORBIDDEN = [...REMOTE_VERBS, ...MUTATING_VERBS];
  *    mirror or tags flag, and it exists in this file alone. `REMOTE_VERBS`
  *    still bans `push` in every OTHER file, and `fetch`, `pull`, `remote`,
  *    `clone` and `init` everywhere including here.
+ *  - `add` and `write-tree` are the fourteenth and fifteenth (control-tower
+ *    phase 62, #68), for ONE function, `workingTreeOf`: naming the tree a
+ *    session's §Verification ran against, which is how the console knows a
+ *    command it is about to run was already proven. Both run with
+ *    `GIT_INDEX_FILE` pointed at a scratch copy of the index, so the
+ *    repository's own index, the session's staged work, every ref and the
+ *    working tree are untouched — what they write is unreferenced objects, as
+ *    `merge-tree --write-tree` does. `write-tree` joins `GIT_VERBS` below so it
+ *    is visible to this gate at all.
  */
 const EXEMPT_FILE = 'runner/worktree.ts';
 const WORKTREE_VERBS = [
   'worktree', 'merge', 'merge-tree', 'rev-parse', 'rev-list', 'diff', 'status',
-  'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push',
+  'switch', 'symbolic-ref', 'branch', 'for-each-ref', 'log', 'push', 'add', 'write-tree',
 ];
 
 /** The flag that makes a phased-execution script commit and push its write. */
@@ -197,7 +207,7 @@ const ALLOWED = [
  * vocabulary must know about a verb whether or not it is allowed; that is the
  * difference between "banned" and "invisible".
  */
-const GIT_VERBS = new Set([...FORBIDDEN, ...ALLOWED, 'add', 'rm', 'mv', 'tag', 'branch', 'switch', 'worktree', 'merge-tree', 'blame', 'grep', 'config']);
+const GIT_VERBS = new Set([...FORBIDDEN, ...ALLOWED, 'add', 'rm', 'mv', 'tag', 'branch', 'switch', 'worktree', 'merge-tree', 'write-tree', 'blame', 'grep', 'config']);
 
 /**
  * The argv scanner is `test/argv-scan.ts` — one definition, shared with
@@ -626,3 +636,17 @@ test('the seam refuses BEFORE spawning — a caller not allowed learns nothing, 
   // The shape the regex admits is exactly the two branch shapes `laneNames` mints.
   assert.ok(PUSH_REF.test('pe/x') && PUSH_REF.test('pe/x-p3') && !PUSH_REF.test('main'));
 });
+
+test('#112 (control-tower phase 84): the manifest\'s push answer is a PARSER, never an argv — and never answers a force, a delete or a trunk, whatever the row names', () => {
+  const source = readFileSync(join(SERVER_DIR, '..', 'shared', 'policy-model.js'), 'utf8');
+  assert.doesNotMatch(source, /child_process|spawn\(|execFile/, 'reading a session\'s command spawns nothing');
+  const row = 'deny; may publish: branch pushes to `pe/x` + `main` + `master`';
+  for (const command of [
+    'git push origin main', 'git push origin pe/x:master', 'git push -f origin pe/x', 'git push origin +pe/x',
+    'git push origin --delete pe/x', 'git push origin :pe/x', 'git push --mirror origin', 'git push --all origin',
+  ]) {
+    assert.equal(manifestPushVerdict(command, row, {}).answer, null, command);
+  }
+  assert.equal(manifestPushVerdict('git push origin pe/x', row, {}).answer, 'allow', 'the named branch alone is answered');
+});
+

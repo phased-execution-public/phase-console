@@ -12,7 +12,8 @@
  *
  * `WIRE` says which server field each value becomes, or `null` for the ones
  * that never reach a run door (`prompt` is a session's first message;
- * `permissionMode` belongs to an agent ticket). `schema-parity.test.ts` walks
+ * `permissionMode` is the run's default mode on the run doors and a
+ * ticket's mode on an agent launch). `schema-parity.test.ts` walks
  * it against `shared/run-settings.js` in both directions, so:
  *
  * - a field the server accepts and this form cannot send fails the test, and
@@ -23,7 +24,7 @@
  *
  * ## Why the numbers are strings
  *
- * Budgets, `maxParallel` and `maxConsecutiveFailures` are `<input type=number>`
+ * Budgets, `maxParallel`, `maxConsecutiveFailures` and the two rung caps are `<input type=number>`
  * values, and an empty one is `''`, not `0`. The distinction is load-bearing on
  * every one of them — `''` means "no ceiling" and `0` means "never" — so they
  * stay text through the form and are coerced once, at the payload boundary,
@@ -32,7 +33,7 @@
 
 import * as z from 'zod/mini';
 import type { Autonomy, McpPolicy, PermissionProfile, PhaseOptions, RelayMode } from '@/lib/api';
-import { RELAY_MODES } from '@shared/run-settings.js';
+import { GIT_STRATEGY_ACKS, RELAY_MODES } from '@shared/run-settings.js';
 import { RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
 import {
   DEFAULT_RETENTION,
@@ -57,7 +58,9 @@ import { DEFAULT_ISSUES, ISSUE_MODES, type IssueMode } from '@shared/issues-mode
 import {
   AUTONOMY_MODES,
   GIT_MODES,
+  DEFAULT_MODEL_POLICY,
   MCP_POLICIES,
+  MODEL_POLICIES,
   ON_LIMIT_POLICIES,
   REVIEWER_POLICIES,
   ULTRA_REVIEW_MODES,
@@ -65,6 +68,7 @@ import {
 import type {
   AutonomyMode,
   GitMode,
+  ModelPolicy,
   OnLimitPolicy,
   ReviewerPolicy,
   UltraReviewMode,
@@ -76,11 +80,23 @@ export type PermissionChoice = PermissionProfile | 'plan';
 export interface RunSetupValues {
   model: string;
   effort: string;
+  /**
+   * Whether the run's model may move (control-tower phase 54, #91): `pinned`
+   * runs on the model it names or parks; `ladder` may fall back, step down at
+   * a wall and escalate. The plan's `**Model policy:**` outranks it.
+   */
+  modelPolicy: ModelPolicy;
   autonomy: Autonomy;
   /** Guarded / Trusted / Bypass, plus `plan` where a session is being minted. */
   permissionProfile: PermissionChoice;
   /** A session's CLI `--permission-mode`, when the choice above does not spell it. */
   permissionMode: string;
+  /**
+   * Minutes an approval card waits for a person before it times out
+   * (control-tower phase 97, #140). `''` says nothing: the hook call's own
+   * hour, which is also the ceiling — a longer wait is an Extend on the card.
+   */
+  approvalTimeoutMinutes: string;
   accountId: string;
   onLimit: OnLimitPolicy;
   phaseBudgetUsd: string;
@@ -159,6 +175,13 @@ export interface RunSetupValues {
   autoRecover: boolean;
   maxParallel: string;
   maxConsecutiveFailures: string;
+  /**
+   * The run's own ladder rung caps (#14). `''` is "this console's own cap" and
+   * `'0'` is a cap — nothing climbs — so these are the one pair where empty and
+   * zero are both answers, and neither is a blank to be filled in.
+   */
+  ladderPerRunRungs: string;
+  ladderPerPhaseRungs: string;
   /** `"1,3,5-7"` — parsed at the payload boundary, so a half-typed range is not an error yet. */
   onlyPhases: string;
   phaseOptions: Record<string, PhaseOptions>;
@@ -174,6 +197,12 @@ export interface RunSetupValues {
    */
   resumeOnRestart: boolean;
   relay: RelayMode;
+  /**
+   * The launch's answer to the plan git lines its strategy will not honour
+   * (control-tower phase 11, #18): `honour`, `override`, or empty — not answered,
+   * which the start door refuses while such a line stands.
+   */
+  gitStrategyAck: '' | (typeof GIT_STRATEGY_ACKS)[number];
   accounts: string;
   acknowledgedWaivers: string[];
   manifestOverride: string;
@@ -196,9 +225,11 @@ export type RunSetupField = keyof RunSetupValues;
 export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freeze({
   model: 'model',
   effort: 'effort',
+  modelPolicy: 'modelPolicy',
   autonomy: 'autonomy',
   permissionProfile: 'permissionProfile',
-  permissionMode: null,
+  permissionMode: 'permissionMode',
+  approvalTimeoutMinutes: 'approvalTimeoutMinutes',
   accountId: 'accountId',
   onLimit: 'onLimit',
   phaseBudgetUsd: 'phaseBudgetUsd',
@@ -233,11 +264,14 @@ export const WIRE: Readonly<Record<RunSetupField, string | null>> = Object.freez
   autoRecover: 'autoRecover',
   maxParallel: 'maxParallel',
   maxConsecutiveFailures: 'maxConsecutiveFailures',
+  ladderPerRunRungs: 'ladderPerRunRungs',
+  ladderPerPhaseRungs: 'ladderPerPhaseRungs',
   onlyPhases: 'onlyPhases',
   phaseOptions: 'phaseOptions',
   prompt: null,
   resumeOnRestart: 'resumeOnRestart',
   relay: 'relay',
+  gitStrategyAck: 'gitStrategyAck',
   accounts: 'accounts',
   acknowledgedWaivers: 'acknowledgedWaivers',
   manifestOverride: 'manifestOverride',
@@ -264,9 +298,12 @@ export const CONTEXT_FIELDS = Object.freeze(['resumeRunId']);
 export const runSetupSchema = z.object({
   model: z.string(),
   effort: z.string(),
+  modelPolicy: z.enum([...MODEL_POLICIES] as [ModelPolicy, ...ModelPolicy[]]),
   autonomy: z.enum([...AUTONOMY_MODES] as [AutonomyMode, ...AutonomyMode[]]),
   permissionProfile: z.enum(['guarded', 'trusted', 'bypass', 'plan']),
   permissionMode: z.string(),
+  // The run door's own ceiling (`intProblem(…, 1, 59)`): inside the hook call's hour.
+  approvalTimeoutMinutes: whole('Approval wait', 1, 59),
   accountId: z.string(),
   onLimit: z.enum([...ON_LIMIT_POLICIES] as [OnLimitPolicy, ...OnLimitPolicy[]]),
   phaseBudgetUsd: money('Budget per phase'),
@@ -324,6 +361,9 @@ export const runSetupSchema = z.object({
   autoRecover: z.boolean(),
   maxParallel: whole('Max parallel', 1, 99),
   maxConsecutiveFailures: whole('Stop after N failures', 1, 50),
+  // The doors' own ranges (`intProblem` in `api/routes.ts`), zero included.
+  ladderPerRunRungs: whole('Recovery rungs per run', 0, 1000),
+  ladderPerPhaseRungs: whole('Recovery rungs per phase', 0, 100),
   onlyPhases: z.string().check(
     z.refine(
       (text) => text.trim() === '' || /^\s*\d+(\s*-\s*\d+)?(\s*,\s*\d+(\s*-\s*\d+)?)*\s*$/.test(text),
@@ -338,6 +378,7 @@ export const runSetupSchema = z.object({
   // From the owner list — `shared/run-settings.js` is the one place the relay's
   // two words are spelled.
   relay: z.enum(RELAY_MODES as unknown as [RelayMode, ...RelayMode[]]),
+  gitStrategyAck: z.enum(['', ...GIT_STRATEGY_ACKS] as unknown as ['', 'honour', 'override']),
   accounts: z.string().check(
     z.refine((text) => text.trim() === '' || parseAccounts(text) !== undefined, {
       message: 'Accounts look like default:20, work:10 — an id and the minimum headroom percent',
@@ -380,9 +421,11 @@ function whole(label: string, min: number, max: number) {
 export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   model: '',
   effort: '',
+  modelPolicy: DEFAULT_MODEL_POLICY,
   autonomy: 'keep-going',
   permissionProfile: 'guarded',
   permissionMode: '',
+  approvalTimeoutMinutes: '',
   accountId: 'default',
   onLimit: 'wait',
   phaseBudgetUsd: '',
@@ -436,6 +479,8 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   autoRecover: false,
   maxParallel: '',
   maxConsecutiveFailures: '',
+  ladderPerRunRungs: '',
+  ladderPerPhaseRungs: '',
   onlyPhases: '',
   phaseOptions: {},
   prompt: '',
@@ -446,6 +491,7 @@ export const EMPTY: Readonly<RunSetupValues> = Object.freeze({
   // never named one. No waiver acknowledged, no override signed.
   resumeOnRestart: true,
   relay: 'off',
+  gitStrategyAck: '',
   accounts: '',
   acknowledgedWaivers: [],
   manifestOverride: '',

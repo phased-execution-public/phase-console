@@ -26,7 +26,7 @@
  *     and the page says exactly that before it does it.
  *
  * The derivation is pure and exported so the fold is testable without a pty,
- * and it reuses `features/now`'s lane + foreign models rather than minting a
+ * and it reuses `features/runs/lanes-model.ts`'s lane + foreign models rather than minting a
  * second vocabulary for the same facts — the `groupOf` rule from Phase 9.
  *
  * ## The strip is this list, collapsed
@@ -48,25 +48,15 @@ import { phaseHref, planHref } from '@shared/routes.js';
 import { cn } from '@/lib/cn';
 import { usePhone } from '@/lib/media';
 import { relativeTime } from '@/lib/format';
-import {
-  Duration,
-  RelativeTime,
-  Sheet,
-  SheetContent,
-  StatusBadge,
-  StatusDot,
-  Tabs,
-  TabsList,
-  TabsTrigger,
-  asUiState,
-} from '@/components/ui';
-import { endedLabel, foreignVehicle, otherSessions, type NowLane } from '@/features/now/model';
+import { Duration, RelativeTime, Sheet, SheetContent, Tabs, TabsList, TabsTrigger } from '@/components/ui';
+import { AttentionMark, ViewBadge } from '@/components/ui/status';
+import { describeWord, type StatusView } from '@shared/status-model.js';
+import { endedLabel, foreignVehicle, otherSessions, type NowLane } from '@/features/runs/lanes-model';
 import type { ForeignSession, PhaseTask, TerminalSession } from '@/lib/api';
 import { TaskLine } from '@/features/runs/task-summary';
 import { sessionsHref } from '@/app/routes';
 import { sessionStateNote } from './session-controls';
 import { SessionInspector } from './session-inspector';
-import { phaseUiState, type UiState } from '@/lib/status-vocab';
 
 /**
  * What the session controls and vitals mean — the sentences a desktop reads
@@ -172,8 +162,12 @@ export interface SessionRow {
    * question from "the quietest".
    */
   createdAt?: number;
-  /** The row's standing through the ONE status vocabulary — the dot's word. */
-  state?: UiState;
+  /**
+   * The row's standing through the ONE status model (control-tower phase 24)
+   * — a lane's phase word, a pty's `terminal` word, a registry session's
+   * presence — drawn by the typed badge with its icon.
+   */
+  view?: StatusView;
   /**
    * The session is stopped waiting on a PERSON — a pending permission card
    * (lanes) or the registry's waiting flag (everyone else) — and since when.
@@ -224,7 +218,7 @@ export const KIND_ICON = { lane: Cpu, agent: Bot, shell: TerminalSquare, foreign
 /**
  * Every process, in one list: live first, then by kind, then most recent.
  *
- * `lanes` and `foreign` come straight from `features/now`'s models — the same
+ * `lanes` and `foreign` come straight from `features/runs/lanes-model.ts` — the same
  * `nowLanes()` the home page ranks and the same `otherSessions()` it uses to
  * drop a registry row that duplicates a lane we already drew. Console-owned
  * ptys are ordered live-before-ended within their kind so eight dismissable
@@ -258,7 +252,7 @@ export function sessionRows(input: {
       ...(lane.startedAt
         ? { startedAt: Date.parse(lane.startedAt), createdAt: Date.parse(lane.startedAt) }
         : {}),
-      state: card ? 'needs-you' : asUiState(phaseUiState(lane.status, lane.stop)),
+      view: describeWord('phase', lane.status),
       ...(lane.tasks?.length ? { tasks: lane.tasks } : {}),
       ...(card ? { attention: { kind: 'permission' as const, since: card.createdAt } } : {}),
       record: lane,
@@ -277,13 +271,18 @@ export function sessionRows(input: {
       live: !session.exited,
       startedAt: session.exitedAt ?? session.lastOutputAt ?? session.createdAt,
       createdAt: session.createdAt,
-      state: session.exited
-        ? session.exited.code
-          ? 'failed'
-          : 'done'
-        : session.frozen || session.stopping
-          ? 'waiting'
-          : 'running',
+      view: describeWord(
+        'terminal',
+        session.exited
+          ? session.exited.code
+            ? 'failed'
+            : 'exited'
+          : session.frozen
+            ? 'frozen'
+            : session.stopping
+              ? 'stopping'
+              : 'running',
+      ),
       // A QA reviewer's list, folded by the server from its inbox — the one
       // pty whose list the console can see. Same key a lane row carries.
       ...(session.tasks?.length ? { tasks: session.tasks } : {}),
@@ -325,15 +324,9 @@ export function sessionRows(input: {
       live: session.presence === 'live',
       startedAt: Date.parse(session.lastSeen),
       createdAt: Date.parse(session.startedAt),
-      state:
-        session.presence === 'live' && session.waiting
-          ? 'needs-you'
-          : session.presence === 'live'
-            ? 'running'
-            : session.presence === 'ended'
-              ? 'done'
-              : // `unknown` is a claim nobody can vouch for — the UNKNOWN_STATE word.
-                'waiting',
+      // Presence is the registry's own word; a session stopped on a person is
+      // the attention mark beside it, never a second colour for the word.
+      view: describeWord('presence', session.presence),
       ...(session.presence === 'live' && session.waiting
         ? { attention: { kind: session.waiting.kind, since: session.waiting.since } }
         : {}),
@@ -489,16 +482,22 @@ function SessionListRow({
               Duration at the end of the row painted over the last 39px of it at
               360. Two overlapping strings is worse than either one truncated. */}
           <span className="flex min-w-0 flex-wrap items-center gap-1.5">
-            {row.state && <StatusDot state={row.state} pulse={row.state === 'running' && row.live} />}
+            {row.view && <ViewBadge view={row.view} pulse={row.live && row.view.paint === 'running'} />}
             <span className="min-w-32 flex-1 truncate text-ink">{row.label}</span>
             {row.attention && (
-              <StatusBadge
-                state="needs-you"
-                label={row.attention.kind === 'permission' ? 'needs permission' : 'needs input'}
-                title={
-                  row.attention.since ? `waiting ${relativeTime(Date.parse(row.attention.since))}` : undefined
-                }
-              />
+              <>
+                <AttentionMark
+                  level="needs-you"
+                  title={
+                    row.attention.since
+                      ? `waiting ${relativeTime(Date.parse(row.attention.since))}`
+                      : undefined
+                  }
+                />
+                <span className="text-2xs text-ink-muted">
+                  {row.attention.kind === 'permission' ? 'needs permission' : 'needs input'}
+                </span>
+              </>
             )}
             {/* A note is not the record's identity, so it is the thing that
                 gives — `min-w-0 truncate`, never `shrink-0`. The full text is

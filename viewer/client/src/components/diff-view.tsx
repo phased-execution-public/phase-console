@@ -76,7 +76,7 @@ export function DiffFileRow({
       ) : (
         <span className="shrink-0 whitespace-nowrap">
           <span className="text-done">+{file.additions}</span>{' '}
-          <span className="text-blocked">−{file.deletions}</span>
+          <span className="text-failed">−{file.deletions}</span>
         </span>
       )}
     </button>
@@ -178,7 +178,7 @@ export function DiffHunks({
                 <Fragment key={li}>
                   <tr
                     className={
-                      line.kind === 'add' ? 'bg-done/10' : line.kind === 'del' ? 'bg-blocked/10' : undefined
+                      line.kind === 'add' ? 'bg-done/10' : line.kind === 'del' ? 'bg-failed/10' : undefined
                     }
                   >
                     <td className="w-10 select-none px-1 text-right align-top text-ink-faint tabular-nums">

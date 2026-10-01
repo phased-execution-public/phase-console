@@ -28,8 +28,9 @@
  *    phone downloads to look at what needs it, and xterm — ~250 KB — must not be
  *    anywhere except the two heads that actually open a pty.
  *
- * The 4.0 shape (`app/routes.ts` holds the reasoning): eight destinations, every
- * older head still resolving, and three overlays that ride the query string
+ * The 6.0 shape (`app/routes.ts` holds the reasoning): seven destinations with
+ * Runs the home, every older head still resolving — Now's among them, as a
+ * redirect onto the Tower — and three overlays that ride the query string
  * rather than taking a head of their own.
  */
 
@@ -117,16 +118,16 @@ const redirect = (to: (route: Route) => string): RedirectRoute => ({ kind: 'redi
  * One entry per `ROUTE_HEADS` member — the client test fails if that stops
  * being true in either direction.
  *
- * The order mirrors `ROUTE_HEADS`: the eight destinations, then the pages a
+ * The order mirrors `ROUTE_HEADS`: the seven destinations, then the pages a
  * destination has not absorbed yet, then the aliases.
  */
 export const ROUTE_TABLE: Record<string, RouteEntry> = {
-  /* ---- the eight destinations ---- */
-  // The needs-you inbox, the live lanes, next up and the plans in flight —
-  // the four pages this one absorbed, on the route that was always its home.
-  now: page(() => import('@/features/now')),
-  plans: page(() => import('@/features/plans')),
+  /* ---- the seven destinations ---- */
+  // The Tower — every run in one bay, what needs you first — and, a switch
+  // away, the ledger of every run there has been. The home since 6.0: Now's
+  // four bands are its bays, and Now's address a redirect onto it.
   runs: page(() => import('@/features/runs')),
+  plans: page(() => import('@/features/plans')),
   // One list and one pane for lanes, agent sessions, shells and the Claude
   // sessions the presence hook reports. xterm is ~250 KB and is NOT in this
   // chunk: `session-page.tsx` reaches the pane through a `lazy()` of its own,
@@ -153,18 +154,24 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
   // opened cold on a phone, over whatever signal is there at 2am, and it must
   // not drag `marked`, the DAG maths or the rail in behind it.
   approve: page(() => import('@/features/approve')),
+  // The whole queue (control-tower phase 99, #135) — its own chunk: the Tower
+  // links to it, and nothing on the home page needs its table.
+  queue: page(() => import('@/features/queue')),
   // The chromeless pre-open directory picker: it renders INSTEAD of the shell,
   // because there is nothing to navigate to until a root is open. Settings ▸
   // General is the door to it.
   source: page(() => import('@/features/settings/source')),
 
   /* ---- aliases: a head whose new home already exists ---- */
+  // 6.0 (control-tower phase 21): the Tower absorbed Now's bands, so Now's
+  // address lands on it — each `?focus=` on the bay that took its question.
+  now: redirect(REDIRECTS.now),
   dashboard: redirect(REDIRECTS.dashboard),
   stats: redirect(REDIRECTS.stats),
   search: redirect(REDIRECTS.search),
   guide: redirect(REDIRECTS.guide),
-  // Phase 8: Now grew the two sections these pages were, so both retire into
-  // it with the `?focus=` that keeps what each address MEANT.
+  // Phase 8 retired these into two sections of Now; 6.0 moved those sections
+  // onto the Tower as bays, so each lands on its bay (`?bay=ready`, `live`).
   ready: redirect(REDIRECTS.ready),
   pulse: redirect(REDIRECTS.pulse),
   // Phase 10: the two terminal pages became `#/sessions/:id`. Both keep their
@@ -179,7 +186,7 @@ export const ROUTE_TABLE: Record<string, RouteEntry> = {
   notifications: redirect(REDIRECTS.notifications),
 };
 
-/** `''` and anything unregistered land on Now rather than nowhere. */
+/** `''` and anything unregistered land on the home (`DEFAULT_HEAD`, Runs) rather than nowhere. */
 export function resolveHead(head: string | undefined): string {
   if (!head) return DEFAULT_HEAD;
   return head in ROUTE_TABLE ? head : DEFAULT_HEAD;
@@ -278,7 +285,7 @@ export function useNavigate(): (path: string, options?: { replace?: boolean }) =
  * go to the right place".
  */
 export function MemoryRouterProvider({
-  initial = '#/now',
+  initial = '#/runs',
   onNavigate,
   children,
 }: {

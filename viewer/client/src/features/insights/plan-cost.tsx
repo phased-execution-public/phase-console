@@ -28,8 +28,9 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   CopyButton,
+  Disclosure,
   Empty,
   KeyValue,
   MoneyAmount,
@@ -124,6 +125,13 @@ export function PlanCostPanel({
   }
 
   const dearest = cost.phases[0];
+  // Absent forecast, a working-time-only one (no measurable duty cycle) and a
+  // dated one are three different tile values, never one fallback covering two.
+  const finish = !forecast
+    ? '—'
+    : forecast.calendar === 'known' && forecast.expected
+      ? localDate(forecast.expected)
+      : 'unknown';
 
   return (
     <div className="flex min-w-0 flex-col gap-3">
@@ -135,11 +143,7 @@ export function PlanCostPanel({
           hint={dearest ? `P${dearest.phase} · ${plural(dearest.attempts, 'session')}` : 'nothing recorded'}
         />
         <Tile label="Ladder" value={money(cost.ladderUsd)} hint="repair — already inside the total" />
-        <Tile
-          label="Finish"
-          value={forecast ? localDate(forecast.expected) : '—'}
-          hint={forecast ? forecast.label : 'no estimate'}
-        />
+        <Tile label="Finish" value={finish} hint={forecast ? forecast.label : 'no estimate'} />
       </div>
 
       {cost.residualUsd !== 0 && (
@@ -185,43 +189,59 @@ export function PlanCostPanel({
         </CardHeader>
         <CardBody>
           {spent.length ? (
-            <ul className="flex min-w-0 flex-col gap-1">
-              {(all ? spent : spent.slice(0, LIST_LIMIT)).map((phase) => (
-                <li key={phase.phase} className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                  {/* `tap-cell`, not `tap-area`: `P7` is 22px wide in a list
+            // The numbers behind the tiles above, folded as a chart's are
+            // (`ChartNumbers`): the tiles answer at a glance, and every phase's
+            // row is one press away (control-tower phase 26).
+            <Disclosure label="The phases" openLabel="Hide the phases" count={spent.length}>
+              <ul className="flex min-w-0 flex-col gap-1">
+                {(all ? spent : spent.slice(0, LIST_LIMIT)).map((phase) => (
+                  <li key={phase.phase} className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                    {/* `tap-cell`, not `tap-area`: `P7` is 22px wide in a list
                       of 20px rows, so a 44×44 overlay covered the rows either
                       side of it in exactly the column their own links sit in.
                       44 both ways as the drawn box instead. */}
-                  <a
-                    href={phaseHref(slug, phase.phase)}
-                    className="tap-cell shrink-0 font-mono text-2xs text-ink hover:text-action"
-                  >
-                    P{phase.phase}
-                  </a>
-                  <span className="shrink-0 text-sm">
-                    {phase.partial && (
-                      <span
-                        className="mr-0.5 font-mono text-ink-faint"
-                        title="a session ran whose spend was never recorded"
-                      >
-                        &ge;
-                      </span>
+                    <a
+                      href={phaseHref(slug, phase.phase)}
+                      className="tap-cell shrink-0 font-mono text-2xs text-ink hover:text-action"
+                    >
+                      P{phase.phase}
+                    </a>
+                    <span className="shrink-0 text-sm">
+                      {phase.partial && (
+                        <span
+                          className="mr-0.5 font-mono text-ink-faint"
+                          title="a session ran whose spend was never recorded"
+                        >
+                          &ge;
+                        </span>
+                      )}
+                      <MoneyAmount usd={phase.usd} />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-2xs text-ink-faint">
+                      {plural(phase.attempts, 'session')}
+                      {phase.durationMs > 0 ? ` · ${duration(phase.durationMs)}` : ''}
+                      {phase.runs > 1 ? ` · ${plural(phase.runs, 'run')}` : ''}
+                    </span>
+                    {phase.model && (
+                      <Badge mono className="shrink-0">
+                        {phase.model}
+                      </Badge>
                     )}
-                    <MoneyAmount usd={phase.usd} />
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-2xs text-ink-faint">
-                    {plural(phase.attempts, 'session')}
-                    {phase.durationMs > 0 ? ` · ${duration(phase.durationMs)}` : ''}
-                    {phase.runs > 1 ? ` · ${plural(phase.runs, 'run')}` : ''}
-                  </span>
-                  {phase.model && (
-                    <Chip mono className="shrink-0">
-                      {phase.model}
-                    </Chip>
-                  )}
-                </li>
-              ))}
-            </ul>
+                  </li>
+                ))}
+              </ul>
+              {spent.length > LIST_LIMIT && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="mt-2"
+                  onClick={() => setAll((was) => !was)}
+                  aria-expanded={all}
+                >
+                  {all ? `Show the first ${LIST_LIMIT}` : `Show all ${spent.length}`}
+                </Button>
+              )}
+            </Disclosure>
           ) : (
             <Empty
               title="No phase has cost anything yet"
@@ -232,17 +252,6 @@ export function PlanCostPanel({
                 </Button>
               }
             />
-          )}
-          {spent.length > LIST_LIMIT && (
-            <Button
-              size="sm"
-              variant="ghost"
-              className="mt-2"
-              onClick={() => setAll((was) => !was)}
-              aria-expanded={all}
-            >
-              {all ? `Show the first ${LIST_LIMIT}` : `Show all ${spent.length}`}
-            </Button>
           )}
           <p className="mt-2 text-2xs text-ink-faint">
             Every number on this page is also on{' '}
@@ -263,15 +272,24 @@ export function PlanCostPanel({
           <CardBody className="flex flex-col gap-3">
             <KeyValue
               items={[
-                ['Earliest', localDate(forecast.earliest)],
-                ['Expected', localDate(forecast.expected)],
-                ['Latest', localDate(forecast.latest)],
+                // Present only when the duty cycle could measure a pace to
+                // project — `forecast.calendar === 'unknown'` means no date
+                // exists at all, not that these three happen to be absent.
+                forecast.calendar === 'known' && forecast.earliest
+                  ? (['Earliest', localDate(forecast.earliest)] as const)
+                  : false,
+                forecast.calendar === 'known' && forecast.expected
+                  ? (['Expected', localDate(forecast.expected)] as const)
+                  : false,
+                forecast.calendar === 'known' && forecast.latest
+                  ? (['Latest', localDate(forecast.latest)] as const)
+                  : false,
                 [
                   'Working time',
                   // The two quantities kept apart on purpose: the estimate is
                   // how long the WORK takes, the date is when the calendar gets
                   // there, and only one of them shrinks if you run more lanes.
-                  `${duration(forecast.workingLowMs)}–${duration(forecast.workingHighMs)} of actual running`,
+                  `${duration(forecast.workingLowMs)}–${duration(forecast.workingHighMs)} of work`,
                 ],
               ]}
             />

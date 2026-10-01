@@ -24,9 +24,14 @@
  * checklist, not an incident, and it is titled like one.
  */
 
-import { Button, Card, CardBody, CardHeader, CardTitle, Chip, StateChip } from '@/components/ui';
+import { Badge, Button, Card, CardBody, CardHeader, CardTitle } from '@/components/ui';
+import { PhaseStatusBadge, type WordOf } from '@/components/ui/status';
+import { boardStateTitle } from '@/lib/status-vocab';
+import { categoryOfHalt, haltSentence } from '@shared/halt-categories.js';
 import { phaseHref } from '@shared/routes.js';
 import { RecoveryActions } from '@/components/recovery-actions';
+import { BudgetRaise } from '@/components/halt-card';
+import { HaltCategoryMark, SituationCategoryMark } from '@/components/halt-mark';
 import type { Errand, PhaseView, RunState } from '@/lib/api';
 
 /** One stopped phase, with its cause and its way forward. */
@@ -46,6 +51,8 @@ type Row = {
   retry?: 'restarts' | 'rechecks-gate' | undefined;
   /** Link into the plan, for gates a person has to read before acting. */
   readMore?: string | undefined;
+  /** The kind of the phase's OWN stop (its record's halt), for the family mark. */
+  haltKind?: string | undefined;
 };
 
 /** The first breath of a longer text — enough to know why, not a second page. */
@@ -160,13 +167,16 @@ export function nextStepRows(slug: string, planPhases: readonly PhaseView[], run
     // re-board the run halted before). Either way the row leads with its ask.
     const errand = run?.recoveries?.[String(p.phase)]?.errand;
     if (record && (['failed', 'interrupted', 'parked', 'gated'].includes(record.status) || errand)) {
-      const haltHere = run?.halt?.phase === p.phase ? run.halt.reason : undefined;
+      // The run's stop, when it is this phase's, in the halt card's one
+      // sentence — never the runner's raw words, which the card keeps one
+      // press away (control-tower phase 17: this card derives no prose of its own).
+      const haltHere = run?.halt?.phase === p.phase ? haltSentence(run.halt) : undefined;
       rows.push({
         phase: p.phase,
         title: p.title,
         // 🔴 The BOARD's word, like both rows above — this passed
         // `record.status` and the two vocabularies are not interchangeable.
-        // `StateChip` resolves through `asPhaseState`, which falls back to
+        // The 2.x board chip (retired in control-tower phase 31) fell back to
         // `waiting` for anything outside the five board buckets, so `failed`,
         // `interrupted`, `parked` and `gated` ALL read "Waiting" — on the strip
         // whose entire job is listing stopped phases and what to do about them.
@@ -183,6 +193,7 @@ export function nextStepRows(slug: string, planPhases: readonly PhaseView[], run
           ...(record.situation ? { situation: { key: record.situation.key } } : {}),
         },
         ...(errand ? { errand } : {}),
+        ...(record.halt?.kind ? { haltKind: record.halt.kind } : {}),
         retry: 'restarts',
       });
     }
@@ -205,6 +216,9 @@ export function NextSteps({
 }) {
   if (live) return null;
   const rows = nextStepRows(slug, planPhases, run);
+  // The RUN-level facts — a spent budget, the streak, an unusable estate —
+  // are the halt card's (control-tower phase 17), drawn once in the status
+  // stack above this card; here are the phases.
   if (!rows.length) return null;
 
   // A plan nobody has run yet has not STOPPED — it has not started. The rows a
@@ -232,9 +246,17 @@ export function NextSteps({
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-2xs text-ink-faint">P{row.phase}</span>
                 <span className="min-w-0 truncate text-sm font-medium">{row.title}</span>
-                <StateChip state={row.state} board />
+                <PhaseStatusBadge board={row.state as WordOf<'board'>} title={boardStateTitle(row.state)} />
+                {row.errand ? (
+                  <SituationCategoryMark situation={row.errand.situation} />
+                ) : (
+                  row.haltKind && (
+                    <HaltCategoryMark category={categoryOfHalt(row.haltKind, row.record?.situation?.key)} />
+                  )
+                )}
               </div>
               <p className="max-w-prose text-2xs text-ink-muted">{row.why}</p>
+              {row.errand?.budget && <BudgetRaise slug={slug} phase={row.phase} fact={row.errand.budget} />}
               <div className="flex flex-wrap items-center gap-1.5">
                 {(row.record || row.stuck || row.retry === 'rechecks-gate') && (
                   <RecoveryActions
@@ -258,6 +280,7 @@ export function NextSteps({
                             { boardState: 'gated', record: { status: 'gated' } }
                     }
                     max={2}
+                    leadTestId="halt-recommended"
                   />
                 )}
                 {row.readMore && (
@@ -272,12 +295,14 @@ export function NextSteps({
                   </Button>
                 )}
                 {row.retry === 'rechecks-gate' && (
-                  <Chip
-                    tone="gate"
+                  // The gate's word, beside the Re-check that asks nothing of
+                  // anyone: a gate is a wait, and the inbox is the summons (6.0).
+                  <Badge
+                    tone="wait"
                     title="A gate is a decision the plan reserved for a person. The console can re-check it, never take it for you."
                   >
                     needs your confirmation
-                  </Chip>
+                  </Badge>
                 )}
               </div>
             </div>

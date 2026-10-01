@@ -11,11 +11,14 @@ import type { Board, QaMode } from '../engine.ts';
 import { mcpServersFor, type PhaseSize } from '../parse/plan.ts';
 import {
   indexGraph, layerGraph, unblockValue, weightOf, resolveBudget, criticalPath, remainingWork,
-  type Sizing, type McpSizing,
+  type Sizing, type McpSizing, type SessionsPerSize,
 } from './graph.ts';
 import { parseScope } from '../../shared/scope.js';
+import { phaseClocks, planSpan } from '../../shared/phase-clocks.js';
 import { CLOSED_PLAN_STATUSES, PLAN_STATUSES } from '../../shared/plan-vocab.js';
-import { ETA_BASES, HEALTH_SEVERITIES } from '../../shared/ops-vocab.js';
+import {
+  ETA_BASES, HEALTH_SEVERITIES, type DutyUnknownReason, type EtaMissingReason,
+} from '../../shared/ops-vocab.js';
 import { mergeDecisions } from '../../shared/decisions-model.js';
 import { personCheckFor } from '../parse/plan.ts';
 import { policyForPlan } from '../runner/policy.ts';
@@ -30,7 +33,7 @@ import { approvalsForPhase, reviewPhase } from '../runner/verify-review.ts';
 export type RunView = {
   id: string;
   status: string;
-  phases: Record<string, { phase: number; status: string }>;
+  phases: Record<string, { phase: number; status: string; startedAt?: string; endedAt?: string; attemptEndedAt?: string }>;
   /** The run's start-door answers for §Verification — what plan health reads to know a phase is answered. */
   verifyApprovals?: RunVerifyApprovals;
 };
@@ -80,6 +83,14 @@ export type PlanStats = {
   closedOn?: string;
   closedReason?: string;
   created?: string;
+  /**
+   * When work on the plan actually began — the earliest boarding any of its
+   * runs recorded, ISO with time (#28). `created` stays the authoring date the
+   * plan file gives, to the day. Absent until a run boards a phase.
+   */
+  startedAt?: string;
+  /** From `startedAt` to now while a run is live, else to the last recorded end — to the millisecond (#28). */
+  spanMs?: number;
   activity: number;
   phases: number;
   declaredPhases?: number;
@@ -188,7 +199,7 @@ const DAY = 86_400_000;
  * size-only answer rather than silently getting a wrong one; the console always
  * has one and always passes it, so its numbers now match `_phase_weight`.
  */
-export function planStats(ctx: PlanContext, sizing: Sizing, mcp?: McpSizing): PlanStats {
+export function planStats(ctx: PlanContext, sizing: Sizing, mcp?: McpSizing, sessions?: SessionsPerSize): PlanStats {
   const { record, board, qaMode } = ctx;
   const plan = record.plan;
   const rows = plan?.graph ?? [];
@@ -196,8 +207,10 @@ export function planStats(ctx: PlanContext, sizing: Sizing, mcp?: McpSizing): Pl
   const budget = resolveBudget(plan?.sessionBudget.targetModel, sizing);
   const index = indexGraph(rows);
 
-  const critical = criticalPath(index, board, sizes, sizing, budget);
-  const remaining = remainingWork(rows, board, sizes, sizing, budget);
+  // Sessions in the console's unit — each phase its measured sessions, never a
+  // weight over a budget (control-tower phase 59, #83).
+  const critical = criticalPath(index, board, sizes, sizing, budget, undefined, sessions);
+  const remaining = remainingWork(rows, board, sizes, sizing, budget, undefined, sessions);
 
   const bottleneck = rows
     .filter((r) => board.states[r.phase] !== 'done')
@@ -228,6 +241,7 @@ export function planStats(ctx: PlanContext, sizing: Sizing, mcp?: McpSizing): Pl
     closedOn: plan?.closed,
     closedReason: plan?.closedReason,
     created: plan?.created,
+    ...planSpan(ctx.runs ?? [], Date.now()),
     activity: record.activity,
     phases: rows.length,
     declaredPhases: plan?.declaredPhases,
@@ -471,9 +485,9 @@ export function healthIssues(ctx: PlanContext): HealthIssue[] {
 }
 
 export function portfolio(
-  contexts: PlanContext[], sizing: Sizing, rate?: RateReading, mcp?: McpSizing,
+  contexts: PlanContext[], sizing: Sizing, rate?: RateReading, mcp?: McpSizing, sessions?: SessionsPerSize,
 ): Portfolio {
-  const stats = contexts.map((ctx) => ({ ctx, stats: planStats(ctx, sizing) }));
+  const stats = contexts.map((ctx) => ({ ctx, stats: planStats(ctx, sizing, undefined, sessions) }));
   const plans = stats.filter((s) => s.stats.kind === 'plan');
   // The census counts every plan; the forward-looking numbers count only the
   // open ones. "23 phases ready" that includes an abandoned plan's phases is an
@@ -600,13 +614,27 @@ export function portfolio(
  * ------------------------------------------------------------------ */
 
 /**
- * One completed phase, as evidence about how fast this plan goes.
+ * One finished phase, as evidence about how long phases take here.
  *
- * Weight rather than count, because phases are not interchangeable: an `S` and
- * an `L` differ by six times the working set, and a plan whose last three
- * phases were small would otherwise promise a finish it cannot keep.
+ * `durationMs` is the phase's WORKED time — every session that worked it,
+ * resume, repair, QA, closeout, landing and review included (#28's
+ * `phaseClocks.workedMs`, control-tower phase 58, #66) — never the first
+ * attempt alone. `size` is the phase's tag, the class the per-size medians are
+ * taken over; `floorMs` a declared `- **Wall-clock floor:**`, which explains
+ * the phase's time by itself and so teaches the rate nothing.
  */
-export type EtaSample = { weight: number; durationMs: number; at?: string };
+export type EtaSample = {
+  weight: number;
+  durationMs: number;
+  at?: string;
+  size?: PhaseSize;
+  floorMs?: number;
+};
+
+/** A finished phase that is NOT evidence, and why — reported, never silently dropped (EE-3). */
+export type EtaMissing = { phase: number; reason: EtaMissingReason };
+
+export type EtaEvidence = { samples: EtaSample[]; missing: EtaMissing[] };
 
 /**
  * Where a rate came from, which is the thing that decides how much to believe it.
@@ -620,31 +648,111 @@ export type EtaSample = { weight: number; durationMs: number; at?: string };
 export type EtaBasis = (typeof ETA_BASES)[number];
 
 /**
- * Milliseconds per unit of weight when nothing, anywhere, has ever finished.
- *
- * Not a measurement — a stake in the ground, chosen so the three size tags land
- * on the durations `references/sizing.md` describes: at the sizing constants
- * (S 15K / M 40K / L 90K) this is 15 min, 40 min and 90 min. It is the last link
- * in the chain and always labelled `heuristic`, so nobody reads it as evidence.
+ * The least worked time that measures a phase's work (EE-2). No session boots,
+ * reads a plan and works a phase in under five minutes: the finished records
+ * below it (12.8 s, 5 s) are closeout-only completions and phases closed outside
+ * the run, and one entered the old EMA as a 40 % cut in a single step.
  */
-export const HEURISTIC_RATE_PER_WEIGHT = 60;
+export const ETA_MIN_EVIDENCE_MS = 5 * 60_000;
 
-/** A rate, and how much weight to put on it. See `rateFor`. */
+/** A plan's newest measured phases the level is read from — a bounded window, never all of history. */
+export const ETA_PLAN_WINDOW = 12;
+
+/**
+ * The pool's newest measured phases the SHAPE is fitted on. Bounded for the
+ * same reason, and so the evidence count a surface prints is the count that was
+ * weighted — the pool once claimed 413 phases while an EMA over four decided.
+ */
+export const ETA_POOL_WINDOW = 60;
+
+/**
+ * How many measured phases a plan needs before its own level stands alone.
+ * Below it each of its ratios is bounded to `ETA_CLIP` of the pool and the
+ * level is shrunk toward the pool in proportion — which is what keeps one
+ * outlier from moving an estimate more than 1.5× even when it is most of the
+ * evidence (ER-1). From the third on, a median does that job by itself.
+ */
+export const ETA_SPEAK_AT = 3;
+
+/** The furthest one ratio may pull a plan that has not yet reached `ETA_SPEAK_AT` (log). */
+export const ETA_CLIP = Math.log(3);
+
+/**
+ * How many phases of one size the pool window needs before that size anchors
+ * the shape. Below it the size's median is one or two phases — itself — and
+ * pe-hub's newest sixty held exactly one S, a six-hour one, which as an anchor
+ * bent the line to S ≈ M ≈ L (2026-09-25). Such a size stays in the window and
+ * the band; the line goes through the sizes that are classes.
+ */
+export const ETA_CLASS_MIN = 3;
+
+/**
+ * The shape when nothing, anywhere, has finished: a floor plus a slope,
+ * re-derived from measurement (control-tower phase 58, #65) rather than the
+ * old stake in the ground (60 ms per weight: 15/40/90 min for S/M/L, which
+ * made an L six times an S). Fitted through the per-size medians of the 520
+ * measured phases two consoles had stored on 2026-09-25 — every session's
+ * worked time: S 0.58 h (38), M 0.89 h (204), L 1.22 h (278) — it lands
+ * S ≈ 41 min, M ≈ 52 min, L ≈ 74 min. Always labelled `heuristic`, so nobody
+ * reads it as evidence.
+ */
+export const HEURISTIC_FLOOR_MS = 34 * 60_000;
+export const HEURISTIC_SLOPE_MS_PER_WEIGHT = 26;
+
+/** The shipped shape at one weight — what a surface with no rate reading may print. */
+export function heuristicPhaseMs(weight: number): number {
+  return HEURISTIC_FLOOR_MS + HEURISTIC_SLOPE_MS_PER_WEIGHT * Math.max(0, weight);
+}
+
+/**
+ * Kept for readers that print one per-weight figure: the shipped shape's rate
+ * at an M phase (40K). The estimator itself never multiplies weight by a rate.
+ */
+export const HEURISTIC_RATE_PER_WEIGHT = Math.round(heuristicPhaseMs(40_000) / 40_000);
+
+/**
+ * A rate, and how much weight to put on it. See `rateFor`.
+ *
+ * The model is AFFINE: a phase takes `floorMs + slopeMsPerWeight × weight` of
+ * working time. The proportional model before it (weight × rate) could not
+ * represent the per-phase floor every session pays — measured, an L phase
+ * takes 2.31× an S, not the 6× its weight says — so it over-estimated L after
+ * a run of small phases and under-estimated S.
+ */
 export type RateReading = {
-  /** Milliseconds per unit of weight. */
-  ratePerWeight: number;
   basis: EtaBasis;
-  /** Finished phases behind the rate. Zero for the heuristic. */
+  /** The affine floor: working time any phase takes before its weight counts. */
+  floorMs: number;
+  /** The affine slope, milliseconds per unit of weight. */
+  slopeMsPerWeight: number;
+  /** One per-weight figure for surfaces that print one: the model at an M phase (40K) ÷ 40K. */
+  ratePerWeight: number;
+  /**
+   * The measured phases actually WEIGHTED: the plan window's count for `plan`,
+   * the pool window's for `portfolio`, zero for the heuristic (ER-3).
+   */
   samples: number;
-  /** How far the band runs either side of the point estimate, as a fraction. */
+  /**
+   * How far the band runs above the point, as a fraction (`e^q − 1`); it runs
+   * the same factor below. From the observed dispersion of the phases behind the
+   * reading (ER-2) — the 75th percentile of how far they fell from the model —
+   * never from how many there were.
+   */
   spread: number;
+  /** Finished phases of this plan with no usable measurement (EE-3). */
+  missing: number;
+  clock: 'working';
 };
 
 export type EtaEstimate = {
-  /** Milliseconds per unit of weight, EMA-smoothed. */
+  /** The reading's per-weight figure (`RateReading.ratePerWeight`). */
   ratePerWeight: number;
-  /** How many completed phases the rate is built from. */
+  floorMs: number;
+  slopeMsPerWeight: number;
+  /** How many measured phases the reading weighted. */
   samples: number;
+  /** Finished phases with no usable measurement, reported beside the count. */
+  missing: number;
   /** Which link of the fallback chain answered. See `EtaBasis`. */
   basis: EtaBasis;
   remainingWeight: number;
@@ -652,7 +760,9 @@ export type EtaEstimate = {
   /** The range, in milliseconds, already snapped to its coarse bucket. */
   lowMs: number;
   highMs: number;
-  /** What to render. Always a range, always hedged. */
+  /** Working time: the remaining phases back to back, nothing parked, queued or overnight. */
+  clock: 'working';
+  /** What to render. Always a range, always hedged, always naming its clock. */
   label: string;
 };
 
@@ -663,63 +773,239 @@ export type PhaseEta = {
   /** The point estimate for this phase alone, in milliseconds, bucketed. */
   estMs: number;
   basis: EtaBasis;
-  /** `~40 min` — no "left", because a phase that has not started has none. */
+  clock: 'working';
+  /** `~40 min of work` — no "left", because a phase that has not started has none. */
   label: string;
 };
 
-/**
- * Smoothing factor for the rate.
- *
- * An EMA is the standard online estimator for this shape of problem —
- * recursive, no history to keep, and recency-weighted. Recency is the point
- * here rather than a nicety: model and effort change between phases in this
- * system, so a run's first phase on `haiku`/`low` says almost nothing about its
- * fourth on `opus`/`xhigh`, and a plain mean would hold that stale evidence
- * forever. At 0.4 the newest phase carries 40% of the estimate and anything
- * five phases back is under 5% of it.
- */
-export const ETA_ALPHA = 0.4;
+/** The phase size an evidence sample is classed under: its tag, else the nearest shipped weight. */
+function classOf(sample: EtaSample): string {
+  if (sample.size) return sample.size;
+  const w = sample.weight;
+  return w < 27_500 ? 'S' : w < 65_000 ? 'M' : 'L';
+}
 
-/** Completed phases across every run of a plan, oldest first. */
-export function etaSamples(
-  runs: { phases: Record<string, { phase: number; status: string; durationMs?: number; endedAt?: string }> }[],
-  weights: Map<number, number>,
-): EtaSample[] {
+/**
+ * Is this finished record evidence of how long a phase takes — and if not, why
+ * not (EE-1..3)? Worked time is `phaseClocks.workedMs`: every session's window.
+ * A closeout's paperwork is part of finishing a phase, but a record whose ONLY
+ * real time is a closeout measured the paperwork, not the work.
+ */
+export function evidenceOf(record: Record<string, unknown>, nowMs = Date.now()): { durationMs: number } | { missing: EtaMissingReason } {
+  const clocks = phaseClocks(record, nowMs);
+  const worked = clocks.workedMs;
+  if (worked === null || !(worked > 0)) return { missing: 'no-duration' };
+  const closeoutMs = clocks.attemptWindows
+    .filter((w) => w.mode === 'closeout')
+    .reduce((sum, w) => sum + Math.max(0, Date.parse(w.endedAt ?? '') - Date.parse(w.startedAt)), 0);
+  if (closeoutMs > 0 && worked - closeoutMs < ETA_MIN_EVIDENCE_MS) return { missing: 'closeout-only' };
+  if (worked < ETA_MIN_EVIDENCE_MS) return { missing: 'near-zero' };
+  return { durationMs: worked };
+}
+
+type EvidencePhase = { weight: number; size?: PhaseSize; floorMs?: number };
+
+/**
+ * Finished phases across every run of a plan, oldest first — the samples, and
+ * the finished phases that could not be samples (EE-3). `phases` maps a phase
+ * number to its weight (and, where known, its size and declared floor); a
+ * number is accepted for the callers that know only the weight.
+ */
+export function etaEvidence(
+  runs: { phases: Record<string, { phase: number; status: string; endedAt?: string } & Record<string, unknown>> }[],
+  phases: ReadonlyMap<number, number | EvidencePhase>,
+  nowMs = Date.now(),
+): EtaEvidence {
   const samples: EtaSample[] = [];
+  const missing: EtaMissing[] = [];
   for (const run of runs) {
     for (const record of Object.values(run.phases ?? {})) {
       // Only a phase that finished is evidence of how long a phase takes. An
       // interrupted one measures when somebody pressed Stop.
-      if (record.status !== 'done' || !record.durationMs || record.durationMs <= 0) continue;
-      const weight = weights.get(record.phase);
-      if (!weight) continue;
-      samples.push({ weight, durationMs: record.durationMs, at: record.endedAt });
+      if (record.status !== 'done') continue;
+      const known = phases.get(record.phase);
+      const phase = typeof known === 'number' ? { weight: known } : known;
+      if (!phase?.weight) continue;
+      const verdict = evidenceOf(record, nowMs);
+      if ('missing' in verdict) {
+        missing.push({ phase: record.phase, reason: verdict.missing });
+        continue;
+      }
+      samples.push({
+        weight: phase.weight,
+        durationMs: verdict.durationMs,
+        at: record.endedAt,
+        ...(phase.size ? { size: phase.size } : {}),
+        ...(phase.floorMs ? { floorMs: phase.floorMs } : {}),
+      });
     }
   }
-  // Chronological, because the EMA's whole behaviour is order-dependent. A
-  // record with no `endedAt` sorts last: it is almost certainly the newest.
-  return samples.sort((a, b) => (a.at ?? '9999').localeCompare(b.at ?? '9999'));
+  // Chronological: both windows are the NEWEST phases. A record with no
+  // `endedAt` sorts last — it is almost certainly the newest.
+  samples.sort((a, b) => (a.at ?? '9999').localeCompare(b.at ?? '9999'));
+  return { samples, missing };
 }
 
-/** EMA of duration-per-weight over samples in order. Null when there are none. */
-export function emaRate(samples: EtaSample[], alpha = ETA_ALPHA): number | null {
-  let ema: number | null = null;
-  for (const sample of samples) {
-    if (!sample.weight || sample.durationMs <= 0) continue;
-    const rate = sample.durationMs / sample.weight;
-    ema = ema === null ? rate : alpha * rate + (1 - alpha) * ema;
+/** `etaEvidence(…).samples` — for a caller that has no use for what was missing. */
+export function etaSamples(
+  runs: Parameters<typeof etaEvidence>[0],
+  phases: ReadonlyMap<number, number | EvidencePhase>,
+): EtaSample[] {
+  return etaEvidence(runs, phases).samples;
+}
+
+/** A sample that teaches the rate: measured, and not explained by a declared floor. */
+function teaches(sample: EtaSample): boolean {
+  return sample.weight > 0 && sample.durationMs >= ETA_MIN_EVIDENCE_MS && !sample.floorMs;
+}
+
+const Q_MIN = Math.log(1.25);
+const Q_MAX = Math.log(4);
+/** The band's half-width (log) under sparse plan evidence, a pool reading, and no evidence at all. */
+const Q_SPARSE = Math.log(2);
+const Q_POOL = Math.log(1.5);
+const Q_HEURISTIC = Math.log(2.5);
+
+/** The shape: working ms ≈ floor + slope × weight, fitted on the pool. */
+export type EtaShape = {
+  floorMs: number;
+  slopeMsPerWeight: number;
+  /** Pool phases the fit weighted (≤ `ETA_POOL_WINDOW`). */
+  samples: number;
+  /** The 75th percentile of |log(actual ÷ shape)| over the window. */
+  dispersion: number;
+  /** The per-size medians; `anchored` ones are those the line went through (`ETA_CLASS_MIN`). */
+  sizes: { size: string; weight: number; medianMs: number; samples: number; anchored: boolean }[];
+};
+
+function shapeMs(shape: Pick<EtaShape, 'floorMs' | 'slopeMsPerWeight'>, weight: number): number {
+  return Math.max(1, shape.floorMs + shape.slopeMsPerWeight * weight);
+}
+
+/** One point of the shared affine fit: a phase's weight, what was measured, and the size class it is taken over. */
+export type AffinePoint = { weight: number; value: number; size: string };
+
+/** A floor + slope through per-size medians, and the medians it went through. */
+export type AffineFit = {
+  floor: number;
+  slope: number;
+  /** The per-size medians; `anchored` ones are those the line went through (`ETA_CLASS_MIN`). */
+  sizes: { size: string; weight: number; median: number; samples: number; anchored: boolean }[];
+};
+
+/**
+ * The shared affine fit — one model, two quantities: phase 58's working TIME
+ * (`fitShape`) and phase 59's session CONTEXT (`analysis/sizing-model.ts`).
+ *
+ * Per-size winsorised medians (each size's values clipped to within 4× of its
+ * median), then a line through them by least squares. Only a size seen
+ * `ETA_CLASS_MIN` times anchors it — a rarer one is a sample, not a class —
+ * unless no size has been, when the line goes through what there is. A slope
+ * the data says is negative is flat, a floor it says is negative is zero, and
+ * points that know only one size take `proportions` (a shipped floor and
+ * slope) scaled through that size's median. Null for no points.
+ *
+ * `weighting` is the one difference between the two readers. `count` — each
+ * median weighs as many phases as it has — is the ETA's, which predicts the
+ * pool's typical phase. `class` — every anchored size weighs once — is the
+ * sizing model's, whose claim is per TAG ("the ratio sits near 1 for every
+ * tag"): counted, eighty-seven M sessions would pull the line off sixteen S.
+ */
+export function fitAffine(
+  points: readonly AffinePoint[],
+  opts: { weighting: 'count' | 'class'; proportions: { floor: number; slope: number } },
+): AffineFit | null {
+  if (!points.length) return null;
+  const bySize = new Map<string, AffinePoint[]>();
+  for (const point of points) bySize.set(point.size, [...(bySize.get(point.size) ?? []), point]);
+  const sizes = [...bySize.entries()]
+    .map(([size, list]) => {
+      const mid = median(list.map((p) => p.value));
+      const clipped = list.map((p) => Math.min(Math.max(p.value, mid / 4), mid * 4));
+      return {
+        size,
+        weight: median(list.map((p) => p.weight)),
+        median: median(clipped),
+        samples: list.length,
+        anchored: list.length >= ETA_CLASS_MIN,
+      };
+    })
+    .sort((a, b) => a.weight - b.weight);
+  if (!sizes.some((s) => s.anchored)) for (const s of sizes) s.anchored = true;
+  const anchors = sizes.filter((s) => s.anchored);
+  const w = (s: (typeof anchors)[number]) => (opts.weighting === 'count' ? s.samples : 1);
+
+  let floor: number;
+  let slope: number;
+  if (anchors.length === 1) {
+    const only = anchors[0]!;
+    const scale = only.median / Math.max(1, opts.proportions.floor + opts.proportions.slope * only.weight);
+    floor = opts.proportions.floor * scale;
+    slope = opts.proportions.slope * scale;
+  } else {
+    const n = sum(anchors.map(w));
+    const mx = sum(anchors.map((s) => w(s) * s.weight)) / n;
+    const my = sum(anchors.map((s) => w(s) * s.median)) / n;
+    const sxx = sum(anchors.map((s) => w(s) * (s.weight - mx) ** 2));
+    const sxy = sum(anchors.map((s) => w(s) * (s.weight - mx) * (s.median - my)));
+    slope = sxx > 0 ? sxy / sxx : 0;
+    floor = my - slope * mx;
+    if (slope < 0) {
+      slope = 0;
+      floor = my;
+    } else if (floor < 0) {
+      floor = 0;
+      slope = sum(anchors.map((s) => w(s) * s.median * s.weight)) / sum(anchors.map((s) => w(s) * s.weight * s.weight));
+    }
   }
-  return ema;
+  return { floor, slope, sizes };
 }
 
-/** Phases that are actually evidence — a zero-weight or zero-duration one is not. */
-function usableSamples(samples: EtaSample[]): number {
-  return samples.filter((s) => s.weight && s.durationMs > 0).length;
+/**
+ * Per-size winsorised medians over the pool's newest measured phases, fitted
+ * to an affine floor + slope (ER-4) by `fitAffine`, the medians weighted by
+ * their counts; the dispersion is then read over the same window, each
+ * deviation bounded, so one sample moves neither a median nor the band far.
+ * Null for an empty pool.
+ */
+export function fitShape(pool: readonly EtaSample[]): EtaShape | null {
+  const window = pool.filter(teaches).slice(-ETA_POOL_WINDOW);
+  const fit = fitAffine(
+    window.map((s) => ({ weight: s.weight, value: s.durationMs, size: classOf(s) })),
+    { weighting: 'count', proportions: { floor: HEURISTIC_FLOOR_MS, slope: HEURISTIC_SLOPE_MS_PER_WEIGHT } },
+  );
+  if (!fit) return null;
+  const fitted = { floorMs: fit.floor, slopeMsPerWeight: fit.slope };
+  const deviations = window.map((s) => Math.min(Math.abs(Math.log(s.durationMs / shapeMs(fitted, s.weight))), Q_MAX));
+  return {
+    floorMs: fit.floor,
+    slopeMsPerWeight: fit.slope,
+    samples: window.length,
+    dispersion: clamp(percentile(deviations, 0.75), Q_MIN, Q_MAX),
+    sizes: fit.sizes.map(({ median: medianMs, ...rest }) => ({ ...rest, medianMs })),
+  };
 }
 
-/** How wide the band runs on `n` of this plan's own finished phases. */
-function spreadFor(used: number): number {
-  return used >= 4 ? 0.35 : used >= 2 ? 0.5 : 0.7;
+/**
+ * This plan's level against the shape, in log space: the median of its newest
+ * measured phases' log(actual ÷ shape) — a plan that runs twice the pool reads
+ * `ln 2`. Below `ETA_SPEAK_AT` phases each ratio is clipped to `ETA_CLIP` and the
+ * level shrunk toward the pool in proportion; from there on it is the plain
+ * median, and the band is the 75th percentile of the winsorised deviations.
+ */
+export function planLevel(own: readonly EtaSample[], shape: Pick<EtaShape, 'floorMs' | 'slopeMsPerWeight'>): {
+  level: number; samples: number; dispersion: number | null;
+} {
+  const window = own.filter(teaches).slice(-ETA_PLAN_WINDOW);
+  if (!window.length) return { level: 0, samples: 0, dispersion: null };
+  const ratios = window.map((s) => Math.log(s.durationMs / shapeMs(shape, s.weight)));
+  if (window.length < ETA_SPEAK_AT) {
+    const clipped = ratios.map((r) => clamp(r, -ETA_CLIP, ETA_CLIP));
+    return { level: (median(clipped) * window.length) / ETA_SPEAK_AT, samples: window.length, dispersion: null };
+  }
+  const level = median(ratios);
+  const deviations = ratios.map((r) => Math.min(Math.abs(r - level), Q_MAX));
+  return { level, samples: window.length, dispersion: clamp(percentile(deviations, 0.75), Q_MIN, Q_MAX) };
 }
 
 /**
@@ -727,112 +1013,181 @@ function spreadFor(used: number): number {
  *
  * Three links, tried in order, each weaker and each labelled as such:
  *
- * 1. **this plan's own finished phases** — the only reading that accounts for
- *    what this particular work is like;
- * 2. **every plan's finished phases, pooled** — the machine and the account are
- *    the same, so throughput transfers *somewhat*; how much is exactly the thing
- *    this cannot measure, hence a band never tighter than half;
- * 3. **the heuristic constant** — no evidence at all, and it says so.
+ * 1. **this plan's own measured phases** set the LEVEL against the pool's
+ *    shape — the only reading that accounts for what this particular work is
+ *    like;
+ * 2. **the pool** (every plan's newest measured phases on this console) when the
+ *    plan has none — the shape at the pool's own level, a band never tighter
+ *    than ±50 %, because how well the pool applies to this plan is exactly what
+ *    it cannot measure;
+ * 3. **the shipped shape** — no evidence at all, and it says so.
  *
- * The chain exists because suppression was the old answer to "no evidence", and
- * suppression is worst precisely where the question is loudest: a plan that has
- * never run showed nothing. A labelled rough guess is more use than silence, and
- * strictly more honest than an unlabelled precise one.
+ * The shape is the pool's per-size medians fitted to a floor + slope
+ * (`fitShape`); with an empty pool it is the shipped one, even under a plan
+ * reading. `missing` is carried through untouched: the count of this plan's
+ * finished phases that could not be samples.
  */
 export function rateFor(
-  planSamples: EtaSample[],
-  portfolioSamples: EtaSample[] = [],
-  alpha = ETA_ALPHA,
+  planSamples: readonly EtaSample[],
+  portfolioSamples: readonly EtaSample[] = [],
+  opts: { missing?: number; shape?: EtaShape | null } = {},
 ): RateReading {
-  const own = emaRate(planSamples, alpha);
-  if (own !== null && own > 0) {
-    const used = usableSamples(planSamples);
-    return { ratePerWeight: own, basis: 'plan', samples: used, spread: spreadFor(used) };
+  const shape = opts.shape !== undefined ? opts.shape : fitShape(portfolioSamples.length ? portfolioSamples : planSamples);
+  const base = shape ?? { floorMs: HEURISTIC_FLOOR_MS, slopeMsPerWeight: HEURISTIC_SLOPE_MS_PER_WEIGHT };
+  const missing = opts.missing ?? 0;
+  const own = planLevel(planSamples, base);
+  if (own.samples > 0) {
+    const scale = Math.exp(own.level);
+    const q = own.dispersion ?? Math.max(shape?.dispersion ?? Q_SPARSE, Q_SPARSE);
+    return reading('plan', base.floorMs * scale, base.slopeMsPerWeight * scale, own.samples, q, missing);
   }
+  if (shape) return reading('portfolio', shape.floorMs, shape.slopeMsPerWeight, shape.samples, Math.max(shape.dispersion, Q_POOL), missing);
+  return reading('heuristic', HEURISTIC_FLOOR_MS, HEURISTIC_SLOPE_MS_PER_WEIGHT, 0, Q_HEURISTIC, missing);
+}
 
-  const pooled = emaRate(portfolioSamples, alpha);
-  if (pooled !== null && pooled > 0) {
-    const used = usableSamples(portfolioSamples);
-    return {
-      ratePerWeight: pooled,
-      basis: 'portfolio',
-      samples: used,
-      // Never tighter than half however many samples there are: the count says
-      // how well the pool is measured, not how well it applies to this plan.
-      spread: Math.max(0.5, spreadFor(used)),
-    };
-  }
-
+function reading(
+  basis: EtaBasis, floorMs: number, slopeMsPerWeight: number, samples: number, q: number, missing: number,
+): RateReading {
   return {
-    ratePerWeight: HEURISTIC_RATE_PER_WEIGHT,
-    basis: 'heuristic',
-    samples: 0,
-    spread: 0.6,
+    basis,
+    floorMs,
+    slopeMsPerWeight,
+    ratePerWeight: (floorMs + slopeMsPerWeight * 40_000) / 40_000,
+    samples,
+    spread: Math.exp(q) - 1,
+    missing,
+    clock: 'working',
   };
 }
 
 /**
- * What is left, as a range nobody should read to the minute.
+ * One phase's working time under a reading, unbucketed: the affine model at its
+ * weight, and never under a declared `- **Wall-clock floor:**`.
+ */
+export function estimateMs(rate: Pick<RateReading, 'floorMs' | 'slopeMsPerWeight'>, weight: number, floorMs = 0): number {
+  return Math.max(rate.floorMs + rate.slopeMsPerWeight * Math.max(0, weight), floorMs);
+}
+
+/** A remaining phase with a declared floor — its weight, so the floor can replace the model where it is higher. */
+export type RemainingFloor = { weight: number; floorMs: number };
+
+/**
+ * What is left, as a range nobody should read to the minute — in WORKING time.
  *
  * A **range in coarse buckets**, never a countdown: the underlying quantity is a
  * model's throughput on work nobody has seen yet, and rendering that to the
- * second claims a precision that does not exist. The band widens as the evidence
- * weakens, which is the honest direction for it to move — and `basis` says which
- * kind of evidence it was, so the render site can hedge in words too.
+ * second claims a precision that does not exist. The point is the affine model
+ * summed over the remaining phases (`phases × floor + slope × weight`, each
+ * declared floor taking over where it is higher); the band is the reading's
+ * own, from observed dispersion. The label says `of work`, because this is the
+ * phases back to back — the calendar is `forecastFrom`'s question.
  *
  * Still null on **zero remaining weight**: "0 min left" on a finished plan is
  * not an estimate, it is a units error.
  */
 export function etaFrom(
   rate: RateReading,
-  remaining: { weight: number; phases: number },
+  remaining: { weight: number; phases: number; floors?: readonly RemainingFloor[] },
 ): EtaEstimate | null {
   if (!remaining.weight || remaining.weight <= 0) return null;
-  if (!(rate.ratePerWeight > 0)) return null;
+  if (!(rate.floorMs + rate.slopeMsPerWeight > 0)) return null;
 
-  const point = remaining.weight * rate.ratePerWeight;
-  const lowMs = bucketMs(point * (1 - rate.spread));
-  const highMs = bucketMs(point * (1 + rate.spread));
+  let point = Math.max(1, remaining.phases) * rate.floorMs + rate.slopeMsPerWeight * remaining.weight;
+  for (const floor of remaining.floors ?? []) {
+    const model = estimateMs(rate, floor.weight);
+    if (floor.floorMs > model) point += floor.floorMs - model;
+  }
+  const factor = 1 + Math.max(0, rate.spread);
+  const lowMs = bucketMs(point / factor);
+  const highMs = bucketMs(point * factor);
 
   return {
     ratePerWeight: rate.ratePerWeight,
+    floorMs: rate.floorMs,
+    slopeMsPerWeight: rate.slopeMsPerWeight,
     samples: rate.samples,
+    missing: rate.missing,
     basis: rate.basis,
     remainingWeight: remaining.weight,
     remainingPhases: remaining.phases,
     lowMs,
     highMs,
-    label: lowMs === highMs ? `~${humanMs(highMs)} left` : `~${humanMs(lowMs)}–${humanMs(highMs)} left`,
+    clock: 'working',
+    label: lowMs === highMs ? `~${humanMs(highMs)} of work left` : `~${humanMs(lowMs)}–${humanMs(highMs)} of work left`,
   };
 }
 
 /**
- * The plan-evidence-only estimate: null until a phase of THIS plan has finished.
+ * The plan-evidence-only estimate: null until a phase of THIS plan has been measured.
  *
  * Kept as its own function because that suppression is still the right answer
  * for a caller that wants "what this plan has actually shown us" and nothing
  * weaker. Everything else goes through `rateFor` + `etaFrom`.
  */
 export function estimateEta(
-  samples: EtaSample[],
+  samples: readonly EtaSample[],
   remaining: { weight: number; phases: number },
-  alpha = ETA_ALPHA,
 ): EtaEstimate | null {
-  const rate = rateFor(samples, [], alpha);
+  const rate = rateFor(samples, samples);
   return rate.basis === 'plan' ? etaFrom(rate, remaining) : null;
 }
 
 /**
  * One phase, on its own.
  *
- * The same rate as the plan estimate, applied to one phase's weight — so a table
- * of phases and the header above it cannot disagree about how fast this plan
- * goes. A point rather than a range: beside a row there is space for one number,
- * and `~` plus a bucket is already the whole claim.
+ * The same reading as the plan estimate, at one phase's weight — so a table of
+ * phases and the header above it cannot disagree about how fast this plan goes.
+ * A point rather than a range: beside a row there is space for one number, and
+ * `~` plus a bucket is already the whole claim.
  */
-export function phaseEtaFor(phase: number, weight: number, rate: RateReading): PhaseEta {
-  const estMs = bucketMs(weight * rate.ratePerWeight);
-  return { phase, weight, estMs, basis: rate.basis, label: `~${humanMs(estMs)}` };
+export function phaseEtaFor(phase: number, weight: number, rate: RateReading, floorMs = 0): PhaseEta {
+  const estMs = bucketMs(estimateMs(rate, weight, floorMs));
+  return { phase, weight, estMs, basis: rate.basis, clock: 'working', label: `~${humanMs(estMs)} of work` };
+}
+
+/** A holder PHASE's remaining working time — `holderRemaining`'s answer (control-tower phase 60, #63). */
+export type HolderRemaining = {
+  /** The point: what is left of its estimate, never under the residual below. */
+  remainingMs: number;
+  lowMs: number;
+  highMs: number;
+  /** It has already worked past its own estimate. */
+  overrun: boolean;
+  /** `~25–50 min of work left` — bucketed, naming its clock, and saying so when it is past its estimate. */
+  label: string;
+};
+
+/**
+ * How much of its own estimate a holder that has worked most or all of it is
+ * still given. Measured, not assumed (`analysis/holder-eta.ts`, 425 admitted
+ * waits on this machine): a holder already past its estimate went on to hold
+ * the scope for a median 0.73 of it, so "0 min left" was the one answer
+ * certain to be wrong. Half its estimate scored best of the rules tried —
+ * MALE 1.19 against 1.79 for the bare difference.
+ */
+export const HOLDER_RESIDUAL_FRACTION = 0.5;
+
+/**
+ * What a holder PHASE has left (control-tower phase 60, #63): its estimate
+ * (phase 58's model, `estimateMs`) minus the working time it has already put
+ * in, never under `HOLDER_RESIDUAL_FRACTION` of the estimate, in a band from the
+ * plan's own dispersion. The scope a waiter needs is released when the holder
+ * PHASE ends — its whole plan was 24.7× the real wait at the median.
+ */
+export function holderRemaining(estimate: number, spread: number, workedMs: number): HolderRemaining {
+  const factor = 1 + Math.max(0, spread);
+  const left = estimate - Math.max(0, workedMs);
+  const point = Math.max(left, estimate * HOLDER_RESIDUAL_FRACTION, 60_000);
+  const lowMs = point / factor;
+  const highMs = point * factor;
+  const low = bucketMs(lowMs);
+  const high = bucketMs(highMs);
+  const range = low === high ? `~${humanMs(high)}` : `~${humanMs(low)}–${humanMs(high)}`;
+  const overrun = left <= 0;
+  return {
+    remainingMs: point, lowMs, highMs, overrun,
+    label: overrun ? `${range} of work left, past its estimate` : `${range} of work left`,
+  };
 }
 
 /** Snap to a scale a person would say out loud: 5 min, then half hours, then hours. */
@@ -861,13 +1216,26 @@ function humanMs(ms: number): string {
 
 function sum(list: number[]): number { return list.reduce((a, b) => a + b, 0); }
 
-function median(list: number[]): number {
+/** The median; shared with `analysis/sizing-model.ts`. */
+export function median(list: number[]): number {
   const sorted = [...list].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 function round1(n: number): number { return Math.round(n * 10) / 10; }
+
+function clamp(n: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, n)); }
+
+/** The p-quantile by linear interpolation between order statistics; 0 for an empty list. */
+export function percentile(list: number[], p: number): number {
+  if (!list.length) return 0;
+  const sorted = [...list].sort((a, b) => a - b);
+  const k = (sorted.length - 1) * p;
+  const lo = Math.floor(k);
+  const hi = Math.min(lo + 1, sorted.length - 1);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (k - lo);
+}
 
 function tally(list: string[]): [string, number][] {
   const counts = new Map<string, number>();
@@ -934,76 +1302,91 @@ export { layerGraph };
  * assumptions are not visible is a number that will be quoted without them.
  */
 
-/** How much of a plan's elapsed wall-clock was a phase actually running. */
+/** How much of a plan's recent wall-clock was a phase actually running. */
 export type DutyCycle = {
-  /** Working ms ÷ elapsed ms, clamped to (0, 1]. */
+  /** Working ms ÷ elapsed ms over the recent window, clamped to (0, 1]. Meaningless unless `known`. */
   ratio: number;
-  /** Completions behind the measurement. Zero when it could not be measured. */
+  /** Completions in the window the measurement read. */
   samples: number;
-  /** True when nothing could be measured and `ratio` is the stated 1.0 assumption. */
-  assumed: boolean;
+  /** False when the window cannot say how this plan is being driven — then there is no date (EE-5). */
+  known: boolean;
+  /** Why it is not known. */
+  reason?: DutyUnknownReason;
   workingMs: number;
   elapsedMs: number;
 };
 
-/** Nothing to measure: the honest fallback is "assume it runs continuously", said out loud. */
-const CONTINUOUS: DutyCycle = { ratio: 1, samples: 0, assumed: true, workingMs: 0, elapsedMs: 0 };
+/** The completions the duty cycle reads: the newest ten … */
+export const DUTY_WINDOW = 10;
+/** … within a week of the newest, and only while the newest is within a week of now. */
+export const DUTY_WINDOW_MS = 7 * DAY;
+/**
+ * Below this the window describes a plan that mostly SAT — 0.0003 and 0.0595
+ * were measured — and dividing by it stretches a working estimate into a
+ * fiction. Unknown is the honest answer.
+ */
+export const DUTY_MIN_RATIO = 0.05;
+/** Fewer dated completions than this in the window is not a pace. */
+export const DUTY_MIN_SAMPLES = 3;
 
 /**
- * The share of elapsed time this plan has spent working.
+ * The share of this plan's RECENT elapsed time spent working (EE-4).
  *
- * Measured over the window between the FIRST and LAST completion, so the
- * numerator excludes the first sample's own duration — that work happened
- * before the window opened, and counting it would let a two-phase plan report
- * a duty cycle above 1.
- *
- * Needs a window with width. ONE decision does that job — `elapsedMs <= 0` —
- * and it covers both ways there is none: a single completion (a duration with
- * no window around it) and two that landed on the same instant. The emptiness
- * check above it is a different rule, guarding the array read, not the maths.
+ * Measured over the newest `DUTY_WINDOW` completions within `DUTY_WINDOW_MS` of
+ * the newest, between the first and last of them, so the numerator excludes the
+ * first one's own duration — that work happened before the window opened. The
+ * old measurement ran from the plan's FIRST completion ever, so one completion
+ * months back, or one near-zero record, stretched every forecast by a history
+ * nobody was repeating. Unknown when the window holds fewer than three, when
+ * its ratio is under `DUTY_MIN_RATIO`, or when its newest completion is more than
+ * a week before `nowMs`.
  */
-export function dutyCycle(samples: EtaSample[]): DutyCycle {
+export function dutyCycle(samples: readonly EtaSample[], nowMs = Date.now()): DutyCycle {
   const dated = samples
     .filter((s) => s.at && s.durationMs > 0)
     .map((s) => ({ at: Date.parse(s.at!), durationMs: s.durationMs }))
     .filter((s) => Number.isFinite(s.at))
     .sort((a, b) => a.at - b.at);
-  if (!dated.length) return CONTINUOUS;
+  const unknown = (reason: DutyUnknownReason, window: typeof dated = []): DutyCycle => ({
+    ratio: 1, samples: window.length, known: false, reason, workingMs: 0, elapsedMs: 0,
+  });
+  if (!dated.length) return unknown('too-few');
+  const newest = dated[dated.length - 1]!.at;
+  if (nowMs - newest > DUTY_WINDOW_MS) return unknown('stale', dated.slice(-DUTY_WINDOW));
+  const window = dated.slice(-DUTY_WINDOW).filter((s) => newest - s.at <= DUTY_WINDOW_MS);
+  if (window.length < DUTY_MIN_SAMPLES) return unknown('too-few', window);
 
-  const elapsedMs = dated[dated.length - 1]!.at - dated[0]!.at;
-  if (elapsedMs <= 0) return CONTINUOUS;
-  // Every entry in `dated` has a positive duration and a non-zero window needs
-  // at least two of them, so this sum is always positive here — no third guard.
-  const workingMs = dated.slice(1).reduce((sum, s) => sum + s.durationMs, 0);
-
-  return {
-    // Clamped: phases may run in parallel lanes, so the working sum can exceed
-    // the window. A duty cycle over 1 would then SHRINK the forecast below the
-    // working time, which is a claim the evidence cannot support.
-    ratio: Math.min(1, workingMs / elapsedMs),
-    samples: dated.length,
-    assumed: false,
-    workingMs,
-    elapsedMs,
-  };
+  const elapsedMs = newest - window[0]!.at;
+  if (elapsedMs <= 0) return unknown('too-few', window);
+  const workingMs = window.slice(1).reduce((total, s) => total + s.durationMs, 0);
+  // Clamped: phases may run in parallel lanes, so the working sum can exceed
+  // the window. A duty cycle over 1 would then SHRINK the forecast below the
+  // working time, which is a claim the evidence cannot support.
+  const ratio = Math.min(1, workingMs / elapsedMs);
+  if (ratio < DUTY_MIN_RATIO) return { ...unknown('idle-history', window), workingMs, elapsedMs, ratio };
+  return { ratio, samples: window.length, known: true, workingMs, elapsedMs };
 }
 
 export type Forecast = {
-  /** ISO instants. The client renders them in its own zone; this module never picks one. */
-  earliest: string;
-  expected: string;
-  latest: string;
+  /** ISO instants, present only when the calendar is `known`. The client renders them in its own zone. */
+  earliest?: string;
+  expected?: string;
+  latest?: string;
+  clock: 'calendar';
+  /** Whether a date exists at all (EE-5): false reads "unknown", never a date off an idle ratio. */
+  calendar: 'known' | 'unknown';
   basis: EtaBasis;
   samples: number;
+  missing: number;
   remainingPhases: number;
   remainingWeight: number;
-  /** What the ETA measured, before the duty cycle stretched it. */
+  /** What the ETA measured, in working time, before the duty cycle stretched it. */
   workingLowMs: number;
   workingHighMs: number;
   duty: DutyCycle;
   /** Every assumption the date rests on, in the order applied. Rendered verbatim. */
   assumptions: string[];
-  /** Zone-free, so it is safe to print anywhere: `~3–9 days out`. */
+  /** Zone-free, so it is safe to print anywhere: `~3–9 d on the calendar`, or `calendar time unknown`. */
   label: string;
 };
 
@@ -1015,12 +1398,20 @@ function pct(ratio: number): string {
   return `${Math.round(value * 100) / 100}%`;
 }
 
+const DUTY_UNKNOWN_SENTENCE: Record<DutyUnknownReason, string> = {
+  'too-few': 'fewer than three of this plan’s phases finished in the recent window, so nothing measures how it is being driven',
+  'idle-history': 'the recent window is mostly idle time, and a pace that small describes a plan that sat, not one being driven',
+  stale: 'no phase of this plan has finished in the last week, so there is no recent pace to project',
+};
+
 /**
- * When this plan finishes, and why you should or should not believe it.
+ * When this plan finishes on the CALENDAR, and why you should or should not believe it.
  *
  * Null exactly when `etaFrom` is null — no remaining work, or no usable rate.
  * "Finishes today" on a finished plan is a units error, and this module inherits
- * that judgement rather than re-deciding it.
+ * that judgement rather than re-deciding it. With a duty cycle that is not
+ * `known` it still answers, with `calendar: 'unknown'` and no dates: the working
+ * estimate stands, the date does not exist, and the assumptions say why.
  */
 export function forecastFrom(
   eta: EtaEstimate | null,
@@ -1031,51 +1422,57 @@ export function forecastFrom(
   const at = now instanceof Date ? now.getTime() : now;
   if (!Number.isFinite(at)) return null;
 
-  const ratio = duty.ratio > 0 && duty.ratio <= 1 ? duty.ratio : 1;
-  const lowMs = eta.lowMs / ratio;
-  const highMs = eta.highMs / ratio;
+  const known = duty.known && duty.ratio > 0 && duty.ratio <= 1;
+  const lowMs = known ? eta.lowMs / duty.ratio : eta.lowMs;
+  const highMs = known ? eta.highMs / duty.ratio : eta.highMs;
   const midMs = (lowMs + highMs) / 2;
-
   const iso = (ms: number): string => new Date(at + ms).toISOString();
 
+  const measured = `${eta.samples} measured ${eta.samples === 1 ? 'phase' : 'phases'} weighted`;
+  const missing = eta.missing
+    ? `; ${eta.missing} finished ${eta.missing === 1 ? 'phase has' : 'phases have'} no usable measurement and ${eta.missing === 1 ? 'is' : 'are'} not in it`
+    : '';
   const assumptions = [
-    `Rate: ${BASIS_CLAIM[eta.basis]} (${eta.samples} completed ${eta.samples === 1 ? 'phase' : 'phases'} behind it).`,
+    `Rate: ${BASIS_CLAIM[eta.basis]} (${measured}${missing}).`,
+    `Model: each phase takes ${humanMs(eta.floorMs)} plus ${Math.round(eta.slopeMsPerWeight)} ms per unit of weight `
+      + 'of working time — a floor every session pays, then its size.',
     `Work left: ${eta.remainingWeight} weight across ${eta.remainingPhases} `
-      + `${eta.remainingPhases === 1 ? 'phase' : 'phases'}, from each phase's size tag.`,
-    duty.assumed
-      ? 'Duty cycle: assumed 100% — this plan has not finished two dated phases, so nothing '
-        + 'measures the hours it spends NOT working. The date is the working estimate added to now, '
-        + 'and it will be early.'
-      : `Duty cycle: ${pct(ratio)} — measured, phases ran for ${humanMs(duty.workingMs)} of the `
-        + `${humanMs(duty.elapsedMs)} between this plan's first and last completion. Gates, review holds, `
-        + 'parks and overnight gaps are already inside that number; change how the plan is driven and it '
-        + 'stops applying.',
+      + `${eta.remainingPhases === 1 ? 'phase' : 'phases'}, from each phase's size tag and any declared wall-clock floor.`,
+    known
+      ? `Duty cycle: ${pct(duty.ratio)} — measured over this plan’s newest ${duty.samples} completions, phases ran for `
+        + `${humanMs(duty.workingMs)} of the ${humanMs(duty.elapsedMs)} between the first and last of them. Gates, `
+        + 'review holds, parks and overnight gaps are inside that number; change how the plan is driven and it stops applying.'
+      : `Duty cycle: unknown — ${DUTY_UNKNOWN_SENTENCE[duty.reason ?? 'too-few']}. There is no calendar date; the working `
+        + 'estimate is the phases back to back, and the calendar will be later by however long the plan sits.',
     'Phases are assumed to run one after another. Concurrent lanes finish sooner than this.',
-    'The band is the ETA’s own: it widens with FEWER completed phases, and never reflects how '
-      + 'variable those phases actually were.',
+    'The band is the spread of the measured phases behind the rate around the model — where three in four of '
+      + 'them fell — not a count of them.',
   ];
 
   return {
-    earliest: iso(lowMs),
-    expected: iso(midMs),
-    latest: iso(highMs),
+    ...(known ? { earliest: iso(lowMs), expected: iso(midMs), latest: iso(highMs) } : {}),
+    clock: 'calendar',
+    calendar: known ? 'known' : 'unknown',
     basis: eta.basis,
     samples: eta.samples,
+    missing: eta.missing,
     remainingPhases: eta.remainingPhases,
     remainingWeight: eta.remainingWeight,
     workingLowMs: eta.lowMs,
     workingHighMs: eta.highMs,
     duty,
     assumptions,
-    label: lowMs === highMs
-      ? `~${humanMs(highMs)} out`
-      : `~${humanMs(lowMs)}–${humanMs(highMs)} out`,
+    label: !known
+      ? 'calendar time unknown'
+      : lowMs === highMs
+        ? `~${humanMs(highMs)} on the calendar`
+        : `~${humanMs(lowMs)}–${humanMs(highMs)} on the calendar`,
   };
 }
 
 /** What each basis actually claims, for the assumptions list. Matches `client/features/insights/eta.tsx`. */
 const BASIS_CLAIM: Record<EtaBasis, string> = {
-  plan: 'measured from this plan’s own completed phases',
-  portfolio: 'pooled across every plan — this one has not finished enough phases to speak for itself',
-  heuristic: 'the shipped constant — nothing has completed anywhere, so this is a placeholder, not a forecast',
+  plan: 'this plan’s own measured phases, against the shape of every plan’s',
+  portfolio: 'every plan’s newest measured phases — this one has none of its own yet',
+  heuristic: 'the shipped shape — nothing has been measured anywhere, so this is a placeholder, not a forecast',
 };

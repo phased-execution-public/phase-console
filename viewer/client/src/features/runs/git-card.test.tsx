@@ -105,6 +105,21 @@ describe('when the card appears at all', () => {
     expect(screen.getByTestId('git-card').textContent).toContain('shared with the console');
   });
 
+  it('says the run is PARKED when the refusal parked it, and names the fix (control-tower phase 90)', () => {
+    const parked = {
+      checkout: 'refused',
+      isolationRefusal: 'cap-reached',
+      halt: { kind: 'isolation-refused', at: '', reason: '' },
+    };
+    mount(<GitCard run={run(parked as never)} git={null} />, {
+      refusalReasons: { 'cap-reached': CAP_REACHED },
+      refusalFixes: { 'cap-reached': 'Raise the worktree cap, then Retry.' },
+    });
+    const refused = screen.getByTestId('git-refused').textContent ?? '';
+    expect(refused).toContain('parked');
+    expect(refused).toContain('Raise the worktree cap, then Retry.');
+  });
+
   it('renders the refusal as a SENTENCE when the console has told it the words (G-20)', () => {
     mount(<GitCard run={run({ checkout: 'refused', isolationRefusal: 'cap-reached' })} git={null} />, {
       refusalReasons: { 'cap-reached': CAP_REACHED },

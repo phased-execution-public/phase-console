@@ -20,8 +20,9 @@ import {
   ACTION_VOCAB, FLAG_OFF, HALT_KINDS, KIND_PROFILE, MECHANISMS, RECOVERY_BLURBS,
   RECOVERY_BUSY, RECOVERY_CLASSES, RECOVERY_LABELS, RECOVERY_TITLES,
   classifyPhase, classifyRun, recoveryActionsFor,
-  isLadderClass,
+  isLadderClass, leadActionFor,
 } from '../shared/recovery-model.js';
+import { classifySituation } from '../server/runner/situation.ts';
 import { RECOVERY_CLASSES as SERVER_CLASSES, RECOVERY_TITLES as SERVER_TITLES } from '../server/recovery.ts';
 import { autoRecoveryClass } from '../server/service.ts';
 import { haltKindLiterals } from './halt-kind-scan.ts';
@@ -159,6 +160,29 @@ test('an MCP preflight park leads with continue-without-servers', () => {
   assert.equal(actions[0].id, 'mcp-continue');
   assert.equal(actions[0].group, 'primary');
   assert.ok(!actions.some((a) => a.id === 'fix-agent'), 'no agent can sign a server in');
+});
+
+test('a verification preflight park leads with Retry — a Recheck can never find a phase that never boarded done', () => {
+  // The tower rehearsal's finding (control-tower phase 33): the card said
+  // "Repair the plan file, then continue", the park said "then Retry", and the
+  // button it recommended was Recheck — which asks whether the phase is DONE,
+  // spawns nothing, and so answers "unchanged" for a phase that never ran.
+  const ctx = {
+    record: { status: 'parked', resumable: false },
+    run: {
+      status: 'parked',
+      halt: { reason: 'the plan states no verification for phase 1', kind: 'verification-preflight', phase: 1 },
+    },
+  };
+  const actions = recoveryActionsFor(ctx);
+  assert.equal(actions[0].id, 'retry');
+  assert.equal(actions[0].group, 'primary');
+  assert.ok(actions.some((a) => a.id === 'recheck' && a.group !== 'primary'), 'Recheck stays, beside it');
+  assert.equal(actions.find((a) => a.id === 'fix-agent')?.recoveryClass, 'plan-repair', 'and the plan-repair agent');
+  // Once the classifier has named the situation, its own rung leads, as for every other kind.
+  const named = recoveryActionsFor({ ...ctx, situation: { id: 'plan-broken', sub: 'verification' } });
+  assert.equal(named[0].id, 'fix-agent');
+  assert.ok(named.some((a) => a.id === 'retry'), 'Retry is still offered');
 });
 
 test('a live recovery disables BOTH AI families with the same sentence', () => {
@@ -368,4 +392,68 @@ test('P9 (QA round 2, L4): with no QA hold the situation’s lead keeps `primary
     flags: { allowRun: true, allowWrites: true, allowAgent: true },
   } as never);
   assert.equal(actions.find((a) => a.id === 'resume')?.group, 'primary');
+});
+
+/* ------------------------------------------------------------------ *
+ * PR-6 (control-tower phase 53, #54) — a needs-human park carries its
+ * `--needs` key into the situation, and `human-acts` leads with Delegate
+ * ------------------------------------------------------------------ */
+
+test('PR-6: a needs-human `--needs human-acts` declaration is blocked-declared:human-acts, and a person\'s', () => {
+  const at = '2026-09-23T12:00:00.000Z';
+  const s = classifySituation({
+    lock: null, gate: null, mcp: null, health: [], registry: null, qa: { mode: 'off' }, auth: null,
+    slug: 'alpha', phase: 2, board: 'in-progress',
+    handoff: { exists: true, status: 'in-progress', outstanding: 'Merge the release branch — the owner does that.' },
+    record: {
+      status: 'parked', attempts: 1, sessionId: 'sess-2', resumable: true, startedAt: at, endedAt: at,
+      verification: null, note: null, said: 'Parked for the owner.', gate: null,
+    },
+    run: { status: 'parked', halt: { kind: 'needs-human', phase: 2, reason: 'phase 2 needs a person' }, waitUntil: null, resolved: false },
+    // The prose alone would read as a lock wait: the session's own word is read first.
+    declared: { status: 'needs-human', needs: 'human-acts', reason: 'phase 3 is held by someone@host', watch: [] },
+    work: { did: true, why: 'one commit since the phase started', dirty: 0, commits: 1 },
+    at,
+  } as never);
+  assert.equal(s.key, 'blocked-declared:human-acts');
+  assert.equal(s.actor, 'person');
+});
+
+test('PR-6: human-acts leads with Delegate to the session — resumable or not — behind --allow-run', () => {
+  assert.equal(leadActionFor('blocked-declared', 'human-acts', true), 'delegate');
+  assert.equal(leadActionFor('blocked-declared', 'human-acts', false), 'delegate',
+    'a session not worth resuming still takes the words: the press boards fresh with the resume brief');
+  const vocab = ACTION_VOCAB.delegate;
+  assert.equal(vocab.label, 'Delegate to the session');
+  assert.equal(vocab.mechanism, 'own-session');
+  assert.equal(vocab.flag, 'run');
+  assert.match(vocab.blurb, /deviation ruling naming you/);
+  assert.match(vocab.blurb, /your words/);
+  assert.match(vocab.blurb, /permission policy still applies/, 'Delegate never widens the wall');
+
+  const flags = { allowRun: true, allowWrites: true, allowAgent: true };
+  for (const resumable of [true, false]) {
+    const actions = recoveryActionsFor({
+      record: { status: 'parked', resumable },
+      run: { status: 'parked', halt: { kind: 'needs-human', phase: 2 } },
+      situation: { id: 'blocked-declared', sub: 'human-acts' },
+      flags,
+    } as never);
+    assert.equal(actions[0].id, 'delegate', `resumable=${resumable}: ${actions.map((a) => a.id).join(', ')}`);
+    assert.equal(actions[0].group, 'primary');
+    assert.equal(actions[0].disabledReason, undefined);
+  }
+  const off = recoveryActionsFor({
+    record: { status: 'parked', resumable: true },
+    situation: { id: 'blocked-declared', sub: 'human-acts' },
+    flags: { ...flags, allowRun: false },
+  } as never);
+  assert.equal(off.find((a) => a.id === 'delegate')?.disabledReason, FLAG_OFF.run);
+  // Only the acts a plan keeps for a person are delegable.
+  const credential = recoveryActionsFor({
+    record: { status: 'parked', resumable: true },
+    situation: { id: 'blocked-declared', sub: 'credential' },
+    flags,
+  } as never);
+  assert.equal(credential.some((a) => a.id === 'delegate'), false);
 });

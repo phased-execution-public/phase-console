@@ -14,7 +14,8 @@
  * disagree with it.
  */
 
-import { Card, CardBody, CardHeader, CardTitle, Chip } from '@/components/ui';
+import { Card, CardBody, CardHeader, CardTitle, Badge } from '@/components/ui';
+import { PhaseStatusBadge } from '@/components/ui/status';
 import { elapsed } from '@/lib/format';
 import type { PlanDetail, PhaseView } from '@/lib/api';
 
@@ -84,7 +85,9 @@ export function WaitingPane({ rows }: { rows: readonly WaitingRow[] }) {
               <span className="ml-2 font-normal text-ink-muted">{row.title}</span>
             </CardTitle>
             <div className="flex flex-wrap items-center gap-1.5">
-              <Chip tone={row.stuck ? 'bad' : 'neutral'}>{row.stuck ? 'stuck' : 'waiting'}</Chip>
+              {/* The board word, painted the one way every page paints it — `stuck`
+                  was red here and amber everywhere else. */}
+              <PhaseStatusBadge board={row.stuck ? 'stuck' : 'waiting'} />
               {row.estMs != null && (
                 <span className="font-mono text-2xs text-ink-faint tabular-nums">~{elapsed(row.estMs)}</span>
               )}
@@ -95,9 +98,9 @@ export function WaitingPane({ rows }: { rows: readonly WaitingRow[] }) {
               <div className="flex flex-wrap items-center gap-1.5">
                 <span className="text-2xs text-ink-faint">Waiting on</span>
                 {row.deps.map((dep) => (
-                  <Chip key={dep.phase} mono>
+                  <Badge key={dep.phase} mono>
                     P{dep.phase} · {dep.state}
-                  </Chip>
+                  </Badge>
                 ))}
               </div>
             )}

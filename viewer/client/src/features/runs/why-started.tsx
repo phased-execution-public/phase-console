@@ -13,16 +13,9 @@
  * `compact` is the session page's cut: the sentence, without the manifest.
  */
 
-import {
-  Badge,
-  Card,
-  CardBody,
-  CardHeader,
-  CardTitle,
-  DataTable,
-  RelativeTime,
-  type Column,
-} from '@/components/ui';
+import { Badge, Card, CardBody, CardHeader, CardTitle, RelativeTime } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
+import { OpsBadge, type WordOf } from '@/components/ui/status';
 import type { LedgerStart, ResolvedManifest, RunLedger } from '@/lib/api';
 
 /** One start as one sentence: what happened, through which door, fired by what, and who. */
@@ -64,7 +57,12 @@ const DECISION_COLUMNS: Column<DecisionRow>[] = [
     priority: 1,
     cell: (row) => <span className="font-mono text-xs">{row.key}</span>,
   },
-  { id: 'state', head: 'State', priority: 1, cell: (row) => <span className="text-xs">{row.state}</span> },
+  {
+    id: 'state',
+    head: 'State',
+    priority: 1,
+    cell: (row) => <OpsBadge vocab="decision" word={row.state as WordOf<'decision'>} />,
+  },
   {
     id: 'source',
     head: 'Answered by',
@@ -110,8 +108,13 @@ function ManifestReport({ manifest }: { manifest: ResolvedManifest }) {
         <ul className="flex flex-col gap-0.5 text-xs text-ink-muted" aria-label="Start probes">
           {probes.map(([name, probe]) => (
             <li key={name}>
-              <span className="font-mono">{name}</span>: {probe.status}
-              {probe.reason ? ` — ${probe.reason}` : ''}
+              <span className="font-mono">{name}</span>{' '}
+              <OpsBadge
+                vocab="probe"
+                word={probe.status as WordOf<'probe'>}
+                data-testid="why-started-probe"
+              />
+              {probe.reason ? ` ${probe.reason}` : ''}
             </li>
           ))}
         </ul>

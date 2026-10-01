@@ -181,3 +181,85 @@ describe('the phase drawer carries what the phase left behind (many-plans-one-re
     expect(screen.queryByRole('region', { name: /Issues filed by this phase/ })).toBeNull();
   });
 });
+
+/* ------------------------------------------------------------------------- *
+ * The QA section (control-tower phase 23, #27) — what the QA tab held for a
+ * row, one press from it now.
+ * ------------------------------------------------------------------------- */
+
+function openWithView(viewOver: Record<string, unknown>, extra: Record<string, unknown> = {}) {
+  hooks.diagnosis.mockReturnValue({ data: DIAGNOSIS, error: null, isFetching: false });
+  hooks.rulings.mockReturnValue({ data: { rulings: [] } });
+  hooks.consoleState.mockReturnValue({ data: { allowTerminal: false, allowWrites: true, allowRun: true } });
+  hooks.issues.mockReturnValue({ data: { at: 0, refreshing: false, repos: [] } });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const out = render(
+    <QueryClientProvider client={client}>
+      <PhaseDrawer
+        slug="alpha"
+        phase={3}
+        run={null}
+        view={
+          {
+            phase: 3,
+            title: 'Three',
+            state: 'done',
+            size: 'M',
+            weight: 1,
+            gated: false,
+            ...viewOver,
+          } as never
+        }
+        {...extra}
+      />
+    </QueryClientProvider>,
+  );
+  const details = out.container.querySelector('details')!;
+  act(() => {
+    details.open = true;
+    details.dispatchEvent(new Event('toggle'));
+  });
+  return screen.getByTestId('drawer-qa');
+}
+
+describe('the drawer’s QA section', () => {
+  it('names the regime WITH the level that decided it, the verdict and its round, and what it holds', () => {
+    const qa = openWithView(
+      {
+        qa: { result: 'fail', report: 'reports/phase-03-qa-round2.md' },
+        qaMode: { mode: 'on', source: 'phase' },
+        qaRounds: { count: 2, latest: { round: 2, result: 'fail' } },
+      },
+      { holds: [5, 6], planQaMode: 'off' },
+    );
+    expect(qa.textContent).toContain('on — decided by the phase’s own QA bullet');
+    expect(qa.textContent).toContain('round 2 of 2');
+    expect(qa.textContent).toContain('P5, P6 — until this verdict changes');
+    // The round history, each round a link to its own report sheet.
+    expect(within(qa).getByRole('link', { name: 'round 1' })).toHaveAttribute(
+      'href',
+      '#/plan/alpha/phases?view=qa&report=3',
+    );
+    expect(within(qa).getByRole('link', { name: 'round 2' })).toHaveAttribute(
+      'href',
+      '#/plan/alpha/phases?view=qa&report=3:2',
+    );
+    expect(within(qa).getByRole('link', { name: 'Open report' })).toBeInTheDocument();
+  });
+
+  it('says the PLAN decided when the phase has no bullet of its own — waived is a regime too', () => {
+    const qa = openWithView({ qaMode: { mode: 'waived', source: 'plan' } });
+    expect(qa.textContent).toContain('waived — decided by the plan’s QA gate line');
+    expect(qa.textContent).toContain('none recorded');
+  });
+
+  it('a phase HELD by a dependency’s verdict says so, in the engine’s own words', () => {
+    const qa = openWithView({ state: 'waiting', blockedBy: [{ phase: 2, why: 'qa:fail' }] });
+    expect(qa.textContent).toContain('P2’s verdict (fail) — the engine says qa:fail');
+  });
+
+  it('is absent when the drawer is opened without the phase — the diagnosis alone, as before', () => {
+    view(null);
+    expect(screen.queryByTestId('drawer-qa')).toBeNull();
+  });
+});

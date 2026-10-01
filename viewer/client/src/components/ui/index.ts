@@ -38,18 +38,6 @@ export {
   type LegendEntry,
 } from './legend';
 export { Progress } from './progress';
-/* 2.x aliases over Badge/StatusBadge — deleted with the old views in Phase 11. */
-export {
-  Chip,
-  StateChip,
-  chipVariants,
-  asPhaseState,
-  PHASE_STATES,
-  LEGACY_TONE,
-  type ChipProps,
-  type ChipTone,
-  type PhaseState,
-} from './chip';
 
 /* ---- actions ---- */
 export { Button, ButtonGroup, buttonVariants, type ButtonProps } from './button';
@@ -64,24 +52,11 @@ export { Tabs, TabsList, TabsTrigger, TabsContent } from './tabs';
 export { Stepper, type Step } from './stepper';
 export { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from './accordion';
 export { Disclosure } from './disclosure';
-export {
-  TableWrap,
-  Table,
-  THead,
-  TBody,
-  TR,
-  TH,
-  TD,
-  DataTable,
-  planColumns,
-  trackOf,
-  railOffsets,
-  useTableFit,
-  stickyHeadCell,
-  stickyIdentityCell,
-} from './table';
-export type { Column, DataTableProps } from './table';
-export { DataList, type DataListProps } from './data-list';
+/* The primitives only. The grid (`DataTable`, `Column`, the cut and the fit)
+   is `@/components/data-table` and the long list is `@/components/ui/data-list`:
+   neither is on the first paint, and this barrel is one modulepreloaded chunk
+   every visitor downloads before the first frame (control-tower phase 18). */
+export { TableWrap, Table, THead, TBody, TR, TH, TD, stickyHeadCell, stickyIdentityCell } from './table';
 export { ListRow } from './list-row';
 export { SectionHeading } from './section-heading';
 export { KeyValue, type KeyValueItem } from './key-value';

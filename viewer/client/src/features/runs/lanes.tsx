@@ -33,7 +33,9 @@ import { useRoute } from '@/app/router';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui';
 import type { PhaseEta, PlanDetail, QueueEntry, RunState } from '@/lib/api';
 import { useNow } from '@/lib/clock';
-import { elapsed } from '@/lib/format';
+import { elapsed, etaPoint } from '@/lib/format';
+import { phaseClocks } from '@shared/phase-clocks.js';
+import { undrivenPhases } from '@shared/run-lifecycle.js';
 import { LanePane } from './pane-host';
 import { SessionPanes, laneId, lanesOf, resolveTab, type Lane } from './session-panes';
 import { WaitingPane, waitingOf } from './waiting-pane';
@@ -150,8 +152,17 @@ export function SessionTabs({
 
   // The second queue: dependency-waiting phases, one aggregate tab. Only while
   // the run is live — a finished run's leftovers belong to the phase table —
-  // and never a phase that already has a lane tab (the two snapshots can skew).
-  const waiting = live ? waitingOf(detail, new Set(lanes.map((lane) => lane.phase))) : [];
+  // and never a phase that already has a lane tab (the two snapshots can skew),
+  // nor one nothing drives: that is the Runs page's undriven card, and this
+  // tab's promise that it starts by itself is exactly what is not true (#114).
+  // Read off the phase records through the one reader, so the per-plan run
+  // route — which carries the stamps but not `/api/runs`' list — answers too.
+  const waiting = live
+    ? waitingOf(
+        detail,
+        new Set([...lanes.map((lane) => lane.phase), ...undrivenPhases(run).map((row) => row.phase)]),
+      )
+    : [];
 
   // Explicit pick while it exists → the sole live lane → Run. See resolveTab.
   const value =
@@ -240,9 +251,17 @@ export function SessionTabs({
  */
 function laneSubtitle(lane: Lane, run: RunState, now: number, phaseEta?: PhaseEta[]): string {
   const record = run.phases[String(lane.phase)];
-  const started = record?.startedAt ? Date.parse(record.startedAt) : null;
   const eta = phaseEta?.find((estimate) => estimate.phase === lane.phase);
-  const clock = started != null ? elapsed(Math.max(0, now - started)) : null;
-  const withEta = clock && eta ? `${clock} / ~${elapsed(eta.estMs)}` : clock;
+  // Worked time — the clock the estimate is fitted on — not since first
+  // boarded: a resumed or repaired phase's queue and park time is not work.
+  const workedMs = record ? phaseClocks(record, now).workedMs : null;
+  const started = record?.startedAt ? Date.parse(record.startedAt) : null;
+  const clock =
+    workedMs != null
+      ? `${elapsed(workedMs)} worked`
+      : started != null
+        ? elapsed(Math.max(0, now - started))
+        : null;
+  const withEta = clock && eta ? `${clock} / ${etaPoint(eta.estMs)}` : clock;
   return [lane.status, run.model, withEta].filter(Boolean).join(' · ');
 }

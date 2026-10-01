@@ -86,6 +86,17 @@ describe('the banner', () => {
     expect(screen.queryByRole('button', { name: 'Thaw all' })).toBeNull();
   });
 
+  it('after a restart the header still names the freeze’s author and its age — the marker round-trips both (#93)', async () => {
+    // Measured 2026-09-24: a freeze outlived a launchd restart. What the page
+    // could say about it came back from the marker file, so the banner reads
+    // who froze it and how long ago from `fleet.at`/`fleet.by` alone.
+    const at = new Date(Date.now() - 14 * 60_000).toISOString();
+    state = { allowRun: true, fleet: { frozen: true, at, by: 'operator' } };
+    draw(<FleetFrozenBanner />);
+    await screen.findByText(/This console is frozen/);
+    expect(screen.getByText(/Frozen by operator/).textContent).toMatch(/Frozen by operator 14 minutes ago\./);
+  });
+
   it('an unreadable timestamp drops the clause instead of rendering a wrong time', async () => {
     state = { allowRun: true, fleet: { frozen: true, at: 'never', by: 'mo' } };
     draw(<FleetFrozenBanner />);

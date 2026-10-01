@@ -19,7 +19,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { planColumns, type Column } from './table';
+import { planColumns, type Column } from '@/components/data-table';
 
 const col = (id: string, priority: number, min: number): Column<unknown> => ({
   id,

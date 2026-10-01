@@ -13,6 +13,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 import { setPrefs } from '@/lib/prefs';
+import { RUN_SECTIONS } from './run-sections';
 import type { ConsoleState, PlanDetail, RunState } from '@/lib/api';
 
 /* ------------------------------------------------------------------ *
@@ -181,17 +182,26 @@ describe('runs', () => {
     expect(runs).not.toHaveBeenCalled();
   });
 
-  it('says nothing is running rather than leaving the subtitle empty', async () => {
+  it('says nothing is running rather than leaving the header empty', async () => {
+    // The situation line is the header's since 6.0 (control-tower phase 21);
+    // the page under it says it once, not twice.
     const { default: RunsView } = await import('@/features/runs');
-    mount(<RunsView />);
+    const { default: HeaderSituation } = await import('@/app/shell/situation');
+    mount(
+      <>
+        <HeaderSituation state={BASE_STATE} phone={false} />
+        <RunsView />
+      </>,
+    );
     expect(await screen.findByText(/Nothing running right now/i)).toBeTruthy();
+    expect(screen.getAllByTestId('situation-line')).toHaveLength(1);
   });
 
 
   it('names the live run in the header when there is one', async () => {
     runs.mockResolvedValue([{ ...RUN, status: 'running', activePhase: 3 }]);
-    const { default: RunsView } = await import('@/features/runs');
-    mount(<RunsView />);
+    const { default: HeaderSituation } = await import('@/app/shell/situation');
+    mount(<HeaderSituation state={BASE_STATE} phone={false} />);
     expect(await screen.findByText(/demo is running — phase 3/i)).toBeTruthy();
   });
 
@@ -246,14 +256,21 @@ describe('runs', () => {
         },
       },
     ]);
+    setPrefs({ runsView: 'board' });
     const { default: RunsView } = await import('@/features/runs');
     mount(<RunsView />);
 
-    // The strip's reading, first — this half was never broken, and it is what
-    // makes the missing tab a contradiction rather than merely an omission.
-    const strip = await screen.findByTestId('live-strip');
-    const waits = within(strip).getAllByTestId('strip-wait');
-    expect(waits.map((li) => li.textContent)).toEqual(['alphaP8parked']);
+    // The Tower's reading, first (control-tower phase 20 retired the live
+    // strip for the bays): the run is in Live, and its parked lane is one of
+    // the lanes its strip carries — which is what makes a missing tab a
+    // contradiction rather than merely an omission.
+    const live = await screen.findByRole('region', { name: /^Live/ });
+    const strip = within(live).getByRole('article', { name: /^alpha/ });
+    fireEvent.click(within(strip).getByTestId('strip-expand'));
+    const lanes = within(strip)
+      .getAllByTestId('board-lane')
+      .map((row) => row.textContent ?? '');
+    expect(lanes.some((text) => /P8/.test(text) && /parked/.test(text))).toBe(true);
 
     const tabs = await screen.findAllByRole('tab');
     expect(tabs.map((t) => t.textContent)).toEqual(['alphaP5', 'alphaP8']);
@@ -315,6 +332,10 @@ const PLAN_PHASES = [
 const planDetail = () => ({ ...DETAIL, phases: PLAN_PHASES }) as unknown as PlanDetail;
 
 describe('the autopilot page', () => {
+  // These read what the page's folds hold, not the folds themselves
+  // (`run-page.test.tsx` owns those): every section opens as a person who had
+  // opened them all would find it (control-tower phase 24).
+  beforeEach(() => setPrefs({ runSectionsOpen: [...RUN_SECTIONS] }));
   it('gives every live and queued phase a tab of its own, beside the run', async () => {
     run.mockResolvedValue({
       run: {
@@ -472,13 +493,24 @@ describe('the autopilot page', () => {
 });
 
 describe('the live strip and the closure cut', () => {
-  it('puts the live strip above the fold when a lane is moving, with its clock', async () => {
+  it('says the situation in one line above the bays, and draws the live run in Live with its clock', async () => {
+    // The live strip's job, since control-tower phase 20: the situation line
+    // in the header names what is running, and the Live bay draws its strip.
     runs.mockResolvedValue([{ ...RUN, id: 'r1', status: 'running', activePhase: 3, phases: RECORDS(3) }]);
+    setPrefs({ runsView: 'board' });
     const { default: RunsView } = await import('@/features/runs');
-    mount(<RunsView />);
-    const strip = await screen.findByTestId('live-strip');
-    expect(strip.textContent).toContain('running');
-    expect(within(strip).getByTestId('strip-lane').textContent).toContain('P3');
+    const { default: HeaderSituation } = await import('@/app/shell/situation');
+    mount(
+      <>
+        <HeaderSituation state={BASE_STATE} phone={false} />
+        <RunsView />
+      </>,
+    );
+    const line = await screen.findByTestId('situation-line');
+    expect(line.textContent).toContain('demo is running — phase 3');
+    const live = await screen.findByRole('region', { name: /^Live, 1/ });
+    const strip = within(live).getByRole('article', { name: /^demo/ });
+    expect(within(strip).getByTestId('strip-clock').textContent).toMatch(/^running/);
   });
 
 });
@@ -530,5 +562,162 @@ describe('the fleet has two shapes and one switch', () => {
       .map((el) => [...el.classList].find((c) => c.startsWith('state-')))
       .filter((c): c is string => Boolean(c));
     expect(painted.includes('state-needs-you'), 'a park nobody is asked about read as an ask').toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * The Tower — `#/runs` as the live management page (control-tower phase 20)
+ * ------------------------------------------------------------------ */
+
+describe('the Tower', () => {
+  it('keeps the approval queue and the auth card first, above every bay', async () => {
+    const { api } = await import('@/lib/api');
+    setPrefs({ runsView: 'board' });
+    runs.mockResolvedValue([{ ...RUN, id: 'r1', status: 'running', activePhase: 3, phases: RECORDS(3) }]);
+    vi.mocked(api.approvals).mockResolvedValue([
+      {
+        id: 'a1',
+        runId: 'r1',
+        slug: 'demo',
+        phase: 3,
+        kind: 'permission',
+        title: 'Bash: npm publish',
+        detail: 'Phase 3 of demo asks to run npm publish.',
+        evidence: [],
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+      },
+    ] as never);
+    vi.mocked(api.auth).mockResolvedValue({ loggedIn: false, checkedAt: '2026-08-03T00:00:00Z' } as never);
+    try {
+      const { default: RunsView } = await import('@/features/runs');
+      const { default: HeaderSituation } = await import('@/app/shell/situation');
+      mount(
+        <>
+          <HeaderSituation state={BASE_STATE} phone={false} />
+          <RunsView />
+        </>,
+      );
+      const queue = await screen.findByText('Waiting on you');
+      const signedOut = await screen.findByText('Claude Code is signed out');
+      const firstBay = (await screen.findAllByTestId('bay'))[0]!;
+      const before = (a: Node, b: Node) =>
+        Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+      expect(before(queue, firstBay), 'the approvals come before the bays').toBe(true);
+      expect(before(signedOut, firstBay), 'the auth card comes before the bays').toBe(true);
+      // And the situation line counts the card with the bays: it needs you too.
+      expect((await screen.findByTestId('situation-line')).textContent).toContain('1 needs you');
+    } finally {
+      vi.mocked(api.approvals).mockImplementation(async () => []);
+      vi.mocked(api.auth).mockImplementation(
+        async () => ({ loggedIn: true, checkedAt: '2026-08-03T00:00:00Z' }) as never,
+      );
+    }
+  });
+
+  it('says in Waiting and Queued what each run waits on — a fence, a hold, a sibling run’s branch', async () => {
+    setPrefs({ runsView: 'board' });
+    runs.mockResolvedValue([
+      {
+        ...RUN,
+        id: 'r-fenced',
+        slug: 'fenced',
+        status: 'waiting',
+        waitReason: 'external',
+        phases: {
+          4: { phase: 4, status: 'parked', attempts: 1, costUsd: 0 },
+          5: {
+            phase: 5,
+            status: 'queued',
+            attempts: 0,
+            costUsd: 0,
+            waitingOn: [
+              {
+                slug: 'fenced',
+                phase: 4,
+                owner: 'this run',
+                kind: 'fence',
+                refs: ['gh:acme/web#pr/12'],
+                until: null,
+              },
+            ],
+          },
+        },
+      },
+      {
+        ...RUN,
+        id: 'r-held',
+        slug: 'held',
+        status: 'queued',
+        hold: { at: '2026-08-03T00:30:00Z', by: 'you' },
+        phases: { 2: { phase: 2, status: 'queued', attempts: 0, costUsd: 0 } },
+      },
+      {
+        ...RUN,
+        id: 'r-branch',
+        slug: 'behind',
+        status: 'queued',
+        phases: { 3: { phase: 3, status: 'queued', attempts: 0, costUsd: 0 } },
+      },
+    ]);
+    queue.mockResolvedValue({
+      max: 3,
+      live: 0,
+      queued: 1,
+      throttledUntil: null,
+      grants: [],
+      entries: [
+        {
+          id: 'e1',
+          slug: 'behind',
+          phase: 3,
+          runId: 'r-branch',
+          scope: ['phased-execution'],
+          since: Date.parse('2026-08-03T00:40:00Z'),
+          bypassed: 0,
+          reserving: false,
+          waitingOn: [
+            {
+              kind: 'branch',
+              slug: 'beta',
+              phase: null,
+              owner: 'run b1 of beta holds phased-execution on pe/beta',
+              scope: ['phased-execution'],
+              overlaps: ['phased-execution'],
+              branch: 'pe/beta',
+            },
+          ],
+        },
+      ],
+    });
+    const { default: RunsView } = await import('@/features/runs');
+    mount(<RunsView />);
+
+    const waits = async (bay: RegExp, slug: RegExp) => {
+      const region = await screen.findByRole('region', { name: bay });
+      const strip = within(region).getByRole('article', { name: slug });
+      return within(strip)
+        .getAllByTestId('strip-wait')
+        .map((el) => el.textContent);
+    };
+    expect(await waits(/^Waiting/, /^fenced/)).toContain(
+      "P5 is fenced by P4's external wall, waiting on gh:acme/web#pr/12",
+    );
+    expect(await waits(/^Queued/, /^held/)).toContain('Held by you: nothing new boards until it is released');
+    await waitFor(async () =>
+      expect(await waits(/^Queued/, /^behind/)).toContain(
+        "P3 queued — waiting on beta's branch pe/beta on phased-execution",
+      ),
+    );
+  });
+
+  it('opens on the bay an address names, even over a stored table preference', async () => {
+    setPrefs({ runsView: 'table' });
+    runs.mockResolvedValue([{ ...RUN, id: 'r1', status: 'running', activePhase: 3, phases: RECORDS(3) }]);
+    const { default: RunsView } = await import('@/features/runs');
+    const { parseHash } = await import('@shared/routes.js');
+    mount(<RunsView route={parseHash('#/runs?bay=live')} />);
+    const live = await screen.findByRole('region', { name: /^Live/ });
+    expect(live.getAttribute('data-focused')).toBe('true');
   });
 });

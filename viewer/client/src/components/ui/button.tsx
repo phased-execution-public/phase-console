@@ -5,9 +5,14 @@ import { forwardRef } from 'react';
 import { cn } from '@/lib/cn';
 
 /**
- * `action` is the amber one, and it is rationed: amber means "this is the thing
- * to do now" (start the ready phase, answer the card). A screen with two amber
- * buttons has told you nothing. Everything else is `default` or `ghost`.
+ * `action` is the primary: ink-solid, the thing to do now on this screen (Save,
+ * Launch, Send). A screen with two primaries has told you nothing.
+ *
+ * `attention` is the amber one, and since tokens 6.0 it is rationed by a list:
+ * amber means a person is being summoned — a session parked on a permission
+ * card until somebody answers it — and `ui/button-attention.test.ts` holds
+ * every use to its allowlist, each with its reason. Everything else is
+ * `default` or `ghost`.
  */
 export const buttonVariants = cva(
   'inline-flex items-center justify-center gap-2 whitespace-nowrap rounded font-medium ' +
@@ -36,9 +41,10 @@ export const buttonVariants = cva(
     variants: {
       variant: {
         default: 'border border-rule bg-surface text-ink hover:bg-surface-raised hover:border-rule-strong',
-        action: 'border border-action/60 bg-action/12 text-action hover:bg-action/20',
+        action: 'border border-action bg-action text-ground hover:bg-action/85',
+        attention: 'border border-accent/60 bg-accent/12 text-accent hover:bg-accent/20',
         ghost: 'border border-transparent text-ink-muted hover:bg-surface hover:text-ink',
-        danger: 'border border-blocked/50 bg-blocked/10 text-blocked hover:bg-blocked/20',
+        danger: 'border border-failed/50 bg-failed/10 text-failed hover:bg-failed/20',
       },
       size: {
         sm: 'h-7 px-2 text-2xs',
@@ -102,12 +108,12 @@ export function ButtonGroup({ className, ...props }: React.HTMLAttributes<HTMLDi
       role="group"
       className={cn(
         'inline-flex shrink-0 rounded border border-rule',
-        '[&>button]:rounded-none [&>button]:border-0 [&>button]:border-r [&>button]:border-rule',
+        '[&>button]:rounded-none [&>button]:border-0 [&>button]:border-e [&>button]:border-rule',
         // −1px: the segment nests inside the group's 1px border, so its own
         // radius has to be that much tighter or the corner reads as thick.
-        '[&>button:first-child]:rounded-l-[calc(var(--radius)-1px)]',
-        '[&>button:last-child]:rounded-r-[calc(var(--radius)-1px)]',
-        '[&>button:last-child]:border-r-0',
+        '[&>button:first-child]:rounded-s-[calc(var(--radius)-1px)]',
+        '[&>button:last-child]:rounded-e-[calc(var(--radius)-1px)]',
+        '[&>button:last-child]:border-e-0',
         '[&>button[aria-pressed=true]]:bg-action/15 [&>button[aria-pressed=true]]:text-action',
         className,
       )}

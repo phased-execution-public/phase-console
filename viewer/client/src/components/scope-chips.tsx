@@ -1,4 +1,4 @@
-import { Chip } from '@/components/ui';
+import { Badge } from '@/components/ui';
 
 /** Scope chips shown before the row starts eliding. The rest go in the title. */
 const SCOPE_SHOWN = 2;
@@ -34,14 +34,14 @@ export function ScopeChips({ tokens, conflicts }: { tokens: string[]; conflicts?
     // this client that came out of a plan file.
     <div className="flex min-w-0 flex-wrap items-center gap-1" title={title}>
       {shown.map((token) => (
-        <Chip
+        <Badge
           key={token}
           mono
-          tone={token === 'all' ? 'warn' : undefined}
+          tone={token === 'all' ? 'accent' : undefined}
           className="max-w-full break-all whitespace-normal"
         >
           {token}
-        </Chip>
+        </Badge>
       ))}
       {hidden > 0 && <span className="font-mono text-2xs text-ink-faint">+{hidden}</span>}
     </div>

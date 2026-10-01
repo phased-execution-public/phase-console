@@ -1,0 +1,63 @@
+{"seq":1,"time":"2026-01-05T08:00:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":2,"time":"2026-01-05T08:00:00.000Z","event":"phase.start","phase":1,"data":{"model":"claude-opus-5-5[1m]","effort":"max"}}
+{"seq":3,"time":"2026-01-05T09:00:00.000Z","event":"phase.session","phase":1,"data":{"mode":"phase","sessionId":"s-a1","costUsd":10,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":4,"time":"2026-01-05T09:00:00.000Z","event":"phase.tokens","phase":1,"data":{"mode":"phase","sessionId":"s-a1","calls":101,"firstContext":100000,"peakContext":300000,"cacheRead":20000000,"cacheWrite":400000,"input":900,"output":40000}}
+{"seq":5,"time":"2026-01-05T09:00:00.000Z","event":"phase.verify","phase":1,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":6,"time":"2026-01-05T09:00:00.000Z","event":"phase.done","phase":1,"data":{}}
+{"seq":7,"time":"2026-01-05T09:00:00.000Z","event":"phase.model-differs","phase":1,"data":{"asked":"claude-opus-5-5[1m]","running":"claude-opus-5[1m]"}}
+{"seq":8,"time":"2026-01-05T09:00:00.000Z","event":"phase.start","phase":2,"data":{}}
+{"seq":9,"time":"2026-01-05T10:00:00.000Z","event":"phase.session","phase":2,"data":{"mode":"phase","sessionId":"s-a2","costUsd":5,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":10,"time":"2026-01-05T10:00:00.000Z","event":"phase.tokens","phase":2,"data":{"mode":"phase","sessionId":"s-a2","calls":51,"firstContext":80000,"peakContext":150000,"cacheRead":5000000,"cacheWrite":200000,"input":500,"output":20000}}
+{"seq":11,"time":"2026-01-05T10:00:00.000Z","event":"phase.verify","phase":2,"data":{"ok":true,"ran":[{"command":"npm test","code":1,"ms":180000},{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":12,"time":"2026-01-05T10:00:00.000Z","event":"phase.halted","phase":2,"data":{"kind":"verify-failed","reason":"npm test failed"}}
+{"seq":13,"time":"2026-01-05T10:00:00.000Z","event":"phase.start","phase":3,"data":{}}
+{"seq":14,"time":"2026-01-05T11:00:00.000Z","event":"phase.session","phase":3,"data":{"mode":"phase","sessionId":"s-a3","costUsd":4,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":15,"time":"2026-01-05T11:00:00.000Z","event":"phase.halted","phase":3,"data":{"kind":"no-handoff","reason":"no handoff"}}
+{"seq":16,"time":"2026-01-05T11:00:00.000Z","event":"run.halt","data":{"kind":"failure-streak","reason":"2 phases failed in a row: phase 2, then phase 3"}}
+{"seq":17,"time":"2026-01-05T13:00:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":18,"time":"2026-01-05T13:00:00.000Z","event":"phase.start","phase":2,"data":{}}
+{"seq":19,"time":"2026-01-05T14:00:00.000Z","event":"phase.session","phase":2,"data":{"mode":"resume","sessionId":"s-a2","costUsd":8,"costSource":"result","ms":3600000,"isError":false,"subtype":"error_max_turns","terminalReason":"max_turns","maxTurns":{"value":60,"source":"closeout"},"resumed":true}}
+{"seq":20,"time":"2026-01-05T14:00:00.000Z","event":"phase.verify","phase":2,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":21,"time":"2026-01-05T14:00:00.000Z","event":"phase.done","phase":2,"data":{}}
+{"seq":22,"time":"2026-01-05T14:00:00.000Z","event":"phase.start","phase":3,"data":{}}
+{"seq":23,"time":"2026-01-05T14:00:00.000Z","event":"phase.queued","phase":4,"data":{"scope":"app","headKind":"grant","waitingOn":[{"slug":"plan-alpha","phase":3,"owner":"autopilot/a1a1a1a1","overlaps":["app"],"eta":{"label":"~1 d–2 d left"}}]}}
+{"seq":24,"time":"2026-01-05T15:00:00.000Z","event":"phase.session","phase":3,"data":{"mode":"phase","sessionId":"s-a3b","costUsd":6,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":25,"time":"2026-01-05T15:00:00.000Z","event":"phase.verify","phase":3,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":26,"time":"2026-01-05T15:00:00.000Z","event":"phase.done","phase":3,"data":{}}
+{"seq":27,"time":"2026-01-05T15:00:00.000Z","event":"phase.admitted","phase":4,"data":{"scope":"app","waitedMs":3600000}}
+{"seq":28,"time":"2026-01-05T15:00:00.000Z","event":"phase.start","phase":4,"data":{}}
+{"seq":29,"time":"2026-01-05T15:00:36.000Z","event":"phase.stall","phase":3,"data":{"signal":"silent","since":"2026-01-05T14:30:00.000Z"}}
+{"seq":30,"time":"2026-01-05T15:30:00.000Z","event":"phase.stall","phase":4,"data":{"signal":"external-wait","since":"2026-01-05T15:24:00.000Z"}}
+{"seq":31,"time":"2026-01-05T16:00:00.000Z","event":"phase.session","phase":4,"data":{"mode":"phase","sessionId":"s-a4","costUsd":3,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":32,"time":"2026-01-05T16:00:00.000Z","event":"phase.halted","phase":4,"data":{"kind":"waiting-external-timeout","reason":"the wait budget is spent"}}
+{"seq":33,"time":"2026-01-05T16:00:00.000Z","event":"phase.start","phase":4,"data":{}}
+{"seq":34,"time":"2026-01-05T17:00:00.000Z","event":"phase.session","phase":4,"data":{"mode":"phase","sessionId":"s-a4b","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":35,"time":"2026-01-05T17:00:00.000Z","event":"phase.halted","phase":4,"data":{"kind":"waiting-external-timeout","reason":"the wait budget is spent"}}
+{"seq":36,"time":"2026-01-05T17:00:00.000Z","event":"run.halt","data":{"kind":"failure-streak","reason":"2 phases failed in a row: phase 4, then phase 4"}}
+{"seq":37,"time":"2026-01-05T18:00:00.000Z","event":"run.start","data":{"door":"converge-relaunch","by":"converge"}}
+{"seq":38,"time":"2026-01-05T18:00:00.000Z","event":"phase.start","phase":4,"data":{}}
+{"seq":39,"time":"2026-01-05T19:00:00.000Z","event":"phase.session","phase":4,"data":{"mode":"phase","sessionId":"s-a4c","costUsd":2,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":40,"time":"2026-01-05T19:00:00.000Z","event":"phase.verify","phase":4,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":41,"time":"2026-01-05T19:00:00.000Z","event":"phase.done","phase":4,"data":{}}
+{"seq":42,"time":"2026-01-05T19:00:00.000Z","event":"phase.start","phase":5,"data":{}}
+{"seq":43,"time":"2026-01-05T20:00:00.000Z","event":"phase.session","phase":5,"data":{"mode":"phase","sessionId":"s-a5","costUsd":3,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":44,"time":"2026-01-05T20:00:00.000Z","event":"phase.verify-stopped","phase":5,"data":{"ran":0,"notRun":3,"reason":"the run was stopped mid-verification — 0 of 3 command(s) ran"}}
+{"seq":45,"time":"2026-01-05T20:00:00.000Z","event":"run.stop-requested","data":{"by":"operator"}}
+{"seq":46,"time":"2026-01-05T21:00:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":47,"time":"2026-01-05T21:00:00.000Z","event":"phase.done","phase":5,"data":{}}
+{"seq":48,"time":"2026-01-05T21:00:00.000Z","event":"phase.start","phase":6,"data":{}}
+{"seq":49,"time":"2026-01-05T21:30:00.000Z","event":"phase.session","phase":6,"data":{"mode":"phase","sessionId":"s-a6","costUsd":0.5,"costSource":"result","ms":1800000,"isError":true,"subtype":"error_during_execution","terminalReason":"api_error","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":50,"time":"2026-01-05T21:30:00.000Z","event":"run.halt","data":{"kind":"credential-refused","reason":"the API refused the connection: a certificate this machine does not trust (a self-signed or intercepting certificate)"}}
+{"seq":51,"time":"2026-01-06T00:30:00.000Z","event":"run.start","data":{"door":"operator","by":"operator"}}
+{"seq":52,"time":"2026-01-06T00:30:00.000Z","event":"phase.start","phase":6,"data":{}}
+{"seq":53,"time":"2026-01-06T01:30:00.000Z","event":"phase.session","phase":6,"data":{"mode":"phase","sessionId":"s-a6b","costUsd":4,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":54,"time":"2026-01-06T01:30:00.000Z","event":"phase.verify","phase":6,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":55,"time":"2026-01-06T01:30:00.000Z","event":"phase.done","phase":6,"data":{}}
+{"seq":56,"time":"2026-01-06T01:30:00.000Z","event":"phase.queued","phase":7,"data":{"scope":"app","headKind":"grant","waitingOn":[{"slug":"plan-beta","phase":7,"owner":"autopilot/b2b2b2b2","overlaps":["app"],"eta":{"label":"~2 h–4 h left"}}]}}
+{"seq":57,"time":"2026-01-06T02:00:00.000Z","event":"run.halt-withdrew","data":{"phases":[7]}}
+{"seq":58,"time":"2026-01-06T03:00:00.000Z","event":"phase.queued","phase":7,"data":{"scope":"app","headKind":"grant","waitingOn":[{"slug":"plan-beta","phase":7,"owner":"autopilot/b2b2b2b2","overlaps":["app"],"eta":{"label":"~2 h–4 h left"}}]}}
+{"seq":59,"time":"2026-01-06T04:00:00.000Z","event":"phase.admitted","phase":7,"data":{"scope":"app","waitedMs":3600000}}
+{"seq":60,"time":"2026-01-06T04:00:00.000Z","event":"phase.start","phase":7,"data":{}}
+{"seq":61,"time":"2026-01-06T05:00:00.000Z","event":"phase.session","phase":7,"data":{"mode":"phase","sessionId":"s-a7","costUsd":3,"costSource":"result","ms":3600000,"isError":false,"subtype":"success","terminalReason":"completed","maxTurns":{"value":300,"source":"size","basis":"M"}}}
+{"seq":62,"time":"2026-01-06T05:00:00.000Z","event":"phase.verify","phase":7,"data":{"ok":true,"ran":[{"command":"npm test","code":0,"ms":180000}]}}
+{"seq":63,"time":"2026-01-06T05:00:00.000Z","event":"phase.done","phase":7,"data":{}}

@@ -130,6 +130,61 @@ fi
 recorded="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 mkdir -p "$dir"
+
+# The upsert below reads the file, writes a copy and moves the copy over it, so
+# two writers at the same moment lost one row between them — a parked phase's
+# `conflict` beside its sibling's `held` when the two lanes landed together. The
+# heading and the upsert run inside a section of their own: mkdir is the one
+# atomic test-and-set bash 3.2 has on every filesystem this runs on (the shape
+# of phase-lock.sh's docs-root section). It is held for a rewrite of one small
+# file, so a writer found dead inside it — its pid gone, or its stamp a minute
+# old — is stepped over rather than waited on.
+section="$dir/.landing.lock"
+section_token=""
+leave_section() {
+  if [ -n "$section_token" ] && [ "$(cat "$section/token" 2>/dev/null || true)" = "$section_token" ]; then
+    rm -rf "$section" 2>/dev/null || true
+  fi
+  section_token=""
+}
+trap 'leave_section' EXIT
+waited=0
+broke=0
+while ! mkdir "$section" 2>/dev/null; do
+  seen="$(cat "$section/token" 2>/dev/null || true)"
+  held_pid="$(cat "$section/pid" 2>/dev/null || true)"
+  case "$held_pid" in ''|*[!0-9]*) held_pid=0 ;; esac
+  held_at="$(cat "$section/at" 2>/dev/null || true)"
+  case "$held_at" in ''|*[!0-9]*) held_at=0 ;; esac
+  stale=0
+  if { [ "$held_pid" -gt 0 ] && ! kill -0 "$held_pid" 2>/dev/null; } \
+     || { [ "$held_at" -gt 0 ] && [ $(( $(date +%s) - held_at )) -ge 60 ]; }; then
+    stale=1
+  elif [ "$waited" -ge 300 ]; then
+    # Still unstamped after the whole wait: its writer died between its mkdir
+    # and its stamp. Broken once, never twice.
+    if [ "$held_at" = 0 ] && [ "$broke" = 0 ]; then
+      broke=1; stale=1
+    else
+      echo "the landing ledger $f stayed busy for 30 s — nothing was written" >&2
+      exit 1
+    fi
+  fi
+  # A dead pid is not proof on its own: a holder removes its section and THEN
+  # exits, and by then the next writer may hold a fresh one. Only the section
+  # that was judged — the same token — is ever broken.
+  if [ "$stale" = 1 ] && [ "$(cat "$section/token" 2>/dev/null || true)" = "$seen" ]; then
+    rm -rf "$section" 2>/dev/null || true
+    continue
+  fi
+  sleep 0.1
+  waited=$((waited + 1))
+done
+section_token="$$.$(date +%s).${RANDOM:-0}"
+printf '%s\n' "$section_token" > "$section/token"
+printf '%s\n' "$$" > "$section/pid"
+date +%s > "$section/at"
+
 if [ ! -f "$f" ]; then
   {
     printf '# Landings — %s\n\n' "$slug"
@@ -161,6 +216,7 @@ PE_ROW="$row" awk -F'|' -v ph="$phase" -v rp="${repo:--}" '
   END{ if (!replaced) print ENVIRON["PE_ROW"] }
 ' "$f" > "$tmp"
 mv "$tmp" "$f"
+leave_section
 
 printf 'landing: %s phase %s%s → %s (policy %s)\n' \
   "$slug" "$phase" "${repo:+ [$repo]}" "$state" "$policy"

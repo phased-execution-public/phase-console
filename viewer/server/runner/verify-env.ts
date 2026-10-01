@@ -79,7 +79,22 @@ export function foldWhitespace(text: string): string {
   // statement led by `echo`, and bypassed the in-turn guard entirely.
   // Semicolon also keeps the multi-line loop matching: `until X \n do \n sleep`
   // becomes `until X; do; sleep`, which the vocabulary's `; *do` arm reads.
-  return text.replace(/\r?\n/g, '; ').replace(/\t/g, ' ').replace(/ {2,}/g, ' ');
+  // A backslash-newline is the exception, and is folded FIRST: it continues
+  // the line, so it joins with a space. Read as a separator it cut a
+  // declaration's `\`-continued `--watch` into a statement of its own, and the
+  // carve-out stopped at the `;` it had been given (AUD-34).
+  return text.replace(/\\\r?\n/g, ' ').replace(/\r?\n/g, '; ').replace(/\t/g, ' ').replace(/ {2,}/g, ' ');
+}
+
+/**
+ * The folded, carved text cut after every `done` KEYWORD — the first word of a
+ * command, so `build/done.flag` stays whole — so a loop is judged inside its
+ * own end and cannot borrow a clock from a statement after it (control-tower
+ * phase 47). The bash reader (`external_wait_hit`, verify.env) cuts at the
+ * same places.
+ */
+function loopSegments(carved: string): string[] {
+  return carved.replace(/(^|[;&] *)done(?=[ ;&|)'"]|$)/g, '$1done\n').split('\n');
 }
 
 /**
@@ -107,8 +122,15 @@ export function externalWaitHit(
   env: VerifyEnv, text: string,
 ): { matched: string; carved: string; index: number } | null {
   const carved = foldWhitespace(text).replace(env.externalWaitAllow, () => '');
-  const hit = env.externalWait.exec(carved);
-  return hit ? { matched: hit[0].trim(), carved, index: hit.index } : null;
+  // Segment by segment, in order, so the first hit is the one bash's
+  // `grep -oE … | head -1` reports; `index` stays an offset into `carved`.
+  let offset = 0;
+  for (const segment of loopSegments(carved)) {
+    const hit = env.externalWait.exec(segment);
+    if (hit) return { matched: hit[0].trim(), carved, index: offset + hit.index };
+    offset += segment.length;
+  }
+  return null;
 }
 
 /** The bring-up fragment this text matches, or null. Folded, never carved. */
@@ -117,17 +139,30 @@ export function setupLeadMatch(env: VerifyEnv, text: string): string | null {
   return hit ? hit[0].trim() : null;
 }
 
+/**
+ * A loop's clock (control-tower phase 47, #52) — a loop is a wait only when its
+ * condition or body holds one of these. Spelled once here and twice in the
+ * alternation below (clock before the `do`, clock after it), exactly as
+ * `verify.env` spells it.
+ */
+const LOOP_HEAD = '(until|while (\\[\\[? |test |\\(\\( |! |(true|:) *;))';
+const LOOP_CLOCK =
+  '([ ;&|(!]sleep [0-9"$]|[ ;&|(]wait( |;|$)|[ ;&|(]read -t'
+  + '|[ ;&|(!](gh|aws|kubectl|ssh|scp|rsync|vercel|terraform|flyctl|fly|gcloud|az|doctl|heroku|curl|wget|nc) '
+  + '|[ ;&|(!]git (fetch|pull|push|ls-remote|clone)|https?://)';
+
 /** The shared external-clock vocabulary. Keep byte-identical to `verify.env`. */
 const EXTERNAL_WAIT_FALLBACK =
   'gh run watch|gh pr checks[^`]*--watch| --watch([^A-Za-z]|$)|task deploy'
   + '|sleep [0-9]{3,}|sleep [6-9][0-9]([^0-9]|$)|sleep [0-9]+[mh]'
-  + '|until [^`]+; *do|until [^`]+ do |while (true|:) *; *do|while \\[\\[? [^`]+; *do|while test [^`]+; *do'
-  + '|while \\(\\( [^`]+; *do|while sleep [^`]+; *do|while ! [^`]+; *do|watch -n'
+  + `|${LOOP_HEAD}[^\`]*${LOOP_CLOCK}[^\`]*(; *| )do( |;|$)`
+  + `|${LOOP_HEAD}[^\`]*(; *| )do[^\`]*${LOOP_CLOCK}`
+  + '|while sleep [^`]+; *do|watch -n'
   + '|aws [a-z0-9-]+ wait |kubectl rollout status'
   + '|docker[ -]compose logs -f|docker[ -]compose up( |$)|tail -f';
 
 /** The carve-out. Keep byte-identical to `verify.env`. */
-const EXTERNAL_WAIT_ALLOW_FALLBACK = 'docker[ -]compose up (-d|--detach)|phase-outcome\\.sh [^;&|]*';
+const EXTERNAL_WAIT_ALLOW_FALLBACK = 'docker[ -]compose up (-d|--detach)|phase-outcome\\.sh([^;&|"]|"[^"]*")*';
 
 /** Lint F22's bring-up vocabulary. Keep byte-identical to `verify.env`. */
 const SETUP_LEADS_FALLBACK =

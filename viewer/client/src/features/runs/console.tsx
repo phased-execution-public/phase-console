@@ -357,7 +357,7 @@ export function LiveConsole({
             aria-hidden="true"
             className={cn(
               'size-2 shrink-0 rounded-full',
-              lines.length ? 'bg-progress shadow-[0_0_6px_currentColor] text-progress' : 'bg-ink-faint/40',
+              lines.length ? 'bg-running shadow-[0_0_6px_currentColor] text-running' : 'bg-ink-faint/40',
             )}
           />
           {/* Both take a floor and permission to shrink. `truncate` alone does

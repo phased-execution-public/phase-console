@@ -41,12 +41,11 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   Empty,
   PageError,
   SectionHeading,
   Skeleton,
-  StatusBadge,
   field,
 } from '@/components/ui';
 import { ToolbarSorts } from '@/components/toolbar';
@@ -54,7 +53,9 @@ import { cn } from '@/lib/cn';
 import { defineSorts } from '@/lib/list-model';
 import { plural } from '@/lib/format';
 import { isClosed } from '@/lib/closure';
-import { UI_STATES, qaResultTitle, qaUiState } from '@/lib/status-vocab';
+import { describeWord } from '@shared/status-model.js';
+import { QaBadge, type WordOf } from '@/components/ui/status';
+import { UI_STATES, qaResultTitle } from '@/lib/status-vocab';
 import { planHref, handoffHref } from '@shared/routes.js';
 import { useConsoleState, usePlan, usePlans, useSpend, useStats } from '@/lib/queries';
 import { PortfolioPanel } from './portfolio';
@@ -140,11 +141,16 @@ export default function InsightsView({ route }: ViewProps) {
               </option>
             ))}
           </select>
-          <Chip mono>{plural(t.plans, 'plan')}</Chip>
+          <Badge mono>{plural(t.plans, 'plan')}</Badge>
+          {/* A count to tidy, not a summons: amber is only for what needs a
+              person (control-tower phase 16), so it wears no tone of its own. */}
           {t.orphans > 0 && (
-            <Chip mono tone="warn">
+            <Badge
+              mono
+              title="Handoff folders with no plan beside them — nothing waits on them, and nothing reads them."
+            >
               {plural(t.orphans, 'orphan folder')}
-            </Chip>
+            </Badge>
           )}
         </>
       }
@@ -253,7 +259,7 @@ type QaRow = { phase: number; result: string; report?: string };
  * word this console does not know sorts last rather than first.
  */
 const qaRank = (result: string): number => {
-  const at = UI_STATES.indexOf(qaUiState(result));
+  const at = UI_STATES.indexOf(describeWord('qa-result', result).paint);
   return at < 0 ? UI_STATES.length : at;
 };
 
@@ -321,11 +327,7 @@ export function PlanRecord({ slug, qa }: { slug: string; qa: QaRow[] }) {
                   </a>
                   {/* The verdict through the QA vocabulary, so it is painted
                       the same hue here as on the phase row and the board. */}
-                  <StatusBadge
-                    state={qaUiState(row.result)}
-                    label={row.result}
-                    title={qaResultTitle(row.result)}
-                  />
+                  <QaBadge result={row.result as WordOf<'qa-result'>} title={qaResultTitle(row.result)} />
                   {row.report ? (
                     // A real link to the report sheet on the plan's QA tab —
                     // this was an inert span despite the card's own docstring.

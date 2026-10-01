@@ -23,13 +23,19 @@
  *     a lazy chunk the entry document never references — in the precache OR
  *     as a `modulepreload`, which is the second way a lazy chunk stops being
  *     lazy and the one nothing checked until Phase 7.
- *   • first paint (entry + every modulepreload) is GATED at 200 KB — of SERVED
+ *   • first paint (entry + every modulepreload) is GATED at 190 KB (200 until
+ *     control-tower phase 18, see the note above the constant) — of SERVED
  *     bytes, the `.br`/`.gz` sibling the server actually sends. It was advisory
  *     for four phases, drifted 211 → 220 KB, and nobody read the printed line;
  *     the cause turned out to be a one-line barrel import, not a dependency
  *     bump. It then spent its whole gated life measuring a compression the
  *     server never applied — 192.7 KB here, 641.1 KB on the wire. See the note
  *     above the constant.
+ *   • the TABLE ENGINE (TanStack Table, behind the grid's filters, groups and
+ *     picks — control-tower phase 18) is a lazy chunk of its own that no chunk
+ *     imports statically and the document never preloads; and first paint is
+ *     held at its figure from before the grid left the preloaded barrel, so
+ *     that move is proven not to have raised it.
  *   • `dist/.build-rev` exists — proves the stamp stayed wired into
  *     `npm run build`, which is what `npm start`'s staleness warning reads.
  *
@@ -205,6 +211,14 @@ const xtermChunks = assets.filter(
   (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes('xterm'),
 );
 check('the terminal emulator is in a chunk at all (nothing to check otherwise)', xtermChunks.length > 0);
+// Exactly ONE (control-tower phase 42): the sessions page and a human step's
+// terminal sheet both reach the emulator through the same lazy door
+// (`import('./pane')`), so they share its chunk. A second chunk carrying it is
+// a second door — somebody imported xterm, or the pane, statically.
+check(
+  `the terminal emulator is in exactly one lazy chunk (${xtermChunks.join(', ') || 'none'})`,
+  xtermChunks.length === 1,
+);
 const precachedXterm = xtermChunks.filter((name) => sw.includes(name));
 check(
   `the precache excludes the emulator, whatever the chunk is called (${xtermChunks.join(', ') || 'none'})`,
@@ -340,8 +354,8 @@ if (repoChunk) {
     `the repo route never statically pulls run-setup (${repoGraph.size} chunks in its graph)`,
     runSetup.length === 0,
     `${runSetup.join(', ')} is reachable from ${repoChunk} by static imports. The issues board's ` +
-      'launch must be reached through `features/repo/lazy-issues-launch` — never `issues-launch` ' +
-      'directly from anything the Repo destination mounts.',
+      'launch must be reached through `features/repo/lazy-issues-launch` — never `issues-launch`, ' +
+      'nor anything else that imports `RunSetup`, directly from anything the Repo destination mounts.',
   );
 }
 
@@ -374,6 +388,24 @@ if (repoChunk) {
     `${pulled.join(', ')} is reachable from ${repoChunk} by static imports. The Landscape section must be ` +
       'reached through `features/repo/pro/lazy-landscape` — never `landscape-section` or `repo-map` ' +
       'directly from anything the Repo destination mounts.',
+  );
+}
+/*
+ * And the plan route, in both trees (control-tower phase 30). The route map is
+ * hand-rolled — `components/dag.tsx`, kept over React Flow by the phase's
+ * spike, which measured React Flow's pane taking a phone's vertical swipe — so
+ * no map library may reach the plan chunk's static graph. Found by content, as
+ * above; in the free tree nothing carries the library and the walk is short.
+ */
+if (planChunk) {
+  const planGraph = chunkClosure(planChunk);
+  const pulled = [...planGraph].filter((name) => reactFlowChunks.includes(name));
+  check(
+    `the plan route's static graph carries no map library (${planGraph.size} chunks walked)`,
+    pulled.length === 0,
+    `${pulled.join(', ')} is reachable from ${planChunk} by static imports. The plan route draws its map ` +
+      'with components/dag.tsx; a map library there would ride into every plan page, and into the free ' +
+      "tree — control-tower phase 30's handoff records why it was not adopted.",
   );
 }
 const precachedReactFlow = reactFlowChunks.filter((name) => sw.includes(name));
@@ -435,6 +467,169 @@ check(
   `modulepreloaded: ${preloadedQr.join(', ')} — a preloaded chunk is fetched by every visitor on first paint. ` +
     'Usually a static import that should be a `lazy()`; see features/fleet/lazy-qr.tsx.',
 );
+/*
+ * The table engine, by the same three rules — and one stricter.
+ *
+ * `components/data-table/engine.ts` is the ONE file that imports TanStack
+ * Table (ESLint's `no-restricted-imports` holds that in the source), and
+ * `components/data-table/data-table.tsx` reaches it through `import()` only
+ * when a table asks for a filter, a group, a pick or a window. A table with
+ * none of those — most of them — never downloads it. Found by CONTENT: an
+ * option name only the library itself spells (the client never writes it), for
+ * the reason the pane check gives — a chunk name is exactly what a bundler is
+ * free to change.
+ *
+ * Stricter than the landscape's rule, which walks named route chunks: NO chunk
+ * may import the engine statically, because the grid is on almost every
+ * destination and a static edge from any of them is that page carrying it.
+ * It is NOT kept out of the precache: the tables it serves are on precached
+ * destinations, and an offline grid that could not load its engine would draw
+ * its rows unfiltered with no way to narrow them.
+ */
+const TABLE_ENGINE_MARK = 'maxLeafRowFilterDepth';
+const engineChunks = assets.filter(
+  (name) =>
+    name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(TABLE_ENGINE_MARK),
+);
+check(
+  `the table engine is its own lazy chunk (engine-*: ${engineChunks.join(', ') || 'none'})`,
+  engineChunks.some((name) => /^engine-.*\.js$/.test(name)),
+  "components/data-table/data-table.tsx reaches the engine through `import('./engine')`; if no engine-* chunk " +
+    'carries it, it was folded into its importer — every page with a table would download it.',
+);
+const staticEngineImporters = assets.filter(
+  (name) =>
+    name.endsWith('.js') &&
+    !engineChunks.includes(name) &&
+    staticImportsOf(name).some((imported) => engineChunks.includes(imported)),
+);
+check(
+  `no chunk imports the table engine statically (${staticEngineImporters.join(', ') || 'none do'})`,
+  staticEngineImporters.length === 0,
+  `${staticEngineImporters.join(', ')} import the engine by a static import. Only ` +
+    'components/data-table/engine.ts may import @tanstack/react-table, and only data-table.tsx reaches it, ' +
+    'through `import()`.',
+);
+const preloadedEngine = engineChunks.filter((name) => preloaded.includes(name));
+check(
+  'the document never modulepreloads the table engine, whatever the chunk is called',
+  preloadedEngine.length === 0,
+  `modulepreloaded: ${preloadedEngine.join(', ')} — a preloaded chunk is fetched by every visitor on first paint.`,
+);
+
+/*
+ * The figures, by the table engine's three rules (control-tower phase 29).
+ *
+ * The four figures' drawings and the run's cost strip draw with visx, in
+ * `components/figures/bars.tsx` and `run-chart.tsx`, and
+ * `components/figures/lazy.tsx` reaches them only through `import()`.
+ * `charts.tsx` is imported by nearly every destination for its MARKS (the
+ * Pulse draws one), so a static edge from it — or from anything — to a drawing
+ * is visx in first paint. Found by CONTENT: the `data-figure` attribute every
+ * drawing spells and nothing else in the client does. Not kept out of the
+ * precache, for the engine's reason: the figures are on precached
+ * destinations, and an offline Insights page that could not draw would show
+ * only its tables.
+ */
+const FIGURES_MARK = 'data-figure';
+const figureChunks = assets.filter(
+  (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(FIGURES_MARK),
+);
+check(
+  `the figures are lazy chunks of their own (bars-*, run-chart-*: ${figureChunks.join(', ') || 'none'})`,
+  figureChunks.some((name) => /^bars-.*\.js$/.test(name)) &&
+    figureChunks.some((name) => /^run-chart-.*\.js$/.test(name)),
+  "components/figures/lazy.tsx reaches the drawings through `import('./bars')` and `import('./run-chart')`; " +
+    'if either chunk is gone it was folded into an importer — and the page that imports it carries visx.',
+);
+const staticFigureImporters = assets.filter(
+  (name) =>
+    name.endsWith('.js') &&
+    !figureChunks.includes(name) &&
+    staticImportsOf(name).some((imported) => figureChunks.includes(imported)),
+);
+check(
+  `no chunk imports a figure drawing statically (${staticFigureImporters.join(', ') || 'none do'})`,
+  staticFigureImporters.length === 0,
+  `${staticFigureImporters.join(', ')} import a figure drawing by a static import. Only ` +
+    'components/figures/lazy.tsx may reach bars.tsx or run-chart.tsx, and only through `import()`.',
+);
+const preloadedFigures = figureChunks.filter((name) => preloaded.includes(name));
+check(
+  'the document never modulepreloads a figure drawing, whatever the chunk is called',
+  preloadedFigures.length === 0,
+  `modulepreloaded: ${preloadedFigures.join(', ')} — a preloaded chunk is fetched by every visitor on first paint.`,
+);
+
+
+
+/*
+ * The status model's word tables and its icon map stay out of first paint
+ * (control-tower phase 16).
+ *
+ * `StatusStack` and the toast sit in the preloaded `@/components/ui` barrel and
+ * draw four note severities. The typed badge family (`ui/status/`) draws every
+ * word of two dozen vocabularies with 98 lucide icons, and only pages import
+ * it. Tree-shaking works per MODULE, not per chunk: a module that one
+ * first-paint file and one page both import is placed whole in a chunk first
+ * paint loads. So the notes live in modules of their own
+ * (`shared/status-notes.js`, `ui/status/note-icons.ts`) — and while they did
+ * not, first paint carried the whole model and all 98 icons, 8 KB served.
+ * Found by CONTENT: `thermometer-snowflake`, the icon of a cooling
+ * entitlement, is spelled by the word table and by that lucide icon, and by
+ * nothing first paint draws.
+ */
+const STATUS_TABLE_MARK = 'thermometer-snowflake';
+const statusTableChunks = assets.filter(
+  (name) =>
+    name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(STATUS_TABLE_MARK),
+);
+check(
+  `the status word tables are built (${statusTableChunks.join(', ') || 'no chunk spells them'})`,
+  statusTableChunks.length > 0,
+  `no chunk spells \`${STATUS_TABLE_MARK}\`, so the check below could not find the tables it guards. ` +
+    'If the icon was renamed, move STATUS_TABLE_MARK to another word only the tables spell.',
+);
+const statusTablesInFirstPaint = statusTableChunks.filter(
+  (name) => name === entryMatch?.[1] || preloaded.includes(name),
+);
+check(
+  `first paint carries none of the status word tables (${statusTablesInFirstPaint.join(', ') || 'none does'})`,
+  statusTablesInFirstPaint.length === 0,
+  `${statusTablesInFirstPaint.join(', ')} spell \`${STATUS_TABLE_MARK}\`: a first-paint file imports ` +
+    '`shared/status-model.js` or `ui/status/status-icons.ts` (or the `ui/status` barrel), and the whole ' +
+    'module came along. First paint takes the notes from `shared/status-notes.js` and ' +
+    '`ui/status/note-icons.ts` only.',
+);
+
+/*
+ * The peek stays out of first paint (control-tower phase 19).
+ *
+ * `components/peek.tsx` wraps `@radix-ui/react-hover-card`, and it sits OUTSIDE
+ * the preloaded `@/components/ui` barrel on purpose: the run strip is its only
+ * user, and the Runs page is a lazy route. A re-export from the barrel — the
+ * one-line mistake that once cost first paint 8 KB — would put the hover card in
+ * every visitor's first load. Found by CONTENT: the trigger's display name,
+ * which the library spells and nothing else in the client does.
+ */
+const PEEK_MARK = 'HoverCardTrigger';
+const peekChunks = assets.filter(
+  (name) => name.endsWith('.js') && readFileSync(join(DIST, 'assets', name), 'utf8').includes(PEEK_MARK),
+);
+check(
+  `the hover card is built (${peekChunks.join(', ') || 'no chunk spells it'})`,
+  peekChunks.length > 0,
+  `no chunk spells \`${PEEK_MARK}\`, so the check below could not find the peek it guards. If the ` +
+    'library renamed its trigger, move PEEK_MARK to another word only it spells.',
+);
+const peekInFirstPaint = peekChunks.filter((name) => name === entryMatch?.[1] || preloaded.includes(name));
+check(
+  `first paint carries no hover card (${peekInFirstPaint.join(', ') || 'none does'})`,
+  peekInFirstPaint.length === 0,
+  `${peekInFirstPaint.join(', ')} spell \`${PEEK_MARK}\`: a first-paint file imports ` +
+    '`components/peek.tsx` (or the barrel re-exports it). The peek is for pages, reached through their routes.',
+);
+
 const preloadedXterm = xtermChunks.filter((name) => preloaded.includes(name));
 check(
   `the document never modulepreloads the emulator, whatever the chunk is called (${preloaded.length} preloaded)`,
@@ -469,7 +664,7 @@ check(
  * so. Raise this deliberately if a real dependency needs the room — with the
  * reason, here.
  */
-const FIRST_PAINT_SERVED = 200 * 1024;
+const FIRST_PAINT_SERVED = 190 * 1024;
 
 /*
  * SERVED bytes, not `gzipSync` of the source.
@@ -485,6 +680,14 @@ const FIRST_PAINT_SERVED = 200 * 1024;
  * written by `scripts/precompress.mjs`, the last step of `npm run build`. Drop
  * that step and this check reads the identity size and FAILS, which is the
  * whole point: the gap can no longer open silently.
+ *
+ * 190, not 200, since control-tower phase 18. That phase took the grid
+ * (`DataTable`) and the long list (`DataList`, with its virtualizer) out of
+ * the preloaded `@/components/ui` barrel: first paint went from 189.3 KB to
+ * 181.3 KB served. The gate is set at the figure from BEFORE that move,
+ * rounded up, so "the grid's new engine did not raise first paint" is a check
+ * rather than a sentence — and the room the move freed is there to be spent
+ * deliberately. Raise it with the reason, here.
  */
 function servedBytes(file) {
   if (!existsSync(file)) return 0;

@@ -36,7 +36,7 @@ import {
   CardTitle,
   CardSkeleton,
   Checkbox,
-  Chip,
+  Badge,
   Input,
   RelativeTime,
   SectionHeading,
@@ -159,7 +159,7 @@ export function DevicesCard() {
                   subscription. Costs nothing and needs no setup, but only exists while a tab is open."
         >
           {inTab === 'granted' ? (
-            <Chip tone="ok">on</Chip>
+            <Badge tone="ok">on</Badge>
           ) : inTab === 'denied' ? (
             <span className="text-2xs text-ink-faint">blocked in browser settings</span>
           ) : inTab === 'unsupported' ? (
@@ -228,9 +228,9 @@ export function DevicesCard() {
                   <span className="min-w-0">
                     <span className="text-sm text-ink">{category.label}</span>
                     {category.urgent && (
-                      <Chip tone="warn" className="ml-1.5">
+                      <Badge tone="accent" className="ml-1.5">
                         urgent
-                      </Chip>
+                      </Badge>
                     )}
                     <span className="mt-0.5 block text-2xs text-ink-muted">{category.detail}</span>
                   </span>
@@ -413,14 +413,14 @@ function OtherDevice({ device, busy, onTest }: { device: PushDevice; busy: boole
       <div className="min-w-0 flex-1">
         <strong className="text-sm text-ink">{device.label}</strong>
         {device.quiet && (
-          <Chip
+          <Badge
             className="ml-1.5"
             title={`Quiet ${device.quiet.start} to ${device.quiet.end}${
               device.quiet.allowUrgent ? ' · urgent still gets through' : ''
             }`}
           >
             quiet {device.quiet.start}–{device.quiet.end}
-          </Chip>
+          </Badge>
         )}
         <span className="ml-1.5 text-2xs text-ink-faint">
           {plural(chosen, 'category', 'categories')} ·{' '}
@@ -475,7 +475,7 @@ function DeliveryReadout({
         {undelivered ? ` and ${undelivered} reached no device at all — those exist only in the inbox` : ''}.
       </p>
       {failures.length > 0 && (
-        <p className="mt-1 text-2xs text-blocked">
+        <p className="mt-1 text-2xs text-failed">
           {plural(failures.length, 'handover')} did not succeed:{' '}
           {[...new Set(failures.map((f) => `${f.label} · ${f.outcome}`))].join(', ')}.
         </p>

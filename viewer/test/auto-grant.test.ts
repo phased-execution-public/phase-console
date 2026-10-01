@@ -20,6 +20,7 @@
  * `hook-decisions.test.ts` uses.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
@@ -178,6 +179,7 @@ function serviceOn(run: RunShape): {
   const service = new Service(flags as never);
   const noted: Noted[] = [];
   (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({ id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: 'guarded', ...run }),
     note: (event: string, data: Record<string, unknown>, phase?: number) =>
@@ -400,4 +402,33 @@ test('a call whose token names no run never auto-grants — an anomaly stays in 
 // top of this file is what keeps all of it out of the operator's real state.
 test('scratch state is our own', () => {
   assert.ok(INSTANCE_STATE_DIR.startsWith(STATE_HOME));
+});
+
+test('#112 (control-tower phase 84): a row that allows the publishing rule answers it with auto-grant OFF — the plan\'s written answer, journalled at level manifest', async () => {
+  mkdirSync(join(POLICY_PATH, '..'), { recursive: true });
+  writeFileSync(POLICY_PATH, `${JSON.stringify({ autoApprove: false })}\n`, 'utf8');
+  const manifest = {
+    decisions: [{ key: 'permission.destructive', state: 'answered', source: 'plan', value: 'deny; allow `Bash(gh pr create:*)`' }],
+  };
+  const { service, noted } = serviceOn({ gitMode: 'new-branch', openPr: true, manifest });
+  try {
+    const answer = reply(await service.decideToolUse(
+      { tool_name: 'Bash', tool_input: { command: 'gh pr create --fill' } }, 'r1',
+    ));
+    assert.equal(answer.permissionDecision, 'allow', 'auto-grant is off, and the plan still answered');
+    const granted = noted.find((n) => n.event === 'phase.approval-auto-granted');
+    assert.equal(granted?.data.level, 'manifest');
+    assert.equal(granted?.data.answeredBy, 'permission.destructive');
+    // An ordinary ask is still a person's: auto-grant is off.
+    const pending = Symbol('still asking');
+    const outcome = await Promise.race([
+      service.decideToolUse(ASKED, 'r1'),
+      new Promise((resolve) => { setTimeout(() => resolve(pending), 100).unref(); }),
+    ]);
+    assert.equal(outcome, pending);
+  } finally {
+    service.approvals.disarm();
+    service.close();
+    rmSync(POLICY_PATH, { force: true });
+  }
 });

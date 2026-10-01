@@ -29,7 +29,7 @@ import {
   CardHeader,
   CardTitle,
   CardSkeleton,
-  Chip,
+  Badge,
   ConfirmButton,
   Dialog,
   DialogContent,
@@ -37,8 +37,10 @@ import {
   copy,
   toast,
 } from '@/components/ui';
-import { LimitsOverview } from '@/components/limits-widget';
+import { LimitsOverview } from '@/components/limits-overview';
 import { navigate } from '@/app/router';
+import { AccountRepair, needsRepair } from '@/components/account-repair';
+import { RetirementEvidence } from '@/components/retirement-evidence';
 
 /** The Accounts section's cards: the registry card, and (Pro) the dashboard under it. */
 export function AccountsCard() {
@@ -123,10 +125,11 @@ function RegistryCard() {
     <Card>
       <CardHeader>
         <CardTitle>Claude accounts</CardTitle>
-        {allowed ? <Chip tone="warn">registration enabled</Chip> : null}
+        {allowed ? <Badge tone="accent">registration enabled</Badge> : null}
       </CardHeader>
       <CardBody className="flex flex-col gap-4">
-        <LimitsOverview accounts={accounts} />
+        {/* Its rows below carry the sign-in and token verbs, so the overview does not repeat them. */}
+        <LimitsOverview accounts={accounts} repair={false} />
 
         {allowed ? (
           <div className="flex flex-col gap-3 border-t border-rule pt-3">
@@ -167,6 +170,7 @@ function RegistryCard() {
                 />
               ))}
             </div>
+            <UnattendedOffer accounts={accounts} busy={busy} onAdd={() => setAdding(true)} />
           </div>
         ) : (
           <p className="border-t border-rule pt-3 text-xs text-ink-muted">
@@ -219,6 +223,43 @@ function RegistryCard() {
       </Dialog>
     </Card>
   );
+}
+
+/**
+ * The unattended path, offered (control-tower phase 91, #147): a login-backed
+ * account's access token lapses every few hours and is renewed through the CLI
+ * while this console runs, but a long-lived token never needs renewing — the
+ * steadier choice for a run left alone for days. The sentence is the server's
+ * (`AccountView.unattended`), so the card and the start door say one thing;
+ * once a token account exists the path is taken and the offer steps back.
+ */
+function UnattendedOffer({
+  accounts,
+  busy,
+  onAdd,
+}: {
+  accounts: AccountView[];
+  busy: boolean;
+  onAdd: () => void;
+}) {
+  const offer = accounts.find((account) => account.unattended)?.unattended;
+  if (!offer || accounts.some((account) => account.kind === 'token')) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+      <p className="min-w-0 flex-1">{offer}</p>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={onAdd}>
+        Add a long-lived token…
+      </Button>
+    </div>
+  );
+}
+
+/** "replace by 5 Oct" — when a setup-token stops working, in the reader's own calendar. */
+function replaceBy(iso: string): string {
+  const when = new Date(iso);
+  return Number.isNaN(when.getTime())
+    ? iso
+    : when.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
 /**
@@ -296,15 +337,28 @@ function AccountRow({
           </Button>
         </>
       )}
-      {account.authState === 'expired' ? <Chip tone="bad">login expired</Chip> : null}
+      {account.authState === 'expired' ? <Badge tone="bad">login expired</Badge> : null}
+      {account.authState === 'refreshable' ? <Badge>idle, renews at its next session</Badge> : null}
+      {account.kind === 'token' && account.tokenExpiresAt ? (
+        <Badge
+          tone={account.authState === 'expiring' || account.authState === 'expired' ? 'accent' : undefined}
+          title="A setup-token lasts a year from when it was added; paste a new one before then"
+        >
+          replace by {replaceBy(account.tokenExpiresAt)}
+        </Badge>
+      ) : null}
       {account.authState === 'signed-out' && account.signedIn !== false ? (
-        <Chip tone="bad">signed out</Chip>
+        <Badge tone="bad">signed out</Badge>
       ) : null}
       {account.kind === 'profile' && (account.signedIn === false || broken) ? (
         <Button size="sm" variant="ghost" disabled={busy} onClick={onSignIn}>
           {account.signedIn === false ? 'Sign in' : 'Sign in again'}
         </Button>
       ) : null}
+      {/* The verb beside the diagnosis for every kind (phase 25, #33): an
+          expired machine login signs in again or copies the command; an
+          expired or signed-out token is replaced in place, keeping its id. */}
+      {account.kind !== 'profile' && needsRepair(account) ? <AccountRepair account={account} /> : null}
       <Button size="sm" variant="ghost" disabled={busy} onClick={onRefresh}>
         Refresh
       </Button>
@@ -343,6 +397,9 @@ function AccountRow({
           Remove
         </ConfirmButton>
       ) : null}
+      <span className="basis-full empty:hidden">
+        <RetirementEvidence entitlement={account.entitlement} />
+      </span>
     </span>
   );
 }

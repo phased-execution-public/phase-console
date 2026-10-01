@@ -19,7 +19,7 @@
 export type CategoryId =
   | 'approval' | 'session-ask' | 'needs-you' | 'gate' | 'qa' | 'halted' | 'parked' | 'stalled'
   | 'phase' | 'finished' | 'ready' | 'changed' | 'session' | 'health' | 'limits' | 'usage-climbing'
-  | 'issue';
+  | 'budget' | 'issue' | 'digest';
 
 export type Category = {
   id: CategoryId;
@@ -53,8 +53,9 @@ export const CATEGORIES: readonly Category[] = [
     id: 'needs-you',
     label: 'A phase needs you',
     detail: 'A phase did its work and stopped at something no automation may sign off — a check '
-      + 'written as prose, a verification only a person can make. It is not failed and not finished; '
-      + 'it is waiting, and it will keep waiting.',
+      + 'written as prose, a verification only a person can make, or a HUMAN STEP: a sign-in, a code, '
+      + 'a secret, an approval only you can give, named with Open and I did it (and, for a device '
+      + 'code, the code). It is not failed and not finished; it is waiting, and it will keep waiting.',
     byDefault: true,
     urgent: true,
   },
@@ -173,9 +174,27 @@ export const CATEGORIES: readonly Category[] = [
     id: 'usage-climbing',
     label: 'Usage climbing',
     detail: 'Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next '
-      + 'long phase will not finish". Off by default: the meters show the same numbers all the '
-      + 'time, and the wall itself still announces under Usage limits.',
-    byDefault: false,
+      + 'long phase will not finish" — and, hours ahead, an account serving live runs that its '
+      + 'measured burn will wall: when, when it resets, and which runs are burning it (2 hours '
+      + 'before by default). On by default: the wall itself still announces under Usage limits.',
+    byDefault: true,
+    urgent: false,
+  },
+  {
+    id: 'budget',
+    label: 'Budget spent or running low',
+    detail: 'A budget that can stop work reached 80% or ran out — a phase\'s wait, a phase\'s or the run\'s '
+      + 'dollars, the recovery ladder\'s cap, the failure streak. It says which budget and the arithmetic (the '
+      + 'limit, what accrued, what is left, what was asked) and what spent it, and the card beside it raises '
+      + 'the budget and retries in one press. Once per budget per attempt. Not urgent: a spent budget holds '
+      + 'the work, and nothing spends while it does (control-tower phase 14, #40).',
+    // On, and not urgent — the `usage-climbing` precedent: the warning is
+    // worth having before the wall, and a spent budget stops spending rather
+    // than a session parked dead with a hook open. Its own category rather
+    // than `parked` or `needs-you` because the remedy is a raise, not a
+    // repair: the CI-flavoured park card sent an operator to check a healthy
+    // build while the only thing wrong was a number in the plan.
+    byDefault: true,
     urgent: false,
   },
   {
@@ -188,7 +207,90 @@ export const CATEGORIES: readonly Category[] = [
     byDefault: true,
     urgent: false,
   },
+  {
+    id: 'digest',
+    label: 'Hourly digest',
+    detail: 'A summary instead of a stream: once an hour, every decision waiting on you with how long it '
+      + 'has waited and when it expires, every parked run and every stalled session — and, once the channel '
+      + 'answers again, the notifications an outage kept from arriving. Nothing waiting sends nothing. Off by '
+      + 'default: the categories above already say each thing as it happens.',
+    byDefault: false,
+    urgent: false,
+  },
 ];
+
+/* ------------------------------------------------------------------ *
+ * A person's turn — what a human step's push carries (control-tower phase 41)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The actions a human step's `needs-you` push names: *Open* (the step's link
+ * or command, where the person is) and *I did it* (run the proof now). Named
+ * as DATA on the payload's `step` — each `action` is the verb's own name,
+ * `POST /api/human-steps/:id/<action>` (control-tower phase 43) — and *I did
+ * it* is ALSO a signed button (`check` in `PUSH_ACTION_VERBS`), because
+ * answering it needs no page: the proof runs on the console. *Open* needs the
+ * person's own browser, so it stays the notification's tap. Two, and never
+ * more — the platform cap. Phase 42 draws them.
+ */
+export const HUMAN_STEP_PUSH_ACTIONS = Object.freeze([
+  Object.freeze({ action: 'open', title: 'Open' }),
+  Object.freeze({ action: 'check', title: 'I did it' }),
+] as const);
+
+/** The `step` block of a human step's push payload — ids and words, never a secret. */
+export type HumanStepPush = {
+  id: string;
+  kind: string;
+  where: 'host' | 'any';
+  actions: typeof HUMAN_STEP_PUSH_ACTIONS;
+  /** A `device-code` step's code: the one code a push carries, on purpose. */
+  code?: string;
+};
+
+/**
+ * One human step's announcement: the words (a title naming the kind and the
+ * phase, a body saying what to do — with the device code, when the kind has
+ * one) and the payload's `step` block. `detail`, which is what a webhook and
+ * the out-of-band notice carry off the machine, never holds the code.
+ */
+export function humanStepPush(step: {
+  id: string; kind: string; label: string; title: string; where: 'host' | 'any'; slug: string; phase: number; code?: string;
+}): { message: { title: string; body: string; detail: string }; step: HumanStepPush } {
+  const place = step.where === 'host' ? ' — at the machine the console runs on' : '';
+  return {
+    message: {
+      title: `Your turn: ${step.label.toLowerCase()} — ${step.slug} phase ${step.phase}`,
+      body: `${step.title}${step.code ? ` — code ${step.code}` : ''}${place}.`,
+      detail: `${step.title}${place}.`,
+    },
+    step: {
+      id: step.id, kind: step.kind, where: step.where, actions: HUMAN_STEP_PUSH_ACTIONS,
+      ...(step.code ? { code: step.code } : {}),
+    },
+  };
+}
+
+/**
+ * A step's REMINDER (control-tower phase 43) — the same payload as its first
+ * push, under words that say it is still waiting and how many times it has
+ * been said, so the phone's lock screen tells a reminder from a new ask. It
+ * rides the first push's tag, so a device shows one notification per step,
+ * replaced, never a pile.
+ */
+export function humanStepReminderPush(
+  step: Parameters<typeof humanStepPush>[0], n: number,
+): ReturnType<typeof humanStepPush> {
+  const first = humanStepPush(step);
+  return {
+    message: {
+      title: `Still your turn: ${step.label.toLowerCase()} — ${step.slug} phase ${step.phase}`,
+      body: `${first.message.body} Reminder ${n}.`,
+      detail: `${first.message.detail} Reminder ${n}.`,
+    },
+    step: first.step,
+  };
+}
 
 /**
  * The categories that are claims about a PLAN's progress — silenced entirely for
@@ -254,6 +356,8 @@ export type RouteContext = {
   sessionId?: string | null;
   /** Which page owns it. A claude session lives on `#/agent`, a shell on `#/terminal`. */
   sessionKind?: 'shell' | 'claude' | null;
+  /** A Tower bay to land on instead of the run — a supervisor's card (phase 102). */
+  bay?: 'needs-you' | null;
 };
 
 /**
@@ -278,6 +382,10 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
   const phase = typeof context.phase === 'number' && Number.isInteger(context.phase) && context.phase > 0
     ? context.phase : null;
 
+  // A supervisor's card is answered where it stands (control-tower phase 102):
+  // the Tower's Needs-you bay, where its ONE action is.
+  if (category === 'needs-you' && context.bay) return `/#/runs?bay=${encodeURIComponent(context.bay)}`;
+
   switch (category) {
     // Everything about a run in flight lands on the run itself, because that is
     // where the queue, the console and the controls are.
@@ -289,6 +397,9 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
     // its tail and the verbs that answer it (steer, freeze, stop) all live.
     case 'stalled':
     case 'finished':
+    // A budget is raised where it stopped the work: the run page's next-steps
+    // card, whose raise writes the plan or the run setting and retries.
+    case 'budget':
       return slug ? `/#/plan/${slug}/run` : '/#/runs';
     case 'phase':
     // A QA hold is answered on the phase page — the QA launcher and Record
@@ -328,6 +439,9 @@ export function routeFor(category: CategoryId, context: RouteContext = {}): stri
     // which is where the draft's evidence and the phase's own record meet.
     case 'issue':
       return slug && phase ? `/#/plan/${slug}/phase/${phase}` : '/#/repo/issues';
+    // A summary of everything waiting lands where everything waiting is: Now.
+    case 'digest':
+      return '/#/now';
     default: {
       // Exhaustiveness: a new category added to CATEGORIES without a route here
       // is a compile error, not a notification that silently opens the

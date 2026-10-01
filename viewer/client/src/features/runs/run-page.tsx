@@ -24,6 +24,19 @@
  *   things that genuinely need to live at the top: the `act()` wrapper and the
  *   `busy` label it drives.
  *
+ * ## A glance, then everything (control-tower phase 24)
+ *
+ * The page opens on a glance: the run's strip as its header (the Tower's
+ * strip, `row` variant — the word, the attempt clock with the phase total, the
+ * track, the cost, the one action), the facts the strip does not carry, the
+ * asks, the halt card when the run is stopped, the verbs and the four figures.
+ * Everything else — phases, sessions and their consoles, where the time went,
+ * why it started and what it cost, notes, messages, the checkout, the landing,
+ * the journal, earlier runs and the raw record — is folded under a row that
+ * names it and counts it (`run-sections.tsx`), remembered per person. Nothing
+ * the page showed is gone: every datum is at most two presses away
+ * (`run-page.datums.test.tsx`).
+ *
  * ## One window per session
  *
  * The page had one console because a run had one session. It can now drive
@@ -33,7 +46,7 @@
  * sentences in one window is a page that is wrong with nothing on it to say so.
  */
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button, Spinner, toast } from '@/components/ui';
 import { api, type PlanDetail } from '@/lib/api';
 import {
@@ -54,25 +67,49 @@ import {
 import { keys } from '@/lib/queries';
 import { useQueryClient } from '@tanstack/react-query';
 import { planHref } from '@/app/routes';
+import { useNow } from '@/lib/clock';
+import type { LabelledClock } from '@/lib/format';
+import { PHASE_CLOCK_LABELS } from '@shared/phase-clocks.js';
 import { isLive } from './defaults';
 import { ApprovalQueue, type Answer, type Decide } from './approvals';
 import { Controls } from './lane-setup';
 import { LiveConsole } from './console';
 import { RunHeader, RunTiles } from './tiles';
-import { GitCard } from './git-card';
+import { GitCard, hasGitStory } from './git-card';
 import { PhaseTable } from './phase-table';
 import { NextSteps } from './ways-forward';
 import { SessionTabs } from './lanes';
+import { LiveNow } from './now-panel';
+import { BudgetApproaching } from './budget-approaching';
+import { ReviewNow } from './review-now';
 import { lanesOf } from './session-panes';
 import { AuthCard, RunStatusStack, StaleServerNote, looksLikeAuthFailure } from './status-strip';
+import { bindingHoldOf } from '@/components/fleet-freeze';
 import { RunHistory } from './history';
 import { Timeline } from './timeline';
 import { Gantt } from './gantt';
 import { AttemptCompare } from './attempt-compare';
-import { Journal } from './journal';
+import { Journal, linkedSeq } from './journal';
+import { nowLanes } from './lanes-model';
+import { RunSection } from './run-sections';
+import { Strip } from './tower/strip';
+import { recordClocks } from './tower/clocks';
 import { LedgerCard } from './ledger';
+// A run's notes are both editions' (phase 96's route and record are free).
+import { NotesCard } from './notes';
 import { WhyStarted } from './why-started';
 import { RecoveryActions } from '@/components/recovery-actions';
+
+/** Does the address name one of the journal's lines (`?j=<seq>`, the Now panel's links)? */
+function useJournalLink(): boolean {
+  const [linked, setLinked] = useState(() => linkedSeq() != null);
+  useEffect(() => {
+    const read = () => setLinked(linkedSeq() != null);
+    window.addEventListener('hashchange', read);
+    return () => window.removeEventListener('hashchange', read);
+  }, []);
+  return linked;
+}
 
 export function RunView({ detail }: { detail: PlanDetail }) {
   const slug = detail.summary.slug;
@@ -120,6 +157,28 @@ export function RunView({ detail }: { detail: PlanDetail }) {
   const { data: ledger } = useRulings(slug, enabled);
 
   const approvals = (queue ?? []).filter((a) => a.status === 'pending');
+
+  // The strip's lanes, from the same fold the Tower draws (`nowLanes`), so the
+  // header of this page and this run's strip in the Tower are one reading.
+  const stripLanes = useMemo(
+    () => (run ? nowLanes([run], new Map([[slug, detail]])) : []),
+    [run, slug, detail],
+  );
+  // The phase total beside the strip's attempt clock (#28): the phase that
+  // clock is about — the lane moving now, else the stop, else the active one.
+  const now = useNow(live, 1000);
+  const totalPhase = lanesOf(run).find((lane) => !lane.queued)?.phase ?? run?.halt?.phase ?? run?.activePhase;
+  const totalRecord = totalPhase != null ? run?.phases?.[String(totalPhase)] : undefined;
+  const phaseTotal: LabelledClock | null =
+    totalRecord && (live || run?.halt)
+      ? {
+          verb: 'worked',
+          ms: recordClocks(totalRecord, now).workedMs,
+          tense: 'for',
+          label: PHASE_CLOCK_LABELS.workedMs,
+        }
+      : null;
+  const journalLinked = useJournalLink();
 
   /* ---- recovery: what an AI session could put right, and whether one is on it ---- */
   const { data: terminals } = useSessions(state);
@@ -212,8 +271,27 @@ export function RunView({ detail }: { detail: PlanDetail }) {
 
   return (
     <div className="flex flex-col gap-4">
+      {/* The glance: the run's strip heads its own page (control-tower phase
+          24), with the facts it does not carry on the line beneath. */}
       {run && (
-        <RunHeader run={run} live={live} eta={detailRun?.eta ?? null} phaseEta={detailRun?.phaseEta ?? []} />
+        <div className="flex flex-col gap-1.5" data-testid="run-head">
+          <Strip
+            run={run}
+            lanes={stripLanes}
+            {...(admission?.entries?.find((entry) => entry.slug === slug)
+              ? { entry: admission.entries.find((entry) => entry.slug === slug)! }
+              : {})}
+            allowRun={allowRun}
+            variant="row"
+            total={phaseTotal}
+          />
+          <RunHeader
+            run={run}
+            live={live}
+            eta={detailRun?.eta ?? null}
+            phaseEta={detailRun?.phaseEta ?? []}
+          />
+        </div>
       )}
 
       {/* First, always: a session parked with its hand up is the only thing on
@@ -247,6 +325,7 @@ export function RunView({ detail }: { detail: PlanDetail }) {
         allowRun={allowRun}
         busy={busy}
         git={detailRun?.git}
+        fleetHold={bindingHoldOf(state)}
         onClearScope={() =>
           void act('scope', async () => {
             await api.runSettings(slug, { onlyPhases: [] });
@@ -299,105 +378,215 @@ export function RunView({ detail }: { detail: PlanDetail }) {
         <RunTiles run={run} phases={phases} total={detail.phases.length} liveness={detailRun?.liveness} />
       )}
 
-      {/* Why this run started, and what it cost and ran session by session
-          (phase 19) — under the tiles that give the totals: the two questions
-          an unattended run is most often opened to answer. */}
-      {run && <WhyStarted ledger={runLedger} manifest={run.manifest ?? null} />}
-      {run && <LedgerCard ledger={runLedger} />}
-
-
-      {/* Where the work IS, under the tiles that say how it is going. Only for
-          a run with a checkout story — an isolated one, or one that asked and
-          was refused; an ordinary shared run gets nothing here. */}
-      <GitCard run={run} git={detailRun?.git} />
-
-
-      {/* Always rendered: a plan with no phase graph is a fact about the PLAN,
-          and the table says so in the plan's words. The card that used to stand
-          in here was titled "No run yet" and said nothing had been run — a
-          claim about the RUN, on a page where the plan is what is missing. */}
-      <PhaseTable
-        slug={slug}
-        run={run}
-        planPhases={planPhases}
-        live={live}
-        allowRun={allowRun}
-        queue={admission?.entries}
-        scopes={scopes?.scopes}
-        phaseEta={detail.eta?.perPhase}
-        liveness={detailRun?.liveness}
-        rulings={ledger?.rulings}
-        recovery={{
-          allowAgent,
-          authFailure,
-          sessions: terminals?.sessions,
-          qaMode: detail.summary.qaMode,
-          planSkills,
-          planReviewers,
-          allowWrites: Boolean(state?.allowWrites),
-        }}
-      />
-
-      {/* The console before the panels.
-          What the session is saying right now is the thing you came to read —
-          and it carries the ask box, the one control on this page that is only
-          useful *while* you are watching. The task list and the tool log are
-          the summary of what it said, so they read after it. */}
-      {run ? (
-        <SessionTabs
-          slug={slug}
-          run={run}
-          live={live}
-          allowRun={allowRun}
-          enabled={enabled}
-          entries={admission?.entries}
-          scopes={scopes?.scopes}
-          phaseEta={detailRun?.phaseEta ?? []}
-          detail={detail}
-        />
-      ) : (
-        <LiveConsole lines={[]} subtitle="idle" />
-      )}
-
-      {/* Where the wall clock went, then the audit trail. Both AFTER the
-          console: the console is the present tense and the reason the page is
-          open; these two are what you scroll to when the present tense has
-          stopped explaining itself. */}
-      {/* Two timelines, two questions. The Gantt says WHEN each phase held the
-          lane and which chain made the run as long as it was; the card below
-          says how each phase's own clock was split. Neither answers the
-          other's question, which is why both are here. */}
-      {run && timeline ? (
-        <Gantt
-          timeline={timeline}
-          onCompare={setComparePhase}
-          // The panel knows nothing about this plan, so the page hands it the
-          // destination: an axis with nothing on it is answered by the ORDER
-          // the plan declared, which the route map has drawn all along.
-          emptyAction={
-            <Button size="sm" variant="default" asChild>
-              <a href={planHref(slug, 'route')}>See the planned order</a>
-            </Button>
-          }
-        />
-      ) : null}
-
+      {/* A budget near its end, with its raise, before the park (phase 25, #40). */}
+      {run && live && <BudgetApproaching slug={slug} run={run} />}
+      {/* One cloud review of the branch, on a person's press (phase 25). */}
       {run && (
-        <Timeline
-          phases={phases}
-          emptyAction={
-            <Button size="sm" variant="default" asChild>
-              <a href={planHref(slug, 'phases')}>Open the phase board</a>
-            </Button>
-          }
+        <div className="flex justify-end">
+          <ReviewNow slug={slug} disabled={!allowRun} />
+        </div>
+      )}
+
+      {/* What each live lane is doing, what is done and left, what it waits
+          on, why it is slow and when it should finish (control-tower phase 95,
+          #163) — refreshed by the journal, no reload. */}
+      {run && live && (
+        <LiveNow
+          slug={slug}
+          phases={[
+            ...new Set(
+              lanesOf(run)
+                .filter((lane) => !lane.qa)
+                .map((lane) => lane.phase),
+            ),
+          ]}
         />
       )}
+
+      {/* Everything else, one press away — each fold names what it shows and,
+          while folded, how much is in it; remembered per person. */}
+      <div
+        className="flex min-w-0 flex-col gap-1 border-t border-rule pt-2"
+        data-testid="run-sections"
+        aria-label="Everything else about this run"
+        role="group"
+      >
+        {/* Always there: a plan with no phase graph is a fact about the PLAN,
+            and the table says so in the plan's words. */}
+        <RunSection
+          id="phases"
+          name="Phases"
+          count={planPhases.length}
+          hint="Every phase of the plan, with this run's record of each"
+        >
+          <PhaseTable
+            slug={slug}
+            run={run}
+            planPhases={planPhases}
+            live={live}
+            allowRun={allowRun}
+            queue={admission?.entries}
+            scopes={scopes?.scopes}
+            phaseEta={detail.eta?.perPhase}
+            liveness={detailRun?.liveness}
+            rulings={ledger?.rulings}
+            recovery={{
+              allowAgent,
+              authFailure,
+              sessions: terminals?.sessions,
+              qaMode: detail.summary.qaMode,
+              planSkills,
+              planReviewers,
+              allowWrites: Boolean(state?.allowWrites),
+            }}
+          />
+        </RunSection>
+
+        {/* The console: what each session is saying, with its ask box. Kept
+            mounted while folded — a pane that unmounts loses stream lines no
+            replay refills (`lanes.tsx`). */}
+        <RunSection
+          id="sessions"
+          name="Sessions and their consoles"
+          count={lanesOf(run).length}
+          hint="Sessions in flight or queued"
+          keepMounted
+        >
+          {run ? (
+            <SessionTabs
+              slug={slug}
+              run={run}
+              live={live}
+              allowRun={allowRun}
+              enabled={enabled}
+              entries={admission?.entries}
+              scopes={scopes?.scopes}
+              phaseEta={detailRun?.phaseEta ?? []}
+              detail={detail}
+            />
+          ) : (
+            <LiveConsole lines={[]} subtitle="idle" />
+          )}
+        </RunSection>
+
+        {/* Two timelines, two questions: WHEN each phase held the lane (the
+            Gantt), and how each phase's own clock was split (the card). */}
+        {run && (
+          <RunSection
+            id="time"
+            name="Where the time went"
+            count={phases.length}
+            hint="Phases this run has a record of"
+          >
+            <div className="flex flex-col gap-4">
+              {timeline ? (
+                <Gantt
+                  timeline={timeline}
+                  // The cached run, `run:progress` patches included: the axis's
+                  // "now" follows the lanes' own frames.
+                  run={run}
+                  onCompare={setComparePhase}
+                  emptyAction={
+                    <Button size="sm" variant="default" asChild>
+                      <a href={planHref(slug, 'route')}>See the planned order</a>
+                    </Button>
+                  }
+                />
+              ) : null}
+              <Timeline
+                phases={phases}
+                emptyAction={
+                  <Button size="sm" variant="default" asChild>
+                    <a href={planHref(slug, 'phases')}>Open the phase board</a>
+                  </Button>
+                }
+              />
+            </div>
+          </RunSection>
+        )}
+
+        {/* Why this run started, and what it cost and ran session by session —
+            the rung ledger with it: the two questions an unattended run is most
+            often opened to answer. */}
+        {run && (
+          <RunSection
+            id="ledger"
+            name="Why it started and what it cost"
+            count={runLedger ? runLedger.sessions.length : null}
+            hint="Sessions this run has ended"
+          >
+            <div className="flex flex-col gap-4">
+              <WhyStarted ledger={runLedger} manifest={run.manifest ?? null} />
+              <LedgerCard ledger={runLedger} />
+            </div>
+          </RunSection>
+        )}
+
+        {/* What people decided about this run, and why (control-tower phase 96,
+            #142) — free, and above the mailbox. */}
+        {run && (run.notes?.length || allowRun) ? (
+          <RunSection
+            id="notes"
+            name="Notes"
+            count={run.notes?.length ?? 0}
+            hint="Notes people left on this run"
+          >
+            <NotesCard run={run} allowRun={allowRun} />
+          </RunSection>
+        ) : null}
+
+
+        {/* Where the work IS — only for a run with a checkout story. */}
+        {run && hasGitStory(run, detailRun?.git) && (
+          <RunSection
+            id="git"
+            name="Checkout"
+            count={detailRun?.git?.checkouts.length ?? null}
+            hint="Checkouts this run's work stands in"
+          >
+            <GitCard run={run} git={detailRun?.git} />
+          </RunSection>
+        )}
+
+
+        {/* The audit trail — opened by itself when a link names one of its lines. */}
+        {run && (
+          <RunSection
+            id="journal"
+            name="Journal"
+            count={journal ? journal.length : null}
+            hint="The run's latest journal lines, up to 500"
+            forceOpen={journalLinked}
+          >
+            <Journal entries={journal ?? []} />
+          </RunSection>
+        )}
+
+        {history.length > 1 && (
+          <RunSection
+            id="history"
+            name="Earlier runs of this plan"
+            count={history.length - 1}
+            hint="Runs before this one"
+          >
+            <RunHistory history={history} />
+          </RunSection>
+        )}
+
+        {/* L3: the record as the machine holds it. */}
+        {run && (
+          <RunSection id="raw" name="Raw record">
+            <pre
+              data-testid="run-raw"
+              className="max-h-[60vh] min-w-0 overflow-auto rounded-md border border-rule p-2 font-mono text-2xs whitespace-pre-wrap"
+            >
+              {JSON.stringify(run, null, 2)}
+            </pre>
+          </RunSection>
+        )}
+      </div>
 
       <AttemptCompare slug={slug} phase={comparePhase} onClose={() => setComparePhase(null)} />
-
-      {run && <Journal entries={journal ?? []} />}
-
-      <RunHistory history={history} />
     </div>
   );
 }

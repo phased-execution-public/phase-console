@@ -5,8 +5,8 @@ Phase graph · Phases · End-to-end verification) · Notes
 
 A plan is the durable blueprint for a multi-phase task. It lives at `docs/plans/<slug>.md`, is committed,
 and is rarely edited after design. Each phase's detail must be **self-contained** — executable from the
-plan + that phase's handoff with no prior conversation — because phases run in fresh sessions (usually
-several phases batched per session, sized to the budget; see `references/sizing.md`).
+plan + that phase's handoff with no prior conversation — because phases run in fresh sessions (the console
+runs one phase per session; a person driving by hand may batch several — see `references/sizing.md`).
 
 ## Frontmatter (required)
 
@@ -105,6 +105,24 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    answering for the phase that truly needs its server and firing for every phase that merely has one
    attached: `parked` is a settled status, so a run whose ready phases all park has nothing left to
    do — one signed-out server stopped an eleven-phase plan that named no MCP servers at all.
+   **Permission mode is a statement about the work, and it has two spellings.** Add
+   `` **Permission mode:** plan `` to §Session budget when every phase must present what it will do
+   before it writes anything, and `` - **Permission mode:** acceptEdits `` on a phase that disagrees
+   with that line — the bullet **overrides** the line, as `MCP policy:` does, because a mode is one
+   answer. The words are the CLI's own `--permission-mode` words — `acceptEdits`, `auto`, `dontAsk`,
+   `plan`, `manual` (`scripts/permission.env`) — matched in any case and handed over as the CLI spells
+   them; `bypassPermissions` is not one of them, because bypass is the run's permission PROFILE, the
+   absence of a mode rather than a value of one. A word that is not a mode fails the lint by name
+   (**F31** `permission-mode-unknown`) — the reader falls through it, and `paln` would otherwise run
+   the very phase that wanted to present first in whatever the run defaults to. Resolution, strongest
+   first: a Retry-with-edits, the run's per-phase choice, this bullet, this line, the run's own
+   default, then `acceptEdits`. Ask the engine: `scripts/phase-graph.sh <slug> --permission-mode <N>`
+   prints `mode<TAB>phase|plan`, and nothing when the plan is silent. Under the console a `plan`
+   session hands its plan over through `ExitPlanMode`, which the CLI offers only to a session with a
+   permission host — so a plan-mode phase boards with the relay's presence-only host even on a run
+   whose relay is off — and the console holds it: the phase parks `plan-approval` until a person
+   presses Approve (the same session resumes in `acceptEdits`) or Reject, unless the plan's
+   `plan-approval` decision says `continue`.
    **Keep the set small — three to six.** Every attached server puts its instructions and tool names
    in the system prompt of *every* turn, and attaching one mid-phase busts the prompt cache
    (`references/sizing.md`), which is why attachment happens at a phase boundary and nowhere else.
@@ -132,6 +150,14 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **new-branch** git strategy, and **per-LANE** worktrees **refuse on a superproject**, because a linked
    worktree of a repo with submodules has EMPTY submodule directories and a scoped phase would board into
    nothing. Every refusal is journalled by name.
+   **`Worktrees: on` is a per-LANE ask, and the run decides whether it can be granted.** The run's own
+   isolation is a LAUNCH setting, not a plan line: a run started on a **shared checkout cannot grant**
+   the ask at all, and a **superproject never grants** it — its answer is the run-level mirror, which
+   phases share. The launch names the line before anything spawns (the prelude's git-strategy probe)
+   and asks for **honour** (isolate the run so the line holds, where the console can) or **override**
+   (run over it; the sessions are told the concrete checkout rather than asked to record a
+   discrepancy). A door no person pressed — the convergence loop, a boot sweep, a webhook — answers
+   `override` for itself and journals `run.git-strategy-overridden`.
    **The superproject refusal was REOPENED and implemented** (the phase-14 deferral of
    console-concurrent-plans, superseded 2026-08-28): a run under a superproject root now takes a
    **MIRROR** — one linked worktree per scoped sub-repository, each on `pe/<slug>`, laid out at
@@ -152,9 +178,25 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    `integration`/`merge-queue` settles refuse a multi-repo run by name — use `pr` or `keep`. Full
    reasoning: `viewer/server/runner/worktree.ts` §Why it refuses on a superproject.
    See `references/sizing.md` for sizing and
-   `references/conventions.md` §Branches for the branch policy. (The console may override the
-   `**Branch:**` line per run with its own work branch — its sessions are told about the mismatch
-   and record it in their handoffs; the line here stays authoritative for hand-driven sessions.)
+   `references/conventions.md` §Branches for the branch policy. (The console may run over the
+   `**Branch:**` line with its own work branch. The launch asks the same **honour**-or-**override**
+   question it asks of `Worktrees: on` above, and an overriding run tells each session the concrete
+   branch and checkout to use for every line it runs over — nothing is left for the session to
+   reconcile. Only a run started before that answer existed still asks its sessions to record the
+   discrepancy in their handoffs. The line here stays authoritative for hand-driven sessions.)
+   **Choose isolation at LAUNCH** (control-tower phase 90, #154). A run's own checkout is decided
+   when it starts, and a resume cannot add one: a shared-checkout run stays shared for the rest of
+   its life. The two escapes are explicit acts, never side effects: `POST /api/run/<slug>/isolate`
+   gives the run a checkout of its own at its next boundary (no lane live; a refusal leaves it
+   shared and says why, `run.isolation-switch-refused`), and `POST /api/run/<slug>/isolate-phase
+   {phase}` gives one waiting phase a lane of its own (refused by name under a superproject, whose
+   phases share the run's mirror). Launch isolated when the plan's phases write the superproject's
+   root, or share a submodule with another run that will be live for days: a shared run's branch
+   hold on that submodule lasts until the holder's run settles. And a run that asked for
+   isolation and is REFUSED a fixable refusal (`branch-in-use`, `worktree-failed`,
+   `mount-occupied`, `setup-failed`, `cap-reached`) now **parks** with the refusal, git's words and
+   the fix, rather than running on in the shared checkout; a structural refusal (`scope-unmapped`,
+   `has-submodules`, …) keeps the named shared fallback.
    **The lines the decision manifest resolves from** (§Decisions below) live here too, each
    optional, each written plain like the MCP servers line, and each read by the engine or the
    console rather than by a person: **`Credentials:`** — backticked credential ids EVERY phase needs
@@ -171,7 +213,9 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    **`QA exhausted:`** `waive|halt|<owner>` (once the QA round budget is spent — `qa.exhausted`,
    `--qa-exhausted`) and **`Wait budget:`** (`48h`, `2d`, `90 min` — the TOTAL wall-clock one phase
    may spend parked across its declared waits, `waits`; the console's default is 8 h) are the
-   console's to read at run start. The wizard also describes **`Permissions:`** (`permission.policy`),
+   console's to read at run start. **`Verify timeout:`** (`60m`) is how long one §Verification command
+   of any phase may run before it is cut (`--verify-timeout`, a phase's own bullet wins; silence scales
+   the limit from each line's measured history). The wizard also describes **`Permissions:`** (`permission.policy`),
    **`May publish:`** (`permission.destructive`) and **`When in doubt:`** (`ambiguity`) lines, but no
    engine or console code reads them — only the `## Decisions` row answers those keys, so write the
    row.
@@ -206,6 +250,8 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    readers fall through it to the next level, which is right for a reader (a typo must never
    silently become a policy) and is why the lint exists to say so: **F27** `land-word-unknown` fails
    a plan with `Land: sometimes` or `Issues: maybe`, naming the level and the word.
+   **F31** `permission-mode-unknown` is F27's twin for the `Permission mode:` line and bullet, and
+   gates for the same reason.
    **F30** `note-target-done` is the notes family's advisory: a `## Notes for later phases` bullet
    addressed to a phase that is already done, which nothing will ever board with. Its gating sibling
    **F26** `note-target-unknown` is one addressed to a phase the plan does not have.
@@ -231,12 +277,41 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    whose scope includes a repository somebody else owns.
 
    Per phase, `- **Waits on:** <ref>[, <ref>…] · <max>`,
-   `- **Human step:** <who, what, proof ref>` and `- **Person-check:** allow|halt|<owner>` refine
+   `- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any ·
+   window: <duration>` and `- **Person-check:** allow|halt|<owner>` refine
    the `waits`, `human-acts` and `verification.person-check` rows for that phase alone. `Waits on:`
    names what the phase waits on and, after the `·`, overrides the budget for that phase; a `date:` ref
-   there countersigns a wait up to that instant. The console never shortens a declared window: one past
-   what is left halts `waiting-external-timeout` with the arithmetic, which names these two lines as
-   the way to allow it (`phase-graph.sh <slug> --wait-budget N` / `--waits-on N` print what it reads).
+   there countersigns a wait up to that instant. Past what is left, a wait naming a ref the console can
+   watch is given what is left, and one naming none parks on a spent budget with a `budgets` errand —
+   never a failure — whose arithmetic names these two lines as the way to give it more
+   (`phase-graph.sh <slug> --wait-budget N` / `--waits-on N` print what it reads). Since control-tower
+   phase 14 (#40) those two lines have a writer: `scripts/wait-budget.sh <slug> [--phase N [--ref REF]…]
+   <max>` rewrites the phase's `Waits on:` max (keeping its refs and any note) or the plan's
+   `Wait budget:` line, idempotently, and proves it by the engine's read-back — it is what the console's
+   one-press raise runs, behind `--allow-writes`. The lint holds a `Waits on:` max to the timeout of the
+   workflow it watches (**F36** `wait-window-short`, advisory): a window shorter than the job it waits
+   on can never outlast it. The timeouts are the console's, told through `PE_WAIT_TIMEOUTS` —
+   whitespace-separated `<ref>=<minutes>` pairs, resolved once per `gh:…#run/<id>` (a job with no
+   `timeout-minutes` counts GitHub's 360); unset turns the check off, set but empty is an answer.
+   **A person's turn, declared by the plan (control-tower phase 41).** A phase names each act only a
+   person can do on its own bullet, so the launch door can ask for it before anything spawns:
+   `- **Human step:** <kind> · <what> · open: <url or command> · proof: <ref> · where: host|any ·
+   window: <duration> [· auto-open: host] [· credential: <id>]`. The kind and what to do are
+   positional; every later field is `key: value`, in any order, a value in one pair of backticks read
+   without them. The kind is one of sixteen (`scripts/human-steps.env`, owner
+   `viewer/shared/human-step-model.js`): `browser-login`, `device-code`, `one-time-code`,
+   `secret-entry`, `claude-login`, `mcp-login`, `os-prompt`, `os-permission`, `third-party-approval`,
+   `physical`, `person-check`, `decision`, `protected-path`, `interactive-prompt`, `captcha`,
+   `email-link`. `where` defaults to the kind's; `open:` is an http(s) link or a command for the
+   terminal; `proof:` is a watch ref (`cmd:`, `gh:`, …); `window:` a duration; `auto-open: host` lets
+   the step open by itself on the machine — a PLAN's step only, never a session's; `credential:` is
+   the registry id a `secret-entry` stores under. A phase may carry several. Read back with
+   `phase-graph.sh <slug> --human-steps [N]`. **The 5.1.0 spelling `- **Human step:** <who, what,
+   proof ref>` is superseded** — nothing ever parsed it — and fails the lint by name, with the new
+   grammar in the sentence (**F37** `human-step-superseded`); so do a kind that is not one of the
+   sixteen (`human-step-kind-unknown`) and a field the grammar does not have
+   (`human-step-field-invalid`). A step with no `proof:` is advised about (**F38**
+   `human-step-no-proof`): only a person's word can close it.
    **Spelling the model.** The `**Target model:**` value may be an alias (`opus`), a full id
    (`claude-opus-5`), or either carrying the `[1m]` window suffix (`opus[1m]`, `claude-opus-5[1m]`) — all
    parse the same. The suffix, not the alias, is what claims the ~200K budget (`references/sizing.md`;
@@ -260,10 +335,12 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
 
    Columns are located **by name**, never by position (like the Phase graph's); `key`, `owner`,
    `state`, `blocking` and `source` are read with bold and backticks stripped, `value` and `evidence`
-   as written. **The seventeen keys:** `permission.policy` (this plan's ask/deny/allow overlay,
+   as written. **The nineteen keys** (`DECISION_KEYS`, `viewer/shared/decisions-model.js`):
+   `permission.policy` (this plan's ask/deny/allow overlay,
    `autoApprove`) · `permission.destructive` (publishing and destructive verbs — `deny`, with named
    exceptions: a clause beginning `allow` naming backticked rules, the only thing that lets
-   auto-grant answer `git push` / `gh pr create`) · `credentials` (backticked ids + the credential policy) · `accounts` (accounts in
+   auto-grant answer `git push` / `gh pr create`) · `issues` (what a session may write OUTWARD to
+   the repository's issue tracker — `off`, `draft` or `file`, the `**Issues:**` line's word) · `credentials` (backticked ids + the credential policy) · `accounts` (accounts in
    order, minimum headroom each, `onLimit`) · `mcp` (the servers and the MCP policy) · `gates`
    (`Gate-check` on every gated heading; `delegated` or `operator`) · `verification.person-check`
    (allow, halt or an owner when a §Verification fragment is prose) · `qa.exhausted` (waive, halt or
@@ -276,7 +353,9 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
    halt) · `relay` (`off` or `last-resort` — whether a question a session asks mid-run is put in front
    of a person for 60 s and then answered by rule; it arms only on a CLI at or above
    `RELAY_CLI_FLOOR`, 2.1.268, and below it, or under `off`, the `ambiguity` row answers) · `announce` (which
-   categories push, to whom). **`state`** is `answered`, `outstanding` (somebody still owes it —
+   categories push, to whom) · `plan-approval` (`hold` or `continue` — what a plan-mode phase's presented
+   plan waits for: a person's Approve or Reject, or nobody, the console journalling the plan as the
+   record of what the session said it would do). **`state`** is `answered`, `outstanding` (somebody still owes it —
    `owner` says who; an outstanding row with NO owner fails `validate.sh`, **F25**
    `decision-outstanding-unowned`, as do a key outside the vocabulary, `decision-key-unknown`, a state
    outside those three, `decision-state-unknown`, and a `source` outside the four below,
@@ -338,6 +417,23 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      The cell is the ONLY declaration — nothing in the phase body overrides it. (Plans already use
      `- **Scope …:**` bullets for prose, and reading those as repo names would silently mis-scope a
      phase.) If a phase's real reach differs from its cell, fix the cell.
+     **A token must name something under the docs root** to be isolated there: the root's own name, or
+     an existing path beneath it (symlinks resolved). A token naming a repository elsewhere on the
+     machine refuses isolation for THAT phase alone — it runs in the run's checkout with an unqualified
+     lock claim, serialised against every claim it intersects — and the lint says so (**F33**
+     `repos-outside-root`, advisory, only when other cells of the plan are inside the root). Before
+     control-tower phase 82 (#94) one such cell refused isolation for the whole run.
+     **In a superproject, name the submodules a phase writes — not the root** (control-tower phase 90,
+     #154). The root's own name (`hub` in a hub of submodules) means the superproject itself: an
+     isolated run mounts the whole root for it, every initialized submodule checked out under it, and
+     the phase waits on any other run holding the ROOT repository on its branch. Until phase 90 that
+     hold reached every submodule under the root, and hub-root closeouts queued for days behind
+     unrelated runs. A documentation phase does not need the token: its handoff, INDEX and locks are
+     declared scope already (`references/conventions.md` §Scoped concurrency), and a gitlink bump
+     commits by explicit pathspec. Keep the root's name for a phase that writes root files outside
+     `docs/`. The lint names the rest (**F34** `repos-root-token`, advisory): a cell naming the root
+     in a phase whose `Files` bullet lists only paths in submodules or under `docs/`. It judges only
+     what the bullet says, so a phase that lists no files is not judged.
    - **Gated phases — mark, describe, categorize.** Mark `*(GATED)*` in the `### Phase N` heading, add a
      `- **Gates (must clear first):** …` line (the full conditions — it may span several lines, and for
      human gates it MUST be numbered step-by-step operator instructions; the boot prompt and the console's
@@ -383,9 +479,10 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      pulled.
    - **Size (optional, drives batching):** tag each phase's rough working-set in its `### Phase N` block —
      `- **Size:** S|M|L` (default `M`; `S` ≤ ~15K, `M` ~15–50K, `L` ~50–120K tokens). Then
-     `scripts/phase-graph.sh <slug> --session-plan <model>` groups the remaining phases — sequential
-     chains *and* independent siblings — into sessions while deps are met and the summed weight fits the
-     budget (GATED phases and QA boundaries always cut), and the board prints `SUGGESTED BATCHES:`.
+     `scripts/phase-graph.sh <slug> --session-plan <model>` forecasts the plan in sessions and, for a
+     person driving by hand, groups the remaining phases — sequential chains *and* independent siblings —
+     into sessions while deps are met and the floor plus the slope × the summed weight stays under the
+     target (GATED phases and QA boundaries always cut), and the board prints `SUGGESTED BATCHES:`.
      Absent any `Size:` tags every phase is treated as `M`. See `references/sizing.md`.
 
 7. **`## Phases`** — one subsection per phase, each self-contained:
@@ -491,7 +588,8 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      watch`, a `task deploy` that needs a CI-built image, a `--watch`/`wait` flag, a `watch -n`, a
      `sleep` of a minute or more, or an `until`/`while … do` poll loop (including one written across
      several fenced lines: both readers fold the block to one line first) —
-     because the runner bounds each verification command at 30 minutes and an unattended session cannot
+     because the runner bounds each verification command with a clock (30 minutes unless the plan's
+     `- **Verify timeout:**` or the line's own history says longer) and an unattended session cannot
      outlive its turn. One carve-out: `docker compose up -d` RETURNS, so it never counts as a wait —
      though it does earn an F22, being bring-up rather than proof.
      The same vocabulary is the console's runtime guard: a supervised session's Bash call matching it
@@ -506,9 +604,22 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      moment is what you actually know** ("not before the release lands at 09:00"); `--wait-minutes <M>`
      is for a duration. They are mutually exclusive, and both work with `blocked` and `needs-human` as
      well as `waiting-external` — the clock only decides when the console next brings the phase up, and
-     never replaces the ask. Better still where it applies: a `--watch date:<ISO8601>` ref, which the
-     watch clock resolves once, at that instant, and which sits beside the other four schemes
-     (`gh:` run/pr, `lock:`, `cmd:`) rather than being a separate mechanism.
+     never replaces the ask. Better still where it applies: a `--watch` ref, which the console polls on
+     a clock of its own and which resumes the phase the moment it lands — the same seven schemes a
+     session's `phase-outcome.sh --watch` takes and a `- **Waits on:**` bullet names:
+
+     | Ref | Lands when | Use it for |
+     |-----|------------|------------|
+     | `gh:<owner/repo>#run/<id>` | the run reaches `completed`, whatever its conclusion | a CI run, a deploy |
+     | `gh:<owner/repo>#pr/<n>` | the PR leaves OPEN, merged or closed | a review, an auto-merge |
+     | `date:<ISO8601>` | that instant passes — resolved once, at that instant | "not before 09:00" |
+     | `lock:<slug>/<phase>` | nothing holds that phase's scope any more | somebody ELSE's lock, never your own |
+     | `phase:<slug>/<N>` | the console's record of sibling phase N reads done, after its §Verification; un-lands if that phase is reopened | waiting on a sibling — never a `cmd:` grep of its handoff |
+     | `verify:<slug>/<N>` | your own red §Verification lines all pass on one branch head, re-run whenever the head moves | your OWN phase, when its blocker is a sibling's red |
+     | `cmd:"<command>"` | the command exits 0 — it is run, not read, under the §Verification policy | anything else, self-contained: absolute paths, no shell variables, no `cd`, at most 1,000 characters |
+
+     A ref the console cannot run as written is refused where it is declared — `phase-outcome.sh` exits
+     2 and cuts nothing — and a ref the console mints for a refused in-turn wait obeys the same rules.
      It warns (**F22**) when a §Verification line is **bring-up rather than proof** — `docker compose
      up -d`, `npm ci`, the `sleep 8` after them. Those belong in `- **Setup:**` (below): the runner runs
      Setup before §Verification and never marks the phase red for one, while the same line inside
@@ -519,6 +630,60 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      its exit code; the sentence is invisible to it, so the phase goes red. Encode the expectation in
      the command instead (`! <cmd>`, or a grep for the specific error), so the thing asserted is the
      thing run.
+     It warns (**F32** `verification-fleet-wide`) when a §Verification line's exit code reads
+     **fleet-wide state** — every plan, branch and working tree in the checkout, or every process on
+     the machine — rather than what this plan did: `task hygiene`, `task drift`, or a `ps … | grep`.
+     In a shared checkout such a line cannot exit 0 while anything else is live (other plans' trees,
+     the console's own `pe/<slug>` branches), so a ship phase that used one shipped, then declared
+     `blocked` for a person to rule the line away; a `ps -axo pid,command | grep phase-console`
+     matches every console on the machine and reported another one's heap flag as this one's. Write
+     what the task accepts instead. `task hygiene` has **no** scoped form — it takes `--offline`,
+     `--remote-only`, `--json` and `--stale-days N`, each still the whole fleet, and exits 2 on
+     anything else (`--plan`, `--repos`) — so assert the plan's own footprint
+     (`test -z "$(git -C <repo> status --porcelain)"`,
+     `! git -C <repo> show-ref --verify --quiet refs/heads/<branch>`) and leave the fleet audit to a
+     person once the run has landed (`Gate-check: manual`). `task drift` reads no arguments
+     (`-- --root …` is dropped): run the one gate the plan changed, `task drift:<gate>`, or the whole
+     set from a main-tip checkout, `task -d <main-tip checkout> drift`. A process read names its one
+     process by pid: `ps -o command= -p "$(lsof -tiTCP:<port> -sTCP:LISTEN)"`. The vocabulary is
+     `FLEET_WIDE_READS` / `FLEET_WIDE_SCOPED` in `scripts/verify.env`; a scoped form on one command of
+     a `&&` chain excuses only that command. The console does its half as well: before the run's LAST
+     phase runs §Verification it settles its own mirror branches whose every change the trunk already
+     holds — 0 commits ahead of it, or merging into it (or into `origin/<trunk>`) without changing a
+     path, which is how a squash-merged pull request reads — in every clean mount, the root included,
+     and gives them back before any later session (`run.mirror-branches-settled`,
+     `run.mirror-branches-restored`).
+     **A session records what it proved.** Each §Verification command a session runs is recorded with
+     `scripts/phase-outcome.sh <slug> <N> verified --command "<command>" --exit <status>` — the
+     command, its exit status and the working tree it ran against. The console's own pass after the
+     session skips a command proven green at an equivalent tree (the same tree, or one where only
+     `docs/handoffs/**`, `.locks/**` or `CHANGELOG.md` changed since), runs the rest, and journals a
+     disagreement between the two verdicts. Its verdict is a GATE: a command red on its final attempt
+     over a phase whose handoff reads `complete` re-opens the phase — its direct dependents wait, it
+     gets one fix session, then an errand — rather than letting the handoff's word stand.
+     **A timeout is not a red.** Each command runs under a clock (`- **Verify timeout:**` below). A
+     command the clock cuts is retried ONCE by the console — no session — at twice its limit, and a
+     second cut is the `verify-timeout` outcome: never a red verdict, never a failure-streak charge.
+     The phase (and the run) parks for a person, who raises the limit or finds the hang, then
+     Re-checks. A command that *exits* 124 by itself is an ordinary red.
+     **A red the phase inherited is not its own.** At its first boarding a phase takes a
+     **baseline** — what its §Verification lines read on the tree it boards on, before its session
+     touches it: the last run of each line on that very tree from the plan's verification ledger, or a
+     run made then. At the verdict each red is compared with it, by the failing tests the output
+     names (node's spec and TAP reporters, bats' TAP) or, when the output names none, by the whole
+     command. A red already in the baseline is recorded **inherited**, with the phase that owns it —
+     the phase once charged with it, else the one phase whose sessions committed between the last run
+     it was green on and the base — and charged to nobody here; only the phase's OWN reds fail it.
+     A red ABSENT from the baseline is attributed the same way before it counts: to the phase once
+     charged with it (unless a later run was clean of it); to a sibling's **uncommitted work** when a
+     tree the line was clean of it on — the session's own proof, or a run in the ledger — differs from
+     the tree it is red on only in paths that sibling's session wrote and never committed (the paths
+     are named); else to the one phase whose sessions committed in its range — but only when the
+     phase itself made none of those commits, since its own could be the one. A red `&&` chain is
+     judged member by member, each run alone (a `cd`/`export` carried into each), so a red its first
+     member hid is seen with its own owner. A red with one owner is recorded as **owed** on that
+     owner's record until its own line runs green.
+     (`phase.verify-baseline`, `phase.verify-inherited`, `phase.verify-owed`.)
      It warns (**F19**) when the plan **cannot progress at all** — nothing ready, nothing in flight,
      and a QA verdict holding every remaining phase. Unlike F14–F18 this is not a claim about one
      phase's §Verification but about the whole board, so it fires once and names the rows responsible.
@@ -537,6 +702,15 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      journal line. When a verification fails and the phase's Repos column names one repo that IS a
      directory near the root, the halt suggests this bullet — it never picks a directory on its own,
      because a wrongly-guessed cwd verifies the wrong tree and reports green.
+   - **Verify timeout:** *(optional)* how long ONE §Verification command of this phase may run before
+     the console cuts it — `- **Verify timeout:** 90m` (the first duration after the label: `45m`,
+     `2h`, `90 min`). A plan-wide `**Verify timeout:** 60m` in §Session budget covers every phase that
+     states none; the phase's bullet wins. With neither, the limit scales with the line's OWN measured
+     history — 3× the longest of its last 10 runs, never under 30 minutes and never past 4 hours — and
+     a line never measured gets 30 minutes. Set it for a suite that is slow under load: control-tower's
+     `bash tests/run-tests.sh` takes 14 minutes on a quiet machine and 34 under the autopilot's own
+     load. The restart drain waits on the same limit. Ask the engine:
+     `scripts/phase-graph.sh <slug> --verify-timeout <N>` (`minutes<TAB>phase|plan`, or nothing).
    - **Setup:** *(optional)* bring-up that runs **before** §Verification and is **never part of the
      verdict** — `- **Setup:** \`docker compose up -d\`, \`sleep 8\``. A preamble that a plan used to
      have nowhere to put: 19 plans wrote it into §Verification, where every line is a command the
@@ -564,8 +738,26 @@ scripts/close-plan.sh <slug> --reopen                           # → active, fi
      name the same working tree, so two such runs at one commit run side by side. The console reaches the same
      state on its own for any phase driven after the run has settled and its branch is gone — this
      bullet is how a plan says so up front. Every other value is carried verbatim and acted on by
-     nobody: a plan may document which branch it means without the console inferring a mechanism.
+     nobody: a plan may document which branch it means without the console inferring a mechanism —
+     and since control-tower phase 90 (#154) the lint says so (**F35** `checkout-inert`, advisory),
+     because a plan that writes `Checkout: pe/<slug>-hotfix` expecting a session on that branch gets
+     the run branch and is told nothing. Write `default`, or name the branch in the phase's prose.
+     **`Checkout: main` is inert under a shared checkout**: detaching needs a checkout the run owns
+     (its run tree or mirror), so in the shared one the phase stands on the run branch like every
+     other. The launch names such phases beside `Worktrees: on` and the plan's `**Branch:**`, for the
+     same honour-or-override answer.
      Ask the engine: `scripts/phase-graph.sh <slug> --checkout <N>`.
+   - **Wall-clock floor:** *(optional)* the phase's FIXED wall-clock floor — a full `gates.sh` run, a CD
+     wait — the least time it can take no matter how small its work is. **Separate from `Size:`**: Size
+     weights CONTEXT for the session-batching ladder; this is a clock an ETA estimate cannot beat.
+     Write `- **Wall-clock floor:** 95 min`, `2 h`, `1h 30m` or `1.5 hours` — one or more LEADING
+     `<number><unit>` groups (a decimal number allowed, the space before the unit and between groups both
+     optional), summed and rounded UP to the minute (`1h 30m` and `1.5h` both read 90). Reading stops at
+     the first token that is not such a group, so trailing prose (`95 min — a full gates.sh run`) is
+     ignored. A value with no readable leading duration (`soon`, prose, empty) is SILENCE — this phase has
+     no floor — and so is a duration that rounds to zero minutes.
+     Ask the engine: `scripts/phase-graph.sh <slug> --floor <N>` (minutes alone, or nothing); with no `N`,
+     every phase that declares a readable floor as `N<TAB>minutes`, one per line, ascending phase order.
    - **Handoff must record:** what Phase N+1 needs to start cold.
    ```
 

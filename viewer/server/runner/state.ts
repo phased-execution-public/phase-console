@@ -19,30 +19,40 @@ import {
 import { join } from 'node:path';
 
 import { DEFAULT_PRIORITY, type RunPriority } from '../../shared/orchestration-model.js';
+import type { AttemptWindow } from '../../shared/phase-clocks.js';
 import {
   DEFAULT_CONFLICT, DEFAULT_LAND,
   type ConflictPolicy, type LandPolicy, type LandingState,
 } from '../../shared/landing-model.js';
 import { DEFAULT_ISSUES, type IssueMode } from '../../shared/issues-model.js';
 import { DEFAULT_MESSAGING, type MessagingWord } from '../../shared/message-model.js';
-import { HALT_KINDS, isAdjudicatedHalt } from '../../shared/recovery-model.js';
+import { HALT_KINDS, isAdjudicatedHalt, isPlanHalt } from '../../shared/recovery-model.js';
 import type { QaFixStrategy, RelayMode } from '../../shared/run-settings.js';
+import type { RungCause } from '../../shared/ladder-model.js';
+import type { LadderCap, LadderCapSetting } from './ladder.ts';
+import type { TreeStamp } from './tree-state.ts';
+import type { HaltHolderKind, HaltHolderVerb } from '../../shared/recovery-model.js';
 import type { CredentialClass } from '../../shared/ops-vocab.js';
+import type { RetirementEvidence } from './errors.ts';
 import type { PolicySource } from '../../shared/policy-model.js';
-import { WAIT_REASONS, waitReasonOf } from '../../shared/status-vocab.js';
+import { BOARD_BUCKETS, WAIT_REASONS, waitReasonOf } from '../../shared/status-vocab.js';
 import {
   DEFAULT_SETTLE, ISOLATED,
   type CheckoutState, type IsolationMode, type SettleStrategy,
 } from '../../shared/worktree-model.js';
-import { consoleRunsDir, journalFile, runDir, runFile } from './run-paths.ts';
+import { consoleRunsDir, isRunSidecar, journalFile, runDir, runFile } from './run-paths.ts';
+import type { BudgetFact, BudgetKind } from '../../shared/budget-model.js';
+import { adoptionHeld } from '../crash-ledger.ts';
 import type { WorktreeRefusal } from './worktree.ts';
 import type { HolderEta } from './scheduler.ts';
 import { pidAlive, pidHoldsWork, processState, type ProcessState } from '../pid.ts';
 import type { PermissionProfile } from './approvals.ts';
+import type { PermissionMode } from './spawn.ts';
 // Type-only, so nothing is imported at runtime and the pair that would
 // otherwise be a cycle (`rulings.ts` needs `runDir` from here) never forms one.
 import type { LaneLiveness, PhaseSuspect, StallState } from './liveness.ts';
 import type { ContextMark, PartialMark, TokenAttempt } from './usage.ts';
+import { CLOCK_MODEL, COST_MODEL, type Cap } from './session-record.ts';
 import type { Ruling } from './rulings.ts';
 import type { TaskItem } from './tasks.ts';
 import type { LadderEnding } from './signals.ts';
@@ -51,14 +61,14 @@ import {
 } from './wait-budget.ts';
 import { Journal } from './journal.ts';
 import {
-  BOARDING_BRIEFS, DECLARATION_CONSUMERS, MCP_POLICIES, ON_LIMIT_POLICIES, PHASE_IN_FLIGHT, RUN_IN_FLIGHT,
-  SETTLED, phaseLifecycle, runLifecycle,
+  BOARDING_BRIEFS, DECLARATION_CONSUMERS, DEFAULT_MODEL_POLICY, MCP_POLICIES, MODEL_POLICIES, ON_LIMIT_POLICIES, PHASE_IN_FLIGHT, RUN_IN_FLIGHT,
+  SETTLED, SETTLED_WELL, phaseLifecycle, phaseSettledWell, runLifecycle, waitOnOf,
 } from '../../shared/run-lifecycle.js';
 import type {
   Actor as ActorShape, ActorVia as ActorViaWord, AnyDoor as AnyDoorWord,
   AutonomyMode, CapSource as CapSourceWord, ClassifiedBy as ClassifiedByWord,
   DeclarationConsumer as DeclarationConsumerWord,
-  EndedBy as EndedByWord, GitMode, McpPolicy, OnLimitPolicy, OutcomeStatus,
+  EndedBy as EndedByWord, FenceLiftReason, GitMode, HolderClass, HolderKind, McpPolicy, ModelPolicy, OnLimitPolicy, OutcomeStatus,
   PhaseLifecycle, PhaseStatus as PhaseStatusWord,
   PhaseStopKind, ReviewerPolicy, RunLifecycle, RungOutcome, RunStatus as RunStatusWord,
   SessionMode as SessionModeWord, SettledRungOutcome, StartDoor as StartDoorWord, UltraReviewMode,
@@ -124,6 +134,84 @@ export type DeclarationLedgerRow = { count: number; lastAt: string; refused?: nu
 export { SETTLED };
 
 /**
+ * `phaseSettledWell(record, errand)` — the ONE predicate for "may a run that
+ * asked for this phase call it over" (#43), owned by `shared/run-lifecycle.js`
+ * and re-exported here, beside `SETTLED`, for the runner's readers. Its three
+ * callers: the drive loop's scoped finish (`runner-loop.ts`, through
+ * `scopeLeftOpen`), the read path's correction of a stored run
+ * (`honestScopedFinish` below, from `settle`) and the inbox's attention gate
+ * (`inbox.ts`). None re-derives it.
+ */
+export { phaseSettledWell };
+
+/** The standing recovery errand for `phase`, if it has one. */
+export function errandOf(state: RunState, phase: number): Errand | undefined {
+  return state.recoveries?.[String(phase)]?.errand;
+}
+
+/**
+ * The phases a SCOPED run asked for that are not settled well — ascending, and
+ * empty for a run that was not scoped. A phase with no record at all never
+ * boarded, so it is open too.
+ */
+export function scopeLeftOpen(state: RunState): number[] {
+  return [...new Set(state.onlyPhases ?? [])]
+    .filter((phase) => !phaseSettledWell(state.phases[String(phase)], errandOf(state, phase)))
+    .sort((a, b) => a - b);
+}
+
+/** "scope not done: phases 10, 11" — the words both halves of #43 lead with. */
+export function scopeNotDoneSentence(open: readonly number[]): string {
+  return `scope not done: ${open.length === 1 ? 'phase' : 'phases'} ${open.join(', ')}`;
+}
+
+/**
+ * Retire the errands whose phase is already settled well (#43). An errand asks
+ * a person for what a phase needs, and a phase that reads `done` (or that the
+ * operator skipped) needs nothing more — but three doors re-board a phase
+ * without spending a rung (Retry, a Continue's reboard, the operator's resume),
+ * so the ask used to outlive the answer. Left standing it would hold a scoped
+ * run open for ever, since `phaseSettledWell` reads any standing errand as
+ * owed. Journalled `phase.errand-cleared {reason: done|skipped}`.
+ */
+export function retireSettledErrands(state: RunState, journal: DeclarationSink = journalOf(state)): number[] {
+  const retired: number[] = [];
+  for (const [key, slot] of Object.entries(state.recoveries ?? {})) {
+    if (!slot?.errand || !/^\d+$/.test(key)) continue;
+    const status = state.phases[key]?.status;
+    if (!status || !(SETTLED_WELL as readonly string[]).includes(status)) continue;
+    const errand = slot.errand;
+    delete slot.errand;
+    journal('phase.errand-cleared', { reason: status, situation: errand.situation, since: errand.at }, Number(key));
+    retired.push(Number(key));
+  }
+  return retired;
+}
+
+/**
+ * The read path's half of #43, for a run an older console already wrote. A
+ * scoped run used to finish when none of its asked phases read `parked`,
+ * `gated` or `failed`, so a run whose phase 10 held an open errand and whose
+ * phase 11 never boarded says "those are settled". Such a run keeps its
+ * status word — flipping a months-old run to `parked` would hand it back to
+ * the healer as its plan's open run — but its sentence is corrected to name
+ * what is still open. Idempotent: a sentence already correct is left alone.
+ * Returns whether it changed anything.
+ */
+export function honestScopedFinish(state: RunState): boolean {
+  if (state.status !== 'finished' || !state.onlyPhases?.length) return false;
+  const retired = retireSettledErrands(state);
+  const open = scopeLeftOpen(state);
+  if (!open.length) return retired.length > 0;
+  const sentence = `${scopeNotDoneSentence(open)} — this run stopped with ${open.length === 1 ? 'it' : 'them'} `
+    + 'unsettled, and the console that wrote it called that finished. Continue the run, or Retry '
+    + `${open.length === 1 ? 'that phase' : 'those phases'}, to carry on.`;
+  if (state.finishedReason === sentence) return retired.length > 0;
+  state.finishedReason = sentence;
+  return true;
+}
+
+/**
  * Statuses that assert work is in flight — each one a claim made by a process
  * that can be killed between writing it and acting on it.
  *
@@ -157,6 +245,18 @@ export { PHASE_IN_FLIGHT };
  * phase and the reason; a writer that did them would make every caller pay for
  * a side effect most of them already perform themselves.
  *
+ * Since control-tower phase 52 it is the ONLY run-status writer (#50): every
+ * other `state.status =` was converted — sixty-two of them, one in this file —
+ * and `invariants.test.ts` refuses a new one. The reason is `waitReason`. It is
+ * written with a wait and read by everything that asks "why is this run
+ * waiting?", and a raw write that ended the wait left it behind: a run stopped
+ * while queued on scope read `paused` beside `waitReason: 'scope'`, and every
+ * reader keying on the reason saw a run waiting for a scope nothing would ever
+ * free. So a word that is not a wait drops the reason with the wait — unless
+ * the run still holds a wait CLOCK (`waitUntil`): a usage window reconciled to
+ * `paused` keeps its clock, and the clock's reason is how the boot re-arm and
+ * `waitHoldWhy` tell a usage wall from a park on external work.
+ *
  * @param wait Overrides the derived wait axis. Pass it when the run is queued
  *   for a schedule rather than for scope, or when the reason is known before
  *   `waitReason` has been written.
@@ -167,6 +267,9 @@ export function setRunState(
   wait?: { kind: WaitReason; until?: string | null; on?: string } | null,
 ): void {
   state.status = status;
+  // "Is this word a wait?" is the fold's question (`queued` and `waiting` fold
+  // to it), asked of the word alone so no stored axis can answer it.
+  if (state.waitReason && !wait && !state.waitUntil && runLifecycle({ status }).state !== 'waiting') state.waitReason = null;
   // Derive from the run as it is AFTER the word lands, so `waitUntil` and
   // `freeze` written moments earlier are already visible to the fold. The
   // stored `lifecycle` is deliberately not consulted — this is the writer, and
@@ -179,9 +282,18 @@ export function setRunState(
   // re-derived away by a fold that could not have known.
   if (wait) state.waitReason = wait.kind;
   const lifecycle = runLifecycle({ ...facts, status, waitReason: state.waitReason });
-  if (wait && lifecycle.state === 'waiting') {
-    lifecycle.wait = { kind: wait.kind, until: wait.until ?? state.waitUntil ?? null };
-    if (wait.on) lifecycle.wait.on = wait.on;
+  // Every wait keeps its kind, its clock and what it is ON (control-tower
+  // phase 88, #148) — as the caller stated them, else as the run implies them —
+  // so no reader has to re-derive a wait the writer knew. A pause that carries
+  // a clock (an operator's pinned wait, `onLimit: pause`) carries the wait too:
+  // it stays a pause, and still says which wall it is sitting out. It used to be
+  // written only for a stated wait on a `waiting` word, so a run reconciled off
+  // a wait stored `{state: 'paused'}` and nothing else, and read "Paused".
+  if (lifecycle.state === 'waiting' || (lifecycle.state === 'paused' && (wait || state.waitUntil))) {
+    const kind = wait?.kind ?? lifecycle.wait?.kind ?? waitReasonOf(state);
+    const on = wait?.on ?? waitOnOf(state, kind);
+    lifecycle.wait = { kind, until: wait?.until ?? state.waitUntil ?? lifecycle.wait?.until ?? null };
+    if (on) lifecycle.wait.on = on;
   }
   state.lifecycle = lifecycle;
 }
@@ -235,6 +347,14 @@ export function setPhaseState(
  * verification — but forgetting one costs a less specific reason, never a
  * wrong state.
  *
+ * The RUN's half was converted after all, in control-tower phase 52 — not for
+ * the lifecycle, which this still keeps honest, but for `waitReason`, which no
+ * fold re-derives and only a writer can clear (#50; see `setRunState`). The
+ * phase records' writes are still bare. Deliberately, nothing here drops a
+ * stale reason on read: `paused` with `usage-limit` and no clock is a reason a
+ * WRITER stated (`onLimit: pause`), and a read cannot tell it from a leftover —
+ * a file written before phase 52 keeps its reason until its next status write.
+ *
  * Agreement is judged on the state AND the reason axis — see `axisStale`. It
  * was `state` alone for one commit, which let the axes go permanently stale:
  * a phase parked on an unreachable MCP server and later parked on an errand
@@ -264,6 +384,11 @@ function syncLifecycle(state: RunState): void {
   // those parks paint `needs-you` again.
   if (storedRun?.state !== derivedRun.state || axisStale(storedRun?.wait, derivedRun.wait)) {
     state.lifecycle = derivedRun;
+  } else if (storedRun?.wait && derivedRun.wait && storedRun.wait.until !== derivedRun.wait.until) {
+    // The same wait on a clock that moved (`syncWaitClock` follows the waiters
+    // that remain without a status write): the clock is the run's, and what
+    // the writer said it is ON stays (#148).
+    state.lifecycle = { ...storedRun, wait: { ...storedRun.wait, until: derivedRun.wait.until ?? null } };
   }
 
   for (const record of Object.values(state.phases ?? {})) {
@@ -319,6 +444,46 @@ export type VerifyRun = {
   /** The second attempt of a command whose first exited red — the verdict is
    * judged on this one; the first stays on the record beside it. */
   retry?: boolean;
+  /**
+   * The verification's OWN clock cut this command (control-tower phase 83,
+   * #95) — not the abort signal, and not a command that exited 124 by itself.
+   * A cut proves only "longer than the limit": the command is retried once at
+   * twice the limit, and a cut on its last attempt is `verify-timeout`, never
+   * a red verdict.
+   */
+  timedOut?: boolean;
+  /** The limit this attempt ran under, in ms — what `timedOut` was measured against. */
+  limitMs?: number;
+  /**
+   * The failing tests this command's output named, one identity each (node's
+   * spec and TAP reporters, bats' TAP — `verify.ts` `failureIds`), bounded.
+   * What a baseline is compared by (#103): absent when the output named none.
+   */
+  failures?: string[];
+  /**
+   * What this command ran AGAINST: the repository its cwd is in, the branch it
+   * stood on and its head (control-tower phase 40, #41). Absent on a record
+   * stored before stamps existed — every reader treats it as optional.
+   */
+  tree?: { repo: string; branch: string | null; head: string | null };
+  /**
+   * The console did NOT run this command: the phase's session proved it green
+   * at an equivalent tree and recorded it (`phase-outcome.sh … verified`,
+   * control-tower phase 62, #68). `tree` is the working tree it ran against,
+   * `paperwork` what changed since — only paths no suite reads. `code: 0` and
+   * `ms: 0` on such a row are the proof's, never a run's.
+   */
+  proven?: { tree: string; at: string; session?: string; paperwork: string[] };
+  /**
+   * The command failed on the MACHINE, not on the work (control-tower phase 89,
+   * #41's 2026-09-25 comment): a runtime exit 127, a line naming a
+   * `PRECONDITION`, or a connection refused to a loopback port the phase's own
+   * session served on — the sentence says which (`verify.ts`
+   * `environmentOf`). Such a row is never red: the verdict reads it
+   * `unproven`, nothing is charged, nothing re-opens, and it is not retried,
+   * since an unchanged precondition fails the same way twice.
+   */
+  environment?: string;
 };
 
 /**
@@ -413,6 +578,179 @@ export type VerifySummary = {
    * reason, the record already says the database never came up.
    */
   setup?: { ok: false; command: string; output: string };
+  /**
+   * `{repo, branch, head}` of every repository this verification compared
+   * against — the one it ran in first, then the scoped ones, the ones a command
+   * reached with `cd` or `git -C`, and every other one under the run's root
+   * (`runner/tree-state.ts` `stampTrees`). Absent on a record stored before
+   * control-tower phase 40.
+   */
+  trees?: TreeStamp[];
+  /**
+   * The commands whose LAST attempt the verification's clock cut (control-tower
+   * phase 83, #95) — the `verify-timeout` outcome: `ok` is false, and nothing
+   * here is a red verdict. Absent when nothing timed out.
+   */
+  timedOut?: string[];
+  /**
+   * Reds this phase INHERITED (control-tower phase 83, #103): failing tests
+   * already present in its baseline, each with the phase that owns it when the
+   * ledger or the commits name one. They travel on the record and are charged
+   * to nobody here. Absent when the phase inherited nothing.
+   */
+  inherited?: InheritedRed[];
+  /**
+   * The commands whose last attempt failed on the machine rather than the work
+   * (control-tower phase 89) — each with the sentence `environmentOf` gave. Not
+   * a red: the phase is neither charged nor re-opened, and its record says the
+   * line is UNPROVEN rather than green. Absent when nothing was.
+   */
+  unproven?: { command: string; why: string }[];
+  /**
+   * Where the commands ran, when it was not the working tree (control-tower
+   * phase 89, #103, #41): a clean checkout of the phase's HEAD in a temporary
+   * directory, because the tree held changes that were not the phase's own —
+   * `reason` names them and `owners` the phases whose they were. Absent when
+   * the verification ran in place, as a clean tree still does.
+   */
+  export?: VerifyExport;
+};
+
+/** A verification's clean checkout — see `VerifySummary.export`. */
+export type VerifyExport = {
+  /** The commit it was checked out at: the verified repository's HEAD. */
+  head: string;
+  /** The repository whose HEAD it was (absolute). */
+  repo: string;
+  /** Why the working tree was not used, as a person reads it. */
+  reason: string;
+  /** The foreign paths that sent it there, bounded. */
+  paths: string[];
+  /** Whose they were: a phase of this run, or null for a path nobody's session wrote for sure. */
+  owners: (number | null)[];
+};
+
+/**
+ * Which word set a §Verification command's limit (control-tower phase 83,
+ * #95): the phase's `- **Verify timeout:**`, the plan's `**Verify timeout:**`,
+ * the line's own measured runs, or the console's default.
+ */
+export type VerifyLimitSource = 'phase' | 'plan' | 'history' | 'default';
+
+/** One command's inherited reds, and whose they are — see `VerifySummary.inherited`. */
+export type InheritedRed = {
+  command: string;
+  /**
+   * The `&&` chain this command is a member of — a red chain is attributed
+   * member by member, each run alone (control-tower phase 83, #103's
+   * chained-gate comment). Absent for a line of the plan's own.
+   */
+  chain?: string;
+  /** The failing tests; empty when the output named none and the whole command was compared. */
+  failures: string[];
+  /** The phase that owns them, when one is known. */
+  owner?: number;
+  /**
+   * How the owner was found: charged with them by its own verification, the
+   * commits between, the UNCOMMITTED paths its session wrote (`wip`), or its
+   * wrap-up's fast gate recording the same red on a commit this head carries
+   * (`wip-red`, control-tower phase 89).
+   */
+  how?: 'charged' | 'commit' | 'wip' | 'wip-red';
+  /** Several phases committed in the range and none can be told from the others: all are named. */
+  candidates?: number[];
+  /** A `wip` red: the uncommitted paths that were the only difference from a tree it was green on. */
+  paths?: string[];
+};
+
+/**
+ * A red another phase's §Verification INHERITED and named this phase as its
+ * owner (control-tower phase 83, #103) — kept on the OWNER's record, so what
+ * it owes is said where its own work is read. Dropped when this phase's own
+ * verification runs the line green; never a charge against it by itself.
+ */
+export type OwedRed = {
+  command: string;
+  chain?: string;
+  failures: string[];
+  /** The phase whose verification found it, and when. */
+  by: number;
+  at: string;
+  how: 'charged' | 'commit' | 'wip' | 'wip-red';
+  paths?: string[];
+};
+
+/**
+ * A phase's COMMITTED work-in-progress is red (control-tower phase 89, #127):
+ * after its session handed off at the console's context wrap-up, the plan's
+ * fast gate (`fastGateLines`) ran on the commit it left and failed. `sha` is
+ * that commit, `files` what the phase's WIP changed since it boarded, `lines`
+ * the gate's red commands with the failing tests each named. Read by the
+ * boarding order (the WIP's owner boards first), by every sibling's brief
+ * (`siblingWipBlock` — "these files are red and are P43's"), by the
+ * verification's attribution (a red on one of these lines is the owner's) and
+ * by the failure streak's root-cause key (phase 87). Cleared when a gate or a
+ * verification of the phase's own reads those lines green.
+ */
+/** Who set an operator's queue mark, when, and why (control-tower phase 99, #135) — `reason` is phase 96's. */
+export type QueueMark = { at: string; by: string; reason?: string };
+
+/**
+ * An operator's standing word on one phase's place in the admission queue
+ * (control-tower phase 99, #135 B and E) — `PhaseRecord.queueControl`.
+ *
+ *   - `bump` — to the front of its class; `stamp` (ms) orders two bumps, the
+ *     most recent first, across plans. Spent when the phase is admitted.
+ *   - `hold` — kept in the queue, never admitted, until released.
+ *   - `defer` — a hold that ends by itself at `until`.
+ *   - `withdrawn` — out of the queue: the run boards its other phases and names
+ *     this one, never boarding it, until it is re-queued.
+ */
+export type QueueControl = {
+  bump?: QueueMark & { stamp: number };
+  hold?: QueueMark;
+  defer?: QueueMark & { until: string };
+  withdrawn?: QueueMark;
+  /** Pinned next in its plan (control-tower phase 100, #135 B.8) — spent when it boards. */
+  pin?: QueueMark;
+  /**
+   * The next lane on its scope is kept for it (control-tower phase 100, #135
+   * D.15–16): when `lane` ends — a yield names the lane that gave up — or at
+   * once. Spent when it boards; the scheduler holds it while it stands.
+   */
+  reserve?: QueueMark & { lane?: { slug: string; phase: number }; via?: 'yield' };
+};
+
+export type WipRed = {
+  sha: string;
+  files?: string[];
+  lines?: { command: string; failures?: string[] }[];
+  at?: string;
+};
+
+/**
+ * What a phase's §Verification read on its BASE tree, before its session
+ * touched it (control-tower phase 83, #103) — taken at the phase's first
+ * boarding and kept for the rest of the run, so its own work can never become
+ * its baseline. Each command is the last run of that line on the base tree
+ * (`reused`), or a run made then (`measured`).
+ */
+export type VerifyBaseline = {
+  at: string;
+  /** The working tree the baseline describes — a git tree object; null when git could not name it. */
+  tree: string | null;
+  head: string | null;
+  commands: {
+    command: string;
+    /** A member of this `&&` chain, run alone because the chain was red. */
+    chain?: string;
+    ok: boolean;
+    code: number;
+    failures?: string[];
+    from: 'reused' | 'measured';
+    /** The run that stood in, for a reused line. */
+    by?: { phase: number; run: string; at: string };
+  }[];
 };
 
 /**
@@ -537,6 +875,26 @@ export type PhaseRecord = {
   lifecycle?: PhaseLifecycle;
   attempts: number;
   costUsd: number;
+  /** The part of `costUsd` spent on credit past a plan window (control-tower phase 93, #146). */
+  creditUsd?: number;
+  /**
+   * Each session's mark: the last `total_cost_usd` booked for it. A `--resume`
+   * re-reports the conversation's running total, so a spawn books only its rise
+   * over this (control-tower phase 46, #62; `RunnerBase.bookSpend`,
+   * `bookedDelta`). Seeded for a stored run by the boot re-price.
+   */
+  costHighWater?: Record<string, number>;
+  /**
+   * How the phase's newest session ended — what `closed()` reads before it
+   * calls a missing handoff a failure (control-tower phase 46, #61): a spent cap
+   * on a resume is resumed with the cap raised, and a console that shut the
+   * session down settles `interrupted`. Written by the spawn door for every
+   * session; the caps are the ones it ran under, so a raise doubles the right one.
+   */
+  lastSession?: {
+    mode: SessionMode; sessionId: string | null; at: string; endedBy: EndedBy;
+    subtype?: string; terminalReason?: string; maxTurns?: Cap; maxBudgetUsd?: Cap;
+  };
   /**
    * The recorded cost is known to be INCOMPLETE — the session really ran, and
    * its spend was never harvested.
@@ -559,6 +917,53 @@ export type PhaseRecord = {
    * told apart — the second is not a slow phase.
    */
   frozenMs?: number;
+  /**
+   * One window per session this phase spawned, oldest first (#28) — kept by
+   * `openAttemptWindow` / `closeAttemptWindow` / `noteFirstTool` in
+   * `shared/phase-clocks.js`, and summed (minus `frozenMs`) into `durationMs`.
+   * Absent on a record written before 6.0, which `phaseClocks` reads from its
+   * `attemptStartedAt`/`attemptEndedAt` instead.
+   */
+  attemptWindows?: AttemptWindow[];
+  /**
+   * Admission waits already over, summed (#28) — `phaseClocks.queuedMs`. Since
+   * control-tower phase 60 (#81) every queue EPISODE joins it when it closes,
+   * whatever closed it (`queue-episodes.ts`), not only an admission.
+   */
+  queuedMs?: number;
+  /** When the queue episode now open began; cleared when it closes (#28, #81). */
+  queuedAt?: string;
+  /**
+   * The queue entry's AGE — when this phase's current wait first joined a queue
+   * (control-tower phase 60, #81). Outlives a withdrawal and a console restart,
+   * so the next admission is born this old; only an admission clears it.
+   */
+  queueSince?: string;
+  /** The current wait's queued time over its episodes already closed (#81) — what `phase.admitted`'s `waitedMs` adds up. */
+  queueWaitedMs?: number;
+  /** The entry had aged into RESERVING before the wait was interrupted (#81); restored at the next admission. */
+  queueReserving?: true;
+  /**
+   * An operator's standing word on this phase's place in the queue
+   * (control-tower phase 99, #135 B and E) — `QUEUE_VERBS`. On the RECORD, not
+   * the scheduler's entry, so it survives the entry: a pause, a retry, a
+   * wrap-up, a relaunch and a restart each re-create the entry, and each new
+   * one is born carrying it (`admit`). Absent when nobody said anything.
+   */
+  queueControl?: QueueControl;
+  /** The last moment the open episode was seen waiting — where a restart ends it (#81). */
+  queueSeenAt?: string;
+  /** The open episode's head holder class and since when (#64) — each stretch is charged to `queuedByClass`. */
+  queueHead?: { class: HolderClass; since: string };
+  /** Closed queue time by the class of the holder at its head (`HOLDER_CLASSES`, #64). */
+  queuedByClass?: Partial<Record<HolderClass, number>>;
+  /**
+   * This ready phase's scope meets a LIVE lane of its own run in the same tree
+   * (control-tower phase 60, #64): it is serial work behind that phase, not a
+   * queue — so it never joins one, and reads `ready (behind this run's P<n>)`.
+   * Cleared when it boards or stops being a candidate.
+   */
+  serialBehind?: number;
   /**
    * How many times this phase actually called each attached MCP server, by id.
    *
@@ -701,7 +1106,7 @@ export type PhaseRecord = {
    * when no child of the run holds work, so a console crash leaves no phantom.
    */
   qaSession?: { round: number; report: string; verb?: string; sessionId?: string; startedAt: string };
-  lint?: { ok: boolean; summary: string };
+  lint?: { ok: boolean; summary: string; crashed?: boolean };
   /**
    * The one continuation this phase is allowed when its session exits without
    * writing a handoff — recorded so a second attempt cannot happen by accident,
@@ -743,6 +1148,13 @@ export type PhaseRecord = {
    */
   tasks?: TaskItem[];
   /**
+   * How far the active task's long operation has got, as the session last
+   * said with `phase-outcome.sh … progress` (control-tower phase 95, #163) —
+   * `task` is the id that was in progress when it was said. Journalled as
+   * `phase.progress`; cleared with the task list.
+   */
+  progress?: { label: string; done: number; of: number; at: string; task?: string };
+  /**
    * How far into `PE_TASKS_FILE` the tail has read, in bytes.
    *
    * Persisted with the record rather than held on the lane, because the offset
@@ -776,6 +1188,32 @@ export type PhaseRecord = {
    */
   retryOverride?: RetryOverride;
   /**
+   * The errand tree a person asked for (control-tower phase 90, #123):
+   * `.worktrees/hand/<slug>/p<N>-errand`, detached at the pushed run branch in
+   * every repository the run mounts. A parked phase's `!` lines belong there —
+   * the run's own mirror is pruned on the console's schedule, this one only
+   * when a person removes it. The errand card names it.
+   */
+  errandTree?: { dir: string; at: string; by: string; mounts: { rel: string; sha: string; pushed: boolean }[] };
+  /**
+   * The plan this phase's session last presented through `ExitPlanMode`
+   * (control-tower phase 11, #34): its sha256, its size, where the console
+   * kept the text, and what became of it. `pending` is a plan a person has
+   * not decided yet — the one state the inbox offers Approve and Reject for.
+   */
+  planApproval?: {
+    sha: string;
+    bytes: number;
+    path: string;
+    at: string;
+    sessionId?: string;
+    truncated?: boolean;
+    state: 'pending' | 'approved' | 'rejected' | 'continued';
+    by?: string;
+    reason?: string;
+    decidedAt?: string;
+  };
+  /**
    * The boarding belt-check's backoff against a foreign lock the scheduler's
    * store-fed view has not caught up with. Doubles 1 s → 30 s per refused
    * boarding so the loop re-boards at most once per half minute against a
@@ -803,6 +1241,26 @@ export type PhaseRecord = {
    * ran" at once, and so measured parked time from the wrong instant (WAI-4).
    */
   parkedFrom?: string;
+  /**
+   * Parked because the session started on another model than the one the
+   * phase is pinned to (control-tower phase 54, #91, `phase.model-mismatch`).
+   * Read with the status: a phase that boards again keeps the fact, not the park.
+   */
+  modelMismatch?: { requested: string; resolved: string; at: string };
+  /**
+   * The usage wall this park waits on, when it is one (control-tower phase 54,
+   * #78): the wall's reset is "until at the latest", never the clock taken on
+   * trust. `Runner.rereadWalls` asks the account's headroom on every fresh
+   * reading, every spend and a back-off re-probe (`probes` of them so far), and
+   * lifts or shortens the park — never lengthens it. `latest` is the reset the
+   * park began with; `lastReading` is what the newest re-read answered. It ends
+   * with its park: every boarding and every re-board deletes it, so no later
+   * park is ever read as a wall.
+   */
+  usageWall?: {
+    account: string; bucket: string; latest: string; probes: number;
+    lastReading?: { at: string; by: 'reading' | 'spend' | 'reprobe'; ok: boolean; resetsAt?: string };
+  };
   /** When the last attempt's session ended — the other meaning `endedAt` carried. */
   attemptEndedAt?: string;
   /**
@@ -811,6 +1269,18 @@ export type PhaseRecord = {
    * Capped at `WAIT_HISTORY_MAX`; older entries fold into `parkedMsCarried`.
    */
   waitHistory?: WaitEntry[];
+  /**
+   * This phase's budgets already warned at `BUDGET_WARN_PCT` (control-tower
+   * phase 14, #40): budget → the attempt-and-limit key it was claimed under,
+   * so each warns once per attempt and again after a raise.
+   */
+  budgetWarned?: Record<string, string>;
+  /**
+   * A budget past its warning line and not yet raised (control-tower phase 25,
+   * #40): budget → the fact as `noteBudgetApproaching` measured it, so the run
+   * page draws the approach with its raise before the park. A raise removes it.
+   */
+  budgetApproaching?: Record<string, BudgetFact>;
   /** Declared parked time folded out of the history (or accrued before it existed). */
   parkedMsCarried?: number;
   /**
@@ -843,6 +1313,13 @@ export type PhaseRecord = {
    * or a fresh boarding goes ahead.
    */
   resumeRefused?: { sessionId: string; at: string; why: 'session-live' | 'session-lease'; pid?: number; lock?: string };
+  /**
+   * This phase's replay file crossed 80 % of its cap (`near-full`) or reached it
+   * (`full`) — journalled once per file as `phase.replay-limit` and kept here
+   * for the card (control-tower phase 94, #133). Past `full` the live view still
+   * streams; nothing more of this phase is replayed.
+   */
+  replay?: { state: 'near-full' | 'full'; bytes: number; cap: number; at: string };
   /**
    * The outcome the session itself declared (`phase-outcome.sh`), persisted so
    * the situation classifier still sees it after the run stops, the console
@@ -893,7 +1370,56 @@ export type PhaseRecord = {
      * phase against a wait nobody is holding any more. `resumes` is the count at
      * the moment of this landing, so a resume brief can say "the third time".
      */
-    landed?: { ref: string; detail?: string; at: string; resumes: number };
+    landed?: {
+      ref: string; detail?: string; at: string; resumes: number;
+      /** A person's turn proven (phase 43): the resume says the step was done, not that external work landed. */
+      step?: { id: string; kind: string; by: string };
+    };
+    /**
+     * The phase's wait budget as the PARK read it (`--wait-budget N`, else the
+     * console default) — stamped on a `needs-human`, `blocked` or
+     * `waiting-external` declaration so the two synchronous readers that end
+     * with it can ask without an engine call: the watch clock stops running a
+     * `cmd:` ref at `waitBudgetEndOf`, and the scope fence lifts there
+     * (control-tower phase 6, #19). Absent on a declaration written before
+     * the stamp; `waitBudgetEndOf` reads the console default for it.
+     */
+    budget?: { ms: number; source: 'phase' | 'plan' | 'default' };
+    /**
+     * The human step this declaration raised (control-tower phase 41): its
+     * ledger id and kind — the step itself lives in `human-steps.ndjson`. A
+     * declaration with a step is a person's turn: situation
+     * `blocked-declared:human-acts` (person, no rungs), no wait budget.
+     *
+     * `proof` and `until` ride here from phase 43, so the watch scheduler can
+     * poll the proof straight off the record and stop a `cmd:` proof at the
+     * step's window rather than at a wait budget; `settled` is written when
+     * the step is expired, refused (*I can't do this*) or dismissed, and ends
+     * that watch.
+     */
+    step?: { id: string; kind: string; proof?: string; until?: string; settled?: 'proven' | 'expired' | 'cannot' | 'dismissed' };
+    /**
+     * Set when this declaration met a SPENT wait budget (control-tower phase
+     * 45, #59): the phase parks `waiting` with no clock and a `budgets` errand
+     * — never `failed`, never a streak charge, never a rung — and its refs go
+     * on being watched, so a landing still resumes it (`parkOnSpentBudget`).
+     * `ledger` is which allowance ran out: the hours (`budget`), the count of
+     * declared waits (`waits`), or the console's own parks (`watchdog`). A
+     * `cmd:` ref keeps running past the budget's end on such a park, bounded
+     * by its per-phase run cap, because nothing else can end the wait.
+     */
+    budgetSpent?: { at: string; ledger: 'waits' | 'budget' | 'watchdog' };
+    /**
+     * Set when the RUNNER parked this `blocked` declaration on the refs it
+     * names (control-tower phase 87, #122, #126): the table's `poll-park` rung,
+     * driven by the loop itself rather than deferred to a healer that only
+     * acts on a stopped run. The phase waits `waiting` exactly as a
+     * `waiting-external` one does — phase 45's budget, phase 50's window — and
+     * its window or its landing resumes its own session; the status stays the
+     * session's word, so the sub-kind, the errand and the resume brief still
+     * read a block.
+     */
+    parked?: 'poll-park';
   };
   /**
    * The watch poller's last verdict about this phase's refs — bookkeeping so
@@ -919,7 +1445,7 @@ export type PhaseRecord = {
     at: string;
     refs: {
       ref: string;
-      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'cmd';
+      scheme: 'gh-run' | 'gh-pr' | 'date' | 'lock' | 'phase' | 'verify' | 'cmd';
       state: WatchStateWord;
       detail?: string;
       checkedAt: string;
@@ -972,6 +1498,16 @@ export type PhaseRecord = {
    * landed and only its journal line was deduped.
    */
   watchLandedErrandFor?: string;
+  /**
+   * Landed refs the healer answered `done` for — nothing in this declaration
+   * waits on them any more (the phase moved on, or the ref was the console's
+   * own) — so the scheduler never offers them again (control-tower phase 87,
+   * #126). Deleting only the row's `nextDueAt` made a landed row read "due"
+   * again, and the same landing was offered and retired every minute. Cleared
+   * with the rest of the watch bookkeeping: a NEW declaration naming the same
+   * ref is a new wait, watched afresh.
+   */
+  watchLandedDone?: string[];
   /**
    * The watch refs whose landings have already been journalled
    * `phase.watch-landed` — a SET, one entry per ref (RCV-8).
@@ -1044,7 +1580,32 @@ export type PhaseRecord = {
      * on the card from a measured one.
      */
     eta?: HolderEta;
+    /**
+     * What KIND of holder this is (`HOLDER_KINDS`). Written for the scope
+     * fence (`fence`, control-tower phase 6) and absent on the queue's own
+     * shadows, which name another claim by slug and owner as they always did.
+     */
+    kind?: HolderKind;
+    /** A `fence` holder's live watch refs — what the fencing phase is still waiting on. */
+    refs?: string[];
+    /** When a `fence` lifts by itself: the fencing phase's wait budget end (epoch ms), null for none known. */
+    until?: number | null;
+    /** A `fence` holder's declaration instant — which wall this fence is (`declared.at`). */
+    wall?: string;
+    /** A `branch` holder's repository, root-relative (`.` for the root). */
+    repo?: string;
+    /** A `branch` holder's branch — the one the repository stands on. */
+    branch?: string;
+    /** A `branch` holder's run — the run that put the repository there. */
+    run?: string;
   }[];
+  /**
+   * An operator's act that took this phase's wall DOWN as a fence — a Retry
+   * (`resetForRetry` by `operator`) or a Release of its lock — stamped so the
+   * siblings it fenced read WHY the fence lifted (`phase.fence-lifted`). It
+   * outranks only the declaration it post-dates: a later wall fences again.
+   */
+  fenceLifted?: { why: FenceLiftReason; at: string };
   /**
    * How this PHASE stopped, when it stopped for a reason that is about the
    * phase and not about the run (`shared/recovery-model.js` `PHASE_HALT_KINDS`).
@@ -1058,7 +1619,23 @@ export type PhaseRecord = {
    * the classifier reads `rec.halt ?? state.halt` so nothing downstream had to
    * learn a second vocabulary.
    */
-  halt?: { at: string; reason: string; phase?: number; kind?: HaltKind };
+  halt?: {
+    at: string; reason: string; phase?: number; kind?: HaltKind;
+    /**
+     * How many registered accounts the breaker refuses, and how many there
+     * are — written on a halt whose remedy might be "use another account", so
+     * the halt card can say whether there IS another one. Four runs once read
+     * "halted — the API refused the connection" while the fact that every
+     * account on the machine was unusable lived on a page nobody opened.
+     */
+    accounts?: { unusable: number; total: number };
+    /**
+     * `credential-refused` (control-tower phase 54, #57): what the refusal
+     * stood on — a kind the API returned or a sentence on its error channel,
+     * the words, and whose stop — so the halt says why, not only that.
+     */
+    evidence?: RetirementEvidence;
+  };
   /**
    * What the classifier last said this phase's situation was (`situation.ts`),
    * with the `id:sub` key the journal and the rung history use. Written by
@@ -1100,6 +1677,8 @@ export type PhaseRecord = {
     at: string;
     /** The account the credential belonged to, when the run named one. */
     account?: string;
+    /** What the refusal stood on (#57) — the same evidence the retirement keeps. */
+    evidence?: RetirementEvidence;
   };
   /**
    * The last tool call THIS CONSOLE refused for the phase (`phase.tool-denied`
@@ -1151,6 +1730,12 @@ export type PhaseRecord = {
    * again, a new session is.
    */
   contextWrapup?: ContextMark;
+  /**
+   * How many times the phase was re-boarded fresh because its session obeyed
+   * the wrap-up notice (`phase.resume-automatic {path: 'wrapup'}`) — the
+   * console's own park, spending no rung (control-tower phase 5, #14).
+   */
+  wrapupResumes?: number;
   /**
    * The checkpoint the console took at `CONTEXT_CHECKPOINT_FRACTION` of the
    * window: the session it ended, and the context it ended at. The next attempt
@@ -1266,6 +1851,131 @@ export type PhaseRecord = {
    * session does not control.
    */
   verifyingSince?: string;
+  /**
+   * A §Verification the console's going-down cut short (control-tower phase
+   * 48, #69): when, why — the console shut down or restarted (`shutdown`),
+   * the run was stopped (`stop`), or a checkpoint still read `verifying` at
+   * boot because the process died mid-run (`crash`) — and how much of it ran.
+   *
+   * While it is set the phase is owed its proof. Reconcile never closes the
+   * record on the board's word (the board reads `done` from the moment the
+   * handoff landed, which is exactly what the verification was checking), a
+   * run is never called finished over it, and the next drive re-runs the
+   * §Verification before anything else is decided about the phase
+   * (`phase.reverify-after-restart`). The re-verification consumes it; a cut
+   * that happens again writes it again.
+   */
+  reverify?: {
+    at: string;
+    /**
+     * `checkpoint` (control-tower phase 89, #121) is a different debt from the
+     * other three: the console's checkpoint ended the phase's SESSION while it
+     * waited on a job of its own, and the group signal took the job with it —
+     * so the next SESSION must re-run it. It is read by that boarding's brief
+     * (`checkpointJobsBlock`) and never by the console's own re-verification
+     * (`owesVerification` says which is which).
+     */
+    cause: 'shutdown' | 'stop' | 'crash' | 'checkpoint';
+    ran?: number;
+    notRun?: number;
+    /** `checkpoint` only: what the killed job was waiting to produce (the wait chain's key). */
+    jobs?: string[];
+  };
+  /**
+   * The limit this phase's §Verification commands ran under (control-tower
+   * phase 83, #95): each command's, and `ms` their sum — the bound the restart
+   * drain reads for a verifying lane. `source` is the plan's word when it gave
+   * one (`phase`, `plan`), else `history` when a line's measured runs raised
+   * it, else `default`. Written when the verification starts.
+   */
+  verifyLimit?: {
+    ms: number;
+    source: VerifyLimitSource;
+    commands?: { command: string; ms: number; source: VerifyLimitSource }[];
+  };
+  /** What this phase's §Verification read before its session touched the tree — see `VerifyBaseline`. */
+  baseline?: VerifyBaseline;
+  /** Reds other phases' verifications inherited and attributed to THIS phase — see `OwedRed`. */
+  owed?: OwedRed[];
+  /**
+   * This phase's COMMITTED work-in-progress is red: the commit, and the files
+   * its fast gate failed on. Written by control-tower phase 89's wrap-up gate;
+   * read here by the failure streak's root-cause key (phase 87, #122) — a block
+   * that names this phase (`phase:<slug>/<N>`, `lock:<slug>/<N>`) is blamed on
+   * this commit, so every sibling it stops is ONE cause, charged once.
+   */
+  wipRed?: WipRed;
+  /**
+   * The loopback ports this phase's sessions served on (control-tower phase
+   * 89, `LaneSignals.ownPorts`), kept past the lane: a refused connection to
+   * one in the console's §Verification is `environment`, never a red.
+   */
+  ownPorts?: number[];
+  /**
+   * The baseline is being MEASURED, since then (control-tower phase 83, #103):
+   * the §Verification commands own the lane, so the stall detector stands down
+   * and the restart drain counts it as verifying — exactly as for
+   * `verifyingSince`, which it is kept apart from on purpose: a console that
+   * dies mid-baseline owes no re-verification (the next boarding simply takes
+   * the baseline again), while one that dies mid-verification does.
+   */
+  baselineSince?: string;
+  /**
+   * §Verification's FINAL verdict was red over a phase the board reads done,
+   * and this run RE-OPENED it (control-tower phase 62, #68) rather than record
+   * a failure after "done". While it stands: reconcile never closes the record
+   * on the board's word (the board is reading the handoff the verdict was
+   * about), the run is never called finished over it, the phase's direct
+   * dependents are held (`phase.verification-held`), and the ladder gives it
+   * ONE fix rung (`verify-red:reopened`) before its errand. A verification of
+   * it that comes back green ends it — the fix session's, or a person's
+   * Re-check. `failed` is the commands that were red; `times` how often the
+   * verdict re-opened it.
+   */
+  reopened?: { at: string; failed: string[]; times: number };
+  /**
+   * A person answered this phase's errand — "Done — continue" (control-tower
+   * phase 88, #124): who, their note, when, and the declaration it answered
+   * (`declared`, that declaration's `at`). The answered declaration is spent
+   * (`applyErrandAnswer`), and this stamp is evidence (`phaseEvidence`), so a
+   * Recover after the answer never re-derives the ask it answered.
+   */
+  errandAnswered?: { by: string; note: string; at: string; declared?: string };
+  /**
+   * Reconcile closed this record on the BOARD's word, not this run's own
+   * verification (control-tower phase 79, #113): `at` is when. It is what the
+   * drive tick re-reads — a board that no longer reads the phase done reopens
+   * the record `pending` (`reopenRegressedRecords`, `phase.reopened`) with its
+   * `resumeSessionId` kept, because the thing that made it read done (an
+   * untracked scaffold, a reverted commit) can go away. A record this run
+   * verified never carries it, and is never reopened.
+   */
+  reconciled?: { at: string };
+  /**
+   * The phase reads `in-progress` or `stuck` on the board, and nothing of this
+   * live run drives it — no lane, no queue entry, no boarding hint, no park, no
+   * errand (control-tower phase 79, #114). Stamped by the drive tick
+   * (`Runner.noteUndriven`), cleared the tick it is driven again; `since` holds
+   * for the episode, which is the clock the inbox's `undriven` stall reads.
+   * `deferred` is the ladder's deferral to a healer that only climbs a STOPPED
+   * run — the one undriven shape raised at once rather than after the clock.
+   * Read through `undrivenPhases` (`shared/run-lifecycle.js`), which answers
+   * only for a live run.
+   */
+  undriven?: UndrivenStamp;
+};
+
+/** See `PhaseRecord.undriven`. */
+export type UndrivenStamp = {
+  since: string;
+  /** The board's word for the phase: `in-progress` or `stuck`. */
+  board: string;
+  /** The last situation the phase was classified in, when it was. */
+  situation: string | null;
+  /** Why nothing drives it, in one sentence. */
+  why: string;
+  /** The ladder deferred it to the healer (`phase.ladder-deferred`). */
+  deferred?: { at: string; situation: string; next: string | null; remaining: string[]; reason: string };
 };
 
 /**
@@ -1343,6 +2053,29 @@ export type RungRecord = {
    * id there would make every offer a "different" rung.
    */
   cardId?: string;
+  /**
+   * WHY it ended (`shared/ladder-model.js` `RUNG_FAILURE_CAUSES`), stamped by
+   * every settlement: `merit` unless the arm that knew said otherwise —
+   * `environment` for an ending the machine caused (a refused credential, no
+   * network, a zero-turn transient), which neither consumes the rung nor
+   * spends a rung cap — and `never-ran` for a `withdrawn` one. Absent on a
+   * record an older console settled, which reads as `merit` (#36).
+   */
+  cause?: RungCause;
+  /**
+   * Re-armed, and by whom: an operator's Retry (`by: 'operator'`) forgives a
+   * phase's interruptions and environment records; a usable account arriving
+   * (`by: 'accounts-changed'`) forgives the rungs a resource wall defeated. A
+   * forgiven record counts toward nothing but the dollars (#14, #36).
+   */
+  forgiven?: { at: string; by: string };
+  /**
+   * `operator` — a person's press, in the PERSON slot (control-tower phase 53,
+   * #56; `shared/ladder-model.js` `PERSON_SLOT_BY`): the phase was boarded
+   * outside the automatic ladder, and the record counts toward no rung cap and
+   * never marks a remedy tried. Absent on every rung the ladder climbed.
+   */
+  by?: string;
 };
 
 /**
@@ -1354,6 +2087,60 @@ export type RungRecord = {
  */
 /** One account a run may spend, and the five-hour headroom (percent) it must show first. */
 export type AccountRequirement = { id: string; minHeadroomPct: number };
+
+/** A person's account switch, as the run remembers it — see `RunState.accountChoice`. */
+export type AccountChoice = { accountId: string; from: string; at: string; by: string };
+
+/**
+ * The account an AUTOMATIC mover took the run off, and when its wall resets
+ * (control-tower phase 92, #100): the run owes it a move back at the next
+ * boarding after that reset. The first origin is kept across later moves.
+ */
+export type SwitchedFrom = { accountId: string; resetsAt: string; at: string; reason: string };
+
+/**
+ * The account a run is on is ALWAYS one of its listed accounts (control-tower
+ * phase 78, #100): a run that declared a pool and runs on an account outside it
+ * reads as spending an account it may not spend, and failover — which ranks
+ * inside the pool — could never come back to it. Appended at `minHeadroomPct: 0`
+ * because nobody stated a floor for it (`applySettings`' and
+ * `switchAccountRun`'s rule, which this is now the one copy of). A run with no
+ * pool is left without one: no rows means every account is a candidate.
+ */
+export function keepAccountInPool(state: { accountId?: string; accounts?: AccountRequirement[] }): void {
+  const rows = state.accounts;
+  if (!rows?.length) return;
+  const on = state.accountId ?? 'default';
+  if (!rows.some((row) => row.id === on)) rows.push({ id: on, minHeadroomPct: 0 });
+}
+
+/**
+ * The run's account POOL (control-tower phase 53, #55): the ids its `accounts`
+ * rows name — what the manifest's `accounts` row answered at launch, plus any
+ * account a person has since switched it to — or null when it declared none,
+ * and every account of the machine is a candidate, as before.
+ *
+ * `state.accounts` was written at launch and then read by nothing: a run with
+ * a declared pool of three failed over at preflight onto a fourth account the
+ * operator had never named, without probing the pool's own members first.
+ */
+export function accountPool(state: { accounts?: readonly AccountRequirement[] | null }): string[] | null {
+  const ids = [...new Set((state.accounts ?? []).map((row) => row.id))];
+  return ids.length ? ids : null;
+}
+
+/**
+ * Failover's candidates, best first, INSIDE the pool (#55): the ranked ids the
+ * pool names, then the pool's remaining members (the rank left them out —
+ * retired, cooling, walled or signed out — and a caller that asks each in turn
+ * records why), never the account being left. No pool: the rank, untouched.
+ * Never an id outside the pool — failover does not leave it by itself.
+ */
+export function rankInPool(ranked: readonly string[], pool: readonly string[] | null, leaving: string): string[] {
+  if (!pool) return [...ranked];
+  const inside = ranked.filter((id) => pool.includes(id));
+  return [...inside, ...pool.filter((id) => !inside.includes(id) && id !== leaving)];
+}
 
 /**
  * One manifest row as the door resolved it: the plan's `## Decisions` row, the
@@ -1403,6 +2190,61 @@ export function manifestEcho(manifest: ResolvedManifest): ResolvedManifest {
   };
 }
 
+/** Who a run's account answered when the run bound to it (`RunState.identity`). No secret, no path. */
+export type BoundIdentity = { account: string; key: string; email?: string; org?: string; at: string };
+
+type IdentityLike = { account: string; key: string; email?: string; org?: string };
+
+/** What a journal line or a stored binding carries of an identity — these four fields, never more. */
+export function identityEcho(identity: IdentityLike): IdentityLike {
+  return {
+    account: identity.account, key: identity.key,
+    ...(identity.email ? { email: identity.email } : {}),
+    ...(identity.org ? { org: identity.org } : {}),
+  };
+}
+
+/**
+ * The words for a run whose account now answers another identity
+ * (control-tower phase 91, #131): the halt says what happened — the login
+ * changed identity, never "expired or signed out" — and the errand offers the
+ * two ways on, each with the verb that takes it. One copy, shared by the
+ * runner's park and the service's park of a run no loop drives.
+ */
+export function identityChangeWords(slug: string, was: IdentityLike, now: IdentityLike): { halt: string; need: string; how: string } {
+  const who = (i: IdentityLike) => i.email ?? i.org ?? `identity ${i.key.slice(0, 8)}`;
+  const label = was.account === 'default' ? 'the machine login' : `account ${was.account}`;
+  return {
+    halt: `${label} changed identity — it is now ${who(now)} (was ${who(was)}, whom this run started on); `
+      + 'parked until a person chooses: continue on the new login, or move to the profile of the identity it started on',
+    need: `A person's choice: ${label} now answers ${who(now)}, not ${who(was)}, whose login this run started on — `
+      + 'nothing resumes on somebody else\'s login by itself.',
+    how: `Continue on the new login (${who(now)}): press "Continue on the new login" on the run `
+      + `(POST /api/run/${slug}/identity {"choice":"continue"}). Or move the run to the profile of ${who(was)}: `
+      + `press "Move to ${who(was)}'s profile" ({"choice":"move"}) — register and sign in a profile as ${who(was)} `
+      + 'under Settings ▸ Accounts first if there is none.',
+  };
+}
+
+/** A person's answer to a phase's errand — "Done — continue" (control-tower phase 88, #124). */
+export type ErrandAnswer = { by: string; note: string; at: string; situation?: string };
+
+/**
+ * Record a person's answer on a run: the stamp on the record (evidence — phase
+ * 51's fingerprint reads it), the answered declaration SPENT and the errand
+ * cleared, so the healer and Recover stop re-deriving an ask a person has
+ * answered — which is what re-halted P27 with the same text (#124).
+ */
+export function applyErrandAnswer(state: RunState, phase: number, answer: ErrandAnswer): void {
+  const record = phaseRecord(state, phase);
+  record.errandAnswered = {
+    by: answer.by, note: answer.note, at: answer.at, ...(record.declared ? { declared: record.declared.at } : {}),
+  };
+  delete record.declared;
+  const slot = state.recoveries?.[String(phase)];
+  if (slot) { delete slot.errand; delete slot.foldedInto; }
+}
+
 export type Errand = {
   phase: number;
   situation: string;
@@ -1410,6 +2252,20 @@ export type Errand = {
   need: string;
   how: string;
   at: string;
+  /**
+   * `how` ends, wherever it is SHOWN, with the clause over the phase's live
+   * watch state (`watch-refs.ts` `liveErrandHow`) — never frozen into `how`
+   * when the errand is written (control-tower phase 88, #125): the first probe
+   * comes after the errand, and its refusal must be what the card says.
+   */
+  watching?: boolean;
+  /**
+   * Other phases of this run whose declared external wall is THIS one — the
+   * same scope, `--needs external`, and reason fingerprint — folded in rather
+   * than written, parked and announced again (control-tower phase 6, #19
+   * ask 2). Each carries `recoveries[N].foldedInto` pointing back here.
+   */
+  alsoPhases?: number[];
   /**
    * The decision-manifest row this ask belongs to (phase 11, ZTD-10/QRL-3):
    * one of `shared/decisions-model.js` `DECISION_KEYS`, derived from the
@@ -1427,6 +2283,13 @@ export type Errand = {
    */
   policy?: { answer: string; source: string };
   /**
+   * The budget that stopped this phase, when a budget did (control-tower phase
+   * 14, #40): which one, its arithmetic and what spent it. Present, it is the
+   * errand's first line (`budgetFirst`), the `budget` push, and the raise the
+   * card offers — never the sentence of whatever the budget stopped.
+   */
+  budget?: BudgetFact;
+  /**
    * The session's own last words, verbatim, when they are the evidence.
    *
    * One producer today: a zero-turn exit whose `said` named the cause
@@ -1437,6 +2300,14 @@ export type Errand = {
    * situation, simply has none.
    */
   said?: string;
+  /**
+   * The human step this errand IS (control-tower phase 44): phase 39's
+   * protected path — `blocked-declared:protected-path` — as a step of kind
+   * `protected-path`, carrying the act and the path the session named, so its
+   * card offers the patch to apply by hand or an interactive session here.
+   * Absent on every other errand.
+   */
+  step?: { kind: 'protected-path'; act?: string; path?: string };
   /**
    * Rungs climbed on this phase for a DIFFERENT situation than the one this
    * errand is about.
@@ -1449,6 +2320,50 @@ export type Errand = {
    * has none.
    */
   earlier?: string[];
+  /**
+   * A CAP errand's arithmetic (control-tower phase 5, #14): which of the
+   * ladder's own caps refused (`LadderCap`), what it had spent and what it
+   * allows, in the cap's unit; how many counted rungs sit on phases the board
+   * already reads done (spent, and no longer charged); and the preference or
+   * run setting that raises it. A cap errand carries NO `decisionKey`: it used
+   * to be keyed `budgets`, a free-text row the caps never read, so no answer a
+   * plan could give lifted the park.
+   */
+  cap?: LadderCap;
+  spent?: number;
+  limit?: number;
+  onDonePhases?: number;
+  setting?: LadderCapSetting;
+  /** Whether a Retry of this phase would forgive anything the cap counted — said BEFORE the press (#14 ask 3). */
+  replenishes?: boolean;
+};
+
+/**
+ * One thing that holds a run the drive loop parked with nothing ready — the
+ * data the `nothing-ready` sentence is built from (control-tower phase 5): the
+ * phase, what kind of holder it is, the ONE verb that clears it, and why.
+ * `setting` names what a `settings` verb changes; `gate` quotes the gate.
+ */
+export type HaltHolder = {
+  phase: number;
+  kind: HaltHolderKind;
+  verb: HaltHolderVerb;
+  why: string;
+  setting?: string;
+  gate?: string;
+  /**
+   * The gate's `--gate-status` verdict word (`manual`, `blocked`, …) — what
+   * tells a person's gate from one that clears itself, so a park held only by
+   * the second reads as a wait (control-tower phase 17, #48).
+   */
+  gateKind?: string;
+  /**
+   * An `errand` holder's errand situation key (`blocked-declared:external`, …)
+   * — what kind of wall holds the phase, so a park behind a declared external
+   * wall reads as one rather than as the park kind's own family
+   * (control-tower phase 33).
+   */
+  situation?: string;
 };
 
 /** The briefs boarding can assemble for a phase the ladder re-boards. */
@@ -1489,6 +2404,42 @@ export type BoardingHint = {
   at: string;
   by?: string;
 };
+
+/**
+ * What a person's press set in motion (control-tower phase 53, #54 #55 #56) —
+ * the answer every boarding verb gives instead of a 200 over nothing.
+ *
+ * `session` names the phase's own session when the press resumes it, with
+ * `brief` saying how (`continue` for a resume with an instruction, `closeout`
+ * for Finish in its own session). `session: null` is a FRESH session — the CLI
+ * is handed its id at the spawn — boarding with `brief` (`fresh` for a Retry,
+ * `resume` for a resume the console boarded fresh), and `why` says why a
+ * resume that was asked for did not resume.
+ */
+export type PressLaunch = {
+  runId: string;
+  phase: number;
+  session: string | null;
+  brief: BoardingBrief;
+  why?: string;
+};
+
+/**
+ * What a press QUEUED rather than boarded (control-tower phase 86, RS-5): the
+ * same account of what will run, plus where it waits — its 1-based position in
+ * the line (null when the loop decided nothing in time to say) and what holds
+ * it. A re-board is a hint, and a hint is not a launch.
+ */
+export type PressQueued = PressLaunch & {
+  position: number | null;
+  behind?: { kind: string; slug: string; phase: number | null; owner: string };
+};
+
+/** A press's whole answer: what it launched or queued, or a refusal with the reason (and the session that holds the phase, when one does). */
+export type PressAnswer =
+  | { ok: true; run: RunState; launched: PressLaunch }
+  | { ok: true; run: RunState; queued: PressQueued }
+  | { ok: false; status: number; error: string; sessionId?: string };
 
 /**
  * Why a stopped run has stopped demanding a person.
@@ -1539,6 +2490,24 @@ export const RESOLVABLE: readonly RunStatus[] = ['halted', 'interrupted'];
 export type FreezeRef = { at: string; by: string; escalateAt?: string };
 
 /** One live session, as the checkpoint records it. */
+/** One of the console's own verification lanes — see `RunState.verifying`. */
+export type VerifyingLane = {
+  phase: number;
+  /** Which pass: the phase's verdict, its baseline at boarding, or a wrap-up's fast gate. */
+  purpose: 'verify' | 'baseline' | 'wip-gate';
+  /** The command running now, and where it sits in the pass. */
+  command: string;
+  index: number;
+  total: number;
+  /** When the PASS started, and when this command did. */
+  startedAt: string;
+  commandStartedAt: string;
+  /** The clean checkout it runs in, when it is not the working tree. */
+  exported?: boolean;
+  /** The console's own pid — the process whose children the commands are. */
+  pid: number;
+};
+
 export type ChildRef = {
   pid: number;
   phase: number;
@@ -1783,6 +2752,41 @@ export type RetryOverride = {
  */
 export type HaltKind = (typeof HALT_KINDS)[number];
 
+/**
+ * One person's note on a run (control-tower phase 96, #142).
+ *
+ * The watchdog that supervised four runs on 2026-09-25/26 kept about 400 lines
+ * a day of decisions and their reasons in a log of its own, because the
+ * console had nowhere to put them. A note is that line, on the run it is
+ * about: journalled as `run.note`, drawn on the timeline, and — when PINNED —
+ * shown on the run page and read into the boot prompt of every phase it
+ * applies to, until somebody unpins it.
+ */
+export type RunNote = {
+  /** Twelve hex characters — what an unpin names. */
+  id: string;
+  at: string;
+  by: string;
+  text: string;
+  /** A standing decision rather than a remark: it stays in front of every reader until unpinned. */
+  pinned: boolean;
+  /** The phase it is about; absent means the whole run. */
+  phase?: number;
+};
+
+/** The longest note a run keeps — a paragraph, not a file. */
+export const RUN_NOTE_MAX = 2000;
+
+/** How many UNPINNED notes a run record keeps; a pinned one is never dropped. The journal keeps them all. */
+export const RUN_NOTES_KEPT = 200;
+
+/** A run's notes after one more: every pinned note, and the newest `RUN_NOTES_KEPT` of the rest. */
+export function keepNotes(notes: readonly RunNote[]): RunNote[] {
+  const loose = notes.filter((note) => !note.pinned);
+  const drop = new Set(loose.slice(0, Math.max(0, loose.length - RUN_NOTES_KEPT)));
+  return notes.filter((note) => !drop.has(note));
+}
+
 export type RunState = {
   id: string;
   slug: string;
@@ -1818,6 +2822,13 @@ export type RunState = {
    */
   qaMaxRounds?: number;
   /**
+   * Minutes an approval card waits for a person before it times out
+   * (control-tower phase 97, #140). Absent: the hook call's own hour, less
+   * the broker's margin — which is also the ceiling: past it the call fails
+   * open, so a longer wait is an Extend and a card that stands, never this.
+   */
+  approvalTimeoutMinutes?: number;
+  /**
    * QA RECOVERY's two: how a fix session is boarded, and what ONE ROUND of the
    * loop may spend. `shared/run-settings.js` owns both vocabularies and the
    * strategy's default; absent means `resume` and no per-round stop.
@@ -1830,11 +2841,32 @@ export type RunState = {
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
   /**
+   * This run's own ladder rung caps (control-tower phase 5, #14) — how many
+   * counted rungs the run may climb across its OPEN phases, and one phase
+   * may climb. Absent = the console's `ladderPerRunRungs` /
+   * `ladderPerPhaseRungs` preference speaks (`runLadderCaps`); a value here
+   * beats it. Set at the launch door and by a settings patch (the verb
+   * phase 14's raise announces); `null` on a patch clears it.
+   */
+  ladderPerRunRungs?: number;
+  ladderPerPhaseRungs?: number;
+  /**
    * The account's usage window as the CLI last reported it mid-session. Not a
    * decision the runner makes — a fact worth showing before someone starts a
    * twelve-phase run against a window that is nearly spent.
    */
-  limits?: { status: string; window?: string; utilization?: number; utilizationPct?: number; resetsAt?: number; at: string };
+  limits?: {
+    status: string; window?: string; utilization?: number; utilizationPct?: number; resetsAt?: number; at: string;
+    /** The session is running on credit past the window (control-tower phase 93, #146), and the CLI's overage words. */
+    usingOverage?: boolean; overageStatus?: string; overageDisabledReason?: string;
+  };
+  /**
+   * What this run's sessions spent ON CREDIT, past their plan windows
+   * (control-tower phase 93, #146) — booked with `spentUsd` by `bookSpend`,
+   * from the turns after a session's first `isUsingOverage`. Part of
+   * `spentUsd`, never beside it. Absent: nothing ran on credit.
+   */
+  creditUsd?: number;
   /**
    * The Claude account this run's sessions spawn as, from the instance's
    * registry. Written as an omission when it is the machine login — a run file
@@ -1843,6 +2875,34 @@ export type RunState = {
    */
   accountId?: string;
   /**
+   * The last account switch a PERSON made on this run (control-tower phase 78,
+   * #106) — what they moved it to, from what, when and who. The ladder reads it:
+   * a switch that moves the run back onto `from` reverses that person, and is
+   * journalled `run.account-switch-reverted` and announced. Written by the
+   * operator's verb (live or stored), never by an automatic mover; replaced by
+   * the next person's switch.
+   */
+  accountChoice?: AccountChoice;
+  /**
+   * Where an automatic switch moved the run FROM (control-tower phase 92,
+   * #100): the next boarding after that account's reset moves the run back —
+   * past the horizon rule, which would weigh a just-reset window against the
+   * new account's days-off wall — and a wall wait on the new account wakes at
+   * that reset. Cleared by the move back and by a person's switch.
+   */
+  switchedFrom?: SwitchedFrom;
+  /**
+   * The identity this run is bound to (control-tower phase 91, #131) — who its
+   * account answered when the run started, or when a person last chose (a
+   * switch, "continue on the new login"). `default` is a SLOT that follows the
+   * machine login: a re-login as somebody else must never move the run onto
+   * their quota unseen, so every boarding compares the account's identity NOW
+   * with this, and a difference parks the run with an errand
+   * (`run.identity-changed`, halt kind `identity-changed`). Absent on a run an
+   * older console started, or one no registry could name — nothing is compared.
+   */
+  identity?: BoundIdentity;
+  /**
    * What to do when a session hits the SHARED usage window (session/weekly —
    * model-specific limits keep their own model-switch path). Absent means
    * `wait`, which is the pre-accounts behavior: sleep to the reset. `switch`
@@ -1850,6 +2910,21 @@ export type RunState = {
    * `pause` checkpoints and stops for a person.
    */
   onLimit?: OnLimitPolicy;
+  /**
+   * What the run may do to a phase's model (control-tower phase 54, #91) —
+   * `pinned` keeps it: no `--fallback-model`, no step down on a wall, no step
+   * up on a rung. Absent = `ladder`, the behaviour before the word existed. A
+   * plan's `**Model policy:**` outranks it (`modelPolicyFor`).
+   */
+  modelPolicy?: ModelPolicy;
+  /**
+   * What each model this run ASKED for resolved to, the first time and the
+   * latest (control-tower phase 54, #91) — keyed by the request (`opus[1m]`,
+   * `claude-opus-5-5[1m]`). `run.model-resolved` is journalled when an entry is
+   * born and when its `resolved` moves, so an alias moving under a live run
+   * says so once, and the run view shows it.
+   */
+  resolvedModels?: Record<string, { resolved: string; at: string; from?: string }>;
   /**
    * The run's answers to the decision manifest (phase 11, ZTD-2/ZTD-8): the
    * four the launch form requires, and the manifest as it resolved at the
@@ -1884,11 +2959,82 @@ export type RunState = {
    * set aside. See `RunVerifyApprovals`. Absent on runs started before it.
    */
   verifyApprovals?: RunVerifyApprovals;
+  /**
+   * The plan git lines this run runs over, answered `override` at launch — by
+   * a person, or `automatic` from a door no person pressed (control-tower
+   * phase 11, #18). The boot prompt turns each into a concrete instruction
+   * instead of asking the session to record a discrepancy.
+   */
+  gitStrategyOverride?: { lines: { kind: string; plan: string; run: string; phases?: number[] }[]; ack: 'override' | 'automatic'; by?: string; at?: string };
   phaseBudgetUsd: number | null;
   runBudgetUsd: number | null;
   spentUsd: number;
+  /**
+   * The WALL-CLOCK time this run had at least one phase waiting in the
+   * admission queue, by the class of what held it (control-tower phase 60,
+   * #64; `queue-episodes.ts` `foldRunBlocked`). Each instant is charged once,
+   * to the first class in `BLOCKED_BY_ORDER` heading any phase then queued, so
+   * three siblings behind one stranger for an hour are one blocked hour — the
+   * phases' own `queuedMs` would say three. Closed stretches only; the one
+   * open now is `blockedOpen`. `phase_console_run_blocked_seconds_total`.
+   */
+  blockedMs?: Partial<Record<HolderClass, number>>;
+  /** The stretch of `blockedMs` open now: the class it is charged to, and since when. */
+  blockedOpen?: { class: HolderClass; since: string };
+  /**
+   * The cost model `spentUsd` and every `PhaseRecord.costUsd` were booked under
+   * (`COST_MODEL`, control-tower phase 46, #62): absent is `1`, every spawn's
+   * reported total added whole; `2` is each spawn's rise over its session's mark.
+   * A new run is born `2`; a stored run is re-priced to `2` once, at boot.
+   */
+  costModel?: number;
+  /**
+   * The clock model every `PhaseRecord.attemptWindows` was kept under
+   * (`CLOCK_MODEL`, control-tower phase 58, #66): absent is `1`, where only a
+   * phase's own attempts opened a window; `2` is every session that worked the
+   * phase. A new run is born `2`; a stored run is re-measured from its journal's
+   * `phase.session` lines once, at boot (`remeasureFromLedger`).
+   */
+  clockModel?: number;
   maxConsecutiveFailures: number;
+  /**
+   * The failure streak's SIZE — `failureStreak.length` whenever this build
+   * wrote it, and kept on the wire under its old name because every surface
+   * (the tiles, the ways-forward card, the relaunch refusal) reads a number.
+   * Raised only by `chargeFailure`; zeroed only by `resetStreak`.
+   */
   consecutiveFailures: number;
+  /**
+   * The failure streak itself (control-tower phase 45, #45, #59): the ordered
+   * set of DISTINCT phases whose ending was a merit failure
+   * (`MERIT_FAILURE_CAUSES`) since the last phase that settled done. A second
+   * ending of a phase already here charges nothing, and a phase the board
+   * closes leaves it (`reconcileRecordsAgainstBoard`). Read it through
+   * `streakPhases`, which answers `[]` for a zero count whatever is stored.
+   * Absent on a run written before the set existed, whose count names no phase.
+   */
+  failureStreak?: number[];
+  /**
+   * The run-wide budgets already warned at `BUDGET_WARN_PCT` (control-tower
+   * phase 14, #40): budget → the key it was claimed under (`claimBudgetWarning`),
+   * so the run budget is announced once per limit, across restarts.
+   */
+  budgetWarned?: Record<string, string>;
+  /**
+   * A budget past its warning line and not yet raised (control-tower phase 25,
+   * #40): budget → the fact as `noteBudgetApproaching` measured it, so the run
+   * page draws the approach with its raise before the park. A raise removes it.
+   */
+  budgetApproaching?: Record<string, BudgetFact>;
+  /**
+   * What each counted phase was charged ON, where the charge named a root cause
+   * (control-tower phase 87, #122): the blamed commit, else the refs a block
+   * watched (`failureRootOf`). A second charge on a key already here is held —
+   * one sibling's red WIP stopping four phases is one failure, not four — and
+   * the streak's halt names each cause. Entries leave with their phases
+   * (`pruneStreak`, `resetStreak`); a charge that named nothing has none.
+   */
+  failureRoots?: { phase: number; key: string; label: string }[];
   createdAt: string;
   updatedAt: string;
   activePhase: number | null;
@@ -1915,6 +3061,17 @@ export type RunState = {
    * one recorded the new way must reconcile identically.
    */
   children?: Record<string, ChildRef>;
+  /**
+   * The console's OWN lanes, keyed by phase (control-tower phase 89, #68's
+   * 2026-09-25 05:44Z comment): a §Verification, a baseline or a wrap-up's
+   * fast gate the runner is running right now, under the phase's grant, with
+   * no session behind it. `children` holds only sessions, so a run mid-
+   * verification read `running` with nothing in it and the Runs page showed
+   * nothing working. Written as each command starts, removed when the pass
+   * ends; a console that dies mid-pass leaves one whose `pid` is gone, which
+   * readers treat as over.
+   */
+  verifying?: Record<string, VerifyingLane>;
   waitUntil: string | null;
   /** Which wait `waitUntil` is — see `WAIT_REASONS`. Absent on older runs. */
   waitReason?: WaitReason | null;
@@ -1945,7 +3102,23 @@ export type RunState = {
    * a sentence; absent on records written before kinds existed, which is why
    * every reader keeps a fallback on the words.
    */
-  halt: { at: string; reason: string; phase?: number; kind?: HaltKind } | null;
+  halt: {
+    at: string; reason: string; phase?: number; kind?: HaltKind;
+    /** The accounts fact a credential-class halt carries (`ACCOUNT_HALT_KINDS`, phase 3). */
+    accounts?: { unusable: number; total: number };
+    /** A drive-loop park with nothing ready: one row per phase holding it (`haltHolders`, phase 5). */
+    holders?: HaltHolder[];
+    /**
+     * The budget a `budget` or `failure-streak` halt spent (control-tower phase
+     * 14, #40): its arithmetic and what spent it, for the card and its raise.
+     */
+    budget?: BudgetFact;
+    /**
+     * The approval card whose timeout raised this park (control-tower phase 97,
+     * #140) — what lets the park LIFT when the phase it was about completes.
+     */
+    approvalId?: string;
+  } | null;
   /**
    * A pause that has been asked for but not yet reached.
    *
@@ -2004,6 +3177,13 @@ export type RunState = {
    * its server is a versioned statement about the work.
    */
   mcpPolicy?: McpPolicy;
+  /**
+   * The run's DEFAULT permission mode (control-tower phase 11, #34) — what a
+   * phase's session starts in when neither the attempt, the run's per-phase
+   * choice nor the plan's bullet or line says (`resolvePermissionMode`).
+   * Absent means `acceptEdits`, so every run written before it reads the same.
+   */
+  permissionMode?: PermissionMode;
   /**
    * How many phases of THIS run may be in flight at once.
    *
@@ -2114,6 +3294,15 @@ export type RunState = {
    */
   mountedRepos?: string[];
   /**
+   * Mounts whose `pe/<slug>` this run DELETED before a final phase's
+   * §Verification, because it held nothing (`settleIdleMirrorBranches`,
+   * control-tower phase 62, #47): each is detached at the commit it stood on.
+   * While this stands, the next session spawned into the mirror first puts
+   * each branch back (`restoreSettledMirror`), so no session ever commits to a
+   * settled mount's detached HEAD; a red final verdict puts them back at once.
+   */
+  mirrorSettled?: { phase: number; at: string; mounts: string[] };
+  /**
    * Which impossibility this run hit, when `checkout` is `refused`.
    *
    * One of `worktree.ts` §`REFUSAL_REASON`'s keys — the reason is looked up
@@ -2121,6 +3310,35 @@ export type RunState = {
    * fall out of step with the code that explains it.
    */
   isolationRefusal?: WorktreeRefusal;
+  /**
+   * The refusal's own words — git's message, or the occupied mounts and their
+   * state (control-tower phase 90) — which the park's halt and the inbox
+   * errand quote. A fact about THIS refusal, not the category's sentence
+   * (that stays `REFUSAL_REASON`'s), and cleared with `isolationRefusal`.
+   */
+  isolationRefusalDetail?: string;
+  /**
+   * A person pressed Repair checkout (control-tower phase 90, #139): the next
+   * checkout decision may move DIRTY or UNPUSHED foreign content at a mount to
+   * `stale-mounts/` (clean content moves without it). One-shot — spent by the
+   * decision it was pressed for, because the word covered what the person was
+   * shown, not whatever a session puts there next.
+   */
+  repairCheckout?: { at: string; by: string };
+  /**
+   * The operator asked to switch this shared-checkout run to its OWN checkout
+   * at its next boundary (control-tower phase 90, #150): applied by the first
+   * fill with no lane of the run live, and cleared either way — a switch the
+   * checkout then refuses leaves the run shared and says why.
+   */
+  isolateAtBoundary?: { at: string; by: string };
+  /**
+   * Phases of a SHARED-checkout run the operator gave their own worktree
+   * (`isolate-phase`, control-tower phase 90, #150): each boards in a lane
+   * worktree on `pe/<slug>-p<N>` and merges back, the `phase-lane.sh` shape,
+   * and no run-long branch hold reaches it.
+   */
+  isolatePhases?: number[];
   /**
    * The commit this run's checkout is DETACHED at, when it owns no branch.
    *
@@ -2146,6 +3364,21 @@ export type RunState = {
    * P8 concurrency suite caught the moment it was written.
    */
   settledAt?: string;
+  /**
+   * The branch each SHARED repository stood on when this run first boarded
+   * into it (physical path → branch, or `detached@<sha12>`), so the run's
+   * settle can return a tree it checked out to where it found it
+   * (control-tower phase 40, #41). Never written for a run whose trees are
+   * its own (a mirror, a lane, an isolated run).
+   */
+  treesFound?: Record<string, string>;
+  /**
+   * The shared repositories this run holds on its branch until it SETTLES —
+   * one per repository, written at `run.tree-hold` beside its record under
+   * `<state>/trees/`, dropped at `run.tree-released`. A lock is per phase;
+   * this is per run.
+   */
+  treeHolds?: { repo: string; dir: string; branch: string; foundOn?: string; at: string }[];
   /**
    * Which class this run's admissions are scanned in.
    *
@@ -2312,6 +3545,13 @@ export type RunState = {
    */
   reopenedAt?: string | null;
   /**
+   * What people decided about this run, and why, in their own words
+   * (control-tower phase 96, #142) — oldest first. The journal has every note
+   * as `run.note`; this is the copy the run page and the next boarding read,
+   * so it keeps every PINNED note and the latest `RUN_NOTES_KEPT` others.
+   */
+  notes?: RunNote[];
+  /**
    * Who last stopped this run — the operator (Stop, Pause, a freeze that
    * escalated into a checkpoint) or the system (a halt or park the loop
    * wrote, a usage-window sleep, a console shutdown, a crash reconciled at
@@ -2368,6 +3608,15 @@ export type RunState = {
     rungs?: RungRecord[];
     /** The one open ask for a person, when the ladder is exhausted; cleared when the phase moves. */
     errand?: Errand;
+    /**
+     * This phase's declared external wall was FOLDED into another phase's
+     * errand (control-tower phase 6, #19 ask 2): the same scope, the same
+     * `--needs external`, the same reason fingerprint. It has no errand of its
+     * own and is announced by nobody; that phase's errand names it in
+     * `alsoPhases`. A fold whose target errand no longer stands is void, and
+     * the phase is given an errand of its own again.
+     */
+    foldedInto?: number;
     /**
      * The ask the policy table answered instead of a person (phase 11,
      * ZTD-10): which manifest row, which word, from which source. The
@@ -2461,6 +3710,11 @@ export function isOnLimitPolicy(value: unknown): value is OnLimitPolicy {
   return typeof value === 'string' && (ON_LIMIT_POLICIES as readonly string[]).includes(value);
 }
 
+/** A model policy a door may name (control-tower phase 54); anything else is refused. */
+export function isModelPolicy(value: unknown): value is ModelPolicy {
+  return typeof value === 'string' && (MODEL_POLICIES as readonly string[]).includes(value);
+}
+
 /**
  * Why a run is sleeping on `waitUntil`. ONE owner — `shared/status-vocab.js`,
  * which the client reads through `lib/status-vocab.ts` — so the server's fallback
@@ -2479,11 +3733,22 @@ export type NewRunOptions = {
   qaModel?: string;
   qaEffort?: string;
   qaMaxRounds?: number;
+  /** An approval card's timeout, in minutes — see `RunState`. */
+  approvalTimeoutMinutes?: number;
   /** QA recovery's fix strategy and per-round stop — see `RunState`. */
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
+  ladderPerRunRungs?: number | null;
+  ladderPerPhaseRungs?: number | null;
   accountId?: string;
   onLimit?: OnLimitPolicy;
+  /**
+   * What the run may do to a phase's model (control-tower phase 54, #91) —
+   * `pinned` keeps it: no `--fallback-model`, no step down on a wall, no step
+   * up on a rung. Absent = `ladder`, the behaviour before the word existed. A
+   * plan's `**Model policy:**` outranks it (`modelPolicyFor`).
+   */
+  modelPolicy?: ModelPolicy;
   autonomy?: Autonomy;
   phaseBudgetUsd?: number | null;
   runBudgetUsd?: number | null;
@@ -2494,6 +3759,7 @@ export type NewRunOptions = {
   mcpServers?: string[];
   mcpPolicy?: McpPolicy;
   permissionProfile?: PermissionProfile;
+  permissionMode?: PermissionMode;
   maxParallel?: number;
   gitMode?: GitMode;
   openPr?: boolean;
@@ -2522,6 +3788,7 @@ export type NewRunOptions = {
   acknowledgedWaivers?: string[];
   manifest?: ResolvedManifest;
   verifyApprovals?: RunVerifyApprovals;
+  gitStrategyOverride?: { lines: { kind: string; plan: string; run: string; phases?: number[] }[]; ack: 'override' | 'automatic'; by?: string; at?: string };
 };
 
 /**
@@ -2541,7 +3808,7 @@ function settleFor(opts: Pick<NewRunOptions, 'settle' | 'openPr'>): SettleStrate
 
 export function newRun(opts: NewRunOptions): RunState {
   const now = new Date().toISOString();
-  return {
+  const state: RunState = {
     // TWELVE hex digits, not eight (S9-b). A run id is not merely a filename:
     // `autopilot/<runId>` is what a lane writes into a lock's `owner=`, so it
     // is the name two consoles use to decide whose lock a lock is — and two
@@ -2585,14 +3852,21 @@ export function newRun(opts: NewRunOptions): RunState {
     ...(opts.qaModel ? { qaModel: opts.qaModel } : {}),
     ...(opts.qaEffort ? { qaEffort: opts.qaEffort } : {}),
     ...(typeof opts.qaMaxRounds === 'number' ? { qaMaxRounds: opts.qaMaxRounds } : {}),
+    ...(typeof opts.approvalTimeoutMinutes === 'number' ? { approvalTimeoutMinutes: opts.approvalTimeoutMinutes } : {}),
     // QA recovery's two, conditional for the same reason: an absent strategy
     // means `resume` resolved at the point of use, and an absent round budget
     // means no per-round stop — neither is a number worth freezing into a file.
     ...(opts.qaFixStrategy ? { qaFixStrategy: opts.qaFixStrategy } : {}),
     ...(opts.qaRoundBudgetUsd === undefined ? {} : { qaRoundBudgetUsd: opts.qaRoundBudgetUsd }),
+    ...(typeof opts.ladderPerRunRungs === 'number' ? { ladderPerRunRungs: opts.ladderPerRunRungs } : {}),
+    ...(typeof opts.ladderPerPhaseRungs === 'number' ? { ladderPerPhaseRungs: opts.ladderPerPhaseRungs } : {}),
     phaseBudgetUsd: opts.phaseBudgetUsd ?? null,
     runBudgetUsd: opts.runBudgetUsd ?? null,
     spentUsd: 0,
+    // Booked as deltas from its first spawn, so the boot re-price never touches it.
+    costModel: COST_MODEL,
+    // Every session's window from its first spawn, so the boot re-measure never touches it.
+    clockModel: CLOCK_MODEL,
     maxConsecutiveFailures: opts.maxConsecutiveFailures ?? 2,
     consecutiveFailures: 0,
     createdAt: now,
@@ -2608,6 +3882,7 @@ export function newRun(opts: NewRunOptions): RunState {
     // readers agree without a migration.
     ...(opts.accountId && opts.accountId !== 'default' ? { accountId: opts.accountId } : {}),
     ...(opts.onLimit && opts.onLimit !== 'wait' ? { onLimit: opts.onLimit } : {}),
+    ...(opts.modelPolicy && opts.modelPolicy !== DEFAULT_MODEL_POLICY ? { modelPolicy: opts.modelPolicy } : {}),
     // The manifest answers are written whenever the door answered them — a
     // `false` resume-on-restart is a decision, not an omission, and the
     // difference between "answered hold" and "never asked" is exactly what
@@ -2619,6 +3894,9 @@ export function newRun(opts: NewRunOptions): RunState {
     ...(opts.accounts?.length ? { accounts: opts.accounts.map((a) => ({ ...a })) } : {}),
     ...(opts.acknowledgedWaivers?.length ? { acknowledgedWaivers: [...opts.acknowledgedWaivers] } : {}),
     ...(opts.manifest ? { manifest: opts.manifest } : {}),
+    ...(opts.gitStrategyOverride?.lines.length
+      ? { gitStrategyOverride: { ...opts.gitStrategyOverride, lines: opts.gitStrategyOverride.lines.map((line) => ({ ...line })) } }
+      : {}),
     ...(opts.verifyApprovals && (opts.verifyApprovals.approve.length || opts.verifyApprovals.waive.length)
       ? {
         verifyApprovals: {
@@ -2636,6 +3914,7 @@ export function newRun(opts: NewRunOptions): RunState {
     // `continue` is the absent state, so a run file written before the policy
     // existed reads as the shipped default rather than as the old park.
     ...(opts.mcpPolicy && opts.mcpPolicy !== 'continue' ? { mcpPolicy: opts.mcpPolicy } : {}),
+    ...(opts.permissionMode ? { permissionMode: opts.permissionMode } : {}),
     ...(opts.maxParallel && opts.maxParallel > 0 ? { maxParallel: opts.maxParallel } : {}),
     // **Absent still means `guarded` when reading**, and that does not change:
     // a run file written before profiles existed must not become trusted because
@@ -2716,6 +3995,11 @@ export function newRun(opts: NewRunOptions): RunState {
     ...(opts.autoRecover ? { autoRecover: {} } : {}),
     phases: {},
   };
+  // The account it starts on is one of its listed accounts (control-tower
+  // phase 78, #100) — observability-plane ran on `account` with a pool of three
+  // others, so failover could never come back to the account it began on.
+  keepAccountInPool(state);
+  return state;
 }
 
 export function phaseRecord(state: RunState, phase: number): PhaseRecord {
@@ -2842,7 +4126,7 @@ export type DeclarationSink = (event: string, data: Record<string, unknown>, pha
 export function journalOf(state: RunState): DeclarationSink {
   let journal: Journal | null = null;
   return (event, data, phase) => {
-    journal ??= new Journal(state.root, state.slug, state.id);
+    journal ??= Journal.for(state.root, state.slug, state.id);
     journal.append(event, data, phase);
   };
 }
@@ -2885,6 +4169,8 @@ export function clearWatchBookkeeping(record: PhaseRecord): void {
   // wherever its subject is cleared — applied to the two fields it missed.
   delete record.watchResumes;
   delete record.watchLandedErrandFor;
+  // A landing retired `done` was retired for THIS declaration (#126).
+  delete record.watchLandedDone;
   // The healer's rejection count bounds THIS landing's deliveries; a new wait
   // is a new landing. `watchRetired` is deliberately NOT here — see the field.
   delete record.watchRejections;
@@ -2946,32 +4232,6 @@ export function consumeDeclaration(
   };
   journal?.(DECLARATION_CONSUMED_EVENT, { ...spend }, record.phase);
   return spend;
-}
-
-/**
- * A phase-level `waiting-external-timeout` written onto a STORED run — the
- * twin, for a park no runner holds, of what `Runner.settlePhase` writes when a
- * live runner refuses a wait. The service's overdue ruling is the caller: a
- * clock that went by while nothing ran is re-read at resume, and a park whose
- * parked time is past its budget halts here instead of boarding (WAI-4).
- *
- * Returns what the declaration was, so the caller journals
- * `phase.declaration-consumed` and `phase.halted` on the run's own journal.
- */
-export function settleStoredWaitTimeout(
-  state: RunState, phase: number, reason: string, at = new Date().toISOString(),
-): ReturnType<typeof consumeDeclaration> {
-  const record = phaseRecord(state, phase);
-  record.status = 'failed';
-  record.note = record.parkReason ?? reason;
-  record.parkedUntil = undefined;
-  record.halt = { at, reason, phase, kind: 'waiting-external-timeout' };
-  const spent = consumeDeclaration(record, 'new-outcome');
-  endLockWait(record);
-  // A new ending is a new fact: a resolution about an earlier stop must not
-  // dismiss this one's card (the rule `settlePhase` states).
-  state.resolved = null;
-  return spent;
 }
 
 /** The journal event written when a declaration is recorded as evidence and NOT acted on (WAI-8). */
@@ -3044,6 +4304,16 @@ export function chargeDeclaration(
  * is the bound on re-boards itself. Only an operator's Retry (`resetForRetry`
  * by `operator`) clears those.
  */
+/**
+ * Does the CONSOLE owe this phase a §Verification — one a shutdown, a stop or
+ * a crash cut (`reverify`, control-tower phase 48)? Not a checkpoint's killed
+ * job (control-tower phase 89): that debt is the next SESSION's, read by its
+ * brief, and must never send the phase into a session-less re-verification.
+ */
+export function owesVerification(record: Pick<PhaseRecord, 'reverify'>): boolean {
+  return Boolean(record.reverify) && record.reverify!.cause !== 'checkpoint';
+}
+
 export function prepareReboard(record: PhaseRecord): void {
   record.status = 'pending';
   record.note = undefined;
@@ -3053,6 +4323,12 @@ export function prepareReboard(record: PhaseRecord): void {
   delete record.mcpDegraded;
   delete record.mcpPark;
   delete record.boardingHint;
+  // A checkpoint's session goes with the attempt that left it (control-tower
+  // phase 86, #134): the boarding this record is prepared for resumes a
+  // session only when its HINT names one. Left here, a Retry boarding `fresh`
+  // found a usage wall's old checkpoint at its spawn, asked the resume gate a
+  // second time, and re-boarded — handing its lane to a sibling.
+  record.resumeSessionId = undefined;
   record.lockWaitSince = undefined;
   delete record.waitingOn;
   delete record.lockBackoffMs;
@@ -3062,11 +4338,24 @@ export function prepareReboard(record: PhaseRecord): void {
   delete record.stall;
   delete record.idleAttempts;
   delete record.verifyingSince;
+  // A fresh attempt verifies itself; an owed re-verification goes with the old
+  // one. A checkpoint's killed job is owed by the NEXT session and stays until
+  // its brief has named it (control-tower phase 89).
+  if (record.reverify?.cause !== 'checkpoint') delete record.reverify;
   // A new attempt at the work is a new task list. The file behind it is
   // deleted at the next spawn (`armTasksFile`); clearing the fold and its
   // offset together is what keeps the two from disagreeing.
   delete record.tasks;
   delete record.tasksAt;
+  delete record.progress;
+  // A usage wall ends with the park it bounded (control-tower phase 54, #78).
+  // Left on the record, the next park — a declared wait, a live-session hold —
+  // would read as the wall's, and a reading with headroom would lift it.
+  delete record.usageWall;
+  // A record being boarded is being driven, and one being boarded again was
+  // not closed by the board (control-tower phase 79).
+  delete record.undriven;
+  delete record.reconciled;
   // …and the phase's own ending. A new attempt makes the reason the LAST one
   // stopped history — left standing it would classify the reset record from a
   // halt that no longer describes anything (QA F1).
@@ -3095,6 +4384,11 @@ export function resetForRetry(
   { by, override, journal }: { by: ResetBy; override?: RetryOverride; journal: DeclarationSink },
 ): DeclarationSpend | null {
   prepareReboard(record);
+  // An operator's Retry of a phase parked on a declared wall takes the wall
+  // down as a FENCE too (control-tower phase 6, #19): its siblings read why.
+  const walled = by === 'operator'
+    && (record.declared?.status === 'needs-human' || record.declared?.status === 'blocked');
+  if (walled) record.fenceLifted = { why: 'retry', at: new Date().toISOString() };
   if (by === 'operator') {
     delete record.stallRemedy;
     delete record.declarations;
@@ -3104,6 +4398,12 @@ export function resetForRetry(
     // the top has, by pressing, claimed the world has changed (phase 9).
     delete record.cause;
     delete record.toolDenied;
+    // …and the count of declared waits opens again (control-tower phase 14,
+    // #40's 2026-09-28 thread): `WAIT_MAX_PER_PHASE` had no reset path, so a
+    // release phase whose four waits were four honest hops could never wait
+    // again. A person's Retry is the reset, as it replenishes the ladder; the
+    // parked MINUTES stay the phase's, raised by `raise-budget`.
+    delete record.waits;
   }
   const spent = consumeDeclaration(record, 'retry', (event, data, phase) => journal(event, { ...data, by }, phase));
   // `consumeDeclaration` clears the watch bookkeeping (and the record-level
@@ -3116,8 +4416,11 @@ export function resetForRetry(
   delete record.watch;
   // A plain Retry clears any override the previous one left unspent — pressing
   // the button with no edits means "again, as the plan says", and inheriting
-  // last week's addendum would be the opposite of that.
-  delete record.retryOverride;
+  // last week's addendum would be the opposite of that. Only a PERSON's Retry
+  // says so (control-tower phase 86, #134): the console's own re-board — the
+  // ladder, converge, a lock-cap re-arm — carries a person's override forward,
+  // because nobody asked it to drop the fix and the steps an operator wrote.
+  if (by === 'operator') delete record.retryOverride;
   if (!override) return spent;
   record.retryOverride = override;
   // `record.model` and `record.effort` are STICKY across attempts — boarding
@@ -3340,7 +4643,8 @@ export function pruneRuns(
  * with it instead of leaving five orphans nobody can name.
  *
  * Before 5.1.0 this was the record and the journal and nothing more: the
- * transcript (`.log.jsonl`, capped at 16 MB EACH), every phase's task ledger,
+ * replays (`.log.jsonl`, one per phase since control-tower phase 94, each capped
+ * at 16 MB, and any moved aside), every phase's task ledger,
  * every phase's declared outcome, the folded git trace and the run's raw
  * Trace2 directory all outlived the run by exactly forever. Nothing read them
  * — `loadRun` returns null for a record that is gone — so they were pure
@@ -3351,12 +4655,14 @@ export function pruneRuns(
  * whose transcript a prefix sweep would take while its record stayed.
  */
 function runSidecars(dir: string, id: string): string[] {
-  const exact = new RegExp(`^run-${id}(?:\\.log\\.jsonl|\\.git\\.ndjson|-p\\d+-(?:tasks\\.ndjson|outcome\\.json))$`);
   const out: string[] = [];
   let names: string[];
   try { names = readdirSync(dir); } catch { return out; }
+  // `isRunSidecar` is retention's pattern too, so a replay kept per phase or
+  // moved aside (`.old`, `.full-<stamp>`) goes with its run (control-tower
+  // phase 94, #133) instead of outliving it.
   for (const name of names) {
-    if (exact.test(name)) out.push(join(dir, name));
+    if (isRunSidecar(name, id)) out.push(join(dir, name));
   }
   // The raw Trace2 directory the drain folds from, `git-trace/<runId>/`.
   const raw = join(dir, 'git-trace', id);
@@ -3456,6 +4762,12 @@ export function settleInFlightRecords(
     record.status = 'interrupted';
     record.note ??= consoleStoppedNote(record.phase, was);
     record.endedAt ??= at;
+    // Died mid-verification: whatever the board reads, the proof is owed
+    // (control-tower phase 48, #69) — the next drive re-runs it.
+    if (was === 'verifying' || record.verifyingSince) {
+      record.reverify ??= { at, cause: 'crash' };
+      delete record.verifyingSince;
+    }
     // The session survives the console that was watching it. Keeping its id
     // here is what makes the difference between offering to CONTINUE this phase
     // and offering only to start it over: an interrupted phase may be twenty
@@ -3536,7 +4848,7 @@ export type WaitSettlement = {
 const TERMINAL_RUN: readonly RunStatus[] = ['finished'];
 
 /** Is the run over — nothing, not even an operator's press, will drive it again? */
-function runIsOver(state: RunState): boolean {
+export function runIsOver(state: RunState): boolean {
   return TERMINAL_RUN.includes(state.status) || Boolean(state.resolved);
 }
 
@@ -3565,6 +4877,52 @@ export function rearmWaitClock(state: RunState, now = Date.now()): WaitSettlemen
     phase, to: 'rearmed', why: 'clock-read-from-record', clock: soonest,
     lateByMs: Math.max(0, now - Date.parse(soonest)), runStatus: state.status,
   };
+}
+
+/**
+ * The stop a sibling phase ended on while the run waits on another phase's
+ * clock (#53) — what `run.waiting-external` carries as `beside`.
+ */
+export type WaitBeside = { phase: number; kind: string | null; reason: string };
+
+/**
+ * A park that must happen keeps the clock a sibling's `waiting` record holds
+ * (#53) — `rearmWaitClock`'s shape, written AT the park rather than read back
+ * after it. A run whose lane ended needs-human while another lane waited on a
+ * CD window used to be written `parked` with no `waitUntil`, so every reader
+ * that asks the run lost the clock the moment the park landed. Carried, not
+ * fired: nothing drives a parked run, and `settleWaitingRecords` still rules
+ * on the record once its clock has passed. Answers the clock it wrote, or null.
+ */
+export function carryWaitClock(state: RunState): string | null {
+  if (state.waitUntil) return null;
+  const soonest = soonestWaitingClock(state);
+  if (!soonest) return null;
+  state.waitUntil = soonest;
+  state.waitReason ??= 'external';
+  return soonest;
+}
+
+/**
+ * The clocks whose settlement this process has already journalled, keyed
+ * `<run>:<phase>:<clock>` (#53 — one settlement per clock). Observed: the same
+ * `phase.wait-settled` three times for one clock (10, 11 and 59 minutes past
+ * it), because the settled record kept coming back `waiting` — a copy written
+ * over the settle before it reached disk. The record is settled again each
+ * time (the write is idempotent, and the stale copy must not stand); the line
+ * is written once. Bounded, oldest first out.
+ */
+const SETTLED_CLOCKS = new Set<string>();
+const SETTLED_CLOCKS_MAX = 512;
+
+function firstSettlement(key: string): boolean {
+  if (SETTLED_CLOCKS.has(key)) return false;
+  SETTLED_CLOCKS.add(key);
+  if (SETTLED_CLOCKS.size > SETTLED_CLOCKS_MAX) {
+    const oldest = SETTLED_CLOCKS.values().next().value;
+    if (oldest !== undefined) SETTLED_CLOCKS.delete(oldest);
+  }
+  return true;
 }
 
 /**
@@ -3624,11 +4982,20 @@ export function settleWaitingRecords(
     // The declaration is NOT spent: it is the session's testimony about a wait
     // that never got its resume, and the next boarding reads it. The record's
     // clock goes, because it is what every surface painted as "waiting until".
+    // Its END is kept as the phase's age (control-tower phase 86, #132): that
+    // is when the phase rejoined the line, and the relaunch that boards it — the
+    // ladder's hint, a Retry — ranks it by that seniority (`seniorityOf`), not
+    // by the moment somebody noticed the clock had passed.
+    if (!over && !(Date.parse(record.queueSince ?? '') <= Date.parse(clock))) record.queueSince = clock;
     delete record.parkedUntil;
     record.resumeSessionId ??= record.sessionId;
-    sink(WAIT_SETTLED_EVENT, { ...settlement }, record.phase);
+    // Said once per clock (#53); settled — and so saved — every time.
+    if (firstSettlement(`${state.id}:${record.phase}:${clock}`)) sink(WAIT_SETTLED_EVENT, { ...settlement }, record.phase);
     settled.push(settlement);
   }
+  // A clock a park CARRIED (`carryWaitClock`) goes with the record it was
+  // carried for; one another waiting record still holds is kept.
+  if (settled.length) syncWaitClock(state);
   return settled;
 }
 
@@ -3742,8 +5109,19 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
     (child) => pidHoldsWork(child.pid, procIdentity(child)),
   );
   if (alive.length) {
+    // A boot hold reaches here too, and THIS is the act it exists to stop.
+    // `readoptQueued` and `convergeAutomatic()` were already gated; the park
+    // that actually happened was written here, on the run-file READ path, by a
+    // page view or the ten-second sweep — so a console in a crash loop parked
+    // two live autopilot runs it had never driven, once per boot, while their
+    // `claude` children carried on at PPID 1 unsupervised. Deferred rather than
+    // skipped: the run keeps its status untouched, and the release does this
+    // pass once.
+    // Said once by the latch's own setter rather than per read: this is the
+    // run-file read path, and a line here is a line per page view.
+    if (adoptionHeld()) return false;
     const advice = orphanAdvice(state, alive, 'continue this run');
-    state.status = 'parked';
+    setRunState(state, 'parked');
     // The same shape `Runner.adopt` writes for the same fact — ONE orphan
     // kind, so the recovery model and the situation classifier read the two
     // paths identically (the read-path one used to be kindless), and now ONE
@@ -3760,19 +5138,35 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
   // waiting for a person. It reconciles to `paused` with the clock intact;
   // whether anything re-arms the wait is the service's boot decision
   // (`readoptIdle`), not this function's — reconcile preserves facts.
+  //
+  // The word is `paused` because the resume machinery keys on it and a dead
+  // run left `waiting` would be in flight and re-reconciled on every read; the
+  // LIFECYCLE stays the wait it is (control-tower phase 88, #148) — its kind,
+  // its clock and what it is on — because nobody paused this run. So the stop
+  // is stamped the system's BEFORE the word lands: the fold reads it.
   if (state.status === 'waiting' && state.waitUntil) {
-    state.status = 'paused';
+    state.stoppedBy = 'system';
+    state.pause = null;
+    const kind = waitReasonOf(state);
+    const stated = state.lifecycle?.wait?.kind === kind ? state.lifecycle.wait.on : undefined;
+    setRunState(state, 'paused', { kind, until: state.waitUntil, ...(stated ? { on: stated } : {}) });
     state.child = null;
     delete state.children;
-    state.pause = null;
     state.freeze = null;
-    // Two kinds of run-level wait share the clock: the usage window, and a
-    // park on external work some phase declared. `waitReason` says which; the
-    // record scan behind it is only the answer for runs written before that
-    // field. The boot re-arm (`Service.readoptQueued`) makes the same read.
-    const parked = waitReasonOf(state) === 'external';
-    state.finishedReason ??= parked
-      ? `waiting on external work — this run meant to resume at ${state.waitUntil}. `
+    // Every run-level wait shares the clock — the usage window, a park on
+    // external work some phase declared, a person's card, the network, a busy
+    // engine. `waitReason` says which; the record scan behind it is only the
+    // answer for runs written before that field. The boot re-arm
+    // (`Service.readoptQueued`) makes the same read. Only the usage window
+    // offers another account: a card or a CD run is not an account's wall.
+    const waitWords: Partial<Record<WaitReason, string>> = {
+      external: 'waiting on external work',
+      person: 'waiting for a person to answer a card',
+      connectivity: 'waiting for the network',
+      'engine-busy': 'waiting for the machine to read the plan',
+    };
+    state.finishedReason ??= waitWords[kind]
+      ? `${waitWords[kind]} — this run meant to resume at ${state.waitUntil}. `
         + 'Continue now, or leave it to re-arm.'
       : `usage limit — this run meant to resume at ${state.waitUntil}. `
         + 'Continue now under another account, or leave it to re-arm.';
@@ -3781,7 +5175,6 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
       record.status = 'pending';
       record.resumeSessionId ??= record.sessionId;
     }
-    state.stoppedBy = 'system';
     return true;
   }
 
@@ -3804,7 +5197,7 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
   // A dead `halting` run DID record why it stopped — its halt is the reason —
   // so it finalizes to the `halted` its drive loop never got to write.
   // `interrupted` remains the word for "nothing recorded why".
-  state.status = state.status === 'halting' ? 'halted' : 'interrupted';
+  const settled: RunStatus = state.status === 'halting' ? 'halted' : 'interrupted';
   // A stop the operator had asked for stays theirs; everything else — a
   // crash, a kill, a console that went away — is the system's to pick up.
   state.stoppedBy = askedToStop ? 'operator' : 'system';
@@ -3817,6 +5210,10 @@ export function reconcileRun(state: RunState, liveRunId?: LiveRuns): boolean {
   // Same for a freeze whose child is already gone: the block would otherwise
   // make a dead run look held, and offer a Continue that resumes nothing.
   state.freeze = null;
+  // The word lands LAST, through the one writer (#50): a run that died queued
+  // on scope drops the queue's reason with it, and the lifecycle is derived
+  // with the freeze above already gone rather than from the run as it died.
+  setRunState(state, settled);
 
   // The records, on the same evidence. Reached only with `alive` empty, so
   // every per-phase probe below answers `gone` too and this settles the same
@@ -3867,6 +5264,163 @@ export function latestEnding(records: readonly PhaseRecord[]): PhaseRecord | nul
 }
 
 /**
+ * A park on a SPENT wait budget has ended — its ref landed, or a person gave it
+ * a session again (control-tower phase 45). The `budgets` errand that asked
+ * for more budget is answered, and the stamp that kept its `cmd:` refs running
+ * past the budget's end goes with it. Answers whether there was one.
+ */
+export function retireSpentBudget(state: RunState, phase: number): boolean {
+  const record = state.phases[String(phase)];
+  if (!record?.declared?.budgetSpent) return false;
+  delete record.declared.budgetSpent;
+  const slot = state.recoveries?.[String(phase)];
+  if (slot?.errand?.decisionKey === 'budgets') delete slot.errand;
+  return true;
+}
+
+/**
+ * A person raised the budget that held this work (control-tower phase 14,
+ * #40): answer the hold it left — a spent wait's stamp (which re-arms the
+ * watch: its `cmd:` refs are bounded by the budget again), the errand that
+ * asked for more, and a run halted on its dollars. Never anything a raise did
+ * not answer: another budget's errand, a streak, a failure. Answers what it
+ * cleared, for the journal.
+ */
+export function clearBudgetHold(state: RunState, budget: BudgetKind, phase: number | null): string[] {
+  const cleared: string[] = [];
+  if (budget === 'wait' && phase != null && retireSpentBudget(state, phase)) cleared.push('spent-wait');
+  const slot = phase != null ? state.recoveries?.[String(phase)] : undefined;
+  const errand = slot?.errand;
+  if (slot && errand && (errand.budget?.budget === budget || (budget === 'ladder' && errand.cap)
+    || (budget === 'wait' && errand.decisionKey === 'budgets'))) {
+    delete slot.errand;
+    cleared.push('errand');
+  }
+  if (budget === 'run-usd') {
+    if (state.halt?.kind === 'budget') { state.halt = null; cleared.push('halt'); }
+    if (state.errand && (state.errand.budget?.budget === 'run-usd' || state.errand.situation === 'resource-wall:budget')) {
+      state.errand = null;
+      cleared.push('run-errand');
+    }
+  }
+  return cleared;
+}
+
+/* ------------------------------------------------------------------ *
+ * The failure streak — the ordered set (control-tower phase 45)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The phases the failure streak counts, oldest first. `[]` whenever the count
+ * reads zero — a writer that zeroed the number zeroed the streak, whatever an
+ * older set still says. A run written before the set existed carries a count
+ * with no phases; it reads `[]` here, and `chargeFailure` carries that count
+ * ahead of the set it starts rather than dropping a failure it cannot name.
+ */
+export function streakPhases(state: Pick<RunState, 'consecutiveFailures' | 'failureStreak'>): number[] {
+  if (!(state.consecutiveFailures > 0)) return [];
+  return (state.failureStreak ?? []).filter((phase) => Number.isInteger(phase));
+}
+
+/**
+ * Zero the streak — the count and the set together, and the only writer of
+ * either besides `chargeFailure`. Answers what the count was.
+ */
+export function resetStreak(state: Pick<RunState, 'consecutiveFailures' | 'failureStreak' | 'failureRoots'>): number {
+  const was = state.consecutiveFailures;
+  state.consecutiveFailures = 0;
+  delete state.failureStreak;
+  delete state.failureRoots;
+  return was;
+}
+
+/** What one charge of the failure streak is blamed on — see `failureRootOf`. */
+export type FailureRoot = { key: string; label: string };
+
+/** A ref naming a phase of a plan: `phase:<slug>/<N>` (phase 88's scheme) or `lock:<slug>/<N>`. */
+const PHASE_REF_RE = /^(?:phase|lock):([^/\s]+)\/(\d+)$/;
+
+/**
+ * The ROOT CAUSE a failure is charged on (control-tower phase 87, #122) — the
+ * key the streak counts once, whichever phase meets it.
+ *
+ * #122's third comment: P50 (1 of 4) and P41 (2 of 4) were ONE cause, P43's red
+ * WIP commit, and the streak counted each honest sibling. The key, in order:
+ *
+ *  1. the BLAMED COMMIT — named outright, or read from a phase of THIS run a ref
+ *     points at (`phase:<slug>/<N>`, `lock:<slug>/<N>`) whose committed WIP is
+ *     red (`wipRed`, control-tower phase 89);
+ *  2. else the refs the block watched, deduped and sorted, so one wait declared
+ *     in two orders is one cause.
+ *
+ * Null when neither names anything: the charge is the phase's own, exactly as
+ * before. Phase 83's attribution needs no key — a red it names another phase
+ * for is `inherited` and never reaches the charge at all.
+ */
+export function failureRootOf(opts: {
+  commit?: string | null;
+  refs?: readonly string[] | null;
+  state?: Pick<RunState, 'slug' | 'phases'> | null;
+}): FailureRoot | null {
+  const blamed = opts.commit ?? blamedCommitOf(opts.refs ?? [], opts.state ?? null);
+  if (blamed) return { key: `commit:${blamed}`, label: `commit ${blamed.slice(0, 8)}` };
+  const refs = [...new Set((opts.refs ?? []).map((ref) => ref.trim()).filter(Boolean))].sort();
+  return refs.length ? { key: `ref:${refs.join(' ')}`, label: refs.join(', ') } : null;
+}
+
+/** The red WIP commit of the first phase of this run a ref names, if it has one. */
+function blamedCommitOf(refs: readonly string[], state: Pick<RunState, 'slug' | 'phases'> | null): string | null {
+  if (!state) return null;
+  for (const ref of refs) {
+    const m = PHASE_REF_RE.exec(ref.trim());
+    if (!m || m[1] !== state.slug) continue;
+    const sha = state.phases[String(Number(m[2]))]?.wipRed?.sha;
+    if (sha) return sha;
+  }
+  return null;
+}
+
+/**
+ * Take phases OUT of the streak — the board has closed them, so the ending
+ * that put each one there is contradicted, and "an ending the board
+ * contradicts charges nothing" holds after the fact too. Only ever lowers the
+ * count. Answers the phases it removed.
+ */
+export function pruneStreak(
+  state: Pick<RunState, 'consecutiveFailures' | 'failureStreak' | 'failureRoots'>, phases: readonly number[],
+): number[] {
+  const counted = streakPhases(state);
+  const removed = counted.filter((phase) => phases.includes(phase));
+  if (!removed.length) return [];
+  state.consecutiveFailures -= Math.min(state.consecutiveFailures, removed.length);
+  if (state.consecutiveFailures > 0) {
+    state.failureStreak = counted.filter((phase) => !phases.includes(phase));
+    // A pruned phase's cause leaves with it: a new block on it is a new failure.
+    const roots = (state.failureRoots ?? []).filter((root) => !phases.includes(root.phase));
+    if (roots.length) state.failureRoots = roots; else delete state.failureRoots;
+  } else resetStreak(state);
+  return removed;
+}
+
+/**
+ * The failure-streak halt's sentence, naming what it counts: "2 phases failed
+ * in a row: phase 3, then phase 5". A count the set cannot name (a run from
+ * before the set) says the number alone rather than inventing phases. A phase
+ * charged on a root cause says it (control-tower phase 87, #122): "phase 5 (on
+ * commit 1c8164e9)".
+ */
+export function streakSentence(state: Pick<RunState, 'consecutiveFailures' | 'failureStreak' | 'failureRoots'>): string {
+  const phases = streakPhases(state);
+  const count = state.consecutiveFailures;
+  const head = `${count} ${count === 1 ? 'phase' : 'phases'} failed in a row`;
+  if (!phases.length) return head;
+  const causeOf = (phase: number) => state.failureRoots?.find((root) => root.phase === phase)?.label;
+  const named = phases.map((phase) => `phase ${phase}${causeOf(phase) ? ` (on ${causeOf(phase)})` : ''}`);
+  const list = named.length === 1 ? named[0] : `${named.slice(0, -1).join(', ')}, then ${named[named.length - 1]}`;
+  return `${head}: ${list}`;
+}
+
+/**
  * Rewrite phase records the board has overtaken: any not-in-flight, not-done
  * record whose phase the board now reads `done` becomes `done` with a note
  * saying the work was closed outside this run.
@@ -3896,8 +5450,17 @@ export function reconcileRecordsAgainstBoard(
    * closes nothing opens nothing.
    */
   journal: DeclarationSink = journalOf(state),
-): { changed: boolean; closed: number[] } {
+  /**
+   * `hold`: phases whose `done` the board reads off handoff content that is NOT
+   * committed (control-tower phase 79, #113) — an untracked scaffold, a status
+   * flipped in the working tree. They are not closed, and are answered in
+   * `held`. The live drive tick asks git for the set; a caller that cannot
+   * ask passes none, which is the old rule.
+   */
+  opts: { hold?: ReadonlySet<number> } = {},
+): { changed: boolean; closed: number[]; held: number[] } {
   const closed: number[] = [];
+  const held: number[] = [];
   // Hoisted: `childrenOf` rebuilds an array, and this loop runs per record on a
   // read path. The probe it feeds is the cached, non-blocking one; the
   // allocation was the only per-record cost worth removing.
@@ -3905,6 +5468,19 @@ export function reconcileRecordsAgainstBoard(
   for (const record of Object.values(state.phases)) {
     if (!RECONCILABLE.includes(record.status)) continue;
     if (board[record.phase] !== 'done') continue;
+    // Only COMMITTED handoff content closes a record (#113): the board's
+    // `done` is only as durable as the file it read, and an untracked
+    // scaffold that is moved aside takes it back.
+    if (opts.hold?.has(record.phase)) { held.push(record.phase); continue; }
+    // A verification the console's going-down cut is owed before any close on
+    // the board's word (control-tower phase 48, #69). This very line closed
+    // one phase "done, not verified by this run" with 0 of its 5 commands run,
+    // a second after the restart that cut them; the next drive re-verifies.
+    if (owesVerification(record)) continue;
+    // …and a phase this run RE-OPENED on a red final verdict (control-tower
+    // phase 62, #68), for the same reason: the board reads the handoff the
+    // verdict was about. A green verification of it is what ends it.
+    if (record.reopened) continue;
     // A phase an operator SENT BACK is not one the board has overtaken — the
     // board is merely still reading the handoff the phase wrote before the
     // review, which is the very handoff being sent back. Closing it here would
@@ -3949,7 +5525,15 @@ export function reconcileRecordsAgainstBoard(
     // ending forever (a done phase never re-boards and never retries, so no other
     // retire path can fire), which is the misclassification wedge this phase
     // exists to close, through a new door.
-    if (record.status === 'failed' && isAdjudicatedHalt(record.halt?.kind)) continue;
+    //
+    // One shape is NOT an adjudication, though it carries the kind: a
+    // `verify-failed` halt over a verification that reads GREEN. That is the
+    // contradiction #45 recorded — a command rescued on its retry, a verdict of
+    // `ok: true`, and a halt written in the same second from the rescued row.
+    // This run's own verdict was green, so the board's `done` outranks nothing
+    // and the record closes like any other.
+    const rescuedContradiction = record.halt?.kind === 'verify-failed' && record.verification?.ok === true;
+    if (record.status === 'failed' && isAdjudicatedHalt(record.halt?.kind) && !rescuedContradiction) continue;
     // A PROCESS IS A FACT; A RECORD IS A CLAIM. The board reads a handoff, and a
     // handoff cannot know that a child of this run is still on the machine
     // holding this phase's work. `pidHoldsWork` is true of a `stopped` process
@@ -3974,6 +5558,10 @@ export function reconcileRecordsAgainstBoard(
     record.note = record.attempts > 0 || record.startedAt
       ? RECONCILED_ATTEMPTED_NOTE
       : 'closed outside this run (the board reads done)';
+    // The close is the board's, and says so: what `reopenRegressedRecords`
+    // re-reads every drive tick (#113).
+    record.reconciled = { at: now };
+    delete record.undriven;
     record.endedAt ??= now;
     // A record that STARTED and reports no spend did not cost nothing — its
     // session was lost before the CLI's terminal `result` arrived. Say so.
@@ -3986,7 +5574,12 @@ export function reconcileRecordsAgainstBoard(
     consumeDeclaration(record, 'board-closed', journal);
     closed.push(record.phase);
   }
-  if (closed.length && state.halt?.phase != null && closed.includes(state.halt.phase)) {
+  // …except a stop about the PLAN (control-tower phase 81, #97). A `plan-lint`
+  // halt is anchored on the phase whose handoff broke the lint, and that phase
+  // reads done by construction — the lint runs after it closes — so this used
+  // to dissolve every fresh one on its first read. The record still closes; the
+  // stop stands until the plan answers it (a clean lint: converge, Recover).
+  if (closed.length && state.halt?.phase != null && closed.includes(state.halt.phase) && !isPlanHalt(state.halt.kind)) {
     // The story moves with the halt: `finishedReason` kept quoting the dead
     // blocker ("phase 7 declared itself blocked…") while the phase list read
     // done — the exact contradiction an operator reported. History lives in
@@ -3994,13 +5587,69 @@ export function reconcileRecordsAgainstBoard(
     state.finishedReason = `halted on phase ${state.halt.phase}; the board has since closed it — `
       + 'nothing is left of the halt';
     state.halt = null;
-    state.consecutiveFailures = 0;
+    // A count the set cannot name — a run written before the set existed —
+    // keeps the rule it was written under: the halt it ended in is gone, and
+    // so is the count.
+    if (streakPhases(state).length < state.consecutiveFailures) resetStreak(state);
   }
+  // The board closing a phase contradicts the ending that put it in the
+  // failure streak, so it leaves the set (control-tower phase 45). The rest of
+  // the set stands: those phases' failures are still what they were. This used
+  // to zero the whole count, and only when the RUN's halt happened to be
+  // anchored on the closed phase.
+  if (closed.length) pruneStreak(state, closed);
   // The same dissolve at the PHASE level, for every record the board closed —
   // not just the one the run's halt happened to be anchored to. A phase the
   // board reads done has no ending left to describe.
   for (const phase of closed) retirePhaseHalt(state.phases[String(phase)]);
-  return { changed: closed.length > 0, closed };
+  // …and the asks that are void now that their phase is (#43): the board closing
+  // a record, or one that already read done, is the answer an errand waited for.
+  const retired = retireSettledErrands(state, journal);
+  return { changed: closed.length > 0 || retired.length > 0, closed, held };
+}
+
+/**
+ * The reverse of the close above, re-read on every drive tick (control-tower
+ * phase 79, #113). A record reconcile closed on the board's word — and ONLY
+ * such a record (`reconciled`): one this run verified is its own evidence —
+ * whose phase the board no longer reads `done` goes back to `pending`, with
+ * `resumeSessionId` kept, so the next boarding resumes the session it was
+ * checkpointed from.
+ *
+ * Measured: an untracked scaffold reading `complete` turned a phase done, this
+ * pass's twin closed the record while the phase's session was checkpointed,
+ * the scaffold was moved aside — and the record stayed `done` while the board
+ * read `in-progress`, undriven for fourteen hours. A close whose reason has
+ * gone away is not a close.
+ *
+ * A board that said nothing about the phase (`unknown`, absent — a read that
+ * failed) is not a regression: nothing is reopened on it.
+ */
+export function reopenRegressedRecords(
+  state: RunState,
+  board: Record<number, string>,
+  now = new Date().toISOString(),
+): { changed: boolean; reopened: { phase: number; board: string; closedAt: string | null; resumeSessionId: string | null }[] } {
+  const reopened: { phase: number; board: string; closedAt: string | null; resumeSessionId: string | null }[] = [];
+  for (const record of Object.values(state.phases)) {
+    if (record.status !== 'done' || !record.reconciled) continue;
+    const word = board[record.phase];
+    if (!word || word === 'done' || !(BOARD_BUCKETS as readonly string[]).includes(word)) continue;
+    const closedAt = record.reconciled.at ?? null;
+    delete record.reconciled;
+    record.status = 'pending';
+    delete record.endedAt;
+    delete record.costUnknown;
+    // The session the checkpoint named is what the next boarding resumes; one
+    // that named none resumes the phase's own, as an elapsed park does.
+    if (!record.resumeSessionId && record.sessionId && !isSessionGone(record, record.sessionId)) {
+      record.resumeSessionId = record.sessionId;
+    }
+    record.note = `reopened — the board no longer reads it done (it reads ${word}); reconcile had closed it`
+      + `${closedAt ? ` at ${closedAt}` : ''} on the board's word, and that word is gone`;
+    reopened.push({ phase: record.phase, board: word, closedAt, resumeSessionId: record.resumeSessionId ?? null });
+  }
+  return { changed: reopened.length > 0, reopened };
 }
 
 /**
@@ -4025,6 +5674,14 @@ export function autoResolveRun(
 ): boolean {
   if (state.resolved || state.reopenedAt) return false;
   if (!RESOLVABLE.includes(state.status)) return false;
+  // A stop about the plan is not superseded by any phase reading done — its
+  // anchor always does (control-tower phase 81, #97). Only a clean lint answers
+  // it, and "superseded" here pinned the run against the relaunch that would.
+  if (isPlanHalt(state.halt?.kind)) return false;
+  // A run owing a verification a restart cut is not superseded by the board's
+  // word — the board is reading the very handoff the verification was checking
+  // (control-tower phase 48, #69). The next drive re-verifies; then this may.
+  if (Object.values(state.phases).some((record) => owesVerification(record) || record.reopened)) return false;
 
   const phases = decidingPhases(state);
   if (!phases.length) return false;
@@ -4105,10 +5762,13 @@ export const RECORD_RECONCILABLE: readonly RunStatus[] = [...SETTLEABLE, 'paused
 export function settleFinishedRun(state: RunState, board: Record<number, string>): boolean {
   if (!SETTLEABLE.includes(state.status)) return false;
   if (state.stoppedBy === 'operator') return false;
+  // A phase still owed the verification a restart cut is not finished work,
+  // however the board reads it (control-tower phase 48, #69).
+  if (Object.values(state.phases).some((record) => owesVerification(record) || record.reopened)) return false;
   const words = Object.values(board);
   if (!words.length) return false;
   if (words.every((word) => word === 'done')) {
-    state.status = 'finished';
+    setRunState(state, 'finished');
     state.halt = null;
     delete state.stoppedBy;
     state.finishedReason ??= `every phase of ${state.slug} is done.`;
@@ -4121,7 +5781,7 @@ export function settleFinishedRun(state: RunState, board: Record<number, string>
   // stopped, work outstanding, nothing wrong that anybody named — and unlike
   // `halted` it is what the recovery paths already expect to find.
   if (state.status === 'halted' && !state.halt) {
-    state.status = 'parked';
+    setRunState(state, 'parked');
     return true;
   }
   return false;
@@ -4254,6 +5914,9 @@ function settle(state: RunState, liveRunId?: LiveRuns): RunState {
   const reclaimed = reconcileRun(state, liveRunId);
   // A kindless legacy halt gets its word before anything reads it (LFC-1).
   const healed = healLegacyHalt(state);
+  // A scoped run an older console called finished with its scope still open
+  // gets the honest sentence (#43) — never a new status; see `honestScopedFinish`.
+  const honest = live ? false : honestScopedFinish(state);
   // The read half. A run file written by 3.4.0 has no `lifecycle` at all, and
   // one written seconds ago by a bare `state.status = …` has a stale one; both
   // come back correct, and neither is a reason on its own to schedule a write.
@@ -4269,7 +5932,7 @@ function settle(state: RunState, liveRunId?: LiveRuns): RunState {
   // has been reconciled, so the verdict reads the run's settled status.
   const waits = live ? [] : settleWaitingRecords(state);
   if (rearmed) journalOf(state)(WAIT_SETTLED_EVENT, { ...rearmed }, rearmed.phase);
-  if (!reclaimed && !settled.length && !healed && !rearmed && !waits.length && !folded) return state;
+  if (!reclaimed && !settled.length && !healed && !rearmed && !waits.length && !folded && !honest) return state;
   saveRunSoon(state);
   return state;
 }
@@ -4314,11 +5977,94 @@ export function loadRun(root: string, slug: string, id: string, liveRunId?: Live
       return clone;
     } catch { /* unclonable — read the file */ }
   }
+  const raw = readRunFile(target);
+  if (!raw) return null;
   try {
-    return settle(JSON.parse(readFileSync(target, 'utf8')) as RunState, liveRunId);
+    return settle(raw, liveRunId);
   } catch {
     return null;
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * The parse cache
+ * ------------------------------------------------------------------ */
+
+/**
+ * One parsed run record per version of its file.
+ *
+ * Keyed on `(mtimeMs, size)` — the key `runRulings` already uses — because a
+ * run file changes when something writes it and at no other time, while the
+ * readers reach it on a ten-second clock over every plan in the store. On the
+ * console where the out-of-memory exits were measured that was seven megabytes
+ * of JSON re-read 8,640 times a day for no news at all.
+ *
+ * Only the PARSE is held. `settle()` runs on every read from a clone, because
+ * its answer depends on which runs are live and a remembered "no lane was
+ * driving this" would outlive the moment it was true. That is also why the
+ * cached object is never handed out: `settle`, `reconcileRun` and most of the
+ * service mutate what they are given, so one reader's repair would silently
+ * become the next reader's fact.
+ */
+const parseCache = new Map<string, { stamp: string; raw: RunState }>();
+
+/**
+ * How many entries the cache may hold.
+ *
+ * A bound, because this is a fix for a process that ran out of heap and an
+ * unbounded map over every run file a long-lived console ever touches is the
+ * same bug wearing a different hat. Oldest-first eviction: `Map` iterates in
+ * insertion order, and the run a sweep is about to ask for again is the one it
+ * just asked for.
+ */
+const PARSE_CACHE_MAX = 256;
+
+let runFileReadCount = 0;
+
+/** How many run files this process has actually read off disk. Tests and the debug bundle. */
+export function runFileReads(): number {
+  return runFileReadCount;
+}
+
+/** Forget every parsed run file. The retention sweep and tests. */
+export function clearRunFileCache(): void {
+  parseCache.clear();
+}
+
+function readRunFile(target: string): RunState | null {
+  let stamp: string;
+  try {
+    const info = statSync(target);
+    stamp = `${info.mtimeMs}:${info.size}`;
+  } catch {
+    // No file is not a cache miss to retry — it is an answer, and a stale entry
+    // for a run that has been pruned must not outlive it.
+    parseCache.delete(target);
+    return null;
+  }
+  const hit = parseCache.get(target);
+  if (hit && hit.stamp === stamp) {
+    try { return structuredClone(hit.raw); } catch { parseCache.delete(target); }
+  }
+  let raw: RunState;
+  try {
+    runFileReadCount += 1;
+    raw = JSON.parse(readFileSync(target, 'utf8')) as RunState;
+  } catch {
+    parseCache.delete(target);
+    return null;
+  }
+  try {
+    const keep = structuredClone(raw);
+    parseCache.delete(target);
+    parseCache.set(target, { stamp, raw: keep });
+    while (parseCache.size > PARSE_CACHE_MAX) {
+      const oldest = parseCache.keys().next();
+      if (oldest.done) break;
+      parseCache.delete(oldest.value);
+    }
+  } catch { /* unclonable: serve it, cache nothing */ }
+  return raw;
 }
 
 /** Every run recorded for a plan, newest first. */

@@ -57,7 +57,32 @@ export type FleetHold = {
    * holds hold automatic starts only: neither is a freeze.
    */
   scope?: 'machine' | 'restart';
+  /**
+   * The plans this hold binds, when it binds only some. Absent — every hold
+   * but one — means every plan of the console. A restart WAITING for its
+   * lanes sets it (control-tower phase 48, #70): the plans whose scope
+   * intersects the lanes it waits for, so an update never again freezes
+   * boarding for plans that could not have touched the copy it replaces.
+   * Read through `holdBinds`, never as a truthiness test on the hold.
+   */
+  plans?: readonly string[];
 };
+
+/**
+ * Does this hold keep `slug`'s automatic starts waiting?
+ *
+ * A hold with no `plans` binds everything, and so does a question with no
+ * slug: a reader that cannot say whose start it is asking about is answered
+ * as the conservative reader always was. The one place a hold is ever read as
+ * less than total, so the rule cannot be spelled two ways.
+ */
+export function holdBinds(
+  hold: Pick<FleetHold, 'plans'> | null | undefined, slug?: string | null,
+): boolean {
+  if (!hold) return false;
+  if (!hold.plans || slug == null) return true;
+  return hold.plans.includes(slug);
+}
 
 /**
  * Read the marker, or `null`.

@@ -39,6 +39,8 @@ npm run lint:client           # ESLint over client/src + shared (typescript-esli
 npm run format                # Prettier over the same files (`format:check` is what CI runs)
 npm run dev                   # Vite on :5173, proxying the live console on :4123
 npm run verify:dist           # build into client/.dist-verify + the gate — leaves the LIVE dist untouched
+npm run test:e2e              # the real-browser tour (Playwright, four viewports) — e2e/baseline.json is [], so any finding fails
+npm run test:e2e:dist         # the same tour against a production build under the real CSP (what scripts/gates.sh runs)
 npm run build                 # emit client/dist and stamp .build-rev
 npm run check:dist            # the build gate — run it after every build
 ```
@@ -93,12 +95,17 @@ velocity). `server/service.ts` is the model, `engine.ts` the script wrapper, `st
 artifact, `api/routes.ts` the surface. `shared/` is dependency-free ESM imported by both the Node
 tests and the client.
 
-### The client — eight destinations, and the vocabularies they share
+### The client — seven destinations, and the vocabularies they share
 
-Since 4.0 the client is eight destinations in three bands — **the work** (Now · Plans · Runs ·
-Sessions) · **the record** (Repo · Insights · Debug) · **the console** (Settings) — under one shell
-(`client/src/app/`), with every older address still resolving. The band is the rail's grouping and
-the phone tab bar's split: the four work destinations ARE the bar, the rest are the More sheet.
+Since 6.0 (control-tower phase 21) the client is seven destinations in three bands — **the work**
+(Runs · Plans · Sessions) · **the record** (Repo · Insights · Debug) · **the console** (Settings) —
+under one shell (`client/src/app/`), with every older address still resolving. The design law is
+`viewer/docs/design.md` ("Control Tower 6.0"): every rule in it names the guard that holds it.
+`#/runs`, the Tower, is the home (`DEFAULT_HEAD`); Now is retired and each of its addresses lands on a Runs bay
+(`#/now?focus=inbox` → `#/runs?bay=needs-you`, `#/ready` → `#/runs?bay=ready`). The band is the
+rail's grouping — a slim 80 px rail, a glyph over each name — and the situation line rides the shell
+header on every page. The phone tab bar is its own list, `TAB_BAR` in `app/shell/nav.ts` (Runs ·
+Plans · Sessions · Insights), and the rest are the More sheet.
 `Repo` and `Debug` are 4.0's additions, both built: Repo is six sections over the `GET /api/repo/…`
 and `GET /api/issues` surfaces (`features/repo/` — the sixth is the issues estate), Debug is every
 log this console writes on one time axis plus the redacted bundle (`features/debug/`). `views/` is gone;
@@ -111,9 +118,15 @@ establish — a vocabulary lives in `shared/` and is imported by identity by ser
 - `shared/status-vocab.js` — the 8 UI states worst-first (`needs-you failed running verifying
   waiting queued skipped done`), the status→state maps, and `isLiveStatus`/`LIVE_RUN_STATUSES`
   (which is deliberately NOT the server's `IN_FLIGHT`: it includes `queued`, because a loop is
-  behind a queued run even though it holds no child and no lock). Hue and icon are read in exactly
-  one component, `ui/status-badge.tsx`.
-- `shared/route-meta.js` — the route heads and the eight destinations, asserted at module load.
+  behind a queued run even though it holds no child and no lock).
+- `shared/status-model.js` — status model v2 (control-tower phase 16), the signal law: every word of
+  every vocabulary gets one row (label, icon, paint, tense, attention), and `describeRun` /
+  `describePhase` decide by table. A page draws a status through the typed family
+  (`client/src/components/ui/status/`), never a raw `StatusBadge`/`StatusDot` — ESLint refuses that
+  import outside the family, the status ratchet (`status/ratchet.test.ts`) is at ZERO, and its source
+  scan holds the retired 2.x `Chip`/`StateChip`, their tone words and the `--line-*` aliases gone
+  (control-tower phase 31). A hue is chosen only there and in theme.css's `.state-<ui>` classes.
+- `shared/route-meta.js` — the route heads and the destinations, asserted at module load.
 - `shared/situation-model.js` · `shared/ladder-model.js` · `shared/recovery-model.js` — the
   situation, rung and recovery-class vocabularies.
 - `shared/attention-model.js` (the inbox — and the OWNER of `RULING_KINDS`, which
@@ -181,7 +194,7 @@ console-managed `CLAUDE_CONFIG_DIR` the operator signs into; `token`, a pasted `
 setup-token`), under `INSTANCE_STATE_DIR/accounts`, and `accounts.json` never holds a secret. What
 the machine has **learned** about a credential is machine-wide: `learned.ts` keeps one
 `<stateHome>/accounts/learned.json`, keyed by the credential's fingerprint — its walls, the
-entitlement breaker (`unknown · entitled · cooling · retired`, moved only along
+entitlement breaker (`unknown · entitled · cooling · suspect · retired`, moved only along
 `ENTITLEMENT_TRANSITIONS`; a transition outside that table is refused and logged), the meter-read
 clocks, the hashed organisation id (a `retired` organisation excludes every account in it) and the
 tombstone a removed registration is still named by — because a wall one console learned used to be
@@ -211,7 +224,11 @@ readers that predate that. Before the wall, a warning past `ALERT_PCT` that no s
 engages the account's **usage brake** (`Scheduler.brake`): no NEW lane on it while one is live —
 never a refused start — until a reading of that window under `WARN_PCT` or its reset. At the wall, a
 reset further off than `LIMIT_ACTION_COOLDOWN_MS` waits on the first rate-limit burst rather than
-after two `none` decisions (autopilot-token-drain phase 6).
+after two `none` decisions (autopilot-token-drain phase 6). That wait is "until at the latest"
+(control-tower phase 54, #78): the parked phase carries `usageWall`, is re-read on every fresh usage
+reading, every spend that went through and a back-off re-probe (`Runner.rereadWalls`), and boards
+the moment the account has headroom; a lane that parked itself on a clock puts the run in `waiting`
+on that clock rather than `parked`, so the service's wait clock is what resumes it.
 
 ### Getting the console started — the desktop artifact and the start command
 
@@ -265,11 +282,33 @@ rather than refusing.
   `- **Setup:**`, which runs BEFORE verification and can never colour a phase red), F23 when an expected
   failure is stated in PROSE beside a command (the runner reads exit codes, not sentences, so it calls
   that phase red). **F28** joins them in 5.1.0 (`land-needs-lane`): a phase that LANDS from a
-  checkout it shares lands whatever else is in it. **F30** (`note-target-done`) closes the family: a
+  checkout it shares lands whatever else is in it. **F30** (`note-target-done`): a
   forward note addressed to a phase that is already done — the near miss of F26, and its own id
-  because an id that both gates and warns cannot answer "did the lint fail?". The advisory family is
-  therefore F15–F19, F22–F23, F28 and F30 — nine ids; F14 gates, and so do F26
-  (`note-target-unknown`), F27 (`land-word-unknown`) and F29 (`landed-gate-unknown-phase`).
+  because an id that both gates and warns cannot answer "did the lint fail?". **F32**
+  (`verification-fleet-wide`, control-tower phase 62, #47) closes the family: a §Verification line
+  whose exit code reads fleet-wide state (`task hygiene`, `task drift`, a machine-wide `ps … | grep`)
+  can never pass while another plan or the run's own branches are live, so the lint names what to
+  write instead — only forms the task accepts (phase 89, #71 PEH-3: phase 62's `--plan`/`--root` were
+  refused or ignored), per read, from `FLEET_WIDE_READS` / `FLEET_WIDE_SCOPED` in
+  `scripts/verify.env`. **F33** (`repos-outside-root`,
+  control-tower phase 82, #94) names a Repos token that is not a path under the docs root, in a plan
+  whose other cells are: that phase alone is refused isolation — the run keeps its checkout, which one
+  such cell used to refuse for every phase. **F34** (`repos-root-token`, control-tower phase 90, #154)
+  names a Repos cell that says the superproject's own name in a phase whose `Files` bullet lists only
+  submodule and `docs/` paths — the token mounts the whole root and holds the phase against any run
+  on the root repository, for nothing — and **F35** (`checkout-inert`, the same phase) a `Checkout:`
+  value other than `main`, `master` or `default`, which the console carries and never acts on.
+  **F36** (`wait-window-short`, control-tower phase 14, #40) names a `Waits on:` max shorter than the
+  timeout of the workflow it watches — told through `PE_WAIT_TIMEOUTS`, `<ref>=<minutes>` pairs the
+  console resolves once per `gh:…#run/<id>` (`watch-refs.ts`); unset is off, set but empty an answer.
+  **F38** (`human-step-no-proof`, control-tower phase 41) names a `- **Human step:**` with no `proof:`
+  ref. The advisory family is therefore F15–F19, F22–F23, F28, F30, F32–F36 and F38 — fifteen ids; F14
+  gates, and so do F26 (`note-target-unknown`), F27 (`land-word-unknown`), F29
+  (`landed-gate-unknown-phase`), F31 (`permission-mode-unknown`, control-tower phase 11): a
+  `Permission mode:` line or bullet whose word is not one of `scripts/permission.env`'s, which the
+  reader falls through exactly as F27's do — and F37 (`human-step-superseded`,
+  `human-step-kind-unknown`, `human-step-field-invalid`, phase 41): a `Human step:` bullet the reader
+  skips, the 5.1.0 `<who, what, proof ref>` spelling named with the grammar that replaced it.
 - **An empty `ready` set is four facts, so the engine says which.** `--memory-block` is the only
   engine command the runner reads, and it emitted five bucket lines — collapsing "finished", "all in
   flight", "closed" and "nothing can ever move again" into one silence. It now also emits
@@ -446,10 +485,13 @@ the probe, and the probe is a **one-turn `claude -p`** whose `system/init` repor
 status before any model call, because that is the only place `needs-auth` is knowable; `catalog.ts`
 degrades to a shipped curated list when the official registry is unreachable; `config.ts` writes the
 per-run `--mcp-config`, 0600, `chmod` after the write. The probe runs as `PE_OWNER=console/mcp-probe`
-with `PHASE_CONSOLE_PROBE=1`, so the session registry keeps its record but leaves it out of every
-operator-facing list; one answer is reused for `HEALTH_TTL_MS` (5 min), which is also the health
-clock's period, and the boarding preflight reads that cache and joins a probe already in flight
-rather than starting its own; and every probe is an automatic start, charged to the start ceiling.
+with `PE_SESSION_KIND=probe`, on which the presence hook registers nothing — a probe is not a session
+(#73), and while nothing reads its answers its clock backs off to `HEALTH_IDLE_MAX_MS`; one answer is
+reused for `HEALTH_TTL_MS` (5 min), which is also the health clock's period, and the boarding
+preflight reads that cache and joins a probe already in flight rather than starting its own; and
+every probe is an automatic start on a budget of its OWN (`PROBE_STARTS_PER_HOUR`, logged
+`mcp.probe.start`) — never the work-start ceiling, because a probe is not a session (control-tower
+phase 100, #73).
 
 Four rules the code is built around. **`--mcp-config` is always paired with `--strict-mcp-config`**
 — alone it would UNION the machine's own servers into an unattended run, and determinism here is a
@@ -528,7 +570,9 @@ The full contract — how a change becomes an update, and the release steps — 
 `README.md` is deliberately short — two copy-paste prompts and what the thing is. The long form is
 `docs/` (indexed by `docs/README.md`); the console's own technical documentation is
 `viewer/README.md`. English files have a Persian sibling (`README.fa.md`, `USAGE.fa.md`,
-`viewer/README.fa.md`) — update both when changing either.
+`viewer/README.fa.md`, and every help-sheet guide's `client/src/content/guide/<id>.fa.md` since
+control-tower phase 32) — update both when changing either; `docs-parity.test.ts` holds each pair section
+for section, and `guide-coverage.test.ts` fails a section with no twin.
 
 Commits use conventional prefixes with a human, declarative summary describing the change's *effect*
 (`feat(run): automation defaults — opt-in skills, QA-on-launch, work branch + PR, repo guard`), not a

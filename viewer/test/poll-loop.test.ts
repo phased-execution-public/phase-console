@@ -297,6 +297,7 @@ function polled(profile: string, opts: { status?: string; throws?: boolean; deli
   const tracker = newPollLoop();
   let clock = 0;
   (service as unknown as { runners: Map<string, unknown> }).runners.set('demo', {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({
       id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: profile,

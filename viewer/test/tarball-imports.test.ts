@@ -74,6 +74,22 @@ test('assert-tarball.sh must-ship and never-ship agree with the server imports',
   }
 });
 
+// `bin/run-verb.mjs` (control-tower phase 98, EC6): the one module both bins
+// dispatch `phase-console run` to — pinned here the way `week-report.test.ts`
+// pins `bin/report-verb.mjs`, and not inside a `!pro:` region, because both
+// halves of this are true in the FREE tree too. Only the reads of Pro paths
+// are marked: in the FREE tree `bin/phase-console.mjs` IS the free bin (the
+// override is applied), and `free/` and the Pro tarball's gate do not ship.
+test('bin/run-verb.mjs ships in both tarballs and is dispatched by both bins', () => {
+  const bins = ['bin/phase-console.mjs'];
+  for (const bin of bins) {
+    assert.match(readFileSync(join(repoRoot, bin), 'utf8'), /args\[0\] === 'run'[\s\S]{0,200}run-verb\.mjs/, bin);
+  }
+  const freeSafeGate = readFileSync(join(repoRoot, '.github', 'scripts', 'assert-tarball.sh'), 'utf8').split('!pro:start')[0]!;
+  assert.match(freeSafeGate, /"bin\/run-verb\.mjs"/, 'assert-tarball.sh must ship it in the free-safe list');
+});
+
+
 
 
 test('SKILL.md and references never hardcode an install path (F13)', () => {

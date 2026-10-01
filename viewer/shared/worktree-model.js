@@ -105,6 +105,53 @@ export const RADAR_STATES = Object.freeze(
 );
 
 /**
+ * What one row of the repository's settle history says happened — how a run's
+ * work reached (or failed to reach) the trunk. `server/git-browse.ts` reads the
+ * run records and journals into these words; the Repo destination paints them
+ * (control-tower phase 26, through `shared/status-model.js`).
+ *
+ * - `settled`     — the run's branch had its fate decided.
+ * - `pending`     — a settle was asked for and is waiting on something.
+ * - `unsupported` — the strategy could not be taken (a mirror run's one-tree settle).
+ * - `landed`      — a lane's commits reached the run branch, or a landing policy took it.
+ * - `pushed`      — the console pushed a phase's branch: the one publication it makes.
+ * - `failed`      — a lane's commits did NOT reach it; the integration was abandoned.
+ * - `released`    — a checkout was given back: released, reclaimed or swept.
+ * - `pruned`      — a branch already contained by the trunk was deleted.
+ * @typedef {'settled'|'pending'|'unsupported'|'landed'|'pushed'|'failed'|'released'|'pruned'} SettleKind
+ * @type {readonly SettleKind[]}
+ */
+export const SETTLE_KINDS = Object.freeze(
+  /** @type {const} */ ([
+    'settled',
+    'pending',
+    'unsupported',
+    'landed',
+    'pushed',
+    'failed',
+    'released',
+    'pruned',
+  ]),
+);
+
+/**
+ * What a working tree IS to the console, decided by identity — never by a
+ * regex over its path, which once came out exactly inverted (P8 QA round 1).
+ *
+ * - `root`     — the main working tree: the repository itself.
+ * - `run`      — a run's own checkout, holding that whole run's work.
+ * - `lane`     — one phase of one run, in a checkout of its own.
+ * - `staging`  — where every plan's folded work waits; never swept.
+ * - `operator` — a linked checkout the console did not create.
+ * - `debris`   — under the console's state directory, and no surviving run record claims it.
+ * @typedef {'root'|'run'|'lane'|'staging'|'operator'|'debris'} CheckoutRole
+ * @type {readonly CheckoutRole[]}
+ */
+export const CHECKOUT_ROLES = Object.freeze(
+  /** @type {const} */ (['root', 'run', 'lane', 'staging', 'operator', 'debris']),
+);
+
+/**
  * A radar pair's identity, order-independent — `a×b` and `b×a` are one
  * question, so they must be one string.
  *

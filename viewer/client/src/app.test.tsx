@@ -85,7 +85,7 @@ const failsFreshly = (message = 'Failed to fetch') =>
 
 beforeEach(() => {
   vi.clearAllMocks();
-  window.location.hash = '#/now';
+  window.location.hash = '#/runs';
   setOnline(true);
   // …and tell React Query too. It keeps its own global `onlineManager`, and a
   // query started while that says offline is PAUSED — it never resolves, and
@@ -128,7 +128,7 @@ describe('the console cannot be reached', () => {
 
     // The whole point. A cached board is indistinguishable from a live one and
     // wrong within a minute.
-    for (const nav of ['Now', 'Plans', 'Runs', 'Sessions', 'Insights', 'Settings']) {
+    for (const nav of ['Runs', 'Plans', 'Sessions', 'Insights', 'Settings']) {
       expect(screen.queryByRole('button', { name: new RegExp(nav, 'i') })).not.toBeInTheDocument();
       expect(screen.queryByRole('link', { name: new RegExp(nav, 'i') })).not.toBeInTheDocument();
     }
@@ -171,7 +171,7 @@ describe('the console cannot be reached', () => {
     await waitFor(() => {
       expect(screen.queryByRole('heading', { name: /you're offline/i })).not.toBeInTheDocument();
     });
-    expect(await screen.findByRole('button', { name: 'Now' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Runs' })).toBeInTheDocument();
   });
 
   it('asks again by itself the moment the network returns', async () => {
@@ -186,7 +186,7 @@ describe('the console cannot be reached', () => {
     window.dispatchEvent(new Event('online'));
 
     await waitFor(() => expect(state.mock.calls.length).toBeGreaterThan(asked));
-    expect(await screen.findByRole('button', { name: 'Now' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Runs' })).toBeInTheDocument();
   });
 });
 
@@ -194,7 +194,7 @@ describe('the network drops while the board is up', () => {
   it('labels what is on screen as no longer updating', async () => {
     state.mockResolvedValue(READY_STATE);
     mount();
-    await screen.findByRole('button', { name: 'Now' });
+    await screen.findByRole('button', { name: 'Runs' });
 
     setOnline(false);
     window.dispatchEvent(new Event('offline'));
@@ -202,7 +202,7 @@ describe('the network drops while the board is up', () => {
     // The board stays — it was true when it was fetched — but it stops being
     // presented as live, which is the only dishonest option here.
     expect(await screen.findByText(/no longer updating/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Now' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Runs' })).toBeInTheDocument();
   });
 });
 
@@ -221,14 +221,14 @@ describe('the whole console is frozen', () => {
       fleet: { frozen: true, at: '2026-08-26T10:00:00Z', by: 'mo' },
     } as ConsoleState);
     mount();
-    await screen.findByRole('button', { name: 'Now' });
+    await screen.findByRole('button', { name: 'Runs' });
     expect(await screen.findByText(/This console is frozen/)).toBeInTheDocument();
   });
 
   it('and says nothing at all when it is not', async () => {
     state.mockResolvedValue(READY_STATE);
     mount();
-    await screen.findByRole('button', { name: 'Now' });
+    await screen.findByRole('button', { name: 'Runs' });
     expect(screen.queryByText(/This console is frozen/)).toBeNull();
   });
 });

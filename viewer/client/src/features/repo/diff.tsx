@@ -235,7 +235,7 @@ export function DiffPanel({
             <p className="px-2 py-3 text-2xs text-ink-faint" data-testid="patch-absent">
               This response carries no patch for <code className="font-mono">{picked}</code>. git reported{' '}
               <span className="text-done">+{current.additions}</span>{' '}
-              <span className="text-blocked">−{current.deletions}</span> for it, so it did change — the lines
+              <span className="text-failed">−{current.deletions}</span> for it, so it did change — the lines
               are simply not in this answer. Pick it again to ask for them.
             </p>
           ) : current ? (

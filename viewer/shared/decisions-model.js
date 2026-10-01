@@ -44,11 +44,11 @@
  * A later row REPLACES the earlier one whole.
  */
 
-import { SUB_KINDS } from './situation-model.js';
+import { CLASSIFIER_ONLY_SUB_KINDS, SUB_KINDS } from './situation-model.js';
 
 /**
- * The eighteen keys — a closed vocabulary (chapter 13 §1.1's seventeen, plus
- * `issues` in 5.1.0). Also the value a ruling, an errand and a `needs-human`
+ * The nineteen keys — a closed vocabulary (chapter 13 §1.1's seventeen, plus
+ * `issues` in 5.1.0 and `plan-approval` in control-tower phase 11). Also the value a ruling, an errand and a `needs-human`
  * reason carry as its `decisionKey`, and what `phase-outcome.sh …
  * blocked|needs-human --needs <key>` is validated against (together with
  * `NEED_CLASSES` below).
@@ -79,6 +79,11 @@ export const DECISION_KEYS = Object.freeze(
     'stop',
     'relay',
     'announce',
+    // What happens when a plan-mode session presents its plan (#34): `hold`
+    // (the default) parks the phase for a person's Approve or Reject;
+    // `continue` lets the console approve it and journal the plan as the
+    // record of what the session said it would do.
+    'plan-approval',
   ]),
 );
 
@@ -95,14 +100,19 @@ export const DECISION_SOURCES = Object.freeze(/** @type {const} */ (['plan', 'ru
 /**
  * The blocker classes a session may name as the SHORT form of a decision key
  * in `--needs`: the classifier's `blocked-declared:*` sub-kinds
- * (`shared/situation-model.js` `SUB_KINDS`), DERIVED, minus `unknown` — which
- * is never something a session needs, only what the classifier says when it
- * was not told. `lock` names no manifest row: a peer holding the scope is
- * nobody's decision, the session queues behind it.
+ * (`shared/situation-model.js` `SUB_KINDS`), DERIVED, minus the ones only the
+ * classifier says (`CLASSIFIER_ONLY_SUB_KINDS`: `unknown`, which is never
+ * something a session needs, and `protected-path`, its reading of a
+ * `--needs permission` wall). `lock` names no manifest row: a peer holding the
+ * scope is nobody's decision, the session queues behind it.
  */
-export const NEED_CLASSES = Object.freeze(SUB_KINDS['blocked-declared'].filter((k) => k !== 'unknown'));
+export const NEED_CLASSES = Object.freeze(
+  SUB_KINDS['blocked-declared'].filter(
+    (k) => !(/** @type {readonly string[]} */ (CLASSIFIER_ONLY_SUB_KINDS).includes(k)),
+  ),
+);
 
-/** @typedef {Exclude<(typeof SUB_KINDS)['blocked-declared'][number], 'unknown'>} NeedClass */
+/** @typedef {Exclude<(typeof SUB_KINDS)['blocked-declared'][number], (typeof CLASSIFIER_ONLY_SUB_KINDS)[number]>} NeedClass */
 
 /** Which manifest row each blocker class points at (`lock` → none). */
 export const DECISION_KEY_OF_NEED = Object.freeze({
@@ -148,10 +158,12 @@ export function decisionKeyOfNeed(word) {
  * regexes in `server/runner/situation.ts` (ZTD-3): a blocker class is its own
  * sub-kind; a decision key answers through the class that points at it
  * (`credentials` → `credential`, either permission key → `permission`,
- * `gates` → `gate`, `waits` → `external`); a key no class points at (say
- * `budgets`) returns `null` and the prose cascade decides, as it always did.
+ * `gates` → `gate`, `waits` → `external`); `human-acts` is the one key with a
+ * sub-kind of its own spelling, which only the classifier says; a key no class
+ * points at (say `budgets`) returns `null` and the prose cascade decides, as it
+ * always did.
  * @param {string | undefined | null} word
- * @returns {NeedClass | null}
+ * @returns {NeedClass | 'human-acts' | null}
  */
 export function subKindOfNeed(word) {
   if (typeof word !== 'string') return null;
@@ -159,6 +171,13 @@ export function subKindOfNeed(word) {
     return /** @type {NeedClass} */ (word);
   }
   if (word === 'permission.destructive') return 'permission';
+  // A held plan is a person's sign-off (control-tower phase 11): the gate
+  // sub-kind, whose ladder is empty — no unblock session may answer it.
+  if (word === 'plan-approval') return 'gate';
+  // Acts the plan keeps for a person (control-tower phase 53, #54): its own
+  // sub-kind, read off the KEY — it used to fall to the prose and land in
+  // `unknown`, so the park card could not say what was being asked.
+  if (word === 'human-acts') return 'human-acts';
   for (const cls of NEED_CLASSES) {
     if (DECISION_KEY_OF_NEED[cls] === word) return cls;
   }

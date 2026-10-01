@@ -151,8 +151,8 @@ describe('the navigation names itself', () => {
   });
 
   it('names every destination, badge and all', async () => {
-    mount(<Rail state={STATE} counts={COUNTS} head="now" />);
-    for (const label of ['Now', 'Plans', 'Runs', 'Sessions', 'Repo', 'Insights', 'Debug', 'Settings']) {
+    mount(<Rail state={STATE} counts={COUNTS} head="runs" />);
+    for (const label of ['Runs', 'Plans', 'Sessions', 'Repo', 'Insights', 'Debug', 'Settings']) {
       expect(screen.getByRole('button', { name: new RegExp(label) }), label).toBeTruthy();
     }
   });
@@ -249,7 +249,9 @@ describe('a hash change is a navigation, and is treated as one', () => {
 
   it('names the destination and where in it, never the raw hash', async () => {
     const { routeAnnouncement } = await import('./route-frame');
-    expect(routeAnnouncement(parseHash('#/now') as Route)).toBe('Now');
+    expect(routeAnnouncement(parseHash('#/runs') as Route)).toBe('Runs');
+    // The retired home is a redirect head now (6.0): it announces where it lands.
+    expect(routeAnnouncement(parseHash('#/now') as Route)).toBe('Runs');
     expect(routeAnnouncement(parseHash('#/settings/automation') as Route)).toBe('Settings, automation');
     // A head that is not itself a destination still announces the one it
     // belongs under — the same mapping that keeps the nav lit.

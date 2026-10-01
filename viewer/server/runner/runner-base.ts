@@ -14,24 +14,28 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
+import { holdBinds } from '../fleet-hold.ts';
 import { onShutdown, offShutdown, type ShutdownContext } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
 import { detachedRef, worktreeRootOf, WORKTREE_ROOTS, type WorktreeRoot} from '../../shared/worktree-model.js';
 import {
   childEnvDecisions, classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
+  type RetirementEvidence,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import {
   markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type SpawnRequest, type StreamEvent,
 } from './spawn.ts';
-import { permissionPromptsFor, relayArmingFor, sessionRecordOf, type Cap, type SessionCaps } from './session-record.ts';
+import {
+  bookedDelta, creditBooked, MAX_COST_MARKS, permissionPromptsFor, relayArmingFor, resolveCaps, sessionRecordOf, type Cap, type CapTable,
+  type SessionCaps,
+} from './session-record.ts';
 import { loadModelsEnv } from './models.ts';
-import { contextWindowOf, MAX_TOKEN_ATTEMPTS, type TokenAttempt } from './usage.ts';
+import { contextWindowOf, costMismatch, MAX_TOKEN_ATTEMPTS, priceUsage, type TokenAttempt } from './usage.ts';
 import type { PollLoopState } from '../../shared/poll-loop.js';
 import { writeMcpConfigFile, type McpConfigDoc } from '../mcp/config.ts';
 import { RELAY_HOST_SERVER, RELAY_HOST_TOOL, relayHostConfig } from '../relay-host.ts';
-import type { PhaseSize } from '../parse/plan.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -51,7 +55,7 @@ import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
 // too — only the ledger path below it is Pro.
 import { DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import {
-  isRegistered, laneNames, realish, scopeConfined,
+  isRegistered, laneNames, realish, restoreSettledMirror, scopeConfined,
   type LaneNames, type RadarState, type RunGitView,
   managedRoots,
   stagingHome,
@@ -59,15 +63,17 @@ import {
   worktreeHome,
   type StagingNames,
 } from './worktree.ts';
+import { standingBranchSync } from './tree-state.ts';
 import {
   classifySituation, collectEvidence, situation as situationOf, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
-  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, rungSettledPayload, settleRung, settleRungRecord,
+  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, rungSettledPayload, rungWasWithdrawn, personRetryOwed, settleRung, settleRungRecord,
   DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { RungRecord, Actor } from './state.ts';
+import type { RungRecord, Actor, WaitBeside } from './state.ts';
+import type { RungCause } from './ladder.ts';
 import { stoppedByOf } from '../actor.ts';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
@@ -83,7 +89,7 @@ import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from '
 import {
   AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
-import { formatScope, repoKeyOf } from '../../shared/scope.js';
+import { formatScope, repoKeyOf, scopesIntersect } from '../../shared/scope.js';
 import { Journal } from './journal.ts';
 import { Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
@@ -93,25 +99,109 @@ import {
 } from './approvals.ts';
 import {
   CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  LOCK_MIRROR_ENV,
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
-import { DEFAULT_WAIT_BUDGET, waitBudgetFrom, type WaitBudget } from './wait-budget.ts';
-import type { ResumeVerdict, SessionRequest } from './runner-core.ts';
+import {
+  DEFAULT_WAIT_BUDGET, claimBudgetWarning, phaseBudgetFact, runBudgetFact, waitBudgetFrom, type WaitBudget,
+} from './wait-budget.ts';
+import { budgetApproaching, type BudgetFact } from '../../shared/budget-model.js';
+import type { ResumeVerdict, SessionRequest, VettedResume } from './runner-core.ts';
+import type { ConsoleSkillFacts } from './runner-core.ts';
+import type { AttemptOptions } from './runner-attempt.ts';
 import { dateOfRef } from '../watch-refs.ts';
+import { DEFAULT_MODEL_POLICY, RUN_PROGRESS_FIELDS, runResumable, type ModelPolicy } from '../../shared/run-lifecycle.js';
+import { taskSummary } from '../../shared/task-model.js';
+import {
+  PHASE_WORK_MODES, closeAttemptWindow, clocksDigest, openSessionWindow, phaseClocks, type PhaseClocks,
+} from '../../shared/phase-clocks.js';
+
+/* ------------------------------------------------------------------ *
+ * The progress frame
+ * ------------------------------------------------------------------ */
+
+/** One `run:progress` payload — `RUN_PROGRESS_FIELDS`, and nothing else. */
+export type RunProgress = {
+  phase: number;
+  status: string;
+  attempt: number;
+  attemptStartedAt: string | null;
+  tasks: { total: number; done: number; active: number } | null;
+  spentUsd: number | null;
+  contextTokens: number | null;
+  stall: string | null;
+  /** The labelled clocks as of this frame (#28) — see `shared/phase-clocks.js`. */
+  phaseClocks: PhaseClocks | null;
+};
+
+/**
+ * Join the two halves that know what a phase is doing.
+ *
+ * `liveness()` carries output, tools, stalls, tokens and THIS session's
+ * unbooked dollars; it knows nothing about phase status, which attempt is
+ * running, when that attempt started, or how many tasks are done. The record
+ * carries those and does not carry the live half. Neither alone is progress,
+ * which is why this is a function and not a method on either of them.
+ *
+ * Pure, so the shape a client reads is asserted without a runner.
+ */
+export function progressFrame(live: LaneLiveness, record: PhaseRecord, nowMs = Date.now()): RunProgress {
+  const tasks = record.tasks ? taskSummary(record.tasks) : null;
+  return {
+    phase: live.phase,
+    status: record.status,
+    attempt: record.attempts ?? 0,
+    attemptStartedAt: record.attemptStartedAt ?? null,
+    tasks: tasks ? { total: tasks.total, done: tasks.done, active: tasks.active } : null,
+    spentUsd: live.spentUsd ?? null,
+    contextTokens: live.tokens?.context ?? null,
+    stall: live.stall?.signal ?? null,
+    phaseClocks: phaseClocks(record, nowMs),
+  };
+}
+
+/**
+ * What makes a frame news.
+ *
+ * Deliberately the frame itself and nothing more. `lastOutputAt` moves on every
+ * streamed line, so a digest that included it would fire on every tick forever
+ * — which is the firehose again, three seconds slower and no cheaper to apply.
+ * What a surface renders is what decides whether it needs to hear.
+ */
+export function progressDigest(frame: RunProgress): string {
+  // The clocks tick every frame by construction; only their stable half —
+  // the windows, the first tool call — is news (`clocksDigest`).
+  return RUN_PROGRESS_FIELDS.map((field) => (field === 'phaseClocks'
+    ? clocksDigest(frame.phaseClocks)
+    : JSON.stringify(frame[field]))).join('|');
+}
+
+/** How long a press waits for the loop to decide whether it boarded (control-tower phase 86, RS-5). */
+export const BOARDING_VERDICT_MS = 5_000;
+
+/** `boardingVerdict`'s answer: the phase boarded at this admission, or where it waits. */
+export type BoardingVerdict =
+  | { boarded: true }
+  | { queued: { position: number | null; behind?: { kind: string; slug: string; phase: number | null; owner: string } } };
 
 export abstract class RunnerBase {
   /** Set while `ensureRunCheckout` is between the cap check and the finished tree. */
   protected abstract reservingCheckout: boolean;
-  protected abstract applyReconcile(board: Board): void;
+  protected abstract applyReconcile(board: Board): Promise<void>;
+  /** The drive tick's `undriven` stamp (control-tower phase 79, #114) — see `Runner.noteUndriven`. */
+  protected abstract noteUndriven(board: Board, boarding: ReadonlySet<number>): void;
   protected abstract armLeaseTimer(lane: Lane, owner: string): void;
   protected abstract armLivenessTicker(): void;
   protected abstract armParkPoke(phase: number, untilIso: string): void;
+  /** Re-read every usage wall this run's phases are parked on (control-tower phase 54, #78); answers how many moved. */
+  abstract rereadWalls(trigger: 'reading' | 'spend' | 'reprobe'): number;
+  protected abstract clearWallProbe(phase: number): void;
   protected abstract askHuman(
     phase: number,
     verification: VerifySummary,
     askable?: VerifySummary['notRun'],
   ): Promise<boolean>;
-  protected abstract attempt(phase: number, prompt: string, model: string, owner: string, lane: Lane, chosen?: PhaseOptions, opts?: { maxTurns?: Cap; mcp?: McpResolution; }): Promise<{ carryOn: boolean; completed: boolean; }>;
+  protected abstract attempt(phase: number, prompt: string, model: string, owner: string, lane: Lane, chosen?: PhaseOptions, opts?: AttemptOptions): Promise<{ carryOn: boolean; completed: boolean; }>;
   protected abstract board(): Promise<Board>;
   protected abstract boardingBlocked(): 'stopped' | 'halted' | 'pause' | 'frozen' | null;
   protected abstract checkpointForShutdown(context?: ShutdownContext): Promise<void>;
@@ -119,23 +209,29 @@ export abstract class RunnerBase {
   protected abstract clearParkPoke(phase: number): void;
   protected abstract climb(record: PhaseRecord, board: Board, by: string, preset?: { situation?: Situation; declared?: PhaseEvidence['declared']; sessionId?: string; }): Promise<boolean>;
   protected abstract climbLadder(board: Board, asked: Set<number> | null): Promise<void>;
-  protected abstract composeBrief(phase: number, board: Board, hint: BoardingHint, engineText: string): Promise<{ prompt: string; brief: BoardingBrief; resume?: string; maxTurns?: number; degraded?: string; }>;
+  protected abstract composeBrief(phase: number, board: Board, hint: BoardingHint, engineText: string): Promise<{ prompt: string; brief: BoardingBrief; resume?: string; vetted?: VettedResume; maxTurns?: number; degraded?: string; }>;
   protected abstract confirmed(phase: number): Promise<boolean>;
+  /** The phase's §Verification baseline at its first boarding (control-tower phase 83, #103) — `RunnerAttempt`. */
+  protected abstract takeBaseline(phase: number): Promise<void>;
+  protected abstract boardingWipBlock(phase: number, lane: Lane): Promise<string>;
   protected abstract disarmLivenessTicker(): void;
+  protected abstract endLaneStall(phase: number): void;
   protected abstract syncGitProbe(): void;
   protected abstract disarmGitProbe(): void;
   abstract refreshGit(): Promise<boolean>;
   protected abstract drive(): Promise<void>;
   protected abstract emit(event: string, data: Record<string, unknown>): void;
   protected abstract engine(args: string[], env?: Record<string, string>): Promise<import("../engine.ts").EngineResult>;
-  protected abstract enterRunWaiting(nowIso: string, asked?: Set<number> | null): boolean;
+  protected abstract enterRunWaiting(nowIso: string, asked?: Set<number> | null, beside?: WaitBeside | null): boolean;
   protected abstract evaluateLane(lane: Lane, thresholds: StallThresholds, now: number): Promise<boolean>;
   protected abstract gitOrNull(args: string[]): Promise<string | null>;
-  protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind): void;
+  protected abstract halt(reason: string, phase: number | undefined, kind: HaltKind, extra?: { evidence?: RetirementEvidence }): void;
   protected abstract now(): Date;
   protected abstract onStream(phase: number, event: StreamEvent): void;
   protected abstract noteContext(phase: number, event: Extract<StreamEvent, { kind: 'usage' }>): void;
   protected abstract armOutcomeFile(phase: number): string;
+  /** The declaration already in the outcome file — read, journalled, consumed (#21 §3). */
+  protected abstract takeArmedOutcome(phase: number): PhaseOutcome | null;
   protected abstract outcomePath(phase: number): string;
   protected abstract armTasksFile(phase: number): string;
   protected abstract tasksPath(phase: number): string;
@@ -155,8 +251,12 @@ export abstract class RunnerBase {
   protected abstract rearmLockCapParks(board: Board): Promise<void>;
   /** Rewrite this run's settings with the relay armed or not, keeping the token (phase 14; `runner-control.ts`). */
   protected abstract rearmRelay(armed: boolean): void;
+  /** The settings file a plan-mode session with the relay's host loads, or null (control-tower phase 11). */
+  protected abstract planHostSettingsPath(): string | null;
   protected abstract reboardWith(record: PhaseRecord, hint: BoardingHint): void;
-  protected abstract record(event: string, data?: Record<string, unknown>, phase?: number): void;
+  /** Withdraw the open rung a console re-brief superseded before its first turn (control-tower phase 86, #14). */
+  protected abstract supersedeOpenRung(phase: number, why: string): void;
+  protected abstract record(event: string, data?: Record<string, unknown>, phase?: number): number | null;
   /**
    * This run's journal as a `DeclarationSink` — what the state helpers that
    * spend testimony (`resetForRetry`, `reconcileRecordsAgainstBoard`) write
@@ -178,10 +278,11 @@ export abstract class RunnerBase {
    */
   protected settleOpenRung(
     phase: number, outcome: NonNullable<RungRecord['outcome']>, note?: string, costUsd?: number,
+    cause?: RungCause,
   ): RungRecord | null {
     const slot = this.state?.recoveries?.[String(phase)];
     if (!slot) return null;
-    const settled = settleRung(slot, outcome, costUsd, note);
+    const settled = settleRung(slot, outcome, costUsd, note, cause);
     if (settled) this.record('phase.rung-settled', rungSettledPayload(settled), phase);
     return settled;
   }
@@ -203,15 +304,40 @@ export abstract class RunnerBase {
     const slot = state?.recoveries?.[String(phase)];
     if (!state || !slot?.rungs?.some((r) => (r.outcome === 'running' || r.outcome == null) && r.at < since)) return;
     const record = state.phases[String(phase)];
-    // Only when an attempt actually RAN in this lane. A lane that ended at the
-    // gate, the queue or a preflight park spawned nothing: its re-board hint
-    // is kept for the next tick, and the rung behind that hint has not been
-    // tried yet — settling it here would spend the remedy on a boarding that
-    // never happened and lose its cost from the ledger.
-    if (!record?.attemptStartedAt || record.attemptStartedAt < since) return;
+    // A lane that ended at the gate, the queue or a preflight park spawned
+    // nothing. Settling its rung by the record would spend the remedy on a
+    // boarding that never happened — which is exactly what scored a rung
+    // `failed` over the note "the record reads pending" (#16).
+    //
+    // It used to return here in silence, which left the rung `running` for the
+    // service's sweep to mis-score on its next pass. It settles `withdrawn`
+    // instead: the rung is closed, nothing is charged, and `countedRungs`
+    // ignores it, so the remedy is still there to climb on the next tick.
+    if (!record?.attemptStartedAt || record.attemptStartedAt < since) {
+      if (!rungWasWithdrawn(record, { at: since })) return;
+      for (const open of slot.rungs!.filter((r) => (r.outcome === 'running' || r.outcome == null) && r.at < since)) {
+        // A PERSON's Retry is not the ladder's to withdraw (control-tower phase
+        // 91, #131): a halt that emptied the queue took its lane, not the
+        // press. While the record still carries the person's hint the rung
+        // stays open, and the resumed run boards it first — the retry is owed.
+        if (personRetryOwed(record, open)) {
+          this.record('phase.retry-kept', { rung: open.rung, at: open.at, by: open.by }, phase);
+          continue;
+        }
+        settleRungRecord(slot, open, 'withdrawn', undefined, 'the lane never spawned — the record never moved past pending');
+        this.record('phase.rung-settled', { ...rungSettledPayload(open), by: 'attempt-end' }, phase);
+      }
+      return;
+    }
     const status = record?.status ?? 'absent';
     const verdict: { outcome: NonNullable<RungRecord['outcome']>; note: string } =
       status === 'done' ? { outcome: 'fixed', note: 'the record reads done' }
+        // The console's OWN park is the watchdog's act, never the session's
+        // declaration (control-tower phase 47, #52): a watchdog-ended session
+        // that declared nothing used to settle `no-defect` over the note "the
+        // session declared waiting-external". It is an interruption.
+        : (status === 'parked' || status === 'waiting') && record?.declared?.by === 'watchdog'
+          ? { outcome: 'interrupted', note: 'the watchdog ended the attempt and parked the phase; nothing was declared' }
         : (status === 'parked' || status === 'waiting') && record?.declared
           ? { outcome: 'no-defect', note: `the session declared ${record.declared.status}` }
           : status === 'interrupted'
@@ -219,21 +345,47 @@ export abstract class RunnerBase {
             : status === 'pending' && record?.boardingHint
               ? { outcome: 'interrupted', note: `the ladder re-boarded the phase (${record.boardingHint.rung}) before this rung settled` }
               : { outcome: 'failed', note: `the record reads ${status}` };
+    // WHY (control-tower phase 5, #36): an attempt the API refused entry to
+    // — the credential wall the runner stamped on the record during THIS
+    // lane — says nothing about the remedy it was climbing. The rung is not
+    // tried; it comes back when the wall does not.
+    const walled = record?.cause?.kind === 'credential-refused' && record.cause.at >= since;
+    const cause: RungCause | undefined = walled ? 'environment' : undefined;
     // Oldest first, every open rung older than the attempt — a phase that
     // climbed twice without settling holds two, and both are past.
     for (const open of slot.rungs.filter((r) => (r.outcome === 'running' || r.outcome == null) && r.at < since)) {
-      settleRungRecord(slot, open, verdict.outcome, undefined, verdict.note);
+      settleRungRecord(slot, open, verdict.outcome, undefined, walled ? `${verdict.note} — the API refused the run's credential` : verdict.note, cause);
       this.record('phase.rung-settled', { ...rungSettledPayload(open), by: 'attempt-end' }, phase);
     }
   }
+  /**
+   * Stamp `environment` on the rungs THIS attempt was climbing, before
+   * whoever settles them does (control-tower phase 5, #36) — for the arms
+   * that know the machine ended it: no network past the outage budget, a wait
+   * on the network cut short, a transient stop before the first turn. The
+   * settlement keeps a stamped cause. Rungs opened after the attempt began
+   * (a re-board hint for the NEXT lane) are that lane's, and are left alone.
+   */
+  protected blameEnvironment(phase: number): void {
+    const state = this.state;
+    const slot = state?.recoveries?.[String(phase)];
+    const since = state?.phases[String(phase)]?.attemptStartedAt;
+    for (const open of slot?.rungs ?? []) {
+      if (open.outcome !== 'running' && open.outcome != null) continue;
+      if (since && open.at >= since) continue;
+      open.cause = 'environment';
+    }
+  }
   protected abstract release(phase: number, owner: string): Promise<void>;
+  protected abstract mirrorLock(phase: number, verb: 'claim' | 'release'): Promise<void>;
   protected abstract resolveMcp(phase: number, chosen: PhaseOptions): Promise<McpResolution>;
   protected abstract resumedStatus(): RunStatus;
   protected abstract retryContext(record: PhaseRecord, halt?: string | null): string;
   protected abstract scopeDirs(phase: number): Promise<string[]>;
   protected abstract script(script: string, args: string[]): Promise<import("../engine.ts").EngineResult>;
   protected abstract settleAwaitingVerification(): void;
-  protected abstract sleep(ms: number): Promise<void>;
+  /** A sleep a stop, a halt, a wake — or the caller's own `cut` — ends early. */
+  protected abstract sleep(ms: number, cut?: AbortSignal): Promise<void>;
   protected abstract takeOutcome(phase: number): PhaseOutcome | null;
   /* The two halves of "act on what the session declared", implemented in
    * RunnerAttempt and called from RunnerControl's `repair` recovery — which
@@ -257,6 +409,19 @@ export abstract class RunnerBase {
    * `state.activePhase` and `state.freeze` are all derived from it.
    */
   protected lanes = new Map<number, Lane>();
+
+  /**
+   * What this run may do to phase N's model (control-tower phase 54, #91): the
+   * PLAN's word — the phase's bullet, else §Session budget's line — then the
+   * run's `modelPolicy`, then `ladder`. The plan outranks the run here as it
+   * does for the MCP policy: "this model, or wait" is a claim about the work,
+   * and a plan that pinned its model should not un-pin because a run forgot.
+   */
+  protected modelPolicyOf(phase: number): ModelPolicy {
+    const state = this.state;
+    const plan = state ? this.deps.phaseDefaults?.(state.slug, phase)?.modelPolicy : undefined;
+    return plan ?? state?.modelPolicy ?? DEFAULT_MODEL_POLICY;
+  }
 
   /**
    * The directory a phase's session runs in: its own worktree when this plan
@@ -330,7 +495,13 @@ export abstract class RunnerBase {
    * what keeps two of them colliding whatever branches they name.
    */
   protected treeFor(phase: number): string | undefined {
-    const tree = this.lanes.get(phase)?.worktree ?? this.state?.workRoot ?? this.state?.root;
+    // 🔴 An ISOLATED run never falls back to the shared root (control-tower
+    // phase 90, #149). Its tree is its own checkout on EVERY admission path —
+    // and on the one #149 measured, a watch-landed automatic resume admitted
+    // with no lane yet and no `workRoot`, the shared root was presented, so the
+    // S12 carve-out that let the same phase past a foreign grant three times
+    // refused it the fourth. `ownRunTree` answers the run's own checkout path.
+    const tree = this.lanes.get(phase)?.worktree ?? this.state?.workRoot ?? this.ownRunTree() ?? this.state?.root;
     // The PHYSICAL path (SCH-1). This is one half of the pair a claim is
     // decided on, and it was returned verbatim — so a run whose root is reached
     // through a symlink (`/tmp/x` for `/private/tmp/x`, which is every macOS
@@ -340,6 +511,24 @@ export abstract class RunnerBase {
     // pair exists to refuse. `realish` resolves what exists and walks up for
     // what does not, so a tree not yet created still answers.
     return tree ? realish(tree) : undefined;
+  }
+
+  /**
+   * An isolated run's own checkout when `workRoot` is not recorded — the path
+   * the run's checkout lives at (`laneNamesFor(0).integration`), which the next
+   * boundary rebuilds if it is gone (`checkoutBeforeBoarding`). Undefined for a
+   * run whose checkout is not its own.
+   *
+   * …and undefined once the run is OVER (`runResumable` answers no). A settle
+   * prunes a tree only then — a resumable run keeps its trees whole — and keeps
+   * `checkout: 'worktree'` as history, so the word alone would claim a
+   * directory the settle removed and that no boundary will rebuild. A settled
+   * run's claim is the shared root (git-strategy F-1a); a run that will board
+   * again claims its own path whatever its record lost (#149).
+   */
+  protected ownRunTree(): string | undefined {
+    const state = this.state;
+    return state?.checkout === 'worktree' && runResumable(state) ? this.laneNamesFor(0).integration : undefined;
   }
 
   /**
@@ -379,7 +568,16 @@ export abstract class RunnerBase {
   ): { branch?: string; tree?: string; repo?: string } {
     const root = this.state?.root;
     if (!root || !scopeConfined(root, scope)) return {};
-    const branch = this.branchFor(phase);
+    // A run that names no branch of its own (a default-branch run) commits on
+    // whatever its SHARED checkout stands on, so its claim says that branch —
+    // the one every repository its scope names stands on, read off disk at
+    // each ask (control-tower phase 90, #149). Stating none made it collide
+    // with every claim in every tree, where its new-branch sibling in the same
+    // checkout was carved past an isolated run's grant. The TREE still keeps
+    // it colliding with everything in the shared checkout. Never the branch
+    // hold's probe: that one is handed the declared branch alone (`admit`).
+    const branch = this.branchFor(phase)
+      ?? (this.worktreeFor(phase) ? undefined : standingBranchSync(root, scope));
     const tree = this.treeFor(phase);
     // The repository the tree rides in — the per-repository cap's key. Derived
     // from the tree rather than from `state.root`, so it is absent for exactly
@@ -394,7 +592,9 @@ export abstract class RunnerBase {
   }
 
   /**
-   * The four environment variables a spawned session claims its lock with.
+   * The four environment variables a spawned session claims its lock with —
+   * and a fifth, `PE_LOCK_MIRROR` (`LOCK_MIRROR_ENV`), which makes those claims
+   * file-only because the console mirrors the lock to git itself.
    *
    * `phase-lock.sh` reads all four (`PE_OWNER`, `PE_SCOPE`, `PE_BRANCH`,
    * `PE_WORKTREE`) and DECIDES on the pair: a claim that names a branch and a
@@ -428,6 +628,9 @@ export abstract class RunnerBase {
       PE_SCOPE: formatScope(scope),
       ...(claim.tree ? { PE_WORKTREE: claim.tree } : {}),
       ...(claim.branch ? { PE_BRANCH: claim.branch } : {}),
+      // …and that the console, not the session, mirrors the lock to git
+      // (control-tower phase 63, #85): the session's lock calls are file-only.
+      ...LOCK_MIRROR_ENV,
     };
   }
 
@@ -442,6 +645,16 @@ export abstract class RunnerBase {
     // A plan read that throws must not stop a phase boarding: messaging is a
     // convenience and the default is on.
     try { return this.deps.messaging.on(state.slug) ?? own; } catch { return own; }
+  }
+
+  /**
+   * The console's commit and this run's skill copy, for the boot prompt (#151)
+   * — asked of the service at every boarding, so a copy updated mid-run is
+   * said to the next session. A read that throws says nothing rather than
+   * stopping a boarding: the directive informs, and the prompt stands without it.
+   */
+  protected consoleSkillFacts(): ConsoleSkillFacts | null {
+    try { return this.deps.consoleSkill?.(this.state?.accountId) ?? null; } catch { return null; }
   }
 
   /**
@@ -539,6 +752,31 @@ export abstract class RunnerBase {
   }
 
   /**
+   * Put back the mirror branches a final phase's §Verification settled
+   * (control-tower phase 62, #47): before ANY session is spawned again — a fix
+   * session, a reviewer's requested changes, the pull-request session — and at
+   * once on a red final verdict. A settled mount stands on a detached HEAD, and
+   * a session committing there would leave its work on no branch at all. One
+   * field read when nothing is settled.
+   */
+  protected async restoreIdleMirror(cause: 'spawn' | 'not-green'): Promise<void> {
+    const state = this.state;
+    const settled = state?.mirrorSettled;
+    if (!state || !settled) return;
+    delete state.mirrorSettled;
+    const names = this.laneNamesFor(0);
+    const out = await restoreSettledMirror(names.integration, names.runBranch, settled.mounts)
+      .catch((error: unknown) => ({
+        restored: [] as string[],
+        failed: settled.mounts.map((mount) => ({ mount, reason: error instanceof Error ? error.message : String(error) })),
+      }));
+    this.record('run.mirror-branches-restored', {
+      phase: settled.phase, cause, branch: names.runBranch, restored: out.restored,
+      ...(out.failed.length ? { failed: out.failed } : {}),
+    });
+  }
+
+  /**
    * The console-wide staging checkout, wherever it already is: git allows a
    * branch ONE working tree, so a `pe/integration` tree standing under the
    * other root keeps its place until an operator removes it.
@@ -599,6 +837,9 @@ export abstract class RunnerBase {
 
   /** The 60-second liveness ticker; armed with the first lane, retired with the last. */
   protected livenessTimer: NodeJS.Timeout | null = null;
+
+  /** The 3-second `run:progress` ticker, armed and retired beside it. */
+  protected progressTimer: NodeJS.Timeout | null = null;
   /**
    * The five-minute branch probe; armed only for a run that has a checkout of
    * its own, because a shared run's branch IS the base and there is nothing to
@@ -671,6 +912,40 @@ export abstract class RunnerBase {
    * signal re-arming is still seen, because the loop top reads the flag.
    */
   protected docsDirty = false;
+  /**
+   * The newest board the drive loop read (control-tower phase 86, #136) — what
+   * a queued entry's `awaiting` probe answers from, because the scheduler's
+   * scan cannot await an engine read. Refreshed every tick and at every grant
+   * that waited; each refresh re-scans the queue (`noteBoard`).
+   */
+  protected lastBoard: Board | null = null;
+  /** Phases whose last admission WAITED in the queue — their grant re-reads a fresh board (#136). */
+  protected admittedAfterWait = new Set<number>();
+  /**
+   * The recovery this runner is driving, while it still waits for its scope
+   * (control-tower phase 86, #149 ask 4): a Pause withdraws it and new words
+   * replace its instruction, where a recovery that has spawned has no boundary.
+   */
+  protected recoveryQueued: { phase: number; controller: AbortController; options: { instruction?: string } } | null = null;
+
+  /** Keep `board` as the newest read and let the queue re-scan against it. */
+  protected noteBoard(board: Board): void {
+    if (board.error || !board.phased) return;
+    this.lastBoard = board;
+    try { this.deps.scheduler?.poll(); } catch { /* a scan that throws must not stop the loop */ }
+  }
+
+  /**
+   * The dependencies of `phase` the newest board says are not done, or null —
+   * the `awaiting` probe (#136). A phase the board reads `waiting` is held
+   * behind the phases its `blocked:` line names; any other word holds nothing.
+   */
+  protected awaitingOf(phase: number): number[] | null {
+    const board = this.lastBoard;
+    if (!board || board.states[phase] !== 'waiting') return null;
+    const deps = board.blockedBy?.[phase] ?? [];
+    return deps.length ? [...deps] : null;
+  }
   protected wake = wakeSignal();
   /**
    * Resolutions the Service could not write because this loop owns the state
@@ -681,13 +956,45 @@ export abstract class RunnerBase {
   /** Per-phase pokes armed at `parkedUntil`, so a live loop resumes a wait on time. */
   protected parkPokes = new Map<number, NodeJS.Timeout>();
   /**
-   * What the loop's ladder pass last judged, per phase, as a fingerprint of the
-   * record and the board. A record the ladder left standing (deferred, or
-   * nothing to climb) is not re-classified — and re-journalled — every tick;
-   * it is looked at again when its status, its attempt count or the board's
-   * word about it changes. Cleared on start and on retry.
+   * Per-phase re-probes of a usage wall's account, on the `WALL_REPROBE_BACKOFF_MS`
+   * back-off (control-tower phase 54, #78). Cleared with the park pokes: they
+   * belong to a live loop, and a restarted one re-arms them from the record's
+   * `usageWall` at its first re-read.
    */
-  protected ladderSeen = new Map<number, string>();
+  protected wallProbes = new Map<number, NodeJS.Timeout>();
+  /**
+   * Phases whose watch landed while this loop was live (`landWatch`) and which
+   * have not been admitted yet: they board AHEAD of their scope — first in the
+   * loop's fill, and with `AdmitRequest.reserve` at the scheduler. In memory on
+   * purpose: the landing itself is on the record (`declared.landed`), and a
+   * loop that dies before boarding it leaves an elapsed wait the next loop
+   * resumes like any other — only the head-of-queue priority is this loop's.
+   */
+  protected landingReserve = new Set<number>();
+  /**
+   * What the loop's ladder pass last judged, per phase, as a fingerprint of the
+   * record, the board and the handoff, and WHEN (`at`, this loop's clock). A
+   * record the ladder left standing (deferred, or nothing to climb) is not
+   * re-classified — and re-journalled — every tick; it is looked at again when
+   * its status, its attempt count, the board's word or its handoff changes, and
+   * in any case once the entry is older than `ladderSeenTtlMs` (control-tower
+   * phase 79, #114 — it used to be trusted for the life of the process, so a
+   * phase whose world moved under an unchanged record was never looked at
+   * again). The age sits BESIDE the fingerprint, never in it (phase 51's rule).
+   * Cleared on start and on retry, and per phase when an input the fingerprint
+   * cannot see moves: walls lifting, a fresh reading with room, a lane freeing
+   * on its scope (`noteLaneFreed`).
+   */
+  protected ladderSeen = new Map<number, { fingerprint: string; at: number }>();
+  /**
+   * Lanes that ended since the ladder last looked, with the scope each held
+   * (control-tower phase 79, #114): a seen phase whose scope meets one is
+   * looked at again — the lane may be what it was waiting on. Bounded by the
+   * seen entries it can still invalidate; pruned by the pass.
+   */
+  protected laneFrees: { at: number; scope: readonly string[] }[] = [];
+  /** The one poke that wakes the loop when the oldest seen entry expires (#114). */
+  protected ladderRecheck: { timer: NodeJS.Timeout; at: number } | null = null;
   /**
    * Set by the console's shutdown checkpoint: the stop about to land on the
    * lanes is the SYSTEM's, not the operator's — the run is stamped so the
@@ -731,7 +1038,16 @@ export abstract class RunnerBase {
   holdsIsolatedCheckout(): boolean {
     return this.reservingCheckout || this.state?.checkout === 'worktree';
   }
-  busy(): boolean { return this.driving !== null; }
+  /**
+   * Is a loop behind this runner — driving, or being STARTED (control-tower
+   * phase 53, #56)? `start()` holds the run it will persist from its first
+   * line, across awaits, before the loop exists; a control that read that
+   * window as idle wrote the file and was overwritten by the start's own save.
+   */
+  busy(): boolean { return this.driving !== null || this.starting; }
+
+  /** True while `start()` is between its first line and its return. See `busy`. */
+  protected starting = false;
 
   /**
    * Is a `claude` process of this run spending `accountId` RIGHT NOW? The
@@ -740,6 +1056,22 @@ export abstract class RunnerBase {
    * cadence; everything else waits the idle ten minutes. A queued or waiting
    * lane holds no child and spends nothing.
    */
+  /**
+   * This run as the account forecast names it (control-tower phase 92, #141):
+   * its plan, its id and the lanes spending `accountId` now — or nothing.
+   */
+  burningOn(accountId: string): { slug: string; runId: string; lanes: number[] }[] {
+    const state = this.state;
+    if (!state || !this.driving) return [];
+    // Each lane's own account: a boundary switch leaves a live session on the old one.
+    const lanes = [...this.lanes.values()]
+      .filter((lane) => lane.pid != null && !lane.checkpointed && !lane.stopped
+        && (lane.accountId ?? state.accountId ?? 'default') === accountId)
+      .map((lane) => lane.phase)
+      .sort((a, b) => a - b);
+    return lanes.length ? [{ slug: state.slug, runId: state.id, lanes }] : [];
+  }
+
   isSpending(accountId: string): boolean {
     const state = this.state;
     if (!state || !this.driving) return false;
@@ -758,6 +1090,71 @@ export abstract class RunnerBase {
   noteDocsChanged(): void {
     this.docsDirty = true;
     this.wake.resolve();
+  }
+
+  /**
+   * An input the ladder's fingerprint cannot see has moved (control-tower
+   * phase 79, #114): forget what the pass has seen — for `phases`, else for
+   * every phase — and wake the loop, so the phases it left standing are judged
+   * again on THIS tick rather than when some lane next happens to end.
+   */
+  protected forgetSeen(phases?: Iterable<number>): boolean {
+    let forgot = false;
+    if (!phases) {
+      forgot = this.ladderSeen.size > 0;
+      this.ladderSeen.clear();
+    } else {
+      for (const phase of phases) forgot = this.ladderSeen.delete(phase) || forgot;
+    }
+    if (forgot) this.wake.resolve();
+    return forgot;
+  }
+
+  /**
+   * A lane of this run ended, holding `scope` (control-tower phase 79, #114).
+   * A phase the ladder left standing whose scope meets it is looked at again
+   * on the next pass — the lane may be exactly what it was waiting on. Kept
+   * only while something seen could care.
+   */
+  protected noteLaneFreed(_phase: number, scope: readonly string[]): void {
+    if (!this.ladderSeen.size) return;
+    this.laneFrees.push({ at: this.now().getTime(), scope: [...scope] });
+    this.wake.resolve();
+  }
+
+  /** Did a lane end on this phase's scope since `since`? The seen entry's invalidation for `noteLaneFreed`. */
+  protected async laneFreedOnScope(phase: number, since: number): Promise<boolean> {
+    const frees = this.laneFrees.filter((free) => free.at >= since);
+    if (!frees.length) return false;
+    const scope = await this.scopeFor(phase);
+    return frees.some((free) => scopesIntersect([...free.scope], scope));
+  }
+
+  /**
+   * Wake the loop when the oldest seen entry expires (#114). Without it the
+   * expiry is only as prompt as the next event — and a lane can run for hours,
+   * which is exactly how the measured phases sat skipped. One timer, re-armed
+   * only when something earlier is due; a frozen console's poke is dropped,
+   * as the park poke's is.
+   */
+  protected armLadderRecheck(atMs: number): void {
+    if (this.ladderRecheck && this.ladderRecheck.at <= atMs) return;
+    this.clearLadderRecheck();
+    const delay = Math.max(0, atMs - this.now().getTime());
+    const timer = setTimeout(() => {
+      this.ladderRecheck = null;
+      let frozen: { by?: string; plans?: readonly string[] } | null | undefined;
+      try { frozen = this.deps.fleetHold?.(); } catch { frozen = null; }
+      if (frozen && holdBinds(frozen, this.state?.slug)) return;
+      this.wake.resolve();
+    }, delay);
+    timer.unref?.();
+    this.ladderRecheck = { timer, at: atMs };
+  }
+
+  protected clearLadderRecheck(): void {
+    if (this.ladderRecheck) clearTimeout(this.ladderRecheck.timer);
+    this.ladderRecheck = null;
   }
 
   /**
@@ -809,11 +1206,41 @@ export abstract class RunnerBase {
   liveness(): LaneLiveness[] {
     return [...this.lanes.values()]
       .map((lane) => ({
-        ...livenessOf(lane.phase, lane.signals),
+        ...livenessOf(lane.phase, lane.signals, stallThresholds(this.deps.stallThresholds?.())),
         // The unbooked half of the run's spend (`LaneLiveness.spentUsd`).
         ...(lane.sessionUsd ? { spentUsd: lane.sessionUsd } : {}),
       }))
       .sort((a, b) => a.phase - b.phase);
+  }
+
+  /**
+   * One `run:progress` frame per live lane whose digest has moved.
+   *
+   * The tick itself is `Runner.tickProgress`; this is the part worth having
+   * here, beside `liveness()`, because the frame is a JOIN of the two halves
+   * and only this class holds both. It mutates `lane.progressDigest`, which is
+   * what makes "only when its digest changed" a property of the lane rather
+   * than of whoever happens to be asking.
+   */
+  progressFrames(): RunProgress[] {
+    const out: RunProgress[] = [];
+    for (const lane of this.lanes.values()) {
+      const record = this.state?.phases[String(lane.phase)];
+      if (!record) continue;
+      const frame = progressFrame(
+        {
+          ...livenessOf(lane.phase, lane.signals, stallThresholds(this.deps.stallThresholds?.())),
+          ...(lane.sessionUsd ? { spentUsd: lane.sessionUsd } : {}),
+        },
+        record,
+        this.now().getTime(),
+      );
+      const digest = progressDigest(frame);
+      if (lane.progressDigest === digest) continue;
+      lane.progressDigest = digest;
+      out.push(frame);
+    }
+    return out;
   }
 
   /**
@@ -1002,24 +1429,15 @@ export abstract class RunnerBase {
     this.handle = handle;
   }
 
-  /** The phase sizes this runner has read, so a retry does not ask the engine again. */
-  protected phaseSizes = new Map<number, PhaseSize>();
-
   /**
-   * A phase's `Size:` from the plan, through the engine (`--size N`) — the
-   * input to its session caps. Read once per phase; an engine that cannot
-   * answer reads as `M`, the engine's own default for a phase with no size.
+   * The caps this console measured from its own sessions (control-tower phase
+   * 59, #83) — the input to every session's caps in place of the phase's
+   * `Size:`, which did not separate an M's spend from an L's. Null where the
+   * console has none yet, or in a harness: `capsFor` then takes the shipped
+   * table, measured the same way at release.
    */
-  protected async sizeOf(phase: number): Promise<PhaseSize> {
-    const known = this.phaseSizes.get(phase);
-    if (known) return known;
-    let size: PhaseSize = 'M';
-    try {
-      const said = (await this.engine(['--size', String(phase)])).stdout.trim();
-      if (said === 'S' || said === 'M' || said === 'L') size = said;
-    } catch { /* unreadable: the engine's own default stands */ }
-    this.phaseSizes.set(phase, size);
-    return size;
+  protected capTable(): CapTable | null {
+    return this.deps.sessionCaps?.() ?? null;
   }
 
   /** The wait budgets this runner has read — one pair of engine reads per phase. */
@@ -1028,21 +1446,29 @@ export abstract class RunnerBase {
   /**
    * A phase's wait budget from the plan, through the engine: `--wait-budget N`
    * (the phase's own `Waits on:` max, else the plan's `Wait budget:`) and
-   * `--waits-on N`, whose `date:` refs countersign a longer wait. Read once per
-   * phase; an engine that cannot answer reads as the console default with
-   * nothing countersigned — the degradation `sizeOf` makes, for the same reason.
+   * `--waits-on N`, whose `date:` refs countersign a longer wait.
+   *
+   * Read at EVERY park and resume, never once per phase (control-tower phase
+   * 14, #40): the budget an errand tells a person to raise has to be the one
+   * the next park reads, from the plan the console shows. It used to be read
+   * once for the runner's whole life, so a raise written to the plan — by
+   * hand, as the errand said, or by `raise-budget` — reached no live run: on
+   * 2026-09-26 a phase raised from 180m to 360m parked again three minutes
+   * later on "3.0 h, this phase's `Waits on:` bullet". Parks are rare and the
+   * engine call is uncached by design, so the price is two short reads. The map
+   * keeps the last answer for the synchronous paths (`knownWaitBudget`), and a
+   * read that fails keeps it too — only a first read with nothing known falls
+   * to the console default, the degradation `sizeOf` makes.
    */
   protected async waitBudgetOf(phase: number): Promise<WaitBudget> {
-    const known = this.waitBudgets.get(phase);
-    if (known) return known;
-    let budget: WaitBudget = DEFAULT_WAIT_BUDGET;
+    let budget: WaitBudget = this.waitBudgets.get(phase) ?? DEFAULT_WAIT_BUDGET;
     try {
       const [line, refs] = await Promise.all([
         this.engine(['--wait-budget', String(phase)]),
         this.engine(['--waits-on', String(phase)]),
       ]);
-      budget = waitBudgetFrom(line.code === 0 ? line.stdout : '', refs.code === 0 ? refs.stdout : '', dateOfRef);
-    } catch { /* unreadable: the console default stands */ }
+      if (line.code === 0) budget = waitBudgetFrom(line.stdout, refs.code === 0 ? refs.stdout : '', dateOfRef);
+    } catch { /* unreadable: the last answer stands */ }
     this.waitBudgets.set(phase, budget);
     return budget;
   }
@@ -1071,6 +1497,9 @@ export abstract class RunnerBase {
   protected async spawnSession(
     phase: number, mode: SessionMode, request: SessionRequest, ctx: { caps: SessionCaps; attempt?: number },
   ): Promise<SpawnOutcome> {
+    // A mirror a final §Verification settled gets its branches back before
+    // anything can commit into it (control-tower phase 62, #47).
+    await this.restoreIdleMirror('spawn');
     // `--resume` only ever arrives vetted (`resumableSession`, REG-1/SLF-10):
     // the type admits nothing else, and this is the one line that unwraps it.
     const { resumeFrom, ...rest } = request;
@@ -1097,6 +1526,28 @@ export abstract class RunnerBase {
       this.noteRelayArming(arming);
       if (arming.armed) relay = this.relayMcpDoc(rest.mcpConfig);
     }
+    // A plan-mode phase needs a permission HOST (control-tower phase 11; spike
+    // `test/fixtures/spikes/exit-plan-mode.json`, CLI 2.1.280): the CLI offers
+    // `ExitPlanMode` only to a session that has one — on the floor it answers
+    // "No such tool available" and the plan has nobody to be handed to, exactly
+    // as spike S1 measured for `AskUserQuestion`. So the phase's own session in
+    // `plan` mode carries the relay's presence-only host even on a run whose
+    // relay is off, under the CLI floor the relay itself needs, and loads the
+    // settings variant with the `PermissionRequest` hook — a host that never
+    // answers needs the hook to answer instead. The RUN's relay is untouched:
+    // a question on this session is still answered by policy (`relayArmed`).
+    let planHostSettings: string | null = null;
+    if (!relay && mode === 'phase' && rest.permissionMode === 'plan' && this.state) {
+      let initVersion: string | null = null;
+      try { initVersion = this.deps.initVersion?.(version) ?? null; } catch { initVersion = null; }
+      const arming = relayArmingFor('last-resort', initVersion);
+      if (arming.armed) planHostSettings = this.planHostSettingsPath();
+      if (planHostSettings) relay = this.relayMcpDoc(rest.mcpConfig);
+      this.record('phase.plan-host', {
+        armed: Boolean(relay), version: arming.version, floor: arming.floor,
+        ...(arming.refused ? { refused: arming.refused } : !planHostSettings ? { refused: 'no-settings' } : {}),
+      }, phase);
+    }
     const armedPath = relay && this.state ? this.writeRelayConfig(phase, relay) : null;
     const prompts = permissionPromptsFor(armedPath ? 'last-resort' : 'off', version);
     if (prompts.refused && this.state && this.promptsSkippedFor !== this.state.id) {
@@ -1105,7 +1556,10 @@ export abstract class RunnerBase {
         version: prompts.refused.version, floor: prompts.refused.floor, relay: this.state.relay ?? 'off',
       });
     }
-    const armed = Boolean(armedPath);
+    // The relay's own checks (`noteSessionEvent`) belong to a relay-ARMED run;
+    // a plan host borrows the transport, not the relay, and must not re-judge
+    // the run's relay from its `system/init`.
+    const armed = Boolean(armedPath) && !planHostSettings;
     const onEvent = rest.onEvent;
     // Every session on a lane starts from nothing: the lane must not go on
     // showing the context of the session before it until this one's first call.
@@ -1118,9 +1572,15 @@ export abstract class RunnerBase {
       delete shared.signals.contextWindow;
       // …and the dollars shown as live (`Lane.sessionUsd`): a closeout or a
       // retry on this lane must not open showing what the session before it
-      // cost — that sum is already booked (autopilot-token-drain H7).
+      // cost — that sum is already booked (autopilot-token-drain H7). A
+      // `--resume` re-reports that booked sum inside its running total, so the
+      // live figure is measured from the session's mark (control-tower phase 46).
       delete shared.sessionUsd;
+      shared.liveCostBase = resumeFrom ? this.costMarkOf(phase, resumeFrom.sessionId) : 0;
     }
+    // Whether this session started a subagent: its calls are the subagent's own
+    // context, which the stream never prices, so they explain a booked excess.
+    let delegated = false;
     const lane = mode === 'phase' ? shared : undefined;
     const pollTracker = lane?.signals.pollLoop;
     const pollBefore = pollTracker ? { ...pollTracker.counts } : undefined;
@@ -1129,6 +1589,7 @@ export abstract class RunnerBase {
       ...(resumeFrom ? { resume: resumeFrom.sessionId } : {}),
       ...(prompts.flag ? { permissionPrompts: prompts.flag } : {}),
       ...(armedPath ? { permissionPromptTool: RELAY_HOST_TOOL, mcpConfig: armedPath } : {}),
+      ...(armedPath && planHostSettings ? { settings: planHostSettings } : {}),
       caps: ctx.caps,
       maxTurns: ctx.caps.maxTurns.value,
       budgetUsd: ctx.caps.maxBudgetUsd.value,
@@ -1137,6 +1598,14 @@ export abstract class RunnerBase {
       // whether the relay actually has a tool to answer and a host to hold it.
       onEvent: (event) => {
         try { this.noteSessionEvent(phase, event, armed, version); } catch { /* bookkeeping never costs the stream */ }
+        // The session a phase's boarding prompt was composed for has STARTED:
+        // the next-attempt notes that prompt carried are delivered now, to it
+        // (control-tower phase 98, #137). A spawn that died before this left
+        // them held for the next boarding.
+        if (event.kind === 'init' && mode === 'phase' && this.state) {
+          try { this.deps.messaging?.confirmBoot?.(this.state.slug, phase, event.sessionId); } catch { /* the mailbox never costs the stream */ }
+        }
+        if (event.kind === 'tool' && event.delegates) delegated = true;
         onEvent?.(event);
         // The context thresholds, after the lane has taken the event, and for
         // the phase's OWN sessions only: a closeout, a QA round or a repair is
@@ -1155,18 +1624,232 @@ export abstract class RunnerBase {
     // Whose prompt cache this session writes — read at the spawn, because a
     // switch can move the run's account while the session is still running.
     const account = this.state?.accountId ?? 'default';
-    const outcome = await (this.deps.spawn ?? spawnClaude)(sent);
-    // Ended, so its cost is the caller's to book (`state.spentUsd +=`, right
-    // after this returns): the lane stops reporting it as live, or the run view
-    // would count it twice until the next session's first `result`.
-    if (shared) delete shared.sessionUsd;
+    // Every session that works the phase is worked time (control-tower phase
+    // 58, #66). The attempt opens its own window before it spawns — it owns the
+    // boarding's stretch — so the door opens one for every OTHER work mode: a
+    // phase finished by its resume or its closeout was recorded as the attempt
+    // alone, and taught the ETA a rate nobody worked at. The pull-request
+    // session is the run's, not the phase's (`PHASE_WORK_MODES`).
+    const worked = mode !== 'phase' && (PHASE_WORK_MODES as readonly string[]).includes(mode)
+      ? this.state?.phases[String(phase)]
+      : undefined;
+    if (worked) openSessionWindow(worked, mode, this.now().toISOString());
+    let outcome: SpawnOutcome;
+    try {
+      outcome = await (this.deps.spawn ?? spawnClaude)(sent);
+    } finally {
+      // Closed even when the spawn throws: a window left open on a record that
+      // still reads `running` would count to now on every read.
+      if (worked) {
+        closeAttemptWindow(worked, this.now().toISOString());
+        // ONE definition (#28): the stored figure is the windows' sum, as the wire's is.
+        worked.durationMs = phaseClocks(worked, this.now().getTime()).workedMs ?? worked.durationMs;
+      }
+    }
+    // Ended, so its cost is booked (below): the lane stops reporting it as
+    // live, or the run view would count it twice until the next session's
+    // first `result`.
+    if (shared) {
+      delete shared.sessionUsd;
+      delete shared.liveCostBase;
+    }
+    // Booked HERE, once, for every session this door spawns — the run, the
+    // phase, the rung and the start ceiling — and before the ledger line, which
+    // carries what was booked beside what the CLI reported (control-tower
+    // phase 46, #62). The eight sites that each added the reported total are gone.
+    const booking = this.bookSpend(phase, mode, outcome);
+    this.noteSpendProof(phase, account, sent, outcome, booking.booked, shared);
+    this.noteEnding(phase, mode, sent, outcome);
     this.record('phase.session', sessionRecordOf({ mode, request: sent, outcome, attempt: ctx.attempt }), phase);
     this.noteTokens(phase, mode, sent, outcome, ctx.attempt, lane ? { lane, tracker: pollTracker, before: pollBefore } : undefined, account);
-    // What this session REPORTED costing goes to the instance's start ceiling
-    // — its dollars-per-hour half reads the last hour's session spend. A cost
-    // that never arrived charges nothing (`costSource: 'none'`).
-    if (outcome.costUsd > 0) this.deps.startCeiling?.spendUsd(outcome.costUsd);
+    this.corroborateSpend(phase, mode, sent, outcome, booking, delegated);
     return outcome;
+  }
+
+  /**
+   * A session that SPENT under the account and ended well is proof the account
+   * can pay (control-tower phase 54, #78): its shared walls, the spent model's
+   * own wall and a usage cooling lift (`deps.noteSpend`), and every phase of
+   * this run parked on a wall is re-read at once rather than at its reported
+   * reset. Only a success that booked money and ended by itself counts — a
+   * refusal books nothing, a session that errored proves nothing about the
+   * window, and one the console ended (a checkpoint at the wall itself, a
+   * switch, the watchdog) wrote whatever its interrupted turn left.
+   */
+  protected noteSpendProof(
+    phase: number, account: string, request: SpawnRequest, outcome: SpawnOutcome, booked: number, lane?: Lane,
+  ): void {
+    if (!(booked > 0) || outcome.signal?.subtype !== 'success' || outcome.signal.isError) return;
+    if ((outcome.endedBy ?? outcome.signal.endedBy ?? 'exit') !== 'exit') return;
+    if (lane?.checkpointed || lane?.stopped) return;
+    let moved: { lifted: string[]; cooled: boolean } | void = undefined;
+    try {
+      moved = this.deps.noteSpend?.(account === 'default' ? undefined : account, request.model);
+    } catch (error) {
+      log.warn('runner.note-spend-failed', { account, error });
+    }
+    if (moved && (moved.lifted.length || moved.cooled)) {
+      this.record('run.walls-lifted', { account, lifted: moved.lifted, cooled: moved.cooled, model: request.model ?? null }, phase);
+      // New information for every phase the ladder left standing (#114): a
+      // phase deferred or classified on a wall that is gone is judged again.
+      this.forgetSeen();
+    }
+    this.rereadWalls('spend');
+  }
+
+  /** A session's mark on the phase record: the last total booked for it, or 0. */
+  protected costMarkOf(phase: number, sessionId: string | null | undefined): number {
+    if (!sessionId) return 0;
+    return this.state?.phases[String(phase)]?.costHighWater?.[sessionId] ?? 0;
+  }
+
+  /**
+   * Book what one spawn cost — the ONE writer of the run's and the phase's
+   * dollars, the rung's charge and the start ceiling's $/hour (control-tower
+   * phase 46, #62, CC-1..4). Called by the spawn door and nowhere else.
+   *
+   * The CLI's `total_cost_usd` is the conversation's running total: from CLI
+   * 2.1.278 a `--resume` spawn carries everything the session spent before it.
+   * Eight sites added it whole, so observability-plane P9 booked $44.51, $58.98,
+   * $62.89 and $67.31 for spawns that spent $14.48, $3.91 and $4.42, and the
+   * $/hour ceiling refused three starts on $297.29 "spent" in an hour that cost
+   * $129.46. A spawn now books its rise over the session's mark
+   * (`bookedDelta`), and the mark is kept on the phase record, so three resumes
+   * of one session book exactly the CLI's final total.
+   */
+  protected bookSpend(
+    phase: number, mode: SessionMode, outcome: SpawnOutcome,
+  ): { booked: number; reported: number; mark: number; restarted: boolean } {
+    const reported = typeof outcome.costUsd === 'number' && Number.isFinite(outcome.costUsd) ? outcome.costUsd : 0;
+    const known = (outcome.costSource ?? (reported ? 'result' : 'none')) !== 'none';
+    const sessionId = outcome.sessionId ?? null;
+    const mark = this.costMarkOf(phase, sessionId);
+    const delta = bookedDelta(mark, reported, known);
+    outcome.bookedUsd = delta.booked;
+    const state = this.state;
+    if (state) {
+      const record = phaseRecord(state, phase);
+      if (sessionId && known && reported > 0) {
+        // Re-inserted last, so the newest marks are the ones the bound keeps.
+        const marks = { ...(record.costHighWater ?? {}) };
+        delete marks[sessionId];
+        marks[sessionId] = delta.mark;
+        record.costHighWater = Object.fromEntries(Object.entries(marks).slice(-MAX_COST_MARKS));
+      }
+      state.spentUsd += delta.booked;
+      record.costUsd += delta.booked;
+      // The part of it spent on credit (control-tower phase 93, #146): the
+      // rise past the running total at which the session went on credit, and
+      // never more than this spawn booked.
+      const credit = creditBooked(outcome.creditFromUsd, mark, reported, delta.booked);
+      if (credit > 0) {
+        state.creditUsd = (state.creditUsd ?? 0) + credit;
+        record.creditUsd = (record.creditUsd ?? 0) + credit;
+      }
+      let rung = true;
+      if (rung) chargeRung(state.recoveries?.[String(phase)], delta.booked);
+      // Approaching (control-tower phase 14, #40): the dollars this spawn booked
+      // may carry the run, or this phase, past BUDGET_WARN_PCT of its budget —
+      // said once per limit for the run and once per attempt for the phase, so
+      // a raise re-arms it and a restart does not repeat it.
+      if (delta.booked > 0) {
+        if (state.runBudgetUsd && budgetApproaching(state.spentUsd, state.runBudgetUsd)) {
+          this.noteBudgetApproaching('run', phase, runBudgetFact(state), `run:${state.runBudgetUsd}`);
+        }
+        const cap = state.phaseBudgetUsd;
+        if (cap && budgetApproaching(record.costUsd, cap)) {
+          this.noteBudgetApproaching('phase', phase, phaseBudgetFact(phase, cap, record.costUsd, sessionSpend(record)),
+            `${record.attempts ?? 0}:${cap}`);
+        }
+      }
+    }
+    if (delta.booked > 0) this.deps.startCeiling?.spendUsd(delta.booked);
+    return { booked: delta.booked, reported, mark, restarted: delta.restarted };
+  }
+
+  /**
+   * A budget at its warning line (`BUDGET_WARN_PCT`, control-tower phase 14,
+   * #40): ONE `phase.budget-approaching` line and one `budget` event per budget
+   * per `key` — the attempt and the limit it was measured against, claimed on
+   * the phase record (or the run, for the run's own budget) so a restart does
+   * not say it twice. The service turns the event into the push.
+   */
+  protected noteBudgetApproaching(
+    holder: 'phase' | 'run', phase: number | null, fact: BudgetFact, key: string, extra: Record<string, unknown> = {},
+  ): void {
+    const state = this.state;
+    if (!state) return;
+    const owner = holder === 'run' || phase == null ? state : phaseRecord(state, phase);
+    if (!claimBudgetWarning(owner, fact.budget, key)) return;
+    // The fact itself stays on the holder until a raise answers it, so a page
+    // can draw the approach with its raise BEFORE the park (phase 25, #40).
+    owner.budgetApproaching = { ...(owner.budgetApproaching ?? {}), [fact.budget]: fact };
+    this.record('phase.budget-approaching', {
+      budget: fact.budget, limit: fact.limit, spent: fact.spent, left: fact.left, unit: fact.unit, key, ...extra,
+    }, phase ?? undefined);
+    this.emit('budget', { phase, state: 'approaching', key, fact, ...extra });
+    this.persist();
+  }
+
+  /**
+   * A phase that stopped on its DOLLAR cap (control-tower phase 14, #40): its
+   * last session spent the cap it was given, doubled on every resume until the
+   * attempts ran out. Announced as the budget it is, with each session's share;
+   * the raise the card offers writes `phaseBudgetUsd` and retries the phase.
+   */
+  protected notePhaseBudgetSpent(phase: number): void {
+    const state = this.state;
+    if (!state) return;
+    const record = phaseRecord(state, phase);
+    const cap = record.lastSession?.maxBudgetUsd?.value;
+    if (!(typeof cap === 'number' && cap > 0)) return;
+    const fact = phaseBudgetFact(phase, cap, record.costUsd, sessionSpend(record));
+    this.emit('budget', { phase, state: 'spent', fact });
+  }
+
+  /**
+   * How the phase's newest session ended, on its record (`lastSession`) — what
+   * `closed()` reads before it calls a missing handoff a failure
+   * (control-tower phase 46, #61).
+   */
+  protected noteEnding(phase: number, mode: SessionMode, request: SpawnRequest, outcome: SpawnOutcome): void {
+    if (!this.state) return;
+    const caps = outcome.caps ?? resolveCaps(request);
+    const signal = outcome.signal ?? {};
+    phaseRecord(this.state, phase).lastSession = {
+      mode, sessionId: outcome.sessionId ?? null, at: this.now().toISOString(), endedBy: outcome.endedBy ?? 'exit',
+      ...(signal.subtype ? { subtype: signal.subtype } : {}),
+      ...(signal.terminalReason ? { terminalReason: signal.terminalReason } : {}),
+      maxTurns: caps.maxTurns, maxBudgetUsd: caps.maxBudgetUsd,
+    };
+  }
+
+  /**
+   * The booked figure beside what the session's own calls are worth
+   * (control-tower phase 46, #62, CC-5): `phase.cost-mismatch` when the two
+   * disagree past tolerance (`costMismatch`). Journalled, never acted on — it
+   * blocks nothing and corrects nothing; it is the evidence a wrong booking
+   * (a re-reported total, a CLI that changes what it reports) leaves behind. A
+   * session with no calls, or on a model with no measured price, is not judged.
+   */
+  protected corroborateSpend(
+    phase: number, mode: SessionMode, request: SpawnRequest, outcome: SpawnOutcome,
+    booking: { booked: number; reported: number; mark: number }, delegated: boolean,
+  ): void {
+    const tokens = outcome.tokens;
+    if (!tokens || tokens.calls <= 0) return;
+    const record = this.state?.phases[String(phase)];
+    const model = record?.actualModel ?? request.model ?? record?.model ?? null;
+    const priced = priceUsage(model, tokens);
+    const mismatch = costMismatch({ booked: booking.booked, priced, delegated });
+    if (!mismatch || priced === null) return;
+    const round4 = (usd: number) => Math.round(usd * 10_000) / 10_000;
+    this.record('phase.cost-mismatch', {
+      mode, sessionId: outcome.sessionId ?? null, model, resumed: Boolean(request.resume),
+      bookedUsd: round4(booking.booked), pricedUsd: round4(priced), reportedUsd: round4(booking.reported),
+      markUsd: round4(booking.mark), direction: mismatch.direction, ratio: mismatch.ratio,
+      calls: tokens.calls, delegated,
+    }, phase);
   }
 
   /**
@@ -1338,8 +2021,12 @@ export abstract class RunnerBase {
    * scheduler and the convergence loop take: a console that wrongly believes
    * itself frozen stops silently and looks like a console with nothing to do.
    */
-  protected fleetFrozen(): { at: string; by?: string } | null {
-    try { return this.deps.fleetHold?.() ?? null; } catch { return null; }
+  protected fleetFrozen(): { at: string; by?: string; scope?: 'machine' | 'restart' } | null {
+    let hold: { at: string; by?: string; scope?: 'machine' | 'restart'; plans?: readonly string[] } | null;
+    try { hold = this.deps.fleetHold?.() ?? null; } catch { return null; }
+    // A restart waiting for its lanes holds only the plans that meet their
+    // scope (control-tower phase 48, #70); to every other run it is no hold.
+    return holdBinds(hold, this.state?.slug) ? hold : null;
   }
 
   /** How many phases of THIS run may be in flight. The scheduler caps the fleet. */
@@ -1408,4 +2095,58 @@ export abstract class RunnerBase {
   /** Resolves once the loop has stopped driving. */
   async wait(): Promise<void> { await this.driving; }
 
+  /** What the last fill pass decided — `boardingVerdict` reads it (control-tower phase 86, RS-5). */
+  protected lastFill: { at: number; order: number[]; inFlight: number[]; max: number } | null = null;
+
+  /**
+   * Did a person's press BOARD the phase, or queue it? (control-tower phase 86,
+   * RS-5, #128's 2026-09-25T20:04Z comment.) A re-board is a hint, and a hint
+   * is not a launch: `boarded` only when the phase's lane holds its grant — it
+   * boards at this admission — else `queued`, with its 1-based position in the
+   * line it waits in (the scheduler's queue, else this run's boarding order)
+   * and what it is behind. `start` returns before the loop has decided
+   * anything, so this waits, bounded, for the next fill pass or the recovery's
+   * admission; a loop that decides nothing in time answers `position: null`.
+   */
+  async boardingVerdict(phase: number, waitMs = BOARDING_VERDICT_MS): Promise<BoardingVerdict> {
+    const asked = Date.now();
+    for (;;) {
+      // A lane holding its grant boarded; so did any lane of a runner with no
+      // scheduler behind it, which grants nothing and queues nothing.
+      const lane = this.lanes.get(phase);
+      if (lane && (lane.grant || !this.deps.scheduler)) return { boarded: true };
+      const runId = this.state?.id;
+      const entry = runId ? this.deps.scheduler?.snapshot().entries.find((e) => e.runId === runId && e.phase === phase) : undefined;
+      if (entry) {
+        const head = entry.waitingOn[0];
+        return {
+          queued: {
+            position: (entry.order ?? 0) + 1,
+            ...(head ? { behind: { kind: head.kind, slug: head.slug, phase: head.phase, owner: head.owner } } : {}),
+          },
+        };
+      }
+      const fill = this.lastFill;
+      if (fill && fill.at >= asked && !fill.inFlight.includes(phase)) {
+        const line = fill.order.filter((p) => !fill.inFlight.includes(p));
+        const at = line.indexOf(phase);
+        const serial = this.state?.phases[String(phase)]?.serialBehind;
+        const slug = this.state?.slug ?? '';
+        const behind = serial != null
+          ? { kind: 'serial', slug, phase: serial, owner: `phase ${serial} of this run, on the same scope` }
+          : fill.inFlight.length >= fill.max
+            ? { kind: 'lanes', slug, phase: null, owner: `all ${fill.max} of this run's lanes are busy` }
+            : null;
+        return { queued: { position: at >= 0 ? at + 1 : null, ...(behind ? { behind } : {}) } };
+      }
+      if (Date.now() - asked >= waitMs || !this.driving) return { queued: { position: null } };
+      await new Promise((done) => { setTimeout(done, 25); });
+    }
+  }
+
+}
+
+/** What each of a phase's sessions spent, from its cost high-water marks — the `spentOn` of a phase budget. */
+function sessionSpend(record: { costHighWater?: Record<string, number> }): { what: string; amount: number }[] {
+  return Object.entries(record.costHighWater ?? {}).map(([session, usd]) => ({ what: `session ${session.slice(0, 8)}`, amount: usd }));
 }

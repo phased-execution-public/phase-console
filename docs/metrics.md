@@ -10,7 +10,7 @@ Everything the cost and progress pages show is on this endpoint too, so a figure
 rather than watched. It is a plain read like every other GET: no flag turns it on, no token guards
 it, and the console binds to loopback.
 
-**30 families** ship in both tiers. The list below comes from `viewer/server/analysis/metrics.ts`
+**50 families** ship in both tiers. The list below comes from `viewer/server/analysis/metrics.ts`
 `METRIC_FAMILIES`, and `viewer/test/docs-parity.test.ts` holds this document to it — a family added
 to one and not the other fails the suite, as does calling a counter a gauge.
 
@@ -41,12 +41,25 @@ which kind of scrape you got.
 | `phase_console_build_info` | gauge | Console version and instance, always 1. |
 | `phase_console_scrape_duration_seconds` | gauge | Seconds spent assembling this response. |
 | `phase_console_plans` | gauge | Plans, by plan status and whether the operator has closed them. |
+| `phase_console_process_heap_used_bytes` | gauge | V8 heap in use by this console process. |
+| `phase_console_process_heap_limit_bytes` | gauge | The heap this console may grow to — what `--max-old-space-size` set, as V8 reports it. The ratio against heap_used is the series worth alerting on. |
+| `phase_console_process_resident_bytes` | gauge | Resident set size of this console process. |
+| `phase_console_process_external_bytes` | gauge | Memory held outside V8's heap by this process — buffers, and the SSE write buffers a slow client fills. |
+| `phase_console_process_event_loop_delay_seconds` | gauge | How late this console's event loop is running — the MEAN over the last complete one-minute window (a mean since boot until control-tower phase 56, which no stall could move). A supervisor that cannot answer promptly is one nothing else can either. |
+| `phase_console_process_event_loop_delay_max_seconds` | gauge | The worst event-loop delay in the last complete one-minute window (#75). A stall shows here for a whole window after it ended; a window at a second or more also writes a `process.loop-stall` log line. |
+| `phase_console_process_event_loop_delay_p99_seconds` | gauge | The 99th-percentile event-loop delay over the same window — the tail every request, hook and lease refresh waited behind. |
+| `phase_console_process_handles` | gauge | Open handles this process holds — sockets, timers, child processes. |
+| `phase_console_process_uptime_seconds` | gauge | Seconds since this console process started. A series that keeps resetting is a crash loop, whatever the other gauges say. |
+| `phase_console_process_sse_clients` | gauge | Event-stream clients this console is writing to. |
+| `phase_console_process_sessions` | gauge | Claude sessions this console has live right now. |
+| `phase_console_process_pty_sessions` | gauge | Terminal (pty) sessions this console is holding open. |
 | `phase_console_phases` | gauge | Phases per plan, by board state. |
 | `phase_console_plan_progress_ratio` | gauge | Done phases over total phases, 0 to 1. |
 | `phase_console_plan_remaining_weight` | gauge | Unfinished phase weight, in the plan sizing units. |
 | `phase_console_runs` | gauge | Autopilot runs per plan, by run status. |
 | `phase_console_phase_attempts_total` | counter | Sessions the console has launched for a plan. |
 | `phase_console_phase_seconds_total` | counter | Wall-clock seconds phases of a plan have run for. |
+| `phase_console_run_blocked_seconds_total` | counter | Wall-clock seconds a plan's runs had a phase waiting in the admission queue, by `class` — what held it: `other-run`, `hand`, `clock` or `own-run`. Each second counts once, charged to the first of those classes heading any waiting phase, so three phases behind one stranger for an hour are one hour: never the phases' queued time summed. Closed stretches only. A phase behind its own run's live lane is serial work, never queued, so it is not counted at all. |
 | `phase_console_spend_usd_total` | counter | USD every session of a plan has cost (the run total). |
 | `phase_console_phase_spend_usd_total` | counter | USD attributed to a numbered phase of a plan. |
 | `phase_console_spend_residual_usd` | gauge | Run total minus what is attributed to phases. Non-zero means a run file disagrees with itself. |
@@ -58,6 +71,13 @@ which kind of scrape you got.
 | `phase_console_worktrees` | gauge | Console-managed checkouts a plan's isolated run holds. Absent when no isolated run exists. |
 | `phase_console_worktree_disk_bytes` | gauge | Bytes those checkouts occupy. Absent where du could not answer. |
 | `phase_console_branch_conflicted_files` | gauge | Files a plan's run branch already conflicts on with another live branch. |
+| `phase_console_account_usage_ratio` | gauge | An account window's utilization, 0 to 1, by account id and window. |
+| `phase_console_account_burn_ratio_per_hour` | gauge | An account window's measured burn, utilization per hour, from a line through the last hour's readings. Absent until measured. |
+| `phase_console_account_wall_seconds` | gauge | Seconds until an account window walls at its measured burn. Absent when it is flat, unmeasured, or resets first. |
+| `phase_console_load_average` | gauge | The machine's 5-minute load average — the reading the load guard holds new admissions on (control-tower phase 100, #135 G.27). |
+| `phase_console_load_guard_threshold` | gauge | The 5-minute load above which new admissions wait: the guard's factor (1.5 by default, `loadGuardFactor`) times the machine's cores. Absent when the guard is off (factor 0). Alert on `load_average > load_guard_threshold` held for long: nothing new is boarding. |
+| `phase_console_lane_reservations` | gauge | Lanes kept for a phase (control-tower phase 100, #135 D.15–16), by `armed` — `yes` once the lane each waits for has ended and it is holding its scope and one lane slot for its phase; `no` while that lane is still live. A `yes` that never falls is a phase that is not coming back for its lane: lift it (`unreserve`). |
+| `phase_console_account_credit_used` | gauge | Credits an account has used this month, in its currency's major unit, by account id and currency. Absent while its credit state is unknown. |
 | `phase_console_log_lines_total` | counter | Console log lines written, by level. A line the level dropped is not counted. |
 | `phase_console_journal_appends_total` | counter | Journal lines appended across every run this process drove. |
 | `phase_console_journal_overflow_total` | counter | Journals that crossed the soft cap and fell back to the terminal reserve. |
@@ -122,6 +142,17 @@ could not answer, without taking the other slugs' samples with it.
 **A counter resets if you delete a run file.** That is the only way these go backwards, and
 `rate()`/`increase()` already handle it. Nothing here is reset by restarting the console: the
 numbers are read from the run files on disk, not from process memory.
+
+### The forecast family is a line through an hour
+
+The three `phase_console_account_*` gauges (control-tower phase 92, #141) are the account forecast the
+account card and the account bar draw, one sample per account ID and live window — the ID, never the
+login's email. The burn is the slope of a least-squares line through that window's readings of the last
+60 minutes (`FORECAST_WINDOW_MS`), measured only once two readings lie ten minutes apart; under 0.5 % an
+hour a window reads flat. The wall is where that line crosses 100 % from the current reading, and only
+when it does so before the window resets — so `phase_console_account_wall_seconds` is ABSENT for a flat,
+unmeasured or resetting-first window, never zero. An alert on "walls within two hours" is
+`phase_console_account_wall_seconds < 7200`, which is the rule `usage-climbing` itself pushes on.
 
 ## What is NOT here
 

@@ -95,5 +95,27 @@ entry="$here/server/index.ts"
 case "$here" in
   */node_modules/*) [ -f "$here/server/index.js" ] && entry="$here/server/index.js" ;;
 esac
+# A copy with no .ts at all ships only the built server, wherever it lives.
+[ -f "$entry" ] || entry="$here/server/index.js"
 
-exec node "$entry" "$@"
+# The heap this console may hold, as a NODE argument rather than NODE_OPTIONS:
+# the environment is inherited by every `claude` child, and a heap size meant
+# for one supervisor would be applied to dozens of unrelated processes. The
+# shared module owns the numbers and the clamp; if it cannot answer, the console
+# starts on V8's default rather than not starting.
+node_args=()
+sel=(--cwd "$PWD")
+i=1
+while [ "$i" -le "$#" ]; do
+  eval "cur=\${$i}"
+  if [ "$cur" = "--root" ] && [ "$i" -lt "$#" ]; then
+    eval "sel=(--root \"\${$((i + 1))}\")"
+    break
+  fi
+  i=$((i + 1))
+done
+while IFS= read -r line; do
+  [ -n "$line" ] && node_args+=("$line")
+done < <(node "$here/shared/instances.mjs" node-args "${sel[@]}" 2>/dev/null || true)
+
+exec node ${node_args[@]+"${node_args[@]}"} "$entry" "$@"

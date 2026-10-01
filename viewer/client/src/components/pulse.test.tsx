@@ -5,8 +5,8 @@
  * operator actually reads off the panel: which phase, in what vehicle, for
  * how long, and what is parked waiting on the world.
  *
- * ⚠️ `pulseRuns` and `otherSessions` moved to `features/now/model.ts` in Phase
- * 8, with `#/pulse`; their cases live in `features/now/model.test.ts`. What is
+ * ⚠️ `pulseRuns` and `otherSessions` moved to `features/runs/lanes-model.ts` in Phase
+ * 8, with `#/pulse`; their cases live in `features/runs/lanes-model.test.ts`. What is
  * left here is the per-plan PANEL, which is the plan page's (Phase 9 owns it).
  */
 

@@ -17,9 +17,17 @@
  *     and `startedAt` are different instants, and the list has room for one.
  */
 
+import { describeWord } from '@shared/status-model.js';
 import { fireEvent, render, screen, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { describe, expect, it, vi } from 'vitest';
 import { TooltipProvider } from '@/components/ui';
+
+const { sessionEvents } = vi.hoisted(() => ({ sessionEvents: vi.fn() }));
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>();
+  return { ...actual, api: { ...actual.api, sessionEvents } };
+});
 import { SessionList, type SessionRow } from './list';
 import { SessionInspector } from './session-inspector';
 
@@ -33,7 +41,7 @@ const row = (over: Partial<SessionRow> = {}): SessionRow => ({
   href: '#/sessions/sess-1',
   id: 'sess-1',
   live: true,
-  state: 'running',
+  view: describeWord('terminal', 'running'),
   createdAt: AT,
   startedAt: AT + 60_000,
   record: { id: 'sess-1', cwd: '/work/hub', pid: 4242, shell: '/bin/zsh' },
@@ -42,9 +50,11 @@ const row = (over: Partial<SessionRow> = {}): SessionRow => ({
 
 const view = (r: SessionRow) =>
   render(
-    <TooltipProvider>
-      <SessionInspector row={r} open onOpenChange={() => {}} />
-    </TooltipProvider>,
+    <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <TooltipProvider>
+        <SessionInspector row={r} open onOpenChange={() => {}} />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 
 describe('the session inspector', () => {
@@ -124,7 +134,7 @@ describe('the session inspector', () => {
   it('drops the running clock on a session that is not running', () => {
     // `KeyValue` drops a null row rather than drawing an em-dash, so an ended
     // session simply has no "Running for" line — never a ticking zero.
-    view(row({ live: false, state: 'done', note: 'ended' }));
+    view(row({ live: false, view: describeWord('terminal', 'exited'), note: 'ended' }));
     expect(screen.getByText('Began')).toBeInTheDocument();
     expect(screen.queryByText('Running for')).toBeNull();
   });
@@ -227,5 +237,39 @@ describe('a QA session says what it is reviewing', () => {
   it('shows the section for no other kind of session', () => {
     view(row());
     expect(screen.queryByRole('heading', { name: 'What it is reviewing' })).toBeNull();
+  });
+});
+
+describe('the hook events behind a session (phase 25)', () => {
+  it('reads GET /api/sessions/<id>/events while open, and lists what the hook said, with its lateness', async () => {
+    sessionEvents.mockResolvedValue({
+      sessionId: 'c399fe08',
+      events: [
+        {
+          at: '2026-09-01T10:00:00Z',
+          appliedAt: '2026-09-01T10:00:00Z',
+          lateMs: 0,
+          via: 'http',
+          event: 'SessionStart',
+          payload: {},
+        },
+        {
+          at: '2026-09-01T10:05:00Z',
+          appliedAt: '2026-09-01T10:05:09Z',
+          lateMs: 9000,
+          via: 'inbox',
+          event: 'Stop',
+          payload: {},
+        },
+      ],
+    });
+    view(row({ sessionId: 'c399fe08' }));
+    const list = await screen.findByTestId('hook-events');
+    expect(sessionEvents).toHaveBeenCalledWith('c399fe08');
+    const lines = within(list)
+      .getAllByRole('listitem')
+      .map((li) => li.textContent);
+    expect(lines[0]).toMatch(/SessionStart.*http/);
+    expect(lines[1]).toMatch(/Stop.*9 s late.*inbox/);
   });
 });

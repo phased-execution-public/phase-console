@@ -35,16 +35,7 @@
  */
 
 import { GitBranch } from 'lucide-react';
-import {
-  Badge,
-  Card,
-  CardBody,
-  CardHeader,
-  CardTitle,
-  Chip,
-  KeyValue,
-  type BadgeTone,
-} from '@/components/ui';
+import { Badge, Card, CardBody, CardHeader, CardTitle, KeyValue, type BadgeTone } from '@/components/ui';
 import type { RadarPair, RunGitView, RunState } from '@/lib/api';
 import { useConsoleState } from '@/lib/queries';
 import { bytes, homePath, plural, relativeTime } from '@/lib/format';
@@ -111,7 +102,7 @@ export function BranchChip({ branch, base }: { branch?: string; base?: RunState[
       `${BASE_DECLARED_WORDS[base.declaredBy] ?? base.declaredBy}).`
     : '';
   return (
-    <Chip
+    <Badge
       tone="neutral"
       mono
       data-testid="branch-chip"
@@ -119,7 +110,7 @@ export function BranchChip({ branch, base }: { branch?: string; base?: RunState[
     >
       <GitBranch size={11} aria-hidden />
       {branch}
-    </Chip>
+    </Badge>
   );
 }
 
@@ -205,14 +196,23 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
       <CardBody className="flex flex-col gap-3">
         {refused && (
           <p className="text-2xs text-ink-muted" data-testid="git-refused">
-            This run asked for its own checkout and could not have one, so it is working in the shared tree
-            with queue semantics — exactly as every run did before worktrees existed. The runner recorded{' '}
-            <code className="font-mono">{run?.isolationRefusal ?? 'no reason'}</code>
+            {/* Parked on a refusal a person can fix, or sharing after a structural
+                one (control-tower phase 90) — the halt kind says which. */}
+            {run?.halt?.kind === 'isolation-refused'
+              ? 'This run asked for its own checkout and could not have one, so it is parked: nothing boards in ' +
+                'the shared tree until the refusal is fixed or isolation is dropped.'
+              : 'This run asked for its own checkout and could not have one, so it is working in the shared tree ' +
+                'with queue semantics — exactly as every run did before worktrees existed.'}{' '}
+            The runner recorded <code className="font-mono">{run?.isolationRefusal ?? 'no reason'}</code>
             {/* The sentence is the server's table for the key (G-20); an older
                 server sends none, and then the journal below still has it. */}
             {run?.isolationRefusal && state?.refusalReasons?.[run.isolationRefusal]
               ? `: ${state.refusalReasons[run.isolationRefusal]}.`
               : '; the journal below carries the sentence.'}
+            {/* …and the remedy, from the same server table (control-tower phase 90). */}
+            {run?.isolationRefusal && state?.refusalFixes?.[run.isolationRefusal]
+              ? ` ${state.refusalFixes[run.isolationRefusal]}`
+              : ''}
           </p>
         )}
 
@@ -224,7 +224,9 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
                 ? run.mountedRepos?.length
                   ? `a mirror of ${run.mountedRepos.length} repositories`
                   : 'its own worktree'
-                : 'shared with the console',
+                : refused && run?.halt?.kind === 'isolation-refused'
+                  ? 'refused — the run is parked'
+                  : 'shared with the console',
             ],
             ...(run?.mountedRepos?.length
               ? [['mounts', run.mountedRepos.join(', ')] as [string, React.ReactNode]]
@@ -320,17 +322,17 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
               {managed.map((entry) => (
                 <li key={entry.dir} className="flex min-w-0 flex-wrap items-baseline gap-1.5">
                   {entry.branch && (
-                    <Chip tone="neutral" mono>
+                    <Badge tone="neutral" mono>
                       {entry.branch}
-                    </Chip>
+                    </Badge>
                   )}
                   <code className="min-w-0 flex-1 truncate font-mono text-2xs text-ink-faint">
                     {homePath(entry.dir, state?.home)}
                   </code>
                   {entry.prunable && (
-                    <Chip tone="warn" title="git still lists this checkout and its directory is gone.">
+                    <Badge tone="accent" title="git still lists this checkout and its directory is gone.">
                       prunable
-                    </Chip>
+                    </Badge>
                   )}
                   {/*
                     Two different facts, and an operator needs to tell them
@@ -341,13 +343,13 @@ export function GitCard({ run, git }: { run: RunState | null; git?: RunGitView |
                     `git worktree unlock` first.
                   */}
                   {entry.locked !== undefined && (
-                    <Chip
-                      tone={ourWorktreeLock(entry.locked) ? 'neutral' : 'warn'}
+                    <Badge
+                      tone={ourWorktreeLock(entry.locked) ? 'neutral' : 'accent'}
                       title={entry.locked || 'locked, with no reason given'}
                       data-testid="checkout-lock"
                     >
                       {ourWorktreeLock(entry.locked) ? 'locked' : 'locked by hand'}
-                    </Chip>
+                    </Badge>
                   )}
                   <span className="text-2xs text-ink-faint">{bytes(entry.disk) ?? UNKNOWN}</span>
                 </li>

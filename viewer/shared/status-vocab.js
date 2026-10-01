@@ -24,7 +24,7 @@
 // The actor table is IMPORTED, never copied: `situation-model.js` owns who a
 // situation is for, beside the classifier that decides it.
 import { SITUATION_ACTOR } from './situation-model.js';
-import { RUN_STATUSES } from './run-lifecycle.js';
+import { RUN_STATUSES, runLifecycle } from './run-lifecycle.js';
 
 /**
  * The eight, WORST FIRST. The order is the sort order of every list that
@@ -302,6 +302,29 @@ export function isLiveStatus(status) {
 }
 
 /**
+ * The status word a surface prints and paints for a run (control-tower phase
+ * 88, #148): its own word, except a `paused` run whose lifecycle is a WAIT.
+ *
+ * Reconcile keeps a run that died waiting on a clock as `paused` — the resume
+ * machinery keys on that word — while nobody paused it and the console resumes
+ * it by itself (`pausedWaitOf`). Printed raw, two such runs read "paused" beside
+ * an operator's own pause, and the operator asked why both plans had stopped.
+ * One reader, so the Runs list, the tiles, the board, the pulse and the plan
+ * rows cannot disagree about it. Liveness stays the raw word's
+ * (`isLiveStatus`): no loop is behind such a run until its clock fires.
+ *
+ * @param {{ status?: string, lifecycle?: object, waitUntil?: string|null, waitReason?: string|null,
+ *           stoppedBy?: string|null, resolved?: unknown, onLimit?: string|null }|null|undefined} run
+ * @returns {string}
+ */
+export function runStatusWord(run) {
+  const status = run?.status ?? '';
+  return status === 'paused' && runLifecycle(/** @type {never} */ (run)).state === 'waiting'
+    ? 'waiting'
+    : status;
+}
+
+/**
  * Two of the eight parks are not an ask, and until 3.5.0 nothing could say so.
  *
  * `PHASE_STATUS_UI` paints `parked` as `needs-you`, which is right for a gate,
@@ -496,10 +519,32 @@ export function uiLabel(state) {
  * phase 6 moves the status with it (ACC-4.8). Every member has a production
  * writer under `server/` and `test/vocab-owners.test.ts` keeps it so — two of
  * the four above had none for a release (LFC-5).
- * @type {readonly ('usage-limit'|'external'|'scope'|'schedule'|'person')[]}
+ *
+ * 5.2.0 adds `connectivity`: the machine cannot reach the API. It is its own
+ * word rather than `external` because the two answer the operator's question
+ * differently — `external` means somebody else's clock is running and there is
+ * nothing to do, `connectivity` means the network is the thing to look at —
+ * and because nothing is charged for it: no attempt, no failure streak, no
+ * ladder rung. The lane backs off and comes back by itself.
+ *
+ * 6.0.0 adds `engine-busy` (control-tower phase 81, #104): the engine timed out
+ * reading the plan — the MACHINE is too loaded to answer, which says nothing
+ * about the plan. It used to halt the run `plan-unreadable`, and the healer then
+ * climbed plan repairs over a plan that linted clean. The drive loop now waits
+ * it out on a back-off clock, charging nothing, and only a timeout that outlasts
+ * the whole back-off stops the run.
+ * @type {readonly ('usage-limit'|'external'|'scope'|'schedule'|'person'|'connectivity'|'engine-busy')[]}
  */
 export const WAIT_REASONS = Object.freeze(
-  /** @type {const} */ (['usage-limit', 'external', 'scope', 'schedule', 'person']),
+  /** @type {const} */ ([
+    'usage-limit',
+    'external',
+    'scope',
+    'schedule',
+    'person',
+    'connectivity',
+    'engine-busy',
+  ]),
 );
 
 /** @typedef {(typeof WAIT_REASONS)[number]} WaitReason */

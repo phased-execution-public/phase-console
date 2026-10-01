@@ -69,7 +69,7 @@ it ended, how to resume it — rather than an empty terminal pretending to conne
 
 ## Where they all are
 
-**Sessions** is the list; **Now ▸ Running now** is the same lanes ranked by what needs you, and the
+**Sessions** is the list; **Runs ▸ Live** is the same lanes ranked by what needs you, and the
 nav badge counts what is live — so a session started from one plan's page is not lost to another.
 
 The **A session ended** notification category covers the case you cannot see: a session that

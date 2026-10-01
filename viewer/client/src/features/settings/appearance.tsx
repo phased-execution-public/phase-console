@@ -27,7 +27,7 @@ import { SettingsSectionFrame, sectionFor } from './nav';
  * not name it: dropping it would silently re-point the preference at "each
  * plan's own target" without saying so.
  */
-function modelOptions(offered: readonly string[] | undefined, stored: string): string[] {
+export function modelOptions(offered: readonly string[] | undefined, stored: string): string[] {
   const list = offered?.length ? [...offered] : [...FALLBACK_MODELS];
   return ['', ...list, ...(stored && !list.includes(stored) ? [stored] : [])];
 }

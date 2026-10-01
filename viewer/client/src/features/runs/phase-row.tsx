@@ -25,14 +25,15 @@
  */
 
 import { memo } from 'react';
-import { Chip, KeyValue, RelativeTime, StateChip } from '@/components/ui';
+import { Badge, KeyValue, RelativeTime } from '@/components/ui';
+import { PhaseStatusBadge, type WordOf } from '@/components/ui/status';
 import { phaseSessionHref } from '@/app/routes';
 import { plural, relativeTime, weight } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { EvidenceProof, LaneLiveness, PhaseLive, PhaseLock } from '@/lib/api';
-import { PHASE_ACTOR_LABELS } from '@/lib/status-vocab';
+import { PHASE_ACTOR_LABELS, boardStateTitle } from '@/lib/status-vocab';
 import { ACTOR_ICON } from '@/components/actor-icon';
-import { STALL_SIGNAL_META } from '@shared/attention-model.js';
+import { SILENCE_LABELS, STALL_SIGNAL_META } from '@shared/attention-model.js';
 
 /* ---------------- evidence ---------------- */
 
@@ -100,19 +101,21 @@ export function EvidenceLine({
   // never as "measured and empty".
   const claimedRunning = proof.stale === true;
 
+  // A claim nothing backs is a caution, never a summons: it asks nobody to act,
+  // so it reads in the quiet neutral beside the green of a backed one (6.0).
   if (!verbose) {
     if (claimedRunning) {
       return (
-        <Chip tone="warn" className={className} title={proof.why.join(' · ')}>
+        <Badge tone="neutral" className={className} title={proof.why.join(' · ')}>
           claimed running
-        </Chip>
+        </Badge>
       );
     }
     if (!claiming) return null;
     return (
-      <Chip tone={alarming ? 'warn' : 'ok'} className={className} title={proof.why.join(' · ')}>
+      <Badge tone={alarming ? 'neutral' : 'ok'} className={className} title={proof.why.join(' · ')}>
         {proof.evidenced ? 'evidenced' : 'claimed only'}
-      </Chip>
+      </Badge>
     );
   }
 
@@ -120,7 +123,7 @@ export function EvidenceLine({
     <section className={cn('rounded border border-rule bg-ground px-2 py-1.5', className)}>
       <h4 className="flex flex-wrap items-baseline gap-1.5 text-2xs font-semibold text-ink">
         Claimed versus evidenced
-        <Chip tone={alarming || claimedRunning ? 'warn' : proof.evidenced ? 'ok' : 'muted'}>
+        <Badge tone={!alarming && !claimedRunning && proof.evidenced ? 'ok' : 'neutral'}>
           {claimedRunning
             ? 'claimed running'
             : proof.evidenced
@@ -128,7 +131,7 @@ export function EvidenceLine({
               : claiming
                 ? 'claimed only'
                 : proof.board}
-        </Chip>
+        </Badge>
       </h4>
       {/* The shared fact list — `minmax(0,auto)` rather than the `max-content`
           this was, which has no ceiling: the longest verification sentence
@@ -195,7 +198,16 @@ export const PhaseStateChip = memo(function PhaseStateChip({
   className?: string;
 }) {
   const href = phaseSessionHref({ slug, phase, live: live ?? null, pty });
-  const chip = <StateChip state={state} board pulse={Boolean(live)} title={title} className={className} />;
+  // The board word as the status model draws it; its hover still says what the
+  // word means and what to do.
+  const chip = (
+    <PhaseStatusBadge
+      board={state as WordOf<'board'>}
+      pulse={Boolean(live)}
+      title={title ?? boardStateTitle(state)}
+      className={className}
+    />
+  );
   if (!href) return chip;
   return (
     <a href={href} className="rounded-sm" title={`Phase ${phase} is being worked — open its session`}>
@@ -227,9 +239,11 @@ export function LivenessChip({ liveness }: { liveness: LaneLiveness | undefined 
 
   if (stall) {
     return (
-      <Chip tone="warn" title={`${STALL_SIGNAL_META[stall.signal]?.blurb ?? ''} ${stall.detail}`.trim()}>
+      // A stall is the lane standing still — the waiting tone. It turns into a
+      // summons only as an inbox item, once the detector escalates it.
+      <Badge tone="wait" title={`${STALL_SIGNAL_META[stall.signal]?.blurb ?? ''} ${stall.detail}`.trim()}>
         {STALL_SIGNAL_META[stall.signal]?.label ?? stall.signal} · <RelativeTime at={stall.since} />
-      </Chip>
+      </Badge>
     );
   }
 
@@ -245,8 +259,8 @@ export function LivenessChip({ liveness }: { liveness: LaneLiveness | undefined 
    */
   if (retries && retries.count > 0) {
     return (
-      <Chip
-        tone="warn"
+      <Badge
+        tone="wait"
         title={
           `${retries.count} API retr${retries.count === 1 ? 'y' : 'ies'} since the last productive ` +
           `event, starting ${relativeTime(Date.parse(retries.since))}. The session is alive and ` +
@@ -255,7 +269,7 @@ export function LivenessChip({ liveness }: { liveness: LaneLiveness | undefined 
         }
       >
         {retries.count}× retry
-      </Chip>
+      </Badge>
     );
   }
 
@@ -267,18 +281,31 @@ export function LivenessChip({ liveness }: { liveness: LaneLiveness | undefined 
   const tail =
     `${liveness.commitsSinceStart} commit(s) this attempt` + `${liveness.treeDirty ? ', tree dirty' : ''}.`;
   return (
-    <Chip
-      tone="busy"
+    <Badge
+      tone="live"
       title={
         openTool
           ? `${openTool.name} has been open since ${relativeTime(Date.parse(openTool.since))}. ${tail}`
           : `Last output ${relativeTime(at)}. ${liveness.turnsSinceLastTool} turn(s) since the last tool call, ${tail}`
       }
     >
-      {openTool ? openTool.name : <RelativeTime at={at} />}
-    </Chip>
+      {openTool ? (
+        openTool.name
+      ) : liveness.silence ? (
+        // The labelled silence (#28), never a bare "12m" timed off the last
+        // output: which quiet it is decides the remedy, and the server says.
+        <>
+          {SILENCE_LABEL[liveness.silence.kind] ?? liveness.silence.kind}{' '}
+          <RelativeTime at={liveness.silence.sinceMs} />
+        </>
+      ) : (
+        <RelativeTime at={at} />
+      )}
+    </Badge>
   );
 }
+
+const SILENCE_LABEL = SILENCE_LABELS as Readonly<Record<string, string>>;
 
 /**
  * What a live lane's session costs in context (autopilot-token-drain phase 3).
@@ -308,8 +335,8 @@ export function ContextChip({ liveness }: { liveness: LaneLiveness | undefined }
         ? ' The session has been told to wrap up and hand off.'
         : '';
   return (
-    <Chip
-      tone={tokens.stage ? 'warn' : 'neutral'}
+    <Badge
+      tone={tokens.stage ? 'wait' : 'neutral'}
       mono
       data-stage={tokens.stage}
       title={
@@ -320,7 +347,7 @@ export function ContextChip({ liveness }: { liveness: LaneLiveness | undefined }
       }
     >
       {parts.join(' · ')}
-    </Chip>
+    </Badge>
   );
 }
 
@@ -374,11 +401,11 @@ export function PhaseActorLine({
 export function RulingsChip({ count }: { count: number }) {
   if (count <= 0) return null;
   return (
-    <Chip
-      tone="muted"
+    <Badge
+      tone="neutral"
       title={`${count} decision${count === 1 ? '' : 's'} the plan did not make for this phase. Open the drawer to read them.`}
     >
       {count} ruling{count === 1 ? '' : 's'}
-    </Chip>
+    </Badge>
   );
 }

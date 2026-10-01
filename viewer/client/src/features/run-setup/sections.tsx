@@ -21,7 +21,7 @@
 
 import { RefreshMeters } from '@/components/refresh-meters';
 import { bucketLabel } from '@/components/limits-widget';
-import { Badge, Disclosure, Meter, field } from '@/components/ui';
+import { Badge, Disclosure, Input, Meter, field } from '@/components/ui';
 import type { AccountView } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { countdown } from '@/lib/format';
@@ -29,7 +29,7 @@ import { usePolicy } from '@/lib/queries';
 import { SkillPicker } from '@/features/run-setup/skill-picker';
 import { McpPicker } from '@/features/run-setup/mcp-picker';
 import { PRIORITY_LABELS, RUN_PRIORITIES, type RunPriority } from '@shared/orchestration-model.js';
-import { QA_FIX_STRATEGIES, QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
+import { PERMISSION_MODES, QA_FIX_STRATEGIES, QA_FIX_STRATEGY_LABELS } from '@shared/run-settings.js';
 import {
   DEFAULT_MAX_PER_REPO,
   ISOLATED,
@@ -40,11 +40,13 @@ import {
   WORKTREE_RETENTION,
 } from '@shared/worktree-model.js';
 import type { UltraReviewMode } from '@shared/run-lifecycle.js';
+import type { CategoryId } from './categories';
 import { NumberField, PressField, SelectField, SetupField, ToggleField } from './fields';
 import { DecisionsSection } from './decisions';
-import { permissionModeFor } from './modes';
+import { GitReconcile } from './git-reconcile';
+import { permissionModeFor, runsPrelude } from './modes';
 import { PerPhase } from './per-phase';
-import type { RunSetupValues } from './schema';
+import { parseAccounts, type RunSetupValues } from './schema';
 import { useSetupForm } from './form-context';
 import { AUTONOMY_HELP, AUTONOMY_LABEL } from '@/features/runs/defaults';
 
@@ -65,6 +67,7 @@ export function ScopeSection() {
           label="Only these phases"
           hint="Empty runs the whole plan. Ranges are fine: 1, 3, 5-7."
           source={f.src('onlyPhases')}
+          effect={f.fx('onlyPhases')}
           error={f.errors.onlyPhases}
         >
           {({ id, describedBy, invalid }) => (
@@ -93,6 +96,7 @@ export function ScopeSection() {
           label="Start after (optional)"
           hint="A plan slug. This run boards nothing until that plan's latest run ends — finished, paused, parked or stopped. Empty starts as soon as the queue allows."
           source={f.src('startAfter')}
+          effect={f.fx('startAfter')}
         >
           {({ id, describedBy }) => (
             <input
@@ -117,13 +121,37 @@ export function ScopeSection() {
 
 export function ModelSection() {
   const f = useSetupForm();
-  if (!f.on('model') && !f.on('effort')) return null;
+  const Bool = f.Bool;
+  if (!f.on('model') && !f.on('effort') && !f.on('modelPolicy') && !f.on('ultracode')) return null;
+  return (
+    <div className="flex flex-col gap-3">
+      <ModelPair />
+      {/* The licence to fan out is a fact about how the work is done — the
+          engine's question since control-tower phase 22, not the reviewers'. */}
+      {f.on('ultracode') && (
+        <Bool
+          label="Ultracode"
+          hint="Every prompt this run composes carries the standing ultracode licence, so a session may use the Workflow tool where the work genuinely fans out. A workflow runs dozens of agents at once — this is a token bill, not a speed setting."
+          source={f.src('ultracode')}
+          effect={f.fx('ultracode')}
+          value={f.values.ultracode}
+          onChange={(next) => f.set('ultracode', next)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ModelPair() {
+  const f = useSetupForm();
+  if (!f.on('model') && !f.on('effort') && !f.on('modelPolicy')) return null;
   return (
     <div className={PAIR}>
       {f.on('model') && (
         <SelectField
           label="Model"
           source={f.src('model')}
+          effect={f.fx('model')}
           value={f.values.model}
           placeholder="default — this machine’s"
           options={f.modelOptions}
@@ -134,9 +162,24 @@ export function ModelSection() {
         <SelectField
           label="Effort"
           source={f.src('effort')}
+          effect={f.fx('effort')}
           value={f.values.effort}
           options={f.effortOptions}
           onChange={(next) => f.set('effort', next)}
+        />
+      )}
+      {f.on('modelPolicy') && (
+        <SelectField
+          label="Model policy"
+          hint="Pinned runs every session on the model named here, or parks the phase. Ladder may fall back, step down at a usage wall, or escalate. A plan's own Model policy line outranks this."
+          source={f.src('modelPolicy')}
+          effect={f.fx('modelPolicy')}
+          value={f.values.modelPolicy}
+          options={[
+            ['ladder', 'ladder — may move to keep going'],
+            ['pinned', 'pinned — this model or park'],
+          ]}
+          onChange={(next) => f.set('modelPolicy', next as RunSetupValues['modelPolicy'])}
         />
       )}
     </div>
@@ -157,6 +200,7 @@ export function PerPhaseSection() {
       runSkills={f.values.skills}
       servers={f.mcpServers}
       runMcp={f.values.mcpServers}
+      runMode={f.on('permissionMode') ? f.values.permissionMode : ''}
       onChange={(next) => f.set('phaseOptions', next)}
     />
   );
@@ -173,11 +217,15 @@ export function PermissionsSection() {
   if (!f.on('permissionProfile')) return null;
   const profile = f.values.permissionProfile;
   const qualifier = f.permissionQualifier(profile);
+  // The run doors, where `permissionMode` is the RUN's default mode rather
+  // than the ticket's mode derived from the profile (control-tower phase 11).
+  const runDoor = f.mode === 'start' || f.mode === 'continue' || f.mode === 'phase' || f.mode === 'live';
   return (
     <div className="flex flex-col gap-2">
       <SelectField
         label="Permissions"
         source={f.src('permissionProfile')}
+        effect={f.fx('permissionProfile')}
         value={profile}
         options={f.permissionOptions.map(([id]) => [id, f.permissionName(id)] as const)}
         hint={
@@ -188,11 +236,43 @@ export function PermissionsSection() {
         }
         onChange={(next) => {
           f.set('permissionProfile', next as RunSetupValues['permissionProfile']);
-          // The two spellings of one choice stay in step: a session's CLI
-          // mode is derived, never a second thing to keep aligned by hand.
-          f.set('permissionMode', permissionModeFor(next));
+          // The two spellings of one choice stay in step on an agent ticket,
+          // where the profile IS the session's mode. A RUN keeps its own mode
+          // (control-tower phase 11, #34): who is asked and what a session may
+          // do before presenting are separate choices there.
+          if (!runDoor) f.set('permissionMode', permissionModeFor(next));
         }}
       />
+      {runDoor && f.on('permissionMode') && (
+        <SelectField
+          label="Permission mode"
+          hint="The mode each phase's session starts in when neither the plan nor the phase names one. Plan presents what it will do and waits for a person's Approve."
+          source={f.src('permissionMode')}
+          effect={f.fx('permissionMode')}
+          value={
+            (PERMISSION_MODES as readonly string[]).includes(f.values.permissionMode)
+              ? f.values.permissionMode
+              : ''
+          }
+          placeholder="The plan's, else acceptEdits"
+          options={PERMISSION_MODES.map((mode) => [mode, mode] as const)}
+          onChange={(next) => f.set('permissionMode', next)}
+        />
+      )}
+      {f.on('approvalTimeoutMinutes') && (
+        <NumberField
+          label="Approvals wait for you (minutes)"
+          hint="How long an approval card waits for your answer before it times out. The card says what happens then, and can be extended while it stands. Empty keeps the hook's own hour, which is also the most it can be."
+          source={f.src('approvalTimeoutMinutes')}
+          effect={f.fx('approvalTimeoutMinutes')}
+          error={f.errors.approvalTimeoutMinutes}
+          value={f.values.approvalTimeoutMinutes}
+          min={1}
+          step={1}
+          placeholder="an hour"
+          onChange={(next) => f.set('approvalTimeoutMinutes', next)}
+        />
+      )}
       {f.context.slug &&
         (f.mode === 'start' || f.mode === 'continue' || f.mode === 'phase' || f.mode === 'live') && (
           <DenyWall slug={f.context.slug} />
@@ -248,6 +328,7 @@ export function BranchSection() {
       <SelectField
         label="Branch"
         source={f.src('gitMode')}
+        effect={f.fx('gitMode')}
         value={values.gitMode}
         options={[
           ['default-branch', 'Work on the current branch'],
@@ -282,6 +363,7 @@ export function BranchSection() {
                   : 'The final phase pushes the branch and opens the PR — after one approval tap on the push. Force-pushes stay denied outright.'
           }
           source={f.src('settle')}
+          effect={f.fx('settle')}
           value={values.settle}
           options={SETTLE_STRATEGIES.map((strategy) => [strategy, SETTLE_LABELS[strategy]])}
           onChange={(next) => {
@@ -299,6 +381,7 @@ export function BranchSection() {
           label="Open a PR when the plan completes"
           hint="The final phase pushes the branch and opens the PR — after one approval tap on the push. Force-pushes stay denied outright."
           source={f.src('openPr')}
+          effect={f.fx('openPr')}
           value={values.openPr}
           onChange={(next) => f.set('openPr', next)}
         />
@@ -321,6 +404,7 @@ export function BranchSection() {
                   : 'The console makes a git worktree for the run’s branch and its sessions work there, so a run on the same repository can drive at the same time instead of queueing. Off is today’s behaviour: overlapping runs wait their turn.'
           }
           source={f.src('isolation')}
+          effect={f.fx('isolation')}
           value={values.isolation === ISOLATED}
           disabled={
             (mode === 'live' && values.isolation === 'queue') ||
@@ -344,6 +428,7 @@ export function BranchSection() {
                 : 'What pe/<slug> — and every lane branch — is cut from: origin/HEAD (the remote’s default, a fresh cut), head (wherever the checkout stands), or a branch name. Empty takes the plan’s Base branch: line, else the console’s preference. A plan that names one outranks this either way.'
           }
           source={f.src('baseBranch')}
+          effect={f.fx('baseBranch')}
           error={f.errors.baseBranch}
         >
           {({ id, describedBy }) => (
@@ -371,6 +456,7 @@ export function BranchSection() {
               : 'How many isolated runs this run will stand beside in its repository before it waits its turn. Empty takes the console’s number; a number here can only be smaller than it — a run may make itself more conservative, never outbid the console.'
           }
           source={f.src('maxConcurrentPerRepo')}
+          effect={f.fx('maxConcurrentPerRepo')}
           error={f.errors.maxConcurrentPerRepo}
           value={values.maxConcurrentPerRepo}
           min={1}
@@ -383,6 +469,7 @@ export function BranchSection() {
           label="When the run settles, its checkouts"
           hint="What becomes of the trees the console made for this run once it settles. A tree holding uncommitted work is never removed under any word; keep-on-failure keeps only a run that ended badly, because its checkout holds the only copy of what went wrong."
           source={f.src('worktreeRetention')}
+          effect={f.fx('worktreeRetention')}
           value={values.worktreeRetention}
           options={RETENTION_OPTIONS}
           onChange={(next) => f.set('worktreeRetention', next)}
@@ -439,9 +526,20 @@ const RETENTION_OPTIONS: [string, string][] = [
  */
 export function AccountSection() {
   const f = useSetupForm();
-  if (!f.on('accountId')) return null;
+  if (!f.on('accountId') && !f.on('accounts')) return null;
+  return (
+    <div className="flex flex-col gap-4">
+      {f.on('accountId') && <AccountPicker />}
+      {f.on('accounts') && <AccountPool />}
+    </div>
+  );
+}
+
+function AccountPicker() {
+  const f = useSetupForm();
   const chosen = f.values.accountId;
   const auto = chosen === 'auto';
+  const offered = offeredAccounts(f.accounts, chosen);
   const account = auto
     ? mostHeadroom(f.accounts)
     : (f.accounts.find((a) => a.id === chosen) ??
@@ -451,6 +549,7 @@ export function AccountSection() {
       <SetupField
         label="Account"
         source={f.src('accountId')}
+        effect={f.fx('accountId')}
         hint={
           <>
             <strong>auto</strong> picks the account with the most headroom, and a run that hits a wall moves
@@ -469,9 +568,9 @@ export function AccountSection() {
               onChange={(event) => f.set('accountId', event.target.value)}
             >
               <option value="auto">auto — the most headroom</option>
-              {f.accounts.map((a) => (
+              {offered.map((a) => (
                 <option key={a.id} value={a.id}>
-                  {accountWho(a)}
+                  {accountOption(a, f.accounts)}
                 </option>
               ))}
               {f.accounts.length === 0 && <option value="default">machine login</option>}
@@ -488,10 +587,119 @@ export function AccountSection() {
   );
 }
 
+/**
+ * The account pool a run may fail over within (the prelude's `accounts`
+ * answer), asked beside the account since control-tower phase 22 — with the
+ * login each id answers as NOW under it, so a pool that names one person twice
+ * reads as the one login it is.
+ */
+function AccountPool() {
+  const f = useSetupForm();
+  const door = runsPrelude(f.mode);
+  const pool = parseAccounts(f.values.accounts) ?? [];
+  return (
+    <div className="flex flex-col gap-2">
+      <SetupField
+        label="Accounts it may spend (id:minimum headroom %)"
+        hint={
+          door ? (
+            <>
+              In order, each with the five-hour headroom it must show before a phase boards — the plan’s{' '}
+              <code>**Accounts:**</code> clause when it has one, else the machine login. The accounts probe
+              refuses the start when every one of them is retired, signed out or under its minimum.
+            </>
+          ) : (
+            <>
+              In order, each with the five-hour headroom it must show before a phase boards. Failover stays
+              inside this list from the next boarding, and the account the run is on always stays in it.
+            </>
+          )
+        }
+        source={f.src('accounts')}
+        effect={f.fx('accounts')}
+        error={f.errors.accounts}
+      >
+        {({ id, describedBy, invalid }) => (
+          <Input
+            id={id}
+            aria-describedby={describedBy}
+            aria-invalid={invalid || undefined}
+            className={field}
+            value={f.values.accounts}
+            placeholder="default:20, work:10"
+            onChange={(event) => f.set('accounts', event.target.value)}
+          />
+        )}
+      </SetupField>
+      {pool.length > 0 && f.accounts.length > 0 && (
+        <ul className="flex flex-col gap-0.5 text-2xs text-ink-muted" aria-label="Who each account is now">
+          {pool.map(({ id }) => (
+            <li key={id} className="min-w-0 break-words">
+              <span className="font-mono text-ink">{id}</span> {identityLine(id, f.accounts)}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 /** Who an account is — a name, else its email, else its id; the machine login by that name. */
 export function accountWho(account: AccountView): string {
   if (account.builtIn) return account.name ?? 'machine login';
   return account.name ?? account.email ?? account.id;
+}
+
+/**
+ * Two registrations that answer as ONE login right now (control-tower phase
+ * 91's binding): the same credential fingerprint, else the same email in the
+ * same organisation. The machine login and a profile signed in as the same
+ * person are one account with two ids.
+ */
+export function sameLogin(a: AccountView, b: AccountView): boolean {
+  if (a.credential && b.credential) return a.credential === b.credential;
+  return Boolean(a.email && b.email && a.email === b.email && (a.orgId ?? '') === (b.orgId ?? ''));
+}
+
+/** The named profile the machine login is, when it is one. */
+function twinOf(account: AccountView, accounts: readonly AccountView[]): AccountView | undefined {
+  return account.builtIn ? accounts.find((other) => !other.builtIn && sameLogin(account, other)) : undefined;
+}
+
+/**
+ * The accounts the picker offers — one entry per LOGIN (fifth amendment). A
+ * machine login that is the same person as a named profile is never a second
+ * choice: the chosen id of the two stays, and the other is dropped, so the
+ * select can still show what the run is on without offering one quota twice.
+ */
+export function offeredAccounts(accounts: readonly AccountView[], chosen: string): AccountView[] {
+  const drop = new Set<string>();
+  for (const account of accounts) {
+    const twin = twinOf(account, accounts);
+    if (!twin) continue;
+    drop.add(chosen === account.id ? twin.id : account.id);
+  }
+  return accounts.filter((account) => !drop.has(account.id));
+}
+
+/** An option's words: who, and the login it answers as now when that says more. */
+export function accountOption(account: AccountView, accounts: readonly AccountView[]): string {
+  const twin = twinOf(account, accounts);
+  if (twin) return `${accountWho(twin)} — the machine login`;
+  const who = accountWho(account);
+  return account.email && account.email !== who ? `${who} — ${account.email}` : who;
+}
+
+/** One pool id, as the login it answers now. */
+function identityLine(id: string, accounts: readonly AccountView[]): string {
+  const account =
+    accounts.find((a) => a.id === id) ?? (id === 'default' ? accounts.find((a) => a.builtIn) : undefined);
+  if (!account) return 'is not registered on this console';
+  const twin =
+    twinOf(account, accounts) ??
+    accounts.find((o) => o.id !== account.id && o.builtIn && sameLogin(o, account));
+  const who = account.email ?? accountWho(account);
+  return twin ? `is ${who} — the same login as ${twin.builtIn ? 'the machine login' : twin.id}` : `is ${who}`;
 }
 
 /**
@@ -508,13 +716,20 @@ export function mostHeadroom(accounts: AccountView[]): AccountView | undefined {
 }
 
 /** Warn at 80, alert at 95 — the thresholds the server announces at (`limits-widget.tsx`). */
-function meterTone(pct: number): 'done' | 'needs-you' | 'failed' {
+function meterPaint(pct: number): 'done' | 'needs-you' | 'failed' {
   if (pct >= 95) return 'failed';
   if (pct >= 80) return 'needs-you';
   return 'done';
 }
 
-function Headroom({ account, auto }: { account: AccountView; auto: boolean }) {
+/**
+ * The paying account's meters — and how its login stays alive unattended
+ * (control-tower phase 91, #147): a login lapses every few hours and is renewed
+ * while this console runs, so the start door offers the long-lived token as the
+ * path for a run left alone for days (the server's own sentence); a token
+ * account says when it must be replaced instead.
+ */
+export function Headroom({ account, auto }: { account: AccountView; auto: boolean }) {
   const buckets = Object.entries(account.usage?.buckets ?? {}).sort(
     ([, a], [, b]) => b.utilization - a.utilization,
   );
@@ -546,7 +761,7 @@ function Headroom({ account, auto }: { account: AccountView; auto: boolean }) {
               max={100}
               label={bucketLabel(key)}
               valueText={`${pct} % used${left ? `, resets in ${left.replace(' left', '')}` : ''}`}
-              tone={meterTone(bucket.utilization)}
+              paint={meterPaint(bucket.utilization)}
             >
               <div className="mt-0.5 flex flex-wrap justify-between gap-x-2 text-2xs text-ink-muted">
                 <span>{bucketLabel(key)}</span>
@@ -567,6 +782,19 @@ function Headroom({ account, auto }: { account: AccountView; auto: boolean }) {
           At its {bucketLabel(bucket).toLowerCase()} limit — {countdown(Date.parse(iso)) || 'reset due'}.
         </p>
       ))}
+      {account.kind === 'token' && account.tokenExpiresAt ? (
+        <p className="text-2xs text-ink-muted">
+          A long-lived token — it needs no renewing; replace it by{' '}
+          {new Date(account.tokenExpiresAt).toLocaleDateString(undefined, {
+            day: 'numeric',
+            month: 'short',
+            year: 'numeric',
+          })}
+          .
+        </p>
+      ) : account.unattended ? (
+        <p className="text-2xs text-ink-muted">{account.unattended}</p>
+      ) : null}
     </div>
   );
 }
@@ -594,6 +822,7 @@ export function SkillsSection() {
           }
           on="Attached"
           source={f.src('attachDefaultSkills')}
+          effect={f.fx('attachDefaultSkills')}
           value={values.attachDefaultSkills}
           onChange={(next) => f.set('attachDefaultSkills', next)}
         />
@@ -650,6 +879,7 @@ export function McpSection() {
               label="If one will not connect"
               hint="A phase whose plan says it requires its servers still parks — this cannot overrule that."
               source={f.src('mcpPolicy')}
+              effect={f.fx('mcpPolicy')}
               value={values.mcpPolicy}
               options={[
                 ['continue', 'Run the phase without it'],
@@ -718,7 +948,7 @@ export function ReviewersSection() {
   const f = useSetupForm();
   const { values } = f;
   const Bool = f.Bool;
-  if (!f.on('reviewEachPhase') && !f.on('ultracode') && !f.on('ultraReview')) return null;
+  if (!f.on('reviewEachPhase') && !f.on('ultraReview')) return null;
   return (
     <div className="flex flex-col gap-3">
       {f.on('reviewEachPhase') && (
@@ -726,6 +956,7 @@ export function ReviewersSection() {
           label="Review each phase"
           hint="When a phase finishes, a fresh session that did not write the code reads its diff against the plan's exit criteria and records what it finds. Costs about a quarter of a phase budget each time."
           source={f.src('reviewEachPhase')}
+          effect={f.fx('reviewEachPhase')}
           value={values.reviewEachPhase}
           onChange={(next) => f.set('reviewEachPhase', next)}
         />
@@ -739,17 +970,9 @@ export function ReviewersSection() {
           label="…and let it hold dependent phases"
           hint="Off: findings are recorded and shown, and nothing is held. On: the reviewer may record changes-requested, which stops every phase that depends on the reviewed one until a person approves or withdraws it."
           source={f.src('reviewerPolicy')}
+          effect={f.fx('reviewerPolicy')}
           value={values.reviewerPolicy === 'may-hold'}
           onChange={(next) => f.set('reviewerPolicy', next ? 'may-hold' : 'comment-only')}
-        />
-      )}
-      {f.on('ultracode') && (
-        <Bool
-          label="Ultracode"
-          hint="Every prompt this run composes carries the standing ultracode licence, so a session may use the Workflow tool where the work genuinely fans out. A workflow runs dozens of agents at once — this is a token bill, not a speed setting."
-          source={f.src('ultracode')}
-          value={values.ultracode}
-          onChange={(next) => f.set('ultracode', next)}
         />
       )}
       {f.on('ultraReview') && (
@@ -757,6 +980,7 @@ export function ReviewersSection() {
           label="Cloud review"
           hint="Runs `claude ultrareview` on this run's branch — a multi-agent review in Anthropic's cloud, billed to the account this run spends. Its findings land beside the reviewer's, under the same hold rule. If the CLI here has no such command, the run says so and carries on."
           source={f.src('ultraReview')}
+          effect={f.fx('ultraReview')}
           value={values.ultraReview}
           options={[
             ['off', 'Never'],
@@ -803,6 +1027,7 @@ export function QaSection() {
             )
           }
           source={f.src('qa')}
+          effect={f.fx('qa')}
           value={values.qa}
           disabledReason={
             allowWrites === false
@@ -813,18 +1038,31 @@ export function QaSection() {
         />
       )}
 
-      {f.on('qa') && mode !== 'qa' && (qaMode === 'off' || mode === 'defaults') && (
+      {f.on('qa') && mode !== 'qa' && (qaMode === 'off' || mode === 'defaults' || mode === 'live') && (
         <Bool
           label={
-            mode === 'defaults' ? 'Turn the QA gate on for new runs' : 'Turn the QA gate on for this plan'
+            mode === 'defaults'
+              ? 'Turn the QA gate on for new runs'
+              : mode === 'live'
+                ? 'The QA gate for this plan'
+                : 'Turn the QA gate on for this plan'
           }
-          hint="Each finished phase then waits for an independent review. Phases that finished before now are recorded as waived, so turning it on does not retroactively hold the board."
+          hint={
+            mode === 'live'
+              ? 'On creates test-status.md, and each phase that finishes from now waits for an independent review — phases that finished before are recorded as waived. Off lets recorded verdicts stop holding dependents. You confirm before anything is written.'
+              : 'Each finished phase then waits for an independent review. Phases that finished before now are recorded as waived, so turning it on does not retroactively hold the board.'
+          }
           source={f.src('qa')}
+          effect={f.fx('qa')}
           value={values.qa}
           disabledReason={
-            mode !== 'defaults' && !f.canQaToggle
-              ? 'Writes are disabled. Restart the console with --allow-writes.'
-              : undefined
+            mode === 'live'
+              ? allowWrites === false
+                ? 'Writes are disabled. Restart the console with --allow-writes.'
+                : undefined
+              : mode !== 'defaults' && !f.canQaToggle
+                ? 'Writes are disabled. Restart the console with --allow-writes.'
+                : undefined
           }
           onChange={(next) => f.set('qa', next)}
         />
@@ -844,6 +1082,7 @@ export function QaSection() {
               label="QA model"
               hint="The reviewer's own tier. A review is a different job from the build and is often worth a different model in either direction."
               source={f.src('qaModel')}
+              effect={f.fx('qaModel')}
               value={values.qaModel}
               placeholder="same as the phase being reviewed"
               options={f.modelOptions}
@@ -854,6 +1093,7 @@ export function QaSection() {
             <SelectField
               label="QA effort"
               source={f.src('qaEffort')}
+              effect={f.fx('qaEffort')}
               value={values.qaEffort}
               placeholder="same as the phase being reviewed"
               options={f.effortOptions}
@@ -865,6 +1105,7 @@ export function QaSection() {
               label="Stop after N failed QA rounds"
               hint="Then the phase parks with one errand naming the last report. Empty leaves the shipped default of 3."
               source={f.src('qaMaxRounds')}
+              effect={f.fx('qaMaxRounds')}
               error={f.errors.qaMaxRounds}
               value={values.qaMaxRounds}
               min={1}
@@ -881,6 +1122,7 @@ export function QaSection() {
               label="How the fix session starts"
               hint="Resuming is cheap — that session already holds the context the report is about. A fresh one gets the findings verbatim under the phase's own boot prompt, and is what the loop falls back to when no session survives."
               source={f.src('qaFixStrategy')}
+              effect={f.fx('qaFixStrategy')}
               value={values.qaFixStrategy}
               placeholder={QA_FIX_STRATEGY_LABELS.resume}
               options={QA_FIX_STRATEGIES.map((id) => [id, QA_FIX_STRATEGY_LABELS[id]] as const)}
@@ -915,7 +1157,7 @@ export function PromptSection() {
   const f = useSetupForm();
   if (!f.on('prompt')) return null;
   return (
-    <SetupField label="First prompt (optional)" source={f.src('prompt')}>
+    <SetupField label="First prompt (optional)" source={f.src('prompt')} effect={f.fx('prompt')}>
       {({ id, describedBy }) => (
         // text-base = 16px — below that iOS zooms the page on focus.
         <textarea
@@ -945,6 +1187,7 @@ export function MoneySection() {
         <NumberField
           label="Budget per phase ($)"
           source={f.src('phaseBudgetUsd')}
+          effect={f.fx('phaseBudgetUsd')}
           error={f.errors.phaseBudgetUsd}
           value={f.values.phaseBudgetUsd}
           min={0}
@@ -956,6 +1199,7 @@ export function MoneySection() {
         <NumberField
           label="Budget for the run ($)"
           source={f.src('runBudgetUsd')}
+          effect={f.fx('runBudgetUsd')}
           error={f.errors.runBudgetUsd}
           value={f.values.runBudgetUsd}
           min={0}
@@ -971,6 +1215,7 @@ export function MoneySection() {
           label="Budget per QA round ($)"
           hint="A hard stop for each round on its own — never for the run. Empty means no per-round ceiling."
           source={f.src('qaRoundBudgetUsd')}
+          effect={f.fx('qaRoundBudgetUsd')}
           error={f.errors.qaRoundBudgetUsd}
           value={f.values.qaRoundBudgetUsd}
           min={0}
@@ -987,9 +1232,21 @@ export function StopsSection() {
   const { values, mode } = f;
   const Bool = f.Bool;
   const any = (
-    ['maxConsecutiveFailures', 'maxParallel', 'priority', 'onLimit', 'autonomy', 'autoRecover'] as const
+    [
+      'maxConsecutiveFailures',
+      'maxParallel',
+      'priority',
+      'onLimit',
+      'autonomy',
+      'autoRecover',
+      'ladderPerRunRungs',
+      'ladderPerPhaseRungs',
+    ] as const
   ).some((field) => f.on(field));
   if (!any) return null;
+  // What an empty rung box falls back to, said as a number when it is known.
+  const fallback = (cap: number | undefined) =>
+    cap === undefined ? "this console's own cap" : `this console's cap of ${cap}`;
   return (
     <div className="flex flex-col gap-3">
       <div className={PAIR}>
@@ -998,6 +1255,7 @@ export function StopsSection() {
             label="Stop after N failures"
             hint="Consecutive failed phases before the run halts. Empty leaves the run's own ceiling."
             source={f.src('maxConsecutiveFailures')}
+            effect={f.fx('maxConsecutiveFailures')}
             error={f.errors.maxConsecutiveFailures}
             value={values.maxConsecutiveFailures}
             min={1}
@@ -1011,6 +1269,7 @@ export function StopsSection() {
             label="Max parallel"
             hint={`Lanes this run may hold at once${f.concurrencyMax ? ` — this console allows ${f.concurrencyMax}` : ''}. Empty means the console's own ceiling.`}
             source={f.src('maxParallel')}
+            effect={f.fx('maxParallel')}
             error={f.errors.maxParallel}
             value={values.maxParallel}
             min={1}
@@ -1023,6 +1282,7 @@ export function StopsSection() {
           <SelectField
             label="On usage limit"
             source={f.src('onLimit')}
+            effect={f.fx('onLimit')}
             value={values.onLimit}
             options={[
               ['switch', 'switch account, else wait'],
@@ -1039,6 +1299,7 @@ export function StopsSection() {
             // difference between the two modes the labels never said.
             hint={AUTONOMY_HELP[values.autonomy]}
             source={f.src('autonomy')}
+            effect={f.fx('autonomy')}
             value={values.autonomy}
             options={[
               ['keep-going', AUTONOMY_LABEL['keep-going']],
@@ -1051,17 +1312,54 @@ export function StopsSection() {
           <SelectField
             label="Queue priority"
             source={f.src('priority')}
+            effect={f.fx('priority')}
             value={values.priority}
             options={RUN_PRIORITIES.map((p) => [p, PRIORITY_LABELS[p]])}
             onChange={(next) => f.set('priority', next as RunPriority)}
           />
         )}
       </div>
+      {/* Where recovery stops (#14), beside the switch that turns it on. Both
+          boxes take 0 — a cap under which nothing climbs — so neither may
+          read an empty box as zero: empty hands the run to the console. */}
+      {(f.on('ladderPerRunRungs') || f.on('ladderPerPhaseRungs')) && (
+        <div className={PAIR}>
+          {f.on('ladderPerRunRungs') && (
+            <NumberField
+              label="Recovery rungs per run"
+              hint={`Recovery attempts across the phases still open; once a phase finishes, its attempts stop counting. 0 means none; empty uses ${fallback(f.ladderCaps?.perRun)}.`}
+              source={f.src('ladderPerRunRungs')}
+              effect={f.fx('ladderPerRunRungs')}
+              error={f.errors.ladderPerRunRungs}
+              value={values.ladderPerRunRungs}
+              min={0}
+              step={1}
+              placeholder="console default"
+              onChange={(next) => f.set('ladderPerRunRungs', next)}
+            />
+          )}
+          {f.on('ladderPerPhaseRungs') && (
+            <NumberField
+              label="Recovery rungs per phase"
+              hint={`Recovery attempts one phase may use before it waits for you with an errand. 0 means none; empty uses ${fallback(f.ladderCaps?.perPhase)}.`}
+              source={f.src('ladderPerPhaseRungs')}
+              effect={f.fx('ladderPerPhaseRungs')}
+              error={f.errors.ladderPerPhaseRungs}
+              value={values.ladderPerPhaseRungs}
+              min={0}
+              step={1}
+              placeholder="console default"
+              onChange={(next) => f.set('ladderPerPhaseRungs', next)}
+            />
+          )}
+        </div>
+      )}
       {f.on('autoRecover') && (
         <Bool
           label={mode === 'defaults' ? 'Auto-recover halted runs' : 'Auto-recover halts'}
           hint="A halt an agent can clear (failed verification, missing handoff, a crash) launches the fix agent by itself — at most 2 tries per phase, never the same failure twice — and the run resumes when the board reads fixed."
           source={f.src('autoRecover')}
+          effect={f.fx('autoRecover')}
           value={values.autoRecover}
           disabledReason={
             mode !== 'defaults' && !f.canAutoRecover
@@ -1076,10 +1374,65 @@ export function StopsSection() {
 }
 
 /**
+ * One category's controls (control-tower phase 22) — what a quick-view tile
+ * expands onto. Every section here is the one the flat layout stacks, so a
+ * control is still written once; the category only says which of them a tile
+ * opens, in `CATEGORY_OF`'s grouping.
+ */
+export function CategorySection({ id }: { id: CategoryId }) {
+  switch (id) {
+    case 'scope':
+      return <ScopeSection />;
+    case 'engine':
+      return (
+        <div className="flex min-w-0 flex-col gap-4">
+          <ModelSection />
+          <PerPhaseSection />
+          <PromptSection />
+        </div>
+      );
+    case 'safety':
+      return <PermissionsSection />;
+    case 'git':
+      return (
+        <div className="flex min-w-0 flex-col gap-4">
+          <GitReconcile />
+          <BranchSection />
+        </div>
+      );
+    case 'money':
+      return (
+        <div className="flex min-w-0 flex-col gap-4">
+          <MoneySection />
+          <StopsSection />
+        </div>
+      );
+    case 'review':
+      return (
+        <div className="flex min-w-0 flex-col gap-4">
+          <ReviewersSection />
+          <QaSection />
+        </div>
+      );
+    case 'tools':
+      return (
+        <div className="flex min-w-0 flex-col gap-4">
+          <SkillsSection />
+          <McpSection />
+        </div>
+      );
+    case 'accounts':
+      return <AccountSection />;
+    case 'decisions':
+      return <DecisionsSection />;
+  }
+}
+
+/**
  * The flat layout — every section in order, for the modes that carry too few
- * fields for a stage bar (a QA review, a recovery, the launcher, the plan
- * wizard, the Automation defaults). The order is the staged order read top
- * to bottom, so a control sits where it would on the stages.
+ * fields for the quick view's tiles (a QA review, a recovery, the launcher,
+ * the plan wizard, the Automation defaults). The order is the stages' read top
+ * to bottom, so a control sits where the old stage bar put it.
  */
 export function FlatForm() {
   return (
@@ -1091,6 +1444,7 @@ export function FlatForm() {
       <PermissionsSection />
       <MoneySection />
       <StopsSection />
+      <GitReconcile />
       <BranchSection />
       <ReviewersSection />
       <PromptSection />

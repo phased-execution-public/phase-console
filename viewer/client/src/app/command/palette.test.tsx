@@ -223,7 +223,7 @@ describe('the commands', () => {
     // Repo and Debug are 4.0's two, and they are here for free: the builder
     // reads `NAV`, so a destination that exists is a row without anyone
     // remembering to add one. That is the property worth pinning.
-    for (const label of ['Now', 'Plans', 'Runs', 'Repo', 'Insights', 'Debug', 'Help']) {
+    for (const label of ['Runs', 'Plans', 'Repo', 'Insights', 'Debug', 'Help']) {
       expect(await rowNamed(label), label).toBeTruthy();
     }
     // "Settings" is both a destination and the hint on "Shut this console
@@ -250,7 +250,7 @@ describe('the commands', () => {
     const { onNavigate } = open('');
 
     fireEvent.click(await rowNamed('The alpha plan'));
-    expect(onNavigate).toHaveBeenCalledWith('#/plan/alpha/route');
+    expect(onNavigate).toHaveBeenCalledWith('#/plan/alpha/phases');
 
     // `/api/plans` sends the queue as bare numbers, so a ready phase is
     // addressable by number under its plan's name — the fastest route to the

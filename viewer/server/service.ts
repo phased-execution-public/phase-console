@@ -7,17 +7,20 @@
  * bumps whenever one of its files changes.
  */
 
-import { basename, join } from 'node:path';
-import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, sanitisePolicyPrefs } from '../shared/policy-model.js';
+import { basename, join, resolve as resolvePath } from 'node:path';
+import { DECISION_ANSWERS, OWNER_KEYS, destructiveExceptions, isAnswerWord, manifestPushVerdict, sanitisePolicyPrefs } from '../shared/policy-model.js';
 import { DECISION_KEYS, mergeDecisions } from '../shared/decisions-model.js';
 import { policyForKey, policyForPlan, policyPrefsOf } from './runner/policy.ts';
+import {
+  planApprovedInstruction, planContinueReason, planHeldReason, planOf, planTextFile, type PlanDecision,
+} from './runner/plan-approval.ts';
 import { homedir } from 'node:os';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, watch, type FSWatcher } from 'node:fs';
 
 import { instanceId } from '../shared/instances.mjs';
 import {
-  INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs, savePrefs,
-  serverIsStale, staticRoot, withAutomation,
+  INSTANCE, INSTANCE_STATE_DIR, SKILL_DIR, STATE_DIR, agentEnabled, checkRoot, distRev, rememberRoot, loadPrefs, prefDefault,
+  savePrefs, serverIsStale, staticRoot, withAutomation,
   type Flags, type Prefs, type RootCheck,
 } from './config.ts';
 import {
@@ -36,15 +39,18 @@ import {
   type GateStatus,
 } from './engine.ts';
 import { QA_DIRECTIVES } from '../shared/plan-vocab.js';
+import { QA_CONFIRM } from '../shared/run-settings.js';
+import { RELOGIN_CONFIRM } from '../shared/ops-vocab.js';
 import { SearchIndex, type SearchResult } from './search.ts';
 import { listSkills, type SkillInfo } from './skills.ts';
+import { SCRIPTS_REF } from './skill-copy.ts';
 import { DocsWatcher } from './watch.ts';
 import {
   degradedState, hasShutdownWork, onDegraded, requestRestart, requestShutdown, stopPlan, supervisor,
 } from './lifecycle.ts';
 import { log } from './log.ts';
 import {
-  CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
+  CATEGORIES, Push, isPlanProgress, parseQuietHours, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
 import { isPushActionVerb } from './push/actions.ts';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
@@ -58,7 +64,10 @@ import { loadGateVocab, gateKindOf, type GateVocab, type GateKind } from './anal
 import {
   planCost, rungsToday, spendSummary, type SpendRunView, type SpendView,
 } from './analysis/spend.ts';
-import { renderMetrics } from './analysis/metrics.ts';
+import { renderMetrics, type MetricsProcess } from './analysis/metrics.ts';
+import { etagOf, type Encoding } from './http/compress.ts';
+import { getHeapStatistics } from 'node:v8';
+import { activeHandles, eventLoopDelay } from './runtime-probe.ts';
 import {
   projectTimeline, attemptsOf, compareConsecutive,
   type RunTimeline, type AttemptSummary, type AttemptComparison,
@@ -130,6 +139,7 @@ import {
   slugsNeedingBoard, runDir, consoleRunsDir, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText,
   type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary,
   journalOf,
+  setRunState,
 } from './runner/state.ts';
 import {
   consumeOutcome, inboxOutcomePhase, outcomeFileFor, outcomeInboxDir, readOutcome, type PhaseOutcome,
@@ -140,7 +150,7 @@ import { loadVerifyEnv } from './runner/verify-env.ts';
 import { checkAuth, checkAuthFor, forgetAuth, openLoginTerminal, openCommandTerminal, shellQuote, type AuthStatus } from './runner/auth.ts';
 import { hashedOrgId } from './accounts/learned.ts';
 import {
-  Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir,
+  AccountInUseError, Accounts, DEFAULT_ACCOUNT_ID, profileConfigDir,
   type AccountView, type EntitlementProbeResult, type HeadroomVerdict, type TombstoneView,
 } from './accounts/index.ts';
 import { realExec, type Exec } from './accounts/credentials.ts';
@@ -161,19 +171,21 @@ import {
 } from './qa-session.ts';
 import { nextQaRound, qaReportPath, highestQaRound } from './qa-round.ts';
 import {
-  Approvals, classifyTool, matchedDenyRule, loadPolicy, loadPolicyFor, policyExtras, addPolicyRules,
+  Approvals, classifyTool, matchedDenyRule, loadPolicy, loadPolicyFor, policyExtras, addPolicyRules, treeGuard,
+  signInCall, signInJournalCommand, signInRefusal, type SignInCall,
   editPolicy, planPolicyPath, effectivePlanPolicyPath, notifyOutOfBand, carvedPolicy, suggestedRule,
-  autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf,
-  parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED,
+  autoApproveFor, neverAutoApproves, hitsHidden, matchedAskRule, publishingRule, questionRule, questionsOf, planRule,
+  parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED, EXTEND_CHOICES_MIN,
   PERMISSION_PROFILES, PROFILE_LABELS,
   DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH, PUSH_DENY,
-  type Evidence, type PolicyScope, type PermissionProfile,
+  type Approval, type Evidence, type ManifestCheck, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
 
 import {
   AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView,
 } from './service-core.ts';
 import { ServiceRecovery } from './service-recovery.ts';
+import { qaAnchorPhase } from './service-runs.ts';
 import { trimOldest, NOTIFIED_CAP } from './service-base.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
 import { managedRoots, stagingHome, stagingNames } from './runner/worktree.ts';
@@ -227,6 +239,25 @@ const SPEND_POOL_MIN_MS = 5_000;
  * whole-portfolio scans than the bare clock that used to be the whole key.
  */
 const SPEND_POOL_MAX_MS = 60_000;
+
+/**
+ * How long a memoised inbox may be served at an unchanged revision
+ * (control-tower phase 56, #75). The revision catches every change that
+ * announces itself; this bounds the ones that do not — a clock crossing a
+ * threshold, a ledger line a session appended — at one refetch beat's worth.
+ */
+export const INBOX_MAX_AGE_MS = 10_000;
+
+/** `GET /api/inbox`'s body as the route sends it — built once per memo. */
+export type InboxEntity = {
+  etag: string;
+  body: Buffer;
+  /** Each coding packed at most once, on first ask. */
+  packed: Partial<Record<Encoding, Promise<Buffer>>>;
+};
+
+/** One memoised inbox: the view, the key it was built at, and when. */
+type InboxMemo = { key: string; at: number; view: InboxView; entity?: InboxEntity };
 
 /** What a QA directive may be set to — `shared/plan-vocab.js` `QA_DIRECTIVES`. */
 export type QaDirective = (typeof QA_DIRECTIVES)[number];
@@ -282,6 +313,15 @@ function keyRank(key: string): number {
 }
 
 export class Service extends ServiceRecovery {
+  /** The attention inbox, memoised per shape (`all` or not) — see `attention`. */
+  private inboxMemo = new Map<boolean, InboxMemo>();
+  /** The build in flight per shape, and the key it is building. */
+  private inboxFlight = new Map<boolean, { key: string; promise: Promise<InboxMemo> }>();
+  /** Each plan's gate answers as the inbox last read them — see `inboxGates`. */
+  private inboxGateAnswers = new Map<string, { revision: number; gates: Map<number, GateStatus | null> }>();
+  /** The refills in flight, as `<slug>@<revision>`. */
+  private inboxGateFills = new Set<string>();
+
   /**
    * Sign-ins whose definition this console wrote and has not taken back.
    *
@@ -636,6 +676,61 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * The plan's QA gate, moved from a live run's settings sheet (control-tower
+   * phase 13, #31). It was start-only beside three live QA fields — a reviewer
+   * an operator could tune and not switch on — for a reason that was a side
+   * effect rather than an impossibility: turning it on writes `test-status.md`.
+   *
+   * On needs the person's `QA_CONFIRM` (the sheet says what it writes before
+   * it posts) and `--allow-writes`; it creates the ledger the way the launch
+   * box does (`activateQa`, finished phases backfilled `waived`) and then
+   * writes the plan's QA-gate line `on`, because a plan whose line says `off`
+   * reads a fresh ledger as `waived`. `new-handoff --qa` records the phase it
+   * is handed as OWING a review — right at a phase-finish, wrong for a phase
+   * that finished before the gate existed, whose dependents a `pending` row
+   * would hold — so a finished anchor is waived with that reason, through
+   * the one waiver door. Off writes the line `off`. A move to where the gate
+   * already is writes nothing. The answer names the regime before and after,
+   * in the engine's words.
+   */
+  async setRunQa(
+    slug: string, on: boolean, opts: { confirm?: unknown; by?: string } = {},
+  ): Promise<{ ok: true; from: string; to: string } | { ok: false; why: string }> {
+    const from = (await this.qaMode(slug)).mode;
+    if (on ? from === 'on' : from !== 'on') return { ok: true, from, to: from };
+    if (on && opts.confirm !== QA_CONFIRM) {
+      return {
+        ok: false,
+        why: 'turning QA on creates test-status.md and holds each dependent on its phase\'s verdict — '
+          + `send confirm: "${QA_CONFIRM}" to go ahead`,
+      };
+    }
+    if (!this.flags.allowWrites) {
+      return { ok: false, why: 'the QA gate is written into the plan, and writes are disabled — restart the console with --allow-writes' };
+    }
+    let finished: number | null = null;
+    if (on && from === 'off') {
+      const record = this.store?.get(slug);
+      if (!record) return { ok: false, why: `No plan named ${slug}.` };
+      const anchor = qaAnchorPhase(record);
+      const turned = await this.activateQa(slug, anchor);
+      if (!turned.ok) return { ok: false, why: turned.detail };
+      if (handoffFor(record, anchor)?.status === 'complete') finished = anchor;
+    }
+    if (!on || (await this.qaMode(slug)).mode !== 'on') {
+      const set = await this.setQaMode(slug, { mode: on ? 'on' : 'off' });
+      if (!set.ok) return { ok: false, why: set.detail };
+    }
+    if (finished != null && (await this.qaVerdict(slug, finished)) === 'pending') {
+      const waived = await this.qaWaive(slug, finished, {
+        reason: 'finished before QA was turned on mid-run', ...(opts.by ? { by: opts.by } : {}),
+      });
+      if (!waived.ok) return { ok: false, why: waived.detail };
+    }
+    return { ok: true, from, to: (await this.qaMode(slug)).mode };
+  }
+
+  /**
    * Switch the QA regime from the console — for the plan, or for ONE phase.
    *
    * `activateQa` above can only turn the gate on. The plan file has carried
@@ -820,6 +915,16 @@ export class Service extends ServiceRecovery {
     return this.accounts.addToken(name, token);
   }
 
+  /**
+   * Replace a token account's credential, keeping its id (control-tower phase
+   * 13, #33) — `PUT /api/accounts/:id/credential`. The same registration-class
+   * gate as adding one: it decides whose money a run may spend.
+   */
+  async replaceTokenAccount(id: string, token: string): Promise<AccountView | undefined> {
+    this.assertAccountsAllowed();
+    return this.accounts.replaceToken(id, token);
+  }
+
   async removeAccount(id: string): Promise<boolean> {
     this.assertAccountsAllowed();
     // Refuse while a LIVE run pays as this account: its very next spawn would
@@ -829,10 +934,64 @@ export class Service extends ServiceRecovery {
     for (const [slug, runner] of this.runners) {
       const state = runner.busy() ? runner.current() : null;
       if (state && (state.accountId ?? DEFAULT_ACCOUNT_ID) === id) {
-        throw new Error(`${slug} is running as this account — pause it, or switch its account first.`);
+        throw new AccountInUseError(`${slug} is running as this account — pause it, or switch its account first.`);
       }
     }
+    // …and refuse while any LIVE SESSION on this machine is signed into the
+    // profile's config directory (#22). `remove` does not merely forget a row:
+    // it deletes that directory, and the session holding it would lose its
+    // transcripts, its settings and its login mid-phase — measured three
+    // minutes from happening on 2026-09-21. The registry knows the live pids
+    // and each one's `CLAUDE_CONFIG_DIR`, so the answer is one read away.
+    const signedIn = this.sessionsSignedInto(id);
+    if (signedIn.length) {
+      throw new AccountInUseError(
+        `${signedIn.length} live session${signedIn.length === 1 ? ' is' : 's are'} signed into this `
+        + `account (${signedIn.join(', ')}) — removing it deletes the config directory they are `
+        + 'using. Let them end, or stop them, and try again.',
+      );
+    }
     return this.accounts.remove(id);
+  }
+
+  /**
+   * The live sessions whose `CLAUDE_CONFIG_DIR` is this account's own directory.
+   *
+   * Only a `profile` account has one — a token's session reads `~/.claude` like
+   * the machine login's does, which is why `sessionsByAccount` leaves tokens
+   * out too — and a session carrying an env credential is not signed into the
+   * DIRECTORY whatever its cwd says (`SessionView.authEnv`, the same precedence
+   * that function uses).
+   */
+  private sessionsSignedInto(id: string): string[] {
+    if (this.accounts.meta(id)?.kind !== 'profile') return [];
+    const lexical = (dir: string): string => resolvePath(dir).replace(/\/+$/, '') || '/';
+    const target = lexical(profileConfigDir(id, this.accounts.dir));
+    let views: SessionView[] = [];
+    try { views = this.sessionViews(); } catch { return []; }
+    return views
+      .filter((view) => view.presence === 'live' && !view.probe && !view.authEnv
+        && view.configDir && lexical(view.configDir) === target)
+      .map((view) => view.sessionId);
+  }
+
+  /**
+   * "Use credits past plan limits" for one account (control-tower phase 93,
+   * #146; operator decision 12) — verified against the account's own credit
+   * state when switched on, refused with the reason when it is not there.
+   * The same registration-class gate as a rename: it decides whose money a
+   * run may spend.
+   */
+  async setAccountOverage(
+    id: string, allowed: boolean, capUsd: number | null | undefined,
+  ): Promise<{ ok: true; account: AccountView | undefined } | { ok: false; reason: string }> {
+    this.assertAccountsAllowed();
+    const result = this.accounts.setOverage(id, allowed, { capUsd, by: 'operator' });
+    if (!result.ok) return result;
+    // Allowed and confirmed: the brake a plan window put on it is lifted now,
+    // not at the next warning (the rules read the carry from here on).
+    if (result.credits.carrying) this.scheduler.releaseBrake(id === DEFAULT_ACCOUNT_ID ? undefined : id);
+    return { ok: true, account: (await this.accounts.list()).find((view) => view.id === id) };
   }
 
   /** Display-name only — ids are journal keys, path segments and keychain hashes. */
@@ -851,30 +1010,64 @@ export class Service extends ServiceRecovery {
    * in Terminal.app or handed back for the operator to paste; `completeLogin`
    * then runs on the next accounts read instead of on an exit event.
    */
-  async beginAccountLogin(options: { accountId?: string; name?: string }): Promise<{
+  async beginAccountLogin(options: { accountId?: string; name?: string; confirm?: unknown }): Promise<{
     accountId: string;
     command: string;
-    mode: 'embedded' | 'external' | 'command';
+    mode: 'embedded' | 'external' | 'command' | 'replace-token' | 'warn';
     terminal?: { sessionId: string; token: string; expiresAt: number };
     detail?: string;
+    /** `warn` only: what a re-login would do, and the live runs it would end. */
+    warning?: string;
+    runs?: string[];
   }> {
     this.assertAccountsAllowed();
     let accountId = options.accountId;
-    if (accountId) {
-      const meta = this.accounts.meta(accountId);
-      if (!meta || meta.kind !== 'profile') throw new Error('Only profile accounts can be signed in here.');
-    } else {
-      accountId = this.accounts.beginProfile(options.name).id;
+    // Every kind has a way back now (control-tower phase 13, #33). A TOKEN is
+    // not signed in — its credential is replaced, keeping its id — so the door
+    // answers with that verb and the command that mints the new token.
+    const meta = accountId ? this.accounts.meta(accountId) : undefined;
+    if (accountId && !meta) throw new Error('No such account.');
+    if (accountId && meta?.kind === 'token') {
+      return { accountId, command: 'claude setup-token', mode: 'replace-token' };
     }
-    const dir = profileConfigDir(accountId);
-    const command = `CLAUDE_CONFIG_DIR=${shellQuote(dir)} claude auth login`;
+    // The MACHINE login signs in with the CLI's own `claude auth login` and no
+    // CLAUDE_CONFIG_DIR — the CLI logging itself in is not a second writer of
+    // its store. A re-login that changes its identity ends every session on it
+    // (#131), so while a live run pays as it the door WARNS first, naming the
+    // runs and the identity they are bound to (phase 91), and runs nothing
+    // until the person answers with `RELOGIN_CONFIRM`.
+    const machine = accountId === DEFAULT_ACCOUNT_ID;
+    if (machine && options.confirm !== RELOGIN_CONFIRM) {
+      const paying = this.payingAs(DEFAULT_ACCOUNT_ID);
+      if (paying.length) {
+        const bound = paying
+          .map(({ slug }) => this.runners.get(slug)?.current()?.identity)
+          .find((identity) => identity?.account === DEFAULT_ACCOUNT_ID);
+        return {
+          accountId: DEFAULT_ACCOUNT_ID,
+          command: 'claude auth login',
+          mode: 'warn',
+          runs: paying.map(({ slug }) => slug),
+          warning: `${paying.map(({ slug }) => slug).join(', ')} ${paying.length === 1 ? 'is' : 'are'} running on the machine login`
+            + `${bound?.email ? `, bound to ${bound.email}` : ''}. Signing it in again as anyone else ends `
+            + `${paying.length === 1 ? 'that run\'s sessions' : 'their sessions'}, and the run parks until you say `
+            + 'which login it continues on. Stop or switch those runs first, or go ahead knowing that.',
+        };
+      }
+    }
+    if (!accountId) accountId = this.accounts.beginProfile(options.name).id;
+    const dir = machine ? null : profileConfigDir(accountId);
+    const command = dir ? `CLAUDE_CONFIG_DIR=${shellQuote(dir)} claude auth login` : 'claude auth login';
 
     const minted = await this.terminals.mint(undefined, undefined, {
       kind: 'claude',
       file: 'claude',
       args: ['auth', 'login'],
       label: `Sign in — ${this.accounts.labelFor(accountId)}`,
-      env: { CLAUDE_CONFIG_DIR: dir },
+      // `undefined` DELETES an inherited value (`{...process.env, ...env}`):
+      // a console started under a profile must not sign that profile in when
+      // the operator asked for the machine's own login.
+      env: { CLAUDE_CONFIG_DIR: dir ?? undefined },
       meta: { intent: 'login', accountId },
     });
     if (minted.ok) {
@@ -985,6 +1178,18 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * How many registered accounts this console cannot spend under, out of how
+   * many it has. Read from the breaker through the quota door, so it answers
+   * the same question boarding does — "would a run be refused on this?" —
+   * rather than a second, parallel opinion about the same accounts.
+   */
+  protected accountsUsable(): { unusable: number; total: number } {
+    const ids = this.accounts.accountIds();
+    const unusable = ids.filter((id: string) => !this.accounts.headroom(id).ok).length;
+    return { unusable, total: ids.length };
+  }
+
+  /**
    * The operator's clearance of a retired account — the one transition out of
    * `retired`, for the credential and its organisation. A registration-class
    * act (it widens what every future run may spend), so it rides the same
@@ -995,6 +1200,9 @@ export class Service extends ServiceRecovery {
     if (!this.accounts.has(id)) return undefined;
     const cleared = this.accounts.clearRetired(id, 'operator');
     log.info('accounts.retired.clear-requested', { account: id, cleared, ...actor });
+    // The clearance lifted the retirement's scheduler hold with it: an entry
+    // queued on that hold admits on this scan, not when the hold's timer fires.
+    if (cleared) this.scheduler.poll();
     const views = await this.accounts.list();
     return views.find((view) => view.id === id);
   }
@@ -1007,6 +1215,9 @@ export class Service extends ServiceRecovery {
 
   /** The registry, already redacted by the facade. Never gated — this is display. */
   async listMcp(): Promise<McpServerView[]> {
+    // A person is reading the health answer, so the clock keeps its pace (#73).
+    // Only here and at Refresh: the clock's own announcement lists too.
+    this.mcp.consumed();
     return this.mcp.list();
   }
 
@@ -1027,6 +1238,7 @@ export class Service extends ServiceRecovery {
    * that linted clean a moment ago may not now.
    */
   async refreshMcp(force = false): Promise<McpServerView[]> {
+    this.mcp.consumed();
     await this.mcp.refresh({ force, ...(this.root ? { cwd: this.root.path } : {}) });
     invalidate();
     const servers = await this.mcp.list();
@@ -1324,8 +1536,9 @@ export class Service extends ServiceRecovery {
       // phase, which is an auto-START, so a frozen console must not do it —
       // and must not lose it either: the park record and its `at` stay on
       // disk, so `thawFleet`'s re-arm pass finds the clock overdue and
-      // continues the phase then.
-      const frozen = this.fleetHold();
+      // continues the phase then. Read for THIS plan: a restart waiting for its
+      // lanes holds only the plans whose scope meets theirs (#70).
+      const frozen = this.fleetHoldFor(slug);
       if (frozen) {
         log.info('mcp.require-timeout-frozen', { slug, phase, by: frozen.by });
         return;
@@ -1412,8 +1625,9 @@ export class Service extends ServiceRecovery {
     // on the way in. The promise is restored by the next boot pass, or by
     // `armFreezeEscalation` when a thawed console next reads this run —
     // deliberately NOT re-armed here, because a clock re-armed inside a freeze
-    // is a clock the operator cannot see and did not ask for.
-    const held = this.fleetHold();
+    // is a clock the operator cannot see and did not ask for. Read for THIS
+    // plan, as `freezeRun` writes the standing form (#70).
+    const held = this.fleetHoldFor(slug);
     if (held) {
       log.info('run.freeze-escalate-frozen', { slug, runId, by: held.by });
       return;
@@ -1427,12 +1641,12 @@ export class Service extends ServiceRecovery {
       // Nothing else is running under it — a stored run has no lanes by
       // definition — so the run itself is now stopped, and the freeze that
       // stopped it was the operator's act.
-      state.status = 'paused';
+      setRunState(state, 'paused');
       state.stoppedBy = 'operator';
       state.halt = null;
     });
     if (!edited || !ruled.length) return;
-    const journal = new Journal(this.root.path, slug, edited.id);
+    const journal = Journal.for(this.root.path, slug, edited.id);
     for (const escalated of ruled) {
       if (!escalated.escalated) continue;
       journal.append('run.freeze-escalated', {
@@ -1488,7 +1702,7 @@ export class Service extends ServiceRecovery {
     if (pending !== null) { this.armMcpRequireTimer(slug, phase, pending); return null; }
     if (!edited || !result) return null;
     const flipped: McpContinueResult = result;
-    const journal = new Journal(this.root.path, slug, edited.id);
+    const journal = Journal.for(this.root.path, slug, edited.id);
     journal.append('phase.mcp-require-timeout', { servers: flipped.servers, waitedMs: flipped.waitedMs, by }, phase);
     journal.append('phase.errand', {
       ...flipped.errand, label: 'MCP server unavailable',
@@ -1622,6 +1836,13 @@ export class Service extends ServiceRecovery {
     if (this.accountsEmitTimer) return;
     this.accountsEmitTimer = setTimeout(() => {
       this.accountsEmitTimer = null;
+      // Every accounts change is a fresh reading as far as a usage wall is
+      // concerned (#78): a meter read under the wall, a spend that lifted it, a
+      // switch to an account that can pay. Each runner re-reads the walls its
+      // phases are parked on — cheap, answered from cache, never a session.
+      for (const runner of this.runners.values()) {
+        try { runner.rereadWalls('reading'); } catch (error) { log.warn('accounts.walls-reread-failed', { error }); }
+      }
       void this.accounts.list()
         .then((accounts) => this.emit('accounts', { accounts }))
         .catch((error) => log.warn('accounts.emit-failed', { error }));
@@ -1642,8 +1863,105 @@ export class Service extends ServiceRecovery {
    * cannot be read should still show its errands: an inbox that throws because
    * one source failed is strictly worse than one missing a row, which is why
    * every field of `InboxFacts` is optional and absent means "nothing to say".
+   *
+   * Computed at most once per change (control-tower phase 56, #75): the view is
+   * memoised on its inputs' revision (`inboxKey`) and built single-flight, so
+   * N tabs asking at one revision cost one build — the hub measured 3.4 s p50
+   * and 29 s p90 with every request building its own. The memo also lapses
+   * after `INBOX_MAX_AGE_MS`, for the inputs that announce no change of their
+   * own (the clocks, a ledger a session appended to).
    */
   async attention(all = false): Promise<InboxView> {
+    return (await this.inboxMemoFor(all)).view;
+  }
+
+  /**
+   * The inbox as an HTTP entity — its body and validator, built once per memo
+   * rather than once per request, and its coded forms packed once each.
+   */
+  async attentionEntity(all = false): Promise<InboxEntity> {
+    const memo = await this.inboxMemoFor(all);
+    if (!memo.entity) {
+      const body = Buffer.from(JSON.stringify(memo.view), 'utf8');
+      memo.entity = { etag: etagOf(body), body, packed: {} };
+    }
+    return memo.entity;
+  }
+
+  /**
+   * The validator of the inbox a request would be served RIGHT NOW, or null
+   * when that would take a build — so a conditional GET is answered 304 from
+   * the input revisions alone, before any body exists (#75).
+   */
+  inboxEtag(all = false): string | null {
+    const memo = this.inboxMemo.get(all);
+    if (!memo?.entity || memo.key !== this.inboxKey(all) || Date.now() - memo.at >= INBOX_MAX_AGE_MS) return null;
+    return memo.entity.etag;
+  }
+
+  /** What the inbox is a function of, as one comparable string. */
+  private inboxKey(all: boolean): string {
+    const plans = (this.store?.list() ?? []).map((record) => `${record.slug}@${record.revision}`).join(',');
+    return `${all ? 'all' : 'open'}|g${this.generation}|r${this.inboxRevision}|${plans}`;
+  }
+
+  /**
+   * One build at a time per shape. A request whose key moved while a build
+   * ran waits for it and asks again, rather than starting a second build
+   * beside it — under a busy run the revision moves constantly, and a build
+   * per revision per request was the pile-up the audit measured.
+   */
+  private async inboxMemoFor(all: boolean): Promise<InboxMemo> {
+    for (;;) {
+      const key = this.inboxKey(all);
+      const memo = this.inboxMemo.get(all);
+      if (memo && memo.key === key && Date.now() - memo.at < INBOX_MAX_AGE_MS) return memo;
+      const flight = this.inboxFlight.get(all);
+      if (flight?.key === key) return flight.promise;
+      if (flight) { await flight.promise.catch(() => undefined); continue; }
+      const promise = this.buildAttention(all).then((view) => {
+        const built: InboxMemo = { key, at: Date.now(), view };
+        this.inboxMemo.set(all, built);
+        return built;
+      }).finally(() => {
+        if (this.inboxFlight.get(all)?.promise === promise) this.inboxFlight.delete(all);
+      });
+      this.inboxFlight.set(all, { key, promise });
+      return promise;
+    }
+  }
+
+  /**
+   * The inbox's gate answers for one plan: the last set read, never a read of
+   * its own (#75 — "a request never shells the engine per gated phase"). A
+   * plan whose revision moved past the held set gets ONE background refill,
+   * one phase at a time so a gated plan cannot take the whole engine pool to
+   * paint a row; when it lands the inbox revision moves and the page is
+   * nudged, so the rows follow within a beat of the refill.
+   */
+  private inboxGates(slug: string, revision: number, phases: readonly number[]): Map<number, GateStatus | null> {
+    const held = this.inboxGateAnswers.get(slug);
+    if (phases.length && (!held || held.revision !== revision)) this.refillInboxGates(slug, revision, phases);
+    return held?.gates ?? new Map();
+  }
+
+  private refillInboxGates(slug: string, revision: number, phases: readonly number[]): void {
+    const fill = `${slug}@${revision}`;
+    if (this.inboxGateFills.has(fill)) return;
+    this.inboxGateFills.add(fill);
+    void (async () => {
+      const gates = new Map<number, GateStatus | null>();
+      for (const phase of phases) gates.set(phase, await this.gateStatus(slug, phase).catch(() => null));
+      const held = this.inboxGateAnswers.get(slug);
+      if (held && held.revision > revision) return;
+      this.inboxGateAnswers.set(slug, { revision, gates });
+      this.emit('inbox', { at: new Date().toISOString() });
+    })()
+      .catch((error) => log.warn('inbox.source-failed', { what: 'gates', error }))
+      .finally(() => this.inboxGateFills.delete(fill));
+  }
+
+  private async buildAttention(all: boolean): Promise<InboxView> {
     const ok = async <T>(what: string, get: () => Promise<T> | T, fallback: T): Promise<T> => {
       try { return await get(); } catch (error) { log.warn('inbox.source-failed', { what, error }); return fallback; }
     };
@@ -1668,12 +1986,12 @@ export class Service extends ServiceRecovery {
           };
         });
         // `gateStatus` shells the engine, so it is asked ONLY for the handful
-        // of phases whose answer can produce a row: gated, and not already
-        // done. On a plan with no gates this costs nothing at all.
-        const gates = await Promise.all(phases
+        // of phases whose answer can produce a row — gated, and not already
+        // done — and never by the build itself: `inboxGates` answers from the
+        // last set read and refills it off the request path (#75).
+        const gateBy = this.inboxGates(record.slug, record.revision, phases
           .filter((ph) => ph.gated && ph.state !== 'done')
-          .map(async (ph) => [ph.phase, await this.gateStatus(record.slug, ph.phase).catch(() => null)] as const));
-        const gateBy = new Map(gates);
+          .map((ph) => ph.phase));
         // Per-phase QA regimes, by the plan-detail precedent (service-live.ts
         // `detail()`): the JS parse decides only WHETHER to ask — phases
         // stating their own `- **QA:**` — and the engine answers, cached by
@@ -1775,6 +2093,10 @@ export class Service extends ServiceRecovery {
     // …and what the sessions said to the operator (phase 15), through the
     // same base default (nothing) or the Pro override.
     const messages = await ok('messages', () => this.inboxMessages(), []);
+    // …and what the supervisor holds standing (control-tower phase 101, #145).
+    const supervisorCards = await ok('supervisor', () => this.inboxSupervisorCards(), []);
+    // …and every person's turn still open (control-tower phase 41).
+    const humanSteps = await ok('human-steps', () => this.humanStepsNow().open(), []);
 
     const facts = {
       runs, approvals: this.approvals.all(), plans, locks, lockPresence, fleet,
@@ -1783,6 +2105,9 @@ export class Service extends ServiceRecovery {
       accounts, auth, mcp,
       environment: this.environment.issues,
       watcher: this.watcher.status(),
+      // The skill copy each config dir loads, against this console (#151).
+      skillCopy: await ok('skill-copy', () => this.skillCopy(), undefined),
+      hookFaults: this.hookFaultFacts(),
       flags: {
         allowWrites: this.flags.allowWrites, allowRun: this.flags.allowRun,
         allowTerminal: this.flags.allowTerminal, allowAgent: this.flags.allowAgent,
@@ -1793,6 +2118,8 @@ export class Service extends ServiceRecovery {
       policyAnswers,
       issueDrafts,
       messages,
+      supervisorCards,
+      humanSteps,
       stalledPlans,
       // The isolated runs' branch facts, read from the runner caches — the
       // conflict rows' one fact. Nothing is probed here; see `runGitFacts`.
@@ -2003,10 +2330,19 @@ export class Service extends ServiceRecovery {
         const parsed = parseInboxItemId(itemId);
         const approvalId = parsed?.subject;
         if (!approvalId) return { ok: false, status: 409, error: 'this card has no id to answer' };
-        const answered = this.decideApproval(approvalId, verb, by, undefined);
+        const answered = this.decideApproval(approvalId, verb, by, undefined, undefined, actor);
         return answered.ok
           ? { ok: true, verb, item: itemId }
           : { ok: false, status: 409, error: answered.error ?? 'the card could not be answered' };
+      }
+      // The expiry warning's second button (control-tower phase 97, #140).
+      case 'extend': {
+        const approvalId = parseInboxItemId(itemId)?.subject;
+        if (!approvalId) return { ok: false, status: 409, error: 'this card has no id to extend' };
+        const extended = this.extendApproval(approvalId, EXTEND_CHOICES_MIN[1], by);
+        return extended.ok
+          ? { ok: true, verb, item: itemId }
+          : { ok: false, status: extended.status, error: extended.error };
       }
       case 'approve': {
         if (!item.slug || typeof item.phase !== 'number') {
@@ -2026,6 +2362,16 @@ export class Service extends ServiceRecovery {
         return outcome.ok
           ? { ok: true, verb, item: itemId }
           : { ok: false, status: 409, error: outcome.detail ?? 'the gate could not be approved' };
+      }
+      // A person's turn (control-tower phase 43): *I did it* from the lock
+      // screen runs the step's proof — the same check the card's button runs.
+      case 'check': {
+        const stepId = parseInboxItemId(itemId)?.subject;
+        if (!stepId) return { ok: false, status: 409, error: 'this card names no step to check' };
+        const checked = await this.checkHumanStep(stepId, { by });
+        return checked.ok
+          ? { ok: true, verb, item: itemId }
+          : { ok: false, status: checked.status, error: checked.error };
       }
       default: {
         // Exhaustiveness: a fourth member of PUSH_ACTION_VERBS with no arm here
@@ -2115,13 +2461,15 @@ export class Service extends ServiceRecovery {
         status: plan.status,
         closed: plan.closed,
         phases: plan.phases,
-        done: plan.done,
+        // An unreadable board (#96) exports its last good reading, else NaN —
+        // Prometheus's "unknown" — never a 0 nobody read.
+        done: plan.done ?? plan.lastGood?.done ?? Number.NaN,
         ready: plan.ready.length,
         waiting: plan.waiting,
         inProgress: plan.inProgress.length,
         stuck: plan.stuck.length,
         remainingWeight: plan.remainingWeight,
-        percent: plan.percent,
+        percent: plan.percent ?? plan.lastGood?.percent ?? Number.NaN,
       })),
       runs: runs.map((run) => {
         const records = Object.values(run.phases ?? {});
@@ -2135,6 +2483,10 @@ export class Service extends ServiceRecovery {
           spentUsd: typeof run.spentUsd === 'number' ? run.spentUsd : 0,
           attempts: records.reduce((sum, rec) => sum + (rec?.attempts ?? 0), 0),
           phaseSeconds: records.reduce((sum, rec) => sum + (rec?.durationMs ?? 0), 0) / 1000,
+          // The run's blocked WALL-CLOCK (#64) — never its phases' queued time summed.
+          blockedSeconds: Object.fromEntries(
+            Object.entries(run.blockedMs ?? {}).map(([klass, ms]) => [klass, (ms ?? 0) / 1000]),
+          ),
         };
       }),
       cost: [...byPlan.entries()].map(([slug, list]) => {
@@ -2182,16 +2534,79 @@ export class Service extends ServiceRecovery {
       version: distRev() ?? 'unbuilt',
       instanceId: INSTANCE.name,
       scrapeSeconds: (Date.now() - startedAt) / 1000,
+      process: this.processFacts(),
+      // The account forecast (control-tower phase 92, #141), by account id.
+      accounts: this.accounts.forecasts().flatMap(({ id, buckets }) =>
+        Object.entries(buckets).map(([window, forecast]) => ({
+          account: id, window, utilization: forecast.pct, burnPctPerHour: forecast.burnPctPerHour,
+          wallsInSeconds: forecast.wallsAt ? Math.max(0, (Date.parse(forecast.wallsAt) - Date.now()) / 1000) : null,
+        }))),
+      // What each account spent on credit this month (control-tower phase 93, #146).
+      // The load guard and the kept lanes (control-tower phase 100).
+      load: (() => { const reading = this.loadGuard(); return { avg5: reading.avg5, threshold: reading.threshold }; })(),
+      reservations: (() => {
+        const kept = this.scheduler.reservationsView();
+        return { armed: kept.filter((r) => r.armed).length, waiting: kept.filter((r) => !r.armed).length };
+      })(),
+      credits: this.accounts.accountIds().flatMap((id) => {
+        const credit = this.accounts.creditOf(id);
+        return credit.used !== null && credit.currency ? [{ account: id, currency: credit.currency, used: credit.used }] : [];
+      }),
     });
   }
 
+  /**
+   * This console's own runtime, for the ten `phase_console_process_*` gauges.
+   *
+   * Every other family here is about the WORK. None was about the supervisor,
+   * which is how a console climbed to V8's default heap over 23.7 hours with
+   * no sample anywhere that would have shown the climb — and then parked two
+   * live runs on its way down. All of it is already in this process; the only
+   * cost is reading it.
+   */
+  private processFacts(): MetricsProcess {
+    const memory = process.memoryUsage();
+    const sessions = this.sessionInventory();
+    // One reading for all three: the last complete window's (#75).
+    const loop = eventLoopDelay();
+    return {
+      heapUsedBytes: memory.heapUsed,
+      heapLimitBytes: getHeapStatistics().heap_size_limit,
+      residentBytes: memory.rss,
+      externalBytes: memory.external,
+      eventLoopDelaySeconds: loop?.meanSeconds,
+      eventLoopDelayMaxSeconds: loop?.maxSeconds,
+      eventLoopDelayP99Seconds: loop?.p99Seconds,
+      // `_getActiveHandles` is internal and undocumented, so it is asked for
+      // rather than assumed: a build without it reports no handle count, which
+      // is a different fact from "none open" and the gauge simply does not emit.
+      handles: activeHandles(),
+      uptimeSeconds: process.uptime(),
+      sseClients: this.sseClients(),
+      sessions: sessions.agent,
+      ptySessions: sessions.terminal,
+    };
+  }
+
   /** Every run across every plan, for the runs list. */
-  async allRuns(): Promise<RunState[]> {
+  async allRuns(): Promise<(RunState & { pendingDrafts?: number })[]> {
     const slugs = this.store?.list().map((r) => r.slug) ?? [];
     if (!this.root) return [];
     const runs = slugs.flatMap((slug) => listRuns(this.root!.path, slug, this.liveRunId()));
     await this.resolveAgainstBoard(runs);
-    return runs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    runs.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    // The run card counts its plan's drafts waiting on a person (#118) — on the
+    // plan's NEWEST run only, since the drafts are the plan's, not every run's.
+    const pending = new Map<string, number>();
+    for (const draft of this.inboxIssueDrafts()) {
+      if (draft.state === 'pending-approval') pending.set(draft.slug, (pending.get(draft.slug) ?? 0) + 1);
+    }
+    return runs.map((run) => {
+      const count = pending.get(run.slug);
+      if (!count) return run;
+      pending.delete(run.slug);
+      return { ...run, pendingDrafts: count };
+    });
   }
 
   /**
@@ -2225,7 +2640,7 @@ export class Service extends ServiceRecovery {
     const sessionId = typeof body.session_id === 'string' ? body.session_id : null;
     if (!runId || !sessionId || !this.root?.ok) return allow;
 
-    const state = this.runBytoken(runId);
+    const state = this.runForToken(runId);
     if (!state) return allow;
     // WHICH phase this session belongs to — matched by session id against the
     // run's own records, never guessed from "the current phase".
@@ -2302,8 +2717,8 @@ export class Service extends ServiceRecovery {
             + 'this plan gates on QA, and a pending row holds every dependent phase exactly as a '
             + 'failure does. Dispatch a FRESH-context QA subagent now, in the FOREGROUND, so the call '
             + 'returns with its verdict — get its brief with '
-            + `\`bash ${this.flags.scriptsDir}/phase-graph.sh ${state.slug} --qa-prompt ${phase}\` — and `
-            + `record what it finds with \`bash ${this.flags.scriptsDir}/qa-record.sh ${state.slug} ${phase} `
+            + `\`bash ${SCRIPTS_REF}/phase-graph.sh ${state.slug} --qa-prompt ${phase}\` — and `
+            + `record what it finds with \`bash ${SCRIPTS_REF}/qa-record.sh ${state.slug} ${phase} `
             + `<pass|fail|waived> --report ${owed.report} --round ${owed.round}\`. Then stop.`,
         },
       };
@@ -2315,11 +2730,11 @@ export class Service extends ServiceRecovery {
         reason: `Phase ${phase} of ${state.slug} is not closed: the board does not read done and no `
           + 'outcome is declared. If you are WAITING on an external process (a CI build, a deploy '
           + 'window), declare it now and stop — prose is invisible to the supervisor: '
-          + `\`bash ${this.flags.scriptsDir}/phase-outcome.sh ${state.slug} ${phase} `
+          + `\`bash ${SCRIPTS_REF}/phase-outcome.sh ${state.slug} ${phase} `
           + 'waiting-external --wait-minutes <M> --reason "<what>" --watch <ref>` '
           + '(write the handoff `in-progress` first). Otherwise finish the closeout — run the '
           + 'plan\'s §Verification commands, commit with explicit paths, then run '
-          + `\`bash ${this.flags.scriptsDir}/new-handoff.sh ${state.slug} ${phase} <kebab-title> complete\` `
+          + `\`bash ${SCRIPTS_REF}/new-handoff.sh ${state.slug} ${phase} <kebab-title> complete\` `
           + 'and fill it in.',
       },
     };
@@ -2334,10 +2749,20 @@ export class Service extends ServiceRecovery {
     // call from a `guarded` run against a `bypass` neighbour's profile — a bug
     // that appears only when two things run at once, and is close to
     // unreadable when it does.
-    const run = this.runBytoken(runId);
+    const run = this.runForToken(runId);
     if (runId && !run) {
       log.warn('hook.run-unknown', {
-        runId, note: 'the token names a run this console is not driving — answered as guarded',
+        runId, note: 'no record on this machine explains this token — answered as guarded',
+      });
+    } else if (run && !this.runnerByRunId(run.id) && !this.storedTokenNamed.has(run.id)) {
+      // A child that outlived its console (#21). Said ONCE per run: the call
+      // that says it is one of ninety in forty-five minutes, and a line per
+      // tool call is a line nobody reads.
+      this.storedTokenNamed.add(run.id);
+      if (this.storedTokenNamed.size > 256) this.storedTokenNamed.clear();
+      log.info('hook.run-stored', {
+        runId: run.id, slug: run.slug, profile: run.permissionProfile ?? 'guarded',
+        note: 'nothing drives this run here — answered from its stored record',
       });
     }
     const toolName = String(body.tool_name ?? 'unknown');
@@ -2376,7 +2801,69 @@ export class Service extends ServiceRecovery {
     // here without troubling anyone. Only what the policy marks `ask` becomes a
     // card — a queue that fills up with `find docs -type f` is a queue nobody
     // reads, and one nobody reads trains the answer "yes".
-    const verdict = classifyTool(toolName, input, policy, profile);
+    // The PATH-aware half (control-tower phase 90, #139): a clone into a run
+    // worktree is the wall, and `git submodule` asks inside one and is allowed
+    // in the run root. Read before the prefix rules, which cannot see a path.
+    // A run with no root has no trees to guard — and this hook must answer,
+    // never throw: `managedRoots` of an undefined root threw here and took the
+    // whole decision with it (control-tower phase 104, #156).
+    const guard = run?.root ? treeGuard(toolName, input, {
+      cwd: typeof body.cwd === 'string' ? body.cwd : null,
+      runRoot: run.root,
+      runTrees: managedRoots({ root: run.root, consoleDir: consoleRunsDir(run.root) }),
+    }) : null;
+    if (guard?.verdict === 'deny') {
+      const bashCommand = (input as { command?: unknown } | null)?.command;
+      this.runnerByRunId(run?.id ?? '')?.note('phase.tool-denied', {
+        tool: toolName, rule: guard.rule,
+        ...(typeof bashCommand === 'string' ? { command: bashCommand.replace(/\s+/g, ' ').slice(0, 400) } : {}),
+      }, phase ?? undefined);
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: `blocked by the console (rule: ${guard.rule}): ${guard.reason} `
+            + 'This is standing policy, not a person rejecting your work — do not retry it; read where it says instead.',
+        },
+      };
+    }
+    const verdict = guard?.verdict === 'allow'
+      ? classifyTool(toolName, input, { ...policy, ask: policy.ask.filter((rule) => rule !== guard.rule) }, profile)
+      : classifyTool(toolName, input, policy, profile);
+
+    // The sign-in guard (control-tower phase 44, §Architecture 12's third birth
+    // channel): an interactive sign-in in a supervised session waits on a
+    // browser or a prompt nobody sees, so it is denied BEFORE it runs, with the
+    // human step to declare instead. Outside `policy` like the in-turn-wait
+    // guard below — identical on every profile, never a deny rule a strike
+    // could remove — and on an `ask` as well as an `allow`: a person approving
+    // the card would still leave the prompt where nobody can answer it. Only a
+    // call this console can place is judged: with no run (an operator's own
+    // terminal, a CLI this console does not drive) the hook stays out of it.
+    // Journalled, never stamped on the record: `record.toolDenied` is the
+    // permission wall's evidence, and there is nothing here to widen.
+    if (verdict !== 'deny' && toolName === 'Bash' && run) {
+      const bashCommand = (input as { command?: unknown } | null)?.command;
+      let call: SignInCall | null = null;
+      try { call = signInCall(bashCommand); } catch { call = null; }
+      if (call) {
+        try {
+          this.runnerByRunId(run.id)?.note('phase.tool-denied', {
+            tool: toolName, rule: 'sign-in', shape: call.shape, step: call.step.kind,
+            command: signInJournalCommand(String(bashCommand)),
+          }, phase ?? undefined);
+        } catch { /* the deny stands */ }
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: signInRefusal(
+              call, `bash ${this.flags.scriptsDir}/phase-outcome.sh ${run.slug} ${phase ?? '<N>'}`,
+            ),
+          },
+        };
+      }
+    }
 
     // The question class (TRS-1): a question, not a permission — held on every
     // profile. On a run whose relay is ARMED (phase 14) the relay answers it,
@@ -2384,6 +2871,11 @@ export class Service extends ServiceRecovery {
     // option — so a question the wall would refuse is a question for a person,
     // never a window. Anywhere else the policy table answers a hold, and the
     // wall's own `deny` answers the rest below exactly as it always has.
+    // The plan class (control-tower phase 11, #34): a plan-mode session
+    // presenting its plan. Answered before the question block, which would
+    // otherwise read any `hold` as a question for the relay.
+    if (verdict === 'hold' && planRule(toolName, input)) return this.holdPlan(run, phase, input, sessionId);
+
     if (verdict === 'hold' || (verdict === 'deny' && questionRule(toolName, input))) {
       if (run && this.relayArmed(run)) {
         const reply = await this.relay.relayQuestion(run, phase, {
@@ -2403,7 +2895,7 @@ export class Service extends ServiceRecovery {
 
     // Both guards below stand down while the lane verifies: `§Verification`
     // runs the phase's own commands, and a plan is entitled to a slow one there.
-    const verifying = lane ? lane.status === 'verifying' || Boolean(lane.verifyingSince) : false;
+    const verifying = lane ? lane.status === 'verifying' || Boolean(lane.verifyingSince) || Boolean(lane.baselineSince) : false;
 
     // The poll-loop guard (autopilot-token-drain phase 2). The session's OWN
     // status checks go to its lane's tracker — never a subagent's: the CLI sets
@@ -2484,7 +2976,14 @@ export class Service extends ServiceRecovery {
       const matched = verifying || typeof bashCommand !== 'string'
         ? null
         : inTurnWait(bashCommand, loadVerifyEnv(this.flags.scriptsDir));
-      if (matched && waitScope(bashCommand as string) === 'external') {
+      // The pids the session announced itself (`$!`) make a probe of one its own
+      // clock (control-tower phase 47, AUD-34); any other pid is one it found.
+      // Read defensively: a throw in this hook reaches the CLI as a failed hook,
+      // and a failed hook is fail-open — the wait would run.
+      const laneRunner = this.runnerByRunId(run.id);
+      const ownPids = typeof phase === 'number' && typeof laneRunner?.ownPids === 'function'
+        ? laneRunner.ownPids(phase) : undefined;
+      if (matched && waitScope(bashCommand as string, { ownPids }) === 'external') {
         const runner = this.runnerByRunId(run.id);
         runner?.note('phase.tool-denied', { tool: toolName, rule: 'in-turn-wait', matched }, phase ?? undefined);
         // …and to the lane's own signals: a denied wait opens no call, so this is
@@ -2614,22 +3113,28 @@ export class Service extends ServiceRecovery {
     // unless the plan's `permission.destructive` row names the rule as an
     // exception — and a grant under one is announced.
     const publishing = publishingRule(toolName, input);
-    const exception = publishing && run ? this.destructiveException(run, phase, publishing) : null;
+    // What the plan's `permission.destructive` row answers for this exact call
+    // (#112): the whole rule, or — for a push — the branches it names. Its
+    // `allow` is the plan's written answer, so it stands whatever auto-grant is
+    // set to; a row that did not match rides the card, naming itself and why.
+    const manifest = publishing && run ? this.manifestAnswerFor(run, phase, toolName, input) : null;
+    const exception = manifest?.answer === 'allow' ? manifest : null;
 
     const scoped = run ? autoApproveFor(run.slug) : null;
     const phaseChoice = phase != null
       ? run?.phaseOptions?.[String(phase)]?.autoApprove
       : undefined;
-    const level: keyof typeof AUTO_GRANT_REASONS = phaseChoice !== undefined ? 'phase'
-      : scoped?.plan != null ? 'plan'
-        : scoped?.global != null ? 'global'
-          : 'default';
     const autoOn = run != null && (phaseChoice ?? scoped?.effective ?? false);
+    const level: keyof typeof AUTO_GRANT_REASONS = exception && !autoOn ? 'manifest'
+      : phaseChoice !== undefined ? 'phase'
+        : scoped?.plan != null ? 'plan'
+          : scoped?.global != null ? 'global'
+            : 'default';
     const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
     const wrapperHeld = typeof command === 'string'
       && neverAutoApproves(command)
       && hitsHidden(command, toolName, policy.deny);
-    if (run && autoOn && !wrapperHeld && (!publishing || exception)) {
+    if (run && !wrapperHeld && (publishing ? exception : autoOn)) {
       const rule = suggestedRule(toolName, input, policy);
       const approval = this.approvals.grant({
         runId: run.id,
@@ -2642,23 +3147,48 @@ export class Service extends ServiceRecovery {
         tool: { name: toolName, input, cwd: typeof body.cwd === 'string' ? body.cwd : undefined },
         suggestedRule: rule,
         matched,
+        ...(exception ? { manifest: exception } : {}),
       }, 'auto-grant', exception
-        ? `${AUTO_GRANT_REASONS[level]} — under this plan's permission.destructive exception for ${exception.rule}`
+        ? `${AUTO_GRANT_REASONS[level]} — under this plan's permission.destructive exception for ${exception.rule}: ${exception.why}`
         : AUTO_GRANT_REASONS[level], { notify: Boolean(exception) });
       // The run journal's twin of `approval.auto-granted`, written HERE rather
       // than by the broker's record hook: this is the one grant site, and the
       // only place that knows which scope answered and under what exception.
       this.runnerByRunId(run.id)?.note(
         'phase.approval-auto-granted',
-        { tool: toolName, rule, matched, level, approvalId: approval.id, ...(exception ? { exception } : {}) },
+        {
+          tool: toolName, rule, matched, level, approvalId: approval.id,
+          ...(exception ? {
+            answeredBy: exception.key,
+            exception: {
+              rule: exception.rule, value: exception.value, source: exception.source, why: exception.why,
+              ...(exception.branch ? { branch: exception.branch } : {}),
+            },
+          } : {}),
+        },
         phase ?? undefined,
       );
       return {
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'allow',
-          permissionDecisionReason:
-            'approved by auto-grant — a standing console setting, not a person reviewing this call',
+          permissionDecisionReason: exception
+            ? `approved by auto-grant from this plan's permission.destructive row (${exception.why}) — the plan's written answer, not a person reviewing this call`
+            : 'approved by auto-grant — a standing console setting, not a person reviewing this call',
+        },
+      };
+    }
+
+    // A call a person allowed on a standing card after its hook call ended
+    // (control-tower phase 97, #140): granted once, then it asks as usual.
+    const granted = run && phase != null ? this.takeOneTimeGrant(run.id, phase, toolName, input) : false;
+    if (granted) {
+      this.runnerByRunId(run!.id)?.note('phase.approval-granted-once', { tool: toolName, approvalId: granted }, phase!);
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'allow',
+          permissionDecisionReason: 'approved once by a person on its standing approval card — the next such call asks again',
         },
       };
     }
@@ -2674,7 +3204,12 @@ export class Service extends ServiceRecovery {
       tool: { name: toolName, input, cwd: typeof body.cwd === 'string' ? body.cwd : undefined },
       suggestedRule: suggestedRule(toolName, input, policy),
       matched,
-    });
+      // The row this call was checked against and why it did not answer it
+      // (#112): a person sees the plan spoke, and what it did not cover.
+      ...(manifest ? { manifest } : {}),
+    // The run's own default (#140); absent, the hook call's hour. The broker
+    // never lets it pass the hook's hard limit either way.
+    }, run?.approvalTimeoutMinutes ? run.approvalTimeoutMinutes * 60_000 : undefined);
 
     // The card is a WAIT on the run that asked (WAI-10): `waitReason 'person'`,
     // the clock at the card's hour, the status `waiting` — until the card is
@@ -2696,15 +3231,21 @@ export class Service extends ServiceRecovery {
     // Nobody answered. The hook still has to be told something — silence fails
     // open — so it is told no, and the run is parked rather than left to treat
     // that no as a judgement about the work. See `Runner.park`.
-    if (by === 'timeout') {
+    if (by === 'timeout' || by === 'standing') {
       // The run that asked, not whichever one happens to be first. Parking a
       // neighbour because this one's card timed out would stop a plan that had
       // done nothing wrong.
       // `awaiting-person`: a person was asked and did not answer (WAI-10).
+      // The card's id rides the halt (#140): the park lifts when this phase
+      // completes, and a card that STANDS is still the answer it waits for.
       this.runnerByRunId(run?.id ?? '')?.park(
-        `an approval went unanswered: ${toolName} — ${describeToolInput(input)}`,
+        by === 'standing'
+          ? `an approval stands past its hook call until ${approval.expiresAt.slice(11, 16)}Z: ${toolName} — `
+            + `${describeToolInput(input)}; allowing it resumes the phase with a one-time grant`
+          : `an approval went unanswered: ${toolName} — ${describeToolInput(input)}`,
         phase,
         'awaiting-person',
+        { approvalId: approval.id },
       );
     }
 
@@ -2731,7 +3272,7 @@ export class Service extends ServiceRecovery {
   async decidePermissionRequest(
     body: Record<string, unknown>, runId?: string | null,
   ): Promise<Record<string, unknown>> {
-    const run = this.runBytoken(runId);
+    const run = this.runForToken(runId);
     const toolName = String(body.tool_name ?? 'unknown');
     const sessionId = typeof body.session_id === 'string' ? body.session_id : null;
     const lane = sessionId && run
@@ -2835,6 +3376,121 @@ export class Service extends ServiceRecovery {
   }
 
   /**
+   * Answer `ExitPlanMode` (control-tower phase 11, #34) — a plan-mode session
+   * handing its plan over. The plan is captured under the run's directory and
+   * journalled (`phase.plan-presented {bytes, sha}`), then the plan's
+   * `plan-approval` decision answers: `continue` approves it here and lets the
+   * call through (the journal keeps what was approved); `hold`, the default,
+   * declares the session's `needs-human --needs plan-approval` for it, denies
+   * with the instruction to end the turn, and leaves the park to the
+   * declared-outcome path — kind `plan-approval`, an errand, an inbox row with
+   * Approve and Reject (`decidePlan`).
+   *
+   * A call this console cannot place — no run, no lane, no plan text, no
+   * runner holding the run — is let through: the hook fails open everywhere
+   * else, and holding a plan nobody can decide would strand the session.
+   */
+  private holdPlan(
+    run: RunState | null, phase: number | null, input: unknown, sessionId: string | null,
+  ): Record<string, unknown> {
+    const allow = (reason: string) => ({
+      hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow', permissionDecisionReason: reason },
+    });
+    const plan = planOf(input);
+    const runner = run ? this.runnerByRunId(run.id) : null;
+    if (!run || typeof phase !== 'number' || !plan || !runner) {
+      return allow('no run this console drives holds this plan, so it is not held');
+    }
+    const presented = runner.presentPlan(phase, plan, sessionId ?? undefined);
+    if (!presented) return allow('the console could not keep this plan, so it is not held');
+    const resolved = policyForKey('plan-approval', run, policyPrefsOf(this.prefs));
+    if (resolved?.answer === 'continue') {
+      runner.continuePlan(phase, presented, resolved.source);
+      return allow(planContinueReason(presented));
+    }
+    runner.holdPlan(phase, presented, sessionId ?? undefined);
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: planHeldReason(presented),
+      },
+    };
+  }
+
+  /**
+   * The plan a plan-mode phase presented, as the console kept it (control-tower
+   * phase 17, #34) — `GET /api/run/:slug/plan-text?phase=N`. The halt card's
+   * reader draws THIS, not a byte count: a person cannot approve a plan they
+   * were only told the size of. The file is found where the runner writes it
+   * (`planTextFile`, from the record's own sha) rather than at the path the run
+   * file names, so a hand-edited run file cannot point the read anywhere else.
+   */
+  planText(slug: string, phase: number): (
+    | { ok: true; phase: number; sha: string; bytes: number; at: string; state: string; truncated: boolean; text: string }
+    | { ok: false; status: number; error: string }
+  ) {
+    if (!this.root?.ok) return { ok: false, status: 409, error: 'No source directory is open.' };
+    const stored = this.liveRunner(slug)?.current() ?? latestRun(this.root.path, slug, this.liveRunId());
+    const held = stored?.phases[String(phase)]?.planApproval;
+    if (!stored || !held) return { ok: false, status: 404, error: `phase ${phase} of ${slug} presented no plan` };
+    let text: string;
+    try {
+      text = readFileSync(planTextFile(stored.root, slug, stored.id, phase, held.sha), 'utf8');
+    } catch {
+      return { ok: false, status: 404, error: `the plan phase ${phase} presented is no longer on disk` };
+    }
+    return {
+      ok: true, phase, sha: held.sha, bytes: held.bytes, at: held.at, state: held.state,
+      truncated: Boolean(held.truncated), text,
+    };
+  }
+
+  /**
+   * A person's answer to a held plan (control-tower phase 11, #34) —
+   * `POST /api/run/:slug/plan-approval`. Approve journals `phase.plan-approved
+   * {by}` and resumes the SAME session through the recover verb, whose spawn
+   * runs `acceptEdits` (`resumeWithInstruction` names no mode). Reject
+   * journals `phase.plan-rejected` and leaves the phase parked, its errand
+   * standing, for the person's next move — Resume with an instruction, or
+   * Retry, which boards a fresh plan-mode session.
+   */
+  async decidePlan(
+    slug: string, phase: number, decision: PlanDecision, by: string, reason?: string,
+  ): Promise<{ ok: true; decision: PlanDecision; sha: string } | { ok: false; status: number; error: string }> {
+    if (!this.root?.ok) return { ok: false, status: 409, error: 'No source directory is open.' };
+    const live = this.liveRunner(slug);
+    const stored = live?.current() ?? latestRun(this.root.path, slug, this.liveRunId());
+    const held = stored?.phases[String(phase)]?.planApproval;
+    if (!stored || held?.state !== 'pending') {
+      return { ok: false, status: 409, error: `no plan waits for a decision on phase ${phase} of ${slug}` };
+    }
+    const at = new Date().toISOString();
+    const event = decision === 'approve' ? 'phase.plan-approved' : 'phase.plan-rejected';
+    const data = { by, sha: held.sha, ...(reason ? { reason: reason.slice(0, 2000) } : {}) };
+    const decide = (state: RunState) => {
+      const record = phaseRecord(state, phase);
+      if (record.planApproval?.sha !== held.sha) return;
+      record.planApproval = {
+        ...record.planApproval,
+        state: decision === 'approve' ? 'approved' : 'rejected',
+        by, decidedAt: at, ...(reason ? { reason: reason.slice(0, 2000) } : {}),
+      };
+    };
+    const runner = this.runnerByRunId(stored.id);
+    if (runner?.current()?.id === stored.id) {
+      runner.recordPlanDecision(phase, decide, event, data);
+    } else {
+      this.editStoredRunById(slug, stored.id, (state) => {
+        decide(state);
+        this.journalStoredEdit(state, event, { ...data, phase }, asActor(by, 'Service.decidePlan'));
+      });
+    }
+    if (decision === 'approve') {
+      await this.recoverPhase(slug, phase, 'resume', { instruction: planApprovedInstruction(by, held), by });
+    }
+    return { ok: true, decision, sha: held.sha };
+  }
+
+  /**
    * May the console push THIS run's branches (many-plans-one-repo phase 8)?
    * Two gates, both required: the console was started with `--allow-publish`,
    * and the plan's `permission.destructive` row names `git push` as an
@@ -2857,13 +3513,55 @@ export class Service extends ServiceRecovery {
   private destructiveException(
     run: RunState, phase: number | null, rule: string,
   ): { rule: string; value: string; source: string } | null {
+    const row = this.destructiveRow(run, phase);
+    if (!row || !destructiveExceptions(row.value).includes(rule)) return null;
+    return { rule, value: row.value.slice(0, 200), source: row.source };
+  }
+
+  /**
+   * The answered `permission.destructive` row for one phase of a run — the
+   * plan's own rows merged for this phase (a per-phase row outranks the
+   * plan-wide one), else the run's stored manifest when the plan is not in this
+   * console's store.
+   */
+  private destructiveRow(run: RunState, phase: number | null): { value: string; source: string } | null {
     const record = this.store?.get(run.slug);
     const rows: readonly { key: string; state: string; value: string; source?: string }[] = record
       ? mergeDecisions(record.plan?.decisions ?? [], record.decisionsTwin ?? [], phase)
       : (run.manifest?.decisions ?? []);
     const row = rows.find((r) => r.key === 'permission.destructive' && r.state === 'answered');
-    if (!row || !destructiveExceptions(row.value).includes(rule)) return null;
-    return { rule, value: row.value.slice(0, 200), source: row.source ?? (record ? 'plan' : 'run') };
+    return row ? { value: row.value, source: row.source ?? (record ? 'plan' : 'run') } : null;
+  }
+
+  /**
+   * What this plan's `permission.destructive` row answers for ONE publishing
+   * call (control-tower phase 84, #112) — or null when the call publishes
+   * nothing or no row is answered. A row that allows the whole rule answers
+   * it; for a `git push` the row may instead NAME branches
+   * (`manifestPushVerdict`), and then only a plain push of those, with
+   * read-only neighbours, is answered. The run branch is `pe/<slug>` under the
+   * new-branch strategy, so "the run branch" in a row reads as that.
+   */
+  private manifestAnswerFor(run: RunState, phase: number | null, toolName: string, input: unknown): ManifestCheck | null {
+    const rule = publishingRule(toolName, input);
+    if (!rule) return null;
+    const row = this.destructiveRow(run, phase);
+    if (!row) return null;
+    const base = { key: 'permission.destructive' as const, rule, value: row.value.slice(0, 200), source: row.source };
+    if (destructiveExceptions(row.value).includes(rule)) return { ...base, answer: 'allow', why: `the row allows ${rule}` };
+    const command = toolName === 'Bash' ? (input as { command?: unknown } | null)?.command : null;
+    if (rule !== PUSH_DENY || typeof command !== 'string') {
+      return { ...base, answer: null, why: `the row does not name ${rule} as an exception` };
+    }
+    const verdict = manifestPushVerdict(command, row.value, { runBranch: run.gitMode === 'new-branch' ? `pe/${run.slug}` : null });
+    return { ...base, answer: verdict.answer, why: verdict.why, ...(verdict.branch ? { branch: verdict.branch } : {}) };
+  }
+
+  /** The broker's re-read at settle time (#112): the run that raised the card, live or stored. */
+  protected override manifestAnswerForCard(approval: Approval): ManifestCheck | null {
+    if (!approval.tool) return null;
+    const run = this.runForToken(approval.runId);
+    return run ? this.manifestAnswerFor(run, approval.phase, approval.tool.name, approval.tool.input) : null;
   }
 
   /**
@@ -2898,7 +3596,7 @@ export class Service extends ServiceRecovery {
 
   runJournal(slug: string, id: string, limit = 500) {
     if (!this.root) return [];
-    return new Journal(this.root.path, slug, id).read(limit);
+    return Journal.for(this.root.path, slug, id).read(limit);
   }
 
   /**
@@ -2924,7 +3622,7 @@ export class Service extends ServiceRecovery {
     const runId = id ?? this.runIdFor(slug);
     const limit = Service.TIMELINE_ENTRIES;
     if (!this.root || !runId) return projectTimeline([], { now: Date.now() });
-    const entries = new Journal(this.root.path, slug, runId).read(limit);
+    const entries = Journal.for(this.root.path, slug, runId).read(limit);
     const rows = this.store?.get(slug)?.plan?.graph ?? [];
     return projectTimeline(entries, {
       now: Date.now(),
@@ -2932,6 +3630,15 @@ export class Service extends ServiceRecovery {
       // `read` returns the LAST n lines, so a full basket means there was more
       // above it. Equality, not `>`: the reader cannot return more than it took.
       truncated: entries.length >= limit,
+      // What the LIVE lanes have spent and reached so far. The journal learns
+      // a session's cost when it ENDS, so an open attempt read from the file
+      // alone draws $0.00 for as long as it lasts — which is precisely the
+      // minute an operator is asking the cost axis about.
+      live: (this.liveRunner(slug)?.liveness() ?? []).map((lane) => ({
+        phase: lane.phase,
+        ...(typeof lane.spentUsd === 'number' ? { spentUsd: lane.spentUsd } : {}),
+        ...(typeof lane.tokens?.context === 'number' ? { contextTokens: lane.tokens.context } : {}),
+      })),
     });
   }
 
@@ -2950,7 +3657,7 @@ export class Service extends ServiceRecovery {
   } {
     const runId = id ?? this.runIdFor(slug);
     if (!this.root || !runId) return { runId: null, attempts: [], comparisons: [] };
-    const entries = new Journal(this.root.path, slug, runId).read(Service.TIMELINE_ENTRIES);
+    const entries = Journal.for(this.root.path, slug, runId).read(Service.TIMELINE_ENTRIES);
     const attempts = attemptsOf(entries, phase);
     return { runId, attempts, comparisons: compareConsecutive(attempts) };
   }
@@ -2967,7 +3674,7 @@ export class Service extends ServiceRecovery {
   runLedger(slug: string, id?: string): RunLedger {
     const runId = id ?? this.runIdFor(slug);
     if (!this.root || !runId) return projectLedger([], null);
-    const entries = new Journal(this.root.path, slug, runId).read(Service.TIMELINE_ENTRIES);
+    const entries = Journal.for(this.root.path, slug, runId).read(Service.TIMELINE_ENTRIES);
     const run = loadRun(this.root.path, slug, runId, this.liveRunId());
     return projectLedger(entries, { id: runId, spentUsd: run?.spentUsd ?? null }, {
       truncated: entries.length >= Service.TIMELINE_ENTRIES,
@@ -3005,7 +3712,7 @@ export class Service extends ServiceRecovery {
           const key = `${slug}/${run.id}`;
           const hit = this.ledgerCache.get(key);
           if (hit && hit.stamp === stamp) return { slug, ledger: hit.ledger };
-          const entries = stamp === 'absent' ? [] : new Journal(root, slug, run.id).read(Service.TIMELINE_ENTRIES);
+          const entries = stamp === 'absent' ? [] : Journal.for(root, slug, run.id).read(Service.TIMELINE_ENTRIES);
           const ledger = projectLedger(entries, { id: run.id, spentUsd: run.spentUsd ?? null }, {
             truncated: entries.length >= Service.TIMELINE_ENTRIES,
           });
@@ -3165,7 +3872,7 @@ export class Service extends ServiceRecovery {
     const history = settleHistory(
       runs.map(({ state }) => ({
         state,
-        entries: new Journal(root, state.slug, state.id).read(entryCap),
+        entries: Journal.for(root, state.slug, state.id).read(entryCap),
       })),
       { limit: opts.limit },
     );
@@ -3285,6 +3992,8 @@ export class Service extends ServiceRecovery {
     if (cap(patch.ladderPerDayUsd)) picked.ladderPerDayUsd = patch.ladderPerDayUsd;
     if (cap(patch.ceilingStartsPerHour)) picked.ceilingStartsPerHour = patch.ceilingStartsPerHour;
     if (cap(patch.ceilingUsdPerHour)) picked.ceilingUsdPerHour = patch.ceilingUsdPerHour;
+    if (cap(patch.usageForecastLeadHours)) picked.usageForecastLeadHours = patch.usageForecastLeadHours;
+    if (typeof patch.usageForecastHold === 'boolean') picked.usageForecastHold = patch.usageForecastHold;
     if (cap(patch.convergeEveryMs)) picked.convergeEveryMs = patch.convergeEveryMs;
     if (cap(patch.budgetAutoRaisePct)) picked.budgetAutoRaisePct = patch.budgetAutoRaisePct;
     if (cap(patch.mcpRequireTimeoutMs)) picked.mcpRequireTimeoutMs = patch.mcpRequireTimeoutMs;
@@ -3342,18 +4051,39 @@ export class Service extends ServiceRecovery {
     // The relay's rules (phase 14): a LIST, replaced wholesale for the reason
     // the schedule is — an operator who deleted a rule meant it gone.
     if (patch.relayRules !== undefined) picked.relayRules = sanitiseRelayRules(patch.relayRules);
+    // The reminder quiet hours (control-tower phase 43): `{start, end}`, or null
+    // to clear — through the push register's own parser, so one bad shape is
+    // refused in one place, and DROPPED here rather than coerced.
+    if ('reminderQuiet' in patch) {
+      const quiet = parseQuietHours(patch.reminderQuiet);
+      if (quiet === null) picked.reminderQuiet = undefined;
+      else if (!('error' in quiet)) picked.reminderQuiet = { start: quiet.start, end: quiet.end };
+    }
     // `notify` is a map inside a patch, so a shallow spread alone would let a
     // client sending one toggle reset every other category to its default.
     // Merged off the *current* map (captured before the spread overwrites it),
     // then sanitised: unknown keys are dropped and a category this client has
     // never heard of keeps the value it already had.
-    const notify = patch.notify === undefined
-      ? this.prefs.notify
-      : sanitiseCategories({ ...this.prefs.notify, ...patch.notify });
+    // `null` returns a key to its shipped default (control-tower phase 53, #56)
+    // — the one way to take an override back. It used to be dropped like a
+    // typo: `{"ladderPerPhaseRungs": null}` answered 200 and the raised cap
+    // stayed, so only another explicit number could ever undo one. A key with
+    // no shipped default, or one this door does not know, is still dropped.
+    const reset: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(patch)) {
+      if (value !== null) continue;
+      const shipped = prefDefault(key);
+      if (shipped.known) reset[key] = shipped.value;
+    }
+    const notify = patch.notify === null
+      ? reset.notify as Prefs['notify']
+      : patch.notify === undefined
+        ? this.prefs.notify
+        : sanitiseCategories({ ...this.prefs.notify, ...patch.notify });
     // Re-DERIVED, never carried: the flat keys are the truth and the object
     // is a view of them, so a write that moves one must move the other.
     const policyBefore = this.prefs.policy ?? {};
-    this.prefs = withAutomation({ ...this.prefs, ...picked, notify });
+    this.prefs = withAutomation({ ...this.prefs, ...(reset as Partial<Prefs>), ...picked, notify });
     savePrefs(this.prefs);
     if (picked.policy) this.journalPolicyAnswers(policyBefore, picked.policy, opts.by ?? 'console');
     // The healer decides with these — the ladder caps, the unblock and takeover
@@ -3544,6 +4274,6 @@ export class Service extends ServiceRecovery {
     const sizes = new Map(record.plan.graph.map((r) => [r.phase, record.plan!.phases[r.phase]?.size ?? 'M' as const]));
     const budget = resolveBudget(record.plan.sessionBudget.targetModel, this.sizing);
     return remainingWork(record.plan.graph, board, sizes, this.sizing, budget,
-      this.phaseWeights(record.plan));
+      this.phaseWeights(record.plan), this.sizingCensus()?.sessions);
   }
 }

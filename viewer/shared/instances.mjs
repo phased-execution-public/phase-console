@@ -51,7 +51,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, totalmem } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { HEARTBEAT_STALE_MS } from './fleet-model.js';
@@ -345,6 +345,8 @@ function sanitizeProfileFields(raw) {
   }
   if (Number.isInteger(raw.maxSessions) && raw.maxSessions > 0) out.maxSessions = raw.maxSessions;
   if (typeof raw.hookScript === 'string' && raw.hookScript.startsWith('/')) out.hookScript = raw.hookScript;
+  if (Number.isInteger(raw.heapMb) && raw.heapMb > 0) out.heapMb = raw.heapMb;
+  if (raw.heapSnapshotOnNearLimit === true) out.heapSnapshotOnNearLimit = true;
   return out;
 }
 
@@ -451,10 +453,82 @@ export function profileFor(id, env = process.env) {
     ...effective,
     maxSessions: profile.maxSessions ?? null,
     hookScript: profile.hookScript ?? null,
+    // Machine-level like the two above: the heap a console may hold and whether
+    // a near-limit event writes the snapshot that names what is holding it.
+    heapMb: profile.heapMb ?? null,
+    heapSnapshotOnNearLimit: profile.heapSnapshotOnNearLimit === true,
     autostart: readAutostart(id, env),
     sources,
     overridden: Object.keys(overrides),
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * The heap this console may hold
+ * ------------------------------------------------------------------ */
+
+/**
+ * The heap a console runs with when the profile does not say, in MB.
+ *
+ * V8's default on the machine where this was measured is 4,288 MB, and the
+ * console reached it twice in five minutes: once over 23.7 hours of two
+ * streaming runs, and once in five and a half minutes having driven nothing at
+ * all. 6 GB is not a fix for a leak — the SSE cap and the parse cache are — it
+ * is the difference between a console that survives a bad hour and one launchd
+ * restarts into the same crash every ten seconds.
+ */
+export const DEFAULT_HEAP_MB = 6144;
+
+/** Below this a console cannot hold a portfolio at all; a profile saying less is ignored. */
+export const MIN_HEAP_MB = 1024;
+
+/**
+ * The heap size this instance's node should be given, in MB.
+ *
+ * Clamped to half of physical memory: a heap larger than the machine turns an
+ * out-of-memory exit — which restarts — into swap death, which does not. The
+ * clamp is a floor as well as a ceiling, because a 2 GB machine that computed
+ * 1,024 MB and a profile asking for 64 are both consoles that cannot work.
+ *
+ * @param {{ heapMb?: number | null }} profile
+ * @param {number} [totalBytes] physical memory; `os.totalmem()` by default
+ * @returns {number}
+ */
+export function heapMbFor(profile, totalBytes = totalmem()) {
+  const asked = Number.isInteger(profile?.heapMb) && profile.heapMb > 0 ? profile.heapMb : DEFAULT_HEAP_MB;
+  const half = Math.floor((Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : 0) / 2 / 1024 / 1024);
+  const ceiling = half > 0 ? Math.max(half, MIN_HEAP_MB) : asked;
+  return Math.max(MIN_HEAP_MB, Math.min(asked, ceiling));
+}
+
+/**
+ * The node arguments a console is started with — the ones that go BEFORE the
+ * script path.
+ *
+ * Deliberately not `NODE_OPTIONS`. The environment is inherited by every
+ * `claude` child this console spawns, so a heap size set there would be applied
+ * to dozens of unrelated processes and a diagnostic directory would collect
+ * their snapshots too. A node argument belongs to this process and to nothing
+ * it starts.
+ *
+ * @param {{ heapMb?: number | null, heapSnapshotOnNearLimit?: boolean }} profile
+ * @param {{ diagDir?: string | null, totalBytes?: number }} [opts]
+ * @returns {string[]}
+ */
+export function nodeArgsFor(profile, opts = {}) {
+  const args = [`--max-old-space-size=${heapMbFor(profile, opts.totalBytes ?? totalmem())}`];
+  if (profile?.heapSnapshotOnNearLimit === true) {
+    // Off by default because the snapshot is the size of the heap that wrote
+    // it: turning this on is a deliberate act taken while hunting a retainer.
+    args.push('--heapsnapshot-near-heap-limit=1');
+    if (opts.diagDir) args.push(`--diagnostic-dir=${opts.diagDir}`);
+  }
+  return args;
+}
+
+/** Where a heap snapshot lands for this instance. */
+export function diagnosticDir(id, isDefault, env = process.env) {
+  return join(instanceStateDir(id, isDefault, env), 'diag');
 }
 
 /**

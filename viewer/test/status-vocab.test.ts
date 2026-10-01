@@ -43,6 +43,8 @@ import {
 import { SITUATIONS, SITUATION_ACTOR } from '../shared/situation-model.js';
 import { BOARD_ORDER } from '../shared/phase-model.js';
 import { PHASE_STATUSES, RUN_STATUSES } from '../shared/run-lifecycle.js';
+import { QA_RESULTS } from '../shared/plan-vocab.js';
+import { describeWord } from '../shared/status-model.js';
 
 /**
  * The status words the server actually writes.
@@ -60,9 +62,25 @@ import { PHASE_STATUSES, RUN_STATUSES } from '../shared/run-lifecycle.js';
 const SERVER_RUN_STATUSES: readonly string[] = RUN_STATUSES;
 const SERVER_PHASE_STATUSES: readonly string[] = PHASE_STATUSES;
 
-test('the server writes at least the twelve run and twelve phase words this test expects', () => {
-  assert.ok(SERVER_RUN_STATUSES.length >= 12, SERVER_RUN_STATUSES.join(','));
-  assert.ok(SERVER_PHASE_STATUSES.length >= 12, SERVER_PHASE_STATUSES.join(','));
+// 6.0 (control-tower phase 31): the two "twelve words" assertions are retired —
+// a floor on how MANY words the server writes, and a pin of where each one
+// landed in the one-question paint map. What a word looks like is now decided
+// by the status model's first-match DECISION TABLE (`describeRun`,
+// `describePhase`, `describeWord` in `shared/status-model.js`), which
+// `status-model.test.ts` holds row by row; this file keeps totality and
+// identity. What it adds is the join: every word the server writes has a row
+// in that table, so no page can draw one as the Unknown.
+test('every run and phase word the server writes is decided by the model’s table, never Unknown', () => {
+  for (const word of SERVER_RUN_STATUSES) {
+    const view = describeWord('run', word);
+    assert.equal(view.known, true, `run word ${word} has no row in WORD_ROWS.run`);
+    assert.ok(isUiState(view.paint), `run word ${word} paints ${view.paint}`);
+  }
+  for (const word of SERVER_PHASE_STATUSES) {
+    const view = describeWord('phase', word);
+    assert.equal(view.known, true, `phase word ${word} has no row in WORD_ROWS.phase`);
+    assert.ok(isUiState(view.paint), `phase word ${word} paints ${view.paint}`);
+  }
 });
 
 test('eight UI states, worst first, each with a label, its own hue, a tone and an icon', () => {
@@ -121,27 +139,6 @@ test('every situation has a UI state through its actor, imported from the situat
   assert.equal(actorUiState('wait'), 'waiting');
   assert.equal(actorUiState('none'), 'done');
   assert.equal(situationUiState('plan-broken', { errand: true }), 'needs-you');
-});
-
-test('the twelve run words land where the design says', () => {
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(RUN_STATUS_UI)),
-    {
-      running: 'running',
-      halting: 'needs-you', halted: 'needs-you', parked: 'needs-you', interrupted: 'needs-you',
-      waiting: 'waiting', paused: 'waiting', pausing: 'waiting', frozen: 'waiting', stopping: 'waiting',
-      queued: 'queued',
-      finished: 'done',
-    },
-  );
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(PHASE_STATUS_UI)),
-    {
-      running: 'running', verifying: 'verifying', done: 'done', failed: 'failed', skipped: 'skipped',
-      queued: 'queued', pending: 'queued', waiting: 'waiting',
-      gated: 'needs-you', parked: 'needs-you', 'awaiting-verification': 'needs-you', interrupted: 'needs-you',
-    },
-  );
 });
 
 test('unknown words read as the unknown state — never amber, never green', () => {
@@ -207,9 +204,19 @@ test('the client re-exports the SAME vocabulary objects (identity, not a copy)',
   for (const word of Object.keys(BOARD_STATE_UI)) assert.ok(client.BOARD_STATE_HELP[word as keyof typeof client.BOARD_STATE_HELP], `help for board ${word}`);
   for (const state of UI_STATES) assert.ok(client.UI_STATE_HELP[state], `help for ui ${state}`);
   // QA verdicts map too, and never to amber: a verdict is a fact, not an ask.
-  assert.equal(client.qaUiState('pass'), 'done');
-  assert.equal(client.qaUiState('fail'), 'failed');
-  assert.equal(client.qaUiState('waived'), 'skipped');
-  assert.equal(client.qaUiState('pending'), 'queued');
-  assert.equal(client.qaUiState(undefined), 'queued');
+  // Since control-tower phase 16 a verdict's paint is the status model's
+  // `qa-result` row, drawn by `QaBadge`; the client keeps only what it MEANS.
+  assert.equal('qaUiState' in client, false, 'the QA paint table was folded into the status model');
+  const paint = (word: string | undefined) => describeWord('qa-result', word);
+  assert.equal(paint('pass').paint, 'done');
+  assert.equal(paint('fail').paint, 'failed');
+  assert.equal(paint('waived').paint, 'skipped');
+  assert.equal(paint('pending').paint, 'queued');
+  assert.equal(paint(undefined).known, false, 'no verdict is Unknown, not a verdict');
+  for (const word of [...QA_RESULTS, 'unknown', undefined]) {
+    assert.equal(paint(word).attention, 'none', `QA ${word ?? '(none)'} asks nothing of a person`);
+    assert.notEqual(paint(word).paint, 'needs-you', `QA ${word ?? '(none)'} is never amber`);
+  }
+  for (const result of QA_RESULTS) assert.ok(client.QA_RESULT_HELP[result], `help for QA ${result}`);
 });
+

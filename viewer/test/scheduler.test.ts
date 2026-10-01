@@ -2225,3 +2225,156 @@ test('snapshot stamps each entry with its scan position: a bumped entry reads fi
  * The radar hold — `radarSerialize` (phase 9)
  * ------------------------------------------------------------------ */
 
+
+/* ------------------------------------------------------------------ *
+ * reserve — a watch landing's head-of-queue admission (control-tower phase 6, #15)
+ * ------------------------------------------------------------------ */
+
+test('reserve: a reserved entry is admitted ahead of an earlier one in its scope, and holds its tokens against the queue behind it', async () => {
+  const s = scheduler();
+  // A sibling lane holds the repository.
+  const live = await s.admit({ slug: 'a', phase: 1, runId: 'r1', scope: ['api'] });
+  // An ordinary entry queues first…
+  const early = s.admit({ slug: 'a', phase: 2, runId: 'r1', scope: ['api'] });
+  await tick();
+  // …then the phase whose watch landed, with a reservation.
+  const landed = s.admit({ slug: 'a', phase: 3, runId: 'r1', scope: ['api'], reserve: true });
+  await tick();
+  assert.ok(await pending(early));
+  assert.ok(await pending(landed), 'a reservation does not preempt a lane already granted');
+  const view = s.snapshot().entries.find((entry) => entry.phase === 3);
+  assert.equal(view?.reserve, true, 'the queue page can say so');
+  // A later intersecting entry cannot slip past the reservation either.
+  const late = s.admit({ slug: 'a', phase: 4, runId: 'r1', scope: ['api', 'web'] });
+  await tick();
+  // A disjoint scope is none of its business.
+  const web = await s.admit({ slug: 'b', phase: 1, runId: 'r2', scope: ['docs'] });
+  assert.equal(web.phase, 1);
+
+  s.release(live);
+  const first = await landed;
+  assert.equal(first.phase, 3, 'the landing is admitted first — without `reserve` the earlier entry would be');
+  assert.ok(await pending(early), 'the earlier ordinary entry waits behind it');
+  assert.ok(await pending(late));
+  s.release(first);
+  assert.equal((await early).phase, 2, 'and FIFO resumes behind it');
+  assert.ok(await pending(late));
+});
+
+test('reserveQueued: an entry already waiting is given the reservation — ahead of its scope, never past the granted lane', async () => {
+  const s = scheduler();
+  const live = await s.admit({ slug: 'a', phase: 1, runId: 'r1', scope: ['api'] });
+  const early = s.admit({ slug: 'a', phase: 2, runId: 'r1', scope: ['api'] });
+  await tick();
+  // An elapsed wait queued behind its own scope, born without a reservation…
+  const waiting = s.admit({ slug: 'a', phase: 3, runId: 'r1', scope: ['api'] });
+  await tick();
+  assert.notEqual(s.snapshot().entries.find((entry) => entry.phase === 3)?.reserve, true);
+  // …and then its watch lands (`landWatch`).
+  assert.equal(s.reserveQueued('r1', 3), true);
+  assert.equal(s.reserveQueued('r1', 3), true, 'a second landing finds the mark already there');
+  assert.equal(s.reserveQueued('r1', 9), false, 'no entry, no reservation');
+  assert.equal(s.reserveQueued('r2', 3), false, "another run's phase 3 is not this one");
+  await tick();
+  assert.equal(s.snapshot().entries.find((entry) => entry.phase === 3)?.reserve, true, 'the queue page can say so');
+  assert.ok(await pending(waiting), 'a reservation does not preempt a lane already granted');
+
+  s.release(live);
+  const first = await waiting;
+  assert.equal(first.phase, 3, 'the reserved entry is admitted first — first-come would have admitted phase 2');
+  assert.ok(await pending(early), 'the earlier entry waits behind it');
+  s.release(first);
+  assert.equal((await early).phase, 2, 'and first-come resumes behind it');
+});
+
+/* ------------------------------------------------------------------ *
+ * The holders a scan finds are TOLD (control-tower phase 60, #82)
+ * ------------------------------------------------------------------ */
+
+test('every scan tells a waiting entry its current holders, so a later holder is never invisible', async () => {
+  let locks: LockView[] = [{ slug: 'x', phase: 1, owner: 'first@laptop', expired: false, scope: ['app'], leaseUntil: Date.now() + 3_600_000 }];
+  const told: string[][] = [];
+  const s = new Scheduler({ max: 4, locks: () => locks });
+  const waiting = s.admit({
+    slug: 'demo', phase: 2, runId: 'R1', scope: ['app'],
+    onHolders: (holders) => { told.push(holders.map((h) => h.owner)); },
+  });
+  await tick();
+  assert.deepEqual(told.at(-1), ['first@laptop'], 'the first scan names the first holder');
+  locks = [{ slug: 'y', phase: 4, owner: 'second@laptop', expired: false, scope: ['app'], leaseUntil: Date.now() + 3_600_000 }];
+  s.poll();
+  assert.deepEqual(told.at(-1), ['second@laptop'], 'the next scan names the one holding it now');
+  locks = [];
+  s.poll();
+  const grant = await waiting;
+  const before = told.length;
+  s.poll();
+  assert.equal(told.length, before, 'a granted entry is told nothing more');
+  s.release(grant);
+  s.close();
+});
+
+test('a listener that throws never stops the scan', async () => {
+  const s = new Scheduler({ max: 1, locks: () => [] });
+  const held = await s.admit({ slug: 'demo', phase: 1, runId: 'R1', scope: ['app'] });
+  const other = s.admit({ slug: 'else', phase: 2, runId: 'R2', scope: ['app'], onHolders: () => { throw new Error('boom'); } });
+  await tick();
+  s.release(held);
+  assert.equal((await other).phase, 2, 'admitted all the same');
+  s.close();
+});
+
+/* ------------------------------------------------------------------ *
+ * A switch re-keys the queue (control-tower phase 78, #92)
+ * ------------------------------------------------------------------ */
+
+test('SW-1: rekeyRun moves ONE run\'s waiting entries to another account — the same age, the same place in line — and re-scans at once', async () => {
+  const clock = { at: Date.parse('2026-09-24T16:50:00Z') };
+  const s = new Scheduler({ now: () => clock.at, locks: () => [] });
+  try {
+    s.throttle(Date.parse('2026-09-24T17:20:00Z'), 'acct-old', 'five_hour');
+    const p15 = s.admit({ slug: 'vca', phase: 15, runId: 'run-1', scope: ['a'], accountId: 'acct-old' });
+    clock.at += 1_000;
+    const p19 = s.admit({ slug: 'vca', phase: 19, runId: 'run-1', scope: ['a'], accountId: 'acct-old' });
+    clock.at += 1_000;
+    const p40 = s.admit({ slug: 'tfar', phase: 40, runId: 'run-2', scope: ['c'], accountId: 'acct-old' });
+    await tick();
+    assert.ok(await pending(p15) && await pending(p19) && await pending(p40), 'all three held by the old account\'s window');
+    const born = new Map(s.snapshot().entries.map((entry) => [entry.phase, entry.since]));
+
+    clock.at += 60_000;
+    assert.equal(s.rekeyRun('run-1', 'acct-new'), 2, 'both of run-1\'s entries, and only those');
+    const grant15 = await p15;
+    assert.equal(grant15.accountId, 'acct-new', 'boarded in the same pass, counted against the new account');
+    const left = s.snapshot().entries;
+    const e19 = left.find((entry) => entry.phase === 19)!;
+    assert.equal(e19.accountId, 'acct-new');
+    assert.equal(e19.since, born.get(19), 'its age is the wait it has already done');
+    assert.equal(e19.waitingOn[0].phase, 15, 'now behind a scope, not the old account\'s wall');
+    const e40 = left.find((entry) => entry.phase === 40)!;
+    assert.equal(e40.accountId, 'acct-old', 'another run\'s entry is never touched');
+    assert.equal(e40.waitingOn[0].slug, 'usage window');
+    assert.equal(s.rekeyRun('run-1', 'acct-new'), 0, 'nothing left on another account: a no-op');
+
+    // One phase only (a Retry), and back to the machine login.
+    assert.equal(s.rekeyRun('run-2', undefined, { phase: 99 }), 0);
+    assert.equal(s.rekeyRun('run-2', undefined, { phase: 40 }), 1);
+    assert.equal((await p40).accountId, undefined, 'the machine login is the absent account on the grant');
+    s.release(grant15);
+    s.release(await p19);
+  } finally { s.close(); }
+});
+
+test('SW-3: the entry view names the account each admission would spend — `default` for the machine login', async () => {
+  const s = new Scheduler({ locks: () => [] });
+  try {
+    const hold = await s.admit({ slug: 'x', phase: 1, runId: 'run-x', scope: ['a'] });
+    const mine = s.admit({ slug: 'y', phase: 2, runId: 'run-y', scope: ['a'], accountId: 'acct-9' });
+    const theirs = s.admit({ slug: 'z', phase: 3, runId: 'run-z', scope: ['a'] });
+    await tick();
+    assert.deepEqual(s.snapshot().entries.map((entry) => entry.accountId), ['acct-9', 'default']);
+    s.release(hold);
+    s.release(await mine);
+    s.release(await theirs);
+  } finally { s.close(); }
+});

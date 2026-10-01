@@ -6,7 +6,8 @@
  * runtime — including a test.
  */
 
-import type { EtaBasis, EtaEstimate } from './api';
+import type { EtaBasis, EtaEstimate, HolderEtaView } from './api';
+import { formatInterval } from '../../../shared/interval-format.js';
 
 /** `310000` → `310K`. A weight is always tokens, and always rounded. */
 export function weight(tokens: number | undefined): string {
@@ -40,29 +41,24 @@ export const pad2 = (n: number | string): string => String(n).padStart(2, '0');
 
 /* ---------------- clocks ----------------
  * Four of these, deliberately, because they answer different questions. A
- * running phase wants a stopwatch (`elapsed`), a finished one wants a rounded
+ * running phase wants a stopwatch (`elapsed`), a finished one wants a settled
  * wall-clock (`duration`), a tool call runs from milliseconds to minutes so it
  * needs its own (`toolTime`), and a figure read out in a sentence wants units
  * rather than colons (`elapsedWords`). One format cannot serve all four without
- * being wrong for three. */
+ * being wrong for three — but the three interval ones share ONE rounding rule:
+ * each delegates to `shared/interval-format.js` (`clock`, `table`, `prose`),
+ * so they differ in precision and never in direction (#28). */
 
 /** `0:07` / `12:03` / `1:04:11` — a stopwatch, for something still running. */
 export function elapsed(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '0:00';
-  const total = Math.floor(ms / 1000);
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
-  return hours ? `${hours}:${pad2(minutes)}:${pad2(seconds)}` : `${minutes}:${pad2(seconds)}`;
+  return formatInterval(ms, 'clock');
 }
 
 /** Wall-clock at the precision someone reading a phase table cares about. */
 export function duration(ms: number): string {
-  const seconds = Math.round(ms / 1000);
-  if (seconds < 90) return `${seconds}s`;
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 90) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  // The table register: one rounding rule (floor) with the other two, so a
+  // phase that reads 1:59 on its stopwatch can no longer read `2m` here (#28).
+  return formatInterval(ms, 'table');
 }
 
 /**
@@ -78,12 +74,47 @@ export function duration(ms: number): string {
  * the console never recorded has not been running for no time.
  */
 export function elapsedWords(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '—';
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${pad2(seconds % 60)}s`;
-  return `${Math.floor(minutes / 60)}h ${pad2(minutes % 60)}m`;
+  return formatInterval(ms, 'prose');
+}
+
+/**
+ * The one interval formatter, re-exported: this file is the client's only door
+ * to `shared/interval-format.js` (`format.test.ts` scans for a second), so a
+ * surface that needs a register the three helpers above do not name asks here.
+ */
+export { formatInterval };
+
+/**
+ * A duration with the verb that says what it measures (control-tower phase 19,
+ * #28). "12m 03s" beside a run is five questions — running for it, halted that
+ * long ago, queued, worked? — and the strip answers exactly one of them, so the
+ * verb travels WITH the figure rather than beside it in a label a narrow row
+ * drops first.
+ */
+export interface LabelledClock {
+  /** What the interval measured, as the verb a sentence leads with: `ran`, `halted`, `queued`. */
+  verb: string;
+  /** The interval itself. `null` (or anything unmeasurable) when the console never measured it. */
+  ms: number | null;
+  /** `for` — the verb lasted this long, and may still be; `ago` — the verb happened this long ago. */
+  tense: 'for' | 'ago';
+  /** Which named clock it is (`PHASE_CLOCK_LABELS`), for a title that says where the figure came from. */
+  label?: string;
+}
+
+/**
+ * `running 12m 03s` · `ran 1h 04m` · `halted 12m 3s ago` · `queued —`.
+ *
+ * A span reads in the `prose` register (padded, so a live figure does not
+ * jitter in width); a moment in the `table` register with "ago". One rounding
+ * rule under both — the floor — so a labelled clock never reads ahead of the
+ * stopwatch beside it. Unmeasured keeps its verb and says `—`, never `0`.
+ */
+export function clockWords(clock: LabelledClock): string {
+  const ms = clock.ms ?? Number.NaN;
+  const figure = formatInterval(ms, clock.tense === 'for' ? 'prose' : 'table');
+  if (!Number.isFinite(ms) || ms < 0) return `${clock.verb} —`;
+  return clock.tense === 'ago' ? `${clock.verb} ${figure} ago` : `${clock.verb} ${figure}`;
 }
 
 /** A tool call: `840ms` / `2.4s` / `6m`. */
@@ -206,32 +237,57 @@ function coarse(ms: number): string {
 }
 
 /**
- * `~40 min–1.5 h (estimate)` — a range and how much to believe it.
+ * `~40 min–1.5 h of work left (estimate)` — a range, its clock, and how much
+ * to believe it.
  *
  * The server has already snapped both ends to a bucket a person would say out
  * loud, so this only formats and hedges. A collapsed range (both ends in the
- * same bucket) prints once rather than as `~5 min–5 min`.
+ * same bucket) prints once rather than as `~5 min–5 min`. `of work` names the
+ * clock: working time, the remaining phases back to back — never a calendar
+ * date, which is `Forecast.label` (`lib/api/plans`) and reads differently.
  */
 export function etaLabel(lowMs: number, highMs: number, basis: EtaBasis): string {
   const range = lowMs === highMs ? `~${coarse(highMs)}` : `~${coarse(lowMs)}–${coarse(highMs)}`;
-  return `${range} ${BASIS_SUFFIX[basis] ?? BASIS_SUFFIX.heuristic}`;
+  return `${range} of work left ${BASIS_SUFFIX[basis] ?? BASIS_SUFFIX.heuristic}`;
 }
 
-/** `~40 min` — one phase's own estimate, with no hedge and no "left". */
+/** `~40 min of work` — one phase's own estimate, with no hedge and no "left". */
 export function etaPoint(ms: number): string {
-  return `~${coarse(ms)}`;
+  return `~${coarse(ms)} of work`;
 }
 
 /** Where the number came from, in a sentence, for the `title` of any of them. */
 export function etaTitle(eta: EtaEstimate): string {
   const evidence =
     eta.basis === 'plan'
-      ? `${plural(eta.samples, 'finished phase')} of this plan`
+      ? `${plural(eta.samples, 'measured phase')} of this plan`
       : eta.basis === 'portfolio'
-        ? `${plural(eta.samples, 'finished phase')} across other plans — this one has none yet`
-        : 'no finished phase anywhere yet, so this is the size tags alone';
+        ? `${plural(eta.samples, 'measured phase')} across other plans — this one has none yet`
+        : 'no measured phase anywhere yet, so this is the size tags alone';
+  // A finished phase can still teach the rate nothing (a closeout-only
+  // completion, a duration nobody recorded) — said here rather than silently
+  // dropped, the same rule the server's own evidence list follows.
+  const missingNote = eta.missing
+    ? ` ${plural(eta.missing, 'finished phase')} had no usable measurement and ${eta.missing === 1 ? 'was' : 'were'} left out.`
+    : '';
   return (
     `From ${evidence}, against ${weight(eta.remainingWeight)} of remaining weight. ` +
-    'Weight-normalised, recency-weighted, and deliberately coarse.'
+    'Working time: the remaining phases back to back, nothing parked or overnight. Each phase is a ' +
+    'floor plus a slope fitted to the measured phases, deliberately coarse.' +
+    missingNote
   );
+}
+
+/**
+ * How long a queue holder has, in the words a card says it (control-tower
+ * phase 60, #63): the holder PHASE's remaining time as its own sentence
+ * (`P3 has ~25–50 min of work left`), or — where no phase is known, and on a
+ * figure written before 6.0 — its plan's, always prefixed `plan remaining` so it
+ * can never be read as the wait. Empty when nothing is known.
+ */
+export function holderEtaText(eta: HolderEtaView | undefined, phase: number | null | undefined): string {
+  const label = eta?.label;
+  if (!label) return '';
+  if (eta.of === 'phase') return `${phase == null ? 'that phase' : `P${phase}`} has ${label}`;
+  return label.startsWith('plan remaining') ? label : `plan remaining ${label.replace(/ left$/, '')}`;
 }

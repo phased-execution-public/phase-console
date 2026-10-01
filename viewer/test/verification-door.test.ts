@@ -238,3 +238,68 @@ test('the start door refuses a run its §Verification would stop, and carries th
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// Control-tower phase 62 (#47): a line whose exit code reads the whole FLEET —
+// every plan, branch and tree in the checkout — can never pass while anything
+// else is live. The lint reader names it before it ever runs, as an advisory
+// with what to write instead, and never as a verdict: the command is safe, and
+// sometimes it is exactly what an author means. Phase 89 (#47): the remedy is a
+// form the task ACCEPTS — `task hygiene` has none (`--plan` exits 2), so phase
+// 1 here reads one drift gate, which is scoped.
+const FLEET_PLAN = `---
+slug: fleet
+created: 2026-09-25
+status: active
+phases: 2
+---
+
+# fleet
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | scoped | — | — | app | green |
+| 2 | ship | 1 | — | app | shipped |
+
+## Phases
+
+### Phase 1 — scoped
+- **Size:** S
+- **Verification:**
+  - **Verify in:** app
+  - \`task drift:pins\`
+
+### Phase 2 — ship
+- **Size:** S
+- **Verification:**
+  - **Verify in:** app
+  - \`task hygiene -- --offline\`
+`;
+
+test('a line that judges the whole fleet is named where the lint is read — an advisory with a form the task accepts, never a verdict', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-verification-fleet-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  mkdirSync(join(root, 'docs', 'handoffs', 'fleet'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'fleet.md'), FLEET_PLAN, 'utf8');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: false, allowRun: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  svc.push.announce = (() => {}) as typeof svc.push.announce;
+  try {
+    assert.equal(svc.open(root).ok, true);
+    const lint = await (svc as never as { lint: (slug: string) => Promise<{ ok: boolean; issues: string[] } | null> }).lint('fleet');
+    assert.ok(lint, 'the plan has a lint');
+    assert.equal(lint!.ok, true, 'an advisory never fails the lint');
+    const named = lint!.issues.filter((line) => /^F32 /.test(line));
+    assert.equal(named.length, 1, named.join('\n'));
+    assert.match(named[0]!, /^F32 phase 2: verification-fleet-wide/);
+    assert.match(named[0]!, /task hygiene -- --offline/, 'it names the line an author has to change');
+    assert.match(named[0]!, /has no scoped form/, 'and says there is no scoped form to take');
+    assert.doesNotMatch(named[0]!, /--plan fleet/, 'never a flag the task refuses (#47)');
+  } finally {
+    svc.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

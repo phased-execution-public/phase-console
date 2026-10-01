@@ -75,6 +75,7 @@ add_budget_line() {  # add_budget_line <slug> <line...>
   run pe_newho diamond 1 root complete
   [ "$status" -eq 0 ]
   grep -qE '^\|[[:space:]]*1[[:space:]]*\|[[:space:]]*waived' "$DOCS_ROOT/docs/handoffs/diamond/test-status.md"
+  write_body diamond phase-01-root.md
   run pg diamond --ready
   [ "$output" = "2 3" ]                    # waived counts as verified — no stall
 }

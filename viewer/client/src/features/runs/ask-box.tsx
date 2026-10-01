@@ -134,7 +134,9 @@ export function AskBox({
           {sending ? 'Sending…' : steering ? 'Steer' : 'Ask'}
         </Button>
       </div>
-      <p className="mt-1.5 text-2xs text-ink-faint">
+      {/* What sending does is read before sending, so muted ink: faint fails
+          AA at this size in both themes (the e2e register). */}
+      <p className="mt-1.5 text-2xs text-ink-muted">
         {!enabled
           ? 'Available while a phase is running'
           : steering

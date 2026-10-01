@@ -24,7 +24,13 @@ export function Command({ className, ...props }: ComponentProps<typeof CommandPr
 
 export function CommandInput({ className, ...props }: ComponentProps<typeof CommandPrimitive.Input>) {
   return (
-    <div className="flex items-center gap-2 border-b border-rule px-3" cmdk-input-wrapper="">
+    // The field's focus is its rule turning to the focus ink: the input itself
+    // draws no outline (it fills the palette's top edge), so without this a
+    // keyboard had no ring to find it by (the tour counted it, control-tower phase 31).
+    <div
+      className="flex items-center gap-2 border-b border-rule px-3 focus-within:shadow-[inset_0_-2px_0_0_var(--focus)]"
+      cmdk-input-wrapper=""
+    >
       <Search size={15} aria-hidden className="shrink-0 text-ink-faint" />
       <CommandPrimitive.Input
         className={cn(
@@ -91,7 +97,7 @@ export function CommandItem({ className, ...props }: ComponentProps<typeof Comma
 
 export function CommandShortcut({ className, ...props }: React.HTMLAttributes<HTMLSpanElement>) {
   return (
-    <span className={cn('ml-auto font-mono text-2xs tracking-wide text-ink-faint', className)} {...props} />
+    <span className={cn('ms-auto font-mono text-2xs tracking-wide text-ink-faint', className)} {...props} />
   );
 }
 

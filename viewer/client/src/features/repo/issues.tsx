@@ -35,7 +35,8 @@
 
 import { useMemo } from 'react';
 import { CircleDot, CircleCheck, ExternalLink, RefreshCw } from 'lucide-react';
-import { Badge, Chip, DataTable, Empty, type BadgeTone, type Column } from '@/components/ui';
+import { Badge, Empty, type BadgeTone } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
 import type { Issue, IssueReason, IssuesPayload, RepoIssues } from '@/lib/api';
 import { relativeTime, elapsedWords, plural } from '@/lib/format';
 import { phaseHref } from '@shared/routes.js';
@@ -462,9 +463,9 @@ export function IssueBoard({
             // escapes the track instead of widening it.
             <span className="flex min-w-0 flex-wrap gap-1">
               {row.issue.labels.map((label) => (
-                <Chip key={label} tone="neutral" className="max-w-full break-all whitespace-normal">
+                <Badge key={label} tone="neutral" className="max-w-full break-all whitespace-normal">
                   {label}
-                </Chip>
+                </Badge>
               ))}
             </span>
           ),
@@ -582,9 +583,9 @@ export function ProvenanceChip({ provenance }: { provenance: NonNullable<Issue['
       title={`Filed by a session of ${provenance.slug}, phase ${provenance.phase}${provenance.runId ? ` (run ${provenance.runId})` : ''} — open the phase`}
       data-testid="provenance-chip"
     >
-      <Chip tone="accent" className="max-w-full break-all whitespace-normal">
+      <Badge tone="accent" className="max-w-full break-all whitespace-normal">
         {provenance.slug} · phase {provenance.phase}
-      </Chip>
+      </Badge>
     </a>
   );
 }

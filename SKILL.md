@@ -11,15 +11,16 @@ allowed-tools:
   - Glob
   - Agent
 metadata:
-  version: 5.1.0
+  version: 6.0.0
 ---
 
 # Phased Execution
 
-Run large work as a sequence of **right-sized sessions** — several adjacent phases usually **share** one
-session (batching), and a phase too big for one session is **split**, sized to the model you're running.
-The point is twofold: **bound cost** and **protect output quality**. A session only delivers if it can be
-**fully bootstrapped from disk** — that's what lets the next one start cold. This skill defines how.
+Run large work as a sequence of **right-sized sessions** — **the console runs one phase per session;
+batch only by hand** (a person driving the phases may let adjacent ones **share** a session), and a phase
+too big for one session is **split**, sized to the model you're running. The point is twofold: **bound
+cost** and **protect output quality**. A session only delivers if it can be **fully bootstrapped from
+disk** — that's what lets the next one start cold. This skill defines how.
 
 **Sizing is the core idea — `references/sizing.md` is the source of truth; read it.** A warm session's
 cost is roughly *linear* (Claude Code caches the prefix), so the levers that actually matter are **context
@@ -30,9 +31,11 @@ overhead** — not raw turn count. The rule:
 > the cache warm, small enough to stay clear of context rot and the harness auto-compaction threshold.
 
 Right size depends on the running model's window, so the plan records a **session budget** (~0.2 × the
-window in phase weight — ~200K for 1M-class models) and the engine proposes which phases share a session.
-A session boundary is a *cost*, not a virtue: it's earned by a spent budget, an external gate, or a model
-switch — never by tidiness.
+window in phase weight — ~200K for 1M-class models). What a session actually holds is **measured**, never a
+multiple of that weight: a floor every session pays before its work counts, plus a slope × the phase's
+weight (`references/sizing.md`). The engine forecasts a plan in sessions from it and — for a person
+driving by hand — proposes which phases may share one. A session boundary is a *cost*, not a virtue:
+it's earned by a spent budget, an external gate, or a model switch — never by tidiness.
 
 ## Three artifacts + two optional — each has ONE job (never duplicate)
 
@@ -73,8 +76,9 @@ That makes two things possible that a linear "phase N → N+1" model can't expre
   the plan's **Repos** column. The invariant: *never two live sessions whose scopes intersect; same repo
   ⇒ serialized; `all` ⇒ exclusive against every unqualified claim; disjoint ⇒ parallel* (`references/conventions.md` §Scoped concurrency).
   Ask before you start — `phase-lock.sh <slug> conflicts <N> --scope "<csv>"` — and **stop and ask the
-  user** on a reported hit. Ready phases may also **share one session** while the budget lasts (execution
-  inside a session is serial, so even same-scope siblings are safe that way).
+  user** on a reported hit. Driving by hand, ready phases may also **share one session** while the budget
+  lasts (execution inside a session is serial, so even same-scope siblings are safe that way); the console
+  never batches.
 - **Out-of-order progress** — you can complete a deep chain (e.g. 1→4→5) before its siblings (2, 3). The
   system must still know 2 and 3 aren't done. "Finished" means **every** phase is `done`, never "reached
   the highest number".
@@ -138,11 +142,21 @@ runs inside machinery it should not mistake for a malfunction. The short version
      `phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --watch <ref>`, stop. **Name the
      ref**: a wait declared without one right after the console refused your in-turn wait takes a ref
      minted from the refused command, else the plan's `- **Waits on:**` refs, else it is refused and the
-     phase parks for a person (`phase.watch-missing`).
+     phase parks for a person (`phase.watch-missing`). A sibling phase's finish is
+     `--watch phase:<slug>/<N>`, never a `cmd:` grep of its handoff; your own red lines going green
+     again is `--watch verify:<slug>/<N>` — the schemes are listed under `phase-outcome.sh` below.
 
-  A wait on your own job still open after five minutes draws one nudge; one the console cannot place
-  far longer parks the phase in its own name (never spending your waits). A short `sleep` is fine, and
-  a §Verification command may take as long as the plan needs.
+  **A wait on your own job runs on the console's clock too.** One still open after 10 minutes draws
+  one nudge, and one still open at 45 minutes parks the phase in the console's own name
+  (`stallLocalJobMs`; it never spends your waits) — so never start a long suite in the background and
+  wait on it in-turn. Record the proofs you already have, leave the long lines to §Verification (the
+  console runs those itself), and when a wait is unavoidable declare `waiting-external` with a
+  `--watch` ref BEFORE 45 minutes, not after. A short `sleep` is fine.
+  **§Verification runs on a clock too:** when the console verifies a phase it cuts each command at 30
+  minutes, unless the plan names a longer limit or the line's own measured history earns one — so a line
+  that needs longer, a device sweep or a suite slow under load, says so on its phase:
+  `- **Verify timeout:** 90m` (or `**Verify timeout:**` in §Session budget, for every phase; see
+  `--verify-timeout` below).
 - **A question is held, never a permission.** `AskUserQuestion` is answered by the console. With the
   run's relay armed (`relay: last-resort`, CLI 2.1.268+, your phase's own session) a person gets 60 s,
   then a relay rule, the sole `(Recommended)` option or the first answers — you are told which, and if
@@ -158,6 +172,26 @@ runs inside machinery it should not mistake for a malfunction. The short version
   `requested-changes` holds your dependents exactly as a person's would. If the board does not move after a
   green finish, look for a review before looking for a bug. A reviewer your own plan orders is dispatched in
   the FOREGROUND (the wait procedure's rule 2), never sent to the background and checked on.
+- **The run's checkout is the console's.** Never clone a repository or initialise a submodule inside
+  it: a repository your scope does not name is an EMPTY directory there, and you read it at the shared
+  root, read-only (the boot prompt names the path; a clone into a run tree is denied, `run-tree-clone`).
+  A person's commands for a parked phase go in an **errand tree** (`POST /api/run/<slug>/errand-tree
+  {phase}`), never in the run's mirror, which the console prunes. Isolation is chosen at LAUNCH — a
+  resume cannot add it; `isolate` (the run, at its next boundary) and `isolate-phase` (one phase) are
+  the explicit escapes. A scoped run (`onlyPhases`) FINISHES when its phases settle, so it is never
+  the way to move one stuck phase. `references/conventions.md` §Scoped concurrency.
+- **The console runs one phase per session, and watches its context.** It never batches: every phase
+  boards in a session of its own (`1 phase ≥ 1 session`), so a supervised session stops after its
+  handoff and never continues into another phase — batching is a person's move, by hand (Mode 3 step 6).
+  On every API call your context is compared with your model's window
+  (`viewer/server/runner/usage.ts`): at **0.6×** you are told once to wrap up — finish the step you are
+  on, commit, hand off `in-progress`, declare `partial --reason context`, stop — and at **0.8×** the
+  console checkpoints the session itself. Either way the next attempt boards FRESH from the handoff; the
+  wrap-up is the cheap exit, not a fault. **What to commit depends on the branch, and the notice says
+  which:** a lane's own branch commits what is done; on a SHARED branch commit only work whose checks you
+  ran green and leave the rest UNCOMMITTED — the console then runs the plan's fast §Verification lines on
+  your commit, and a red is recorded against your phase (`wipRed`) and named, with its files, in every
+  sibling's brief.
 - **An unfinished phase is retried, differently.** A convergence loop re-reads stopped runs on a clock,
   releases dead sessions' locks, and climbs a bounded **ladder** of remediations. Uncommitted work in the
   tree is the previous attempt's: read `git status` first, and never `git stash` / `git reset` it away.
@@ -165,8 +199,10 @@ runs inside machinery it should not mistake for a malfunction. The short version
   that wedged before the CLI's init frame has no session id, and is boarded FRESH with a resume brief), and
   a session is resumed only while it is worth resuming: one that ended at ≥ 250k tokens of context and is
   cold (idle ≥ 55 min) or under another account, that declared `partial --reason budget|context`, or that
-  the console checkpointed is boarded FRESH with the resume brief instead. So the tree, the handoff and the
-  journal are the memory that survives; the transcript is not.
+  the console checkpointed is boarded FRESH with the resume brief instead — and so, at any size, is one
+  that ended at or past **0.55×** of its window (the 0.6× wrap-up line less `RESUME_WRAPUP_MARGIN`):
+  resumed, it would start inside the wrap-up zone. So the tree, the handoff and the journal are the memory
+  that survives; the transcript is not.
 - **A message can arrive mid-phase, from two different places.** *Ask* (answer, then carry on) and
   *steer* (do this differently from here) are written to your stdin from the console or `bin/btw` — a
   steer may also be a person's answer, from the inbox, to a prompt your lane stopped on. A steer
@@ -180,13 +216,15 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
 1. **Set the session budget, then minimize phase count.** Identify the model that will *run* these phases —
    you know your own from your system context; if a different model will execute them, ask
    (`AskUserQuestion`; the common split is Fable plans, Opus executes — default `claude-opus-5`). Look up
-   its budget in `references/sizing.md` and **author the fewest phases that fit it**: target
-   `phase count ≈ ceil(total weight / budget)`, then add a boundary only where one is *earned* — an
+   its budget in `references/sizing.md` and **author the fewest phases that each fit one session** — by
+   the measured model there (the floor every session pays plus the slope × the phase's weight, under the
+   target), never by weight over budget — then add a boundary only where one is *earned* — an
    external gate, a deliberate model switch, or a checkpoint the user asked for. Never split for subsystem
    tidiness alone — extra phases buy repeated bootstrap + handoff ceremony. They buy real parallelism only
    when the split falls along **repo boundaries**, since disjoint scopes may run as concurrent sessions;
    splitting inside one repo buys none. Don't author three trivial phases that should be one, or one
-   giant phase that should be three (a phase whose weight exceeds the budget is two phases). Record the
+   giant phase that should be three (a phase that does not fit one session is two phases —
+   `--session-plan` flags it `over budget — split`). Record the
    target model + budget in a `## Session budget` note in the plan, and tag each phase's rough
    `- **Size:** S|M|L` (drives the batch engine; default is `M`). **QA is off by default** — only if the
    user asked for QA on this work, record `**QA gate:** on` in that note (see Mode 3 step on QA).
@@ -240,7 +278,7 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    `AskUserQuestion`, the Tier-1 default first and marked `(Recommended)`, and write the answer as
    `| \`<key>\` | <value> | <who answered> | answered | <yes|no> | plan | <evidence> |`; a key the
    user leaves open stays `outstanding` with an owner (an `outstanding` row with NO owner fails
-   `validate.sh`, F25), and one they rule out is `waived` with the reason as its value. The eighteen
+   `validate.sh`, F25), and one they rule out is `waived` with the reason as its value. The nineteen
    keys, in order — `permission.policy` (this plan's ask/deny/allow overlay, `autoApprove`; also
    goes on a `**Permissions:**` line) · `permission.destructive` (publishing and destructive verbs:
    `deny`, with named per-phase exceptions — `**May publish:**`) · `credentials` (backticked ids on
@@ -252,15 +290,19 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    `- **Person-check:**`) · `qa.exhausted` (`**QA exhausted:** waive|halt|<owner>`; skip when QA is
    off) · `waits` (each expected external wait, its `--watch` ref and its maximum — `**Wait budget:**`
    and per phase `- **Waits on:** <ref> · <max>`) · `human-acts` (steps denied to an agent, each with
-   the ref that proves it landed — `- **Human step:**`) · `ambiguity` (ruling, ask or halt when the
+   the ref that proves it landed — `- **Human step:** <kind> · <what> · open: <url or command> · proof:
+   <ref> · where: host|any · window: <duration>`, whose 5.1.0 `<who, what, proof ref>` spelling is
+   superseded and fails the lint, F37) · `ambiguity` (ruling, ask or halt when the
    plan did not decide — `**When in doubt:**`) · `budgets` (run, phase and turn ceilings) ·
    `resume.on-restart` (continue, hold or ask — the RUN's answer) · `plan-health` (whether the advisory
    lints gate this plan) · `stop` (`autonomy`, and who is told on a halt) · `relay` (`off` or
    `last-resort` — a question a session asks mid-run gets 60 s in front of a person, then a rule
-   answers; arms only at CLI 2.1.268+) · `announce` (which categories push, to whom). The shipped
+   answers; arms only at CLI 2.1.268+) · `announce` (which categories push, to whom) · `plan-approval`
+   (`hold` or `continue` — what a plan-mode phase's presented plan waits for: a person's Approve, or
+   nobody; `hold` is the default). The shipped
    defaults (`POLICY_DEFAULTS`): `gates: delegated` · `qa.exhausted: waive` · `resume.on-restart:
    continue` · `ambiguity: ruling` — the template's four — and `verification.person-check: operator` ·
-   `credentials: continue` · `mcp: continue` · `relay: off` · `waits: window`. The template carries
+   `credentials: continue` · `mcp: continue` · `relay: off` · `waits: window` · `plan-approval: hold`. The template carries
    the skeleton; `scripts/phase-graph.sh <slug> --decisions`
    reads it back, and the boot prompt hands each phase its rows.
 2. Draft the plan in the `references/plan-format.md` shape. **Every phase must be self-contained** — written
@@ -295,16 +337,19 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    budget. If the count is wrong or a phase is missing, the table has a row the parser skipped (odd
    phase-number formatting) — fix it before proceeding.
 5. **Commit** the plan (`docs/plans/<slug>.md`).
-6. **Immediately implement the root phase(s) in this same session** → switch to Mode 2. (Keep going into
-   further ready phases while the budget lasts — see Mode 3 batching; whatever doesn't fit runs in later
-   sessions via the pasted prompts from Mode 3 — concurrently where their scopes are disjoint.)
+6. **Immediately implement the root phase(s) in this same session** → switch to Mode 2. (Driving by hand,
+   keep going into further ready phases while the budget lasts — Mode 3 step 6; the console runs one phase
+   per session. Whatever doesn't fit runs in later sessions via the pasted prompts from Mode 3 —
+   concurrently where their scopes are disjoint.)
 
 ### Mode 2 — `phase-start` (begin or continue a phase in a fresh session)
 1. **Bootstrap from disk only:** run `scripts/handoff-status.sh <slug>` — it prints the INDEX, per-file
    status, **and** the live DAG board, so you see at a glance what is done, what this phase depends on, and
    whether it is genuinely `ready`. Read this phase's **dependency** handoffs (the phase's `depends_on`, not
    merely the previous number), `docs/plans/<slug>.md` §Phase N + §Session budget, and memory
-   `project_<slug>`. **Read the phase's decision rows** — `scripts/phase-graph.sh <slug> --decisions <N>`
+   `project_<slug>`. In a dependency handoff's `▶ Start next phase(s)` section, read the shared boot and
+   **your own phase's block only — never a sibling's**: your boot prompt already carries the whole of it,
+   and a sibling's block is another session's prompt (#115). **Read the phase's decision rows** — `scripts/phase-graph.sh <slug> --decisions <N>`
    (the boot prompt prints them; an `outstanding` row is a decision nobody has answered, and a
    `blocked` or `needs-human` you declare must name its key with `--needs`). **Read your notes** —
    `scripts/phase-graph.sh <slug> --notes <N>`, which your boot prompt already carries as
@@ -342,8 +387,8 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    allowed to do the unblocking work. The brief is the supervisor's snapshot; the repository wins.) Then
    check the plan's
    `## Session budget` target model against the model you're *actually* running — if they differ, recompute
-   the budget from `references/sizing.md` and re-batch accordingly. **Then check scope, then claim
-   (concurrency guard):** `git pull`, read the phase's scope
+   the budget from `references/sizing.md` (and, driving by hand, re-batch accordingly). **Then check
+   scope, then claim (concurrency guard):** `git pull`, read the phase's scope
    (`scripts/phase-graph.sh <slug> --repos <N>` — the boot prompt already states it), then
    ```
    scripts/phase-lock.sh <slug> conflicts <N> --scope "<csv>" --git   # 0 = clear, 1 = collides
@@ -377,10 +422,15 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    lives, and prints the `claim … --here` line for it; `merge` folds it onto `pe/<slug>` — a fast-forward
    when it can, a merge commit when it cannot — and `remove [--force]` takes the tree, the merged branch and the lock away
    (`list` shows every hand lane). Never `git worktree add` a sibling folder of the project by hand —
-   nothing sweeps it and, until now, nothing inside it found the docs root. (**Unattended**: never wait for an answer that cannot come —
+   nothing sweeps it and, until now, nothing inside it found the docs root. **Under a console run** a
+   session takes at most a review tree (`--detach`) or a QA round's (`--qa`) — never a build lane or a
+   `merge`, never a `pe/<slug>` checkout or `git switch -c`: the console owns the run's trees and
+   branches, and the script refuses the rest. (**Unattended**: never wait for an answer that cannot come —
    file `bash scripts/phase-outcome.sh <slug> <N> blocked --needs lock --reason "lock held by <owner>"
-   --watch lock:<slug>/<N>`, hand off `in-progress` if you already did work, and stop; the supervisor
-   queues the retry for when the lock frees.) The lock auto-expires (lease) and is released at phase-finish.
+   --watch lock:<holder-slug>/<holder-phase>` — the HOLDER's lock, as `conflicts` named it, never your
+   own phase's, which your own closeout releases (the script refuses that watch, exit 2) — hand off
+   `in-progress` if you already did work, and stop; the supervisor queues the retry for when that lock
+   frees.) The lock auto-expires (lease) and is released at phase-finish.
    See `references/conventions.md` §Locking + §Scoped concurrency.
 
    **Gate check — GATED phases only, and BEFORE implementing.** Run
@@ -441,6 +491,20 @@ Pick the mode that matches the situation and announce it ("Using phased-executio
    offers to remember, and `--remember plan` writes it as a `## Decisions` row the moment it is recorded
    (`--remember global` asks the owning console to make it this console's `policy.<key>` answer — the
    words must be an answer word for the key). `references/conventions.md` §Rulings.
+   **A person's turn is a human step, not prose.** When the work needs an act only a person can do —
+   a sign-in that opens a browser, a device code, a token to paste, a prompt at the machine, an
+   approval on somebody else's dashboard — declare it typed, hand off `in-progress`, and stop:
+   ```
+   bash scripts/phase-outcome.sh <slug> <N> needs-human --needs credential \
+     --step browser-login --title "Sign the gh CLI in to the acme org" \
+     --open-command "gh auth login" --proof 'cmd:"gh auth status"'
+   ```
+   Never run the sign-in yourself: in a `-p` session it hangs on a browser nobody sees, and the
+   console refuses it before it runs, naming this declaration filled in. Never put a
+   code, a token or a password in any flag — the script refuses it; the person types it where the
+   step opens. The console reminds the person, watches your `--proof` (and runs it when they press
+   *I did it*), and resumes THIS session told what was proven — so name the proof you would check
+   yourself. `references/conventions.md` §A person's turn.
 
 ### Mode 3 — `phase-finish` (phase is done)
 
@@ -450,31 +514,44 @@ bottom.** Step 1
 checklist is what makes it unmissable: **never hand off a phase whose verification is red.**
 
 ```
-1. VERIFY — run plan §Phase N's Verification commands; ALL green (never hand off red)
+1. VERIFY — run EVERY line of plan §Phase N's Verification; ALL green (never hand off red)
 2. Commit changed files — explicit paths; verify the sha with: git log -1
-3. Write the handoff — new-handoff.sh, then fill frontmatter + body
+3. Write the handoff — new-handoff.sh, then the body; `complete` + INDEX last, once every line is green
 4. Leave notes for later phases — one addressed bullet each; nothing else reaches them
 5. Update memory project_<slug> + its MEMORY.md index line
-6. Stop & hand off, or batch — continue while the budget lasts
+6. Stop & hand off — the console runs one phase per session; batch only by hand
 ```
 
 1. **Verify.** Run the phase's own `Verification` commands from plan §Phase N (tests, build, lint —
    whatever the plan names) and confirm **every exit criterion** against them. All green is the bar for
    `status: complete`. If something is red and you can't fix it now, hand off **blocked**
    (`new-handoff.sh <slug> <N> <title> blocked`) with the failure recorded — never a `complete` handoff
-   on red verification.
+   on red verification. **Not run is not green:** a line owed, deferred or skipped (a device sweep left
+   for later, a check "owed at idle") means the handoff says `in-progress` and, under a supervisor, the
+   phase declares `partial` (`waiting-external` when the line waits on a clock you do not control) —
+   never `complete`. `complete`, and the INDEX row's flip to it, are written LAST, after every
+   §Verification line ran green: the board reads a `complete` handoff as done the moment it holds a
+   body, and its dependents board at once (#153). **Record each command as you run it**, red ones too:
+   `bash scripts/phase-outcome.sh <slug> <N> verified --command "<the command as the plan writes it>"
+   --exit <its exit status>`. A supervising console then re-runs only what you did not prove at an
+   equivalent tree (the same one, or one where only your handoff, a lock or `CHANGELOG.md` changed
+   since), and a red verdict of its own re-opens the phase whatever the handoff says.
 2. **Commit** changed files — explicit paths, never `git add -A`; commit inside the relevant submodule(s);
    end the message with the repo's `Co-Authored-By:` trailer. Commit to the plan's recorded branch — **the
    current branch by default; never `git checkout -b`** unless the user asked and the plan names a branch
    (then that single branch carries *all* phases, sequential and concurrent), or the boot prompt names a
    console-declared run branch — that prompt then owns the branch discipline. **Verify with `git log -1` —
    never copy a sha from memory; the environment may have auto-committed.**
-3. **Handoff:** `bash <skill-root>/scripts/new-handoff.sh <slug> <N> <title>`, then
+3. **Handoff:** `bash <skill-root>/scripts/new-handoff.sh <slug> <N> <title>` (its status defaults to
+   `complete`; pass `in-progress` while any §Verification line is still owed — step 1), then
    fill the frontmatter and body (see `references/handoff-format.md`) — and put every ruling you
    recorded into **Key decisions / gotchas**, since the handoff is what a person reads and the ledger
    is what the console reads. The script auto-fills `depends_on` +
-   `blocks` from the graph and **auto-generates the `## ▶ Start next phase(s)` section with one boot prompt
-   per phase this phase unblocks** — review it, don't rewrite it. (It reads the just-finished phase as done,
+   `blocks` from the graph and **auto-generates the `## ▶ Start next phase(s)` section** — the whole boot
+   prompt of the one phase this phase unblocks, or, when it unblocks several, **the shared boot ONCE and a
+   block per phase** holding only that phase's own parts (its reading list, notes, gate, and whatever else
+   differs), from which `next-phase-prompt.sh <slug> <N> --phase <M>` and the console compose the full
+   prompt at launch — review it, don't rewrite it. (It reads the just-finished phase as done,
    so the prompts are correct even before you commit the handoff.) Writing the handoff every phase keeps it
    resumable from a fresh session **even when you batch** the next one.
 4. **Leave notes for later phases.** Fill the handoff's `## Notes for later phases` with what you
@@ -525,9 +602,10 @@ checklist is what makes it unmissable: **never hand off a phase whose verificati
    done, what remains, and what you are waiting on; (3) declare the wait machine-readably:
    `bash scripts/phase-outcome.sh <slug> <N> waiting-external --wait-minutes <M> --reason "<what>"
    --watch <ref>`; (4) stop. The supervisor parks the phase and resumes THIS session when the window
-   elapses — within the phase's wait budget (a window past what is left is refused with a
-   `waiting-external-timeout` halt, never shortened; `- **Waits on:** <ref> · <max>` allows more), and
-   never while your session is still running. (An interactive session may instead simply keep the turn
+   elapses — within the phase's wait budget (past what is left, a wait naming a ref it can watch is
+   given what is left, and one naming none parks on a spent budget with a `budgets` errand for a
+   person — never a failure; `- **Waits on:** <ref> · <max>` allows more), and never while your
+   session is still running. (An interactive session may instead simply keep the turn
    and wait.) **A session nobody supervises** (no
    `PE_OUTCOME_FILE` in its environment) writes the same declaration into the console's inbox
    (`runs/<instance>/<slug>/outcomes/phase-NN.json`, printed on stderr); a running Phase Console with `--allow-run`
@@ -547,19 +625,25 @@ checklist is what makes it unmissable: **never hand off a phase whose verificati
    console sent to mend one specific thing that turned out to be already mended. It is neither `complete`
    (it fixed nothing) nor a failure (nothing was wrong).
 
-6. **Stop & hand off, or batch.** If the proof is waiting on an external clock, use the
+6. **Stop & hand off — the console runs one phase per session; batch only by hand.** If the proof is
+   waiting on an external clock, use the
    §External-waits protocol above — under a supervisor, `phase-outcome.sh … waiting-external`
    is the ONLY channel it can read; prose reads as a failed phase. Then run the
-   end-of-phase script (it prints the live board, batching advice,
-   and a START COPY / END COPY boot prompt for **every** phase now ready):
+   end-of-phase script (it prints the live board, batching advice for a person driving by hand,
+   and the boot for **every** phase now ready — one phase's START COPY / END COPY prompt, or a fan-out's
+   shared boot once with a block per phase, any of which `--phase <M>` composes whole):
    ```bash
    DOCS_ROOT=<hub-root> bash <skill-root>/scripts/next-phase-prompt.sh <slug> <N>
    ```
    Then decide, and **release the phase lock when you stop** (`phase-lock.sh <slug> release <N> --owner … --git`):
-   - **Batch (continue in THIS session) — the efficient default.** If a ready phase fits the **remaining
-     session budget** (your live context meter, `references/sizing.md`) — sequential on this one *or* an
-     independent sibling — just continue into it (Mode 2 in place, lock and all). You save a full
-     bootstrap + closeout and keep the cache warm. (`--session-plan` shows which phases belong together.)
+   - **Under a supervisor (`$PE_OUTCOME_FILE` set), this is the stop** — never continue into another
+     phase, whatever the script's batching advice says: the console boards every phase in a session of
+     its own, and the next one is its to start.
+   - **Batch (continue in THIS session) — by hand only.** Driving the phases yourself, if a ready phase
+     fits the **remaining session budget** (your live context meter, `references/sizing.md`) — sequential
+     on this one *or* an independent sibling — just continue into it (Mode 2 in place, lock and all). You
+     save a full bootstrap + closeout and keep the cache warm. (`--session-plan` shows which phases
+     belong together.)
    - **Stop & hand off (fresh session)** — when the budget is spent, the next phase is **GATED** (never
      batch past a gate: a 🔒GATED·ai phase's fresh session clears the gate itself, a 🔒GATED·human one
      waits for the operator's approval first), it wants a **different model**, the **account's usage window is
@@ -570,26 +654,40 @@ checklist is what makes it unmissable: **never hand off a phase whose verificati
      finished.
    - **Several phases ready:** run them in any order. Ones with **disjoint scopes** may run as separate
      sessions at the same time (the banner names which pairs those are); ones sharing a repo run one at a
-     time. Continue into ONE of them here if the budget allows; the output lists a boot prompt for each of
-     the rest, and every prompt carries its own `conflicts` check.
+     time. By hand, continue into ONE of them here if the budget allows; the output lists a boot prompt
+     for each of the rest, and every prompt carries its own `conflicts` check.
    - **No phase ready but work remains:** the just-finished phase unblocked nothing yet (downstream still
      waits on other deps). The script says so; pick up any *other* phase the board shows as `ready`.
    - **Final / all done:** when the board shows every phase `done`, the script prints the closeout — run
      the plan's §End-to-end verification yourself (always), dispatch the fresh **`qa-full` subagent only
-     if the closeout prints its brief** (QA-on plans), then mark the plan `status: complete` and check
-     memory for user gates. You can also pass `none` to force the closeout.
+     if the closeout prints its brief** (QA-on plans), then — only once every line is green — mark the
+     plan `status: complete` and check memory for user gates. You can also pass `none` to force the
+     closeout.
 
 ## Helper scripts (deterministic, output-only — code never enters context)
 Run from the repo root that owns `docs/` (in this monorepo, the **superproject root**), or set `DOCS_ROOT`.
 Scripts resolve the superproject root automatically when run from inside a submodule directory.
+**Which copy of the scripts:** a session Phase Console starts carries `PE_SCRIPTS` — the console's own
+scripts directory — and every prompt it composes names a script as `$PE_SCRIPTS/<script>`; a boot prompt
+says `"${PE_SCRIPTS:-<skill-root>/scripts}"`, so the same line runs by hand. Run them that way, and write
+them that way in a handoff — never a skill copy's own path, which pins later sessions to that copy. The boot
+prompt also carries the console's commit, and says so when the skill you loaded is at another one: then the
+prompt and `$PE_SCRIPTS` win. `scripts/skill-api.env` stamps the interface (`PE_API`, `PE_API_MIN`); a run
+refuses to start when the console's and the skill's do not meet, naming the half to update.
 - `scripts/new-plan.sh <slug>` — scaffold `docs/plans/<slug>.md`.
 - `scripts/phase-graph.sh <slug>` — **the engine.** Default: the live DAG board (done / ready / waiting,
   with unmet deps, gated flags, and `SUGGESTED BATCHES:` when sizes are present). Machine modes used by the
   other scripts (and handy directly): `--ready`, `--ready-after N`, `--deps N`, `--dependents N`,
-  `--gated N`, `--boot-prompt N`, `--size N`, **`--repos N`** (phase N's SCOPE as a normalized csv, read
+  `--gated N`, `--boot-prompt N`, **`--boot-fanout "N M …"`** (the shared boot once — `<N>` for the
+  number, a `⟨section⟩` line wherever the siblings differ — then each phase's own block; the shared boot
+  plus a block composes to that phase's `--boot-prompt`, byte for byte), `--size N`, **`--repos N`** (phase N's SCOPE as a normalized csv, read
   from the Repos column — never empty; an undeclared phase reads as `all`),
-  **`--session-plan [model|budget]`** (live-aware session
-  grouping for a model's budget — done phases excluded, GATED/over-budget/unmet-dep groups flagged),
+  **`--session-plan [model|budget]`** (the unit first — `1 phase ≥ 1 session`, since the console's
+  autopilot never batches — then the plan's weight as a generated line to quote, the remaining phases
+  forecast in MEASURED sessions per phase, the session model — a floor paid once plus a slope — and
+  this repository's boot floor; then live-aware grouping a person may batch by hand — done phases
+  excluded, GATED/over-budget/unmet-dep groups flagged; with no argument it sizes for the plan's own
+  `**Target model:**`, as the board does; `references/sizing.md`),
   **`--setup N`** (phase N's bring-up commands, one per line, in the order they run — the plan-wide
   `**Setup (every phase):**` line then the phase's own `- **Setup:**` bullet; the runner runs these
   BEFORE §Verification and never marks a phase red for one),
@@ -599,6 +697,10 @@ Scripts resolve the superproject root automatically when run from inside a submo
   branch* — board it in a checkout DETACHED at the trunk's head, which owns no ref and so may stand
   beside any number of others. That is what a phase after the run's pull request has merged needs.
   Every other value is documentation the console reads and acts on for nobody),
+  **`--floor [N]`** (phase N's `- **Wall-clock floor:** <duration>` bullet, in MINUTES rounded up — the
+  phase's FIXED floor (a full gate run, a CD wait), separate from its `Size:` tag, which weights context
+  rather than clock time; with no argument, every phase that declares one as `N<TAB>minutes`, ascending
+  order; nothing when a phase has none),
   **`--lint`** (structural validation: exit non-zero on a malformed row (**F1**), an undefined
   dependency (**F2**), a cycle (**F3**), a table whose SHAPE the parser cannot trust — no header row, no
   `Depends on` column, no `Repos` column, a row shorter than the header (**F20**) — or a cell it read but
@@ -610,14 +712,30 @@ Scripts resolve the superproject root automatically when run from inside a submo
   `gate-type-unknown` (**F24** — a `*(GATED)*` heading with no `Gate-check`, which reads as `ai` until
   it has one, and a directive whose type is not on the list), and `decision-outstanding-unowned`
   (**F25** — a `## Decisions` row nobody owes; its siblings `decision-key-unknown`,
-  `decision-state-unknown`, `decision-source-unknown` are the same tier).
-  Plus the **advisory family F15–F19, F22–F23, F28, F30** on stderr, which
+  `decision-state-unknown`, `decision-source-unknown` are the same tier). **Since 6.0.0 a fifth:**
+  `human-step-superseded`, `human-step-kind-unknown` and `human-step-field-invalid` (**F37** — a
+  `- **Human step:**` bullet the reader skips: the 5.1.0 `<who, what, proof ref>` spelling, named in the
+  line with the grammar that replaced it; a kind that is not one of the sixteen; a field, `where`,
+  `window`, `auto-open`, `credential` or `open:` link the grammar cannot read).
+  Plus the **advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38** on stderr, which
   never changes the exit code: F15 an unregistered MCP server, credential or account ·
   F16 a verification that waits on an external clock · F17 a lead binary not installed here ·
   F18 a cwd-sensitive lead with no `**Verify in:**` · F19 a plan that cannot progress at all ·
   **F22** bring-up inside §Verification (move it to `- **Setup:**`) · **F23** an expected failure stated
   in prose beside a command (the runner reads exit codes, not sentences) · **F30** a forward note
-  addressed to a phase that is already done, which nothing will ever board with.
+  addressed to a phase that is already done, which nothing will ever board with · **F32** a
+  §Verification line whose exit code reads FLEET-WIDE state (`task hygiene`, `task drift`, a
+  machine-wide `ps … | grep`), which cannot pass while anyone else is working — the warning names only
+  forms the task accepts: `task hygiene` has none, so assert the plan's own footprint; one
+  `task drift:<gate>`; a process named by its pid ·
+  **F33** a Repos cell naming a repository outside the docs root, in a plan whose other cells are inside
+  it: that phase alone cannot be isolated (it runs in the run's checkout with an unqualified claim) ·
+  **F34** a Repos cell naming the superproject itself in a phase whose `Files` are all in submodules or
+  under `docs/` — name the submodules it writes · **F35** a `Checkout:` value the console never acts on
+  (only `main`, `master` or `default` means anything to it) · **F36** a `Waits on:` max shorter
+  than the timeout of the workflow it watches (`wait-window-short`, told through `PE_WAIT_TIMEOUTS`
+  — `<ref>=<minutes>` pairs; unset is off, set but empty an answer) · **F38** a `Human step:` that
+  names no `proof:` ref (`human-step-no-proof`) — only a person's word can ever close it.
   `references/plan-format.md` has the full reasoning for each), **`--qa-mode [N]`** (the QA regime: `off` ·
   `on <reason>` · `waived <reason>` — with no argument the PLAN's, and with a phase number that phase's
   resolved answer naming which level decided it, since `- **QA:** on|off` in a §Phase section beats the
@@ -657,7 +775,15 @@ Scripts resolve the superproject root automatically when run from inside a submo
   to do when one will not connect — with no phase argument, the plan-wide `## Session budget` line alone;
   with one, that phase's answer, which for `--mcp` is the plan line UNIONED with the phase's own bullet
   and for `--mcp-policy` is the phase's bullet OVERRIDING the plan's. Empty `--mcp-policy` means the plan
-  has no opinion, which is a different fact from `continue`), **`--credentials [N]`** /
+  has no opinion, which is a different fact from `continue`), **`--permission-mode [N]`** (the
+  `--permission-mode` a phase's session starts in, as `mode<TAB>phase|plan` — the phase's
+  `- **Permission mode:**` bullet OVERRIDING the plan's `**Permission mode:**` line, any case, printed as
+  the CLI spells it; nothing when both are silent, so the run's default answers and `acceptEdits` below
+  it; a word that is not a mode fails the lint, **F31** `permission-mode-unknown`),
+  **`--model-policy [N]`** (what a run may do to a phase's model, as `ladder|pinned<TAB>phase|plan` —
+  the phase's answer over the §Session budget line; nothing when the plan is silent, so the run's
+  `modelPolicy` answers, and `ladder` below it),
+  **`--credentials [N]`** /
   **`--credential-policy [N]`** (the credential ids a phase needs and what the plan says when one is not
   held — the two MCP shapes exactly: `**Credentials:**` ∪ `- **Credentials:**`, and
   `**Credential policy:** require|continue` overridden by the phase's bullet, silence printing nothing),
@@ -665,11 +791,20 @@ Scripts resolve the superproject root automatically when run from inside a submo
   (how long a phase may stay parked on its declared waits, as `minutes<TAB>phase|plan` — its own
   `- **Waits on:** <ref> · <max>` bullet, else the plan's `**Wait budget:**`; nothing means the console's
   default) / **`--waits-on N`** (that bullet's refs, one per line — a `date:` among them countersigns a
-  wait up to that instant), **`--qa-exhausted`** (the `**QA exhausted:**` line's one word — `waive`,
+  wait up to that instant), **`--verify-timeout [N]`** (how long ONE §Verification command may run
+  before the console cuts it, as `minutes<TAB>phase|plan` — the phase's `- **Verify timeout:**`
+  bullet, else the plan's `**Verify timeout:**`; nothing means the console scales the limit from the
+  line's measured history. A command cut by its clock is retried once at twice the limit, and a second
+  cut parks the phase `verify-timeout` — never a red), **`--qa-exhausted`** (the `**QA exhausted:**` line's one word — `waive`,
   `halt`, or an owner — the answer the console acts on when a phase's QA rounds run out) /
   **`--person-check N`** (that phase's `- **Person-check:**` bullet — `allow`, `halt`, or an owner — what
   to do with a §Verification fragment written as prose; silence prints nothing and the console's
-  policy table answers),
+  policy table answers), **`--human-steps [N]`** (the acts only a person can do that phase N declares,
+  one `- **Human step:** <kind> · <what> · open: … · proof: … · where: … · window: … [· auto-open: host]
+  [· credential: <id>]` bullet per line as `kind<TAB>what<TAB>open<TAB>proof<TAB>where<TAB>window-minutes
+  <TAB>auto-open<TAB>credential` — `where` resolved to the kind's default when the bullet is silent; with
+  no argument, every phase's, each line led by `N<TAB>`; a bullet the lint refuses (F37) is not a step;
+  the sixteen kinds are `scripts/human-steps.env`'s),
   **`--decisions [N]`**
   (the decision manifest as it HOLDS — the plan's `## Decisions` rows with
   `docs/handoffs/<slug>/decisions.md` merged over them and, with a phase, that phase's own rows over
@@ -689,7 +824,8 @@ Scripts resolve the superproject root automatically when run from inside a submo
   bash twin of `viewer/shared/decisions-model.js`, which owns them.
 - `scripts/new-handoff.sh <slug> <N> <title> [status] [--qa] [--force]` — scaffold the phase handoff +
   create/update `INDEX.md`. Auto-fills `depends_on` + `blocks` from the graph and the
-  `## ▶ Start next phase(s)` section (a boot prompt per unblocked phase). `status` is one of the four
+  `## ▶ Start next phase(s)` section (the next phase's boot prompt, or a fan-out's shared boot once and a
+  block per unblocked phase). `status` is one of the four
   writable handoff words — **`complete | in-progress | blocked | pending`**, frozen (a fifth would change
   what "done" means; owner `viewer/shared/plan-vocab.js` `HANDOFF_STATUSES`) — and defaults to `complete`;
   pass `in-progress`/`blocked` mid-phase, and `pending` for a handoff scaffolded before its phase runs.
@@ -698,16 +834,18 @@ Scripts resolve the superproject root automatically when run from inside a submo
   when the plan's qa-mode is not `off`; `--qa` forces QA on for this finish (creates the file,
   backfilling earlier completed phases as `waived`).
 - `scripts/handoff-status.sh <slug>` — INDEX + per-file status + the live DAG board (calls the engine).
-- `scripts/next-phase-prompt.sh <slug> <completed-phase|none>` — end-of-phase stop banner, live board,
-  batching advice, and a START COPY / END COPY boot prompt for **every** phase the completed phase unblocks
+- `scripts/next-phase-prompt.sh <slug> <completed-phase|none> [--phase N]` — end-of-phase stop banner, live
+  board, batching advice, and the boot for **every** phase the completed phase unblocks (a lone next
+  phase's START COPY / END COPY prompt; a fan-out's shared boot once and a block per phase), and with
+  `--phase N` only phase N's full prompt, composed at launch
   (on a QA-`on` plan, run it only *after* the verdict is recorded). Pass the phase you just finished (not
   the next number); `none` forces the final-phase closeout (which prints the `qa-full` brief only for
   QA-`on` plans).
 - `scripts/validate.sh <slug>` — deterministic validator: structural lint of the plan
-  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29, and the advisory family F15–F19, F22–F23, F28, F30 on stderr) **plus**
+  (F1/F2/F3/F14/F20/F21/F24/F25/F26/F27/F29/F31/F37, and the advisory family F15–F19, F22–F23, F28, F30, F32–F36, F38 on stderr) **plus**
   handoff body/consistency checks (valid status, required sections, `depends_on` agreeing with the graph).
   Run before trusting a board or finishing a phase.
-- `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts> <N> [--owner ID] [--lease S]
+- `scripts/phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> <N> [--owner ID] [--lease S]
   [--scope CSV] [--session ID] [--worktree PATH] [--branch NAME] [--git] [--force]` — cooperative phase
   locks (concurrency guard). `--session` (or `$PE_SESSION_ID` / `$CLAUDE_CODE_SESSION_ID`, read
   automatically) names the Claude conversation holding the lock, which is what lets the console show it
@@ -716,7 +854,10 @@ Scripts resolve the superproject root automatically when run from inside a submo
   **half of the pair that changes an answer** (see `--branch` below): a tree alone carves nothing, but
   without one a branch carves nothing either. Lock files at
   `docs/handoffs/<slug>/.locks/phase-NN.lock`; `--git` pulls before checking and commits+pushes the claim
-  so other clones see it (retrying a raced commit/push up to 3×). `--scope` (or `$PE_SCOPE`) records the
+  so other clones see it (retrying a raced commit/push up to 3×) — committing the lock's path ALONE, inside
+  the docs root's short critical section. **Under an autopilot (`$PE_LOCK_MIRROR=console`, which the
+  runner exports) `--git` is skipped** and your lock calls are file-only: the console runs `mirror` — one
+  commit of that lock path where it stands now, never a pull or a push — outside your turn. `--scope` (or `$PE_SCOPE`) records the
   repos the session is working in as a `scope=` line — older locks simply have none, which reads as
   *unknown* and therefore collides with everything. `--branch` (or `$PE_BRANCH`) records the branch the
   work rides as a `branch=` line, and together with `worktree=` it is the PAIR that CHANGES an answer:
@@ -736,7 +877,8 @@ Scripts resolve the superproject root automatically when run from inside a submo
   prints the `claim … --here` line for it; `merge` folds it onto `pe/<slug>` — a fast-forward when it can,
   a merge commit when it cannot — and `remove` takes the tree, the merged branch and the lock away. Never
   `git worktree add` a sibling folder of the project by hand: nothing sweeps it, and nothing inside it
-  finds the docs root.
+  finds the docs root. Under a console run (`PE_OWNER=autopilot/…`) a build lane and `merge` refuse:
+  a hand tree on the run branch takes the branch the run's own checkout needs.
 - `scripts/phase-landing.sh <slug> <N> <state> [--repo KEY] [--policy WORD] [--ref REF] [--sha SHA]
   [--pr URL] [--by WHO] [--note TEXT]` · `<slug> list [N]` — the deterministic, idempotent writer for
   `docs/handoffs/<slug>/landing.md`, the ledger the `landed N` and `pr-merged N` gates read. `state` is
@@ -766,6 +908,13 @@ Scripts resolve the superproject root automatically when run from inside a submo
   somebody decided something. It is a third section rather than a fifth cell because both tables are
   COUNTED positionally by the bash and JS readers, and prose is the one value that cannot promise to be
   short. See `references/qa-method.md`.
+- `scripts/wait-budget.sh <slug> [--phase N [--ref REF]…] <max>` — the deterministic writer for the
+  two wait-budget directives `--wait-budget` reads: the phase's `- **Waits on:** <refs> · <max>` (the
+  refs and any note kept; `--ref` names them when the phase has no bullet yet) or, without `--phase`,
+  the plan's `**Wait budget:**` line. `<max>` is `90m`, `2h`, `3d` or bare minutes, written in its
+  plainest unit. Idempotent, atomic, never touches git; its only output is the engine's read-back
+  (`minutes<TAB>phase|plan`), and a disagreement is exit 1. What the console's one-press raise runs
+  (control-tower phase 14, #40).
 - `scripts/qa-mode.sh <slug> [--phase N] on|off|inherit` — the deterministic writer for the two QA
   switches the engine reads. Without `--phase` it sets the plan's `**QA gate:** on|off` line in
   §Session budget (adding the line — or the whole section — when there is none); with one it sets that
@@ -788,8 +937,12 @@ Scripts resolve the superproject root automatically when run from inside a submo
   every word were legal everywhere.
 - `scripts/phase-outcome.sh <slug> <N> <complete|waiting-external|blocked|needs-human|partial|no-defect>
   [--reason TEXT] [--watch REF]… [--wait-minutes N | --until ISO8601] [--needs KEY] [--rule TEXT]
-  [--command TEXT]` — the
+  [--command TEXT] [--step KIND --title TEXT [--open-url URL | --open-command CMD] [--where host|any]
+  [--proof REF] [--step-line TEXT]… [--code CODE] [--credential ID]]` — the
   session→runner channel: ONE atomic JSON file at `$PE_OUTCOME_FILE`, read once and consumed.
+  **A parking declaration that names `--watch` refs asks the console first** (`POST /hooks/declaration`,
+  20 s at most): when a ref has ALREADY landed, nothing is written or parked and the script **exits 3**
+  with `already landed — continue: <ref>` — carry on with the phase; never stop on it.
   **`--needs <key>` is REQUIRED on `blocked` and `needs-human`** (exit 2 without it) and refused on
   the rest: the decision the session is missing, as a key of the plan's `## Decisions` manifest
   (`scripts/decisions.env`) or a blocker class as its short form — `credential`, `permission`, `gate`,
@@ -806,18 +959,40 @@ Scripts resolve the superproject root automatically when run from inside a submo
   `--watch` is repeatable to 8 refs, and the console polls them on a timer of its own
   (`viewer/server/watch-scheduler.ts`), resuming YOUR session when one lands: `gh:<repo>#run/<id>`
   (the run reaches `completed`, any conclusion) · `gh:<repo>#pr/<n>` (the PR leaves OPEN) ·
-  `date:<ISO8601>` (that instant passes) · `lock:<slug>/<phase>` (nothing holds that scope any more) ·
+  `date:<ISO8601>` (that instant passes) · `lock:<slug>/<phase>` (nothing holds that scope any more —
+  somebody ELSE's lock: one naming the declaring phase is refused, exit 2, because the only release it
+  could see is its own closeout's) · `phase:<slug>/<N>` (the console's RECORD of sibling phase N reads
+  done, after its §Verification — the way to wait on a sibling, re-probed the moment that phase moves;
+  a re-opened phase un-lands it; prefer it to any `cmd:` grep of a handoff) · `verify:<slug>/<N>` (your
+  OWN phase only: your red §Verification lines are re-run whenever the branch head moves, and it lands
+  when all of them pass on one head — for "my blocker is a sibling's red") ·
   `cmd:"<command>"` (it exits 0 — **run** under the same policy a plan's §Verification gets — NOT
-  read-only: `npm ci` passes it — 60 s, and **at most 12 runs per phase**, after which the ref reads
-  `refused`; so write a ref that only READS and costs little). The resume instruction names what actually happened, so
-  read it rather than assuming the thing you waited for succeeded — a cancelled run is not a result.
-  A ref no scheme parses is still recorded, with a warning on stderr: nothing will ever check it.
+  read-only: `npm ci` passes it — 60 s, backing off 5 m → 15 m → 1 h → 6 h **until the phase's wait
+  budget ends**, after which the ref reads `refused`; so write a ref that only READS and costs little).
+  **A `cmd:` probe is self-contained**, because the console runs it later, from its own directory, with
+  none of your shell: absolute paths, no shell variables, no backticks, no cd, balanced quotes, and
+  exit 0 only when the thing has happened. A ref is at most 1,000 characters, and the script never cuts
+  one: a longer ref, or a `cmd:` ref holding a `$` or a path relative to your cwd, exits 2 with nothing
+  written (a script at an absolute path is one short ref). The resume instruction names what actually
+  happened, so read it rather than assuming the thing you waited for succeeded — a cancelled run is not
+  a result. A ref no scheme parses is still recorded, with a warning on stderr: nothing will ever check it.
   **Declarations are bounded.** `waiting-external` spends the phase's 4 waits and its wait budget;
   each other status is acted on at most 4 times per phase — a fifth is recorded, not acted on, and parks
   the phase for a person until an operator's Retry; a `blocked`/`needs-human` clock is capped at 7 days;
   and unsupervised, two `partial`s within 5 minutes are one act. A declaration stands until a newer one,
   a `git commit` or `phase-outcome.sh` call in the resumed session, the board closing the phase, or a
   Retry spends it.
+  **`--step KIND` makes a `needs-human` a HUMAN STEP** (control-tower phase 41) — refused on every
+  other status: the ask becomes a typed record the console holds in its ledger, raises as ONE
+  `human-step` inbox row and ONE `needs-you` push, and parks with wait kind `person`, charging no
+  external-wait budget. KIND is one of the sixteen (`scripts/human-steps.env`); `--title` (required)
+  says what the person must do, `--open-url` (http or https only) or `--open-command` what to open,
+  `--where host|any` where (default: the kind's), `--proof` the watch ref that proves it, `--step-line`
+  a numbered step (repeatable), `--code` a device code (`device-code` only), `--credential` the
+  registry id a `secret-entry` stores under (required there). A value shaped like a secret — a token,
+  a password, a one-time code, a URL query secret — is refused (exit 2, nothing written, the value
+  never echoed): the person types it where the step opens, never into a declaration. A session's
+  step never opens by itself; only a plan's `auto-open: host` may.
   Its second
   shape, **`… <N> ruling --what … [--why …] [--kind ambiguity|deviation|deferral] [--cost-if-wrong …]
   [--for <M|next|all>]
@@ -832,6 +1007,20 @@ Scripts resolve the superproject root automatically when run from inside a submo
   ledger; `--remember global` asks the console that owns the repository to hold the words as its
   `policy.<key>` answer, through the same route the inbox's action uses, and exits 1 naming the
   Settings page when no console answers.
+  Its third shape, **`… <N> verified --command TEXT --exit N [--in DIR]`**, records what the
+  session's OWN §Verification proved: one NDJSON line to `$PE_PROOFS_FILE`, else
+  `runs/<instance>/<slug>/proofs.ndjson`, naming the command (whitespace folded), its exit status and
+  the WORKING tree it ran against — committed or not, computed in a private index copy, so the
+  session's own index is never touched; `--in` names where the command ran (default: here), and
+  outside a git working tree it exits 2. Like a ruling it is never an outcome. The console's pass
+  after the session skips a command proven green at an equivalent tree — the same tree, or one where
+  only paperwork (`docs/handoffs/**`, `.locks/**`, `CHANGELOG.md`) changed since — runs everything
+  else, and journals any disagreement between the two verdicts (`phase.verify-disagreed`).
+  Its fourth shape, **`… <N> progress --label TEXT --done N --of M`**, says how far the active task's
+  long operation has got (a sweep, a batch): one line on the task channel (`$PE_TASKS_FILE`, else the
+  console's inbox task file), journalled `phase.progress` on the task in progress at the next tool
+  result, and drawn as that task's bar in the phase report. Never an outcome; `1 ≤ --of`,
+  `--done ≤ --of`, and a malformed call exits 2 having written nothing.
 - `scripts/decisions.sh <slug> [--phase N] answer <key> --value TEXT | waive <key> --reason TEXT |
   promote --from-ruling <id> --key <key> | list` — the deterministic writer for the decision
   manifest's mutable twin, `docs/handoffs/<slug>/decisions.md`, which `--decisions` merges OVER the
@@ -910,7 +1099,8 @@ Scripts resolve the superproject root automatically when run from inside a submo
 - **For maintainers of this repository, never for a session working a plan:** `scripts/gates.sh
   [--quick] [--list] [--ci] [--build] [--keep-going] [--install-hook] [--help]` — the release gate, on
   this machine (there is no CI): bash engine, engine parity, the server and client suites, both
-  typechecks, lint, format, the build gate, the scrub and the tarball assertions, in that order;
+  typechecks, lint, format, the build gate, the real-browser tour (`viewer/e2e`), the scrub and the
+  tarball assertions, in that order;
   `--quick` is the cheap subset, `--list` prints the plan, `--install-hook` points the clone's
   `core.hooksPath` at `scripts/git-hooks/` so a push to `main` or a tag runs the full matrix and any
   other ref the quick one (`PHASE_CONSOLE_SKIP_GATES=1` skips, and says so).
@@ -920,9 +1110,10 @@ Scripts resolve the superproject root automatically when run from inside a submo
 The load-bearing rules a session must not get wrong; full rationale in `references/conventions.md` +
 `references/sizing.md`.
 - **Right-size; don't reflexively split.** One coherent chunk per session, sized to the running model's
-  budget (~0.2 × window in weight); batch any ready phases — sequential or siblings — that fit it, split
-  any phase that won't fit alone. A session boundary is earned by budget, gate, or model switch — never
-  tidiness. (sizing.md; conventions §Session sizing)
+  budget (~0.2 × window in weight) by the measured model; split any phase that won't fit alone. The
+  console runs one phase per session; batch only by hand — ready phases, sequential or siblings, that fit
+  together. A session boundary is earned by budget, gate, or model switch — never tidiness. (sizing.md;
+  conventions §Session sizing)
 - **Keep the cache warm; offload to `Agent` subagents.** No model/effort switch or `/compact` mid-phase
   (open a fresh session instead). Push broad search, multi-file reads, and independent verification to
   `Agent` subagents — they return only a summary, so the tokens stay out of your session (the biggest

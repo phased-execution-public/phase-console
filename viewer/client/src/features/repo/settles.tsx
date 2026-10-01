@@ -21,30 +21,20 @@
 
 import { useMemo } from 'react';
 import { GitPullRequestArrow } from 'lucide-react';
-import { Badge, Chip, DataTable, Empty } from '@/components/ui';
-import type { BadgeTone, Column } from '@/components/ui';
+import { Badge, Empty } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
+import { OpsBadge } from '@/components/ui/status';
+import type { Column } from '@/components/data-table';
 import type { RepoSettleEvent, RepoSettles, SettleKind } from '@/lib/api';
 import { relativeTime } from '@/lib/format';
 
 /**
- * How each settle event paints.
- *
- * `pending` and `unsupported` are deliberately not amber: neither is a problem
- * with the run. `pending` is a settle that has not happened yet and
- * `unsupported` is a strategy this repository cannot do — a standing
- * configuration fact. `failed` is the one that gets the alarm.
+ * What each settle event means, on its badge's title. Its word, icon and paint
+ * are the model's (`settle` in `shared/status-model.js`): `pending` and
+ * `unsupported` are deliberately not failures — one has not happened yet, the
+ * other is a strategy this repository cannot do — and `failed` is the one that
+ * paints the alarm.
  */
-const KIND_TONE: Readonly<Record<SettleKind, BadgeTone>> = Object.freeze({
-  settled: 'ok',
-  landed: 'ok',
-  pushed: 'ok',
-  pending: 'neutral',
-  unsupported: 'neutral',
-  failed: 'bad',
-  released: 'neutral',
-  pruned: 'neutral',
-});
-
 const KIND_BLURB: Readonly<Record<SettleKind, string>> = Object.freeze({
   settled: 'The lane folded back into the run branch.',
   landed: 'The work reached the trunk.',
@@ -60,8 +50,8 @@ const KIND_BLURB: Readonly<Record<SettleKind, string>> = Object.freeze({
  * The columns, and the one number each of them declares.
  *
  * Every `min` below was measured against the widest real content the column can
- * hold, not guessed: `unsupported` is the longest kind word and its `Badge` is
- * 78 px of border box, `fast-forward` the longest strategy. Under-declaring one
+ * hold, not guessed: `Not supported here` is the longest settle word, drawn
+ * behind its icon, and `fast-forward` the longest strategy. Under-declaring one
  * is what flips a whole table to scroll mode for four pixels and takes the
  * sticky header with it — see `components/ui/table.tsx`.
  *
@@ -105,13 +95,10 @@ const settleColumns: Column<RepoSettleEvent>[] = [
     id: 'kind',
     head: 'Event',
     priority: 1,
-    min: 108,
+    // `Not supported here` behind its icon is the widest word of the settle row.
+    min: 148,
     cellClassName: 'align-top',
-    cell: (e) => (
-      <Badge tone={KIND_TONE[e.kind] ?? 'neutral'} title={KIND_BLURB[e.kind] ?? e.kind}>
-        {e.kind}
-      </Badge>
-    ),
+    cell: (e) => <OpsBadge vocab="settle" word={e.kind} title={KIND_BLURB[e.kind] ?? e.kind} />,
   },
   {
     id: 'branch',
@@ -143,7 +130,7 @@ const settleColumns: Column<RepoSettleEvent>[] = [
     min: 96,
     cellClassName: 'align-top',
     cell: (e) => (
-      <Chip
+      <Badge
         tone="neutral"
         data-testid="settle-via"
         title={
@@ -153,7 +140,7 @@ const settleColumns: Column<RepoSettleEvent>[] = [
         }
       >
         {e.via}
-      </Chip>
+      </Badge>
     ),
   },
   {

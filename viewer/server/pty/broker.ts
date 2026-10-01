@@ -123,10 +123,14 @@ export class Broker {
   private idleSince: number = Date.now();
   private idleTimer: NodeJS.Timeout | undefined;
   private readonly injectedSpawn: PtySpawn | undefined;
+  /** node-pty's package root for the heal; undefined = resolved from this copy. */
+  private readonly spawnHelperRoot: string | undefined;
 
   constructor(options: {
     socketPath: string; credential: string; pidPath?: string;
     logPath?: string; idleMs?: number; spawn?: PtySpawn;
+    /** Where node-pty's `spawn-helper` lives — a test points it at a helper of its own. */
+    spawnHelperRoot?: string;
   }) {
     this.socketPath = options.socketPath;
     this.pidPath = options.pidPath;
@@ -134,6 +138,7 @@ export class Broker {
     this.logPath = options.logPath ?? join(dirname(options.socketPath), 'pty-broker.log');
     this.idleMs = options.idleMs ?? BROKER_IDLE_MS;
     this.injectedSpawn = options.spawn;
+    this.spawnHelperRoot = options.spawnHelperRoot;
     if (options.spawn) this.ptyState = 'yes';
   }
 
@@ -296,6 +301,11 @@ export class Broker {
       this.send(client.socket, { t: 'spawn-failed', ref: message.ref, error: this.ptyReason || 'node-pty is not available' });
       return;
     }
+    // Healed HERE, before every spawn, and not once when node-pty loaded
+    // (#89): this process outlives the console, so it outlives the update that
+    // ran `npm ci` underneath it, and that install put the helper back at 0644.
+    // One stat per spawn is the price of a terminal that opens after an update.
+    this.healHelper();
     let pty: PtyProcess;
     try {
       pty = spawn(message.file, message.args, {
@@ -455,6 +465,16 @@ export class Broker {
     try { socket.write(frame(message)); } catch { /* the close handler cleans up */ }
   }
 
+  /**
+   * The heal belongs in whichever process will actually spawn, and that is
+   * this one — see `pty/spawn-helper.ts`. Never throws: a helper that cannot be
+   * healed fails the spawn with node-pty's own error, as it always did.
+   */
+  private healHelper(): void {
+    const healed = this.spawnHelperRoot === undefined ? healSpawnHelper() : healSpawnHelper(this.spawnHelperRoot);
+    if (healed) this.say('broker.healed-spawn-helper', { path: healed });
+  }
+
   private loadPty(): Promise<PtySpawn | null> {
     if (this.injectedSpawn) return Promise.resolve(this.injectedSpawn);
     this.ptyModule ??= import('node-pty')
@@ -463,10 +483,6 @@ export class Broker {
           ?? (module_ as unknown as { default?: { spawn?: PtySpawn } }).default?.spawn
           ?? null;
         if (spawn) {
-          // The heal belongs in whichever process will actually spawn, and
-          // that is this one now — see `pty/spawn-helper.ts`.
-          const healed = healSpawnHelper();
-          if (healed) this.say('broker.healed-spawn-helper', { path: healed });
           this.ptyState = 'yes';
         } else {
           this.ptyState = 'no';

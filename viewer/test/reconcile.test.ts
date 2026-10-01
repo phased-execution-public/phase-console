@@ -301,6 +301,11 @@ test('a run asleep on a usage window reconciles to paused, with its clock intact
     assert.match(state.finishedReason ?? '', /usage limit/i);
     assert.equal(record.status, 'pending');
     assert.equal(record.resumeSessionId, 'sess-window', 'Continue resumes the same session');
+    // The WORD is the resume machinery's; the lifecycle stays the wait it is
+    // (control-tower phase 88, #148) — nobody paused this run.
+    assert.equal(state.lifecycle?.state, 'waiting', 'reconcile never flattens a clocked wait into a pause');
+    assert.equal(state.lifecycle?.wait?.kind, 'usage-limit');
+    assert.equal(state.lifecycle?.wait?.until, '2026-08-06T20:00:00.000Z');
   } finally { dir.cleanup(); }
 });
 
@@ -509,7 +514,32 @@ test('a restart mid-park reconciles to paused with the clock and the waiting rec
     assert.equal(state.phases['8'].parkedUntil, '2099-01-01T00:00:00Z');
     assert.match(state.finishedReason ?? '', /external work/,
       'the pause explains itself as a park, not a usage limit');
+    // #148: the park is still a WAIT on every reader — its kind, its clock, and
+    // the phase it is on — and the stop is the system's.
+    assert.equal(state.stoppedBy, 'system');
+    assert.equal(state.lifecycle?.state, 'waiting');
+    assert.equal(state.lifecycle?.wait?.kind, 'external');
+    assert.equal(state.lifecycle?.wait?.until, '2099-01-01T00:00:00Z');
+    assert.match(state.lifecycle?.wait?.on ?? '', /^phase 8\b/);
   } finally { dir.cleanup(); }
+});
+
+test('a person, network or engine wait reconciled off a dead console says so — never "usage limit" (#148)', () => {
+  for (const [kind, words] of [
+    ['person', /waiting for a person to answer a card/],
+    ['connectivity', /waiting for the network/],
+    ['engine-busy', /waiting for the machine to read the plan/],
+  ] as const) {
+    const state = crashedRun('/tmp/whatever', { status: 'waiting', child: null });
+    state.waitUntil = '2099-01-01T00:00:00Z';
+    state.waitReason = kind;
+    delete state.children;
+    assert.equal(reconcileRun(state, null), true);
+    assert.match(state.finishedReason ?? '', words, kind);
+    assert.doesNotMatch(state.finishedReason ?? '', /usage limit|another account/, `${kind} is not an account's wall`);
+    assert.equal(state.lifecycle?.state, 'waiting', kind);
+    assert.equal(state.lifecycle?.wait?.kind, kind);
+  }
 });
 
 /* ------------------------------------------------------------------ *

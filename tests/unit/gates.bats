@@ -20,6 +20,7 @@ typecheck-client
 lint-client
 format-check
 build
+e2e
 scrub
 pack"
   run "$SYS_BASH" "$GATES" --list
@@ -28,6 +29,82 @@ pack"
 }
 
 
+
+# The e2e stage drives a real Chromium, and the revision the pinned Playwright
+# drives is a download nobody wants to discover forty minutes into a full run.
+# Driven over a scratch tree holding exactly what the preflight reads, so the
+# machine's own browser cache never answers for the test.
+e2e_tree() {
+  T="$BATS_TEST_TMPDIR/tree"
+  mkdir -p "$T/scripts" "$T/viewer/node_modules/playwright-core" "$T/viewer/client/dist" "$BATS_TEST_TMPDIR/browsers"
+  cp "$GATES" "$T/scripts/gates.sh"
+  echo '<!doctype html>' > "$T/viewer/client/dist/index.html"
+  printf '{"browsers":[{"name":"chromium","revision":"999998"},{"name":"chromium-headless-shell","revision":"999999"}]}\n' \
+    > "$T/viewer/node_modules/playwright-core/browsers.json"
+}
+
+
+@test "gates: the e2e stage runs after build, before scrub" {
+  run "$SYS_BASH" "$GATES" --list
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "build
+e2e
+scrub"
+}
+
+@test "gates: the e2e stage tours the production build in dist mode, never Vite" {
+  # control-tower phase 31: the console serves the build under its real CSP.
+  sed -n '/^stage_e2e() {/,/^}/p' "$GATES" > "$BATS_TEST_TMPDIR/e2e.sh"
+  run grep -c 'PHASE_CONSOLE_DIST_DIR="$dist" npm run test:e2e' "$BATS_TEST_TMPDIR/e2e.sh"
+  [ "$output" = "1" ]
+  # The default tours the scratch build verify:dist KEPT; --build tours client/dist.
+  sed -n '/^stage_build() {/,/^}/p' "$GATES" > "$BATS_TEST_TMPDIR/build.sh"
+  run grep -c 'npm run verify:dist -- --keep' "$BATS_TEST_TMPDIR/build.sh"
+  [ "$output" = "1" ]
+  sed -n '/^e2e_dist_dir() {/,/^}/p' "$GATES" > "$BATS_TEST_TMPDIR/dir.sh"
+  run grep -c -e 'client/dist' -e 'client/.dist-verify' "$BATS_TEST_TMPDIR/dir.sh"
+  [ "$output" = "1" ]
+  assert_contains "$(cat "$BATS_TEST_TMPDIR/dir.sh")" 'client/.dist-verify'
+}
+
+@test "gates: the e2e stage refuses to tour when there is no production build" {
+  # Run the stage function alone over a scratch viewer with no build in it.
+  VIEWER="$BATS_TEST_TMPDIR/viewer" BUILD=0 run "$SYS_BASH" -c "
+    VIEWER='$BATS_TEST_TMPDIR/viewer'; BUILD=0
+    $(sed -n '/^e2e_dist_dir() {/,/^}/p' "$GATES")
+    $(sed -n '/^stage_e2e() {/,/^}/p' "$GATES")
+    stage_e2e"
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "tours a production build"
+}
+
+@test "gates: a missing Playwright browser exits 2 before any stage, naming the line that installs it" {
+  e2e_tree
+  run env PLAYWRIGHT_BROWSERS_PATH="$BATS_TEST_TMPDIR/browsers" "$SYS_BASH" "$T/scripts/gates.sh"
+  [ "$status" -eq 2 ]
+  assert_contains "$output" "npm --prefix viewer exec -- playwright install chromium"
+  assert_contains "$output" "999999"
+  # The preflight refuses the RUN, not a stage: nothing ran.
+  refute_contains "$output" "bash-engine"
+}
+
+@test "gates: with the browser revision installed the preflight lets the run start" {
+  e2e_tree
+  mkdir -p "$BATS_TEST_TMPDIR/browsers/chromium_headless_shell-999999"
+  : > "$BATS_TEST_TMPDIR/browsers/chromium_headless_shell-999999/INSTALLATION_COMPLETE"
+  run env PLAYWRIGHT_BROWSERS_PATH="$BATS_TEST_TMPDIR/browsers" "$SYS_BASH" "$T/scripts/gates.sh"
+  # The scratch tree has no suites, so the first stage fails — with 1, a stage's
+  # failure, never the preflight's 2.
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "bash-engine"
+}
+
+@test "gates: --quick never asks for the browser" {
+  e2e_tree
+  run env PLAYWRIGHT_BROWSERS_PATH="$BATS_TEST_TMPDIR/browsers" "$SYS_BASH" "$T/scripts/gates.sh" --quick
+  [ "$status" -ne 2 ]
+  refute_contains "$output" "playwright install"
+}
 
 @test "gates: --list --quick is the five cheap stages" {
   run "$SYS_BASH" "$GATES" --list --quick

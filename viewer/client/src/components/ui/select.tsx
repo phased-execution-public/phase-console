@@ -26,7 +26,7 @@ export function SelectTrigger({
     <SelectPrimitive.Trigger
       className={cn(
         field,
-        'inline-flex w-full items-center justify-between gap-2 text-left text-ink',
+        'inline-flex w-full items-center justify-between gap-2 text-start text-ink',
         'hover:border-rule-strong data-[placeholder]:text-ink-faint',
         'aria-[invalid=true]:border-failed/70',
         '[&>span]:min-w-0 [&>span]:truncate',
@@ -92,20 +92,20 @@ export function SelectItem({
   return (
     <SelectPrimitive.Item
       className={cn(
-        'relative flex w-full cursor-default select-none items-center gap-2 rounded py-1.5 pl-8 pr-2 text-sm text-ink outline-none',
+        'relative flex w-full cursor-default select-none items-center gap-2 rounded py-1.5 ps-8 pe-2 text-sm text-ink outline-none',
         'data-[highlighted]:bg-surface-raised data-[disabled]:pointer-events-none data-[disabled]:opacity-50',
         '[@media(hover:none)]:min-h-(--tap-min)',
         className,
       )}
       {...props}
     >
-      <span className="absolute left-2 inline-flex size-4 items-center justify-center">
+      <span className="absolute start-2 inline-flex size-4 items-center justify-center">
         <SelectPrimitive.ItemIndicator>
           <Check size={14} aria-hidden />
         </SelectPrimitive.ItemIndicator>
       </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
-      {hint != null && <span className="ml-auto pl-3 text-2xs text-ink-faint">{hint}</span>}
+      {hint != null && <span className="ms-auto ps-3 text-2xs text-ink-faint">{hint}</span>}
     </SelectPrimitive.Item>
   );
 }

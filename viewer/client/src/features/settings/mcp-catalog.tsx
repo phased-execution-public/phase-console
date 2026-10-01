@@ -20,7 +20,7 @@ import {
   Button,
   Card,
   CardBody,
-  Chip,
+  Badge,
   Dialog,
   DialogContent,
   Empty,
@@ -108,15 +108,15 @@ function CatalogRow({
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-medium">{entry.label}</span>
           <code className="text-xs text-ink-faint">{entry.id}</code>
-          <Chip>{entry.transport}</Chip>
-          {entry.auth !== 'none' && <Chip>{authLabel(entry.auth)}</Chip>}
-          {entry.source === 'registry' && <Chip tone="warn">from the registry</Chip>}
+          <Badge>{entry.transport}</Badge>
+          {entry.auth !== 'none' && <Badge>{authLabel(entry.auth)}</Badge>}
+          {entry.source === 'registry' && <Badge tone="accent">from the registry</Badge>}
         </div>
         <p className="text-sm text-ink-muted">{entry.description}</p>
         {entry.authNote && <p className="text-xs text-ink-faint">{entry.authNote}</p>}
         <div className="flex flex-wrap items-center gap-2">
           {already ? (
-            <Chip tone="ok">registered</Chip>
+            <Badge tone="ok">registered</Badge>
           ) : allowed ? (
             <Button size="sm" onClick={onAdd}>
               Add

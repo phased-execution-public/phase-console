@@ -164,7 +164,7 @@ describe('insights', () => {
     const links = await screen.findAllByRole('link');
     const hrefs = links.map((a) => a.getAttribute('href'));
     expect(hrefs).toContain('#/plan/demo/phase/2');
-    expect(hrefs).toContain('#/plan/other/route');
+    expect(hrefs).toContain('#/plan/other/phases');
   });
 
   it('links a held lock at the phase it holds', async () => {
@@ -256,16 +256,40 @@ describe('recentRate — how long a phase actually takes', () => {
     // "60 ms per unit of weight" is the right thing to store and an unreadable
     // thing to print. M is the size the sizing constants are anchored on.
     const { recentRate } = await import('./portfolio');
-    expect(recentRate({ ratePerWeight: 60, basis: 'plan', samples: 5, spread: 0.35 }, 40_000)).toBe(
-      ' · recent rate ≈ 40 min per M phase',
-    );
+    expect(
+      recentRate(
+        {
+          ratePerWeight: 60,
+          floorMs: 0,
+          slopeMsPerWeight: 60,
+          basis: 'plan',
+          samples: 5,
+          spread: 0.35,
+          missing: 0,
+          clock: 'working',
+        },
+        40_000,
+      ),
+    ).toBe(' · recent rate ≈ 40 min per M phase');
   });
 
   it("scales with the machine's own sizing rather than a baked-in 40K", async () => {
     const { recentRate } = await import('./portfolio');
-    expect(recentRate({ ratePerWeight: 60, basis: 'portfolio', samples: 5, spread: 0.5 }, 20_000)).toContain(
-      '20 min',
-    );
+    expect(
+      recentRate(
+        {
+          ratePerWeight: 60,
+          floorMs: 0,
+          slopeMsPerWeight: 60,
+          basis: 'portfolio',
+          samples: 5,
+          spread: 0.5,
+          missing: 0,
+          clock: 'working',
+        },
+        20_000,
+      ),
+    ).toContain('20 min');
   });
 
   it('says nothing at all when there is nothing to say', async () => {
@@ -273,7 +297,29 @@ describe('recentRate — how long a phase actually takes', () => {
     // is worse than silence — and the heuristic is not a measured rate.
     const { recentRate } = await import('./portfolio');
     expect(recentRate(undefined)).toBe('');
-    expect(recentRate({ ratePerWeight: 60, basis: 'heuristic', samples: 0, spread: 0.6 })).toBe('');
-    expect(recentRate({ ratePerWeight: 0, basis: 'plan', samples: 1, spread: 0.7 })).toBe('');
+    expect(
+      recentRate({
+        ratePerWeight: 60,
+        floorMs: 0,
+        slopeMsPerWeight: 60,
+        basis: 'heuristic',
+        samples: 0,
+        spread: 0.6,
+        missing: 0,
+        clock: 'working',
+      }),
+    ).toBe('');
+    expect(
+      recentRate({
+        ratePerWeight: 0,
+        floorMs: 0,
+        slopeMsPerWeight: 0,
+        basis: 'plan',
+        samples: 1,
+        spread: 0.7,
+        missing: 0,
+        clock: 'working',
+      }),
+    ).toBe('');
   });
 });

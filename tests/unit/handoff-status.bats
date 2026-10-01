@@ -33,6 +33,37 @@ load ../helpers/test_helper
   assert_contains "$output" "(no phase handoffs yet)"
 }
 
+@test "handoff-status: a complete handoff still holding the template reads in-progress on the board (#46)" {
+  setup_docs linear linear
+  local f="$DOCS_ROOT/docs/handoffs/linear/phase-01-alpha.md"
+  mkdir -p "$(dirname "$f")"
+  printf -- '---\nplan: docs/plans/linear.md\nphase: 1\ntitle: alpha\nstatus: complete\n---\n# Phase 1\n\n## What this phase did\n<!-- 1–3 sentences + bullets of what shipped.\n     (a comment may span lines) -->\n\n## State now (verified)\nall green\n' > "$f"
+  run pe_hostatus linear
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "status=complete"
+  assert_contains "$output" "IN PROGRESS: 1"
+  run pg linear --lint
+  assert_contains "$output" "phase 1: handoff-scaffold-complete"
+
+  # A heading inside a code fence is not a section, and a deeper heading is
+  # content: neither makes the section look written or empty on its own.
+  printf -- '---\nplan: docs/plans/linear.md\nphase: 1\ntitle: alpha\nstatus: complete\n---\n## What this phase did\n```\n## not a heading\n```\n' > "$f"
+  run pg linear --memory-block
+  assert_contains "$output" "done: 1"
+
+  # Written: done.
+  printf -- '---\nplan: docs/plans/linear.md\nphase: 1\ntitle: alpha\nstatus: complete\n---\n## What this phase did\n<!-- template -->\nShipped the alpha.\n' > "$f"
+  run pe_hostatus linear
+  refute_contains "$output" "IN PROGRESS: 1"
+  run pg linear --memory-block
+  assert_contains "$output" "done: 1"
+
+  # No such section at all is not a scaffold: a hand-written handoff stands.
+  write_handoff linear 1 alpha complete
+  run pg linear --memory-block
+  assert_contains "$output" "done: 1"
+}
+
 @test "handoff-status: appends the live DAG board" {
   setup_docs linear linear
   write_handoff linear 1 alpha complete

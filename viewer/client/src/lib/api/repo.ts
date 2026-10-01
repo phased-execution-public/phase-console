@@ -23,16 +23,15 @@
  *   renderer for both would say the same word about two different things.
  */
 
+import type { CheckoutRole, SettleKind } from '@shared/worktree-model.js';
 import { request, q } from './client';
 
 /* ---------------- vocabularies ---------------- */
 
-/** What a checkout IS to this console. `debris` is a tree no surviving record claims. */
-export type CheckoutRole = 'root' | 'run' | 'lane' | 'staging' | 'operator' | 'debris';
-
-/** The journal's own settle-event names. */
-export type SettleKind =
-  'settled' | 'pending' | 'unsupported' | 'landed' | 'pushed' | 'failed' | 'released' | 'pruned';
+// What a checkout IS to this console, and what a settle-history row says
+// happened — both owned by `shared/worktree-model.js` (`CHECKOUT_ROLES`,
+// `SETTLE_KINDS`), and imported as types only: this module is first paint.
+export type { CheckoutRole, SettleKind };
 
 /** A repository this console will answer about: the root, a linked worktree, or a mirror mount. */
 export type RepoTargetKind = 'root' | 'submodule' | 'linked' | 'mount';

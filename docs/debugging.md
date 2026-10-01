@@ -152,9 +152,12 @@ them. This is the walk:
 4. **runId + phase → the session.** The checkpoint (`run-<id>.json`) carries
    `sessionId` per phase record, and the journal's `phase.boarded` line names
    the session an attempt was given.
-5. **session → the transcript.** `run-<id>.log.jsonl` is the SSE replay ring
-   for that run; a Claude session's own transcript is the CLI's, not the
-   console's.
+5. **session → the transcript.** `run-<id>.p<N>.log.jsonl` is the SSE replay
+   ring for phase N of that run, one capped file per phase since control-tower
+   phase 94; `run-<id>.log.jsonl` holds the lines that name no phase, and a run
+   written before the split keeps every line there. A file moved aside
+   (`.old`, `.full-<stamp>`) is an archive retention sweeps with its run. A
+   Claude session's own transcript is the CLI's, not the console's.
 6. **phase → why it is not done.** `GET /api/run/<slug>/diagnosis/<phase>` is
    the richest single payload this console has: the command output, the
    session's closing words, the lint summary, the board-vs-handoff
@@ -284,7 +287,8 @@ MANIFEST.json      schema "phase-console/run-bundle", version 2, every member
                    with its size, everything that was ABSENT, and the notes
 record.json        the run record — status, phases, timings
 journal.ndjson     the run's journal
-transcript.ndjson  the session transcript
+transcript.ndjson  the session transcript — the run's own replay (lines that name no phase)
+transcripts/pN.ndjson  each phase's replay (control-tower phase 94)
 tasks/             this run's per-phase ledgers, and the plan's inbox copies
 outcomes/          the same, for declared outcomes
 rulings.ndjson     what the sessions DECIDED, as opposed to how they ended
@@ -342,6 +346,7 @@ what the NEXT sweep would do — which is also what Settings ▸ This instance �
 | session event logs | pruned with the session record; 1 MB each |
 | raw git traces | leftovers past 24 h; 64 MB in the console's directory |
 | message ledgers | rotate at 8 MB, the rotated copy kept 90 days |
+| the lock history ledger (`locks.ndjson`) | rotates at 4 MB, one previous kept |
 
 
 Three verbs and one non-verb, and the choice per sink is the design.

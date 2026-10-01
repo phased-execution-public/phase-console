@@ -119,14 +119,52 @@ export type JournalOptions = {
   reserveBytes?: number;
 };
 
+/**
+ * The one Journal per run file this process keeps — `Journal.for`'s registry.
+ *
+ * A `seq` is a counter, and a counter numbers ONE sequence only while it has
+ * one owner (#51). Every writer used to build its own `new Journal(…)`, each
+ * read the tail once at construction and counted on from there — so the watch
+ * scheduler's fresh instance read 488 and wrote 489 while the live runner's,
+ * still believing 488, wrote 489 too, and a reader whose cursor sat between
+ * the two lines never saw one of them. Keyed by the FILE: two spellings of one
+ * root resolve to one instance directory (`instanceId` is lexical), so they
+ * are one file and must be one counter.
+ *
+ * Never pruned. An instance is a path, a trace id and three numbers; a console
+ * that has touched ten thousand runs holds a few megabytes, and evicting one a
+ * runner still holds would hand the next caller a second counter — the very
+ * thing this exists to prevent.
+ */
+const journals = new Map<string, Journal>();
+
 export class Journal {
   readonly path: string;
   /** The run's trace — derived, so a restart recomputes it rather than losing it. */
   readonly traceId: string;
   private seq = 0;
+  /** The file's size as this instance last left it (or read it); `follow` compares against it. */
+  private seen = 0;
   private overflowed = false;
   private readonly maxBytes: number;
   private readonly reserveBytes: number;
+
+  /**
+   * THE way to reach a run's journal: the one instance this process keeps for
+   * that run's file, built on first use (#51). Nothing under `server/` calls
+   * the constructor — `invariants.test.ts` scans for it — because a second
+   * instance is a second counter. Tests still construct one directly, which is
+   * how they stand in for a writer this process does not own.
+   */
+  static for(root: string, slug: string, id: string): Journal {
+    const path = journalFile(root, slug, id);
+    let journal = journals.get(path);
+    if (!journal) {
+      journal = new Journal(root, slug, id);
+      journals.set(path, journal);
+    }
+    return journal;
+  }
 
   constructor(root: string, slug: string, id: string, options: JournalOptions = {}) {
     this.path = journalFile(root, slug, id);
@@ -139,11 +177,44 @@ export class Journal {
       // at 1, so the file stays readable as one sequence. Only the LAST line
       // carries the answer, so only the tail is read: a full parse here was
       // paid by every construction, including the two read paths that then
-      // read the file again themselves.
+      // read the file again themselves. The size is taken FIRST: a line landing
+      // between the two reads then looks like a foreign write, and `follow`
+      // re-reads — the safe direction.
+      this.seen = this.size();
       this.seq = this.lastSeq();
     } catch {
       /* a journal we cannot open costs the audit trail, never the run */
     }
+  }
+
+  /** The file's size in bytes; 0 when it does not exist yet. */
+  private size(): number {
+    try { return statSync(this.path).size; } catch { return 0; }
+  }
+
+  /**
+   * Number on from the FILE, not from this instance, when somebody else moved it.
+   *
+   * The registry makes this instance the only writer of its file in this
+   * process; it cannot make it the only writer there is — a test's own
+   * `new Journal`, another console on the same state directory. So each append
+   * compares the file's size with where this instance left it, and only when
+   * they differ pays the tail read construction already pays: a file that grew
+   * is continued from its last `seq`, and one that shrank or vanished (a
+   * deleted run, a hand edit) is numbered from what is on disk now, exactly as
+   * a fresh construction would number it.
+   */
+  private follow(size: number): void {
+    if (size === this.seen) return;
+    const onDisk = size === 0 ? 0 : this.lastSeq();
+    if (size > this.seen) {
+      this.seq = Math.max(this.seq, onDisk);
+    } else {
+      this.seq = onDisk;
+      // A file that shrank is sized afresh: the overflow it had is gone with it.
+      this.overflowed = false;
+    }
+    this.seen = size;
   }
 
   /**
@@ -227,29 +298,34 @@ export class Journal {
   }
 
   private writeLine(entry: JournalEntry): void {
+    const line = `${JSON.stringify(entry)}\n`;
     try {
       count('journal_appends_total', []);
-      appendFileSync(this.path, `${JSON.stringify(entry)}\n`, 'utf8');
+      try {
+        appendFileSync(this.path, line, 'utf8');
+      } catch (error) {
+        // The directory went with the run (a deleted run, a swept state dir).
+        // A fresh construction re-made it; the one instance that now outlives
+        // the directory must too, once, or it would never write again.
+        if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+        mkdirSync(dirname(this.path), { recursive: true });
+        appendFileSync(this.path, line, 'utf8');
+      }
+      this.seen += Buffer.byteLength(line, 'utf8');
     } catch (error) {
       log.warn('journal.append', { path: this.path, error });
     }
   }
 
   /**
-   * Size the file once, and mark the overflow IN BAND the moment it happens.
+   * Mark the overflow IN BAND the moment it happens.
    *
    * The marker is a journal line so the file explains its own ending, and it
    * names `lastSeq` so a reader can tell a dropped line from one that never
    * happened. Everything after it is dropped except the reserve.
    */
-  private checkOverflow(): void {
+  private checkOverflow(size: number): void {
     if (this.overflowed) return;
-    let size: number;
-    try {
-      size = statSync(this.path).size;
-    } catch {
-      return; // no file yet — that is the normal first append
-    }
     if (size <= this.maxBytes - this.reserveBytes) return;
 
     this.overflowed = true;
@@ -267,7 +343,9 @@ export class Journal {
   }
 
   append(event: string, data?: Record<string, unknown>, phase?: number): JournalEntry {
-    this.checkOverflow();
+    const size = this.size();
+    this.follow(size);
+    this.checkOverflow(size);
     const entry = this.entryFor(event, data, phase);
     // A dropped entry still consumes its `seq`: the gap in the file is the
     // honest record that something happened and was not written down.

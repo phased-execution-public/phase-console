@@ -11,6 +11,9 @@ import type { UiState } from '@/lib/status-vocab';
  * are not — over the ceiling the fill turns the failed colour and the text
  * says by how much. Quarter ticks make the share readable without a number
  * beside it, which is what a phone needs.
+ *
+ * The fill is a PAINT — one of the eight, worn as `.state-<paint>` — and the
+ * caller chooses it: this primitive is first paint and knows no status word.
  */
 export function Meter({
   value,
@@ -18,8 +21,8 @@ export function Meter({
   min = 0,
   label,
   valueText,
-  tone = 'running',
-  over: overTone = 'failed',
+  paint: within = 'running',
+  overPaint = 'failed',
   showTicks = true,
   className,
   children,
@@ -32,10 +35,10 @@ export function Meter({
   label: string;
   /** The human reading ("62 %", "$1.20 of $5.00"); defaults to the percentage. */
   valueText?: string;
-  /** The fill's UI-state hue while within the ceiling. */
-  tone?: UiState;
-  /** The fill's UI-state hue once over the ceiling. */
-  over?: UiState;
+  /** The fill's paint while within the ceiling. */
+  paint?: UiState;
+  /** The fill's paint once over the ceiling. */
+  overPaint?: UiState;
   showTicks?: boolean;
   /** Slot for a caption under the bar. */
   children?: ReactNode;
@@ -45,6 +48,7 @@ export function Meter({
   const over = fraction > 1;
   const shown = Math.max(0, Math.min(1, fraction));
   const text = valueText ?? `${Math.round(fraction * 100)} %`;
+  const paint = over ? overPaint : within;
   return (
     <div className={cn('min-w-0', className)} {...props}>
       <div
@@ -55,10 +59,7 @@ export function Meter({
         aria-valuenow={value}
         aria-valuetext={text}
         title={`${label}: ${text}${over ? ' — over' : ''}`}
-        className={cn(
-          'relative h-2 w-full overflow-hidden rounded-full bg-track',
-          `state-${over ? overTone : tone}`,
-        )}
+        className={cn('relative h-2 w-full overflow-hidden rounded-full bg-track', `state-${paint}`)}
       >
         {showTicks && (
           <span aria-hidden className="pointer-events-none absolute inset-0 flex justify-evenly">

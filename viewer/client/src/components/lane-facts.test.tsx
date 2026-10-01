@@ -7,15 +7,16 @@
  * over a frozen lane, a cost that printed `$NaN` for a lane with none.
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
-import { LaneFactRow, laneFacts, type LaneFacts } from './lane-facts';
-import type { NowLane } from '@/features/now/model';
+import { LaneBeat, LaneFactRow, laneFacts, type LaneFacts } from './lane-facts';
+import type { NowLane } from '@/features/runs/lanes-model';
 
 const facts = (over: Partial<LaneFacts> = {}): LaneFacts => ({
   startedAt: Date.now() - 90_000,
-  lastOutputAt: Date.now() - 5_000,
+  silence: null,
   costUsd: 1.5,
   model: 'opus',
   effort: null,
@@ -37,7 +38,9 @@ describe('laneFacts — the NowLane adapter', () => {
     } as unknown as NowLane;
     const out = laneFacts(lane);
     expect(out.startedAt).toBeNull();
-    expect(out.lastOutputAt).toBeNull();
+    // A last output is not a silence: with no reading from the server the bag
+    // carries none, rather than a gap timed here off that stamp (#28).
+    expect(out.silence).toBeNull();
     // Zero is a REAL cost, and distinct from absent: a lane that has spent
     // nothing is different from one nobody has measured.
     expect(out.costUsd).toBe(0);
@@ -89,5 +92,44 @@ describe('LaneFactRow', () => {
     expect(text.indexOf('$1.50')).toBeLessThan(text.indexOf('~45 min'));
     expect(text.indexOf('~45 min')).toBeLessThan(text.indexOf('opus'));
     expect(text.indexOf('opus')).toBeLessThan(text.indexOf('frozen'));
+  });
+});
+
+describe('LaneBeat — a named silence, never one timed off the last output (control-tower phase 24, #28)', () => {
+  it('prints which silence the server read, how long, and the threshold it is measured against', () => {
+    const sinceMs = Date.now() - 12 * 60_000;
+    render(
+      <LaneBeat
+        facts={facts({ silence: { kind: 'unproductive', sinceMs, thresholdMs: 30 * 60_000 } })}
+        live
+      />,
+    );
+    const beat = screen.getByTestId('lane-silence');
+    expect(beat.getAttribute('data-silence')).toBe('unproductive');
+    expect(beat.textContent).toMatch(/^no productive output 12m/);
+    expect(beat.textContent).toMatch(/stalls at 30m/);
+  });
+
+  it('draws nothing when the server reports no silence, and nothing for a lane that is not live', () => {
+    const { container, rerender } = render(<LaneBeat facts={facts()} live />);
+    expect(container.textContent).toBe('');
+    rerender(
+      <LaneBeat
+        facts={facts({ silence: { kind: 'no-output', sinceMs: Date.now(), thresholdMs: 1 } })}
+        live={false}
+      />,
+    );
+    expect(container.textContent).toBe('');
+  });
+
+  it('source scan: no silence figure on these surfaces is timed off lastOutputAt', () => {
+    // The three files #28 named. Two were retired with Now (phase 21); the one
+    // that remains reads the server's `liveness.silence` and nothing else.
+    const here = (path: string) => new URL(path, import.meta.url);
+    expect(existsSync(here('../features/now/model.ts'))).toBe(false);
+    expect(existsSync(here('../features/now/lane-row.tsx'))).toBe(false);
+    const source = readFileSync(here('./lane-facts.tsx'), 'utf8').replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, '');
+    expect(source).not.toMatch(/lastOutputAt/);
+    expect(source).not.toMatch(/<Heartbeat\b/);
   });
 });

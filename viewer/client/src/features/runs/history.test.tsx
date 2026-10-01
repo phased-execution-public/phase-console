@@ -59,7 +59,8 @@ describe('<RunHistory>', () => {
     expect(screen.getByRole('columnheader', { name: 'Spent' })).toBeInTheDocument();
     // The run this page is about is not listed a second time.
     expect(screen.queryByTitle(/current-run/)).toBeNull();
-    expect(screen.getByText('halted')).toBeInTheDocument();
+    // The typed badge paints the run's word with its icon (control-tower phase 24).
+    expect(screen.getByText('Halted').closest('[data-status]')?.getAttribute('data-status')).toBe('halted');
   });
 
   it('draws a short id and keeps the whole one one press away', () => {

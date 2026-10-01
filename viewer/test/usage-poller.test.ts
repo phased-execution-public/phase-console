@@ -16,10 +16,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  liveBuckets, UsagePoller, parseBuckets, parseUsageBody, USAGE_ACTIVE_MS, USAGE_IDLE_MS, USAGE_STALE_MS,
+  agedUsage, liveBuckets, UsagePoller, parseBuckets, parseUsageBody, USAGE_ACTIVE_MS, USAGE_IDLE_MS, USAGE_STALE_MS,
   type AccountUsage, type TokenAnswer, type UsageMeta,
 } from '../server/accounts/usage.ts';
 import type { Exec } from '../server/accounts/credentials.ts';
+import { ConnectivityProbe } from '../server/connectivity-probe.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -333,4 +334,155 @@ test('a meter stops being evidence when it is stale, or when its window has rese
     {},
   );
   assert.deepEqual(liveBuckets(undefined, now), {}, 'and nothing at all is nothing at all');
+});
+
+/* ---------------- a fresh reading re-reads the walls (#78) ---------------- */
+
+test('#78: a facade poll re-reads the learned walls — a reading under the wall lifts it and the quota door opens; an earlier reset shortens one that stands', async () => {
+  const { Accounts } = await import('../server/accounts/index.ts');
+  const { join } = await import('node:path');
+  const { STATE_SANDBOX } = await import('./state-sandbox.ts');
+  const HOUR = 3_600_000;
+  const soon = new Date(Date.now() + 2 * HOUR).toISOString();
+  let body: Record<string, unknown> = {
+    five_hour: { utilization: 99, resets_at: new Date(Date.now() + 4 * HOUR).toISOString() },
+    seven_day: { utilization: 100, resets_at: soon },
+  };
+  const fetchFn = (async () => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })) as typeof fetch;
+  const exec: Exec = async (file, args) => (file === 'claude' && args[0] === '--version' ? { stdout: '9.9.9 (Claude Code)\n' } : { stdout: '' });
+  const accounts = new Accounts({
+    platform: 'linux', exec, fetchFn, usageBase: 'http://usage.invalid', learnedFile: join(STATE_SANDBOX, 'learned-78-poll.json'),
+  });
+  try {
+    const walled = await accounts.addToken('walled', 'token-walled-cccccccccccc');
+    const sooner = new Date(Date.now() + 3 * HOUR).toISOString();
+    const later = new Date(Date.now() + 5 * HOUR).toISOString();
+    accounts.markLimited(walled.id, 'five_hour', sooner);
+    accounts.markLimited(walled.id, 'seven_day', later);
+    await accounts.refreshUsage(walled.id);
+    const walls = accounts.limitedUntil(walled.id);
+    assert.equal(walls.five_hour, sooner, 'a reading still over the wall lifts nothing — and its later reset never lengthens it');
+    assert.equal(walls.seven_day, soon, 'an earlier reset shortens the wall that stands');
+    assert.equal(accounts.headroom(walled.id).ok, false);
+
+    body = {
+      five_hour: { utilization: 20, resets_at: new Date(Date.now() + 4 * HOUR).toISOString() },
+      seven_day: { utilization: 30, resets_at: soon },
+    };
+    await accounts.refreshUsage(walled.id);
+    assert.deepEqual(accounts.limitedUntil(walled.id), {}, 'a reading under the wall lifts it, before the reset it reported');
+    assert.equal(accounts.headroom(walled.id).ok, true, 'and the quota door opens');
+    await accounts.remove(walled.id);
+  } finally { accounts.stop(); }
+});
+
+/* ---------------- control-tower phase 76 (#110): weather is not a fault ---------------- */
+
+test('#110: a transport failure never grows the back-off — a 5xx and a refusal still do', async () => {
+  const thrown = poller({ fetchFn: (async () => { throw new TypeError('fetch failed'); }) as typeof fetch });
+  thrown.track('a');
+  for (let i = 0; i < 4; i++) {
+    thrown.kick('a');
+    await sleep(20);
+    assert.equal(thrown.lastDelayFor('a'), USAGE_IDLE_MS, `failure ${i + 1}: the account keeps its own cadence`);
+  }
+  assert.match(thrown.snapshot('a')?.error ?? '', /fetch failed/, 'and the failure is said beside the meters');
+  thrown.stop();
+
+  const answered = poller({ fetchFn: fakeFetch({ status: 500 }).fetchFn });
+  answered.track('b');
+  const delays: (number | undefined)[] = [];
+  for (let i = 0; i < 3; i++) {
+    answered.kick('b');
+    await sleep(20);
+    delays.push(answered.lastDelayFor('b'));
+  }
+  answered.stop();
+  assert.deepEqual(delays, [60_000, 120_000, 240_000], 'an answer the endpoint GAVE still backs off');
+
+  const refused = poller({ fetchFn: fakeFetch({ status: 401 }).fetchFn });
+  refused.track('c');
+  refused.kick('c');
+  await sleep(20);
+  refused.stop();
+  assert.equal(refused.lastDelayFor('c'), 60_000, 'a refusal keeps its back-off');
+});
+
+test('#110: the moment the probe answers, every tracked account is read — not at the end of its back-off', async () => {
+  let down = true;
+  let reads = 0;
+  const fetchFn = (async () => {
+    reads += 1;
+    if (down) throw new TypeError('fetch failed');
+    return new Response(JSON.stringify(OK.body), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  const connectivity = new ConnectivityProbe({ probe: async () => !down, everyMs: 20 });
+  const p = new UsagePoller({
+    resolveToken: async () => ({ token: 'tok' }), exec: versionExec, base: 'http://usage.invalid/', fetchFn, connectivity,
+  });
+  try {
+    p.track('a');
+    p.track('b');
+    p.kick('a');
+    p.kick('b');
+    await sleep(10);
+    assert.equal(connectivity.offline, true, 'the failed reads told the probe');
+    assert.equal(reads, 2);
+    down = false;
+    await sleep(80);
+    assert.equal(connectivity.offline, false);
+    assert.ok(p.snapshot('a')?.fetchedAt, 'a is read on recovery');
+    assert.ok(p.snapshot('b')?.fetchedAt, 'and so is b, without its own clock coming round');
+    assert.equal(reads, 4, 'one read each — the probe itself is not a meter read');
+  } finally {
+    p.stop();
+    connectivity.stop();
+  }
+});
+
+
+test('control-tower phase 92 (#141): the poller keeps each window\'s readings for the forecast, and a view never serves the series', async () => {
+  let clock = Date.parse('2026-09-26T06:35:00Z');
+  const resetsAt = '2026-09-30T12:00:00Z';
+  const bodies = [37, 44, 51].map((pct) => ({ five_hour: { utilization: pct, resets_at: resetsAt } }));
+  let i = 0;
+  const poller = new UsagePoller({
+    resolveToken: async () => ({ token: 'tok' }),
+    fetchFn: (async () => new Response(JSON.stringify(bodies[Math.min(i++, bodies.length - 1)]), { status: 200 })) as typeof fetch,
+    exec: async () => ({ stdout: '9.9.9\n' }), base: 'http://usage.test', now: () => clock,
+  });
+  try {
+    for (const step of [0, 14, 16]) {
+      clock += step * 60_000;
+      await poller.refresh('a');
+    }
+    const snapshot = poller.snapshot('a')!;
+    assert.deepEqual(snapshot.samples?.five_hour?.map((s) => s.pct), [37, 44, 51], 'one reading per successful read');
+    const view = agedUsage(snapshot, 90_000, clock);
+    assert.equal(view.samples, undefined, 'the view carries the forecast, not the series');
+    assert.equal(view.buckets.five_hour?.utilization, 51);
+  } finally {
+    poller.stop();
+  }
+});
+
+test('control-tower phase 93 (#146): the poller keeps the credit block with each read, a failed read carries it, and a read without it forgets it', async () => {
+  const extra = { is_enabled: true, monthly_limit: 4000, used_credits: 250, currency: 'USD', decimal_places: 2, disabled_reason: null };
+  const { fetchFn } = fakeFetch(
+    { status: 200, body: { ...OK.body, extra_usage: extra } },
+    { status: 500 },
+    { status: 200, body: OK.body },
+  );
+  const p = poller({ fetchFn });
+  p.track('a');
+  p.kick('a');
+  await sleep(50);
+  assert.deepEqual(p.snapshot('a')?.credits, { enabled: true, monthlyLimit: 40, used: 2.5, currency: 'USD' });
+  p.kick('a');
+  await sleep(50);
+  assert.equal(p.snapshot('a')?.credits?.used, 2.5, 'yesterday\'s balance beats blank — with its read\'s age');
+  p.kick('a');
+  await sleep(50);
+  p.stop();
+  assert.equal(p.snapshot('a')?.credits, undefined, 'a successful read that says nothing is unknown, not the old answer');
 });

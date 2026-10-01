@@ -99,7 +99,7 @@ describe('the announcement count in the header', () => {
 describe('the counts in the tab bar', () => {
   const bar = (over: Partial<ShellCounts>) =>
     render(
-      <TabBar state={SESSIONS_ON} counts={counts(over)} head="now" moreOpen={false} onMore={() => {}} />,
+      <TabBar state={SESSIONS_ON} counts={counts(over)} head="runs" moreOpen={false} onMore={() => {}} />,
     );
 
   it('caps the corner badge at 9+, so it cannot grow into the next tab', () => {
@@ -116,22 +116,25 @@ describe('the counts in the tab bar', () => {
     expect(badge.parentElement!.className).toMatch(/pointer-events-none/);
   });
 
-  it('offers Now, Plans, Runs, Sessions and More — and marks where you are', () => {
+  it('offers Runs, Plans, Sessions, the fourth and More — and marks where you are', () => {
     bar({});
-    for (const label of ['Now', 'Plans', 'Runs', 'Sessions', 'More']) {
+    // Insights in the Free tree; the Supervisor's slot in the Pro tree, where
+    // a server with the chat offers it (control-tower phase 28).
+    const fourth = SESSIONS_ON.chat ? 'Supervisor' : 'Insights';
+    for (const label of ['Runs', 'Plans', 'Sessions', fourth, 'More']) {
       expect(screen.getByRole('button', { name: new RegExp(`^${label}$`) }), label).toBeTruthy();
     }
-    expect(screen.getByRole('button', { name: 'Now' }).getAttribute('aria-current')).toBe('page');
+    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBe('page');
   });
 
-  it('lights Sessions for a terminal deep link, not Now', () => {
+  it('lights Sessions for a terminal deep link, not Runs', () => {
     // The 2.x bar had no Sessions entry at all, so `#/terminal/abc` lit nothing
     // and the app read as though you had left it.
     render(
       <TabBar state={SESSIONS_ON} counts={counts()} head="terminal" moreOpen={false} onMore={() => {}} />,
     );
     expect(screen.getByRole('button', { name: 'Sessions' }).getAttribute('aria-current')).toBe('page');
-    expect(screen.getByRole('button', { name: 'Now' }).getAttribute('aria-current')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Runs' }).getAttribute('aria-current')).toBeNull();
   });
 });
 

@@ -55,3 +55,57 @@ export function runFile(root: string, slug: string, id: string): string {
 export function journalFile(root: string, slug: string, id: string): string {
   return join(runDir(root, slug), `run-${id}.jsonl`);
 }
+
+/**
+ * The session replay's file: one per PHASE, plus the run's own for a line that
+ * names no phase (control-tower phase 94, #133).
+ *
+ * It was one file per run, `run-<id>.log.jsonl`, with a 16 MB hard stop — so a
+ * long run crossed it within days and every later phase replayed nothing. The
+ * run's own name is kept for the lines with no phase, and it is also where a
+ * run written before the split still has every line it wrote.
+ */
+export function transcriptFile(root: string, slug: string, id: string, phase?: number): string {
+  return join(runDir(root, slug), phase == null ? `run-${id}.log.jsonl` : `run-${id}.p${phase}.log.jsonl`);
+}
+
+/**
+ * Which replay a file name is: a phase's number, `null` for the run's own, and
+ * `undefined` for anything else — another run, another sidecar, an ARCHIVE.
+ * An archive (`.old`, `.full-<stamp>`) is kept evidence a writer must never
+ * append to and a reader must never mistake for the live replay.
+ */
+export function transcriptPhase(name: string, id: string): number | null | undefined {
+  if (name === `run-${id}.log.jsonl`) return null;
+  const prefix = `run-${id}.p`;
+  if (!name.startsWith(prefix) || !name.endsWith('.log.jsonl')) return undefined;
+  const digits = name.slice(prefix.length, -'.log.jsonl'.length);
+  return /^\d+$/.test(digits) ? Number(digits) : undefined;
+}
+
+/**
+ * Everything a run leaves beside its record, after `run-<id>`: the journal,
+ * the replays (the run's and each phase's) and their archives, the folded git
+ * trace, and each phase's task ledger and outcome.
+ *
+ * ONE pattern, read by retention's inventory, `pruneRuns` and the debug bundle.
+ * Each used to spell its own, and none knew the archived names the 2026-09-25
+ * workaround left when it moved full replays aside — so those were counted by
+ * nobody and outlived their runs for ever.
+ */
+const SIDECAR_TAIL = String.raw`(?:\.jsonl|(?:\.p\d+)?\.log\.jsonl(?:\.old|\.full-[0-9A-Za-z:._-]+)?|\.git\.ndjson|-p\d+-(?:tasks\.ndjson|outcome\.json))`;
+const SIDECAR = new RegExp(`^run-([0-9a-f]{8,32})${SIDECAR_TAIL}$`);
+
+/** The run id a sidecar's name belongs to, or `null` when it is not one. */
+export function runSidecarId(name: string): string | null {
+  return SIDECAR.exec(name)?.[1] ?? null;
+}
+
+/**
+ * Whether `name` is one of run `id`'s sidecars — the id matched EXACTLY. Run
+ * ids are 8–32 hex, so a prefix match on `run-aaaaaaaa` takes the files of
+ * `run-aaaaaaaabbbb`, a different run.
+ */
+export function isRunSidecar(name: string, id: string): boolean {
+  return name.startsWith(`run-${id}`) && new RegExp(`^${SIDECAR_TAIL}$`).test(name.slice(`run-${id}`.length));
+}

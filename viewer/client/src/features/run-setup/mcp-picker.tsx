@@ -19,7 +19,7 @@
 import { useMemo, useState } from 'react';
 
 import type { McpServerView } from '@/lib/api';
-import { Checkbox, Chip } from '@/components/ui';
+import { Checkbox, Badge } from '@/components/ui';
 
 /** Past this, the context cost stops being noise. Same number the MCP page uses. */
 const COMFORTABLE = 6;
@@ -87,7 +87,7 @@ export function McpPicker({
         )}
 
         {total > COMFORTABLE && (
-          <p className="text-2xs text-stuck">
+          <p className="text-2xs text-needs-you">
             {total} servers is more than most runs want. Each one costs context on every turn.
           </p>
         )}
@@ -118,8 +118,8 @@ export function McpPicker({
               <span className="min-w-0">
                 <span className="text-ink">{server.label}</span>
                 <code className="ml-1.5 text-2xs text-ink-muted">{server.id}</code>
-                {fromPlan && <Chip className="ml-1.5">from the plan</Chip>}
-                {!ok && <span className="ml-1.5 text-2xs text-stuck">{whyNot(server)}</span>}
+                {fromPlan && <Badge className="ml-1.5">from the plan</Badge>}
+                {!ok && <span className="ml-1.5 text-2xs text-needs-you">{whyNot(server)}</span>}
                 {/* Tickable, but do not let it read as verified: nobody has
                     asked this one whether it works. */}
                 {ok && unchecked(server) && (

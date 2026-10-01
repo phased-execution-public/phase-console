@@ -31,7 +31,9 @@ import './state-sandbox.ts';
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { spawn as spawnProcess } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 process.env.PHASE_CONSOLE_LOG = '';
@@ -42,7 +44,10 @@ const { freezeVerdict } = await import('../server/runner/freeze.ts');
 const {
   readFleetHold, writeFleetHold, clearFleetHold, FLEET_FREEZE_FILE,
 } = await import('../server/fleet-hold.ts');
-const { FLEET_HOLDER, fleetFreezeReason } = await import('../shared/orchestration-model.js');
+// Every top-level await sits here, above the first test: one between two
+// tests lets `--test-force-exit` see an empty queue while the module is still
+// loading, and cancel the tests registered after it (RR-1, under a name filter).
+const { FLEET_HOLDER, fleetFreezeReason, fleetHoldSentence, heldStopReason, SHUTDOWN_CONTINUES } = await import('../shared/orchestration-model.js');
 
 type ConvergeTrigger = import('../server/converge.ts').ConvergeTrigger;
 type ConvergeReport = import('../server/converge.ts').ConvergeReport;
@@ -162,13 +167,15 @@ const MECHANISMS: {
     id: 'scheduler:poll',
     what: 'the admission scan — the one door every lane passes through',
     where: 'server/runner/scheduler.ts',
-    guard: 'const fleet = this.fleetHolder();',
+    // Per entry since control-tower phase 48 (#70): a restart waiting for its
+    // lanes binds only the plans whose scope meets theirs.
+    guard: 'const fleet = this.fleetHolderOf(hold, entry.slug);',
   },
   {
     id: 'scheduler:would-block',
     what: 'the probe that tells the runner whether an admission is free',
     where: 'server/runner/scheduler.ts',
-    guard: 'const fleet = this.fleetHolder();\n    if (fleet) return [fleet];',
+    guard: 'const fleet = this.fleetHolder(request.slug);\n    if (fleet) return [fleet];',
   },
   {
     id: 'scheduler:release',
@@ -349,11 +356,23 @@ const START_SITES: { file: string; count: number; note: string }[] = [
   },
   {
     file: 'server/service-runs.ts',
-    count: 4,
+    count: 10,
     note: 'retryPhase (an operator door that nonetheless QUEUES — it funnels into a phase, and '
       + "every phase goes through admit()) · recoverPlan (goes through: its halt path uses the "
-      + "EXEMPT `button` trigger) · convergeDeps' healer vehicle (gated at the loop) · "
-      + 'unsupervised outcome re-boarding (gated in place)',
+      + "EXEMPT `button` trigger — and refuses 409 first under a hold that binds the plan, #93) · "
+      + "convergeDeps' healer vehicle (gated at the loop) · "
+      + 'unsupervised outcome re-boarding (gated in place) · a person\'s fresh resume '
+      + '(`reboardForPerson`, control-tower phase 53 — an operator door that queues as retryPhase '
+      + 'does: its reboard boards through admit()) · the continue a press queued behind the loop '
+      + '(`continueAfterPress` — gated in place on `fleetHoldFor`) · Resume lifting a settled pause '
+      + '(`resumeRun`, control-tower phase 77 — an operator door, refused 409 under a hold that binds '
+      + 'the plan since phase 81, #93, rather than a 200 queued behind it) · a person\'s answer to an '
+      + 'identity park (`answerIdentity`, control-tower phase 91 — an operator door, refused 409 under a '
+      + 'hold that binds the plan, as Resume is) · a person\'s repair of a refused checkout '
+      + '(`repairCheckout`, control-tower phase 90 — an operator door, refused 409 under a hold that '
+      + 'binds the plan, as Resume is) · a person\'s raise of a spent run budget (`raiseBudget`, '
+      + 'control-tower phase 14 — an operator door: the raise is a person\'s Continue, started under '
+      + '`pressActor`, and a phase-scoped raise goes through `pressRetry` instead)',
   },
   {
     file: 'server/service-recovery.ts',
@@ -583,6 +602,13 @@ test('the operator doors, per verb — and the one that only LOOKS like the othe
     "recoverPlan reaches the healer through the EXEMPT trigger, so its halt path goes through — "
     + 'the opposite of `retryPhase`, which queues behind the fleet holder like any other phase',
   );
+  // …but only once no hold binds the plan. Under one, Recover and Resume answer
+  // 409 naming it before anything is reconciled or started (control-tower phase
+  // 81, #93, RR-3): whatever they launched would queue behind the holder, and a
+  // 200 that changes nothing is what the operator got on 2026-09-24.
+  for (const refusal of ['was not recovered — ${fleetHoldSentence(held)}', 'was not resumed — ${fleetHoldSentence(held)}']) {
+    assert.ok(source('server/service-runs.ts').includes(refusal), `the press refuses by name under a hold: ${refusal}`);
+  }
   const control = source('server/service-runs.ts');
   for (const verb of ['freezeRun(', 'thawRun(', 'stopRun(']) {
     assert.ok(control.includes(verb), `${verb} acts on a live child and starts nothing`);
@@ -882,3 +908,179 @@ test('standing: the run-control freeze writes the standing form when asked, and 
   );
 });
 
+
+/* ================================================================== *
+ * F. A freeze is named wherever a card would promise continuation
+ *    (control-tower phase 81, #93)
+ * ================================================================== */
+
+/**
+ * Measured on hub 4123 and pe-hub 4130, 2026-09-24: an operator froze the
+ * whole console at 09:57:43Z; launchd restarted it at 10:11:30Z with the
+ * freeze still set. Every run's `finishedReason` said "the console shut down
+ * while this run was working — it continues by itself once the console is
+ * back", and nothing continued; a per-run Resume answered 200 and changed
+ * nothing, because admission holds every entry behind the fleet holder. An
+ * agent spent seven minutes finding the console-wide flag behind a stall the
+ * card had called self-healing.
+ *
+ * RR-1: the shutdown sentence names the freeze — who, when, and the one act
+ * that ends it — whenever a hold that outlives the process binds the run.
+ * RR-2: the card's reading of a stored promise, through one shared function:
+ * under a hold the promise is replaced by the hold, and a restart's own hold
+ * (which lifts with the process) leaves it standing.
+ * RR-3: Resume and Recover under a hold answer 409 with that sentence.
+ */
+
+const FROZE_AT = '2026-09-24T09:57:43.000Z';
+
+function stubRepo(): { root: string; scripts: string; cleanup: () => void } {
+  const root = mkdtempSync(join(tmpdir(), 'pc-freeze-named-'));
+  const scripts = join(root, 'scripts');
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
+  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+mode="\${2:-}"; arg="\${3:-}"
+case "$mode" in
+  --memory-block) echo "done: "; echo "ready: 1"; echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --boot-prompt) echo "BOOT phase $arg" ;;
+  --size) echo M ;;
+  *) exit 0 ;;
+esac
+`);
+  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
+  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
+  return { root, scripts, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+/** A console going away under a working run — the SHD-8 shape: a real child, killed by the checkpoint. */
+async function shutDownUnder(hold: { at: string; by: string; scope?: 'machine' | 'restart' } | null): Promise<string | undefined> {
+  const { Runner } = await import('../server/runner/runner.ts');
+  const r = stubRepo();
+  // The ladder's waits are unref'd; something has to hold the loop open around them.
+  const keepAlive = setInterval(() => {}, 1_000);
+  try {
+    let childPid = 0;
+    let current: typeof hold = null;
+    const instance = new Runner({
+      scriptsDir: r.scripts, verificationText: () => '`true`',
+      // The freeze lands while the phase is working, as it did: nothing would
+      // have boarded under it.
+      fleetHold: () => current,
+      spawn: async (request) => {
+        const child = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore', detached: true });
+        childPid = child.pid!;
+        request.onPid?.(child.pid!);
+        request.onHandle?.({ pid: child.pid!, open: () => true, send: () => true, setFrozen: () => {} });
+        request.onEvent?.({ kind: 'init', sessionId: 'sess-frozen-0001', model: 'stub-1', tools: 0 });
+        await new Promise<void>((resolve) => { child.on('exit', () => resolve()); });
+        return {
+          signal: { subtype: 'error_during_execution', code: 143, text: 'terminated' },
+          sessionId: 'sess-frozen-0001', costUsd: 0, turns: 1, resultText: '', durationMs: 10, argv: [], injected: 0,
+        };
+      },
+    });
+    await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+    for (let i = 0; i < 200 && !childPid; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    current = hold;
+    await (instance as never as { checkpointForShutdown: (context: unknown) => Promise<void> })
+      .checkpointForShutdown({ intent: 'restart', reason: 'restart (launchd)', mode: 'exit' });
+    await instance.wait();
+    return instance.current()?.finishedReason;
+  } finally { clearInterval(keepAlive); r.cleanup(); }
+}
+
+test('RR-1: a console that shuts down under a fleet freeze says so on the run — who froze it and when — never "it continues by itself"', async () => {
+  const said = await shutDownUnder({ at: FROZE_AT, by: 'operator' });
+  assert.match(said ?? '', /frozen console-wide by operator at 2026-09-24T09:57:43\.000Z/);
+  assert.match(said ?? '', /thaw to continue/);
+  assert.doesNotMatch(said ?? '', /continues by itself/, 'the one promise the freeze makes false');
+});
+
+test('RR-1: with no hold, or only a restart\'s own (it lifts with the process), the promise stands — it is true', async () => {
+  for (const hold of [null, { at: FROZE_AT, by: 'a restart by mo, updating to the latest version first', scope: 'restart' as const }]) {
+    const said = await shutDownUnder(hold);
+    assert.match(said ?? '', new RegExp(SHUTDOWN_CONTINUES), `hold=${JSON.stringify(hold)}: ${said}`);
+  }
+});
+
+test('RR-2: the card reads a stored promise through the hold — replaced while one binds, untouched once it lifts', () => {
+  const stored = `the console shut down while this run was working — ${SHUTDOWN_CONTINUES}`;
+  const frozen = heldStopReason(stored, { at: FROZE_AT, by: 'operator' });
+  assert.equal(frozen, `the console shut down while this run was working — frozen console-wide by operator at ${FROZE_AT} — thaw to continue`);
+  assert.equal(heldStopReason(stored, null), stored, 'thawed: the promise is true again');
+  assert.equal(heldStopReason(stored, { at: FROZE_AT, by: 'a restart by mo', scope: 'restart' }), stored,
+    'a restart\'s hold lifts with the process — the run does continue by itself');
+  assert.match(heldStopReason(stored, { at: FROZE_AT, by: 'the supervisor', scope: 'machine' }),
+    /held machine-wide by the supervisor at .* — release the hold to continue/);
+  assert.equal(heldStopReason('phase 3 declared itself blocked', { at: FROZE_AT, by: 'operator' }),
+    'phase 3 declared itself blocked', 'a stop that promised nothing keeps its own words');
+  assert.equal(fleetHoldSentence({ at: FROZE_AT, by: 'operator' }), `frozen console-wide by operator at ${FROZE_AT} — thaw to continue`);
+});
+
+test('RR-3: under a fleet freeze Resume and Recover answer 409 with the freeze — never a 200 that does nothing', async () => {
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { Service } = await import('../server/service.ts');
+  const { newRun, phaseRecord, saveRun } = await import('../server/runner/state.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-freeze-409-'));
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'alpha.md'), `---
+slug: alpha
+created: 2026-08-06
+status: active
+phases: 2
+---
+
+# alpha
+
+## Phase graph
+
+| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
+|------:|-------|-----------|--------------------|-------|---------------|
+| 1 | schema | — | — | app | it works |
+| 2 | cart api | 1 | — | app | it still works |
+
+## Phases
+
+### Phase 1 — schema
+- **Size:** S
+
+### Phase 2 — cart api
+- **Size:** S
+`, 'utf8');
+  const svc = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowWrites: true, allowRun: true,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  svc.push.announce = (() => {}) as typeof svc.push.announce;
+  try {
+    assert.equal(svc.open(root).ok, true);
+    const state = newRun({ slug: 'alpha', root });
+    state.status = 'paused';
+    state.stoppedBy = 'system';
+    state.finishedReason = `the console shut down while this run was working — ${SHUTDOWN_CONTINUES}`;
+    phaseRecord(state, 1).status = 'pending';
+    saveRun(state);
+    const started: unknown[] = [];
+    (svc as never as Record<string, unknown>).startRun = async (...args: unknown[]) => { started.push(args); return state; };
+
+    assert.equal(svc.freezeFleet('operator').ok, true);
+    const actor = { by: 'operator', door: 'operator' } as never;
+
+    const resumed = await svc.resumeRun('alpha', actor);
+    assert.equal(resumed.ok, false);
+    assert.equal(!resumed.ok && resumed.status, 409);
+    assert.match(!resumed.ok ? resumed.error : '', /frozen console-wide by operator at .* — thaw to continue/);
+
+    await assert.rejects(svc.recoverPlan('alpha', actor), /frozen console-wide by operator at .* — thaw to continue/,
+      'the route answers a refusal 409 — see `case \'recover\'`');
+    assert.deepEqual(started, [], 'nothing was started under the freeze');
+  } finally {
+    clearFleetHold();
+    svc.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

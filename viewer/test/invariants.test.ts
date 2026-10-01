@@ -161,15 +161,21 @@ test('clause 1: only pid.ts shells `ps`', () => {
  *
  * The plan's Detail says a grep finds `process.kill(`/`child.kill(` only in
  * `signals.ts`. That was never true of this tree, and asserting it literally
- * would force three wrong refactors: none of these is a PHASE SESSION, which is
- * what the invariant is about. Three are short-lived children the console
+ * would force wrong refactors: none of these is a PHASE SESSION, which is
+ * what the invariant is about. Two are short-lived children the console
  * spawns and awaits, with no group of their own to address; two are ptys, which
  * have their own ladder in `terminal.ts`.
+ *
+ * `shell.ts` LEFT this list in control-tower phase 56 (#75, #77), on purpose:
+ * its ceiling killed the direct child alone, so a grandchild holding the pipe
+ * kept the call — and the engine slot under it — open to 6.89x the ceiling.
+ * The seam now spawns each command as its own group and ends it at the ceiling
+ * with `groupSignal(pid, 'SIGKILL')` from `runner/signals.ts`, the one door.
  *
  * The list is asserted as an exact SET, so it fails in both directions — a new
  * kill anywhere fails, and so does deleting one of these without deleting its
  * entry here, which is what keeps the reasons from rotting. What it CANNOT see
- * is a kill inside one of these six files that is about something else; the
+ * is a kill inside one of these five files that is about something else; the
  * unit is the file, and for `terminal.ts` and `pty/broker.ts` that is the
  * loosest this can be.
  */
@@ -184,12 +190,6 @@ const KILL_ALLOWED: Record<string, string> = {
     + 'servers) — and what is left here is the no-group fallback (a spawn seam that gave us no pid)',
   'runner/auth.ts':
     'the `claude auth status` probe, killed at its 20s timeout',
-  'shell.ts':
-    'the command seam\'s own timeout, on a child it started itself a moment ago. Deliberately NOT '
-    + 'the signal ladder: these are git, du, gh and a setup `sh -c` — piped, short-lived, no turn to '
-    + 'close and no session to end, and the ladder exists for a `claude -p` whose SIGINT writes the '
-    + 'result that books the turn. The one `claude` this seam must never take is spawn.ts\'s, which '
-    + 'stays outside it by name (with pid.ts\'s `ps`) in the two lints below',
   'runner/spawn.ts':
     'onAbort\'s fallback for a child with NO pid — there is no group to address, so the '
     + 'ladder has nothing to work with; the pid path above it goes through wakeAndTerm()',
@@ -673,7 +673,11 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
     why: 'attemptSession hands it to resumableSession (the gate) before anything spawns; the shutdown '
       + 'checkpoint\'s finishedReason only phrases a sentence with it',
   },
-  'runner/runner-control.ts': { count: 1, why: 'resumeWithInstruction hands it to resumableSession before the spawn' },
+  'runner/runner-control.ts': {
+    count: 2,
+    why: 'resumeWithInstruction hands it to resumableSession before the spawn; boardAtBoundary names the session on '
+      + 'a person-slot hint, which boards through composeBrief\'s gate like the ladder\'s (control-tower phase 98)',
+  },
   'runner/runner-loop.ts': {
     count: 3,
     why: 'the wait-resume bookkeeping asks whether one is named — a gone own-session is journalled, never re-armed; '
@@ -683,12 +687,20 @@ const RESUME_ID_READERS: Record<string, { count: number; why: string }> = {
       + 'spawn and no --resume (many-plans-one-repo phase 11)',
   },
   'runner/runner.ts': {
-    count: 3,
+    count: 5,
     why: 'the ladder\'s own-session availability (the hint still boards through composeBrief\'s gate), an errand '
-      + 'sentence, and the widen-rule card\'s answer, which re-boards through the same hint and the same gate (phase 9)',
+      + 'sentence, and the widen-rule card\'s answer, which re-boards through the same hint and the same gate (phase 9); '
+      + 'the ladder\'s switch-account rung names the transcript to carry to the new account — a port, no spawn, the '
+      + 'boarding still through the hint and the gate; and the phase.reopened line names the session reconcile kept — '
+      + 'a journal decoration (control-tower phase 79)',
   },
   'runner/situation.ts': { count: 2, why: 'the evidence a situation is classified from — display, no spawn' },
-  'runner/state.ts': { count: 1, why: 'isSessionGone, the predicate the gate itself reads' },
+  'runner/state.ts': {
+    count: 3,
+    why: 'isSessionGone, the predicate the gate itself reads; and reopenRegressedRecords, which keeps the id on a '
+      + 'record it reopens and reports it — bookkeeping for the next boarding, which resumes through the gate '
+      + '(control-tower phase 79)',
+  },
 };
 
 test('clause 1: every --resume passes the one gate, the gate reads presence, and the id reaches no spawn around it', () => {
@@ -812,13 +824,14 @@ test('WAI-6: no fixture run loads with a waiting record past its clock and no ru
  * WAI-9 — every licence journals. `consumeDeclaration` is the one deleter of
  * `record.declared`; a site that spends testimony either hands it a journal
  * (the third argument) or writes `DECLARATION_CONSUMED_EVENT` itself within
- * the next few lines. `settleStoredWaitTimeout` returns the spend for ITS one
- * caller to pair, and that caller is held here too.
+ * the next few lines. (The third shape — `settleStoredWaitTimeout` returning
+ * its spend to the boot's overdue ruling — left with it in control-tower
+ * phase 45: a spent budget keeps its declaration, so nothing is spent there.)
  */
 test('WAI-9: every consumeDeclaration( site is paired with phase.declaration-consumed — a sink, or the line beside it', () => {
   const sites = hits(/\bconsumeDeclaration\(/);
   const unpaired: string[] = [];
-  const shapes = { sink: 0, beside: 0, returned: 0 };
+  const shapes = { sink: 0, beside: 0 };
   for (const hit of sites) {
     const [rel, lineNo] = hit.split(':');
     const lines = SOURCES.find((s) => s.rel === rel)!.lines;
@@ -830,24 +843,13 @@ test('WAI-9: every consumeDeclaration( site is paired with phase.declaration-con
     const args = /consumeDeclaration\(([^;]*?)\)(?:;|\s*$|\s*\))/.exec(window)?.[1] ?? '';
     const passesSink = args.split(',').length >= 3;
     const pairedBeside = lines.slice(idx, idx + 5).some((l) => l.includes('DECLARATION_CONSUMED_EVENT'));
-    const returnsForCaller = /^\s*const spent = consumeDeclaration\(record, 'new-outcome'\);/.test(text)
-      && lines.slice(Math.max(0, idx - 40), idx).some((l) => /export function settleStoredWaitTimeout\(/.test(l));
-    if (passesSink) shapes.sink++; else if (pairedBeside) shapes.beside++; else if (returnsForCaller) shapes.returned++;
-    if (!passesSink && !pairedBeside && !returnsForCaller) unpaired.push(hit);
+    if (passesSink) shapes.sink++; else if (pairedBeside) shapes.beside++;
+    if (!passesSink && !pairedBeside) unpaired.push(hit);
   }
   assert.deepEqual(unpaired, [], `a declaration is spent here with no journal line: ${unpaired.join(', ')}`);
   assert.ok(sites.length >= 8, `the licences have callers (${sites.length})`);
-  // Not vacuous: all three shapes exist today (the sink form, the paired line, the one returned spend).
-  assert.ok(shapes.sink >= 3 && shapes.beside >= 3 && shapes.returned === 1, JSON.stringify(shapes));
-  // …and the one site that returns its spend has its caller pair it.
-  const callers = hits(/\bsettleStoredWaitTimeout\(/).filter((hit) => !hit.startsWith('runner/state.ts'));
-  assert.deepEqual(filesOf(callers), ['service-base.ts']);
-  for (const hit of callers) {
-    const [rel, lineNo] = hit.split(':');
-    const lines = SOURCES.find((s) => s.rel === rel)!.lines;
-    assert.ok(lines.slice(Number(lineNo) - 1, Number(lineNo) + 4).some((l) => l.includes('DECLARATION_CONSUMED_EVENT')),
-      `${hit}: the returned spend is not journalled`);
-  }
+  // Not vacuous: both shapes exist today (the sink form, the paired line).
+  assert.ok(shapes.sink >= 3 && shapes.beside >= 3, JSON.stringify(shapes));
 });
 
 /**
@@ -984,6 +986,23 @@ test('SLF-1: every startRun( site names its door, and the doors named are the ce
       'service-recovery.ts → watch-landed',
       "service-runs.ts → the caller's",
       "service-runs.ts → the caller's",
+      // Two more since control-tower phase 53: a person's fresh resume
+      // (`reboardForPerson`) and the continue its press queues behind the loop
+      // (`continueAfterPress`) — both thread the press's own actor.
+      "service-runs.ts → the caller's",
+      "service-runs.ts → the caller's",
+      // One more since control-tower phase 77 (#102): Resume lifting a settled
+      // pause (`resumeRun`) threads the press's own actor.
+      "service-runs.ts → the caller's",
+      // One more since control-tower phase 91 (#131): a person's answer to an
+      // identity park (`answerIdentity`) threads the press's own actor.
+      "service-runs.ts → the caller's",
+      // One more since control-tower phase 90 (#123): a person's repair of a
+      // refused checkout (`repairCheckout`) threads the press's own actor.
+      "service-runs.ts → the caller's",
+      // One more since control-tower phase 14 (#40): a budget raise continues
+      // the run its dollars halted, as the person's own Continue.
+      'service-runs.ts → operator',
       'service-runs.ts → outcome-inbox',
       'service.ts → mcp-require-timeout',
     ].sort(),
@@ -1011,7 +1030,7 @@ test('SLF-1: every startRun( site names its door, and the doors named are the ce
  */
 const SETTLE_SITES: Record<string, { count: number; why: string }> = {
   'runner/ladder.ts': { count: 3, why: 'the two definitions, and `settleRung` handing the newest open rung to `settleRungRecord` — the one writer of `outcome`' },
-  'runner/runner-base.ts': { count: 2, why: "the runner's door (`settleOpenRung`) and its attempt-end backstop (`settleRungsAfterAttempt`), both writing `phase.rung-settled` through `rungSettledPayload`" },
+  'runner/runner-base.ts': { count: 3, why: "the runner's door (`settleOpenRung`) and its attempt-end backstop (`settleRungsAfterAttempt`) — whose two arms are a lane that never spawned, settled `withdrawn` (control-tower phase 4, #16), and a lane that ran, settled by its record — all writing `phase.rung-settled` through `rungSettledPayload`" },
   'service-recovery.ts': { count: 1, why: "the service's door (`settleRungOn`), writing the same payload on the stored run's journal" },
   'runner/mcp-park.ts': { count: 1, why: "the `require` flip settles the `wait-heal` rung the healer accounted while the clock ran, in place, and journals it through the caller's sink" },
 };
@@ -1297,3 +1316,88 @@ test('LCK-2: losing the lock stops the lane, it does not merely say so', () => {
   assert.match(arm, /this\.stopPhase\(/, 'the lock-lost arm stops the lane');
   assert.match(arm, /stopped: stopped\.ok/, 'and the journal line reports whether it could');
 });
+
+// ── #51 — one journal counter per run file (control-tower phase 52) ──────────
+// A `seq` numbers one sequence only while it has one owner. Every writer used
+// to build its own `new Journal(…)`, each read the file's tail once and counted
+// on from there — so the watch scheduler's fresh instance wrote seq 489 while
+// the live runner's, still believing 488, wrote 489 too, and a reader whose
+// cursor sat between the two never saw one of them. `Journal.for` keeps one
+// instance per run file per process; a second construction is a second counter.
+test('JC-3: nothing under server/ constructs a Journal but the registry — every writer asks Journal.for', () => {
+  const built = hits(/\bnew Journal\(/);
+  assert.deepEqual(filesOf(built), ['runner/journal.ts'], `a Journal built outside the registry is a second counter: ${built.join(', ')}`);
+  assert.equal(built.length, 1, `the registry builds each run's one instance in one place: ${built.join(', ')}`);
+
+  // The positive half, so the scan cannot pass by seeing nothing: the writers
+  // that used to construct their own now ask the registry.
+  const asked = hits(/\bJournal\.for\(/);
+  assert.ok(asked.length >= 45, `expected every journal writer to ask Journal.for (${asked.length})`);
+  for (const file of ['service-base.ts', 'service-runs.ts', 'service-recovery.ts', 'service.ts', 'runner/runner-control.ts', 'runner/state.ts', 'debug/sources.ts']) {
+    assert.ok(filesOf(asked).includes(file), `${file} reaches its journals through Journal.for`);
+  }
+});
+
+// ── #50 — a stop left its wait's reason behind (control-tower phase 52) ──────
+// The queue writes its wait through `setRunState(state, 'queued', {kind:
+// 'scope'})`; the stop ended the loop with a raw `state.status = …`, which
+// wrote the word and kept `waitReason: 'scope'` beside "stopped by the
+// operator". The writer is the only place that can drop a reason whose wait is
+// over, so it is the only place a run's status is written.
+//
+// Deny by default: EVERY `.status =` under server/ is found, and its receiver
+// must be one this rule knows is not a run — a phase record, an approval card —
+// or `state` inside `setRunState` itself. A run held under a new name is a
+// receiver this list does not know, and the scan says so rather than missing it.
+test('SW-3: every run-status write goes through setRunState — no raw `state.status =` anywhere else', () => {
+  // `firing` is a stored trigger's firing: its status is the pressed verb's HTTP answer (triggers.ts).
+  const NOT_A_RUN = new Set(['record', 'rec', 'phaseRecord(…)', 'card', 'approval', 'firing']);
+  const writes = hits(/\.status\s*=(?!=)/);
+  assert.ok(writes.length > 50, `the scan sees the phase-record writes too (${writes.length})`);
+  const offenders: string[] = [];
+  let writer: string | null = null;
+  for (const hit of writes) {
+    const [rel, n] = hit.split(':');
+    const line = SOURCES.find((s) => s.rel === rel)!.lines[Number(n) - 1];
+    for (const match of line.matchAll(/([A-Za-z_$][\w$]*)(\([^()]*\))?\.status\s*=(?!=)/g)) {
+      const receiver = match[2] ? `${match[1]}(…)` : match[1];
+      if (NOT_A_RUN.has(receiver)) continue;
+      if (rel === 'runner/state.ts' && receiver === 'state' && line.trim() === 'state.status = status;') { writer = hit; continue; }
+      offenders.push(`${hit} (${receiver})`);
+    }
+  }
+  assert.deepEqual(offenders, [], `a run status written around setRunState — the wait's reason outlives it: ${offenders.join(', ')}`);
+
+  // …and that one raw write is setRunState's own.
+  assert.ok(writer, 'setRunState writes the word');
+  const lines = SOURCES.find((s) => s.rel === 'runner/state.ts')!.lines;
+  const opens = lines.findIndex((l) => l.startsWith('export function setRunState('));
+  const at = Number(writer!.split(':')[1]) - 1;
+  assert.ok(opens >= 0 && at > opens && at < opens + 12, `the one raw run-status write is inside setRunState: ${writer}`);
+});
+
+// ── #49 — two readers of one claim disagreed (control-tower phase 52) ────────
+// The inbox gate asked the registry about a declaring session, heard `ended`
+// and boarded its `partial`; admission, two seconds later, read the same
+// session's unexpired lock as held and queued the boarding behind it. The run
+// waited on itself until it was stopped. A lock's session and a declarer are
+// now asked about in ONE place: `declarerPresence`, reached directly by the
+// inbox gate and the resume gate, and through `lockPresenceFor` by admission,
+// the belt-check, converge, the classifier and the isolation census.
+test('DL-4: a declarer and a lock\'s session are asked about in one place — declarerPresence — never the raw registry', () => {
+  const raw = hits(/\bsessions\.presenceOfLock\(/);
+  assert.deepEqual(raw, [], `a lock's session read from the raw registry, beside declarerPresence: ${raw.join(', ')}`);
+  const detail = hits(/\bsessions\.presenceDetail\(/);
+  assert.deepEqual(detail.map((hit) => hit.split(':')[0]), ['service-base.ts'], `presenceDetail read outside declarerPresence: ${detail.join(', ')}`);
+
+  // The positive half: declarerPresence holds that one read, and every reader named above reaches it.
+  const base = SOURCES.find((s) => s.rel === 'service-base.ts')!.lines;
+  const opens = base.findIndex((l) => /^\s*protected declarerPresence\(/.test(l));
+  const at = Number(detail[0].split(':')[1]) - 1;
+  assert.ok(opens >= 0 && at > opens && at < opens + 8, `the registry's presenceDetail is read inside declarerPresence: ${detail[0]}`);
+  const via = hits(/\bthis\.declarerPresence\(/);
+  assert.ok(via.length >= 3, `declarerHold, lockPresenceFor and the resume gate ask it: ${via.join(', ')}`);
+  assert.ok(hits(/sessionPresence:\s*\(\w+\)\s*=>\s*this\.declarerPresence\(/).length === 1, 'the runner\'s resume gate asks declarerPresence');
+  assert.ok(hits(/lockPresence:\s*\(lock\)\s*=>\s*this\.lockPresenceFor\(/).length >= 1, 'the boarding belt-check asks lockPresenceFor');
+});
+

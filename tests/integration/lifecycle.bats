@@ -21,6 +21,7 @@ setup() {
 
 @test "QA off: finishing a phase unblocks dependents immediately (no gating)" {
   pe_newho demo 1 root complete >/dev/null
+  write_body demo phase-01-root.md
   run pg demo --ready
   [ "$output" = "2 3" ]
 }
@@ -36,6 +37,7 @@ setup() {
 
 @test "QA on: dependents gated until the verdict is recorded pass" {
   pe_newho demo 1 root complete --qa >/dev/null
+  write_body demo phase-01-root.md
   printf '## QA status\n\n| Phase | Result |\n|--:|--|\n| 1 | pass |\n' \
     > "$DOCS_ROOT/docs/handoffs/demo/test-status.md"
   run pg demo --ready
@@ -45,6 +47,12 @@ setup() {
 @test "next-phase-prompt no longer emits a separate QA-skill prompt (QA is a subagent now)" {
   pe_newho demo 1 root complete >/dev/null
   run pe_nextp demo 1
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "/phased-execution-qa"
+  # Phase 1 of the diamond unblocks two: the shared boot once, a block each (#115).
+  assert_contains "$output" "boot-shared"
+  assert_contains "$output" "### Phase 3"
+  run pe_nextp demo 1 --phase 2
   [ "$status" -eq 0 ]
   refute_contains "$output" "/phased-execution-qa"
   assert_contains "$output" "START COPY"
@@ -64,6 +72,18 @@ setup() {
   [ "$status" -eq 0 ]
   refute_contains "$output" "qa-full demo"
   assert_contains "$output" "End-to-end verification"
+}
+
+@test "closeout: the end-to-end verification comes BEFORE close-plan.sh (#153)" {
+  # A plan closed first and verified after reads `complete` to every reader while
+  # its proof is still owed — the same order defect #153 found in the handoff.
+  run pe_nextp demo none
+  [ "$status" -eq 0 ]
+  verify_at="$(printf '%s\n' "$output" | grep -n 'End-to-end verification' | head -1 | cut -d: -f1)"
+  close_at="$(printf '%s\n' "$output" | grep -n 'close-plan.sh demo --status complete' | head -1 | cut -d: -f1)"
+  [ -n "$verify_at" ] && [ -n "$close_at" ] || false
+  [ "$verify_at" -lt "$close_at" ] || { echo "close-plan.sh (line $close_at) precedes the verification (line $verify_at)" >&2; false; }
+  assert_contains "$output" "only once every line is green"
 }
 
 @test "closeout emits the qa-full brief when the plan enables QA" {

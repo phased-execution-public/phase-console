@@ -21,7 +21,8 @@ import { expectNoAxeViolations } from '@/test/axe';
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from './accordion';
 import { Button, ButtonGroup } from './button';
 import { Card, CardBody, CardHeader, CardTitle, Tile } from './card';
-import { DataTable, Table, TableWrap, TBody, TD, TH, THead, TR, stickyHeadCell, type Column } from './table';
+import { DataTable, type Column } from '@/components/data-table';
+import { Table, TableWrap, TBody, TD, TH, THead, TR, stickyHeadCell } from './table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './tabs';
 import { ToggleGroup, ToggleItem } from './toggle-group';
 
@@ -31,11 +32,14 @@ describe('Button', () => {
     expect(screen.getByRole('button', { name: 'Save' })).toHaveAttribute('type', 'button');
   });
 
-  it('variant="action" is the amber one', () => {
+  it('variant="action" is the ink-solid primary; variant="attention" is the amber one (tokens 6.0)', () => {
     render(<Button variant="action">Start phase</Button>);
-    expect(screen.getByRole('button')).toHaveClass('text-action');
+    expect(screen.getByRole('button', { name: 'Start phase' })).toHaveClass('bg-action', 'text-ground');
+    render(<Button variant="attention">Allow</Button>);
+    expect(screen.getByRole('button', { name: 'Allow' })).toHaveClass('text-accent');
     const { container } = render(<Button>Plain</Button>);
-    expect(container.querySelector('button')).not.toHaveClass('text-action');
+    expect(container.querySelector('button')).not.toHaveClass('bg-action');
+    expect(container.querySelector('button')).not.toHaveClass('text-accent');
   });
 
   it('asChild lends the classes to a real element', () => {
@@ -105,8 +109,10 @@ describe('a clipping box may not squash what it clips', () => {
     expect(group.className, 'a clip here hides a segment instead of squeezing it').not.toMatch(CLIP);
     expect(group.className, 'a segmented control keeps the width its segments declare').toContain('shrink-0');
     // The radius the clip used to produce, now on the segments themselves.
-    expect(group.className).toMatch(/\[&>button:first-child\]:rounded-l/);
-    expect(group.className).toMatch(/\[&>button:last-child\]:rounded-r/);
+    // Logical (`s` = start, `e` = end), so the group's ends swap under RTL —
+    // `styles/logical.test.ts` holds the kit to that spelling.
+    expect(group.className).toMatch(/\[&>button:first-child\]:rounded-s/);
+    expect(group.className).toMatch(/\[&>button:last-child\]:rounded-e/);
   });
 
   it('ToggleGroup — the same primitive with Radix roving focus — says the same', () => {
@@ -121,7 +127,7 @@ describe('a clipping box may not squash what it clips', () => {
     expect(group.className).not.toMatch(CLIP);
     expect(group.className).toContain('shrink-0');
     const [first] = screen.getAllByRole('radio');
-    expect(first?.className).toMatch(/first:rounded-l/);
+    expect(first?.className).toMatch(/first:rounded-s/);
   });
 
   it('CardHeader wraps — a header that cannot fit on one line takes two', () => {

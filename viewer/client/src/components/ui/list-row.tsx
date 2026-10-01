@@ -90,9 +90,9 @@ export function ListRow({
       {(facts != null || time != null) && (
         <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 font-mono text-2xs tabular-nums text-ink-faint">
           {facts}
-          {/* `ml-auto` on a row that is allowed to wrap: on a phone the clock
+          {/* `ms-auto` on a row that is allowed to wrap: on a phone the clock
               drops to its own line rather than pushing the facts off-screen. */}
-          {time != null && <span className="ml-auto shrink-0 whitespace-nowrap">{time}</span>}
+          {time != null && <span className="ms-auto shrink-0 whitespace-nowrap">{time}</span>}
         </div>
       )}
 

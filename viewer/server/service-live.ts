@@ -9,7 +9,7 @@
  * more. Read the chain in order; `service.ts` holds the concrete class.
  */
 import { basename, join } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, loadavg } from 'node:os';
 import { existsSync, mkdirSync, readdirSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { instanceId } from '../shared/instances.mjs';
 import {
@@ -22,13 +22,13 @@ import {
   type RunLink, type SessionEventName, type SessionRecord, type SessionView,
 } from './sessions/registry.ts';
 import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type HooksWrite } from './hooks-install.ts';
-import { REFUSAL_REASON } from './runner/worktree.ts';
-import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
+import { REFUSAL_FIX, REFUSAL_REASON } from './runner/worktree.ts';
+import { Store, handoffFor, lockFor, lockOnlySlugs, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
   ConvergeScheduler, convergePlan, HALT_DELAY_MS, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
 import { planWrite, runWrite } from './writes.ts';
 import {
-  run, invalidate, readMemoryBlock, readQaMode, readSessionPlan, readLint, readGateStatus,
+  run, invalidate, engineQueue, readMemoryBlock, readQaMode, readSessionPlan, readLint, readGateStatus,
   readText, readBoardText, readNotes, type Board, type QaMode, type SessionPlan, type LintResult,
   type GateStatus,
 } from './engine.ts';
@@ -49,6 +49,9 @@ import {
   CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
 import { isCategory } from './push/catalogue.ts';
+import {
+  BUDGET_LABELS, BUDGET_WARN_PCT, budgetAmount, budgetArithmetic, budgetHeadline, isBudgetKind, type BudgetFact,
+} from '../shared/budget-model.js';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
 import {
   branchState, commitsInRange, repoInfo, lastCommit, commitsTouching,
@@ -72,9 +75,10 @@ import {
   INBOX_ACKS_DIR, type InboxAck, type InboxFacts, type InboxView,
 } from './inbox.ts';
 import {
-  STALL_ESCALATE_MS, STALL_SIGNAL_META, inboxItemId, parseInboxItemId,
+  LOCAL_WAIT_LABEL, STALL_ESCALATE_MS, STALL_SIGNAL_META, inboxItemId, parseInboxItemId,
 } from '../shared/attention-model.js';
 import { isLiveStatus } from '../shared/status-vocab.js';
+import { waitSentence } from '../shared/status-model.js';
 import { deriveEvidence } from '../shared/evidence-model.js';
 import {
   DOCUMENT_PLAN_FIELDS, HANDOFF_PROSE_FIELDS, PROSE_PHASE_FIELDS, omit, summarizeRun, wants,
@@ -82,12 +86,15 @@ import {
 import { mergeDecisions } from '../shared/decisions-model.js';
 import { heldIdsCached } from './credentials-probe.ts';
 import {
-  planStats, portfolio, etaSamples, etaFrom, rateFor, phaseEtaFor, healthIssues, isClosedStatus, splitRepos,
+  planStats, portfolio, etaSamples, etaEvidence, etaFrom, rateFor, phaseEtaFor, healthIssues, isClosedStatus, splitRepos,
   dutyCycle, forecastFrom,
   type PlanStats, type Portfolio, type PlanContext, type EtaEstimate, type EtaSample,
   type PhaseEta, type RateReading, type Forecast,
 } from './analysis/stats.ts';
-import { landFor, mcpServersFor, type Plan, type PhaseDetail, type PhaseRow } from './parse/plan.ts';
+import { landFor, mcpServersFor, waitsOnFor, type Plan, type PhaseDetail, type PhaseRow, type PhaseSize } from './parse/plan.ts';
+import {
+  bootFloorLine, FORECAST_UNIT, forecastLine, forecastSessions, sessionsPerPhaseOf, shippedContextModel,
+} from './analysis/sizing-model.ts';
 import {
   Runner, applySettings, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
@@ -118,7 +125,7 @@ import {
 } from './runner/freeze.ts';
 import type { LaneLiveness } from './runner/liveness.ts';
 import { DEFAULT_WAIT_BUDGET, waitBudgetFrom, type WaitBudget } from './runner/wait-budget.ts';
-import { dateOfRef } from './watch-refs.ts';
+import { dateOfRef, learnWorkflowTimeouts, waitTimeoutsCached } from './watch-refs.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive,
@@ -150,13 +157,13 @@ import {
   Approvals, classifyTool, matchedDenyRule, loadPolicy, loadPolicyFor, policyExtras, addPolicyRules,
   editPolicy, planPolicyPath, effectivePlanPolicyPath, notifyOutOfBand, carvedPolicy, suggestedRule,
   autoApproveFor, neverAutoApproves, hitsHidden, struckFor,
-  parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED,
+  parseRule, inertRules, HOOK_TOOLS, WRAPPERS_NOT_STRIPPED, type Approval,
   PERMISSION_PROFILES, PROFILE_LABELS, DEFAULT_PERMISSION_PROFILE,
   DEFAULT_DENY, DEFAULT_ASK, DEFAULT_ALLOW, POLICY_PATH,
   type Evidence, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
 import {
-  AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, phaseLive, ptyClaudeSessions, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLive, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView, qaHeldBy,
+  AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, phaseLive, ptyClaudeSessions, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, etaPhaseFacts, remainingFloors, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLive, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSizing, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView, blockedByView, qaHeldBy,
 } from './service-core.ts';
 import { factsFor, splitSituation } from '../shared/fact-map.js';
 import type { Service } from './service.ts';
@@ -164,7 +171,27 @@ import { ServiceBase, trimOldest, NOTIFIED_CAP } from './service-base.ts';
 import { parseQaRounds, type QaRoundRow } from './parse/folder.ts';
 import { readFileSync } from 'node:fs';
 
+/**
+ * How long a board read that timed out stays this revision's cached answer
+ * before the next read asks the engine again (#44). Long enough that a loaded
+ * machine is not asked on every request, short enough that a page does not sit
+ * on a stale board once the machine has recovered.
+ */
+export const BOARD_RETRY_MS = 60_000;
+
 export abstract class ServiceLive extends ServiceBase {
+  /** A released lock's phase stops fencing its scope — `ServiceRuns.noteFenceReleased`. */
+  protected abstract noteFenceReleased(slug: string, phase: number): void;
+
+  /**
+   * The attention inbox's input revision (control-tower phase 56, #75): moved
+   * by every event that can change the inbox (`INBOX_SOURCES`), by an ack, and
+   * by a gate answer landing. `Service.attention` memoises on it.
+   */
+  protected inboxRevision = 0;
+  /** True only while the debounced tick emits — see `nudgeInbox`. */
+  private inboxEcho = false;
+
   /* ---------------------------------------------------------------- *
    * Live updates
    * ---------------------------------------------------------------- */
@@ -205,11 +232,23 @@ export abstract class ServiceLive extends ServiceBase {
    * that refetched per event would be the noisiest thing on the wire.
    */
   private nudgeInbox(event: string): void {
-    if (event === 'inbox' || !INBOX_SOURCES.some((prefix) => event.startsWith(prefix))) return;
+    if (event === 'inbox') {
+      // A direct `inbox` event — an ack, an issue draft, a gate answer landing
+      // — says the inbox changed. The debounced tick below is only the echo of
+      // a source event that has already moved the revision.
+      if (!this.inboxEcho) this.inboxRevision++;
+      return;
+    }
+    if (!INBOX_SOURCES.some((prefix) => event.startsWith(prefix))) return;
+    // The inbox's input revision moves at once, on every such event — the
+    // memo in `attention()` is keyed on it (#75) — while the client's refetch
+    // tick below stays debounced.
+    this.inboxRevision++;
     if (this.inboxTimer) return;
     this.inboxTimer = setTimeout(() => {
       this.inboxTimer = null;
-      this.emit('inbox', { at: new Date().toISOString() });
+      this.inboxEcho = true;
+      try { this.emit('inbox', { at: new Date().toISOString() }); } finally { this.inboxEcho = false; }
     }, 400);
     this.inboxTimer.unref?.();
   }
@@ -224,6 +263,15 @@ export abstract class ServiceLive extends ServiceBase {
    */
   protected onRunnerEvent(event: string, data: unknown): void {
     this.emit(event, data);
+    // A phase reaching done, or re-opened, is a board transition: every watch
+    // ref naming it is asked NOW, not on its cadence (control-tower phase 88,
+    // #129 — P50 would have noticed P43's completion 3 h 20 min late).
+    const moved = data as { slug?: string; phase?: number; status?: string; event?: string } | undefined;
+    if (moved?.slug && typeof moved.phase === 'number'
+      && ((event === 'run:phase' && moved.status === 'done')
+        || (event === 'run:journal' && (moved.event === 'phase.reopened' || moved.event === 'phase.verification-failed')))) {
+      this.watchClock.boardMoved(moved.slug, moved.phase);
+    }
     if (event === 'run:phase') {
       // A `require` MCP park starts its clock here — the service owns the
       // timer because only the service can restart a run the park stopped.
@@ -260,6 +308,7 @@ export abstract class ServiceLive extends ServiceBase {
       }
       return;
     }
+    if (event === 'run:budget') { this.announceBudget(data); return; }
     if (event === 'run:liveness') { this.announceStall(data); return; }
     if (event === 'run:watchdog') { this.announceWatchdog(data); return; }
     if (event !== 'run:run') return;
@@ -333,12 +382,15 @@ export abstract class ServiceLive extends ServiceBase {
         break;
       case 'waiting': {
         const parked = waitReasonOf(state) === 'external';
+        // What it waits on and when it resumes, in the words the Runs list
+        // uses (control-tower phase 88, #148): the watch ref or the park's
+        // reason, and the clock. The stored reason is the fallback.
         push('parked', `${state.slug} is waiting`,
-          parked
+          waitSentence(state as Parameters<typeof waitSentence>[0]) ?? (parked
             ? state.finishedReason ?? 'waiting on external work; resumes on its own'
             // The runner writes "usage limit — resets <time>" here; saying
             // when is the whole of what the operator wants from this card.
-            : state.finishedReason ?? 'asleep until a usage window reopens');
+            : state.finishedReason ?? 'asleep until a usage window reopens'));
         // The resume clock is armed ABOVE the dedupe, not here — an arm that
         // rides an announcement is silenced with it.
         break;
@@ -412,9 +464,16 @@ export abstract class ServiceLive extends ServiceBase {
   protected announceErrand(data: unknown): void {
     const event = data as {
       slug?: string; runId?: string; phase?: number;
-      errand?: { at?: string; need?: string; how?: string; tried?: string[]; situation?: string };
+      errand?: { at?: string; need?: string; how?: string; tried?: string[]; situation?: string; budget?: BudgetFact };
     } | undefined;
     const { slug, runId, phase, errand } = event ?? {};
+    // An errand a BUDGET wrote (a ladder cap, a spent wait) is announced as the
+    // budget it is (control-tower phase 14, #40), under `budget` and through the
+    // one dedupe, never as a second, mismatched needs-you card beside it.
+    if (slug && errand?.budget) {
+      this.announceBudget({ slug, runId, phase: phase ?? null, state: 'spent', fact: errand.budget });
+      return;
+    }
     // A RUN-level errand carries no phase — converge writes one for a stop that
     // belongs to no single phase, and `ConvergeDeps.announceErrand` types the
     // parameter `number | null` precisely to allow it. This guard read `typeof
@@ -470,6 +529,67 @@ export abstract class ServiceLive extends ServiceBase {
       ...(phase != null ? { phase } : {}),
       ...(runId ? { runId } : {}),
       ...(gate ? { answer: { item: inboxItemId({ kind: 'gate', slug, phase }), verbs: ['approve'] } } : {}),
+    });
+  }
+
+  /**
+   * A budget at its warning line, or spent (control-tower phase 14, #40).
+   *
+   * Every budget the console keeps could stop a run and none of them said so:
+   * a spent wait budget parked under a card describing CI, a spent run budget
+   * halted under the generic "Run halted", and the operator learned which
+   * budget from a paragraph in the phase record. This is the one announcer for
+   * all five, fed by the runner's `budget` event, by an errand carrying a
+   * `BudgetFact`, and by the two service paths that park a stored run (the
+   * unsupervised inbox and the boot's overdue ruling).
+   *
+   * The body is the budget's headline — which budget, then the arithmetic —
+   * so the lock screen says what the card says. Once per spend (the fact's
+   * stamp) and once per warning key (the attempt and the limit), so a raise
+   * that moves the limit is warned about again and nothing else is.
+   */
+  protected announceBudget(data: unknown): void {
+    const event = data as {
+      slug?: string; runId?: string; phase?: number | null; state?: string; key?: string; crossesAt?: string;
+      fact?: BudgetFact;
+    } | undefined;
+    const fact = event?.fact;
+    if (!event?.slug || !fact || !isBudgetKind(fact.budget)) return;
+    const state: 'approaching' | 'spent' = event.state === 'approaching' ? 'approaching' : 'spent';
+    const phase = typeof event.phase === 'number' ? event.phase : typeof fact.phase === 'number' ? fact.phase : null;
+    const key = `${event.runId ?? event.slug}:${phase ?? 'run'}:${fact.budget}:${state}:`
+      + (state === 'approaching' ? event.key ?? String(fact.limit) : fact.at);
+    if (this.notifiedBudget.has(key)) return;
+    this.notifiedBudget.add(key);
+    if (this.notifiedBudget.size > 500) {
+      const oldest = this.notifiedBudget.values().next().value;
+      if (oldest) this.notifiedBudget.delete(oldest);
+    }
+    const label = BUDGET_LABELS[fact.budget];
+    const crosses = state === 'approaching' && event.crossesAt && Date.parse(event.crossesAt) > Date.now()
+      ? event.crossesAt : null;
+    const body = crosses
+      ? `${label[0].toUpperCase()}${label.slice(1)} reaches ${BUDGET_WARN_PCT}% at ${crosses.slice(11, 16)} UTC — `
+        + budgetArithmetic(fact)
+      : budgetHeadline(fact, state);
+    const went = fact.spentOn.slice(0, 3)
+      .map((s) => (typeof s.amount === 'number' ? `${s.what} ${budgetAmount(fact.budget, s.amount, fact.unit)}` : s.what))
+      .join(', ');
+    const raise = fact.budget === 'streak'
+      ? 'Clear the streak on the run page to go on.'
+      : fact.budget === 'wait'
+        ? 'Raise it on the run page — +30m, +60m or any amount — and the phase retries in the same press.'
+        : 'Raise it on the run page and the work retries in the same press.';
+    this.announce('budget', {
+      title: `${event.slug}${phase != null ? ` · phase ${phase}` : ''} · ${label} `
+        + (state === 'spent' ? (fact.budget === 'streak' ? 'reached' : 'spent') : `at ${BUDGET_WARN_PCT}%`),
+      body: body.slice(0, 200),
+      detail: `${went ? `Spent on ${went}. ` : ''}${raise}`.slice(0, 400),
+      tag: tagFor('budget', event.slug, phase ?? 'run', fact.budget),
+    }, {
+      slug: event.slug,
+      ...(phase != null ? { phase } : {}),
+      ...(event.runId ? { runId: event.runId } : {}),
     });
   }
 
@@ -531,8 +651,11 @@ export abstract class ServiceLive extends ServiceBase {
    */
   private announceStall(data: unknown): void {
     const event = data as {
-      slug?: string; runId?: string; phase?: number; attempt?: number;
-      stall?: { signal?: string; detail?: string } | null;
+      slug?: string; runId?: string; phase?: number; attempt?: number; ended?: boolean;
+      stall?: {
+        signal?: string; detail?: string; since?: string; scope?: string; overBudget?: boolean;
+        chain?: { key?: string; calls?: number };
+      } | null;
     } | undefined;
     const { slug, runId, phase, stall } = event ?? {};
     if (!slug || typeof phase !== 'number') return;
@@ -543,12 +666,26 @@ export abstract class ServiceLive extends ServiceBase {
     // raised stayed open forever: 26 issued, 0 resolved, against 34 of 37
     // `halted` cards resolving themselves.
     if (!stall?.signal) {
-      this.retractStall({ runId, slug, phase }, 'the lane started producing work again');
+      // …or the lane ENDED, which clears its stall too (#80) and says so.
+      this.retractStall({ runId, slug, phase }, event?.ended ? 'the lane ended' : 'the lane started producing work again');
       return;
     }
+    // A wait on the session's OWN job is the wait procedure being followed, so
+    // it is silent — no card, no push — until its chain outlives the local-job
+    // budget, and then it is said once (control-tower phase 47, #67): 233
+    // cards in a week, one per 10-minute slice, led to no action at all.
+    const wait = stall.signal === 'external-wait';
+    if (wait && stall.scope === 'local' && !stall.overBudget) return;
 
-    const key = `${runId ?? ''}:${phase}:${stall.signal}:${event?.attempt ?? 0}`;
+    // One card per EPISODE: for a wait that is its chain (`since`) and stage,
+    // so the next slice of the same chain is not news and a new chain is.
+    const episode = wait ? `:${stall.since ?? ''}${stall.overBudget ? ':over' : ''}` : '';
+    const key = `${runId ?? ''}:${phase}:${stall.signal}:${event?.attempt ?? 0}${episode}`;
     if (this.notifiedStall.has(key)) return;
+    // A new episode on a phase whose earlier one is still carded replaces it.
+    if (runId && [...this.notifiedStall].some((said) => said.startsWith(`${runId}:${phase}:`))) {
+      this.retractStall({ runId, slug, phase }, 'a new stall episode began on the lane');
+    }
     this.notifiedStall.add(key);
     // The same bound the errand set keeps, for the same reason: a set that only
     // ever grows is a leak in a console that runs for weeks.
@@ -559,7 +696,8 @@ export abstract class ServiceLive extends ServiceBase {
 
     const meta = STALL_SIGNAL_META[stall.signal as keyof typeof STALL_SIGNAL_META];
     const title = this.store?.get(slug)?.plan?.phases[phase]?.title;
-    const headline = `${slug} · phase ${phase} — ${meta?.label.toLowerCase() ?? stall.signal}`;
+    const label = wait && stall.scope === 'local' ? LOCAL_WAIT_LABEL : meta?.label;
+    const headline = `${slug} · phase ${phase} — ${label?.toLowerCase() ?? stall.signal}`;
     const body = stall.detail ?? meta?.blurb ?? 'the session has stopped producing work';
     this.announce('stalled', {
       title: headline,
@@ -569,6 +707,7 @@ export abstract class ServiceLive extends ServiceBase {
     }, { slug, phase, ...(runId ? { runId } : {}) });
     this.armStallEscalation(key, {
       slug, phase, runId, signal: stall.signal, title: headline, body, at: Date.now(),
+      ...(stall.since ? { since: stall.since } : {}),
     });
   }
 
@@ -638,7 +777,7 @@ export abstract class ServiceLive extends ServiceBase {
    */
   private armStallEscalation(key: string, info: {
     slug: string; phase: number; runId?: string; signal: string;
-    title: string; body: string; at: number;
+    title: string; body: string; at: number; since?: string;
   }): void {
     if (this.stallEscalations.has(key)) return;
     // Zero is the off switch, not a zero-length timer: an operator who wants
@@ -672,7 +811,13 @@ export abstract class ServiceLive extends ServiceBase {
     // somebody for a lane that is not running any more is worse than silence.
     const live = open.runId ? this.runners.get(open.slug)?.current() : null;
     if (!live || live.id !== open.runId || !isLiveStatus(live.status)) return;
-    if (!live.phases[open.phase]?.stall) return;
+    // …and the PHASE must still be running, in the episode this was armed for
+    // (control-tower phase 47, #80): a finished phase's leftover stall, or a
+    // later episode on the same lane, is not the stall this timer is about.
+    const record = live.phases[open.phase];
+    const stall = record?.stall;
+    if (!stall || record.status !== 'running') return;
+    if (stall.signal !== open.signal || (open.since !== undefined && stall.since !== open.since)) return;
 
     const minutes = Math.max(1, Math.round((Date.now() - open.at) / 60_000));
     const said = this.announce('stalled', {
@@ -941,8 +1086,19 @@ export abstract class ServiceLive extends ServiceBase {
 
   protected onChange(paths: string[]): void {
     if (!this.store) return;
+    // A plan touched ONLY through its `.locks/` keeps its cached answers (#44).
+    // The store re-reads its locks and carries its revision, since a lock is
+    // not in the fingerprint and neither `phase-graph.sh` nor `validate.sh`
+    // reads one — forgetting here threw away the board of the plan an autopilot
+    // is working on every claim, lease refresh and release. The lock ledger and
+    // the scheduler below still see every one of those writes.
+    const lockOnly = lockOnlySlugs(paths, (p) => this.store!.slugForPath(p));
+    const carried = new Map([...lockOnly].map((s) => [s, this.store!.get(s)?.revision]));
     const slugs = this.store.refresh(paths);
-    for (const slug of slugs) this.forget(slug);
+    for (const slug of slugs) {
+      if (lockOnly.has(slug) && this.store.get(slug)?.revision === carried.get(slug)) continue;
+      this.forget(slug);
+    }
     this.portfolioCache = null;
     this.generation++;
     void this.refreshRepoInfo();
@@ -1103,7 +1259,11 @@ export abstract class ServiceLive extends ServiceBase {
       // reconstructing "who removed my lock" will want.
       ...(!lock.expired && lapsed ? { debris: true, session: lock.session } : {}),
     });
-    if (outcome.ok) this.invalidateAll();
+    if (outcome.ok) {
+      this.invalidateAll();
+      // A released wall stops fencing its scope (control-tower phase 6, #19).
+      try { this.noteFenceReleased(slug, phase); } catch { /* the release stands; a fence still lifts at its budget's end */ }
+    }
     return {
       slug,
       phase,
@@ -1171,6 +1331,8 @@ export abstract class ServiceLive extends ServiceBase {
       // `mcpServers` — empty is a real answer, absent is a bare install.
       credentials: heldIdsCached(),
       accounts: [DEFAULT_ACCOUNT_ID, ...this.accounts.accountIds()],
+      // F36 is told the workflow timeouts this console has learned (phase 14).
+      waitTimeouts: waitTimeoutsCached(),
     };
   }
 
@@ -1254,8 +1416,74 @@ export abstract class ServiceLive extends ServiceBase {
     // a cache key can only split entries that DIFFER in that field — so the
     // 10× is structurally impossible, not merely unobserved. **Never quote it
     // as a measured fact.** See the P6 and P9 handoffs.
-    return this.cached(this.boards, slug, record.revision, async () =>
-      readMemoryBlock(await run(this.engineOpts(), 'phase-graph.sh', [slug, '--memory-block'])));
+    //
+    // A read that TIMED OUT is not an answer (#44): it stays cached — so a busy
+    // machine is not asked again on every request — but only for
+    // `BOARD_RETRY_MS`, after which the next read tries the engine again. It
+    // used to be this revision's board until the plan next moved, which after
+    // lock writes stopped moving the revision could be hours.
+    const hit = this.boards.get(slug);
+    if (hit?.revision === record.revision && hit.settled?.timedOut
+      && Date.now() - (this.boardTimeouts.get(slug) ?? 0) >= BOARD_RETRY_MS) this.boards.delete(slug);
+    return this.cached(this.boards, slug, record.revision, async () => {
+      const started = Date.now();
+      const result = await run(this.engineOpts(), 'phase-graph.sh', [slug, '--memory-block']);
+      const board = readMemoryBlock(result);
+      if (!board.error) this.rememberGoodBoard(slug, board);
+      else if (board.timedOut) {
+        const now = Date.now();
+        const good = this.lastGoodBoard(slug);
+        this.boardTimeouts.set(slug, now);
+        // What a person reconstructing a slow page needs: how long the read
+        // really took (queue wait included — `ms` on `engine.command` is the
+        // script alone), how loaded the machine was, and what the page got.
+        log.warn('engine.board-timeout', {
+          slug, ms: now - started, runMs: result.ms, load: loadavg().map((l) => Math.round(l * 100) / 100),
+          ...engineQueue(), served: good ? 'last-good' : 'empty', ...(good ? { ageMs: now - good.at } : {}),
+        });
+      }
+      return board;
+    });
+  }
+
+  /**
+   * The board a PAGE shows (#44): `board()`, except that a read that timed out
+   * is replaced by the last good board this console read, marked stale with its
+   * age — never the empty board, which paints every phase `waiting` on a plan a
+   * live run is working. Only the plan page and the list read this. The healer,
+   * plan health and the runs keep seeing the timeout as the unreadable board it
+   * is: acting on an old board is how a finished phase gets boarded twice.
+   */
+  protected pageBoard(board: Board, slug: string): Board {
+    if (!board.timedOut) return board;
+    // The previous process's reading too (#96): a restart must not turn "the
+    // board is slow" into "nothing is done".
+    const good = this.lastGoodBoard(slug);
+    if (!good) return board;
+    return { ...good.board, stale: { at: good.at, ageMs: Math.max(0, Date.now() - good.at) } };
+  }
+
+  /**
+   * The lint a PAGE shows (#44): this revision's verdict once it has landed and
+   * proved something; else the last verdict that did, marked stale with its
+   * revision — while the new one is still running, or when it timed out. A lint
+   * that CRASHED is shown as it is: "the engine cannot run on this plan" is
+   * news, and hiding it behind an old verdict would bury it.
+   */
+  protected pageLint(slug: string, revision: number): LintResult | null {
+    const now = this.settled(this.lints, slug, revision);
+    if (now && !now.timedOut) return now;
+    const known = this.knownLints.get(slug);
+    if (!known) return now ?? null;
+    // This revision's own verdict, whose cache entry a directory flush dropped
+    // while the revision was carried: fresh, not stale.
+    if (known.revision === revision) return known.lint;
+    return { ...known.lint, stale: { at: known.at, revision: known.revision } };
+  }
+
+  /** The engine pool right now — `GET /api/engine`, for a page whose read is still queued (#44). */
+  engineQueue(): { active: number; queued: number; max: number } {
+    return engineQueue();
   }
 
   /**
@@ -1272,6 +1500,31 @@ export abstract class ServiceLive extends ServiceBase {
     return weightOf(
       plan?.phases[phase]?.size, this.sizing, mcpServersFor(plan, phase).length, this.mcpSizing,
     );
+  }
+
+  /**
+   * The sizing model as it reads one plan (control-tower phase 59, #83): the
+   * phases left in sessions — each its size's measured sessions per phase, the
+   * console's own once its census has landed — and a session's context model,
+   * with the repository's boot floor as its own line.
+   */
+  protected planSizing(rows: readonly PhaseRow[], board: Board, sizes: ReadonlyMap<number, PhaseSize>): PlanSizing {
+    const census = this.sizingCensus();
+    const table = census?.sessions ?? sessionsPerPhaseOf([], this.sizing);
+    const open = rows.filter((r) => board.states[r.phase] !== 'done').map((r) => ({ size: sizes.get(r.phase) ?? 'M' }));
+    const forecast = forecastSessions(open, table);
+    const context = census?.context ?? shippedContextModel(this.sizing);
+    const measured = (['S', 'M', 'L'] as const).some((s) => table[s].basis === 'measured');
+    return {
+      unit: FORECAST_UNIT,
+      forecast: { sessions: forecast.sessions, phases: forecast.phases, basis: measured ? 'measured' : 'shipped' },
+      forecastLine: forecastLine(forecast, table),
+      context: {
+        floor: Math.round(context.floor), slope: Math.round(context.slope * 100) / 100, boot: context.boot,
+        work: Math.round(context.work), basis: context.basis, samples: context.samples,
+      },
+      bootLine: bootFloorLine(context.bootMeasured, this.sizing.bootFloor),
+    };
   }
 
   /** Every phase's weight, computed once — see `weightOfPhase`. */
@@ -1311,8 +1564,28 @@ export abstract class ServiceLive extends ServiceBase {
   async lint(slug: string): Promise<LintResult | null> {
     const record = this.store?.get(slug);
     if (!record?.plan?.phased) return null;
-    return this.cached(this.lints, slug, record.revision, async () =>
-      readLint(await run(this.engineOpts(), 'validate.sh', [slug], { slug, revision: record.revision })));
+    // A verdict that timed out or could not run is not an answer: cached for
+    // `BOARD_RETRY_MS`, as the board's is (#44), then asked again. Converge and
+    // Recover decide a stop about the plan on this read (control-tower phase 81,
+    // #97), and a busy minute must not become the revision's answer.
+    // F36 is TOLD the workflow timeouts (control-tower phase 14, #40): learn the
+    // ones this plan's `Waits on:` refs name before the lint reads them — once
+    // per run id, bounded — and a newly learned one re-lints this revision.
+    const plan = record.plan;
+    const runRefs = Object.keys(plan.phases)
+      .flatMap((phase) => waitsOnFor(plan, Number(phase)))
+      .filter((ref) => ref.startsWith('gh:') && ref.includes('#run/'));
+    if (runRefs.length && await learnWorkflowTimeouts(runRefs)) this.lints.delete(slug);
+    const hit = this.lints.get(slug);
+    if (hit?.revision === record.revision && (hit.settled?.timedOut || hit.settled?.crashed)
+      && Date.now() - (this.lintTimeouts.get(slug) ?? 0) >= BOARD_RETRY_MS) this.lints.delete(slug);
+    return this.cached(this.lints, slug, record.revision, async () => {
+      const lint = readLint(await run(this.engineOpts(), 'validate.sh', [slug], { slug, revision: record.revision }));
+      // Remembered past this revision only when it proved something (#44).
+      if (!lint.timedOut && !lint.crashed) this.knownLints.set(slug, { at: Date.now(), revision: record.revision, lint });
+      else this.lintTimeouts.set(slug, Date.now());
+      return lint;
+    });
   }
 
   /**
@@ -1349,7 +1622,7 @@ export abstract class ServiceLive extends ServiceBase {
       // Dropped rather than pushed if the plan moved underneath us: the next
       // read starts a fresh one against the revision that is actually current.
       if (this.store?.get(slug)?.revision !== revision) return;
-      this.emit('plan:lint', { slug, revision, lint });
+      this.emit('plan:lint', { slug, revision, lint: this.pageLint(slug, revision) ?? lint });
     }, () => { /* the direct route reports this; a page that never had it is unharmed */ });
   }
 
@@ -1357,11 +1630,17 @@ export abstract class ServiceLive extends ServiceBase {
     const record = this.store?.get(slug);
     if (!record?.plan?.phased) return null;
     const alias = model || record.plan.sessionBudget.targetModel || '';
-    return this.cached(this.sessionPlans, `${slug}::${alias}`, record.revision, async () =>
+    // This repository's measured boot floor, when the census has one (control-tower
+    // phase 59): the engine's `Boot floor:` line and its session floor then say
+    // what THIS repository's sessions read first, not the shipped default.
+    const boot = this.sizingCensus()?.context.bootMeasured ?? null;
+    const env = boot ? { PE_BOOT_FLOOR: String(boot.tokens), PE_BOOT_FLOOR_SAMPLES: String(boot.samples) } : undefined;
+    return this.cached(this.sessionPlans, `${slug}::${alias}::${boot?.tokens ?? ''}`, record.revision, async () =>
       readSessionPlan(await run(
         this.engineOpts(), 'phase-graph.sh',
         alias ? [slug, '--session-plan', alias] : [slug, '--session-plan'],
         { slug, revision: record.revision },
+        env ? { env } : undefined,
       )));
   }
 
@@ -1965,40 +2244,83 @@ export abstract class ServiceLive extends ServiceBase {
     return { record, board, qaMode, runs };
   }
 
-  private toSummary(ctx: PlanContext, ownSamples?: EtaSample[]): PlanSummary {
-    const stats = planStats(ctx, this.sizing, this.mcpSizing);
+  /** `context()` with the board a page shows (`pageBoard`) — the plan page, the list and the portfolio (#44). */
+  private async pageContext(record: PlanRecord, planRuns?: RunState[]): Promise<PlanContext> {
+    const ctx = await this.context(record, planRuns);
+    const board = this.pageBoard(ctx.board, record.slug);
+    return board === ctx.board ? ctx : { ...ctx, board };
+  }
+
+  private toSummary(ctx: PlanContext, ownSamples?: EtaSample[], ownMissing?: number): PlanSummary {
+    const stats = planStats(ctx, this.sizing, this.mcpSizing, this.sizingCensus()?.sessions);
     const issueCounts = { error: 0, warning: 0, info: 0 };
     for (const issue of stats.issues) issueCounts[issue.severity]++;
     // `remainingWork` already excludes done phases by weight; the phase count
     // beside it is only metadata on the estimate, so it is derived rather than
     // recomputed from the graph a second time.
-    const eta = etaFrom(this.planRate(stats.slug, ownSamples), {
+    const plan = ctx.record.plan;
+    const open = (plan?.graph ?? []).filter((r) => ctx.board.states[r.phase] !== 'done').map((r) => r.phase);
+    const facts = etaPhaseFacts(plan, (phase) => this.weightOfPhase(plan, phase));
+    const eta = etaFrom(this.planRate(stats.slug, ownSamples, ownMissing), {
       weight: stats.remainingWeight,
       phases: Math.max(0, stats.phases - stats.done),
+      floors: remainingFloors(facts, open),
     });
     return {
       ...stats,
+      ...this.progressOf(ctx, stats.phases),
       engineError: ctx.board.error,
+      ...(ctx.board.stale ? { boardStale: ctx.board.stale } : {}),
       issueCounts,
       hasHandoffs: ctx.record.handoffs.length > 0,
-      ...(eta ? { eta } : {}),
+      ...(eta && !ctx.board.error ? { eta } : {}),
+    };
+  }
+
+  /**
+   * What a summary may claim about progress (control-tower phase 84, #96). A
+   * board the engine could not read this time — it failed, or it timed out —
+   * is `unknown`, never "done 0, 0 %", which is what the empty board it falls
+   * back to used to summarise as while `boardText` beside it said 41/72. The
+   * last good reading rides beside the word with its age: the one the page is
+   * already drawing (a timed-out read, #44), else the one this console — or
+   * the one before its restart — last took. With no reading anywhere, `done`
+   * and `percent` are null: nothing was read, so nothing is claimed.
+   */
+  private progressOf(ctx: PlanContext, phases: number): Partial<PlanSummary> {
+    const board = ctx.board;
+    if (!board.error && !board.stale) return {};
+    const now = Date.now();
+    const good = board.stale ? { at: board.stale.at, board } : this.lastGoodBoard(ctx.record.slug);
+    const lastGood = good ? {
+      done: good.board.done.length,
+      phases,
+      percent: phases ? Math.round((good.board.done.length / phases) * 100) : 0,
+      at: good.at,
+      ageMs: Math.max(0, now - good.at),
+    } : undefined;
+    return {
+      progress: 'unknown',
+      ...(lastGood ? { lastGood } : {}),
+      ...(board.error ? { done: null, percent: null } : {}),
     };
   }
 
   async summaries(): Promise<PlanSummary[]> {
     const records = this.store?.list() ?? [];
-    const contexts = await Promise.all(records.map((r) => this.context(r)));
+    const contexts = await Promise.all(records.map((r) => this.pageContext(r)));
     return contexts.map((ctx) => this.toSummary(ctx)).sort((a, b) => b.activity - a.activity);
   }
 
   async portfolio(): Promise<Portfolio> {
     if (this.portfolioCache?.generation === this.generation) return this.portfolioCache.value;
     const records = this.store?.list() ?? [];
-    const contexts = await Promise.all(records.map((r) => this.context(r)));
+    const contexts = await Promise.all(records.map((r) => this.pageContext(r)));
     // `rateFor([], pool)` and not `rateFor(pool)`: the number IS the pool, so it
     // has to be labelled `portfolio` — reading it as one plan's own evidence
     // would put "(estimate)" under a figure that is an average of everything.
-    const value = portfolio(contexts, this.sizing, rateFor([], this.etaPool().all), this.mcpSizing);
+    const pool = this.etaPool();
+    const value = portfolio(contexts, this.sizing, rateFor([], pool.all, { shape: pool.shape }), this.mcpSizing, this.sizingCensus()?.sessions);
     this.portfolioCache = { generation: this.generation, value };
     return value;
   }
@@ -2029,7 +2351,7 @@ export abstract class ServiceLive extends ServiceBase {
     // request, for facts that cannot differ between them.
     const planRuns = listRuns(this.root.path, slug, this.liveRunId());
 
-    const ctx = await this.context(record, planRuns);
+    const ctx = await this.pageContext(record, planRuns);
     const plan = record.plan;
     const rows = plan?.graph ?? [];
     const sizes = new Map(rows.map((r) => [r.phase, plan?.phases[r.phase]?.size ?? 'M' as const]));
@@ -2043,9 +2365,12 @@ export abstract class ServiceLive extends ServiceBase {
     // pool is still the fallback and still the right answer when this plan has
     // no evidence of its own (`planRate` asks for it then, and only then), but
     // opening one plan no longer pays for all the others as a matter of course.
-    const ownSamples = etaSamples(planRuns, new Map(weights));
-    const summary = this.toSummary(ctx, ownSamples);
-    const critical = criticalPath(index, ctx.board, sizes, this.sizing, budget, weights);
+    const facts = etaPhaseFacts(plan, (phase) => this.weightOfPhase(plan, phase));
+    const evidence = etaEvidence(planRuns, facts);
+    const ownSamples = evidence.samples;
+    const summary = this.toSummary(ctx, ownSamples, evidence.missing.length);
+    const measuredSessions = this.sizingCensus()?.sessions;
+    const critical = criticalPath(index, ctx.board, sizes, this.sizing, budget, weights, measuredSessions);
     const analyses = analysePhases(rows, ctx.board, sizes, this.sizing, critical.phases, weights);
     const layout = routeLayout(index);
 
@@ -2053,11 +2378,15 @@ export abstract class ServiceLive extends ServiceBase {
     // same reading applied to different weights, so they cannot drift apart —
     // and the `basis` each carries is the same basis, which is what lets the
     // header and a row hedge in the same words.
-    const rate = this.planRate(slug, ownSamples);
+    const rate = this.planRate(slug, ownSamples, evidence.missing.length);
+    const open = rows.filter((r) => ctx.board.states[r.phase] !== 'done').map((r) => r.phase);
     const eta = {
-      plan: etaFrom(rate, remainingWork(rows, ctx.board, sizes, this.sizing, budget, weights)),
+      plan: etaFrom(rate, {
+        ...remainingWork(rows, ctx.board, sizes, this.sizing, budget, weights, measuredSessions),
+        floors: remainingFloors(facts, open),
+      }),
       perPhase: rows.map((row) =>
-        phaseEtaFor(row.phase, this.weightOfPhase(plan, row.phase), rate)),
+        phaseEtaFor(row.phase, this.weightOfPhase(plan, row.phase), rate, facts.get(row.phase)?.floorMs)),
     };
 
     // What it cost, and when it lands. The forecast is deliberately NOT
@@ -2065,7 +2394,8 @@ export abstract class ServiceLive extends ServiceBase {
     // duty cycle and reports every assumption it used, because a date is quoted
     // long after the caveats around it are forgotten.
     const cost = planCost({ slug, runs: planRuns });
-    const forecast = forecastFrom(eta.plan, dutyCycle(ownSamples), Date.now());
+    const now = Date.now();
+    const forecast = forecastFrom(eta.plan, dutyCycle(ownSamples, now), now);
 
     // THE LINT IS NOT AWAITED HERE — and it is the reason this whole phase
     // exists.
@@ -2083,7 +2413,7 @@ export abstract class ServiceLive extends ServiceBase {
     // arrives on the page over SSE (`plan:lint`) the moment it lands. What the
     // response carries is whatever has ALREADY landed for this revision — a
     // second open, or a reload, has it immediately.
-    const lint = this.settled(this.lints, slug, record.revision) ?? null;
+    const lint = this.pageLint(slug, record.revision);
 
     const [batches, boardText, gitInfo] = await Promise.all([
       this.sessionPlan(slug, model),
@@ -2173,6 +2503,8 @@ export abstract class ServiceLive extends ServiceBase {
     // the set to name the ACTOR behind a lock- or registry-witnessed session.
     const ptyClaude = ptyClaudeSessions(this.terminals.state().sessions);
 
+    // The HELD state per holder, computed once — projected onto each view below.
+    const heldBy = qaHeldBy(ctx.board);
     const phases: PhaseView[] = rows.map((row) => {
       const detail: PhaseDetail | undefined = plan?.phases[row.phase];
       const handoff = handoffFor(record, row.phase);
@@ -2291,6 +2623,8 @@ export abstract class ServiceLive extends ServiceBase {
             },
           },
         } : {}),
+        blockedBy: blockedByView(ctx.board, row.phase),
+        ...(heldBy[row.phase]?.length ? { qaHeld: heldBy[row.phase] } : {}),
         ...(review ? { review } : {}),
         ...(hold.length ? { reviewHold: hold } : {}),
         lock: lockView(lock),
@@ -2379,6 +2713,7 @@ export abstract class ServiceLive extends ServiceBase {
         rows: layout.reduce((max, n) => Math.max(max, n.row + 1), 0),
       },
       batches,
+      sizing: this.planSizing(rows, ctx.board, sizes),
       boardText,
       lint,
       handoffs: record.handoffs.map((h) => ({
@@ -2571,8 +2906,70 @@ export abstract class ServiceLive extends ServiceBase {
     by: string,
     reason: string | undefined,
     remember?: { scope: PolicyScope; rule: string },
+    actor?: Actor,
   ): { ok: boolean; decision?: string; wrote?: string; scope?: PolicyScope; error?: string } {
     const approval = this.approvals.all().find((entry) => entry.id === id);
+    const answered = this.settleApproval(id, decision, by, reason, remember, approval);
+    // A card that outlived its hook call and stood (control-tower phase 97,
+    // #140): the session was told no long ago and the run is parked on it. A
+    // person's Allow is the answer it was waiting for — the call is granted
+    // ONCE, and the phase resumes through the Resume press, so the session
+    // asks again and is let through.
+    if (answered.ok && decision === 'allow' && approval?.converted && approval.tool && approval.phase != null) {
+      this.grantOnce(approval);
+      const instruction = `A person allowed ${approval.title} on its standing approval card after your hook call `
+        + 'ended — run that exact call again: it is granted once, then asks as usual.';
+      void this.pressResume(approval.slug, approval.phase, 'resume', {
+        instruction, actor: pressActor(actor ?? asActor(by, 'Service.decideApproval')),
+      }).catch((error: unknown) => log.warn('approval.resume-failed', { id, error: String(error) }));
+    }
+    return answered;
+  }
+
+  /**
+   * Extend a pending card (control-tower phase 97, #140) — the route, the
+   * inbox and the expiry push all come here. The broker judges the number and
+   * the hook's hard limit; see `Approvals.extend`.
+   */
+  extendApproval(
+    id: string, minutes: number, by: string,
+  ): { ok: true; approval: Approval; standing: boolean } | { ok: false; status: number; error: string } {
+    return this.approvals.extend(id, minutes, by);
+  }
+
+  /** Calls a person allowed on a standing card, each granted once (#140): run|phase|tool|input → the card. */
+  protected oneTimeGrants = new Map<string, string>();
+
+  private grantKey(runId: string, phase: number, tool: string, input: unknown): string {
+    return `${runId}|${phase}|${tool}|${JSON.stringify(input ?? null)}`;
+  }
+
+  private grantOnce(approval: Approval): void {
+    this.oneTimeGrants.set(
+      this.grantKey(approval.runId, approval.phase!, approval.tool!.name, approval.tool!.input), approval.id,
+    );
+  }
+
+  /**
+   * Spend a one-time grant (#140): true — and gone — when a person allowed
+   * exactly this call of this phase on a standing card; false for anything else.
+   */
+  takeOneTimeGrant(runId: string, phase: number, tool: string, input: unknown): string | false {
+    const key = this.grantKey(runId, phase, tool, input);
+    const card = this.oneTimeGrants.get(key);
+    if (!card) return false;
+    this.oneTimeGrants.delete(key);
+    return card;
+  }
+
+  private settleApproval(
+    id: string,
+    decision: 'allow' | 'deny',
+    by: string,
+    reason: string | undefined,
+    remember: { scope: PolicyScope; rule: string } | undefined,
+    approval: Approval | undefined,
+  ): { ok: boolean; decision?: string; wrote?: string; scope?: PolicyScope; error?: string } {
     let wrote: string | undefined;
     let failed: string | undefined;
 
@@ -2684,10 +3081,18 @@ export abstract class ServiceLive extends ServiceBase {
       // compares this against the tab's own baked rev to say whether the page
       // someone is looking at is the page this server serves.
       distRev: distRev(),
+      // …and the skill copy each Claude Code config dir's sessions load
+      // against it (#151) — Settings ▸ Instance names the ONE copy in use and
+      // warns when it is another commit. The reader is cached five seconds.
+      skillCopy: this.skillCopy(),
       // Whether a clean exit comes back. The Restart button is only honest if
       // it knows this before it is pressed — under `./run` there is nothing to
       // restart it, and a button that ends the console is not a Restart button.
       supervisor: supervisor(),
+      // The node arguments this process was started with (#71): the half of
+      // its command line `process.argv` never carries, and so the only proof
+      // of the heap this console actually has.
+      execArgv: process.execArgv,
       unread: this.notifications.unread(),
       // How many cards this console has put in front of a person, and since when
       // (TRS-5): "0 cards in N days" visible rather than assumed benign.
@@ -2778,6 +3183,9 @@ export abstract class ServiceLive extends ServiceBase {
       // drift from the code that decided the refusal — so the table travels
       // once, here, by reference, and every card looks its key up in it.
       refusalReasons: REFUSAL_REASON,
+      // …and what fixes each (control-tower phase 90): a refused run PARKS, so
+      // the card owes the remedy, not only the reason.
+      refusalFixes: REFUSAL_FIX,
       // What a NEW run would start with, so the picker can pre-check them and
       // say where they came from. Not what any existing run has — that is on
       // the run.

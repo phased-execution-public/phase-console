@@ -33,9 +33,11 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
+import { availableParallelism, loadavg } from 'node:os';
 
 import { VIEWER_DIR } from '../server/config.ts';
-import { spawnConsole } from './spawn-console.ts';
+import { DEFAULT_LOAD_FACTOR, loadReading, loadReason } from '../shared/orchestration-model.js';
+import { sandbox, spawnConsole } from './spawn-console.ts';
 
 const TEST_DIR = join(VIEWER_DIR, 'test');
 
@@ -87,19 +89,44 @@ test('a sandboxed console keeps its state out of the real state directory', asyn
     `the console put its state somewhere else — expected it under ${box.stateHome}`);
 });
 
+/**
+ * Every file that may boot a console for a test: the node suite's `test/` and
+ * the real-browser harness's `e2e/` (its fixture console is the one a whole
+ * tour runs against), relative to `viewer/`.
+ */
+function spawnerCandidates(): string[] {
+  const e2e = join(VIEWER_DIR, 'e2e');
+  return [
+    ...readdirSync(TEST_DIR).filter((f) => f.endsWith('.ts')).map((f) => `test/${f}`),
+    ...(existsSync(e2e) ? filesUnder(e2e) : [])
+      .filter((f) => /\.(ts|mjs|js)$/.test(f) && !/\/e2e\/\./.test(f)) // not .shots/ or .results/
+      .map((f) => f.slice(VIEWER_DIR.length + 1)),
+  ];
+}
+
+/** The server entry point named inside a spawn argv is the tell. Naming it in
+ * prose or in a path is fine; handing it to a child process is not. */
+const spawnsConsoleDirectly = (source: string): boolean =>
+  /spawn\([^)]*\bserver['"]?\s*,\s*['"]index\.ts|spawn\([^)]*server\/index\.ts/s.test(source);
+
 test('no test file spawns the console without the sandbox helper', () => {
   const offenders: string[] = [];
-  for (const file of readdirSync(TEST_DIR).filter((f) => f.endsWith('.ts'))) {
-    if (file === 'spawn-console.ts') continue;
-    const source = readFileSync(join(TEST_DIR, file), 'utf8');
-    // The server entry point named inside a spawn argv is the tell. Naming it in
-    // prose or in a path is fine; handing it to a child process is not.
-    if (/spawn\([^)]*\bserver['"]?\s*,\s*['"]index\.ts|spawn\([^)]*server\/index\.ts/s.test(source)) {
-      offenders.push(file);
-    }
+  for (const file of spawnerCandidates()) {
+    if (file === 'test/spawn-console.ts') continue;
+    if (spawnsConsoleDirectly(readFileSync(join(VIEWER_DIR, file), 'utf8'))) offenders.push(file);
   }
   assert.deepEqual(offenders, [],
     `these files spawn a console directly — use spawnConsole() from test/spawn-console.ts:\n  ${offenders.join('\n  ')}`);
+});
+
+test('the spawn scan reaches the browser harness, and would name an e2e fixture that spawns the console itself', () => {
+  assert.ok(spawnerCandidates().includes('e2e/fixture/console.ts'),
+    'the scan no longer reads e2e/ — the tour\'s console could boot unsandboxed and nothing would say so');
+  // Assembled, so this file's own source is not the offender it describes.
+  const entry = ['server', 'index.ts'].join('/');
+  const direct = `spawn(process.execPath, ['${entry}', '--port', '4961'])`;
+  assert.equal(spawnsConsoleDirectly(direct), true, 'a fixture handing server/index.ts to spawn() must be caught');
+  assert.equal(spawnsConsoleDirectly("spawnConsole(VIEWER, port, ['--no-converge'], { sandbox: box })"), false);
 });
 
 test('no test points a live console at the operator\'s real plan library', () => {
@@ -283,4 +310,49 @@ test('the fixture roots hold nothing that points at a real machine', () => {
     }
   }
   assert.deepEqual(offenders, [], `scrub these before they are committed:\n  ${offenders.join('\n  ')}`);
+});
+
+/**
+ * A test reads a quiet machine (control-tower phase 34). The scheduler holds
+ * every NEW admission while the 5-minute load is above the guard's factor ×
+ * the cores (phase 100, `loadHolder`), and a `Service` reads the real
+ * `os.loadavg()` — so on a busy machine every `admit()` a test awaited queued
+ * for ever. Two free-tree tests sat out their whole 600 s in the 6.0.0 gate,
+ * and a console `zero-touch-e2e` spawns never boarded its phase. The sandbox
+ * holds the load still the way the e2e fixture always has
+ * (`e2e/fixture/steady-load.mjs`): in this process, and in every console a
+ * test spawns.
+ */
+test('a test reads a quiet machine: the load guard never holds an admission a test awaits', () => {
+  assert.deepEqual(loadavg(), [1, 1, 1]);
+  const reading = loadReading({ avg5: loadavg()[1] ?? 0, cores: availableParallelism(), factor: DEFAULT_LOAD_FACTOR });
+  assert.equal(reading.holding, false, loadReason(reading));
+});
+
+/**
+ * …and so does every file that reaches the server without the sandbox. A file
+ * that redirects inline reaches `../server/` by `await import(…)` after its own
+ * redirect, so it never ran `state-sandbox.ts`, and two of them were the two
+ * that hung: it imports the shim itself.
+ */
+test('every test file that reaches the server reads a quiet machine', () => {
+  const reaches = /from '\.\.\/server\/|import\('\.\.\/server\//;
+  const holds = /'\.\/state-sandbox\.ts'|'\.\.\/e2e\/fixture\/steady-load\.mjs'/;
+  const offenders = readdirSync(TEST_DIR)
+    .filter((file) => file.endsWith('.test.ts'))
+    .filter((file) => {
+      const source = readFileSync(join(TEST_DIR, file), 'utf8');
+      return reaches.test(source) && !holds.test(source);
+    });
+  assert.deepEqual(offenders, [],
+    `these files read the machine's real load, which holds every admission on a busy machine — import '../e2e/fixture/steady-load.mjs' first:\n  ${offenders.join('\n  ')}`);
+});
+
+test('a console a test spawns reads the same quiet machine', () => {
+  const box = sandbox('steady-load');
+  try {
+    assert.match(box.env.NODE_OPTIONS ?? '', /--import=file:\S*\/e2e\/fixture\/steady-load\.mjs(?:\s|$)/);
+  } finally {
+    box.cleanup();
+  }
 });

@@ -5,9 +5,10 @@
  * state the console can show is one of eight UI states, each with a hue, an
  * icon and a plain label, read from one module (`shared/status-vocab.js`).
  * This file holds the hues. Amber — the one accent — is reserved for the one
- * thing that needs a person (`--status-needs-you` = `--accent` = `--action` =
- * the focus ring); nothing else in the interface may reach for it by literal,
- * because the literal cannot say *why* it is amber.
+ * thing that needs a person (`--status-needs-you` = `--accent`, and nothing
+ * else: since 6.0 the action colour and the focus ring are ink); nothing in the
+ * interface may reach for it by literal, because the literal cannot say *why*
+ * it is amber.
  *
  * ---- What this file promises (and styles/*.test.ts hold) ----
  *
@@ -105,9 +106,14 @@
 
   /* ---- Ink ---- */
   --ink: light-dark(oklch(21.36% 0.0229 232.86), oklch(95.17% 0.0097 204.91));
-  --ink-muted: light-dark(oklch(47.24% 0.0283 227.06), oklch(74.72% 0.0244 220.82));
-  /* Faint ink is for true metadata only — timestamps, ids, hints. */
-  --ink-faint: light-dark(oklch(58.32% 0.0264 223.97), oklch(60.50% 0.0298 223.53));
+  --ink-muted: light-dark(oklch(43% 0.0283 227.06), oklch(74.72% 0.0244 220.82));
+  /* Faint ink is for true metadata only — timestamps, ids, hints. It is still
+     TEXT, set at 12px, so it clears AA's 4.5:1 on every surface text sits on
+     (6.0: it held only the large-text 3:1, and the tour's axe counted 768
+     places it was read small). Paper: 4.62 on deep, 5.09 on ground, 6.21 on
+     surface. Night: 4.87 on raised, 5.39 on surface. Muted moved a step darker
+     on paper so the three inks stay three. */
+  --ink-faint: light-dark(oklch(49% 0.0264 223.97), oklch(68% 0.0298 223.53));
 
   /* ---- The track the stations sit on ---- */
   --track: light-dark(oklch(82.37% 0.0175 223), oklch(36.05% 0.0405 223.66));
@@ -141,26 +147,18 @@
   --status-failed: light-dark(oklch(48% 0.08 25), oklch(75% 0.12 25));
   --status-skipped: light-dark(oklch(48% 0.012 230), oklch(75% 0.012 230));
 
-  /* ---- The one accent ----
-     Amber is what needs a person. `--accent` is the semantic name; `--action`
-     ("do this now") and `--focus` (the ring) are it. Nothing asks for the amber
-     literal and nothing but a needs-you state asks for `--status-needs-you`. */
+  /* ---- The one accent, and the ink that is not it (tokens 6.0) ----
+     Amber is a summons: `--accent` is the one door to it, and it is the
+     needs-you state. `--action` ("do this now" — the primary button) and
+     `--focus` (the ring) are high-contrast INK, because a primary button and
+     a focused control are not a person being summoned; the one amber button is
+     `Button variant="attention"`, used only from its allowlist
+     (`ui/button-attention.test.ts`). Nothing asks for the amber literal, and
+     `styles/theme.test.ts` follows every token to its root to hold it so. */
   --accent: var(--status-needs-you);
-  --action: var(--accent);
-  --focus: var(--accent);
+  --action: var(--ink);
+  --focus: var(--ink);
 
-  /* ---- Legacy line tokens (2.x) — aliases, removed in Phase 11 ----
-     The old board palette, pointed at the new vocabulary so the views that
-     predate it keep painting: a ready phase is "next up" (queued), a blocked,
-     stuck or gated one needs a person, "progress" is running. New code never
-     names these. */
-  --line-done: var(--status-done);
-  --line-ready: var(--status-queued);
-  --line-progress: var(--status-running);
-  --line-waiting: var(--status-waiting);
-  --line-blocked: var(--status-failed);
-  --line-stuck: var(--status-needs-you);
-  --line-gated: var(--status-needs-you);
 
   /* ---- Elevation ---- */
   --shadow-card: light-dark(
@@ -171,13 +169,16 @@
     0 8px 20px -18px oklch(21.36% 0.0229 232.86 / 40%),
     0 8px 24px -16px oklch(0% 0 0 / 80%)
   );
-  --glow-action: 0 0 0 3px color-mix(in oklab, var(--accent) 14%, transparent);
+  --glow-action: 0 0 0 3px color-mix(in oklab, var(--action) 14%, transparent);
 
   /* ---- Touch ----
      44px is Apple's floor for a target you are expected to hit with a thumb.
      16px is iOS's floor for a text input: focus a smaller one and the browser
      zooms the whole viewport to meet it and leaves it there. */
   --tap-min: 44px;
+  /* The narrowest a run strip's name may get before the row wraps instead —
+     a strip with no legible name is a coloured bar (control-tower phase 19). */
+  --strip-name-floor: 12ch;
   --text-input: 16px;
   /* The shell's height. lib/viewport.ts overwrites it with the visual
      viewport's real height while the software keyboard is up (iOS never
@@ -200,7 +201,7 @@
   --z-scrim: 60; /* modals, sheets, menus, popovers */
   --z-toast: 70; /* toasts — above everything, including a modal */
 
-  --rail-width: 236px;
+  --rail-width: 80px; /* the slim rail (6.0): a glyph over its name, the longest name wide */
   --content-max: 1560px;
 
   /* ---- Density ----
@@ -266,12 +267,6 @@
   --color-failed: var(--status-failed);
   --color-skipped: var(--status-skipped);
 
-  /* Legacy 2.x colour names — the same aliases as the line tokens above. */
-  --color-ready: var(--line-ready);
-  --color-progress: var(--line-progress);
-  --color-blocked: var(--line-blocked);
-  --color-stuck: var(--line-stuck);
-  --color-gated: var(--line-gated);
 
   --color-accent: var(--accent);
   --color-action: var(--action);
@@ -373,6 +368,32 @@
   50% { opacity: 0.35; }
 }
 
+/* The expand transition (docs/design.md §5, control-tower phase 19) — a
+   TRANSITION, not a fourth animation. A region opening in place grows its one
+   grid row from 0fr to 1fr: the height its content needs, which no max-height
+   can know, on the medium duration token. `@starting-style` supplies the first
+   frame, so a region that MOUNTS as it opens (a fold is not a cache —
+   `Disclosure`, the strip) still grows, and no script measures anything. The
+   global reduced-motion rule collapses it like every other transition. The row
+   clips while it grows; the clip margin lets a focus ring inside still paint. */
+.expand-region {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--transition-duration-medium) var(--ease-transit);
+}
+
+@starting-style {
+  .expand-region {
+    grid-template-rows: 0fr;
+  }
+}
+
+.expand-region > * {
+  min-height: 0;
+  overflow: clip;
+  overflow-clip-margin: 4px;
+}
+
 /* Tabular figures on demand — for a number that sits in a column or ticks. The
    body already asks for them; this is for an element that opted out upstream. */
 @utility tnum {
@@ -435,6 +456,8 @@
       content: '';
       position: absolute;
       top: 50%;
+      /* A centring pair with the translate below, so `left` and not `inset-inline-start`:
+         `translate` has no logical twin, and 50% with -50% centres in either direction. */
       left: 50%;
       translate: -50% -50%;
       width: max(100%, var(--tap-min));
@@ -592,13 +615,6 @@
 .state-failed { --state: var(--status-failed); }
 .state-skipped { --state: var(--status-skipped); }
 
-/* Legacy 2.x board-state classes — aliases onto the vocabulary, removed in
-   Phase 11 with the views that set them. */
-.state-ready { --state: var(--status-queued); }
-.state-in-progress { --state: var(--status-running); }
-.state-blocked { --state: var(--status-needs-you); }
-.state-stuck { --state: var(--status-needs-you); }
-.state-gated { --state: var(--status-needs-you); }
 
 /* ------------------------------------------------------------------ *
  * Safe areas — the phone shell's floor and ceiling
@@ -606,6 +622,10 @@
 
 .pt-safe { padding-top: env(safe-area-inset-top, 0px); }
 .pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+/* PHYSICAL on purpose. The safe-area insets are the DEVICE's left and right (a
+   notch or a rounded corner does not move with `dir`), so their padding may not
+   either. `logical.test.ts` holds this, and `tap-area`'s centring pair, as the
+   two exceptions in this file — each with its reason. */
 .px-safe {
   padding-left: env(safe-area-inset-left, 0px);
   padding-right: env(safe-area-inset-right, 0px);

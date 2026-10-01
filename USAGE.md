@@ -145,6 +145,14 @@ presence inbox is drained without it by `phase-console sessions ingest` — the 
 POST finds nobody — which does nothing while that console answers.
 
 
+**Reading a run from a shell.** `phase-console run status <slug>` prints the latest run in a small
+shape (the status word every page shows — `waiting` for a run asleep on a clock nobody paused — halt,
+lanes, one word per phase); `run runs`, `run queue`, `run accounts`,
+`run approvals`, `run journal <slug>`, `run triggers <slug>`, `run tail <slug> <N>` and
+`run explain <slug> <N>` read the rest, and `explain` prints the phase report's summary first.
+`phase-console doctor` lists console processes whose install root no longer exists, and
+`doctor --stop-strays` stops exactly those.
+
 ## Where things live (two places)
 
 - **The skill** (this repo — cloned to `~/.claude/skills/phased-execution`, installed as a plugin,
@@ -157,3 +165,8 @@ POST finds nobody — which does nothing while that console answers.
   machine can pull and continue a partially-finished plan.
 
 Full procedure: `SKILL.md` and its `references/`.
+
+## Licensing
+
+The free edition is open source under the MIT License, at
+[phased-execution-public/phase-console](https://github.com/phased-execution-public/phase-console).

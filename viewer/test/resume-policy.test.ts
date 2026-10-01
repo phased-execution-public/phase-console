@@ -17,7 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  RESUME_CACHE_COLD_MS, RESUME_FRESH_MIN_CONTEXT, resumePolicy, type TokenAttempt,
+  CONTEXT_WRAPUP_FRACTION, RESUME_CACHE_COLD_MS, RESUME_FRESH_MIN_CONTEXT, RESUME_WRAPUP_MARGIN, resumePolicy, type TokenAttempt,
 } from '../server/runner/usage.ts';
 import type { ResumeVerdict, RunnerDeps } from '../server/runner/runner-core.ts';
 import type { PhaseRecord, RunState } from '../server/runner/state.ts';
@@ -261,4 +261,31 @@ test('O5: a closeout declined by the POLICY explains itself; the other refusals 
     assert.ok(note.length > 0, `${why} says something`);
     assert.ok(!new RegExp(`\\(${why}\\)`).test(note), `${why}: not the raw union member either`);
   }
+});
+
+/* ---- a session past the wrap-up line (control-tower phase 46, #79) ---- */
+
+test('#79: many-plans P15 — ended at 578k of a 1M window, warm — is boarded FRESH: a resume there starts inside the wrap-up zone', () => {
+  const record = { tokens: [attempt('sess-p15', 578_475, 72_955)] };
+  assert.deepEqual(resumePolicy(record, 'sess-p15', { now: NOW, paying: 'default' }), {
+    choice: 'fresh', reason: 'context-wrapup', contextTokens: 578_475, idleMs: 72_955, accountChanged: false,
+  });
+});
+
+test('#79: the line is CONTEXT_WRAPUP_FRACTION × the session\'s own window, less a margin of 5 % of it', () => {
+  assert.equal(RESUME_WRAPUP_MARGIN, 0.05);
+  const line = (CONTEXT_WRAPUP_FRACTION - RESUME_WRAPUP_MARGIN) * 1_000_000;
+  const at = (context: number, extra: Partial<TokenAttempt> = {}) =>
+    resumePolicy({ tokens: [attempt('s', context, 60_000, extra)] }, 's', { now: NOW, paying: 'default' });
+  assert.deepEqual([at(line - 1).choice, at(line - 1).reason], ['resume', 'cache-warm']);
+  assert.deepEqual([at(line).choice, at(line).reason], ['fresh', 'context-wrapup']);
+  // A 200k window is judged against its own line — even under the "small" size.
+  assert.deepEqual([at(110_000, { window: 200_000 }).choice, at(110_000, { window: 200_000 }).reason], ['fresh', 'context-wrapup']);
+  assert.deepEqual([at(100_000, { window: 200_000 }).choice, at(100_000, { window: 200_000 }).reason], ['resume', 'small']);
+  // No window, no judgement: the session is sized, not placed.
+  assert.deepEqual([at(700_000, { window: null }).choice, at(700_000, { window: null }).reason], ['resume', 'cache-warm']);
+  // The reasons that were already fresh keep their names.
+  assert.equal(resumePolicy({ tokens: [attempt('s', 700_000, 30_000, { account: 'default' })] }, 's', { now: NOW, paying: 'other' }).reason,
+    'account-changed');
+  assert.equal(resumePolicy({ tokens: [attempt('s', 700_000, 3 * HOUR)] }, 's', { now: NOW, paying: 'default' }).reason, 'cache-cold');
 });

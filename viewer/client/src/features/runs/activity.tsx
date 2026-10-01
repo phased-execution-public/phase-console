@@ -221,8 +221,8 @@ export function ActivityPanels({
                   key={tool.id ?? `${tool.name}-${i}`}
                   className={cn(
                     'flex items-baseline gap-2 text-2xs',
-                    tool.ok === false && 'text-blocked',
-                    tool.ok === null && 'text-progress',
+                    tool.ok === false && 'text-failed',
+                    tool.ok === null && 'text-running',
                   )}
                 >
                   <span className="shrink-0 font-mono">
@@ -303,7 +303,7 @@ export function ActivityPanels({
                   key={agent.id}
                   className={cn(
                     'border-l-2 pl-2',
-                    agent.done ? 'border-rule text-ink-faint' : 'border-progress',
+                    agent.done ? 'border-rule text-ink-faint' : 'border-running',
                   )}
                 >
                   <div className="flex items-baseline justify-between gap-2">

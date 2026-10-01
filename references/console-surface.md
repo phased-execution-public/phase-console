@@ -3,8 +3,9 @@
 Contents: What a supervised session is · The convergence loop · The watch clock ·
 The Stop hook · Permission profiles and the deny wall · Never wait inside a turn ·
 Questions · Run settings ·
-The remediation ladder · Freeze and thaw · Talking to a running phase ·
-What happens around your phase · Session terminals · Reading the console's API ·
+The remediation ladder · When a run stops itself · Budgets that stop work · What a status word means ·
+Freeze and thaw · Talking to a running phase ·
+What happens around your phase · A person's turn · Session terminals · Reading the console's API ·
 Where the state lives
 
 SKILL.md tells a session how to execute a phase. This file tells it what is executing it — the
@@ -29,6 +30,14 @@ environment that a hand-run session does not have:
 | `PE_RULINGS_FILE` | The plan's ruling ledger, append-only |
 | `PE_OWNER` / `PE_SESSION_ID` | The lock identity — **never override `--owner`**, or the supervisor cannot release your lock |
 
+**Say how far a long operation has got** — a sweep, a migration, a batch of N files — with
+`phase-outcome.sh <slug> <N> progress --label <text> --done <n> --of <m>` (control-tower phase 95).
+It is not an outcome and never ends your turn: one line on the task channel (`PE_TASKS_FILE`), read at
+your next tool result and journalled `phase.progress` on the task you have in progress. The console's
+phase report draws it as that task's bar and times its rate for the ETA, so say it as the count moves
+(every few minutes, not every item). Whole numbers, `1 ≤ --of`, `--done ≤ --of`; a malformed call
+exits 2 and records nothing.
+
 `PE_SCOPE` and `PE_WORKTREE` may also be set; `scripts/phase-lock.sh` reads all of them by itself.
 The presence of `PE_OUTCOME_FILE` is the reliable test for "am I supervised" — the scripts fall back
 to the console's inbox without it, which is how a hand-driven session's declaration still reaches a
@@ -44,10 +53,13 @@ with no handoff and no declared outcome reads as a failed phase, not as a quiet 
 Two more facts about the process itself. **It runs under two caps it did not choose.** Every session
 the console spawns carries `--max-budget-usd` and `--max-turns`, set per session by `capsFor`
 (`viewer/server/runner/session-record.ts`): a phase session gets the run's `phaseBudgetUsd`, or — when
-the run set none — its size row (`SESSION_CAPS_BY_SIZE`: S $25 / 150 turns · M $60 / 300 · L $120 /
-600; `references/sizing.md`); a closeout, QA round, PR session or reviewer gets a quarter of those
-dollars and 60 turns, a repair 90. A cap that bites resumes the same session with that cap doubled, so
-meeting one is not the end of the phase. **And a stop asks your turn to close before it asks the
+the run set none — the phase's MEASURED caps, each mode's p99 over this console's own sessions plus 50 %
+(else the shipped table: $120 / 490 turns; `references/sizing.md`), its derivation recorded on the
+session; a session that continues the phase's work — a resume with an
+instruction, a wait-resume — gets the same dollars and what is left of the phase's turns, never under
+120; a closeout, QA round, PR session or reviewer gets a quarter of those dollars and 60 turns, a
+repair 90. A cap that bites resumes the same session with that cap doubled, so meeting one is not the
+end of the phase. **And a stop asks your turn to close before it asks the
 process to leave.** When the console stops a session it wakes the process (SIGCONT), sends the CLI one
 SIGINT and gives it `INT_GRACE_MS` (5 s) — long enough for the CLI to close the turn and write its
 `result`, so what the session spent reaches the record — and only then SIGTERMs the process group, with
@@ -58,7 +70,13 @@ a SIGKILL backstop (`viewer/server/runner/signals.ts`).
 call's `message.usage` and compares your newest context with your model's window (`scripts/models.env`
 classes: `[1m]` and the big families 1M, anything else 200k). At **0.6 ×** you are told once, in a
 `Supervisor check`, to finish the step you are on, commit, hand off `in-progress` and declare
-`phase-outcome.sh <slug> <N> partial --reason context`. At **0.8 ×** the console checkpoints the session
+`phase-outcome.sh <slug> <N> partial --reason context`. The notice says WHAT to commit
+(`wrapupCommitStep`, control-tower phase 89): on a lane's own branch, what is done; on a SHARED branch,
+only work whose checks you ran green — the rest stays uncommitted for the next session. After you stop,
+the console runs the plan's fast §Verification lines (those whose measured runs never exceeded five
+minutes) on that commit; a red is written on your phase as `wipRed {sha, files, lines}`, your phase
+boards ahead of every sibling but a person's press, and every sibling's brief names the red files as
+yours. At **0.8 ×** the console checkpoints the session
 itself and boards the next attempt FRESH with the resume brief — that session is never `--resume`d,
 because resuming it would re-read all of it. Each line acts once per session, and only on the phase's
 own session: a closeout, a QA round or a repair is never cut off. Every session's counters are journalled
@@ -70,12 +88,15 @@ its peak, its cache rebuilds and its status checks.
 of it into the cache again on its first call — a 681k session resumed four hours later rewrote 554k before
 it did anything. So a session is resumed only while it is worth resuming: one that ended at ≥ 250k tokens
 of context and is cold (idle ≥ 55 min) or under another account, that declared `partial --reason
-budget|context`, or that the console checkpointed is boarded FRESH with the resume brief instead. That
+budget|context`, or that the console checkpointed is boarded FRESH with the resume brief instead — and so,
+at any size, is one that ended at or past **0.55 ×** of its window (the 0.6 × wrap-up line less
+`RESUME_WRAPUP_MARGIN`), because resumed it would start inside the wrap-up zone. That
 holds for every resume — a wait whose window elapsed or whose ref landed, a `partial`, an account switch,
 a model's window, a QA round — and the brief carries what the resume would have: your handoff, the
 uncommitted paths, your last words and, for a wait, its refs and what it was waiting on. Each decision is
 journalled `phase.resume-policy`. Declaring `partial --reason context` when told to wrap up is the cheap
 exit, not a request to be resumed into the same context.
+
 
 ## The convergence loop — converge, classify, climb
 
@@ -109,8 +130,20 @@ next visits your plan. Five schemes:
 | `gh:owner/repo#run/<id>` | the run reaches `completed` — **any** conclusion, a failure included |
 | `gh:owner/repo#pr/<n>` | the PR leaves `OPEN`, merged or closed |
 | `date:<ISO8601>` (or `until:`) | that instant passes |
-| `lock:<slug>/<phase>` | nothing holds that phase's scope any more |
+| `lock:<slug>/<phase>` | nothing holds that phase's scope any more — somebody ELSE's lock: one naming your own phase is refused (exit 2 at the script, `phase.watch-refused` at ingest), since your own closeout is what releases it |
 | `cmd:"<command>"` | the command exits 0 |
+
+**A ref that has already landed parks nothing — exit 3.** The moment you declare a wait, block or
+needs-human with `--watch` refs, `phase-outcome.sh` stages the declaration and asks the console
+(`POST /hooks/declaration`, 20 s at most) whether one of them has ALREADY landed. If one has, nothing is
+written, nothing parks, the script prints `already landed — continue: <ref> (<what it saw>)` and **exits
+3**: the thing you were about to wait for has happened, so carry on with the phase from it — do not stop.
+Any other answer, or no console at all, writes the declaration and exits 0 exactly as before
+(control-tower phase 50, #86 — five of thirty declared refs had landed before they were declared).
+
+Inside the window you declared, a `cmd:` ref is asked at least every sixth of that window (and every five
+minutes when it wraps `gh run` or `gh pr`); the 5 → 15 → 60 → 360-minute back-off starts when the window
+ends (#87).
 
 **What happens when one lands:** your OWN session is resumed (or, when it is no longer worth resuming —
 above — the phase boards fresh with what landed in its brief), with your declaration still on the
@@ -126,9 +159,10 @@ something else, declare it again.
 **`cmd:` runs your command, repeatedly.** Through the same policy a plan's §Verification gets — a
 denylist of mutating verbs, an inverted allowlist for verbs that reach off this machine, 60 seconds,
 a process-group kill. That policy is not "read-only" in the strict sense (`npm ci` and `cargo build`
-pass it), and your ref runs every five minutes while the phase is parked — **at most 12 times per
-phase**, after which the console stops running it and the ref reads `refused` in words
-(`MAX_CMD_RUNS_PER_PHASE`) — so write one that only LOOKS and costs little: `cmd:"gh run list --workflow deploy.yml"`, never `cmd:"npm ci"`. Its
+pass it), and your ref runs for as long as the phase is parked — after 5 minutes, then 15, then an
+hour, then every 6 hours (`WATCH_CMD_BACKOFF_MS`) **until the phase's wait budget ends**, after which
+the console stops running it and the ref reads `refused` in words (a 200-run backstop,
+`MAX_CMD_RUNS_PER_PHASE`, refuses the same way) — so write one that only LOOKS and costs little: `cmd:"gh run list --workflow deploy.yml"`, never `cmd:"npm ci"`. Its
 output tail rides the journal, the resume instruction and a desktop notification, so do not have it
 print anything you would not want quoted. A command the policy refuses is journalled once and dropped; the operator
 can also switch the whole scheme off (`watchCmdRefs`), in which case such a ref simply reads
@@ -139,13 +173,15 @@ can also switch the whole scheme off (`watchCmdRefs`), in which case such a ref 
 phase up. If you know both — a person must look, *and* not before the release lands at 09:00 — say
 both.
 
-**What a declaration may ask for is bounded, and past a bound it is refused, never cut.** A
+**What a declaration may ask for is bounded, and spending the bound is never a failure.** A
 `waiting-external` spends this phase's wait budget: at most 4 waits (`WAIT_MAX_PER_PHASE`) and 8 h
 parked in total (`DEFAULT_WAIT_BUDGET_MS`) unless the plan's `**Wait budget:**` line or the phase's
 `- **Waits on:** <ref> · <max>` bullet says otherwise — a `date:` ref there countersigns a wait up to
-that instant. Your boot prompt's contract states the ceiling and where it came from, and a window past
-what is left is REFUSED with a `waiting-external-timeout` halt carrying the arithmetic — never shortened,
-so name the real end of the wait. Each of the other statuses is acted on at most 4 times for one phase
+that instant. Your boot prompt's contract states the ceiling and where it came from. Past what is left,
+a wait that names a `--watch` ref the console can poll is given what is left and then waits on that ref
+alone; one that names none parks on a SPENT budget — `waiting`, no clock of its own, and a `budgets`
+errand carrying the arithmetic for a person to raise it — never a failure, never a streak charge. So
+name the ref and the real end of the wait. Each of the other statuses is acted on at most 4 times for one phase
 (`DECLARATIONS_MAX_PER_PHASE`): a fifth is recorded, not acted on, and parks the phase `needs-human` on
 the `unknown:declaration-cap` errand until an operator's Retry clears the count. A `blocked` or
 `needs-human` clock is capped at 7 days (`DECLARED_CLOCK_MAX_MS`, the cap journalled), and on the
@@ -376,7 +412,8 @@ elicitations are cancelled. A CLI known to predate the flag runs without it, and
 because **most of it is changeable mid-run**: `model`, `effort`, `maxParallel`, `autonomy`, the phase
 and run budgets, `skills`, `mcpServers`, `mcpPolicy`, `permissionProfile`, `gitMode`, `openPr`,
 `reviewEachPhase`, `reviewerPolicy`, `ultracode`, `ultraReview`, `onLimit`, `autoRecover`,
-`maxConsecutiveFailures`, `onlyPhases`, `phaseOptions`, `isolation` (a drop lands, a raise 409s),
+`maxConsecutiveFailures`, `onlyPhases` (a scoped run FINISHES when those phases settle — never the way
+to move one stuck phase; `references/conventions.md` §Scoped concurrency), `phaseOptions`, `isolation` (a drop lands, a raise 409s),
 `settle`, `priority`, `attachDefaultSkills`, and the five that belong to the Fix & re-QA loop —
 `qaMaxRounds`, `qaModel`, `qaEffort`, `qaFixStrategy`, `qaRoundBudgetUsd`. A handful
 are start-only — `resumeRunId`, `startAfter`, `qa`, `accountId`, and since 5.0.0 the run's own
@@ -500,7 +537,75 @@ For a session, the practical consequences are:
   every checkout and `pe/*` branch that appeared under a phase or repair session. Nothing deletes
   them — a checkout may hold uncommitted work — but nothing hides them either. The boot prompt no
   longer tells you to make one: when another live session shares your repository, work in the
-  checkout you have, or declare `blocked --watch lock:<slug>/<N>` and let admission queue you.
+  checkout you have, or declare `blocked --needs lock --watch lock:<holder-slug>/<holder-phase>` —
+  the holder's lock, never your own — and let admission queue you.
+
+## When a run stops itself — halts, the fence, the connectivity wait
+
+A **halt** is the run stopping itself, as opposed to a pause a person asked for, and every halt has a
+kind (`HALT_KINDS`, `viewer/shared/recovery-model.js`). The kind says what the stop is ABOUT:
+`PHASE_HALT_KINDS` settle one phase and leave the run boarding its other candidates (`verify-failed`,
+`no-handoff`, `phase-blocked`, `needs-human`, `verify-timeout`, …); `RUN_HALT_KINDS` stop the whole
+run (`budget`, `failure-streak`, `credential-refused`, `models-exhausted`, `plan-deadlocked`, …); and
+`PLAN_HALT_KINDS` (`plan-lint`, `plan-unreadable`) are answered by the plan — the console re-reads the
+lint and the stop ends when the plan is clean. Each halt reaches the operator as ONE card with one
+sentence and one recovery (**Recover & continue**, which re-reads the board, stands down whatever the
+errand settled and carries on). `failure-streak` and `credential-refused` are **press-only**
+(`PRESS_ONLY_HALT_KINDS`): nothing relaunches them but a person. The full list and every rule:
+`docs/loop.md`.
+
+What that means for a session:
+
+- **The streak counts failed PHASES, not endings.** Only a merit failure charges it — a red final
+  §Verification, a lint the plan is left failing, a session with no handoff and nothing on disk, a
+  declared `blocked`, a session whose every attempt crashed — and the same phase failing twice is one
+  failure. A command rescued by its retry, a spent wait budget and an ending the board contradicts
+  charge nothing. So a `blocked` you declare is a charge; a `waiting-external` is not.
+- **A refused credential and the network never charge.** A `connectivity` stop is the weather: the run
+  waits on the network (a wait of kind `connectivity`) and resumes when the API answers, without
+  spending the streak or a rung. A `credential-refused` halt waits for a person's sign-in.
+- **A declared block that names a watch is a wait.** `blocked --watch <ref>` on a ref the console polls
+  parks the phase `waiting` on that ref (`declared-wait`) instead of charging a failure.
+- **A declared external wall fences its scope.** While a phase of this run sits parked on a declared
+  EXTERNAL wall (`needs-human` / `blocked --needs external`) that can still come down by itself — a live
+  watch ref, or an errand inside its wait budget — every other candidate whose scope intersects it is
+  held `queued` with `waitingOn: [{kind: 'fence', …}]`, naming the holder and when the fence lifts
+  (`applyScopeFence`, `viewer/server/runner/scheduler.ts`). A disjoint phase still boards. So if you
+  declare an external wall on a repository, your siblings in that repository stop paying to rediscover
+  it; if you are boarded and read a fence in your brief, it is not yours to clear.
+- **`withdrawn`** is the rung outcome of a lane that never spawned — a sibling took the scope, or a park
+  withdrew the queue entry it waited in. It costs nothing, counts toward no cap and leaves the rung
+  climbable; a boot prompt that follows one is simply the next attempt.
+
+## Budgets that stop work — and the verb that raises one
+
+Every budget that can stop work — a phase's wait budget, a phase's or the run's dollars, the recovery
+ladder's cap, the failure streak — announces under the `budget` notification category at 80 %
+(`phase.budget-approaching`) and again when it is spent, and the card's first line says **budget** with
+the arithmetic rather than the sentence of whatever it stopped. An operator answers with one press:
+`POST /api/run/<slug>/raise-budget {budget, phase?, add? | to?, scope?}` — `wait` writes the plan's
+`Waits on:` max or `Wait budget:` through `scripts/wait-budget.sh`; `phase-usd`, `run-usd` and `ladder`
+patch the run's own setting — journalled `run.budget-raised` and followed by a retry of what it held.
+The streak is never raised; it is cleared (`clear-streak`). What this means for you: a spent wait
+budget parks your phase with a `budgets` errand, never a failure, and your session is resumed when
+someone raises it (`docs/controls.md`, `docs/session-budget.md`).
+
+## What a status word means — the status model, and the lock ledger
+
+Every status the console paints is read through ONE model, `viewer/shared/status-model.js`: each word
+has a **tense** (`live`, `standing`, `settled`), an **outcome** once settled, and an **attention** level
+(`none`, then the inbox's severities). The law it holds: **amber is never derived from a status word.**
+It comes from an open inbox item, or from a word that is a person-actor situation (`PERSON_WORDS` —
+a sign-off only a person gives, an MCP or account sign-in, an outstanding decision, a landing conflict).
+So a board `stuck` phase reads **Stuck** in the waiting paint with an alert glyph, `halted` and `parked`
+runs read as waits, and settled things go quiet. When your handoff or an errand describes a colour,
+describe it in these terms; when you declare `needs-human`, the errand you raise is what turns it amber.
+
+The locks you claim and release are also written to an append-only **lock ledger**,
+`locks.ndjson` in the console's state directory (rotated at 4 MB, one previous kept) — who held which
+scope, from when to when, and who released it. It is a record, never a reason to fail: a ledger that
+cannot be written is said once (`locks.ledger-failed`) and nothing else changes.
+
 
 ## Freeze and thaw — a phase held, and a lock released
 
@@ -594,6 +699,72 @@ acts — they raise a mark a person can see. If you are about to retry the same 
 fourth time, the detector is right and the plan is not going to change under you: stop and declare.
 
 
+## A person's turn — what the console does with a human step
+
+A `needs-human --step <kind> …` declaration (`references/conventions.md` §A person's turn) is
+recorded before anything else: the console writes the step to `human-steps.ndjson` in its own state
+directory, sends ONE `needs-you` push — its title names the kind and the phase, its payload's `step`
+block carries the step's id, kind, where, the actions *Open* and *I did it*, and a `device-code`
+step's code — moves the step to `notified`, and derives ONE `human-step` inbox row from the ledger
+for as long as the step is open. The phase parks with its errand written in the step's own words
+(what, where, what proves it) under situation `blocked-declared:human-acts`, whose ladder is empty,
+and its wait history gains an entry of kind `person` that is UNBUDGETED: a person's time is never
+charged to the external-wait budget a phase has for somebody else's clock, and no `Waits on:` max
+ends it. The journal says `phase.human-step`. The same happens whichever door the declaration came
+through — the lane's own outcome file, a live run's inbox, or a hand-run session's inbox with no run
+live.
+
+**The verbs** (control-tower phase 43) are six routes, each attributed and each a ledger move:
+`GET /api/human-steps[?open=1]` lists the steps with their window, next reminder and every move;
+`POST /api/human-steps/:id/open` answers the link for the caller's browser (`where: here`), opens it on
+the machine (`host` — behind `--allow-terminal` or `--allow-agent`, and only once the caller has sent
+back the FULL URL it was shown), or, for a command, mints the embedded terminal that prints the
+command and runs it on the person's Enter — any number of times, in any state short of settled, each
+open counted and journalled; `…/check` runs the proof NOW; `…/snooze`, `…/cannot {reason}` and
+`…/dismiss`. Anything but an `http(s)` link is refused, and nothing a person types in the terminal
+reaches the ledger, a journal or the ticket.
+
+**The proof is a watch.** The declaration carries the step's proof and its window's end, so the watch
+clock polls it off the record on phase 6's `cmd:` back-off (5 m, 15 m, 1 h, then 6 h), bounded by the
+step's window — seven days when it names none — and never by a wait budget a person's turn does not
+have. When it lands, or when *I did it — check* finds it true (a terminal's exit 0 is the proof of a
+step that names none, and a person's word proves a step with no proof at all), the step reads
+`proven` (`phase.human-step-proven`) and the SAME session resumes through the declared-resume path,
+told "the person's turn this phase declared is done: …" with the step's words, the proof and what it
+read. A check that does not land answers what the proof read, in its own words, and the step waits on.
+
+**It never loops.** The reminder clock re-announces a waiting step at +15 m, +1 h, +6 h, then daily
+(each gap after the last reminder or the person's last open or check), under the first push's tag, and
+defers one out of the reminder quiet hours (`reminderQuiet`) and past a snooze. At the window's end the
+step reads `expired` and the park's errand is rewritten in its words; *I can't do this* does the same
+at once, carrying the person's reason. Neither re-arms a reminder, a settled step's proof leaves the
+watch, and a step whose phase has closed or moved on is withdrawn. So a session that declares a step
+does nothing more: it stops, and it is resumed told what was proven — or a person reads the errand.
+
+**What the console notices (phase 44).** A step is also born without anyone declaring it. A
+supervised Bash call that starts an interactive sign-in — a `SIGN_IN_SHAPES` member at a statement's
+lead, seen through wrappers, `sudo`, `npx`/`bunx`/`pnpm dlx`, env prefixes, groups and chains, but
+never in a here-doc's data — is DENIED before it runs, on every profile and on an `ask` as much as an
+`allow`, and the refusal carries the whole `needs-human --step …` declaration to make instead: the
+kind, and the tool's own status verb as `--proof` where the console's command judge runs that tool
+(`SIGN_IN_STEPS`; otherwise no proof, and a person's *I did it* proves it). A status verb (`gh auth
+status`) and a sign-in with a non-interactive flag (`SIGN_IN_UNATTENDED`: `--with-token`,
+`--password-stdin`, `--identity`, …) run; a call no run token names is not this console's to judge.
+A lane that goes `silent` with an http(s) link beside waiting words in its last output
+(`SUSPECT_WAIT_WORDS`; the weaker "open this link in your browser" counts only for a link that is not
+the machine's own loopback) is read as a SUSPECTED step: the stall carries `suspectedStep`, the
+journal says `phase.human-step-suspected`, and the inbox raises the silent row at once with *Make it
+a person's turn* — `POST /api/human-steps/suspected`, a step born `console` that parks nothing,
+because the session is still waiting on that link (a second press answers the same step, and the
+step is withdrawn once that lane stops running). The console never converts or opens one by itself.
+At the launch door, probe 9 lists the plan's own `- **Human step:**` bullets for the phases the run
+will drive, runs every proof at once through the watch clock's probe, pre-clears the proven and
+returns the rest with their open actions (`Prelude.humanSteps`); a start records the owed ones, born
+`plan`, just before the runner starts, and each is withdrawn once its phase's handoff reads complete. And every inbox row that asks a person for an act — a sign-in, an MCP sign-in, the
+verification card, a plan to approve, a gate, a relayed question, a QA verdict, phase 39's protected
+edit — carries one `humanStep` view (`humanStepView`, the fold map `HUMAN_STEP_FOLDS`), so a person's
+turn is drawn as one card whatever raised it; the row's own actions still answer it.
+
 ## Session terminals — other sessions on this machine
 
 Every Claude session on the machine reports presence through `scripts/session-hook.sh`
@@ -666,3 +837,5 @@ That is what makes an unsupervised declaration land in the console's inbox rathe
 so `scripts/phase-lock.sh` and `scripts/phase-graph.sh` read a plan's **Repos** column exactly once.
 `viewer/test/engine-parity.test.ts` holds the two halves against every real plan — which is the only
 thing that keeps them honest, and the reason neither may be "fixed" alone.
+
+

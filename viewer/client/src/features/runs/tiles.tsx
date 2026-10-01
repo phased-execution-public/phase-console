@@ -13,13 +13,12 @@
  * work that is not happening; the clock holds where it stood and says so.
  */
 
-import { Bot, Clock, Gauge, Timer } from 'lucide-react';
-import { Chip, RelativeTime, StatusBadge, Tile } from '@/components/ui';
-import { elapsed, etaLabel, etaPoint, etaTitle, money } from '@/lib/format';
+import { Bot, Clock, Gauge } from 'lucide-react';
+import { Badge, RelativeTime, Tile } from '@/components/ui';
+import { clockWords, etaLabel, etaPoint, etaTitle, money } from '@/lib/format';
 import { useAccounts } from '@/lib/queries';
 import { useNow } from '@/lib/clock';
-import { cn } from '@/lib/cn';
-import { runStatusTitle, runUiState } from '@/lib/status-vocab';
+import { waitNote } from '@shared/status-model.js';
 import type { EtaEstimate, LaneLiveness, PhaseEta, PhaseRecord, RunState } from '@/lib/api';
 
 /**
@@ -30,6 +29,36 @@ import type { EtaEstimate, LaneLiveness, PhaseEta, PhaseRecord, RunState } from 
  * existed — including a run recorded by an older console, which is why it is the
  * fallback rather than dead weight.
  */
+/**
+ * What the run's model request resolved to (control-tower phase 54, #91) —
+ * the sessions' own `init`, kept on the run as `resolvedModels`. A request
+ * that moved within the run (an alias that now names another model) says
+ * which model it moved from; a pinned run says it is pinned, because under
+ * `pinned` a session on any other model parks rather than spends.
+ */
+export function ResolvedModel({ run }: { run: RunState }) {
+  const seen = run.resolvedModels?.[run.model ?? 'default'];
+  const pinned = run.modelPolicy === 'pinned';
+  if (!seen && !pinned) return null;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1" data-testid="resolved-model">
+      {/* Muted, not the hint's faint ink: which model ran is evidence, and faint
+          ink fails AA at this size in both themes (the e2e register). */}
+      {seen ? <span className="text-ink-muted">resolves to {seen.resolved}</span> : null}
+      {seen?.from ? (
+        <Badge tone="accent" title={`earlier in this run the same request ran on ${seen.from}`}>
+          moved from {seen.from}
+        </Badge>
+      ) : null}
+      {pinned ? (
+        <Badge tone="neutral" title="the run parks a phase whose session starts on any other model">
+          pinned
+        </Badge>
+      ) : null}
+    </span>
+  );
+}
+
 export function livePhases(run: RunState): number[] {
   const lanes = run.children ? Object.values(run.children) : [];
   const phases = lanes.length ? lanes.map((lane) => lane.phase) : run.child ? [run.child.phase] : [];
@@ -49,6 +78,18 @@ export function phaseProgress(ms: number, estMs: number | undefined): string | n
   return ms > estMs ? 'over estimate' : etaPoint(estMs);
 }
 
+/**
+ * The run's facts, under its strip (control-tower phase 24).
+ *
+ * The strip heads the page and carries the run's word, its ONE clock — the
+ * attempt, labelled, with the phase's total beside it — the track, the cost
+ * and the one action. What it does not carry lives here, one line of the
+ * operator's side and one of the record's: what the run waits on, who pays,
+ * which phases hold lanes and how the running one stands against its
+ * estimate, the work branch; the run's id, its own clock, the ETA, the
+ * completion promise and the failure streak. Every duration is a labelled
+ * clock (`clockWords`, #28), never a bare figure.
+ */
 export function RunHeader({
   run,
   live,
@@ -62,14 +103,16 @@ export function RunHeader({
 }) {
   const ticking = live && run.status !== 'frozen';
   const now = useNow(ticking);
-  // The chip shows who is PAYING, so it reads as a name, not a registry id.
   const { data: accountsState } = useAccounts();
   const accountLabel = run.accountId
     ? (() => {
         const view = accountsState?.accounts.find((candidate) => candidate.id === run.accountId);
         return view ? (view.name ?? view.email ?? view.id) : run.accountId;
       })()
-    : null;
+    : (() => {
+        const login = accountsState?.accounts.find((candidate) => candidate.id === 'default');
+        return login?.email ? `machine login · ${login.email}` : 'machine login';
+      })();
 
   const runMs = ticking
     ? now - Date.parse(run.createdAt)
@@ -80,107 +123,81 @@ export function RunHeader({
   const phaseMs =
     startedAt == null ? null : (frozenAt ?? (ticking ? now : Date.parse(run.updatedAt))) - startedAt;
 
-  // Which phases this run holds a session on right now. `children` is the full
-  // set; `child` is the mirror of the lowest-numbered one, and the fallback for a
-  // run recorded before the pool existed.
   const lanes = livePhases(run);
-  // `child` is the mirror lane and `phaseMs` is measured from it, so this is the
-  // estimate that belongs beside that clock rather than "the first one sent".
   const mirrorEta = phaseEta.find((p) => p.phase === run.child?.phase);
+  const waiting = waitNote(run as Parameters<typeof waitNote>[0]);
 
   return (
-    <header className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <StatusBadge
-          state={runUiState(run.status)}
-          label={run.status}
-          mono
-          title={runStatusTitle(run.status)}
-          pulse={run.status === 'running'}
-        />
+    <div className="flex flex-col gap-1" data-testid="run-facts">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-muted">
+        {/* What a waiting run waits on and when it resumes (control-tower
+            phase 88, #148) — the watch ref or the park's reason, and the
+            clock, in the words the Runs list and the pushes use. */}
+        {waiting ? (
+          <span className="text-ink-faint" data-testid="run-wait-note">
+            {waiting}
+          </span>
+        ) : null}
         {accountLabel ? (
-          <Chip title="Which Claude account this run's sessions spend. Absent means the machine login.">
+          <Badge title="Which Claude account this run's sessions spend — the machine login when the run names none.">
             {accountLabel}
-          </Chip>
+          </Badge>
         ) : null}
         {lanes.length > 1 ? (
           <>
-            <span className="font-display text-sm">phases {lanes.join(', ')}</span>
-            <Chip tone="busy" title="This run is driving several phases whose scopes do not overlap">
+            <span>phases {lanes.join(', ')}</span>
+            <Badge tone="live" title="This run is driving several phases whose scopes do not overlap">
               {lanes.length} sessions
-            </Chip>
+            </Badge>
           </>
         ) : (
-          run.activePhase != null && <span className="font-display text-sm">phase {run.activePhase}</span>
+          run.activePhase != null && <span>phase {run.activePhase}</span>
         )}
-        {/* The biggest thing on the line, because it is the figure people come
-            back to the page for. It was `text-sm` beside four other `text-sm`
-            spans, which made "how long has this been going" something you had
-            to find rather than something you saw. Size and weight only — the
-            colour still carries the one distinction it always did, stopped
-            versus counting. */}
-        {phaseMs != null && (
-          <span
-            className={cn(
-              'inline-flex items-center gap-1.5 font-mono text-base font-semibold tabular-nums md:text-lg',
-              frozenAt ? 'text-ink-faint' : 'text-ink',
-            )}
-            title={
-              frozenAt
-                ? 'The session is stopped where it stood, so this clock is stopped too.'
-                : lanes.length > 1
-                  ? // The mirror is the lowest-numbered lane, so with several running
-                    // this is the oldest of them — saying "the phase" would be a
-                    // claim about whichever one the reader happens to be watching.
-                    `How long phase ${lanes[0]}, the earliest of ${lanes.length} running, has been going`
-                  : 'How long the phase running now has been going'
-            }
-          >
-            <Timer size={16} className="shrink-0 text-ink-faint" aria-hidden />
-            {elapsed(phaseMs)}
-          </span>
-        )}
-        {/* Against the estimate for the SAME lane the clock beside it counts —
-            the mirror — so the two figures are about one phase. */}
+        {/* Against the estimate for the lane the strip's clock counts — the
+            mirror — so the two figures are about one phase. */}
         {phaseMs != null && mirrorEta && (
           <span
-            className="text-2xs text-ink-faint"
+            data-testid="run-phase-estimate"
             title={`Phase ${mirrorEta.phase} was expected to take about ${mirrorEta.label.replace('~', '')}.`}
           >
-            / {phaseProgress(phaseMs, mirrorEta.estMs)}
+            {phaseMs > (mirrorEta.estMs ?? Infinity) ? '' : 'expected '}
+            {phaseProgress(phaseMs, mirrorEta.estMs)}
           </span>
         )}
         {/* The run's own record, never a preference fallback — a header states
             what this run IS, and an older server that echoes nothing gets
             nothing rendered. */}
         {run.gitMode === 'new-branch' && (
-          <Chip title="This run works on its own branch and, unless turned off, the final phase opens a PR after one approval tap.">
+          <Badge title="This run works on its own branch and, unless turned off, the final phase opens a PR after one approval tap.">
             work branch{run.openPr === false ? '' : ' · PR'}
-          </Chip>
+          </Badge>
         )}
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs text-ink-faint">
         <span>
           run <code className="font-mono">{run.id}</code>
         </span>
-        {/* The whole run, under the phase and visibly secondary to it: on a plan
-            that has been going for days the phase clock is what changed. */}
+        {/* The whole run, visibly secondary to the attempt the strip counts:
+            on a plan that has been going for days the attempt is what moved. */}
         <span
           className="inline-flex items-center gap-1"
-          title={`started ${new Date(run.createdAt).toLocaleString()}`}
+          data-testid="run-clock"
+          title={`The run's own clock — started ${new Date(run.createdAt).toLocaleString()}`}
         >
           <Clock size={11} aria-hidden />
-          {ticking ? 'running for' : 'ran for'} {elapsed(Math.max(0, runMs))}
+          {clockWords({
+            verb: ticking ? 'running' : 'ran',
+            ms: Math.max(0, runMs),
+            tense: 'for',
+            label: 'the run',
+          })}
         </span>
         {/* A range rather than a countdown, and hedged by where the rate came
-            from: the thing being predicted is a model's throughput on work
-            nobody has looked at yet. `basis` is what stops a plan with no
-            history from showing a number that reads like a measurement. */}
-        {eta && <span title={etaTitle(eta)}>{etaLabel(eta.lowMs, eta.highMs, eta.basis)} left</span>}
+            from. `etaLabel` already ends in "left" — do not append a second. */}
+        {eta && <span title={etaTitle(eta)}>{etaLabel(eta.lowMs, eta.highMs, eta.basis)}</span>}
         {/* The promise people came to this page doubting: the queue only shows
-            what can run NOW, and phases waiting on dependencies looked like
-            phases the run would never reach. Scoped and halt-on-everything
-            runs make no such promise, so they say nothing. */}
+            what can run NOW. Scoped and halt-on-everything runs make no such
+            promise, so they say nothing. */}
         {live && run.autonomy === 'keep-going' && !run.onlyPhases?.length && (
           <span title="Every time a phase finishes the board is re-read, and newly unlocked phases start themselves. The run ends when the whole graph is done — or when something needs a person.">
             runs to plan completion
@@ -188,14 +205,14 @@ export function RunHeader({
         )}
         {live && run.maxConsecutiveFailures > 0 && run.consecutiveFailures > 0 && (
           <span
-            className="text-blocked"
+            className="text-failed"
             title={`${run.consecutiveFailures} phase(s) have failed in a row; at ${run.maxConsecutiveFailures} the run halts. A phase finishing cleanly — or you pressing Continue — resets it.`}
           >
             failures {run.consecutiveFailures}/{run.maxConsecutiveFailures}
           </span>
         )}
       </div>
-    </header>
+    </div>
   );
 }
 
@@ -289,9 +306,12 @@ export function RunTiles({
           </span>
         }
         hint={
-          <span className="inline-flex items-center gap-1">
-            <Gauge size={11} className="shrink-0" aria-hidden />
-            {`${run.effort ?? 'default'} effort · ${run.autonomy}`}
+          <span className="flex flex-col gap-0.5">
+            <span className="inline-flex items-center gap-1">
+              <Gauge size={11} className="shrink-0" aria-hidden />
+              {`${run.effort ?? 'default'} effort · ${run.autonomy}`}
+            </span>
+            <ResolvedModel run={run} />
           </span>
         }
       />

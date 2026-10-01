@@ -7,7 +7,8 @@ import { useMemo } from 'react';
  * the same chips from `row.tsx`.
  */
 
-import { DataTable, RelativeTime, type Column } from '@/components/ui';
+import { RelativeTime } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
 import { Lock } from 'lucide-react';
 import { etaLabel, etaTitle } from '@/lib/format';
 import { closedTitle } from '@/lib/closure';
@@ -16,6 +17,7 @@ import { cn } from '@/lib/cn';
 import { phaseHref, planHref } from '@shared/routes.js';
 import { concerns, type PlanRow, type SortId } from './model';
 import { ConcernChip, NeedsYouChip, RunChip, Track, repoLabel } from './row';
+import { PlanStatusBadge, type WordOf } from '@/components/ui/status';
 
 /**
  * The nine columns.
@@ -50,12 +52,14 @@ function planColumnsFor(): Column<PlanRow>[] {
           <span className={cn('flex min-w-0 items-center gap-1.5', row.isClosed && 'text-ink-muted')}>
             <span className="truncate">{row.title}</span>
             {row.isClosed && (
+              // The status PAINTED (control-tower phase 23) — the padlock says
+              // closed, the badge says which of the three closings it was.
               <span
                 title={closedTitle(row)}
-                className="inline-flex shrink-0 items-center gap-1 rounded-sm border border-rule bg-surface-raised px-1 py-px text-2xs font-medium uppercase tracking-wide text-ink-faint"
+                className="inline-flex shrink-0 items-center gap-1 text-ink-faint"
               >
                 <Lock size={9} className="shrink-0" aria-hidden />
-                {row.status}
+                <PlanStatusBadge status={row.status as WordOf<'plan'>} />
               </span>
             )}
           </span>
@@ -88,7 +92,7 @@ function planColumnsFor(): Column<PlanRow>[] {
         !row.isClosed && row.readyPhases.length ? (
           <a
             href={phaseHref(row.slug, row.readyPhases[0])}
-            className="text-ready hover:text-action"
+            className="text-queued hover:text-action"
             title={`Open phase ${row.readyPhases[0]}`}
           >
             {row.readyPhases.length}

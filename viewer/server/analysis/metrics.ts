@@ -71,6 +71,14 @@ export type MetricsRun = {
   attempts: number;
   /** Sum of `PhaseRecord.durationMs` over this run, in seconds. */
   phaseSeconds: number;
+  /**
+   * The WALL-CLOCK this run had a phase waiting in the admission queue, by the
+   * class of what held it (`HOLDER_CLASSES`, control-tower phase 60, #64), in
+   * seconds — `RunState.blockedMs`, closed stretches only. Each instant counts
+   * once however many phases waited through it: never the phases' lane-time
+   * summed. Absent on a run older than the split.
+   */
+  blockedSeconds?: Partial<Record<string, number>>;
 };
 
 /** Per-plan money, from `analysis/spend.ts` `planCost`. */
@@ -105,6 +113,31 @@ export type MetricsGit = {
   conflictedFiles: number;
 };
 
+/**
+ * What this console's own process is doing.
+ *
+ * Absent rather than zeroed when a count is not knowable: a gauge saying zero
+ * SSE clients and one saying "this build cannot tell you" are different facts,
+ * and the second is the honest one on a console whose surface does not report
+ * it yet. `family()` drops a non-finite sample for the same reason.
+ */
+export type MetricsProcess = {
+  heapUsedBytes: number;
+  heapLimitBytes: number;
+  residentBytes: number;
+  externalBytes: number;
+  eventLoopDelaySeconds?: number;
+  /** The last complete window's worst delay (`runtime-probe.ts`, #75). */
+  eventLoopDelayMaxSeconds?: number;
+  /** …and its 99th percentile. */
+  eventLoopDelayP99Seconds?: number;
+  handles?: number;
+  uptimeSeconds: number;
+  sseClients?: number;
+  sessions?: number;
+  ptySessions?: number;
+};
+
 export type MetricsFacts = {
   plans: readonly MetricsPlan[];
   runs: readonly MetricsRun[];
@@ -119,6 +152,33 @@ export type MetricsFacts = {
   instanceId?: string;
   /** How long assembling these facts took, in seconds. */
   scrapeSeconds?: number;
+  /** This console's own runtime. Absent ⇒ the ten process families emit nothing. */
+  process?: MetricsProcess;
+  /** Every account window's forecast (control-tower phase 92, #141). Absent or empty ⇒ the forecast family emits nothing. */
+  accounts?: readonly MetricsAccountWindow[];
+  /** Each account's credit spend this month (control-tower phase 93); absent or empty ⇒ the family emits nothing. */
+  credits?: readonly MetricsAccountCredit[];
+  /** The machine-load guard's reading (control-tower phase 100). Absent ⇒ both load families emit nothing. */
+  load?: { avg5: number; threshold: number | null };
+  /** The lanes kept for a phase (control-tower phase 100), armed or waiting for their lane. Absent ⇒ nothing. */
+  reservations?: { armed: number; waiting: number };
+};
+
+/**
+ * One account window's forecast (control-tower phase 92, #141), labelled by the
+ * account's ID — never its email, which a scrape must not carry. `burnPctPerHour`
+ * is null until measured; `wallsInSeconds` null when the window is flat,
+ * unmeasured, or resets before it walls.
+ */
+/** One account's credit spend (control-tower phase 93, #146). */
+export type MetricsAccountCredit = { account: string; currency: string; used: number };
+
+export type MetricsAccountWindow = {
+  account: string;
+  window: string;
+  utilization: number;
+  burnPctPerHour: number | null;
+  wallsInSeconds: number | null;
 };
 
 /**
@@ -153,6 +213,8 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
   ['phase_console_runs', 'gauge', 'Autopilot runs per plan, by run status.'],
   ['phase_console_phase_attempts_total', 'counter', 'Sessions the console has launched for a plan.'],
   ['phase_console_phase_seconds_total', 'counter', 'Wall-clock seconds phases of a plan have run for.'],
+  ['phase_console_run_blocked_seconds_total', 'counter',
+    'Wall-clock seconds a plan\'s runs had a phase waiting in the admission queue, by the class of what held it: other-run, hand, clock or own-run. Each second counts once, however many phases waited.'],
   ['phase_console_spend_usd_total', 'counter', 'USD every session of a plan has cost (the run total).'],
   ['phase_console_phase_spend_usd_total', 'counter', 'USD attributed to a numbered phase of a plan.'],
   ['phase_console_spend_residual_usd', 'gauge',
@@ -175,6 +237,51 @@ export const METRIC_FAMILIES: readonly (readonly [string, 'gauge' | 'counter', s
     'Bytes those checkouts occupy. Absent where du could not answer.'],
   ['phase_console_branch_conflicted_files', 'gauge',
     'Files a plan\'s run branch already conflicts on with another live branch.'],
+  // The account forecast (control-tower phase 92, #141): per account id and
+  // window, the reading, the measured burn and the time to the projected wall.
+  ['phase_console_account_usage_ratio', 'gauge',
+    'An account window\'s utilization, 0 to 1, by account id and window.'],
+  ['phase_console_account_burn_ratio_per_hour', 'gauge',
+    'An account window\'s measured burn, utilization per hour, from a line through the last hour\'s readings. Absent until measured.'],
+  ['phase_console_account_wall_seconds', 'gauge',
+    'Seconds until an account window walls at its measured burn. Absent when it is flat, unmeasured, or resets first.'],
+  // Account credits (control-tower phase 93, #146): what each account has
+  // spent this month past its plan windows, in its own currency.
+  ['phase_console_account_credit_used', 'gauge',
+    'Credits an account has used this month, in its currency\'s major unit, by account id and currency. Absent while its credit state is unknown.'],
+  // Lanes, policies and capacity (control-tower phase 100, #135 D and G): the
+  // load the guard reads, the line it holds new admissions at, and the lanes
+  // kept for a phase.
+  ['phase_console_load_average', 'gauge',
+    'The machine\'s 5-minute load average — the reading the load guard holds new admissions on.'],
+  ['phase_console_load_guard_threshold', 'gauge',
+    'The 5-minute load above which new admissions wait: the guard\'s factor times the machine\'s cores. Absent when the guard is off.'],
+  ['phase_console_lane_reservations', 'gauge',
+    'Lanes kept for a phase, by `armed` — `yes` once the lane each waits for has ended and it is holding its scope and slot.'],
+  // The console's OWN runtime (control-tower phase 7). Every family above is
+  // about the WORK; none of them was about the supervisor, which is how a
+  // console climbed to a 4 GB heap over 23.7 hours with no sample anywhere
+  // that would have shown the climb, and then took two live runs down with it.
+  // Cheapest gauges here by a distance — `process.memoryUsage()` and three
+  // counters the process already holds.
+  ['phase_console_process_heap_used_bytes', 'gauge', 'V8 heap in use by this console process.'],
+  ['phase_console_process_heap_limit_bytes', 'gauge',
+    'The heap this console may grow to — what `--max-old-space-size` set, as V8 reports it. The ratio against heap_used is the series worth alerting on.'],
+  ['phase_console_process_resident_bytes', 'gauge', 'Resident set size of this console process.'],
+  ['phase_console_process_external_bytes', 'gauge',
+    'Memory held outside V8\'s heap by this process — buffers, and the SSE write buffers a slow client fills.'],
+  ['phase_console_process_event_loop_delay_seconds', 'gauge',
+    'How late this console\'s event loop is running — the mean over the last complete one-minute window. A supervisor that cannot answer promptly is one nothing else can either.'],
+  ['phase_console_process_event_loop_delay_max_seconds', 'gauge',
+    'The worst event-loop delay in the last complete one-minute window. A stall shows here for a whole window; a mean would average it away.'],
+  ['phase_console_process_event_loop_delay_p99_seconds', 'gauge',
+    'The 99th-percentile event-loop delay in the last complete one-minute window — the tail every request and hook waited behind.'],
+  ['phase_console_process_handles', 'gauge', 'Open handles this process holds — sockets, timers, child processes.'],
+  ['phase_console_process_uptime_seconds', 'gauge',
+    'Seconds since this console process started. A series that keeps resetting is a crash loop, whatever the other gauges say.'],
+  ['phase_console_process_sse_clients', 'gauge', 'Event-stream clients this console is writing to.'],
+  ['phase_console_process_sessions', 'gauge', 'Claude sessions this console has live right now.'],
+  ['phase_console_process_pty_sessions', 'gauge', 'Terminal (pty) sessions this console is holding open.'],
   // The process-lifetime counters (5.1.0, `server/counters.ts`). Appended for
   // the same reason as the three above, and monotonic WITHIN a process: a
   // restart resets them, which is what a Prometheus counter is. `build_info`
@@ -311,6 +418,28 @@ export function renderMetrics(facts: MetricsFacts): string {
     emit('phase_console_scrape_duration_seconds', 'gauge', [{ value: facts.scrapeSeconds }]);
   }
 
+  // The console's own process. Unlabelled scalars: there is exactly one of it,
+  // and a label would invite a second series that cannot exist.
+  const proc = facts?.process;
+  if (proc) {
+    const scalar = (name: string, value: number | undefined): void => {
+      if (typeof value !== 'number') return;
+      emit(name, 'gauge', [{ value }]);
+    };
+    scalar('phase_console_process_heap_used_bytes', proc.heapUsedBytes);
+    scalar('phase_console_process_heap_limit_bytes', proc.heapLimitBytes);
+    scalar('phase_console_process_resident_bytes', proc.residentBytes);
+    scalar('phase_console_process_external_bytes', proc.externalBytes);
+    scalar('phase_console_process_event_loop_delay_seconds', proc.eventLoopDelaySeconds);
+    scalar('phase_console_process_event_loop_delay_max_seconds', proc.eventLoopDelayMaxSeconds);
+    scalar('phase_console_process_event_loop_delay_p99_seconds', proc.eventLoopDelayP99Seconds);
+    scalar('phase_console_process_handles', proc.handles);
+    scalar('phase_console_process_uptime_seconds', proc.uptimeSeconds);
+    scalar('phase_console_process_sse_clients', proc.sseClients);
+    scalar('phase_console_process_sessions', proc.sessions);
+    scalar('phase_console_process_pty_sessions', proc.ptySessions);
+  }
+
   emit('phase_console_plans', 'gauge',
     tally(plans, (p) => `${p.status ?? 'unknown'} ${p.closed ? '1' : '0'}`).map(([key, count]) => {
       const [status, closed] = key.split(' ');
@@ -342,6 +471,25 @@ export function renderMetrics(facts: MetricsFacts): string {
 
   emit('phase_console_phase_attempts_total', 'counter', bySlug(runs, (r) => r.slug, (r) => r.attempts));
   emit('phase_console_phase_seconds_total', 'counter', bySlug(runs, (r) => r.slug, (r) => r.phaseSeconds));
+  // The WALL-CLOCK a run was blocked, by WHOSE claim held it (#64): blocked by
+  // others is the `other-run`, `hand` and `clock` series; `own-run` is
+  // pipelining, and a phase behind its own live lane is not queued at all.
+  // Never the phases' queued lane-time summed — three siblings behind one
+  // stranger for an hour are one hour here.
+  const blocked = new Map<string, number>();
+  for (const run of runs) {
+    for (const [klass, seconds] of Object.entries(run.blockedSeconds ?? {})) {
+      if (!seconds) continue;
+      const key = `${run.slug} ${klass}`;
+      blocked.set(key, (blocked.get(key) ?? 0) + seconds);
+    }
+  }
+  emit('phase_console_run_blocked_seconds_total', 'counter', [...blocked.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([key, value]) => {
+      const [slug, klass] = key.split(' ');
+      return { labels: { slug: slug ?? '', class: klass ?? '' }, value };
+    }));
 
   emit('phase_console_spend_usd_total', 'counter', bySlug(cost, (c) => c.slug, (c) => c.totalUsd));
   emit('phase_console_phase_spend_usd_total', 'counter', bySlug(cost, (c) => c.slug, (c) => c.attributedUsd));
@@ -375,6 +523,29 @@ export function renderMetrics(facts: MetricsFacts): string {
     git.map((entry) => ({ labels: { slug: entry.slug }, value: entry.diskBytes ?? NaN })));
   emit('phase_console_branch_conflicted_files', 'gauge',
     git.map((entry) => ({ labels: { slug: entry.slug }, value: entry.conflictedFiles })));
+
+  // The account forecast, account- then window-sorted. An unmeasured burn or a
+  // wall that is not projected is DROPPED by `family()`'s non-finite filter:
+  // absent is "nothing measured", never a zero nobody read.
+  const windows = [...(facts?.accounts ?? [])]
+    .sort((a, b) => a.account.localeCompare(b.account) || a.window.localeCompare(b.window));
+  const labelled = (entry: MetricsAccountWindow, value: number): Sample =>
+    ({ labels: { account: entry.account, window: entry.window }, value });
+  emit('phase_console_account_usage_ratio', 'gauge', windows.map((entry) => labelled(entry, entry.utilization / 100)));
+  emit('phase_console_account_burn_ratio_per_hour', 'gauge',
+    windows.map((entry) => labelled(entry, entry.burnPctPerHour === null ? NaN : entry.burnPctPerHour / 100)));
+  emit('phase_console_account_wall_seconds', 'gauge',
+    windows.map((entry) => labelled(entry, entry.wallsInSeconds ?? NaN)));
+  emit('phase_console_account_credit_used', 'gauge', [...(facts?.credits ?? [])]
+    .sort((a, b) => a.account.localeCompare(b.account))
+    .map((entry) => ({ labels: { account: entry.account, currency: entry.currency }, value: entry.used })));
+  // Lanes, policies and capacity (control-tower phase 100).
+  emit('phase_console_load_average', 'gauge', facts?.load ? [{ value: facts.load.avg5 }] : []);
+  emit('phase_console_load_guard_threshold', 'gauge',
+    facts?.load && facts.load.threshold !== null ? [{ value: facts.load.threshold }] : []);
+  emit('phase_console_lane_reservations', 'gauge', facts?.reservations
+    ? [{ labels: { armed: 'yes' }, value: facts.reservations.armed }, { labels: { armed: 'no' }, value: facts.reservations.waiting }]
+    : []);
 
   emitCounters();
 

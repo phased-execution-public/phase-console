@@ -23,15 +23,14 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  DataTable,
   Empty,
   PageError,
   RelativeTime,
   SectionHeading,
   Spinner,
   Tile,
-  type Column,
 } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
 import type { DebugEntry } from '@/lib/api';
 import { useDebugIndex } from '@/lib/queries';
 import { debugHref } from './routes';
@@ -102,6 +101,18 @@ const TONE_OF: Record<string, 'ok' | 'bad' | 'neutral' | 'wait'> = {
   'no-device': 'bad',
 };
 
+const outcomeOf = (row: DebugEntry): string => row.event.replace(/^delivery\./, '');
+const labelOf = (row: DebugEntry): string | undefined => (row.data as { label?: string } | undefined)?.label;
+const categoryOf = (row: DebugEntry): string | undefined =>
+  (row.data as { category?: string } | undefined)?.category;
+
+/*
+ * Each column says what its cell MEANS as well as how it looks (`value`), so the
+ * ledger can be narrowed and gathered: by outcome, device and category (their
+ * values, counted), by the announcement's words, and grouped under any of the
+ * first three. The ledger holds up to 500 rows, so it is windowed past the
+ * grid's threshold rather than drawing every one.
+ */
 const columns: Column<DebugEntry>[] = [
   {
     id: 'at',
@@ -109,6 +120,7 @@ const columns: Column<DebugEntry>[] = [
     priority: 2,
     min: 120,
     cell: (row) => (row.at ? <RelativeTime at={row.at} /> : <span className="text-ink-faint">undated</span>),
+    value: (row) => row.at,
   },
   {
     id: 'outcome',
@@ -116,8 +128,11 @@ const columns: Column<DebugEntry>[] = [
     identity: true,
     priority: 1,
     min: 110,
+    value: outcomeOf,
+    filter: 'facet',
+    groupable: true,
     cell: (row) => {
-      const outcome = row.event.replace(/^delivery\./, '');
+      const outcome = outcomeOf(row);
       return (
         <Badge tone={TONE_OF[outcome] ?? 'neutral'} size="sm">
           {outcome}
@@ -130,14 +145,20 @@ const columns: Column<DebugEntry>[] = [
     head: 'Device',
     priority: 2,
     min: 120,
-    cell: (row) => String((row.data as { label?: string } | undefined)?.label ?? '—'),
+    cell: (row) => String(labelOf(row) ?? '—'),
+    value: labelOf,
+    filter: 'facet',
+    groupable: true,
   },
   {
     id: 'category',
     head: 'Category',
     priority: 3,
     min: 100,
-    cell: (row) => String((row.data as { category?: string } | undefined)?.category ?? '—'),
+    cell: (row) => String(categoryOf(row) ?? '—'),
+    value: categoryOf,
+    filter: 'facet',
+    groupable: true,
   },
   {
     id: 'what',
@@ -147,6 +168,8 @@ const columns: Column<DebugEntry>[] = [
     min: 200,
     card: 'title',
     cell: (row) => <span className="text-xs">{row.text}</span>,
+    value: (row) => row.text,
+    filter: 'text',
   },
 ];
 
@@ -227,6 +250,9 @@ export default function DeliverySection(_props: { route: ViewProps['route'] }) {
           rows={rows}
           getRowKey={(row, index) => `${row.at}|${row.event}|${index}`}
           label="Delivery ledger"
+          tableId="debug-delivery"
+          toolbar
+          virtual
           // The row's own record under it — the service's rejection reason is
           // the whole answer to "why did this one not arrive", and it is too
           // long for a column that has to survive a phone.

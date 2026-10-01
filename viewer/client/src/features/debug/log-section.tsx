@@ -25,7 +25,6 @@ import {
   Banner,
   Button,
   CopyButton,
-  DataList,
   Empty,
   Input,
   Inspector,
@@ -35,12 +34,19 @@ import {
   SectionHeading,
   Spinner,
   Switch,
+  field,
 } from '@/components/ui';
+import { DataList } from '@/components/ui/data-list';
 import { cn } from '@/lib/cn';
 import { DEBUG_LEVELS, DEBUG_SOURCES, type DebugEntry, type DebugLevel, type DebugSource } from '@/lib/api';
 import { useDebugIndex } from '@/lib/queries';
 import { debugHref, listOf } from './routes';
 import { useDebugTail } from './tail';
+
+/** What the index answers without `?limit=` (`DEFAULT_LIMIT`, `server/debug/sources.ts`). */
+const DEFAULT_ROWS = 500;
+/** The steps the Rows control offers, up to the server's own ceiling. */
+const ROW_LIMITS: readonly number[] = [100, DEFAULT_ROWS, 2000, 5000];
 
 /** How a level paints. `Badge` has no `warn` — the amber one is `wait`. */
 const LEVEL_TONE: Record<DebugLevel, 'neutral' | 'wait' | 'bad'> = {
@@ -125,14 +131,18 @@ function Row({ entry, onOpen }: { entry: DebugEntry; onOpen: () => void }) {
       // of its own.
       className="flex w-full min-w-0 flex-wrap items-start gap-2 px-2 py-1.5 text-left hover:bg-surface-raised min-h-(--tap-min) sm:min-h-0 sm:flex-nowrap"
     >
-      <span className="w-28 shrink-0 font-mono text-2xs text-ink-faint tabular-nums">
+      {/* The row's meta in `ink-muted`, not `ink-faint`: faint ink on the page
+          ground reads under 4.5:1 at this size (WCAG 1.4.3), once per row — so
+          the register's count followed however many lines the console had
+          written by the time it looked (control-tower phase 26). */}
+      <span className="w-28 shrink-0 font-mono text-2xs text-ink-muted tabular-nums">
         {/* An unplaced row says so rather than borrowing a neighbour's time. */}
         {entry.at ? <RelativeTime at={entry.at} /> : 'undated'}
       </span>
       <Badge tone={LEVEL_TONE[entry.level]} size="sm">
         {entry.level}
       </Badge>
-      <span className="w-20 shrink-0 truncate text-2xs text-ink-faint" title={SOURCE_BLURB[entry.source]}>
+      <span className="w-20 shrink-0 truncate text-2xs text-ink-muted" title={SOURCE_BLURB[entry.source]}>
         {entry.source}
       </span>
       <span className="min-w-0 basis-full sm:flex-1 sm:basis-auto">
@@ -147,14 +157,14 @@ function Row({ entry, onOpen }: { entry: DebugEntry; onOpen: () => void }) {
       </span>
       {entry.traceId ? (
         <span
-          className="hidden shrink-0 font-mono text-2xs text-ink-faint sm:inline"
+          className="hidden shrink-0 font-mono text-2xs text-ink-muted sm:inline"
           title={`trace ${entry.traceId}`}
         >
           {entry.traceId.slice(0, 8)}
         </span>
       ) : null}
       {entry.slug ? (
-        <span className="hidden shrink-0 text-2xs text-ink-faint sm:inline">
+        <span className="hidden shrink-0 text-2xs text-ink-muted sm:inline">
           {entry.slug}
           {entry.phase !== undefined ? ` · p${entry.phase}` : ''}
         </span>
@@ -185,6 +195,11 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
   // evidence" — the one wrong answer this page can give.
   const traceRaw = route.query.trace ?? '';
   const trace = /^[0-9a-f]{32}$/.test(traceRaw) ? traceRaw : '';
+  // `?limit=` — how many rows the index answers with. The server clamps it to
+  // 1…5000 and answers 500 without it; the page reads, sends and carries it
+  // like every other key, so a quoted link shows the reader the same page.
+  const limitRaw = Number(route.query.limit);
+  const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
 
   // Every key the server parses. These were read from the URL and then not
   // sent for one round, which is worse than not offering them: the module
@@ -201,6 +216,7 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
     ...(run ? { run } : {}),
     ...(phase !== undefined ? { phase } : {}),
     ...(trace ? { trace } : {}),
+    ...(limit ? { limit } : {}),
   };
 
   const { data, isPending, error, refetch } = useDebugIndex(params);
@@ -220,6 +236,7 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
         until,
         run,
         phase: phaseRaw,
+        limit,
         follow: follow ? '1' : undefined,
         ...next,
       }),
@@ -301,6 +318,29 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
               onChange={(event) => go({ until: fromLocalInput(event.target.value) })}
             />
           </label>
+          {/* Muted, not faint: faint fails AA at this size on the toolbar's
+              ground (the e2e register, tablet-768). */}
+          <label className="flex flex-col gap-1 text-2xs text-ink-muted uppercase">
+            Rows
+            <select
+              value={String(limit ?? DEFAULT_ROWS)}
+              aria-label="How many rows to read"
+              className={cn(field, 'w-28')}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                go({ limit: next === DEFAULT_ROWS ? undefined : next });
+              }}
+            >
+              {ROW_LIMITS.map((n) => (
+                <option key={n} value={n}>
+                  {n.toLocaleString()}
+                </option>
+              ))}
+              {limit && !ROW_LIMITS.includes(limit) ? (
+                <option value={limit}>{limit.toLocaleString()}</option>
+              ) : null}
+            </select>
+          </label>
           {since || until ? (
             <Button size="sm" variant="ghost" onClick={() => go({ since: undefined, until: undefined })}>
               Clear window
@@ -344,6 +384,7 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
           until ||
           slug ||
           run ||
+          limit ||
           phase !== undefined ? (
             <Button size="sm" variant="ghost" onClick={() => navigate(debugHref('logs'))}>
               Clear filters
@@ -369,8 +410,8 @@ export default function LogSection({ route }: { route: ViewProps['route'] }) {
 
       {data.truncated ? (
         <Banner severity="warn" data-testid="logs-truncated">
-          More rows matched than are shown. Narrow by source, level or text — or add <code>?since=</code> to
-          the URL for a window.
+          More rows matched than are shown. Narrow by source, level or text, read more rows, or add{' '}
+          <code>?since=</code> to the URL for a window.
         </Banner>
       ) : null}
 

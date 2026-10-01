@@ -27,14 +27,14 @@
  *    `api.runSettings` and the two agent-ticket helpers have exactly one
  *    caller each, guarded by `single-source.test.ts`.
  *
- * ## The launch flow (Phase 8)
+ * ## The launch flow (Phase 8; one screen since control-tower phase 22)
  *
  * The values, the seed, the provenance and the submit live here; the
  * ARRANGEMENT lives in `sections.tsx` (the controls, grouped by what they
- * decide) and, in an overlay, in four stages — `what-runs.tsx`,
- * `how-it-runs.tsx`, `money-and-stops.tsx`, `review.tsx` — under
- * `launch-shell.tsx`'s frame. `stages.ts` says which field is on which stage
- * and which modes are staged at all. Rendered inline on a page (the
+ * decide) and, in an overlay, in the quick view (`quick.tsx`) — what runs, a
+ * preset, nine category tiles (`categories.ts`) that expand onto those
+ * sections, how many values differ — under `launch-shell.tsx`'s frame.
+ * `stages.ts` says which modes are staged at all. Rendered inline on a page (the
  * Automation card, the launcher, the wizard) the form is flat: the same
  * sections, stacked. Nothing it posts changed: `modes.ts` is untouched, so
  * the payload is byte-identical to the one the old dialog sent.
@@ -43,10 +43,13 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Bot, Play, ShieldCheck } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Button, TabsContent, toast } from '@/components/ui';
+import { AlertDialog, AlertDialogContent, Button, toast } from '@/components/ui';
+import { LIVE_LANE_LOCKED_FIELDS, QA_CONFIRM, SETTING_EFFECTS } from '@shared/run-settings.js';
+import type { ApiError } from '@/lib/api/client';
 import {
   api,
   automationPrefs,
+  ladderPrefs,
   type PhaseView,
   type PlanReviewer,
   type RunState,
@@ -60,15 +63,13 @@ import {
   useIsolationPreflight,
   useMcp,
   useSkills,
-  useVerifyPreflight,
   usePrelude,
 } from '@/lib/queries';
 import { DEFAULT_ISOLATION_FOR_NEW_BRANCH, ISOLATED } from '@shared/worktree-model.js';
 import { startSession } from '@/lib/start-session';
 import { cn } from '@/lib/cn';
-import { plural } from '@/lib/format';
 import { DEFAULTS, EFFORTS, EFFORT_NOTE, MODEL_NOTE, MODELS } from '@/features/runs/defaults';
-import { PressField, ToggleField, sourceOf, type Source } from './fields';
+import { PressField, ToggleField, sourceOf, type FieldEffect, type Source } from './fields';
 import { SetupFormProvider, type SetupForm } from './form-context';
 import { LaunchShell } from './launch-shell';
 import { recallLaunch, rememberLaunch } from './launch-memory';
@@ -83,21 +84,22 @@ import {
   buildRunPayload,
   buildTicket,
   mergedSkills,
+  runsPrelude,
   shows,
   submitLabel,
   type RunSetupContext,
   type RunSetupMode,
 } from './modes';
 import { formatAccounts, runSetupSchema, type RunSetupField, type RunSetupValues } from './schema';
+import type { CategoryId } from './categories';
 import { FlatForm, accountWho } from './sections';
 import { BASELINE, seedFor, type Origins } from './seed';
-import { Decisions, preludeDraft } from './decisions';
-import { HowItRuns } from './how-it-runs';
-import { MoneyAndStops } from './money-and-stops';
-import { LaunchReview, LaunchTicket, NoAllowRun } from './review';
-import { STAGES, isLive, isStaged, type StageId } from './stages';
-import { changedPerStage, summaryRows } from './summary';
-import { WhatRuns } from './what-runs';
+import { preludeDraft } from './decisions';
+import { gitLinesOf } from './git-reconcile';
+import { matchingPreset, presetAgrees, presetValues, presetsFor, withPreset, type PresetId } from './presets';
+import { QuickView } from './quick';
+import { NoAllowRun } from './review';
+import { isLive, isStaged } from './stages';
 
 /** The overlay a caller puts the form in. Present = a dialog; absent = inline on a page. */
 export interface RunSetupOverlay {
@@ -110,7 +112,7 @@ export interface RunSetupOverlay {
 export interface RunSetupProps {
   mode: RunSetupMode;
   context?: RunSetupContext;
-  /** The plan's phases — the per-phase matrix and the What-runs stage read them. */
+  /** The plan's phases — the per-phase matrix and the What-runs fold read them. */
   planPhases?: PhaseView[];
   /** What the plan asks every session to invoke / attach. Shown, never unticked here. */
   planSkills?: string[];
@@ -142,6 +144,12 @@ export interface RunSetupProps {
   /** Refuse to submit (a live claim on the phase, the session cap). */
   blocked?: boolean;
   blockedReason?: string;
+  /**
+   * A lane of this run is working (control-tower phase 24): the fields the
+   * settings door refuses under a live lane (`LIVE_LANE_LOCKED_FIELDS`) say so
+   * beside their controls, before the press. Read in `live` mode only.
+   */
+  laneWorking?: boolean;
   /** Called after a successful submit, with a session id where one was minted. */
   onDone?: (sessionId?: string) => void;
   /** `session` mode only: the launcher owns the pty, so it owns the call. */
@@ -172,6 +180,7 @@ export function RunSetup({
   skillsEnabled = true,
   blocked: blockedProp = false,
   blockedReason: blockedReasonProp,
+  laneWorking = false,
   onDone,
   onLaunch,
   children,
@@ -199,9 +208,6 @@ export function RunSetup({
   const { data: isolationPreflight } = useIsolationPreflight(
     shows(mode, 'isolation') && mode !== 'live' ? context.slug : undefined,
   );
-  // What boarding will find — for the stage bar's note on the review. The
-  // review itself asks the same key; two hooks, one request.
-  const { data: preflight } = useVerifyPreflight(context.slug, staged);
 
   // The server's own list when it can say, this build's copy when it cannot —
   // an older server has no `models` on its state, and a form that offered
@@ -235,26 +241,42 @@ export function RunSetup({
   // `null` per field means "the operator has not said" — the seed keeps
   // answering, and keeps re-deriving as `/api/state` and the run arrive.
   const [touched, setTouched] = useState<Partial<RunSetupValues>>({});
+  // The preset the operator pressed (control-tower phase 22): a SEED layer,
+  // under their own touches, so what it moved reads "from preset".
+  const [preset, setPreset] = useState<PresetId | null>(null);
+  // The quick view's one expanded tile — null is the list.
+  const [openCategory, setOpenCategory] = useState<CategoryId | null>(null);
   const [busy, setBusy] = useState(false);
+  // A settings patch that turns QA on, held for the person's confirmation.
+  const [qaAsk, setQaAsk] = useState<Record<string, unknown> | null>(null);
 
   // The prelude for THIS draft (phase 11): asked whenever the mode asks the
-  // Decisions stage's questions, and it gates the submit — a blocking row
+  // Decisions tile's questions, and it gates the submit — a blocking row
   // still open disables Launch and names itself in the footer, unless the
-  // operator has signed an override. The stage asks the same key; two hooks,
+  // operator has signed an override. The tiles ask the same key; two hooks,
   // one request. Asked over the BASE seed and the operator's edits, so the
   // account list it resolves can seed the form below without the draft
   // changing under it.
-  const asksDecisions = shows(mode, 'resumeOnRestart') || shows(mode, 'relay') || shows(mode, 'accounts');
-  const { data: prelude } = usePrelude(
+  // Only a launch through the run door (control-tower phase 77): the live
+  // sheet shows three of these answers and passes no door.
+  const asksDecisions =
+    runsPrelude(mode) && (shows(mode, 'resumeOnRestart') || shows(mode, 'relay') || shows(mode, 'accounts'));
+  const { data: prelude, isError: preludeUnread } = usePrelude(
     context.slug,
-    preludeDraft({ ...seedBase, ...touched }),
+    preludeDraft({ ...withPreset(seedBase, originsBase, preset, mode, memory)[0], ...touched }),
     asksDecisions,
   );
+  // Launch waits for the prelude's FIRST answer: it fills a fresh start's
+  // account list and names any blocking row, and a press before it landed was
+  // refused by the start door for having no accounts (control-tower phase 33,
+  // the tower rehearsal's quick start). A prelude that could not be read holds
+  // nothing — the door's own refusal then says what is missing.
+  const preludePending = asksDecisions && Boolean(context.slug) && !prelude && !preludeUnread;
   // The account list a fresh start opens on is the prelude's resolved clause
   // — the plan's `**Accounts:**` line, else the machine login — SEEDED rather
   // than typed, so the review reads it as the plan's word (or the default),
   // never as a change the operator made here. A run answers for itself.
-  const [seed, origins] = useMemo<[RunSetupValues, Origins]>(() => {
+  const [seedPlain, originsPlain] = useMemo<[RunSetupValues, Origins]>(() => {
     // A run with a stored list keeps it; one without (from before the field,
     // or a finished run a phase launch starts afresh) takes the prelude's.
     if (!prelude?.accounts.length || seedBase.accounts) return [seedBase, originsBase];
@@ -264,37 +286,72 @@ export function RunSetup({
       { ...originsBase, accounts: row?.origin === 'plan' ? 'plan' : 'defaults' },
     ];
   }, [prelude, seedBase, originsBase]);
+  // The preset, laid over the seed — the seed every provenance word and the
+  // review compare against, so a value a preset moved reads "from preset".
+  const [seed, origins] = useMemo(
+    () => withPreset(seedPlain, originsPlain, preset, mode, memory),
+    [seedPlain, originsPlain, preset, mode, memory],
+  );
   const values: RunSetupValues = { ...seed, ...touched };
   const parsed = runSetupSchema.safeParse(values);
   const errors = fieldErrors(parsed);
   const openDecision =
     asksDecisions && !values.manifestOverride.trim() ? (prelude?.blocking[0] ?? null) : null;
-  const decisionsBlocked = Boolean(openDecision);
+  // #18: the plan's git lines this launch will not honour hold Launch until
+  // they are answered — the start door would refuse it by name anyway, and a
+  // refusal after the press is the answer asked too late (control-tower phase 22).
+  const gitUnanswered =
+    asksDecisions &&
+    shows(mode, 'gitStrategyAck') &&
+    gitLinesOf(prelude).length > 0 &&
+    !values.gitStrategyAck;
   const decisionsReason = openDecision
     ? `Decision outstanding: ${openDecision.key} — ${openDecision.why}`
-    : undefined;
-  const blocked = blockedProp || decisionsBlocked;
+    : gitUnanswered
+      ? 'Answer the plan’s git lines first — honour or override, in Git.'
+      : preludePending
+        ? 'Reading this plan’s decisions…'
+        : undefined;
+  const blocked = blockedProp || Boolean(openDecision) || gitUnanswered || preludePending;
   const blockedReason = blockedProp ? blockedReasonProp : decisionsReason;
 
-  // The stage — the overlay's, and the review's "Change" links'. A launch that
-  // asks the Decisions stage's questions opens ON it (phase 11): the point of
-  // the prelude is that these are answered first.
-  const first: StageId = asksDecisions && isStaged(mode, Boolean(overlay)) ? 'decisions' : 'what';
-  const [stage, setStage] = useState<StageId>(first);
-  const [visited, setVisited] = useState<ReadonlySet<StageId>>(() => new Set<StageId>([first]));
-  const goStage = (next: StageId) => {
-    setStage(next);
-    setVisited((prev) => (prev.has(next) ? prev : new Set(prev).add(next)));
+  // The preset row (a launch through the run door, staged): the choice on
+  // screen is the one pressed while the values still agree with it, else the
+  // first the values happen to match — or none, the operator's own mix.
+  const presets = staged ? presetsFor(mode, memory) : [];
+  const shownPreset =
+    preset && presetAgrees(preset, values, mode, memory) ? preset : matchingPreset(values, mode, memory);
+  const choosePreset = (id: PresetId) => {
+    const moved = Object.keys(presetValues(id, mode, memory));
+    setPreset(id);
+    // The preset answers for its keys from now: an earlier touch of one of
+    // them would otherwise sit on top of it and the press would do nothing.
+    setTouched((prior) => {
+      const next = { ...prior } as Record<string, unknown>;
+      for (const key of moved) delete next[key];
+      return next as Partial<RunSetupValues>;
+    });
   };
 
   const canQaToggle = qaMode === 'off' && allowWrites !== false;
   const canAutoRecover = state?.allowAgent === true;
+  const ladder = ladderPrefs(state);
   const on = (field: RunSetupField) => shows(mode, field);
   // What the mode offers, narrowed by what the live values allow — the one
   // predicate the sections gate their controls on and the review lists rows by.
   const live = (field: RunSetupField) => isLive(mode, field, values);
   const src = (field: RunSetupField): Source | undefined =>
     mode === 'defaults' ? undefined : sourceOf(values[field], seed[field], origins[field] ?? 'defaults');
+  // When a change lands (#31): the settings sheet only — a launch has nothing
+  // running for a change to land on, so every word would read "now".
+  const fx = (field: RunSetupField): FieldEffect | undefined => {
+    const word =
+      mode === 'live' ? (SETTING_EFFECTS as Record<string, FieldEffect['word']>)[field] : undefined;
+    if (!word) return undefined;
+    return laneWorking && (LIVE_LANE_LOCKED_FIELDS as readonly string[]).includes(field)
+      ? { word, refused: 'Refused while a lane is working — a change here is not applied' }
+      : { word };
+  };
 
   // Settings ▸ Automation states a preference; a launch ticks a box for one
   // run. Same value, same field, two idioms — and the idiom matters here for a
@@ -329,6 +386,27 @@ export function RunSetup({
       if (key) void savePref(client, { [key]: patch[key] });
     }
   };
+
+  /**
+   * One settings patch, and what came of it. A 409 carries `refused` — the
+   * fields the door would not take, BY NAME (a live lane holds `gitMode`, the
+   * account is its own verb) — beside the run with everything else applied,
+   * so it reads as a partial success rather than a failure (phase 13, #31).
+   */
+  async function postSettings(slug: string, payload: Record<string, unknown>) {
+    try {
+      await api.runSettings(slug, payload as never);
+      toast('Settings applied.', 'ok');
+      onDone?.();
+    } catch (error) {
+      const refused = (error as ApiError).status === 409 ? refusedOf((error as ApiError).body) : [];
+      if (!refused.length) throw error;
+      toast('Applied everything else in the patch.', 'ok');
+      for (const row of refused) toast(`${row.field} was not applied — ${row.why}`, 'warn');
+      for (const queryKey of keys.afterRunLaunch()) void client.invalidateQueries({ queryKey });
+      onDone?.();
+    }
+  }
 
   async function onSubmit() {
     if (blocked || busy) return;
@@ -373,8 +451,15 @@ export function RunSetup({
         return;
       }
       if (door === 'runSettings') {
-        await api.runSettings(slug, payload as never);
-        toast('Applied — from the next phase.', 'ok');
+        // Turning the plan's QA gate on writes `test-status.md`, so the person
+        // is asked BEFORE the patch posts (control-tower phase 13, #31); the
+        // dialog's confirm posts it again with the server's word for "yes".
+        if (payload.qa === true && !/^on\b/.test(qaMode ?? '')) {
+          setQaAsk(payload);
+          return;
+        }
+        await postSettings(slug, payload);
+        return;
       } else {
         // The RESPONSE decides what this says. It used to be discarded
         // entirely — `await` then an unconditional "Continuing …" — so a start
@@ -428,7 +513,12 @@ export function RunSetup({
   const accountName = (id: string) => {
     if (id === 'auto') return 'auto — the most headroom';
     const account = accounts.find((a) => a.id === id);
-    return account ? accountWho(account) : id === 'default' ? 'machine login' : id;
+    if (!account) return id === 'default' ? 'machine login' : id;
+    // Credits carry it past its plan windows (control-tower phase 93): said
+    // where the account is chosen, so nobody picks it thinking it is capped.
+    return account.credits?.carrying
+      ? `${accountWho(account)} — uses credits past plan limits`
+      : accountWho(account);
   };
 
   const form: SetupForm = {
@@ -442,6 +532,7 @@ export function RunSetup({
     on,
     live,
     src,
+    fx,
     Bool,
     models,
     modelOptions: models.map((name) => [name, MODEL_NOTE[name] ?? name] as const),
@@ -470,6 +561,7 @@ export function RunSetup({
     canAutoRecover,
     isolationPreflight,
     concurrencyMax: state?.concurrency?.max,
+    ladderCaps: { perRun: ladder.ladderPerRunRungs, perPhase: ladder.ladderPerPhaseRungs },
     blocked,
     blockedReason,
     busy,
@@ -477,7 +569,15 @@ export function RunSetup({
     submitLabel: submitLabel(mode, context),
     submit: () => void onSubmit(),
     footerNote,
-    ...(staged ? { goStage } : {}),
+    ...(staged
+      ? {
+          openCategory,
+          goCategory: setOpenCategory,
+          presets,
+          preset: shownPreset,
+          choosePreset,
+        }
+      : {}),
   };
 
   const icon =
@@ -491,21 +591,6 @@ export function RunSetup({
 
   if (overlay) {
     const runDoor = MODES[mode].door === 'runStart' || MODES[mode].door === 'runSettings';
-    const rows = staged
-      ? summaryRows(mode, values, seed, origins, { permission: permissionName, account: accountName })
-      : [];
-    const changed = changedPerStage(rows);
-    const note = (n: number) => (n ? `${plural(n, 'change')} here` : undefined);
-    const notes: Partial<Record<StageId, string>> = staged
-      ? {
-          what: note(changed.what),
-          how: note(changed.how),
-          money: note(changed.money),
-          review: preflight?.phases.length
-            ? `${plural(preflight.phases.length, 'phase')} to know about`
-            : undefined,
-        }
-      : {};
     return (
       <SetupFormProvider value={form}>
         <LaunchShell
@@ -515,57 +600,44 @@ export function RunSetup({
           description={overlay.description}
           mode={mode}
           staged={staged}
-          stage={stage}
-          onStage={goStage}
-          visited={visited}
-          notes={notes}
+          scrollKey={openCategory ?? 'list'}
           banners={
             <>
               {state?.allowRun === false && runDoor && <NoAllowRun />}
               {children}
             </>
           }
-          ticket={staged ? <LaunchTicket /> : undefined}
           submit={{
             label: submitLabel(mode, context),
             busy,
             disabled: busy || blocked || !parsed.success,
             ...(blocked && blockedReason ? { title: blockedReason } : {}),
             onSubmit: () => void onSubmit(),
-            note: blocked && blockedReason ? blockedReason : footerNote,
+            note: blocked && blockedReason ? blockedReason : staged ? undefined : footerNote,
           }}
         >
-          {staged ? (
-            // `forceMount` + our own `hidden`: every stage stays in the DOM and
-            // the inactive ones are hidden. Two reasons. The stage bar's
-            // `aria-controls` names each panel whether or not it is showing,
-            // and an id that names nothing is an axe violation rather than a
-            // hint. And a stage's own state — a half-typed skill search, an
-            // open per-phase row — survives a trip to the review and back.
-            // (Radix sets `hidden` only when it owns the mounting, so with
-            // `forceMount` the attribute is ours to write.)
-            <>
-              {STAGES.map((s) => (
-                <TabsContent key={s.id} forceMount hidden={stage !== s.id} value={s.id} className="pt-0">
-                  <StageIntro id={s.id} />
-                  {s.id === 'decisions' ? (
-                    <Decisions />
-                  ) : s.id === 'what' ? (
-                    <WhatRuns />
-                  ) : s.id === 'how' ? (
-                    <HowItRuns />
-                  ) : s.id === 'money' ? (
-                    <MoneyAndStops />
-                  ) : (
-                    <LaunchReview />
-                  )}
-                </TabsContent>
-              ))}
-            </>
-          ) : (
-            <FlatForm />
-          )}
+          {/* A staged launch is the quick view (control-tower phase 22): one
+              screen of category tiles, each control one Edit away. */}
+          {staged ? <QuickView /> : <FlatForm />}
         </LaunchShell>
+        <AlertDialog open={qaAsk !== null} onOpenChange={(open) => (open ? null : setQaAsk(null))}>
+          {qaAsk !== null ? (
+            <AlertDialogContent
+              title="Turn the QA gate on for this plan?"
+              description="This creates test-status.md: each phase that finishes from now waits for an independent review before its dependents board, and the phases that finished before now are recorded as waived."
+              confirmLabel="Turn QA on"
+              cancelLabel="Leave QA off"
+              onConfirm={() => {
+                const pending = qaAsk;
+                setQaAsk(null);
+                setBusy(true);
+                void postSettings(context.slug!, { ...pending, confirm: QA_CONFIRM })
+                  .catch(toastError)
+                  .finally(() => setBusy(false));
+              }}
+            />
+          ) : null}
+        </AlertDialog>
       </SetupFormProvider>
     );
   }
@@ -594,15 +666,37 @@ export function RunSetup({
           </div>
         )}
       </div>
+      <AlertDialog open={qaAsk !== null} onOpenChange={(open) => (open ? null : setQaAsk(null))}>
+        {qaAsk !== null ? (
+          <AlertDialogContent
+            title="Turn the QA gate on for this plan?"
+            description="This creates test-status.md: each phase that finishes from now waits for an independent review before its dependents board, and the phases that finished before now are recorded as waived."
+            confirmLabel="Turn QA on"
+            cancelLabel="Leave QA off"
+            onConfirm={() => {
+              const pending = qaAsk;
+              setQaAsk(null);
+              setBusy(true);
+              void postSettings(context.slug!, { ...pending, confirm: QA_CONFIRM })
+                .catch(toastError)
+                .finally(() => setBusy(false));
+            }}
+          />
+        ) : null}
+      </AlertDialog>
     </SetupFormProvider>
   );
 }
 
-/** The one sentence under a stage's name, so a stage opens on what it is for. */
-function StageIntro({ id }: { id: StageId }) {
-  const stage = STAGES.find((s) => s.id === id);
-  if (!stage) return null;
-  return <p className="mb-4 max-w-prose text-xs text-ink-muted">{stage.blurb}</p>;
+/** The fields a settings 409 names as not applied (control-tower phase 13) — empty for any other refusal. */
+export function refusedOf(body: unknown): { field: string; why: string; verb?: string }[] {
+  const rows = (body as { refused?: unknown } | null | undefined)?.refused;
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(
+    (row): row is { field: string; why: string; verb?: string } =>
+      typeof (row as { field?: unknown })?.field === 'string' &&
+      typeof (row as { why?: unknown })?.why === 'string',
+  );
 }
 
 /** What each toggle in `defaults` mode is called on the server. */

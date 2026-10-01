@@ -10,7 +10,8 @@ import { render, screen, act, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('@/lib/media', () => ({
+vi.mock('@/lib/media', async (original) => ({
+  ...(await original<Record<string, unknown>>()),
   usePhone: () => true,
   useNarrow: () => true,
   useTouch: () => true,

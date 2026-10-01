@@ -41,21 +41,38 @@ import { randomUUID } from 'node:crypto';
 import {
   CHAIN_HOLDER,
   DEFAULT_PRIORITY,
+  DEFER_HOLDER,
+  ENTRY_HOLD_HOLDER,
   FLEET_HOLDER,
   HOLD_HOLDER,
+  LOAD_HOLDER,
+  PIN_HOLDER,
+  RESERVATION_HOLDER,
   chainReason,
+  deferReason,
+  entryHoldReason,
   fleetFreezeReason,
   holdReason,
+  loadReading,
+  loadReason,
+  pinHoldReason,
   priorityRank,
+  reservationReason,
   type RunPriority,
 } from '../../shared/orchestration-model.js';
 import { scopesIntersect, intersectingTokens, formatScope, claimsDisjoint } from '../../shared/scope.js';
 import { scheduleState, type SchedulePolicy } from '../../shared/schedule-policy.js';
 import { DEFAULT_MAX_SESSIONS } from '../config.ts';
 import { log } from '../log.ts';
+import { holdBinds } from '../fleet-hold.ts';
 import type { Presence } from '../../shared/run-lifecycle.js';
-import type { HolderKind, QueueKind } from '../../shared/run-lifecycle.js';
+import type { FenceLiftReason, HolderClass, HolderKind, QueueKind } from '../../shared/run-lifecycle.js';
+import { subKindOfNeed } from '../../shared/decisions-model.js';
 import type { MachineLane, SchedulerMachine } from '../fleet.ts';
+import type { BranchHoldView } from './tree-state.ts';
+import { pollableRefs, watchSummary } from '../watch-refs.ts';
+import { waitBudgetEndOf } from './wait-budget.ts';
+import type { Errand, PhaseRecord, RunState } from './state.ts';
 
 /** How many later intersecting entries may be admitted past a blocked one. */
 export const MAX_BYPASS = 4;
@@ -89,6 +106,49 @@ export type ScopeGrant = {
   repo?: string;
   at: number;
 };
+
+/**
+ * A TICKET's claim on a repository (control-tower phase 12, #29) — the one
+ * grant with no run behind it (`QUEUE_KINDS`' `agent`).
+ *
+ * A person pressed "Fix this issue", so the session that answers will edit that
+ * repository's tree while they watch. Lock files need a slug and a phase a
+ * ticket does not have, so the claim lives here, beside the lanes' grants: every
+ * run lane of this console that would board into the same tree queues behind it
+ * (named on the queue page as `console/agent`), and a second ticket is refused.
+ * It never queues itself — `grantAgent` answers at once, because a wait nobody
+ * can see from a button is worse than a refusal that names who is in the way.
+ * Released when the ticket's terminal ends (`releaseAgent`), whatever ended it.
+ */
+export type AgentGrant = {
+  id: string;
+  kind: 'agent';
+  /** The ticket's claude session id — the key it is released by. */
+  ticket: string;
+  /** What the queue page calls it: `fix owner/repo#12`. */
+  label: string;
+  scope: string[];
+  /** The branch the fix commits on (`fix/issue-<n>`), for the carve-out. */
+  branch?: string;
+  /** The working tree the fix edits, for the carve-out. */
+  tree?: string;
+  at: number;
+};
+
+/**
+ * The holders that refuse a ticket: the CLAIMS on a tree — a lane's grant, a
+ * lock on disk, and (Pro) another console's grant. A set of words rather than a
+ * comparison chain, because the free tree's holder vocabulary has no `fleet`.
+ */
+const AGENT_REFUSING_KINDS: ReadonlySet<string> = new Set(['grant', 'lock', 'fleet']);
+
+/** The owner an agent grant is named by — the `PE_OWNER` its session carries. */
+export const AGENT_GRANT_OWNER = 'console/agent';
+
+/** What `grantAgent` answers: the grant, or every holder in its way. */
+export type AgentGrantAnswer =
+  | { ok: true; grant: AgentGrant }
+  | { ok: false; holders: Holder[] };
 
 export type AdmitRequest = {
   slug: string;
@@ -165,21 +225,151 @@ export type AdmitRequest = {
    * have and should not grow.
    */
   priority?: RunPriority;
+  /**
+   * Admit this AHEAD of its scope's queue (control-tower phase 6, #15 ask 4):
+   * the entry is born with the power aging grants only after `MAX_BYPASS`
+   * overtakes or `AGING_MS` — it is scanned before every class and bump, and
+   * the moment its scope blocks it, its tokens are held back against every
+   * later intersecting entry, so nothing queued behind it is admitted past it.
+   *
+   * What it does NOT do: preempt a lane already granted (a reserved landing
+   * waits for the live lane in its scope to release, like anything else), or
+   * pass a clock — a freeze, the boarding window, a hold, a chain, a throttle,
+   * a brake or the repository cap stop it exactly as they stop everything.
+   *
+   * The one caller is a watch landing delivered to a live run
+   * (`Runner.landWatch`): a phase that parked to wait for CI, and then could
+   * not get its repository back to merge, is the shape that turned a
+   * 40-minute wait into a six-phase pile-up.
+   */
+  reserve?: boolean;
+  /**
+   * Is a repository of this admission's scope standing on ANOTHER open run's
+   * branch right now? (control-tower phase 40, #41.) A SYNCHRONOUS probe the
+   * runner supplies — it answers from tree facts it keeps fresh itself
+   * (`runner/tree-state.ts`), because an await between deciding and granting
+   * is the one window an admission check may not open. Asked at every scan as
+   * a SKIP, like the repository cap: the entry waits, never reserves tokens,
+   * and a `reserve` never passes it. Absent for a run whose trees are its own.
+   */
+  branchHold?: () => BranchHoldView | null | undefined;
+  /**
+   * The dependencies of this phase that are NOT done right now, or nothing
+   * (control-tower phase 86, #136). A SYNCHRONOUS probe the runner answers from
+   * the latest board it read — a board can take a dependency back from done
+   * while its dependant sits in the queue. Asked at every scan as a SKIP, like
+   * the branch hold: the entry waits on an `after` holder naming them, never
+   * reserves tokens, keeps its age, and sorts behind its dependency.
+   */
+  awaiting?: () => readonly number[] | null | undefined;
+  /**
+   * The entry's AGE, carried over from the queue episode a withdrawal or a
+   * console restart ended (control-tower phase 60, #81) — ms epoch of when this
+   * phase's current wait first joined a queue (`PhaseRecord.queueSince`). The
+   * entry is born that old and takes its place among younger entries rather
+   * than at the back. Absent: now; never later than now.
+   */
+  since?: number;
+  /**
+   * Born RESERVING — the aging reservation the previous entry for this phase
+   * had already earned when it was withdrawn (`PhaseRecord.queueReserving`, #81).
+   * Unlike `reserve`, it is no promise of priority: it restores what aging
+   * would have given it back had the wait never been interrupted.
+   */
+  aged?: boolean;
+  /**
+   * Told this entry's holders at the end of every scan that labelled it
+   * (control-tower phase 60, #82). The scan re-derives `waitingOn` on every
+   * poll; before this, only the holders at ENTRY were ever journalled or
+   * persisted, so a later holder — a hand lock, then an own sibling, then
+   * another run — was never recorded, and the cap judged a stale snapshot.
+   * Synchronous and best-effort: a throwing listener never stops the scan.
+   */
+  onHolders?: (holders: readonly Holder[], state: { reserving: boolean }) => void;
+  /**
+   * An operator's standing word on this phase's place (control-tower phase 99,
+   * #135) — `PhaseRecord.queueControl`, carried from the record so a
+   * re-created entry is born with it: a bump (its `stamp` orders it among
+   * bumps), a hold, a deferral. `withdrawn` never reaches here: a withdrawn
+   * phase does not ask to be admitted at all.
+   */
+  control?: EntryControl;
+  /**
+   * The scheduling policy's word on this entry (control-tower phase 100, #135
+   * F; #128 asks 2–3) — asked at every scan, like `awaiting`. A promotion
+   * orders the entry ahead of unpromoted ones in its class, behind a pin and a
+   * bump; `holdsSiblings` (a red WIP's owner) also holds its run's other
+   * entries while it waits for a lane, as a pin does.
+   */
+  promotion?: () => Promotion | null;
+};
+
+/** What an entry carries of `PhaseRecord.queueControl` — see `AdmitRequest.control`. */
+export type EntryControl = {
+  bump?: { at: string; by?: string; reason?: string; stamp: number };
+  /** Pinned next in its plan (control-tower phase 100): its run's other entries wait while it waits for a lane. */
+  pin?: { at: string; by?: string; reason?: string };
+  hold?: { at: string; by?: string; reason?: string };
+  defer?: { until: string; at: string; by?: string; reason?: string };
 };
 
 /**
- * How much longer the plan a holder belongs to has left.
+ * How much longer a holder has.
  *
  * The one question an operator asks about a queue that the queue could not
- * answer: *how long*. Both fields are nullable and stay absent rather than
- * guessing — an estimate exists only once something of that plan has finished,
- * and a made-up number here would be indistinguishable from a measured one.
+ * answer: *how long*. Every field is nullable and stays absent rather than
+ * guessing — a made-up number here would be indistinguishable from a measured one.
+ *
+ * Since control-tower phase 60 (#63) the figure is the holder PHASE's remaining
+ * working time — its phase estimate (phase 58's model) minus the time that phase
+ * has already worked — because the scope is released when the holder PHASE
+ * ends, not its plan. The plan's remaining work was 24.7× the real wait at the
+ * median, and for a sibling of the waiter's own run it counted the waiter
+ * itself. A plan-level figure survives only where no phase is known, and says so.
  */
+/** A scheduling policy's promotion of one entry (control-tower phase 100). */
+export type Promotion = { policy: string; rank: number; text: string; holdsSiblings?: boolean };
+
+/**
+ * A lane KEPT for one phase (control-tower phase 100, #135 D.15–16): when the
+ * lane named in `lane` ends — or at once when none is named — nothing else on
+ * `scope`, and nothing into the slot it frees, is admitted until the phase
+ * boards. It stands whether or not the phase has an entry — a parked phase
+ * keeps its window — and is spent by the grant that boards it.
+ */
+export type LaneReservation = {
+  slug: string;
+  runId: string;
+  phase: number;
+  scope?: string[];
+  lane?: { slug: string; phase: number };
+  by?: string;
+  reason?: string;
+  at?: string;
+};
+
+/** A reservation as the snapshot shows it: armed once the lane it waits for has ended. */
+export type LaneReservationView = LaneReservation & { scope: string[]; at: string; armed: boolean };
+
+/** One reading of the machine's load and the guard's factor (null: the guard is off). */
+export type LoadSample = { avg5: number; cores: number; factor: number | null };
+
 export type HolderEta = {
-  /** Plan weight still to do — the raw number, for sorting and for a tooltip. */
+  /** Plan weight still to do — the raw number, for sorting and for a tooltip. Plan-level figures only. */
   remainingWeight?: number;
-  /** The hedged range the plan page shows (`~2–4 h left`). */
+  /** The hedged range, naming its clock and its unit: `~25–50 min of work left`, or `plan remaining ~2–4 d of work`. */
   label?: string;
+  /** Whose remaining time this is. Absent on a figure written before 6.0, which was always the plan's. */
+  of?: 'phase' | 'plan';
+  /** The holder phase's remaining working time, unbucketed — the point the back-test scores. */
+  remainingMs?: number;
+  /** The band around it, from the plan's observed dispersion. */
+  lowMs?: number;
+  highMs?: number;
+  /** The holder phase has already worked past its own estimate — the figure is the band's residual, not a countdown. */
+  overrun?: true;
+  /** Plan-level figures only: how many phases the holder's plan has left (control-tower phase 90, #150). */
+  remainingPhases?: number;
 };
 
 /** A peer session as the scheduler reads it — the Service's `SessionPeer`, structurally. */
@@ -193,6 +383,10 @@ export type SessionPeerView = {
   plan: { slug: string; phase: number } | null;
   /** When the peer's claim window shuts (ms epoch); absent for a session on the phase itself. */
   claimUntil?: number;
+  /** How the peer's scope was read — `declared`, `touched`, `unknown` (#119). */
+  basis?: string;
+  /** What that reading rests on, a few lines. */
+  evidence?: readonly string[];
 };
 
 /** What is standing in an entry's way, in the words the queue page shows. */
@@ -214,6 +408,15 @@ export type Holder = {
   tree?: string;
   /** Which tokens actually collided — the *why*, not just the *that*. */
   overlaps: string[];
+  /**
+   * The carve-out would have parted this pair but for a DIMENSION one of the
+   * two claims left undeclared (control-tower phase 90, #149): `claim` says
+   * which side (`this` is the waiting entry), `missing` which dimensions, and
+   * `reason` is the queue's sentence — "blocked: this claim declares no
+   * branch, so the carve-out cannot apply". Absent when the pair collides on
+   * what both declared — one branch, one tree — which no declaration changes.
+   */
+  unqualified?: UnqualifiedCarve;
   /**
    * How much longer the holder's own plan has. Reported, never acted on — a
    * queue that reordered itself on an estimate would be a queue whose order
@@ -252,6 +455,23 @@ export type Holder = {
    */
   presence?: 'live' | 'unknown';
   /**
+   * A `branch` holder is a RUN, not a phase (control-tower phase 90, #150): the
+   * hold ends when that run finishes, so the queue names it, how many phases
+   * it has left, and the ways out a person can take instead of waiting.
+   */
+  holderRun?: { run: string; slug: string; remainingPhases?: number };
+  escapes?: { verb: string; label: string; endpoint: string; method: 'POST'; body?: Record<string, unknown> }[];
+  /**
+   * A `session` holder's scope, and how it was read (control-tower phase 82,
+   * #119): `declared` (its `PE_SCOPE`), `touched` (its own edits and plan
+   * calls), `unknown` (nothing touched yet — the cwd, for a bounded lease).
+   * The queue and the run card name a terminal by it rather than saying
+   * "queued" and nothing else.
+   */
+  scopeBasis?: string;
+  /** What a `session` holder's scope reading rests on, a few lines. */
+  evidence?: string[];
+  /**
    * This holder is a CLOCK, not another actor: the operator's boarding window,
    * the live-session cap, an account's usage wall. Synthesised by the scheduler
    * rather than read off a grant or a lock — there is nobody to name, nothing to
@@ -262,6 +482,10 @@ export type Holder = {
    * it was told to is the console punishing its own policy.
    */
   clock?: true;
+  /** A `branch` holder's repository, root-relative (`.` for the root). */
+  repo?: string;
+  /** A `branch` holder's run — the one that put the repository on `branch`. */
+  run?: string;
 };
 
 export type QueueEntry = {
@@ -274,7 +498,11 @@ export type QueueEntry = {
   branch?: string;
   /** See `AdmitRequest.tree`. Absent means unqualified — collides with all. */
   tree?: string;
-  /** The account the admission spends — see `AdmitRequest.accountId`. */
+  /**
+   * The account the admission spends — see `AdmitRequest.accountId`. Absent on
+   * the scheduler's own entry for the machine login; the VIEW (`entryFields`)
+   * always names it, `default` included. A switch moves it (`rekeyRun`).
+   */
   accountId?: string;
   /** The repository this entry is counted against — see `AdmitRequest.repo`. */
   repo?: string;
@@ -288,10 +516,18 @@ export type QueueEntry = {
   bypassed: number;
   /** Aged out — its tokens now block everything behind it. */
   reserving: boolean;
+  /** Admitted with `AdmitRequest.reserve`: aged at birth. Absent reads as false. */
+  reserve?: true;
   /** The scan class. Absent reads as `normal`; see `AdmitRequest.priority`. */
   priority?: RunPriority;
-  /** Moved to the front of its class by an operator. One-shot — see `bump`. */
+  /** Moved to the front of its class by an operator — see `bump`. */
   bumped?: true;
+  /**
+   * The operator's marks on this entry, with who and why (control-tower phase
+   * 99, #135): the bump behind `bumped`, and a hold or a deferral that keeps
+   * it queued and never admitted. Absent when nobody said anything.
+   */
+  control?: EntryControl;
   /** The run is held: nothing of it may board. `by` is who said so. */
   held?: { at: string; by?: string };
   /** The plan this entry is chained behind and still waiting on. */
@@ -303,6 +539,14 @@ export type QueueEntry = {
    * queue's own array stays in arrival order (many-plans-one-repo phase 9).
    */
   order?: number;
+  /** Pinned next in its plan (control-tower phase 100). */
+  pinned?: true;
+  /** A lane is reserved for it (control-tower phase 100). */
+  laneReserved?: { by?: string; reason?: string; lane?: { slug: string; phase: number } };
+  /** The scheduling policy's promotion, when one applies. */
+  promotion?: Promotion;
+  /** Its fair-share turn: its plan's live lanes plus its plan's entries ahead of it. */
+  share?: { round: number; lanes: number };
 };
 
 /** A lock on disk, as the store already reads it. Scope absent = never declared. */
@@ -382,6 +626,51 @@ export function lockLapsed(
  */
 function sameUnitOfWork(holder: Pick<Holder, 'slug' | 'phase'>, entry: Pick<Waiting, 'slug' | 'phase'>): boolean {
   return entry.phase != null && holder.phase === entry.phase && holder.slug === entry.slug;
+}
+
+/** See `Holder.unqualified`. */
+export type UnqualifiedCarve = {
+  claim: 'this' | 'holder';
+  missing: ('branch' | 'tree')[];
+  reason: string;
+};
+
+type CarveClaim = { slug: string; phase: number | null; branch?: string; tree?: string };
+
+/**
+ * Is an undeclared dimension the whole reason these two intersecting claims
+ * collide (control-tower phase 90, #149)? Asked of `claimsDisjoint` itself —
+ * the pair with the missing dimensions filled by values nothing else holds —
+ * so the answer can never drift from the rule it explains. Measured on hub
+ * 4123: a resumed shared-checkout run's entry carried `branch: null` beside a
+ * sibling's `pe/<slug>`, waited out a foreign L-size phase in another tree,
+ * and nothing on the queue said the missing branch was why.
+ *
+ * Only when the OTHER claim is fully qualified — a checkout of its own, both
+ * dimensions stated. Two claims that both left dimensions out are the ordinary
+ * shared-checkout world, where the carve-out was never in play and a sentence
+ * about it on every holder would be noise.
+ */
+export function unqualifiedCarve(holder: CarveClaim, entry: CarveClaim): UnqualifiedCarve | undefined {
+  if (sameUnitOfWork(holder, entry)) return undefined;
+  // Tree first, deliberately: an array of string literals headed by a git
+  // verb (`branch`) is read as a git argv by the never-push census.
+  const dims = ['tree', 'branch'] as const;
+  const lacking = (claim: CarveClaim) => dims.filter((dim) => !String(claim[dim] ?? '').trim());
+  const mine = lacking(entry);
+  const theirs = lacking(holder);
+  if (Boolean(mine.length) === Boolean(theirs.length)) return undefined;
+  const side = mine.length ? 'this' : 'holder';
+  const missing = mine.length ? mine : theirs;
+  const partial = mine.length ? entry : holder;
+  const filled: CarveClaim = {
+    ...partial,
+    ...Object.fromEntries(missing.map((dim) => [dim, `${dim === 'tree' ? '/' : ''}\u0000undeclared`])),
+  };
+  if (!claimsDisjoint(mine.length ? holder : filled, mine.length ? filled : entry)) return undefined;
+  const words = missing.map((dim) => `no ${dim}`).join(' and ');
+  const who = side === 'this' ? 'this claim' : `${holder.phase != null ? `${holder.slug} phase ${holder.phase}` : holder.slug}'s claim`;
+  return { claim: side, missing: [...missing], reason: `blocked: ${who} declares ${words}, so the carve-out cannot apply` };
 }
 
 /**
@@ -471,17 +760,25 @@ export type SchedulerDeps = {
    */
   scopeFor?: (slug: string, phase: number) => string[] | undefined;
   /**
-   * How much longer a holder's plan has, for the queue page's *how long*.
+   * How much longer a holder has, for the queue page's *how long* — the holder
+   * PHASE's remaining estimate when `phase` is known, else its plan's, labelled
+   * as such (control-tower phase 60, #63; `ServiceRuns.holderEta`).
    *
    * SYNCHRONOUS, like `locks()` and `scopeFor` and for the identical reason:
    * an await between deciding and granting is the one window an admission
-   * check may not open. The Service answers from a memo it refreshes in the
-   * background (`ServiceRuns.etaHint`), so a cold answer is `undefined` —
+   * check may not open. The Service answers from what it holds in memory and a
+   * memo it refreshes in the background, so a cold answer is `undefined` —
    * which is the honest one, and which changes no decision, because this is
    * decoration and nothing reads it to admit or refuse anything.
    */
-  etaFor?: (slug: string) => HolderEta | undefined;
+  etaFor?: (slug: string, phase: number | null) => HolderEta | undefined;
   now?: () => number;
+  /**
+   * The machine's load and the guard's factor (control-tower phase 100, #135
+   * G.27) — read once per scan; above `factor` × `cores` every NEW admission
+   * waits. Absent, or a null answer, is no guard.
+   */
+  load?: () => LoadSample | null;
   /** Called whenever the queue or the grant set changed. Drives `run:queue`. */
   onChange?: (snapshot: SchedulerSnapshot) => void;
   /**
@@ -590,7 +887,7 @@ export type SchedulerDeps = {
    * Absent means nothing is ever frozen, which is the behaviour before this
    * existed and the right answer for a harness not exercising it.
    */
-  fleetHold?: () => { at: string; by?: string } | null | undefined;
+  fleetHold?: () => { at: string; by?: string; plans?: readonly string[] } | null | undefined;
   /**
    * The MACHINE lane ceiling (zero-touch phase 17, FLT-7): `fleet.json`
    * `maxSessions`, held across every console on this machine through one lane
@@ -674,6 +971,16 @@ export type SchedulerSnapshot = {
    * way to find out is to have a phase fail to start.
    */
   schedule?: { open: boolean; opensAt: number | null; reason: string | null } | null;
+  /**
+   * Waiting entries by their HEAD holder's class (`HOLDER_CLASSES`,
+   * control-tower phase 60, #64): `own-run` is pipelining inside one run, the
+   * rest is a run blocked by somebody else. Entries not yet scanned are not counted.
+   */
+  byClass?: Partial<Record<HolderClass, number>>;
+  /** The lanes kept for a phase (control-tower phase 100), armed or waiting for their lane to end. */
+  reservations: LaneReservationView[];
+  /** The machine-load guard's reading, or null when none is wired (control-tower phase 100). */
+  load?: ReturnType<typeof loadReading> | null;
 };
 
 /** Thrown into a pending `admit()` when the run it belonged to was stopped. */
@@ -681,6 +988,19 @@ export class AdmissionAborted extends Error {
   constructor(slug: string, phase: number | null) {
     super(`admission for ${slug}${phase == null ? '' : ` phase ${phase}`} was cancelled`);
     this.name = 'AdmissionAborted';
+  }
+}
+
+/**
+ * Thrown into an admission an operator WITHDREW from the queue (control-tower
+ * phase 99, #135 E.21). An abort, so every caller that already stands down on
+ * one does — but a different fact from the run stopping: the phase goes back
+ * to its run unboarded, and the run boards its other phases instead.
+ */
+export class AdmissionWithdrawn extends AdmissionAborted {
+  constructor(slug: string, phase: number | null) {
+    super(slug, phase);
+    this.message = `admission of ${slug}${phase != null ? ` phase ${phase}` : ''} was withdrawn from the queue`;
   }
 }
 
@@ -717,6 +1037,27 @@ export class AdmissionCapped extends AdmissionAborted {
     this.message = `admission for ${slug}${phase == null ? '' : ` phase ${phase}`} hit the lock-wait cap`;
     this.name = 'AdmissionCapped';
     this.waitedMs = waitedMs;
+  }
+}
+
+/**
+ * Thrown into a PHASE admission whose holders are a live lane of its own run
+ * (control-tower phase 60, #64): serial work inside one run, not contention.
+ * The phase goes back to `ready (behind this run's P<n>)` and boards when that
+ * lane ends; it never waits in the queue behind its own sibling, so it has no
+ * `phase.queued`, no `waitedMs` and no queued badge. A subclass of
+ * `AdmissionAborted` for the same reason capped is: the admission will not be
+ * granted — but the caller must tell it apart, because nothing was stopped.
+ */
+export class AdmissionSerial extends AdmissionAborted {
+  /** The own-run phase whose lane holds the scope. */
+  readonly behind: number;
+
+  constructor(slug: string, phase: number | null, behind: number) {
+    super(slug, phase);
+    this.message = `admission for ${slug}${phase == null ? '' : ` phase ${phase}`} is serial behind this run's phase ${behind}`;
+    this.name = 'AdmissionSerial';
+    this.behind = behind;
   }
 }
 
@@ -766,6 +1107,59 @@ export function autopilotOwner(runId: string): string {
   return `autopilot/${runId}`;
 }
 
+/**
+ * A holder's PLAN-level remaining, labelled as such (control-tower phase 60,
+ * #63) — the only form a whole-plan figure may reach a queue card in, and only
+ * where the holder names no phase. `plan remaining ~2–4 d of work` can never be
+ * read as the wait; `~2–4 d of work left` beside a holder was read exactly so.
+ */
+export function planRemainingEta(eta: HolderEta | undefined): HolderEta | undefined {
+  if (!eta?.label) return eta;
+  const label = eta.label.startsWith('plan remaining') ? eta.label : `plan remaining ${eta.label.replace(/ left$/, '')}`;
+  return { ...eta, of: 'plan', label };
+}
+
+/**
+ * Whose claim a holder is, seen from the waiting run (`HOLDER_CLASSES`,
+ * control-tower phase 60, #64) — the split queue metrics are reported by. The
+ * pseudo-holders (a `reserved` holder with no phase: the caps, the brake, the
+ * window, a hold, a chain, the freeze) are policy or capacity, so `clock`.
+ */
+export function holderClass(
+  holder: Pick<Holder, 'kind' | 'owner' | 'slug' | 'phase' | 'clock'>, runId: string,
+): HolderClass {
+  if (holder.clock) return 'clock';
+  if (holder.kind === 'fence') return 'own-run';
+  // A dependency of its own plan (control-tower phase 86, #136).
+  if (holder.kind === 'after') return 'own-run';
+  if (holder.kind === 'session') return 'hand';
+  if (holder.kind === 'branch') return 'other-run';
+  if (holder.kind === 'reserved' && holder.phase == null) {
+    return 'clock';
+  }
+  if (holder.owner === autopilotOwner(runId)) return 'own-run';
+  if (autopilotRunId(holder.owner)) return 'other-run';
+  return holder.kind === 'lock' ? 'hand' : 'other-run';
+}
+
+/**
+ * Is this holder a LIVE lane of the waiting run itself — its own grant? The one
+ * shape that is serial work rather than contention (#64): the lane finishes and
+ * the waiter boards, so the waiter reads `ready (behind this run's P<n>)`
+ * instead of joining the queue.
+ */
+export function isOwnLiveLane(holder: Pick<Holder, 'kind' | 'owner' | 'phase'>, runId: string): boolean {
+  return holder.kind === 'grant' && holder.phase != null && holder.owner === autopilotOwner(runId);
+}
+
+/**
+ * One holder set, as a key that changes exactly when the set does — WHO holds,
+ * never how long they have (an ETA or a lease end moving is not a new holder).
+ */
+export function holdersKey(holders: readonly Pick<Holder, 'kind' | 'owner' | 'slug' | 'phase'>[]): string {
+  return holders.map((h) => `${h.kind ?? ''}|${h.owner}|${h.slug}|${h.phase ?? ''}`).join(',');
+}
+
 /** The run id an autopilot-owned lock names, or null for any other owner. */
 export function autopilotRunId(owner: string): string | null {
   // 8..32 hex: `newRun` mints twelve (S9-b) and every lock written before it
@@ -795,6 +1189,249 @@ export function debrisLocks(locks: readonly LockView[], deadRunIds: ReadonlySet<
   });
 }
 
+/* ------------------------------------------------------------------ *
+ * The scope fence (control-tower phase 6, #19)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A phase of this run whose DECLARED external wall fences its scope.
+ *
+ * `keep-going` means a phase that failed does not stop its siblings. It never
+ * meant "board a sibling into a wall another phase has just declared", and
+ * that is what it did: a session declared `needs-human --needs external` (an
+ * organisation's plan had lapsed — every check on the repository refused), and
+ * within the hour three more sessions were boarded into the same repository,
+ * each paying to rediscover the wall and file a third copy of one errand. So
+ * a phase parked on a declared EXTERNAL wall fences the phases of its run
+ * whose scope intersects its own, for as long as the wall can still come down
+ * by itself — it holds a live watch ref, or its errand stands inside its wait
+ * budget. A disjoint phase still boards: that is `keep-going`, unchanged.
+ *
+ * Not a scheduler holder: the scan admits against CLAIMS on a repository, and
+ * a wall is a fact about the work. The drive loop and the healer ask
+ * `applyScopeFence` before they board anything; the record says so as a
+ * `waitingOn` entry of kind `fence`, which is what the queue page reads.
+ */
+export type FenceHolder = {
+  phase: number;
+  scope: string[];
+  /** Its live refs — what it is still waiting on (`watchSummary`). */
+  refs: string[];
+  /** When the fence lifts by itself: the holder's wait budget end (epoch ms), or null. */
+  until: number | null;
+  /** The declaration's instant — which wall this is. */
+  wall: string;
+};
+
+/** The record fields the fence reads. */
+type FenceRecord = Pick<PhaseRecord,
+  'phase' | 'status' | 'declared' | 'situation' | 'watch' | 'watchState' | 'watchRetired'
+  | 'waitHistory' | 'parkedMs' | 'parkedMsCarried' | 'fenceLifted'>;
+
+/**
+ * Is this record a declared EXTERNAL wall — `needs-human`/`blocked` whose
+ * `--needs` says external, or which the classifier or its errand filed as
+ * `blocked-declared:external`?
+ */
+export function isExternalWall(record: FenceRecord, errand?: Pick<Errand, 'situation'> | null): boolean {
+  const declared = record.declared;
+  if (!declared || (declared.status !== 'needs-human' && declared.status !== 'blocked')) return false;
+  if (subKindOfNeed(declared.needs) === 'external') return true;
+  return errand?.situation === 'blocked-declared:external' || record.situation?.key === 'blocked-declared:external';
+}
+
+/**
+ * Does this phase fence its scope right now? Parked on a declared external
+ * wall; not landed, not lifted by an operator since it was declared; inside
+ * its wait budget; and holding a live ref or a standing errand. Everything
+ * else answers null — including a wall whose refs were all refused and whose
+ * errand was settled, which can no longer come down by itself.
+ */
+export function fenceHolderOf(
+  record: FenceRecord, errand: Pick<Errand, 'situation'> | null | undefined, now: number,
+): Omit<FenceHolder, 'scope'> | null {
+  if (record.status !== 'parked' || !isExternalWall(record, errand)) return null;
+  const declared = record.declared!;
+  if (declared.landed) return null;
+  if (record.fenceLifted && Date.parse(record.fenceLifted.at) >= Date.parse(declared.at)) return null;
+  const until = waitBudgetEndOf(record);
+  if (until !== null && now >= until) return null;
+  const summary = watchSummary(record);
+  if (summary.landed.length) return null;
+  const errandStands = Boolean(errand?.situation.startsWith('blocked-declared'));
+  // Still being asked: a pending row, or one with no answer yet (#125 split
+  // `unknown` out of `live`; the fence stands on both, exactly as before).
+  const asked = [...summary.live, ...summary.unknown];
+  if (!asked.length && !errandStands) return null;
+  return { phase: record.phase, refs: asked, until, wall: declared.at };
+}
+
+/** Every phase of this run that fences its scope right now, with that scope. */
+export function fenceHolders(
+  state: Pick<RunState, 'phases' | 'recoveries'>, scopeOf: (phase: number) => string[], now: number,
+): FenceHolder[] {
+  const out: FenceHolder[] = [];
+  for (const record of Object.values(state.phases ?? {})) {
+    const holder = fenceHolderOf(record, state.recoveries?.[String(record.phase)]?.errand, now);
+    if (holder) out.push({ ...holder, scope: scopeOf(record.phase) });
+  }
+  return out.sort((a, b) => a.phase - b.phase);
+}
+
+/** The holder that fences a phase of this scope, or null — never the phase itself. */
+export function fenceFor(phase: number, scope: readonly string[], holders: readonly FenceHolder[]): FenceHolder | null {
+  return holders.find((holder) => holder.phase !== phase && scopesIntersect(holder.scope, [...scope])) ?? null;
+}
+
+/**
+ * Why the fence a phase put up is no longer standing. The operator's two doors
+ * stamp their word on the holder (`fenceLifted`); a landing is on the
+ * declaration; the budget is a clock; anything else — skipped, finished, an
+ * errand settled with every ref refused — is `cleared`.
+ */
+export function fenceLiftWhy(record: FenceRecord | undefined, wall: string | undefined, now: number): FenceLiftReason {
+  if (!record) return 'cleared';
+  const wallAt = wall ? Date.parse(wall) : NaN;
+  if (record.fenceLifted && (!Number.isFinite(wallAt) || Date.parse(record.fenceLifted.at) >= wallAt)) {
+    return record.fenceLifted.why;
+  }
+  if (record.declared && record.declared.at === wall) {
+    if (record.declared.landed || watchSummary(record).landed.length) return 'landed';
+    const until = waitBudgetEndOf(record);
+    if (until !== null && now >= until) return 'budget';
+  }
+  return 'cleared';
+}
+
+/** The words a fenced phase's record carries (its `note`). */
+export function fenceNote(holder: Pick<FenceHolder, 'phase' | 'refs' | 'until'>): string {
+  return `fenced behind phase ${holder.phase}'s declared external wall in the same scope`
+    + (holder.refs.length ? ` (watching ${holder.refs.join(', ')})` : '')
+    + ' — it boards when that lands, is retried or released, or its wait budget ends'
+    + (holder.until !== null ? ` (${new Date(holder.until).toISOString()})` : '');
+}
+
+/**
+ * The keys a declared wall is recognised by — its reason, normalised (case,
+ * spacing, punctuation and every number folded away, so "403" and a run id do
+ * not make two walls of one), and each pollable ref it declared. Two
+ * declarations are the SAME wall when their keys meet: the same words, or the
+ * same probe (#19 ask 2 — "the same reason fingerprint"). Two sessions rarely
+ * write one sentence twice; they very often hand the console the same ref.
+ */
+export function wallFingerprint(declared: { reason?: string; watch?: string[] } | undefined): string[] {
+  if (!declared) return [];
+  const reason = (declared.reason ?? '').toLowerCase()
+    .replace(/\d+/g, '#')
+    .replace(/[^a-z#]+/g, ' ')
+    .trim();
+  return [...(reason ? [`reason:${reason}`] : []), ...pollableRefs(declared.watch).map((target) => `ref:${target.ref}`)];
+}
+
+/**
+ * The phase whose standing external-wall errand a NEW declaration of `phase`
+ * folds into, or null (control-tower phase 6, #19 ask 2): another phase of
+ * this run, parked, whose errand is `blocked-declared:external`, whose scope
+ * intersects this one's and whose wall fingerprint meets this one's. The
+ * lowest such phase is the first errand. The caller has already found this
+ * declaration to be an external wall.
+ */
+export function errandFoldTarget(
+  state: Pick<RunState, 'phases' | 'recoveries'>, phase: number, scopeOf: (phase: number) => string[],
+): number | null {
+  const record = state.phases[String(phase)];
+  const keys = new Set(wallFingerprint(record?.declared));
+  if (!record || !keys.size) return null;
+  const scope = scopeOf(phase);
+  for (const other of Object.values(state.phases).sort((a, b) => a.phase - b.phase)) {
+    if (other.phase === phase || other.status !== 'parked') continue;
+    const errand = state.recoveries?.[String(other.phase)]?.errand;
+    if (errand?.situation !== 'blocked-declared:external' || !isExternalWall(other, errand)) continue;
+    if (!scopesIntersect(scopeOf(other.phase), scope)) continue;
+    if (wallFingerprint(other.declared).some((key) => keys.has(key))) return other.phase;
+  }
+  return null;
+}
+
+/** Does this phase's fold still stand — its target's errand still names it? */
+export function foldStands(state: Pick<RunState, 'recoveries'>, phase: number): boolean {
+  const into = state.recoveries?.[String(phase)]?.foldedInto;
+  if (into === undefined) return false;
+  return Boolean(state.recoveries?.[String(into)]?.errand?.alsoPhases?.includes(phase));
+}
+
+/** Where `applyScopeFence` says what it did. */
+export type FenceSink = {
+  journal: (event: 'phase.fenced' | 'phase.fence-lifted', data: Record<string, unknown>, phase: number) => void;
+  /** A record's status or holders changed — the caller's `phase` emit. */
+  changed?: (phase: number, record: PhaseRecord) => void;
+};
+
+/**
+ * Fence this pass's boarding candidates, and lift every fence that no longer
+ * stands. Returns the candidates that must not board.
+ *
+ * One function for both boarders — the drive loop's candidate filter and the
+ * healer's loop — so the two can never disagree about a wall. A fenced
+ * `pending` phase reads `queued`; any other status (an expired wait, a failed
+ * phase the healer would retry) keeps its word and gains only the holder, so
+ * a wait's own resume is not lost to the fence. `phase.fenced` is written once
+ * per wall per phase, `phase.fence-lifted {why}` once when it comes down.
+ */
+export function applyScopeFence(
+  state: Pick<RunState, 'slug' | 'phases' | 'recoveries'>,
+  candidates: readonly number[],
+  scopeOf: (phase: number) => string[],
+  now: number,
+  sink: FenceSink,
+): Set<number> {
+  const holders = fenceHolders(state, scopeOf, now);
+  // Lift first, so a fence that came down and a new one that went up in the
+  // same pass read in the order they happened.
+  for (const record of Object.values(state.phases ?? {})) {
+    const fence = record.waitingOn?.find((holder) => holder.kind === 'fence');
+    if (!fence || fence.phase === undefined) continue;
+    const standing = holders.find((holder) => holder.phase === fence.phase && holder.wall === fence.wall);
+    if (standing && fenceFor(record.phase, scopeOf(record.phase), [standing])) continue;
+    const why = fenceLiftWhy(state.phases[String(fence.phase)], fence.wall, now);
+    record.waitingOn = record.waitingOn!.filter((holder) => holder !== fence);
+    if (!record.waitingOn.length) delete record.waitingOn;
+    if (record.status === 'queued') record.status = 'pending';
+    if (record.note?.startsWith('fenced behind phase')) delete record.note;
+    sink.journal('phase.fence-lifted', { fence: fence.phase, why, wall: fence.wall ?? null }, record.phase);
+    sink.changed?.(record.phase, record);
+  }
+  const fenced = new Set<number>();
+  if (!holders.length) return fenced;
+  for (const phase of candidates) {
+    const record = state.phases[String(phase)];
+    if (!record || holders.some((holder) => holder.phase === phase)) continue;
+    const scope = scopeOf(phase);
+    const holder = fenceFor(phase, scope, holders);
+    if (!holder) continue;
+    fenced.add(phase);
+    const standing = record.waitingOn?.find((entry) => entry.kind === 'fence');
+    const entry = {
+      kind: 'fence' as const, slug: state.slug, phase: holder.phase, owner: `phase ${holder.phase}`,
+      refs: holder.refs, until: holder.until, wall: holder.wall,
+    };
+    if (standing && standing.phase === holder.phase && standing.wall === holder.wall) {
+      // The same wall: its refs and clock are refreshed, and nothing is said.
+      Object.assign(standing, entry);
+      continue;
+    }
+    record.waitingOn = [entry];
+    if (record.status === 'pending' || record.status === 'queued') record.status = 'queued';
+    record.note = fenceNote(holder);
+    sink.journal('phase.fenced', {
+      fence: holder.phase, refs: holder.refs, overlaps: intersectingTokens(holder.scope, scope),
+      until: holder.until === null ? null : new Date(holder.until).toISOString(), wall: holder.wall,
+    }, phase);
+    sink.changed?.(phase, record);
+  }
+  return fenced;
+}
+
 type Waiting = QueueEntry & {
   resolve: (grant: ScopeGrant) => void;
   reject: (error: Error) => void;
@@ -809,11 +1446,26 @@ type Waiting = QueueEntry & {
    * both claim it, and the later instruction is the one the operator meant.
    */
   bumpedAt?: number;
+  /** `AdmitRequest.branchHold`, asked at every scan. */
+  branchHold?: () => BranchHoldView | null | undefined;
+  /** `AdmitRequest.awaiting`, asked at every scan. */
+  awaiting?: () => readonly number[] | null | undefined;
+  /** `AdmitRequest.onHolders`, told at the end of every scan. */
+  onHolders?: (holders: readonly Holder[], state: { reserving: boolean }) => void;
+  /** `AdmitRequest.promotion`, asked at every scan; its answer is `promoted`. */
+  promote?: () => Promotion | null;
+  promoted?: Promotion | null;
+  /** The fair-share turn the last scan gave it, and whether it put it behind a younger entry of another plan. */
+  turn?: { round: number; lanes: number; moved?: boolean };
+  /** Set by a scan on a LEAD (a pin, a red WIP's owner) left waiting for a lane: what its siblings wait on. */
+  leadHold?: Holder;
 };
 
 export class Scheduler {
   private deps: SchedulerDeps;
   private grants = new Map<string, ScopeGrant>();
+  /** The tickets' claims (`AgentGrant`), by ticket — never counted as lanes. */
+  private readonly agentGrants = new Map<string, AgentGrant>();
   private queue: Waiting[] = [];
   /**
    * Per-ACCOUNT "come back at" marks — DERIVED, never stored here.
@@ -843,6 +1495,8 @@ export class Scheduler {
   private lockTimer: NodeJS.Timeout | null = null;
   /** Armed at the boarding window's next opening. See `armScheduleTimer`. */
   private scheduleTimer: NodeJS.Timeout | null = null;
+  /** Armed at the soonest deferral's clock. See `armDeferTimer`. */
+  private deferTimer: NodeJS.Timeout | null = null;
   /** Monotone, so two bumps order against each other. See `Waiting.bumpedAt`. */
   private bumpSeq = 0;
   private closed = false;
@@ -851,6 +1505,8 @@ export class Scheduler {
   private unwatchMachine: (() => void) | null = null;
   /** Who held the machine's lanes at the last refused acquisition — the `machine cap` holder's names. */
   private machineHolders: MachineLane[] = [];
+  /** The lanes kept for a phase, by `slug:phase` (control-tower phase 100). See `reserveLane`. */
+  private readonly laneReservations = new Map<string, LaneReservation & { scope: string[]; at: string }>();
 
   constructor(deps: SchedulerDeps = {}) {
     this.deps = deps;
@@ -936,10 +1592,25 @@ export class Scheduler {
    * the console against work that could legitimately start the moment it thaws,
    * and the thaw would then have to unwind reservations nobody asked for.
    */
-  private fleetHolder(): Holder | null {
-    let hold: { at: string; by?: string } | null | undefined;
-    try { hold = this.deps.fleetHold?.(); } catch { return null; }
-    if (!hold) return null;
+  private fleetHolder(slug?: string): Holder | null {
+    return this.fleetHolderOf(this.readFleetHold(), slug);
+  }
+
+  /** The hold as the dep reports it — a throwing dep reads as none, like every other clock here. */
+  private readFleetHold(): { at: string; by?: string; plans?: readonly string[] } | null {
+    try { return this.deps.fleetHold?.() ?? null; } catch { return null; }
+  }
+
+  /**
+   * The holder a hold puts in front of `slug`'s entry, or null when it does
+   * not bind that plan: a restart waiting for its lanes holds only the plans
+   * whose scope meets theirs (control-tower phase 48, #70), and every other
+   * plan's entries are scanned as if nothing were held.
+   */
+  private fleetHolderOf(
+    hold: { at: string; by?: string; plans?: readonly string[] } | null, slug?: string,
+  ): Holder | null {
+    if (!hold || !holdBinds(hold, slug)) return null;
     return {
       kind: 'reserved', slug: FLEET_HOLDER, phase: null, clock: true,
       owner: fleetFreezeReason(hold.by), scope: ['all'], overlaps: ['all'],
@@ -978,6 +1649,30 @@ export class Scheduler {
       kind: 'reserved', slug: HOLD_HOLDER, phase: null, clock: true,
       owner: holdReason(hold.by), scope: ['all'], overlaps: ['all'],
     };
+  }
+
+  /**
+   * The holder an operator's word on ONE entry makes (control-tower phase 99,
+   * #135 E.19–20): a hold, or a deferral whose clock is still ahead — a clock
+   * holder either way, so the lock-wait cap never parks an entry for waiting
+   * exactly as long as it was told to. A deferral that has passed holds nothing.
+   */
+  private entryHolder(entry: Pick<Waiting, 'control'>, now: number): Holder | null {
+    const control = entry.control;
+    if (control?.hold) {
+      return {
+        kind: 'reserved', slug: ENTRY_HOLD_HOLDER, phase: null, clock: true,
+        owner: entryHoldReason(control.hold), scope: ['all'], overlaps: ['all'],
+      };
+    }
+    const until = Date.parse(control?.defer?.until ?? '');
+    if (control?.defer && Number.isFinite(until) && until > now) {
+      return {
+        kind: 'reserved', slug: DEFER_HOLDER, phase: null, clock: true, leaseUntil: until,
+        owner: deferReason(control.defer), scope: ['all'], overlaps: ['all'],
+      };
+    }
+    return null;
   }
 
   /** The holder that says "this run begins after another plan", or null. */
@@ -1031,6 +1726,62 @@ export class Scheduler {
    *
    * An entry with no `repo` is never capped: see `AdmitRequest.repo`.
    */
+  /**
+   * The `branch` holder, when the entry's own probe says a repository of its
+   * scope stands on another open run's branch. A probe that throws holds
+   * nothing — the same rule as every other synchronous dep here.
+   */
+  private branchHolder(entry: Pick<Waiting, 'branchHold' | 'scope'> & Partial<Pick<Waiting, 'slug' | 'phase'>>): Holder | null {
+    let hold: BranchHoldView | null | undefined;
+    try { hold = entry.branchHold?.(); } catch { return null; }
+    if (!hold) return null;
+    // The holder is a RUN (#150): its plan's remaining work is the wait, not a
+    // phase's — labelled `plan remaining` so no surface reads it as a lane.
+    const eta = this.etaOf(hold.slug, null);
+    const remainingPhases = eta.eta?.remainingPhases;
+    const waiter = entry.slug ? encodeURIComponent(entry.slug) : null;
+    return {
+      kind: 'branch', slug: hold.slug, phase: null,
+      owner: `run ${hold.run} of ${hold.slug} holds ${hold.repo} on ${hold.branch}`,
+      scope: [...entry.scope], overlaps: [hold.repo],
+      repo: hold.repo, branch: hold.branch, run: hold.run,
+      holderRun: { run: hold.run, slug: hold.slug, ...(remainingPhases != null ? { remainingPhases } : {}) },
+      ...eta,
+      // The two escapes from a run-long hold, for the WAITER's run: this phase
+      // in a worktree of its own, or the whole run on its own checkout from
+      // its next boundary.
+      ...(waiter ? {
+        escapes: [
+          ...(entry.phase != null ? [{
+            verb: 'isolate-phase', label: 'Give this phase its own worktree', method: 'POST' as const,
+            endpoint: `/api/run/${waiter}/isolate-phase`, body: { phase: entry.phase },
+          }] : []),
+          {
+            verb: 'isolate', label: 'Switch the run to its own checkout at its next boundary', method: 'POST' as const,
+            endpoint: `/api/run/${waiter}/isolate`,
+          },
+        ],
+      } : {}),
+    };
+  }
+
+  /**
+   * The `after` holder, when the entry's own probe names dependencies of its
+   * phase that are not done (control-tower phase 86, #136). A probe that throws
+   * holds nothing — the rule every synchronous dep here keeps.
+   */
+  private afterHolder(entry: Pick<Waiting, 'awaiting' | 'scope' | 'slug' | 'phase'>): Holder | null {
+    let deps: readonly number[] | null | undefined;
+    try { deps = entry.awaiting?.(); } catch { return null; }
+    if (!deps?.length) return null;
+    const list = deps.join(', ');
+    return {
+      kind: 'after', slug: entry.slug, phase: deps[0]!,
+      owner: `phase ${list} of ${entry.slug} — ${deps.length === 1 ? 'its dependency is' : 'its dependencies are'} not done`,
+      scope: [...entry.scope], overlaps: [],
+    };
+  }
+
   private repoHolder(entry: Waiting): Holder | null {
     if (!entry.repo) return null;
     const console = typeof this.deps.maxPerRepo === 'function' ? this.deps.maxPerRepo() : this.deps.maxPerRepo;
@@ -1079,6 +1830,121 @@ export class Scheduler {
   }
 
   /* ---------------------------------------------------------------- *
+   * Lanes, policies and capacity (control-tower phase 100, #135 C D G)
+   * ---------------------------------------------------------------- */
+
+  /** The machine-load guard's reading now, or null when no guard is wired. */
+  private loadNow(): ReturnType<typeof loadReading> | null {
+    let sample: LoadSample | null | undefined;
+    try { sample = this.deps.load?.(); } catch { return null; }
+    return sample ? loadReading(sample) : null;
+  }
+
+  /**
+   * The holder every NEW admission waits on while the machine is loaded, or
+   * null. A clock holder, like the boarding window: the two-hour cap must never
+   * park a phase for the machine's load, and a live lane is never touched.
+   */
+  private loadHolder(reading = this.loadNow()): Holder | null {
+    if (!reading?.holding) return null;
+    return {
+      kind: 'reserved', slug: LOAD_HOLDER, phase: null, clock: true,
+      owner: loadReason(reading), scope: ['all'], overlaps: ['all'],
+    };
+  }
+
+  /** The reservation kept for this entry's phase, if there is one. */
+  private reservationOf(entry: Pick<Waiting, 'slug' | 'phase'>): (LaneReservation & { scope: string[]; at: string }) | undefined {
+    return entry.phase == null ? undefined : this.laneReservations.get(`${entry.slug}:${entry.phase}`);
+  }
+
+  /** Has the lane this reservation waits for ended — or did it name none? */
+  private armed(reservation: LaneReservation): boolean {
+    const lane = reservation.lane;
+    if (!lane) return true;
+    return ![...this.grants.values()].some((grant) => grant.slug === lane.slug && grant.phase === lane.phase);
+  }
+
+  /**
+   * What an entry that is NOT a reservation's phase waits on while one is
+   * armed: the reservation's scope, or — when the free lanes left are exactly
+   * the kept ones — the slot. Null for the reservation's own phase, and when
+   * nothing is armed.
+   */
+  private reservationHolder(entry: Pick<Waiting, 'slug' | 'phase' | 'scope'>): Holder | null {
+    const own = this.reservationOf(entry);
+    const others = [...this.laneReservations.values()].filter((kept) => kept !== own && this.armed(kept));
+    if (!others.length) return null;
+    const onScope = others.find((kept) => scopesIntersect(kept.scope, entry.scope));
+    const slot = onScope ? undefined : this.grants.size + others.length >= this.maxLive() ? others[0] : undefined;
+    const kept = onScope ?? slot;
+    if (!kept) return null;
+    return {
+      kind: 'reserved', slug: RESERVATION_HOLDER, phase: null, clock: true,
+      owner: `${reservationReason(kept)}${slot ? ' — the last free lane is kept for it' : ''}`,
+      scope: kept.scope, overlaps: kept.scope,
+    };
+  }
+
+  /**
+   * Is this entry a LEAD of its run — pinned, or promoted by a policy that
+   * holds its siblings (a red WIP's owner)? And the holder its siblings wait on.
+   */
+  private leadHolderOf(entry: Waiting): Holder | null {
+    if (entry.phase == null) return null;
+    if (entry.control?.pin) {
+      return {
+        kind: 'reserved', slug: PIN_HOLDER, phase: null, clock: true,
+        owner: pinHoldReason(entry.slug, entry.phase, entry.control.pin), scope: ['all'], overlaps: ['all'],
+      };
+    }
+    if (entry.promoted?.holdsSiblings) {
+      return {
+        kind: 'reserved', slug: PIN_HOLDER, phase: null, clock: true,
+        owner: `${entry.slug} P${entry.phase} goes first — ${entry.promoted.text}`, scope: ['all'], overlaps: ['all'],
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Keep a lane for one phase (control-tower phase 100, #135 D.15–16). Its
+   * scope is the one given, else the plan's for that phase, else `all`. One
+   * reservation per phase: a second replaces the first. Scans at once — a
+   * reservation armed now may hold what the next entry would have taken.
+   */
+  reserveLane(reservation: LaneReservation): void {
+    let scope = reservation.scope?.length ? [...reservation.scope] : undefined;
+    if (!scope) {
+      try { scope = this.deps.scopeFor?.(reservation.slug, reservation.phase) ?? undefined; } catch { scope = undefined; }
+    }
+    this.laneReservations.set(`${reservation.slug}:${reservation.phase}`, {
+      ...reservation,
+      scope: scope?.length ? scope : ['all'],
+      at: reservation.at ?? new Date(this.now()).toISOString(),
+    });
+    this.poll();
+    this.announce();
+  }
+
+  /** Lift a reservation, named by its run id or its plan's slug. Returns whether one was found. */
+  unreserveLane(runOrSlug: string, phase: number): boolean {
+    for (const [key, kept] of this.laneReservations) {
+      if ((kept.runId !== runOrSlug && kept.slug !== runOrSlug) || kept.phase !== phase) continue;
+      this.laneReservations.delete(key);
+      this.poll();
+      this.announce();
+      return true;
+    }
+    return false;
+  }
+
+  /** Every lane kept for a phase, armed or waiting for its lane to end. */
+  reservationsView(): LaneReservationView[] {
+    return [...this.laneReservations.values()].map((kept) => ({ ...kept, armed: this.armed(kept) }));
+  }
+
+  /* ---------------------------------------------------------------- *
    * Admission
    * ---------------------------------------------------------------- */
 
@@ -1115,15 +1981,29 @@ export class Scheduler {
         // degenerates to the FIFO it has always been.
         ...(request.priority && request.priority !== DEFAULT_PRIORITY
           ? { priority: request.priority } : {}),
-        since: this.now(),
+        ...(request.reserve ? { reserve: true as const } : {}),
+        ...(request.branchHold ? { branchHold: request.branchHold } : {}),
+        ...(request.awaiting ? { awaiting: request.awaiting } : {}),
+        ...(request.onHolders ? { onHolders: request.onHolders } : {}),
+        ...(request.promotion ? { promote: request.promotion } : {}),
+        // An operator's standing word, carried from the record (control-tower
+        // phase 99, #135): a bump born on a re-created entry orders by the
+        // stamp it was given, so it keeps its place among other bumps.
+        ...(request.control && Object.keys(request.control).length ? { control: { ...request.control } } : {}),
+        ...(request.control?.bump ? { bumpedAt: request.control.bump.stamp } : {}),
+        // An age carried over from a withdrawn or restarted episode (#81) —
+        // never in the future, whatever the record says.
+        since: Math.min(this.now(), request.since ?? this.now()),
         waitingOn: [],
         bypassed: 0,
-        reserving: false,
+        reserving: request.aged === true,
         resolve,
         reject,
         detach: () => {},
         settled: false,
       };
+      // Every later bump orders in front of this one's stamp.
+      if (entry.bumpedAt) this.bumpSeq = Math.max(this.bumpSeq, entry.bumpedAt);
 
       const signal = request.signal;
       if (signal) {
@@ -1136,7 +2016,13 @@ export class Scheduler {
         entry.detach = () => signal.removeEventListener('abort', onAbort);
       }
 
-      this.queue.push(entry);
+      // In AGE order, which for an entry born now is the back of the queue —
+      // exactly the push it always was. An entry carrying the age of the wait a
+      // pause or a restart interrupted takes its place among the younger ones
+      // instead of queueing behind them a second time (#81).
+      const younger = this.queue.findIndex((other) => other.since > entry.since);
+      if (younger < 0) this.queue.push(entry);
+      else this.queue.splice(younger, 0, entry);
       // A tick later, so the caller's promise exists before it can settle.
       queueMicrotask(() => this.poll());
     });
@@ -1157,7 +2043,7 @@ export class Scheduler {
     // some OTHER reason to be reported while the console is switched off — and
     // the operator would read the queue page looking for the freeze they just
     // pressed and not find it.
-    const fleet = this.fleetHolder();
+    const fleet = this.fleetHolder(request.slug);
     if (fleet) return [fleet];
     // The schedule leads the rest, and does so in both scans for the same reason it
     // leads in `poll`: it is the console's own statement about this hour, so
@@ -1165,6 +2051,9 @@ export class Scheduler {
     // is the one worth reading first.
     const schedule = this.scheduleHolder({ kind: request.kind });
     if (schedule) return [schedule];
+    // The machine's load (control-tower phase 100): every NEW admission.
+    const load = this.loadHolder();
+    if (load) return [load];
     // Both in the same order `poll` checks them, and for the reason the two
     // scans share one `blocking()`: a `wouldBlock` that did not know about
     // holds would tell the runner an admission was free, the runner would skip
@@ -1172,12 +2061,25 @@ export class Scheduler {
     // would then sit in `admit()` with nothing anywhere saying it was held.
     const held = this.holdHolder({ slug: request.slug, runId: request.runId });
     if (held) return [held];
+    const own = this.entryHolder({ ...(request.control ? { control: request.control } : {}) }, this.now());
+    if (own) return [own];
+    // A lead of this run waiting for a lane — a pin, a red WIP's owner — holds its siblings.
+    if (!request.control?.pin) {
+      const lead = this.queue.find((entry) => !entry.settled && entry.runId === request.runId && entry.phase !== request.phase && entry.leadHold);
+      if (lead?.leadHold) return [lead.leadHold];
+    }
     const chained = this.chainHolder({ slug: request.slug, runId: request.runId });
     if (chained) return [chained];
     const throttle = this.throttleFor(request.accountId);
     if (throttle) return [throttle];
     const braked = this.brakeFor(request.accountId);
     if (braked) return [braked];
+    const kept = this.reservationHolder({ slug: request.slug, phase: request.phase, scope: request.scope.length ? request.scope : ['all'] });
+    if (kept) return [kept];
+    const branched = this.branchHolder(request);
+    if (branched) return [branched];
+    const after = this.afterHolder({ ...request, scope: request.scope.length ? request.scope : ['all'] });
+    if (after) return [after];
     // D28: the session cap is NOT a clock, and it no longer short-circuits.
     //
     // Two defects in one early return. It was marked `clock: true` beside the
@@ -1365,6 +2267,69 @@ export class Scheduler {
   }
 
   /** Hand a grant back. The only thing that lets the queue move on its own. */
+  /**
+   * Admit a ticket on its repository NOW, or name every holder in its way.
+   *
+   * The same scan an admission runs (`blocking` — the carve-out, lease lapse
+   * with presence, the guard, another console's claims), narrowed to the
+   * CLAIMS: a grant, a lock, another console's grant. The clocks (a boarding
+   * window, a usage wall, the session cap) are the autopilot's policy about its
+   * own lanes, not a statement about this tree, and a peer session is a guess
+   * about a scope nobody declared — neither refuses a person at a button.
+   * Synchronous by design, like every scan here: two presses in one tick are
+   * one grant and one refusal, never two grants.
+   */
+  grantAgent(request: {
+    ticket: string; label: string; scope: string[]; branch?: string; tree?: string;
+  }): AgentGrantAnswer {
+    const scope = request.scope.length ? [...request.scope] : ['all'];
+    const probe: Waiting = {
+      id: '', slug: request.label, phase: null, runId: '', scope, kind: 'agent',
+      ...(request.branch ? { branch: request.branch } : {}),
+      ...(request.tree ? { tree: request.tree } : {}),
+      since: this.now(), waitingOn: [], bypassed: 0, reserving: false,
+      resolve: () => {}, reject: () => {}, detach: () => {}, settled: false,
+    };
+    const holders = this.blocking(probe, [])
+      .filter((holder) => AGENT_REFUSING_KINDS.has(holder.kind))
+      .filter((holder) => holder.session !== request.ticket);
+    if (holders.length) {
+      log.info('scheduler.agent-refused', {
+        ticket: request.ticket, label: request.label, scope,
+        holders: holders.map((holder) => ({ kind: holder.kind, owner: holder.owner, slug: holder.slug, phase: holder.phase })),
+      });
+      return { ok: false, holders };
+    }
+    const grant: AgentGrant = {
+      id: randomUUID().slice(0, 8), kind: 'agent', ticket: request.ticket, label: request.label, scope,
+      ...(request.branch ? { branch: request.branch } : {}),
+      ...(request.tree ? { tree: request.tree } : {}),
+      at: this.now(),
+    };
+    this.agentGrants.set(request.ticket, grant);
+    log.info('scheduler.agent-granted', { ticket: grant.ticket, label: grant.label, scope: grant.scope });
+    return { ok: true, grant };
+  }
+
+  /**
+   * The ticket's terminal ended — exited, closed or dismissed — so its claim
+   * does too, and every lane queued behind it is re-scanned at once. True when
+   * there was a claim to drop.
+   */
+  releaseAgent(ticket: string): boolean {
+    const grant = this.agentGrants.get(ticket);
+    if (!grant) return false;
+    this.agentGrants.delete(ticket);
+    log.info('scheduler.agent-released', { ticket, label: grant.label, heldMs: Math.max(0, this.now() - grant.at) });
+    this.poll();
+    return true;
+  }
+
+  /** The tickets' claims standing now, oldest first. */
+  agentGrantsNow(): AgentGrant[] {
+    return [...this.agentGrants.values()].sort((a, b) => a.at - b.at);
+  }
+
   release(grant: ScopeGrant | null | undefined): void {
     if (!grant) return;
     if (!this.grants.delete(grant.id)) return;
@@ -1499,7 +2464,19 @@ export class Scheduler {
     // answer cannot change halfway down a synchronous loop, and a scan where
     // half the queue saw a freeze and half did not would be a queue page that
     // contradicts itself.
-    const fleet = this.fleetHolder();
+    const hold = this.readFleetHold();
+    // …and the machine's load, once, for the same reason (control-tower phase 100).
+    const load = this.loadHolder();
+    /** Leads (a pin, a red WIP's owner) this scan left waiting for a lane, by run: what their siblings wait on. */
+    const leads = new Map<string, Holder>();
+    for (const entry of this.queue) delete entry.leadHold;
+    const lead = (entry: Waiting): void => {
+      if (leads.has(entry.runId)) return;
+      const holder = this.leadHolderOf(entry);
+      if (!holder) return;
+      entry.leadHold = holder;
+      leads.set(entry.runId, holder);
+    };
 
     let changed = false;
     /** Token sets held back by aged entries ahead in the queue. */
@@ -1525,6 +2502,7 @@ export class Scheduler {
       // one. A skip rather than a `break`, so EVERY waiting entry is labelled
       // with the freeze: the operator who froze the console wants to see the
       // whole queue saying so, not the first line of it.
+      const fleet = this.fleetHolderOf(hold, entry.slug);
       if (fleet) {
         entry.waitingOn = [fleet];
         continue;
@@ -1541,6 +2519,15 @@ export class Scheduler {
         continue;
       }
 
+      // The machine is loaded (control-tower phase 100, #135 G.27): every NEW
+      // admission waits, labelled with the reading, and never ages into
+      // `reserving` — a clock, like the window above. Live lanes carry on.
+      if (load) {
+        if (entry.waitingOn[0]?.slug !== LOAD_HOLDER) changed = true;
+        entry.waitingOn = [load];
+        continue;
+      }
+
       // A HELD run and a CHAINED one are skips for the same reasons the two
       // clocks below and above are: the entry is blocked by a decision, not by
       // scope contention, so it is labelled with why and never allowed to age
@@ -1550,6 +2537,28 @@ export class Scheduler {
       const held = this.holdHolder(entry);
       if (held) {
         entry.waitingOn = [held];
+        continue;
+      }
+
+      // …and an operator's word on THIS entry (control-tower phase 99, #135
+      // E.19–20): held, or deferred until a clock. A skip for the same reasons
+      // as the run's hold — it stays queued with its age, never admitted, and
+      // never reserves tokens against anybody.
+      const own = this.entryHolder(entry, now);
+      if (own) {
+        if (entry.waitingOn[0]?.slug !== own.slug) changed = true;
+        entry.waitingOn = [own];
+        continue;
+      }
+
+      // A LEAD of this run is waiting for a lane (control-tower phase 100):
+      // a pinned phase takes its plan's next lane, and a red WIP's owner under
+      // `blocker-first` is every sibling's gate — so its run's other entries
+      // wait for it, whatever their own scope. Another run is never held.
+      const leadHold = !entry.control?.pin ? leads.get(entry.runId) : undefined;
+      if (leadHold) {
+        if (entry.waitingOn[0]?.owner !== leadHold.owner) changed = true;
+        entry.waitingOn = [leadHold];
         continue;
       }
 
@@ -1573,6 +2582,17 @@ export class Scheduler {
         continue;
       }
 
+      // A lane kept for another phase (control-tower phase 100, #135 D): its
+      // scope, or the last free slot. A skip, never aging — it is an
+      // operator's word, and the kept phase boards on it the moment it asks.
+      const kept = this.reservationHolder(entry);
+      if (kept) {
+        if (entry.waitingOn[0]?.owner !== kept.owner) changed = true;
+        entry.waitingOn = [kept];
+        lead(entry);
+        continue;
+      }
+
       // A SKIP, like the throttle and the brake above and unlike a scope
       // conflict: an entry the cap holds must not age into `reserving` and
       // start blocking everything behind it. Nothing is being taken from it —
@@ -1581,6 +2601,28 @@ export class Scheduler {
       const repoFull = this.repoHolder(entry);
       if (repoFull) {
         entry.waitingOn = [repoFull];
+        lead(entry);
+        continue;
+      }
+
+      // Another SKIP: a repository of this scope stands on another open run's
+      // branch (control-tower phase 40, #41). Nothing is being taken from this
+      // entry and it takes nothing — it would board into somebody else's
+      // in-flight work, so it waits for the tree or the holder to move on.
+      const branched = this.branchHolder(entry);
+      if (branched) {
+        if (entry.waitingOn[0]?.kind !== 'branch') changed = true;
+        entry.waitingOn = [branched];
+        continue;
+      }
+
+      // …and a dependency the board took back from done while this entry
+      // waited (control-tower phase 86, #136): its own plan holds it. A skip,
+      // for the reason above — it takes nothing and must block nobody.
+      const after = this.afterHolder(entry);
+      if (after) {
+        if (entry.waitingOn[0]?.kind !== 'after' || entry.waitingOn[0]?.phase !== after.phase) changed = true;
+        entry.waitingOn = [after];
         continue;
       }
 
@@ -1588,7 +2630,9 @@ export class Scheduler {
       if (holders.length) {
         entry.waitingOn = holders;
         blocked.push(entry);
-        if (this.aging(entry, now)) {
+        lead(entry);
+        // A `reserve` entry is aged at birth (`AdmitRequest.reserve`).
+        if (entry.reserve || this.aging(entry, now)) {
           if (!entry.reserving) changed = true;
           entry.reserving = true;
           reserved.push(entry);
@@ -1623,6 +2667,7 @@ export class Scheduler {
           if (!entry.waitingOn.some((holder) => holder.slug === MACHINE_HOLDER)) changed = true;
           entry.waitingOn = [machine];
         }
+        lead(entry);
         continue;
       }
       this.grant(entry);
@@ -1631,7 +2676,21 @@ export class Scheduler {
 
     this.armLockTimer();
     this.armScheduleTimer();
+    this.armDeferTimer();
+    this.tellHolders();
     if (changed) this.announce();
+  }
+
+  /**
+   * Every waiting entry's holders, told to whoever admitted it (#82) — after
+   * the scan, so a listener sees the scan's whole answer and cannot reorder it.
+   * Over a copy: a listener may withdraw its own entry, which splices the queue.
+   */
+  private tellHolders(): void {
+    for (const entry of [...this.queue]) {
+      if (entry.settled || !entry.onHolders) continue;
+      try { entry.onHolders(entry.waitingOn, { reserving: entry.reserving }); } catch { /* a listener never stops the scan */ }
+    }
   }
 
   /**
@@ -1661,26 +2720,82 @@ export class Scheduler {
    */
   private scanOrder(): Waiting[] {
     const position = new Map(this.queue.map((entry, index) => [entry, index]));
-    return [...this.queue].sort((a, b) => {
-      if (a.reserving !== b.reserving) return a.reserving ? -1 : 1;
+    // The policy's word on each entry, asked once per scan (control-tower phase 100).
+    for (const entry of this.queue) {
+      let promoted: Promotion | null | undefined = null;
+      try { promoted = entry.promote?.(); } catch { promoted = null; }
+      entry.promoted = promoted ?? null;
+    }
+    // A `reserve` entry sorts with the aged ones from its first scan, and so
+    // does the phase a lane is kept for (control-tower phase 100).
+    const ahead = (entry: Waiting): boolean => entry.reserving || entry.reserve === true || Boolean(this.reservationOf(entry));
+    // What each entry's phase is still waiting on in its own plan (#136) —
+    // asked once per scan, so the sort below reads a map, not a probe.
+    const waitsFor = new Map<Waiting, ReadonlySet<number>>();
+    for (const entry of this.queue) {
+      let deps: readonly number[] | null | undefined;
+      try { deps = entry.awaiting?.(); } catch { deps = null; }
+      if (deps?.length) waitsFor.set(entry, new Set(deps));
+    }
+    const dependsOn = (a: Waiting, b: Waiting): boolean =>
+      a.runId === b.runId && b.phase != null && Boolean(waitsFor.get(a)?.has(b.phase));
+    const keys = (a: Waiting, b: Waiting): number => {
+      // 0. A dependency before its dependants, whatever the two ages (control-
+      //    tower phase 86, #136): a re-opened dependency re-queues young, and
+      //    the phase waiting on it must never read as next in line.
+      if (dependsOn(a, b)) return 1;
+      if (dependsOn(b, a)) return -1;
+      if (ahead(a) !== ahead(b)) return ahead(a) ? -1 : 1;
       const byClass = priorityRank(a.priority) - priorityRank(b.priority);
       if (byClass !== 0) return byClass;
+      // A pin: its plan's next lane (control-tower phase 100).
+      const pin = Number(Boolean(b.control?.pin)) - Number(Boolean(a.control?.pin));
+      if (pin !== 0) return pin;
       // Most recently bumped first, so a second bump lands in front of the
       // first — an operator correcting themselves means the correction.
       const bump = (b.bumpedAt ?? 0) - (a.bumpedAt ?? 0);
       if (bump !== 0) return bump;
-      return (position.get(a) ?? 0) - (position.get(b) ?? 0);
-    });
+      // The scheduling policy (control-tower phase 100): promoted first, the
+      // higher rank first — behind every word an operator said.
+      if (Boolean(a.promoted) !== Boolean(b.promoted)) return a.promoted ? -1 : 1;
+      if (a.promoted && b.promoted && a.promoted.rank !== b.promoted.rank) return b.promoted.rank - a.promoted.rank;
+      return 0;
+    };
+    const byPosition = (a: Waiting, b: Waiting): number => (position.get(a) ?? 0) - (position.get(b) ?? 0);
+    // Fair share (control-tower phase 100, #135 C.13): inside a class the
+    // plans take TURNS. An entry's round is its plan's live lanes plus its
+    // plan's entries ahead of it in its plan's own order, so one run with many
+    // ready phases cannot fill every slot, and a plan already holding lanes has
+    // had its turns. Strict classes, an operator's words and the policy come
+    // first; with one plan in the queue the rounds follow its own order, so a
+    // console running one plan scans exactly as it did before.
+    const lanes = new Map<string, number>();
+    for (const grant of this.grants.values()) lanes.set(grant.slug, (lanes.get(grant.slug) ?? 0) + 1);
+    const taken = new Map<string, number>();
+    for (const entry of [...this.queue].sort((a, b) => keys(a, b) || byPosition(a, b))) {
+      const held = lanes.get(entry.slug) ?? 0;
+      const round = taken.get(entry.slug) ?? held;
+      entry.turn = { round, lanes: held };
+      taken.set(entry.slug, round + 1);
+    }
+    // Did the turn MOVE it — behind a younger entry of another plan standing
+    // level with it? Only then is fair share its reason on the queue page.
+    for (const entry of this.queue) {
+      const turn = entry.turn!;
+      turn.moved = turn.round > 0 && this.queue.some((other) => other.slug !== entry.slug && keys(other, entry) === 0
+        && (other.turn?.round ?? 0) < turn.round && byPosition(other, entry) > 0);
+    }
+    return [...this.queue].sort((a, b) => keys(a, b) || (a.turn?.round ?? 0) - (b.turn?.round ?? 0) || byPosition(a, b));
   }
 
   /**
    * Move ONE queued entry to the front of its class.
    *
-   * One-shot, in the only sense that is honest here: the mark lives on this
-   * queue entry and dies with it. A bumped entry that is admitted, cancelled or
-   * capped takes the mark with it, so the same phase queueing again later
-   * starts from its class's FIFO tail — an operator bumps a wait they can see,
-   * not a plan forever.
+   * The mark on THIS entry dies with it — but since control-tower phase 99
+   * (#135) the operator's bump lives on the phase's record too
+   * (`PhaseRecord.queueControl.bump`), and the entry a pause, a retry or a
+   * restart re-creates is born with the same stamp (`AdmitRequest.control`).
+   * Admission spends it: an operator bumps a wait, not a plan forever.
    *
    * It does not cross a class boundary, and that is deliberate rather than a
    * limitation: bumping a `low` entry past a `high` one would make the queue
@@ -1690,15 +2805,102 @@ export class Scheduler {
    * Returns whether an entry was found — a stale entry id from a page that has
    * been open a while is a 404, not a silent success.
    */
-  bump(entryId: string): boolean {
+  /**
+   * One entry still in the line, by id — what a bump is about to move, so the
+   * service can write the move on that entry's own run (control-tower phase
+   * 96, #142). `undefined` for an id that has since been admitted or settled.
+   */
+  entry(entryId: string): QueueEntry | undefined {
+    return this.queue.find((candidate) => candidate.id === entryId && !candidate.settled);
+  }
+
+  bump(entryId: string, mark?: Omit<NonNullable<EntryControl['bump']>, 'stamp'> & { stamp?: number }): boolean {
     const entry = this.queue.find((candidate) => candidate.id === entryId && !candidate.settled);
     if (!entry) return false;
-    this.bumpSeq += 1;
-    entry.bumpedAt = this.bumpSeq;
+    // A stamp, not a counter (control-tower phase 99, #135): the mark outlives
+    // this entry on the phase's record, and the entry a later scan re-creates
+    // is born with the SAME stamp — so two bumps still order against each
+    // other, most recent first, across entries, runs and restarts.
+    const stamp = mark?.stamp ?? this.nextStamp();
+    this.bumpSeq = Math.max(this.bumpSeq, stamp);
+    entry.bumpedAt = stamp;
+    entry.control = {
+      ...entry.control,
+      bump: { at: mark?.at ?? new Date(this.now()).toISOString(), ...(mark?.by ? { by: mark.by } : {}), ...(mark?.reason ? { reason: mark.reason } : {}), stamp },
+    };
     log.info('scheduler.bumped', { id: entry.id, slug: entry.slug, phase: entry.phase });
     this.poll();
     this.announce();
     return true;
+  }
+
+  /**
+   * The next bump's stamp — now, or one past the newest stamp this queue has
+   * seen, whichever is later, so a bump never orders behind an older one.
+   */
+  nextStamp(): number {
+    return Math.max(this.now(), this.bumpSeq + 1);
+  }
+
+  /**
+   * The waiting entry of one run's phase, if it has one — what an operator's
+   * press on a PHASE (`{slug, phase}`, control-tower phase 99) acts on.
+   */
+  entryOf(runId: string, phase: number): QueueEntry | undefined {
+    return this.queue.find((candidate) => candidate.runId === runId && candidate.phase === phase && !candidate.settled);
+  }
+
+  /**
+   * Hold or defer ONE entry, or lift either (control-tower phase 99, #135
+   * E.19–20): `null` clears, a mark sets, an absent key leaves it. The entry
+   * keeps its place and its age either way; a held one is skipped by every scan
+   * until released, a deferred one until its clock passes. Returns whether an
+   * entry was found.
+   */
+  markEntry(entryId: string, patch: {
+    hold?: EntryControl['hold'] | null;
+    defer?: EntryControl['defer'] | null;
+    bump?: null;
+    pin?: EntryControl['pin'] | null;
+  }): boolean {
+    const entry = this.queue.find((candidate) => candidate.id === entryId && !candidate.settled);
+    if (!entry) return false;
+    const control: EntryControl = { ...entry.control };
+    for (const key of ['hold', 'defer', 'bump', 'pin'] as const) {
+      if (!(key in patch)) continue;
+      const value = patch[key];
+      if (value) (control as Record<string, unknown>)[key] = { ...value };
+      else delete control[key];
+    }
+    if (!control.bump) delete entry.bumpedAt;
+    if (Object.keys(control).length) entry.control = control; else delete entry.control;
+    this.poll();
+    this.armDeferTimer();
+    this.announce();
+    return true;
+  }
+
+  /**
+   * Take ONE entry out of the queue (control-tower phase 99, #135 E.21). Its
+   * admission ends as `AdmissionWithdrawn` — an abort its runner stands down on
+   * — and the run, which records the withdrawal on the phase, boards its other
+   * phases instead. Returns the entry as it stood, or undefined.
+   */
+  withdrawEntry(entryId: string): QueueEntry | undefined {
+    const entry = this.queue.find((candidate) => candidate.id === entryId && !candidate.settled);
+    if (!entry) return undefined;
+    const view = this.entryView(entry);
+    this.settle(entry);
+    entry.reject(new AdmissionWithdrawn(entry.slug, entry.phase));
+    this.announce();
+    // Somebody else may have been queued behind exactly this one.
+    this.poll();
+    return view;
+  }
+
+  /** The scan position of each waiting entry, by id — the order before and after a move. */
+  positions(): Map<string, number> {
+    return new Map(this.scanOrder().filter((entry) => !entry.settled).map((entry, index) => [entry.id, index] as const));
   }
 
   /**
@@ -1724,6 +2926,64 @@ export class Scheduler {
     this.announce();
   }
 
+  /**
+   * Move a run's already-queued entries onto another account (control-tower
+   * phase 78, #92) — `reprioritize`'s shape, for the account a run pays with.
+   *
+   * `AdmitRequest.accountId` is the birth value, and the scan judges each entry's
+   * throttle and brake by it. Without this a switch moved `state.accountId` and
+   * nothing else: every phase already waiting behind the OLD account's usage
+   * window stayed there until that window reset — days, for a weekly wall — and
+   * an entry that did board was counted against the account the run had just
+   * left. Each entry keeps its age, its place, its reservation and its bump —
+   * the wait it has done is the same wait — and the scan runs at once, so an
+   * entry whose only holder was the old account boards in this very call.
+   *
+   * `phase` narrows it to one entry (a Retry). `undefined` is the machine login.
+   * A grant is not an entry: a lane already live stays counted against the
+   * account it boarded on (`ScopeGrant.accountId`) for as long as it lives.
+   * Returns how many entries moved.
+   */
+  rekeyRun(runId: string, accountId: string | undefined, opts: { phase?: number } = {}): number {
+    const to = accountId && accountId !== 'default' ? accountId : undefined;
+    let moved = 0;
+    for (const entry of this.queue) {
+      if (entry.runId !== runId || entry.settled) continue;
+      if (opts.phase !== undefined && entry.phase !== opts.phase) continue;
+      if ((entry.accountId ?? 'default') === (to ?? 'default')) continue;
+      if (to) entry.accountId = to; else delete entry.accountId;
+      moved++;
+    }
+    if (!moved) return 0;
+    log.info('scheduler.rekeyed', { runId, account: to ?? 'default', entries: moved, ...(opts.phase !== undefined ? { phase: opts.phase } : {}) });
+    this.poll();
+    this.announce();
+    return moved;
+  }
+
+  /**
+   * Reserve a live run's already-queued admission for one phase (control-tower
+   * phase 6, #15).
+   *
+   * `AdmitRequest.reserve` is a birth value, like the priority seed above. A
+   * landing that arrives while its phase already sits in `admit()` — an
+   * elapsed wait queued behind its own scope — would otherwise keep its
+   * first-come place, and the reservation `landWatch` promised would buy
+   * nothing. The mark is the birth value's exactly: ahead in the scan, holding
+   * its tokens once its scope blocks it, never past a clock or a granted lane,
+   * and it dies with the entry. Returns whether an entry was found.
+   */
+  reserveQueued(runId: string, phase: number): boolean {
+    const entry = this.queue.find((candidate) => candidate.runId === runId && candidate.phase === phase
+      && (candidate.kind ?? 'phase') === 'phase' && !candidate.settled);
+    if (!entry) return false;
+    if (entry.reserve) return true;
+    entry.reserve = true;
+    this.poll();
+    this.announce();
+    return true;
+  }
+
   /** Everything the queue page and `state().concurrency` read. */
   snapshot(): SchedulerSnapshot {
     const throttledAccounts = this.walledAccounts();
@@ -1743,7 +3003,22 @@ export class Scheduler {
       throttledAccounts,
       grants: [...this.grants.values()],
       entries: this.queue.filter((entry) => !entry.settled).map((entry) => this.entryView(entry, order.get(entry))),
+      byClass: this.byClass(),
+      reservations: this.reservationsView(),
+      load: this.loadNow(),
     };
+  }
+
+  /** See `SchedulerSnapshot.byClass`. */
+  private byClass(): Partial<Record<HolderClass, number>> {
+    const out: Partial<Record<HolderClass, number>> = {};
+    for (const entry of this.queue) {
+      const head = entry.waitingOn[0];
+      if (entry.settled || !head) continue;
+      const klass = holderClass(head, entry.runId);
+      out[klass] = (out[klass] ?? 0) + 1;
+    }
+    return out;
   }
 
   private machineSnapshot(): { live: number; max: number | null } | null {
@@ -1767,6 +3042,7 @@ export class Scheduler {
     after: string | null,
     order?: number,
   ): QueueEntry {
+    const kept = this.reservationOf(entry);
     return {
       id: entry.id,
       slug: entry.slug,
@@ -1775,6 +3051,11 @@ export class Scheduler {
       scope: entry.scope,
       ...(entry.branch ? { branch: entry.branch } : {}),
       ...(entry.tree ? { tree: entry.tree } : {}),
+      // Named ALWAYS, the machine login as `default` (control-tower phase 78,
+      // #92): "held by the wrong account" has to be readable off the queue —
+      // an entry waiting on `usage window · account A` while its run pays with
+      // B printed `null` here, and only the code could say which it would spend.
+      accountId: entry.accountId ?? 'default',
       ...(entry.kind ? { kind: entry.kind } : {}),
       since: entry.since,
       waitingOn: entry.waitingOn,
@@ -1786,6 +3067,8 @@ export class Scheduler {
       // client reading this snapshot sees the queue it always saw.
       ...(entry.priority ? { priority: entry.priority } : {}),
       ...(entry.bumpedAt ? { bumped: true as const } : {}),
+      ...(entry.control ? { control: entry.control } : {}),
+      ...(entry.reserve ? { reserve: true as const } : {}),
       // `held`/`after` are DERIVED at snapshot time rather than stored on the
       // entry: they are facts about the run and the fleet right now, and a
       // copy would be a second answer that goes stale the moment an operator
@@ -1793,6 +3076,11 @@ export class Scheduler {
       ...(held ? { held } : {}),
       ...(after ? { after } : {}),
       ...(order === undefined ? {} : { order }),
+      // Lanes and policies (control-tower phase 100) — omitted when they do not apply.
+      ...(entry.control?.pin ? { pinned: true as const } : {}),
+      ...(kept ? { laneReserved: { ...(kept.by ? { by: kept.by } : {}), ...(kept.reason ? { reason: kept.reason } : {}), ...(kept.lane ? { lane: kept.lane } : {}) } } : {}),
+      ...(entry.promoted ? { promotion: entry.promoted } : {}),
+      ...(entry.turn?.moved ? { share: { round: entry.turn.round, lanes: entry.turn.lanes } } : {}),
     };
   }
 
@@ -1812,10 +3100,12 @@ export class Scheduler {
     if (this.idleTimer) clearInterval(this.idleTimer);
     if (this.lockTimer) clearTimeout(this.lockTimer);
     if (this.scheduleTimer) clearTimeout(this.scheduleTimer);
+    if (this.deferTimer) clearTimeout(this.deferTimer);
     this.throttleTimer = null;
     this.idleTimer = null;
     this.lockTimer = null;
     this.scheduleTimer = null;
+    this.deferTimer = null;
     for (const entry of [...this.queue]) this.cancel(entry, false);
     for (const grant of this.grants.values()) this.releaseMachine(grant);
     this.grants.clear();
@@ -1852,9 +3142,9 @@ export class Scheduler {
    * field is dropped, so "nothing is known" and "an empty object arrived" stay
    * the same fact on the wire.
    */
-  private etaOf(slug: string): { eta?: HolderEta } {
+  private etaOf(slug: string, phase: number | null): { eta?: HolderEta } {
     try {
-      const eta = this.deps.etaFor?.(slug);
+      const eta = this.deps.etaFor?.(slug, phase);
       if (!eta || (eta.remainingWeight == null && !eta.label)) return {};
       return { eta };
     } catch { return {}; }
@@ -1887,12 +3177,20 @@ export class Scheduler {
     const carved = (holder: { slug: string; phase: number | null; branch?: string; tree?: string }): boolean =>
       !opts?.ignoreCarve && this.carvedOut(holder, entry);
     const holders: Holder[] = [];
+    // Name the undeclared dimension when it is the whole reason a CLAIM
+    // collides (#149) — grants, locks, another console's grants, reserved
+    // entries. Never a peer session (it declares nothing and is never carved,
+    // by design) or the radar (a landing order, not a claim).
+    const named = (holder: Holder): Holder => {
+      const why = unqualifiedCarve(holder, entry);
+      return why ? { ...holder, unqualified: why } : holder;
+    };
 
     for (const grant of this.grants.values()) {
       if (grant.runId === entry.runId && grant.phase === entry.phase) continue;
       if (!scopesIntersect(grant.scope, entry.scope)) continue;
       if (carved(grant)) continue;
-      holders.push({
+      holders.push(named({
         kind: 'grant',
         slug: grant.slug,
         phase: grant.phase,
@@ -1901,8 +3199,26 @@ export class Scheduler {
         ...(grant.branch ? { branch: grant.branch } : {}),
         ...(grant.tree ? { tree: grant.tree } : {}),
         overlaps: intersectingTokens(grant.scope, entry.scope),
-        ...this.etaOf(grant.slug),
-      });
+        ...this.etaOf(grant.slug, grant.phase),
+      }));
+    }
+
+    // A ticket's claim (`AgentGrant`): a person's session editing that tree.
+    // Named by its label and its ticket, never by a run it does not have.
+    for (const grant of this.agentGrants.values()) {
+      if (!scopesIntersect(grant.scope, entry.scope)) continue;
+      if (carved({ slug: grant.label, phase: null, branch: grant.branch, tree: grant.tree })) continue;
+      holders.push(named({
+        kind: 'grant',
+        slug: grant.label,
+        phase: null,
+        owner: AGENT_GRANT_OWNER,
+        scope: grant.scope,
+        ...(grant.branch ? { branch: grant.branch } : {}),
+        ...(grant.tree ? { tree: grant.tree } : {}),
+        overlaps: intersectingTokens(grant.scope, entry.scope),
+        session: grant.ticket,
+      }));
     }
 
     const own = autopilotOwner(entry.runId);
@@ -1925,7 +3241,7 @@ export class Scheduler {
       if (!scopesIntersect(scope, entry.scope)) continue;
       if (carved(lock)) continue;
       const presence = this.presenceOf(lock);
-      holders.push({
+      holders.push(named({
         kind: 'lock',
         slug: lock.slug,
         phase: lock.phase,
@@ -1934,11 +3250,11 @@ export class Scheduler {
         ...(lock.branch ? { branch: lock.branch } : {}),
         ...(lock.tree ? { tree: lock.tree } : {}),
         overlaps: intersectingTokens(scope, entry.scope),
-        ...this.etaOf(lock.slug),
+        ...this.etaOf(lock.slug, lock.phase),
         ...(lock.leaseUntil != null ? { leaseUntil: lock.leaseUntil } : {}),
         ...(lock.session ? { session: lock.session } : {}),
         ...(presence === 'live' ? { presence } : {}),
-      });
+      }));
     }
 
 
@@ -1967,6 +3283,10 @@ export class Scheduler {
           cwd: peer.cwd,
           ...(peer.presence === 'live' ? { presence: 'live' as const } : {}),
           ...(peer.claimUntil != null ? { leaseUntil: peer.claimUntil } : {}),
+          // How its scope was read, so the queue and the run card can say
+          // "your terminal … — scope app, from its edits" (#119).
+          ...(peer.basis ? { scopeBasis: peer.basis } : {}),
+          ...(peer.evidence?.length ? { evidence: [...peer.evidence] } : {}),
         });
       }
     }
@@ -1975,7 +3295,7 @@ export class Scheduler {
       if (ahead.id === entry.id) continue;
       if (!scopesIntersect(ahead.scope, entry.scope)) continue;
       if (carved(ahead)) continue;
-      holders.push({
+      holders.push(named({
         kind: 'reserved',
         slug: ahead.slug,
         phase: ahead.phase,
@@ -1984,8 +3304,8 @@ export class Scheduler {
         ...(ahead.branch ? { branch: ahead.branch } : {}),
         ...(ahead.tree ? { tree: ahead.tree } : {}),
         overlaps: intersectingTokens(ahead.scope, entry.scope),
-        ...this.etaOf(ahead.slug),
-      });
+        ...this.etaOf(ahead.slug, ahead.phase),
+      }));
     }
 
     return holders;
@@ -2090,6 +3410,12 @@ export class Scheduler {
     };
     this.grants.set(grant.id, grant);
     this.settle(entry);
+    // The lane kept for this phase has boarded it: spent (control-tower phase 100).
+    const kept = this.reservationOf(entry);
+    if (kept) {
+      this.laneReservations.delete(`${entry.slug}:${entry.phase}`);
+      log.info('scheduler.reservation-spent', { slug: entry.slug, phase: entry.phase, runId: entry.runId, ...(kept.by ? { by: kept.by } : {}) });
+    }
     log.info('scheduler.admitted', {
       slug: entry.slug, phase: entry.phase, runId: entry.runId,
       scope: formatScope(entry.scope), waitedMs: this.now() - entry.since,
@@ -2205,6 +3531,28 @@ export class Scheduler {
       this.poll();
     }, delay);
     this.scheduleTimer.unref?.();
+  }
+
+  /**
+   * Wake when the soonest DEFERRAL ends (control-tower phase 99, #135 E.20) —
+   * an operator's "not before 12:50Z" is a promise with a known moment, like a
+   * lease, and nothing else announces that it has passed.
+   */
+  private armDeferTimer(): void {
+    if (this.deferTimer) { clearTimeout(this.deferTimer); this.deferTimer = null; }
+    if (this.closed) return;
+    const now = this.now();
+    let soonest = Infinity;
+    for (const entry of this.queue) {
+      const until = Date.parse(entry.control?.defer?.until ?? '');
+      if (!entry.settled && Number.isFinite(until) && until > now && until < soonest) soonest = until;
+    }
+    if (!Number.isFinite(soonest)) return;
+    this.deferTimer = setTimeout(() => {
+      this.deferTimer = null;
+      this.poll();
+    }, Math.min(Math.max(0, soonest - now), 2 ** 31 - 1));
+    this.deferTimer.unref?.();
   }
 
   /**

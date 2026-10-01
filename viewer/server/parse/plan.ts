@@ -24,8 +24,13 @@ import {
 } from '../../shared/landing-model.js';
 import { MESSAGING_WORDS, DEFAULT_MESSAGING } from '../../shared/message-model.js';
 import { ISSUE_MODES, DEFAULT_ISSUES } from '../../shared/issues-model.js';
+import {
+  CREDENTIAL_ID_RE, HUMAN_STEP_AUTO_OPEN, HUMAN_STEP_BULLET_KEYS, HUMAN_STEP_WHERE, KIND_META, humanStepKindOf,
+  type HumanStepKind, type HumanStepWhere,
+} from '../../shared/human-step-model.js';
 import { parseDecisionsTable } from '../../shared/decisions-model.js';
-import { inPlanReviewers } from '../../shared/run-settings.js';
+import { inPlanReviewers, PERMISSION_MODES, withWindowNote } from '../../shared/run-settings.js';
+import { MODEL_POLICIES, type ModelPolicy } from '../../shared/run-lifecycle.js';
 import type { DecisionRow } from '../../shared/decisions-model.js';
 import type { McpPolicy } from '../runner/state.ts';
 
@@ -39,6 +44,8 @@ type GitlinkPolicy = (typeof GITLINK_POLICIES)[number];
 type ConflictPolicy = (typeof CONFLICT_POLICIES)[number];
 type IssueMode = (typeof ISSUE_MODES)[number];
 type IsolationDirective = (typeof ISOLATION_DIRECTIVES)[number];
+/** A CLI `--permission-mode` word a plan may name (control-tower phase 11). */
+export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
 /**
  * `**Credential policy:**` — the SAME vocabulary as `McpPolicy`
@@ -104,6 +111,19 @@ export type PhaseDetail = {
   isolation?: IsolationDirective;
   issues?: IssueMode;
   /**
+   * `- **Permission mode:** plan` — the mode this phase's session starts in,
+   * OVERRIDING the plan's `**Permission mode:**` line (`permissionModeFor`).
+   * Absent means the bullet is missing or names no mode: the reader falls
+   * through, and lint F31 names the typo.
+   */
+  permissionMode?: PermissionMode;
+  /**
+   * `- **Model policy:** pinned|ladder` — what a run may do to this phase's
+   * model (control-tower phase 54, #91), OVERRIDING the plan's line
+   * (`modelPolicyFor`). Absent: the bullet is missing or names no policy.
+   */
+  modelPolicy?: ModelPolicy;
+  /**
    * `**QA:** on|off` — this phase's OWN QA regime, overriding the plan's
    * `**QA gate:**` where it is stated, inheriting where it is silent.
    *
@@ -147,6 +167,27 @@ export type PhaseDetail = {
    */
   checkout?: string;
   /**
+   * `- **Wall-clock floor:** <duration>` — this phase's FIXED wall-clock
+   * floor: a full `gates.sh` run, a CD wait — the least time it can take, no
+   * matter how small its `Size` tag (`Size` weights CONTEXT for the ladder;
+   * this is a clock).
+   *
+   * In MINUTES, rounded UP (`wallClockFloorMinutes`): one or more LEADING
+   * `<number><unit>` groups, summed. Undefined when the bullet is missing, its
+   * value has no leading duration, or that duration rounds to zero minutes —
+   * all three are silence, meaning "this phase has no floor".
+   */
+  wallClockFloorMin?: number;
+  /**
+   * `- **Verify timeout:** <duration>` — how long ONE of this phase's
+   * §Verification commands may run before the console cuts it, in minutes
+   * (control-tower phase 83, #95; `verify_timeout_for_phase()`). The FIRST
+   * duration after the label, like `Waits on:`'s max; it overrides the plan's
+   * `**Verify timeout:**` for this phase (`verifyTimeoutFor`). Undefined when
+   * the bullet is missing or names no duration.
+   */
+  verifyTimeoutMinutes?: number;
+  /**
    * `**MCP:**` — the MCP servers this phase needs, as registry ids.
    *
    * What a phase states is WHICH server it needs, never how to reach it: the
@@ -186,6 +227,14 @@ export type PhaseDetail = {
    * silence and the console's policy table answers (`personCheckFor`).
    */
   personCheck?: string;
+  /**
+   * `- **Human step:** <kind> · <what> · open: … · proof: … · where: … ·
+   * window: … [· auto-open: host] [· credential: <id>]` — the acts only a
+   * person can do that this phase declares (control-tower phase 41,
+   * `human_steps_for_phase()`). Several bullets are several steps; one the
+   * lint refuses (F37) is not a step. Absent when the phase declares none.
+   */
+  humanSteps?: HumanStepDirective[];
   handoffMustRecord?: string;
   /** Every labelled bullet, so nothing in an unusual plan is dropped. */
   bullets: { label: string; body: string }[];
@@ -238,6 +287,13 @@ export type SessionBudget = {
    */
   waitBudgetMinutes?: number;
   /**
+   * `**Verify timeout:**` — how long one §Verification command of any phase may
+   * run, in minutes (control-tower phase 83, #95; `plan_verify_timeout()`). A
+   * phase's own bullet overrides it. Absent is silence: the console scales the
+   * limit from each line's measured history (`verify-ledger.ts`).
+   */
+  verifyTimeoutMinutes?: number;
+  /**
    * `**QA exhausted:** waive|halt|<owner>` — the plan's answer once the QA
    * round budget is spent (`plan_qa_exhausted()`; chapter 10 ZTD-9, the
    * `qa.exhausted` row). One lower-cased word; absent is silence and the
@@ -275,6 +331,10 @@ export type SessionBudget = {
   messaging?: 'on' | 'off';
   issues?: IssueMode;
   isolation?: IsolationDirective;
+  /** `**Permission mode:**` — the plan's mode for every phase with no bullet of its own. */
+  permissionMode?: PermissionMode;
+  /** `**Model policy:**` — what a run may do to a model, for every phase with no bullet of its own (#91). */
+  modelPolicy?: ModelPolicy;
   /** `**Clash zones:**` — paths two concurrent phases must never both touch. Empty when none. */
   clashZones: string[];
 };
@@ -538,7 +598,11 @@ function parseSessionBudget(section?: Section): SessionBudget {
   const raw = section?.body ?? '';
   const flat = raw.replace(/^[\s>]*/gm, '');
 
-  const model = /\*\*Target model:\*\*\s*`?([^`·\n(]+)`?/i.exec(flat)?.[1]?.trim();
+  // A "(1M window)" after the name is the window the plan asked for, and reads
+  // as `[1m]` (control-tower phase 13, #91) — the bash twin is `plan_model`.
+  const target = /\*\*Target model:\*\*\s*`?([^`·\n(]+)`?/i.exec(flat);
+  const named = target?.[1]?.trim();
+  const model = named && target ? withWindowNote(named, flat.slice(target.index + target[0].length)) : named;
   const budget = /\*\*Budget:\*\*\s*([^·\n]+)/i.exec(flat)?.[1]?.trim();
   const branch = /\*\*Branch:\*\*\s*([^·\n]+)/i.exec(flat)?.[1]?.trim();
 
@@ -578,6 +642,8 @@ function parseSessionBudget(section?: Section): SessionBudget {
   // `plan_wait_budget()`: the label at the start of a line, then the FIRST
   // duration after the colon.
   const waitBudgetMinutes = durationMinutes(/^\*{0,2}Wait[ \t]+budget\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
+  // `plan_verify_timeout()`: the same shape as the wait budget above.
+  const verifyTimeoutMinutes = durationMinutes(/^\*{0,2}Verify[ \t]+timeout\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
   // `plan_qa_exhausted()`: the label at the start of a line (after the quote
   // marks), then the FIRST word after the colon.
   const qaExhausted = policyWord(/^\*{0,2}QA[ \t]+exhausted\*{0,2}[ \t]*:\s*(.+)/im.exec(flat)?.[1]);
@@ -616,6 +682,11 @@ function parseSessionBudget(section?: Section): SessionBudget {
   const messaging = planWord(flat, 'Messaging', MESSAGING_WORDS);
   const issues = planWord(flat, 'Issues', ISSUE_MODES);
   const isolation = planWord(flat, 'Isolation', ISOLATION_DIRECTIVES);
+  const permissionMode = permissionModeWord(
+    new RegExp(`^[\\s>]*\\*{0,2}${PERMISSION_MODE_LABEL}\\*{0,2}[ \\t]*:(.*)$`, 'im').exec(flat)?.[1],
+  );
+  // control-tower phase 54 (#91): `_plan_directive 'Model[[:space:]]+policy'`.
+  const modelPolicy = planWord(flat, MODEL_POLICY_LABEL, MODEL_POLICIES);
   // The base branch is the one value that is not a vocabulary — two words are
   // special and everything else is a git ref, passed through whole — so it
   // takes the raw remainder rather than its first token.
@@ -631,6 +702,7 @@ function parseSessionBudget(section?: Section): SessionBudget {
     clashZones,
     ...(setupLine ? { setup: setupLine } : {}),
     ...(waitBudgetMinutes !== undefined ? { waitBudgetMinutes } : {}),
+    ...(verifyTimeoutMinutes !== undefined ? { verifyTimeoutMinutes } : {}),
     ...(qaExhausted !== undefined ? { qaExhausted } : {}),
     ...(landing !== undefined ? { landing } : {}),
     ...(baseBranch !== undefined ? { baseBranch } : {}),
@@ -639,6 +711,8 @@ function parseSessionBudget(section?: Section): SessionBudget {
     ...(messaging !== undefined ? { messaging } : {}),
     ...(issues !== undefined ? { issues } : {}),
     ...(isolation !== undefined ? { isolation } : {}),
+    ...(permissionMode !== undefined ? { permissionMode } : {}),
+    ...(modelPolicy !== undefined ? { modelPolicy } : {}),
   };
 }
 
@@ -655,6 +729,23 @@ function planWord<T extends string>(flat: string, label: string, words: readonly
   const re = new RegExp(`^[\\s>]*\\*{0,2}${label}\\*{0,2}[ \\t]*:(.*)$`, 'im');
   const word = policyWord(re.exec(flat)?.[1]);
   return words.includes(word as T) ? (word as T) : undefined;
+}
+
+/** `Permission[[:space:]]+mode` in phase-graph.sh — one space or several. */
+const PERMISSION_MODE_LABEL = 'Permission[ \\t]+mode';
+
+/** `Model[[:space:]]+policy` in phase-graph.sh (control-tower phase 54). */
+const MODEL_POLICY_LABEL = 'Model[ \\t]+policy';
+
+/**
+ * A permission mode, matched case-insensitively and returned the way the CLI
+ * spells it — `_permission_mode_word()`. `policyWord` lower-cases and the CLI's
+ * modes are camelCase (`acceptEdits`, `dontAsk`), so a plain membership test
+ * would refuse the one spelling the CLI accepts. Undefined = not a mode.
+ */
+function permissionModeWord(remainder: string | undefined): PermissionMode | undefined {
+  const word = policyWord(remainder);
+  return word === undefined ? undefined : PERMISSION_MODES.find((mode) => mode.toLowerCase() === word);
 }
 
 /**
@@ -688,6 +779,44 @@ export function durationMinutes(text: string | undefined): number | undefined {
   if (unit.startsWith('d')) return n * 1440;
   if (unit.startsWith('h')) return n * 60;
   return n;
+}
+
+/**
+ * `wall_clock_floor_minutes()` in phase-graph.sh: a phase's `- **Wall-clock
+ * floor:**` value as minutes, or undefined.
+ *
+ * Unlike `durationMinutes` above — the FIRST duration anywhere in the text,
+ * single group, integers only — this reads one or more LEADING
+ * `<number><unit>` groups (decimal numbers allowed, the space before a unit
+ * and between groups both optional), sums them and rounds UP: `1h 30m` and
+ * `1.5h` both read 90. Reading stops at the first token that is not such a
+ * group — a lookahead rather than a trailing-boundary character class, so a
+ * following DIGIT does not stop it (`1h30m` still reads two groups) while a
+ * following LETTER does (`5 miles` is not `5 minutes`) — so trailing prose
+ * (` — a full gates.sh run`) never reaches the sum. Undefined when nothing
+ * leading is readable, or when the total rounds to zero minutes — both are
+ * silence, meaning "no floor".
+ */
+export function wallClockFloorMinutes(text: string | undefined): number | undefined {
+  if (!text) return undefined;
+  const re = /^([0-9]+(?:\.[0-9]+)?)[ \t]*(minutes|minute|mins|min|m|hours|hour|hrs|hr|h|days|day|d)(?![a-z])/i;
+  let rest = text.replace(/[`*]/g, '');
+  let total = 0;
+  let matched = false;
+  for (;;) {
+    rest = rest.replace(/^[ \t]+/, '');
+    const m = re.exec(rest);
+    if (!m) break;
+    matched = true;
+    const n = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    if (unit.startsWith('d')) total += n * 1440;
+    else if (unit.startsWith('h')) total += n * 60;
+    else total += n;
+    rest = rest.slice(m[0].length);
+  }
+  if (!matched || total <= 0) return undefined;
+  return Math.ceil(total);
 }
 
 /** `plan_credential_policy()`'s word filter — the MCP policy filter, because it is the MCP policy vocabulary. */
@@ -753,6 +882,12 @@ const CREDENTIAL_POLICY_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Credential[ \t]+pol
 const WAITS_ON_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Waits[ \t]+on\*{0,2}[ \t]*:(.*)$/i;
 /** `person_check_for_phase()` — the same shape. */
 const PERSON_CHECK_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Person-check\*{0,2}[ \t]*:(.*)$/i;
+/** `human_step_bodies()`: every `- **Human step:**` bullet, bold or not, the colon inside or outside it. */
+const HUMAN_STEP_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}human[ \t]+step\*{0,2}[ \t]*:/i;
+/** `wall_clock_floor_directive()` — the same shape; bold optional, like `Checkout`. */
+const WALL_CLOCK_FLOOR_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Wall-clock[ \t]+floor\*{0,2}[ \t]*:(.*)$/i;
+/** `verify_timeout_directive()` — the same shape again (control-tower phase 83, #95). */
+const VERIFY_TIMEOUT_BULLET_RE = /^[ \t]*[-*][ \t]*\*{0,2}Verify[ \t]+timeout\*{0,2}[ \t]*:(.*)$/i;
 
 /**
  * `_policy_word()`: bold and backticks stripped, the FIRST token lower-cased
@@ -823,6 +958,67 @@ function credentialPolicyBullet(block: string): CredentialPolicy | undefined {
 /** The phase's `- **Person-check:** allow|halt|<owner>`, or undefined for silence. */
 function personCheckBullet(block: string): string | undefined {
   return policyWord(firstMatch(block, PERSON_CHECK_BULLET_RE));
+}
+
+/**
+ * One `- **Human step:**` bullet — `_human_step_parse()` in phase-graph.sh,
+ * field for field: the kind and what to do are positional, every later field is
+ * `key: value` in any order (last wins), one wrapping pair of backticks is read
+ * without them. Undefined for anything the F37 lint refuses — the superseded
+ * `<who, what, proof ref>` spelling, an unknown kind, a field the grammar does
+ * not have, a `where`/`auto-open`/`window` it cannot read, a `credential` off a
+ * `secret-entry` step, or an `open:` link that is not http(s).
+ */
+export function parseHumanStepBody(body: string): HumanStepDirective | undefined {
+  const fields = body.split(/\s*·\s*/).map((f) => f.trim());
+  const kind = humanStepKindOf((fields[0] ?? '').replace(/[`*]/g, '').trim().split(/\s+/)[0]);
+  if (!kind) return undefined;
+  const what = fields[1] ?? '';
+  if (!what) return undefined;
+  const values: Record<string, string> = {};
+  for (const field of fields.slice(2)) {
+    const key = /^([A-Za-z][A-Za-z-]*)\s*:/.exec(field)?.[1]?.toLowerCase() ?? '';
+    if (!(HUMAN_STEP_BULLET_KEYS as readonly string[]).includes(key)) return undefined;
+    values[key] = field.replace(/^[^:]*:\s*/, '').replace(/^`(.*)`$/, '$1').trim();
+  }
+  const where = (values.where?.toLowerCase() || KIND_META[kind].where) as HumanStepWhere;
+  if (!(HUMAN_STEP_WHERE as readonly string[]).includes(where)) return undefined;
+  const autoOpen = values['auto-open']?.toLowerCase();
+  if (autoOpen && !(HUMAN_STEP_AUTO_OPEN as readonly string[]).includes(autoOpen)) return undefined;
+  let windowMinutes: number | undefined;
+  if (values.window) {
+    windowMinutes = durationMinutes(values.window);
+    if (windowMinutes === undefined) return undefined;
+  }
+  const credential = values.credential;
+  if (credential && (kind !== 'secret-entry' || !CREDENTIAL_ID_RE.test(credential))) return undefined;
+  const open = values.open;
+  if (open && /^[A-Za-z][A-Za-z0-9+.-]*:\S/.test(open) && !/^https?:\/\/[^\s/?#]+/i.test(open)) return undefined;
+  return {
+    kind, what, where,
+    ...(open ? { open } : {}),
+    ...(values.proof ? { proof: values.proof } : {}),
+    ...(windowMinutes !== undefined ? { windowMinutes } : {}),
+    ...(autoOpen ? { autoOpen: 'host' as const } : {}),
+    ...(credential ? { credential } : {}),
+  };
+}
+
+/** The phase's well-formed `- **Human step:**` bullets, or undefined when it has none. */
+function humanStepBullets(block: string): HumanStepDirective[] | undefined {
+  const steps: HumanStepDirective[] = [];
+  for (const line of block.split('\n')) {
+    if (!HUMAN_STEP_BULLET_RE.test(line)) continue;
+    const body = line.replace(/^[^:]*:\s*/, '').replace(/^\*{1,2}\s*/, '').replace(/\s+$/, '');
+    const step = parseHumanStepBody(body);
+    if (step) steps.push(step);
+  }
+  return steps.length ? steps : undefined;
+}
+
+/** The phase's `- **Wall-clock floor:** <duration>`, in minutes — or undefined for silence. */
+function wallClockFloorBullet(block: string): number | undefined {
+  return wallClockFloorMinutes(firstMatch(block, WALL_CLOCK_FLOOR_BULLET_RE));
 }
 
 /**
@@ -910,6 +1106,35 @@ export function credentialPolicyFor(plan: Plan | undefined, phase: number): Cred
   return plan.phases[phase]?.credentialPolicy ?? plan.sessionBudget.credentialPolicy;
 }
 
+/**
+ * One step the plan declares for a person (control-tower phase 41) — what
+ * `--human-steps N` prints, as a record. `where` is resolved (the kind's
+ * default when the bullet is silent); `windowMinutes` is read as minutes.
+ */
+export type HumanStepDirective = {
+  kind: HumanStepKind;
+  what: string;
+  open?: string;
+  proof?: string;
+  where: HumanStepWhere;
+  windowMinutes?: number;
+  autoOpen?: 'host';
+  credential?: string;
+};
+
+/** The steps phase N declares for a person — `human_steps_for_phase()`. */
+export function humanStepsFor(plan: Plan | undefined, phase: number): HumanStepDirective[] {
+  return plan?.phases[phase]?.humanSteps ?? [];
+}
+
+/** One step as the engine prints it: kind, what, open, proof, where, window, auto-open, credential — tab-separated. */
+export function humanStepLine(step: HumanStepDirective): string {
+  return [
+    step.kind, step.what, step.open ?? '', step.proof ?? '', step.where,
+    step.windowMinutes === undefined ? '' : String(step.windowMinutes), step.autoOpen ?? '', step.credential ?? '',
+  ].join('\t');
+}
+
 /** The phase's `- **Person-check:**` word — `person_check_for_phase()`; phase-only, no plan-wide line. */
 export function personCheckFor(plan: Plan | undefined, phase: number): string | undefined {
   return plan?.phases[phase]?.personCheck;
@@ -968,6 +1193,33 @@ export function isolationFor(plan: Plan | undefined, phase?: number): Resolved<I
   return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
 }
 
+/**
+ * The permission mode a plan asks a phase's session to start in —
+ * `permission_mode_for_phase()` (control-tower phase 11, #34). Overrides, never
+ * unions: the phase's bullet beats the plan's line. Undefined when both are
+ * silent, because the RUN's default answers then (and `acceptEdits` below it) —
+ * the same reason `isolationFor` leaves the run's question to the run.
+ */
+export function permissionModeFor(plan: Plan | undefined, phase?: number): Resolved<PermissionMode> | undefined {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.permissionMode;
+  if (own !== undefined) return { value: own, source: 'phase' };
+  const planWide = plan?.sessionBudget.permissionMode;
+  return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
+}
+
+/**
+ * What a run may do to a phase's model — `model_policy_for_phase()`
+ * (control-tower phase 54, #91). Overrides, never unions: the phase's bullet
+ * beats the plan's line. Undefined when both are silent, because the RUN's
+ * `modelPolicy` answers then (and `ladder` below it).
+ */
+export function modelPolicyFor(plan: Plan | undefined, phase?: number): Resolved<ModelPolicy> | undefined {
+  const own = phase === undefined ? undefined : plan?.phases[phase]?.modelPolicy;
+  if (own !== undefined) return { value: own, source: 'phase' };
+  const planWide = plan?.sessionBudget.modelPolicy;
+  return planWide !== undefined ? { value: planWide, source: 'plan' } : undefined;
+}
+
 /** What the run branch is cut from — `plan_base_branch()`. Plan-wide: a base branch is a fact about the RUN. */
 export function baseBranchOf(plan: Plan | undefined): Resolved<string> {
   const own = plan?.sessionBudget.baseBranch;
@@ -1006,6 +1258,23 @@ export function waitBudgetFor(
   const own = phase === undefined ? undefined : plan.phases[phase]?.waitsOn?.maxMinutes;
   if (own !== undefined) return { minutes: own, source: 'phase' };
   const planWide = plan.sessionBudget.waitBudgetMinutes;
+  return planWide !== undefined ? { minutes: planWide, source: 'plan' } : undefined;
+}
+
+/**
+ * How long one §Verification command of a phase may run, and which line said
+ * so (control-tower phase 83, #95) — `verify_timeout_for_phase()`: the phase's
+ * `Verify timeout:` bullet, else the plan's `Verify timeout:` line, else
+ * undefined (the console scales the limit from the line's history). With no
+ * phase, the plan line alone.
+ */
+export function verifyTimeoutFor(
+  plan: Plan | undefined, phase?: number,
+): { minutes: number; source: 'phase' | 'plan' } | undefined {
+  if (!plan) return undefined;
+  const own = phase === undefined ? undefined : plan.phases[phase]?.verifyTimeoutMinutes;
+  if (own !== undefined) return { minutes: own, source: 'phase' };
+  const planWide = plan.sessionBudget.verifyTimeoutMinutes;
   return planWide !== undefined ? { minutes: planWide, source: 'plan' } : undefined;
 }
 
@@ -1079,6 +1348,13 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       // Distinct prefix from every other bullet here, and read the same way
       // the engine's `checkout_directive()` reads it (`--checkout <phase>`).
       checkout: bullet(bullets, 'Checkout'),
+      // Read off the RAW block like the MCP/Waits-on family, because the
+      // engine's `wall_clock_floor_directive()` does not require the bold
+      // either (`--floor <phase>`).
+      wallClockFloorMin: wallClockFloorBullet(block.raw),
+      // The first duration after the label, read off the RAW block like the
+      // floor above (`verify_timeout_for_phase()`).
+      verifyTimeoutMinutes: durationMinutes(firstMatch(block.raw, VERIFY_TIMEOUT_BULLET_RE)),
       // Backticked ids off the bullet, matching `mcp_directive()` in
       // phase-graph.sh — read from the RAW block, because the engine does not
       // require the bold and this side decides what actually gets attached.
@@ -1092,6 +1368,9 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       credentials: credentialsBullet(block.raw),
       credentialPolicy: credentialPolicyBullet(block.raw),
       personCheck: personCheckBullet(block.raw),
+      // control-tower phase 41: the acts only a person can do, as the plan
+      // declares them (`human_steps_for_phase()`).
+      humanSteps: humanStepBullets(block.raw),
       // 5.1.0: where this phase's work lands and where it runs. Each is the
       // phase half of a plan-wide line; `landFor` and its siblings resolve the
       // pair. `Land` and not `Landing` on purpose — the plan-wide line is a
@@ -1100,6 +1379,13 @@ export function parsePlan(text: string, slug: string, path: string): Plan {
       gitlink: phaseWord(block.raw, 'Gitlink', GITLINK_POLICIES),
       isolation: phaseWord(block.raw, 'Isolation', ISOLATION_DIRECTIVES),
       issues: phaseWord(block.raw, 'Issues', ISSUE_MODES),
+      // control-tower phase 11: the mode this phase's session starts in —
+      // `_phase_directive <N> 'Permission[[:space:]]+mode'`, any case.
+      permissionMode: permissionModeWord(
+        new RegExp(`^[ \\t]*[-*][ \\t]*\\*{0,2}${PERMISSION_MODE_LABEL}\\*{0,2}[ \\t]*:(.*)$`, 'im').exec(block.raw)?.[1],
+      ),
+      // control-tower phase 54 (#91): `_phase_directive <N> 'Model[[:space:]]+policy'`.
+      modelPolicy: phaseWord(block.raw, MODEL_POLICY_LABEL, MODEL_POLICIES),
       // What the phase waits on and its own parked-time allowance
       // (`waits_on_refs()` / `wait_budget_for_phase()`).
       waitsOn: waitsOnBullet(block.raw),

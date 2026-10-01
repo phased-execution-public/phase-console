@@ -22,6 +22,8 @@ import { basename, dirname, join } from 'node:path';
 import { runDir } from './state.ts';
 import { OUTCOME_STATUSES } from '../../shared/run-lifecycle.js';
 import type { OutcomeStatus } from '../../shared/run-lifecycle.js';
+import { humanStepKindOf, redactSecrets } from '../../shared/human-step-model.js';
+import type { DeclaredStep } from '../human-steps.ts';
 
 /**
  * `partial` — "work remains; resume me" — is the one a session declares when
@@ -64,7 +66,22 @@ export type PhaseOutcome = {
   command?: string;
   /** ISO time the session suggests re-checking at (waiting-external only). */
   resume_after?: string;
+  /**
+   * A HUMAN STEP (control-tower phase 41): `needs-human --step <kind> …`. Kept
+   * here only in its outline — a known kind and a title on a `needs-human` —
+   * and sanitised field by field where it is recorded (`sanitiseStep`), so a
+   * file an older or hand-written script produced cannot carry more than the
+   * language allows.
+   */
+  step?: DeclaredStep;
   watch: string[];
+  /**
+   * Refs the CONSOLE refused at ingest — never written by the script, never
+   * read from a file (`screenDeclaration`): a watch naming the declarer's own
+   * lock (#42). Present only in memory, so the router can tell a lock block
+   * that named nobody else's lock from one queued behind a holder.
+   */
+  refused?: string[];
   written_at: string;
   /**
    * The session that declared it, when it knew its own id (`$PE_SESSION_ID`,
@@ -194,7 +211,11 @@ export function readOutcome(
     slug: parsed.slug,
     phase: parsed.phase,
     status: parsed.status as PhaseOutcomeStatus,
-    ...(typeof parsed.reason === 'string' && parsed.reason ? { reason: parsed.reason.slice(0, 500) } : {}),
+    // A declaration with a human step keeps no secret in its prose either — the
+    // script refuses one, and a hand-written file is redacted here (phase 41).
+    ...(typeof parsed.reason === 'string' && parsed.reason
+      ? { reason: (parsed.step ? redactSecrets(parsed.reason) : parsed.reason).slice(0, 500) }
+      : {}),
     // A word, never a sentence: the same shape the script validates against
     // decisions.env. Membership is the CLASSIFIER's question (an unknown word
     // classifies through the prose, exactly like no word), so a key added to
@@ -205,12 +226,20 @@ export function readOutcome(
     ...(typeof parsed.resume_after === 'string' && parsed.resume_after
       ? { resume_after: parsed.resume_after }
       : {}),
+    ...(parsed.status === 'needs-human' && stepOutline(parsed.step) ? { step: parsed.step as DeclaredStep } : {}),
     watch,
     written_at: parsed.written_at,
     ...(typeof parsed.session_id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(parsed.session_id)
       ? { session_id: parsed.session_id }
       : {}),
   };
+}
+
+/** A `step` worth keeping: an object with a known kind and a non-empty title. */
+function stepOutline(step: unknown): boolean {
+  if (!step || typeof step !== 'object') return false;
+  const { kind, title } = step as { kind?: unknown; title?: unknown };
+  return humanStepKindOf(kind) !== null && typeof title === 'string' && title.trim().length > 0;
 }
 
 /** Remove a consumed outcome file. Never throws — best-effort. */

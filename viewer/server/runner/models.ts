@@ -48,13 +48,15 @@ export type ModelsEnv = {
   big: ReadonlySet<string>;
   /** Families the 1M window is actually available on — for pick lists only. */
   oneMCapable: readonly string[];
+  /** What a run may do to a phase's model (`MODEL_POLICIES`, control-tower phase 54). */
+  policies: readonly string[];
 };
 
 export const MODELS_ENV_FALLBACK: ModelsEnv = {
   aliases: ['fable', 'opus', 'sonnet', 'haiku'],
   ids: new Map([
-    ['fable', 'claude-fable-5'],
-    ['opus', 'claude-opus-5'],
+    ['fable', 'claude-fable-5-1'],
+    ['opus', 'claude-opus-5-5'],
     ['sonnet', 'claude-sonnet-5'],
     ['haiku', 'claude-haiku-4-5'],
   ]),
@@ -62,6 +64,7 @@ export const MODELS_ENV_FALLBACK: ModelsEnv = {
   oneM: '[1m]',
   big: new Set(['fable', 'opus', 'sonnet', 'mythos']),
   oneMCapable: ['fable', 'opus', 'sonnet'],
+  policies: ['ladder', 'pinned'],
 };
 
 const cache = new Map<string, ModelsEnv>();
@@ -103,6 +106,7 @@ export function loadModelsEnv(scriptsDir: string): ModelsEnv {
       oneM: readWord(text, 'MODEL_1M_SUFFIX') || MODELS_ENV_FALLBACK.oneM,
       big: new Set(readList(text, 'MODEL_BIG') ?? [...MODELS_ENV_FALLBACK.big]),
       oneMCapable: readList(text, 'MODEL_1M_CAPABLE') ?? MODELS_ENV_FALLBACK.oneMCapable,
+      policies: readList(text, 'MODEL_POLICIES') ?? MODELS_ENV_FALLBACK.policies,
     };
   } catch { /* an older scripts dir without the file — the fallback holds */ }
   cache.set(scriptsDir, env);
@@ -144,6 +148,26 @@ export function isModelMode(model?: string, env: ModelsEnv = MODELS_ENV_FALLBACK
 export function isKnownModel(model?: string, env: ModelsEnv = MODELS_ENV_FALLBACK): boolean {
   if (!model || !model.trim()) return false;
   return isModelMode(model, env) || modelFamily(model, env) !== null;
+}
+
+/**
+ * Is `resolved` — the id a session's `system/init` frame reported — the model
+ * `requested` names (control-tower phase 54, #91)? An alias pins its canonical
+ * id (`opus[1m]` → `MODEL_IDS`'s `claude-opus-5-5[1m]`) and a dated id is its
+ * base model (`claude-haiku-4-5-20251001` is `claude-haiku-4-5`). The `[1m]`
+ * suffix is a WINDOW, not a model, and is not compared: measured on this
+ * machine, `fable[1m]` and `claude-fable-5-1[1m]` both report
+ * `claude-fable-5-1` at init while `opus[1m]` reports its suffix — so a
+ * suffix-strict reading would park every pinned Fable phase. A mode alias
+ * (`opusplan`) pins nothing.
+ */
+export function sameModel(requested: string, resolved: string, env: ModelsEnv = MODELS_ENV_FALLBACK): boolean {
+  if (isModelMode(requested, env)) return true;
+  const base = (id: string) => {
+    const lower = id.toLowerCase().trim();
+    return (lower.endsWith(env.oneM) ? lower.slice(0, -env.oneM.length) : lower).replace(/-\d{8}$/, '');
+  };
+  return base(canonicalModelId(requested, env) ?? requested) === base(resolved);
 }
 
 /** The canonical full id for a name, or the name itself when it is already one. */

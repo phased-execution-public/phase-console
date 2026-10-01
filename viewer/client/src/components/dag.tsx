@@ -32,13 +32,27 @@
  * from taste would lose that. The view state and the gestures are a hook
  * (`useMapView`) that knows nothing about stations, and the SVG is a component
  * that knows nothing about pointers.
+ *
+ * ---- Seventy stations and more (control-tower phase 30) ----
+ *
+ * A plan too big to show whole at a tappable zoom is CROWDED, and four things
+ * change for it. It opens with every row across the frame (fit-to-width — the
+ * plan's width is its breadth, the phases side by side; its waves are its
+ * length, and you pan along them) instead of as a field of one-pixel specks.
+ * Only what the window shows is drawn, so the DOM stays the size of the frame
+ * however long the plan grows. A minimap under the frame shows the whole plan
+ * and where the window is on it. And a station search moves the window to the
+ * station it finds. The stations are one tab stop: the arrow keys walk them.
+ * The spike that chose this over React Flow is the phase-30 handoff's.
  */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Lock, Unlock, X } from 'lucide-react';
 import { ACTOR_ICON } from '@/components/actor-icon';
-import { Button, ButtonGroup, Legend, asPhaseState, type PhaseState } from '@/components/ui';
-import { PHASE_ACTOR_LABELS, STATE_META, boardLabel, boardUiState, type UiState } from '@/lib/status-vocab';
+import { Button, ButtonGroup, Input, Legend } from '@/components/ui';
+import { PHASE_ACTOR_LABELS, type UiState } from '@/lib/status-vocab';
+import { describePhase, describeWord, type StatusView } from '@shared/status-model.js';
+import { BOARD_ORDER } from '@shared/phase-model.js';
 import { weight } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import { useNarrow, useTouch } from '@/lib/media';
@@ -95,6 +109,18 @@ const FIT_MIN_K = 0.06;
  */
 const ZOOM_STEP = 1.1;
 
+/**
+ * Where a station search lands: a zoom at which the station's name reads.
+ * Never a zoom-out — a search from closer in keeps the reader's zoom.
+ */
+const FIND_K = 1;
+
+/** A plan this long gets the station search; a shorter one is read at a glance. */
+const FIND_FROM = 20;
+
+/** The minimap strip's height, in CSS pixels. Wide enough is the plan's own shape. */
+const MINIMAP_H = 56;
+
 /** Exported for the test that re-derives the floor from the two it depends on. */
 export const MAP_CONSTANTS = {
   COL_W,
@@ -107,6 +133,9 @@ export const MAP_CONSTANTS = {
   FIT_MIN_K,
   FIT_MAX_K,
   ZOOM_STEP,
+  FIND_K,
+  FIND_FROM,
+  MINIMAP_H,
 };
 
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value));
@@ -175,6 +204,8 @@ interface DrawnEdge {
   d: string;
   /** The draw-in stagger column, already capped. */
   i: number;
+  /** Its bounding box in plan units — what the window test asks. */
+  box: PlanRect;
 }
 
 /**
@@ -326,6 +357,121 @@ export function centreView(k: number, frame: Box, content: Box, at?: { x: number
 }
 
 /**
+ * Fit-to-width: every row of the plan across the frame, never below the floor.
+ *
+ * A plan's WIDTH, on this map, is its breadth — the phases that stand side by
+ * side in one wave, drawn down the frame — and its LENGTH is its waves, drawn
+ * left to right. At seventy stations the length is what cannot fit: a fit of
+ * the whole plan drew a phone's stations at 1.9 px. Fitting the width instead
+ * keeps every parallel track on screen at a size a finger can take, and the
+ * reader travels the length by panning, the way a line map is read.
+ */
+export function rowsScale(frame: Box, content: Box): number {
+  return clamp(frame.h / Math.max(content.h, 1), MIN_K, FIT_MAX_K);
+}
+
+/**
+ * Too big to show whole at a tappable zoom.
+ *
+ * The one predicate behind everything that changes at scale — the opening
+ * view, the minimap, the Fit-rows button — so they cannot disagree about which
+ * plans they are for. An unmeasured frame is never crowded.
+ */
+export function crowded(frame: Box, content: Box): boolean {
+  return frame.w > 0 && frame.h > 0 && fitScale(frame, content) < MIN_K;
+}
+
+/**
+ * The zoom a plan opens at: the whole plan, unless that draws it below the
+ * floor — then fit-to-width. The minimap is what says there is more, which is
+ * the job the whole-plan fit was doing by being unreadable.
+ */
+export function openingScale(frame: Box, content: Box): number {
+  return crowded(frame, content) ? rowsScale(frame, content) : fitScale(frame, content);
+}
+
+/** A rectangle in plan units. */
+export interface PlanRect {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+/**
+ * What the window shows, plus one wave and one row of margin on every side —
+ * what gets drawn. The margin is what keeps a pan from uncovering bare paper
+ * for a frame before the stations it arrived at are drawn.
+ */
+export function drawWindow(view: MapView, box: Box): PlanRect {
+  return { x0: view.x - COL_W, y0: view.y - ROW_H, x1: view.x + box.w + COL_W, y1: view.y + box.h + ROW_H };
+}
+
+const inRect = (rect: PlanRect, x: number, y: number) =>
+  x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1;
+
+const overlaps = (rect: PlanRect, x0: number, y0: number, x1: number, y1: number) =>
+  x1 >= rect.x0 && x0 <= rect.x1 && y1 >= rect.y0 && y0 <= rect.y1;
+
+/** The keys that walk the stations. */
+const STATION_MOVES: ReadonlySet<string> = new Set([
+  'ArrowLeft',
+  'ArrowRight',
+  'ArrowUp',
+  'ArrowDown',
+  'Home',
+  'End',
+]);
+
+/**
+ * Where an arrow key goes from a station — the map's keyboard, as arithmetic.
+ *
+ * Left and right cross to the nearest wave that has anyone in it, landing on
+ * the station nearest in height; up and down move within the wave; Home and
+ * End are the plan's first and last phase. Every station is reachable: every
+ * wave by left and right, every station of a wave by up and down.
+ */
+export function neighbour(points: ReadonlyMap<number, PlacedNode>, from: number, key: string): number | null {
+  const all = [...points.values()];
+  if (!all.length) return null;
+  if (key === 'Home') return Math.min(...all.map((node) => node.phase));
+  if (key === 'End') return Math.max(...all.map((node) => node.phase));
+  const here = points.get(from);
+  if (!here) return null;
+  const nearest = (list: PlacedNode[]) =>
+    list.sort((a, b) => Math.abs(a.y - here.y) - Math.abs(b.y - here.y) || a.y - b.y)[0]?.phase ?? null;
+  if (key === 'ArrowUp' || key === 'ArrowDown') {
+    const dir = key === 'ArrowDown' ? 1 : -1;
+    return nearest(all.filter((node) => node.layer === here.layer && (node.y - here.y) * dir > 0));
+  }
+  if (key === 'ArrowLeft' || key === 'ArrowRight') {
+    const dir = key === 'ArrowRight' ? 1 : -1;
+    const ahead = all.filter((node) => (node.layer - here.layer) * dir > 0);
+    if (!ahead.length) return null;
+    const layers = ahead.map((node) => node.layer);
+    const layer = dir > 0 ? Math.min(...layers) : Math.max(...layers);
+    return nearest(ahead.filter((node) => node.layer === layer));
+  }
+  return null;
+}
+
+/**
+ * The stations a search names, best first: the phase whose NUMBER it is
+ * (`38`, `p38`, `#38`, `phase 38`), then every title that contains it, in plan
+ * order.
+ */
+export function findStations(nodes: readonly RouteNode[], query: string): number[] {
+  const text = query.trim().toLowerCase();
+  if (!text) return [];
+  const number = text.match(/^(?:phase\s*|p\s*|#)?(\d+)$/)?.[1];
+  const exact = number == null ? [] : nodes.filter((node) => node.phase === Number(number));
+  const titled = nodes
+    .filter((node) => !exact.includes(node) && node.title.toLowerCase().includes(text))
+    .sort((a, b) => a.phase - b.phase);
+  return [...exact, ...titled].map((node) => node.phase);
+}
+
+/**
  * The frame's size in CSS pixels, kept current.
  *
  * Measured in a LAYOUT effect, and seeded from the node if one is already
@@ -425,11 +571,12 @@ export function useMapView({
   const focusRef = useRef(focusPoint);
   focusRef.current = focusPoint;
 
-  const fitView = useCallback(
-    (at?: { x: number; y: number } | null) => {
+  /** The window at a scale this frame and this plan decide, looking at `at`. */
+  const viewAt = useCallback(
+    (scale: (frame: Box, content: Box) => number, at?: { x: number; y: number } | null) => {
       setView((v) => {
         if (!size.w || !size.h) return v;
-        return centreView(fitScale(size, content), size, content, at ?? undefined);
+        return centreView(scale(size, content), size, content, at ?? undefined);
       });
     },
     [size, content],
@@ -438,8 +585,10 @@ export function useMapView({
   /*
    * One effect owns every automatic move, so the open and the resize cannot
    * race each other. `framed` is what tells the two apart: a fitKey that has
-   * not been opened is an open (fit, then look at the focus point); a frame
-   * whose measurements changed is a resize.
+   * not been opened is an open (the opening scale, looking at the focus
+   * point); a frame whose measurements changed is a resize. Both open the way
+   * a plan opens — the whole of it, or fit-to-width when that is crowded —
+   * and both look at the focus point, which a whole-plan fit ignores anyway.
    */
   const opened = useRef<string | null>(null);
   const framed = useRef<Box>({ w: 0, h: 0 });
@@ -452,11 +601,11 @@ export function useMapView({
     if (fresh) {
       opened.current = fitKey;
       touched.current = false;
-      fitView(focusRef.current);
+      viewAt(openingScale, focusRef.current);
       return;
     }
-    if (!touched.current) fitView();
-  }, [fitKey, size.w, size.h, fitView]);
+    if (!touched.current) viewAt(openingScale, focusRef.current);
+  }, [fitKey, size.w, size.h, viewAt]);
 
   /** Zoom about a point in the frame, so what is under the finger stays there. */
   const zoomAt = useCallback((px: number, py: number, next: (k: number) => number) => {
@@ -584,10 +733,57 @@ export function useMapView({
     onPointerUp(event);
   };
 
+  /** The whole plan — the overview, below the floor if that is what it takes. */
   const fit = () => {
     touched.current = false;
-    fitView();
+    viewAt(fitScale);
   };
+
+  /**
+   * Fit-to-width, around the wave the reader is looking at: every row, and
+   * the same stretch of the route that was in the middle of the frame.
+   */
+  const fitRows = () => {
+    touched.current = false;
+    const vw = (size.w || width * view.k) / view.k;
+    viewAt(rowsScale, { x: view.x + vw / 2, y: contentH / 2 });
+  };
+
+  /** Centre on a plan point at `k` — a search's answer, a press on the minimap. */
+  const lookAt = useCallback(
+    (at: { x: number; y: number }, k?: number) => {
+      setView((v) => {
+        if (!size.w || !size.h) return v;
+        touched.current = true;
+        return centreView(clamp(k ?? v.k, MIN_K, MAX_K), size, content, at);
+      });
+    },
+    [size, content],
+  );
+
+  /**
+   * Bring a plan point inside the window with a station's room around it,
+   * moving as little as possible and keeping the zoom — what the keyboard
+   * does as it walks off the edge of what is drawn.
+   */
+  const reveal = useCallback(
+    (at: { x: number; y: number }) => {
+      setView((v) => {
+        if (!size.w || !size.h) return v;
+        const vw = size.w / v.k;
+        const vh = size.h / v.k;
+        const mx = Math.min(COL_W / 2, vw / 2);
+        const my = Math.min(ROW_H / 2, vh / 2);
+        const x = at.x < v.x + mx ? at.x - mx : at.x > v.x + vw - mx ? at.x - vw + mx : v.x;
+        const y = at.y < v.y + my ? at.y - my : at.y > v.y + vh - my ? at.y - vh + my : v.y;
+        const next = clampView({ k: v.k, x, y }, size, content);
+        if (next.x === v.x && next.y === v.y) return v;
+        touched.current = true;
+        return next;
+      });
+    },
+    [size, content],
+  );
 
   /**
    * Zoom about the middle of what is currently drawn.
@@ -605,6 +801,9 @@ export function useMapView({
     view,
     size,
     fit,
+    fitRows,
+    lookAt,
+    reveal,
     zoomCentre,
     /** Read at click time: a drag that crossed a station is not a tap on it. */
     dragged,
@@ -649,28 +848,68 @@ export function markGeometry(r: number) {
   };
 }
 
-/** The drawn marks. A glyph, never a letter: text at this size is a smudge. */
-type MarkGlyph = 'check' | 'play' | 'next' | 'wait' | 'alert' | 'gate';
+/**
+ * The map's one door to theme.css's `.state-*` → `--state` bridge. A station,
+ * its legend mark and the minimap's dots all paint through it — and the paint
+ * is always a view's (`describePhase`), never a word the map folded itself
+ * (control-tower phase 31).
+ */
+const stateClass = (paint: UiState) => `state-${paint}`;
 
 /**
- * The glyph each UI state wears. Five reach the map (`BOARD_STATE_UI` emits
- * done, running, queued, waiting and needs-you); the other three are given the
- * nearest reading rather than a blank, because a state with no glyph is the
- * one case a reader cannot tell from a rendering bug.
+ * What a station IS: the status model's view of its board word, with the
+ * run's `verifying` record joined in (the board has no such bucket). The board
+ * saying `done` wins over any record, which is `describePhase`'s first rule.
+ */
+const VERIFYING_RECORD = { status: 'verifying' } as const;
+const stationView = (state: string, verifying?: boolean): StatusView =>
+  describePhase(verifying ? VERIFYING_RECORD : null, { boardState: state });
+
+/** The drawn marks. A glyph, never a letter: text at this size is a smudge. */
+type MarkGlyph = 'check' | 'play' | 'next' | 'wait' | 'alert' | 'gate' | 'scan';
+
+/**
+ * The glyph a view's own icon draws as, at station size — so two words that
+ * share a paint still look different (`stuck` is a quiet wait in the model, and
+ * wears the alert its icon names, not the hourglass `waiting` wears).
+ */
+const ICON_GLYPH: Readonly<Record<string, MarkGlyph>> = {
+  'circle-check': 'check',
+  'circle-play': 'play',
+  'circle-arrow-right': 'next',
+  hourglass: 'wait',
+  'circle-alert': 'alert',
+  'octagon-x': 'alert',
+  lock: 'gate',
+  'search-check': 'scan',
+};
+
+/**
+ * The glyph each paint wears when its view names no icon the map draws. Every
+ * paint has one — a state with no glyph is the one case a reader cannot tell
+ * from a rendering bug.
  */
 const STATE_GLYPH: Record<UiState, MarkGlyph> = {
   'needs-you': 'alert',
   failed: 'alert',
   running: 'play',
-  verifying: 'play',
+  verifying: 'scan',
   waiting: 'wait',
   queued: 'next',
   skipped: 'wait',
   done: 'check',
 };
 
-/** The two states whose ring is part of the reading, not decoration. */
-const RINGED: ReadonlySet<UiState> = new Set<UiState>(['running', 'needs-you']);
+/** A view's glyph: its own icon's, else its paint's. */
+const glyphOf = (view: Pick<StatusView, 'icon' | 'paint'>): MarkGlyph =>
+  ICON_GLYPH[view.icon] ?? STATE_GLYPH[view.paint];
+
+/**
+ * The states whose ring is part of the reading, not decoration: the running
+ * family (running, and verifying — told apart by the ring's dash, as the design
+ * law has it) and needs-you, whose solid heavy ring is the summons.
+ */
+const RINGED: ReadonlySet<UiState> = new Set<UiState>(['running', 'verifying', 'needs-you']);
 
 function Glyph({ kind, cx, cy, g }: { kind: MarkGlyph; cx: number; cy: number; g: number }) {
   switch (kind) {
@@ -711,6 +950,17 @@ function Glyph({ kind, cx, cy, g }: { kind: MarkGlyph; cx: number; cy: number; g
         <>
           <path className="mark-glyph" d={`M${n2(cx)},${n2(cy - g)} L${n2(cx)},${n2(cy + 0.15 * g)}`} />
           <circle className="mark-glyph filled" cx={n2(cx)} cy={n2(cy + 0.72 * g)} r={n2(0.22 * g)} />
+        </>
+      );
+    case 'scan':
+      // A lens and its handle: the console reading a finished session's work.
+      return (
+        <>
+          <circle className="mark-glyph" cx={n2(cx - 0.2 * g)} cy={n2(cy - 0.2 * g)} r={n2(0.62 * g)} />
+          <path
+            className="mark-glyph"
+            d={`M${n2(cx + 0.25 * g)},${n2(cy + 0.25 * g)} L${n2(cx + g)},${n2(cy + g)}`}
+          />
         </>
       );
     case 'gate':
@@ -755,24 +1005,29 @@ function MarkChip({
 }
 
 /**
- * The dot, its state ring and its state chip — the whole of what a state says.
+ * The dot, its state ring and its state chip — the whole of what a state says:
+ * the ring by the view's paint, the glyph by the view's own icon.
  *
  * Rendered by the map at `R` and by the legend at the same `R` scaled down by
  * its viewBox, so the two cannot drift.
  */
-export function StationMark({ ui, x, y, r }: { ui: UiState; x: number; y: number; r: number }) {
+export function StationMark({
+  view,
+  x,
+  y,
+  r,
+}: {
+  view: Pick<StatusView, 'icon' | 'paint'>;
+  x: number;
+  y: number;
+  r: number;
+}) {
   const geo = markGeometry(r);
   return (
     <>
-      {RINGED.has(ui) && <circle className="state-ring" cx={x} cy={y} r={geo.ring} />}
+      {RINGED.has(view.paint) && <circle className="state-ring" cx={x} cy={y} r={geo.ring} />}
       <circle className="dot" cx={x} cy={y} r={r} />
-      <MarkChip
-        kind={STATE_GLYPH[ui]}
-        cx={x + geo.offset}
-        cy={y - geo.offset}
-        chip={geo.chip}
-        g={geo.glyph}
-      />
+      <MarkChip kind={glyphOf(view)} cx={x + geo.offset} cy={y - geo.offset} chip={geo.chip} g={geo.glyph} />
     </>
   );
 }
@@ -830,6 +1085,8 @@ interface Train extends BatchGroup {
   nodes: PlacedNode[];
   path: string;
   head: PlacedNode;
+  /** The stations' bounding box, in plan units — what the window test asks. */
+  box: PlanRect;
 }
 
 /**
@@ -842,6 +1099,13 @@ interface Train extends BatchGroup {
 export interface PhaseDriver {
   live?: PhaseLive;
   lock?: PhaseLock;
+  /**
+   * The console is running this phase's §Verification — its run record reads
+   * `verifying`. A board word cannot say it (the board has no such bucket), so
+   * the plan page joins it from the run, and the station wears the verifying
+   * mark instead of its board word's.
+   */
+  verifying?: boolean;
 }
 
 /* ------------------------------------------------------------------ *
@@ -859,12 +1123,17 @@ export interface PhaseDriver {
  */
 export function stationFacts(
   node: { phase: number; title: string; size: string; gated?: boolean; locked?: 'live' | 'stale' },
-  state: PhaseState,
+  /** The board word, as the engine spells it — named by the status model's board row. */
+  state: string,
   needs: number[] | undefined,
   driver?: PhaseDriver,
   critical?: boolean,
 ): string[] {
-  const lines = [`Phase ${node.phase} — ${node.title}`, `${boardLabel(state)} · size ${node.size}`];
+  const lines = [
+    `Phase ${node.phase} — ${node.title}`,
+    `${describeWord('board', state).label} · size ${node.size}`,
+  ];
+  if (driver?.verifying) lines.push('verifying — the console is running its checks');
   if (needs?.length) lines.push(`needs ${needs.map((p) => `P${p}`).join(' · ')}`);
   if (node.gated) lines.push('gated — a person must clear it before it boards');
   if (critical) lines.push('on the critical path');
@@ -897,10 +1166,10 @@ const LEGEND_BOX = 27;
  * Named for what it draws rather than for where it is shown: the legend is a
  * shared primitive now, and this is the map's contribution to it.
  */
-function MarkSvg({ ui, live, children }: { ui?: UiState; live?: boolean; children: React.ReactNode }) {
+function MarkSvg({ paint, live, children }: { paint?: UiState; live?: boolean; children: React.ReactNode }) {
   return (
     <svg
-      className={cn('legend-mark route-mark', ui && `state-${ui}`, live && 'live')}
+      className={cn('legend-mark route-mark', paint && stateClass(paint), live && 'live')}
       viewBox={`${-LEGEND_BOX} ${-LEGEND_BOX} ${LEGEND_BOX * 2} ${LEGEND_BOX * 2}`}
       width="22"
       height="22"
@@ -913,16 +1182,11 @@ function MarkSvg({ ui, live, children }: { ui?: UiState; live?: boolean; childre
 }
 
 /**
- * The five states a board word reaches, worst first, plus everything else the
- * map draws. `ready` reads "Next up" like every badge in the console.
+ * The five board words, in the operator's order (`BOARD_ORDER`), each as the
+ * status model draws it — its own word ("Next up", "Stuck"), its paint and its
+ * glyph. Everything else the map draws is in the fold below.
  */
-const LEGEND_STATES: readonly { state: UiState; label: string }[] = [
-  { state: 'needs-you', label: STATE_META['needs-you'].label },
-  { state: 'running', label: STATE_META.running.label },
-  { state: 'queued', label: boardLabel('ready') },
-  { state: 'waiting', label: STATE_META.waiting.label },
-  { state: 'done', label: STATE_META.done.label },
-];
+const LEGEND_WORDS: readonly StatusView[] = BOARD_ORDER.map((word) => describeWord('board', word));
 
 /** The order the driver chips are explained in — the vocabulary's own. */
 const LEGEND_ACTORS = Object.keys(PHASE_ACTOR_LABELS) as PhaseActor[];
@@ -939,21 +1203,33 @@ const LEGEND_ACTORS = Object.keys(PHASE_ACTOR_LABELS) as PhaseActor[];
 function RouteLegend() {
   const [open, setOpen] = useState(false);
   const geo = markGeometry(LEGEND_R);
-  const states = LEGEND_STATES.map(({ state, label }) => ({
-    key: state,
-    label,
+  const states = LEGEND_WORDS.map((view) => ({
+    key: view.word ?? view.label,
+    label: view.label,
     mark: (
-      <MarkSvg ui={state} live={state === 'running'}>
-        <StationMark ui={state} x={0} y={0} r={LEGEND_R} />
+      <MarkSvg paint={view.paint} live={view.tense === 'live'}>
+        <StationMark view={view} x={0} y={0} r={LEGEND_R} />
       </MarkSvg>
     ),
   }));
+  const verifying = stationView('in-progress', true);
   const rest = [
+    // Not a board word, so not among the five: a phase is verifying only while
+    // a run is checking it, and the key names it beside the other joined facts.
+    {
+      key: 'verifying',
+      label: verifying.label,
+      mark: (
+        <MarkSvg paint={verifying.paint}>
+          <StationMark view={verifying} x={0} y={0} r={LEGEND_R} />
+        </MarkSvg>
+      ),
+    },
     {
       key: 'gated',
       label: 'Gated',
       mark: (
-        <MarkSvg ui="needs-you">
+        <MarkSvg paint="needs-you">
           <circle className="gate-ring" cx={0} cy={0} r={geo.gate} fill="url(#gate-hatch)" />
           <circle className="dot" cx={0} cy={0} r={LEGEND_R} />
           <MarkChip kind="gate" cx={-geo.offset} cy={geo.offset} chip={geo.chip} g={geo.glyph} />
@@ -964,7 +1240,7 @@ function RouteLegend() {
       key: 'claimed',
       label: 'Claimed',
       mark: (
-        <MarkSvg ui="waiting">
+        <MarkSvg paint="waiting">
           <circle className="claim-ring live" cx={0} cy={0} r={geo.claim} />
           <circle className="dot" cx={0} cy={0} r={LEGEND_R} />
         </MarkSvg>
@@ -974,7 +1250,7 @@ function RouteLegend() {
       key: 'lapsed',
       label: 'Lapsed claim',
       mark: (
-        <MarkSvg ui="waiting">
+        <MarkSvg paint="waiting">
           <circle className="claim-ring stale" cx={0} cy={0} r={geo.claim} />
           <circle className="dot" cx={0} cy={0} r={LEGEND_R} />
         </MarkSvg>
@@ -984,7 +1260,7 @@ function RouteLegend() {
       key: `actor-${actor}`,
       label: PHASE_ACTOR_LABELS[actor],
       mark: (
-        <MarkSvg ui="running" live>
+        <MarkSvg paint="running" live>
           <circle className="dot" cx={0} cy={0} r={LEGEND_R} />
           <ActorChip actor={actor} cx={geo.offset} cy={geo.offset} chip={geo.chip} />
         </MarkSvg>
@@ -997,7 +1273,7 @@ function RouteLegend() {
     },
     {
       key: 'train',
-      label: 'Session batch',
+      label: 'Batch by hand',
       mark: <span className="legend-line train" aria-hidden />,
     },
     // The ruling is `aria-hidden` on the map — forty stray "wave 3, 5" text
@@ -1011,9 +1287,11 @@ function RouteLegend() {
       mark: <span className="legend-band" aria-hidden />,
     },
   ];
+  // Sentence case, never all caps: the 6.0 law retires capitals as a label
+  // style, and a word the status model spells ("Next up") is read as it is spelled.
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-      <Legend entries={states} inline className="gap-x-3 gap-y-1.5 font-display uppercase tracking-wider" />
+      <Legend entries={states} inline className="gap-x-3 gap-y-1.5 font-display" />
       <Button
         size="sm"
         variant="ghost"
@@ -1023,12 +1301,125 @@ function RouteLegend() {
       >
         {open ? 'Less' : 'Key'}
       </Button>
-      {open && (
-        <Legend entries={rest} inline className="gap-x-3 gap-y-1.5 font-display uppercase tracking-wider" />
-      )}
+      {open && <Legend entries={rest} inline className="gap-x-3 gap-y-1.5 font-display" />}
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ *
+ * The minimap
+ * ------------------------------------------------------------------ */
+
+/**
+ * The whole plan, small, under the frame — and the window's place on it.
+ *
+ * Drawn only for a CROWDED plan, the one the frame cannot show whole at a
+ * tappable zoom, and for every frame of it, so the strip never comes and goes
+ * under a pan. Its DOM is bounded however long the plan grows: all track is
+ * ONE path, and the stations are one path per state they stand in, each
+ * painted through `.state-*` like every other mark on the map.
+ *
+ * A pointer convenience, hidden from the accessibility tree: the keyboard has
+ * the arrow keys and the station search, which say more than a picture of
+ * dots. A press moves the window there; a sideways drag scrubs it; a vertical
+ * swipe stays the page's (`touch-action: pan-y`).
+ */
+function Minimap({
+  nodes,
+  edges,
+  paintOf,
+  content,
+  seen,
+  onJump,
+}: {
+  nodes: readonly PlacedNode[];
+  edges: readonly DrawnEdge[];
+  paintOf: (node: PlacedNode) => UiState;
+  content: Box;
+  seen: PlanRect;
+  onJump: (at: { x: number; y: number }) => void;
+}) {
+  const scale = MINIMAP_H / Math.max(content.h, 1);
+  // A dot never wider than the pitch between two stations, or the strip smears.
+  const r = Math.min(2.4, 0.42 * ROW_H * scale, 0.42 * COL_W * scale) / scale;
+  const track = useMemo(() => edges.map((edge) => edge.d).join(' '), [edges]);
+  const dots = useMemo(() => {
+    const byPaint = new Map<UiState, string[]>();
+    for (const node of nodes) {
+      const paint = paintOf(node);
+      const arc = `M${n2(node.x - r)},${n2(node.y)}a${n2(r)},${n2(r)} 0 1,0 ${n2(2 * r)},0a${n2(r)},${n2(r)} 0 1,0 ${n2(-2 * r)},0`;
+      const list = byPaint.get(paint);
+      if (list) list.push(arc);
+      else byPaint.set(paint, [arc]);
+    }
+    return [...byPaint].map(([paint, arcs]) => ({ paint, d: arcs.join('') }));
+  }, [nodes, paintOf, r]);
+
+  const scrubbing = useRef(false);
+  const stopScrub = () => {
+    scrubbing.current = false;
+  };
+  const jump = (event: React.PointerEvent<SVGSVGElement>) => {
+    const box = event.currentTarget.getBoundingClientRect();
+    if (!box.width || !box.height) return;
+    onJump({
+      x: ((event.clientX - box.left) / box.width) * content.w,
+      y: ((event.clientY - box.top) / box.height) * content.h,
+    });
+  };
+
+  return (
+    <svg
+      className="route-minimap"
+      viewBox={`0 0 ${n2(content.w)} ${n2(content.h)}`}
+      width={n2(content.w * scale)}
+      height={MINIMAP_H}
+      aria-hidden="true"
+      focusable="false"
+      onPointerDown={(event) => {
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+        scrubbing.current = true;
+        // A mouse keeps scrubbing past the strip's edge. A finger is not
+        // captured: its vertical swipe must stay free to become the page's.
+        if (event.pointerType === 'mouse') {
+          try {
+            event.currentTarget.setPointerCapture?.(event.pointerId);
+          } catch {
+            /* not capturable */
+          }
+        }
+        jump(event);
+      }}
+      onPointerMove={(event) => {
+        if (scrubbing.current) jump(event);
+      }}
+      onPointerUp={stopScrub}
+      onPointerCancel={stopScrub}
+      onLostPointerCapture={stopScrub}
+    >
+      <path className="minimap-track" d={track} />
+      {dots.map(({ paint, d }) => (
+        <path key={paint} className={cn('minimap-dots', stateClass(paint))} d={d} />
+      ))}
+      <rect
+        className="minimap-view"
+        x={n2(Math.max(0, seen.x0))}
+        y={n2(Math.max(0, seen.y0))}
+        width={n2(Math.max(0, Math.min(content.w, seen.x1) - Math.max(0, seen.x0)))}
+        height={n2(Math.max(0, Math.min(content.h, seen.y1) - Math.max(0, seen.y0)))}
+      />
+    </svg>
+  );
+}
+
+/** Whether a focus arrived by keyboard. Guarded: an engine without the selector throws. */
+const focusVisible = (el: Element): boolean => {
+  try {
+    return el.matches(':focus-visible');
+  } catch {
+    return false;
+  }
+};
 
 /* ------------------------------------------------------------------ *
  * The map
@@ -1073,6 +1464,7 @@ export function RouteMap({
   className,
 }: RouteMapProps) {
   const { points, width, height } = useMemo(() => positions(route), [route]);
+  const stations = useMemo(() => [...points.values()], [points]);
   const geo = useMemo(() => markGeometry(R), []);
   const bands = useMemo(() => platforms(route, width), [route, width]);
 
@@ -1101,19 +1493,32 @@ export function RouteMap({
         key: `${edge.from}-${edge.to}`,
         from: edge.from,
         to: edge.to,
-        done: boardUiState(asPhaseState(from.state)) === 'done',
+        done: from.state === 'done',
         d: trackPath(from, to),
         i: Math.min(from.layer, STAGGER_CAP),
+        box: {
+          x0: Math.min(from.x, to.x),
+          y0: Math.min(from.y, to.y),
+          x1: Math.max(from.x, to.x),
+          y1: Math.max(from.y, to.y),
+        },
       };
       if (critical?.has(edge.from) && critical.has(edge.to)) trunk.push(drawnEdge);
       else plain.push(drawnEdge);
     }
     return { plain, trunk };
   }, [route.edges, points, critical]);
+  const allEdges = useMemo(() => drawn.plain.concat(drawn.trunk), [drawn]);
 
   const [hover, setHover] = useState<number | null>(null);
   /** The station a finger asked about — there is no hover to ask with. */
   const [peek, setPeek] = useState<number | null>(null);
+  /** The station a search went to — rung, like the one the map opened on. */
+  const [found, setFound] = useState<number | null>(null);
+  /** The station holding the map's one tab stop — where the keyboard is. */
+  const [current, setCurrent] = useState<number | null>(null);
+  const [query, setQuery] = useState('');
+  const [hit, setHit] = useState(-1);
   const [prefs, setPrefs] = usePrefs();
   const narrow = useNarrow();
   const touch = useTouch();
@@ -1122,7 +1527,7 @@ export function RouteMap({
     const point = focus == null ? undefined : points.get(focus);
     return point ? { x: point.x, y: point.y } : null;
   }, [focus, points]);
-  const { frame, view, size, fit, zoomCentre, dragged, handlers } = useMapView({
+  const { frame, view, size, fit, fitRows, lookAt, reveal, zoomCentre, dragged, handlers } = useMapView({
     width,
     contentH: height,
     fitKey,
@@ -1130,8 +1535,48 @@ export function RouteMap({
     interactive: prefs.mapPanZoom,
   });
 
-  // A new plan is a new map: whatever a finger was asking about is gone.
-  useEffect(() => setPeek(null), [fitKey]);
+  // A new plan is a new map: whatever a finger or a search was asking about
+  // is gone, and the keyboard starts again where the map opened.
+  useEffect(() => {
+    setPeek(null);
+    setFound(null);
+    setCurrent(null);
+    setQuery('');
+    setHit(-1);
+  }, [fitKey]);
+
+  /**
+   * The ONE station in the tab order. Seventy tab stops is seventy presses to
+   * get past the map; one, and the arrow keys inside it, is a composite
+   * widget's own pattern. It starts where the map opened.
+   */
+  const tabStop = useMemo(() => {
+    if (current != null && points.has(current)) return current;
+    if (focus != null && points.has(focus)) return focus;
+    return stations.length ? Math.min(...stations.map((node) => node.phase)) : null;
+  }, [current, focus, points, stations]);
+
+  /* A keyboard move re-renders first (the station it went to may only now be
+     inside the window, and so only now drawn), then takes focus. */
+  const svg = useRef<SVGSVGElement>(null);
+  const pendingFocus = useRef<number | null>(null);
+  useEffect(() => {
+    const phase = pendingFocus.current;
+    if (phase == null) return;
+    const node = svg.current?.querySelector<SVGGElement>(`.station[data-phase="${phase}"]`);
+    if (!node) return;
+    pendingFocus.current = null;
+    node.focus();
+  });
+
+  const walk = (from: number, key: string) => {
+    const next = neighbour(points, from, key);
+    const point = next == null ? undefined : points.get(next);
+    if (next == null || !point) return;
+    setCurrent(next);
+    pendingFocus.current = next;
+    reveal(point);
+  };
 
   /** What each station waits on — the edges, read the way a tooltip needs them. */
   const incoming = useMemo(() => {
@@ -1144,12 +1589,20 @@ export function RouteMap({
     return map;
   }, [route]);
 
+  /** A station's view: the board's word, with the run's `verifying` record joined in. */
+  const viewOf = useCallback(
+    (node: RouteNode): StatusView => stationView(node.state, drivers?.get(node.phase)?.verifying),
+    [drivers],
+  );
+  const paintOf = useCallback((node: RouteNode): UiState => viewOf(node).paint, [viewOf]);
+
   /* Hover is the desktop's question and `peek` the phone's; both dim the rest
      of the network down to the station's own neighbours. `selected` does NOT —
      it is where the map opened, and a map that dimmed nine tenths of itself the
-     moment it opened would be answering a question nobody asked. */
+     moment it opened would be answering a question nobody asked. A search's
+     answer is rung the same way and dims nothing either. */
   const highlight = hover ?? peek ?? null;
-  const ringed = peek ?? selected ?? null;
+  const ringed = peek ?? found ?? selected ?? null;
   const related = useMemo(() => {
     if (highlight == null) return null;
     const set = new Set<number>([highlight]);
@@ -1179,6 +1632,12 @@ export function RouteMap({
             nodes: ordered,
             path: ordered.map((node, i) => `${i === 0 ? 'M' : 'L'}${node.x},${node.y}`).join(' '),
             head: ordered[0],
+            box: {
+              x0: Math.min(...ordered.map((node) => node.x)),
+              y0: Math.min(...ordered.map((node) => node.y)),
+              x1: Math.max(...ordered.map((node) => node.x)),
+              y1: Math.max(...ordered.map((node) => node.y)),
+            },
           };
         })
         .filter((t): t is Train => Boolean(t)),
@@ -1190,6 +1649,33 @@ export function RouteMap({
      division by zero. */
   const boxW = (size.w || width * view.k) / view.k;
   const boxH = (size.h || height * view.k) / view.k;
+  const content = useMemo<Box>(() => ({ w: width, h: height }), [width, height]);
+  const isCrowded = crowded(size, content);
+
+  /**
+   * Windowed drawing: a station, a track, a train or a wave's heading is drawn
+   * only when it stands inside the window or its margin. Unmeasured, the
+   * window is the whole plan. The station holding the tab stop, and the ones a
+   * search or a finger is asking about, are drawn wherever they are — focus
+   * cannot land on an element that is not there.
+   */
+  const win = size.w && size.h ? drawWindow(view, { w: boxW, h: boxH }) : null;
+  const pinned = (phase: number) => phase === tabStop || phase === found || phase === peek;
+  const shown = win ? stations.filter((node) => inRect(win, node.x, node.y) || pinned(node.phase)) : stations;
+  const shownSet = new Set(shown.map((node) => node.phase));
+  const edgeShown = (edge: DrawnEdge) =>
+    !win || overlaps(win, edge.box.x0, edge.box.y0, edge.box.x1, edge.box.y1);
+  const plainShown = drawn.plain.filter(edgeShown);
+  const trunkShown = drawn.trunk.filter(edgeShown);
+  const bandsShown = win ? bands.filter((band) => band.right >= win.x0 && band.left <= win.x1) : bands;
+  const trainsShown = win
+    ? trains.filter((train) => overlaps(win, train.box.x0, train.box.y0, train.box.x1, train.box.y1))
+    : trains;
+
+  /* What the minimap's caption says: the waves the frame shows, of how many. */
+  const lastLayer = Math.max(0, route.layers - 1);
+  const waveAt = (x: number) => clamp(Math.round((x - PAD) / COL_W), 0, lastLayer) + 1;
+  const wavesSeen = `Waves ${waveAt(view.x + COL_W / 2)}–${waveAt(view.x + boxW - COL_W / 2)} of ${route.layers}`;
 
   /* A station's hit area, in plan units, so it lands at 44 CSS px whatever the
      zoom. Capped at the row pitch: a target that overlaps its neighbour is
@@ -1200,7 +1686,7 @@ export function RouteMap({
   const peekFacts = peekNode
     ? stationFacts(
         peekNode,
-        asPhaseState(peekNode.state),
+        peekNode.state,
         incoming.get(peekNode.phase),
         drivers?.get(peekNode.phase),
         critical?.has(peekNode.phase),
@@ -1219,10 +1705,62 @@ export function RouteMap({
     onSelect?.(phase);
   };
 
+  /* The station search — a plan long enough to lose a station in. Enter goes
+     to the next match, Shift+Enter to the one before; the window moves to it
+     at a zoom its name reads at, and it takes the tab stop. */
+  const searchable = route.nodes.length >= FIND_FROM;
+  const matches = useMemo(() => findStations(route.nodes, query), [route.nodes, query]);
+  const go = (step: 1 | -1) => {
+    if (!matches.length) return;
+    const at = hit < 0 ? (step > 0 ? 0 : matches.length - 1) : (hit + step + matches.length) % matches.length;
+    const phase = matches[at]!;
+    const point = points.get(phase);
+    setHit(at);
+    setFound(phase);
+    setCurrent(phase);
+    if (point) lookAt(point, Math.max(view.k, FIND_K));
+  };
+  const findStatus = !query.trim()
+    ? ''
+    : !matches.length
+      ? 'No station matches'
+      : hit < 0
+        ? `${matches.length} ${matches.length === 1 ? 'match' : 'matches'}, press Enter`
+        : `${hit + 1} of ${matches.length}`;
+
   return (
     <div className={cn('overflow-hidden rounded-lg border border-rule bg-surface', className)}>
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-rule bg-surface-raised px-3 py-2">
         <RouteLegend />
+        {searchable && (
+          <div className="flex min-w-0 items-center gap-2 max-sm:w-full" role="search">
+            <Input
+              type="search"
+              aria-label="Find a station"
+              placeholder="Find a station"
+              className="w-44 max-sm:flex-1"
+              value={query}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setHit(-1);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  go(event.shiftKey ? -1 : 1);
+                } else if (event.key === 'Escape' && query) {
+                  event.preventDefault();
+                  setQuery('');
+                  setHit(-1);
+                  setFound(null);
+                }
+              }}
+            />
+            <span className="shrink-0 text-2xs text-ink-muted tabular-nums" aria-live="polite">
+              {findStatus}
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-2">
           <Button
             size="sm"
@@ -1251,6 +1789,15 @@ export function RouteMap({
             <Button size="sm" onClick={fit} title="Fit the whole plan — double-click the map does the same.">
               Fit
             </Button>
+            {isCrowded && (
+              <Button
+                size="sm"
+                onClick={fitRows}
+                title="Fit every row of the plan to the frame, then pan along its waves."
+              >
+                Fit rows
+              </Button>
+            )}
           </ButtonGroup>
         </div>
       </div>
@@ -1297,6 +1844,7 @@ export function RouteMap({
         {...handlers}
       >
         <svg
+          ref={svg}
           className="route-svg"
           width="100%"
           height="100%"
@@ -1306,7 +1854,7 @@ export function RouteMap({
              is a contradiction: an image has no interactive content, so a
              screen reader was told to ignore every station on the map. */
           role="group"
-          aria-label={`Phase dependency map — ${route.nodes.length} stations`}
+          aria-label={`Phase dependency map — ${route.nodes.length} stations; the arrow keys move between them`}
         >
           <defs>
             <pattern
@@ -1316,7 +1864,15 @@ export function RouteMap({
               patternTransform="rotate(45)"
               patternUnits="userSpaceOnUse"
             >
-              <line x1="0" y1="0" x2="0" y2="6" stroke="var(--line-gated)" strokeWidth="3" opacity="0.5" />
+              <line
+                x1="0"
+                y1="0"
+                x2="0"
+                y2="6"
+                stroke="var(--status-needs-you)"
+                strokeWidth="3"
+                opacity="0.5"
+              />
             </pattern>
             {/* Marker contents inherit from the `<defs>`, never from the path
                 that references them, so a marker cannot read the track's own
@@ -1358,7 +1914,7 @@ export function RouteMap({
               legend below teaches what a column means, in words, once. */}
           {bands.length > 1 && (
             <g className="platforms" aria-hidden="true">
-              {bands.map((band) => (
+              {bandsShown.map((band) => (
                 <g key={band.layer}>
                   {band.layer > 0 && (
                     <line
@@ -1391,28 +1947,38 @@ export function RouteMap({
           )}
 
           <g>
-            {trains.map((train) => (
+            {trainsShown.map((train) => (
               <g className="train" key={`train-${train.index}`}>
                 {train.nodes.length > 1 && <path className="train-line" d={train.path} />}
                 {/* Outside every ring the station itself wears, or the batch's
                     cordon reads as one more thing the phase is in. */}
-                {train.nodes.map((node) => (
-                  <circle key={node.phase} className="train-ring" cx={node.x} cy={node.y} r={geo.halo + 3} />
-                ))}
-                <text
-                  x={train.head.x}
-                  y={train.head.y - geo.halo - 6}
-                  className="band-label"
-                  textAnchor="middle"
-                >
-                  S{train.index} · {train.weight ?? ''}
-                  {budget ? `/${weight(budget)}` : ''}
-                  {train.gated ? ' · gated' : ''}
-                </text>
+                {train.nodes
+                  .filter((node) => shownSet.has(node.phase))
+                  .map((node) => (
+                    <circle
+                      key={node.phase}
+                      className="train-ring"
+                      cx={node.x}
+                      cy={node.y}
+                      r={geo.halo + 3}
+                    />
+                  ))}
+                {shownSet.has(train.head.phase) && (
+                  <text
+                    x={train.head.x}
+                    y={train.head.y - geo.halo - 6}
+                    className="band-label"
+                    textAnchor="middle"
+                  >
+                    S{train.index} · {train.weight ?? ''}
+                    {budget ? `/${weight(budget)}` : ''}
+                    {train.gated ? ' · gated' : ''}
+                  </text>
+                )}
               </g>
             ))}
 
-            {drawn.plain.map((edge) => (
+            {plainShown.map((edge) => (
               <path
                 key={edge.key}
                 className={cn(
@@ -1439,9 +2005,9 @@ export function RouteMap({
                 one at all. Nothing here is a second copy of an edge above:
                 `drawn` partitions, it does not duplicate, so the map still
                 draws exactly one `.track` per edge. */}
-            {drawn.trunk.length > 0 && (
+            {trunkShown.length > 0 && (
               <g className="trunk">
-                {drawn.trunk.map((edge) => (
+                {trunkShown.map((edge) => (
                   <path
                     key={`casing-${edge.key}`}
                     className={cn('track-casing', dimEdge(related, edge) && 'dim')}
@@ -1451,7 +2017,7 @@ export function RouteMap({
                     d={edge.d}
                   />
                 ))}
-                {drawn.trunk.map((edge) => (
+                {trunkShown.map((edge) => (
                   <path
                     key={edge.key}
                     className={cn(
@@ -1473,10 +2039,9 @@ export function RouteMap({
                 is a 13px circle at the fit zoom of a phone — a mark, not a
                 target. Transparent rather than `fill: none`, because `none`
                 does not receive pointer events at all. */}
-            {[...points.values()].map((node) => {
+            {shown.map((node) => {
               const dim = related && !related.has(node.phase);
-              const state = asPhaseState(node.state);
-              const ui = boardUiState(state);
+              const view = viewOf(node);
               const driver = drivers?.get(node.phase);
               const live = Boolean(driver?.live);
               const actor = driver?.live?.actor;
@@ -1494,28 +2059,40 @@ export function RouteMap({
                   key={node.phase}
                   className={cn(
                     'station route-mark',
-                    // The station wears its UI state; the CSS paints by it.
-                    `state-${ui}`,
+                    // The station wears its view's paint; the CSS paints by it.
+                    stateClass(view.paint),
                     live && 'live',
                     dim && 'dim',
                     ringed === node.phase && 'selected',
                   )}
-                  tabIndex={0}
+                  data-phase={node.phase}
+                  tabIndex={node.phase === tabStop ? 0 : -1}
                   role="button"
-                  aria-label={`Phase ${node.phase}: ${node.title}, ${boardLabel(state)}`}
+                  aria-label={`Phase ${node.phase}: ${node.title}, ${view.label}`}
                   onClick={() => choose(node.phase)}
                   onKeyDown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
                       event.preventDefault();
                       onSelect?.(node.phase);
+                    } else if (STATION_MOVES.has(event.key)) {
+                      event.preventDefault();
+                      walk(node.phase, event.key);
                     }
                   }}
                   onMouseEnter={() => setHover(node.phase)}
                   onMouseLeave={() => setHover(null)}
                   /* Focus has to light the same neighbours hover does, or the
                      keyboard walks the map with the one affordance the mouse
-                     gets for free switched off. */
-                  onFocus={() => setHover(node.phase)}
+                     gets for free switched off. A keyboard focus also brings
+                     the station into the window — Tab can land on the tab
+                     stop after the reader has panned away from it. A click
+                     does not move the map: it would move it under the finger
+                     between a phone's two taps. */
+                  onFocus={(event) => {
+                    setHover(node.phase);
+                    setCurrent(node.phase);
+                    if (focusVisible(event.currentTarget)) reveal(node);
+                  }}
                   onBlur={() => setHover(null)}
                 >
                   <circle className="station-hit" cx={node.x} cy={node.y} r={hitR} />
@@ -1532,7 +2109,7 @@ export function RouteMap({
                     <circle className={cn('claim-ring', claim)} cx={node.x} cy={node.y} r={geo.claim} />
                   )}
                   <circle className="halo" cx={node.x} cy={node.y} r={geo.halo} />
-                  <StationMark ui={ui} x={node.x} y={node.y} r={R} />
+                  <StationMark view={view} x={node.x} y={node.y} r={R} />
                   <text className="station-number" x={node.x} y={node.y + 4} textAnchor="middle">
                     {node.phase}
                   </text>
@@ -1556,7 +2133,13 @@ export function RouteMap({
                   )}
                   <StationLabel node={node} drop={geo.label} />
                   <title>
-                    {stationTitle(node, state, incoming.get(node.phase), driver, critical?.has(node.phase))}
+                    {stationTitle(
+                      node,
+                      node.state,
+                      incoming.get(node.phase),
+                      driver,
+                      critical?.has(node.phase),
+                    )}
                   </title>
                 </g>
               );
@@ -1564,6 +2147,23 @@ export function RouteMap({
           </g>
         </svg>
       </div>
+
+      {/* The whole plan and the window's place on it — a crowded plan only,
+          and for every frame of it, so the card never changes height under a
+          pan. The caption is the same fact in words. */}
+      {isCrowded && (
+        <div className="route-overview flex items-center gap-3 border-t border-rule bg-surface-raised px-3 py-2">
+          <Minimap
+            nodes={stations}
+            edges={allEdges}
+            paintOf={paintOf}
+            content={content}
+            seen={{ x0: view.x, y0: view.y, x1: view.x + boxW, y1: view.y + boxH }}
+            onJump={(at) => lookAt(at)}
+          />
+          <span className="text-2xs text-ink-muted tabular-nums">{wavesSeen}</span>
+        </div>
+      )}
     </div>
   );
 }

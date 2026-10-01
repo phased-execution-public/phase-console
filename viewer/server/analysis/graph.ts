@@ -13,11 +13,26 @@ import type { PhaseRow, PhaseSize } from '../parse/plan.ts';
 import type { Board, PhaseState } from '../engine.ts';
 import { budgetClassOf, loadModelsEnv } from '../runner/models.ts';
 
+/** One size's sessions per phase under the console, as `sizing.env` states them (× 100, and a percent). */
+export type SessionsPerPhaseEnv = { noWrapX100: number; wrapX100: number; wrapPct: number };
+
 export type Sizing = {
   S: number; M: number; L: number;
   budgetHaiku: number; budgetBig: number; budgetDefault: number;
   /** Any model carrying the `[1m]` window suffix. See `scripts/sizing.env`. */
   budget1m: number;
+  /**
+   * The session model (control-tower phase 59, #83): a fresh phase session's
+   * peak context ≈ `bootFloor + workFloor + slopePct/100 × weight`. The boot is
+   * per repository; this is the shipped one. See `analysis/sizing-model.ts`.
+   */
+  bootFloor: number;
+  workFloor: number;
+  slopePct: number;
+  /** The share of the window a session is sized to stay under (the console's wrap-up line). */
+  targetPct: number;
+  /** Measured sessions per phase, by size and by whether the phase wrapped — the forecast's unit. */
+  sessions: Record<PhaseSize, SessionsPerPhaseEnv>;
 };
 
 /**
@@ -32,6 +47,12 @@ export const SIZING_ENV_FALLBACK: Sizing = {
   S: 15_000, M: 40_000, L: 90_000,
   budgetHaiku: 40_000, budgetBig: 200_000, budgetDefault: 40_000,
   budget1m: 200_000,
+  bootFloor: 121_000, workFloor: 198_000, slopePct: 217, targetPct: 60,
+  sessions: {
+    S: { noWrapX100: 169, wrapX100: 200, wrapPct: 7 },
+    M: { noWrapX100: 146, wrapX100: 278, wrapPct: 15 },
+    L: { noWrapX100: 148, wrapX100: 254, wrapPct: 42 },
+  },
 };
 
 const FALLBACK = SIZING_ENV_FALLBACK;
@@ -51,6 +72,11 @@ export function loadSizing(scriptsDir: string): Sizing {
       const m = /^([A-Z0-9_]+)=(\d+)/.exec(line.trim());
       if (m) values[m[1]] = Number(m[2]);
     }
+    const perPhase = (size: PhaseSize): SessionsPerPhaseEnv => ({
+      noWrapX100: values[`SESSIONS_${size}_X100`] ?? FALLBACK.sessions[size].noWrapX100,
+      wrapX100: values[`SESSIONS_${size}_WRAP_X100`] ?? FALLBACK.sessions[size].wrapX100,
+      wrapPct: values[`WRAP_${size}_PCT`] ?? FALLBACK.sessions[size].wrapPct,
+    });
     return {
       S: values.SIZE_S ?? FALLBACK.S,
       M: values.SIZE_M ?? FALLBACK.M,
@@ -59,9 +85,14 @@ export function loadSizing(scriptsDir: string): Sizing {
       budgetBig: values.BUDGET_BIG ?? FALLBACK.budgetBig,
       budgetDefault: values.BUDGET_DEFAULT ?? FALLBACK.budgetDefault,
       budget1m: values.BUDGET_1M ?? FALLBACK.budget1m,
+      bootFloor: values.SESSION_BOOT_FLOOR ?? FALLBACK.bootFloor,
+      workFloor: values.SESSION_WORK_FLOOR ?? FALLBACK.workFloor,
+      slopePct: values.SESSION_SLOPE_PCT ?? FALLBACK.slopePct,
+      targetPct: values.SESSION_TARGET_PCT ?? FALLBACK.targetPct,
+      sessions: { S: perPhase('S'), M: perPhase('M'), L: perPhase('L') },
     };
   } catch {
-    return { ...FALLBACK };
+    return { ...FALLBACK, sessions: { ...FALLBACK.sessions } };
   }
 }
 
@@ -271,8 +302,9 @@ export function criticalPath(
   board: Board,
   sizes: Map<number, PhaseSize>,
   sizing: Sizing,
-  budget: number,
+  _budget: number,
   weights?: ReadonlyMap<number, number>,
+  table?: SessionsPerSize,
 ): CriticalPath {
   const best = new Map<number, { weight: number; path: number[] }>();
 
@@ -305,7 +337,10 @@ export function criticalPath(
   return {
     phases: overall.path,
     weight: overall.weight,
-    sessions: overall.weight > 0 ? Math.max(1, Math.ceil(overall.weight / budget)) : 0,
+    // The chain runs one phase after another, each in a session of its own at
+    // least (control-tower phase 59): its phases' measured sessions, not its
+    // weight over a budget.
+    sessions: sessionsFor(overall.path.map((phase) => sizes.get(phase)), table ?? shippedSessionsPerSize(sizing)),
   };
 }
 
@@ -350,11 +385,50 @@ export function remainingWork(
   board: Board,
   sizes: Map<number, PhaseSize>,
   sizing: Sizing,
-  budget: number,
+  _budget: number,
   weights?: ReadonlyMap<number, number>,
+  table?: SessionsPerSize,
 ): { weight: number; sessions: number; phases: number } {
   const remaining = rows.filter((r) => board.states[r.phase] !== 'done');
   const weight = remaining.reduce(
     (sum, r) => sum + (weights?.get(r.phase) ?? weightOf(sizes.get(r.phase), sizing)), 0);
-  return { weight, phases: remaining.length, sessions: weight ? Math.max(1, Math.ceil(weight / budget)) : 0 };
+  const sessions = sessionsFor(remaining.map((r) => sizes.get(r.phase)), table ?? shippedSessionsPerSize(sizing));
+  return { weight, phases: remaining.length, sessions };
+}
+
+/* ---- sessions, in the unit the console runs (control-tower phase 59, #83) ---- */
+
+/** Expected sessions per phase of each size — `sizing-model.ts` `sessionsPerPhaseOf`'s rows, or `sizing.env`'s. */
+export type SessionsPerSize = Record<PhaseSize, { expected: number }>;
+
+/**
+ * A phase's expected sessions from `sizing.env`'s integers — `((100 − WRAP) ×
+ * SESSIONS + WRAP × SESSIONS_WRAP) / 10000` — the arithmetic `phase-graph.sh
+ * --session-plan` does in bash, so the two agree to the session.
+ */
+export function expectedFromEnv(row: SessionsPerPhaseEnv): number {
+  return ((100 - row.wrapPct) * row.noWrapX100 + row.wrapPct * row.wrapX100) / 10_000;
+}
+
+/** The shipped rows: sizing.env's measured sessions per phase. */
+export function shippedSessionsPerSize(sizing: Sizing): SessionsPerSize {
+  return {
+    S: { expected: expectedFromEnv(sizing.sessions.S) },
+    M: { expected: expectedFromEnv(sizing.sessions.M) },
+    L: { expected: expectedFromEnv(sizing.sessions.L) },
+  };
+}
+
+/**
+ * The sessions `phases` are expected to take under the console — never a
+ * weight over a budget. The autopilot boards `1 phase ≥ 1 session` and never
+ * batches (#83 SIZ-3), so each phase counts its size's measured expectation,
+ * at least one; the sum is rounded half up in ten-thousandths, the engine's
+ * integer arithmetic, and never falls below the phase count. An unsized phase
+ * is an M, as everywhere.
+ */
+export function sessionsFor(phases: readonly (PhaseSize | undefined)[], table: SessionsPerSize): number {
+  if (!phases.length) return 0;
+  const units = phases.reduce((sum, size) => sum + Math.round(Math.max(1, table[size ?? 'M'].expected) * 10_000), 0);
+  return Math.max(phases.length, Math.floor((units + 5_000) / 10_000));
 }

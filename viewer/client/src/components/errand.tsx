@@ -21,11 +21,12 @@
 
 import { ArrowRight, Footprints, Hand, Loader2 } from 'lucide-react';
 import { RUNG_DRIVER_LABELS, drivableBy } from '@shared/ladder-model.js';
-import { Chip, RelativeTime } from '@/components/ui';
+import { Badge, RelativeTime, type BadgeTone } from '@/components/ui';
 import { money, relativeTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
 import type { Errand } from '@/lib/api';
 import type { LadderSituation, LadderView, TriedRung } from '@/lib/ladder';
+import { capArithmetic, SituationCategoryMark } from '@/components/halt-mark';
 
 /** What the actor word means for a situation with no rung left to climb. */
 const NO_RUNG_WORDS: Record<LadderSituation['actor'], string> = {
@@ -35,9 +36,9 @@ const NO_RUNG_WORDS: Record<LadderSituation['actor'], string> = {
   none: 'nothing is wrong',
 };
 
-const SITUATION_TONE: Record<LadderSituation['actor'], 'warn' | 'busy' | 'ok' | 'neutral'> = {
-  person: 'warn',
-  machine: 'busy',
+const SITUATION_TONE: Record<LadderSituation['actor'], BadgeTone> = {
+  person: 'accent',
+  machine: 'live',
   none: 'ok',
   wait: 'neutral',
 };
@@ -52,7 +53,7 @@ function TriedChip({ rung }: { rung: TriedRung }) {
     rung.outcome === 'fixed'
       ? 'ok'
       : rung.outcome === 'running'
-        ? 'busy'
+        ? 'live'
         : rung.outcome === 'failed'
           ? 'bad'
           : 'neutral';
@@ -70,10 +71,10 @@ function TriedChip({ rung }: { rung: TriedRung }) {
     .filter(Boolean)
     .join(' ');
   return (
-    <Chip tone={tone} title={title} data-testid="ladder-tried" data-driver={driver}>
+    <Badge tone={tone} title={title} data-testid="ladder-tried" data-driver={driver}>
       {rung.label}
       {rung.outcomeLabel && <span className="text-ink-faint"> → {rung.outcomeLabel}</span>}
-    </Chip>
+    </Badge>
   );
 }
 
@@ -93,12 +94,12 @@ export function LadderStrip({ view, className }: { view: LadderView; className?:
       {situation && (
         <span className="inline-flex items-center gap-1">
           <span className="text-ink-faint">Situation</span>
-          <Chip
+          <Badge
             tone={SITUATION_TONE[situation.actor]}
             title={`${situation.key} — ${situation.actor === 'machine' ? 'the autopilot climbs its ladder' : situation.actor === 'person' ? 'a person is needed' : situation.actor === 'wait' ? 'nothing to do but wait' : 'nothing is wrong'}`}
           >
             {situation.label}
-          </Chip>
+          </Badge>
         </span>
       )}
       {view.tried.length > 0 && (
@@ -112,7 +113,7 @@ export function LadderStrip({ view, className }: { view: LadderView; className?:
       )}
       {view.running && (
         <span className="inline-flex items-center gap-1" data-testid="ladder-running">
-          <Loader2 size={11} className="animate-spin text-progress" aria-hidden />
+          <Loader2 size={11} className="animate-spin text-running" aria-hidden />
           <span className="text-ink-faint">now</span>
           <span className="text-ink">{view.running.label}</span>
         </span>
@@ -121,9 +122,9 @@ export function LadderStrip({ view, className }: { view: LadderView; className?:
         <span className="inline-flex items-center gap-1" data-testid="ladder-next">
           <ArrowRight size={11} className="text-ink-faint" aria-hidden />
           <span className="text-ink-faint">next</span>
-          <Chip tone="busy" title={`${view.next.blurb}${view.next.spends ? '' : ' Free.'}`}>
+          <Badge tone="live" title={`${view.next.blurb}${view.next.spends ? '' : ' Free.'}`}>
             {view.next.label}
-          </Chip>
+          </Badge>
         </span>
       )}
       {!view.next && !view.running && !settled && situation && (
@@ -156,22 +157,41 @@ export function ErrandCard({
       role="note"
       data-testid="errand"
       aria-label={`Needs you${errand.phase ? ` — phase ${errand.phase}` : ''}`}
-      className={cn('rounded-md border border-action/55 bg-action/8 px-3 py-2 text-sm', className)}
+      // An errand is the one ask a person owes, so it is amber through `--accent`
+      // (tokens 6.0: `--action` is ink and would have quieted it).
+      className={cn('rounded-md border border-accent/55 bg-accent/8 px-3 py-2 text-sm', className)}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <Hand size={14} className="text-action" aria-hidden />
+        <Hand size={14} className="text-accent" aria-hidden />
         <strong className="font-medium text-ink">
           Needs you{errand.phase ? ` — phase ${errand.phase}` : ''}
         </strong>
-        <Chip tone="warn" title={errand.situation}>
+        <Badge tone="accent" title={errand.situation}>
           {situationLabel ?? errand.situation}
-        </Chip>
+        </Badge>
+        {/* The family the halt card uses (control-tower phase 17), so an ask
+            reads the same kind of stop wherever it is drawn. */}
+        <SituationCategoryMark situation={errand.situation} />
         {errand.at && <RelativeTime at={errand.at} className="ml-auto text-2xs text-ink-faint" />}
       </div>
       <p className="mt-1 max-w-prose text-sm text-ink">{errand.need}</p>
       <p className="mt-0.5 max-w-prose text-2xs text-ink-muted">
         <strong className="font-medium text-ink-muted">How:</strong> {errand.how}
       </p>
+      {/* A cap's arithmetic and the setting that raises it (#14) — "the
+          ladder's sessions did not carry it" with nothing tried told nobody
+          what was spent, or where. */}
+      {capArithmetic(errand) && (
+        <p className="mt-0.5 max-w-prose text-2xs text-ink-muted" data-testid="errand-cap">
+          {capArithmetic(errand)}
+        </p>
+      )}
+      {/* Said BEFORE the press (#14 ask 3): a Retry of this phase forgives what the cap counted. */}
+      {errand.replenishes && (
+        <p className="mt-0.5 max-w-prose text-2xs text-ink-muted" data-testid="errand-replenishes">
+          A Retry of this phase gives the cap back what it counted here — the rungs start again.
+        </p>
+      )}
       {!compact && errand.said && (
         /*
          * Verbatim, and in the card rather than a tooltip: a refusal cannot be

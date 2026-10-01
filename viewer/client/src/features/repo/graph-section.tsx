@@ -22,7 +22,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   Empty,
   KeyValue,
   PageError,
@@ -34,8 +34,8 @@ import {
   TR,
   TableWrap,
   stickyHeadCell,
-  useTableFit,
 } from '@/components/ui';
+import { useTableFit } from '@/components/data-table';
 import { cn } from '@/lib/cn';
 import { useRepoGraph } from '@/lib/queries';
 import type { ApiError } from '@/lib/api';
@@ -268,7 +268,7 @@ export default function GraphSection({ route }: { route: ViewProps['route'] }) {
               {open.commit.refs.map((r) => (
                 <RefChip key={r} decorated={decorateRef(r, data.trunk)} />
               ))}
-              {open.commit.parents.length > 1 && <Chip tone="neutral">merge</Chip>}
+              {open.commit.parents.length > 1 && <Badge tone="neutral">merge</Badge>}
             </>
           }
           record={open.commit}

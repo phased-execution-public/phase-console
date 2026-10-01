@@ -48,6 +48,10 @@ import { ISSUE_REF_RE, TICKET_ISSUES_MAX, type ResolvedIssues } from './issues/i
 import {
   ISSUES_FIXED_BYTES, ISSUES_MARGIN_BYTES, ISSUES_MIN_BYTES, issuesSection,
 } from './issues/prompt.ts';
+import { AGENT_INTENTS } from '../shared/run-settings.js';
+
+/** The owner's list, re-exported as the object it is — `vocab-owners.test.ts` holds the identity. */
+export { AGENT_INTENTS };
 import type { LaunchSpec, SessionMeta } from './terminal.ts';
 import { inboxTasksFile } from './runner/tasks.ts';
 import { MANIFEST_ORDER, MANIFEST_QUESTIONS, PLAN_FIELDS, manifestDefault } from './plan-fields.ts';
@@ -198,6 +202,7 @@ export type AgentContext = {
   plan?: PlanFacts;
 };
 
+
 /** The repository's ledgers, digested for the plan wizard's opening. */
 export type PlanFacts = {
   /** Open plans whose manifests and ledgers were read. */
@@ -264,8 +269,10 @@ export function buildAgentLaunch(
   const resume = str(body.resume);
   if (resume && !UUID_RE.test(resume)) return bad('resume must be a claude session id (a uuid).');
 
-  if (body.intent != null && body.intent !== 'plan' && body.intent !== 'recovery' && body.intent !== 'qa') {
-    return bad("intent, when given, must be 'plan', 'recovery' or 'qa'.");
+  // Membership from the owner (`AGENT_INTENTS`), and the refusal names what the
+  // owner holds — so the free tree, whose list is three words, names three.
+  if (body.intent != null && !(AGENT_INTENTS as readonly unknown[]).includes(body.intent)) {
+    return bad(`intent, when given, must be one of: ${AGENT_INTENTS.join(', ')}.`);
   }
   const planIntent = body.intent === 'plan';
   const recoveryIntent = body.intent === 'recovery';
@@ -290,8 +297,9 @@ export function buildAgentLaunch(
   // QA session composes a prompt about a phase; issues have nowhere to go in
   // it, and silently dropping them would let a caller believe a session was
   // briefed on work it never saw.
-  if (body.issues != null && !planIntent) {
-    return bad('issues are only accepted on a plan session — they compose its brief.');
+  let takesIssues = planIntent;
+  if (body.issues != null && !takesIssues) {
+    return bad('issues are only accepted on a plan session or a fix session — they compose its brief.');
   }
 
   /**
@@ -304,7 +312,7 @@ export function buildAgentLaunch(
    * which is where they already are. An explicit `permissionMode` still wins:
    * the form offers the choice, so choosing must mean something.
    */
-  const effectiveMode = planIntent ? (permissionMode ?? 'plan') : permissionMode;
+  let effectiveMode = planIntent ? (permissionMode ?? 'plan') : permissionMode;
 
   const prompt = str(body.prompt)?.trim();
   if (prompt && Buffer.byteLength(prompt) > MAX_AGENT_PROMPT_BYTES) {
@@ -420,7 +428,7 @@ export function buildAgentLaunch(
 
   // The skill the composed prompt is already about; naming it again in the
   // directive would read as a second, competing instruction.
-  const composed = planIntent || recoveryIntent || qaIntent;
+  let composed = planIntent || recoveryIntent || qaIntent;
   const extras = skillIds(body.skills).filter((id) =>
     id !== planSkill && !(composed && (id === 'phased-execution' || id.endsWith(':phased-execution'))));
   const directive = skillDirective(extras);
@@ -502,6 +510,10 @@ export function buildAgentLaunch(
       env: {
         ...(ctx.account?.env ?? {}),
         PE_OWNER: 'console/agent',
+        // The console's own scripts, as every session it starts carries them
+        // (control-tower phase 98, #151): `$PE_SCRIPTS/<script>` in a prompt
+        // or a handoff resolves here, never to a clone's copy.
+        PE_SCRIPTS: ctx.scriptsDir,
         // Where this reviewer publishes its task list: the unsupervised inbox
         // for its (slug, phase), which the Sessions page folds. Without it
         // `phase-tasks.sh` wrote the same file by its own fallback rule — and

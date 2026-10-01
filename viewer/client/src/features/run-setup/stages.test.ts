@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '@shared/run-settings.js';
+import { CATEGORY_OF, categoryById } from './categories';
 import { MODES, buildRunPayload, shows, type RunSetupMode } from './modes';
 import { EMPTY, WIRE, type RunSetupField, type RunSetupValues } from './schema';
 import {
@@ -78,22 +79,32 @@ describe('every field has a stage', () => {
   });
 
   it('puts the scope on What runs, the money and the stops on Money and stops, the rest on How', () => {
-    // The prelude's answers on Decisions (phase 11) — the three the door
-    // requires, the waivers a person acknowledges, the recorded override, and
-    // (2026-09-18) the verification probe's approvals and waivers.
+    // The prelude's answers on Decisions (phase 11) — the two the run answers
+    // for itself, the waivers a person acknowledges, the recorded override,
+    // and (2026-09-18) the verification probe's approvals and waivers.
     expect([...fieldsOnStage('start', 'decisions')].sort()).toEqual(
-      [
-        'accounts',
-        'acknowledgedWaivers',
-        'manifestOverride',
-        'relay',
-        'resumeOnRestart',
-        'verifyAnswers',
-      ].sort(),
+      ['acknowledgedWaivers', 'manifestOverride', 'relay', 'resumeOnRestart', 'verifyAnswers'].sort(),
     );
+    // The account pool and the answer to the plan's git lines are asked where
+    // their question is since control-tower phase 22 — the pool beside the
+    // account, the git lines beside the git — so both are How's now, and every
+    // quick-view category nests inside the one stage its fields are on.
+    expect(fieldsOnStage('start', 'how')).toEqual(
+      expect.arrayContaining(['accountId', 'accounts', 'gitMode', 'gitStrategyAck']),
+    );
+    for (const field of FIELDS) {
+      expect(STAGE_OF[field], `${field} is on another stage than its tile`).toBe(
+        categoryById(CATEGORY_OF[field]).stage,
+      );
+    }
     // A phase launch asks them too: on a finished run it is a fresh start.
     expect(stageHasControls('phase', 'decisions')).toBe(true);
-    expect(stageHasControls('live', 'decisions')).toBe(false);
+    // A live run edits three of the answers — restarts, the relay, the pool —
+    // and none of how its launch passed the door (control-tower phase 77, #101);
+    // the pool is among How's since phase 22, and the git answer is nowhere.
+    expect([...fieldsOnStage('live', 'decisions')].sort()).toEqual(['relay', 'resumeOnRestart']);
+    expect(fieldsOnStage('live', 'how')).toContain('accounts');
+    expect(fieldsOnStage('live', 'how')).not.toContain('gitStrategyAck');
     expect([...fieldsOnStage('start', 'what')].sort()).toEqual(['onlyPhases', 'startAfter']);
     expect(fieldsOnStage('start', 'money').sort()).toEqual(
       [
@@ -103,8 +114,13 @@ describe('every field has a stage', () => {
         'autoRecover',
         'maxParallel',
         'maxConsecutiveFailures',
+        'ladderPerRunRungs',
+        'ladderPerPhaseRungs',
         'priority',
         'onLimit',
+        // The QA-fix gap, closed (control-tower phase 22): a start says what
+        // one QA round may spend.
+        'qaRoundBudgetUsd',
       ].sort(),
     );
     // A `phase` launch narrows nothing and chains nothing: its What-runs stage has facts and no controls.

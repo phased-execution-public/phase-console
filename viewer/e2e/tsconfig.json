@@ -1,0 +1,25 @@
+{
+  // The real-browser harness's TYPE GATE — `npm run typecheck:e2e`, which the
+  // `e2e` stage of `scripts/gates.sh` runs before the tour. Playwright strips
+  // types without checking them, and the fixture runs under Node's own
+  // stripping, so this is the only place a wrong type in `e2e/` is caught.
+  // `erasableSyntaxOnly` for the same reason as the server's: the fixture is
+  // plain `node e2e/fixture/console.ts`.
+  "compilerOptions": {
+    "target": "es2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "allowJs": true,
+    "checkJs": false,
+    "lib": ["es2023", "dom", "dom.iterable"],
+    "types": ["node"]
+  },
+  "include": ["**/*.ts", "../playwright.config.ts"],
+  "exclude": [".results", ".shots"]
+}

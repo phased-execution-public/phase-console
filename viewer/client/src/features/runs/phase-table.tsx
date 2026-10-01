@@ -13,35 +13,35 @@
  *
  * That rule lives in `shared/phase-model.js` (`mergePhases` / `boardCounts` /
  * `phaseActions`), imported unchanged — the same module `node --test` checks.
+ *
+ * ## One table, both pages (control-tower phase 23, #25 #26 #27)
+ *
+ * The plan page listed the same phases four times — a departures board, a card
+ * list, a QA table and a handoffs table, each with a third of their facts —
+ * and the run page drew a fifth, hand-rolled, with the rest. `PHASE_COLUMNS` is
+ * ONE column array now, and both pages draw it through `DataTable`: the run page
+ * as the `run` reading, the plan page's Phases tab as `plan`, `plan-qa` or
+ * `plan-handoffs` (`PHASE_TABLE_CONTEXTS`). A reading is a `tableId` and the
+ * columns it leads with; the operator's own column set, filters, grouping and
+ * folded groups are remembered per reading (`lib/prefs.ts` `tables`), and a
+ * hidden column is still in every row's detail.
+ *
+ * The rows group by NEED (the five `PHASE_GROUPS`, needs-you first, Done
+ * folded), by plan order (no groups) or by scope. Past `PHASE_VIRTUAL_FROM`
+ * rows only a window is drawn — against `<main>`, so the header still sticks.
+ *
+ * The cells that move while a lane works — the attempt clock, the silence, the
+ * tasks, the spend — read the run query `run:progress` patches in place
+ * (`lib/queries.ts` `patchProgress`) and tick on a clock of their own, so a
+ * live table costs no request per frame on either page (#25).
  */
 
-import { Fragment, useMemo, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useMemo, useState, type ReactNode } from 'react';
+import { Badge, Button, Card, CardBody, CardHeader, CardTitle, Empty } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
+import { OpsBadge, PhaseStatusBadge, QaBadge, type WordOf } from '@/components/ui/status';
 import {
-  Button,
-  Card,
-  CardBody,
-  CardHeader,
-  CardTitle,
-  Chip,
-  Empty,
-  ListRow,
-  StateChip,
-  TBody,
-  TD,
-  TH,
-  THead,
-  TR,
-  Table,
-  TableWrap,
-  StatusBadge,
-  planColumns,
-  trackOf,
-  useTableFit,
-  stickyHeadCell,
-  stickyIdentityCell,
-  type Column,
-} from '@/components/ui';
-import {
+  type HandoffRow,
   type LaneLiveness,
   type PhaseEta,
   type Ruling,
@@ -54,35 +54,34 @@ import {
   type RunState,
   type TerminalSession,
 } from '@/lib/api';
-import { countdown, duration, elapsed, money, pad2 } from '@/lib/format';
-import { DepsCell, LockCell, PhaseDetails, SizeCell } from '@/features/plans/phase-cells';
+import { countdown, duration, elapsed, money, pad2, relativeTime } from '@/lib/format';
+import { PHASE_CLOCK_LABELS, PHASE_ROW_CLOCK, phaseClocks } from '@shared/phase-clocks.js';
+import { SILENCE_LABELS } from '@shared/attention-model.js';
+import { hintedPhases, type HintedPhase } from '@shared/run-lifecycle.js';
+import { DepsCell, LockCell, SizeCell } from '@/features/plans/phase-cells';
+import { InspectButton, PhaseProse } from '@/features/plans/phase-inspector';
+import { plainText } from '@/components/markdown';
 import { ForceReleaseButton } from '@/components/release-lock';
 import { useNow } from '@/lib/clock';
 import { useConsoleState } from '@/lib/queries';
-import { usePrefs } from '@/lib/prefs';
-import { usePhone } from '@/lib/media';
 import { phaseProgress } from './tiles';
 import { MCP_REASON } from './defaults';
 import { classifyBoardPhase, classifyPhase, liveRecovery } from '@/lib/recovery';
-import { canQa, liveQa, phaseQaMode } from '@/lib/qa';
-import { QaButton, QaVerdict } from '@/components/qa-launcher';
-import { LaunchDialog } from '@/features/run-setup/launch-dialog';
+import { canQa, isVerdict, liveQa, phaseQaMode, qaReportHref } from '@/lib/qa';
+import { QaButton } from '@/components/qa-launcher';
+// The LAZY dialog: this table is on the plan page too, and the dialog is the
+// whole run-setup surface, which `check-dist.mjs` keeps out of that chunk.
+import { LaunchDialog } from '@/features/run-setup/lazy-launch-dialog';
 import { RecoveryButton } from './status-strip';
 import { PhaseDrawer } from './phase-drawer';
-import {
-  ContextChip,
-  EvidenceLine,
-  LivenessChip,
-  PhaseActorLine,
-  PhaseStateChip,
-  RulingsChip,
-} from './phase-row';
+import { ContextChip, EvidenceLine, LivenessChip, PhaseStateChip, RulingsChip } from './phase-row';
 import { BranchChip } from './git-card';
 import { LandChip, LandingStateChip } from './landing-chips';
+import { LastActivity } from './now-panel';
 import { TaskLine } from './task-summary';
 import { RecoveryActions } from '@/components/recovery-actions';
-import { queueEntryFor, waitingLabel } from './session-panes';
-import { phaseHref, planHref } from '@shared/routes.js';
+import { queueEntryFor, queueMarks, waitingLabel } from './queue-words';
+import { handoffHref, phaseHref, planHref } from '@shared/routes.js';
 import {
   BOARD_ORDER,
   boardCounts,
@@ -94,18 +93,11 @@ import { Bot, Gauge } from 'lucide-react';
 
 import { scopeOfRow } from '@shared/scope.js';
 import { ScopeChips } from '@/components/scope-chips';
-import { boardStateTitle, phaseStatusTitle, phaseUiState } from '@/lib/status-vocab';
+import { boardStateTitle, phaseStatusTitle, qaResultTitle } from '@/lib/status-vocab';
 import { cn } from '@/lib/cn';
 import { PHASE_GROUPS, displayState, groupOf, groupRows } from './phase-groups';
 import type { GroupablePhase, PhaseGroupId } from './phase-groups';
-
-/**
- * `displayState` — the state to paint in the Status cell, which is not always
- * the board's — moved to `./phase-groups` with the grouping rule that uses it,
- * and is re-exported below. The reasoning for the rule itself travelled with
- * the code; the reason it MOVED is the chunk graph, and that note is on the
- * re-export.
- */
+import { TreeLine, verdictTree } from '@/components/verify-tree';
 
 /** A plan phase joined to whatever this run recorded against it. */
 interface MergedPhase extends PhaseView {
@@ -129,9 +121,13 @@ const merge = mergePhases as (planPhases: PhaseView[], run: RunState | null) => 
 const counts = boardCounts as (rows: MergedPhase[]) => Record<string, number>;
 const actionsFor = phaseActions as (phase: MergedPhase, ctx: { live: boolean; allowRun: boolean }) => Actions;
 const fellOver = fellOverToAnotherModel as (record: PhaseRecord | undefined) => boolean;
+/** Parked because its session started on another model than the one it is pinned to (#91). */
+const modelMismatch = (record: PhaseRecord | undefined): boolean =>
+  record?.status === 'parked' && Boolean(record.modelMismatch);
 const ORDER = BOARD_ORDER as string[];
 /** The Repos cell as scope tokens, never empty — a blank cell means `all`. */
 const scopeOf = scopeOfRow as (cell: string | undefined) => string[];
+const SILENCE_LABEL = SILENCE_LABELS as Readonly<Record<string, string>>;
 
 /**
  * What this console can hand to a Claude session, and what is already on it.
@@ -154,110 +150,343 @@ export type PhaseRecovery = {
   allowWrites?: boolean;
 };
 
-/**
- * The five groups a phase can be in, in the order they are worth reading.
- *
- * This is NOT `BOARD_ORDER`. The board's order is about the lifecycle; this is
- * about attention, and the two differ in exactly one way that matters: a
- * FAILED phase and a phase that needs a person outrank everything, including
- * the phase that is running. A fifteen-phase plan renders as fifteen rows in
- * board order, and the two that are asking for something sit wherever their
- * numbers put them — which on a phone is below the fold.
- *
- * `done` is last and collapsed, because a finished phase is the one thing here
- * nobody is looking for. The collapse is REMEMBERED (`prefs.runPhasesDone`):
- * a section that re-opens on every navigation is a section being re-collapsed
- * rather than read. The shipped default is `['done']` (`lib/prefs.ts`).
- */
 /*
- * The five groups, `groupOf`, `groupRows` and `displayState` now live in
+ * The five groups, `groupOf`, `groupRows` and `displayState` live in
  * `./phase-groups` — a leaf module with no imports — and are re-exported here
  * so every existing caller and test keeps working.
  *
- * ⚠️ The plan page's Phases tab must import them from `./phase-groups`, NOT
- * through this re-export: an import of this file is an import of the whole
- * table, and the table reaches `run-setup` (77.6 KB) — which is how a form the
- * plan route cannot show ended up in the plan route's chunk. `check-dist.mjs`
- * asserts it stays out.
+ * ⚠️ This table is mounted by the plan page since control-tower phase 23, so
+ * everything it imports is in the plan route's chunk: the launch dialog comes
+ * through `run-setup/lazy-launch-dialog`, the queue's words through
+ * `./queue-words`, and `check-dist.mjs` asserts run-setup stays out.
  */
 export { PHASE_GROUPS, displayState, groupOf, groupRows };
 export type { GroupablePhase, PhaseGroupId };
 
+/* ------------------------------------------------------------------------- *
+ * The row, and what every row of one render shares
+ * ------------------------------------------------------------------------- */
+
+/** Which page the table is drawn on, and which reading of it. */
+export type PhaseTableContext = 'run' | 'plan' | 'plan-qa' | 'plan-handoffs';
+
+/** What every cell of one render shares — one object, handed to every row. */
+interface TableScope {
+  slug: string;
+  run: RunState | null;
+  live: boolean;
+  allowRun: boolean;
+  recovery?: PhaseRecovery;
+  /** The plan's own QA word — what a phase with no bullet of its own inherits. */
+  planQaMode?: string;
+  onRunAlone: (phase: number) => void;
+  /** Opens the phase's L2 sheet, where the page mounts one (the plan page). */
+  onInspect?: (phase: number) => void;
+}
+
+/** One row: a phase, and every fact this render knows about it. */
+export interface PhaseTableRow {
+  p: MergedPhase;
+  scope: TableScope;
+  entry?: QueueEntry | undefined;
+  conflicts?: string[] | undefined;
+  eta?: PhaseEta | undefined;
+  /** This phase's live lane, when it has one. */
+  liveness?: LaneLiveness | undefined;
+  /** How many rulings this phase's sessions recorded. */
+  rulings: number;
+  /** The phases this phase's recorded QA verdict holds — the HELD state. */
+  holds: number[];
+  /** The handoff file's own row, when one was written. */
+  handoff?: HandoffRow | undefined;
+  /** INDEX.md's word for this phase — `missing` when a handoff exists and the index has no row. */
+  index?: string | undefined;
+}
+
+/** A session of THIS run is open on the phase — the record's account AND the console's. */
+const runningOf = (row: PhaseTableRow): boolean => {
+  const r = row.p.record;
+  return (
+    row.scope.live &&
+    Boolean(r?.startedAt) &&
+    !r?.endedAt &&
+    (r?.status === 'running' || r?.status === 'verifying')
+  );
+};
+
+/** What the run has spent on the phase: the booked sessions plus the one in flight. */
+const spendOf = (r: PhaseRecord | undefined): number | undefined => {
+  if (!r) return undefined;
+  const inflight = r.status === 'running' ? (r.live?.spentUsd ?? 0) : 0;
+  const total = (r.costUsd ?? 0) + inflight;
+  return total > 0 ? total : undefined;
+};
+
+/** The verdict word a QA filter tests: a recorded verdict, `pending`, or `none`. */
+const qaWordOf = (p: PhaseView): string => {
+  const result = p.qa?.result;
+  return isVerdict(result) || result === 'pending' ? (result as string) : 'none';
+};
+
+const NEED_LABEL: Record<string, string> = Object.fromEntries(PHASE_GROUPS.map((g) => [g.id, g.label]));
+const NEED_RANK: Record<string, number> = Object.fromEntries(PHASE_GROUPS.map((g, i) => [g.id, i]));
+const needOf = (row: PhaseTableRow): PhaseGroupId =>
+  groupOf({ phase: row.p.phase, state: row.p.state, ...(row.p.record ? { record: row.p.record } : {}) });
+
+/* ------------------------------------------------------------------------- *
+ * The columns — ONE array, for both pages
+ * ------------------------------------------------------------------------- */
+
 /**
- * The twelve columns, as data.
+ * Every column a phase has, as data.
  *
  * `priority` is what a column is worth when the box is too small for all of
  * them: `1` never leaves, and the rest fold into the row's detail smallest-
- * first. The widths are the other half of the same fix — Phase was starved to
- * about 100px and wrapped four-line titles while Status held five hundred and
- * mostly nothing, because nothing had ever declared what either was worth.
+ * first. `value` is what a column MEANS — what its filter tests, its facet
+ * counts and its group heading names; `cell` only draws it.
+ *
+ * ⚠️ One array serves the run page and every reading of the plan page — a
+ * reading may HIDE columns (`PHASE_TABLE_CONTEXTS`), never define its own.
+ * `phase-table.test.tsx` holds both pages to this array.
  */
-const PHASE_COLUMNS: Column<never>[] = [
-  { id: 'num', head: '#', cell: () => null, priority: 1, min: 48, identity: true },
-  { id: 'phase', head: 'Phase', cell: () => null, priority: 1, min: 220, flex: true, card: 'title' },
-  // Priority 2, not 1, and that is a phone decision. Four columns that never
-  // leave adds up to 700px, which on a 390px screen is not a narrow table —
-  // it is a 390px window onto a table twice as wide as the phone, and the page
-  // itself starts scrolling sideways. Below the fold is a tap away; off the
-  // right-hand edge is not.
-  { id: 'status', head: 'Status', cell: () => null, priority: 2, min: 180, card: 'meta' },
-  { id: 'deps', head: 'Deps', cell: () => null, priority: 3, min: 108 },
-  { id: 'lock', head: 'Lock', cell: () => null, priority: 4, min: 112 },
-  { id: 'repos', head: 'Repos', cell: () => null, priority: 4, min: 108 },
-  { id: 'size', head: 'Size', cell: () => null, priority: 3, min: 72 },
-  { id: 'thisRun', head: 'This run', cell: () => null, priority: 2, min: 128 },
-  { id: 'cost', head: 'Cost', cell: () => null, priority: 2, min: 76, align: 'end' },
-  { id: 'turns', head: 'Turns', cell: () => null, priority: 5, min: 68, align: 'end' },
-  { id: 'took', head: 'Took', cell: () => null, priority: 2, min: 88, align: 'end' },
+export const PHASE_COLUMNS: Column<PhaseTableRow>[] = [
+  // 68 holds the row's toggle and a three-digit number (this plan has 104
+  // phases); the grid adds the room it reserved for the `+N` when columns fold.
+  // A number never wraps: at 64 px, beside `+12`, `47` read as a 4 over a 7.
+  {
+    id: 'num',
+    head: '#',
+    priority: 1,
+    min: 68,
+    identity: true,
+    card: 'hide',
+    value: (row) => row.p.phase,
+    cell: (row) => <span className="font-mono whitespace-nowrap tabular-nums">{pad2(row.p.phase)}</span>,
+  },
+  {
+    id: 'phase',
+    head: 'Phase',
+    priority: 1,
+    min: 220,
+    flex: true,
+    card: 'title',
+    filter: 'text',
+    value: (row) => `${row.p.phase} ${plainText(row.p.title)}`,
+    cell: (row) => <TitleCell row={row} />,
+  },
+  {
+    id: 'state',
+    head: 'State',
+    priority: 2,
+    min: 184,
+    card: 'meta',
+    filter: 'facet',
+    value: (row) => displayState(row.p.state, { running: runningOf(row) }),
+    cell: (row) => <StateCell row={row} />,
+  },
+  {
+    // The grouping by NEED — the five sections both pages always had, now a
+    // column a person can group by, filter on, or read in a row's detail.
+    id: 'need',
+    head: 'Need',
+    priority: 5,
+    min: 104,
+    card: 'hide',
+    filter: 'facet',
+    groupable: true,
+    value: needOf,
+    groupLabel: (value) => NEED_LABEL[String(value)] ?? String(value),
+    groupOrder: (value) => NEED_RANK[String(value)] ?? PHASE_GROUPS.length,
+    cell: (row) => NEED_LABEL[needOf(row)],
+  },
+  {
+    id: 'blockedBy',
+    head: 'Blocked by',
+    priority: 3,
+    min: 152,
+    value: (row) => (row.p.blockedBy ?? []).map((b) => `P${b.phase} ${b.why}`).join(', ') || null,
+    cell: (row) => <BlockedByCell row={row} />,
+  },
+  {
+    id: 'scope',
+    head: 'Scope',
+    priority: 4,
+    min: 124,
+    filter: 'facet',
+    groupable: true,
+    value: (row) => scopeOf(row.p.row?.repos).join(' + '),
+    cell: (row) => <ScopeChips tokens={scopeOf(row.p.row?.repos)} conflicts={row.conflicts} />,
+  },
+  {
+    id: 'deps',
+    head: 'Deps',
+    priority: 4,
+    min: 108,
+    cell: (row) => <DepsCell slug={row.scope.slug} phase={row.p} max={3} />,
+  },
+  {
+    id: 'lock',
+    head: 'Lock',
+    priority: 5,
+    min: 112,
+    cell: (row) => <LockCell lock={row.p.lock} compact />,
+  },
+  {
+    id: 'size',
+    head: 'Size',
+    priority: 3,
+    min: 92,
+    filter: 'facet',
+    value: (row) => row.p.size || null,
+    cell: (row) => <SizeCell phase={row.p} eta={row.eta} />,
+  },
+  {
+    // The lane and its attempt, on the labelled clock (#28) — never a bare
+    // elapsed figure, and never `now - startedAt`, which counts parks as work.
+    id: 'lane',
+    head: 'Lane',
+    priority: 2,
+    min: 184,
+    cell: (row) => <LaneCell row={row} />,
+  },
+  {
+    id: 'run',
+    head: 'This run',
+    priority: 3,
+    min: 136,
+    value: (row) => row.p.record?.status ?? null,
+    cell: (row) => <RunRecordCell row={row} />,
+  },
+  {
+    id: 'qa',
+    head: 'QA',
+    priority: 3,
+    min: 168,
+    filter: 'facet',
+    value: (row) => qaWordOf(row.p),
+    cell: (row) => <QaCell row={row} />,
+  },
+  {
+    id: 'handoff',
+    head: 'Handoff',
+    priority: 4,
+    min: 132,
+    filter: 'facet',
+    value: (row) => row.p.handoff?.status ?? row.handoff?.status ?? 'none',
+    cell: (row) => <HandoffCell row={row} />,
+  },
+  {
+    id: 'gate',
+    head: 'Gate',
+    priority: 4,
+    min: 108,
+    filter: 'facet',
+    value: (row) => (row.p.gated ? (row.p.gateKind ?? 'gated') : 'none'),
+    cell: (row) => <GateCell row={row} />,
+  },
+  {
+    id: 'spend',
+    head: 'Spend',
+    priority: 3,
+    min: 84,
+    align: 'end',
+    filter: 'range',
+    value: (row) => spendOf(row.p.record) ?? null,
+    cell: (row) => <SpendCell row={row} />,
+  },
+  {
+    id: 'turns',
+    head: 'Turns',
+    priority: 5,
+    min: 68,
+    align: 'end',
+    value: (row) => row.p.record?.turns ?? null,
+    cell: (row) => row.p.record?.turns ?? '—',
+  },
   // 252 is measured, not guessed — the widest single remedy this table can draw
-  // is `Pick up with a new agent` with its mechanism badge, which measures 249px
-  // on the hub's own run. It was 236, then 244 against a two-button group of
-  // 240; the number that matters turned out to be one BUTTON, because the group
-  // already wraps and an item cannot wrap inside itself.
-  // It was 236, which is the same defect in miniature as the fleet table's
-  // collapsed Plan track and cost far more than four pixels: the group
-  // overflowed its cell, `useTableFit` read the table 4 px over its 1160 px box
-  // and flipped the whole thing to scroll mode, so all twenty rows lost the
-  // sticky header for want of a track four pixels wider.
-  //
-  // Priority 2 for the same reason as Status: on a phone the remedies move into
-  // the row's own detail, which is one tap, rather than off the edge, which is
-  // nowhere.
-  { id: 'actions', head: 'Actions', cell: () => null, priority: 2, min: 252 },
+  // is `Pick up with a new agent` with its mechanism badge, which measures 249px.
+  // Priority 2: on a phone the remedies move into the row's own detail, which
+  // is one tap, rather than off the edge, which is nowhere.
+  {
+    id: 'actions',
+    head: 'Actions',
+    priority: 2,
+    min: 252,
+    cell: (row) => (
+      <PhaseActions
+        phase={row.p}
+        slug={row.scope.slug}
+        run={row.scope.run}
+        live={row.scope.live}
+        allowRun={row.scope.allowRun}
+        onRunAlone={row.scope.onRunAlone}
+        {...(row.scope.recovery ? { recovery: row.scope.recovery } : {})}
+      />
+    ),
+  },
 ];
 
-/** Which attached servers a phase actually reached for, and how often. */
-function mcpCallList(calls: Record<string, number>): string {
-  return Object.entries(calls)
-    .map(([id, count]) => `${id} ×${count}`)
-    .join(' · ');
-}
-
-/** "Cost", "Cost and Turns", "Cost, Turns and Took" — never "Cost, Turns". */
-function listOf(words: string[]): string {
-  if (words.length <= 1) return words[0] ?? '';
-  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
-}
-
 /**
- * Per-cell classes the column array does not carry, keyed the same way.
- *
- * TYPOGRAPHY only — never alignment. `align` is declared on the column and read
- * by the header and the body from that one place: this map carried `text-right`
- * for the three numeric cells while `c.align === 'end'` painted the header, so
- * the two halves of one column agreed only for as long as nobody added a fourth
- * numeric column. The `align`-less half is the one that would have been missed.
+ * The readings — one per page, three on the plan page — and the columns each
+ * leads with. Everything a reading hides is still in each row's detail, and
+ * the operator's own choice (the View sheet), stored under `tableId`, wins.
  */
-const CELL_CLASS: Record<string, string> = {
-  num: 'font-mono tabular-nums',
-  thisRun: 'text-2xs',
-  cost: 'font-mono tabular-nums',
-  turns: 'font-mono tabular-nums',
-  took: 'font-mono tabular-nums',
+export const PHASE_TABLE_CONTEXTS: Record<
+  PhaseTableContext,
+  { tableId: string; label: string; hidden: readonly string[]; groupBy?: string }
+> = {
+  run: {
+    tableId: 'phases.run',
+    label: 'Phases in this run',
+    hidden: ['need', 'handoff', 'gate'],
+    groupBy: 'need',
+  },
+  plan: {
+    tableId: 'phases.plan',
+    label: 'Phases',
+    hidden: ['need', 'deps', 'lock', 'run', 'turns'],
+    groupBy: 'need',
+  },
+  // The QA and Handoffs readings open in PLAN ORDER: their subject is mostly
+  // finished phases, which grouping by need would fold away under Done.
+  'plan-qa': {
+    tableId: 'phases.plan-qa',
+    label: 'QA by phase',
+    hidden: ['need', 'scope', 'deps', 'lock', 'size', 'run', 'handoff', 'gate', 'spend', 'turns'],
+  },
+  'plan-handoffs': {
+    tableId: 'phases.plan-handoffs',
+    label: 'Handoffs by phase',
+    hidden: [
+      'need',
+      'scope',
+      'deps',
+      'lock',
+      'size',
+      'lane',
+      'run',
+      'qa',
+      'gate',
+      'spend',
+      'turns',
+      'actions',
+    ],
+  },
 };
 
-/** One column's alignment, wherever it is drawn. */
-const alignClass = (c: Column<never>): string | false => c.align === 'end' && 'text-right';
+/**
+ * Past this many phases only a window of rows is drawn. Lower than the grid's
+ * default because a phase row is a dozen chips, not a line of text: #26
+ * measured a 72-phase plan, and every row of it was in the DOM twice over.
+ */
+export const PHASE_VIRTUAL_FROM = 40;
+
+/** Done is folded until someone opens it — the one group nobody is looking for. */
+const DONE_FOLDED: readonly string[] = ['need:done'];
+
+const rowKey = (row: PhaseTableRow): string => String(row.p.phase);
+const rowTint = (row: PhaseTableRow): string | undefined =>
+  cn(runningOf(row) && 'bg-running/8', row.p.state === 'done' && 'text-ink-faint') || undefined;
 
 export function PhaseTable({
   slug,
@@ -271,6 +500,11 @@ export function PhaseTable({
   phaseEta,
   liveness,
   rulings,
+  context = 'run',
+  qaHeld,
+  handoffs,
+  index,
+  onInspect,
 }: {
   slug: string;
   run: RunState | null;
@@ -288,29 +522,63 @@ export function PhaseTable({
   liveness?: LaneLiveness[] | undefined;
   /** The plan's whole ruling ledger — counted per phase for the row badge. */
   rulings?: readonly Ruling[] | undefined;
+  /** Which page, and which reading of it. */
+  context?: PhaseTableContext;
+  /** Which phases each recorded verdict holds (`PlanDetail.qaHeld`). */
+  qaHeld?: Record<number, number[]> | undefined;
+  /** The handoff files (`PlanDetail.handoffs`). */
+  handoffs?: readonly HandoffRow[] | undefined;
+  /** INDEX.md's rows (`PlanDetail.index`) — a handoff with no row here is `missing`. */
+  index?: readonly { phase: number; status: string }[] | undefined;
+  /** Opens the phase's L2 sheet, where the page mounts one. */
+  onInspect?: (phase: number) => void;
 }) {
   // "Run only this" opens the launch dialog on the row's phase; one dialog for
-  // the table, keyed by which phase asked. Before the early return — a hook.
+  // the table, keyed by which phase asked.
   const [launchPhase, setLaunchPhase] = useState<number | null>(null);
-  const [prefs, setPrefs] = usePrefs();
-  const collapsed = prefs.runPhasesCollapsed;
-  // Twelve columns do not become a phone table by folding nine of them away:
-  // what is left is three columns and a disclosure triangle, and the remedies
-  // — the reason anybody opens this page on a phone — are behind the triangle.
-  // Below the shell breakpoint the same rows are cards instead.
-  const phone = usePhone();
-
-  // Measured, not assumed: the cards above this table grow as their queries
-  // land and the rail comes and goes at 900px, so the cut is recomputed rather
-  // than decided once at mount.
-  const { wrapRef, tableRef, width, overflows, measured } = useTableFit();
-  const { shown, folded } = useMemo(() => planColumns(PHASE_COLUMNS, width), [width]);
+  // Written HERE, as JSX, so the render-tree guard (`plans/tabs.test.ts`) walks
+  // into the detail from the table — a module-level arrow is invisible to it.
+  const rowDetail = useCallback((row: PhaseTableRow): ReactNode => <PhaseRowDetail row={row} />, []);
 
   const rulingCounts = useMemo(() => {
-    const counts: Record<number, number> = {};
-    for (const ruling of rulings ?? []) counts[ruling.phase] = (counts[ruling.phase] ?? 0) + 1;
-    return counts;
+    const out: Record<number, number> = {};
+    for (const ruling of rulings ?? []) out[ruling.phase] = (out[ruling.phase] ?? 0) + 1;
+    return out;
   }, [rulings]);
+
+  const rows = useMemo(() => merge(planPhases, run), [planPhases, run]);
+  const scope = useMemo<TableScope>(
+    () => ({
+      slug,
+      run,
+      live,
+      allowRun,
+      onRunAlone: setLaunchPhase,
+      ...(recovery ? { recovery } : {}),
+      ...(recovery?.qaMode ? { planQaMode: recovery.qaMode } : {}),
+      ...(onInspect ? { onInspect } : {}),
+    }),
+    [slug, run, live, allowRun, recovery, onInspect],
+  );
+  const tableRows = useMemo<PhaseTableRow[]>(() => {
+    const files = new Map((handoffs ?? []).map((h) => [h.phase, h]));
+    const indexed = index ? new Map(index.map((r) => [r.phase, r.status])) : null;
+    return rows.map((p) => {
+      const file = files.get(p.phase);
+      return {
+        p,
+        scope,
+        entry: queueEntryFor(queue, slug, p.phase),
+        conflicts: scopes?.find((s) => s.phase === p.phase)?.conflicts,
+        eta: phaseEta?.find((e) => e.phase === p.phase),
+        liveness: liveness?.find((l) => l.phase === p.phase),
+        rulings: rulingCounts[p.phase] ?? 0,
+        holds: qaHeld?.[p.phase] ?? p.qaHeld ?? [],
+        handoff: file,
+        index: indexed && file ? (indexed.get(p.phase) ?? 'missing') : undefined,
+      };
+    });
+  }, [rows, scope, queue, slug, scopes, phaseEta, liveness, rulingCounts, qaHeld, handoffs, index]);
 
   if (!planPhases.length) {
     return (
@@ -319,17 +587,17 @@ export function PhaseTable({
         body="The autopilot drives phases from the plan's own graph table, so there is nothing here to run."
         action={
           <Button size="sm" variant="default" asChild>
-            <a href={planHref(slug)}>Read the plan</a>
+            <a href={planHref(slug, 'source')}>Read the plan</a>
           </Button>
         }
       />
     );
   }
 
-  const rows = merge(planPhases, run);
   const board = counts(rows);
   const asked = run?.onlyPhases?.length ? new Set(run.onlyPhases) : null;
   const spent = rows.reduce((sum, r) => sum + (r.record?.costUsd ?? 0), 0);
+  const reading = PHASE_TABLE_CONTEXTS[context];
 
   return (
     <Card>
@@ -338,165 +606,37 @@ export function PhaseTable({
         <div className="flex flex-wrap items-center gap-2">
           {ORDER.filter((state) => board[state]).map((state) => (
             <span key={state} className="flex items-center gap-1">
-              <StateChip state={state} board />
+              <PhaseStatusBadge board={state as WordOf<'board'>} title={boardStateTitle(state)} />
               <b className="font-mono text-2xs tabular-nums">{board[state]}</b>
             </span>
           ))}
         </div>
       </CardHeader>
 
-      <CardBody className="p-0">
-        <p className="max-w-prose px-4 py-2 text-2xs text-ink-faint">
-          Status is the plan's own board, so a phase finished by any other session reads as finished here.
-          {/* Said once, in words, rather than as a "+2" repeated on every row.
-              A column that leaves the screen without saying so is the defect;
-              saying so twenty-one times is a different one. */}
-          {!phone &&
-            folded.length > 0 &&
-            ` ${listOf(folded.map((c) => c.head))} ${folded.length === 1 ? 'does' : 'do'} not fit this window — open a row to read ${folded.length === 1 ? 'it' : 'them'}.`}
+      <CardBody className="flex flex-col gap-2 px-3 pt-2 pb-3">
+        <p className="max-w-prose text-2xs text-ink-muted">
+          Status is the plan’s own board, so a phase finished by any other session reads as finished here.
           {asked &&
             ` This run was asked for phase${asked.size === 1 ? '' : 's'} ${[...asked].join(', ')} only.`}
         </p>
-
-        {/* Unmeasured is not "it fits": until the box has answered, the
-            wrapper scrolls, because a full-width table inside a wrapper that
-            does not is a table with columns off the edge and no scrollbar
-            anywhere to reach them. */}
-        {phone ? (
-          <PhaseCards
-            groups={groupRows(rows)}
-            collapsed={collapsed}
-            onCollapsed={(next) => setPrefs({ runPhasesCollapsed: next })}
-            slug={slug}
-            run={run}
-            live={live}
-            allowRun={allowRun}
-            {...(recovery ? { recovery } : {})}
-            onRunAlone={setLaunchPhase}
-            {...(queue ? { queue } : {})}
-            {...(phaseEta ? { phaseEta } : {})}
-            {...(liveness ? { liveness } : {})}
-            rulingCounts={rulingCounts}
-          />
-        ) : (
-          <TableWrap ref={wrapRef} scrolls={overflows || !measured}>
-            {/* hand-rolled because: collapsible groups. Each group is its own
-                `<tbody>` with a heading row that names it, so `aria-expanded`
-                on the heading has something to control — and the rows a group
-                holds come and go without the table re-cutting its columns.
-                `DataTable` renders one flat body. Everything else here IS the
-                primitive: `planColumns` for the cut, `trackOf` for the layout,
-                `useTableFit` for the wrapper and the sticky header. */}
-            <Table ref={tableRef} aria-label="Phases in this run" fixed>
-              <THead>
-                <TR>
-                  {shown.map((c) => (
-                    <TH
-                      key={c.id}
-                      className={cn(
-                        alignClass(c),
-                        // Sticky only on the branch where the wrapper is not a
-                        // scroll container — then it binds to <main> and pins for
-                        // real. Thirty-four rows used to scroll the headings away.
-                        // `measured` is the other half of the same decision: the
-                        // wrapper above scrolls until the box has answered, and a
-                        // header stuck to a box that never scrolls vertically is
-                        // paint nobody sees.
-                        !overflows && measured && stickyHeadCell,
-                        // The header end of the identity rail. `bg-ground`, not
-                        // the row-hover token it used to carry: this cell sits in
-                        // the header band and has to be painted in the band's own
-                        // colour, or the pinned corner reads as a hovered row.
-                        overflows &&
-                          c.identity &&
-                          'sticky left-0 z-(--z-base) bg-ground shadow-[1px_0_0_0_var(--rule)]',
-                      )}
-                      // `trackOf`, not `c.min`: the cut budgets `trackOf` and a
-                      // layout that reads a different number is how the two came
-                      // to disagree by 360 px once already. They are equal for
-                      // every column here today, and the point is that they stay
-                      // equal when one grows a `width`.
-                      {...(c.flex ? {} : { style: { width: trackOf(c) } })}
-                    >
-                      {c.id === 'actions' ? <span className="sr-only">Actions</span> : c.head}
-                    </TH>
-                  ))}
-                </TR>
-              </THead>
-              {groupRows(rows).map((group) => {
-                const shut = collapsed.includes(group.id);
-                // The rows are their own `<tbody>` so the heading can NAME them:
-                // `aria-expanded` alone tells a screen reader that something
-                // opened and not what. Two bodies per group is valid — and the
-                // rows' body is rendered whether or not it is shut, so the
-                // reference never dangles.
-                const bodyId = `phase-group-${group.id}`;
-                return (
-                  <Fragment key={group.id}>
-                    <TBody>
-                      <TR>
-                        {/* The section head is a row of the same table, so the
-                          columns stay aligned across every group — a separate
-                          table per group is how a phone ends up with five
-                          different column widths. */}
-                        <TD colSpan={shown.length} className="bg-ground-deep/60 py-1">
-                          <button
-                            type="button"
-                            aria-expanded={!shut}
-                            aria-controls={bodyId}
-                            className="flex w-full cursor-pointer items-baseline gap-2 text-left"
-                            onClick={() =>
-                              setPrefs({
-                                runPhasesCollapsed: shut
-                                  ? collapsed.filter((id) => id !== group.id)
-                                  : [...collapsed, group.id],
-                              })
-                            }
-                          >
-                            <span aria-hidden="true" className="font-mono text-2xs text-ink-faint">
-                              {shut ? '▸' : '▾'}
-                            </span>
-                            <strong className="text-2xs">{group.label}</strong>
-                            <span className="font-mono text-2xs text-ink-faint tabular-nums">
-                              {group.rows.length}
-                            </span>
-                            <span className="truncate text-2xs text-ink-faint">{group.hint}</span>
-                          </button>
-                        </TD>
-                      </TR>
-                    </TBody>
-                    <TBody id={bodyId}>
-                      {!shut &&
-                        group.rows.map((p) => (
-                          <PhaseRows
-                            key={p.phase}
-                            shown={shown}
-                            folded={folded}
-                            pinIdentity={overflows}
-                            phase={p}
-                            slug={slug}
-                            run={run}
-                            live={live}
-                            allowRun={allowRun}
-                            recovery={recovery}
-                            onRunAlone={setLaunchPhase}
-                            entry={queueEntryFor(queue, slug, p.phase)}
-                            conflicts={scopes?.find((s) => s.phase === p.phase)?.conflicts}
-                            eta={phaseEta?.find((e) => e.phase === p.phase)}
-                            liveness={liveness?.find((l) => l.phase === p.phase)}
-                            rulings={rulingCounts[p.phase] ?? 0}
-                          />
-                        ))}
-                    </TBody>
-                  </Fragment>
-                );
-              })}
-            </Table>
-          </TableWrap>
-        )}
-
+        <DataTable
+          label={reading.label}
+          columns={PHASE_COLUMNS}
+          rows={tableRows}
+          getRowKey={rowKey}
+          detail={rowDetail}
+          rowClassName={rowTint}
+          tableId={reading.tableId}
+          toolbar
+          {...(reading.groupBy ? { groupBy: reading.groupBy } : {})}
+          defaultHidden={reading.hidden}
+          defaultCollapsed={DONE_FOLDED}
+          ungroupedLabel="Plan order"
+          virtual
+          virtualFrom={PHASE_VIRTUAL_FROM}
+        />
         {spent > 0 && (
-          <p className="px-4 py-2 text-2xs text-ink-faint">
+          <p className="text-2xs text-ink-faint">
             This run has spent <b className="font-mono tabular-nums">{money(spent)}</b> across{' '}
             {rows.filter((r) => r.record).length} phase(s) it touched.
           </p>
@@ -528,688 +668,527 @@ export function PhaseTable({
   );
 }
 
-function PhaseRows({
-  shown,
-  folded,
-  pinIdentity,
-  phase: p,
-  slug,
-  run,
-  live,
-  allowRun,
-  recovery,
-  onRunAlone,
-  entry,
-  conflicts,
-  eta,
-  liveness,
-  rulings = 0,
-}: {
-  shown: Column<never>[];
-  folded: Column<never>[];
-  pinIdentity: boolean;
-  phase: MergedPhase;
-  slug: string;
-  run: RunState | null;
-  live: boolean;
-  allowRun: boolean;
-  recovery?: PhaseRecovery;
-  /** Opens the launch dialog scoped to this phase. */
-  onRunAlone: (phase: number) => void;
-  entry?: QueueEntry | undefined;
-  conflicts?: string[] | undefined;
-  eta?: PhaseEta | undefined;
-  /** This phase's live lane, when it has one. Absent on an older server. */
-  liveness?: LaneLiveness | undefined;
-  /** How many rulings this phase's sessions recorded. */
-  rulings?: number;
-}) {
-  const r = p.record;
-  // Gated on the BOARD, never on the run record. Offering to run a phase the
-  // board calls done is the defect this table was rebuilt for.
-  const can = actionsFor(p, { live, allowRun });
-  const detoured = fellOver(r);
-  const hasNote = Boolean(
-    r?.note ||
-    r?.status === 'waiting' ||
-    r?.verification ||
-    r?.preflight?.length ||
-    r?.mcpDegraded?.length ||
-    r?.mcpPark ||
-    can.diagnose,
-  );
-  /*
-   * The detail row used to be unconditional, because the "Everything about
-   * phase N" disclosure lived in it and was always there. On a 21-phase plan
-   * that is 21 full-width bands carrying one collapsed summary each — close to
-   * half the table's height, holding nothing. The disclosure moved onto the
-   * row's own number, so this row appears when it has something to say.
-   */
-  const [open, setOpen] = useState(false);
+/* ------------------------------------------------------------------------- *
+ * The cells
+ * ------------------------------------------------------------------------- */
 
-  // A session of THIS run is open on this phase. `startedAt` with no `endedAt`
-  // is the record's own account; `live` is the console's, and both have to hold
-  // — a checkpoint left by a killed console has the first and not the second.
-  const running =
-    live && Boolean(r?.startedAt) && !r?.endedAt && (r?.status === 'running' || r?.status === 'verifying');
-  const showing = displayState(p.state, { running });
-  // The record is what THIS run is doing; the entry is the scheduler's own view.
-  // Either alone is enough to say the phase is in a line.
-  const queued = r?.status === 'queued' || Boolean(entry);
-  const now = useNow(running);
-  const runningMs = running && r?.startedAt ? now - Date.parse(r.startedAt) : 0;
-
-  /*
-   * Every cell addressed by name.
-   *
-   * All twelve columns is `PHASE_COLUMNS.reduce((n, c) => n + trackOf(c), 0)`
-   * of table — the same accumulator the cut and the layout read, named here
-   * rather than written out as a figure, because the figure that used to sit in
-   * this sentence had drifted 200px from the declarations and was then cited in
-   * a review as evidence about a layout it no longer described. The box it sits
-   * in is 1232px on a 1512px laptop. So Cost, Turns, Took and Actions left the screen
-   * with no scrollbar, no header to scroll back to and nothing saying they were
-   * gone. Naming the cells lets the layout keep what fits and put the rest
-   * in the row's own detail, which this row already had.
-   */
-  const cells: Record<string, ReactNode> = {
-    num: pad2(p.phase),
-    phase: (
-      <>
-        <a className="underline-offset-2 hover:underline" href={phaseHref(slug, p.phase)}>
-          {p.title}
+/** The phase's name, what it is for, and the two ways in: its page and its sheet. */
+function TitleCell({ row }: { row: PhaseTableRow }) {
+  const { p, scope } = row;
+  const title = plainText(p.title);
+  const goal = p.goal ? plainText(p.goal) : '';
+  return (
+    <div className="min-w-0">
+      <span className="flex min-w-0 items-baseline gap-2">
+        <a
+          className="min-w-0 truncate underline-offset-2 hover:underline"
+          href={phaseHref(scope.slug, p.phase)}
+          title={title}
+        >
+          {title}
         </a>
+        {scope.onInspect && (
+          <InspectButton onClick={() => scope.onInspect?.(p.phase)} label={`Inspect phase ${p.phase}`} />
+        )}
+      </span>
+      {goal && (
+        <span className="block truncate text-2xs text-ink-muted" title={goal}>
+          {goal}
+        </span>
+      )}
+      {(runningOf(row) || p.elsewhere) && (
         <div className="mt-0.5 flex flex-wrap items-center gap-1">
-          {p.gated && (
-            <Chip tone="gate" title={boardStateTitle('gated')}>
-              gated
-            </Chip>
-          )}
           {/* The row's own record, not the mirror pointer: with two lanes
               live, `activePhase` names only the lowest one. */}
-          {running && <Chip tone="busy">running now</Chip>}
+          {runningOf(row) && <Badge tone="live">running now</Badge>}
           {p.elsewhere && (
             <span
-              className="text-2xs text-ink-faint"
+              className="text-2xs text-ink-muted"
               title="The run record beside this is what this run did; the board is what is true now."
             >
               finished outside this run
             </span>
           )}
         </div>
-      </>
-    ),
-    status: (
-      <>
-        <div className="flex flex-wrap items-center gap-1">
-          {/* `live` and not `running` decides the pulse and the link. Both
-              are live facts, but `p.live` is the SERVER's — one answer from
-              the run record, the lock and the session registry — and the
-              plan page reads the same field. Two pages disagreeing about
-              whether a phase is running is the failure this vocabulary
-              exists to prevent. `running` keeps its own jobs below: the row
-              tint, the promoted `showing` word and the elapsed clock, which
-              are claims about THIS run rather than about the phase. */}
-          <PhaseStateChip
-            slug={slug}
-            phase={p.phase}
-            state={showing}
-            live={p.live}
-            title={
-              showing !== p.state
-                ? `This run is working on phase ${p.phase} now. The board still reads ` +
-                  `"${p.state}" and catches up when the phase's handoff lands.`
-                : undefined
-            }
-          />
-          <QaVerdict qa={p.qa} />
-          {/* Three facts the client has carried since Phases 4 and 5 and
-              rendered nowhere: whether a `done` claim is backed, what a
-              lane that has not stopped is actually doing, and how many
-              decisions the plan did not make for this phase. Each renders
-              nothing when its fact is absent. */}
-          {p.proof && <EvidenceLine proof={p.proof} />}
-          <LivenessChip liveness={liveness} />
-          <ContextChip liveness={liveness} />
-          <RulingsChip count={rulings} />
-          {/* …and a fifth, once a run can drive lanes on branches of their
-              own: which branch THIS row's session is committing on. Read off
-              the run's live children, keyed by phase like `phases` is —
-              absent means the lane is on the run's own branch, which is every
-              lane that did not take a worktree. */}
-          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} base={run?.base} />
-          {/* …and where the commits GO (phase 15): the plan's `Land:` word,
-              resolved by the server, and — once the engine has written one —
-              where the landing has got to. Two facts, two chips. */}
-          <LandChip land={p.land} />
-          <LandingStateChip landing={r?.landing} />
-          {/* …and a fourth: what the SESSION says it is doing. The panel
-              below carries the whole list for the open lane; a run with
-              three lanes needs the one-line version on each row. */}
-          <TaskLine tasks={r?.tasks} />
-        </div>
-        {/* "Queued" alone is the same non-answer `pausing` used to be. What
-            makes the wait bearable is WHAT it is behind, and that is the one
-            thing the payload exists to carry. */}
-        {queued && (
-          <div className="mt-0.5">
-            <Chip
-              tone="busy"
-              title={
-                entry?.waitingOn.length
-                  ? entry.waitingOn
-                      .map(
-                        (h) =>
-                          `${h.slug}${h.phase != null ? ` P${h.phase}` : ''}` +
-                          (h.overlaps.length ? ` — overlaps ${h.overlaps.join(', ')}` : ''),
-                      )
-                      .join('\n')
-                  : 'Waiting on the scheduler for a scope something else is holding'
-              }
-            >
-              {waitingLabel(entry)}
-            </Chip>
-          </div>
-        )}
-      </>
-    ),
-    deps: (
-      <>
-        <DepsCell slug={slug} phase={p} max={3} />
-      </>
-    ),
-    lock: (
-      <>
-        <LockCell lock={p.lock} compact />
-      </>
-    ),
-    repos: (
-      <>
-        <ScopeChips tokens={scopeOf(p.row?.repos)} conflicts={conflicts} />
-      </>
-    ),
-    size: (
-      <>
-        <SizeCell phase={p} eta={eta} />
-      </>
-    ),
-    thisRun: (
-      <>
-        {r ? (
-          <>
-            <StatusBadge
-              state={phaseUiState(r.status, r.lifecycle?.stop)}
-              label={r.status}
-              mono
-              title={phaseStatusTitle(r.status, r.lifecycle?.stop)}
-              pulse={r.status === 'running'}
-            />
-            {/* Same icon vocabulary as the header's Model tile — what a row
-                ran as should not be the smallest, least-scannable text on it. */}
-            <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-ink-faint">
-              <span className="inline-flex items-center gap-1 font-medium text-ink-muted">
-                <Bot size={11} aria-hidden className="shrink-0" />
-                {r.model ?? '—'}
-              </span>
-              {r.effort && (
-                <span className="inline-flex items-center gap-1">
-                  <Gauge size={11} aria-hidden className="shrink-0" />
-                  {r.effort}
-                </span>
-              )}
-              {r.attempts > 1 && <span>{r.attempts} tries</span>}
-            </div>
-            {detoured && (
-              <div
-                className="text-ink-faint"
-                title="the session fell over to another model without restarting"
-              >
-                ran on {r.actualModel}
-              </div>
-            )}
-            {/* Which attached servers this phase actually reached for — the
-                only honest answer to "was attaching that worth it". A zero is
-                the interesting number: it was paid for on every turn and
-                never used. */}
-            {r.mcpCalls && Object.keys(r.mcpCalls).length > 0 && (
-              // One line, however many servers were attached. A join has no
-              // width of its own, and this column's track is 128px — six
-              // servers wrapped it into six lines and pushed the row's own
-              // remedies below the fold. The whole list is the hover.
-              <div className="truncate text-2xs text-ink-faint" title={mcpCallList(r.mcpCalls)}>
-                mcp {mcpCallList(r.mcpCalls)}
-              </div>
-            )}
-          </>
-        ) : (
-          <span className="text-ink-faint">not attempted</span>
-        )}
-      </>
-    ),
-    cost: r?.costUsd ? money(r.costUsd) : '—',
-    turns: r?.turns ?? '—',
-    took: (
-      <>
-        {r?.durationMs ? (
-          duration(r.durationMs)
-        ) : running ? (
-          <span
-            title={
-              eta ? `Phase ${p.phase} was expected to take about ${eta.label.replace('~', '')}.` : undefined
-            }
-          >
-            {elapsed(runningMs)}
-            {eta && <span className="text-ink-faint"> / {phaseProgress(runningMs, eta.estMs)}</span>}
-          </span>
-        ) : eta ? (
-          <span className="text-ink-faint" title={`An estimate for phase ${p.phase}, not a measurement.`}>
-            {eta.label}
-          </span>
-        ) : (
-          '—'
-        )}
-      </>
-    ),
-    actions: (
-      <PhaseActions
-        phase={p}
-        slug={slug}
-        run={run}
-        live={live}
-        allowRun={allowRun}
-        onRunAlone={onRunAlone}
-        {...(recovery ? { recovery } : {})}
-      />
-    ),
-  };
-
-  return (
-    <>
-      <TR className={cn(running && 'bg-progress/8', p.state === 'done' && 'text-ink-faint')}>
-        {shown.map((c) => (
-          <TD
-            key={c.id}
-            className={cn(
-              CELL_CLASS[c.id],
-              alignClass(c),
-              // The identity rail. When the table does scroll sideways this is
-              // the one cell that does not go with it, so the twelfth column
-              // still has a phase number attached to it.
-              pinIdentity && c.identity && cn(stickyIdentityCell, 'shadow-[1px_0_0_0_var(--rule)]'),
-            )}
-          >
-            {c.identity ? (
-              <span className="flex items-center gap-1">
-                <button
-                  type="button"
-                  aria-expanded={open}
-                  aria-controls={`phase-${p.phase}-detail`}
-                  onClick={() => setOpen((v) => !v)}
-                  className="inline-flex items-center text-ink-faint hover:text-ink [@media(hover:none)]:min-h-(--tap-min)"
-                >
-                  <span aria-hidden className="font-mono text-2xs">
-                    {open ? '▾' : '▸'}
-                  </span>
-                  <span className="sr-only">
-                    {open ? 'Hide' : 'Show'} everything about phase {p.phase}
-                    {folded.length ? ` — and ${folded.length} more column(s)` : ''}
-                  </span>
-                </button>
-                {cells[c.id]}
-              </span>
-            ) : (
-              cells[c.id]
-            )}
-          </TD>
-        ))}
-      </TR>
-
-      {/*
-       * The detail row, now that it has a reason to exist.
-       *
-       * The notes half is unchanged and still unconditional-when-present: a
-       * verification failure or an MCP warning is not something to go looking
-       * for. What moved is the disclosure — it hangs off the row's number, so
-       * a phase with nothing to say costs no row at all.
-       */}
-      {(hasNote || open) && (
-        <TR className="hover:bg-surface">
-          <TD className={cn(pinIdentity && stickyIdentityCell)} />
-          <TD colSpan={Math.max(1, shown.length - 1)} id={`phase-${p.phase}-detail`}>
-            <>
-              {r?.note && <div className="text-2xs text-ink-faint">{r.note}</div>}
-              {r?.status === 'waiting' && (
-                // A declared external wait: what it waits on, when the runner
-                // resumes the phase's own session, and which round of waiting
-                // this is (the runner caps them).
-                <div className="text-2xs text-ink-faint">
-                  {/* Whose park it is, first: the console's own inference is never
-                      drawn as the session's testimony. */}
-                  {r.declared?.by === 'watchdog'
-                    ? 'Parked by the console — it was waiting inside its turn'
-                    : 'Waiting on external work'}
-                  {r.parkReason ? `: ${r.parkReason}` : ''}
-                  {r.parkedUntil ? ` — resumes ${new Date(r.parkedUntil).toLocaleTimeString()}` : ''}
-                  {r.declared?.by === 'watchdog'
-                    ? r.watchdogParks
-                      ? ` (automatic park ${r.watchdogParks})`
-                      : ''
-                    : r.waits
-                      ? ` (wait ${r.waits})`
-                      : ''}
-                  {r.resumeRefused
-                    ? ` · resume held: session ${r.resumeRefused.sessionId.slice(0, 8)} is still running`
-                    : ''}
-                  {r.watch?.length ? (
-                    <>
-                      {' '}
-                      · watching{' '}
-                      {/* Paths, and a watch list is as long as the phase made
-                          it. `inline-block` is what gives a `truncate` a box to
-                          truncate against inside a sentence. */}
-                      <code
-                        className="inline-block max-w-full truncate align-bottom font-mono"
-                        title={r.watch.join(', ')}
-                      >
-                        {r.watch.join(', ')}
-                      </code>
-                    </>
-                  ) : null}
-                  {/* A ref nothing will ever probe is named beside the ones that
-                      will be, never dropped in silence (WAI-11). */}
-                  {r.watchUnpollable?.length ? (
-                    <>
-                      {' '}
-                      · not watchable{' '}
-                      <code
-                        className="inline-block max-w-full truncate align-bottom font-mono"
-                        title={r.watchUnpollable.map((u) => `${u.ref} — ${u.reason}`).join('\n')}
-                      >
-                        {r.watchUnpollable.map((u) => u.ref).join(', ')}
-                      </code>
-                    </>
-                  ) : null}
-                </div>
-              )}
-              {r?.verification && (
-                <div className={cn('text-2xs', r.verification.ok ? 'text-done' : 'text-blocked')}>
-                  {r.verification.reason}
-                </div>
-              )}
-              {r?.verification?.notRun?.length ? (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-2xs">
-                    {r.verification.notRun.length} step(s) a person must check
-                  </summary>
-                  <ul className="mt-1 flex flex-col gap-0.5 text-2xs">
-                    {r.verification.notRun.map((n, i) => (
-                      <li key={i}>
-                        <code className="font-mono">{n.text}</code> — {n.reason}
-                      </li>
-                    ))}
-                  </ul>
-                </details>
-              ) : null}
-              {r?.preflight?.length ? (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-2xs text-gated">
-                    {r.preflight.length} verification warning{r.preflight.length === 1 ? '' : 's'} from
-                    boarding
-                  </summary>
-                  <ul className="mt-1 flex flex-col gap-0.5 text-2xs">
-                    {r.preflight.map((warning, i) => (
-                      <li key={i}>{warning}</li>
-                    ))}
-                  </ul>
-                </details>
-              ) : null}
-              {r?.mcpDegraded?.length ? (
-                // Not a `<details>`: a phase that quietly did without half its
-                // tools and a phase that had all of them look identical in the
-                // handoff afterwards, so this one stays open. The errand is the
-                // operator's, and it is the same errand every time.
-                <p className="mt-1 text-2xs text-gated">
-                  Ran without{' '}
-                  {r.mcpDegraded.map((d) => `${d.id} (${d.detail ?? MCP_REASON[d.reason]})`).join(', ')}
-                  {' — '}the session was told to record what it could not do.
-                </p>
-              ) : null}
-              {r?.mcpPark && r.status === 'parked' ? <McpParkNote park={r.mcpPark} /> : null}
-              {can.diagnose && <PhaseDrawer slug={slug} phase={p.phase} run={run} />}
-              {/* Whatever did not fit, named and valued — never dropped in
-                silence. This is the other end of the "+3" on the row. */}
-              {open && folded.length > 0 && (
-                <dl
-                  className={cn(
-                    'grid grid-cols-[max-content_minmax(0,1fr)] gap-x-3 gap-y-1 text-2xs',
-                    hasNote && 'mt-1.5',
-                  )}
-                >
-                  {folded.map((c) => (
-                    <div key={c.id} className="contents">
-                      <dt className="uppercase tracking-wide text-ink-muted">{c.head}</dt>
-                      <dd className="min-w-0">{cells[c.id]}</dd>
-                    </div>
-                  ))}
-                </dl>
-              )}
-              {open && (
-                <div className={cn('max-w-prose', (hasNote || folded.length > 0) && 'mt-2')}>
-                  <PhaseDetails slug={slug} phase={p} eta={eta} />
-                </div>
-              )}
-            </>
-          </TD>
-        </TR>
       )}
-    </>
-  );
-}
-
-/* ------------------------------------------------------------------------- *
- * The phone shape — the same rows, as cards
- * ------------------------------------------------------------------------- */
-
-/**
- * What survives when there is no room for twelve columns.
- *
- * The cut (`planColumns`) is honest on a laptop and useless at 390px: nine of
- * the twelve fold, so the phone got a three-column table whose remedies —
- * Retry, Recover, Run only this, QA, the whole reason the page is open on a
- * phone at 11pm — were behind a disclosure triangle on every row.
- *
- * A card instead, and the choice of facts is the point: the state, the name,
- * what this run has spent on it, who is on it, and the buttons. Everything the
- * table's other columns carry (deps, repos, size, turns, the notes, the whole
- * §Phase detail) is one tap away on the phase's own page, which the title
- * links to — so nothing is hidden, only deferred.
- *
- * The group headings stay, and stay collapsible, because the same preference
- * drives both shapes: an operator who folded Done away on a laptop has folded
- * it away here.
- */
-function PhaseCards({
-  groups,
-  collapsed,
-  onCollapsed,
-  slug,
-  run,
-  live,
-  allowRun,
-  recovery,
-  onRunAlone,
-  queue,
-  phaseEta,
-  liveness,
-  rulingCounts,
-}: {
-  groups: { id: string; label: string; hint: string; rows: MergedPhase[] }[];
-  collapsed: string[];
-  onCollapsed: (next: string[]) => void;
-  slug: string;
-  run: RunState | null;
-  live: boolean;
-  allowRun: boolean;
-  recovery?: PhaseRecovery;
-  onRunAlone: (phase: number) => void;
-  queue?: QueueEntry[] | undefined;
-  phaseEta?: PhaseEta[] | undefined;
-  liveness?: LaneLiveness[] | undefined;
-  rulingCounts: Record<number, number>;
-}) {
-  return (
-    <div className="flex flex-col gap-3 px-3 pb-3">
-      {groups.map((group) => {
-        const shut = collapsed.includes(group.id);
-        const listId = `phase-cards-${group.id}`;
-        return (
-          <section key={group.id}>
-            <button
-              type="button"
-              aria-expanded={!shut}
-              aria-controls={listId}
-              className="flex w-full min-h-(--tap-min) cursor-pointer items-center gap-2 text-left"
-              onClick={() =>
-                onCollapsed(shut ? collapsed.filter((id) => id !== group.id) : [...collapsed, group.id])
-              }
-            >
-              <span aria-hidden className="font-mono text-2xs text-ink-faint">
-                {shut ? '▸' : '▾'}
-              </span>
-              <strong className="text-2xs uppercase tracking-wide">{group.label}</strong>
-              <span className="font-mono text-2xs tabular-nums text-ink-faint">{group.rows.length}</span>
-              <span className="min-w-0 truncate text-2xs text-ink-faint">{group.hint}</span>
-            </button>
-            <ul id={listId} className="flex flex-col gap-2">
-              {!shut &&
-                group.rows.map((p) => (
-                  <PhaseCard
-                    key={p.phase}
-                    phase={p}
-                    slug={slug}
-                    run={run}
-                    live={live}
-                    allowRun={allowRun}
-                    {...(recovery ? { recovery } : {})}
-                    onRunAlone={onRunAlone}
-                    entry={queueEntryFor(queue, slug, p.phase)}
-                    eta={phaseEta?.find((e) => e.phase === p.phase)}
-                    liveness={liveness?.find((l) => l.phase === p.phase)}
-                    rulings={rulingCounts[p.phase] ?? 0}
-                  />
-                ))}
-            </ul>
-          </section>
-        );
-      })}
     </div>
   );
 }
 
-/** One phase, at arm's length. */
-function PhaseCard({
-  phase: p,
-  slug,
-  run,
-  live,
-  allowRun,
-  recovery,
-  onRunAlone,
-  entry,
-  eta,
-  liveness,
-  rulings = 0,
-}: {
-  phase: MergedPhase;
-  slug: string;
-  run: RunState | null;
-  live: boolean;
-  allowRun: boolean;
-  recovery?: PhaseRecovery;
-  onRunAlone: (phase: number) => void;
-  entry?: QueueEntry | undefined;
-  eta?: PhaseEta | undefined;
-  liveness?: LaneLiveness | undefined;
-  rulings?: number;
-}) {
+/**
+ * The state, with its two overlays — `gated` (a flag orthogonal to the bucket)
+ * and `blocked` (a handoff that says so, or a review holding it) — and every
+ * live fact about the lane on it.
+ */
+function StateCell({ row }: { row: PhaseTableRow }) {
+  const { p, scope, liveness, entry, rulings } = row;
   const r = p.record;
-  const running =
-    live && Boolean(r?.startedAt) && !r?.endedAt && (r?.status === 'running' || r?.status === 'verifying');
-  const now = useNow(running);
-  const showing = displayState(p.state, { running });
+  const showing = displayState(p.state, { running: runningOf(row) });
+  // The record is what THIS run is doing; the entry is the scheduler's own view.
   const queued = r?.status === 'queued' || Boolean(entry);
-  const took = r?.durationMs
-    ? duration(r.durationMs)
-    : running && r?.startedAt
-      ? elapsed(now - Date.parse(r.startedAt))
-      : (eta?.label ?? null);
-
+  const hinted = hintedOf(scope.run, p.phase);
+  const reviewHold = p.reviewHold ?? [];
   return (
-    <ListRow
-      lead={<PhaseStateChip slug={slug} phase={p.phase} state={showing} live={p.live} />}
-      title={p.title}
-      href={phaseHref(slug, p.phase)}
-      hint={p.title}
-      subtitle={
-        <>
-          P{pad2(p.phase)}
-          {r ? ` · ${r.status}` : ' · not attempted'}
-          {p.elsewhere ? ' · finished outside this run' : ''}
-        </>
-      }
-      aside={
-        <>
-          {p.gated && (
-            <Chip tone="gate" title={boardStateTitle('gated')}>
-              gated
-            </Chip>
-          )}
-          {queued && (
-            <Chip tone="busy" title="Waiting on the scheduler for a scope something else is holding">
-              {waitingLabel(entry)}
-            </Chip>
-          )}
-          <QaVerdict qa={p.qa} />
-          {p.proof && <EvidenceLine proof={p.proof} />}
-          <LivenessChip liveness={liveness} />
-          <ContextChip liveness={liveness} />
-          <RulingsChip count={rulings} />
-          {/* …and a fifth, once a run can drive lanes on branches of their
-              own: which branch THIS row's session is committing on. Read off
-              the run's live children, keyed by phase like `phases` is —
-              absent means the lane is on the run's own branch, which is every
-              lane that did not take a worktree. */}
-          <BranchChip branch={run?.children?.[String(p.phase)]?.branch} base={run?.base} />
-          <LandChip land={p.land} />
-          <LandingStateChip landing={r?.landing} />
-        </>
-      }
-      facts={
-        <>
-          {/* Money first: it is the one number nobody can recover after the
-              fact, and the one an operator opens this page at midnight for. */}
-          {r?.costUsd ? <span>{money(r.costUsd)}</span> : null}
-          {r?.turns ? <span>{r.turns} turns</span> : null}
-          {took ? <span>{took}</span> : null}
-          <PhaseActorLine live={p.live} {...(p.lock ? { lock: p.lock } : {})} />
-        </>
-      }
-      actions={
-        <PhaseActions
-          phase={p}
-          slug={slug}
-          run={run}
-          live={live}
-          allowRun={allowRun}
-          onRunAlone={onRunAlone}
-          {...(recovery ? { recovery } : {})}
+    <>
+      <div className="flex flex-wrap items-center gap-1">
+        {/* `p.live` decides the pulse and the link — the SERVER's one answer
+            from the run record, the lock and the session registry, so two
+            pages cannot disagree about whether a phase is running. */}
+        <PhaseStateChip
+          slug={scope.slug}
+          phase={p.phase}
+          state={showing}
+          live={p.live}
+          title={
+            showing !== p.state
+              ? `This run is working on phase ${p.phase} now. The board still reads ` +
+                `"${p.state}" and catches up when the phase's handoff lands.`
+              : undefined
+          }
         />
+        {p.gated && (
+          // A gate is a wait the plan reserved for a person — the waiting tone;
+          // the inbox, not the word, is what summons them (6.0).
+          <Badge tone="wait" title={boardStateTitle('gated')}>
+            gated
+          </Badge>
+        )}
+        {(p.state === 'stuck' || reviewHold.length > 0) && (
+          <Badge
+            tone="bad"
+            title={
+              reviewHold.length
+                ? `Changes were requested on P${reviewHold.join(', P')} — this console will not board the phase until that review is answered.`
+                : 'Its handoff says blocked: a session stopped and asked for something only a person can settle.'
+            }
+          >
+            blocked
+          </Badge>
+        )}
+        {p.proof && <EvidenceLine proof={p.proof} />}
+        <LivenessChip liveness={liveness} />
+        <ContextChip liveness={liveness} />
+        <RulingsChip count={rulings} />
+        {/* Which branch THIS row's session commits on; absent means the run's own. */}
+        <BranchChip branch={scope.run?.children?.[String(p.phase)]?.branch} base={scope.run?.base} />
+        <LandChip land={p.land} />
+        <LandingStateChip landing={r?.landing} />
+        {/* What the SESSION says it is doing — moved by `run:progress`. */}
+        <TaskLine tasks={r?.tasks} live={r?.live?.tasks} />
+        {liveness && <LastActivity slug={scope.slug} phase={p.phase} />}
+      </div>
+      {/* "Queued" alone is a non-answer: what makes a wait bearable is WHAT it
+          is behind. */}
+      {queued && (
+        <div className="mt-0.5">
+          // Queued is a place in line: the queued paint's own quiet tone.
+          <Badge
+            tone="neutral"
+            title={
+              entry?.waitingOn.length
+                ? entry.waitingOn
+                    .map(
+                      (h) =>
+                        `${h.slug}${h.phase != null ? ` P${h.phase}` : ''}` +
+                        (h.overlaps.length ? ` — overlaps ${h.overlaps.join(', ')}` : '') +
+                        (h.unqualified ? ` — ${h.unqualified.reason}` : ''),
+                    )
+                    .join('\n')
+                : 'Waiting on the scheduler for a scope something else is holding'
+            }
+          >
+            {waitingLabel(entry)}
+          </Badge>
+        </div>
+      )}
+      {!queued && r?.serialBehind != null && (
+        <div className="mt-0.5">
+          <SerialChip behind={r.serialBehind} />
+        </div>
+      )}
+      {!queued && hinted && (
+        <div className="mt-0.5">
+          <HintedChip hinted={hinted} />
+        </div>
+      )}
+      {/* An operator's word on its place in the queue (control-tower phase 99,
+          #135): read off the RECORD, so a bump or a hold shows whether or not
+          the phase is queued right now — the whole sentence on hover. */}
+      <QueueMarkChips marks={queueMarks(r?.queueControl)} />
+      {/* The runner's last word, on the row: a verification failure or an MCP
+          warning is not something to go looking for. The whole of it is in
+          the row's detail. */}
+      {(r?.verification && !r.verification.ok) || r?.note ? (
+        <p
+          className={cn(
+            'mt-0.5 truncate text-2xs',
+            r?.verification && !r.verification.ok ? 'text-failed' : 'text-ink-faint',
+          )}
+          title={r?.verification && !r.verification.ok ? r.verification.reason : r?.note}
+        >
+          {r?.verification && !r.verification.ok ? r.verification.reason : r?.note}
+        </p>
+      ) : null}
+      {/* A red verdict says which tree it judged (#41, phase 24). */}
+      {r?.verification && !r.verification.ok && verdictTree(r.verification) ? (
+        <TreeLine tree={verdictTree(r.verification)!} className="truncate text-2xs" />
+      ) : null}
+    </>
+  );
+}
+
+/** What holds the phase, in the engine's own words (`blockedBy`): `not-done`, `qa:<verdict>`. */
+function BlockedByCell({ row }: { row: PhaseTableRow }) {
+  const { p, scope } = row;
+  const by = p.blockedBy ?? [];
+  if (!by.length) return <span className="text-ink-faint">—</span>;
+  return (
+    <ul className="flex flex-col gap-0.5 text-2xs">
+      {by.map((b) => {
+        const verdict = b.why.startsWith('qa:') ? b.why.slice(3) : null;
+        return (
+          <li key={`${b.phase}:${b.why}`} className="flex flex-wrap items-baseline gap-1">
+            <a href={phaseHref(scope.slug, b.phase)} className="font-mono hover:underline">
+              P{b.phase}
+            </a>
+            <code className="font-mono text-ink-muted">{b.why}</code>
+            {/* HELD, not merely waiting: the dependency is done and its QA
+                verdict is what stops this one (#27). */}
+            {verdict && <span className="text-warn">held by its QA verdict</span>}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/**
+ * The lane and its attempt, on the labelled clock (#28): the attempt clock the
+ * row prints (`PHASE_ROW_CLOCK`), worked time once it has ended, and — while a
+ * lane is live — which SILENCE it is in, for how long, against which
+ * threshold. It ticks on its own clock; the anchors come from the record that
+ * `run:progress` patches, so it asks the server for nothing.
+ */
+function LaneCell({ row }: { row: PhaseTableRow }) {
+  const r = row.p.record;
+  const running = runningOf(row);
+  const now = useNow(running);
+  if (!r) {
+    return row.eta ? (
+      <span
+        className="text-2xs text-ink-muted"
+        title={`An estimate for phase ${row.p.phase}, not a measurement.`}
+      >
+        {row.eta.label}
+      </span>
+    ) : (
+      <span className="text-ink-faint">—</span>
+    );
+  }
+  // The frame's windows when a frame has arrived — they know about an attempt
+  // the last full read of the run did not.
+  const windows = r.live?.phaseClocks?.attemptWindows;
+  const clocks = phaseClocks(windows?.length ? { ...r, attemptWindows: windows } : r, now);
+  const attemptMs = clocks[PHASE_ROW_CLOCK];
+  return (
+    <div className="flex flex-col gap-0.5 text-2xs" data-testid={`lane-${row.p.phase}`}>
+      <span className="text-ink-muted">attempt {Math.max(1, r.attempts ?? 1)}</span>
+      {attemptMs != null && (
+        <span title="From the start of the latest attempt — every other clock is in the phase's drawer.">
+          {PHASE_CLOCK_LABELS[PHASE_ROW_CLOCK]}{' '}
+          <b className="font-mono font-normal tabular-nums">
+            {running ? elapsed(attemptMs) : duration(attemptMs)}
+          </b>
+          {running && row.eta && clocks.workedMs != null && (
+            <span className="text-ink-muted"> · {phaseProgress(clocks.workedMs, row.eta.estMs)}</span>
+          )}
+        </span>
+      )}
+      {!running && clocks.workedMs != null && clocks.workedMs !== attemptMs && (
+        <span className="text-ink-muted">
+          {PHASE_CLOCK_LABELS.workedMs} {duration(clocks.workedMs)}
+        </span>
+      )}
+      <SilenceLine liveness={row.liveness} now={now} />
+    </div>
+  );
+}
+
+/** Which silence a live lane is in, since when, and what it is measured against. */
+function SilenceLine({ liveness, now }: { liveness: LaneLiveness | undefined; now: number }) {
+  const silence = liveness?.silence;
+  if (!silence) return null;
+  const quietMs = Math.max(0, now - silence.sinceMs);
+  const over = quietMs >= silence.thresholdMs;
+  return (
+    <span
+      className={over ? 'text-warn' : 'text-ink-muted'}
+      data-testid="lane-silence"
+      title={
+        `${SILENCE_LABEL[silence.kind] ?? silence.kind} for ${duration(quietMs)}. ` +
+        `The stall detector raises a card for this lane at ${duration(silence.thresholdMs)}` +
+        (silence.graceMs ? `, and nudges it after a ${duration(silence.graceMs)} grace.` : '.')
       }
     >
-      {/* The runner's own last word about this phase, in full — it is the
-          reason a card is red, and a title attribute is not reachable here. */}
-      {r?.note && <p className="text-2xs text-ink-faint">{r.note}</p>}
-    </ListRow>
+      {SILENCE_LABEL[silence.kind] ?? silence.kind} {elapsed(quietMs)} · flagged at{' '}
+      {duration(silence.thresholdMs)}
+      {silence.graceMs ? ` (grace ${duration(silence.graceMs)})` : ''}
+    </span>
+  );
+}
+
+/** What THIS run recorded against the phase — its word, its model, its tries. */
+function RunRecordCell({ row }: { row: PhaseTableRow }) {
+  const r = row.p.record;
+  if (!r) return <span className="text-2xs text-ink-faint">not attempted</span>;
+  return (
+    <div className="text-2xs">
+      <PhaseStatusBadge
+        record={r}
+        title={phaseStatusTitle(r.status, r.lifecycle?.stop)}
+        pulse={r.status === 'running'}
+      />
+      <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-ink-faint">
+        <span className="inline-flex items-center gap-1 font-medium text-ink-muted">
+          <Bot size={11} aria-hidden className="shrink-0" />
+          {r.model ?? '—'}
+        </span>
+        {r.effort && (
+          <span className="inline-flex items-center gap-1">
+            <Gauge size={11} aria-hidden className="shrink-0" />
+            {r.effort}
+          </span>
+        )}
+        {r.attempts > 1 && <span>{r.attempts} tries</span>}
+      </div>
+      {fellOver(r) && (
+        <div className="text-ink-faint" title="the session fell over to another model without restarting">
+          ran on {r.actualModel}
+        </div>
+      )}
+      {modelMismatch(r) && (
+        <Badge
+          tone="bad"
+          className="mt-0.5"
+          title="the phase is pinned to its model and the session started on another — it parked before spending"
+        >
+          model mismatch
+        </Badge>
+      )}
+      {r.mcpCalls && Object.keys(r.mcpCalls).length > 0 && (
+        <div className="truncate text-ink-faint" title={mcpCallList(r.mcpCalls)}>
+          mcp {mcpCallList(r.mcpCalls)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * QA in one cell (#27): the verdict and its ROUND, linked to the report; what
+ * the verdict holds; and the regime with the level that decided it — the
+ * phase's own `QA:` bullet or the plan's line. Three states, never a bare word.
+ */
+function QaCell({ row }: { row: PhaseTableRow }) {
+  const { p, scope, holds } = row;
+  const mode = phaseQaMode(p, scope.planQaMode);
+  const result = p.qa?.result;
+  const rounds = p.qaRounds;
+  return (
+    <div className="flex flex-col gap-0.5 text-2xs" data-testid={`qa-${p.phase}`}>
+      <span className="flex flex-wrap items-center gap-1">
+        {isVerdict(result) ? (
+          <a
+            href={qaReportHref(scope.slug, p.phase, rounds?.latest.round)}
+            className="rounded-sm"
+            aria-label={`QA ${result} — open the report`}
+          >
+            <QaBadge result={result as WordOf<'qa-result'>} title={qaResultTitle(result!)} />
+          </a>
+        ) : (
+          <span className="text-ink-muted">{result === 'pending' ? 'pending' : 'no verdict'}</span>
+        )}
+        {rounds && (
+          <span
+            className="font-mono text-ink-muted"
+            title={`${rounds.count} round${rounds.count === 1 ? '' : 's'} on file — the latest is round ${rounds.latest.round} (${rounds.latest.result})`}
+          >
+            round {rounds.latest.round}
+          </span>
+        )}
+        {holds.length > 0 && (
+          <span className="text-warn" title={`This verdict holds P${holds.join(', P')} until it changes.`}>
+            holds P{holds.join(', P')}
+          </span>
+        )}
+      </span>
+      <span className="text-ink-faint">
+        <span className="font-mono">{mode ?? '—'}</span> ·{' '}
+        {p.qaMode?.source === 'phase' ? 'phase directive' : 'plan'}
+      </span>
+    </div>
+  );
+}
+
+/** The handoff: its word, when, and whether INDEX.md knows about it. */
+function HandoffCell({ row }: { row: PhaseTableRow }) {
+  const { p, scope, handoff, index } = row;
+  const status = p.handoff?.status ?? handoff?.status;
+  if (!status) return <span className="text-2xs text-ink-faint">none yet</span>;
+  const completed = p.handoff?.completed ?? handoff?.completed;
+  return (
+    <div className="flex flex-col items-start gap-0.5 text-2xs">
+      <a
+        href={handoffHref(scope.slug, p.phase)}
+        className="rounded-sm"
+        aria-label={`Handoff ${status} — read it`}
+      >
+        <OpsBadge vocab="handoff" word={status as WordOf<'handoff'>} />
+      </a>
+      {completed && <span className="font-mono text-ink-faint">{completed}</span>}
+      {index === 'missing' && (
+        <Badge
+          tone="neutral"
+          title="INDEX.md has no row for this handoff. Re-running new-handoff.sh for the phase rebuilds it — or Repair with AI."
+        >
+          no index row
+        </Badge>
+      )}
+    </div>
+  );
+}
+
+/** Who can clear the phase's gate, and what it checks. */
+function GateCell({ row }: { row: PhaseTableRow }) {
+  const { p } = row;
+  if (!p.gated) return <span className="text-ink-faint">—</span>;
+  return (
+    <span className="flex min-w-0 flex-col items-start gap-0.5 text-2xs">
+      <Badge tone="wait" title={p.gates ?? boardStateTitle('gated')}>
+        {p.gateKind && p.gateKind !== 'none' ? `${p.gateKind} gate` : 'gated'}
+      </Badge>
+      {p.gateCheck && (
+        <span className="max-w-full truncate text-ink-faint" title={p.gateCheck}>
+          {p.gateCheck}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** Dollars, the session in flight included — `run:progress` moves it. */
+function SpendCell({ row }: { row: PhaseTableRow }) {
+  const r = row.p.record;
+  const spend = spendOf(r);
+  if (spend == null) return <span className="text-ink-faint">—</span>;
+  const inflight = r?.status === 'running' ? r.live?.spentUsd : undefined;
+  return (
+    <span
+      className="font-mono tabular-nums"
+      title={
+        inflight ? `Includes ${money(inflight)} for the session in flight — booked when it ends.` : undefined
+      }
+    >
+      {money(spend)}
+    </span>
+  );
+}
+
+/** Which attached servers a phase actually reached for, and how often. */
+function mcpCallList(calls: Record<string, number>): string {
+  return Object.entries(calls)
+    .map(([id, count]) => `${id} ×${count}`)
+    .join(' · ');
+}
+
+/* ------------------------------------------------------------------------- *
+ * The row's detail — one press from the row
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Everything about one phase that a column does not carry: the runner's own
+ * notes in full, the drawer (why it is not done, its QA, its gate, its
+ * rulings), the handoff's facts, and the phase's prose — which is fetched
+ * here, on open, by `PhaseProse`, so no view of the table pays for it.
+ */
+function PhaseRowDetail({ row }: { row: PhaseTableRow }) {
+  const { p, scope } = row;
+  const r = p.record;
+  return (
+    <div className="flex flex-col gap-1.5 py-1">
+      {r?.note && <div className="text-2xs text-ink-faint">{r.note}</div>}
+      {r?.status === 'waiting' && <WaitDetail r={r} />}
+      {r?.verification && (
+        <div className={cn('text-2xs', r.verification.ok ? 'text-done' : 'text-failed')}>
+          {r.verification.reason}
+          {verdictTree(r.verification) && <TreeLine tree={verdictTree(r.verification)!} />}
+        </div>
+      )}
+      {r?.verification?.notRun?.length ? (
+        <details>
+          <summary className="cursor-pointer text-2xs">
+            {r.verification.notRun.length} step(s) a person must check
+          </summary>
+          <ul className="mt-1 flex flex-col gap-0.5 text-2xs">
+            {r.verification.notRun.map((n, i) => (
+              <li key={i}>
+                <code className="font-mono">{n.text}</code> — {n.reason}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+      {r?.preflight?.length ? (
+        <details>
+          <summary className="cursor-pointer text-2xs text-needs-you">
+            {r.preflight.length} verification warning{r.preflight.length === 1 ? '' : 's'} from boarding
+          </summary>
+          <ul className="mt-1 flex flex-col gap-0.5 text-2xs">
+            {r.preflight.map((warning, i) => (
+              <li key={i}>{warning}</li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+      {r?.mcpDegraded?.length ? (
+        <p className="text-2xs text-needs-you">
+          Ran without {r.mcpDegraded.map((d) => `${d.id} (${d.detail ?? MCP_REASON[d.reason]})`).join(', ')}
+          {' — '}the session was told to record what it could not do.
+        </p>
+      ) : null}
+      {r?.mcpPark && r.status === 'parked' ? <McpParkNote park={r.mcpPark} /> : null}
+      <PhaseDrawer
+        slug={scope.slug}
+        phase={p.phase}
+        run={scope.run}
+        view={p}
+        holds={row.holds}
+        {...(scope.planQaMode ? { planQaMode: scope.planQaMode } : {})}
+        {...(scope.recovery?.planSkills ? { planSkills: scope.recovery.planSkills } : {})}
+      />
+      <HandoffFacts row={row} />
+      <div className="max-w-prose">
+        <PhaseProse slug={scope.slug} phase={p} eta={row.eta} />
+      </div>
+    </div>
+  );
+}
+
+/** The handoff file's own facts — what the Handoffs tab's row carried. */
+function HandoffFacts({ row }: { row: PhaseTableRow }) {
+  const { p, scope, handoff, index } = row;
+  if (!handoff && !p.handoff) return null;
+  const skills = handoff?.skillsUsed ?? p.handoff?.skillsUsed ?? [];
+  return (
+    <p className="text-2xs text-ink-muted" data-testid={`handoff-facts-${p.phase}`}>
+      <a href={handoffHref(scope.slug, p.phase)} className="text-action hover:underline">
+        Read the handoff
+      </a>
+      {handoff?.title ? ` — ${handoff.title}` : ''}
+      {handoff ? ` · ${Math.round(handoff.bytes / 1024)}K` : ''}
+      {skills.length ? ` · skills ${skills.join(', ')}` : ''}
+      {index ? ` · INDEX.md ${index === 'missing' ? 'has no row' : `reads ${index}`}` : ''}
+    </p>
   );
 }
 
@@ -1370,6 +1349,94 @@ function PhaseActions({
 }
 
 /**
+ * A waiting phase's park, on its row: whose park it is, why, when the runner
+ * resumes it — as a countdown that moves — and what each watched ref's last
+ * probe found and when (control-tower phase 88, #148). The bare list of refs
+ * could not say whether anything was still looking, and a clock time with no
+ * day and no countdown read as a pause.
+ *
+ * It ticks on its own, every 30 s: a waiting run has no live lane, so the
+ * table's own clock stands still.
+ */
+function WaitDetail({ r }: { r: PhaseRecord }) {
+  useNow(true, 30_000);
+  const until = r.parkedUntil ? Date.parse(r.parkedUntil) : NaN;
+  const clock = Number.isFinite(until)
+    ? new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '';
+  const rows = r.watchState?.refs ?? [];
+  // The declared refs first, in their order; a ref the console minted beside
+  // them is shown too, and marked, so it is never read as the session's.
+  const refs = [
+    ...(r.watch ?? []),
+    ...rows.filter((row) => row.minted && !(r.watch ?? []).includes(row.ref)).map((row) => row.ref),
+  ];
+  const probe = (ref: string): string => {
+    const row = rows.find((w) => w.ref === ref);
+    if (!row) return 'not checked yet';
+    const found = row.state === 'refused' && row.detail ? `refused: ${row.detail}` : row.state;
+    return `${found} · checked ${relativeTime(Date.parse(row.checkedAt))}${row.minted ? ' · the console’s' : ''}`;
+  };
+  return (
+    <div className="text-2xs text-ink-faint">
+      {/* Whose park it is, first: the console's own inference is never drawn
+          as the session's testimony. */}
+      {r.declared?.by === 'watchdog'
+        ? 'Parked by the console — it was waiting inside its turn'
+        : 'Waiting on external work'}
+      {r.parkReason ? `: ${r.parkReason}` : ''}
+      {clock
+        ? until > Date.now()
+          ? ` — resumes ${clock} (${countdown(until)})`
+          : ` — was due to resume at ${clock}`
+        : ''}
+      {r.declared?.by === 'watchdog'
+        ? r.watchdogParks
+          ? ` (automatic park ${r.watchdogParks})`
+          : ''
+        : r.waits
+          ? ` (wait ${r.waits})`
+          : ''}
+      {r.resumeRefused
+        ? ` · resume held: session ${r.resumeRefused.sessionId.slice(0, 8)} is still running`
+        : ''}
+      {refs.length ? (
+        <>
+          {' '}
+          · watching{' '}
+          {refs.map((ref, i) => (
+            <Fragment key={ref}>
+              {i > 0 ? ', ' : null}
+              {/* Paths, and a watch list is as long as the phase made it.
+                  `inline-block` gives a `truncate` a box to truncate against
+                  inside a sentence. */}
+              <code className="inline-block max-w-full truncate align-bottom font-mono" title={ref}>
+                {ref}
+              </code>{' '}
+              ({probe(ref)})
+            </Fragment>
+          ))}
+        </>
+      ) : null}
+      {/* A ref nothing will ever probe is named beside the ones that will be,
+          never dropped in silence (WAI-11). */}
+      {r.watchUnpollable?.length ? (
+        <>
+          {' '}
+          · not watchable{' '}
+          <code
+            className="inline-block max-w-full truncate align-bottom font-mono"
+            title={r.watchUnpollable.map((u) => `${u.ref} — ${u.reason}`).join('\n')}
+          >
+            {r.watchUnpollable.map((u) => u.ref).join(', ')}
+          </code>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/**
  * A `require` MCP park on its clock: when it parked, on which servers, and
  * when the phase continues without them (`mcpRequireTimeoutMs`, a console
  * preference; 0 means it waits for the server to heal, however long).
@@ -1382,11 +1449,75 @@ function McpParkNote({ park }: { park: NonNullable<PhaseRecord['mcpPark']> }) {
   const servers = park.degraded.map((d) => d.id).join(', ') || 'an MCP server';
   const due = timeoutMs > 0 && Number.isFinite(since) ? new Date(since + timeoutMs) : null;
   return (
-    <p className="mt-1 text-2xs text-gated" data-testid="mcp-park">
+    <p className="mt-1 text-2xs text-needs-you" data-testid="mcp-park">
       Parked on {servers} since {Number.isFinite(since) ? new Date(since).toLocaleTimeString() : park.at}
       {due
         ? ` — continues without ${park.degraded.length === 1 ? 'it' : 'them'} at ${due.toLocaleTimeString()} unless the server heals first (an errand is recorded then).`
         : ' — waits for the server to heal; no timeout is set (Settings ▸ Automation).'}
     </p>
+  );
+}
+
+/**
+ * A phase a re-board asked for that no lane or queue entry holds yet
+ * (control-tower phase 86, #128 #114) — with the hint's time, because that
+ * time IS its seniority: it boards at the next free lane ahead of every phase
+ * that never started. Read through `hintedPhases`, the reader `/api/queue`
+ * uses, so a stopped run — which boards nothing — names none.
+ */
+function HintedChip({ hinted }: { hinted: HintedPhase }) {
+  return (
+    <Badge
+      tone="wait"
+      title={`A re-board (${hinted.rung}${hinted.by ? `, by ${hinted.by}` : ''}) asked for this phase at ${hinted.since}. It boards at the next free lane, by seniority — ahead of phases that never started.`}
+    >
+      hinted since {hinted.since.slice(11, 16)}Z
+    </Badge>
+  );
+}
+
+/**
+ * The marks an operator left on this phase's place in the queue — moved ahead,
+ * held, deferred, withdrawn (control-tower phase 99, #135). The chip is the
+ * word; its title is who said it, and why.
+ */
+function QueueMarkChips({ marks }: { marks: ReturnType<typeof queueMarks> }) {
+  if (!marks.length) return null;
+  return (
+    <div className="mt-0.5 flex flex-wrap gap-1">
+      {marks.map((mark) => (
+        // An operator's mark on the queue, never a summons: moved ahead reads
+        // live, the rest (held, deferred, withdrawn) wait.
+        <Badge
+          key={mark.key}
+          tone={mark.key === 'bump' ? 'live' : 'wait'}
+          title={mark.text}
+          data-testid={`queue-mark-${mark.key}`}
+        >
+          {mark.label}
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
+/** This phase's row in `hintedPhases(run)`, or undefined. */
+function hintedOf(run: RunState | null, phase: number): HintedPhase | undefined {
+  return hintedPhases(run).find((row) => row.phase === phase);
+}
+
+/**
+ * A ready phase behind a live lane of its OWN run in the same checkout
+ * (control-tower phase 60, #64): serial work, not a queue — it never waits on
+ * anybody else, and boards the moment that lane ends.
+ */
+function SerialChip({ behind }: { behind: number }) {
+  return (
+    <Badge
+      tone="wait"
+      title={`Phase ${behind} of this run is working in the same checkout. This phase starts when it ends — it is not waiting on anyone else.`}
+    >
+      behind this run’s P{behind}
+    </Badge>
   );
 }

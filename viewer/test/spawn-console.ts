@@ -33,6 +33,14 @@ import { join } from 'node:path';
 
 import { sweepBrokers } from './broker-sweep.ts';
 
+/**
+ * The machine load a console under test reads: held still, as the e2e fixture
+ * holds its own (`steady-load.mjs`, loaded first through NODE_OPTIONS). On a
+ * busy machine the load guard holds every new admission (control-tower phase
+ * 100), so a spawned console asked to run a phase never boarded it.
+ */
+const STEADY_LOAD = `--import=${new URL('../e2e/fixture/steady-load.mjs', import.meta.url).href}`;
+
 export type ConsoleSandbox = {
   /** `XDG_CONFIG_HOME` — preferences, remembered roots, notification switches. */
   configHome: string;
@@ -74,9 +82,16 @@ export function sandbox(label = 'console'): ConsoleSandbox {
     configHome,
     stateHome,
     root,
-    // A console a test starts never updates the repository it runs from (see
-    // state-sandbox.ts) — restated here, where the environment is handed over.
-    env: { ...process.env, XDG_CONFIG_HOME: configHome, XDG_STATE_HOME: stateHome, PHASE_CONSOLE_SELF_UPDATE: '0' },
+    // A console a test starts never updates the repository it runs from, and
+    // reads a quiet machine (see state-sandbox.ts) — restated here, where the
+    // environment is handed over.
+    env: {
+      ...process.env,
+      XDG_CONFIG_HOME: configHome,
+      XDG_STATE_HOME: stateHome,
+      PHASE_CONSOLE_SELF_UPDATE: '0',
+      NODE_OPTIONS: [process.env.NODE_OPTIONS, STEADY_LOAD].filter(Boolean).join(' '),
+    },
     cleanup: () => {
       // A console under test is KILLED, not shut down, and since Phase 7 its
       // ptys belong to a broker that survives exactly that. Right in
@@ -109,16 +124,59 @@ export function spawnConsole(
      * a suite that prints every console's startup banner is unreadable.
      */
     stdio?: 'ignore' | 'pipe';
+    /**
+     * The script node runs — this tree's `server/index.ts` unless a test is
+     * about another build of it: the Pro package's bundled `server/index.js`, or
+     * the `phase-console` bin an install put on PATH (control-tower phase 68).
+     * Same sandbox, same arguments, whichever it is.
+     */
+    entry?: string;
+    /**
+     * Give the child its OWN process group (pgid = its own pid) rather than
+     * inheriting this one's. Pass this when `entry` is a shim that may fork a
+     * server of its own (the `phase-console` bin does, at the end of
+     * `bin/phase-console.mjs`): a bare `child.kill('SIGKILL')` on a
+     * non-detached shim only ever reaches the shim itself, and the server it
+     * forked survives it as an orphan (#155) — `stopConsole` below is the
+     * teardown that goes with this flag.
+     */
+    detached?: boolean;
   } = {},
 ): { child: ChildProcess; box: ConsoleSandbox } {
   const box = opts.sandbox ?? sandbox();
   const child = spawn(process.execPath, [
-    join(viewerDir, 'server', 'index.ts'),
+    opts.entry ?? join(viewerDir, 'server', 'index.ts'),
     '--port', String(port), '--no-open', '--no-log-file',
     ...(opts.withRoot ? ['--root', box.root] : []),
     ...args,
-  ], { stdio: opts.stdio ?? 'ignore', env: { ...box.env, ...opts.env } });
+  ], { stdio: opts.stdio ?? 'ignore', env: { ...box.env, ...opts.env }, detached: opts.detached ?? false });
   return { child, box };
+}
+
+/**
+ * Stop a console spawned with `detached: true` — the process GROUP, TERM
+ * then KILL, so a shim that forked a server of its own takes it down too
+ * (#155: `child.kill('SIGKILL')` alone only ever reached the shim, whose
+ * SIGCONT/SIGTERM/SIGHUP forwarding — the end of `bin/phase-console.mjs` —
+ * never runs for a signal it cannot catch, and the server it forked lived on
+ * as an orphan). Safe to call on a child that has already exited: signalling
+ * a group nobody is left in is not an error here, it is the point.
+ */
+export async function stopConsole(child: ChildProcess, opts: { graceMs?: number } = {}): Promise<void> {
+  const pid = child.pid;
+  if (pid === undefined) return;
+  const alive = (): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
+  const graceMs = opts.graceMs ?? 2000;
+  const deadline = Date.now() + graceMs;
+  while (alive() && Date.now() < deadline) {
+    await new Promise((resolve) => { setTimeout(resolve, 50); });
+  }
+  if (alive()) {
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
 }
 
 const DEMO_PLAN = `---

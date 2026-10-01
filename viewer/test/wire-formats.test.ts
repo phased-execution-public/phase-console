@@ -91,6 +91,9 @@ function sh(script: string, args: string[], env: Record<string, string> = {}): s
       // script writes for ITS arguments, not for the environment it happens to
       // run in.
       PE_SCOPE: '', PE_OWNER: '', PE_SESSION_ID: '', PE_WORKTREE: '', PE_BRANCH: '',
+      // …and `PE_LOCK_MIRROR` (control-tower phase 63): under an autopilot it
+      // turns a `--git` into a file-only call, which is not what a wire test reads.
+      PE_LOCK_MIRROR: '',
       NO_COLOR: '1', TERM: 'dumb',
       ...env,
     },

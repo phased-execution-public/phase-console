@@ -21,15 +21,18 @@
  * - **from the plan** — the plan's own bullet (a phase's model, its skills).
  * - **from your last launch** — what this browser launched this plan with last
  *   time (`launch-memory.ts`); outranks a preference, never a run.
+ * - **from preset** — a posture the operator picked in the quick view's preset
+ *   row (`presets.ts`, control-tower phase 22): chosen, but not typed.
  * - **changed here** — the operator touched it; this launch differs.
  */
 
 import type { ReactNode } from 'react';
+import { SETTING_EFFECT_LABELS } from '@shared/run-settings.js';
 import { Button, Checkbox, Field, Input, field as fieldClass } from '@/components/ui';
 import { cn } from '@/lib/cn';
 
 /** Where a value came from, once the form and its seed are compared. */
-export type Source = 'defaults' | 'prefs' | 'run' | 'plan' | 'last-launch' | 'changed';
+export type Source = 'defaults' | 'prefs' | 'run' | 'plan' | 'last-launch' | 'preset' | 'changed';
 
 export const SOURCE_WORDS: Readonly<Record<Source, string>> = Object.freeze({
   defaults: 'from defaults',
@@ -37,6 +40,7 @@ export const SOURCE_WORDS: Readonly<Record<Source, string>> = Object.freeze({
   run: 'from this run',
   plan: 'from the plan',
   'last-launch': 'from your last launch',
+  preset: 'from preset',
   changed: 'changed here',
 });
 
@@ -53,7 +57,32 @@ export function Provenance({ source }: { source?: Source }) {
 }
 
 /**
- * Which of the six it is.
+ * When a change to this field lands on a LIVE run (control-tower phase 24,
+ * #31): `SETTING_EFFECTS`' word for it — and, while a lane is working on a
+ * field the door refuses under a live lane (`LIVE_LANE_LOCKED_FIELDS`), the
+ * refusal in the sheet's own words, before the press rather than after it.
+ */
+export interface FieldEffect {
+  word: keyof typeof SETTING_EFFECT_LABELS;
+  refused?: string;
+}
+
+/** The effect line beside a control — `SETTING_EFFECT_LABELS`' words, never a sentence of its own. */
+export function EffectNote({ effect }: { effect?: FieldEffect | undefined }) {
+  if (!effect) return null;
+  return (
+    <span
+      className={cn('text-2xs', effect.refused ? 'text-ink' : 'text-ink-muted')}
+      data-effect={effect.word}
+      {...(effect.refused ? { 'data-refused': '' } : {})}
+    >
+      {effect.refused ?? SETTING_EFFECT_LABELS[effect.word]}
+    </span>
+  );
+}
+
+/**
+ * Which of the seven it is.
  *
  * `seed` is what the form opened on and `origin` is where THAT came from, so a
  * value equal to its seed reports the seed's origin and anything else reports
@@ -74,6 +103,7 @@ export function SetupField({
   label,
   hint,
   source,
+  effect,
   error,
   inline,
   children,
@@ -82,6 +112,7 @@ export function SetupField({
   label: ReactNode;
   hint?: ReactNode;
   source?: Source;
+  effect?: FieldEffect | undefined;
   error?: ReactNode;
   inline?: boolean;
   children: Parameters<typeof Field>[0]['children'];
@@ -92,15 +123,23 @@ export function SetupField({
   // and it also breaks every `getByLabelText('Branch')` in the suite. As a
   // description it is exactly right: `aria-describedby`, read after the name,
   // and it is a description of where the value came from.
-  const described =
-    source && hint != null ? (
+  // The effect rides beside it for the same reason: when a change lands is
+  // a description of the control, never its name.
+  const notes =
+    source || effect ? (
       <>
-        {hint} <Provenance source={source} />
+        <Provenance source={source} />
+        {source && effect ? ' · ' : null}
+        <EffectNote effect={effect} />
       </>
-    ) : source ? (
-      <Provenance source={source} />
+    ) : null;
+  const described =
+    notes && hint != null ? (
+      <>
+        {hint} {notes}
+      </>
     ) : (
-      hint
+      (notes ?? hint)
     );
   return (
     <Field label={label} hint={described} error={error} inline={inline} className={className}>
@@ -114,6 +153,7 @@ export function SelectField({
   label,
   hint,
   source,
+  effect,
   value,
   options,
   disabled,
@@ -123,6 +163,7 @@ export function SelectField({
   label: ReactNode;
   hint?: ReactNode;
   source?: Source;
+  effect?: FieldEffect | undefined;
   value: string;
   /** `[value, label]`; a `''` entry is offered by the caller, never invented here. */
   options: readonly (readonly [string, string])[];
@@ -132,7 +173,7 @@ export function SelectField({
   placeholder?: string;
 }) {
   return (
-    <SetupField label={label} hint={hint} source={source}>
+    <SetupField label={label} hint={hint} source={source} effect={effect}>
       {({ id, describedBy }) => (
         <select
           id={id}
@@ -170,6 +211,7 @@ export function NumberField({
   label,
   hint,
   source,
+  effect,
   error,
   value,
   min,
@@ -181,6 +223,7 @@ export function NumberField({
   label: ReactNode;
   hint?: ReactNode;
   source?: Source;
+  effect?: FieldEffect | undefined;
   error?: ReactNode;
   value: string;
   min?: number;
@@ -190,7 +233,7 @@ export function NumberField({
   onChange: (next: string) => void;
 }) {
   return (
-    <SetupField label={label} hint={hint} source={source} error={error}>
+    <SetupField label={label} hint={hint} source={source} effect={effect} error={error}>
       {({ id, describedBy, invalid }) => (
         <Input
           id={id}
@@ -233,6 +276,7 @@ export function ToggleField({
   label,
   hint,
   source,
+  effect,
   value,
   disabledReason,
   disabled,
@@ -241,6 +285,7 @@ export function ToggleField({
   label: ReactNode;
   hint?: ReactNode;
   source?: Source;
+  effect?: FieldEffect | undefined;
   value: boolean;
   disabledReason?: string;
   disabled?: boolean;
@@ -260,7 +305,7 @@ export function ToggleField({
         onCheckedChange={(next) => onChange(next === true)}
       />
       <span className="min-w-0 flex-1">
-        {label} <Provenance source={source} />
+        {label} <Provenance source={source} /> <EffectNote effect={effect} />
         {/* The HINT wins over the reason when both are given: `disabledReason`
             is the terse thing the tooltip needs ("restart with --allow-writes"),
             and the hint is the paragraph that says what is still true anyway.
@@ -284,6 +329,7 @@ export function PressField({
   label,
   hint,
   source,
+  effect,
   value,
   disabled,
   on = 'On',
@@ -293,6 +339,7 @@ export function PressField({
   label: ReactNode;
   hint?: ReactNode;
   source?: Source;
+  effect?: FieldEffect | undefined;
   value: boolean;
   disabled?: boolean;
   on?: string;
@@ -302,7 +349,8 @@ export function PressField({
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
       <span className="min-w-0">
-        <span className="text-ink">{label}</span> <Provenance source={source} />
+        <span className="text-ink">{label}</span> <Provenance source={source} />{' '}
+        <EffectNote effect={effect} />
         {hint != null && <span className="mt-0.5 block text-2xs text-ink-muted">{hint}</span>}
       </span>
       <Button size="sm" aria-pressed={value} disabled={disabled} onClick={() => onChange(!value)}>

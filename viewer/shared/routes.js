@@ -40,8 +40,20 @@ export function navigate(path, { replace = false } = {}) {
   if (replace) window.dispatchEvent(new HashChangeEvent('hashchange'));
 }
 
-export function planHref(slug, tab = 'route') {
+export function planHref(slug, tab = 'phases') {
   return `#/plan/${encodeURIComponent(slug)}/${tab}`;
+}
+
+/**
+ * One view of a plan's phase table (`PLAN_PHASE_VIEWS`) — `table`, the
+ * default, carries no `?view=`, so its address is the tab's own. `extra` rides
+ * along (`report=4:2` for the QA report sheet).
+ */
+export function planViewHref(slug, view = 'table', extra = '') {
+  const query = [view && view !== 'table' ? `view=${encodeURIComponent(view)}` : '', extra]
+    .filter(Boolean)
+    .join('&');
+  return `${planHref(slug, 'phases')}${query ? `?${query}` : ''}`;
 }
 
 export function phaseHref(slug, phase) {

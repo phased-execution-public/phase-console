@@ -26,7 +26,7 @@
  */
 
 import { useMemo, useState } from 'react';
-import { Bot, Plus } from 'lucide-react';
+import { Bot, Lock, Plus } from 'lucide-react';
 import { api, type TerminalState, type TerminalTicket } from '@/lib/api';
 import { usePhone } from '@/lib/media';
 import { usePrefs } from '@/lib/prefs';
@@ -41,7 +41,7 @@ import {
   useTerminals,
 } from '@/lib/queries';
 import { useQueryClient } from '@tanstack/react-query';
-import { nowLanes } from '@/features/now/model';
+import { nowLanes } from '@/features/runs/lanes-model';
 import { navigate, type Route } from '@/app/router';
 import { Button, Empty } from '@/components/ui';
 import { Page } from '@/components/page';
@@ -49,6 +49,7 @@ import { SessionList, sessionRows } from './list';
 import { NO_FILTERS, applyFilters, isSortId, kindCounts, sortRows, type Filters, type SortId } from './model';
 import { Controls } from './toolbar';
 import SessionPage from './session-page';
+import LocksSection from './locks';
 
 /** `?new=` — the only two things a person can start from here. */
 function startingOf(route: Route): 'agent' | 'shell' | undefined {
@@ -84,6 +85,9 @@ export default function SessionsView({ route }: { route: Route }) {
     () => rows.filter((row) => row.kind === 'lane' || row.kind === 'foreign'),
     [rows],
   );
+
+  // `#/sessions/locks` is a section, not a session: an id is a UUID, never this word (#24).
+  if (sessionId === 'locks') return <LocksSection />;
 
   if (sessionId || starting) {
     return (
@@ -163,6 +167,9 @@ function SessionsList({
         subtitle="Every process this console owns or can see — the lanes it runs, the sessions you open, and the Claude sessions the presence hook reports on this machine."
         actions={
           <div className="flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="ghost" onClick={() => navigate('sessions/locks')}>
+              <Lock size={14} aria-hidden /> Locks
+            </Button>
             {allowAgent && (
               <Button size="sm" onClick={() => navigate('sessions?new=agent')}>
                 <Bot size={14} aria-hidden /> New session

@@ -395,3 +395,149 @@ setup() {
   [ "$status" -eq 0 ]
   [ "$(tail -1 "$DOCS_ROOT/docs/handoffs/linear/.locks/phase-01.lock" | cut -d= -f1)" = pid ]
 }
+
+# ---------------------------------------------------------------------------
+# control-tower phase 63 (#85, #88): under an autopilot the session's lock calls
+# are file-only and the CONSOLE mirrors the lock to git outside the turn —
+# `mirror`, one pathspec commit inside the docs root's critical section, never
+# a pull and never a push. A hand session keeps `--git`.
+# ---------------------------------------------------------------------------
+
+# A docs root that is a git repository with one commit, and a remote that does
+# not exist — so any pull or push would fail loudly.
+git_docs() {
+  setup_docs linear linear
+  git -C "$DOCS_ROOT" init -q -b main .
+  git -C "$DOCS_ROOT" config user.email t@t.t
+  git -C "$DOCS_ROOT" config user.name t
+  git -C "$DOCS_ROOT" remote add origin "$BATS_TEST_TMPDIR/no-such-remote.git"
+  git -C "$DOCS_ROOT" add -A
+  git -C "$DOCS_ROOT" commit -qm init
+}
+lockrel() { printf 'docs/handoffs/linear/.locks/phase-%02d.lock' "$1"; }
+
+@test "lock: PE_LOCK_MIRROR=console skips --git on claim, release and conflicts — file-only, and says so" {
+  git_docs
+  head0="$(git -C "$DOCS_ROOT" rev-parse HEAD)"
+  PE_LOCK_MIRROR=console run pe_lock linear claim 1 --owner autopilot/r1 --git
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "claimed by autopilot/r1"
+  assert_contains "$output" "console mirrors the lock to git outside your turn"
+  [ -f "$DOCS_ROOT/$(lockrel 1)" ]
+  PE_LOCK_MIRROR=console run pe_lock linear conflicts 2 --scope other --git
+  [ "$status" -eq 0 ]
+  PE_LOCK_MIRROR=console run pe_lock linear release 1 --owner autopilot/r1 --git
+  [ "$status" -eq 0 ]
+  # Nothing committed, nothing pulled: HEAD never moved and no retry was tried.
+  [ "$(git -C "$DOCS_ROOT" rev-parse HEAD)" = "$head0" ]
+  ! printf '%s' "$output" | grep -q "git sync retry"
+}
+
+@test "lock: without PE_LOCK_MIRROR a hand session's --git still commits (and tries to push)" {
+  git_docs
+  run env PE_GIT_RETRIES=1 PE_GIT_RETRY_DELAY=0 DOCS_ROOT="$DOCS_ROOT" /bin/bash \
+    "$PE_SCRIPTS/phase-lock.sh" linear claim 1 --owner hand/1 --git
+  [ "$status" -eq 0 ]
+  # The push cannot land (no remote), so the commit comes off again — the
+  # UNPUBLISHED path proves --git was honoured rather than skipped.
+  assert_contains "$output" "UNPUBLISHED"
+}
+
+@test "lock: mirror commits the phase's lock path ALONE — a file somebody else staged stays staged" {
+  git_docs
+  run pe_lock linear claim 1 --owner autopilot/r1
+  [ "$status" -eq 0 ]
+  echo foreign > "$DOCS_ROOT/notes.md"
+  git -C "$DOCS_ROOT" add notes.md
+  run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "phase 1: mirrored (claim)"
+  [ "$(git -C "$DOCS_ROOT" log -1 --format=%s)" = "phase-lock: claim phase 1 (linear) by autopilot/r1" ]
+  [ "$(git -C "$DOCS_ROOT" show --name-only --format= HEAD)" = "$(lockrel 1)" ]
+  git -C "$DOCS_ROOT" diff --cached --name-only | grep -qx notes.md
+}
+
+@test "lock: mirror after a release commits the deletion, and a second mirror has nothing to do" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  pe_lock linear mirror 1 >/dev/null
+  pe_lock linear release 1 --owner autopilot/r1 >/dev/null
+  run pe_lock linear mirror 1 --owner autopilot/r1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "phase 1: mirrored (release)"
+  [ "$(git -C "$DOCS_ROOT" log -1 --format=%s)" = "phase-lock: release phase 1 (linear) by autopilot/r1" ]
+  ! git -C "$DOCS_ROOT" ls-files --error-unmatch "$(lockrel 1)" 2>/dev/null
+  run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "phase 1: nothing to mirror"
+}
+
+@test "lock: mirror never pulls and never pushes — a dead remote costs it nothing" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  run env PE_GIT_RETRIES=1 PE_GIT_RETRY_DELAY=0 DOCS_ROOT="$DOCS_ROOT" /bin/bash \
+    "$PE_SCRIPTS/phase-lock.sh" linear mirror 1
+  [ "$status" -eq 0 ]
+  ! printf '%s' "$output" | grep -q "UNPUBLISHED\|retry\|could not refresh"
+  [ "$(git -C "$DOCS_ROOT" rev-list --count HEAD)" -eq 2 ]
+}
+
+@test "lock: mirror outside a git repository is a no-op, never an error" {
+  setup_docs linear linear
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "nothing to mirror"
+}
+
+@test "lock: a held docs-root critical section makes mirror wait, then say UNMIRRORED and keep the lock" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  mkdir "$DOCS_ROOT/.git/pe-root-section"
+  date +%s > "$DOCS_ROOT/.git/pe-root-section/at"
+  PE_ROOT_SECTION_WAIT=1 run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "UNMIRRORED: phase 1"
+  [ -f "$DOCS_ROOT/$(lockrel 1)" ]
+  [ "$(git -C "$DOCS_ROOT" rev-list --count HEAD)" -eq 1 ]
+  # Somebody else's section is theirs to remove.
+  [ -d "$DOCS_ROOT/.git/pe-root-section" ]
+}
+
+@test "lock: a stale critical section is broken and the mirror lands; its own section never outlives it" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  mkdir "$DOCS_ROOT/.git/pe-root-section"
+  echo 1000 > "$DOCS_ROOT/.git/pe-root-section/at"
+  PE_ROOT_SECTION_WAIT=0 run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "broke a stale docs-root critical section"
+  assert_contains "$output" "phase 1: mirrored (claim)"
+  [ ! -d "$DOCS_ROOT/.git/pe-root-section" ]
+}
+
+@test "lock: a critical section whose writer is gone is broken at once, however fresh" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  sleep 0 & dead=$!
+  wait "$dead" 2>/dev/null || true
+  mkdir "$DOCS_ROOT/.git/pe-root-section"
+  date +%s > "$DOCS_ROOT/.git/pe-root-section/at"
+  echo "$dead" > "$DOCS_ROOT/.git/pe-root-section/pid"
+  PE_ROOT_SECTION_WAIT=5 run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "broke a stale docs-root critical section"
+  assert_contains "$output" "phase 1: mirrored (claim)"
+}
+
+@test "lock: a section held by a LIVE writer is waited on, never broken by a fresh age" {
+  git_docs
+  pe_lock linear claim 1 --owner autopilot/r1 >/dev/null
+  mkdir "$DOCS_ROOT/.git/pe-root-section"
+  date +%s > "$DOCS_ROOT/.git/pe-root-section/at"
+  echo "$$" > "$DOCS_ROOT/.git/pe-root-section/pid"
+  PE_ROOT_SECTION_WAIT=1 run pe_lock linear mirror 1
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "UNMIRRORED: phase 1"
+  [ -d "$DOCS_ROOT/.git/pe-root-section" ]
+}

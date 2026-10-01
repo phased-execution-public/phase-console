@@ -414,6 +414,31 @@ test('ACT-6: a live wall the runner escalated classifies resource-wall:usage fro
   assert.equal(parked.actor, 'machine', 'the ladder\'s to climb — switch-account, wait-window — never a person\'s first');
 });
 
+test('#106: a usage wall is re-judged on the run\'s CURRENT account — room now is work-in-progress, a plain resume in place (control-tower phase 79)', () => {
+  // The wall a checkpoint remembers was an EARLIER attempt's, often on another
+  // account: classified from the note alone, it moved a run off a 5 % account
+  // back onto a 64 % one. The live meter of the account the run is on decides.
+  const reason = 'rate limited mid-session (rate_limit) — 3 rate-limit events in 40s with no work between them';
+  const checkpointed: PhaseEvidence = {
+    ...P2_WORK_IN_PROGRESS,
+    run: { status: 'running', halt: null, waitUntil: null },
+    record: { ...P2_WORK_IN_PROGRESS.record!, status: 'pending', note: `checkpointed (${reason}) — the next attempt resumes session s-1` },
+  };
+  assert.equal(classifySituation(checkpointed).key, 'resource-wall:usage', 'with no word from the meters the record\'s wall stands');
+  const walled = classifySituation({ ...checkpointed, account: { id: 'acct-b', ok: false, resetsAt: '2026-08-13T15:00:00.000Z' } });
+  assert.equal(walled.key, 'resource-wall:usage', 'a live wall on the run\'s account is a wall');
+  const lifted = classifySituation({ ...checkpointed, account: { id: 'acct-b', ok: true } });
+  assert.equal(lifted.key, 'work-in-progress', 'the account the run is on has room: the stored wall is stale');
+  assert.ok(lifted.why.some((line) => /acct-b/.test(line) && /room/.test(line)), lifted.why.join(' | '));
+  // The run's own sleep on the window and a CLI rejection are the same stale evidence once the account has room.
+  assert.equal(classifySituation({
+    ...checkpointed, run: { status: 'waiting', waitUntil: '2026-08-13T15:00:00.000Z', halt: null }, account: { id: 'acct-b', ok: true },
+  }).key, 'work-in-progress');
+  assert.equal(classifySituation({
+    ...checkpointed, run: { status: 'running', halt: null, limits: { status: 'rejected', utilization: 1 } }, account: { id: 'acct-b', ok: true },
+  }).key, 'work-in-progress');
+});
+
 test('only a run budget is a budget wall — the ladder\'s and the wait\'s "budget is spent" are not (LFC-8)', () => {
   // All ten `resource-wall:budget` classifications the audit found were the
   // LADDER's exhaustion sentence, carried into a kindless park's reason and
@@ -1168,10 +1193,12 @@ test('LFC-3: the console\'s own tool-denied record classifies blocked-declared:p
   assert.equal(waited.key, 'blocked-declared:unknown');
 });
 
-test('LFC-3: the four empty sub-tables are a person\'s — one table, read by the classifier, the ladder and the client alike', () => {
+test('LFC-3: the six empty sub-tables are a person\'s — one table, read by the classifier, the ladder and the client alike', () => {
   assert.deepEqual(SITUATION_SUB_ACTOR, {
+    'blocked-declared:protected-path': 'person',
     'blocked-declared:credential': 'person',
     'blocked-declared:gate': 'person',
+    'blocked-declared:human-acts': 'person',
     'never-started:refusal': 'person',
     'never-started:skill-missing': 'person',
   });
@@ -1187,6 +1214,32 @@ test('LFC-3: the four empty sub-tables are a person\'s — one table, read by th
   assert.equal(actorFor('no-such-situation'), 'person', 'a word from a newer build reaches a person, never a crash');
 });
 
+test('#43: a permission wall this console recorded no rule for, over a path the CLI reserves, is blocked-declared:protected-path; the console\'s own denial keeps it permission', () => {
+  const blocked = (over: Partial<PhaseEvidence>) => classifySituation({
+    ...P7_BLOCKED_DECLARED,
+    handoff: { exists: true, status: 'blocked', outstanding: 'blocked — could not proceed' },
+    ...over,
+  });
+  // The measured wall: `--needs permission`, the act and the path in `--rule`,
+  // and no `phase.tool-denied` of this console's behind it.
+  const wall = { status: 'blocked', needs: 'permission', reason: 'the CLI refused the edit', rule: 'Edit(.claude/x.md)', watch: [] };
+  const cli = blocked({ declared: wall });
+  assert.equal(cli.key, 'blocked-declared:protected-path');
+  assert.equal(cli.actor, 'person', 'no rule on this console can widen the CLI\'s own wall');
+  assert.deepEqual([...rungsFor(cli.key)], []);
+  // The same words over a rule this console DID record: its own wall, which widen-rule answers.
+  const ours = blocked({
+    declared: wall,
+    record: {
+      ...P7_BLOCKED_DECLARED.record!,
+      toolDenied: { tool: 'Edit', rule: 'Edit(.claude/**)', command: '.claude/x.md', at: '2026-09-22T00:00:00.000Z' },
+    },
+  });
+  assert.equal(ours.key, 'blocked-declared:permission');
+  // A directory merely NAMED like the protected one is not under it.
+  assert.equal(blocked({ declared: { ...wall, rule: 'Edit(docs/claude/x.md)' } }).key, 'blocked-declared:permission');
+});
+
 test('blockerSubKind: every scheme the watch clock polls reads as an external wait, not only the GitHub ones', () => {
   const prose = 'The boxes have to come back first; nothing here can bring them up.';
   assert.equal(blockerSubKind(prose), 'unknown', 'the prose alone names no machine category');
@@ -1195,4 +1248,21 @@ test('blockerSubKind: every scheme the watch clock polls reads as an external wa
   assert.equal(blockerSubKind(prose, ['cmd:"test -f /tmp/done"']), 'external');
   assert.equal(blockerSubKind(prose, ['gh:phased-execution-public/phase-console#run/1']), 'external');
   assert.equal(blockerSubKind(prose, ['lock:demo/3']), 'lock', 'a lock ref is still a lock');
+});
+
+test('#43 (control-tower phase 44): the protected-path situation\'s errand IS a human step — the act and the path the session named', () => {
+  const declared = { status: 'blocked', needs: 'permission', reason: 'the CLI refused the edit', rule: 'Edit(.claude/x.md)', command: 'append the release checklist to .claude/x.md', watch: [] };
+  const situation = classifySituation({
+    ...P7_BLOCKED_DECLARED,
+    handoff: { exists: true, status: 'blocked', outstanding: 'blocked — could not proceed' },
+    declared,
+  });
+  assert.equal(situation.key, 'blocked-declared:protected-path');
+  const errand = errandFor(situation.key, [], 7, '2026-09-30T10:00:00.000Z', null, null, null, null, null, declared);
+  assert.deepEqual(errand.step, { kind: 'protected-path', act: 'append the release checklist to .claude/x.md', path: '.claude/x.md' });
+  // The session named only a rule: the act is the rule, the path is read out of it.
+  const ruleOnly = errandFor(situation.key, [], 7, '2026-09-30T10:00:00.000Z', null, null, null, null, null, { rule: 'Edit(.claude/x.md)' });
+  assert.deepEqual(ruleOnly.step, { kind: 'protected-path', act: 'Edit(.claude/x.md)', path: '.claude/x.md' });
+  // The console's own permission wall is not a person's step.
+  assert.equal(errandFor('blocked-declared:permission', [], 7, '2026-09-30T10:00:00.000Z', null, null, null, null, null, declared).step, undefined);
 });

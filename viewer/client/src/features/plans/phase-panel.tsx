@@ -6,10 +6,9 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   Empty,
   KeyValue,
-  StateChip,
   type Severity,
 } from '@/components/ui';
 import { Markdown, MarkdownInline } from '@/components/markdown';
@@ -24,6 +23,7 @@ import { countdown, pad2, plural, weight } from '@/lib/format';
 import { handoffHref, phaseHref, planHref } from '@shared/routes.js';
 import type { PhaseView, PlanDetail } from '@/lib/api';
 import { PhaseStateChip } from '@/features/runs/phase-row';
+import { OpsBadge, type WordOf } from '@/components/ui/status';
 import { AskBox } from '@/features/runs/ask-box';
 import { RecoveryActions } from '@/components/recovery-actions';
 import { GateCard } from './gate-card';
@@ -71,7 +71,7 @@ export function SteerCard({ slug, view, allowRun }: { slug: string; view: PhaseV
     <Card data-testid="phase-steer">
       <CardHeader>
         <CardTitle className="text-sm normal-case">This phase is running</CardTitle>
-        <Chip mono>via {live.via}</Chip>
+        <Badge mono>via {live.via}</Badge>
       </CardHeader>
       {driven ? (
         <AskBox slug={slug} enabled={allowRun} allowRun={allowRun} phase={view.phase} />
@@ -145,21 +145,21 @@ export function PhasePanel({ detail, phase }: { detail: PlanDetail; phase: strin
                 </CardTitle>
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
                   <PhaseStateChip slug={slug} phase={view.phase} state={view.state} live={view.live} />
-                  <Chip mono>{view.size}</Chip>
-                  <Chip mono>{weight(view.weight)}</Chip>
-                  {view.model && <Chip mono>{view.model}</Chip>}
-                  {view.effort && <Chip mono>effort {view.effort}</Chip>}
+                  <Badge mono>{view.size}</Badge>
+                  <Badge mono>{weight(view.weight)}</Badge>
+                  {view.model && <Badge mono>{view.model}</Badge>}
+                  {view.effort && <Badge mono>effort {view.effort}</Badge>}
                   {view.gated && (
-                    <Chip tone="gate">
+                    <Badge tone="accent">
                       {view.gateKind && view.gateKind !== 'none' ? `gated·${view.gateKind}` : 'gated'}
-                    </Chip>
+                    </Badge>
                   )}
                   {view.mcpServers?.map((id) => (
-                    <Chip key={id} mono>
+                    <Badge key={id} mono>
                       mcp {id}
-                    </Chip>
+                    </Badge>
                   ))}
-                  {view.analysis?.onCriticalPath && <Chip>critical path</Chip>}
+                  {view.analysis?.onCriticalPath && <Badge>critical path</Badge>}
                   <QaVerdict qa={view.qa} />
                   <ReviewVerdictChip {...(view.review ? { review: view.review } : {})} />
                 </div>
@@ -425,10 +425,7 @@ export function PhasePanel({ detail, phase }: { detail: PlanDetail; phase: strin
             <CardBody className="flex flex-col gap-3">
               <KeyValue
                 items={[
-                  [
-                    'Status',
-                    <StateChip state={handoffState(view.handoff.status)} label={view.handoff.status} />,
-                  ],
+                  ['Status', <OpsBadge vocab="handoff" word={view.handoff.status as WordOf<'handoff'>} />],
                   ['Completed', view.handoff.completed],
                   ['Skills used', view.handoff.skillsUsed.join(', ')],
                   ['Prompts', view.handoff.prompts ? plural(view.handoff.prompts, 'boot prompt') : null],
@@ -516,17 +513,4 @@ export function promptBanner(view: {
           'its own boot prompt tells it to run.',
       };
   }
-}
-
-/**
- * A handoff's own status vocabulary, mapped onto the phase palette.
- *
- * `complete`/`blocked` are handoff words; `done`/`stuck` are what the map and
- * the chips paint. Keeping the mapping in one exported function is what stops
- * the handoffs table and the phase panel from drifting into two answers.
- */
-export function handoffState(status: string): string {
-  if (status === 'complete') return 'done';
-  if (status === 'blocked') return 'stuck';
-  return status;
 }

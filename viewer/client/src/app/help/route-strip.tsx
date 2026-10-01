@@ -20,7 +20,7 @@
  *
  * The filled/ringed distinction is the one carried over from `concepts.md`'s
  * legend, which used two emoji: a solid station is work the machine does, a
- * ringed one is work that waits for you. `--line-done` and `--line-gated` are
+ * ringed one is work that waits for you. `--status-done` and `--status-needs-you` are
  * reused rather than invented — `gated` already means "a person must decide" in
  * the engine's own vocabulary, so the colour is already true.
  */

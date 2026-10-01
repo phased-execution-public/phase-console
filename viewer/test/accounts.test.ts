@@ -20,19 +20,19 @@ import { mkdirSync, mkdtempSync, readFileSync, statSync, existsSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AccountStore, ACCOUNTS_DIR, profileConfigDir } from '../server/accounts/store.ts';
+import { AccountStore, ACCOUNT_ID_RE, ACCOUNTS_DIR, profileConfigDir } from '../server/accounts/store.ts';
 import {
   Credentials, claudeKeychainService, consoleKeychainService, KEYCHAIN_STORE_FAILED, type Exec,
 } from '../server/accounts/credentials.ts';
 import { USAGE_STALE_MS } from '../server/accounts/usage.ts';
 import {
-  Accounts, ACCOUNT_COOLDOWN_MS, PREFLIGHT_REFUSE_PCT, ProbeInFlightError, probeVerdict,
+  AccountInUseError, Accounts, ACCOUNT_COOLDOWN_MS, PREFLIGHT_REFUSE_PCT, ProbeInFlightError, probeVerdict,
 } from '../server/accounts/index.ts';
 import {
   ENTITLEMENT_PROBE_OWNER, probeArgv, probeEnv, runProbeSession, type ProbeSession,
 } from '../server/accounts/entitlement-probe.ts';
 import { recent } from '../server/log.ts';
-import { LearnedAccounts, LEARNED_FILE, credentialFingerprint } from '../server/accounts/learned.ts';
+import { LearnedAccounts, LEARNED_FILE, SUSPECT_CLEAR_MS, credentialFingerprint } from '../server/accounts/learned.ts';
 import { ENTITLEMENT_TRANSITIONS, entitlementMayMove } from '../shared/ops-vocab.js';
 import { STATE_SANDBOX } from './state-sandbox.ts';
 
@@ -79,7 +79,10 @@ test('store: add, update, remove round-trip through disk with owner-only modes',
 });
 
 test('store: ids are readable, collision-suffixed, and never the built-in one', () => {
-  const store = new AccountStore();
+  // Its own registry, not the module-level one. Since SE-3 a removal RETIRES
+  // the id it freed, so a neighbour test that registered and removed
+  // `work-max` would make the first assertion here about its leftovers.
+  const store = new AccountStore(mkdtempSync(join(tmpdir(), 'pc-readable-ids-')));
   assert.equal(store.newId('Work Max!'), 'work-max');
   store.add({ id: 'work-max', kind: 'token', createdAt: 'x' });
   const second = store.newId('Work MAX');
@@ -389,35 +392,56 @@ test('facade: rename changes the display name only — stored accounts and the m
   accounts.stop();
 });
 
-test('facade: an expired profile announces once, after the refresh was tried — never on first sight', async () => {
+test('facade: an expired profile announces once, after the CLI\'s refresh was tried or had nothing to renew with — never on first sight', async () => {
   const transitions: string[] = [];
-  const { exec, calls } = fakeExec(() => '');
+  let profileDir = '';
+  const { exec, calls } = fakeExec((file, args) => {
+    // The CLI's own refresh (`keep-alive.ts`, measured on 2.1.283): the `-p`
+    // start rewrites the blob, then refuses the model and exits 1.
+    if (file !== 'claude' || args[0] !== '-p') return '';
+    writeFileSync(join(profileDir, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'tok-renewed', refreshToken: 'ref', expiresAt: Date.now() + 8 * 60 * 60_000, subscriptionType: 'max' },
+    }));
+    return new Error('claude exited 1: unrecognized model');
+  });
   const accounts = new Accounts({
     platform: 'linux',
     exec,
     onAuthChange: (view, state) => transitions.push(`${view.id}:${state}`),
   });
   const { id, dir } = accounts.beginProfile('stale');
+  profileDir = dir;
   writeFileSync(join(dir, '.credentials.json'), JSON.stringify({
-    claudeAiOauth: { accessToken: 'tok', expiresAt: Date.now() + 60 * 60_000, subscriptionType: 'max' },
+    claudeAiOauth: { accessToken: 'tok', refreshToken: 'ref', expiresAt: Date.now() + 60 * 60_000, subscriptionType: 'max' },
   }));
   const view = (await accounts.list()).find((a) => a.id === id);
   assert.equal(view?.authState, 'ok');
   await sleep(20);
   assert.deepEqual(transitions, [], 'a first observation never announces');
 
-  // The login expires. The poller path is the authoritative writer, and it
-  // sits AFTER the CLI-refresh attempt — only a login the CLI could not
-  // rescue may read as expired.
+  // The access token lapses. The poller path is the authoritative writer, and
+  // it sits AFTER the CLI's refresh — a login the CLI rescues never reads as
+  // expired (control-tower phase 91: the refresh is a `-p` start, because
+  // `claude auth status`, which this used to call, renews nothing).
   writeFileSync(join(dir, '.credentials.json'), JSON.stringify({
-    claudeAiOauth: { accessToken: 'tok', expiresAt: Date.now() - 60_000, subscriptionType: 'max' },
+    claudeAiOauth: { accessToken: 'tok', refreshToken: 'ref', expiresAt: Date.now() - 60_000, subscriptionType: 'max' },
   }));
   const facade = accounts as unknown as { resolveToken(id: string): Promise<unknown> };
   await facade.resolveToken(id);
-  assert.ok(
-    calls.some((c) => c.file === 'claude' && c.args[0] === 'auth' && c.args[1] === 'status'),
-    'the CLI refresh was attempted before believing the expiry',
-  );
+  const renewals = () => calls.filter((c) => c.file === 'claude' && c.args[0] === '-p').length;
+  assert.equal(renewals(), 1, 'the CLI refresh was attempted before believing the expiry');
+  assert.ok(!calls.some((c) => c.args[0] === 'auth' && c.args[1] === 'status'), '`auth status` is never asked to refresh');
+  assert.equal(accounts.authStateFor(id), 'ok', 'the renewed login reads as the login it is');
+  await sleep(20);
+  assert.deepEqual(transitions, [], 'a rescued login announces nothing');
+
+  // The login lapses with nothing left to renew it with: no refresh is tried,
+  // and only now may it read as expired.
+  writeFileSync(join(dir, '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { accessToken: 'tok', expiresAt: Date.now() - 60_000, subscriptionType: 'max' },
+  }));
+  await facade.resolveToken(id);
+  assert.equal(renewals(), 1, 'a blob holding no refresh token is not handed to the CLI');
   await sleep(20);
   assert.deepEqual(transitions, [`${id}:expired`], 'announced exactly once, on the transition');
 
@@ -653,11 +677,13 @@ test('SES-2: a credential-class refusal RETIRES the account — rankAccounts omi
   assert.equal(view.entitlement.class, 'org-policy');
   assert.equal(view.authState, 'unusable', 'a retired credential paints `unusable` whatever its login says');
 
-  // Nothing automatic reopens it: a successful read is refused by the table.
+  // Nothing automatic REOPENS it: a successful read later than a classifier's
+  // retirement demotes it to `suspect` (control-tower phase 54, #57) — still
+  // out of the rank — and retired → entitled is still not a transition.
   plantMeters(accounts, a.id, { buckets: { five_hour: { utilization: 10, resetsAt: new Date(Date.now() + HOUR).toISOString() } }, fetchedAt: new Date().toISOString() });
   (accounts as unknown as { usageUpdated: (id: string, u: unknown, m: unknown) => void })
-    .usageUpdated(a.id, { buckets: {}, fetchedAt: new Date().toISOString() }, { outcome: 'ok' });
-  assert.equal(accounts.entitlementOf(a.id).state, 'retired', 'retired → entitled is not a transition');
+    .usageUpdated(a.id, { buckets: {}, fetchedAt: new Date(Date.now() + 1_000).toISOString() }, { outcome: 'ok' });
+  assert.equal(accounts.entitlementOf(a.id).state, 'suspect', 'demoted, never reopened');
   assert.deepEqual(accounts.rankAccounts('default'), [b.id]);
 
   // The operator's clearance is the one door out — to `unknown`, not `entitled`.
@@ -669,6 +695,43 @@ test('SES-2: a credential-class refusal RETIRES the account — rankAccounts omi
 
   await accounts.remove(a.id);
   await accounts.remove(b.id);
+  accounts.stop();
+});
+
+test('clearing a retirement lifts the scheduler hold the retirement placed — and no real window (control-tower phase 33)', async () => {
+  // The tower rehearsal's finding: a credential refusal retires the account
+  // AND holds it in the scheduler for `ACCOUNT_COOLDOWN_MS`, which
+  // `scheduler.throttle` writes through as the nameless wall. The operator's
+  // clearance opened the breaker and left the hold, so the Continue that
+  // followed sat `queued` on a "usage window" for half an hour.
+  const accounts = makeAccounts();
+  const a = await accounts.addToken('alpha', 'sk-ant-oat01-alphavalue000000');
+  const retire = () => accounts.leaveAccount(a.id, {
+    kind: 'credential', class: 'org-policy', by: 'classifier',
+    reason: 'organization policy blocks this credential',
+  });
+  const left = retire();
+  assert.ok(left.throttleUntilMs, 'the retirement asks the scheduler for a hold');
+  // What the runner does with that answer (`scheduler.throttle`).
+  accounts.markLimited(a.id, 'learned_window', new Date(left.throttleUntilMs!).toISOString());
+  const fiveHour = new Date(Date.now() + 3 * HOUR).toISOString();
+  accounts.markLimited(a.id, 'five_hour', fiveHour);
+  assert.ok(accounts.limitedUntil(a.id).learned_window, 'the hold stands while it is retired');
+
+  assert.equal(accounts.clearRetired(a.id), true);
+  assert.equal(accounts.limitedUntil(a.id).learned_window, undefined, 'the hold goes with the retirement');
+  assert.equal(accounts.limitedUntil(a.id).five_hour, fiveHour, 'a window the meters named stays');
+  assert.equal(accounts.headroom(a.id).ok, false, 'and still answers for itself');
+
+  // A nameless wall LATER than the retirement's hold is a real window the CLI
+  // walled on without naming it — a clearance is not a reason to forget it.
+  const later = new Date(Date.now() + 2 * HOUR).toISOString();
+  retire();
+  accounts.markLimited(a.id, 'learned_window', later);
+  assert.equal(accounts.clearRetired(a.id), true);
+  assert.equal(accounts.limitedUntil(a.id).learned_window, later, 'a real nameless window survives the clearance');
+
+  await accounts.remove(a.id);
   accounts.stop();
 });
 
@@ -723,7 +786,10 @@ test('ACT-8: an entitlement refusal against one account excludes EVERY account s
 test('the breaker\'s table: every write outside it is refused and the state stands', () => {
   // The four states and the transitions between them, asserted against the
   // owner (`shared/ops-vocab.js`) rather than restated.
-  assert.deepEqual(Object.keys(ENTITLEMENT_TRANSITIONS).sort(), ['cooling', 'entitled', 'retired', 'unknown']);
+  assert.deepEqual(Object.keys(ENTITLEMENT_TRANSITIONS).sort(), ['cooling', 'entitled', 'retired', 'suspect', 'unknown']);
+  assert.equal(entitlementMayMove('retired', 'suspect'), true, 'a contradicted classifier retirement is demoted (#57)');
+  assert.equal(entitlementMayMove('suspect', 'entitled'), true, 'and cleared by a check, a spend, or standing');
+  assert.equal(entitlementMayMove('suspect', 'retired'), true, 'or retired again by a refusal');
   assert.equal(entitlementMayMove('unknown', 'entitled'), true);
   assert.equal(entitlementMayMove('unknown', 'cooling'), false, 'a credential nobody proved can pay cannot cool');
   assert.equal(entitlementMayMove('retired', 'entitled'), false, 'nothing reopens a retirement but a person or a new org');
@@ -1357,9 +1423,15 @@ test('phase 15: tombstones() answers what THIS console removed from the learned 
     assert.equal(tomb?.credential, view.credential);
     assert.equal(tomb?.entitlement.state, 'unknown');
     assert.deepEqual(other.tombstones(), [], 'another console\'s registrations are its own to list');
+    // Registering the same NAME again mints a FRESH id since SE-3 (#22): an id
+    // is a directory path and a journal key, so reusing one gave the new
+    // credential the old one's history and made a run record naming it
+    // unreadable. The tombstone therefore stays — that credential really is
+    // gone, and `labelFor` still has to name it for the journals that spent it.
     const again = await accounts.addToken('Old Support', 'sk-ant-oat01-oldsupport1111111111');
-    assert.equal(again.id, view.id);
-    assert.deepEqual(accounts.tombstones(), [], 'registered again, so no longer a tombstone');
+    assert.notEqual(again.id, view.id, 'the re-registration took the removed account\'s id');
+    assert.deepEqual(accounts.tombstones().map((t) => t.id), [view.id],
+      'the removed credential is still a tombstone — nothing re-registered IT');
     await accounts.remove(again.id);
   } finally {
     accounts.stop();
@@ -1398,4 +1470,590 @@ test('phase 15: list() ranks the candidates in the order an `auto` pick walks, a
     for (const view of [busy, idle, cool]) await accounts.remove(view.id);
     accounts.stop();
   }
+});
+
+/* ------------------------------------------------------------------ *
+ * An outage is not a credential fault (control-tower phase 3, #35/#37/#38)
+ *
+ * ⚠️ Every matched string below is built by CONCATENATION. This file's text
+ * reaches the classifier when a session reads it, and a literal here would arm
+ * the exact trap the phase removes.
+ * ------------------------------------------------------------------ */
+
+/** What a run hands `leaveAccount` when the classifier named a certificate. */
+function certificateStop(session: string, reason = 'the connection answered with a certificate this machine does not trust') {
+  return { kind: 'credential' as const, reason, by: 'classifier' as const, class: 'certificate' as const, structured: false, session };
+}
+
+test('AC-cert-1..4: a certificate needs corroboration — three strikes, two sessions, ten minutes, nothing succeeding between — and then it COOLS, never retires', async () => {
+  let now = Date.parse('2026-09-21T10:00:00Z');
+  const accounts = makeAccounts({
+    now: () => now,
+    learnedFile: join(STATE_SANDBOX, 'learned-cert.json'),
+    registryDir: join(STATE_SANDBOX, 'reg-cert'),
+  });
+  const a = await accounts.addToken('cert-corrob', 'sk-ant-oat01-certcorrob00000000');
+  accounts.noteAuthProbe(a.id, { loggedIn: true, orgId: 'org-cert', checkedAt: '' });
+
+  // AC-cert-1 — one sighting moves nothing. This is the whole of the measured
+  // incident: a single transient stop took seven accounts across two
+  // organisations offline for two and a half hours.
+  accounts.leaveAccount(a.id, certificateStop('sess-1'));
+  assert.equal(accounts.entitlementOf(a.id, now).state, 'unknown', 'one blip decides nothing');
+  assert.deepEqual(accounts.learned.snapshot().orgs, {}, 'and certainly not the organisation');
+
+  // AC-cert-2 — three strikes inside 39 seconds, from ONE session: still the
+  // weather. That is the measured burst, exactly (three halts in 39 s).
+  now += 20_000;
+  accounts.leaveAccount(a.id, certificateStop('sess-1'));
+  now += 19_000;
+  accounts.leaveAccount(a.id, certificateStop('sess-1'));
+  assert.equal(accounts.entitlementOf(a.id, now).state, 'unknown', 'one wedged lane is one opinion, not three');
+
+  // AC-cert-3 — enough strikes, enough sessions, enough time: now it is worth
+  // believing. `cooling`, which expires — never `retired`, which does not.
+  now += 11 * 60_000;
+  accounts.leaveAccount(a.id, certificateStop('sess-2'));
+  const cooling = accounts.entitlementOf(a.id, now);
+  assert.equal(cooling.state, 'cooling');
+  assert.equal(cooling.class, 'certificate');
+  assert.equal(cooling.via, 'credential', 'one credential — the organisation was never asked');
+  assert.deepEqual(accounts.learned.snapshot().orgs, {});
+
+  // AC-cert-4 — and the cool-down has a clock, so the machine comes back by
+  // itself. `retired` is the state with no clock and no evidence path out.
+  now += ACCOUNT_COOLDOWN_MS + 1;
+  assert.equal(accounts.entitlementOf(a.id, now).state, 'entitled', 'the cool-down passed and nobody had to press anything');
+
+  await accounts.remove(a.id);
+  accounts.stop();
+});
+
+test('AC-cert: a successful read between strikes breaks the streak — corroboration means nothing worked in between', async () => {
+  let now = Date.parse('2026-09-21T10:00:00Z');
+  const accounts = makeAccounts({
+    now: () => now,
+    learnedFile: join(STATE_SANDBOX, 'learned-cert-break.json'),
+    registryDir: join(STATE_SANDBOX, 'reg-cert-break'),
+  });
+  const a = await accounts.addToken('cert-break', 'sk-ant-oat01-certbreak000000000');
+  const fp = accounts.fingerprintOf(a.id);
+
+  accounts.leaveAccount(a.id, certificateStop('sess-1'));
+  now += 6 * 60_000;
+  accounts.leaveAccount(a.id, certificateStop('sess-2'));
+  // The network answered in between. Whatever those two stops were, they were
+  // not one standing interception.
+  accounts.learned.noteRead(fp, { successAt: new Date(now).toISOString() });
+  now += 6 * 60_000;
+  accounts.leaveAccount(a.id, certificateStop('sess-3'));
+  assert.notEqual(accounts.entitlementOf(a.id, now).state, 'cooling', 'the streak was broken by proof of reach');
+
+  await accounts.remove(a.id);
+  accounts.stop();
+});
+
+test('AC-org-1..3: the org row is written ONLY from a structured verdict, and never for a certificate — on the failure path as well as the success path', async () => {
+  const accounts = makeAccounts({
+    learnedFile: join(STATE_SANDBOX, 'learned-orggate.json'),
+    registryDir: join(STATE_SANDBOX, 'reg-orggate'),
+  });
+  const a = await accounts.addToken('gate-a', 'sk-ant-oat01-gatea00000000000000');
+  const b = await accounts.addToken('gate-b', 'sk-ant-oat01-gateb00000000000000');
+  accounts.noteAuthProbe(a.id, { loggedIn: true, orgId: 'org-gate', checkedAt: '' });
+  accounts.noteAuthProbe(b.id, { loggedIn: true, orgId: 'org-gate', checkedAt: '' });
+
+  // AC-org-1 — a PROSE org match retires one credential and stops there.
+  accounts.leaveAccount(a.id, {
+    kind: 'credential', reason: 'organization policy blocks this credential', by: 'classifier',
+    class: 'org-policy', structured: false,
+  });
+  assert.equal(accounts.entitlementOf(a.id).state, 'retired');
+  assert.deepEqual(accounts.learned.snapshot().orgs, {}, 'prose never reaches the organisation');
+  assert.equal(accounts.entitlementOf(b.id).state, 'unknown', 'failover still has a survivor');
+  accounts.clearRetired(a.id);
+
+  // AC-org-2 — a prose BILLING match, likewise: `billing` is org-scoped as a
+  // class and still needs the API to have said so.
+  accounts.leaveAccount(a.id, {
+    kind: 'credential', reason: 'billing or credit balance needs attention', by: 'classifier',
+    class: 'billing', structured: false,
+  });
+  assert.deepEqual(accounts.learned.snapshot().orgs, {});
+  accounts.clearRetired(a.id);
+
+  // AC-org-3 — the structured verdict does reach it, which is what the row is for.
+  accounts.leaveAccount(a.id, {
+    kind: 'credential', reason: 'organization policy blocks this credential', by: 'classifier',
+    class: 'org-policy', structured: true,
+  });
+  assert.equal(accounts.entitlementOf(b.id).state, 'retired');
+  assert.equal(accounts.entitlementOf(b.id).via, 'org');
+
+  await accounts.remove(a.id);
+  await accounts.remove(b.id);
+  accounts.stop();
+});
+
+test('AC-proof-1/2: a successful read after a certificate retirement reopens it; an org-policy retirement is not reopened', async () => {
+  let now = Date.parse('2026-09-21T10:54:48Z');
+  const accounts = makeAccounts({
+    now: () => now,
+    learnedFile: join(STATE_SANDBOX, 'learned-proof.json'),
+    registryDir: join(STATE_SANDBOX, 'reg-proof'),
+  });
+  const a = await accounts.addToken('proof-a', 'sk-ant-oat01-proofa0000000000000');
+  const b = await accounts.addToken('proof-b', 'sk-ant-oat01-proofb0000000000000');
+  const fpA = accounts.fingerprintOf(a.id);
+  const fpB = accounts.fingerprintOf(b.id);
+
+  // A certificate-class retirement written directly — the shape the store held
+  // on 2026-09-21, before the classifier stopped producing it.
+  accounts.learned.setEntitlement(fpA, {
+    state: 'retired', at: new Date(now).toISOString(), by: 'classifier',
+    reason: 'the API refused the connection', class: 'certificate',
+  });
+  assert.equal(accounts.entitlementOf(a.id, now).state, 'retired');
+
+  // AC-proof-1 — two and a half hours later the poller is succeeding, hourly,
+  // against the very credential the breaker calls unusable. That evidence was
+  // being collected and thrown away; now it opens the door.
+  now += 2.5 * 60 * 60_000;
+  accounts.learned.noteRead(fpA, { successAt: new Date(now).toISOString() });
+  const reopened = accounts.entitlementOf(a.id, now);
+  assert.equal(reopened.state, 'entitled');
+  assert.equal(reopened.by, 'proof');
+  assert.ok(recent(200).some((line) => line.event === 'accounts.retired.reopened'), 'and it is logged');
+
+  // A read from BEFORE the retirement proves nothing about it.
+  accounts.learned.setEntitlement(fpA, {
+    state: 'retired', at: new Date(now).toISOString(), by: 'classifier',
+    reason: 'the API refused the connection', class: 'certificate',
+  });
+  accounts.learned.noteRead(fpA, { successAt: new Date(now - 60_000).toISOString() });
+  assert.equal(accounts.entitlementOf(a.id, now).state, 'retired', 'the proof must be later than the fault');
+
+  // AC-proof-2 — an org-policy retirement is a statement the API made about
+  // the organisation. A meter read says nothing about it, and the one door out
+  // stays a person's.
+  accounts.learned.setEntitlement(fpB, {
+    state: 'retired', at: new Date(now).toISOString(), by: 'classifier',
+    reason: 'organization policy blocks this credential', class: 'org-policy',
+  });
+  now += 60 * 60_000;
+  accounts.learned.noteRead(fpB, { successAt: new Date(now).toISOString() });
+  // Since control-tower phase 54 (#57) a read later than a CLASSIFIER's
+  // retirement demotes it — never reopens it: still out of the rank, and only
+  // a check, a spend, or the contradiction standing clears it.
+  assert.equal(accounts.entitlementOf(b.id, now).state, 'suspect', 'demoted, not reopened');
+  assert.equal(accounts.rankAccounts(null, undefined, now).includes(b.id), false);
+
+  await accounts.remove(a.id);
+  await accounts.remove(b.id);
+  accounts.stop();
+});
+
+/* ------------------------------------------------------------------ *
+ * SE-2 / SE-3 — the removal that took a live session's world with it
+ * ------------------------------------------------------------------ */
+
+test('SE-3: a removed id is never reissued, and the refusal survives a restart', () => {
+  // An id is a path segment, a journal key, a throttle key and the keychain
+  // service hash's input. Re-minting a removed one gave the new profile the
+  // old one's DIRECTORY and the old one's history while it carried a different
+  // credential, so a run record reading `accountId: "account"` named a path
+  // rather than a login — and nothing could tell the two apart afterwards.
+  const dir = mkdtempSync(join(tmpdir(), 'pc-retired-ids-'));
+  const store = new AccountStore(dir);
+  const first = store.newId('Work Account');
+  store.add({ id: first, kind: 'profile', name: 'Work Account', createdAt: new Date().toISOString() });
+  store.remove(first);
+  assert.deepEqual(store.retired, [first]);
+
+  const second = store.newId('Work Account');
+  assert.notEqual(second, first);
+  assert.match(second, ACCOUNT_ID_RE, 'a retired base still mints a usable id');
+
+  // On disk, so a console that restarts does not forget and reissue.
+  const file = JSON.parse(readFileSync(join(dir, 'accounts.json'), 'utf8')) as { retired?: string[] };
+  assert.deepEqual(file.retired, [first]);
+  assert.notEqual(new AccountStore(dir).newId('Work Account'), first);
+});
+
+test('SE-3: a registry written before retiring reads as retiring nothing', () => {
+  // Every `accounts.json` on every machine today. The key is absent, which must
+  // read as "no id has been given up", not as a parse failure.
+  const dir = mkdtempSync(join(tmpdir(), 'pc-retired-legacy-'));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'accounts.json'), `${JSON.stringify({
+    version: 1,
+    accounts: [{ id: 'kept', kind: 'profile', name: 'kept', createdAt: '2026-01-01T00:00:00.000Z' }],
+  })}\n`, 'utf8');
+  const store = new AccountStore(dir);
+  assert.deepEqual(store.retired, []);
+  assert.equal(store.newId('gone'), 'gone', 'an id nobody has ever held is free');
+});
+
+test('SE-2: the in-use refusal is a 409 the route can read off the error', () => {
+  // The class exists so the route can tell "not now" from "never": a live run
+  // paying as this account, or a live session signed into its config directory,
+  // is a request that would be fine in a minute. `Service.removeAccount` throws
+  // it; `api/routes.ts` reads `status` and answers with it.
+  const error = new AccountInUseError('1 live session is signed into this account (sess-live)');
+  assert.equal(error.status, 409);
+  assert.equal(error.name, 'AccountInUseError');
+  assert.ok(error instanceof Error, 'a route that catches Error must still catch this');
+  assert.match(error.message, /sess-live/, 'the refusal names what is holding it');
+});
+
+/* ------------------------------------------------------------------ *
+ * BA-4..6 — a classifier's retirement argued with, cleared, and explained
+ * (control-tower phase 54, #57). The billing sentence is NAMED here, never
+ * spelled: until phase 57's restart the console running this plan reads it.
+ * ------------------------------------------------------------------ */
+
+const BILLING_REASON = 'billing or credit balance needs attention';
+const ORG_57 = '38b70c98-0000-4000-8000-000000000057';
+const iso = (ms: number) => new Date(ms).toISOString();
+
+test('BA-4: a green read after the stamp demotes a CLASSIFIER\'s retirement to suspect — its organisation\'s too — and only a classifier\'s', async () => {
+  let now = Date.parse('2026-09-23T00:26:03Z');
+  const accounts = makeAccounts({
+    now: () => now, learnedFile: join(STATE_SANDBOX, 'learned-ba4.json'), registryDir: join(STATE_SANDBOX, 'reg-ba4'),
+  });
+  const a = await accounts.addToken('ba4-main', 'sk-ant-oat01-ba4main000000000000');
+  const b = await accounts.addToken('ba4-sibling', 'sk-ant-oat01-ba4sibling0000000000');
+  const c = await accounts.addToken('ba4-by-hand', 'sk-ant-oat01-ba4byhand00000000000');
+  const [fpA, fpB, fpC] = [a.id, b.id, c.id].map((id) => accounts.fingerprintOf(id));
+  try {
+    for (const fp of [fpA, fpB]) accounts.learned.noteIdentity(fp, { orgId: ORG_57 });
+    // #57's retirement: billing, by the classifier, reaching the organisation.
+    accounts.retire(a.id, ORG_57, BILLING_REASON, 'classifier', 'billing');
+    assert.equal(accounts.entitlementOf(a.id, now).state, 'retired');
+    assert.equal(accounts.entitlementOf(b.id, now).via, 'org', 'the sibling is out with its organisation');
+
+    // A read from BEFORE the stamp proves nothing about it.
+    accounts.learned.noteRead(fpA, { successAt: iso(now - 60_000) });
+    assert.equal(accounts.entitlementOf(a.id, now).state, 'retired');
+
+    // The usage endpoint kept answering (07:07:47Z in the incident).
+    now = Date.parse('2026-09-23T07:07:47Z');
+    accounts.learned.noteRead(fpA, { successAt: iso(now) });
+    const word = accounts.entitlementOf(a.id, now);
+    assert.equal(word.state, 'suspect');
+    assert.equal(word.class, 'billing', 'the retirement travels inside the suspect');
+    assert.equal(word.retired?.by, 'classifier');
+    assert.equal(word.contradicted?.by, 'poller');
+    assert.equal(word.contradicted?.at, iso(now));
+    assert.equal(accounts.entitlementOf(b.id, now).state, 'suspect', 'the organisation\'s word is demoted with it');
+    assert.ok(recent(400).some((line) => line.event === 'accounts.retired.suspect'));
+
+    // Still OUT: a read argues with the retirement, it does not overrule it.
+    assert.equal(accounts.rankAccounts(null, undefined, now).some((id) => id === a.id || id === b.id), false);
+    const refused = accounts.headroom(a.id, undefined, now);
+    assert.equal(refused.ok, false);
+    assert.match(!refused.ok ? refused.reason : '', /suspect/);
+
+    // A retirement a PERSON wrote is theirs: no read argues with it.
+    accounts.retire(c.id, undefined, 'retired by hand', 'operator');
+    accounts.learned.noteRead(fpC, { successAt: iso(now + HOUR) });
+    assert.equal(accounts.entitlementOf(c.id, now + HOUR).state, 'retired');
+  } finally {
+    for (const id of [a.id, b.id, c.id]) await accounts.remove(id);
+    accounts.stop();
+  }
+});
+
+test('BA-5: …then clears it — the contradiction standing half an hour, a check the API takes, or a spend; a refusal meanwhile retires it again', async () => {
+  let now = Date.parse('2026-09-23T00:26:03Z');
+  const accounts = makeAccounts({
+    now: () => now, learnedFile: join(STATE_SANDBOX, 'learned-ba5.json'), registryDir: join(STATE_SANDBOX, 'reg-ba5'),
+  });
+  const a = await accounts.addToken('ba5-standing', 'sk-ant-oat01-ba5standing000000000');
+  const b = await accounts.addToken('ba5-spent', 'sk-ant-oat01-ba5spent00000000000000');
+  const [fpA, fpB] = [a.id, b.id].map((id) => accounts.fingerprintOf(id));
+  try {
+    // (1) Standing: the demotion's read, one inside the window, one past it.
+    accounts.retire(a.id, undefined, BILLING_REASON, 'classifier', 'billing');
+    const demotedAt = now + 60_000;
+    accounts.learned.noteRead(fpA, { successAt: iso(demotedAt) });
+    accounts.learned.noteRead(fpA, { successAt: iso(demotedAt + 10 * 60_000) });
+    assert.equal(accounts.entitlementOf(a.id, now).state, 'suspect', 'ten minutes of agreement is not yet half an hour');
+    now = demotedAt + SUSPECT_CLEAR_MS;
+    accounts.learned.noteRead(fpA, { successAt: iso(now) });
+    const cleared = accounts.entitlementOf(a.id, now);
+    assert.equal(cleared.state, 'entitled');
+    assert.equal(cleared.by, 'poller');
+    assert.ok(accounts.rankAccounts(null, undefined, now).includes(a.id), 'back in the rotation');
+
+    // (2) A spend under a suspect account is proof it may pay.
+    accounts.retire(b.id, undefined, BILLING_REASON, 'classifier', 'billing');
+    now += 60_000;
+    accounts.learned.noteRead(fpB, { successAt: iso(now) });
+    assert.equal(accounts.entitlementOf(b.id, now).state, 'suspect');
+    assert.deepEqual(accounts.learned.noteProof(fpB, { at: iso(now + 1_000), by: 'runner', reason: 'a session spent under it' }),
+      { from: 'suspect', to: 'entitled' });
+
+    // (3) A refusal meanwhile retires it again — suspect → retired is on the table.
+    accounts.retire(b.id, undefined, BILLING_REASON, 'classifier', 'billing');
+    now += 60_000;
+    accounts.learned.noteRead(fpB, { successAt: iso(now) });
+    assert.equal(accounts.entitlementOf(b.id, now).state, 'suspect');
+    accounts.retire(b.id, undefined, BILLING_REASON, 'classifier', 'billing');
+    assert.equal(accounts.entitlementOf(b.id, now).state, 'retired');
+  } finally {
+    for (const id of [a.id, b.id]) await accounts.remove(id);
+    accounts.stop();
+  }
+});
+
+test('BA-5: a green one-turn check clears a classifier\'s retirement at once — demoted and cleared in one write', async () => {
+  const { accounts, id } = await probeHarness('BA5 Probe');
+  try {
+    accounts.noteAuthProbe(id, { loggedIn: true } as never);
+    accounts.retire(id, undefined, BILLING_REASON, 'classifier', 'billing');
+    await sleep(5);
+    const out = await accounts.probeEntitlement(id, { actor: { by: 'operator' }, spawnFn: fakeProbeSpawn([PROBE_INIT, PROBE_ANSWER]).spawnFn });
+    assert.equal(out?.probe.status, 'ok');
+    assert.deepEqual(out?.moved, { from: 'retired', to: 'entitled' });
+    assert.equal(out?.account.entitlement.by, 'probe');
+  } finally {
+    await accounts.remove(id);
+    accounts.stop();
+  }
+});
+
+test('BA-6: a retirement records its evidence — source, matched words, session, phase — and the view, the quota door and a restart keep it', async () => {
+  let now = Date.parse('2026-09-23T00:26:03Z');
+  const file = join(STATE_SANDBOX, 'learned-ba6.json');
+  const accounts = makeAccounts({ now: () => now, learnedFile: file, registryDir: join(STATE_SANDBOX, 'reg-ba6') });
+  const a = await accounts.addToken('ba6', 'sk-ant-oat01-ba6value0000000000000');
+  const evidence = {
+    source: 'text' as const, matched: `API Error: 400 ${['Credit bal', 'ance is too low'].join('')}`,
+    session: '55eae732', phase: 23, slug: 'shop-checkout', runId: 'run-57',
+  };
+  try {
+    accounts.leaveAccount(a.id, { kind: 'credential', class: 'billing', by: 'classifier', reason: BILLING_REASON, evidence });
+    const view = (await accounts.list()).find((v) => v.id === a.id)!;
+    assert.deepEqual(view.entitlement.evidence, evidence, 'the account view carries it');
+    const door = accounts.headroom(a.id, undefined, now);
+    assert.deepEqual(!door.ok ? door.evidence : undefined, evidence, 'the quota door — and so the switch — carries it');
+    assert.deepEqual(new LearnedAccounts({ file }).entitlementOf(accounts.fingerprintOf(a.id)).evidence, evidence, 'it survives a restart');
+
+    // Demoted, the suspect keeps the evidence and names what contradicts it.
+    now += HOUR;
+    accounts.learned.noteRead(accounts.fingerprintOf(a.id), { successAt: iso(now) });
+    const suspect = (await accounts.list()).find((v) => v.id === a.id)!.entitlement;
+    assert.equal(suspect.state, 'suspect');
+    assert.deepEqual(suspect.evidence, evidence);
+    assert.equal(suspect.contradicted?.by, 'poller');
+  } finally {
+    await accounts.remove(a.id);
+    accounts.stop();
+  }
+});
+
+test('PR-9 (control-tower phase 53, #56): a switch onto a retired or walled account is refused before anything is checkpointed', async () => {
+  const { Service } = await import('../server/service.ts');
+  const accounts = makeAccounts();
+  const work = await accounts.addToken('work', 'sk-ant-oat01-workvalue0000000000');
+  const gone = await accounts.addToken('gone', 'sk-ant-oat01-gonevalue0000000000');
+  const walled = await accounts.addToken('walled', 'sk-ant-oat01-walledvalue00000000');
+  const fine = await accounts.addToken('fine', 'sk-ant-oat01-finevalue0000000000');
+  accounts.retire(gone.id, undefined, 'organization policy blocks this credential', 'classifier', 'org-policy');
+  accounts.markLimited(walled.id, 'five_hour', new Date(Date.now() + 3_600_000).toISOString());
+
+  // The door with a live runner behind it: the session a bad switch used to end.
+  const switched: unknown[][] = [];
+  const edited: unknown[][] = [];
+  const live = {
+    current: () => ({ id: 'r1', slug: 'demo', accountId: work.id, model: 'opus' }),
+    switchAccount: (...args: unknown[]) => { switched.push(args); return { ok: true }; },
+  };
+  const host = {
+    accounts,
+    root: { ok: true, path: '/nowhere' },
+    liveRunner: () => live,
+    liveRunIds: () => new Set(['r1']),
+    editStoredRun: (...args: unknown[]) => { edited.push(args); return null; },
+  };
+  const door = (Service.prototype as unknown as {
+    switchAccountRun: (slug: string, accountId: string) => { ok: boolean; reason?: string };
+  }).switchAccountRun;
+
+  for (const target of [gone.id, walled.id]) {
+    const verdict = accounts.headroom(target, 'opus');
+    assert.equal(verdict.ok, false, `${target} is one the quota door refuses`);
+    const out = door.call(host, 'demo', target);
+    assert.equal(out.ok, false, target);
+    assert.ok(out.reason?.startsWith(verdict.ok ? '' : verdict.reason), `the door's own reason: ${out.reason}`);
+    assert.match(out.reason ?? '', /nothing was checkpointed/);
+  }
+  assert.equal(switched.length, 0, 'the live session is never ended for a target that cannot pay — no run.account-switch');
+  assert.equal(edited.length, 0, 'and no stored run is edited');
+
+  // A target that can pay goes through to the live runner, as before.
+  assert.equal(door.call(host, 'demo', fine.id).ok, true);
+  assert.deepEqual(switched.map((args) => args[0]), [fine.id]);
+});
+
+/* ---------------- control-tower phase 76 (#111): a lapsed access token is not a lapsed login ---------------- */
+
+test('#111: an idle profile whose access token lapsed reads refreshable, stays a candidate and is still polled; expired comes only from a refused answer', async () => {
+  const transitions: string[] = [];
+  const HOUR = 3_600_000;
+  const OPEN = {
+    status: 200,
+    body: {
+      five_hour: { utilization: 5, resets_at: new Date(Date.now() + 2 * HOUR).toISOString() },
+      seven_day: { utilization: 14, resets_at: new Date(Date.now() + 96 * HOUR).toISOString() },
+    },
+  };
+  let answer: { status: number; body?: unknown } | 'down' = OPEN;
+  let reads = 0;
+  const fetchFn = (async () => {
+    reads += 1;
+    if (answer === 'down') throw new TypeError('fetch failed');
+    return new Response(JSON.stringify(answer.body ?? {}), { status: answer.status, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  const accounts = new Accounts({
+    platform: 'linux',
+    exec: fakeExec((file, args) => (file === 'claude' && args[0] === '--version' ? '9.9.9 (Claude Code)\n' : '')).exec,
+    fetchFn, usageBase: 'http://usage.invalid',
+    learnedFile: join(STATE_SANDBOX, 'learned-p76-refreshable.json'),
+    onAuthChange: (view, state) => transitions.push(`${view.id}:${state}`),
+  });
+  const blob = (token: string, expiresAt: number) => JSON.stringify({
+    claudeAiOauth: { accessToken: token, refreshToken: `r-${token}`, expiresAt, subscriptionType: 'max' },
+  });
+  try {
+    const { id, dir } = accounts.beginProfile('idle');
+    writeFileSync(join(dir, '.credentials.json'), blob('tok-live', Date.now() + HOUR));
+    await accounts.refreshUsage(id);
+    assert.equal(accounts.authStateFor(id), 'ok');
+
+    // Hours after its last session the ACCESS token lapses; the blob can still renew it.
+    writeFileSync(join(dir, '.credentials.json'), blob('tok-live', Date.now() - 60_000));
+    answer = { status: 401 };
+    const before = reads;
+    await accounts.refreshUsage(id);
+    assert.equal(reads, before + 1, 'its meters are still asked for');
+    assert.equal(accounts.authStateFor(id), 'refreshable', 'a lapsed access token with a refresh credential is refreshable, not expired');
+    const view = (await accounts.list()).find((a) => a.id === id);
+    assert.equal(view?.authState, 'refreshable');
+    assert.equal(view?.breaker?.candidate, true, 'it stays a candidate — the idle account with the most headroom is pickable');
+    assert.ok(accounts.rankAccounts(null).includes(id));
+    assert.equal(view?.usage?.buckets.seven_day?.utilization, 14, 'and its last reading is kept, with its age');
+
+    // An outage is not a sign-in fault either.
+    answer = 'down';
+    await accounts.refreshUsage(id);
+    assert.equal(accounts.authStateFor(id), 'refreshable');
+    await sleep(20);
+    assert.deepEqual(transitions, [], 'nothing asked anybody to sign in');
+
+    // A session renews it, and the endpoint refuses the NEW, live token: only that is expired.
+    writeFileSync(join(dir, '.credentials.json'), blob('tok-renewed', Date.now() + HOUR));
+    answer = { status: 401 };
+    await accounts.refreshUsage(id);
+    assert.equal(accounts.authStateFor(id), 'expired', 'a refused answer to a live token is the one road to expired');
+    assert.ok(!accounts.rankAccounts(null).includes(id), 'and an expired login is out of the rank');
+    await accounts.refreshUsage(id);
+    await sleep(20);
+    assert.deepEqual(transitions, [`${id}:expired`], 'announced once — the blob’s own expiry never flips a refused token back to ok');
+
+    // A new credential that reads cleanly clears it.
+    writeFileSync(join(dir, '.credentials.json'), blob('tok-again', Date.now() + HOUR));
+    answer = OPEN;
+    await accounts.refreshUsage(id);
+    assert.equal(accounts.authStateFor(id), 'ok');
+    assert.ok(accounts.rankAccounts(null).includes(id));
+    await accounts.remove(id);
+  } finally { accounts.stop(); }
+});
+
+test('#147 (control-tower phase 91): the poller\'s renewal is the CLI\'s own refresh, never `auth status`; a renewal the CLI could not make is a warning, not a verdict', async () => {
+  const HOUR = 3_600_000;
+  const calls: string[][] = [];
+  const warned: string[] = [];
+  const transitions: string[] = [];
+  const accounts = new Accounts({
+    platform: 'linux',
+    // A CLI whose refresh fails: the blob is left as it was.
+    exec: fakeExec((file, args) => {
+      if (file === 'claude') calls.push(args);
+      return file === 'claude' && args[0] === '--version' ? '9.9.9 (Claude Code)\n' : '';
+    }).exec,
+    fetchFn: (async () => new Response('{}', { status: 401 })) as typeof fetch,
+    usageBase: 'http://usage.invalid',
+    learnedFile: join(STATE_SANDBOX, 'learned-p91-renewal.json'),
+    onLoginAtRisk: (view, risk) => warned.push(`${view.id}:${risk.fix}`),
+    onAuthChange: (view, state) => transitions.push(`${view.id}:${state}`),
+  });
+  try {
+    const { id, dir } = accounts.beginProfile('stale');
+    writeFileSync(join(dir, '.credentials.json'), JSON.stringify({
+      claudeAiOauth: { accessToken: 'tok-lapsed', refreshToken: 'r-lapsed', expiresAt: Date.now() - HOUR, subscriptionType: 'max' },
+    }));
+    await accounts.refreshUsage(id);
+    await sleep(20);
+    assert.ok(calls.some((args) => args[0] === '-p'), 'the renewal is a `claude -p` start');
+    assert.ok(!calls.some((args) => args[0] === 'auth' && args[1] === 'status'), '`auth status` renews nothing (measured) and is not asked to');
+    assert.equal(accounts.authStateFor(id), 'refreshable', 'a renewal that did not happen is no verdict on the login');
+    assert.deepEqual(transitions, [], 'nobody is told to sign in on it');
+    assert.equal(warned.length, 1, 'but the login can no longer be renewed by the console, and that is said');
+    assert.match(warned[0], /claude auth login/);
+    await accounts.remove(id);
+  } finally { accounts.stop(); }
+});
+
+/* ---------------- CR-3 — overage: allowed (control-tower phase 93, #146) ---------------- */
+
+test('CR-3: "use credits past plan limits" is per account and OFF by default; switching it on is verified from the account\'s own credit state, or refused with the reason', async () => {
+  const registryDir = mkdtempSync(join(STATE_SANDBOX, 'p93-cr3-'));
+  const now = Date.parse('2026-09-27T22:06:00Z');
+  const accounts = makeAccounts({ registryDir, now: () => now, learnedFile: join(registryDir, 'learned.json') });
+  const plant = (credits: Record<string, unknown> | undefined) =>
+    (accounts as unknown as { poller: { cache: Map<string, unknown> } }).poller.cache.set('default', {
+      buckets: { five_hour: { utilization: 100, resetsAt: '2026-09-27T23:10:00Z' } }, fetchedAt: '2026-09-27T22:05:50Z',
+      ...(credits ? { credits } : {}),
+    });
+  try {
+    const credit = () => accounts.creditOf('default');
+    assert.equal(credit().allowed, false, 'off by default');
+
+    plant(undefined);
+    const unknown = accounts.setOverage('default', true);
+    assert.equal(unknown.ok, false, 'no credit state read: nothing to verify against');
+    assert.match(unknown.ok ? '' : unknown.reason, /credit state unknown/);
+
+    plant({ enabled: false, monthlyLimit: 40, used: 0, currency: 'USD', disabledReason: 'out_of_credits' });
+    const out = accounts.setOverage('default', true);
+    assert.equal(out.ok, false, 'the live account\'s own state: credits are off');
+    assert.match(out.ok ? '' : out.reason, /out of credits/);
+    assert.equal(credit().allowed, false, 'a refused switch changes nothing');
+
+    plant({ enabled: true, monthlyLimit: 40, used: 5, currency: 'USD' });
+    const yes = accounts.setOverage('default', true);
+    assert.equal(yes.ok, true);
+    assert.equal(credit().allowed, true);
+    assert.equal(credit().cap, 40, 'the cap defaults to the API\'s monthly limit');
+    assert.equal(credit().carrying, true);
+
+    const capped = accounts.setOverage('default', true, { capUsd: 5 });
+    assert.equal(capped.ok, false, 'a cap already reached is refused like an exhausted balance');
+    assert.match(capped.ok ? '' : capped.reason, /cap/);
+    assert.equal(accounts.setOverage('default', true, { capUsd: 20 }).ok, true);
+    assert.equal(credit().cap, 20, 'the operator\'s own cap, when lower');
+
+    const reread = makeAccounts({ registryDir, now: () => now, learnedFile: join(registryDir, 'learned.json') });
+    try {
+      assert.equal(reread.creditOf('default').allowed, true, 'kept in this instance\'s registry');
+      assert.equal(reread.creditOf('default').capUsd, 20);
+    } finally { reread.stop(); }
+
+    assert.equal(accounts.setOverage('default', false).ok, true, 'switching it off needs no verification');
+    assert.equal(credit().allowed, false);
+    assert.equal(accounts.setOverage('nobody', true).ok, false, 'an unknown account is refused');
+  } finally { accounts.stop(); }
 });

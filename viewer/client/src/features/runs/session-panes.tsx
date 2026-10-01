@@ -34,16 +34,17 @@
  * hidden DOM is the cheaper half of that trade.
  */
 
-import { useEffect, type ReactNode } from 'react';
-import { Card, CardBody, CardHeader, CardTitle, Chip } from '@/components/ui';
+import { useEffect, useState, type ReactNode } from 'react';
+import { Button, Card, CardBody, CardHeader, CardTitle, Badge } from '@/components/ui';
 import { useRun, useTranscript } from '@/lib/queries';
 import { elapsed } from '@/lib/format';
 import { useNow } from '@/lib/clock';
-import type { PhaseStatus, QueueEntry, RunState } from '@/lib/api';
-import { LANE_STATUSES, type NowLane } from '@/features/now/model';
+import { api, type PhaseRecord, type PhaseStatus, type QueueEntry, type RunState } from '@/lib/api';
+import { LANE_STATUSES, type NowLane } from '@/features/runs/lanes-model';
 import { ActivityPanels } from './activity';
 import { AskBox } from './ask-box';
 import { LiveConsole, forPhase, useLiveLines, useSessionStream } from './console';
+import { holderLabel, sessionHolderText } from './queue-words';
 
 /**
  * Phase records that deserve a pane of their own.
@@ -63,7 +64,7 @@ import { LiveConsole, forPhase, useLiveLines, useSessionStream } from './console
  * deleted, because "which statuses get a pane" is a question this module is
  * the natural place to ask.
  */
-export { LANE_STATUSES as PANE_STATUSES } from '@/features/now/model';
+export { LANE_STATUSES as PANE_STATUSES } from '@/features/runs/lanes-model';
 
 /**
  * A lane, as a tab strip needs it: the identity of one worked-on phase.
@@ -203,11 +204,14 @@ export function SessionPanes({
 }) {
   const { lines, activity, record, clear, hydrate, seedTasks } = useLiveLines();
 
-  // One transcript per RUN, shared by every pane of it through the query cache,
-  // and filtered per lane in the client. Splitting it server-side would mean a
-  // fetch per tab of a payload that is already the largest thing this console
-  // reads, to save a single pass over an array it holds anyway.
-  const { data: transcript } = useTranscript(slug, runId, enabled);
+  // A lane reads its OWN phase's replay: one capped file per phase on the
+  // server, read from its end (control-tower phase 94, #133), so a long run's
+  // later phases are never starved by an earlier one's lines — with one file per
+  // RUN and a 400-line tail, a busy lane took every other lane's window. The Run
+  // tab and a finished run's replay read the run's files merged. `forPhase`
+  // stays as the guard for a replay written before the split, whose one file
+  // held every lane, and whose phase-less lines belong to every pane.
+  const { data: transcript } = useTranscript(slug, runId, enabled, runLevel ? undefined : phase);
   useEffect(() => {
     hydrate(
       runLevel ? (transcript ?? []).filter((entry) => entry.event !== 'stream') : forPhase(transcript, phase),
@@ -222,6 +226,7 @@ export function SessionPanes({
   const { data: detail } = useRun(slug, enabled);
   const shown = [detail?.run, ...(detail?.history ?? [])].find((state) => state?.id === runId);
   const seedable = !runLevel && phase != null ? shown?.phases?.[String(phase)]?.tasks : undefined;
+  const replay = !runLevel && phase != null ? shown?.phases?.[String(phase)]?.replay : undefined;
   useEffect(() => {
     seedTasks(seedable);
   }, [seedable, seedTasks]);
@@ -247,6 +252,7 @@ export function SessionPanes({
           />
         }
       />
+      {replay && phase != null ? <ReplayNote phase={phase} replay={replay} /> : null}
       {runLevel ? (
         <p className="text-2xs text-ink-faint">
           Each phase&rsquo;s session text, task list and tool calls live in its own tab.
@@ -255,6 +261,30 @@ export function SessionPanes({
         <ActivityPanels activity={activity} live={live} />
       )}
     </div>
+  );
+}
+
+/**
+ * How much of this lane's replay is left (control-tower phase 94, #133).
+ *
+ * The runner journals `phase.replay-limit` once per file, at 80 % of the cap
+ * and at the cap, and keeps it on the phase's record. It is said here because
+ * this pane is what a reload rebuilds from the replay: past the cap it rebuilds
+ * only up to that point, and someone watching a long phase should learn that
+ * before the lines stop, not after.
+ */
+export function ReplayNote({ phase, replay }: { phase: number; replay: NonNullable<PhaseRecord['replay']> }) {
+  // One decimal, not `bytes()`'s whole numbers past 10: "14 MB of 16 MB" beside
+  // "84 %" reads as a sum that does not add up.
+  const size = (n: number) => `${Number((n / (1024 * 1024)).toFixed(1))} MB`;
+  const text =
+    replay.state === 'full'
+      ? `Phase ${phase}'s replay is full at ${size(replay.cap)}, so a reload shows it only up to that point. The live view keeps streaming, and the journal keeps everything after it.`
+      : `Phase ${phase}'s replay is ${Math.floor((replay.bytes / replay.cap) * 100)} % full (${size(replay.bytes)} of ${size(replay.cap)}). Once it fills, a reload shows it only up to that point; the live view keeps streaming.`;
+  return (
+    <p role="status" className="text-2xs text-ink-faint">
+      {text}
+    </p>
   );
 }
 
@@ -292,7 +322,7 @@ export function QueuedPane({
       <CardHeader className="flex-wrap items-center">
         <CardTitle>Phase {phase} is queued</CardTitle>
         <div className="flex flex-wrap items-center gap-1.5">
-          <Chip tone="busy">queued</Chip>
+          <Badge tone="live">queued</Badge>
           {entry && (
             <span className="font-mono text-2xs text-ink-faint tabular-nums">
               {elapsed(Math.max(0, now - entry.since))}
@@ -311,7 +341,7 @@ export function QueuedPane({
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-2xs text-ink-faint">Wants</span>
             {wanted.map((token) => (
-              <Chip key={token}>{token}</Chip>
+              <Badge key={token}>{token}</Badge>
             ))}
           </div>
         )}
@@ -330,6 +360,9 @@ export function QueuedPane({
                       · overlaps <code className="font-mono">{holder.overlaps.join(', ')}</code>
                     </span>
                   )}
+                  {holder.unqualified && (
+                    <span className="text-ink-faint"> · {holder.unqualified.reason}</span>
+                  )}
                   {/* Which branch the holder's work rides, when it declared
                       one. This reads the wait in REVERSE: branch-disjoint
                       claims are carved out of admission entirely, so a holder
@@ -343,17 +376,23 @@ export function QueuedPane({
                     </span>
                   )}
                   {holder.kind === 'session' && (
-                    // A peer in the repository holds no lease to outlive: the
-                    // wait ends when that session ends or claims (REG-3).
+                    // A terminal in the repository holds no lock: the wait ends
+                    // when it stops touching the scope, ends, or is released
+                    // (control-tower phase 82, #119 — it used to say only
+                    // "a live session" and offer nothing).
                     <span className="text-ink-faint" data-testid="holder-session">
                       {' '}
-                      · {holder.owner}
+                      · {sessionHolderText(holder)}
                       {holder.cwd ? (
                         <>
                           {' '}
                           in <code className="font-mono">{holder.cwd}</code>
                         </>
                       ) : null}
+                      {holder.leaseUntil != null && (
+                        <> · holds until {new Date(holder.leaseUntil).toLocaleTimeString()}</>
+                      )}
+                      {holder.session ? <ReleaseHold sessionId={holder.session} /> : null}
                     </span>
                   )}
                   {holder.kind === 'lock' && holder.leaseUntil != null && (
@@ -393,42 +432,37 @@ export function QueuedPane({
 }
 
 /**
- * Who is holding it, in the three ways something can be held.
- *
- * `reserved` is not a plan at all — it is the scheduler reporting one of the two
- * non-scope blocks (the session cap, or an account usage window) through the same
- * shape, so that a queue card never has to say "queued" with nothing after it.
+ * Tell the queue a terminal is not working here — for two hours, or for as
+ * long as it lives. The release is the operator's word against the console's
+ * reading of a transcript, so it is offered wherever that reading holds a run.
  */
-export function holderLabel(kind: string, slug: string, phase: number | null): string {
-  if (kind === 'reserved') return slug;
-  const where = phase != null ? `${slug} P${phase}` : slug;
-  if (kind === 'session')
-    return phase != null
-      ? `${where} (a live session, no lock)`
-      : 'a live session in this repository (no lock)';
-  return kind === 'lock' ? `${where} (lock)` : where;
-}
-
-/**
- * The one-line version, for a table cell: what this phase is waiting on.
- *
- * Same reading as the card, and deliberately the same function feeding both — a
- * chip that disagreed with the pane beside it would be worse than no chip.
- */
-export function waitingLabel(entry: QueueEntry | undefined): string {
-  const first = entry?.waitingOn?.[0];
-  if (!first) return 'queued';
-  const rest = (entry?.waitingOn.length ?? 0) - 1;
+export function ReleaseHold({ sessionId }: { sessionId: string }) {
+  const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
+  const release = (hours?: number) => {
+    setState('busy');
+    api.releaseSessionHold(sessionId, hours).then(
+      () => setState('done'),
+      () => setState('error'),
+    );
+  };
+  if (state === 'done')
+    return <span className="ml-1.5 text-ink-muted">Released — the queue no longer waits on it.</span>;
   return (
-    `queued — waiting on ${holderLabel(first.kind, first.slug, first.phase)}` + (rest > 0 ? ` +${rest}` : '')
+    <span className="ml-1.5 inline-flex flex-wrap items-center gap-1.5">
+      <Button size="sm" variant="ghost" disabled={state === 'busy'} onClick={() => release(2)}>
+        Release for 2 h
+      </Button>
+      <Button size="sm" variant="ghost" disabled={state === 'busy'} onClick={() => release()}>
+        Not working here
+      </Button>
+      {state === 'error' && (
+        <span role="alert" className="text-warn">
+          Not released — releasing needs a console started with --allow-run.
+        </span>
+      )}
+    </span>
   );
 }
 
-/** This plan's entry in the admission queue for one phase, if it has one. */
-export function queueEntryFor(
-  entries: readonly QueueEntry[] | undefined,
-  slug: string,
-  phase: number,
-): QueueEntry | undefined {
-  return (entries ?? []).find((entry) => entry.slug === slug && entry.phase === phase);
-}
+// The queue's words live in a leaf, so the plan page can use them without this file.
+export { holderLabel, queueEntryFor, sessionHolderText, waitingLabel } from './queue-words';

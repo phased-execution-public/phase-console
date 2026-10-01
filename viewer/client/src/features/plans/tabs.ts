@@ -1,4 +1,4 @@
-import { LEGACY_PLAN_TABS, PLAN_TABS } from '@shared/route-meta.js';
+import { LEGACY_PLAN_TABS, PLAN_PHASE_VIEWS, PLAN_TABS } from '@shared/route-meta.js';
 
 /**
  * The tab ids come from `shared/route-meta.js` — the server builds notification
@@ -15,13 +15,14 @@ import { LEGACY_PLAN_TABS, PLAN_TABS } from '@shared/route-meta.js';
  * answer than the tab it is about to become.
  */
 export const PLAN_TAB_LABELS: Record<string, string> = {
-  route: 'Route',
   phases: 'Phases',
   run: 'Autopilot',
+  source: 'Source',
+  // retired — see LEGACY_PLAN_TABS. `route`, `qa` and `handoffs` are views of
+  // the Phases tab since 6.0 (control-tower phase 23).
+  route: 'Route',
   qa: 'QA',
   handoffs: 'Handoffs',
-  source: 'Source',
-  // retired — see LEGACY_PLAN_TABS
   analysis: 'Analysis',
   overview: 'Overview',
   raw: 'Raw',
@@ -45,7 +46,9 @@ export const isLegacyTab = (id: string): boolean => id in LEGACY_PLAN_TABS;
  */
 export const DETAIL_TABS: Record<string, string> = {
   phase: 'phases',
-  handoff: 'handoffs',
+  // A handoff is a fact about a phase, and its list is a view of the phase
+  // table since 6.0 — so the strip shows the one tab that lists phases.
+  handoff: 'phases',
 };
 
 export const isDetailRoute = (tab: string | undefined): tab is 'phase' | 'handoff' =>
@@ -54,16 +57,42 @@ export const isDetailRoute = (tab: string | undefined): tab is 'phase' | 'handof
 /**
  * The tab strip's current value for any second segment, valid or not.
  *
- * A retired id resolves to what it became rather than falling back to `route`:
- * the redirect is what actually moves the address, and for the render before it
- * lands this is the tab the reader asked for.
+ * A retired id resolves to what it became rather than falling back to
+ * `phases`: the redirect is what actually moves the address, and for the
+ * render before it lands this is the tab the reader asked for.
  */
 export function resolveTab(segment: string | undefined): string {
-  if (!segment) return 'route';
+  if (!segment) return 'phases';
   if (isDetailRoute(segment)) return DETAIL_TABS[segment];
   if (TAB_IDS.includes(segment)) return segment;
-  return legacyTabTarget(segment) ?? 'route';
+  return legacyTabTarget(segment) ?? 'phases';
 }
+
+/* ---------------- the Phases tab's four views ---------------- */
+
+/** One view of the phase table — `PLAN_PHASE_VIEWS` in `shared/route-meta.js`. */
+export type PhasesViewId = 'table' | 'map' | 'qa' | 'handoffs';
+
+export const PHASES_VIEW_IDS = PLAN_PHASE_VIEWS as readonly PhasesViewId[];
+
+/** The words on the view switch. The ids are the URL's; only these are ours. */
+export const PHASES_VIEW_LABELS: Record<PhasesViewId, string> = {
+  table: 'Table',
+  map: 'Map',
+  qa: 'QA',
+  handoffs: 'Handoffs',
+};
+
+/**
+ * Which view `?view=` asks for. Anything unknown is the table — the one view
+ * that can answer every question the others ask, a column away.
+ *
+ * Here, beside `sourceViewOf`, for the same chunk reason: `detail.tsx` calls it
+ * to build the props of a tab body, and a helper imported from that body's
+ * module would make the module a static import of the page.
+ */
+export const phasesViewOf = (value: string | undefined): PhasesViewId =>
+  (PHASES_VIEW_IDS as readonly string[]).includes(value ?? '') ? (value as PhasesViewId) : 'table';
 
 /* ---------------- what each tab actually renders ---------------- */
 
@@ -89,10 +118,12 @@ export function resolveTab(segment: string | undefined): string {
  * board projection, and the tabs that render the expensive prose now ask for
  * it. A tab's own file is not its render tree — follow the JSX.
  *
- * - **route** · **phases** · **handoffs** · **handoff** — the board projection.
- *   The Route table and the phase cards render `title`, `goal`, `proof`, `row`,
- *   `analysis`, the lock and the handoff status chip; all of those are board
- *   fields. The Handoffs surfaces fetch the handoff itself from
+ * - **phases** · **handoff** — the board projection. The phase table renders
+ *   `title`, `goal`, `proof`, `row`, `analysis`, `blockedBy`, the QA fields,
+ *   the lock and the handoff status chip; all of those are board fields. Its
+ *   row detail reaches the prose through `PhaseProse`, which fetches it for
+ *   itself on open (`phase-inspector.tsx`), so the table's four views cost the
+ *   board and nothing more. The handoff page fetches the handoff itself from
  *   `/api/plans/<slug>/handoff/<n>` (`useHandoff`), not from this payload.
  * - **phase** — `phase-panel.tsx` renders every prose field and the handoff's
  *   Outstanding section in full.
@@ -104,12 +135,9 @@ export function resolveTab(segment: string | undefined): string {
  *   `provenance`, `callouts`, `graph`, `sections`).
  */
 export const TAB_INCLUDES: Record<string, readonly string[]> = {
-  route: [],
+  // The QA view reads `qa`, `qaMode`, `qaRounds`, `qaHeld`, `state`, `title` —
+  // all board fields — and fetches a report itself from `/api/plans/<slug>/qa-report`.
   phases: [],
-  // The QA tab reads `qa`, `qaMode`, `qaRounds`, `state`, `title` — all board
-  // fields — and fetches the report itself from `/api/plans/<slug>/qa-report`.
-  qa: [],
-  handoffs: [],
   handoff: [],
   phase: ['prose', 'handoffs'],
   run: ['prose', 'handoffs'],

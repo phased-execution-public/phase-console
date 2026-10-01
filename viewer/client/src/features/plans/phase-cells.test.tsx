@@ -139,7 +139,10 @@ describe('DepsCell', () => {
 describe('SizeCell and FlagsCell', () => {
   it('the size carries its weight in the tooltip and its estimate beneath', () => {
     render(
-      <SizeCell phase={phase()} eta={{ phase: 4, weight: 3, estMs: 1, basis: 'plan', label: '~40m' }} />,
+      <SizeCell
+        phase={phase()}
+        eta={{ phase: 4, weight: 3, estMs: 1, basis: 'plan', clock: 'working', label: '~40m' }}
+      />,
     );
     expect(screen.getByText('M').getAttribute('title')).toContain('weight');
     expect(screen.getByText('~40m')).toBeTruthy();

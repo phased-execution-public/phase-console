@@ -32,7 +32,9 @@ import assert from 'node:assert/strict';
 
 import { CATEGORIES, routeFor } from '../server/push/catalogue.ts';
 import type { RouteContext } from '../server/push/catalogue.ts';
-import { ROUTE_HEADS, PLAN_TABS, LEGACY_PLAN_TABS, isRouteHead } from '../shared/route-meta.js';
+import {
+  DEFAULT_HEAD, DESTINATIONS, ROUTE_HEADS, PLAN_TABS, LEGACY_PLAN_TABS, isRouteHead,
+} from '../shared/route-meta.js';
 import {
   parseHash, toHash, planHref, phaseHref, handoffHref, laneHref, phaseSessionHref, sessionsHref,
 } from '../shared/routes.js';
@@ -66,12 +68,35 @@ test('a server-emitted plan URL names a tab the plan view actually registers', (
       const { segments } = parseHash(toHash(routeFor(category.id, context)));
       if (segments[0] !== 'plan') continue;
       const tail = segments[2];
+      // A RETIRED tab is a real target too, as long as it redirects onto a
+      // live one: the server mints `#/plan/:slug/route` to this day, and 6.0's
+      // client lands it on the phase table's map view (control-tower phase 23).
+      const retired = (LEGACY_PLAN_TABS as Record<string, { tab?: string } | undefined>)[tail];
       assert.ok(
-        PLAN_TABS.includes(tail) || tail === 'phase' || tail === 'handoff',
-        `routeFor('${category.id}') targets plan tab '${tail}', which the plan view does not register`,
+        PLAN_TABS.includes(tail) ||
+          tail === 'phase' ||
+          tail === 'handoff' ||
+          Boolean(retired?.tab && PLAN_TABS.includes(retired.tab)),
+        `routeFor('${category.id}') targets plan tab '${tail}', which the plan view neither registers nor redirects`,
       );
     }
   }
+});
+
+test('the route the server still mints lands on the phase table, carrying its view', () => {
+  // `server/push/catalogue.ts` writes `/#/plan/<slug>/route` into every plan
+  // push. The tab left in 6.0; the address must not. It becomes the phases
+  // tab's `map` view — and `qa` and `handoffs` become their views of the same
+  // table — so a redirect keeps what the address MEANT, not only where it went.
+  const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
+  assert.deepEqual(PLAN_TABS, ['phases', 'run', 'source']);
+  assert.deepEqual(legacy.route, { tab: 'phases', view: 'map' });
+  assert.deepEqual(legacy.qa, { tab: 'phases', view: 'qa' });
+  assert.deepEqual(legacy.handoffs, { tab: 'phases', view: 'handoffs' });
+  const minted = CATEGORIES.flatMap((category) =>
+    CONTEXTS.map((context) => parseHash(toHash(routeFor(category.id, context))).segments),
+  ).filter((segments) => segments[0] === 'plan' && segments[2] === 'route');
+  assert.ok(minted.length > 0, 'the catalogue no longer mints #/plan/:slug/route — drop this test with it');
 });
 
 test('the run tab the server routes every in-flight notification to still exists', () => {
@@ -79,6 +104,26 @@ test('the run tab the server routes every in-flight notification to still exists
   // would send approval pushes to the router's silent fallback — the exact bug
   // routeFor was written to end.
   assert.ok(PLAN_TABS.includes('run'), `'run' must stay in PLAN_TABS: ${PLAN_TABS.join(', ')}`);
+});
+
+test('the heads 6.0 retired still resolve, and an address that names nothing lands on a destination', () => {
+  // Control-tower phase 21 made `runs` the home and folded Now and the Ready
+  // list into it — but the digest push still mints `/#/now` and the ready push
+  // `/#/ready`, and a phone keeps a notification for days. Both must stay heads
+  // the client resolves (its redirects carry them to `#/runs`), and neither is a
+  // destination any more.
+  const minted = new Set(
+    CATEGORIES.flatMap((category) =>
+      CONTEXTS.map((context) => parseHash(toHash(routeFor(category.id, context))).segments[0]),
+    ),
+  );
+  for (const head of ['now', 'ready']) {
+    assert.ok(minted.has(head), `catalogue.ts no longer mints '${head}' — drop it from this case`);
+    assert.ok(isRouteHead(head), `'${head}' is minted by the server and must stay in ROUTE_HEADS`);
+    assert.ok(!DESTINATIONS.includes(head), `'${head}' is a redirect since 6.0, not a destination`);
+  }
+  assert.equal(DEFAULT_HEAD, 'runs');
+  assert.ok(DESTINATIONS.includes(DEFAULT_HEAD), `DEFAULT_HEAD '${DEFAULT_HEAD}' must be a destination`);
 });
 
 test('toHash accepts every form this system produces for the same route', () => {

@@ -75,9 +75,13 @@ export function Disclosure({
         <span>{open ? openLabel : label}</span>
         {count != null && !open && <span className="tnum text-ink-faint">({count})</span>}
       </button>
+      {/* The expand transition: the row grows 0fr → 1fr from its first frame
+          (`.expand-region`, theme.css) — mounted on open, gone when folded. */}
       {open && (
-        <div id={region} className={cn('animate-rise', bodyClassName)}>
-          {children}
+        <div className="expand-region">
+          <div id={region} className={bodyClassName}>
+            {children}
+          </div>
         </div>
       )}
     </div>

@@ -42,7 +42,7 @@
 import { spawn } from 'node:child_process';
 
 import { log } from '../log.ts';
-import { PROBE_FLAG } from '../mcp/health.ts';
+import { PROBE_FLAG, PROBE_SESSION_KIND, SESSION_KIND_ENV } from '../mcp/health.ts';
 import { API_RETRY_ERRORS, type StopSignal } from '../runner/errors.ts';
 import { killLadder, type LadderOptions } from '../runner/signals.ts';
 
@@ -146,6 +146,8 @@ export function probeEnv(accountEnv: NodeJS.ProcessEnv | null, base: NodeJS.Proc
     ...(accountEnv ?? {}),
     PE_OWNER: ENTITLEMENT_PROBE_OWNER,
     [PROBE_FLAG]: '1',
+    // A probe is not a session: the presence hook registers nothing for it (#73).
+    [SESSION_KIND_ENV]: PROBE_SESSION_KIND,
     CLAUDE_CODE_MAX_RETRIES: ENTITLEMENT_PROBE_RETRIES,
   };
 }

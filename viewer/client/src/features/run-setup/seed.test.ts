@@ -107,3 +107,42 @@ describe('this browser’s last launch of the plan', () => {
     expect(origins.runBudgetUsd).toBe('defaults');
   });
 });
+
+describe('the run’s own rung caps', () => {
+  it('seed from the run, zero included, and say so', () => {
+    // Zero is a cap — nothing climbs. Read as "no override" by a truthiness
+    // test, it would reach a live patch as `null`, which CLEARS the run's cap.
+    const run = {
+      id: 'r1',
+      slug: 'a',
+      status: 'running',
+      ladderPerRunRungs: 0,
+      ladderPerPhaseRungs: 3,
+      phases: {},
+    } as unknown as RunState;
+    const [values, origins] = seedFor('live', {
+      run,
+      ...prefsOf({ ladderPerRunRungs: 40 }),
+      context: { slug: 'a', run },
+      defaultSkills: [],
+    });
+    expect(values.ladderPerRunRungs).toBe('0');
+    expect(values.ladderPerPhaseRungs).toBe('3');
+    expect(origins.ladderPerRunRungs).toBe('run');
+    expect(origins.ladderPerPhaseRungs).toBe('run');
+  });
+
+  it('stay empty on a run that set none, so the console’s own caps keep speaking', () => {
+    // The preference is NOT copied in: a run holding the console's number as
+    // its own would stop following the preference the day Settings changes.
+    const run = { id: 'r1', slug: 'a', status: 'running', phases: {} } as unknown as RunState;
+    const [values] = seedFor('live', {
+      run,
+      ...prefsOf({ ladderPerRunRungs: 40 }),
+      context: { slug: 'a', run },
+      defaultSkills: [],
+    });
+    expect(values.ladderPerRunRungs).toBe('');
+    expect(values.ladderPerPhaseRungs).toBe('');
+  });
+});

@@ -16,6 +16,7 @@
  * this.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -59,7 +60,9 @@ const { SHARED_CHECKOUT_TOKEN } = await import('../shared/scope.js');
 // `STATE_DIR`, which config.ts reads at import time from the env set just above.
 const { runDir, consoleRunsDir } = await import('../server/runner/state.ts');
 const { ensureIntegration, holdsBranch, isRegistered, laneNames, worktreeHome } = await import('../server/runner/worktree.ts');
+const { printedCommits } = await import('../server/runner/scope-drift.ts');
 import type { LockView } from '../server/runner/scheduler.ts';
+import type { StreamEvent } from '../server/runner/spawn.ts';
 import type { SpawnFn, SpawnOutcome, SpawnRequest } from '../server/runner/spawn.ts';
 // Dynamic, for exactly the reason the four above are: a STATIC import hoists
 // over the `XDG_STATE_HOME` assignment at the top of this file, and
@@ -183,6 +186,27 @@ async function requestsFor(
 ): Promise<SpawnRequest[]> {
   const { requests } = await driveOn(makeRunner(r, deps, onSpawn), r, options);
   assert.ok(requests.length, 'no phase ever started, so there is no prompt to read');
+  return requests;
+}
+
+/**
+ * The same drive, for a run whose isolation is REFUSED for a reason a person
+ * can fix (`ISOLATION_PARKS`): since control-tower phase 90 (#123 #139) it
+ * PARKS with `isolation-refused` and its fix, and NOTHING boards in the
+ * shared tree — the silent shared-checkout claimant those issues measured.
+ * The refusal is recorded exactly as before; only what follows it changed.
+ */
+async function parkedFor(
+  r: Repo,
+  options: Record<string, unknown>,
+  deps: Record<string, unknown> = {},
+  onSpawn?: (request: SpawnRequest) => void,
+): Promise<SpawnRequest[]> {
+  const { requests } = await driveOn(makeRunner(r, deps, onSpawn), r, options);
+  assert.equal(requests.length, 0, 'a refused run boarded a session in the shared tree');
+  const state = runStateAfter(r);
+  assert.equal(state.status, 'parked', `the refused run did not park (status ${String(state.status)})`);
+  assert.equal((state.halt as { kind?: string } | null)?.kind, 'isolation-refused');
   return requests;
 }
 
@@ -660,7 +684,7 @@ test('P6 — a DIRTY root is never moved, and the refusal names the files', asyn
     // created and never added, which is exactly the shape this must not lose.
     writeFileSync(join(r.root, 'scratch.txt'), 'a session was here\n');
 
-    await requestsFor(r, { ...ISOLATED_RUN });
+    await parkedFor(r, { ...ISOLATED_RUN });
 
     // Untouched. Everything else in this test is about SAYING so.
     assert.equal(git(r.root, 'rev-parse', '--abbrev-ref', 'HEAD'), 'pe/demo');
@@ -683,7 +707,7 @@ test('P6 — isolationReclaim: never leaves the tree exactly as it was', async (
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
 
-    await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       worktreePrefs: () => ({ reclaim: 'never' }),
     });
 
@@ -776,14 +800,13 @@ test('P6 — a refusal after the detach decision clears detachAt with the tree',
 
     const before = driver.requests.length;
     await driveOn(driver, r, { resumeRunId: String(runStateAfter(r).id), onlyPhases: [2] });
-    const resumed = driver.requests[before]!;
 
-    // The refusal must take the detach decision with it, or the degraded run
-    // writes PE_BRANCH=detached@<sha> and a lock qualified by a commit its
-    // session is not standing at.
-    assert.equal(resumed.cwd, r.root, 'the refusal degrades the resumed phase to the shared root');
-    assert.equal(resumed.env?.PE_BRANCH, 'pe/demo',
-      'PE_BRANCH names the run branch again — never a commit the session is not standing at');
+    // The refusal must take the detach decision with it, or the run writes
+    // PE_BRANCH=detached@<sha> and a lock qualified by a commit nothing stands
+    // at. Since control-tower phase 90 the refused run PARKS rather than
+    // boarding the resumed phase in the shared root.
+    assert.equal(driver.requests.length, before, 'the refused run boarded in the shared root');
+    assert.equal(runStateAfter(r).status, 'parked');
 
     const state = runStateAfter(r);
     assert.equal(state.checkout, 'refused');
@@ -906,12 +929,10 @@ test('EC2 — cap-reached: the console already holds as many trees as it may', a
   const r = repo();
   try {
     makeGitRepo(r);
-    const requests = await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       worktreePrefs: () => ({ maxConcurrent: 2 }),
       isolatedCheckouts: () => 2,
     });
-    assert.equal(requests[0]!.cwd, r.root, 'the run took a tree it was not allowed');
-    assert.equal(requests[0]!.addDirs, undefined, 'a shared-root session needs no --add-dir');
 
     const state = runStateAfter(r);
     assert.equal(state.checkout, 'refused');
@@ -923,10 +944,6 @@ test('EC2 — cap-reached: the console already holds as many trees as it may', a
     const data = events[0]!.data as Record<string, unknown>;
     assert.equal(data.refusal, 'cap-reached');
     assert.match(String(data.reason), /worktreeMaxConcurrent/);
-
-    // And the prompt is the ordinary shared one, in every particular.
-    assert.match(requests[0]!.prompt, /BEFORE editing anything: if `pe\/demo` exists/);
-    assert.doesNotMatch(requests[0]!.prompt, /cwd IS a console-managed worktree/);
   } finally { r.cleanup(); }
 });
 
@@ -960,8 +977,7 @@ test('EC2 — branch-in-use: somebody else has `pe/demo` checked out', async () 
     const held = join(r.root, '..', `held-${Date.now()}`);
     git(r.root, 'worktree', 'add', '-q', '-b', 'pe/demo', held, 'HEAD');
     try {
-      const requests = await requestsFor(r, { ...ISOLATED_RUN });
-      assert.equal(requests[0]!.cwd, r.root);
+      await parkedFor(r, { ...ISOLATED_RUN });
 
       const state = runStateAfter(r);
       assert.equal(state.checkout, 'refused');
@@ -988,10 +1004,9 @@ test('EC2 — setup-failed: the tree is REMOVED, not left half-prepared', async 
     const names = laneNames({
       stateDir: runDir(r.root, 'demo'), runId: 'unknown', slug: 'demo', phase: 0,
     });
-    const requests = await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       worktreePrefs: () => ({ setup: 'echo "no build here" >&2; exit 7' }),
     });
-    assert.equal(requests[0]!.cwd, r.root);
 
     const state = runStateAfter(r);
     assert.equal(state.checkout, 'refused');
@@ -1181,23 +1196,18 @@ test('a shared-checkout run writes a QUALIFIED lock — its branch, plus the sha
   } finally { r.cleanup(); }
 });
 
-test('a REFUSED run claims the shared tree — qualified, and colliding exactly as it should', async () => {
+test('a REFUSED run claims NOTHING in the shared tree — it parks (control-tower phase 90)', async () => {
   const r = repo();
   try {
     makeGitRepo(r);
-    // The subtle one. The run ASKED for isolation and did not get it, so it is
-    // in the shared checkout, committing on `pe/demo` there. Its claim says
-    // both facts — and the TREE is what keeps it honest: naming the shared
-    // root, it collides with every other claim on that root, so the refusal
-    // grants it nothing an unqualified claim would not have. What it gains is
-    // truthful narrowing the other way: an ISOLATED neighbour in its own tree
-    // can now be admitted past this run instead of behind it.
-    const requests = await requestsFor(r, { ...ISOLATED_RUN }, { isolatedCheckouts: () => 99 });
-    assert.equal(requests[0]!.cwd, r.root);
+    // This used to be the subtle one: the run ASKED for isolation, did not get
+    // it, and worked in the shared checkout on `pe/demo`, claiming that tree.
+    // That claim is exactly what queued observability-plane's release phase
+    // behind another plan's run-long branch hold for eleven hours (#123 #139),
+    // so a refusal a person can fix now PARKS the run: no session, so no claim.
+    await parkedFor(r, { ...ISOLATED_RUN }, { isolatedCheckouts: () => 99 });
     assert.equal(runStateAfter(r).checkout, 'refused');
-    assert.equal(requests[0]!.env?.PE_BRANCH, 'pe/demo');
-    assert.equal(requests[0]!.env?.PE_WORKTREE, phys(r.root),
-      'refused means the shared tree, and the claim names it');
+    assert.equal(runStateAfter(r).workRoot, undefined, 'refused means no tree, and the run names none');
   } finally { r.cleanup(); }
 });
 
@@ -1499,10 +1509,9 @@ test('F-2 — a setup command that leaves FILES still gets its tree discarded', 
     // stayed registered holding `pe/demo`, nothing pointed at it, the sweep kept
     // it forever because it was dirty, and every later run refused
     // `branch-in-use` — a permanent, silent wedge of the whole plan.
-    const requests = await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       worktreePrefs: () => ({ setup: 'echo half > leftover.txt; mkdir -p junk; exit 7' }),
     });
-    assert.equal(requests[0]!.cwd, r.root);
 
     const state = runStateAfter(r);
     assert.equal(state.checkout, 'refused');
@@ -1525,7 +1534,7 @@ test('F-2 — and the NEXT run of the plan is not wedged by it', async () => {
     // The consequence, executed rather than reasoned about: a leftover tree
     // holds `pe/demo`, and git allows a branch one working tree, so every later
     // run of the plan meets `branch-in-use` forever.
-    await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       worktreePrefs: () => ({ setup: 'echo half > leftover.txt; exit 7' }),
     });
     assert.equal(runStateAfter(r).isolationRefusal, 'setup-failed');
@@ -1862,7 +1871,6 @@ test('R4-1 — a resume REFUSED `branch-in-use` clears the tree it can no longer
     try {
       const before = driver.requests.length;
       await driveOn(driver, r, { resumeRunId: String(runStateAfter(r).id), onlyPhases: [2] });
-      const resumed = driver.requests[before]!;
       const state = runStateAfter(r);
 
       assert.equal(state.checkout, 'refused');
@@ -1872,14 +1880,11 @@ test('R4-1 — a resume REFUSED `branch-in-use` clears the tree it can no longer
       // pointing at a directory that is gone — and spawned into it.
       assert.equal(state.workRoot, undefined,
         'a refused run still points at a tree it does not have');
-      assert.equal(resumed.cwd, r.root, 'the session was spawned into the vanished tree');
-      assert.equal(existsSync(resumed.cwd!), true, 'the session was spawned into a missing cwd');
-      // …and its claim tells the truth: `pe/demo` in the SHARED root. The
-      // tree dimension is what keeps that from being a carve-out — the shared
-      // root collides with every claim on it, and the held tree's `pe/demo`
-      // collides on the branch besides.
-      assert.equal(resumed.env?.PE_BRANCH, 'pe/demo');
-      assert.equal(resumed.env?.PE_WORKTREE, phys(r.root));
+      // …and no session was spawned at all — not into the vanished tree, and
+      // not into the shared root either: a refusal a person can fix PARKS the
+      // run (control-tower phase 90, #123).
+      assert.equal(driver.requests.length, before, 'a session was spawned after the refusal');
+      assert.equal(state.status, 'parked');
     } finally { rmSync(held, { recursive: true, force: true }); }
   } finally { r.cleanup(); }
 });
@@ -2106,8 +2111,9 @@ test('R7-3 — a tree switched to ANOTHER branch is not adopted, and the run doe
     assert.notEqual(state.checkout, 'worktree',
       'the run adopted a tree standing on another branch');
     assert.equal(state.workRoot, undefined);
-    assert.notEqual(driver.requests[before]!.cwd, tree,
-      'a session was sent into a tree that is not on this run\'s branch');
+    // Nor anywhere else: the refusal PARKS the run (control-tower phase 90).
+    assert.equal(driver.requests.length, before,
+      'a session was sent somewhere after the run was refused its tree');
     // And the refusal names the branch it actually found, which is the one fact
     // that makes the situation fixable.
     const line = isolationEvents(r).at(-1)!.data as Record<string, unknown>;
@@ -2449,8 +2455,7 @@ test('R5-3 — a git failure that is not a setup command says so', async () => {
     mkdirSync(home, { recursive: true });
     execFileSync('chmod', ['500', home]);
     try {
-      const requests = await requestsFor(r, { ...ISOLATED_RUN });
-      assert.equal(requests[0]!.cwd, r.root);
+      await parkedFor(r, { ...ISOLATED_RUN });
       const state = runStateAfter(r);
       assert.equal(state.checkout, 'refused');
       assert.equal(state.isolationRefusal, 'worktree-failed',
@@ -2597,7 +2602,7 @@ test('P1/W1 — the reclaim leaves a tree a LIVE lock names alone, and the refus
     // Clean and on the branch: by every git read, reclaimable. A hand session
     // is working in it right now — its lock says so — and it just committed.
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
-    await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       occupiedTrees: () => [{ tree: r.root, by: 'sam@laptop, other-plan phase 3' }],
     });
     assert.equal(git(r.root, 'rev-parse', '--abbrev-ref', 'HEAD'), 'pe/demo', 'moved under a live session');
@@ -2725,7 +2730,7 @@ test("P1/QA-F1 — a tree-less live claim on the plan's scope refuses the reclai
     makeGitRepo(r);
     git(r.root, 'switch', '-q', '-c', 'pe/demo');
     const asked: string[][] = [];
-    await requestsFor(r, { ...ISOLATED_RUN }, {
+    await parkedFor(r, { ...ISOLATED_RUN }, {
       planScope: () => ['all'],
       // A claim that never said where its work rides — the boot prompt's own
       // shape — on an intersecting scope. The Service decides the intersection;
@@ -2927,12 +2932,15 @@ test('S6 — a phase that commits OUTSIDE its Repos cell is journalled', async (
     git(r.root, 'add', '-A');
     git(r.root, 'commit', '-q', '-m', 'gitmodules');
 
-    // The session commits in `web`, which its scope never named.
+    // The session commits in `web`, which its scope never named — and its own
+    // git prints the commit, which is how the console knows the phase made it
+    // (control-tower phase 63, #88: drift credits only the lane's own commits).
     const driver = makeRunner(r, { phaseScope: () => ['docs'] }, (request) => {
       if (!/BOOT phase/.test(request.prompt)) return;
       writeFileSync(join(web, 'app.ts'), 'export const a = 2;\n');
       git(web, 'add', '-A');
-      git(web, 'commit', '-q', '-m', 'work the plan never declared');
+      const printed = git(web, 'commit', '-m', 'work the plan never declared');
+      request.onEvent?.({ kind: 'tool-result', id: 'toolu_s6', ok: true, commits: printedCommits(printed) } as StreamEvent);
     });
     await driveOn(driver, r, { onlyPhases: [1] });
 
@@ -2940,11 +2948,39 @@ test('S6 — a phase that commits OUTSIDE its Repos cell is journalled', async (
       .map((line) => line.data as Record<string, unknown>);
     assert.equal(drift.length, 1, `exactly the undeclared repository: ${JSON.stringify(drift)}`);
     assert.equal(drift[0]!.repo, 'web');
-    assert.equal(drift[0]!.scope, 'docs');
+    // The declared scope: the Repos cell, then the docs root's per-slug token.
+    assert.equal(String(drift[0]!.scope).split(',')[0], 'docs');
+    assert.match(String(drift[0]!.scope), /,docs\/handoffs\//);
     assert.deepEqual(
       (drift[0]!.commits as { subject: string }[]).map((c) => c.subject),
       ['work the plan never declared'],
     );
+  } finally { r.cleanup(); }
+});
+
+test('S6 — a commit in an unscoped repository that the phase did NOT make journals nothing (#88)', async () => {
+  // Somebody else — another plan's lane, a person — commits in `web` while
+  // this phase runs. The HEAD moves; the phase did nothing wrong.
+  const r = repo();
+  try {
+    makeGitRepo(r);
+    const web = join(r.root, 'web');
+    mkdirSync(web, { recursive: true });
+    git(web, 'init', '-q', '-b', 'main');
+    writeFileSync(join(web, 'app.ts'), 'export const a = 1;\n');
+    git(web, 'add', '-A');
+    git(web, 'commit', '-q', '-m', 'web base');
+    writeFileSync(join(r.root, '.gitmodules'), '[submodule "web"]\n\tpath = web\n\turl = ../web\n');
+    git(r.root, 'add', '-A');
+    git(r.root, 'commit', '-q', '-m', 'gitmodules');
+    const driver = makeRunner(r, { phaseScope: () => ['docs'] }, (request) => {
+      if (!/BOOT phase/.test(request.prompt)) return;
+      writeFileSync(join(web, 'app.ts'), 'export const a = 3;\n');
+      git(web, 'add', '-A');
+      git(web, 'commit', '-m', 'another writer\'s work');   // printed to nobody
+    });
+    await driveOn(driver, r, { onlyPhases: [1] });
+    assert.deepEqual(journalEvents(r, 'phase.scope-drift'), []);
   } finally { r.cleanup(); }
 });
 
@@ -3105,5 +3141,128 @@ test('P7 — the run branch is cut from the base the PLAN names, and the prompt 
       git(cwd, 'rev-list', '--count', 'release/5.1..HEAD'), '0',
       'the run branch was cut from somewhere other than the base the plan named',
     );
+  } finally { r.cleanup(); }
+});
+
+/* ------------------------------------------------------------------ *
+ * control-tower phase 11 (#18) — the plan's git lines are answered at launch
+ * ------------------------------------------------------------------ */
+
+const { journalFile } = await import('../server/runner/run-paths.ts');
+const { SKILL_DIR } = await import('../server/config.ts');
+const { Service } = await import('../server/service.ts');
+const { GitStrategyRefusal } = await import('../server/prelude.ts');
+
+const BRANCH_LINE = {
+  kind: 'branch', plan: 'feature/checkout', honourable: false,
+  run: "every phase works on `pe/demo`; the plan's branch is never created",
+};
+const WORKTREES_LINE = {
+  kind: 'worktrees', plan: 'Worktrees: on', honourable: true,
+  run: 'the phases share one checkout — a shared-checkout run cannot grant a worktree per lane',
+};
+
+/** A Service whose `startRun` reaches the runner with every collaborator but the ack stubbed. */
+function ackService(lines: Record<string, unknown>[]) {
+  const service = new Service({
+    port: 0, host: '127.0.0.1', open: false, allowRun: true, allowWrites: false,
+    scriptsDir: join(SKILL_DIR, 'scripts'), logFile: null,
+  } as never);
+  const started: Record<string, unknown>[] = [];
+  Object.assign(service as object, {
+    root: { ok: true, path: tmpdir() },
+    store: { get: () => ({ slug: 'demo', plan: { phased: true, graph: [{ phase: 1, repos: '' }], phases: {}, sessionBudget: {} } }), list: () => [] },
+    liveRunner: () => null,
+    foreignRunHoldingWork: () => null,
+    assertNotClaimed: () => {},
+    prelude: async () => ({
+      slug: 'demo', rows: [], blocking: [], accounts: [], acknowledged: [], at: '2026-09-23T00:00:00Z',
+      probes: { 'git-strategy': { status: 'ok', ok: true, reason: 'x', detail: { lines } } },
+      // The prelude's owed human steps (control-tower phase 44): none here.
+      humanSteps: [],
+    }),
+    admitStart: () => ({ ok: true }),
+    runnerFor: () => ({
+      start: async (options: Record<string, unknown>) => { started.push(options); return { id: 'r1', slug: 'demo' }; },
+    }),
+  });
+  return { service: service as unknown as { startRun: (slug: string, options: Record<string, unknown>) => Promise<unknown> }, started };
+}
+
+test('EC7 — the launch form must answer a standing git line: no ack is a 409 naming every line', async () => {
+  const { service, started } = ackService([BRANCH_LINE, WORKTREES_LINE]);
+  await assert.rejects(
+    service.startRun('demo', { gitMode: 'new-branch', gitStrategyAckRequired: true }),
+    (error: unknown) => {
+      assert.ok(error instanceof GitStrategyRefusal);
+      assert.equal((error as InstanceType<typeof GitStrategyRefusal>).lines.length, 2);
+      assert.match(String((error as Error).message), /feature\/checkout/);
+      assert.match(String((error as Error).message), /Worktrees: on/);
+      assert.match(String((error as Error).message), /"honour" or "override"/);
+      return true;
+    },
+  );
+  assert.equal(started.length, 0, 'nothing spawned before the answer');
+});
+
+test('EC7 — override runs over the lines and records them; honour refuses a line it cannot make hold', async () => {
+  const over = ackService([BRANCH_LINE]);
+  await over.service.startRun('demo', { gitMode: 'new-branch', gitStrategyAck: 'override', gitStrategyAckRequired: true, actor: { by: 'mobin', via: 'browser', origin: 'test', remoteUser: null } });
+  const recorded = over.started[0]!.gitStrategyOverride as { lines: { kind: string }[]; ack: string; by: string };
+  assert.deepEqual(recorded.lines.map((line) => line.kind), ['branch']);
+  assert.equal(recorded.ack, 'override');
+  assert.equal(recorded.by, 'mobin');
+
+  const honourBranch = ackService([BRANCH_LINE]);
+  await assert.rejects(
+    honourBranch.service.startRun('demo', { gitMode: 'new-branch', gitStrategyAck: 'honour', gitStrategyAckRequired: true }),
+    (error: unknown) => error instanceof GitStrategyRefusal && /cannot honour/.test((error as Error).message),
+  );
+
+  // A line a checkout of the run's own makes hold IS honoured: the run is isolated.
+  const honourTrees = ackService([WORKTREES_LINE]);
+  await honourTrees.service.startRun('demo', { gitMode: 'new-branch', gitStrategyAck: 'honour', gitStrategyAckRequired: true });
+  assert.equal(honourTrees.started[0]!.isolation, 'worktree');
+  assert.equal(honourTrees.started[0]!.gitStrategyOverride, undefined, 'honoured, so nothing is overridden');
+});
+
+test('EC7 — an automatic door answers override for itself, and the run journals run.git-strategy-overridden', async () => {
+  const { service, started } = ackService([BRANCH_LINE]);
+  await service.startRun('demo', { gitMode: 'new-branch' });
+  const recorded = started[0]!.gitStrategyOverride as { ack: string };
+  assert.equal(recorded.ack, 'automatic', 'a door no person pressed never waits on one');
+
+  // The runner writes the journal line the moment the run exists.
+  const r = repo();
+  try {
+    const driver = await driveOn(makeRunner(r, { planBranch: () => 'feature/checkout' }), r, {
+      onlyPhases: [1], gitMode: 'new-branch',
+      gitStrategyOverride: { lines: [BRANCH_LINE], ack: 'automatic' },
+    });
+    const state = driver.runner.current()!;
+    const journal = readFileSync(journalFile(r.root, 'demo', state.id), 'utf8');
+    assert.match(journal, /"run\.git-strategy-overridden"/);
+    assert.match(journal, /"ack":"automatic"/);
+    assert.equal(state.gitStrategyOverride?.lines[0]?.kind, 'branch', 'the run keeps what its launch answered');
+  } finally { r.cleanup(); }
+});
+
+test('EC8 — under an override the session gets the concrete branch, never "record the discrepancy"', async () => {
+  const r = repo();
+  try {
+    const lines = [
+      BRANCH_LINE,
+      { kind: 'checkout', plan: 'Checkout: main on phase 1', run: 'inert in the shared checkout', phases: [1] },
+    ];
+    const prompts = await promptsFor(r, {
+      onlyPhases: [1], gitMode: 'new-branch', gitStrategyOverride: { lines, ack: 'override', by: 'mobin' },
+    }, { planBranch: () => 'feature/checkout' });
+    const text = prompts[0]!;
+    assert.match(text, /`pe\/demo` IS this plan's branch for the whole run/);
+    assert.match(text, /per-phase `pe\/demo-pN`/, "the plan's per-phase branch names do not exist");
+    assert.match(text, /gh pr checks/);
+    assert.match(text, /There is no discrepancy to record/);
+    assert.match(text, /`Checkout: main` is inert in this run/);
+    assert.doesNotMatch(text, /record the discrepancy in your/);
   } finally { r.cleanup(); }
 });

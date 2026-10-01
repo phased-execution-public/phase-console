@@ -91,6 +91,9 @@
  * so that landing their detector changed no type, no route and no stored ack.
  */
 
+import type { HumanStep } from './human-steps.ts';
+import { HUMAN_STEP_FOLDS, KIND_META, humanStepView, type HumanStepView } from '../shared/human-step-model.js';
+import { HALT_CATEGORY_LABELS, HUMAN_STEP_CATEGORY, categoryOfSituation, type HaltCategory } from '../shared/halt-categories.js';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -99,16 +102,23 @@ import {
   situationRaises, sortInbox, type InboxKind, type InboxSeverity,
 } from '../shared/attention-model.js';
 import { DECISION_KEYS, type DecisionKey } from '../shared/decisions-model.js';
+import { rungLabel } from '../shared/ladder-model.js';
 import { POLICY_DEFAULTS, isAnswerWord } from '../shared/policy-model.js';
 import { recommendedOption } from '../shared/relay-model.js';
 import { phaseHref, planHref, toHash } from '../shared/routes.js';
+import { OPERATOR_ISSUE_SCOPE } from '../shared/issues-model.js';
 import { parseSituationKey, situationLabel } from '../shared/situation-model.js';
+import { isPersonErrand } from '../shared/recovery-model.js';
 import { isLiveStatus } from '../shared/status-vocab.js';
 import { ISOLATED, pairKey } from '../shared/worktree-model.js';
 import { INSTANCE_STATE_DIR } from './config.ts';
 import { log } from './log.ts';
 import { routeFor } from './push/catalogue.ts';
+import { EXTEND_CHOICES_MIN } from './runner/approvals.ts';
 import type { Presence } from '../shared/run-lifecycle.js';
+import { phaseSettledWell, undrivenPhases } from '../shared/run-lifecycle.js';
+import { liveErrandHow } from './watch-refs.ts';
+import { UPDATE_SKILL_COMMAND, copyCommit, type SkillCopyReport } from './skill-copy.ts';
 
 /* ------------------------------------------------------------------ *
  * The wire shapes
@@ -197,6 +207,47 @@ export type InboxItem = {
   href: string;
   /** Acknowledged — seen, not cleared. Absent when it is not. */
   ack?: InboxAck | null;
+  /**
+   * The halt family of what stopped the work (control-tower phase 17,
+   * `shared/halt-categories.js`) — the word and its label, so a row on the
+   * first-paint path names the kind of stop without loading the family's
+   * tables. On errands and the console's own crash loop.
+   */
+  category?: { word: HaltCategory; label: string };
+  /**
+   * A person's turn, drawn as ONE family (control-tower phase 44): every row
+   * that asks a person for an act — a ledger step, and each card built before
+   * the family existed (a sign-in, an MCP sign-in, the verification card, a
+   * plan to approve, a gate, a relayed question, a QA verdict, phase 39's
+   * protected edit, a silent lane's suspected turn) — carries the same view
+   * (`shared/human-step-model.js` `humanStepView`, the fold map
+   * `HUMAN_STEP_FOLDS`), so the client draws one card for all of them. The
+   * row's `actions` stay what answers it. Absent on a row that is not a
+   * person's turn (a lock, a health fault, a ruling …).
+   */
+  humanStep?: HumanStepView;
+  /**
+   * A supervisor card's own facts (control-tower phase 102, #145 E), so the
+   * Tower draws the card — its situation, its evidence, its ONE action — and
+   * the annunciator counts it under its detection category, rather than
+   * parsing a sentence. Only on a `supervisor` row.
+   */
+  supervisor?: InboxSupervisorView;
+};
+
+/** What a `supervisor` row carries of its card — see `InboxItem.supervisor`. */
+export type InboxSupervisorView = {
+  card: 'suggestion' | 'escalation';
+  situation: string;
+  /** Its detection category (`SUPERVISOR_CATEGORIES`). */
+  category: string;
+  verb: string | null;
+  why: string;
+  evidence: readonly string[];
+  command?: string;
+  then?: string | null;
+  /** The cap that turned an act into this card: Extend lifts it for one act. */
+  cap?: { cap: string; limit: number; count: number };
 };
 
 export type InboxView = {
@@ -217,6 +268,8 @@ export type InboxErrand = {
   need: string;
   how: string;
   at: string;
+  /** The human step the errand is (`Errand.step`, control-tower phase 44) — a protected edit's act and path. */
+  step?: { kind: string; act?: string; path?: string };
 };
 
 /**
@@ -244,16 +297,31 @@ export type InboxRunPhase = {
   liveness?: {
     lastOutputAt?: string;
     turnsSinceLastTool?: number;
-    openTool?: { name?: string; since?: string };
+    openTool?: { name?: string; since?: string; summary?: string };
+    /** The last call it finished, when nothing is open (control-tower phase 95). */
+    lastCall?: { tool: string; summary?: string };
   };
   /** The live signal, when the runner has one. */
-  stall?: { signal?: string; since?: string; detail?: string };
+  stall?: {
+    signal?: string; since?: string; detail?: string;
+    /** `silent` only: the lane's last output read as a person's turn (control-tower phase 44). */
+    suspectedStep?: { kind: string; url: string; words: string; where: string; at?: string };
+  };
   lockWaitSince?: string;
   /** Who admission said the wait is behind — `autopilot/<runId>` owners. */
   waitingOn?: { slug: string; phase?: number; owner: string }[];
   parkedUntil?: string;
   parkReason?: string;
   verifyingSince?: string;
+  /** The plan this phase's session presented (`PhaseRecord.planApproval`) — `pending` offers Approve and Reject. */
+  planApproval?: { state?: string; sha?: string; bytes?: number; path?: string };
+  /** `PhaseRecord.errandTree` — the stable checkout a person's errand runs in (control-tower phase 90, #123). */
+  errandTree?: { dir: string; mounts?: readonly { rel: string; sha: string; pushed: boolean }[] };
+  /** `PhaseRecord.undriven`, read only through `undrivenPhases`. */
+  undriven?: {
+    since: string; board: string; situation: string | null; why: string;
+    deferred?: { next: string | null; situation: string; reason: string };
+  };
 };
 
 export type InboxRun = {
@@ -334,6 +402,9 @@ export type InboxApproval = {
   kind?: string;
   /** A card no session holds a hook open for — the ladder's `widen-rule` offer (phase 9). */
   standing?: true;
+  /** What the card's timeout will do, and whether it outlived its hook call (control-tower phase 97, #140). */
+  onTimeout?: string;
+  converted?: { at: string };
   title?: string;
   detail?: string;
   createdAt?: string;
@@ -522,6 +593,13 @@ export type InboxFacts = {
     delivery?: { ok: boolean; reason: string };
     /** `notifications.unread()`. */
     unread?: number;
+    /**
+     * This console's own hard endings (`crash-ledger.ts`). A boot that finds no
+     * exit record from the one before it used to write a single log line, and
+     * the measured consequence was two live runs parked by a console nobody
+     * knew had died — so it is a row where a person looks, not only in a file.
+     */
+    crashed?: { at: string; boots: number; snapshot?: string | null } | null;
     /** Only under `--remote`: whether Tailscale runs and whose port Serve fronts. */
     remote?: InboxReach | null;
     /** Every OTHER registered console, as the census reads it. */
@@ -540,6 +618,21 @@ export type InboxFacts = {
   };
   /** `this.watcher.status()`. A deaf watcher looks fine from everywhere else. */
   watcher?: { healthy?: boolean; watching?: number; expected?: number; failures?: number };
+  /**
+   * `ServiceBase.skillCopy()` (control-tower phase 98, #151): the skill copy
+   * each config dir's sessions load, against the console's commit. A copy at
+   * another commit is a `needs-you` health row — every session under that dir
+   * reads a procedure its console's scripts no longer match.
+   */
+  skillCopy?: Pick<SkillCopyReport, 'consoleRev' | 'drift' | 'plugin'>;
+  /**
+   * `Service.hookFaultFacts()` (#74): sessions one of this console's runs
+   * launched whose hook calls are being answered 401 — working with no policy,
+   * because the CLI does not block a tool on a failed hook.
+   */
+  hookFaults?: readonly {
+    runId: string; slug: string; phase?: number; sessionId: string; hook: string; count: number; since: string;
+  }[];
   /** `degradedState()`. */
   degraded?: { healthy?: boolean; recent?: readonly { kind: string; message: string; at?: string }[] };
   /**
@@ -566,6 +659,12 @@ export type InboxFacts = {
    */
   issueDrafts?: readonly InboxIssueDraft[];
   /**
+   * The supervisor's standing cards (control-tower phase 101, #145) — see
+   * `supervisorDrafts`. A FREE type over data the Pro engine feeds; the free
+   * tree hands the builder none and draws nothing.
+   */
+  supervisorCards?: readonly InboxSupervisorCard[];
+  /**
    * The plans' mailboxes (phase 15 over phase 10), any order — every message
    * a session sent and what became of it. Only the ones addressed to the
    * OPERATOR and still open raise a row (`messages`); a note to a phase is
@@ -574,6 +673,12 @@ export type InboxFacts = {
    * builder none and draws nothing, the `issueDrafts` arrangement.
    */
   messages?: readonly InboxMessage[];
+  /**
+   * The human steps still OPEN in the ledger (control-tower phase 41,
+   * `HumanStepLedger.open()`) — a person's turn each. One row per step, by
+   * construction: the row is derived here, never written.
+   */
+  humanSteps?: readonly InboxHumanStep[];
   /**
    * The plans `server/analysis/stats.ts` already calls stalled: open, with
    * ready phases, untouched for a week.
@@ -626,6 +731,24 @@ export type InboxFacts = {
   git?: readonly InboxGit[];
 };
 
+/** One standing supervisor card, narrowed to what its row is drawn from — `pro/supervisor/index.ts`'s `Standing`. */
+export type InboxSupervisorCard = {
+  id: string;
+  kind: 'suggestion' | 'escalation';
+  situation: string;
+  slug: string;
+  phase: number | null;
+  runId: string | null;
+  since: string;
+  verb: string | null;
+  why: string;
+  evidence: readonly string[];
+  command?: string;
+  then?: string | null;
+  /** The cap that turned an act into this card (phase 102). */
+  cap?: { ok?: false; cap: string; limit: number; count: number };
+};
+
 /** One issue draft, narrowed to what its row is decided from — `pro/issues/drafts.ts`'s `IssueDraft` is one. */
 export type InboxIssueDraft = {
   id: string;
@@ -648,6 +771,8 @@ export type InboxIssueDraft = {
   /** The newest state's note — which flag is off, why a close is held. */
   note?: string;
   runId?: string;
+  /** Set when the file it names moved after it was written (#118) — `where-changed` · `where-gone`. */
+  maybeStale?: { reason: string; at?: string };
 };
 
 /** One message, narrowed to what its row is decided from — `pro/messaging/messages.ts`'s `Message` is one. */
@@ -695,6 +820,11 @@ export type InboxGit = {
   /** Which impossibility a refused ask hit, and its sentence. */
   isolationRefusal?: string;
   refusalReason?: string;
+  /** What fixes it (`REFUSAL_FIX`), and git's or the quarantine's own words for this run. */
+  refusalFix?: string;
+  refusalDetail?: string;
+  /** The run PARKED on the refusal (`isolation-refused`), rather than running shared after a structural one. */
+  parked?: boolean;
   /** A mirror run's mounted repositories, root-relative. */
   mounts?: readonly string[];
   /** `RunGitView.radar`, worst first. Only `conflicted` pairs raise anything. */
@@ -762,6 +892,12 @@ function stableSince(...candidates: (string | number | null | undefined)[]): str
  * `flag: undefined`. Flipping the contract to "always name the gate" is a
  * one-line change here rather than eleven call sites.
  */
+/** The halt family of an errand's situation, for its row (control-tower phase 17). */
+function familyOf(situation: string | undefined): { category?: { word: HaltCategory; label: string } } {
+  const word = categoryOfSituation(situation);
+  return word ? { category: { word, label: HALT_CATEGORY_LABELS[word] } } : {};
+}
+
 function gatedBy(flag: string, allowed: boolean | undefined): { flag?: string } {
   return allowed ? {} : { flag };
 }
@@ -824,6 +960,40 @@ function ackFor(
  * including the `/^\d+$/` key filter, without which the `plan` slot (a
  * plan-wide repair, not a phase) leaks in as `phase: NaN`.
  */
+/**
+ * The human step an errand IS, when it is one (control-tower phase 44): the
+ * plan a plan-mode phase presented and a person has not decided (the
+ * `plan-approval` fold, a decision — phase 11, #34), and phase 39's protected
+ * path (the `protected-path` fold: the act and the path the session named,
+ * with the patch to apply by hand or an interactive session here as its
+ * offers). Every other errand is the ladder's ask rather than a person's act
+ * of the family, and carries none.
+ */
+function errandStep(errand: InboxErrand, phase: number | null | undefined, planPending: boolean): HumanStepView | undefined {
+  if (planPending) {
+    return humanStepView({
+      kind: HUMAN_STEP_FOLDS['plan-approval'], fold: 'plan-approval',
+      title: `Approve or reject the plan phase ${phase} presented`,
+      lines: ['The session planned before acting and waits for your answer; approving lets it carry out the plan as written.'],
+    });
+  }
+  if (errand.situation === 'blocked-declared:protected-path') {
+    const { act, path } = errand.step ?? {};
+    return humanStepView({
+      kind: HUMAN_STEP_FOLDS['protected-path'], fold: 'protected-path',
+      title: path ? `Make the protected edit on ${path}` : 'Make a protected edit',
+      ...(act ? { act } : {}),
+      ...(path ? { path } : {}),
+      lines: [
+        act ? `The edit the session named: ${act}` : null,
+        'Apply it by hand in this checkout and commit it on the run branch — or open an interactive session '
+          + 'here and make it there — then Retry. No unattended session may make it.',
+      ],
+    });
+  }
+  return undefined;
+}
+
 function errandsOf(run: InboxRun): InboxErrand[] {
   const phased = Object.entries(run.recoveries ?? {})
     .filter(([key, slot]) => slot?.errand && /^\d+$/.test(key))
@@ -882,6 +1052,10 @@ function errandDrafts(facts: InboxFacts): Draft[] {
       const auth = id === 'resource-wall' && sub === 'auth';
       const mcp = id === 'mcp-unavailable' || mcpParked;
       const phase = positivePhase(errand.phase);
+      // A plan a plan-mode phase presented and a person has not decided
+      // (control-tower phase 11, #34): the row carries the two answers, live
+      // run or stopped. Once decided the errand's ordinary actions return.
+      const planPending = phase != null && run.phases?.[String(phase)]?.planApproval?.state === 'pending';
       // A QA errand whose ask the QA table already answers is history, not an
       // ask: nothing dissolves a stored errand while its run drives, and a
       // standing "needs you" over a recorded verdict is how the needs-you
@@ -895,6 +1069,10 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         if (answered) continue;
       }
 
+      // The errand tree, when a person prepared one (control-tower phase 90,
+      // #123): the card names WHERE the errand's commands run, because the run's
+      // own mirror is pruned on the console's schedule and this tree is not.
+      const tree = phase != null ? run.phases?.[String(phase)]?.errandTree : undefined;
       out.push({
         kind: 'errand',
         severity: 'needs-you',
@@ -903,15 +1081,40 @@ function errandDrafts(facts: InboxFacts): Draft[] {
         ...(phase != null ? { phase } : {}),
         runId: run.id,
         title: `${run.slug} — ${phase != null ? `phase ${phase} needs you` : 'needs you'}`,
+        ...familyOf(errand.situation),
         need: errand.need,
-        how: errand.how,
+        how: tree
+          ? `${liveErrandHow(errand, (phase != null ? run.phases?.[String(phase)] : null) as Parameters<typeof liveErrandHow>[1])} Run its commands in the errand tree ${tree.dir} — a stable checkout at the pushed `
+            + 'run branch that the console never prunes; never in the run\'s own mirror.'
+          : liveErrandHow(errand, (phase != null ? run.phases?.[String(phase)] : null) as Parameters<typeof liveErrandHow>[1]),
         ...(errand.tried?.length ? { tried: [...errand.tried] } : {}),
+        humanStep: errandStep(errand, phase, planPending),
         since: stableSince(errand.at, run.halt?.at, run.updatedAt),
         href: planHref(run.slug, 'run'),
         actions: [
+          ...(planPending
+            ? [
+                {
+                  verb: 'approve-plan',
+                  label: 'Approve the plan',
+                  endpoint: runVerb(run.slug, 'plan-approval'),
+                  method: 'POST' as const,
+                  body: { phase: phase ?? 0, decision: 'approve' },
+                  ...gatedBy('run', flags.allowRun),
+                },
+                {
+                  verb: 'reject-plan',
+                  label: 'Reject the plan',
+                  endpoint: runVerb(run.slug, 'plan-approval'),
+                  method: 'POST' as const,
+                  body: { phase: phase ?? 0, decision: 'reject' },
+                  says: { field: 'reason', label: 'Why', placeholder: 'What the plan should do differently' },
+                  ...gatedBy('run', flags.allowRun),
+                },
+              ]
           // Signing in first, because continuing before it is a session that
           // reports success, spends a turn and changes nothing.
-          ...(auth
+          : auth
             ? [
                 {
                   verb: 'login',
@@ -927,6 +1130,21 @@ function errandDrafts(facts: InboxFacts): Draft[] {
                   method: 'POST' as const,
                 },
               ]
+            // A person's ask is answered by the person (control-tower phase
+            // 88, #124): "Done — continue" records the answer and its note and
+            // re-boards the phase. Recover re-derived the same ask from the
+            // session's stale declaration and read as broken.
+            : phase != null && isPersonErrand(errand.situation)
+              ? [
+                  {
+                    verb: 'errand-answered',
+                    label: 'Done — continue',
+                    endpoint: `/api/run/${encodeURIComponent(run.slug)}/phase/${phase}/errand-answered`,
+                    method: 'POST' as const,
+                    says: { field: 'note', label: 'Note', placeholder: 'What you did (optional)' },
+                    ...gatedBy('run', flags.allowRun),
+                  },
+                ]
             : live
               // Recover refuses a live run and Dismiss would resolve one, so
               // neither is offered — but "I did what it asked, look again" is
@@ -1009,9 +1227,11 @@ function errandDrafts(facts: InboxFacts): Draft[] {
     //
     // Narrow on purpose: only the shape the ladder provably cannot reach. A run
     // with no records yet, or with one still open, is still the ladder's.
+    // "Settled" is the one predicate the drive loop and the read path ask too
+    // (`phaseSettledWell`, #43) — `done` or skipped, and no standing errand.
     const records = Object.values(run.phases ?? {});
     const allSettled = records.length > 0
-      && records.every((record) => record?.status === 'done' || record?.status === 'skipped');
+      && records.every((record) => phaseSettledWell(record, run.recoveries?.[String(record?.phase)]?.errand));
     const engaged = Object.values(run.recoveries ?? {})
       .some((slot) => slot?.rungs?.length || slot?.errand || (slot?.attempts ?? 0) > 0);
     if (flags.allowRun && run.autoRecover && !(allSettled && !engaged)) continue;
@@ -1087,15 +1307,41 @@ function approvalDrafts(facts: InboxFacts): Draft[] {
         ...(phase != null ? { phase } : {}),
         ...(approval.runId ? { runId: approval.runId } : {}),
         title: approval.title || (approval.standing ? 'A phase is parked on a decision' : 'A session is waiting on a decision'),
-        need: approval.detail || 'A session is parked until you answer.',
+        // …and what its timeout will do, before it does it (control-tower phase 97, #140).
+        need: `${approval.detail || 'A session is parked until you answer.'}`
+          + `${approval.onTimeout ? ` If nobody answers, it ${approval.onTimeout}.` : ''}`,
         // A STANDING card (the ladder's `widen-rule` offer, phase 9) holds no
         // hook open: the phase is parked behind it and nothing spends.
-        how: approval.standing
-          ? 'Allow it to strike the rule for this plan and resume the phase\'s own session, or deny it and do the step by hand — the phase is parked, nothing spends, until you do.'
-          : 'Allow it or deny it — the session is holding a hook open until you do.',
+        how: approval.converted
+          ? 'It outlived its hook call: allow it to resume the phase with this one call granted once, or deny it — the phase is parked, nothing spends, until you do.'
+          : approval.standing
+            ? 'Allow it to strike the rule for this plan and resume the phase\'s own session, or deny it and do the step by hand — the phase is parked, nothing spends, until you do.'
+            : 'Allow it or deny it — the session is holding a hook open until you do.',
+        // The verification card (`kind: 'verify'`) is a check by eye — the
+        // person-check fold (control-tower phase 44). A tool's permission card
+        // is not a person's act, and carries no step.
+        humanStep: approval.kind === 'verify'
+          ? humanStepView({
+            kind: HUMAN_STEP_FOLDS['person-check'], fold: 'person-check',
+            title: approval.title || 'Check it by eye', lines: [approval.detail],
+          })
+          : undefined,
         since: stableSince(approval.createdAt),
+        expiresAt: approval.expiresAt,
         href: approval.slug ? planHref(approval.slug, 'run') : toHash(routeFor('approval')),
-        actions: [decide('allow', 'Allow'), decide('deny', 'Deny')],
+        actions: [
+          decide('allow', 'Allow'),
+          decide('deny', 'Deny'),
+          // Not yet (#140): the long Extend — the same verb the expiry push carries.
+          {
+            verb: 'extend',
+            label: `Extend ${EXTEND_CHOICES_MIN[1] / 60} h`,
+            endpoint: `/api/approvals/${encodeURIComponent(approval.id)}/extend`,
+            method: 'POST',
+            body: { minutes: EXTEND_CHOICES_MIN[1] },
+            ...gatedBy('run', flags.allowRun),
+          },
+        ],
       };
     });
 }
@@ -1134,6 +1380,10 @@ function questionDrafts(facts: InboxFacts): Draft[] {
         title: item.question.slice(0, 240),
         need: `${approval.slug}${phase != null ? ` phase ${phase}` : ''} asks${item.header ? ` (${item.header})` : ''} — pick one.`,
         how: `Unanswered, the console answers by its relay rules when the window closes${silence ? ` — "${silence}" unless a rule says otherwise` : ''}.`,
+        humanStep: humanStepView({
+          kind: HUMAN_STEP_FOLDS.question, fold: 'question', title: item.question.slice(0, 240),
+          lines: item.options.map((option) => option.label.slice(0, 80)),
+        }),
         since: stableSince(approval.createdAt),
         ...(approval.expiresAt ? { expiresAt: approval.expiresAt } : {}),
         href: planHref(approval.slug, 'run'),
@@ -1309,6 +1559,10 @@ function planDrafts(facts: InboxFacts): Draft[] {
           how: phase.gateCheck
             ? `Do what the gate asks — \`${phase.gateCheck}\` — then approve it on the phase page.`
             : 'Do what the gate asks, then approve it on the phase page under Gate.',
+          humanStep: humanStepView({
+            kind: HUMAN_STEP_FOLDS.gate, fold: 'gate', title: `Clear the gate on ${plan.slug} phase ${phase.phase}`,
+            lines: [phase.gate.detail, phase.gateCheck ? `What it checks: ${phase.gateCheck}` : null],
+          }),
           since: planSince,
           href: phaseHref(plan.slug, phase.phase),
           actions: [
@@ -1382,6 +1636,11 @@ function planDrafts(facts: InboxFacts): Draft[] {
             : 'Press Re-run QA to dispatch the review this gate is waiting for, or Waive with a reason '
               + 'to record `waived`. Fix & re-QA does both, when the phase needs work before it is '
               + 'reviewed. Until a verdict exists, this phase holds every phase that depends on it.',
+          humanStep: humanStepView({
+            kind: HUMAN_STEP_FOLDS.qa, fold: 'qa',
+            title: failed ? `Decide what phase ${row.phase}'s failed QA needs` : `Record phase ${row.phase}'s QA verdict`,
+            lines: [failed && row.report ? `The report: ${row.report}` : null],
+          }),
           since: planSince,
           href: phaseHref(plan.slug, row.phase),
           actions: [
@@ -1500,7 +1759,7 @@ function planDrafts(facts: InboxFacts): Draft[] {
         need: issue.message,
         how: 'Fix it in the plan or the handoff, then the board re-reads it on the next change.',
         since: planSince,
-        href: phase != null ? phaseHref(plan.slug, phase) : planHref(plan.slug, 'route'),
+        href: phase != null ? phaseHref(plan.slug, phase) : planHref(plan.slug, 'phases'),
         actions: [],
       });
     }
@@ -1542,6 +1801,11 @@ function signInDrafts(facts: InboxFacts): Draft[] {
       title: 'Claude is signed out on this machine',
       need: 'A signed-in machine login — nothing starts or resumes under the default account until there is one.',
       how: 'Open a sign-in terminal and run `claude auth login`, or sign a console profile in under Settings ▸ Accounts.',
+      humanStep: humanStepView({
+        kind: HUMAN_STEP_FOLDS['sign-in'], fold: 'sign-in', title: 'Sign Claude in on this machine', where: 'host',
+        openCommand: 'claude auth login',
+        lines: ['Nothing starts or resumes under the default account until the machine login is signed in.'],
+      }),
       // `auth.checkedAt` is when the PROBE ran, not when the sign-out began; it
       // moves on every poll, so using it would make every ack stale at once.
       since: '',
@@ -1570,6 +1834,10 @@ function signInDrafts(facts: InboxFacts): Draft[] {
       title: `${name} is ${account.authState === 'expired' ? 'expired' : 'signed out'}`,
       need: 'A signed-in account — a run pinned to this one cannot spawn a session.',
       how: 'Sign it in from Settings ▸ Accounts; the console opens the login in its own config directory.',
+      humanStep: humanStepView({
+        kind: HUMAN_STEP_FOLDS['sign-in'], fold: 'sign-in', title: `Sign ${name} in`, where: 'host',
+        lines: ['A run pinned to this account cannot spawn a session until it is signed in again.'],
+      }),
       since: '',
       href: toHash(routeFor('limits')),
       actions: [
@@ -1636,6 +1904,11 @@ function mcpDrafts(facts: InboxFacts): Draft[] {
       how: unconfigured
         ? 'Finish the registration under MCP servers: supply the missing values, then re-check it.'
         : 'Sign it in from the MCP servers page, then re-check it. Or let the parked run continue without it.',
+      humanStep: humanStepView({
+        kind: HUMAN_STEP_FOLDS['mcp-auth'], fold: 'mcp-auth', where: 'host',
+        title: unconfigured ? `Finish registering ${label}` : `Sign ${label} in`,
+        lines: [unconfigured ? `It needs values for ${server.needsConfig!.join(', ')}.` : server.issue],
+      }),
       since: '',
       href: toHash('mcp'),
       actions: [
@@ -1843,12 +2116,54 @@ function stallDrafts(facts: InboxFacts, now: number): Draft[] {
       // 1. Silent. The runner's own signal is the trigger and its `since` is
       //    the clock, so the row and the push cannot disagree about when the
       //    silence began; the longer floor is applied here.
+      // A silent lane whose last output read as a person's turn (control-tower
+      // phase 44) is raised at the runner's own clock, not the inbox's longer
+      // floor: it is waiting on a person, not thinking.
+      // Once a person converted it, the human-step row is the ask; the
+      // suspicion stands down and this reads as any other silence.
+      const converted = (facts.humanSteps ?? []).some((step) => step.birth === 'console'
+        && step.slug === run.slug && step.phase === phase && step.runId === run.id);
+      const suspected = !converted && live && record.status === 'running' && record.stall?.signal === 'silent'
+        ? record.stall.suspectedStep : undefined;
       const silentSince = live && record.status === 'running'
         ? older(record.stall?.signal === 'silent' ? record.stall.since : record.liveness?.lastOutputAt,
-          after('session-silent'))
+          suspected ? 0 : after('session-silent'))
         : null;
-      if (silentSince !== null) {
-        const open = record.liveness?.openTool?.name;
+      if (silentSince !== null && suspected) {
+        const label = KIND_META[suspected.kind as keyof typeof KIND_META]?.label.toLowerCase() ?? "a person's turn";
+        out.push({
+          kind: 'stall',
+          severity: 'needs-you',
+          subject: 'session-silent',
+          ...common,
+          title: `${run.slug} phase ${phase} — silent for ${agoText(now - silentSince)}, and it looks like your turn`,
+          need: `The session went quiet after its last output named a link and said "${suspected.words}": `
+            + `${suspected.url}. It reads as "${label}" — something only a person can finish.`,
+          how: "Make it a person's turn to get the step with its link, reminders and I did it — the console never "
+            + 'opens or converts it by itself. Or nudge, freeze or stop the lane as for any silence.',
+          since: new Date(silentSince).toISOString(),
+          humanStep: humanStepView({
+            kind: suspected.kind, title: `Finish what phase ${phase}'s session is waiting on`, where: suspected.where,
+            state: 'declared', suspected: true, openUrl: suspected.url,
+            lines: [`The session went silent after saying: "${suspected.words}".`],
+          }),
+          actions: [
+            {
+              verb: 'convert-step',
+              label: "Make it a person's turn",
+              endpoint: '/api/human-steps/suspected',
+              method: 'POST',
+              body: { slug: run.slug, phase },
+            },
+            ...stallActions(run.slug, phase, flags.allowRun),
+          ],
+        });
+      } else if (silentSince !== null) {
+        // WHAT it is quiet inside (control-tower phase 95, #138): the open
+        // call's own command, else the last one it ran.
+        const tool = record.liveness?.openTool;
+        const last = tool ? undefined : record.liveness?.lastCall;
+        const open = tool ? `${tool.name}${tool.summary ? ` — \`${tool.summary.slice(0, 160)}\`` : ''}` : undefined;
         out.push({
           kind: 'stall',
           severity: STALL_META['session-silent'].severity,
@@ -1856,7 +2171,8 @@ function stallDrafts(facts: InboxFacts, now: number): Draft[] {
           ...common,
           title: `${run.slug} phase ${phase} — silent for ${agoText(now - silentSince)}`,
           need: `The session is still running and still spending, and it has produced nothing for ${agoText(now - silentSince)}.`
-            + (open ? ` Its oldest open tool call is ${open}.` : ''),
+            + (open ? ` Its oldest open tool call is ${open}.` : '')
+            + (last ? ` Nothing is open; its last call was ${last.tool}${last.summary ? ` \`${last.summary.slice(0, 160)}\`` : ''}.` : ''),
           how: 'Nudge it, freeze it where it stands, or stop this lane. Nothing else is blocked on it — '
             + 'the rest of the run carries on either way.',
           since: new Date(silentSince).toISOString(),
@@ -2034,6 +2350,48 @@ function stallDrafts(facts: InboxFacts, now: number): Draft[] {
         });
       }
     }
+
+    // 6. Undriven (control-tower phase 79, #114): the board reads the phase in
+    //    progress or stuck, and nothing of this live run drives it. The drive
+    //    tick stamps the record; `undrivenPhases` is the one reader and answers
+    //    only for a live run — a stopped run asks through its halt. The clock
+    //    is the episode's, except for a ladder that DEFERRED the phase to the
+    //    healer: the healer climbs only a stopped run, so no amount of waiting
+    //    changes that, and the row is raised at once.
+    for (const row of undrivenPhases(run)) {
+      if (frozen.has(row.phase)) continue;
+      const since = older(row.since, row.deferred ? 0 : after('undriven'));
+      if (since === null) continue;
+      const phase = row.phase;
+      const next = row.deferred?.next ?? null;
+      out.push({
+        kind: 'stall',
+        severity: STALL_META.undriven.severity,
+        subject: 'undriven',
+        slug: run.slug, phase, runId: run.id, href: phaseHref(run.slug, phase),
+        title: `${run.slug} phase ${phase} — ${row.board} on the board, nothing driving it for ${agoText(now - since)}`,
+        need: `The board reads phase ${phase} ${row.board}, and no lane, queue entry, park or errand of this run `
+          + `is working on it. ${row.why}`
+          + (next
+            ? ` The ladder deferred it: its next rung, "${rungLabel(next, undefined, row.deferred?.situation)}" `
+              + `(${next}), belongs to the healer, which climbs only a stopped run.`
+            : ''),
+        how: 'Retry boards it now. If it should not run, stop the run or settle the phase on its plan.',
+        // The stamp's own words, so the row and the record never disagree about
+        // when the episode began.
+        since: row.since,
+        actions: [
+          {
+            verb: 'retry',
+            label: `Retry phase ${phase}`,
+            endpoint: runVerb(run.slug, 'retry'),
+            method: 'POST',
+            body: { phase },
+            ...gatedBy('run', flags.allowRun),
+          },
+        ],
+      });
+    }
   }
 
   // 4. A plan nobody has touched in a week that still has startable work.
@@ -2057,7 +2415,7 @@ function stallDrafts(facts: InboxFacts, now: number): Draft[] {
       // The plan's own last write. Stable between polls and it moves exactly
       // when the plan does, which is the only moment this ask is new again.
       since: stableSince(plan?.updatedAt),
-      href: planHref(idle.slug, 'route'),
+      href: planHref(idle.slug, 'phases'),
       actions: [],
     });
   }
@@ -2359,6 +2717,47 @@ function healthDrafts(facts: InboxFacts): Draft[] {
     });
   }
 
+  // A run's session refused by the console's own hooks (#74). A health row
+  // rather than a log line, because nothing else shows it: the session goes on
+  // working, and every tool call it makes skips the policy it was launched under.
+  for (const fault of facts.hookFaults ?? []) {
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: `hook-unauthorised:${fault.runId}:${fault.sessionId}`,
+      title: `A session of ${fault.slug} is running without the console's hooks`,
+      need:
+        `Session ${fault.sessionId.slice(0, 8)}${fault.phase != null ? ` (phase ${fault.phase})` : ''} is still working, `
+        + `and the console has refused its ${fault.hook} hook ${fault.count} time${fault.count === 1 ? '' : 's'}: `
+        + 'its run token is no longer armed, so its tool calls are not checked against the run’s permission policy.',
+      how: 'Open the phase and stop that session, or let it finish and review what it did. Restarting the console does not re-arm the token.',
+      since: fault.since,
+      href: fault.phase != null ? phaseHref(fault.slug, fault.phase) : planHref(fault.slug),
+      actions: [],
+    });
+  }
+
+  // The skill a session reads is at another commit than the console that
+  // launches it (#151). One row per config dir, keyed by the dir alone: a copy
+  // that moves again is the same ask, and one that catches up clears it.
+  for (const copy of facts.skillCopy?.drift ?? []) {
+    const at = copyCommit(copy)?.slice(0, 12) ?? 'an unknown commit';
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: `skill-drift:${copy.configDir}`,
+      title: 'The skill sessions read is at another commit than this console',
+      need:
+        `Sessions under ${copy.configDir} load ${facts.skillCopy!.plugin} at ${at} (${copy.install?.installPath ?? 'its plugin cache'}), `
+        + `and this console runs ${facts.skillCopy!.consoleRev?.slice(0, 12) ?? 'another commit'} — they follow a procedure its scripts `
+        + 'no longer match. Each boot prompt says so to the session it boards.',
+      how: `Move the skill to the console: ${UPDATE_SKILL_COMMAND}. Open sessions pick it up on /reload-plugins or a restart.`,
+      since: '',
+      href: settings,
+      actions: [],
+    });
+  }
+
   if (facts.watcher && facts.watcher.healthy === false) {
     out.push({
       kind: 'health',
@@ -2431,6 +2830,46 @@ function instanceHealthDrafts(facts: InboxFacts): Draft[] {
       since: '',
       href: settings,
       actions: [],
+    });
+  }
+
+  const crashed = fleet.crashed;
+  if (crashed) {
+    const loop = crashed.boots >= 2;
+    out.push({
+      kind: 'health',
+      severity: 'needs-you',
+      subject: 'previous-run-crashed',
+      title: loop
+        ? `Phase Console ended hard ${crashed.boots} times — automation is held`
+        : 'Phase Console ended hard and restarted',
+      need:
+        'The console before this one wrote no exit record: it was killed, ran out of heap, or the machine '
+        + `stopped. ${loop
+          ? 'Three inside ten minutes is a loop, so nothing is re-adopted, nothing converges, and no run is '
+            + 're-parked as orphaned until you release it — which is what keeps a supervisor\'s ten-second '
+            + 'restart from parking runs that are still working.'
+          : 'Any run it was driving kept its own child process, which has been unsupervised since.'}`,
+      how: crashed.snapshot
+        ? `Debug → the console log around ${crashed.at}; a heap snapshot was written to ${crashed.snapshot}.`
+        : `Debug → the console log around ${crashed.at}. Turn on heapSnapshotOnNearLimit in the machine `
+          + 'profile if it happens again and the cause is memory.',
+      since: crashed.at,
+      href: settings,
+      category: { word: 'environment', label: HALT_CATEGORY_LABELS.environment },
+      // The one recovery, on the row Now already shows (#20): release the
+      // hold once the cause is understood. A lone hard stop holds nothing.
+      actions: loop
+        ? [
+            {
+              verb: 'release-hold',
+              label: 'Release it for this boot',
+              endpoint: '/api/automation/hold/release',
+              method: 'POST' as const,
+              ...gatedBy('run', facts.flags?.allowRun),
+            },
+          ]
+        : [],
     });
   }
 
@@ -2599,9 +3038,16 @@ function serializeTarget(pair: { a: string; b: string }, byBranch: Map<string, I
  * The shape that used to be invisible: the operator ticks "Give this run its
  * own checkout", the preamble refuses by name, and the only witnesses were a
  * journal line and a chip on a page nobody was looking at — while the run
- * queued on scope exactly as if nobody had asked. The row says what was asked,
- * what the console answered, and why, and its one action is the honest one:
- * drop the ask, so the record stops promising what the run does not have.
+ * queued on scope exactly as if nobody had asked.
+ *
+ * 🔴 Since control-tower phase 90 (#123 #139) the refused run PARKS rather than
+ * degrading, so the row is the errand: what was refused, in the run's own
+ * words, and the FIX. Its first action is the repair — a person's word that
+ * lets the console move foreign mount content to `stale-mounts/` (never
+ * delete it) and rebuild — and "Drop isolation" is the second, the explicit
+ * choice to run in the shared checkout. It used to be the only action, and it
+ * was the opposite of the fix: on hub 4123 it would have made an eleven-hour
+ * shared-checkout fallback permanent.
  *
  * Kind `conflict`, deliberately: the row is about this run CONTENDING for a
  * shared tree, which is the same story the radar's rows tell, and a new kind
@@ -2619,13 +3065,27 @@ function isolationDrafts(facts: InboxFacts): Draft[] {
       subject: `isolation:${entry.slug}`,
       slug: entry.slug,
       href: planHref(entry.slug, 'run'),
-      title: `${entry.slug} asked for its own checkout — refused: ${entry.isolationRefusal ?? 'unavailable'}`,
-      need: `${why}. The run shares the console's checkout and queues on scope, exactly as `
-        + 'before isolation existed.',
-      how: 'Fix what the refusal names and Retry the run — or drop the ask, so the run record '
-        + 'stops promising a checkout it does not have.',
+      title: entry.parked
+        ? `${entry.slug} is parked — its own checkout was refused: ${entry.isolationRefusal ?? 'unavailable'}`
+        : `${entry.slug} asked for its own checkout — refused: ${entry.isolationRefusal ?? 'unavailable'}`,
+      need: `${entry.refusalDetail ? `${entry.refusalDetail.replace(/[.\s]+$/, '')}. ` : ''}${why}. `
+        + (entry.parked
+          ? 'Nothing boards in the shared checkout while the run asks for its own.'
+          : 'No repair gives this plan a checkout of its own here, so the run shares the console\'s '
+            + 'checkout and queues on scope, exactly as before isolation existed.'),
+      how: `${entry.refusalFix ?? 'Fix what the refusal names, then Retry the run.'} `
+        + (entry.parked
+          ? 'Or drop the ask, and the run continues in the shared checkout, queueing on scope.'
+          : 'Or drop the ask, so the run record stops promising a checkout it does not have.'),
       since: entry.startedAt ?? '',
-      actions: [{
+      actions: [...(entry.parked ? [{
+        verb: 'repair-checkout',
+        label: 'Repair checkout',
+        endpoint: runVerb(entry.slug, 'repair-checkout'),
+        method: 'POST' as const,
+        body: {},
+        ...gatedBy('run', facts.flags?.allowRun),
+      }] : []), {
         verb: 'serialize',
         label: 'Drop isolation',
         endpoint: runVerb(entry.slug, 'settings'),
@@ -2785,7 +3245,10 @@ function issueDrafts(facts: InboxFacts): Draft[] {
   for (const draft of facts.issueDrafts ?? []) {
     if (!draft?.slug || closed.has(draft.slug)) continue;
     if (draft.state !== 'pending-approval' && draft.state !== 'pending-landing') continue;
-    const phase = positivePhase(draft.phase);
+    // An operator's draft (control-tower phase 12, #30) has no plan and phase 0:
+    // the same row, the same verbs, named for the ticket that wrote it.
+    const operator = draft.slug === OPERATOR_ISSUE_SCOPE;
+    const phase = operator ? 0 : positivePhase(draft.phase);
     if (phase == null) continue;
     const held = draft.state === 'pending-landing';
     const target = draft.number ? `${draft.repo}#${draft.number}` : draft.repo;
@@ -2795,10 +3258,18 @@ function issueDrafts(facts: InboxFacts): Draft[] {
         ? `comment on ${target}`
         : `close ${target}`;
     const words = draft.action === 'file' ? draft.evidence ?? '' : draft.action === 'comment' ? draft.text ?? '' : draft.reason ?? '';
+    // A draft whose file moved since it was written may describe code that is
+    // gone (#118): the reviewer is told before Approve, not after.
+    const stale = draft.maybeStale
+      ? draft.maybeStale.reason === 'where-gone'
+        ? 'Maybe stale: the file it names is gone.'
+        : 'Maybe stale: the file it names changed after it was written — check before approving.'
+      : '';
     const need = [
+      stale,
       draft.where ? `At \`${draft.where}\`.` : '',
       words ? (words.length > 300 ? `${words.slice(0, 300)}…` : words) : '',
-    ].filter(Boolean).join(' ') || 'A session drafted this outside its phase.';
+    ].filter(Boolean).join(' ') || (operator ? 'An issue ticket drafted this from a complaint.' : 'A session drafted this outside its phase.');
     const endpoint = (verb: string) => runVerb(draft.slug, `issues/${encodeURIComponent(draft.id)}/${verb}`);
     const publish = facts.flags?.allowPublish;
     const actions: InboxAction[] = held
@@ -2820,11 +3291,14 @@ function issueDrafts(facts: InboxFacts): Draft[] {
       severity: held ? 'fyi' : 'needs-you',
       subject: draft.id,
       slug: draft.slug,
-      phase,
+      // No phase on an operator's row: there is none, and "phase 0" would read as one.
+      ...(operator ? {} : { phase }),
       ...(draft.runId ? { runId: draft.runId } : {}),
-      title: held
-        ? `${draft.slug} phase ${phase} — ${what} waits for phase ${phase} to land`
-        : `${draft.slug} phase ${phase} — ${what}`,
+      title: operator
+        ? `Issue ticket — ${what}`
+        : held
+          ? `${draft.slug} phase ${phase} — ${what} waits for phase ${phase} to land`
+          : `${draft.slug} phase ${phase} — ${what}`,
       need,
       how: held
         ? `${draft.note ?? `Held until phase ${phase} has landed`} — the console moves it to Approve by itself; Discard drops it now.`
@@ -2833,12 +3307,13 @@ function issueDrafts(facts: InboxFacts): Draft[] {
         }. Discard drops it. Edit the title or rewrite the body first if a session's words need a person's.${
           draft.note && !held ? ` (${draft.note})` : ''}`,
       since: draft.stateAt,
-      href: phaseHref(draft.slug, phase),
+      href: operator ? toHash('repo/issues') : phaseHref(draft.slug, phase),
       actions,
     });
   }
   return out;
 }
+
 
 /* ------------------------------------------------------------------ *
  * message — what a session said to the OPERATOR (phase 15)
@@ -2912,6 +3387,83 @@ function messageDrafts(facts: InboxFacts): Draft[] {
   return out;
 }
 
+/** A human step as the inbox reads it — `server/human-steps.ts`'s `HumanStep`, the fields a row needs. */
+export type InboxHumanStep = Pick<
+  HumanStep, 'id' | 'kind' | 'title' | 'where' | 'slug' | 'phase' | 'runId' | 'declaredAt' | 'until'
+  | 'openUrl' | 'openCommand' | 'proof' | 'code' | 'lines'
+> & Partial<Pick<HumanStep, 'state' | 'birth'>>;
+
+/**
+ * A person's turn (control-tower phase 41): one `needs-you` row per open
+ * human step, saying what to do, where, and what proves it — in the step's
+ * own words, with the kind's label from `KIND_META` (the one place a kind is
+ * named). A device code is in the words, on purpose; nothing else a step
+ * holds is a secret, because nothing secret reaches the ledger. The row
+ * carries the verbs a card can press verbatim (control-tower phase 43) —
+ * *I did it — check*, *Snooze* and *I can't do this*, the last with the
+ * person's reason as its words; *Open* needs the person's own browser, so it
+ * is the step card's (phase 42), and the row's `href` is the phase.
+ *
+ * Keyed on the step id, so an ack survives a restart; `since` is when it was
+ * declared and `expiresAt` its window's end.
+ */
+/** The verbs a human-step row offers, each performed verbatim (`POST /api/human-steps/:id/<verb>`). */
+function humanStepActions(id: string): InboxAction[] {
+  const at = (verb: string): string => `/api/human-steps/${encodeURIComponent(id)}/${verb}`;
+  return [
+    { verb: 'check', label: 'I did it — check', endpoint: at('check'), method: 'POST' },
+    { verb: 'snooze', label: 'Snooze an hour', endpoint: at('snooze'), method: 'POST', body: { minutes: 60 } },
+    {
+      verb: 'cannot', label: "I can't do this", endpoint: at('cannot'), method: 'POST',
+      says: { field: 'reason', label: 'Why not?', placeholder: 'Who can do it, or what is in the way' },
+    },
+  ];
+}
+
+function humanStepDrafts(facts: InboxFacts): Draft[] {
+  const closed = new Set((facts.plans ?? []).filter((plan) => plan.closed).map((plan) => plan.slug));
+  const out: Draft[] = [];
+  for (const step of facts.humanSteps ?? []) {
+    if (!step?.slug || closed.has(step.slug)) continue;
+    const phase = positivePhase(step.phase);
+    if (phase == null) continue;
+    const meta = KIND_META[step.kind];
+    if (!meta) continue;
+    const open = step.openUrl ? `open ${step.openUrl}` : step.openCommand ? `run \u0060${step.openCommand}\u0060` : '';
+    out.push({
+      kind: 'human-step',
+      severity: 'needs-you',
+      subject: step.id,
+      slug: step.slug,
+      phase,
+      ...(step.runId ? { runId: step.runId } : {}),
+      title: `Your turn — ${meta.label.toLowerCase()} for ${step.slug} phase ${phase}`,
+      // The family its kind lights on the Tower's annunciator (control-tower phase 42).
+      ...(HUMAN_STEP_CATEGORY[step.kind]
+        ? { category: { word: HUMAN_STEP_CATEGORY[step.kind]!, label: HALT_CATEGORY_LABELS[HUMAN_STEP_CATEGORY[step.kind]!] } }
+        : {}),
+      need: `${step.title}${step.code ? ` — code ${step.code}` : ''}`,
+      how: `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}${open ? `: ${open}` : ''}`
+        + `${step.lines?.length ? ` (${step.lines.map((line, i) => `${i + 1}. ${line}`).join(' ')})` : ''}`
+        + `. ${step.proof ? `${step.proof} proves it` : `What proves it: ${meta.proof}`}; when it is done, press I did it — check.`,
+      humanStep: humanStepView({
+        kind: step.kind, title: step.title, where: step.where, state: step.state, stepId: step.id,
+        ...(step.lines ? { lines: step.lines } : {}),
+        ...(step.openUrl ? { openUrl: step.openUrl } : {}),
+        ...(step.openCommand ? { openCommand: step.openCommand } : {}),
+        ...(step.code ? { code: step.code } : {}),
+        ...(step.proof ? { proof: step.proof } : {}),
+        check: true,
+      }),
+      since: step.declaredAt,
+      ...(step.until ? { expiresAt: step.until } : {}),
+      href: phaseHref(step.slug, phase),
+      actions: humanStepActions(step.id),
+    });
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ *
  * The build
  * ------------------------------------------------------------------ */
@@ -2947,6 +3499,7 @@ export function buildInbox(facts: InboxFacts = {}, now: number = Date.now(), opt
     ...instanceHealthDrafts(facts),
     ...issueDrafts(facts),
     ...messageDrafts(facts),
+    ...humanStepDrafts(facts),
   ];
 
   // Dedupe by id, first writer wins. The builders are written so that two

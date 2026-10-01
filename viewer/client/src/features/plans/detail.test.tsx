@@ -21,6 +21,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { PLAN_TABS } from '@shared/route-meta.js';
 import { queryClientConfig } from '@/lib/queries';
 import type { PlanDetail } from '@/lib/api';
+import { loadEngine } from '@/components/data-table';
 import PlanView from './detail';
 import { DETAIL_TABS, TAB_IDS, resolveTab, tabLabel } from './tabs';
 
@@ -37,9 +38,11 @@ import { DETAIL_TABS, TAB_IDS, resolveTab, tabLabel } from './tabs';
  * window. `route-tab.test.tsx` stubs both and tests the window itself.
  */
 const realOffsetHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
-beforeAll(() => {
+beforeAll(async () => {
   Object.defineProperty(HTMLElement.prototype, 'offsetHeight', { configurable: true, get: () => 800 });
-});
+  // The phase table's row model arrives on demand; fetched once, up front.
+  await loadEngine();
+}, 30_000);
 afterAll(() => {
   if (realOffsetHeight) Object.defineProperty(HTMLElement.prototype, 'offsetHeight', realOffsetHeight);
 });
@@ -84,6 +87,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
       approvals: vi.fn(async () => []),
       auth: vi.fn(async () => ({ loggedIn: true, checkedAt: '2026-08-03T00:00:00Z' })),
       skills: vi.fn(async () => []),
+      engineQueue: vi.fn(async () => ({ active: 0, queued: 0, max: 8 })),
     },
   };
 });
@@ -394,14 +398,14 @@ describe('the tab strip', () => {
 });
 
 describe('resolveTab', () => {
-  it('defaults to the route map and maps the two detail sub-routes', () => {
-    expect(resolveTab(undefined)).toBe('route');
+  it('defaults to the phase table and maps the two detail sub-routes', () => {
+    expect(resolveTab(undefined)).toBe('phases');
     expect(resolveTab('phase')).toBe('phases');
-    expect(resolveTab('handoff')).toBe('handoffs');
+    expect(resolveTab('handoff')).toBe('phases');
   });
 
   it('falls back rather than showing an empty strip for an unknown segment', () => {
-    expect(resolveTab('not-a-tab')).toBe('route');
+    expect(resolveTab('not-a-tab')).toBe('phases');
   });
 
   it('accepts every id the shared vocabulary declares', () => {
@@ -414,7 +418,7 @@ describe('a repo change does not blank the page', () => {
     const client = new QueryClient(queryClientConfig);
     renderPlan(['demo'], client);
     await screen.findByText('demo plan');
-    expect(screen.getByText('Departures')).toBeInTheDocument();
+    expect(await screen.findByRole('table', { name: 'Phases' })).toBeInTheDocument();
 
     // What the SSE bridge does for a `changed` event naming this slug — with a
     // refetch that has not answered yet.
@@ -433,7 +437,7 @@ describe('a repo change does not blank the page', () => {
 
     // The old view set its state to null here and rendered a spinner.
     expect(screen.getByText('demo plan')).toBeInTheDocument();
-    expect(screen.getByText('Departures')).toBeInTheDocument();
+    expect(await screen.findByRole('table', { name: 'Phases' })).toBeInTheDocument();
 
     await act(async () => {
       release(DETAIL);
@@ -503,15 +507,18 @@ describe('the plan surface renders its parts', () => {
         earliest: '2026-08-26T00:00:00Z',
         expected: '2026-08-28T00:00:00Z',
         latest: '2026-08-30T00:00:00Z',
+        clock: 'calendar',
+        calendar: 'known',
         basis: 'plan',
         samples: 6,
+        missing: 0,
         remainingPhases: 4,
         remainingWeight: 160_000,
         workingLowMs: 7_200_000,
         workingHighMs: 14_400_000,
-        duty: { ratio: 0.25, samples: 6, assumed: false, workingMs: 3_600_000, elapsedMs: 14_400_000 },
+        duty: { ratio: 0.25, samples: 6, known: true, workingMs: 3_600_000, elapsedMs: 14_400_000 },
         assumptions: ['Duty cycle: 25% — measured.'],
-        label: '~8 h out',
+        label: '~8 h on the calendar',
       },
     } as unknown as PlanDetail);
     renderPlan(['demo']);
@@ -601,8 +608,11 @@ describe('the plan surface renders its parts', () => {
     // The chips and the boot-prompt card are the invitations. All gone.
     expect(screen.queryByRole('link', { name: 'P2 ready' })).toBeNull();
     expect(screen.queryByText('Boot prompt — phase 2')).toBeNull();
-    // The record is not: the phase is still reachable from the departures table.
-    expect(screen.getByRole('link', { name: '02' })).toHaveAttribute('href', '#/plan/demo/phase/2');
+    // The record is not: the phase is still reachable from the phase table.
+    expect(await screen.findByRole('link', { name: 'Surface' })).toHaveAttribute(
+      'href',
+      '#/plan/demo/phase/2',
+    );
   });
 
   it('says why there are no suggested sessions rather than dropping the card', async () => {
@@ -637,12 +647,19 @@ describe('the plan surface renders its parts', () => {
     ).toBeTruthy();
   });
 
-  it('makes every departures row reachable by keyboard', async () => {
+  it('makes every phase row reachable by keyboard — a folded group is one button away', async () => {
     renderPlan(['demo']);
-    await screen.findByText('Departures');
+    await screen.findByRole('table', { name: 'Phases' });
+    // Done folds by default; its heading is a real button, so one Enter opens it.
+    const done = screen.queryByRole('button', { name: /Need:\s*Done/ });
+    if (done && done.getAttribute('aria-expanded') === 'false') fireEvent.click(done);
     // One link per phase, each carrying the phase deep link — not a `tr onClick`.
-    for (const phase of [1, 2, 3]) {
-      expect(screen.getByRole('link', { name: String(phase).padStart(2, '0') })).toHaveAttribute(
+    for (const [phase, title] of [
+      [1, 'Foundations'],
+      [2, 'Surface'],
+      [3, 'Cutover'],
+    ] as const) {
+      expect(await screen.findByRole('link', { name: title })).toHaveAttribute(
         'href',
         `#/plan/demo/phase/${phase}`,
       );
@@ -763,5 +780,65 @@ describe('the plan surface renders its parts', () => {
     renderPlan(['demo', 'handoff', '1']);
     expect(await screen.findByText('Scaffolded it.')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'What this phase did' })).toBeInTheDocument();
+  });
+});
+
+/*
+ * A slow engine is said, not hidden (#44, control-tower phase 55). A cold plan's
+ * board queues behind every other engine read, and a board read that times out
+ * is served as the last good one: both used to look like a console that was
+ * down, or like a plan where nothing had ever run.
+ */
+describe('a slow engine is said, not hidden', () => {
+  it('says the board is being computed, and how many reads wait ahead of it', async () => {
+    vi.mocked(api.plan).mockReturnValue(new Promise<PlanDetail>(() => {}));
+    vi.mocked(api.engineQueue).mockResolvedValue({ active: 8, queued: 3, max: 8 });
+    renderPlan(['demo']);
+    const line = await screen.findByText('Computing the board (3 queued)');
+    expect(line).toHaveAttribute('role', 'status');
+  });
+
+  it('says only that it is computing when nothing is queued ahead', async () => {
+    vi.mocked(api.plan).mockReturnValue(new Promise<PlanDetail>(() => {}));
+    vi.mocked(api.engineQueue).mockResolvedValue({ active: 1, queued: 0, max: 8 });
+    renderPlan(['demo']);
+    expect(await screen.findByText('Computing the board')).toBeInTheDocument();
+  });
+
+  it('marks a board served from the last good read as stale, beside the progress it qualifies', async () => {
+    const at = Date.now() - 5 * 60_000;
+    vi.mocked(api.plan).mockResolvedValue({
+      ...DETAIL,
+      summary: { ...DETAIL.summary, boardStale: { at, ageMs: 5 * 60_000 } },
+    });
+    renderPlan(['demo']);
+    const marker = await screen.findByText(/Stale board, read/);
+    expect(marker).toHaveAttribute('title', expect.stringMatching(/timed out/));
+    // The stale board replaces the engine-error banner; it does not sit under one.
+    expect(screen.queryByText(/^Engine:/)).toBeNull();
+  });
+
+  it('shows no stale marker on a board the current read answered', async () => {
+    renderPlan(['demo']);
+    await screen.findByText(DETAIL.summary.title);
+    expect(screen.queryByText(/Stale board/)).toBeNull();
+  });
+
+  it('dates a lint verdict carried over from an earlier revision', async () => {
+    vi.mocked(api.plan).mockResolvedValue({
+      ...DETAIL,
+      lint: {
+        ok: false,
+        issues: ['F2: phase 3 depends on undefined phase 9'],
+        summary: 'LINT FAIL: demo — 1 error',
+        timedOut: false,
+        stale: { at: Date.now() - 60_000, revision: 4 },
+      },
+    });
+    renderPlan(['demo']);
+    // The summary is painted twice (the header's banner and the health panel);
+    // the date belongs to the banner alone.
+    expect(await screen.findAllByText('LINT FAIL: demo — 1 error')).not.toHaveLength(0);
+    expect(screen.getByText(/From the last check that finished/)).toBeInTheDocument();
   });
 });

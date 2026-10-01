@@ -199,11 +199,25 @@ export function scopesIntersect(a, b) {
  * outranks all of this in the scheduler, so two runs of ONE plan never carve.
  * The CLAIM_TABLE rows in `test/scope.test.ts` and `tests/unit/lock-scope.bats`
  * pin every case.
- * @param {{ branch?: unknown, tree?: unknown } | null | undefined} a
- * @param {{ branch?: unknown, tree?: unknown } | null | undefined} b
+ *
+ * 🔑 **A RUN's hold on a shared tree is not a lock, and one rule flips for it**
+ * (control-tower phase 40, #41). A lock is per PHASE and says "I am writing
+ * here"; a hold (`hold: true`) is per RUN and says "this repository stands on
+ * my branch until my run settles". Against a hold, the same branch is the
+ * OPPOSITE of a collision — the tree already stands where the claim needs it —
+ * and a different branch on the same ground is exactly the collision a lock
+ * never saw: two claims naming different branches read as disjoint, which is
+ * right for two writers in two trees and wrong for one tree left on somebody
+ * else's branch. A claim that names no branch (a run on the trunk) or no tree
+ * (a hand session anywhere) collides with a hold, as it would with anything.
+ * `holdDisjoint` below; the bash twin is `claim_disjoint_hold` in
+ * `scripts/scope.sh`, which `phase-lock.sh conflicts` asks.
+ * @param {{ branch?: unknown, tree?: unknown, hold?: unknown } | null | undefined} a
+ * @param {{ branch?: unknown, tree?: unknown, hold?: unknown } | null | undefined} b
  * @returns {boolean}
  */
 export function claimsDisjoint(a, b) {
+  if (a?.hold || b?.hold) return holdDisjoint(a?.hold ? a : b, a?.hold ? b : a);
   const leftBranch = String(a?.branch ?? '').trim();
   const rightBranch = String(b?.branch ?? '').trim();
   const leftTree = String(a?.tree ?? '')
@@ -223,6 +237,31 @@ export function claimsDisjoint(a, b) {
   // Segment-wise, like the token rule: `/w/a-b` is not inside `/w/a`.
   if (sameGround(leftTree, rightTree)) return false;
   if (sameGround(rightTree, leftTree)) return false;
+  return true;
+}
+
+/**
+ * A claim against a RUN's hold on a shared tree — see `claimsDisjoint`.
+ * Disjoint when the claim rides the held branch itself, or stands in a tree
+ * that is not on the held repository's ground.
+ * @param {{ branch?: unknown, tree?: unknown } | null | undefined} hold
+ * @param {{ branch?: unknown, tree?: unknown } | null | undefined} claim
+ * @returns {boolean}
+ */
+function holdDisjoint(hold, claim) {
+  const heldBranch = String(hold?.branch ?? '').trim();
+  const heldTree = String(hold?.tree ?? '')
+    .trim()
+    .replace(/\/+$/, '');
+  const branch = String(claim?.branch ?? '').trim();
+  const tree = String(claim?.tree ?? '')
+    .trim()
+    .replace(/\/+$/, '');
+  if (!heldBranch || !heldTree) return false; // a hold naming nothing holds everything
+  if (branch && branch === heldBranch) return true; // the tree already stands where it needs
+  if (!tree) return false; // it may be standing in the held tree
+  if (sameGround(tree, heldTree)) return false;
+  if (sameGround(heldTree, tree)) return false;
   return true;
 }
 
@@ -324,6 +363,28 @@ function isDetachedSpelling(branch) {
  * which is the safe direction.
  */
 export const SHARED_CHECKOUT_TOKEN = 'pe--shared-checkout';
+
+/**
+ * The docs root's per-slug path token (control-tower phase 63, #88): the part
+ * of the ROOT every phase of a plan writes whatever its Repos cell says — its
+ * handoffs, INDEX, locks and ledgers under `docs/handoffs/<slug>/`.
+ *
+ * DECLARED, never admitted on. A plan's own lanes all write it, so carving on
+ * it would serialise every phase of the plan; what orders those writes is the
+ * docs root's critical section in `phase-lock.sh`, for the length of a commit
+ * or a rebase. So it never reaches a lock, a grant or `formatScope`: the boot
+ * prompt names it and the scope-drift probe counts a commit inside it as the
+ * phase's own declared write rather than as drift.
+ *
+ * Mirrored by `scope_root_token` in `scripts/scope.sh`; empty for a slug that
+ * does not normalise to exactly one token.
+ * @param {string} slug
+ * @returns {string}
+ */
+export function rootScopeToken(slug) {
+  const tokens = parseScope(slug);
+  return tokens.length === 1 ? `docs/handoffs/${tokens[0]}` : '';
+}
 
 /**
  * The csv form written to a lock file and passed to `--scope`.

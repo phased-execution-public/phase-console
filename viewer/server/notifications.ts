@@ -108,6 +108,15 @@ export type NotificationRecord = {
    * seconds. Additive JSONL like the context fields.
    */
   resolved?: { at: string; reason: string };
+  /**
+   * The buttons a phone's notification offered, and the signed token that
+   * answers them (control-tower phase 25) — kept on the record so the bell
+   * drawer offers the same answer through `POST /api/push/action`. The token
+   * names its verbs and expires, and one nonce answers once across every
+   * device and the drawer.
+   */
+  actions?: { action: string; title: string }[];
+  callback?: string;
 };
 
 export type NotificationInput = {
@@ -121,6 +130,8 @@ export type NotificationInput = {
    * stall is announced urgent while its category stays quiet, and the ledger
    * must say what the wire did. Omitted means the catalogue decides. */
   urgent?: boolean;
+  actions?: { action: string; title: string }[];
+  callback?: string;
 } & RouteContext;
 
 export type NotificationQuery = {
@@ -171,6 +182,7 @@ export class Notifications {
       ...(input.runId ? { runId: input.runId } : {}),
       ...(typeof input.phase === 'number' ? { phase: input.phase } : {}),
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(input.callback && input.actions?.length ? { actions: input.actions, callback: input.callback } : {}),
       urgent: input.urgent ?? safeUrgent(input.category),
       read: false,
       delivery: [],

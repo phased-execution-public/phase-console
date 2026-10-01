@@ -10,7 +10,7 @@
  * Two rules the builders are shaped by.
  *
  *  - **A door names itself.** Every automatic start goes through one of the
- *    fourteen `START_DOORS`, and the site that opens it says the door, what
+ *    sixteen `START_DOORS`, and the site that opens it says the door, what
  *    fired it, which guard let it through and which counter it spent. A verb
  *    several doors share (`retryPhase`, `recoverPhase`) carries its CALLER's
  *    actor through rather than inventing one — the door is where the decision
@@ -112,7 +112,19 @@ export function isAutomatic(actor: Actor | StartActor): actor is StartActor & { 
  * and its observations did not.
  */
 export function stoppedByOf(actor: Actor): 'operator' | 'system' {
-  return actor.via === 'timer' || actor.via === 'boot' || actor.via === 'event' ? 'system' : 'operator';
+  return actor.via === 'timer' || actor.via === 'boot' || actor.via === 'event' || actor.via === 'supervisor' ? 'system' : 'operator';
+}
+
+/**
+ * Was this act a PERSON's (control-tower phase 78, #106)? `stoppedByOf`'s
+ * `operator`, and no automatic door: a press over the API — or a script acting
+ * for one — names none, while the console's own movers (the ladder's rung
+ * through converge, a watch landing) name theirs even when a person's button
+ * set them going. Only a person's account switch is remembered as a choice.
+ */
+export function isPersonsAct(actor: Actor): boolean {
+  const door = (actor as { door?: string }).door;
+  return stoppedByOf(actor) === 'operator' && (!door || door === OPERATOR_DOOR);
 }
 
 /**

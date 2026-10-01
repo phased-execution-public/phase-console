@@ -29,7 +29,7 @@
 import { useState, type ReactNode } from 'react';
 import {
   Checkbox,
-  Chip,
+  Badge,
   TBody,
   TD,
   TH,
@@ -39,8 +39,8 @@ import {
   TableWrap,
   field,
   stickyHeadCell,
-  useTableFit,
 } from '@/components/ui';
+import { useTableFit } from '@/components/data-table';
 import { cn } from '@/lib/cn';
 import { usePhone } from '@/lib/media';
 import { EFFORTS } from '@/features/runs/defaults';
@@ -67,6 +67,7 @@ export function PerPhase({
   runSkills = [],
   servers = [],
   runMcp = [],
+  runMode = '',
   disabled,
   onChange,
 }: {
@@ -76,6 +77,8 @@ export function PerPhase({
   runEffort: string;
   /** The model names to offer — the server's own list, via RunSetup. */
   models: readonly string[];
+  /** The run's default permission mode (Safety) — '' when the launch says none. */
+  runMode?: string;
   skills: SkillInfo[];
   /** What the run gives every phase — what the Skip box turns off for one. */
   runSkills?: string[];
@@ -352,6 +355,13 @@ export function PerPhase({
           ))}
         </select>
       </label>
+      {/* #34 (control-tower phase 22): the mode this phase will ACTUALLY
+          start in, and which level said so — the runner's own order
+          (`resolvePermissionMode`): this phase's choice here, then the plan's
+          (the phase's bullet, then its line), then the run's default. */}
+      <p className="text-2xs text-ink-muted" data-testid={`phase-mode-source-${p.phase}`}>
+        {phaseModeSource(p, own, runMode)}
+      </p>
       <label className="flex flex-wrap items-center gap-2 text-2xs">
         <span className="text-ink-muted">Auto-grant approvals in phase {p.phase} only</span>
         <select
@@ -419,7 +429,7 @@ export function PerPhase({
       <summary className="flex cursor-pointer flex-wrap items-center gap-2 px-3 py-2 text-sm [@media(hover:none)]:min-h-(--tap-min)">
         <span>Per phase</span>
         {count ? (
-          <Chip tone="ok">{count} overridden</Chip>
+          <Badge tone="ok">{count} overridden</Badge>
         ) : planned ? (
           <span className="text-2xs text-ink-muted">
             {planned} {planned === 1 ? 'phase follows' : 'phases follow'} the plan's own model or effort
@@ -430,9 +440,9 @@ export function PerPhase({
         {/* On the summary, because the disclosure starts closed: a warning
             nobody opens the table to find is not a warning. */}
         {differing > 0 && (
-          <Chip tone="warn">
+          <Badge tone="accent">
             plan and run differ on {differing} {differing === 1 ? 'phase' : 'phases'}
-          </Chip>
+          </Badge>
         )}
       </summary>
 
@@ -579,4 +589,22 @@ export function PerPhase({
       </div>
     </details>
   );
+}
+
+/** A plan bullet's first word, when it is a CLI permission mode. */
+function bulletMode(p: PhaseView): string | undefined {
+  const body = p.bullets?.find((b) => /^permission mode$/i.test(b.label.trim()))?.body ?? '';
+  const word = /^\W*([A-Za-z]+)/.exec(body)?.[1];
+  return word && (PHASE_PERMISSION_MODES as readonly string[]).includes(word) ? word : undefined;
+}
+
+/** Where phase `p`'s permission mode comes from, in the runner's order — one sentence. */
+export function phaseModeSource(p: PhaseView, own: PhaseOptions, runMode: string): string {
+  const name = (mode: string) => PERMISSION_MODE_LABELS[mode] ?? mode;
+  if (own.permissionMode) return `Starts in ${name(own.permissionMode)} — chosen here for this phase.`;
+  const planned = bulletMode(p);
+  if (planned) return `Starts in ${name(planned)} — the plan asks for it on this phase.`;
+  return runMode
+    ? `Starts in the plan’s mode when its Permission mode line names one, else ${name(runMode)} — this run’s default.`
+    : 'Starts in the plan’s mode when its Permission mode line names one, else accept edits.';
 }

@@ -9,6 +9,7 @@
  * workflow — and fail loudly if anything dangerous drifts from one to the other.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -26,7 +27,7 @@ process.env.PHASE_CONSOLE_LOG = '';
 const {
   Approvals, buildSettings, writeSettingsFile, loadPolicy, classifyTool, ruleMatches,
   DEFAULT_DENY, DEFAULT_ASK, HOOK_TIMEOUT_SECONDS, RECOVERED_NOTE, TIMEOUT_REASON, UNANSWERABLE_REASONS,
-  tokenFromSettingsFile,
+  tokenFromSettingsFile, treeGuard, RUN_TREE_CLONE_RULE,
 } = await import('../server/runner/approvals.ts');
 const { recent: recentLog } = await import('../server/log.ts');
 
@@ -481,6 +482,12 @@ test('ACC-8.7 (TRS-5): through Service.announce, a raised tool card produces exa
   assert.equal(approvalPushes[0].message.approvalId, approval.id, 'the notification is the card\'s');
   assert.equal(approvalPushes[0].message.actions?.length, 2, 'Allow and Deny ride the notification itself');
   assert.ok(approvalPushes[0].message.callback, 'with the token that makes them spendable');
+  // The stored record carries the same buttons and token, so the bell drawer
+  // offers the answer through /api/push/action too (control-tower phase 25).
+  const record = (notes as { category?: string; actions?: { action: string }[]; callback?: string }[])
+    .find((note) => note.category === 'approval')!;
+  assert.deepEqual(record.actions?.map((a) => a.action), approvalPushes[0].message.actions?.map((a) => a.action));
+  assert.equal(record.callback, approvalPushes[0].message.callback, 'one token — one answer across the phone and the drawer');
   assert.equal(svc.state().approvals?.raised, svc.approvals.counts().raised, '/api/state carries the counter');
   assert.equal(svc.state().approvals?.pending, 1);
   svc.approvals.settle(approval.id, 'deny', 'test');
@@ -1109,6 +1116,7 @@ test('disarming a run answers only its OWN cards', async () => {
   broker.disarm();
   assert.equal((await theirs.decided).decision, 'deny', 'and a bare disarm still means everything');
 });
+
 
 test.after(() => rmSync(STATE_HOME, { recursive: true, force: true }));
 
@@ -1868,3 +1876,83 @@ test('SHR-1: an operator who strikes a pinned rule really strikes it', async () 
     'the rule is not in this policy at all, so nothing pins it',
   );
 });
+
+test('#112 (control-tower phase 84): the settle closure asks the manifest before an AUTOMATIC deny — timeout and script resolve to its allow, a person\'s deny stands, and no answer leaves the deny', async () => {
+  const dir = mkdtempSync(join(STATE_HOME, 'pending-manifest-'));
+  let answer: 'allow' | null = 'allow';
+  const approvals = new Approvals({
+    manifestAnswer: () => ({
+      key: 'permission.destructive', rule: 'Bash(git push:*)', value: 'deny; may publish: branch pushes to `pe/demo`',
+      source: 'plan', answer, why: answer ? 'the row names pe/demo' : 'the row does not name it',
+    }),
+  }, join(dir, 'pending.json'));
+  const request = {
+    runId: 'run-m', slug: 'demo', phase: 2, kind: 'tool' as const, title: 'Bash: git push', detail: 'd', evidence: [],
+    tool: { name: 'Bash', input: { command: 'git push origin pe/demo' } },
+  };
+  const timedOut = await approvals.request(request, 20).decided;
+  assert.deepEqual([timedOut.decision, timedOut.by], ['allow', 'manifest'], 'the timeout resolves to the manifest');
+  assert.match(timedOut.reason ?? '', /permission\.destructive/);
+  assert.equal(approvals.recent().at(-1)?.manifest?.answer, 'allow', 'and the card records the row it resolved from');
+
+  const scripted = approvals.request(request);
+  approvals.settle(scripted.approval.id, 'deny', 'script');
+  assert.equal((await scripted.decided).by, 'manifest');
+
+  const person = approvals.request(request);
+  approvals.settle(person.approval.id, 'deny', 'someone@desk', 'not today');
+  assert.deepEqual([(await person.decided).decision, (await person.decided).by], ['deny', 'someone@desk']);
+
+  answer = null;
+  const unanswered = await approvals.request(request, 20).decided;
+  assert.deepEqual([unanswered.decision, unanswered.by], ['deny', 'timeout'], 'a row that does not cover it leaves the deny');
+});
+
+/* ------------------------------------------------------------------ *
+ * GD-1..2 (control-tower phase 90, #139): the guard reads the PATH
+ * ------------------------------------------------------------------ */
+
+const HUB = '/work/hub';
+const RUN_TREES = [`${HUB}/.worktrees/runs`, `${HUB}/.worktrees/staging`, '/state/runs'];
+const MIRROR = `${HUB}/.worktrees/runs/obs/86103bfe79aa/integration`;
+const guardOf = (command: string, cwd: string) => treeGuard('Bash', { command }, { cwd, runRoot: HUB, runTrees: RUN_TREES });
+
+test('GD-1: a git clone or gh repo clone into a run worktree is denied by rule, and says where to read instead', () => {
+  // The measured shape: seven clones into a mirror's empty mount paths.
+  for (const command of [
+    'git clone --depth 1 --filter=blob:none --sparse git@github.com:org/site-admin.git site-admin',
+    `git clone git@github.com:org/website.git ${MIRROR}/website`,
+    'cd trade && git clone -q https://example.invalid/org/shop-frontend.git',
+    'gh repo clone org/customer-app customer-app',
+    `git -C ${MIRROR} clone -b main https://example.invalid/org/aws.git aws`,
+  ]) {
+    const verdict = guardOf(command, MIRROR);
+    assert.equal(verdict?.verdict, 'deny', command);
+    assert.equal(verdict?.rule, RUN_TREE_CLONE_RULE);
+    assert.match(String(verdict?.reason), /shared root \(\/work\/hub\/<repo>\), read-only/, command);
+  }
+  // Outside every run tree a clone is none of this guard's business.
+  assert.equal(guardOf('git clone https://example.invalid/org/x.git /tmp/scratch/x', MIRROR), null);
+  assert.equal(guardOf('git clone https://example.invalid/org/x.git x', '/tmp/elsewhere'), null);
+  assert.equal(guardOf('git status', MIRROR), null);
+  // Not a Bash call, or no cwd to judge from: the ordinary rules stand.
+  assert.equal(treeGuard('Read', { file_path: MIRROR }, { cwd: MIRROR, runRoot: HUB, runTrees: RUN_TREES }), null);
+});
+
+test('GD-2: `git submodule` inside a run worktree asks; in the run root it is allowed', () => {
+  const inMirror = guardOf('git submodule update --init aws', MIRROR);
+  assert.equal(inMirror?.verdict, 'ask');
+  assert.match(String(inMirror?.reason), /inside a run worktree/);
+  assert.equal(guardOf(`git -C ${MIRROR} submodule status`, HUB)?.verdict, 'ask', 'git -C into the mirror is judged by the -C path');
+  // The run ROOT, outside every run tree: allowed — the refusal text that
+  // says "run `git submodule update --init` in the run root" stays true.
+  assert.equal(guardOf('git submodule update --init aws', HUB)?.verdict, 'allow');
+  assert.equal(guardOf(`cd ${MIRROR} && cd ../../../../.. && git submodule update --init aws`, HUB)?.verdict, 'allow');
+  // And the classification the service then asks drops only that one rule.
+  const policy = loadPolicy();
+  assert.equal(classifyTool('Bash', { command: 'git submodule update --init aws' }, policy, 'trusted'), 'ask',
+    'the pinned ask still stands where the guard does not speak');
+  assert.equal(classifyTool('Bash', { command: 'git submodule update --init aws' },
+    { ...policy, ask: policy.ask.filter((rule: string) => rule !== 'Bash(git submodule:*)') }, 'trusted'), 'allow');
+});
+

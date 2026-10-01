@@ -29,6 +29,7 @@ import {
   type MetricsFacts,
 } from '../server/analysis/metrics.ts';
 import { count } from '../server/counters.ts';
+import { LOOP_DELAY_WINDOW_MS, LoopDelayWindow, type DelayHistogram } from '../server/runtime-probe.ts';
 
 /* ------------------------------------------------------------------ *
  * a real parser, so "parseable" means parsed
@@ -142,7 +143,7 @@ const PLAN = {
 const FACTS: MetricsFacts = {
   plans: [PLAN, { ...PLAN, slug: 'closed-plan', status: 'complete', closed: true, done: 10, ready: 0, waiting: 0, inProgress: 0, remainingWeight: 0, percent: 100 }],
   runs: [
-    { slug: 'demo-plan', status: 'running', spentUsd: 12.5, attempts: 7, phaseSeconds: 3600 },
+    { slug: 'demo-plan', status: 'running', spentUsd: 12.5, attempts: 7, phaseSeconds: 3600, blockedSeconds: { 'other-run': 900, hand: 120 } },
     { slug: 'demo-plan', status: 'halted', spentUsd: 3, attempts: 2, phaseSeconds: 600 },
   ],
   cost: [{ slug: 'demo-plan', totalUsd: 15.5, attributedUsd: 15.5, residualUsd: 0, ladderUsd: 4 }],
@@ -158,10 +159,43 @@ const FACTS: MetricsFacts = {
     { slug: 'demo-plan', worktrees: 2, diskBytes: 1_234_567, conflictedFiles: 3 },
     { slug: 'busy-plan', worktrees: 1, diskBytes: 89_000, conflictedFiles: 0 },
   ],
+  // The account forecast (control-tower phase 92, #141): one window climbing
+  // toward a wall, one measured flat, one not measured yet.
+  accounts: [
+    { account: 'default', window: 'seven_day', utilization: 85, burnPctPerHour: 4, wallsInSeconds: 13_500 },
+    { account: 'default', window: 'five_hour', utilization: 51, burnPctPerHour: 28, wallsInSeconds: 6_300 },
+    { account: 'account-84b6', window: 'five_hour', utilization: 78, burnPctPerHour: 0, wallsInSeconds: null },
+    { account: 'account-84b6', window: 'seven_day', utilization: 40, burnPctPerHour: null, wallsInSeconds: null },
+  ],
+  // Credits used this month (control-tower phase 93, #146): one account that
+  // reports them; one whose credit state is unknown sends no row at all.
+  credits: [{ account: 'default', currency: 'USD', used: 12.34 }],
+  // Lanes, policies and capacity (control-tower phase 100) — seeded by phase 31,
+  // which found the three families declared with nothing in the fixture to emit.
+  load: { avg5: 3.25, threshold: 21 },
+  reservations: { armed: 1, waiting: 2 },
   today: { settledUsd: 9.25, ladderUsd: 4, capUsd: 20 },
   version: 'abc1234',
   instanceId: 'hub',
   scrapeSeconds: 0.012,
+  // The console's own runtime (control-tower phase 7). Every family above this
+  // is about the WORK; none was about the supervisor, which is how a console
+  // climbed to V8's default heap over 23.7 hours with no sample anywhere that
+  // would have shown the climb — and took two live runs down on the way.
+  process: {
+    heapUsedBytes: 512 * 1024 * 1024,
+    heapLimitBytes: 6144 * 1024 * 1024,
+    residentBytes: 700 * 1024 * 1024,
+    externalBytes: 12 * 1024 * 1024,
+    eventLoopDelaySeconds: 0.004,
+    eventLoopDelayMaxSeconds: 1.25,
+    eventLoopDelayP99Seconds: 0.09,
+    handles: 42,
+    uptimeSeconds: 85_224,
+    sseClients: 3,
+    sessions: 2,
+    ptySessions: 1,
+  },
 };
 
 /* ------------------------------------------------------------------ *
@@ -425,4 +459,118 @@ test('a du that could not answer drops ONE slug, not the family', () => {
   assert.equal(valueOf(parsed, 'phase_console_worktree_disk_bytes', { slug: 'busy-plan' }), 89_000);
   // The count is a different measurement and is not lost with the bytes.
   assert.equal(valueOf(parsed, 'phase_console_worktrees', { slug: 'demo-plan' }), 2);
+});
+
+/* ------------------------------------------------------------------ *
+ * The console's own runtime — #32's gap 4
+ * ------------------------------------------------------------------ */
+
+/**
+ * Every other family in this file is about the WORK — plans, phases, runs,
+ * attempts, seconds, dollars, rungs, checkouts. None of them was about the
+ * supervisor, and `process.memoryUsage()` appeared nowhere under `server/`.
+ * That is how a console climbed to V8's default heap over 23.7 hours with no
+ * sample anywhere that would have shown the climb, and parked two live runs on
+ * its way down. It is also the cheapest gap this repository had: the scrape
+ * path, the catalogue and the numbers were all already there.
+ */
+test('the ten process gauges are emitted, unlabelled, with the right types', () => {
+  const parsed = parse(renderMetrics(FACTS));
+
+  assert.equal(valueOf(parsed, 'phase_console_process_heap_used_bytes', {}), 512 * 1024 * 1024);
+  assert.equal(valueOf(parsed, 'phase_console_process_heap_limit_bytes', {}), 6144 * 1024 * 1024);
+  assert.equal(valueOf(parsed, 'phase_console_process_resident_bytes', {}), 700 * 1024 * 1024);
+  assert.equal(valueOf(parsed, 'phase_console_process_external_bytes', {}), 12 * 1024 * 1024);
+  assert.equal(valueOf(parsed, 'phase_console_process_event_loop_delay_seconds', {}), 0.004);
+  assert.equal(valueOf(parsed, 'phase_console_process_event_loop_delay_max_seconds', {}), 1.25);
+  assert.equal(valueOf(parsed, 'phase_console_process_event_loop_delay_p99_seconds', {}), 0.09);
+  assert.equal(valueOf(parsed, 'phase_console_process_handles', {}), 42);
+  assert.equal(valueOf(parsed, 'phase_console_process_uptime_seconds', {}), 85_224);
+  assert.equal(valueOf(parsed, 'phase_console_process_sse_clients', {}), 3);
+  assert.equal(valueOf(parsed, 'phase_console_process_sessions', {}), 2);
+  assert.equal(valueOf(parsed, 'phase_console_process_pty_sessions', {}), 1);
+
+  for (const name of parsed.order.filter((n) => n.startsWith('phase_console_process_'))) {
+    assert.equal(parsed.type.get(name), 'gauge', `${name} is a level, never a total`);
+  }
+});
+
+test('a build that cannot count handles emits no handle gauge — absent is not zero', () => {
+  // "No handle count available" and "no handles open" are different facts, and
+  // a metric that cannot tell them apart is worse than one that is missing:
+  // `_getActiveHandles` is internal and a build without it must not claim a
+  // process holds nothing.
+  const blind = parse(renderMetrics({
+    ...FACTS,
+    process: {
+      ...FACTS.process!, handles: undefined, eventLoopDelaySeconds: undefined,
+      eventLoopDelayMaxSeconds: undefined, eventLoopDelayP99Seconds: undefined,
+    },
+  }));
+  assert.ok(!blind.order.includes('phase_console_process_handles'));
+  assert.ok(!blind.order.includes('phase_console_process_event_loop_delay_seconds'));
+  assert.ok(!blind.order.includes('phase_console_process_event_loop_delay_max_seconds'));
+  assert.ok(!blind.order.includes('phase_console_process_event_loop_delay_p99_seconds'));
+  assert.ok(blind.order.includes('phase_console_process_heap_used_bytes'), 'the rest still scrape');
+});
+
+test('a console that reports no process facts emits none of the family', () => {
+  const none = parse(renderMetrics({ ...FACTS, process: undefined }));
+  assert.deepEqual(none.order.filter((name) => name.startsWith('phase_console_process_')), []);
+});
+
+/* ------------------------------------------------------------------ *
+ * IS-6 — event-loop delay is a WINDOWED max and p99 (control-tower phase 56, #75)
+ * ------------------------------------------------------------------ */
+
+/** A histogram a test can feed, in node's units (nanoseconds). */
+function fakeHistogram(): DelayHistogram & { record(ms: number): void; resets: number } {
+  let samples: number[] = [];
+  const h = {
+    resets: 0,
+    record(ms: number) { samples.push(ms * 1e6); },
+    get max() { return samples.length ? Math.max(...samples) : 0; },
+    get mean() { return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : Number.NaN; },
+    percentile(p: number) {
+      if (!samples.length) return 0;
+      const sorted = [...samples].sort((a, b) => a - b);
+      return sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];
+    },
+    reset() { samples = []; h.resets++; },
+  };
+  return h;
+}
+
+test('IS-6: a stall shows as the window max and p99 for a whole window, where a mean since boot hid it', () => {
+  let now = 0;
+  const closed: number[] = [];
+  const histogram = fakeHistogram();
+  const window = new LoopDelayWindow(histogram, { now: () => now, onClose: (r) => closed.push(r.maxSeconds) });
+
+  assert.equal(window.reading(), undefined, 'no sample yet is no reading, not a zero');
+
+  // A minute of healthy 20 ms samples with one 4.6-minute stall in it.
+  for (let i = 0; i < 99; i++) histogram.record(20);
+  histogram.record(276_000);
+  now = LOOP_DELAY_WINDOW_MS;
+  const stalled = window.reading()!;
+  assert.equal(stalled.maxSeconds, 276, 'the stall is the window max');
+  assert.ok(stalled.p99Seconds >= 0.02 && stalled.p99Seconds <= 276);
+  assert.ok(stalled.meanSeconds < 3, 'the mean alone would have read as a merely slow loop');
+  assert.equal(stalled.windowMs, LOOP_DELAY_WINDOW_MS);
+  assert.deepEqual(closed, [276], 'closing a stalled window is announced once');
+  assert.equal(histogram.resets, 1, 'the histogram starts over for the next window');
+
+  // Inside the next window, the reading is still the CLOSED one — a stall stays
+  // visible for a whole window after it ended.
+  for (let i = 0; i < 50; i++) histogram.record(15);
+  now += LOOP_DELAY_WINDOW_MS / 2;
+  assert.equal(window.reading()!.maxSeconds, 276);
+
+  // …and once that window closes, the healthy one replaces it.
+  now = 2 * LOOP_DELAY_WINDOW_MS;
+  const healthy = window.reading()!;
+  assert.equal(healthy.maxSeconds, 0.015);
+  assert.equal(healthy.p99Seconds, 0.015);
+  assert.equal(histogram.resets, 2);
 });

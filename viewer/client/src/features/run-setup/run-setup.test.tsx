@@ -356,6 +356,24 @@ describe('the payloads', () => {
     expect('resumeRunId' in payload).toBe(false);
   });
 
+  it('an empty rung cap hands the run back to the console’s own cap', () => {
+    // `null` is both doors' CLEAR — the preference speaks again — so a payload
+    // that reaches a run that exists sends it, and a fresh start, with nothing
+    // to clear, says nothing. Omitted on a live run, a cap once set could
+    // never be given back.
+    const cleared = buildRunPayload('live', values(), { slug: 'alpha', run: RUN });
+    expect(cleared.ladderPerRunRungs).toBeNull();
+    expect(cleared.ladderPerPhaseRungs).toBeNull();
+    expect(buildRunPayload('continue', values(), { slug: 'alpha', run: RUN }).ladderPerRunRungs).toBeNull();
+    expect('ladderPerRunRungs' in buildRunPayload('start', values(), { slug: 'alpha' })).toBe(false);
+    const set = buildRunPayload('start', values({ ladderPerRunRungs: '40', ladderPerPhaseRungs: '0' }), {
+      slug: 'alpha',
+    });
+    expect(set.ladderPerRunRungs).toBe(40);
+    // Zero is a cap — nothing climbs — never a blank.
+    expect(set.ladderPerPhaseRungs).toBe(0);
+  });
+
   it('a recovery ticket merges the attached defaults into the skills it sends', () => {
     const body = buildTicket(
       'recovery',
@@ -479,7 +497,7 @@ describe('the submits', () => {
 
   it('a live run patches its settings rather than starting anything', async () => {
     await mount({ mode: 'live', context: { slug: 'alpha', run: RUN } });
-    fireEvent.click(await screen.findByRole('button', { name: /Apply from next phase/ }));
+    fireEvent.click(await screen.findByRole('button', { name: /Apply changes/ }));
     await waitFor(() => expect(runSettings).toHaveBeenCalledTimes(1));
     expect(runStart).not.toHaveBeenCalled();
   });
@@ -744,6 +762,36 @@ describe('phase 15 — the seven launch words', () => {
     });
     expect(payload.baseBranch).toBe('');
     expect(payload.maxConcurrentPerRepo).toBeNull();
+  });
+
+  it('a live patch carries the three answers about the run’s future, and nothing about how it passed the door (control-tower phase 77, #101)', () => {
+    const payload = buildRunPayload(
+      'live',
+      values({
+        resumeOnRestart: false,
+        relay: 'last-resort',
+        accounts: 'default:10, acct-b:5',
+        gitStrategyAck: 'override',
+        acknowledgedWaivers: ['credentials'],
+        manifestOverride: 'operator',
+      }),
+      { slug: 'alpha', run: RUN },
+    );
+    expect(payload.resumeOnRestart).toBe(false);
+    expect(payload.relay).toBe('last-resort');
+    expect(payload.accounts).toEqual([
+      { id: 'default', minHeadroomPct: 10 },
+      { id: 'acct-b', minHeadroomPct: 5 },
+    ]);
+    for (const key of [
+      'gitStrategyAck',
+      'acknowledgedWaivers',
+      'manifestOverride',
+      'verifyAnswers',
+      'resumeRunId',
+    ]) {
+      expect(key in payload, `${key} is how a launch passed the door — a patch never carries it`).toBe(false);
+    }
   });
 
   it('a narrow phase launch carries none of the seven — it inherits the run', () => {

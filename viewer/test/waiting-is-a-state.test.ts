@@ -349,6 +349,29 @@ test('a stale phase halt no longer decides the situation after a retry', () => {
     'the reader still honours a halt that is genuinely there — the fix is the WRITER retiring it');
 });
 
+test('a block the runner parked on its refs is a WAIT to every reader — never `blocked-declared`, so no ladder climbs it again (control-tower phase 87)', () => {
+  // What `parkWaiting({blocked: true})` leaves: the session's `blocked` word,
+  // parked `waiting` on its refs by the runner's own `poll-park`. Read as the
+  // block it was, the healer would climb `poll-park`/`timed-park` over a phase
+  // already waiting on exactly that — and a halt on it would be `phase-blocked`.
+  const ref = "cmd:grep -q '^status: complete' docs/handoffs/demo/phase-43-perf-ii-catalogs.md";
+  const parked: PhaseEvidence = {
+    ...EVIDENCE,
+    board: 'in-progress',
+    handoff: { exists: true, status: 'blocked' },
+    record: {
+      status: 'waiting', attempts: 1, note: null, parkedUntil: new Date(Date.now() + 3_600_000).toISOString(),
+      declared: { status: 'blocked', needs: 'external', reason: 'P43\'s WIP', watch: [ref], at: new Date().toISOString(), parked: 'poll-park' },
+    },
+    run: { status: 'waiting', halt: null, waitUntil: null, resolved: false },
+    health: [],
+    work: { did: false, why: 'clean tree, no commits', dirty: 0, commits: 0 },
+  } as PhaseEvidence;
+  const read = classifySituation(parked);
+  assert.equal(read.id, 'waiting-external', 'a wait');
+  assert.equal(read.actor, 'wait', 'whose actor is the clock — the ladder climbs nothing on it');
+});
+
 test('the fingerprint moves when a phase-level halt is written', () => {
   const run = newRun({ slug: 'alpha', root: '/tmp/x' });
   const record = phaseRecord(run, 2);
@@ -407,7 +430,8 @@ test('WAI-9: board-closed journals exactly one phase.declaration-consumed — th
     saveRun(state);
     // No sink passed: the run's own journal takes the line (a read path's shape).
     const result = reconcileRecordsAgainstBoard(state, { 3: 'done' });
-    assert.deepEqual(result, { changed: true, closed: [3] });
+    // `held` (control-tower phase 79, #113): closes an uncommitted handoff held back — none here.
+    assert.deepEqual(result, { changed: true, closed: [3], held: [] });
     assert.equal(record.status, 'done');
     assert.equal(record.declared, undefined);
     const lines = readFileSync(journalFile(root, 'alpha', state.id), 'utf8').trim().split('\n').filter(Boolean)
@@ -854,4 +878,32 @@ test('no phase.waiting payload lacks `requested` — every park says what was as
     });
   }
   assert.equal(writers, 2, 'the two parks — the runner\'s and the unsupervised twin');
+});
+
+test('a wait that outlived its console is still a wait: the corpus\'s own reconciled park reads Waiting, its operator pauses stay theirs (#148)', async () => {
+  // The corpus holds the #148 shape as the console really wrote it: `paused`
+  // with its clock, `stoppedBy: 'system'`, the lifecycle stored `{state:
+  // 'paused'}`. Nobody paused it. The operator's own pauses in the same corpus
+  // are the control: they stay pauses, and say whose.
+  const { runLifecycle } = await import('../shared/run-lifecycle.js');
+  const { describeRun } = await import('../shared/status-model.js');
+  let waits = 0;
+  let pauses = 0;
+  for (const { slug, runId, state } of fixtureRuns()) {
+    if (state.status !== 'paused') continue;
+    const run = state as Parameters<typeof describeRun>[0] & { stoppedBy?: string; waitUntil?: string | null };
+    const view = describeRun(run, { now: Date.parse(String(state.updatedAt ?? '')) || Date.now() });
+    if (run.waitUntil && run.stoppedBy === 'system') {
+      waits += 1;
+      assert.equal(runLifecycle(run as never).state, 'waiting', `${slug}/${runId}: a clock nobody paused is a wait`);
+      assert.equal(view.label, 'Waiting', `${slug}/${runId}`);
+      assert.match(view.note?.text ?? '', /resumes/, `${slug}/${runId}: the note says when`);
+    } else if (run.stoppedBy === 'operator') {
+      pauses += 1;
+      assert.equal(runLifecycle(run as never).state, 'paused', `${slug}/${runId}`);
+      assert.match(view.label, /by you/, `${slug}/${runId}: an operator's pause says whose`);
+    }
+  }
+  assert.ok(waits >= 1, 'the corpus no longer holds a reconciled park — was it rebuilt?');
+  assert.ok(pauses >= 1, 'the corpus no longer holds an operator pause to compare against');
 });

@@ -36,6 +36,26 @@
 #   phase-lock.sh <slug> status  <N>
 #   phase-lock.sh <slug> list
 #   phase-lock.sh <slug> conflicts [N] [--scope CSV] [--branch NAME] [--worktree DIR] [--here] [--owner ID] [--git]
+#   phase-lock.sh <slug> mirror  <N> [--owner ID]
+#
+# Under an AUTOPILOT the console owns the lock's git mirror (control-tower phase
+# 63, #85): it runs `mirror` itself, outside the session's turn, and exports
+# PE_LOCK_MIRROR=console to every session it spawns — on which a `--git` passed
+# to claim, release or conflicts is skipped with one line on stderr, so the
+# session's own lock calls are file-only. `mirror` commits this phase's lock
+# path ALONE (a pathspec commit, so a file somebody else staged never rides
+# along) inside the docs root's critical section, and it never pulls and never
+# pushes: the console publishes nothing, and the next push of the docs root —
+# a person's, or a session's own — carries the commit. A hand session keeps
+# `--git`, which commits the same way and still pulls and pushes.
+#
+# The docs root's CRITICAL SECTION is a directory at
+# `<git-dir>/pe-root-section` taken with mkdir around every commit and every
+# pull this script makes there — short on purpose: a commit or a rebase, never
+# the push. PE_ROOT_SECTION_WAIT (seconds, default 30) bounds the wait; a
+# section whose writer's pid is gone — or, should the pid have been reused,
+# one older than PE_ROOT_SECTION_STALE (default 900) — was left by a writer
+# that died and is broken. A writer removes only a section it still owns.
 #
 # Owner defaults to "$PE_OWNER" or "<user>@<host>". Pass a per-SESSION --owner
 # (e.g. "account/conversation-id") so two sessions on the same host are distinct.
@@ -53,13 +73,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/scope.sh"
 
-slug="${1:?usage: phase-lock.sh <slug> <claim|release|status|list|conflicts> [N] [opts]}"
-action="${2:?usage: phase-lock.sh <slug> <claim|release|status|list|conflicts> [N] [opts]}"
+slug="${1:?usage: phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> [N] [opts]}"
+action="${2:?usage: phase-lock.sh <slug> <claim|release|status|list|conflicts|mirror> [N] [opts]}"
 shift 2
 
 phase=""
 case "$action" in
-  claim|release|status)
+  claim|release|status|mirror)
     phase="${1:?usage: phase-lock.sh <slug> $action <N> ...}"; shift
     case "$phase" in ''|*[!0-9]*) echo "phase must be a number, got: $phase" >&2; exit 2 ;; esac
     ;;
@@ -71,7 +91,7 @@ case "$action" in
     fi
     ;;
   list) : ;;
-  *) echo "unknown action: $action (want claim|release|status|list|conflicts)" >&2; exit 2 ;;
+  *) echo "unknown action: $action (want claim|release|status|list|conflicts|mirror)" >&2; exit 2 ;;
 esac
 # Handoff files are `phase-08-*.md`, so `08` is what gets copied into a command —
 # and to bash it is an invalid octal literal, not the number eight. Normalise
@@ -142,6 +162,19 @@ fi
 case "$lease" in
   ''|*[!0-9]*|0) echo "--lease must be a positive number of seconds, got: $lease" >&2; exit 2 ;;
 esac
+# 🔴 An autopilot session's `--git` was the console's work done in the turn
+# (#85): every claim pulled, committed and pushed the docs root — 107 s at the
+# median on the hub, 36 of 92 claims outran the CLI's 120 s Bash timeout and
+# went to the background unread — while the console already held the grant and
+# the lease. So the console mirrors (`mirror`, above) and says so in the child's
+# environment; a `--git` here is skipped rather than refused, because SKILL.md
+# and every older prompt still print it and a refusal would strand a session on
+# a flag it was told to pass. `mirror` itself is the console's verb and is never
+# skipped.
+if [ "$use_git" = 1 ] && [ "${PE_LOCK_MIRROR:-}" = console ] && [ "$action" != mirror ]; then
+  use_git=0
+  printf 'phase-lock: --git skipped — under this autopilot the console mirrors the lock to git outside your turn (PE_LOCK_MIRROR=console)\n' >&2
+fi
 scope="$(scope_normalize "$scope")"
 # One line in a key=value file: the id is kept to the characters an id has.
 session="$(printf '%s' "$session" | tr -cd 'A-Za-z0-9._-' | cut -c1-128)"
@@ -304,9 +337,83 @@ _lock_body() {
 # session on the machine. A conflicted rebase is not a transient failure and
 # must not be left in place: abort it (best effort) so the tree is exactly as it
 # was, and hand the real code back to the caller.
+# The docs root's critical section (control-tower phase 63, #88). Every phase
+# of every plan commits its handoff and its lock into ONE root index, and the
+# scheduler rightly admits lanes on disjoint scopes side by side — so the root
+# is carved here, for the length of a commit or a rebase, and never for the
+# length of a phase (the per-slug token `docs/handoffs/<slug>` declares the
+# writes; this section orders them). mkdir is the one atomic test-and-set bash
+# 3.2 has on every filesystem this runs on.
+_root_wait="${PE_ROOT_SECTION_WAIT:-30}"
+_root_stale="${PE_ROOT_SECTION_STALE:-900}"
+case "$_root_wait" in ''|*[!0-9]*) _root_wait=30 ;; esac
+case "$_root_stale" in ''|*[!0-9]*) _root_stale=900 ;; esac
+_root_dir=""
+_root_held=0
+_root_token=""
+_root_enter() {
+  local gitdir waited=0 at pid broke=0
+  gitdir="$(git -C "$DOCS_ROOT" rev-parse --git-dir 2>/dev/null || true)"
+  # No repository, nothing shared to order.
+  [ -n "$gitdir" ] || return 0
+  case "$gitdir" in /*) ;; *) gitdir="$DOCS_ROOT/$gitdir" ;; esac
+  _root_dir="$gitdir/pe-root-section"
+  while ! mkdir "$_root_dir" 2>/dev/null; do
+    at="$(cat "$_root_dir/at" 2>/dev/null || true)"
+    case "$at" in ''|*[!0-9]*) at=0 ;; esac
+    pid="$(cat "$_root_dir/pid" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
+    # A writer that died inside its section leaves the directory behind, and
+    # waiting on it would stop every writer on the machine for good. Every
+    # writer is a process on THIS machine (the section lives in a local git
+    # dir), so a gone pid is proof; the age bound is only for a pid the system
+    # has since reused, and it is long because a live writer's commit through a
+    # repository's hooks can take minutes — breaking THAT is worse than waiting.
+    if { [ "$pid" -gt 0 ] && ! kill -0 "$pid" 2>/dev/null; } \
+       || { [ "$at" -gt 0 ] && [ $(( $(date +%s) - at )) -ge "$_root_stale" ]; }; then
+      rm -rf "$_root_dir" 2>/dev/null || true
+      printf 'phase-lock: broke a stale docs-root critical section (held since %s)\n' "$(_fmt "$at")" >&2
+      continue
+    fi
+    if [ "$waited" -ge "$_root_wait" ]; then
+      # Still unstamped after the whole wait: its writer died between its
+      # mkdir and its stamp. Broken once, never twice.
+      if [ "$at" = 0 ] && [ "$broke" = 0 ]; then
+        broke=1; rm -rf "$_root_dir" 2>/dev/null || true; continue
+      fi
+      return 1
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  _root_token="$$.$(date +%s).${RANDOM:-0}"
+  date +%s > "$_root_dir/at" 2>/dev/null || true
+  printf '%s\n' "$$" > "$_root_dir/pid" 2>/dev/null || true
+  printf '%s\n' "$_root_token" > "$_root_dir/token" 2>/dev/null || true
+  printf '%s\n' "$owner" > "$_root_dir/owner" 2>/dev/null || true
+  _root_held=1
+  return 0
+}
+_root_leave() {
+  [ "$_root_held" = 1 ] || return 0
+  # Only a section this process still OWNS: one broken and re-taken by another
+  # writer while this one ran is that writer's, and removing it would let a
+  # third writer in beside it.
+  if [ "$(cat "$_root_dir/token" 2>/dev/null || true)" = "$_root_token" ]; then
+    rm -rf "$_root_dir" 2>/dev/null || true
+  fi
+  _root_held=0
+}
+# A section this process holds never outlives it, whatever path `exit` took.
+trap '_root_leave' EXIT
 _git_pull() {
   [ "$use_git" = 1 ] || return 0
   local code gitdir was_rebasing=0
+  # The rebase is the root's MERGE: inside the section, or two writers rebase
+  # one index at once.
+  if ! _root_enter; then
+    printf 'phase-lock: the docs root'"'"'s critical section stayed held for %ss — pull skipped\n' "$_root_wait" >&2
+    return 1
+  fi
   # Was a rebase ALREADY in progress before we touched anything? This is a docs
   # repo every session on the machine shares, and a pull that fails because
   # somebody else holds `index.lock` while they are mid-rebase must not abort
@@ -318,9 +425,28 @@ _git_pull() {
   fi
   git -C "$DOCS_ROOT" pull --rebase --autostash >/dev/null 2>&1
   code=$?
-  [ "$code" -eq 0 ] && return 0
-  [ "$was_rebasing" = 0 ] && git -C "$DOCS_ROOT" rebase --abort >/dev/null 2>&1
+  if [ "$code" -ne 0 ] && [ "$was_rebasing" = 0 ]; then
+    git -C "$DOCS_ROOT" rebase --abort >/dev/null 2>&1 || true
+  fi
+  _root_leave
   return "$code"
+}
+# Commit this phase's lock path ALONE. `git commit` with no pathspec — what
+# this script ran until phase 63 — commits the whole index, so a file another
+# session had staged in the shared docs root rode along under a `phase-lock:`
+# subject. `--only` takes the lock path's working-tree state and leaves every
+# other staged path exactly as it was. Runs inside the critical section.
+_commit_lock() {  # _commit_lock <verb> <who>
+  local rel="docs/handoffs/$slug/.locks/phase-$pad.lock"
+  ( cd "$DOCS_ROOT" || exit 1
+    # Nothing to record — already committed (a retry after a rejected push), or
+    # a lock that was claimed and released without ever reaching git.
+    [ -z "$(git status --porcelain -- "$rel" 2>/dev/null)" ] && exit 0
+    # A failed add is a FAILURE — somebody else's index.lock — never "nothing
+    # staged": read that way, the caller pushed nothing and reported success.
+    git add -A -- "$rel" >/dev/null 2>&1 || exit 1
+    git diff --cached --quiet -- "$rel" && exit 0
+    git commit -q -m "phase-lock: $1 phase $phase ($slug) by $2" --only -- "$rel" >/dev/null 2>&1 )
 }
 # Two sessions finishing phases at the same moment write the same handoff folder
 # from different clones, and git says so: a held index.lock, or a push rejected
@@ -392,17 +518,21 @@ _resolve_unpublishable() {  # _resolve_unpublishable <verb>
 }
 _git_sync() {  # _git_sync <verb>
   [ "$use_git" = 1 ] || return 0
-  local attempt=1
+  local attempt=1 committed
   while :; do
     # Commit only when something is staged: after a rejected push the commit is
     # already made, and re-running it would fail with "nothing to commit" and
     # break the chain before the retry ever reached the push — which is the
-    # whole point of retrying.
-    if ( cd "$DOCS_ROOT" \
-           && git add "docs/handoffs/$slug/.locks" >/dev/null 2>&1 \
-           && { git diff --cached --quiet -- "docs/handoffs/$slug/.locks" \
-                || git commit -m "phase-lock: $1 phase $phase ($slug) by $owner" >/dev/null 2>&1; } \
-           && git push >/dev/null 2>&1 ); then
+    # whole point of retrying. The commit is inside the root's critical
+    # section and the push is not: the section orders writers of one index,
+    # and a push writes no index — holding it across the network is what
+    # would make it long.
+    committed=0
+    if _root_enter; then
+      _commit_lock "$1" "$owner" && committed=1
+      _root_leave
+    fi
+    if [ "$committed" = 1 ] && ( cd "$DOCS_ROOT" && git push >/dev/null 2>&1 ); then
       return 0
     fi
     attempt=$((attempt + 1))
@@ -495,6 +625,37 @@ case "$action" in
     fi
     printf 'phase %s: held by %s, not %s — use --force to override\n' "$phase" "$cur_owner" "$owner" >&2
     exit 1
+    ;;
+  mirror)
+    # The console's verb (control-tower phase 63, #85): record where this
+    # phase's lock stands NOW — claimed (the file) or released (no file) — as
+    # one commit of that path alone, outside any session's turn. It decides
+    # nothing about who holds the phase and never refuses; it never pulls and
+    # never pushes (the console publishes nothing — `never-push.test.ts`), so
+    # the next push of the docs root carries it. Never fatal: a mirror that
+    # could not land says UNMIRRORED and leaves the lock on disk, where every
+    # session on this machine reads it anyway.
+    if ! git -C "$DOCS_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+      printf 'phase %s: nothing to mirror — %s is not a git repository\n' "$phase" "$DOCS_ROOT"; exit 0
+    fi
+    rel="docs/handoffs/$slug/.locks/phase-$pad.lock"
+    if [ -z "$(git -C "$DOCS_ROOT" status --porcelain -- "$rel" 2>/dev/null)" ]; then
+      printf 'phase %s: nothing to mirror\n' "$phase"; exit 0
+    fi
+    if [ -f "$lockfile" ]; then mverb=claim; who="$(_field owner)"; else mverb=release; who="$owner"; fi
+    [ -n "$who" ] || who="$owner"
+    if ! _root_enter; then
+      printf 'UNMIRRORED: phase %s — the docs root'"'"'s critical section stayed held for %ss; the lock is on disk and the next mirror commits it\n' "$phase" "$_root_wait"
+      exit 0
+    fi
+    if _commit_lock "$mverb" "$who"; then
+      _root_leave
+      printf 'phase %s: mirrored (%s) at %s\n' "$phase" "$mverb" "$(git -C "$DOCS_ROOT" rev-parse --short HEAD 2>/dev/null || printf '?')"
+      exit 0
+    fi
+    _root_leave
+    printf 'UNMIRRORED: phase %s — the commit failed; the lock is on disk and the next mirror commits it\n' "$phase"
+    exit 0
     ;;
   status)
     if [ ! -f "$lockfile" ]; then printf 'phase %s: free\n' "$phase"; exit 0; fi
@@ -642,12 +803,49 @@ case "$action" in
       printf 'CONFLICT %s phase %s — held by %s%s until %s [scope: %s]%s overlaps: %s\n' \
         "${s:-?}" "${p:-?}" "${o:-?}" "$_se" "$(_fmt "$l")" "$sc" "$_br" "$overlap"
     done
+    # A RUN's hold on a shared tree (control-tower phase 40, #41). A lock is per
+    # PHASE; the branch a run checked a shared repository onto is per RUN and
+    # outlives every lock it takes. The scheduler reads these very records
+    # (`viewer/server/runner/tree-state.ts`), so a hand session and the autopilot
+    # get one answer: a repository of this scope standing on the branch another
+    # open run holds is a conflict until that run settles or the tree leaves the
+    # branch — and a claim in a tree of its own is not touched by it.
+    held=0
+    _wt_p="$worktree"
+    if [ -n "$_wt_p" ] && [ -d "$_wt_p" ]; then _wt_p="$(cd "$_wt_p" 2>/dev/null && pwd -P || printf '%s' "$_wt_p")"; fi
+    for f in "$(pe_state_home)"/trees/*.hold; do
+      [ -e "$f" ] || continue
+      hr="$(grep -m1 '^run=' "$f" | sed 's/^run=//' || true)"
+      hs="$(grep -m1 '^slug=' "$f" | sed 's/^slug=//' || true)"
+      ho="$(grep -m1 '^owner=' "$f" | sed 's/^owner=//' || true)"
+      hrepo="$(grep -m1 '^repo=' "$f" | sed 's/^repo=//' || true)"
+      hrel="$(grep -m1 '^rel=' "$f" | sed 's/^rel=//' || true)"
+      hb="$(grep -m1 '^branch=' "$f" | sed 's/^branch=//' || true)"
+      hrf="$(grep -m1 '^run_file=' "$f" | sed 's/^run_file=//' || true)"
+      [ -n "$hr" ] && [ -n "$hrepo" ] && [ -n "$hb" ] || continue
+      hold_lapsed "$hrf" && continue
+      # The caller's own run: every session of it carries the run's owner.
+      [ -n "$ho" ] && [ "$ho" = "$owner" ] && continue
+      [ -d "$hrepo" ] || continue
+      _cur="$(git -C "$hrepo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      [ "$_cur" = "$hb" ] || continue
+      hold_in_scope "$DOCS_ROOT" "$scope" "$hrepo" || continue
+      claim_disjoint_hold "$hb" "$hrepo" "$branch" "$_wt_p" && continue
+      hits=$((hits + 1)); held=$((held + 1))
+      _head="$(git -C "$hrepo" rev-parse --short=10 HEAD 2>/dev/null || true)"
+      printf 'CONFLICT %s run %s — holds %s on %s%s until the run settles [branch: %s] [worktree: %s]\n' \
+        "${hs:-?}" "$hr" "${hrel:-.}" "$hb" "${_head:+ at $_head}" "${branch:-unstated}" "${worktree:-unstated}"
+    done
     if [ "$hits" = 0 ]; then
       _on=""; [ -n "$branch" ] && _on=" on branch $branch"
       printf 'no scope conflicts for [%s]%s — safe to start\n' "$scope" "$_on"
       exit 0
     fi
     printf '  → %s live session(s) share a working tree with [%s].\n' "$hits" "$scope" >&2
+    if [ "$held" -gt 0 ]; then
+      printf '    %s of them: a RUN holding a shared repository on its branch — it frees when that run\n' "$held" >&2
+      printf '    settles or the tree leaves the branch; a checkout of your own (phase-lane.sh) is untouched.\n' >&2
+    fi
     printf '    Stop and ask: wait for them, take a phase with a disjoint scope, or (if you know\n' >&2
     printf '    that session is dead) --force the claim.\n' >&2
     exit 1

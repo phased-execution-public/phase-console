@@ -15,11 +15,12 @@
 
 import { useState } from 'react';
 import { ShieldCheck, ShieldPlus, Wrench } from 'lucide-react';
-import { Button, ConfirmButton, StatusBadge, toast } from '@/components/ui';
+import { Button, ConfirmButton, toast } from '@/components/ui';
 import { api } from '@/lib/api';
 import { keys, useApiMutation } from '@/lib/queries';
 import { sessionsHref } from '@/app/routes';
-import { qaResultTitle, qaUiState } from '@/lib/status-vocab';
+import { QaBadge, type WordOf } from '@/components/ui/status';
+import { qaResultTitle } from '@/lib/status-vocab';
 import { isVerdict } from '@/lib/qa';
 import { qaGateHolds } from '@shared/plan-vocab.js';
 import { ACTION_VOCAB } from '@shared/recovery-model.js';
@@ -360,9 +361,7 @@ export function QaRecoveryActions({
  */
 export function QaVerdict({ qa, href }: { qa?: { result: string; report?: string }; href?: string }) {
   if (!qa || !isVerdict(qa.result)) return null;
-  const chip = (
-    <StatusBadge state={qaUiState(qa.result)} label={`QA ${qa.result}`} title={qaResultTitle(qa.result)} />
-  );
+  const chip = <QaBadge result={qa.result as WordOf<'qa-result'>} title={qaResultTitle(qa.result)} />;
   return qa.report && href ? (
     <a href={href} className="hover:underline" title={qa.report}>
       {chip}
@@ -420,11 +419,7 @@ export function QaRounds({
           <li key={`${entry.round}-${entry.at ?? ''}`} className="flex flex-wrap items-center gap-1 text-2xs">
             <span className="font-mono text-ink-muted">round {entry.round}</span>
             {isVerdict(entry.verdict) ? (
-              <StatusBadge
-                state={qaUiState(entry.verdict)}
-                label={entry.verdict}
-                title={qaResultTitle(entry.verdict)}
-              />
+              <QaBadge result={entry.verdict as WordOf<'qa-result'>} title={qaResultTitle(entry.verdict)} />
             ) : (
               <span className="text-ink-muted">{entry.verdict || 'no verdict'}</span>
             )}

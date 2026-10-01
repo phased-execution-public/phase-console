@@ -156,7 +156,12 @@ describe('scroll traps stay dead', () => {
    * to `<main>` and works. The invariant is that the two stay coupled.
    */
   it('the table header is sticky only when the wrapper is not a scroll container', () => {
+    // Two files since control-tower phase 18: the primitives (the wrapper and
+    // the sticky class) stayed in `ui/table.tsx`, and `DataTable`, which
+    // decides when to apply them, moved to `components/data-table/`. The pair
+    // is still one decision, so the pin reads both halves.
     const table = readFileSync(join(SRC, 'components', 'ui', 'table.tsx'), 'utf8');
+    const grid = readFileSync(join(SRC, 'components', 'data-table', 'data-table.tsx'), 'utf8');
 
     // The wrapper never scrolls unconditionally — `scrolls` gates it.
     expect(table).toMatch(/scrolls && 'overflow-x-auto overscroll-x-contain'/);
@@ -166,11 +171,15 @@ describe('scroll traps stay dead', () => {
     // — and only once a real width exists, because "not measured" resolves to
     // the scrolling branch and sticky may not ride along with it.
     expect(table).toMatch(/stickyHeadCell =\s*\n?\s*'sticky top-0/);
-    expect(table).toMatch(/sticky=\{!overflows && measured\}/);
+    expect(grid).toMatch(/sticky=\{!overflows && measured\}/);
+    expect(grid).toMatch(/scrolls=\{overflows \|\| !measured\}/);
 
     // The wrapper still never gets a max-height: overflow-x makes computed
     // overflow-y auto, and a height-capped wrapper eats the page's touch flick.
+    // The grid's window does not change that — it scrolls `<main>`, never a box
+    // of its own.
     expect(table).not.toMatch(/max-h-/);
+    expect(grid).not.toMatch(/max-h-/);
   });
 
   /*
@@ -195,7 +204,7 @@ describe('scroll traps stay dead', () => {
 
   it('the pinned identity cell is opaque, whatever the row is tinted with', () => {
     // `bg-inherit` alone took the row's colour and NOTHING under it, so a live
-    // run's row (`bg-progress/8`) left its pinned phase number 92 % see-through
+    // run's row (`bg-running/8`) left its pinned phase number 92 % see-through
     // and the Status column was read through it as it scrolled past. The cell
     // paints its own base and composites the row's tint back over it.
     const table = readFileSync(join(SRC, 'components', 'ui', 'table.tsx'), 'utf8');
@@ -322,7 +331,7 @@ describe('the thumb floor is a hit area, not a class', () => {
    * jsdom computes no styles; the measurement lives in the register.
    */
   const BOX_FLOOR: Readonly<Record<string, number>> = Object.freeze({
-    'features/approve/index.tsx': 2, // "Open the console" · "Open where it lives"
+    'features/approve/index.tsx': 3, // "Open the console" · "Open where it lives" on an ask and on a step card (phase 42)
     'features/insights/cost-vs-caps.tsx': 1, // Runs against their budgets
     'features/insights/portfolio.tsx': 2, // Locks · Stalled plans
     'features/insights/plan-cost.tsx': 1, // the per-phase spend list
@@ -739,12 +748,6 @@ describe('a row that can grow may shrink and wrap', () => {
       );
     });
   }
-
-  it("Now's plan facts line is min-w-0, not shrink-0", () => {
-    // `3/9 · 33%` is 60 px; `3/9 · 33% · ~1.5 h–5 h (from other plans)` is 295.
-    const text = readFileSync(join(SRC, 'features/now/portfolio-strip.tsx'), 'utf8');
-    expect(text).toContain('min-w-0 font-mono text-2xs break-words tabular-nums text-ink-faint');
-  });
 });
 
 describe('text the app did not write can wrap', () => {
@@ -932,8 +935,10 @@ describe('a table says whether it scrolls', () => {
    * nearest one above it — a file with two tables and one reason fails, which
    * is the shape a later table added beside an explained one would take.
    *
-   * `components/ui/table.tsx` is the primitive: its own two render sites are
-   * what everything else is being asked to reach.
+   * `components/ui/table.tsx` is the primitive, and `components/data-table/
+   * data-table.tsx` is the grid built on it (moved there by control-tower phase
+   * 18): their own render sites are what everything else is being asked to
+   * reach.
    */
   /*
    * `[\s>/]` on BOTH branches, not `\s` on the lowercase one.
@@ -979,7 +984,8 @@ describe('a table says whether it scrolls', () => {
     const offenders: string[] = [];
     for (const path of walk(SRC)) {
       if (!path.endsWith('.tsx')) continue;
-      if (rel(path) === 'components/ui/table.tsx') continue;
+      if (rel(path) === 'components/ui/table.tsx' || rel(path) === 'components/data-table/data-table.tsx')
+        continue;
       const bare = unexplained(readFileSync(path, 'utf8'));
       if (bare > 0) offenders.push(`${rel(path)} (${bare} unexplained)`);
     }
@@ -1017,7 +1023,7 @@ describe('a table says whether it scrolls', () => {
    *
    * The ban above reads `cellClassName` string literals, which is the spelling
    * a column uses to refuse to wrap. It cannot see the commoner one: `cell:`
-   * renders a `<Chip>` or a `<Badge>`, and `badgeVariants`' base class is
+   * renders a `<Badge>`, and `badgeVariants`' base class is
    * `'font-medium whitespace-nowrap tabular-nums'`. `features/repo/branches.tsx`
    * declared `min: 176` for a chip that reads `phase-console-commerce · p23` —
    * about 240px that cannot break — and passed the ban with nothing to see.
@@ -1037,19 +1043,32 @@ describe('a table says whether it scrolls', () => {
    */
   const VOCABULARY_CELLS: Readonly<Record<string, string>> = Object.freeze({
     'features/debug/delivery-section.tsx:outcome': 'the delivery outcome words — shared/ops-vocab.js',
-    'features/plans/handoffs-tab.tsx:index': 'a handoff status, or the literal word `missing`',
-    'features/plans/handoffs-tab.tsx:status': 'the frozen handoff statuses — shared/plan-vocab.js',
-    'features/plans/qa-tab.tsx:verdict':
-      'the QA verdicts — shared/plan-vocab.js QA_RESULTS, or the literal word `pending`',
+    // The Handoffs and QA tabs' three vocabulary cells folded into the phase
+    // table's `handoff` and `qa` columns (control-tower phase 23), whose cells
+    // are components — `HandoffCell`, `QaCell` — and paint through the badges.
+    'features/plans/list.tsx:plan':
+      'a closed plan’s status — shared/plan-vocab.js PLAN_STATUSES, painted by PlanStatusBadge (anything else paints as Unknown)',
+    // The queue page's class cell (control-tower phase 99, #135): a run priority.
+    'features/queue/index.tsx:class':
+      'the scan classes — shared/orchestration-model.js RUN_PRIORITIES (high, normal, low)',
     'features/plans/source-tab.tsx:state':
       'the decision states — shared/decisions-model.js DECISION_STATES (anything else renders as breakable text)',
     'features/repo/branches.tsx:name': 'the literal words `checked out` and `trunk`',
-    'features/repo/checkouts.tsx:role': 'the checkout roles',
-    'features/repo/checkouts.tsx:state': 'the checkout states',
+    // The repo's vocabulary cells paint through the badge family (control-tower phase 26).
+    'features/repo/checkouts.tsx:role':
+      'the checkout roles — shared/worktree-model.js CHECKOUT_ROLES, painted by OpsBadge (`checkout-role`)',
+    'features/repo/checkouts.tsx:state':
+      'the presence words `live` / `ended` by OpsBadge, and the literal words `prunable` / `managed`',
     'features/repo/issues.tsx:state': 'a fetch reason, or the literal words `no issues` / `open` / `closed`',
-    'features/repo/settles.tsx:kind': 'the settle kinds — server/git-browse.ts SettleKind',
+    'features/repo/settles.tsx:kind':
+      'the settle kinds — shared/worktree-model.js SETTLE_KINDS, painted by OpsBadge (`settle`)',
     'features/repo/settles.tsx:via': 'exactly `record` or `journal`',
     'features/runs/history.tsx:status': 'the 8 UI states — shared/status-vocab.js',
+    // A number that wraps is two numbers: at 64 px, beside `+12`, `47` read as a
+    // 4 over a 7 (control-tower phase 23). Its 68 px track holds the row toggle
+    // and three digits; the grid lays out the fold count's room beside it.
+    'features/runs/phase-table.tsx:num':
+      'a phase number — two digits padded, three at most (104 phases today)',
     'features/settings/tailscale.tsx:state': 'the tailscale states',
   });
 
@@ -1106,7 +1125,10 @@ describe('a table says whether it scrolls', () => {
     // Two ways to be a nowrap primitive: BE one of the components, or carry the
     // utility by hand. Round 2's L3 — a raw `<span className="whitespace-nowrap">`
     // in a `cell:` was invisible to a check that only knew the component names.
-    const NOWRAP_COMPONENT = /^<(?:Chip|Badge|StatusBadge|CountBadge|StateChip)\b/;
+    // The typed status family (`@/components/ui/status`, phase 16) wears the
+    // same badge core, so each of its members is a nowrap primitive too.
+    const NOWRAP_COMPONENT =
+      /^<(?:Badge|StatusBadge|CountBadge|RunStatusBadge|PhaseStatusBadge|PlanStatusBadge|QaBadge|AccountBadge|McpBadge|OpsBadge|AttentionMark|FactBadge|ViewBadge|SeverityBadge)\b/;
     const NOWRAP_CLASS = /\bwhitespace-nowrap\b/;
     const BREAKS = /\b(whitespace-normal|break-all|break-words)\b/;
     // Scoped to the tag that carries the primitive, not the whole column literal
@@ -1157,8 +1179,12 @@ describe('a table says whether it scrolls', () => {
     // badge — measures 249px, and the group around it already wraps, which does
     // nothing when one ITEM is wider than the cell.
     expect(phase).toMatch(/id: 'actions',[^}]*min: 252/);
-    // The cut and the layout read ONE number.
-    expect(phase).toMatch(/style: \{ width: trackOf\(c\) \}/);
+    // The cut and the layout read ONE number — the grid's, since the table
+    // moved onto `DataTable` (control-tower phase 23).
+    expect(phase).toMatch(/<DataTable\b/);
+    expect(code(join(SRC, 'components/data-table/data-table.tsx'))).toMatch(
+      /width: column\.width \?\? trackOf\(column\)/,
+    );
 
   });
 
@@ -1172,13 +1198,15 @@ describe('a table says whether it scrolls', () => {
    * past the edge. Unmeasured is not "it fits".
    */
   it('the departures board waits to be measured', () => {
-    const text = code(join(SRC, 'features/plans/route-tab.tsx'));
-    expect(text).toMatch(/const \{ wrapRef, tableRef, overflows, measured \} = useTableFit\(\)/);
-    expect(text).toMatch(/scrolls=\{overflows \|\| !measured\}/);
-    expect(text).toMatch(/const headCell = !overflows && measured \? stickyHeadCell : undefined/);
-    // And the floor moves with the columns actually shown at each width.
-    expect(text).toMatch(/const DEPARTURES_WIDE = 'hidden xl:table-cell'/);
-    expect(text).toMatch(/const DEPARTURES_FLOOR = 'min-w-\[45\.5rem\] xl:min-w-\[62rem\]'/);
+    // The departures board IS the phase table since control-tower phase 23,
+    // and it waits through the grid: the wrapper scrolls until the box has
+    // answered, and a window of rows is drawn against `<main>`.
+    const grid = code(join(SRC, 'components/data-table/data-table.tsx'));
+    expect(grid).toMatch(/const \{ wrapRef, tableRef, width, overflows, measured \} = useTableFit\(\)/);
+    expect(grid).toMatch(/scrolls=\{overflows \|\| !measured\}/);
+    const table = code(join(SRC, 'features/runs/phase-table.tsx'));
+    expect(table).toMatch(/virtualFrom=\{PHASE_VIRTUAL_FROM\}/);
+    expect(table).toMatch(/export const PHASE_VIRTUAL_FROM = 40;/);
   });
 
   /**
@@ -1195,7 +1223,7 @@ describe('a table says whether it scrolls', () => {
    */
   it('a record’s name declares a floor', () => {
     const pins: [string, RegExp][] = [
-      ['features/now/inbox-row.tsx', /className="min-w-48 flex-1 truncate font-medium/],
+      ['components/inbox-row.tsx', /className="min-w-48 flex-1 truncate font-medium/],
       ['features/plans/card.tsx', /className="min-w-56 flex-1 hover:text-action"/],
       ['features/sessions/list.tsx', /className="min-w-32 flex-1 truncate text-ink"/],
       ['features/runs/console.tsx', /className="min-w-24 flex-1 truncate text-sm"/],
@@ -1203,14 +1231,11 @@ describe('a table says whether it scrolls', () => {
     for (const [file, pattern] of pins) {
       expect(code(join(SRC, file)), `${file} lost its identity floor`).toMatch(pattern);
     }
-    // The meta cluster wraps UNDER the title on a phone rather than taking a
-    // track beside it.
-    expect(code(join(SRC, 'features/plans/phases-tab.tsx'))).toMatch(
-      /grid-cols-\[auto_minmax\(0,1fr\)\][^"]*sm:grid-cols-\[auto_minmax\(0,1fr\)_auto\]/,
-    );
-    // And the strip's spend group can reflow instead of painting onward.
-    expect(code(join(SRC, 'features/now/portfolio-strip.tsx'))).toMatch(
-      /className="flex min-w-0 flex-1 basis-full items-center gap-2 sm:basis-auto"/,
+    // The phase table's name column is the one that absorbs the rest, and it
+    // has a floor of its own (the phases tab's cards became this table's rows
+    // in control-tower phase 23).
+    expect(code(join(SRC, 'features/runs/phase-table.tsx'))).toMatch(
+      /id: 'phase',\s*head: 'Phase',\s*priority: 1,\s*min: 220,\s*flex: true,/,
     );
   });
 
@@ -1422,8 +1447,8 @@ describe('focus stays visible on every page surface', () => {
         if (!/\boutline-none\b/.test(attr)) continue;
         // The legitimate form: suppressed for the pointer, restored for the
         // keyboard by an explicit `focus-visible:` indicator that PAINTS.
-        // Either property counts — `features/now/needs-you.tsx`'s roving-focus
-        // list draws a `ring` rather than an `outline`, which is the same
+        // Either property counts — Now's needs-you band (retired in 6.0) drew
+        // its roving-focus list with a `ring` rather than an `outline`, the same
         // promise kept with the other of the two that can keep it. But the
         // suffix has to be checked: `focus-visible:outline-none`,
         // `focus-visible:outline-hidden` and `focus-visible:ring-0` all match
@@ -1499,5 +1524,33 @@ describe('every Settings section is reachable by thumb', () => {
     // phone and scrolled the whole page sideways (Phase 6's trap).
     const text = readFileSync(join(SRC, 'features/insights/index.tsx'), 'utf8');
     expect(text).toMatch(/w-full max-w-\d+ min-w-0/);
+  });
+});
+
+/*
+ * The run page since control-tower phase 24: it opens on a glance and folds
+ * everything else under a named row, so the fold's row is the thing a thumb
+ * presses most there. The e2e spec (`e2e/run-page.spec.ts`) hit-tests each one
+ * at 360; these pins keep the classes that make it win.
+ */
+describe('the run page’s folds and header keep their thumb', () => {
+  it('features/runs/run-sections.tsx: each fold is a full-width row with the tap floor on touch', () => {
+    const text = readFileSync(join(SRC, 'features/runs/run-sections.tsx'), 'utf8');
+    expect(text).toContain('flex w-full min-w-0 items-center gap-2');
+    expect(text).toContain('[@media(hover:none)]:min-h-(--tap-min)');
+    // The name truncates inside the row rather than pushing the count out of it.
+    expect(text).toContain('min-w-0 truncate font-medium');
+  });
+
+  it('features/runs/run-page.tsx: the header is the strip’s row variant, and the folds sit in one shrinkable column', () => {
+    const text = readFileSync(join(SRC, 'features/runs/run-page.tsx'), 'utf8');
+    expect(text).toContain('variant="row"');
+    expect(text).toContain('flex min-w-0 flex-col gap-1 border-t border-rule pt-2');
+  });
+
+  it('features/runs/tower/strip.tsx: the row variant keeps the name’s floor and draws no second way in', () => {
+    const text = readFileSync(join(SRC, 'features/runs/tower/strip.tsx'), 'utf8');
+    expect(text.match(/min-w-\(--strip-name-floor\) flex-1 truncate/g)?.length).toBe(2);
+    expect(text).toContain('{!row && (');
   });
 });

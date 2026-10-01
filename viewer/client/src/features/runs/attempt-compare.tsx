@@ -42,6 +42,7 @@ import { useAttempts } from '@/lib/queries';
 import { phaseHref } from '@shared/routes.js';
 import { duration, money } from '@/lib/format';
 import type { AttemptComparison, AttemptSummary, VerificationFlip } from '@/lib/api';
+import { TreeLine, verdictTree } from '@/components/verify-tree';
 
 /** A figure that may legitimately be unknown, never silently zero. */
 function Figure({ value, render }: { value: number | null; render: (n: number) => string }) {
@@ -281,6 +282,15 @@ function Single({ attempt }: { attempt: AttemptSummary }) {
             {attempt.verification
               ? `${attempt.verification.ok ? 'passed' : 'failed'} · ${attempt.verification.ran.length} command(s)`
               : 'never reached verification'}
+            {/* The tree the verdict ran against (#41) — or that it names none. */}
+            {attempt.verification &&
+              (verdictTree(attempt.verification) ? (
+                <TreeLine tree={verdictTree(attempt.verification)!} className="text-2xs" />
+              ) : (
+                <span className="block text-2xs text-ink-faint" data-testid="verify-tree-unknown">
+                  the verdict names no tree
+                </span>
+              ))}
           </Row>
         </TBody>
       </Table>

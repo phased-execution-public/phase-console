@@ -71,6 +71,10 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       return values.model ? (MODEL_NOTE[values.model] ?? values.model) : 'this machine’s default';
     case 'effort':
       return values.effort ? (EFFORT_NOTE[values.effort] ?? values.effort) : 'this machine’s default';
+    case 'modelPolicy':
+      return values.modelPolicy === 'pinned'
+        ? 'pinned — a session on any other model parks instead of spending'
+        : 'ladder — may fall back, step down at a wall, or escalate';
     case 'qaModel':
       return values.qaModel
         ? (MODEL_NOTE[values.qaModel] ?? values.qaModel)
@@ -85,6 +89,10 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       return names.permission(values.permissionProfile);
     case 'permissionMode':
       return values.permissionMode || 'the profile’s own';
+    case 'approvalTimeoutMinutes':
+      return values.approvalTimeoutMinutes.trim() === ''
+        ? 'the hook’s own hour'
+        : `${values.approvalTimeoutMinutes} ${values.approvalTimeoutMinutes === '1' ? 'minute' : 'minutes'}`;
     case 'accountId':
       return names.account(values.accountId);
     case 'onLimit':
@@ -168,6 +176,14 @@ export function valueText(field: RunSetupField, values: RunSetupValues, names: N
       return values.maxConsecutiveFailures.trim() === ''
         ? 'the run’s own ceiling'
         : `${values.maxConsecutiveFailures} in a row`;
+    // Empty and zero are both answers here, and different ones (see `schema.ts`).
+    case 'ladderPerRunRungs':
+    case 'ladderPerPhaseRungs': {
+      const text = values[field].trim();
+      if (text === '') return 'the console’s own cap';
+      if (Number(text) === 0) return 'none — nothing recovers by itself';
+      return field === 'ladderPerRunRungs' ? `${text} across the open phases` : `${text} per phase`;
+    }
     case 'onlyPhases': {
       const phases = parsePhases(values.onlyPhases);
       return phases ? `P${phases.join(', P')}` : 'the whole plan';
@@ -278,13 +294,6 @@ export function summaryRows(
 /** The rows worth a line: not the shipped default, or changed here. */
 export function notableRows(rows: readonly SummaryRow[]): SummaryRow[] {
   return rows.filter((row) => !row.baseline || row.source === 'changed');
-}
-
-/** How many rows the operator changed in THIS dialog, per stage — the stepper's note. */
-export function changedPerStage(rows: readonly SummaryRow[]): Record<ControlStage, number> {
-  const out: Record<ControlStage, number> = { decisions: 0, what: 0, how: 0, money: 0 };
-  for (const row of rows) if (row.source === 'changed') out[row.stage] += 1;
-  return out;
 }
 
 /** What the review knows that the values do not: the plan and its board. */

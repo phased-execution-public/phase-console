@@ -32,12 +32,15 @@ import {
 } from '@shared/projection.js';
 import {
   DETAIL_TABS,
+  PHASES_VIEW_IDS,
+  PHASES_VIEW_LABELS,
   PLAN_TAB_LABELS,
   TAB_IDS,
   TAB_INCLUDES,
   includesForTab,
   isLegacyTab,
   legacyTabTarget,
+  phasesViewOf,
   resolveTab,
   tabLabel,
 } from './tabs';
@@ -58,13 +61,16 @@ describe('the plan tab vocabulary', () => {
   });
 
   it('gives every id a real panel in TabBody', () => {
+    // `phases` is also the switch's `default:` — deliberate, so that an id the
+    // vocabulary gains before its panel lands on the table rather than on
+    // nothing — and it names its own case too.
     for (const id of PLAN_TABS) {
-      // `route` is the switch's `default:` — the fallback is deliberate, so
-      // that an id the vocabulary gains before its panel lands on the map
-      // rather than on nothing.
-      if (id === 'route') continue;
       expect(detailSource, `TabBody has no case for '${id}'`).toContain(`case '${id}':`);
     }
+  });
+
+  it('is three tabs since 6.0 — phases, run, source (control-tower phase 23, #26)', () => {
+    expect([...PLAN_TABS]).toEqual(['phases', 'run', 'source']);
   });
 
   it('keeps `run` — every in-flight notification is routed to it', () => {
@@ -77,8 +83,27 @@ describe('the plan tab vocabulary', () => {
 });
 
 describe('the retired tabs', () => {
-  it('names all three, and only tabs that really left', () => {
-    expect(Object.keys(LEGACY_PLAN_TABS).sort()).toEqual(['analysis', 'overview', 'raw']);
+  it('names all six, and only tabs that really left', () => {
+    expect(Object.keys(LEGACY_PLAN_TABS).sort()).toEqual([
+      'analysis',
+      'handoffs',
+      'overview',
+      'qa',
+      'raw',
+      'route',
+    ]);
+  });
+
+  it('folds Route, QA and Handoffs into views of the phase table, carrying the view', () => {
+    // The server still mints `#/plan/:slug/route` — it must land on the map.
+    const legacy = LEGACY_PLAN_TABS as Record<string, { tab?: string; view?: string }>;
+    expect(legacy.route).toEqual({ tab: 'phases', view: 'map' });
+    expect(legacy.qa).toEqual({ tab: 'phases', view: 'qa' });
+    expect(legacy.handoffs).toEqual({ tab: 'phases', view: 'handoffs' });
+    for (const id of ['route', 'qa', 'handoffs']) {
+      expect(resolveTab(id), id).toBe('phases');
+      expect(PHASES_VIEW_IDS, `${id}'s view is a real view`).toContain(legacy[id]!.view);
+    }
   });
 
   it('sends the two file readings to Source and the numbers off the page', () => {
@@ -102,16 +127,31 @@ describe('the retired tabs', () => {
   });
 });
 
+describe('the phase table’s views', () => {
+  it('are the shared four, each with a word of its own', () => {
+    expect([...PHASES_VIEW_IDS]).toEqual(['table', 'map', 'qa', 'handoffs']);
+    for (const id of PHASES_VIEW_IDS) expect(PHASES_VIEW_LABELS[id], id).toBeTruthy();
+  });
+
+  it('reads an unknown or absent ?view= as the table', () => {
+    expect(phasesViewOf(undefined)).toBe('table');
+    expect(phasesViewOf('raw')).toBe('table');
+    expect(phasesViewOf('map')).toBe('map');
+    expect(phasesViewOf('qa')).toBe('qa');
+  });
+});
+
 describe('resolveTab', () => {
-  it('opens on Route with no segment, and for a word nobody registered', () => {
-    expect(resolveTab(undefined)).toBe('route');
-    expect(resolveTab('')).toBe('route');
-    expect(resolveTab('not-a-tab')).toBe('route');
+  it('opens on Phases with no segment, and for a word nobody registered', () => {
+    expect(resolveTab(undefined)).toBe('phases');
+    expect(resolveTab('')).toBe('phases');
+    expect(resolveTab('not-a-tab')).toBe('phases');
   });
 
   it('shows the list a detail page was reached from', () => {
     expect(resolveTab('phase')).toBe('phases');
-    expect(resolveTab('handoff')).toBe('handoffs');
+    // A handoff's list is a view of the phase table since 6.0.
+    expect(resolveTab('handoff')).toBe('phases');
     // And those two lists are themselves real tabs.
     for (const target of Object.values(DETAIL_TABS)) expect(PLAN_TABS).toContain(target);
   });
@@ -170,7 +210,7 @@ describe('the include set each tab asks for', () => {
     // the lock and the handoff STATUS chip — all board fields, so the tabs that
     // show them ask for nothing. The two tabs that render the page-length prose
     // (`phase-panel.tsx`, and `PhaseDetails` under the Autopilot table) ask.
-    for (const tab of ['route', 'phases', 'handoffs', 'handoff']) {
+    for (const tab of ['phases', 'handoff']) {
       expect(includesForTab(tab), `tab '${tab}'`).toEqual([]);
     }
     for (const tab of ['phase', 'run']) {
@@ -235,15 +275,19 @@ describe('the include set each tab asks for', () => {
     const ALWAYS: [file: string, component: string][] = [['features/plans/header.tsx', 'PlanHeader']];
 
     /** Entry component per tab — what `TabBody` mounts. */
+    /*
+     * The phase table's column array is a ROOT of both tabs that draw it. Its
+     * cells are render functions in an array, which a JSX walk cannot reach
+     * from `<DataTable columns={…}>` (blind spot 4 below) — so the array is
+     * walked as if it were a component, and every cell it names with it.
+     */
+    const COLUMNS: [file: string, component: string] = ['features/runs/phase-table.tsx', 'PHASE_COLUMNS'];
     const ENTRY: Record<string, [file: string, component: string][]> = {
-      route: [['features/plans/route-tab.tsx', 'RouteTab']],
-      phases: [['features/plans/phases-tab.tsx', 'PhasesTab']],
+      phases: [['features/plans/phases-tab.tsx', 'PhasesTab'], COLUMNS],
       phase: [['features/plans/phase-panel.tsx', 'PhasePanel']],
-      handoffs: [['features/plans/handoffs-tab.tsx', 'HandoffsTab']],
-      handoff: [['features/plans/handoffs-tab.tsx', 'HandoffPanel']],
+      handoff: [['features/plans/handoff-panel.tsx', 'HandoffPanel']],
       source: [['features/plans/source-tab.tsx', 'SourceTab']],
-      run: [['features/runs/run-page.tsx', 'RunView']],
-      qa: [['features/plans/qa-tab.tsx', 'QaTab']],
+      run: [['features/runs/run-page.tsx', 'RunView'], COLUMNS],
     };
 
     // F-N3: the map above is hand-written, so it needs a completeness check —
@@ -345,6 +389,8 @@ describe('the include set each tab asks for', () => {
      */
     const SELF_FETCHING: Record<string, readonly string[]> = {
       'features/plans/phase-inspector#PhaseInspector': ['prose', 'handoffs'],
+      // The same boundary under a table row (control-tower phase 23).
+      'features/plans/phase-inspector#PhaseProse': ['prose', 'handoffs'],
     };
 
     /**
@@ -462,9 +508,13 @@ describe('the include set each tab asks for', () => {
     // matched on its OWN segment rather than at the end of the string.
     const has = (tab: string, name: string) =>
       [...(reached.get(tab) ?? [])].some((key) => key.split('#')[1] === name);
-    expect(has('route', 'TitleCell'), 'route → TitleCell (renders phase.goal)').toBe(true);
-    expect(has('route', 'FlagsCell'), 'route → FlagsCell (renders the handoff chip)').toBe(true);
-    expect(has('route', 'PhasesTab'), 'route → PhasesTab (the phone branch)').toBe(true);
+    expect(has('phases', 'PhaseTable'), 'phases → PhaseTable (the one table)').toBe(true);
+    expect(has('phases', 'TitleCell'), 'phases → the columns → TitleCell (renders phase.goal)').toBe(true);
+    expect(has('phases', 'PhaseRowDetail'), 'phases → a row’s detail').toBe(true);
+    expect(has('phases', 'PhaseProse'), 'phases → PhaseProse (the self-fetching boundary)').toBe(true);
+    expect(has('phases', 'PhaseDetails'), 'phases → PhaseProse → PhaseDetails (every prose field)').toBe(
+      true,
+    );
     expect(has('run', 'PhaseDetails'), 'run → PhaseTable → PhaseDetails (renders every prose field)').toBe(
       true,
     );

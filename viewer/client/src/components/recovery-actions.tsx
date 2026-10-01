@@ -12,6 +12,7 @@
  * of two differently-named buttons silently sharing one session.
  */
 
+import { haltReasonOf } from '@shared/halt-categories.js';
 import { useMemo, useState } from 'react';
 import { Bot, ChevronDown } from 'lucide-react';
 import { Button, InfoTip, Tooltip, TooltipProvider } from '@/components/ui';
@@ -31,6 +32,7 @@ import {
   type RecoveryClass,
 } from '@/lib/recovery';
 import { runRecoverVerb, type RunRecoverVerb } from '@/lib/run-recover';
+import { RUN_RECOVER_VERBS } from '@/lib/run-recover-verbs';
 import { cn } from '@/lib/cn';
 import { EFFORTS } from '@/features/runs/defaults';
 import { SwitchAccountRow } from '@/components/switch-account';
@@ -45,7 +47,7 @@ import { SwitchAccountRow } from '@/components/switch-account';
  * the useful half: it reminds the operator what they are answering.
  */
 function failureHint(ctx: RecoveryCtx): string {
-  const reason = ctx.run?.halt?.reason ?? ctx.record?.status;
+  const reason = haltReasonOf(ctx.run?.halt) ?? ctx.record?.status;
   const short = typeof reason === 'string' && reason.length > 90 ? `${reason.slice(0, 90)}…` : reason;
   return short
     ? `It stopped on: ${short}\n\nWhat should this attempt do differently?`
@@ -94,16 +96,7 @@ type ActionView = {
   disabledReason?: string;
 };
 
-const RUN_VERBS = new Set<string>([
-  'recheck',
-  'closeout',
-  'resume',
-  'retry',
-  'retry-edits',
-  'skip',
-  'mcp-continue',
-  'auto-recover',
-]);
+const RUN_VERBS = new Set<string>(RUN_RECOVER_VERBS);
 
 export function RecoveryActions({
   target,
@@ -113,6 +106,8 @@ export function RecoveryActions({
   showBlurbs = false,
   account = false,
   perform,
+  bare = false,
+  leadTestId,
   className,
 }: {
   /** What the actions are about — the ticket, the verbs and the dedupe key all use it. */
@@ -137,6 +132,14 @@ export function RecoveryActions({
   /** Surface-owned verbs (continue-run, dismiss, release, force-release):
    * rendered only when the surface says how to perform them. */
   perform?: Partial<Record<string, () => void>>;
+  /** Buttons only — no errand card and no ladder strip (a row that links to the full card). */
+  bare?: boolean;
+  /**
+   * `data-testid` for the RECOMMENDED button — the first inline one, when the
+   * model put it in `primary`. The halt card names it so a test (and a phone's
+   * `elementFromPoint`) can find the one button the card recommends.
+   */
+  leadTestId?: string;
   className?: string;
 }) {
   const touch = useTouch();
@@ -144,7 +147,9 @@ export function RecoveryActions({
   const { data: sessions } = useSessions(state);
   const [busy, setBusy] = useState<string | null>(null);
   const [dialog, setDialog] = useState<RecoveryClass | null>(null);
-  const [resumeOpen, setResumeOpen] = useState(false);
+  // Which verb the words box answers: Resume needs words, Delegate takes them
+  // when given (its own instruction already says the acts are the session's).
+  const [wordsFor, setWordsFor] = useState<'resume' | 'delegate' | 'errand-answered' | null>(null);
   const [instruction, setInstruction] = useState('');
   const [editsOpen, setEditsOpen] = useState(false);
   const [addendum, setAddendum] = useState('');
@@ -183,7 +188,7 @@ export function RecoveryActions({
     [ctx, state, running?.id, perform],
   );
 
-  if (!actions.length && !running && ladder.empty) return null;
+  if (!actions.length && !running && (bare || ladder.empty)) return null;
 
   const inline = actions.filter((action) => action.group !== 'overflow').slice(0, max);
   const rest = actions.filter((action) => !inline.includes(action));
@@ -197,8 +202,9 @@ export function RecoveryActions({
       setDialog(action.recoveryClass as RecoveryClass);
       return;
     }
-    if (action.id === 'resume') {
-      setResumeOpen((open) => !open);
+    if (action.id === 'resume' || action.id === 'delegate' || action.id === 'errand-answered') {
+      const verb = action.id;
+      setWordsFor((open) => (open === verb ? null : verb));
       return;
     }
     if (action.id === 'retry-edits') {
@@ -214,10 +220,11 @@ export function RecoveryActions({
     void runRecoverVerb(action.id as RunRecoverVerb, target).finally(() => setBusy(null));
   };
 
-  const renderButton = (action: ActionView, variant: 'action' | 'default') => {
+  const renderButton = (action: ActionView, variant: 'action' | 'default', lead = false) => {
     const button = (
       <Button
         size="sm"
+        {...(lead && leadTestId ? { 'data-testid': leadTestId, 'data-recommended': action.id } : {})}
         variant={action.disabledReason ? 'default' : variant}
         disabled={Boolean(action.disabledReason) || busy === action.id}
         onClick={() => act(action)}
@@ -229,7 +236,11 @@ export function RecoveryActions({
       >
         {action.mechanism === 'new-agent' && <Bot size={13} aria-hidden />}
         {busy === action.id ? 'Working…' : action.label}
-        <span className="ml-0.5 text-2xs font-normal text-ink-faint" aria-hidden>
+        {/* The button's own ink, quieter — never `text-ink-faint`, which is a
+            colour for the page's ground: on the solid action button it read
+            faint-on-ink, and axe measured it once the phase table's live row
+            reached the first screen of the plan page (control-tower phase 23). */}
+        <span className="ml-0.5 text-2xs font-normal opacity-75" aria-hidden>
           {MECHANISMS[action.mechanism].badge}
         </span>
       </Button>
@@ -264,8 +275,10 @@ export function RecoveryActions({
         {/* The machine's account of itself comes first: a person reading Ways
           forward should know what was already tried before pressing anything
           — and when the ladder is spent, the ONE errand is the headline. */}
-        {ladder.errand && <ErrandCard errand={ladder.errand} situationLabel={ladder.situation?.label} />}
-        <LadderStrip view={ladder} />
+        {!bare && ladder.errand && (
+          <ErrandCard errand={ladder.errand} situationLabel={ladder.situation?.label} />
+        )}
+        {!bare && <LadderStrip view={ladder} />}
         <div className="flex flex-wrap items-center gap-2">
           {running && (
             <Button size="sm" variant="default" asChild>
@@ -280,39 +293,64 @@ export function RecoveryActions({
               </a>
             </Button>
           )}
-          {inline.map((action, index) =>
-            renderButton(action, index === 0 && action.group === 'primary' ? 'action' : 'default'),
-          )}
+          {inline.map((action, index) => {
+            const lead = index === 0 && action.group === 'primary';
+            return renderButton(action, lead ? 'action' : 'default', lead);
+          })}
         </div>
 
         {account && <SwitchAccountRow slug={target.slug} run={ctx.run ?? null} disabled={false} />}
 
-        {resumeOpen && (
+        {wordsFor && (
           <div className="flex flex-wrap items-end gap-2">
             <textarea
               value={instruction}
               onChange={(event) => setInstruction(event.target.value)}
               rows={2}
-              placeholder="What it should fix before closing out…"
+              aria-label={
+                wordsFor === 'delegate'
+                  ? 'Your words to the session'
+                  : wordsFor === 'errand-answered'
+                    ? 'What you did'
+                    : 'Your instruction'
+              }
+              placeholder={
+                wordsFor === 'delegate'
+                  ? 'Anything it should know about these acts (optional)…'
+                  : wordsFor === 'errand-answered'
+                    ? 'What you did, for the session to read (optional)…'
+                    : 'What it should fix before closing out…'
+              }
               className="min-h-16 w-full max-w-xl rounded border border-rule bg-ground px-2 py-1 text-sm"
             />
             <Button
               size="sm"
               variant="action"
-              disabled={!instruction.trim() || busy === 'resume'}
+              disabled={(wordsFor === 'resume' && !instruction.trim()) || busy === wordsFor}
               onClick={() => {
-                setBusy('resume');
-                void runRecoverVerb('resume', target, { instruction: instruction.trim() })
+                const verb = wordsFor;
+                setBusy(verb);
+                void runRecoverVerb(verb, target, { instruction: instruction.trim() })
                   .then((ok) => {
                     if (ok) {
-                      setResumeOpen(false);
+                      setWordsFor(null);
                       setInstruction('');
                     }
                   })
                   .finally(() => setBusy(null));
               }}
             >
-              {busy === 'resume' ? 'Resuming…' : 'Resume with this'}
+              {wordsFor === 'delegate'
+                ? busy === 'delegate'
+                  ? 'Delegating…'
+                  : 'Delegate the acts'
+                : wordsFor === 'errand-answered'
+                  ? busy === 'errand-answered'
+                    ? 'Continuing…'
+                    : 'Done — continue'
+                  : busy === 'resume'
+                    ? 'Resuming…'
+                    : 'Resume with this'}
             </Button>
           </div>
         )}

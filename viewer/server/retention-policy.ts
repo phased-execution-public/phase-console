@@ -24,7 +24,12 @@ export type RetentionSink =
   | 'rulings'
   | 'session-events'
   | 'git-trace'
-  | 'messages';
+  | 'messages'
+  | 'crashes'
+  | 'locks'
+  | 'run-worktrees'
+  | 'human-steps'
+  ;
 
 export type RetentionPolicy = {
   /** `console.log`; rotation itself is `log.ts`'s — this is the number reported. */
@@ -57,6 +62,37 @@ export type RetentionPolicy = {
   messagesRotateBytes: number;
   /** …and the rotated copy goes after this many days. */
   messagesRetainDays: number;
+  /**
+   * `crashes.json` and the heap snapshots beside it, in days.
+   *
+   * The ledger bounds itself at twenty entries, so this row is about the
+   * SNAPSHOTS: one is the size of the heap that wrote it, which on the console
+   * this was measured on is four gigabytes each, and the flag that writes them
+   * is turned on precisely when something is going wrong repeatedly.
+   */
+  crashRetainDays: number;
+  /**
+   * `locks.ndjson`, the lock history ledger (#24, written in Pro), is rotated
+   * to `.1` past this — the rotated copy is replaced at the next rotation, so
+   * the ledger never holds more than twice this.
+   */
+  locksRotateBytes: number;
+  /**
+   * `human-steps.ndjson`, the human-step ledger (control-tower phase 41), is
+   * rotated to `.1` past this. The reader folds `.1` and the live file
+   * together, so a step declared before a rotation is still read after it;
+   * the next rotation replaces `.1`, bounding the ledger at twice this.
+   */
+  humanStepsRotateBytes: number;
+  /**
+   * A kept run worktree — a finished run's checkout, left by its `keep` or
+   * `keep-on-failure` policy — past this many days (control-tower phase 56,
+   * #75). Reported, never deleted by the sweep: a git worktree is removed by
+   * the prune that knows its repository, not by `rm`.
+   */
+  runWorktreeRetainDays: number;
+  /** Every kept run worktree, together, oldest finished first past this. */
+  runWorktreesMaxBytes: number;
 };
 
 /**
@@ -85,6 +121,11 @@ export const RETENTION_DEFAULTS: RetentionPolicy = Object.freeze({
   gitTraceDirMaxBytes: 64 * 1024 * 1024,
   messagesRotateBytes: 8 * 1024 * 1024,
   messagesRetainDays: 90,
+  crashRetainDays: 14,
+  locksRotateBytes: 4 * 1024 * 1024,
+  humanStepsRotateBytes: 4 * 1024 * 1024,
+  runWorktreeRetainDays: 14,
+  runWorktreesMaxBytes: 2 * 1024 * 1024 * 1024,
 });
 
 /**
@@ -120,6 +161,11 @@ export function sanitiseRetention(parsed: Partial<RetentionPolicy> | undefined):
     gitTraceDirMaxBytes: positive('gitTraceDirMaxBytes'),
     messagesRotateBytes: positive('messagesRotateBytes'),
     messagesRetainDays: positive('messagesRetainDays'),
+    crashRetainDays: positive('crashRetainDays'),
+    locksRotateBytes: positive('locksRotateBytes'),
+    humanStepsRotateBytes: positive('humanStepsRotateBytes'),
+    runWorktreeRetainDays: positive('runWorktreeRetainDays'),
+    runWorktreesMaxBytes: positive('runWorktreesMaxBytes'),
   };
   // A tail bigger than the cap that triggers the trim is a trim that never
   // shrinks anything — the sweep would run every day and change nothing.

@@ -22,7 +22,8 @@
 import { useState } from 'react';
 import { api } from '@/lib/api';
 import { keys, useApiMutation, useConsoleState, useRetention } from '@/lib/queries';
-import { Button, Card, CardBody, CardHeader, CardTitle, DataTable, Skeleton, field } from '@/components/ui';
+import { Button, Card, CardBody, CardHeader, CardTitle, Skeleton, field } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
 
 /** Bytes as a person reads them. Three significant figures is all a size card needs. */
 function bytes(value: number): string {
@@ -63,6 +64,11 @@ const SINK_LABEL: Record<string, { label: string; policy: (p: Record<string, num
     policy: (p) =>
       `${p.runRetainDays ?? 0} days, at least ${p.runRetainMin ?? 0} per plan, ${bytes(p.runsMaxBytes ?? 0)} in total`,
   },
+  'run-worktrees': {
+    label: 'Kept run worktrees',
+    policy: (p) =>
+      `reported past ${p.runWorktreeRetainDays ?? 0} days or ${bytes(p.runWorktreesMaxBytes ?? 0)} together — removed by their run's prune, never by the sweep`,
+  },
   'task-inbox': { label: 'Task ledgers', policy: (p) => `${p.taskInboxDays ?? 0} days` },
   'outcome-inbox': {
     label: 'Declared outcomes',
@@ -84,6 +90,14 @@ const SINK_LABEL: Record<string, { label: string; policy: (p: Record<string, num
   messages: {
     label: 'Message ledgers',
     policy: (p) => `rotates at ${bytes(p.messagesRotateBytes ?? 0)}, kept ${p.messagesRetainDays ?? 0} days`,
+  },
+  locks: {
+    label: 'Lock history',
+    policy: (p) => `rotates at ${bytes(p.locksRotateBytes ?? 0)}, one previous kept`,
+  },
+  'human-steps': {
+    label: 'Your-turn steps',
+    policy: (p) => `rotates at ${bytes(p.humanStepsRotateBytes ?? 0)}, one previous kept`,
   },
 };
 

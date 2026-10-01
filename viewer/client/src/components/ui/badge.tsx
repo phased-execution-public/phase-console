@@ -5,11 +5,15 @@ import { cn } from '@/lib/cn';
 /**
  * A badge: a short word or number in a bordered pill.
  *
- * The tone axis is the TONE FAMILY of the status vocabulary (`STATE_META[*].tone`)
- * plus `state`, which paints with whatever `--state` the nearest `.state-<ui>`
- * class set — that is how `StatusBadge` and a `.state-*` row agree without
- * either naming a colour. A badge that forgets to pick a tone is grey, which
- * is visibly wrong rather than invisibly wrong.
+ * The tone axis is the eight paints' tone families — `accent` (needs-you, the
+ * one amber, rationed to a summons), `bad` (failed), `live` (running and
+ * verifying), `wait` (waiting), `neutral` (queued, skipped) and `ok` (done) —
+ * plus `state`, which paints with whatever `--state` the nearest `.state-<paint>`
+ * class set: that is how the typed status family (`@/components/ui/status`) and
+ * a `.state-*` row agree without either naming a colour. There is no other tone
+ * word — the 2.x `warn`/`gate`/`stuck`/`busy` aliases are gone (control-tower
+ * phase 31). A badge that forgets to pick a tone is grey, which is visibly
+ * wrong rather than invisibly wrong.
  *
  * Never a hover-only affordance: a badge's `title` is a hint for a mouse; the
  * word on it must carry the meaning by itself.

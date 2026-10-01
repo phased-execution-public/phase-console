@@ -41,7 +41,27 @@ if closed="$("$BASH_BIN" "$SCRIPT_DIR/phase-graph.sh" "$slug" --closed 2>/dev/nu
 fi
 
 # 1) Structural lint of the plan (aborts here on F1/F2/F3 via the engine's exit code).
-"$BASH_BIN" "$SCRIPT_DIR/phase-graph.sh" "$slug" --lint
+#
+# The engine answers with a code that is a VERDICT: 0 clean, 1 issues, each
+# named on stderr. Anything else is the engine failing to RUN, and the two are
+# not the same fact. `set -e` used to hand the difference on unchanged, so the
+# bash 3.2 allocator death (#17) reached a plan author as exit 133 over an
+# empty stderr — which reads as "nothing to fix" to a person and as a lint
+# failure to a console. Name it, and answer with a code of our own (70,
+# EX_SOFTWARE) so no caller can mistake it for a statement about the plan.
+lint_status=0
+"$BASH_BIN" "$SCRIPT_DIR/phase-graph.sh" "$slug" --lint || lint_status=$?
+if [ "$lint_status" -ge 2 ]; then
+  if [ "$lint_status" -ge 128 ]; then
+    printf "VALIDATE UNRUN: the engine's lint crashed (signal %s) — run it under bash 5 or report the plan\n" \
+      "$((lint_status - 128))" >&2
+  else
+    printf "VALIDATE UNRUN: the engine's lint crashed (exit %s) — run it under bash 5 or report the plan\n" \
+      "$lint_status" >&2
+  fi
+  exit 70
+fi
+[ "$lint_status" -eq 0 ] || exit "$lint_status"
 
 # 2) Handoff body + consistency checks (F10).
 ho_dir="$DOCS_ROOT/docs/handoffs/$slug"
@@ -62,6 +82,45 @@ if [ -d "$ho_dir" ]; then
     # handoffs, so don't enforce them rigidly — bootstrap-ability is the contract.
     grep -qiE 'start next phase|final phase|closeout' "$f" \
       || { echo "  ✗ $base: missing the '▶ Start next phase(s)' boot section" >&2; problems=$((problems + 1)); }
+
+    # …and it must not swallow the handoff (control-tower phase 85, #115). The
+    # section is a hand-off to OTHER sessions; tfar phase 32's ran 1,090 of 1,350
+    # lines — eight whole prompts, ~85 % copies of each other — and buried
+    # `## Outstanding` at line 1,333. Over 300 lines, or over 40 % of the file, is
+    # named here: a WARNING, never a problem, so the exit code is untouched. A
+    # handoff written before the shared boot existed stays as it is. Fences are
+    # skipped, since a `## ` inside a prompt is not a heading.
+    awk -v base="$base" '
+      /^```/ || /^~~~/ { fence = !fence }
+      !fence && /^## / {
+        if (ins) { sec += NR - start; ins = 0 }
+        if ($0 ~ /[Ss]tart next phase/) { ins = 1; start = NR }
+      }
+      END {
+        if (ins) sec += NR - start + 1
+        if (NR == 0 || sec == 0) exit
+        over = ""
+        if (sec > 300) over = "300 lines"
+        if (100 * sec > 40 * NR) over = (over == "" ? "" : over " and ") "40% of the handoff"
+        if (over != "")
+          printf "  ⚠ %s: its \047▶ Start next phase(s)\047 section is %d of %d lines (%d%%) — over %s (#115: a fan-out writes the shared boot once, then a block per phase)\n", base, sec, NR, int(100 * sec / NR), over
+      }' "$f" >&2
+
+    # …and a person's `!` line must not point into a console RUN TREE
+    # (control-tower phase 90, #123). A parked phase's handoff gave the operator
+    # production apply lines that `cd` into the run's mirror, and the console
+    # pruned that mirror at the end of the very session that wrote them. A run
+    # tree is pruned on the console's schedule; an errand tree
+    # (`.worktrees/hand/<slug>/p<N>-errand`, POST /api/run/<slug>/errand-tree)
+    # is removed only by a person. A WARNING, like the one above.
+    awk -v base="$base" '
+      {
+        line = $0
+        sub(/^[[:space:]>*+-]*`?/, "", line)
+        if (line ~ /^![[:space:]]*[^[:space:]=]/ && ($0 ~ /\/\.worktrees\/runs\// || $0 ~ /\/phase-console\/runs\/.*\/worktrees\//)) {
+          printf "  ⚠ %s:%d: a `!` line points into a console run tree, which the console prunes on its own schedule — prepare an errand tree (POST /api/run/<slug>/errand-tree {phase}) under .worktrees/hand/ and point there instead (#123)\n", base, NR
+        }
+      }' "$f" >&2
 
     phnum="$(grep -m1 '^phase:' "$f" | sed 's/^phase:[[:space:]]*//; s/[[:space:]]*#.*$//' || true)"
     if [ -n "$phnum" ]; then

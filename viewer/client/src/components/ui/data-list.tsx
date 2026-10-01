@@ -82,7 +82,7 @@ export function DataList<T>({
               const style: CSSProperties = {
                 position: 'absolute',
                 top: 0,
-                left: 0,
+                insetInlineStart: 0,
                 width: '100%',
                 transform: `translateY(${row.start}px)`,
               };

@@ -99,8 +99,31 @@ export const ISSUE_STATES = Object.freeze(
  * problem, and a class of problem is one issue with four bullets — which is
  * also the issue a person can act on. The cap is what turns the second shape
  * into the first.
+ *
+ * The OPERATOR door has meters of its own (control-tower phase 12, #30): one
+ * draft per ticket — an investigation that files four issues was not asked
+ * to — and ten a day across every ticket, counted by the UTC date the draft
+ * was written. A phase and a run are the wrong meters for a person's button.
  */
-export const ISSUE_BUDGETS = Object.freeze({ phase: 3, run: 10 });
+export const ISSUE_BUDGETS = Object.freeze({ phase: 3, run: 10, ticket: 1, operatorDay: 10 });
+
+/**
+ * The ledger scope of a draft an OPERATOR asked for — the issues board's compose
+ * door, and `phase-issue.sh` under `PE_ISSUE_DOOR=operator` (control-tower phase
+ * 12, #30). Written where a plan slug goes, and it cannot collide with one: a slug
+ * starts `[a-z0-9]`. Its phase is always 0, and its draft id is derived from the
+ * ticket's session id in the phase's place, so two tickets drafting the same
+ * title in the same second are two drafts.
+ */
+export const OPERATOR_ISSUE_SCOPE = '_operator';
+
+/**
+ * The repository KEY that names the console's OWN repository rather than one
+ * of the plan's (control-tower phase 101, #145 D): the supervisor drafts the
+ * console's defects there, through the same ledger, dedupe and approval a
+ * session's draft takes. Never a submodule path, so it can never shadow one.
+ */
+export const CONSOLE_REPO_KEY = 'console';
 
 /**
  * The fields a session's draft carries, in the order `phase-issue.sh` takes

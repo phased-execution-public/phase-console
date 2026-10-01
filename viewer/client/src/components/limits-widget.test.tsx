@@ -12,16 +12,20 @@
  * working. The warning is part of the control, not a footnote elsewhere.
  */
 
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { queryClientConfig } from '@/lib/queries';
-import { LimitsOverview, LimitsWidget } from './limits-widget';
+import { RELOGIN_CONFIRM } from '@shared/ops-vocab.js';
+import { LimitsWidget } from './limits-widget';
+import { LimitsOverview } from './limits-overview';
 
 const savePrefs = vi.fn(async (_patch: Record<string, unknown>) => ({}));
+const accountLogin = vi.fn(async (_body: Record<string, unknown>) => ({}) as Record<string, unknown>);
 let notify: Record<string, boolean> = {};
 let registered: unknown[] = [];
+let allowAccounts = false;
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
@@ -29,9 +33,10 @@ vi.mock('@/lib/api', async (importOriginal) => {
     ...actual,
     api: {
       ...actual.api,
-      state: vi.fn(async () => ({ prefs: { notify } })),
+      state: vi.fn(async () => ({ prefs: { notify }, allowAccounts })),
       accounts: vi.fn(async () => ({ accounts: registered, allowAccounts: true })),
       savePrefs: (patch: Record<string, unknown>) => savePrefs(patch),
+      accountLogin: (body: Record<string, unknown>) => accountLogin(body),
     },
   };
 });
@@ -47,8 +52,54 @@ function renderOverview(accounts?: Parameters<typeof LimitsOverview>[0]['account
 
 beforeEach(() => {
   savePrefs.mockClear();
+  accountLogin.mockReset();
   notify = {};
   registered = [];
+  allowAccounts = false;
+});
+
+/**
+ * A verb beside each diagnosis (control-tower phase 13, #33). The dialog named
+ * four failures and offered only "re-read the numbers" — the one thing that
+ * cannot help a login that broke.
+ */
+describe('the repair beside the diagnosis', () => {
+  const BROKEN = [
+    { id: 'default', kind: 'default', builtIn: true, email: 'me@example.com', authState: 'expired' },
+    { id: 'prof', kind: 'profile', builtIn: false, name: 'prof', signedIn: false },
+    { id: 'gone', kind: 'profile', builtIn: false, name: 'gone', signedIn: true, authState: 'signed-out' },
+    { id: 'tok', kind: 'token', builtIn: false, name: 'tok', usage: { buckets: {}, unsupported: true } },
+  ];
+
+  it('offers sign-in for a login, the command for the machine login, and replace for a token', async () => {
+    renderOverview(BROKEN as never);
+    expect(await screen.findAllByRole('button', { name: 'Sign in again' })).toHaveLength(3);
+    expect(screen.getByRole('button', { name: 'Copy command' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Replace token' })).toBeTruthy();
+  });
+
+  it('asks before signing the machine login in again while a run pays as it', async () => {
+    allowAccounts = true;
+    accountLogin
+      .mockResolvedValueOnce({
+        accountId: 'default',
+        command: 'claude auth login',
+        mode: 'warn',
+        runs: ['alpha'],
+        warning: 'alpha is running on the machine login, bound to me@example.com.',
+      })
+      .mockResolvedValueOnce({ accountId: 'default', command: 'claude auth login', mode: 'command' });
+    renderOverview([BROKEN[0]] as never);
+    const signIn = await screen.findByRole('button', { name: 'Sign in again' });
+    await waitFor(() => expect(signIn).not.toBeDisabled());
+    fireEvent.click(signIn);
+    const ask = await screen.findByRole('alertdialog');
+    expect(ask.textContent).toMatch(/bound to me@example\.com/);
+    expect(accountLogin).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(ask).getByRole('button', { name: 'Sign in again' }));
+    await waitFor(() => expect(accountLogin).toHaveBeenCalledTimes(2));
+    expect(accountLogin.mock.calls[1]![0]).toEqual({ accountId: 'default', confirm: RELOGIN_CONFIRM });
+  });
 });
 
 /**
@@ -70,6 +121,22 @@ describe('two entries, one identity', () => {
     ] as never);
     expect(await screen.findByText(/are the same Claude account/)).toBeTruthy();
     expect(screen.getByText('default and info')).toBeTruthy();
+  });
+
+  it('carries an action: remove the registered duplicate, never the machine login (phase 25, #33)', async () => {
+    const accountDelete = vi.fn(async () => ({ ok: true }));
+    const { api } = await import('@/lib/api');
+    (api as unknown as { accountDelete: typeof accountDelete }).accountDelete = accountDelete;
+    renderOverview([
+      { id: 'default', kind: 'default', builtIn: true, name: 'default', email: 'one@example.com' },
+      { id: 'info', kind: 'profile', builtIn: false, name: 'info', email: 'One@Example.com' },
+    ] as never);
+    const banner = await screen.findByTestId('duplicate-identity');
+    const remove = await within(banner).findByRole('button', { name: 'Remove info' });
+    await waitFor(() => expect(remove.hasAttribute('disabled')).toBe(false));
+    fireEvent.click(remove);
+    fireEvent.click(await screen.findByRole('button', { name: 'Remove info' }, { container: document.body }));
+    await waitFor(() => expect(accountDelete).toHaveBeenCalledWith('info'));
   });
 
   it('stays quiet when the logins genuinely differ', async () => {
@@ -114,8 +181,49 @@ describe('the usage indicator', () => {
     ).toBeTruthy();
   });
 
-  it('an account reporting nothing draws nothing, and does not hide the others', async () => {
-    registered = [account('default', {}), account('info', { five_hour: 12 })];
+  it('FC-5: 78 % and climbing draws the next hour faint above its fill; 78 % and flat draws none (#33)', async () => {
+    const forecast = (trend: 'climbing' | 'flat', burn: number) => ({
+      pct: 78,
+      burnPctPerHour: burn,
+      trend,
+      wallsAt: null,
+      resetsAt: '2026-09-30T12:00:00Z',
+      samples: 3,
+      spanMs: 1_800_000,
+    });
+    registered = [
+      {
+        ...account('default', { five_hour: 78 }),
+        forecast: {
+          buckets: { five_hour: forecast('climbing', 12) },
+          wallsAt: null,
+          bucket: null,
+          burning: [],
+        },
+      },
+      {
+        ...account('info', { five_hour: 78 }),
+        forecast: { buckets: { five_hour: forecast('flat', 0) }, wallsAt: null, bucket: null, burning: [] },
+      },
+    ];
+    const client = new QueryClient(queryClientConfig);
+    render(
+      <QueryClientProvider client={client}>
+        <LimitsWidget variant="header" />
+      </QueryClientProvider>,
+    );
+    const climbing = await screen.findByLabelText('default: 5-hour session 78% and climbing · +12 %/h');
+    const flat = await screen.findByLabelText('info: 5-hour session 78% and flat');
+    expect(climbing.querySelector('[data-forecast="climbing"]')).toBeTruthy();
+    expect(flat.querySelector('[data-forecast="climbing"]')).toBeNull();
+  });
+
+  it('an account reporting nothing still has a bar — broken drawn as broken — and hides none of the others (phase 25)', async () => {
+    registered = [
+      { ...account('default', {}), meter: 'broken', usage: { buckets: {}, error: 'HTTP 401' } },
+      { ...account('spare', {}), meter: 'none' },
+      account('info', { five_hour: 12 }),
+    ];
     const client = new QueryClient(queryClientConfig);
     render(
       <QueryClientProvider client={client}>
@@ -123,7 +231,85 @@ describe('the usage indicator', () => {
       </QueryClientProvider>,
     );
     expect(await screen.findByLabelText('info: 5-hour session 12%')).toBeTruthy();
-    expect(screen.queryByLabelText(/^default:/)).toBeNull();
+    const broken = screen.getByLabelText('default: meter broken (HTTP 401)');
+    expect(broken.getAttribute('data-meter')).toBe('broken');
+    expect(broken.querySelector('.state-failed')).toBeTruthy();
+    expect(screen.getByLabelText('spare: no reading yet').getAttribute('data-meter')).toBe('none');
+  });
+
+  it('marks the account a live run pays as (phase 25, #33)', async () => {
+    registered = [
+      { ...account('default', { five_hour: 20 }), paying: [{ slug: 'demo', runId: 'abc' }] },
+      account('info', { five_hour: 12 }),
+    ];
+    const client = new QueryClient(queryClientConfig);
+    render(
+      <QueryClientProvider client={client}>
+        <LimitsWidget variant="header" />
+      </QueryClientProvider>,
+    );
+    const paying = await screen.findByLabelText('default: 5-hour session 20% — paying for demo');
+    expect(paying.getAttribute('data-paying')).toBe('true');
+    expect(screen.getByLabelText('info: 5-hour session 12%').getAttribute('data-paying')).toBeNull();
+  });
+});
+
+describe('the overview says what each account is now (phase 25)', () => {
+  it('shows the email beside a named account, the identity it resolves to, the paying run, and the forecast', async () => {
+    renderOverview([
+      {
+        id: 'acct-work',
+        kind: 'token',
+        name: 'work',
+        email: 'work@example.com',
+        org: 'Example Org',
+        paying: [{ slug: 'demo', runId: 'abc' }],
+        usage: { buckets: { five_hour: { utilization: 60, resetsAt: null } } },
+        forecast: {
+          buckets: {},
+          wallsAt: '2026-09-29T10:50:00.000Z',
+          bucket: 'five_hour',
+          burning: [{ slug: 'demo', runId: 'abc', lanes: [3, 5] }],
+        },
+      },
+    ] as never);
+    expect(await screen.findByText('work@example.com')).toBeTruthy();
+    expect(screen.getByTestId('identity')).toHaveTextContent(
+      'Resolves to work@example.com · Example Org now.',
+    );
+    expect(screen.getByTestId('paying')).toHaveTextContent('pays for demo');
+    expect(screen.getByTestId('forecast-walls')).toHaveTextContent(
+      /At this burn the 5-hour session window walls ≈/,
+    );
+    const burning = screen.getByTestId('forecast-burning');
+    expect(within(burning).getByRole('link', { name: 'demo' }).getAttribute('href')).toBe('#/plan/demo/run');
+    expect(burning).toHaveTextContent('(2 lanes)');
+  });
+
+  it('renders a retirement’s evidence and the read that contradicted it (#57)', async () => {
+    renderOverview([
+      {
+        id: 'acct-work',
+        kind: 'token',
+        name: 'work',
+        usage: { buckets: {} },
+        meter: 'broken',
+        entitlement: {
+          state: 'suspect',
+          via: 'probe',
+          evidence: { source: 'api', matched: 'credit balance is too low', phase: 4, slug: 'demo' },
+          contradicted: {
+            at: '2026-09-29T09:00:00.000Z',
+            by: 'usage-poll',
+            reason: 'a usage read answered 200',
+          },
+        },
+      },
+    ] as never);
+    expect(await screen.findByTestId('retirement-evidence')).toHaveTextContent(
+      'Was retired on from the API · “credit balance is too low” · phase 4 of demo',
+    );
+    expect(screen.getByTestId('retirement-contradicted')).toHaveTextContent('a usage read answered 200');
   });
 });
 

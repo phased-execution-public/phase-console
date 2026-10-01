@@ -30,6 +30,7 @@ import {
   collectNotes, parseNoteSection, noteReaches, NOTES_MAX, NOTE_TEXT_MAX,
   type Note, type NoteHandoff, type NoteMessage, type NoteRuling,
 } from '../server/parse/notes.ts';
+import { parseHandoff } from '../server/parse/handoff.ts';
 
 const SKILL = fileURLToPath(new URL('../../', import.meta.url));
 const ENGINE = join(SKILL, 'scripts', 'phase-graph.sh');
@@ -373,4 +374,52 @@ test('noteReaches never hands a phase its own note, whatever the address', () =>
   assert.equal(noteReaches('next', 2, 4, [2, 3]), true);
   assert.equal(noteReaches('next', 1, 4, [2, 3]), false, 'next is a dependency edge, not a phase number');
   assert.equal(noteReaches('all', 1, 4, [2, 3]), true);
+});
+
+/* ------------------------------------------------------------------ *
+ * The fan-out handoff (control-tower phase 85, #115): the shared boot
+ * once, a block per phase, and the console composes the prompt
+ * ------------------------------------------------------------------ */
+
+/** A handoff for phase 1 whose start section is what `--boot-fanout` wrote. */
+function fanoutHandoff(box: Corpus, phases: number[]): string {
+  return [
+    '---', 'phase: 1', 'title: root', 'status: complete', '---', '',
+    '# Phase 1 — root', '',
+    '## ▶ Start next phase(s) (paste into fresh sessions)', '',
+    bash(box, ['--boot-fanout', phases.join(' ')]),
+    '## Outstanding / blockers', '', 'none', '',
+  ].join('\n');
+}
+
+test('HF-3: the console composes each fanned-out phase from the shared boot and its block — equal to --boot-prompt', () => {
+  const box = corpus();
+  const text = fanoutHandoff(box, [2, 3]);
+  const parsed = parseHandoff(text, 'diamond', 'phase-01-root.md', join(box.root, 'x.md'), { size: text.length, mtimeMs: 0 });
+  assert.deepEqual(parsed.prompts.map((p) => p.phase), [2, 3]);
+  for (const prompt of parsed.prompts) {
+    const phase = prompt.phase as number;
+    assert.equal(prompt.text, bash(box, ['--boot-prompt', String(phase)]).trim(), `phase ${phase}`);
+    // The block carries this phase's notes and only its own: what the twin
+    // collects for the phase is in the prompt the console composes.
+    for (const note of twinNotes(box, phase)) assert.ok(prompt.text.includes(note.text), note.text);
+    assert.equal(prompt.gated, false);
+  }
+  // Written once: the wait procedure, the lock steps and the task list appear
+  // in the whole section a single time, however many phases it hands on.
+  for (const once of ['Waiting without polling.', 'Two sessions may run at once', 'Then publish this phase']) {
+    assert.equal(text.split(once).length - 1, 1, once);
+  }
+});
+
+test('HF-3: a legacy handoff — one whole fenced prompt per phase — still reads as before', () => {
+  const box = corpus();
+  const prompt2 = bash(box, ['--boot-prompt', '2']);
+  const text = [
+    '---', 'phase: 1', 'status: complete', '---', '',
+    '## ▶ Start next phase(s)', '', '### Phase 2', '', '```', prompt2.trimEnd(), '```', '',
+    '## Outstanding / blockers', '',
+  ].join('\n');
+  const parsed = parseHandoff(text, 'diamond', 'phase-01-root.md', join(box.root, 'x.md'), { size: text.length, mtimeMs: 0 });
+  assert.deepEqual(parsed.prompts.map((p) => [p.phase, p.text]), [[2, prompt2.trim()]]);
 });

@@ -13,6 +13,34 @@ const KEY = 'phase-console.ui';
 
 export type Theme = 'system' | 'dark' | 'light';
 
+/**
+ * What an operator made of one grid table, kept by its `tableId`
+ * (`components/data-table`). Every field is optional and absent means "the
+ * table's own default": a table that has never been touched stores nothing.
+ *
+ *   - `filters`   column id → the filter's value, by the column's kind: the
+ *                 text typed, the facet values kept, or the range's two ends
+ *                 (`null` for an open end). An empty filter is never stored.
+ *   - `hidden`    the column ids the operator hid. A hidden column FOLDS into
+ *                 the row's detail; it is never removed.
+ *   - `groupBy`   the column the rows are grouped under. `null` is a choice —
+ *                 "no grouping" — and outranks the table's own `groupBy`
+ *                 default, which is what absence falls back to.
+ *   - `collapsed` the groups folded, as `${columnId}:${value}`, so a group
+ *                 folded under one grouping says nothing about another.
+ *
+ * Selection is deliberately NOT here: a pick is an intention about this
+ * visit's rows, and a pick that outlived the visit would act on rows the
+ * operator can no longer see were picked.
+ */
+export interface TableState {
+  filters?: Record<string, string | string[] | [number | null, number | null]>;
+  hidden?: string[];
+  groupBy?: string | null;
+  collapsed?: string[];
+}
+
+
 export interface Prefs {
   theme: Theme;
   density: 'comfortable' | 'compact';
@@ -45,12 +73,9 @@ export interface Prefs {
   model: string;
   /** Plan list: rich cards, or the dense comparison table. */
   plansLayout: 'board' | 'table';
-  /** The Runs fleet's shape — `auto` follows the viewport (resolved in
-   * `features/runs/layout.ts`). */
-  runsLayout: 'auto' | 'table' | 'cards';
   /** Plan list: one flat list, or sectioned by status or by repo. */
   plansGroup: 'none' | 'status' | 'repo';
-  /** How Next up is ordered — see `features/now/model.ts` `RANKS`. */
+  /** How Next up is ordered — see `features/runs/lanes-model.ts` `RANKS`. */
   readyRank: string;
   /**
    * Ready board: one flat queue, or grouped under each plan.
@@ -70,18 +95,14 @@ export interface Prefs {
    * one would have to turn them on again after every click.
    */
   nowShowAcked: boolean;
-  /** How the fleet is ordered — see `views/runs/model.ts` `SORTS`. */
+  /** How the runs ledger is ordered — see `features/runs/model.ts` `SORTS`; its filters, groups and hidden columns are `tables['runs-ledger']`. */
   runsSort: string;
-  /** Which outcome the fleet is filtered to; empty is every outcome. */
-  runsOutcome: string;
   /**
    * Fleet: keep runs of CLOSED plans in the table. Off by default — a run of a
    * complete or abandoned plan is history, not fleet — and the toolbar names
    * how many are hidden so the cut is never silent.
    */
   runsShowClosed: boolean;
-  /** Fleet: one flat table, or a section per plan. */
-  runsGroup: boolean;
   /**
    * Which shape the fleet section takes: the orchestration BOARD (every live
    * run in its column, with its controls) or the TABLE (every run there has
@@ -106,6 +127,31 @@ export interface Prefs {
    */
   runPhasesCollapsed: string[];
   /**
+   * Which run strips are expanded in place (`features/runs/tower/strip.tsx`),
+   * by run id, newest first and capped — "expand in place, and remember each
+   * expansion per user" (docs/design.md, control-tower phase 19). Stored as the
+   * OPEN ids: a strip is folded until somebody opens it.
+   */
+  stripsOpen: string[];
+  /**
+   * Which of the run page's folded sections are open (`features/runs/run-sections.tsx`,
+   * control-tower phase 24), by section id. Stored as the OPEN ids, like
+   * `stripsOpen`: the page opens on a glance, and a section stays folded until
+   * somebody opens it — then stays open for them on every run they read.
+   */
+  runSectionsOpen: string[];
+  /**
+   * The Tower's saved filters (`features/runs/tower/`, control-tower phase 20):
+   * the annunciator lamp pressed — a `HALT_CATEGORIES` word, empty for none,
+   * stored as a plain string so a family the vocabulary later drops reads as
+   * "no filter" — and the free text over plan names. Kept, because a filter a
+   * person set is a question they are still asking the next time they look.
+   */
+  towerCategory: string;
+  towerQuery: string;
+  /** Whether the Settled bay is open. Folded by default: settled things go quiet. */
+  towerSettledOpen: boolean;
+  /**
    * The same, for the PLAN page's Phases tab — deliberately its own key.
    *
    * The two lists group by the same five states and answer different
@@ -122,7 +168,7 @@ export interface Prefs {
    * Which kind the sessions list is filtered to; empty is every kind.
    *
    * A `SessionGroupKind` (`features/sessions/list.tsx`), stored as a plain
-   * string for the same reason `runsOutcome` is: a value the vocabulary has
+   * string on purpose: a value the vocabulary has
    * since stopped offering must read as "every kind" rather than as an empty
    * list, and a browser carrying a retired word cannot be migrated.
    */
@@ -163,6 +209,12 @@ export interface Prefs {
    * than a slower one. Flip it once a real retina device has shown text.
    */
   terminalWebgl: boolean;
+  /**
+   * Each grid table's view, by its `tableId` — see `TableState`. One key for
+   * every table rather than a key per table, so a table added later needs no
+   * new field here and a retired one leaves a harmless entry behind.
+   */
+  tables: Record<string, TableState>;
 }
 
 // A key added here is safe for a browser carrying the old client's settings:
@@ -177,7 +229,6 @@ const DEFAULTS: Prefs = {
   plansHiddenBannerOff: false,
   model: '',
   plansLayout: 'board',
-  runsLayout: 'auto',
   plansGroup: 'none',
   readyRank: 'leverage',
   // Off: acknowledged is "seen, not cleared", and a list that shows everything
@@ -187,14 +238,15 @@ const DEFAULTS: Prefs = {
   // in individual phases across plans (the flat board remains one toggle away).
   readyGroup: true,
   runsSort: 'updated',
-  // Empty rather than an outcome: the fleet opens showing everything it has,
-  // and a filter is something the operator turned on.
-  runsOutcome: '',
   runsShowClosed: false,
-  runsGroup: false,
   runsView: 'board',
   // Only `done` — the one group that is usually the longest and least read.
   runPhasesCollapsed: ['done'],
+  stripsOpen: [],
+  runSectionsOpen: [],
+  towerCategory: '',
+  towerQuery: '',
+  towerSettledOpen: false,
   planPhasesCollapsed: ['done'],
   runsConsole: false,
   // Most recently active first, everything live above everything ended — the
@@ -206,6 +258,7 @@ const DEFAULTS: Prefs = {
   terminalFontStep: 0,
   terminalScreenReader: false,
   terminalWebgl: false,
+  tables: {},
 };
 
 /** Read-only view of the shipped defaults, so a test can pin one without

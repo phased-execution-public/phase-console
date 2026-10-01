@@ -25,12 +25,25 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+/**
+ * The machine reads quiet (control-tower phase 34). The scheduler holds every
+ * NEW admission while the 5-minute load is above its guard (phase 100), and a
+ * `Service` a test builds reads the real `os.loadavg()` — so on a busy machine
+ * every `admit()` a test awaited queued for ever. This is the e2e fixture's
+ * shim, held for the whole process; `spawn-console.ts` hands it to every
+ * console a test starts. A test of the guard injects its own reading.
+ */
+import '../e2e/fixture/steady-load.mjs';
 import { sweepBrokers } from './broker-sweep.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'phase-console-state-'));
 
 process.env.XDG_STATE_HOME = join(dir, 'state');
 process.env.XDG_CONFIG_HOME = join(dir, 'config');
+// …and which Claude Code config dirs the skill-copy reader counts (#151): an
+// empty sandbox, so a console a test builds never reads the machine's plugins
+// into its prompts, its inbox or its doctor.
+process.env.PE_CLAUDE_CONFIG_DIRS = join(dir, 'claude');
 
 /**
  * A pty broker started by a test retires in seconds, not in five minutes.
@@ -58,6 +71,16 @@ process.env.PHASE_CONSOLE_PTY_IDLE_MS ??= '20000';
  * stand-in for the updater and turns it back on for itself.
  */
 process.env.PHASE_CONSOLE_SELF_UPDATE = '0';
+
+/**
+ * A declaration a test writes never asks a real console (control-tower phase
+ * 50). `phase-outcome.sh` asks the console its repository resolves to whether
+ * a watched ref has already landed, and a root nothing registered resolves to
+ * the DEFAULT instance — port 4123, the operator's own console. Off for every
+ * test and every script a test spawns; `declare-already-landed.test.ts` turns
+ * it on against a console of its own.
+ */
+process.env.PHASE_OUTCOME_PROBE = '0';
 
 process.on('exit', () => {
   // Before the directory goes, so the pid files are still there to read.

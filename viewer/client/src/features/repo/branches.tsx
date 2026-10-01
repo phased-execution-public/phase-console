@@ -23,8 +23,9 @@
 
 import { useMemo } from 'react';
 import { GitBranch } from 'lucide-react';
-import { Badge, Chip, DataTable, Empty } from '@/components/ui';
-import type { Column } from '@/components/ui';
+import { Badge, Empty } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
+import type { Column } from '@/components/data-table';
 import type { RepoBranch, RepoBranches } from '@/lib/api';
 import { relativeTime, homePath, plural } from '@/lib/format';
 
@@ -122,7 +123,7 @@ function branchColumns(home: string | undefined, onPick: (b: RepoBranch) => void
           // the exact escape this table was migrated to close. Same answer as
           // `components/scope-chips.tsx`: the vocabulary badges stay nowrap, a
           // value that came out of a plan file wraps.
-          <Chip
+          <Badge
             tone="accent"
             mono
             className="max-w-full break-all whitespace-normal"
@@ -133,7 +134,7 @@ function branchColumns(home: string | undefined, onPick: (b: RepoBranch) => void
           >
             {branch.run.slug}
             {branch.run.phase === undefined ? '' : ` · p${branch.run.phase}`}
-          </Chip>
+          </Badge>
         ) : (
           <span className="text-2xs text-ink-faint">{UNKNOWN}</span>
         ),

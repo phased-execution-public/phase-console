@@ -113,6 +113,18 @@ const happySpawn = async () => ({
   sessionId: 'sid', costUsd: 0, turns: 1, resultText: 'done', durationMs: 1, argv: [],
 });
 
+/**
+ * What the CLI reports as `total_cost_usd` for one conversation spawned again
+ * and again: its RUNNING total, each spawn adding its own spend to the last
+ * (a `--resume` carries everything the session spent before it). The runner
+ * books each spawn's rise over the session's mark (`bookedDelta`), so a stub
+ * that reported the same total twice said the second spawn cost nothing.
+ */
+function runningTotal(each: number): () => number {
+  let total = 0;
+  return () => (total += each);
+}
+
 function makeRunner(h: ReturnType<typeof harness>, verification: VerifySummary, approvals?: Approvals) {
   return new Runner({
     scriptsDir: h.scriptsDir,
@@ -148,7 +160,7 @@ const RED_WITH_CASCADE: VerifySummary = {
   notRun: [{ text: 'npm run typecheck', reason: 'skipped after an earlier command failed' }],
 };
 
-test('a command that ran and failed is a verdict on the record, never a card — and the board-vouched phase is not halted', async () => {
+test('a command that ran and failed is a verdict on the record, never a card — and the board-vouched phase is RE-OPENED, not halted', async () => {
   // The halt this used to pin was the phantom class the board-first rule
   // retired: verification only runs after `closed()` has read the board done,
   // so every ran-and-failed red lands over a complete handoff — and the
@@ -156,7 +168,9 @@ test('a command that ran and failed is a verdict on the record, never a card —
   // reconcile sixty seconds later) were exactly that shape. The distinction
   // this suite exists for survives whole: ran-and-failed is a VERDICT, so it
   // is recorded and never asks a person; not-run is a QUESTION, so it raises
-  // the card the next test pins.
+  // the card the next test pins. Since control-tower phase 62 (#68) the
+  // verdict is also a GATE: the phase is re-opened rather than settled done
+  // under a red, and its dependents wait (`verification-gates.test.ts`).
   const h = harness();
   try {
     const approvals = new Approvals();
@@ -164,8 +178,9 @@ test('a command that ran and failed is a verdict on the record, never a card —
     const state = await runner.start({ slug: 'demo', root: h.root, autonomy: 'keep-going' });
     await runner.wait();
 
-    assert.notEqual(state.status, 'halted', 'the board vouched for the phase; no halt');
-    assert.equal(state.phases['1'].status, 'done');
+    assert.notEqual(state.status, 'halted', 'a re-open is not the halt reconcile used to dissolve');
+    assert.notEqual(state.phases['1'].status, 'done', 'a red final verdict is not a done phase');
+    assert.deepEqual(state.phases['1'].reopened?.failed, ['npm test'], 'it re-opened the phase');
     assert.equal(state.phases['1'].verification?.ok, false, 'the red verdict is not erased');
     assert.match(state.phases['1'].note ?? '', /Verification is red/, 'and it travels on the record');
     assert.equal(approvals.pending().length, 0, 'a verdict is not a question — no card');
@@ -293,6 +308,9 @@ exit 0
     // and what puts a row in the ledger. Doing it in the SPAWN rather than as a
     // side effect of the engine being asked is both truer and independent of
     // which engine calls the runner happens to make.
+    // The review resumes the phase's own session, so each spawn spends 1.25
+    // and reports the conversation's running total.
+    const costUsd = runningTotal(1.25);
     const spawn = async (request: Record<string, unknown>) => {
       // The REVIEWER records the verdict — not the phase's own build session,
       // which uses this same stub. Keyed on the brief, because that is what
@@ -300,7 +318,7 @@ exit 0
       if (/qa-record\.sh/.test(String(request.prompt))) writeFileSync(join(h.root, '.qa-asked'), '');
       return {
         signal: { subtype: 'success' as const, code: 0, text: 'done' },
-        sessionId: 'sid', costUsd: 1.25, turns: 7, resultText: 'done', durationMs: 1, argv: [],
+        sessionId: 'sid', costUsd: costUsd(), turns: 7, resultText: 'done', durationMs: 1, argv: [],
       };
     };
     const runner = new Runner({
@@ -351,6 +369,7 @@ esac
 exit 0
 `, { mode: 0o755 });
     const briefs: string[] = [];
+    const costUsd = runningTotal(2);
     const spawn = async (request: Record<string, unknown>) => {
       if (/qa-record\.sh/.test(String(request.prompt))) {
         briefs.push(String(request.prompt));
@@ -358,7 +377,7 @@ exit 0
       }
       return {
         signal: { subtype: 'success' as const, code: 0, text: 'done' },
-        sessionId: 'sid', costUsd: 2, turns: 9, resultText: 'done', durationMs: 1, argv: [],
+        sessionId: 'sid', costUsd: costUsd(), turns: 9, resultText: 'done', durationMs: 1, argv: [],
       };
     };
     const runner = new Runner({
@@ -474,7 +493,7 @@ test('a recorded verdict dispatches nothing at finish', async () => {
   } finally { h.cleanup(); }
 });
 
-test('a cascade skip behind a real red raises no card — the overtaken settle carries it', async () => {
+test('a cascade skip behind a real red raises no card — the re-open carries it', async () => {
   // Measured: one of these parked a whole run for 3h52m awaiting a human,
   // over a phase the board already vouched for — the skipped command was a
   // CONSEQUENCE of the red, manufactured at verify time, not a fragment the
@@ -490,7 +509,7 @@ test('a cascade skip behind a real red raises no card — the overtaken settle c
     ]);
 
     assert.notEqual(state.status, 'halted', 'the board vouched for the phase; no halt');
-    assert.equal(state.phases['1'].status, 'done');
+    assert.ok(state.phases['1'].reopened, 'the red re-opened the phase (control-tower phase 62)');
     assert.equal(state.phases['1'].verification?.ok, false, 'the red verdict is not erased');
     assert.match(state.phases['1'].note ?? '', /Verification is red/, 'and it travels on the record');
     assert.equal(approvals.pending().length, 0);
@@ -528,7 +547,7 @@ test('a genuine fragment behind measured, board-vouched work raises no card on k
     ]);
 
     assert.notEqual(state.status, 'halted', 'the board vouched for the phase; no halt');
-    assert.equal(state.phases['1'].status, 'done');
+    assert.ok(state.phases['1'].reopened, 'the measured red re-opened the phase (control-tower phase 62)');
     assert.equal(state.phases['1'].verification?.ok, false, 'the red verdict is not erased');
     assert.equal(state.phases['1'].verification?.notRun.length, 1, 'the fragment stays on the record');
     assert.equal(approvals.pending().length, 0);
@@ -539,28 +558,34 @@ test('a genuine fragment behind measured, board-vouched work raises no card on k
   }
 });
 
-test('halt-on-everything still asks — and confirming the fragments does not repaint a measured red', async () => {
+test('halt-on-everything: a measured red re-opens the phase before any card — nobody vouches for fragments of a verdict already red', async () => {
+  // It used to ask, and a person's "the docker line is fine" then settled the
+  // phase done with the red on its record. Since control-tower phase 62 (#68)
+  // the red is a gate: the phase re-opens at once, and the fragments are asked
+  // about when it verifies again — a card before that is a person's time spent
+  // on a verdict their answer cannot change.
   const h = harness();
   const { approvals, first } = watchedApprovals();
+  const runner = makeRunner(h, RED_WITH_QUESTION, approvals);
   try {
-    const runner = makeRunner(h, RED_WITH_QUESTION, approvals);
-    void runner.start({ slug: 'demo', root: h.root, autonomy: 'halt-on-everything' });
+    const state = await runner.start({ slug: 'demo', root: h.root, autonomy: 'halt-on-everything' });
+    await Promise.race([
+      runner.wait(),
+      first.then(() => { throw new Error('a measured red re-opens before any card is raised'); }),
+    ]);
 
-    await first;
-    const card = approvals.pending()[0];
-    assert.equal(card.kind, 'verify', 'the cautious autonomy keeps its card');
-
-    approvals.settle(card.id, 'allow', 'a reviewer', 'compose stack is up');
-    await runner.wait();
-
-    const record = runner.current()!.phases['1'];
-    assert.equal(record.status, 'done');
-    assert.equal(record.verification?.ok, false,
-      'a tap on "the docker line is fine" must not erase a command that ran and exited red');
+    const record = state.phases['1'];
+    assert.notEqual(record.status, 'done');
+    assert.ok(record.reopened, 'the red re-opened the phase');
+    assert.equal(record.verification?.ok, false);
     assert.match(record.verification?.reason ?? '', /exited 1/, 'the red verdict stays named');
-    assert.match(record.verification?.reason ?? '', /confirmed by a reviewer/,
-      'and so does who confirmed the manual checks');
-  } finally { h.cleanup(); }
+    assert.equal(record.verification?.notRun.length, 1, 'the fragment stays on the record');
+    assert.equal(approvals.pending().length, 0);
+  } finally {
+    for (const card of approvals.pending()) approvals.settle(card.id, 'allow', 'cleanup', '');
+    await runner.wait().catch(() => {});
+    h.cleanup();
+  }
 });
 
 test('a verification that ran nothing raises a card instead of failing the phase', async () => {

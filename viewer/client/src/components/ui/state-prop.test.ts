@@ -8,8 +8,9 @@
  * an obviously broken one. So the page renders, nothing logs, and a phase that
  * needs a person reads "Waiting".
  *
- *   1. `features/now/lane-row.tsx` passed a raw phase status into `StatusBadge`.
- *      Every `parked`, `gated` and `awaiting-verification` lane read "Waiting"
+ *   1. `features/now/lane-row.tsx` (retired with Now in 6.0) passed a raw phase
+ *      status into `StatusBadge`. Every `parked`, `gated` and
+ *      `awaiting-verification` lane read "Waiting"
  *      on the destination whose whole question is "does anything need me".
  *      Shipped 2026-08-24, found 2026-09-01 by QA round 3.
  *   2. `features/runs/live-strip.tsx` did the same, and was safe only because a
@@ -70,7 +71,7 @@ describe('a state= prop takes a UI state, never a status word', () => {
     }
     expect(
       offences,
-      'a `state=` prop resolves through asUiState/asPhaseState, which fall back to `waiting` ' +
+      'a `state=` prop resolves through asUiState, which falls back to `waiting` ' +
         'for a word they do not know — so a status word here paints every ask as "Waiting". ' +
         'Pass a fold (`phaseUiState(status, stop)`) or the board word instead:\n  ' +
         offences.join('\n  '),

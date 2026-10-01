@@ -17,8 +17,10 @@
  * offered only one made the other invisible.
  */
 
+import { CrashLoopCard } from '@/components/halt-mark';
 import { useState } from 'react';
-import { api } from '@/lib/api';
+import { api, type SkillCopyView } from '@/lib/api';
+import { homePath } from '@/lib/format';
 import { keys, useApiMutation, useConsoleState } from '@/lib/queries';
 import { applyUpdateNow } from '@/lib/pwa';
 import {
@@ -60,7 +62,22 @@ export function InstanceSection() {
           The server files on disk are newer than this process. Restart it below to run them.
         </Banner>
       )}
-      {state.bootHold && <BootHoldBanner hold={state.bootHold} allowRun={state.allowRun === true} />}
+      {state.bootHold &&
+        (state.bootHold.kind === 'crash-loop' ? (
+          // The crash loop is a stop like a run's, drawn through the halt family (#20).
+          <CrashLoopCard hold={state.bootHold} allowRun={state.allowRun === true} />
+        ) : (
+          <BootHoldBanner hold={state.bootHold} allowRun={state.allowRun === true} />
+        ))}
+      {state.skillCopy && state.skillCopy.drift.length > 0 && (
+        <Banner severity="warn" data-testid="skill-drift">
+          The skill sessions read is at another commit than this console, so they follow a procedure its
+          scripts no longer match:{' '}
+          {state.skillCopy.drift.map((copy) => homePath(copy.configDir, state.home)).join(', ')}. Move it to
+          this console: <code>{state.skillCopy.update}</code> — open sessions pick it up on{' '}
+          <code>/reload-plugins</code> or a restart.
+        </Banner>
+      )}
 
       <Card>
         <CardHeader>
@@ -100,6 +117,9 @@ export function InstanceSection() {
               // THIS TAB against the server's build — the diagnostic for "I
               // deployed and still see the old app".
               ['Interface', interfaceRow(state.distRev)],
+              // The OTHER half of the install (#151): the skill copy the
+              // sessions this console starts load, against its build.
+              ['Skill', skillRow(state.skillCopy, state.home)],
               ['Supervisor', state.supervisor?.detail ?? 'unknown'],
             ]}
           />
@@ -176,6 +196,41 @@ function interfaceRow(distRev: string | null | undefined): React.ReactNode {
     <span className="text-action">
       this tab was built from <MonoId id={mine} chars={12} copyable />; the server now serves{' '}
       <MonoId id={distRev} chars={12} copyable /> — use &ldquo;Get the latest interface&rdquo; below
+    </span>
+  );
+}
+
+/**
+ * The ONE skill copy sessions load — the plugin each Claude Code config dir
+ * installed, its commit and its path — against the server's build (control-tower
+ * phase 98, #151). Fourteen copies once sat on one machine with nothing saying
+ * which was live; this row is where that is said.
+ */
+function skillRow(view: SkillCopyView | null | undefined, home: string | undefined): React.ReactNode {
+  if (!view) return 'unknown — this server predates the skill-copy report';
+  const installed = view.copies.filter((copy) => copy.install);
+  if (!installed.length) {
+    return 'no plugin copy installed — sessions read the skill from wherever Claude Code finds it';
+  }
+  return (
+    <span className="flex flex-col gap-1">
+      {installed.map((copy) => {
+        const install = copy.install!;
+        const commit = install.commit ?? install.version;
+        const drifted = view.drift.some((one) => one.configDir === copy.configDir);
+        return (
+          <span key={copy.configDir} className={drifted ? 'text-action' : undefined}>
+            {view.plugin} at {commit ? <MonoId id={commit} chars={12} copyable /> : 'an unknown commit'} in{' '}
+            <code>{homePath(copy.configDir, home)}</code>
+            {drifted
+              ? ' — another commit than this console'
+              : view.consoleRev
+                ? ' — the console’s own commit'
+                : ''}{' '}
+            <code className="text-2xs text-ink-faint">{homePath(install.installPath, home)}</code>
+          </span>
+        );
+      })}
     </span>
   );
 }

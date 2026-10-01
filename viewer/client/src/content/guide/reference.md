@@ -148,23 +148,32 @@ up to half an hour.
 
 ## Run timeline
 
-**Plan → a run → Run timeline** draws the run on one absolute axis: a row per phase, bars
-bracketed by two journal entries each. It answers a different question from the *Timeline* card
-below it — that one splits each phase's own clock, this one says *when* each phase held the lane.
+**Plan → a run → Run timeline** draws the run on one absolute axis: a row per phase, every bar
+held to a journal line. It answers a different question from the *Timeline* card below it — that
+one splits each phase's own clock, this one says *when* each phase held the lane.
 
 | Bar | What the lane was doing |
 | --- | --- |
-| `working` | a session was alive and spending |
-| `verifying` | §Verification was running (`phase.awaiting-verification` → `phase.verify`) |
+| `working` | a session was running — measured from its `phase.session` line: it ended there, and began that line's `ms` earlier |
+| `verifying` | §Verification was running — the automatic proof measured back from `phase.verify`'s own command times, and the person-check path bracketed by `phase.awaiting-verification` → `phase.verify` |
+| `queued` | waiting for a scope somebody else held — a queue episode, `phase.queued` → `phase.queue-closed` |
 | `waiting` | parked on something outside the phase — a wait, an MCP preflight |
+| `down` | the RUN was down with this phase in flight — halted, parked, paused, stopped or shut down — until the next start; the bar's tooltip names the cause (`halted: plan-lint`, `stopped by operator`) |
 | `frozen` | stopped by the operator (a SIGSTOP: no spend, real wall-clock) |
+
+Working means a session and nothing else, so a stretch no line claims is left as a gap: the phase
+was in nobody's hands. A phase settled by reconcile ends its lane there, and a run that goes down
+ends the work of every lane it held (control-tower phase 61 — until then all of it was drawn as
+`working`).
 
 A **hatched** bar is still open. Ticks along a lane mark `board`, `verify`, `rung`, `park`,
 `wall`, `outcome`, `session` (a session ended — its mode, how it ended, what it cost), `ask` (a
 question or a card was raised or answered) and `policy` (the console answered something by itself);
-`start` ticks sit on the axis itself, one per start of the run, naming its door. The **critical path** highlighted here is the longest dependency chain
-weighted by what each lane MEASURED — not the plan page's estimate, which answers what is left
-rather than what happened.
+`start` ticks sit on the axis itself, one per start of the run, naming its door. A `note` tick is a
+person's note on the run — on its phase's lane when it names a phase that ran, else on the axis — and
+reads `pinned` while it is a standing decision. The **critical path** highlighted here is the longest dependency chain
+weighted by each phase's MEASURED session and verification time, never by a bar still open — not
+the plan page's estimate, which answers what is left rather than what happened.
 
 A phase boarded twice offers **attempt comparison**: what changed between two boardings —
 outcome, model, duration, spend, ladder rung, and every §Verification command whose result moved.
@@ -242,24 +251,41 @@ the header, on every page.
 Everything the old letters reached is in the palette by name: type `ready` for what is next up,
 `stats` or `insights` for the numbers, `guide` for this page.
 
+## The route map
+
+The Phases tab's **Map** view draws the plan as a route: a station per phase, a line per dependency.
+It opens locked, as a picture the page scrolls past; press **Pan & zoom** to drag and pinch it, and the
+**−**, **+** and **Fit** buttons work either way (double-clicking the map fits it too). A plan too big to
+show whole never draws its stations smaller than they can be read. Instead:
+
+- **Fit rows** fits every row of the plan across the frame, then you pan along its waves.
+- The **minimap** strip under the frame shows the whole plan and where you are; press it to go there.
+- **Find a station** searches by number or title — Enter jumps to the next match.
+- The stations are one tab stop: focus the map, then the **arrow keys** walk from station to station.
+
+A station's paint is its status (the eight states below). A **Stuck** phase is drawn in the waiting
+paint with an alert glyph; only a summons — something a person must do — wears the amber ring.
+
 ## The eight states
 
 Every badge in the console is one of eight **UI states**, each with its own colour, icon and plain
 word — and colour is never the only carrier: the word and the icon are always there. Amber is one
-state's alone: **Needs you**. The underlying vocabularies (a run's status, a phase record, the board,
-a situation) each map onto these eight; the tables further down list every word under the state it
-reads as.
+state's alone: **Needs you** — and since 6.0 it is never read off a status word by itself. It comes
+from an open item in your inbox, or from a word that only a person can move: a sign-off, a sign-in,
+an outstanding decision, a landing conflict. Everything else paints what it is, and settled things go
+quiet. The underlying vocabularies (a run's status, a phase record, the board, a situation) each map
+onto these eight; the tables further down list every word under the state it reads as.
 
 | State | Badge | What it means | Underlying words |
 |---|---|---|---|
-| `needs-you` | **Needs you** | Stopped until a person does something — an approval, a gate, a sign-in, a decision, an errand. The only amber. | run `halting` `halted` `parked` `interrupted` · phase `gated` `parked` `awaiting-verification` `interrupted` · board `gated` `blocked` `stuck` · a situation for a person, or any with an errand |
+| `needs-you` | **Needs you** | Stopped until a person does something — an approval, a gate, a sign-in, a decision, an errand. The only amber. | phase `awaiting-verification` (**Awaiting sign-off**) · an MCP server or account to sign in · an outstanding decision · a landing conflict · anything with an open inbox item |
 | `failed` | **Failed** | The attempt failed — a red verification, or a session that produced nothing the board accepts. | phase `failed` · QA `fail` |
-| `running` | **Running** | A session is working right now. The only state that may pulse. | run `running` · phase `running` · board `in-progress` · a machine's situation |
+| `running` | **Running** | A session is working right now, or the run is on its way to a stop. The only state that may pulse. | run `running` `halting` `pausing` `stopping` · phase `running` · board `in-progress` (**In progress**) · a machine's situation |
 | `verifying` | **Verifying** | The session finished; the console is running the plan's §Verification itself. Running's family, drawn dashed on a map or strip. | phase `verifying` |
-| `waiting` | **Waiting** | Asleep on something that settles by itself — a dependency, a usage window, an external clock, a pause you asked for. | run `waiting` `paused` `pausing` `frozen` `stopping` · phase `waiting` · board `waiting` · a situation that waits on time or someone else |
+| `waiting` | **Waiting** | Asleep on something that settles by itself or by a press — a dependency, a usage window, an external clock, a pause you asked for, a halt whose errand waits in the inbox. | run `waiting` `paused` `frozen` `halted` `parked` `interrupted` · phase `waiting` `gated` `parked` `interrupted` · board `waiting` `gated` `blocked` `stuck` (**Stuck**, with an alert glyph) · a situation that waits on time or someone else |
 | `queued` | **Queued** | In line — next up, or behind something holding the same repos. A board phase that is `ready` reads **Next up**. | run `queued` · phase `queued` `pending` · board `ready` · QA `pending` |
-| `skipped` | **Skipped** | Taken off this run's list by the operator. Not finished, not failed. | phase `skipped` · QA `waived` |
-| `done` | **Done** | Finished and recorded on the board. | run `finished` · phase `done` · board `done` · QA `pass` · a situation the board already settled |
+| `skipped` | **Skipped** | Taken off this run's list by the operator. Not finished, not failed. Also how a word the console does not know reads: **Unknown**, never a borrowed colour. | phase `skipped` · QA `waived` · an unknown word |
+| `done` | **Done** | Finished and recorded on the board. | run `finished` (**Finished**) · phase `done` · board `done` · QA `pass` · a situation the board already settled |
 
 A thing several vocabularies describe at once reads as the **worst** of them, in the order above —
 except that the board saying `done` wins over everything: a run record the board has overtaken is
@@ -350,6 +376,7 @@ phase, and the phases already queued or in flight keep their places. A run-level
 | `awaiting-person` | phase | A person was asked — a verification or permission card — and its clock ran out unanswered. |
 | `phase-crashed` | phase | The phase failed inside the runner. |
 | `verification-preflight` | phase | The phase's §Verification gave the runner nothing it could run. |
+| `verify-timeout` | phase | A §Verification command ran past its time limit twice — the second time at double the limit. It is not a failure: raise the phase's `Verify timeout:` or look for a hang, then Re-check. |
 | `mcp-preflight` | phase | An MCP server the phase requires would not connect. |
 | `recovery-failed` | phase | A recovery crashed, or said why it could not finish. |
 | `orphaned-session` | phase | A live session from an earlier console was found still working. |
@@ -378,8 +405,8 @@ shows the UI state's word (`ready` reads **Next up**).
 | `ready` | Next up | Every dependency is met; this phase can start now. | Start it (or the autopilot will), or copy its boot prompt from the phase page. |
 | `in-progress` | Running | A session is on this phase right now. | Watch its lane. The board catches up when the handoff lands. |
 | `waiting` | Waiting | An earlier phase it depends on is not done yet. | Nothing here; finish what it waits on. |
-| `stuck` / `blocked` | Needs you | Its handoff is marked blocked — the Outstanding section says exactly why. | Read the excerpt on the phase page, or use Ways forward on the run page. |
-| `gated` | Needs you | The plan gates this phase — on a person (`manual`), a session's own check (`ai`), or an automatic condition. | The phase page's Gate card shows the steps and the Approve button; ai gates clear themselves when their session boots. |
+| `stuck` / `blocked` | Stuck · Blocked | Its handoff is marked blocked — the Outstanding section says exactly why. Drawn in the waiting paint with an alert glyph; it turns amber only when an errand asks you for something. | Read the excerpt on the phase page, or use Ways forward on the run page. |
+| `gated` | Gated | The plan gates this phase — on a person (`manual`), a session's own check (`ai`), or an automatic condition. | The phase page's Gate card shows the steps and the Approve button; ai gates clear themselves when their session boots. |
 
 ## The claim
 

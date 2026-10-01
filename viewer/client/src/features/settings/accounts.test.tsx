@@ -131,3 +131,97 @@ describe('rename, remove, and a broken login', () => {
     expect(screen.getByRole('button', { name: 'Sign in again' })).toBeTruthy();
   });
 });
+
+describe('the unattended path (control-tower phase 91, #147)', () => {
+  const OFFER =
+    'For runs left alone for days, add a long-lived token for this login: run `claude setup-token`, sign in as the same person, and paste the token under Add account ▸ Token.';
+
+  it('offers a long-lived token where every account is a login that lapses, and opens the paste dialog from it', async () => {
+    accountsMock.mockResolvedValue({
+      allowAccounts: true,
+      accounts: [
+        {
+          id: 'default',
+          kind: 'default',
+          builtIn: true,
+          email: 'me@example.com',
+          authState: 'ok',
+          unattended: OFFER,
+        },
+      ],
+    });
+    mount();
+    expect(await screen.findByText(/For runs left alone for days/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Add a long-lived token…' }));
+    expect(await screen.findByText('Add a token account')).toBeTruthy();
+  });
+
+  it('names when a token must be replaced, and warns in its last fortnight — never "unknown"', async () => {
+    accountsMock.mockResolvedValue({
+      allowAccounts: true,
+      accounts: [
+        { id: 'default', kind: 'default', builtIn: true, email: 'me@example.com', unattended: OFFER },
+        {
+          id: 'unattended',
+          kind: 'token',
+          builtIn: false,
+          name: 'unattended',
+          authState: 'expiring',
+          tokenExpiresAt: '2026-10-05T00:00:00.000Z',
+        },
+      ],
+    });
+    mount();
+    expect(await screen.findByText(/replace by/)).toBeTruthy();
+    expect(screen.queryByText(/For runs left alone for days/)).toBeNull();
+  });
+});
+
+describe('every row: its email, a verb beside each diagnosis, a retirement’s evidence (phase 25, #33)', () => {
+  it('offers the machine login’s sign-in and a token’s replacement where their diagnoses are', async () => {
+    accountsMock.mockResolvedValue({
+      allowAccounts: true,
+      accounts: [
+        { id: 'default', kind: 'default', builtIn: true, email: 'me@example.com', authState: 'expired' },
+        {
+          id: 'acct-ci',
+          kind: 'token',
+          builtIn: false,
+          name: 'ci',
+          email: 'ci@example.com',
+          authState: 'signed-out',
+          meter: 'broken',
+          entitlement: {
+            state: 'retired',
+            via: 'session',
+            evidence: {
+              source: 'api',
+              matched: 'invalid x-api-key',
+              session: '0123456789abcdef',
+              phase: 2,
+              slug: 'demo',
+            },
+          },
+        },
+      ],
+    } as AccountsState);
+    mount();
+    // The email on every row — the named token's included, where its name alone says nothing.
+    expect((await screen.findAllByText('ci@example.com')).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('me@example.com').length).toBeGreaterThanOrEqual(1);
+    // A verb beside each diagnosis, whatever the kind: before phase 25 only a profile had one here.
+    expect(screen.getAllByRole('button', { name: 'Sign in again' }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByRole('button', { name: 'Copy command' }).length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByRole('button', { name: 'Replace token' }).length).toBeGreaterThanOrEqual(1);
+    // And what the retirement stood on.
+    expect(
+      screen
+        .getAllByTestId('retirement-evidence')
+        .some((node) =>
+          node.textContent?.includes(
+            'from the API · “invalid x-api-key” · session 01234567 · phase 2 of demo',
+          ),
+        ),
+    ).toBe(true);
+  });
+});

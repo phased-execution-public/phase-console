@@ -821,7 +821,7 @@ test('D10 — two belts hold the sweep off: a live run, and a dead one whose chi
 
   // Belt 1: this console is driving run1 right now.
   const live = await sweepStale(root, { stateDir, slug: 'demo', liveRunIds: ['run1'] });
-  assert.deepEqual(live, { removed: [], kept: [], runs: [], lockedForeign: [] });
+  assert.deepEqual(live, { removed: [], kept: [], runs: [], lockedForeign: [], spared: [] });
   assert.ok(await isRegistered(root, names.dir), 'a live run must be untouched');
 
   // Belt 2: run1 is NOT this console's — it belongs to a console that died —
@@ -834,7 +834,7 @@ test('D10 — two belts hold the sweep off: a live run, and a dead one whose chi
     children: (runId) => (runId === 'run1' ? [4242] : []),
     probe: (pid) => pid === 4242,
   });
-  assert.deepEqual(held, { removed: [], kept: [], runs: [], lockedForeign: [] });
+  assert.deepEqual(held, { removed: [], kept: [], runs: [], lockedForeign: [], spared: [] });
   assert.ok(await isRegistered(root, names.dir));
 
   // …and once that pid is gone, the same call sweeps.
@@ -899,7 +899,7 @@ test('D10 — an operator\'s uncommitted hand-resolution in `integration/` is ne
 test('D10 — a plan that never used worktrees costs the sweep nothing', async () => {
   const { root, stateDir } = fixture();
   const swept = await sweepStale(root, { stateDir, slug: 'demo', liveRunIds: [] });
-  assert.deepEqual(swept, { removed: [], kept: [], runs: [], lockedForeign: [] });
+  assert.deepEqual(swept, { removed: [], kept: [], runs: [], lockedForeign: [], spared: [] });
   assert.equal(git(root, 'worktree', 'list').split('\n').length, 1, 'nothing was created');
 });
 
@@ -1039,8 +1039,10 @@ test('every refusal reason is a sentence, and every reason has a key', () => {
   // no producer is a claim about a state that cannot happen.
   const keys = Object.keys(REFUSAL_REASON).sort();
   assert.deepEqual(keys, [
-    'branch-in-use', 'cap-reached', 'has-submodules', 'no-run-branch',
-    'not-a-repo', 'not-opted-in', 'root-scoped', 'scope-outside-root', 'scope-unmapped',
+    'branch-in-use', 'cap-reached', 'has-submodules',
+    // A mount path holding content the run did not put there (control-tower phase 90, #123).
+    'mount-occupied',
+    'no-run-branch', 'not-a-repo', 'not-opted-in', 'root-scoped', 'scope-outside-root', 'scope-unmapped',
     'setup-failed', 'worktree-failed',
   ]);
   for (const [key, text] of Object.entries(REFUSAL_REASON)) {

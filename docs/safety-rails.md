@@ -74,10 +74,11 @@ that same `permission.destructive` row.
 
 
 **Every session carries two caps.** Every `claude -p` the spawn door starts passes `--max-budget-usd`
-and `--max-turns`, and its `phase.session` line names the policy that set each. With no
-`phaseBudgetUsd` on the run, the phase's size decides — `S` $25 and 150 turns, `M` $60 and 300, `L`
-$120 and 600 (`SESSION_CAPS_BY_SIZE`, `viewer/server/runner/session-record.ts`); a side session gets
-a quarter of those dollars, never under $1. A cap that bites is not a crash: the same session resumes
+and `--max-turns`, and its `phase.session` line names the policy that set each — and, for a measured
+cap, how it was measured. With no `phaseBudgetUsd` on the run, the caps are measured: each mode's p99
+over the console's own sessions of the last two weeks plus 50 %, else the shipped table ($120 and 490
+turns for a phase; `deriveCapTable`, `viewer/server/runner/session-record.ts`, control-tower phase
+59); a side session gets a quarter of those dollars, never under $1. A cap that bites is not a crash: the same session resumes
 under double that cap (`phase.resume {raise}`), so the numbers bound a runaway without cutting a long
 phase. What a size buys: [Session budget](session-budget.md) §3.
 

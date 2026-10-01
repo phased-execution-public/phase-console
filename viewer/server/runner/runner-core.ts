@@ -11,6 +11,8 @@
  * outside this folder is affected by the split.
  */
 
+import type { DeclareInput, HumanStep } from '../human-steps.ts';
+import type { TreeHold } from './tree-state.ts';
 import type { OccupiedTree } from './worktree.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -23,20 +25,26 @@ import {
   hoursText, DEFAULT_WAIT_BUDGET_MS as WAIT_BUDGET_DEFAULT, WAIT_MAX_PER_PHASE as WAITS_PER_PHASE,
   type WaitBudgetSource,
 } from './wait-budget.ts';
-import { QA_FIX_STRATEGIES, type QaFixStrategy, type RelayMode } from '../../shared/run-settings.js';
+import {
+  LIVE_LANE_LOCKED_FIELDS, QA_FIX_STRATEGIES, RELAY_MODES, type QaFixStrategy, type RelayMode,
+} from '../../shared/run-settings.js';
 import { RELAY_WINDOW_MS } from '../../shared/relay-model.js';
 import type { PollEpisode } from '../../shared/poll-loop.js';
 import { CONTEXT_CHECKPOINT_FRACTION, tokensLabel, type ResumePolicy } from './usage.ts';
+import type { CapTable } from './session-record.ts';
+import { landingDirective } from '../watch-refs.ts';
 import { log } from '../log.ts';
 import { onShutdown, offShutdown } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
+import { SCRIPTS_REF, sameCommit } from '../skill-copy.ts';
 import type { ReviewerFacts, ReviewerReport, ReviewerVerdictPolicy } from '../reviewer.ts';
+import type { ConnectivityProbe } from '../connectivity-probe.ts';
 import {
   classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
-import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent } from './spawn.ts';
+import { EFFORTS, markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnRequest, type StreamEvent, type PermissionMode } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
 import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
@@ -59,12 +67,12 @@ import {
 import {
   accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { Actor, AccountRequirement, ResolvedManifest, RungRecord, RunVerifyApprovals } from './state.ts';
+import type { Actor, AccountChoice, AccountRequirement, ResolvedManifest, RungRecord, RunNote, RunVerifyApprovals } from './state.ts';
 import type { PolicyInputs } from '../../shared/policy-model.js';
 import {
   childrenOf, loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
   PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
-  settleInFlightRecords,
+  settleInFlightRecords, keepAccountInPool,
   type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
@@ -91,7 +99,7 @@ import { Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
 // Type-only, deliberately: the runner holds no runtime import of the accounts
 // facade (zero-touch-console phase 4's cycle rule); these shapes are erased.
-import type { AccountKind, HeadroomVerdict, LeaveReason, LeaveResult } from '../accounts/index.ts';
+import type { AccountKind, HeadroomVerdict, LeaveReason, LeaveResult, SessionCredit, SwitchCandidates } from '../accounts/index.ts';
 import type { AccountSessions } from '../sessions/registry.ts';
 import type { McpTransport } from '../../shared/ops-vocab.js';
 import type { PortResult } from '../accounts/transcripts.ts';
@@ -101,9 +109,9 @@ import {
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
 import type {
-  GitMode, PhaseLifecycle, PhaseLifecycleState, ReviewerPolicy, UltraReviewMode,
+  GitMode, ModelPolicy, PhaseLifecycle, PhaseLifecycleState, ReviewerPolicy, UltraReviewMode,
 } from '../../shared/run-lifecycle.js';
-import { phaseLifecycle } from '../../shared/run-lifecycle.js';
+import { DEFAULT_MODEL_POLICY, phaseLifecycle } from '../../shared/run-lifecycle.js';
 
 
 export type RunnerEvent = (event: string, data: Record<string, unknown>) => void;
@@ -196,11 +204,31 @@ export type McpResolution = {
 
 export type RunnerDeps = {
   scriptsDir: string;
+  /**
+   * Record a declared HUMAN STEP (control-tower phase 41): the ledger line,
+   * the one `needs-you` push, the move to `notified` — answered with the step,
+   * or null when the declaration's step was not one (`Service.recordHumanStep`).
+   * Absent: a needs-human with a step parks exactly as one without.
+   */
+  humanStep?: (input: DeclareInput) => HumanStep | null;
+  /**
+   * This plan's scheduling policy (control-tower phase 100) — the plan's own,
+   * else the console's (`Service.schedulingPolicyFor`). Absent: `seniority`.
+   */
+  schedulingPolicy?: (slug: string) => string;
+  /** The plan's critical path over a board, in order (control-tower phase 100) — what `critical-path` promotes. */
+  criticalPath?: (slug: string, board: Board | null) => readonly number[];
   /** Injectable so the loop can be tested without spending money on a model. */
   spawn?: SpawnFn;
   verify?: typeof verifyPhase;
   /** The plan's `**Verification:**` text for a phase, from the service's store. */
   verificationText: (slug: string, phase: number) => Promise<string | undefined> | string | undefined;
+  /**
+   * Will the watch clock RUN a `cmd:` ref the console minted (`watchMintedCmdRefs`,
+   * under `--allow-run`)? Absent or false: a watchdog park arms no minted `cmd:`
+   * ref, since nothing would ever run it (control-tower phase 88, #121 item 3).
+   */
+  mintedCmdRefs?: () => boolean;
   /**
    * The phase's `- **Setup:**` bullet, raw — bring-up run before the
    * verification commands and never part of the verdict (`verify.ts`
@@ -229,6 +257,15 @@ export type RunnerDeps = {
    */
   phaseRepos?: (slug: string, phase: number) => Promise<string[] | undefined> | string[] | undefined;
   /**
+   * The phase's Repos cell as FULL paths — `shop/shop-api`, never the
+   * `shop` that `phaseRepos` truncates it to (control-tower phase 45, #60).
+   * What `scopeDirs` picks directories from, so the working tree is asked
+   * where the phase's work really is. The sibling of `phaseRepos` rather than a
+   * change to it: `splitRepos` stays the NAME view the hint and the analysis
+   * read. Absent, `scopeDirs` falls back to `phaseRepos`.
+   */
+  phaseRepoDirs?: (slug: string, phase: number) => Promise<string[] | undefined> | string[] | undefined;
+  /**
    * Admission control. Without one, every phase runs the moment it is ready —
    * which is exactly what this runner did before lanes existed, and is the
    * right behaviour for a test harness that is not exercising concurrency.
@@ -243,7 +280,7 @@ export type RunnerDeps = {
    * Absent means never frozen — the right answer for a harness that is not
    * exercising it, and the behaviour before this existed.
    */
-  fleetHold?: () => { at: string; by?: string } | null | undefined;
+  fleetHold?: () => { at: string; by?: string; scope?: 'machine' | 'restart'; plans?: readonly string[] } | null | undefined;
   /**
    * The phase's scope tokens, from the plan's Repos column. What the scheduler
    * admits against, and what the child is told it holds (`PE_SCOPE`).
@@ -264,7 +301,11 @@ export type RunnerDeps = {
    * nobody was told. Read from the store, exactly as the verification text is,
    * because the plan is the source for what a phase needs.
    */
-  phaseDefaults?: (slug: string, phase: number) => { model?: string; effort?: string } | undefined;
+  phaseDefaults?: (slug: string, phase: number) => {
+    model?: string; effort?: string; permissionMode?: string;
+    /** The plan's `**Model policy:**` for the phase — its bullet, else the plan's line (#91). */
+    modelPolicy?: ModelPolicy;
+  } | undefined;
   /**
    * The MCP servers the PLAN says a phase needs — its §Session budget line
    * unioned with the phase's own `**MCP:**` bullet, as `phase-graph.sh --mcp N`
@@ -463,6 +504,14 @@ export type RunnerDeps = {
    */
   occupiedTrees?: (scope: readonly string[]) => readonly OccupiedTree[];
   /**
+   * Every standing hold on a shared tree (control-tower phase 40, #41) — the
+   * records under `<state>/trees/`, read fresh at every admission scan. Absent
+   * reads them from disk (`readHolds`); a test states its own.
+   */
+  treeHolds?: () => readonly TreeHold[];
+  /** How often a phase queued in a shared checkout re-reads its trees, in ms (`TREE_POLL_MS`). */
+  treePollMs?: number;
+  /**
    * Every run id this CONSOLE is driving right now, across all its plans (SWP-2).
    *
    * 🔴 The drive sweep passed `[state.id]` — this Runner's own run and nothing
@@ -527,6 +576,58 @@ export type RunnerDeps = {
    * breaker, and never throws. Absent in harnesses: no quota door.
    */
   accountHeadroom?: (accountId: string | undefined, forModel?: string) => HeadroomVerdict;
+  /**
+   * A session spent under this account and ended well (control-tower phase
+   * 54, #78): the service's `accounts.noteSpend`, which lifts the account's
+   * shared walls, the spent model's own and a usage cooling, and answers what
+   * moved. The runner then re-reads the walls its phases are parked on.
+   */
+  noteSpend?: (accountId: string | undefined, model?: string) => { lifted: string[]; cooled: boolean; entitlement?: unknown } | void;
+  /** Re-read one account's usage meters now (the service's `accounts.refreshUsage`) — the wall re-probe's poll. */
+  refreshUsage?: (accountId: string | undefined) => Promise<unknown>;
+  /** Test seam: the wall re-probe's back-off, in ms (default `WALL_REPROBE_BACKOFF_MS`). */
+  wallReprobeBackoffMs?: readonly number[];
+  /** Test seam: the engine-busy back-off, in ms (default `ENGINE_BUSY_BACKOFF_MS`). */
+  engineBusyBackoffMs?: readonly number[];
+  /**
+   * An account's room NOW (the service's `Accounts.roomOf`): the percent its
+   * tightest live window has left — 0 under a learned wall or the breaker,
+   * null when nothing was read — and when its wall lifts. What the drive
+   * loop's own `switch-account` rung weighs a target against the walled
+   * account with (control-tower phase 79, #98), through phase 78's
+   * `switchRungDecision`: never onto less headroom. Absent in harnesses: every
+   * room is unknown, which the decision reads as not known to be worse.
+   */
+  accountRoom?: (accountId: string | undefined, forModel?: string) =>
+    { ok: boolean; headroomPct: number | null; resetsAt?: string | null; why?: string };
+  /**
+   * Do credits carry this account past its plan windows right now
+   * (control-tower phase 93, #146; `Accounts.creditCarries`)? While they do,
+   * no plan-window reading decides anything: the 95 % decision is not taken
+   * and the live wall does not act on a number the CLI is paying past.
+   */
+  creditCarries?: (accountId: string | undefined) => boolean;
+  /** A session's overage fields, for the account it spends (`Accounts.noteSessionCredit`, #146). */
+  noteSessionCredit?: (accountId: string | undefined, info: SessionCredit) => void;
+  /**
+   * How long the drive loop's ladder pass trusts "this record has not changed
+   * since I last climbed it" (`ladderSeen`, control-tower phase 79, #114) —
+   * the service's `convergeEveryMs`, so the loop re-judges a phase it skipped
+   * as often as the healer re-judges a stopped run. Default
+   * `LADDER_SEEN_TTL_MS`.
+   */
+  ladderSeenTtlMs?: () => number;
+  /**
+   * How many registered accounts this console could spend under, and how many
+   * of them the breaker currently refuses. The service's `accountsUsable`.
+   *
+   * A count rather than a list, because what the operator needs is the ONE
+   * fact the halt card could not say: whether switching accounts is even an
+   * option. The measured incident had four runs reading "halted — the API
+   * refused the connection", with the information that EVERY account on the
+   * machine was unusable sitting on a different page nobody was looking at.
+   */
+  accountsUsable?: () => { unusable: number; total: number };
   /**
    * Can the SERVICE drive this rung on a stopped run (zero-touch-console
    * phase 10, LFC-2)? The drive loop's own vehicles are the few `hintFor`
@@ -620,6 +721,13 @@ export type RunnerDeps = {
   /** The ladder's caps (Settings ▸ Automation). Absent = the shipped defaults. */
   ladderCaps?: () => Partial<LadderCaps>;
   /**
+   * The session caps this console measured from its own `phase.session` lines
+   * — each mode's p99 + headroom, re-derived as sessions accrue (control-tower
+   * phase 59, #83; `session-record.ts` `deriveCapTable`). Absent, or null
+   * before the first derivation, is the shipped table.
+   */
+  sessionCaps?: () => CapTable | null | undefined;
+  /**
    * Every ladder rung this console climbed TODAY, across every run.
    *
    * A dep and not a field, because the per-day cap is the one ladder cap whose
@@ -655,6 +763,16 @@ export type RunnerDeps = {
    * preflight parks it with "add a §Verification command, then Retry".
    */
   allowUnverifiedPhases?: () => boolean;
+  /**
+   * Does a phase take a §Verification BASELINE at its first boarding
+   * (control-tower phase 83, #103)? — the run of its lines on the tree it boards
+   * on, reused from the plan's ledger when a run on that very tree exists and
+   * measured otherwise, so a red already there is recorded inherited rather
+   * than failing a phase that could not have caused it. The service answers
+   * yes; absent is no, so a harness verifier is never asked at boarding by a
+   * test that did not mean it to be.
+   */
+  verifyBaseline?: () => boolean;
   /**
    * May a `human` gate be briefed to the phase's own session to verify and
    * clear, instead of stopping the run for a person? Absent = no, and that is
@@ -735,6 +853,34 @@ export type RunnerDeps = {
    */
   rankAccounts?: (excluding: string | undefined, forModel?: string) => string[];
   /**
+   * The switch picker a wall moves the run by (control-tower phase 78, #100) —
+   * `Accounts.switchCandidates`: the rank inside the run's pool, less every
+   * account that would wall before `until` (the reset of the wall being left),
+   * with each one it passed over and the soonest a walled pool member frees up.
+   * Absent in harnesses, where the failover ranks by `rankAccounts` /
+   * `pickAccount` as it always did.
+   */
+  switchCandidates?: (
+    excluding: string | undefined, forModel: string | undefined,
+    opts: { until: number | null; pool: readonly string[] | null; floors?: Readonly<Record<string, number>> | null; usage?: boolean },
+  ) => SwitchCandidates;
+  /**
+   * A switch moved the run back onto the account a person had moved it away
+   * from (control-tower phase 78, #106). Told to the service so it announces
+   * under `limits` — the runner has no notification vocabulary of its own, and
+   * a person's choice undone in silence is how #106 was found by hand.
+   */
+  /**
+   * WHO an account id answers right now (control-tower phase 91, #131) — the
+   * facade's `identityOf`, read afresh from the CLI's own files. A run binds
+   * to its answer at start and compares it before every boarding. Absent in
+   * harnesses: nothing is bound and nothing compared.
+   */
+  identityOf?: (accountId: string | undefined) => { account: string; key: string; email?: string; org?: string } | undefined;
+  onAccountSwitchReverted?: (
+    state: RunState, detail: { from: string; to: string; choice: AccountChoice; by: string; reason: string },
+  ) => void;
+  /**
    * The child spawner `claude ultrareview` is started through.
    *
    * A test seam and nothing more — absent means `node:child_process`. It exists
@@ -797,6 +943,13 @@ export type RunnerDeps = {
    */
   mcpIds?: () => string[];
   /**
+   * The console's commit and the skill copy a session of this run loads — the
+   * plugin install of the config dir the run's account spawns under (#151).
+   * Read at every boarding, so an update that lands mid-run is said to the
+   * next session. Absent (a harness): the boot prompt says nothing about either.
+   */
+  consoleSkill?: (accountId?: string) => ConsoleSkillFacts | null;
+  /**
    * The messaging half a runner cannot reach on its own (5.1.0).
    *
    * The TYPE is free — it names no Pro module, only functions — while every
@@ -825,12 +978,22 @@ export type RunnerDeps = {
     on?: (slug: string) => boolean | undefined;
     token?: (runId: string) => string | null;
     deliverBoot?: (slug: string, phase: number, opts: { sessionId?: string }) => string | null;
+    /** The boarding's session started — its next-attempt notes are delivered (control-tower phase 98). */
+    confirmBoot?: (slug: string, phase: number, sessionId: string) => void;
   };
   /** Lease keepalive cadence override — tests only; defaults to `LEASE_REFRESH_MS`. */
   leaseRefreshMs?: number;
   /** Minimum park window override — tests only; defaults to one minute. */
   waitFloorMs?: number;
   now?: () => Date;
+  /**
+   * What a lane waiting out an outage asks "is the API back?" (control-tower
+   * phase 80, #108) — phase 76's `ConnectivityProbe`. The service passes one
+   * and shares it with every run it starts, so one look a minute serves every
+   * waiting lane. Absent (a test harness), the wait is its backstop clock
+   * alone and nothing touches the network.
+   */
+  connectivity?: ConnectivityProbe;
   /**
    * The console's stall thresholds (`config.ts` prefs), read fresh on every
    * evaluation so a number changed in Settings applies to the lane already
@@ -888,14 +1051,25 @@ export type StartOptions = {
   qaModel?: string;
   qaEffort?: string;
   qaMaxRounds?: number;
+  /** An approval card's timeout, in minutes (control-tower phase 97, #140) — see `RunState`. */
+  approvalTimeoutMinutes?: number;
   /** QA recovery's fix strategy and per-round stop — `shared/run-settings.js`. */
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
+  /** The run's own ladder rung caps (control-tower phase 5, #14); `null` on a patch clears one. */
+  ladderPerRunRungs?: number | null;
+  ladderPerPhaseRungs?: number | null;
   autonomy?: Autonomy;
   phaseBudgetUsd?: number | null;
   runBudgetUsd?: number | null;
   /** Continue this run id instead of creating one. */
   resumeRunId?: string;
+  /**
+   * A person's Repair checkout press (control-tower phase 90, #139): this
+   * drive's checkout decision may move DIRTY or UNPUSHED foreign content at a
+   * mount to `stale-mounts/` — never delete it. Only on a resume; spent by it.
+   */
+  repairCheckout?: { by: string };
   /** Drive only these phases, then finish. Absent means the whole plan. */
   onlyPhases?: number[];
   /** Per-phase model / effort / tools / skills, keyed by phase number. */
@@ -908,6 +1082,8 @@ export type StartOptions = {
   mcpPolicy?: McpPolicy;
   /** How much this run may do unasked. Defaults to `guarded`. */
   permissionProfile?: PermissionProfile;
+  /** The run's default permission mode (control-tower phase 11). Absent = `acceptEdits`. */
+  permissionMode?: PermissionMode;
   /** Lanes this run may fill. Never above the console's own cap. */
   maxParallel?: number;
   /**
@@ -968,6 +1144,8 @@ export type StartOptions = {
   accountId?: string;
   /** What to do at the shared usage window. Absent = `wait`, the old behavior. */
   onLimit?: OnLimitPolicy;
+  /** What the run may do to a phase's model (control-tower phase 54, #91). Absent = `ladder`. */
+  modelPolicy?: ModelPolicy;
   /**
    * The prelude's answers (phase 11, ZTD-2): the launch form's four required
    * fields, and the manifest the Service resolved at the door — echoed whole
@@ -982,6 +1160,17 @@ export type StartOptions = {
   acknowledgedWaivers?: string[];
   manifest?: ResolvedManifest;
   manifestOverride?: { rows: string[]; by: string };
+  /**
+   * The launch's answer to the prelude's git-strategy rows (control-tower
+   * phase 11, #18): `honour` makes the plan's lines hold where the console
+   * can, `override` runs over them and tells the sessions. Only the launch
+   * form sends it; `gitStrategyAckRequired` is that door saying so — every
+   * other door answers `override` for itself.
+   */
+  gitStrategyAck?: 'honour' | 'override';
+  gitStrategyAckRequired?: boolean;
+  /** The lines this run runs over, as `startRun` resolved them — stored on the run for the boot prompt. */
+  gitStrategyOverride?: { lines: { kind: string; plan: string; run: string; phases?: number[] }[]; ack: 'override' | 'automatic'; by?: string; at?: string };
   /** The start door's §Verification answers (`RunVerifyApprovals`) — absent on a resume, whose stored answers stand. */
   verifyApprovals?: RunVerifyApprovals;
   /**
@@ -1071,6 +1260,14 @@ export type RecoverOptions = {
    * the service's `recoverPhase` always passes one.
    */
   fingerprint?: string;
+  /**
+   * A person's press rather than a ladder rung (control-tower phase 53, #54):
+   * a `resume` that then cannot resume leaves the phase hinted to board fresh
+   * with the resume brief and the instruction, and the press continues the
+   * run — the words are never lost. A rung's own resume leaves the next move
+   * to the ladder, exactly as before.
+   */
+  person?: boolean;
 };
 
 /**
@@ -1090,14 +1287,20 @@ export { CLOSEOUT_MAX_TURNS, REPAIR_MAX_TURNS } from './session-record.ts';
 
 /** Per phase: one first try, plus room for a model switch, a resume and a retry. */
 export const MAX_ATTEMPTS = 4;
+
 /**
- * Per verification command. Half an hour, stated here rather than left to
- * `verify.ts`'s default, because the number is a statement about what a phase's
- * verification IS: a full suite, often a build, sometimes a container. At the
- * old default a slow-but-green check came back red at fifteen minutes and
- * halted a phase that had done nothing wrong.
+ * How long a PINNED phase waits before trying its own model again after a
+ * capacity refusal that names no window (control-tower phase 54, #91) — where
+ * `ladder` would have stepped down at once. Five minutes: the CLI has already
+ * spent its own retries on the 529 by the time the disposition reaches here.
  */
-export const VERIFY_TIMEOUT_MS = 30 * 60_000;
+export const PINNED_CAPACITY_RETRY_MS = 5 * 60_000;
+/**
+ * Per verification command, when neither the plan nor the line's measured
+ * history says more (control-tower phase 83, #95) — owned by `verify.ts`, and
+ * re-exported here under the name every runner module already imports.
+ */
+export { VERIFY_TIMEOUT_MS } from './verify.ts';
 /**
  * How much of a failed command's output rides the LIVE verify stream.
  *
@@ -1160,6 +1363,14 @@ export {
  * naming the holder. Bounds the dead-but-unexpired-lock case.
  */
 export const LOCK_WAIT_CAP_MS = 2 * 60 * 60_000;
+
+/**
+ * How often a phase waiting in the queue writes down that it is still waiting
+ * (`PhaseRecord.queueSeenAt`, control-tower phase 60, #81) — the instant a
+ * console restart ends its open episode at. A change of holder or a close
+ * writes it at once; this bounds how much of a quiet wait a crash can lose.
+ */
+export const QUEUE_SEEN_PERSIST_MS = 5 * 60_000;
 /**
  * The lease keepalive cadence.
  *
@@ -1192,6 +1403,19 @@ export const LEASE_REFRESH_MS = 10 * 60_000;
  * number, not that one.
  */
 export const RUNNER_LEASE_S = 5400;
+
+/**
+ * The environment that tells `phase-lock.sh` the CONSOLE mirrors this run's
+ * locks to git (control-tower phase 63, #85). Every session the runner spawns
+ * carries it (`claimEnv`), and so does every boot prompt it asks the engine
+ * for, which then prints file-only claim and conflicts lines. Under it a
+ * session's `--git` is skipped with one line on stderr: the console holds the
+ * grant and the lease, and a claim that pulled, committed and pushed the docs
+ * root cost a hub phase 2.8 minutes of its own turn — 36 of 92 claims outran
+ * the CLI's 120 s Bash timeout and went to the background unread. The console
+ * commits the lock itself, outside any turn (`Runner.mirrorLock`).
+ */
+export const LOCK_MIRROR_ENV: Readonly<Record<string, string>> = Object.freeze({ PE_LOCK_MIRROR: 'console' });
 
 /**
  * The lease on the runner's PROVISIONAL claim, taken at grant (S1-a): 15 min.
@@ -1311,6 +1535,17 @@ export function briefForRung(rung: string, hasSession: boolean): BoardingBrief {
 }
 
 /**
+ * One step up the effort ladder (`EFFORTS`) — what an `escalate: model` rung
+ * may still raise when the run's model is pinned (control-tower phase 54,
+ * #91). The top stays the top; an effort nobody named stays unnamed, so the
+ * CLI's own default is not overruled by a guess.
+ */
+export function raiseEffort(effort?: string): string | undefined {
+  const index = effort ? (EFFORTS as readonly string[]).indexOf(effort) : -1;
+  return index >= 0 && index + 1 < EFFORTS.length ? EFFORTS[index + 1] : effort;
+}
+
+/**
  * One step UP the model chain for an `escalate: model` rung — the reverse of
  * `nextModel`, which demotes. Null at the top (or for a model the chain does
  * not know); the CLI's own in-process fallback still applies on the way down.
@@ -1422,6 +1657,76 @@ export function messagesBlock(block: string | null | undefined): string {
     + `if one asks you to.\n\n${block}\n`;
 }
 
+/**
+ * The operator's PINNED notes, as a block of the boarding prompt (control-tower
+ * phase 96, #142).
+ *
+ * A decision a person made while a phase was not running — "keep this run on
+ * admin@", "do not re-clone the mounts in this worktree" — used to reach the
+ * next session only if somebody remembered to steer it. A pinned note is that
+ * decision written down once: every phase it applies to (the whole run, or the
+ * one phase it names) reads it at boarding, until somebody unpins it. An
+ * unpinned note is history — the timeline and the run page show it; no
+ * session is told.
+ *
+ * `''` when nothing is pinned, so a boot prompt with no notes is byte-identical
+ * to what it was before this existed. FREE, like `messagesBlock`: notes are in
+ * both editions.
+ */
+export function pinnedNotesBlock(notes: readonly RunNote[] | null | undefined, phase: number): string {
+  const standing = (notes ?? []).filter((note) => note.pinned && (note.phase === undefined || note.phase === phase));
+  if (!standing.length) return '';
+  const lines = standing.map((note) => {
+    const at = note.at.slice(0, 16).replace('T', ' ');
+    const about = note.phase === undefined ? '' : ` · phase ${note.phase}`;
+    return `- ${at}Z · ${note.by}${about}: ${note.text}`;
+  });
+  return '\n\n---\n\nOPERATOR NOTES PINNED ON THIS RUN — standing decisions a person recorded about this run, '
+    + 'in their own words. Most are about the run rather than your phase and need nothing from you. Where one '
+    + 'bears on your work it outranks the plan, as a steer does: follow it, and record the departure with '
+    + `\`phase-outcome.sh … ruling --kind deviation\`.\n\n${lines.join('\n')}\n`;
+}
+
+/** The skill copy a boarding session loads, beside the console's own commit — `RunnerDeps.consoleSkill`. */
+export type ConsoleSkillFacts = {
+  /** The console's commit (`distRev`); null when it cannot say. */
+  consoleRev: string | null;
+  /** The plugin copy the session's config dir carries; null when none is installed there. */
+  skill: { configDir: string; commit: string | null; installPath: string } | null;
+};
+
+/**
+ * The console's commit and the one indirection for its scripts, said to every
+ * session it boards (control-tower phase 98, #151) — and, when the skill that
+ * session loaded is a plugin copy at ANOTHER commit, that too. Appended by the
+ * runner like the contract above, because only the console knows either fact:
+ * a session reads SKILL.md from whatever copy Claude Code loaded, and nothing
+ * in it can say how far that copy is from the scripts it is told to run.
+ *
+ * `''` when nothing was wired or there is nothing to say — a harness, or an
+ * unbuilt console with no copy — so those prompts stay what they always were.
+ */
+export function consoleSkillDirective(facts: ConsoleSkillFacts | null | undefined): string {
+  if (!facts || (!facts.consoleRev && !facts.skill)) return '';
+  const rev = facts.consoleRev ? facts.consoleRev.slice(0, 12) : 'an unstamped build';
+  const lines = [
+    '',
+    '',
+    `CONSOLE AND SKILL: this console runs phased-execution at ${rev}, and its scripts are ${SCRIPTS_REF}. Run every`,
+    `skill script as \`bash ${SCRIPTS_REF}/<script>\` — never from a skill copy's own directory, and never from a path`,
+    'an older handoff wrote down; name it the same way in anything you write.',
+  ];
+  const skill = facts.skill;
+  if (skill?.commit && sameCommit(skill.commit, facts.consoleRev) === false) {
+    lines.push(
+      `The /phased-execution skill this session loaded is the plugin copy in ${skill.configDir}, at ${skill.commit.slice(0, 12)} —`,
+      'ANOTHER commit than this console. Where SKILL.md and this prompt disagree about a script, a flag or a rule, this',
+      `prompt and ${SCRIPTS_REF} win: they are this console's. The operator is told (the console's inbox shows it).`,
+    );
+  }
+  return lines.join('\n');
+}
+
 export function unattendedDirective(
   scriptsDir: string, slug: string, phase: number,
   wait: { budgetMs: number; source: WaitBudgetSource } = { budgetMs: WAIT_BUDGET_DEFAULT, source: 'default' },
@@ -1444,12 +1749,21 @@ export function unattendedDirective(
     '        --wait-minutes <realistic-window> --reason "<what you are waiting on>" --watch <ref>',
     '  The supervisor parks the phase and RESUMES THIS SESSION when the window elapses — inside',
     `  this phase's wait budget: at most ${WAITS_PER_PHASE} waits (WAIT_MAX_PER_PHASE) and ${hoursText(wait.budgetMs)} parked in total`,
-    `  (${WAIT_BUDGET_WORDS[wait.source]}). A window past what is left is REFUSED with a`,
-    '  `waiting-external-timeout` halt, never shortened: name the real end of the wait, and a',
-    '  longer wait needs the plan to say so (`- **Waits on:** <ref> · <max>` on the phase).',
+    `  (${WAIT_BUDGET_WORDS[wait.source]}). Past what is left, a wait naming a --watch ref the console`,
+    '  can poll is given what is left and then waits on that ref alone; one naming none parks on a',
+    '  spent budget with a `budgets` errand — never a failure, and no clock resumes it until a',
+    '  person raises the budget. So name the ref and the real end of the wait; a longer wait',
+    '  needs the plan to say so (`- **Waits on:** <ref> · <max>` on the phase).',
+    '  If phase-outcome.sh exits 3, a --watch ref has ALREADY landed: nothing was parked, so do',
+    '  not stop — carry on with the phase from what landed.',
     '- Blocked on a lock or scope conflict? Do not wait for a user reply that cannot come:',
-    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs lock --reason "lock held by <owner>" --watch lock:${slug}/${phase}`,
-    '  then stop; the supervisor queues the retry for when the lock frees.',
+    `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs lock --reason "lock held by <owner>" --watch lock:<holder-slug>/<holder-phase>`,
+    // The HOLDER's lock, never this phase's own (#42): the console claimed that
+    // one for this session and releases it at its closeout, so a watch on it
+    // fired on the phase's own teardown. The script now refuses it.
+    "  naming the lock phase-lock.sh conflicts reported — never this phase's own, which this session",
+    '  holds and its closeout releases (the script refuses that watch). Then stop; the supervisor',
+    '  queues the retry for when that lock frees.',
     '- Need a person (an MCP sign-in, a manual gate, credentials)? Declare it and stop:',
     `      bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} needs-human --needs <key> --reason "<what and why>"`,
     // One line, not a restatement: the engine's boot prompt that leads this
@@ -1519,8 +1833,11 @@ const WAIT_BUDGET_WORDS: Record<WaitBudgetSource, string> = {
  *    own window did (a park from before 5.0.0, or a default window shortened
  *    to what was left). The session asked for longer and must be told so.
  *  - `watchdog` — the console parked it by itself; the session declared nothing.
+ *  - `landed` — a watch ref the declaration named LANDED while the run was
+ *    live, and the run's own lane resumes it (`landWatch`, control-tower
+ *    phase 6): the landing, and how it concluded, is the news.
  */
-export type WaitResumeCause = 'declared-window' | 'budget-elapsed' | 'watchdog';
+export type WaitResumeCause = 'declared-window' | 'budget-elapsed' | 'watchdog' | 'landed';
 
 export type WaitResumeFacts = {
   scriptsDir: string;
@@ -1536,6 +1853,8 @@ export type WaitResumeFacts = {
   budgetSource: WaitBudgetSource;
   /** How long past the armed clock this resume actually came. */
   lateMs: number;
+  /** The landing that woke it, for cause `landed` — `declared.landed`. */
+  landed?: { ref: string; detail?: string; step?: { id: string; kind: string; by: string } };
 };
 
 /** Lateness worth saying out loud: past this, "the world may have moved on" is the likely truth. */
@@ -1557,7 +1876,23 @@ export function waitResumePrompt(facts: WaitResumeFacts): string {
   const { scriptsDir, slug, phase, reason, watch, cause } = facts;
   const waitingOn = reason ? ` (you were waiting on: ${reason})` : '';
   const left = hoursText(facts.budgetRemainingMs);
-  const opening: string[] = cause === 'declared-window'
+  const landed = facts.landed;
+  const opening: string[] = cause === 'landed' && landed?.step
+    // A person's turn proven (control-tower phase 43): what the person did is
+    // the news, in the step's words — never "external work landed".
+    ? [
+      `The person's turn phase ${phase} of \`${slug}\` declared is done${waitingOn}: `
+        + `${landed.detail ?? landed.ref}.`,
+      'Carry on from where you parked: re-run what the step unblocked before anything else.',
+    ]
+    : cause === 'landed' && landed
+    ? [
+      `The external work phase ${phase} of \`${slug}\` declared it was waiting on has LANDED${waitingOn}: `
+        + `${landed.ref}${landed.detail ? ` (${landed.detail})` : ''}.`,
+      // The directive is written to run on into a sentence; here it stands alone.
+      landingDirective(landed).replace(/[;,]$/, '.'),
+    ]
+    : cause === 'declared-window'
     ? [`The wait window you declared for phase ${phase} of \`${slug}\` has elapsed${waitingOn}.`]
     : cause === 'budget-elapsed'
       ? [
@@ -1591,8 +1926,9 @@ export function waitResumePrompt(facts: WaitResumeFacts): string {
     `2. If they are STILL not finished, re-file the wait with the real end of it and a watch ref —`,
     `   \`bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} waiting-external --wait-minutes <M> --reason "…" --watch <ref>\` —`,
     `   and stop. Do not sit in the turn waiting. This phase may stay parked ${left} more (its wait`,
-    `   budget is ${hoursText(facts.budgetMs)}, ${WAIT_BUDGET_WORDS[facts.budgetSource]}); a window past that is refused`,
-    '   with a `waiting-external-timeout` halt. If that is not enough, write the handoff `in-progress`',
+    `   budget is ${hoursText(facts.budgetMs)}, ${WAIT_BUDGET_WORDS[facts.budgetSource]}); past that, a wait naming a`,
+    '   --watch ref waits on the ref alone, and one naming none parks on a spent budget for a',
+    '   person. If that is not enough, write the handoff `in-progress`',
     `   and declare \`bash ${scriptsDir}/phase-outcome.sh ${slug} ${phase} blocked --needs waits --reason "…"\` instead.`,
     '3. If they failed, write the handoff `blocked` recording exactly what failed.',
     '',
@@ -1605,6 +1941,27 @@ export function wakeSignal(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((r) => { resolve = r; });
   return { promise, resolve };
+}
+
+/**
+ * What the runner says to a session it resumes after an outage (control-tower
+ * phase 80, #108). The session was working when this machine lost the API and
+ * it is the same conversation, so it needs no boot prompt — only the fact that
+ * it was cut off, and the instruction to carry on. A boot prompt here is what
+ * re-claimed a finished phase's lock and reset its task list in the measured
+ * incident. It deliberately avoids the CLI's own could-not-reach sentence: a
+ * session that quotes its instructions must not read as another outage.
+ */
+export function outageResumePrompt(slug: string, phase: number, waitedMs: number): string {
+  const minutes = Math.max(1, Math.round(waitedMs / 60_000));
+  return [
+    `This machine lost the API while you were working on phase ${phase} of \`${slug}\`, and the console `
+      + `waited about ${minutes} minute${minutes === 1 ? '' : 's'} for it to answer again. It answers now.`,
+    '',
+    'This is the SAME session, resumed: carry on from where you stopped. Do not start the phase over —',
+    'your task list, your lock and your work are where you left them. If you are not sure the last',
+    'step finished, read `git status` and `git log -1` before doing it again.',
+  ].join('\n');
 }
 
 /**
@@ -1635,9 +1992,9 @@ export function closeoutPrompt(slug: string, phase: number, boardState: string, 
       : []),
     '   If verification CANNOT finish because an external process must complete first (a CI',
     '   build, a PR auto-merge, a deploy window), write the handoff `in-progress` instead and',
-    `   declare the wait — \`bash scripts/phase-outcome.sh ${slug} ${phase} waiting-external`,
+    `   declare the wait — \`bash ${SCRIPTS_REF}/phase-outcome.sh ${slug} ${phase} waiting-external`,
     '   --wait-minutes <M> --reason "…"\` — then stop; the supervisor resumes you when it elapses.',
-    `4. Run \`scripts/new-handoff.sh ${slug} ${phase} <title> [status]\`, then fill in the frontmatter`,
+    `4. Run \`bash ${SCRIPTS_REF}/new-handoff.sh ${slug} ${phase} <title> [status]\`, then fill in the frontmatter`,
     '   and the body. Review the generated "Start next phase(s)" section rather than rewriting it.',
     '5. Update `INDEX.md`.',
     '',
@@ -1735,6 +2092,13 @@ export type Lane = {
   phase: number;
   pid: number | null;
   /**
+   * The account this lane's live session spends, stamped when it spawned
+   * (control-tower phase 92): a switch taken at the lanes' boundary moves the
+   * RUN's account while this session finishes on the old one, so a wall it
+   * meets belongs to this account, not to `state.accountId`.
+   */
+  accountId?: string;
+  /**
    * This lane's own git worktree, when the plan opted into worktree lanes and
    * nothing refused (`runner/worktree.ts`). It is the session's cwd and the
    * base its verification resolves `**Verify in:**` against — so a lane with
@@ -1743,6 +2107,13 @@ export type Lane = {
    * paths then read exactly as they did before it existed.
    */
   worktree?: string;
+  /**
+   * The plan's fast gate for this phase, read at boarding (control-tower phase
+   * 89, `fastGateLines`): the §Verification lines the wrap-up checks a
+   * committed WIP with, which the wrap-up notice names. Empty when no line of
+   * the phase is measured fast; absent until the boarding read it.
+   */
+  fastGate?: string[];
   /**
    * The branch that worktree is on — `pe/<slug>-p<N>`, from `laneNames`.
    *
@@ -1833,6 +2204,12 @@ export type Lane = {
   limitHits?: number[];
   /** When the live wall last acted on this lane (ms) — the cooldown's clock. */
   limitActedAt?: number;
+  /**
+   * Every commit this lane's sessions printed (`[branch sha] subject`), across
+   * its attempts — the scope-drift credit's "by its session" (control-tower
+   * phase 63, #88). Abbreviated as git printed them.
+   */
+  sessionCommits?: Set<string>;
   /** The `action: 'none'` decisions this lane has journalled (ms), newest last — `LIMIT_NONE_MAX`'s evidence. */
   limitNones?: number[];
   /**
@@ -1859,6 +2236,22 @@ export type Lane = {
    */
   sessionUsd?: number;
   /**
+   * What the session IN FLIGHT had already booked when it was resumed — its
+   * mark, 0 for a new conversation. A `--resume` reports the conversation's
+   * running total, so `sessionUsd` is that total less this (control-tower
+   * phase 46, #62): the live half never repeats dollars the booked half holds.
+   */
+  liveCostBase?: number;
+  /**
+   * The digest of the last `run:progress` frame this lane emitted.
+   *
+   * In memory, like the two latches below and for the same reason: it exists
+   * only to keep a lane that is thinking from re-sending an identical frame
+   * every three seconds, and a console restart re-arming it costs one extra
+   * frame. See `RunnerBase.progressFrames`.
+   */
+  progressDigest?: string;
+  /**
    * Whether the local-job nudge has already been refused on this lane.
    *
    * In memory on purpose: it exists only to stop one journal line repeating
@@ -1872,6 +2265,16 @@ export type Lane = {
 
 /** How often the liveness ticker evaluates every live lane. */
 export const LIVENESS_TICK_MS = 60_000;
+
+/**
+ * How often a live lane may send a `run:progress` frame.
+ *
+ * The liveness tick is a minute, which is right for what it does — a journal
+ * line, a stall verdict, a resource sample — and far too slow for a person
+ * watching a phase work. Three seconds reads as live, costs a digest per lane
+ * per tick, and sends nothing at all when nothing moved.
+ */
+export const RUN_PROGRESS_TICK_MS = 3_000;
 
 /** How often that tick is allowed to spend subprocesses on the working tree. */
 export const LIVENESS_GIT_EVERY_MS = 5 * 60_000;
@@ -2049,16 +2452,39 @@ export function pollLoopNotice(episode: PollEpisode, outcome = 'phase-outcome.sh
  * session told only "you are big" keeps going; `outcome` is the command prefix
  * the session runs (`bash <scripts>/phase-outcome.sh <slug> <N>`).
  */
-export function contextWrapupNotice(context: number, window: number, outcome = 'bash phase-outcome.sh <slug> <N>'): string {
+export function contextWrapupNotice(
+  context: number, window: number, outcome = 'bash phase-outcome.sh <slug> <N>',
+  where: { shared?: boolean; fastGate?: readonly string[] } = {},
+): string {
   return `Supervisor check: your context is ${tokensLabel(context)} tokens of a ${tokensLabel(window)} window `
     + `(${Math.round((context / window) * 100)} %). Every tool call re-reads all of it, and a session this large `
     + 'is both expensive and past its best. Wrap up now:\n'
     + '  1. Finish the step you are on — do not start another.\n'
-    + '  2. Commit what is done.\n'
+    + `  2. ${wrapupCommitStep(where)}\n`
     + '  3. Write the handoff with status `in-progress`, naming exactly what remains.\n'
     + `  4. Declare it: \`${outcome} partial --reason context\`\n`
     + '  5. Stop. The next attempt boards fresh from the handoff.\n'
     + `At ${Math.round(CONTEXT_CHECKPOINT_FRACTION * 100)} % of the window the console checkpoints this session itself.`;
+}
+
+/**
+ * Step 2 of the wrap-up, as it applies to THIS lane (control-tower phase 89,
+ * #127) — it said "Commit what is done" unconditionally, and on a shared run
+ * branch that commit is instantly every sibling's base: P43's unverified WIP
+ * turned a sibling plan's gate red for every later lane. On a lane of its own
+ * nothing else builds on the branch; on a shared one the notice says what the
+ * console will do with the commit — its fast gate, the `wipRed` record, the
+ * siblings told — or, with no fast line measured, that nothing will check it.
+ */
+export function wrapupCommitStep(where: { shared?: boolean; fastGate?: readonly string[] }): string {
+  if (where.shared === false) return 'Commit what is done — this lane\'s branch is its own; nothing else builds on it until it lands.';
+  const gate = where.fastGate?.length
+    ? `After you stop, the console runs this phase's fast gate on your last commit (${where.fastGate.map((line) => `\`${line}\``).join(', ')}); `
+      + 'if it is red, the red is recorded against THIS phase (`wipRed`) and every sibling is told those files are yours.'
+    : 'No line of this phase\'s §Verification is measured fast, so NOTHING checks your commit before siblings build on it.';
+  return 'Commit only work whose checks you ran green — this branch is SHARED, and every sibling phase builds on your commit. '
+    + `${gate} Leave anything unverified UNCOMMITTED: the next session of this phase finds it in \`git status\`, `
+    + 'and every sibling\'s brief names it as yours.';
 }
 
 /**
@@ -2086,6 +2512,9 @@ export function resumePolicyWhy(policy: ResumePolicy): string {
     case 'partial-context':
       return `it declared \`partial --reason ${policy.reason.slice('partial-'.length)}\` — it said itself that it is spent`;
     case 'account-changed': return `it holds ${size}, cached under another account than the one paying now`;
+    case 'context-wrapup':
+      return `it ended at ${size}, at the wrap-up line of its window — resumed, it would start inside the wrap-up zone `
+        + 'and run to the checkpoint';
     case 'cache-cold':
       return `it holds ${size} and last ran ${policy.idleMs !== null ? hoursText(policy.idleMs) : 'too long'} ago, `
         + 'past the life of its prompt cache';
@@ -2254,6 +2683,54 @@ export const LIMIT_NONE_MAX = 2;
 /** The window those `none` decisions have to land inside — a five-hour wall is hours; an hour is plenty. */
 export const LIMIT_NONE_WINDOW_MS = 60 * 60_000;
 
+/**
+ * How long a phase parked on a usage wall waits between re-probes of its
+ * account (control-tower phase 54, #78): 10, 20, 40, then every 60 minutes.
+ * A wall's reported reset is "until at the latest" — the window can reopen
+ * early (a meter read under the wall, a spend that went through) — and a
+ * phase that trusted the clock sat idle for hours on an account that could
+ * already pay. The back-off keeps the poll gentle on an account that really
+ * is spent; each probe is one usage read, never a session.
+ */
+export const WALL_REPROBE_BACKOFF_MS: readonly number[] = [10, 20, 40, 60].map((minutes) => minutes * 60_000);
+
+/**
+ * How long the drive loop waits before reading the plan again after the engine
+ * TIMED OUT reading it (control-tower phase 81, #104): 15 s, 30 s, 1 min, 2 min,
+ * then 5 min a wait — the last repeated up to `ENGINE_BUSY_MAX_WAITS`, about 24
+ * minutes in all. A timeout is the machine's load, not the plan. Measured on hub
+ * 4123 at a load average of 35–42: a 72-phase run halted `plan-unreadable` over
+ * a plan `validate.sh` called clean in the same minute, and the healer climbed
+ * four plan repairs and a paid agent session over it. Each wait is one board
+ * read, never a session, and charges nothing.
+ */
+export const ENGINE_BUSY_BACKOFF_MS: readonly number[] = [15, 30, 60, 120, 300].map((seconds) => seconds * 1000);
+
+/**
+ * How many timed-out reads in a row the drive loop waits out before it stops the
+ * run `plan-unreadable` — saying how many timed out, so the stop reads as the
+ * machine's and converge relaunches it once the plan reads and lints clean.
+ */
+export const ENGINE_BUSY_MAX_WAITS = 8;
+
+/**
+ * How long a seen ladder fingerprint is trusted (control-tower phase 79, #114):
+ * five minutes, the shipped `convergeEveryMs` (`config.ts` `DEFAULT_PREFS`,
+ * held equal by `ladder-rearm.test.ts` UW-4). `ladderSeen` stops a hot loop —
+ * an unchanged record is not climbed twice in a row — and it had no expiry, so
+ * a phase whose first climb deferred or found no rung was skipped for as long
+ * as the process lived once the world moved under an unchanged record: a wall
+ * lifting, a lane freeing, a handoff edited. The inputs that are known are
+ * cleared the moment they move; this bounds the ones that are not (a foreign
+ * lock released, a gate cleared elsewhere). The healer's own cadence is the
+ * right bound: re-judging a skipped phase more often than a stopped run is
+ * re-judged buys journal lines, not progress, and less often is how a phase
+ * waits an hour on a lane that freed in a minute. The stamp lives BESIDE the
+ * fingerprint, never in it — phase 51's rule: a clock in a fingerprint makes
+ * every pass a change.
+ */
+export const LADDER_SEEN_TTL_MS = 5 * 60_000;
+
 
 /**
  * The settings an operator may change on a run that has already started.
@@ -2266,6 +2743,22 @@ export type RunSettingsPatch = {
   model?: string;
   effort?: string;
   /**
+   * The run's own lane cap and its self-healing switch (control-tower phase 13,
+   * #31). The door read both for a long time and `applySettings` dropped both,
+   * so a lowered cap answered 200 and changed nothing. `maxLanes()` reads the
+   * cap at every admission, so it governs the very next one; `0`/`null` hands
+   * the run back to the console's own cap.
+   */
+  maxParallel?: number | null;
+  autoRecover?: boolean;
+  /**
+   * The plan's QA gate, as the settings door moved it (phase 13). Never stored
+   * on the run — the gate is the PLAN's, written by `Service.setRunQa` before
+   * the patch is applied — and carried here only so the one `run.reconfigured`
+   * line says it moved.
+   */
+  qa?: boolean;
+  /**
    * QA's three, mid-run. An operator watching a run burn rounds on one phase
    * must be able to stop THAT without stopping the run; they land on the next
    * QA dispatch, like every other setting that reaches a session at spawn.
@@ -2273,6 +2766,8 @@ export type RunSettingsPatch = {
   qaModel?: string;
   qaEffort?: string;
   qaMaxRounds?: number;
+  /** An approval card's timeout, in minutes (control-tower phase 97, #140); `null` goes back to the hook call's hour. */
+  approvalTimeoutMinutes?: number | null;
   /**
    * QA recovery's two, mid-run for the same reason: an operator watching a
    * recovery loop board fresh sessions it should be resuming, or spend more per
@@ -2281,6 +2776,9 @@ export type RunSettingsPatch = {
    */
   qaFixStrategy?: QaFixStrategy;
   qaRoundBudgetUsd?: number | null;
+  /** The run's own ladder rung caps (control-tower phase 5, #14); `null` on a patch clears one. */
+  ladderPerRunRungs?: number | null;
+  ladderPerPhaseRungs?: number | null;
   autonomy?: Autonomy;
   phaseBudgetUsd?: number | null;
   runBudgetUsd?: number | null;
@@ -2303,6 +2801,8 @@ export type RunSettingsPatch = {
    */
   mcpPolicy?: McpPolicy;
   permissionProfile?: PermissionProfile;
+  /** The run's default permission mode; `''` clears it back to `acceptEdits`. */
+  permissionMode?: PermissionMode | '';
   gitMode?: GitMode;
   openPr?: boolean;
   /**
@@ -2366,6 +2866,8 @@ export type RunSettingsPatch = {
    * checkpoints the live session first.)
    */
   onLimit?: OnLimitPolicy;
+  /** `pinned` keeps a phase's model from here on; `ladder` returns to stepping (#91). */
+  modelPolicy?: ModelPolicy;
   /**
    * Phase 15's seven, mid-run. `landing` and `conflictPolicy` move BOTH ways
    * — they decide what happens when a phase settles, which has not happened
@@ -2386,7 +2888,63 @@ export type RunSettingsPatch = {
   conflictPolicy?: ConflictPolicy;
   messaging?: MessagingWord;
   issuesMode?: IssueMode;
+  /**
+   * Three of the prelude's answers, after launch (control-tower phase 77,
+   * #101). They answer questions about the run's FUTURE, and a run launched
+   * with the wrong one had no door to change it: a `resumeOnRestart: false`
+   * run stranded at every console restart. `resumeOnRestart` is read at the
+   * next boot, `relay` at the next spawn, `accounts` at the next failover.
+   * An empty pool is no answer and is ignored here (the route 400s it).
+   */
+  resumeOnRestart?: boolean;
+  relay?: RelayMode;
+  accounts?: AccountRequirement[];
 };
+
+/**
+ * The settings a stored run carries — the keys a resume keeps unless its start
+ * NAMES them (control-tower phase 77, #101 #102), and so the keys
+ * `run.resume-settings` compares before and after a resume applies what it
+ * was given. #21's ruling: the stored run is the source of truth.
+ */
+export const RUN_SETTING_KEYS = [
+  'model', 'effort', 'permissionMode', 'autonomy', 'phaseBudgetUsd', 'runBudgetUsd', 'maxConsecutiveFailures',
+  'maxParallel', 'onlyPhases', 'phaseOptions', 'skills', 'mcpServers', 'mcpPolicy', 'permissionProfile',
+  'accountId', 'onLimit', 'modelPolicy', 'gitMode', 'openPr', 'isolation', 'settle', 'priority', 'startAfter',
+  'reviewEachPhase', 'reviewerPolicy', 'ultracode', 'ultraReview', 'qaModel', 'qaEffort', 'qaMaxRounds',
+  'approvalTimeoutMinutes',
+  'ladderPerRunRungs', 'ladderPerPhaseRungs', 'baseBranch', 'maxConcurrentPerRepo', 'worktreeRetention',
+  'landing', 'conflictPolicy', 'messaging', 'issuesMode', 'resumeOnRestart', 'relay', 'accounts',
+] as const satisfies readonly (keyof RunState)[];
+
+/**
+ * What a resume changed, setting by setting: `{from, to}` for each key whose
+ * value moved, `null` standing for "not set". `autoRecover` is compared by
+ * presence — its stored object is the ceiling's bookkeeping, not a choice.
+ */
+export function settingsOverridden(
+  before: Partial<RunState>, after: RunState,
+): Record<string, { from: unknown; to: unknown }> {
+  const out: Record<string, { from: unknown; to: unknown }> = {};
+  for (const key of RUN_SETTING_KEYS) {
+    const from = before[key] ?? null;
+    const to = after[key] ?? null;
+    if (JSON.stringify(from) !== JSON.stringify(to)) out[key] = { from, to };
+  }
+  if (Boolean(before.autoRecover) !== Boolean(after.autoRecover)) {
+    out.autoRecover = { from: Boolean(before.autoRecover), to: Boolean(after.autoRecover) };
+  }
+  return out;
+}
+
+/** A deep copy of the run's settings, taken before a resume touches them. */
+export function settingsSnapshot(state: RunState): Partial<RunState> {
+  const copy: Partial<RunState> = {};
+  for (const key of [...RUN_SETTING_KEYS, 'autoRecover'] as const) {
+    if (state[key] !== undefined) (copy as Record<string, unknown>)[key] = structuredClone(state[key]);
+  }
+  return copy;
+}
 
 /**
  * How far an `issuesMode` word lets a session reach: `off` < `draft` < `file`.
@@ -2411,8 +2969,92 @@ export function branchExists(state: Pick<RunState, 'checkout' | 'workRoot' | 'se
  * on-disk path so the two cannot drift — the whole reason Pause was broken is
  * that one of them existed and the other did not.
  */
+/**
+ * The run's own ladder rung caps (control-tower phase 5, #14), one rule for
+ * both doors that move them — a settings patch and a Continue. Absent says
+ * nothing; a whole number — zero included, which means nothing climbs — sets
+ * one, beating the console's preference; `null` (or anything else) clears it,
+ * and the preference speaks again.
+ */
+export function applyRungCaps(
+  state: RunState,
+  patch: { ladderPerRunRungs?: number | null; ladderPerPhaseRungs?: number | null },
+): void {
+  for (const field of ['ladderPerRunRungs', 'ladderPerPhaseRungs'] as const) {
+    const value = patch[field];
+    if (value === undefined) continue;
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) state[field] = value;
+    else delete state[field];
+  }
+}
+
+/**
+ * What a settings patch replaced: each patched field's value BEFORE it, `null`
+ * for "not set" (control-tower phase 13, #31). `run.reconfigured` recorded
+ * only what a value became, so the journal could never say what it had been.
+ * `qa` is the plan's and is supplied by the door; `attachDefaultSkills` is a
+ * request the service translates, never a field.
+ */
+export function settingsBefore(state: RunState, patch: RunSettingsPatch): Record<string, unknown> {
+  const before: Record<string, unknown> = {};
+  for (const key of Object.keys(patch)) {
+    if (key === 'qa' || key === 'attachDefaultSkills' || patch[key as keyof RunSettingsPatch] === undefined) continue;
+    const value = (state as unknown as Record<string, unknown>)[key];
+    before[key] = value === undefined ? null : structuredClone(value);
+  }
+  return before;
+}
+
+/** A setting the door would not take, by name — why, and the verb that moves it instead when there is one. */
+export type RefusedSetting = { field: string; why: string; verb?: string };
+
+/**
+ * The settings in this patch that cannot move while a lane is in flight
+ * (control-tower phase 13, #31) — `LIVE_LANE_LOCKED_FIELDS`, and only when the
+ * patch would actually CHANGE the run: a form resubmits every field, and
+ * re-asserting the value the run already has is not a move. The change is
+ * judged by applying that one field to a copy, so a word with side effects
+ * (`gitMode` takes `settle`, `openPr` and `isolation` with it) is judged by
+ * all of them.
+ */
+export function lockedSettingRefusals(state: RunState | null, patch: RunSettingsPatch): RefusedSetting[] {
+  if (!state) return [];
+  const lanes = Object.values(state.phases ?? {})
+    .filter((record) => PHASE_IN_FLIGHT.includes(record.status))
+    .map((record) => record.phase)
+    .sort((a, b) => a - b);
+  if (!lanes.length) return [];
+  const refused: RefusedSetting[] = [];
+  for (const field of LIVE_LANE_LOCKED_FIELDS) {
+    const value = patch[field];
+    if (value === undefined) continue;
+    const trial = applySettings(structuredClone(state), { [field]: value } as RunSettingsPatch);
+    if (!Object.keys(settingsOverridden(state, trial)).length) continue;
+    refused.push({
+      field,
+      why: `phase${lanes.length === 1 ? '' : 's'} ${lanes.join(', ')} ${lanes.length === 1 ? 'has' : 'have'} a live `
+        + `session committing in the run's checkout — ${field} decides where that work lands, so it moves only `
+        + 'once the lane has stopped.',
+    });
+  }
+  return refused;
+}
+
 export function applySettings(state: RunState, patch: RunSettingsPatch): RunState {
   if (patch.model) state.model = patch.model;
+  // The run's own lane cap (phase 13): a positive whole number sets it, and
+  // `0`/`null` clears it back to the console's cap — `newRun`'s omission.
+  if (patch.maxParallel !== undefined) {
+    if (typeof patch.maxParallel === 'number' && Number.isInteger(patch.maxParallel) && patch.maxParallel > 0) {
+      state.maxParallel = patch.maxParallel;
+    } else delete state.maxParallel;
+  }
+  // Arming only, the way a Continue arms it (`runner-control.ts`): the old
+  // `attempts` ceiling is retired, and carrying it forward kept it alive.
+  if (patch.autoRecover !== undefined) {
+    if (patch.autoRecover) state.autoRecover = {};
+    else delete state.autoRecover;
+  }
   if (patch.effort !== undefined) {
     if (patch.effort) state.effort = patch.effort;
     else delete state.effort;
@@ -2432,6 +3074,12 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
   if (patch.qaMaxRounds !== undefined && patch.qaMaxRounds > 0) {
     state.qaMaxRounds = patch.qaMaxRounds;
   }
+  // An approval card's timeout (#140): a number sets it, `null` goes back to
+  // the hook call's hour. The door has already judged the range.
+  if (patch.approvalTimeoutMinutes !== undefined) {
+    if (patch.approvalTimeoutMinutes) state.approvalTimeoutMinutes = patch.approvalTimeoutMinutes;
+    else delete state.approvalTimeoutMinutes;
+  }
   // QA recovery's two. The strategy is a closed vocabulary, so anything off it
   // is "stop overriding" and deletes the field — a typo must never be the reason
   // a loop stops resuming and starts paying for fresh sessions. The round budget
@@ -2441,6 +3089,8 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
     if (QA_FIX_STRATEGIES.includes(patch.qaFixStrategy)) state.qaFixStrategy = patch.qaFixStrategy;
     else delete state.qaFixStrategy;
   }
+  // The run's own ladder rung caps — the door a spent cap's errand names.
+  applyRungCaps(state, patch);
   if (patch.qaRoundBudgetUsd !== undefined) {
     if (typeof patch.qaRoundBudgetUsd === 'number' && patch.qaRoundBudgetUsd > 0) {
       state.qaRoundBudgetUsd = patch.qaRoundBudgetUsd;
@@ -2496,6 +3146,13 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
   if (patch.mcpPolicy !== undefined) {
     if (patch.mcpPolicy === 'require') state.mcpPolicy = 'require';
     else delete state.mcpPolicy;
+  }
+  // The run's default permission mode (control-tower phase 11). Read at the
+  // NEXT boarding (`optionsFor`), never by a session already running — a mode
+  // is a spawn flag. Empty clears it back to the machine's `acceptEdits`.
+  if (patch.permissionMode !== undefined) {
+    if (patch.permissionMode) state.permissionMode = patch.permissionMode;
+    else delete state.permissionMode;
   }
   if (patch.permissionProfile) {
     if (patch.permissionProfile === 'guarded') delete state.permissionProfile;
@@ -2564,6 +3221,11 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
     if (patch.onLimit === 'wait') delete state.onLimit;
     else state.onLimit = patch.onLimit;
   }
+  if (patch.modelPolicy !== undefined) {
+    // `ladder` is the absent state on disk, the same convention (#91).
+    if (patch.modelPolicy === DEFAULT_MODEL_POLICY) delete state.modelPolicy;
+    else state.modelPolicy = patch.modelPolicy;
+  }
   // Phase 15's seven — see `RunSettingsPatch` for the rule each obeys. Every
   // one stores its absent state as no key, the convention everything above
   // follows, so a run put back to a default reads as one that never left it.
@@ -2602,6 +3264,18 @@ export function applySettings(state: RunState, patch: RunSettingsPatch): RunStat
     if (patch.issuesMode === DEFAULT_ISSUES) delete state.issuesMode;
     else state.issuesMode = patch.issuesMode;
   }
+  // The prelude's three answers (control-tower phase 77, #101). Stored as
+  // given — `newRun` writes `false` and `off` too, because `converge.ts` reads
+  // an absent `resumeOnRestart` as "never answered", which is a different fact.
+  if (typeof patch.resumeOnRestart === 'boolean') state.resumeOnRestart = patch.resumeOnRestart;
+  if (patch.relay !== undefined && (RELAY_MODES as readonly string[]).includes(patch.relay)) state.relay = patch.relay;
+  if (patch.accounts?.length) {
+    state.accounts = patch.accounts.map((row) => ({ id: row.id, minHeadroomPct: row.minHeadroomPct }));
+  }
+  // The run's own account stays in its pool — the manifest names what the
+  // record names (`keepAccountInPool`, control-tower phase 78): a pool that
+  // left it out would read as a run spending an account it may not spend.
+  keepAccountInPool(state);
   return state;
 }
 

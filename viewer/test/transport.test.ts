@@ -93,12 +93,12 @@ test('If-None-Match is compared weakly, as RFC 9110 requires', () => {
   assert.ok(!etagMatches(undefined, tag));
 });
 
-test('compressing is only ever a saving — and the floor says when to bother', () => {
+test('compressing is only ever a saving — and the floor says when to bother', async () => {
   const body = Buffer.from('a'.repeat(4096));
-  assert.ok(compress(body, 'br').length < body.length);
-  assert.ok(compress(body, 'gzip').length < body.length);
-  assert.equal(brotliDecompressSync(compress(body, 'br')).toString(), body.toString());
-  assert.equal(gunzipSync(compress(body, 'gzip')).toString(), body.toString());
+  assert.ok((await compress(body, 'br')).length < body.length);
+  assert.ok((await compress(body, 'gzip')).length < body.length);
+  assert.equal(brotliDecompressSync((await compress(body, 'br'))).toString(), body.toString());
+  assert.equal(gunzipSync((await compress(body, 'gzip'))).toString(), body.toString());
   assert.equal(MIN_COMPRESS_BYTES, 1024);
 });
 

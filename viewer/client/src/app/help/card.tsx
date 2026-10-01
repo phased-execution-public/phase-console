@@ -13,7 +13,7 @@
  * then runs exactly once per card, at mount, with no re-entry to reason about.
  *
  * A card's title can itself be a status word — `troubleshooting` has a card per
- * resting state — so it goes through the same `decorateStatusWord` the prose
+ * resting state — so it goes through the same `wearStatusWord` the prose
  * does. That is why `halted` in a heading is painted like `halted` in a table.
  */
 
@@ -21,8 +21,7 @@ import { ChevronRight, Link2 } from 'lucide-react';
 import { cardClass } from '@/components/ui';
 import { cn } from '@/lib/cn';
 import { navigate } from '@/app/router';
-import { decorateStatusWord } from '@/components/ui/status-badge';
-import { StatusProse } from './prose';
+import { StatusProse, wearStatusWord } from './prose';
 import type { GuideCard as Card } from './split';
 
 export function GuideCard({
@@ -48,7 +47,7 @@ export function GuideCard({
   open: boolean;
   onToggle: (open: boolean) => void;
 }) {
-  const worn = decorateStatusWord(card.title);
+  const worn = wearStatusWord(card.title);
 
   return (
     <details
@@ -59,7 +58,10 @@ export function GuideCard({
     >
       <summary
         className={cn(
-          'flex cursor-pointer list-none items-start gap-2 px-4 py-3',
+          // The card's own radius, named rather than inherited: the card clips to
+          // its rounded corners, and a summary square at its corners lost them to
+          // the card (the touch tour counted it, control-tower phase 31).
+          'flex cursor-pointer list-none items-start gap-2 rounded-lg px-4 py-3 group-open/card:rounded-b-none',
           'transition-colors duration-fast ease-transit hover:bg-surface-raised',
           '[@media(hover:none)]:min-h-(--tap-min)',
           '[&::-webkit-details-marker]:hidden',
@@ -86,30 +88,28 @@ export function GuideCard({
             card.title
           )}
         </h3>
+      </summary>
 
+      <div className="border-t border-rule px-4 py-3">
+        <StatusProse text={card.body} />
         {/*
           A permalink, not an in-page anchor: `#card-x` IS a route to a hash
-          router, which is the bug the tabbed guide was built to fix. And the
-          click must be stopped dead — inside a `<summary>`, following the link
-          would otherwise also toggle the card shut behind you.
+          router, which is the bug the tabbed guide was built to fix. It lives in
+          the card's body, not its `<summary>`: a link inside the summary is an
+          interactive control inside another (axe's nested-interactive), and a
+          tap on it had to be stopped dead or it toggled the card shut behind you.
         */}
         <a
           href={href}
           onClick={(e) => {
             e.preventDefault();
-            e.stopPropagation();
             navigate(href);
           }}
-          title="Link to this card"
-          aria-label={`Link to ${card.title}`}
-          className="tap-area mt-1 shrink-0 rounded-sm p-1 text-ink-faint opacity-0 transition-opacity duration-fast focus-visible:opacity-100 group-hover/card:opacity-100 [@media(hover:none)]:opacity-100"
+          className="tap-area mt-2 inline-flex items-center gap-1 rounded-sm text-xs text-ink-muted hover:text-ink"
         >
-          <Link2 size={14} aria-hidden />
+          <Link2 size={12} aria-hidden />
+          Link to this card
         </a>
-      </summary>
-
-      <div className="border-t border-rule px-4 py-3">
-        <StatusProse text={card.body} />
       </div>
     </details>
   );

@@ -26,7 +26,10 @@ pre-push hook runs it for you.
 **The gates — `scripts/gates.sh`.** In this order: `tests/run-tests.sh` (shellcheck + bats), the
 engine-parity test, the server suite serially, the three timing-sensitive files with one retry
 each, the client suite, both typechecks, lint, the format check, the build gate (`verify:dist`, a
-scratch build — `--build` builds `client/dist` for real), the scrub, and the tarball assertions.
+scratch build — `--build` builds `client/dist` for real), the real-browser tour (`npm run
+test:e2e` in `viewer/`: a sandboxed console toured in Chromium over four viewports and held to
+`viewer/e2e/baseline.json`; its preflight exits 2, naming the install line, when the pinned
+Playwright's browser revision is missing), the scrub, and the tarball assertions.
 `--quick` is typechecks + lint + format + scrub, under a minute; `--list` prints what a call would
 run; `--ci` reinstalls `viewer/node_modules` first; `--keep-going` runs past a failure. A green full
 run records the sha it verified in `.git/phase-console-gates-ok`. Every `node --test` the gates run,
@@ -66,11 +69,12 @@ wrapper does the two things `prepack` does that the assertions need (the pack `t
 `.ts` sibling, because `viewer/server/fallback-sw.js` is real tracked source sitting among the ~148
 emitted files. `--keep` leaves the tarball in place and prints its path, and `--tree DIR` packs
 another checkout of this repository, which is how a tag behind `HEAD` is released.
-The tarball is **7.1 MB** — 693 entries, 20 MB unpacked, measured at **5.1.0** with the pack `tsc`
-emit in place, which is what a release actually packs (5.0.0 was 5.9 MB and 599 entries, 4.0.0
-4.7 MB and 503; 5.1 added the landing, messaging, issues, trace, retention and reach modules and
-the emitted `.js` beside each; the free tarball is 576 entries).
-`assert-tarball.sh` prints the same 693: this
+The tarball is **8.8 MB** — 973 entries, 24 MB unpacked, measured at **6.0.0** with the pack `tsc`
+emit in place, which is what a release actually packs (5.1.0 was 7.1 MB and 693 entries, 5.0.0
+5.9 MB and 599, 4.0.0 4.7 MB and 503; 6.0 added the status model and its shared vocabularies, the
+person's-turn, queue, lock, clock and budget models, the run's new probes, ledgers and reports, and
+the emitted `.js` beside each; the free tarball is 755 entries).
+`assert-tarball.sh` prints the same 973: this
 tarball carries no directory entries, so the older note about `tar -tzf` counting them no longer
 applies, and the two numbers agreeing is now the expected answer rather than a discrepancy to
 explain. It was ~36 MB until 3.1 shipped the screencast from a
@@ -81,6 +85,103 @@ slack: `server/http/static.ts` serves them and never compresses at request time,
 `check-dist.mjs` gates first paint on the bytes that would actually be **served**. Re-measure with
 `bash .github/scripts/pack-and-assert.sh --keep` and read the file it names, rather than trusting
 this line — a bare `npm pack --dry-run` skips the emit and undercounts by the ~148 files it adds.
+
+## Upgrading to 6.0.0
+
+The root `package.json` says 6.0.0, and `CHANGELOG.md` carries its section. 6.0.0 is a **major**
+version: the console's home, the plan page's tabs and the colour law moved under people's feet, and
+one plan spelling 5.1.0 accepted now fails the lint. Everything else is additive — a new door stays
+closed until a plan line, a flag or a person opens it. What follows is what an operator, a plan
+author, a fork or a session running an older copy will notice, in the order they are likely to
+notice it.
+
+### The console: the home, the plan page and the colour law
+
+- **The home is the Tower** (`#/runs`). An empty or unknown address opens it; `#/now` and
+  `#/dashboard` redirect there, keeping whatever half of the address still means something, and a
+  bookmark, a handoff link or a notification minted by 5.x still lands. Now is retired, and its
+  bands are the Tower's bays.
+- **A plan page has three tabs** — Phases, Run, Source. Route, Phases, QA and Handoffs are the Phases
+  tab's views (`?view=table|map|qa|handoffs`), and the old tab addresses redirect into them.
+- **Amber is a summons, never a status.** A `stuck` phase reads **Stuck** in the waiting paint with an
+  alert glyph, and `halted`, `parked` and `gated` read as waits; only something that asked a person
+  for something turns amber, through its inbox item. The law is `viewer/docs/design.md`, and each of
+  its rules names the guard that holds it.
+- **The failure streak counts failed phases.** The same phase failing twice is one failure, and a
+  refused credential or a lost network never counts — so a run halts on a streak later than 5.1.0 did.
+- **For forks of the client:** the 2.x `Chip`, its tones, the `--line-*` aliases, the 2.x colour
+  utilities and the `.state-<board-word>` classes are deleted. A status draws through the typed family
+  under `components/ui/status/`; ESLint refuses a raw `StatusBadge` import outside it, and the status
+  ratchet is at zero.
+
+### Plans: a person's turn, one superseded spelling, the new lints
+
+- **`- **Human step:**` has a six-field grammar** — `<kind> · <what> · open: … · proof: … · where:
+  host|any · window: …` (`references/plan-format.md`), read by `phase-graph.sh <slug> --human-steps
+  [N]`. The 5.1.0 `<who, what, proof ref>` spelling, which nothing ever parsed, now **fails the lint**
+  (F37, `human-step-superseded`): rewrite it, or leave the label off for an errand a session declares.
+- **Two lint ids gate and six advise.** F31 `permission-mode-unknown` and F37
+  (`human-step-superseded`, `human-step-kind-unknown`, `human-step-field-invalid`) fail a plan. F32
+  `verification-fleet-wide`, F33 `repos-outside-root`, F34 `repos-root-token`, F35 `checkout-inert`,
+  F36 `wait-window-short` and F38 `human-step-no-proof` advise on stderr and never change the exit
+  code, so the advisory family is now F15–F19, F22–F23, F28, F30, F32–F36 and F38.
+- **Four new lines a plan may write**, each read the same way by the engine and the console:
+  `**Permission mode:**` (`--permission-mode`), `**Model policy:**` (`--model-policy`),
+  `**Verify timeout:**` (`--verify-timeout`) — each a plan line a phase's own bullet overrides — and
+  the phase bullet `- **Wall-clock floor:**` (`--floor`). A plan that writes none reads as it did
+  under 5.1.0.
+- **The decision manifest has nineteen keys** — `issues` and `plan-approval` joined the seventeen; a
+  plan that answers neither keeps the shipped defaults (`off` and `hold`).
+
+### Sessions: new arms, and the scripts move together
+
+- **`phase-outcome.sh <slug> <N> needs-human --step <kind> --title …`** declares a person's turn — a
+  sign-in, a device code, a token to paste, an approval at the machine — with its own card, proof and
+  push; a value shaped like a secret is refused with nothing written. Two more shapes record rather
+  than declare: `verified --command … --exit N` (what the session's own §Verification proved, which
+  the console's pass then skips at an equivalent tree) and `progress --label … --done N --of M`.
+- **A supervised session's sign-in is denied before it runs**, with the `needs-human --step`
+  declaration to make instead — as a wait on somebody else's clock already was.
+- **A 5.1.0 copy of the scripts rejects the new arms**: a 5.1.0 `phase-outcome.sh` refuses
+  `needs-human --step`, and a 5.1.0 `phase-graph.sh` has no `--human-steps`. As at 5.0.0 and 5.1.0,
+  move the runtime console's scripts and the plugin together before a boot prompt tells a session to
+  use them.
+
+### The run: the heap, a person's turn, the queue and the lanes
+
+- **The console's heap is a number it chooses.** `viewer/run` passes `--max-old-space-size` as a node
+  argument from the machine profile's `heapMb` (6144 by default), clamped to half of RAM — never
+  `NODE_OPTIONS`, which every `claude` child would inherit. A console started some other way keeps
+  V8's default heap until it is started through `viewer/run` again.
+- **A person's turn parks its phase on a person**: an unbudgeted wait with one inbox row and one push,
+  reminded on a clock, proven by its own ref and resumed in the same session. Its ledger is
+  `human-steps.ndjson` in the instance's state directory, and no secret is ever written there.
+- **A loaded machine holds new work.** The scheduler admits no NEW lane while the five-minute load is
+  above 1.5 × the cores (`loadGuardFactor`; `0` switches it off); a running lane is never touched.
+  Inside a priority class the plans take turns, and `#/queue` names every entry's reason — with
+  `POST /api/queue/{bump,hold,release,defer,withdraw,requeue,reorder}` and
+  `POST /api/lane/{pin,unpin,reserve,unreserve,yield,isolate-phase,isolate}` to move it.
+- **A budget that can stop a run says so first**, with the arithmetic, and is announced (the `budget`
+  push category); one press on the run's card raises it where it was declared and retries.
+
+
+### Packaging: what the tarball gained
+
+- The root `package.json` `files` allowlist gained `scripts/skill-api.env` and eleven shared modules —
+  `status-model.js`, `status-notes.js`, `halt-categories.js`, `bays.js`, `budget-model.js`,
+  `queue-model.js`, `human-step-model.js`, `phase-clocks.js`, `lock-model.js`, `verb-model.js` and
+  `supervisor-model.js` under `viewer/shared/`; the free tree's allowlist gained the same twelve.
+- `.github/scripts/assert-tarball.sh` asserts the new runtime files: the twelve above,
+  `scripts/human-steps.env`, `scripts/permission.env`, `scripts/wait-budget.sh`, `bin/report-verb.mjs`,
+  `bin/run-verb.mjs`, `viewer/server/locks.ts`, `viewer/server/skill-copy.ts` and its emitted `.js`,
+  `viewer/server/host-open.ts` and its emitted `.js`, `viewer/server/verify-watch.ts`,
+  `viewer/server/connectivity-probe.ts`, `viewer/server/declared-probe.ts`,
+  `viewer/server/accounts/keep-alive.ts`, `viewer/server/analysis/phase-report.ts`,
+  `viewer/server/analysis/week-report.ts`, `viewer/server/runner/proofs.ts`,
+  `viewer/server/runner/verify-ledger.ts`, `viewer/server/runner/queue-episodes.ts`,
+  `viewer/server/runner/scope-drift.ts` and `viewer/server/runner/tree-state.ts`; and
+  `viewer/playwright.config.ts` joins the never-ship list.
+
 
 ## Upgrading to 5.1.0
 

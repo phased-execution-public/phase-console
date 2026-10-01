@@ -8,16 +8,20 @@
  * private members. `protected` here means "another link uses it", nothing
  * more. Read the chain in order; `runner.ts` holds the concrete class.
  */
+import { parkOnStep, stepJournalFields } from '../human-steps.ts';
+import { KIND_META } from '../../shared/human-step-model.js';
+import { comparedClause, stampTrees, type TreeStamp } from './tree-state.ts';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join, relative, resolve } from 'node:path';
 import { log } from '../log.ts';
 import { onShutdown, offShutdown } from '../lifecycle.ts';
-import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, type Board } from '../engine.ts';
+import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readText, readVerifyTimeout, type Board } from '../engine.ts';
 import { mcpDirective, skillDirective } from '../skills.ts';
 import {
-  classify, fallbackChain, limitBucket, nextModel, resetWaitUntil, MODEL_FALLBACK, type Disposition, lostResume,
+  classify, connectivityBackoffMs, fallbackChain, limitBucket, nextModel, resetWaitUntil, structuredRefusal,
+  MAX_AUTO_WAIT_MS, MODEL_FALLBACK, type Disposition, type RetirementEvidence, lostResume,
 } from './errors.ts';
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type StreamEvent } from './spawn.ts';
@@ -26,54 +30,75 @@ import {
   FREEZE_ESCALATE_MS, checkpointFrozenRecord, escalatePersistedFreeze, freezeVerdict,
   type PersistedEscalation,
 } from './freeze.ts';
-import { CASCADE_SKIP_REASON, STOPPED_SKIP_REASON, extractCommands, resolveLead, verifyPhase } from './verify.ts';
+import {
+  CASCADE_SKIP_REASON, STOPPED_SKIP_REASON, chainMembers, extractCommands, foldCommand, limitWords, resolveLead,
+  verificationVerdict, verifyPhase,
+} from './verify.ts';
+import {
+  appendLedger, cleanTrees, committers, fastGateLines, FAST_GATE_BUDGET_MS, lastCleanHead, lastRunOn, ownerByCommits, ownerFromLedger, readLedger,
+  resolveVerifyLimit, splitReds, verificationsFile, wipAttribution, wipOwners, WHOLE_COMMAND,
+  type LedgerRow, type RedRow, type RedShare, type SessionWindow, type WipOwner,
+} from './verify-ledger.ts';
 import { qaVerdictInstruction } from '../qa-session.ts';
 import type { QueueKind } from '../../shared/run-lifecycle.js';
+import { closeAttemptWindow, openAttemptWindow, phaseClocks } from '../../shared/phase-clocks.js';
+import { OWN_LOCK_WATCH_REFUSAL } from '../../shared/run-lifecycle.js';
 import { nextQaRound, qaReportPath, parseQaHistory } from '../qa-round.ts';
 import {
   DEFAULT_QA_ROUND_BUDGET_USD, qaExhaustedErrand, qaFixInstruction, readQaFindings, releasesGate,
   roundBudgetUsd, type QaFixStrategy, type QaRecoverVerb,
 } from './qa-recover.ts';
 import { policyForKey } from './policy.ts';
-import { capsFor, raiseCap, sizeTurns, sizeUsd, type Cap } from './session-record.ts';
+import { capsFor, lastWords, phaseCaps, raiseCap, type Cap, type SessionCaps } from './session-record.ts';
+import { CONNECTIVITY_PROBE_MS } from '../connectivity-probe.ts';
 import {
-  evaluateWait, openWaitEntry, parkedMsOf, WAIT_FLOOR_MS, type WaitAuthor, type WaitBudget,
+  evaluateWait, openWaitEntry, parkedMsOf, spendsWaitBudget, WAIT_FLOOR_MS, waitApproaching, waitBudgetFact,
+  type WaitAuthor, type WaitBudget,
 } from './wait-budget.ts';
 import { pollableRefs, unpollableRefs } from '../watch-refs.ts';
 import { RESUME_REFUSED_RECHECK_MS, declaredClock, ordinalSuffix, type DeclaredClock } from './wait-budget.ts';
-import { closeoutSkipNote, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, type VettedResume } from './runner-core.ts';
+import { closeoutSkipNote, outageResumePrompt, reboardResumeBrief, resumePolicyInstruction, resumePolicyWhy, type VettedResume, LOCK_MIRROR_ENV } from './runner-core.ts';
 import type { ResumePolicy } from './usage.ts';
 import { loadVerifyEnv, type VerifyEnv } from './verify-env.ts';
 import {
   failureContext, resumeBrief, resumeInstruction, unblockBrief, type BriefFacts,
 } from './failure-context.ts';
 import {
-  applyEvent, evaluateStall, isProductiveEvent, livenessOf, newLaneSignals, stallThresholds,
+  applyEvent, attemptSignals, evaluateStall, isProductiveEvent, livenessOf, newLaneSignals, stallThresholds,
   type LaneLiveness, type LaneSignals, type StallState, type StallThresholds, mintWatchRef,
 } from './liveness.ts';
 import { ingestRulings, rulingsFile, type Ruling } from './rulings.ts';
+import { isPaperwork, judgeProofs, proofsFile, type ProofJudgement } from './proofs.ts';
 import {
-  blockerSubKind, classifySituation, collectEvidence, situation as situationOf, workEvidence,
+  commitOf, commitsBetween, exportCheckout, filesCommittedBetween, filesCommittedSince, inHistory, settleIdleMirrorBranches,
+  treeChanges, uncommittedPaths, workingTreeOf, type ExportCheckout,
+} from './worktree.ts';
+import {
+  classifySituation, collectEvidence, declaredSubKind, situation as situationOf, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
-  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, settleRung, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
+  accountRung, endedOnEnvironment, errandFor, nextRung, rungKey, rungsFor, settleRung, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
 } from './ladder.ts';
-import type { RungRecord } from './state.ts';
+import type {
+  InheritedRed, OwedRed, RungRecord, VerifyBaseline, VerifyExport, VerifyingLane, VerifyLimitSource, VerifyRun, WipRed,
+} from './state.ts';
 import {
   childrenOf, consumeDeclaration, DECLARATION_CONSUMED_EVENT, endLockWait,
   loadRun, newRun, phaseRecord, procIdentity, saveRun, pidAlive, processState, IN_FLIGHT, SETTLED,
-  PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
+  PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, resetStreak, streakSentence, mcpReasonText, resetForRetry, consoleStoppedNote,
   settleInFlightRecords,
   type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type QaRoundRecord, type RunStatus, type VerifySummary, clearWatchBookkeeping, isSessionGone,
   syncWaitClock, chargeDeclaration, DECLARATION_REFUSED_EVENT, type DeclarationCharge, prepareReboard,
+  setRunState, failureRootOf,
 } from './state.ts';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome, needsOf } from './outcome.ts';
+import { PLAN_APPROVAL_NEED } from './plan-approval.ts';
 import {
-  AdmissionAborted, autopilotOwner, type Scheduler, type ScopeGrant,
+  AdmissionAborted, autopilotOwner, errandFoldTarget, type Scheduler, type ScopeGrant,
 } from './scheduler.ts';
 import { formatScope } from '../../shared/scope.js';
 import { Journal } from './journal.ts';
@@ -84,7 +109,7 @@ import {
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TAIL_CHARS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, PINNED_CAPACITY_RETRY_MS, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TAIL_CHARS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, prBlockText, preflight, reasonOf, survivingChildren, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
 } from './runner-core.ts';
 import type { Runner } from './runner.ts';
 import { RunnerLoop } from './runner-loop.ts';
@@ -92,6 +117,45 @@ import { allLeadsMissingPark, approvalsForPhase, reviewPhase } from './verify-re
 import type { VerifyApprovals } from './verify.ts';
 import { withSpan } from '../trace.ts';
 
+
+/**
+ * How many times one boarding may swap its brief in place before the old
+ * re-board takes over (control-tower phase 86, #134) — a swap is a fresh
+ * session each time, and three in one lane is a loop, not a change of brief.
+ */
+const MAX_REBRIEFS = 3;
+
+/** What an attempt is handed beside its prompt (see `attempt`). */
+export type AttemptOptions = {
+  maxTurns?: Cap;
+  mcp?: McpResolution;
+  /** The resume the boarding's gate already vetted for this session — asked once, never again (#134). */
+  vetted?: VettedResume;
+  /**
+   * The boarding's composer, for a brief swapped IN PLACE: given the resume
+   * hint, it answers the whole prompt (brief + directives) this lane spawns
+   * next. Absent, a not-worth-resuming session re-boards the phase as before.
+   */
+  rebrief?: (hint: BoardingHint, why: { sessionId: string; why: string; unspawned: boolean }) => Promise<string>;
+};
+
+/** An attempt's ending; `rebrief` asks `attempt` to swap the brief and go on in the same lane. */
+type AttemptResult = {
+  carryOn: boolean; completed: boolean;
+  rebrief?: { policy: ResumePolicy; sessionId: string; unspawned: boolean };
+};
+
+/**
+ * Where `dir` sits inside the repository whose toplevel git named as `top` —
+ * both resolved first: git answers with the REAL path, a caller may hold a
+ * symlinked one (`/var/…` for `/private/var/…` on macOS), and the relative
+ * path between the two spellings climbs out of any checkout it is joined to.
+ */
+function withinRepo(top: string, dir: string): string {
+  const real = (path: string): string => { try { return realpathSync(path); } catch { return resolve(path); } };
+  const rel = relative(real(top), real(dir));
+  return rel.startsWith('..') ? '' : rel;
+}
 
 export abstract class RunnerAttempt extends RunnerLoop {
 
@@ -110,25 +174,52 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   protected async attempt(
     phase: number, prompt: string, model: string, owner: string, lane: Lane,
-    chosen: PhaseOptions = {}, opts: { maxTurns?: Cap; mcp?: McpResolution } = {},
+    chosen: PhaseOptions = {}, opts: AttemptOptions = {},
   ): Promise<{ carryOn: boolean; completed: boolean }> {
     const before = await this.artefactScan(phase);
     try {
-      // The phase's own span, inside the run's. Everything below it — the
-      // session spawned, the git it runs, the bash scripts that session calls —
-      // inherits the phase number and the attempt, so a line found on its own
-      // says which retry of which phase produced it. The attempt is stated
-      // here and nowhere else: a retry is a new attempt inside one run, and
-      // that distinction is exactly what a reader of a failed phase needs.
-      return await withSpan(
-        'phase.attempt',
-        { phase, attempt: (this.state?.phases?.[phase]?.attempts ?? 0) + 1 },
-        () => this.attemptSession(phase, prompt, model, owner, lane, chosen, opts),
-      );
+      // A change of brief under the grant this lane holds (control-tower phase
+      // 86, #134): the session the attempt would continue is not worth
+      // resuming — a resume-checkpoint verdict, an account switch, an outage —
+      // so the boarding's own composer builds the resume brief and the attempt
+      // goes on HERE, in the same lane. It used to re-board the phase, which
+      // released the grant; a sibling queued seconds earlier took the lane.
+      let current = prompt;
+      let vetted = opts.vetted;
+      for (let swaps = 0; ; swaps++) {
+        const swappable = Boolean(opts.rebrief) && swaps < MAX_REBRIEFS;
+        if (swappable) this.rebriefing.add(phase);
+        let settled: AttemptResult;
+        try {
+          // The phase's own span, inside the run's. Everything below it — the
+          // session spawned, the git it runs, the bash scripts that session
+          // calls — inherits the phase number and the attempt, so a line found
+          // on its own says which retry of which phase produced it. The attempt
+          // is stated here and nowhere else: a retry is a new attempt inside one
+          // run, and that distinction is exactly what a reader of a failed
+          // phase needs.
+          settled = await withSpan(
+            'phase.attempt',
+            { phase, attempt: (this.state?.phases?.[phase]?.attempts ?? 0) + 1 },
+            () => this.attemptSession(phase, current, model, owner, lane, chosen, { ...opts, vetted }),
+          );
+        } finally {
+          this.rebriefing.delete(phase);
+        }
+        if (!settled.rebrief) return settled;
+        const { policy, sessionId, unspawned } = settled.rebrief;
+        current = await opts.rebrief!(reboardResumeBrief(resumePolicyInstruction(policy, sessionId)), {
+          sessionId, why: resumePolicyWhy(policy), unspawned,
+        });
+        vetted = undefined;
+      }
     } finally {
       await this.noteArtefacts(before, phase);
     }
   }
+
+  /** The phases whose attempt can swap its brief in place right now — see `attempt`. */
+  private readonly rebriefing = new Set<number>();
 
   /**
    * The attempt's own session again, for an attempt that carries on in place —
@@ -158,7 +249,15 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   private reboardNotWorth(
     phase: number, record: PhaseRecord, policy: ResumePolicy, sessionId = record.sessionId ?? 'unknown',
-  ): { carryOn: boolean; completed: boolean } {
+    opts: { unspawned?: boolean } = {},
+  ): AttemptResult {
+    // The lane holds its grant and its boarding can compose the resume brief
+    // (control-tower phase 86, #134): the brief is swapped in place by
+    // `attempt`, and nothing here gives the lane back.
+    if (this.rebriefing.has(phase)) {
+      record.resumeSessionId = undefined;
+      return { carryOn: true, completed: false, rebrief: { policy, sessionId, unspawned: Boolean(opts.unspawned) } };
+    }
     prepareReboard(record);
     record.resumeSessionId = undefined;
     const hint: BoardingHint = reboardResumeBrief(resumePolicyInstruction(policy, sessionId));
@@ -195,10 +294,67 @@ export abstract class RunnerAttempt extends RunnerLoop {
     return { carryOn: true, completed: false };
   }
 
+  /**
+   * Start this attempt's liveness (control-tower phase 80, #99): a fresh
+   * accumulator stamped with the attempt, and the record's snapshot moved with
+   * it — the snapshot is what a checkpoint and every watchdog read, and it kept
+   * the dead session's clocks until the new one wrote. A stall the dead session
+   * left ends here, the way `endLaneStall` ends one with its lane: the episode
+   * was that process's, and the one about to start has said nothing yet.
+   * `stalemate` stays, as it does there — it is about the phase.
+   */
+  private freshAttemptLiveness(phase: number, lane: Lane, record: PhaseRecord): void {
+    const previous = lane.signals;
+    const was = previous.stall ?? record.stall ?? null;
+    const ended = was && was.signal !== 'stalemate' ? was : null;
+    lane.signals = attemptSignals(previous, this.now().getTime(), record.attempts);
+    // The git evidence is this attempt's too: the next tick reads it afresh.
+    lane.gitAt = undefined;
+    record.liveness = livenessOf(phase, lane.signals, stallThresholds(this.deps.stallThresholds?.()));
+    if (!ended) return;
+    delete record.stall;
+    delete lane.localNudgeRefused;
+    delete lane.automaticParkDeclined;
+    this.record('phase.liveness', { cleared: ended.signal, reason: 'new-attempt', attempt: record.attempts }, phase);
+    this.emit('liveness', { phase, liveness: record.liveness, stall: null, attempt: record.attempts });
+  }
+
+  /**
+   * Where a lane goes once the API answers again (control-tower phase 80, #108)
+   * — decided BEFORE anything boards. The board first: a phase whose handoff
+   * went in complete before the network went is closed out through the same
+   * `completed` path a clean ending takes (§Verification, the landing, the
+   * lock), and no session boots over it — measured, a full "start Phase 21"
+   * boot re-claimed a finished phase's lock and reset its task list. Otherwise
+   * the session that lost the API is resumed through the one gate when it has a
+   * conversation to go back to; one that never reached the API boards fresh
+   * from its self-contained boot prompt, as it always did. An unreadable board
+   * is no evidence that a phase finished, so it reads as "not done".
+   */
+  private async afterOutage(
+    phase: number, record: PhaseRecord, conversation: boolean,
+  ): Promise<
+    | { next: 'closeout' } | { next: 'resume'; resume: VettedResume }
+    | { next: 'reboard'; policy: ResumePolicy } | { next: 'fresh' }
+  > {
+    let done = false;
+    try {
+      const board = await this.board();
+      done = board.phased && !board.timedOut && !board.error && board.done.includes(phase);
+    } catch {
+      done = false;
+    }
+    if (done) return { next: 'closeout' };
+    if (!conversation) return { next: 'fresh' };
+    const again = this.resumeAgain(record);
+    if (again.notWorth) return { next: 'reboard', policy: again.notWorth };
+    return again.resume ? { next: 'resume', resume: again.resume } : { next: 'fresh' };
+  }
+
   private async attemptSession(
     phase: number, prompt: string, model: string, owner: string, lane: Lane,
-    chosen: PhaseOptions = {}, opts: { maxTurns?: Cap; mcp?: McpResolution } = {},
-  ): Promise<{ carryOn: boolean; completed: boolean }> {
+    chosen: PhaseOptions = {}, opts: AttemptOptions = {},
+  ): Promise<AttemptResult> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     let currentModel = model;
@@ -208,7 +364,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // the "Session ID … is already in use" refusal.
     let resume: VettedResume | undefined;
     const asked = record.resumeSessionId;
-    if (asked) {
+    if (asked && opts.vetted?.sessionId === asked) {
+      // The boarding asked the gate for exactly this session and was told yes
+      // (control-tower phase 86, #134): that verdict is this attempt's. Asking
+      // again a second later once answered differently, and the second answer
+      // re-boarded a phase that already held its lane.
+      record.resumeSessionId = undefined;
+      resume = opts.vetted;
+    } else if (asked) {
       record.resumeSessionId = undefined;
       this.record('phase.resume-checkpoint', { sessionId: asked }, phase);
       // The one gate (`resumableSession`), BEFORE anything spawns — this site
@@ -221,7 +384,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       else if (gate.why === 'session-live') return this.holdForLiveSession(phase, asked);
       // Not worth resuming — the boarding asks first and composes the brief, so
       // this is the backstop: this prompt may be a continuation, so re-board.
-      else if (gate.why === 'fresh' && gate.policy) return this.reboardNotWorth(phase, record, gate.policy, asked);
+      else if (gate.why === 'fresh' && gate.policy) return this.reboardNotWorth(phase, record, gate.policy, asked, { unspawned: true });
     }
     // The two caps this phase's sessions run under, each with the policy that
     // set it (SES-8): the run's own budget or the plan's size for the dollars,
@@ -229,7 +392,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // closeout's turn cap the boarding chose. A cap the CLI reports spent is
     // doubled below for the resume that carries on.
     let caps = capsFor({
-      mode: 'phase', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd,
+      mode: 'phase', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd,
       ...(opts.maxTurns ? { turns: opts.maxTurns } : {}),
     });
     // The per-model walls this phase met, first first: when the whole chain
@@ -237,6 +400,19 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // per phase — a second exhaustion after that wait halts as it always did.
     const modelWalls: { model: string; at: Date }[] = [];
     let modelWindowWaited = false;
+    // Outages met on this phase, and the time already spent waiting them out.
+    // Neither is an attempt — a session that never reached the API did not try
+    // the work — so the arm gives the attempt back and the budget is what
+    // bounds the loop instead.
+    let outages = 0;
+    let outageWaitedMs = 0;
+    // What the NEXT spawn is told instead of `prompt`, once: a session resumed
+    // after an outage is mid-phase and gets a continuation, not a start boot.
+    let promptOnce: string | undefined;
+    // Set when the attempts ran out on the WEATHER — half a day unreachable, or
+    // every retry dying before its first turn — so the ending below is offered
+    // to the streak as `connectivity`, which it does not count (phase 45).
+    let environmental = false;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       // A per-lane stop can land between attempts — during a retry backoff, a
@@ -244,13 +420,23 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // next iteration starts a session for a phase the operator already ended.
       if (lane.stopped) return this.settleStoppedLane(lane, phase, 'spawn');
       record.attempts++;
+      // #28: this session's own window — what `workedMs` (= `durationMs`) sums.
+      openAttemptWindow(record, record.attempts, this.now().toISOString());
+      // #99: and its own liveness. The lane outlives its attempts; the clocks
+      // the stall detector judges belong to the process about to start.
+      this.freshAttemptLiveness(phase, lane, record);
       const scope = lane.grant?.scope ?? await this.scopeFor(phase);
       // The claim this session makes about where its work rides — both
       // dimensions, or neither when the scope lives outside the run root
       // (`RunnerBase.qualificationFor`); the same answer admission weighed.
       const claim = this.qualificationFor(phase, scope);
+      const sessionPrompt = promptOnce ?? prompt;
+      promptOnce = undefined;
+      // The account this session will spend, stamped as it is asked for
+      // (control-tower phase 92): a later boundary switch moves the run, not it.
+      lane.accountId = state.accountId ?? 'default';
       const outcome = await this.spawnSession(phase, 'phase', {
-        prompt,
+        prompt: sessionPrompt,
         // The lane's own worktree when this plan opted into them, the shared root
         // otherwise. One line, because a lane worktree IS just a different cwd —
         // the branch, the merge-back and the prune are the runner's business
@@ -263,7 +449,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // disposition below can only restart the phase from its boot prompt,
         // discarding however long it had been working — so it is the second
         // line of defence, not the first.
-        fallbackModels: fallbackChain(currentModel),
+        // …unless the run's model is PINNED (#91): then nothing below it is
+        // offered, and a wall is an account's or a clock's problem, never a
+        // reason to run a weaker model.
+        fallbackModels: this.modelPolicyOf(phase) === 'pinned' ? [] : fallbackChain(currentModel),
         // Legible in `/resume` and `claude agents`, which matters when the
         // question is "what is this hours-old session on my machine?".
         name: `${state.slug} p${phase}`,
@@ -337,6 +526,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // kept, and a session must be able to record the second without
           // touching the first.
           PE_RULINGS_FILE: rulingsFile(this.state!.root, this.state!.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
+          PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
           // Where the session publishes its TASK LIST. A clone of the outcome
           // channel next door, for the same reason: the CLI stopped
           // provisioning TodoWrite/TaskCreate to `-p` sessions in August 2026,
@@ -348,8 +539,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
         onPid: (pid) => {
           lane.pid = pid;
           // Stamped here and nowhere else: this is the only moment the console
-          // knows the process is new. `syncMirror` carries it forward.
+          // knows the process is new. `syncMirror` carries it forward, and the
+          // lane's liveness carries the same instant (#99), so a snapshot names
+          // the process it describes.
           lane.procStartedAt = new Date().toISOString();
+          lane.signals.procStartedAt = Date.parse(lane.procStartedAt);
+          record.liveness = livenessOf(phase, lane.signals, stallThresholds(this.deps.stallThresholds?.()));
           // A live, un-frozen child has just appeared, so if the run still
           // reads `frozen` that word is now false. This is the ONLY moment it
           // becomes false, which is why the re-derivation belongs here and not
@@ -372,20 +567,27 @@ export abstract class RunnerAttempt extends RunnerLoop {
           this.persistNow();
         },
         onEvent: (event) => this.onStream(phase, event),
-      }, { caps, attempt });
+        // The phase's attempt number, not this boarding's retry index
+        // (control-tower phase 89, #130): the loop restarts at 1 on every
+        // boarding, so a second boarding's `phase.session` and `phase.tokens`
+        // read `attempt: 1` beside `record.attempts` 2. ONE number, the one
+        // `openAttemptWindow` above stamped.
+      }, { caps, attempt: record.attempts });
       // When this attempt's session ended — its own field. `endedAt` also meant
       // "the park began" and "a session ran", and parked time was measured from
       // whichever of the three wrote it last (WAI-4).
       record.attemptEndedAt = new Date().toISOString();
+      closeAttemptWindow(record, record.attemptEndedAt);
+      // The loopback ports this session served on (control-tower phase 89): a
+      // refusal on one of them, once it has gone, is the machine's, not a red.
+      const served = lane.signals.ownPorts;
+      if (served?.length) record.ownPorts = [...new Set([...(record.ownPorts ?? []), ...served])].slice(-16);
 
       lane.pid = null;
       lane.handle = null;
       this.syncMirror();
-      state.spentUsd += outcome.costUsd;
-      record.costUsd += outcome.costUsd;
-      // See the other attempt-end sites: the rung is charged what its own
-      // attempt spent, and settled later by whoever learns how it ended.
-      chargeRung(state.recoveries?.[String(record.phase)], outcome.costUsd);
+      // The dollars — the run's, the phase's and the rung's — were booked by the
+      // spawn door (`bookSpend`), as this spawn's rise over its session's mark.
       record.turns = (record.turns ?? 0) + outcome.turns;
       // Wall-clock minus whatever the operator held it for. A phase frozen over
       // lunch did not take an extra hour to think. Read off THIS lane: with
@@ -394,12 +596,21 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // that happened to another.
       const frozenNow = lane.frozen ? Math.max(0, this.now().getTime() - Date.parse(lane.frozen.at)) : 0;
       if (frozenNow) record.frozenMs = (record.frozenMs ?? 0) + frozenNow;
-      record.durationMs = (record.durationMs ?? 0) + Math.max(0, outcome.durationMs - frozenNow);
+      // ONE definition (#28): the sum of the attempt windows minus the frozen
+      // time — `phaseClocks.workedMs`. The session's own process lifetime
+      // (`outcome.durationMs`) was a sixth answer that matched no subtraction.
+      record.durationMs = phaseClocks(record, this.now().getTime()).workedMs
+        ?? (record.durationMs ?? 0) + Math.max(0, outcome.durationMs - frozenNow);
       if (outcome.sessionId) record.sessionId = outcome.sessionId;
       // Kept on the record, not only in the journal. When a phase exits clean
       // and changes nothing this is the only account of why, and the halt that
       // reports it needs to be able to quote it without re-reading NDJSON.
-      record.said = outcome.resultText.replace(/\s+/g, ' ').slice(0, 1_200);
+      // The session's words, not the network's (#108): a result that is the
+      // CLI saying it could not reach the API gives way to the session's own
+      // last prose, and when it wrote none the words an earlier attempt said
+      // stand.
+      const words = lastWords(outcome);
+      if (words.said || !words.transportError) record.said = words.said;
       // `phase.session` — attempt, caps, ending, the session's own closing
       // words — was written by `spawnSession` the moment the child exited.
 
@@ -494,7 +705,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // its run `halted` with its own reason. `paused` beside a live halt
         // painted one screen as waiting and the strip as an error (hub run
         // e44c15da); `stoppedBy` is what pins the stop as the operator's.
-        state.status = state.halt ? 'halted' : 'paused';
+        setRunState(state, state.halt ? 'halted' : 'paused');
         return { carryOn: false, completed: false };
       }
 
@@ -506,17 +717,24 @@ export abstract class RunnerAttempt extends RunnerLoop {
         case 'ok':
           return { carryOn: true, completed: true };
 
-        case 'retry':
-          if (attempt === MAX_ATTEMPTS) break;
+        case 'retry': {
+          // A transient stop before the session's first turn never reached
+          // the work: the rung it ends is the environment's, not the remedy's
+          // (control-tower phase 5, #36 — sessions that died on a TLS blip
+          // before turn one were charged as remedies that failed).
+          const weather = endedOnEnvironment({ disposition: 'retry', turns: outcome.turns, costUsd: outcome.bookedUsd ?? outcome.costUsd });
+          if (attempt === MAX_ATTEMPTS) { if (weather) { this.blameEnvironment(phase); environmental = true; } break; }
           await this.sleep(disposition.afterMs);
           // Same stand-down as the usage-window wake: a halt from another lane
           // during the backoff means no attempt N+1.
           if (state.halt) {
             record.status = 'interrupted';
             record.note = 'the run halted while this phase waited to retry';
+            if (weather) this.blameEnvironment(phase);
             return { carryOn: false, completed: false };
           }
           continue;
+        }
 
         case 'wait-until': {
           // The usage window belongs to the ACCOUNT, not to this run. The one
@@ -538,7 +756,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
           const policy = state.onLimit ?? 'wait';
           const wantSwitch =
             policy === 'switch' || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
-          if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel)) {
+          if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel, disposition.at)) {
             // Continue NOW, on the account that can pay — same session when
             // its transcript came along, a fresh boot prompt when it did not,
             // and a fresh boarding with the resume brief when it is too large
@@ -550,8 +768,21 @@ export abstract class RunnerAttempt extends RunnerLoop {
             continue;
           }
           // `pause` checkpoints for a person; `wait` sleeps on the clock —
-          // one helper, shared with the walls below.
-          if (await this.waitOutWindow(phase, record, disposition.at, disposition.reason) === 'continue') continue;
+          // one helper, shared with the walls below — until the SOONEST reset
+          // (#100): a pool member that frees up before this account's own
+          // wall wakes it early, and the switch is tried again before any
+          // attempt is spent proving this account is still walled.
+          const wake = this.soonestReset(phase, disposition.at);
+          if (await this.waitOutWindow(phase, record, wake, disposition.reason) === 'continue') {
+            if (wake < disposition.at && wantSwitch
+              && this.trySwitchAccount(phase, record, disposition.reason, currentModel, disposition.at)) {
+              const again = this.resumeAgain(record);
+              if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+              resume = again.resume;
+              this.persist();
+            }
+            continue;
+          }
           return { carryOn: false, completed: false };
         }
 
@@ -570,6 +801,47 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // and is not remembered: there is nothing to wait for.
           if (disposition.at && !modelWalls.some((wall) => wall.model === currentModel)) {
             modelWalls.push({ model: currentModel, at: disposition.at });
+          }
+          // A PINNED model never steps down (control-tower phase 54, #91): the
+          // run's `onLimit` may move it to an account that can pay for THIS
+          // model, or it waits for the window; with neither, a person is asked.
+          if (this.modelPolicyOf(phase) === 'pinned') {
+            this.record('phase.model-held', { model: currentModel, why: 'wall', reason: disposition.reason }, phase);
+            const policy = state.onLimit ?? 'wait';
+            const wantSwitch = policy === 'switch' || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
+            if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel, disposition.at ?? null)) {
+              const again = this.resumeAgain(record);
+              if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+              resume = again.resume;
+              this.persist();
+              continue;
+            }
+            // A capacity blip names no window: the same model, a little later.
+            if (!disposition.bucket && !disposition.at && attempt < MAX_ATTEMPTS) {
+              await this.sleep(PINNED_CAPACITY_RETRY_MS);
+              if (state.halt) return { carryOn: false, completed: false };
+              continue;
+            }
+            const until = disposition.at && !modelWindowWaited ? resetWaitUntil(disposition.at, this.now()) : null;
+            if (until) {
+              modelWindowWaited = true;
+              const verdict = await this.waitOutWindow(
+                phase, record, until, `${currentModel} is pinned; its window reopens ${until.toLocaleString()}`,
+                { policy: policy === 'pause' ? 'pause' : 'wait' },
+              );
+              if (verdict !== 'continue') return { carryOn: false, completed: false };
+              const again = this.resumeAgain(record);
+              if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+              resume = again.resume;
+              continue;
+            }
+            const reason = `${currentModel} is pinned (Model policy: pinned) and walled, with no other account to run it `
+              + `and no reset near enough to wait for — ${disposition.reason}`;
+            record.status = 'parked';
+            record.note = reason;
+            this.record('phase.needs-human', { reason }, phase);
+            this.halt(reason, phase, 'needs-human');
+            return { carryOn: false, completed: false };
           }
           const next = nextModel(currentModel);
           if (!next) {
@@ -652,7 +924,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
             // stopping for a person. `pause` keeps its word and pauses.
             const policy = state.onLimit ?? 'wait';
             const wantSwitch = policy === 'switch' || (policy === 'wait' && this.deps.autoAccountSwitch?.() !== false);
-            if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel)) {
+            if (wantSwitch && this.trySwitchAccount(phase, record, disposition.reason, currentModel, disposition.at ?? null)) {
               const again = this.resumeAgain(record);
               if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
               resume = again.resume;
@@ -669,8 +941,19 @@ export abstract class RunnerAttempt extends RunnerLoop {
                 how: `The run waits by itself until ${disposition.at.toLocaleString()}. To continue sooner, `
                   + 'register or sign in another Claude account under Settings ▸ Accounts and switch the run to it.',
               };
-              const verdict = await this.waitOutWindow(phase, record, disposition.at, disposition.reason, { errand });
-              if (verdict === 'continue') continue;
+              // Until the SOONEST reset (#100), as above.
+              const wake = this.soonestReset(phase, disposition.at);
+              const verdict = await this.waitOutWindow(phase, record, wake, disposition.reason, { errand });
+              if (verdict === 'continue') {
+                if (wake < disposition.at && wantSwitch
+                  && this.trySwitchAccount(phase, record, disposition.reason, currentModel, disposition.at)) {
+                  const again = this.resumeAgain(record);
+                  if (again.notWorth) return this.reboardNotWorth(phase, record, again.notWorth);
+                  resume = again.resume;
+                  this.persist();
+                }
+                continue;
+              }
               return { carryOn: false, completed: false };
             }
           }
@@ -704,9 +987,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
           //   2. the CAUSE is stamped on the record, so the situation classifier
           //      reads `resource-wall:auth` from the console's own evidence
           //      whatever a later rung's result looks like (RCV-2, SES-3);
-          //   3. the streak is charged — a wall that stops the run is a failed
-          //      attempt, and the counter is the run's only "this plan is
-          //      broken" bound;
+          //   3. the streak is NOT charged. It was, until 5.2.0, and the
+          //      argument ("a wall that stops the run is a failed attempt")
+          //      reads well and is wrong: the counter means "this PLAN keeps
+          //      failing", and being refused entry says nothing about the
+          //      plan. Measured: one transient event charged three failures
+          //      in 39 s and left a run at 3 of a maximum 2 — over its own
+          //      ceiling, its signal destroyed, and converted into a second,
+          //      independent press-only halt on top of the one it already had;
           //   4. the RUN halts (`credential-refused` is run-level), with the one
           //      errand on it: nothing downstream can spend under a credential
           //      the API refuses, and the errand — not the halt card — is what
@@ -714,27 +1002,80 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // A credential complaint names WHOSE credential: the classifier is
           // deliberately account-blind, and "sign that account in again" is
           // only actionable when the reason says which one.
+          // A refusal met AFTER the login changed identity is not a lapse and not
+          // this credential's fault (control-tower phase 91, #131): the halt says
+          // what happened, and nothing is retired — the new login did nothing.
+          if (disposition.class === 'auth' && this.identityDrifted(phase)) {
+            record.status = 'parked';
+            record.note = state.halt?.reason ?? 'the login changed identity';
+            this.blameEnvironment(phase);
+            return { carryOn: false, completed: false };
+          }
           const paying = state.accountId ?? 'the machine login';
           const reason = `${disposition.reason} (account: ${paying})`;
           const at = this.now().toISOString();
-          this.leaveAccount(phase, {
-            kind: 'credential', reason: disposition.reason, by: 'classifier', class: disposition.class,
-          });
+          // A SECOND lane arriving at the same wall is the same event reaching
+          // a second reader. It marks its own record so the phase table is
+          // honest, and does nothing else: no second retirement of an already
+          // retired credential, no second errand over the first, no re-halt.
+          const alreadyStopped = state.halt?.kind === 'credential-refused';
+          // What the verdict stood on, and whose stop it was (#57): kept on the
+          // retirement, the cause and the halt, so a person reads WHY — the kind
+          // the API returned, or the sentence on its error channel.
+          const evidence: RetirementEvidence | undefined = disposition.evidence
+            ? {
+              ...disposition.evidence,
+              ...(record.sessionId ? { session: record.sessionId } : {}),
+              phase, slug: state.slug, runId: state.id,
+            }
+            : undefined;
+          if (!alreadyStopped) {
+            this.leaveAccount(phase, {
+              kind: 'credential', reason: disposition.reason, by: 'classifier', class: disposition.class,
+              // A sentence, not a verdict the API returned — so this refusal
+              // reaches ONE credential and never its organisation. `classify`
+              // answers the structured kinds before it ever reads text, and
+              // those arrive here through `signal.retryCategories` and
+              // `signal.apiErrors`.
+              structured: structuredRefusal(outcome.signal),
+              ...(record.sessionId ? { session: record.sessionId } : {}),
+              ...(evidence ? { evidence } : {}),
+            });
+          }
           record.status = 'parked';
           record.note = reason;
           record.cause = {
             kind: 'credential-refused', class: disposition.class, reason: disposition.reason, at,
             ...(state.accountId ? { account: state.accountId } : {}),
+            ...(evidence ? { evidence } : {}),
           };
-          state.consecutiveFailures++;
+          // …and the rung this attempt was climbing did not fail on its merits
+          // (control-tower phase 5, #36): it comes back when an account does.
+          this.blameEnvironment(phase);
+          if (alreadyStopped) {
+            this.record('phase.credential-wall-seen', {
+              class: disposition.class, account: state.accountId ?? null, reason: disposition.reason,
+            }, phase);
+            return { carryOn: false, completed: false };
+          }
           // The wall's errand: the situation's fixed sentences, with the
           // account, the class and the session's own last words on it — the
           // words ARE the evidence for a policy refusal (RCV-7).
           const base = errandFor('resource-wall:auth', [], phase, at, record.said ?? null);
+          // Is there anything to switch TO? The measured incident had four runs
+          // parked on this exact errand while every account on the machine was
+          // unusable — so "switch the run to another account" was advice nobody
+          // could take, and the fact that said so lived on another page.
+          const usable = this.deps.accountsUsable?.();
+          const allGone = Boolean(usable && usable.total > 0 && usable.unusable >= usable.total);
           const errand: Errand = {
             ...base,
             need: `A Claude account this run may spend under — the API refused ${paying}'s credential `
-              + `(${disposition.class}): ${disposition.reason}.`,
+              + `(${disposition.class}): ${disposition.reason}.`
+              + (allGone
+                ? ` Every account registered here is unusable (${usable!.unusable} of ${usable!.total}), `
+                  + 'so there is nothing to switch to: one has to be cleared or a new one signed in.'
+                : ''),
             how: disposition.class === 'certificate'
               ? 'Fix the certificate trust between this machine and the API (the proxy, or the trust '
                 + 'store), then Continue the run; or switch it to an account that reaches the API from '
@@ -748,8 +1089,84 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // The errand rides the phase event, which is the one channel
           // `announceErrand` listens on (`needs-you`, deduped by `errand.at`).
           this.emit('phase', { phase, status: 'parked', note: record.note, errand });
-          this.halt(reason, phase, 'credential-refused');
+          this.halt(reason, phase, 'credential-refused', evidence ? { evidence } : {});
           return { carryOn: false, completed: false };
+        }
+
+        case 'connectivity': {
+          // Nobody's fault. This machine could not reach the API, so there is
+          // nothing to diagnose, nothing to retire and nothing to charge — the
+          // lane waits and comes back, and the attempt it did not get is not
+          // spent. Everything else in this switch answers "what does this say
+          // about the credential, the phase or the plan?"; the answer here is
+          // "nothing", and saying so is the whole fix.
+          //
+          // A certificate-SHAPED stop files a strike on its way through. Three
+          // of them, from two sessions, over ten minutes, with nothing
+          // succeeding in between, is a standing interception rather than the
+          // weather — and even then it cools ONE credential.
+          if (disposition.class) {
+            this.leaveAccount(phase, {
+              kind: 'credential', reason: disposition.reason, by: 'classifier', class: disposition.class,
+              structured: false,
+              ...(record.sessionId ? { session: record.sessionId } : {}),
+            });
+          }
+          const waitMs = connectivityBackoffMs(outages);
+          if (outageWaitedMs + waitMs > MAX_AUTO_WAIT_MS) {
+            // Past half a day of no network, stop waiting. Fall through to the
+            // ordinary failure path, which fails the phase and leaves it for the
+            // ladder and a person — the one thing that IS worth doing now.
+            record.note = `${disposition.reason} — and it has been unreachable for `
+              + `${Math.round(outageWaitedMs / 60_000)} minutes`;
+            // The phase fails now; the REMEDY it was climbing is not charged,
+            // and nor is the run's streak — the weather is no claim about the
+            // plan (phase 3), however long it lasts (phase 45).
+            this.blameEnvironment(phase);
+            environmental = true;
+            break;
+          }
+          outages += 1;
+          outageWaitedMs += waitMs;
+          // `waitMs` is the backstop: the probe looks every `probeEveryMs` and
+          // wakes the lane at the first answer (#108).
+          const until = new Date(this.now().getTime() + waitMs);
+          this.record('phase.connectivity-wait', {
+            attempt, outage: outages, waitMs, probeEveryMs: CONNECTIVITY_PROBE_MS, until: until.toISOString(),
+            reason: disposition.reason, ...(disposition.class ? { class: disposition.class } : {}),
+          }, phase);
+          const waitBegan = this.now().getTime();
+          const woke = await this.waitOutOutage(phase, record, until, disposition.reason);
+          if (woke === 'stop') {
+            this.blameEnvironment(phase);
+            return { carryOn: false, completed: false };
+          }
+          // Read the board before boarding again — and resume the session that
+          // lost the API rather than replacing it (#108). A session that worked
+          // has a conversation to go back to; so does one this attempt already
+          // resumed, whatever it managed before the network went again.
+          const waitedMs = Math.max(0, this.now().getTime() - waitBegan);
+          const after = await this.afterOutage(phase, record, outcome.turns > 0 || Boolean(resume));
+          this.record('phase.connectivity-restored', {
+            outage: outages, by: woke === 'recovered' ? 'probe' : 'clock', waitedMs, next: after.next,
+            ...(after.next === 'resume' ? { session: after.resume.sessionId } : {}),
+          }, phase);
+          // The phase finished before the network went: its closeout — the
+          // §Verification, the landing, the lock — is what a clean ending gets.
+          if (after.next === 'closeout') return { carryOn: true, completed: true };
+          // The attempt is given back, both counters: an outage is not an
+          // attempt at the work, and three dropouts must not exhaust a phase's
+          // three tries.
+          attempt -= 1;
+          record.attempts -= 1;
+          if (after.next === 'reboard') return this.reboardNotWorth(phase, record, after.policy);
+          if (after.next === 'resume') {
+            resume = after.resume;
+            promptOnce = outageResumePrompt(state.slug, phase, waitedMs);
+          } else {
+            resume = undefined;
+          }
+          continue;
         }
 
         case 'phase-failed':
@@ -762,10 +1179,12 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
     record.status = 'failed';
     record.endedAt = new Date().toISOString();
-    state.consecutiveFailures++;
+    this.chargeFailure(phase, environmental ? 'connectivity' : 'crash', record.note ?? 'the phase failed');
     this.record('phase.failed', { attempts: record.attempts, note: record.note }, phase);
+    // The last session spent its dollar cap: a budget stopped it (phase 14, #40).
+    if (record.lastSession && spentCapOf(record.lastSession) === 'budget') this.notePhaseBudgetSpent(phase);
     if (state.consecutiveFailures >= state.maxConsecutiveFailures) {
-      this.halt(`${state.consecutiveFailures} phases failed in a row`, phase, 'failure-streak');
+      this.halt(streakSentence(state), phase, 'failure-streak');
       return { carryOn: false, completed: false };
     }
     return { carryOn: state.autonomy === 'keep-going', completed: false };
@@ -830,7 +1249,591 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * The three independent checks. All must agree before a phase counts as done.
    * Nothing here asks the session what happened.
    */
+  /** `{repo, branch, head}` of every repository a verification can read; empty when none can be read. */
+  private async stampVerification(phase: number, cwd: string, text: string | undefined): Promise<TreeStamp[]> {
+    try {
+      return await stampTrees({ root: this.laneRoot(phase), cwd, scope: await this.scopeFor(phase), text });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Settle the run's idle mirror branches before the LAST phase's §Verification
+   * (control-tower phase 62, #47). The mirror mints `pe/<slug>` in every
+   * repository it mounts, and where no phase committed, that branch sits 0
+   * ahead of the trunk, checked out by the mirror — so a ship phase's check of
+   * the checkout's hygiene could never pass while its own run was live, and the
+   * phase shipped, then declared `blocked` for a person to rule the line away.
+   * Only a mirror run, only its final phase (`isFinalPhase`, the rule the
+   * pull-request block uses), and only branches holding nothing
+   * (`settleIdleMirrorBranches`); every session spawned afterwards gets them
+   * back first (`restoreIdleMirror`). Nothing here can fail the phase.
+   */
+  private async settleIdleMirror(phase: number): Promise<void> {
+    const state = this.state!;
+    if (state.checkout !== 'worktree' || !state.mountedRepos?.length || state.mirrorSettled) return;
+    const names = this.laneNamesFor(0);
+    if (state.workRoot !== names.integration) return;
+    let board: Board;
+    try { board = await this.board(); } catch { return; }
+    if (!board.phased || board.timedOut || !this.isFinalPhase(board, phase)) return;
+    const out = await settleIdleMirrorBranches(names.integration, names.runBranch).catch(() => null);
+    if (!out || (!out.settled.length && !out.kept.length)) return;
+    if (out.settled.length) {
+      state.mirrorSettled = { phase, at: this.now().toISOString(), mounts: out.settled };
+    }
+    this.record('run.mirror-branches-settled', {
+      phase, branch: names.runBranch, settled: out.settled,
+      // Why each branch could go, and the tip it named (phase 89, #47): a
+      // squash-merged branch is on no trunk by identity, so this line is where
+      // it can be named and re-created from.
+      ...(out.proofs.length ? { proofs: out.proofs } : {}),
+      ...(out.kept.length ? { kept: out.kept } : {}),
+    }, phase);
+    this.persist();
+  }
+
+  /** Which of the session's recorded proofs hold for the tree about to be verified — null on any failure to ask. */
+  private async sessionProofs(phase: number, cwd: string): Promise<ProofJudgement | null> {
+    const state = this.state!;
+    try {
+      return await judgeProofs({ file: proofsFile(state.root, state.slug), slug: state.slug, phase, cwd });
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The proofs' two journal lines (control-tower phase 62, #68): what was
+   * honoured and what was not, and — for every command the console ran that
+   * the session had also recorded — any disagreement between the two verdicts.
+   * A disagreement was the audit's one unexplained number (a mirror's suite red
+   * in 15 of 17 console runs while the sessions reported it green); from here on
+   * each one is a line naming both trees.
+   */
+  private recordProofVerdicts(phase: number, judged: ProofJudgement, ran: readonly VerifyRun[]): void {
+    if (!judged.recorded.size) return;
+    this.record('phase.verify-proven', {
+      tree: judged.tree,
+      proven: [...judged.proven].map(([command, by]) => ({
+        command, tree: by.tree, at: by.at,
+        ...(by.session ? { session: by.session } : {}),
+        ...(by.paperwork.length ? { paperwork: by.paperwork.slice(0, 20) } : {}),
+      })),
+      refused: judged.refused,
+    }, phase);
+    for (const [command, proof] of judged.recorded) {
+      // The command's verdict is its LAST attempt, and a proven row is the
+      // proof itself rather than a run of anything.
+      const rows = ran.filter((row) => !row.proven && foldCommand(row.command) === command);
+      const last = rows[rows.length - 1];
+      if (!last || (proof.code === 0) === last.ok) continue;
+      const refusal = judged.refused.find((entry) => entry.command === command);
+      this.record('phase.verify-disagreed', {
+        command,
+        session: { code: proof.code, tree: proof.tree, at: proof.at, ...(proof.session ? { session: proof.session } : {}) },
+        console: { code: last.code, ...(judged.tree ? { tree: judged.tree } : {}) },
+        ...(refusal?.why ? { why: refusal.why } : {}),
+        ...(refusal?.changed?.length ? { changed: refusal.changed } : {}),
+      }, phase);
+    }
+  }
+
+  /* ---- the verification's clock and ledger (control-tower phase 83, #95 #103) ---- */
+
+  /** The plan's `Verify timeout:` for this phase, as the engine reads it — undefined is silence. */
+  private async verifyTimeoutDirective(phase: number): Promise<{ minutes: number; source: 'phase' | 'plan' } | undefined> {
+    try {
+      return readVerifyTimeout(await this.engine(['--verify-timeout', String(phase)]));
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The clock each of this phase's §Verification commands runs under (#95):
+   * the plan's `Verify timeout:` when it states one, else each line's own
+   * measured history in the plan's ledger, else the default — and the record
+   * the restart drain reads for a verifying lane (their sum).
+   */
+  protected async verifyLimitsFor(
+    phase: number, text: string | undefined, approvals?: VerifyApprovals,
+  ): Promise<{ timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> }> {
+    const state = this.state!;
+    const directive = await this.verifyTimeoutDirective(phase);
+    const rows = directive ? [] : readLedger(verificationsFile(state.root, state.slug), state.slug);
+    const commands = extractCommands(text, 'verify', approvals).commands;
+    const each = commands.map((command) => {
+      const resolved = resolveVerifyLimit({ command, rows, ...(directive ? { directive } : {}) });
+      return { command, ms: resolved.ms, source: resolved.source };
+    });
+    const byLine = new Map(each.map((entry) => [foldCommand(entry.command), entry.ms]));
+    const fallback = directive ? directive.minutes * 60_000 : VERIFY_TIMEOUT_MS;
+    const source: VerifyLimitSource = directive?.source
+      ?? (each.some((entry) => entry.source === 'history') ? 'history' : 'default');
+    return {
+      timeoutFor: (command) => byLine.get(foldCommand(command)) ?? fallback,
+      limit: {
+        ms: each.length ? each.reduce((sum, entry) => sum + entry.ms, 0) : fallback,
+        source,
+        ...(each.length ? { commands: each } : {}),
+      },
+    };
+  }
+
+  /** Each command's LAST attempt — the row its verdict is — in the order the commands ran. */
+  private static finalRows(ran: readonly VerifyRun[]): VerifyRun[] {
+    const last = new Map<string, VerifyRun>();
+    for (const row of ran) last.set(row.command, row);
+    return [...last.values()];
+  }
+
+  /** One ledger row per command the console ran — a proof it honoured is not a run, and is not ledgered. */
+  private ledgerRows(
+    phase: number, kind: LedgerRow['kind'], ran: readonly VerifyRun[],
+    tree: { tree: string; head: string | null } | null, own: readonly RedShare[] = [], chain?: string,
+  ): LedgerRow[] {
+    const state = this.state!;
+    const at = this.now().toISOString();
+    return RunnerAttempt.finalRows(ran).filter((row) => !row.proven).map((row) => {
+      const mine = own.find((share) => share.command === row.command && (share.chain ?? '') === (chain ?? ''));
+      return {
+        type: 'verification', slug: state.slug, phase, run: state.id, at, kind,
+        command: foldCommand(row.command), ...(chain ? { chain: foldCommand(chain) } : {}), code: row.code, ms: row.ms, ok: row.ok,
+        ...(row.timedOut ? { timedOut: true } : {}),
+        tree: tree?.tree ?? null, head: tree?.head ?? null,
+        ...(row.failures?.length ? { failures: row.failures } : {}),
+        ...(kind === 'verify' ? { own: mine ? (mine.failures.length ? [...mine.failures] : [WHOLE_COMMAND]) : [] } : {}),
+      };
+    });
+  }
+
+  /** Every session window this run's phases opened — what a commit's author is read from. */
+  private sessionWindows(): SessionWindow[] {
+    const out: SessionWindow[] = [];
+    for (const record of Object.values(this.state!.phases)) {
+      for (const window of record.attemptWindows ?? []) {
+        out.push({ phase: record.phase, startedAt: window.startedAt, ...(window.endedAt ? { endedAt: window.endedAt } : {}) });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Whose each red is (control-tower phase 83, #103) — the reds the baseline
+   * already had (inherited) and, since the fifth amendment, the ones it did not
+   * (the phase's own until shown otherwise). In order, for each failing test:
+   *  1. the ledger — another phase was charged with it, and no run since was
+   *     clean of it;
+   *  2. uncommitted work — a tree the line was clean of it on (the session's
+   *     own proof, or a run in the ledger) differs from the tree it is red on
+   *     ONLY in paths another phase's session wrote and never committed
+   *     (`wip`): P61's red was P62's 17 uncommitted files, never P61's;
+   *  3. the commits — between the last run clean of it and the head it was
+   *     first seen red on (the baseline's, for an inherited red; the verified
+   *     one, for a new red), read against this run's session windows. A new
+   *     red leaves the phase only when the phase itself made none of those
+   *     commits: its own could be the one, and the rule never guesses.
+   * A red nothing names stays where the split put it.
+   */
+  private async attribute(
+    phase: number, split: { own: RedShare[]; inherited: RedShare[] }, rows: readonly LedgerRow[],
+    verified: { top: string; tree: string; head: string | null } | null, proofs: ProofJudgement | null,
+  ): Promise<{ own: RedShare[]; inherited: InheritedRed[] }> {
+    const baseline = phaseRecord(this.state!, phase).baseline;
+    const base = baseline?.head ?? null;
+    // A new red is attributed only on a line the baseline read: without one,
+    // nothing says the red was absent when the phase boarded, and every red is
+    // the phase's, as it always was.
+    const baselined = (share: RedShare): boolean => Boolean(baseline?.commands.some((line) => line.command === foldCommand(share.command)
+      || (share.chain !== undefined && !line.chain && line.command === foldCommand(share.chain))));
+    const windows = this.sessionWindows();
+    // Read once, and only when a red gets as far as asking.
+    let wipRead: Promise<Map<string, WipOwner> | null> | undefined;
+    const wipNow = () => (wipRead ??= verified ? this.wipOf(phase, verified.top, windows) : Promise.resolve(null));
+    const diffs = new Map<string, Promise<string[] | null>>();
+    const changedSince = (tree: string): Promise<string[] | null> => {
+      if (!diffs.has(tree)) diffs.set(tree, treeChanges(verified!.top, tree, verified!.tree).catch(() => null));
+      return diffs.get(tree)!;
+    };
+    // One read per range, however many failing tests share it.
+    const ranges = new Map<string, Promise<{ sha: string; at: string }[] | null>>();
+    const commitsIn = (from: string, to: string) => {
+      const key = `${from}..${to}`;
+      if (!ranges.has(key)) ranges.set(key, commitsBetween(verified!.top, from, to).catch(() => null));
+      return ranges.get(key)!;
+    };
+    type Found = Pick<InheritedRed, 'owner' | 'how' | 'candidates' | 'paths'>;
+    const lookup = async (share: RedShare, id: string, isNew: boolean): Promise<Found> => {
+      const charged = ownerFromLedger(rows, share.command, id, phase);
+      if (charged !== undefined) return { owner: charged, how: 'charged' };
+      // A sibling's wrap-up WIP already failed this line with this test, on a
+      // commit this head carries (control-tower phase 89, #127): its red.
+      const wipOwner = verified ? await this.wipRedOwner(phase, share, id, verified) : undefined;
+      if (wipOwner !== undefined) return { owner: wipOwner, how: 'wip-red' };
+      const wip = verified ? await wipNow() : null;
+      if (wip && verified) {
+        for (const tree of this.cleanRefs(share, id, rows, proofs)) {
+          const changed = await changedSince(tree);
+          const found = changed ? wipAttribution(changed.filter((path) => !isPaperwork(path)), wip) : null;
+          if (found) {
+            return { ...(found.owner !== undefined ? { owner: found.owner } : { candidates: found.candidates }), how: 'wip', paths: found.paths };
+          }
+        }
+      }
+      const clean = lastCleanHead(rows, share.command, id);
+      const until = isNew ? verified?.head ?? null : base;
+      if (!clean || !until || !verified || clean === until) return {};
+      const commits = await commitsIn(clean, until);
+      if (!commits || (isNew && committers(commits, windows).includes(phase))) return {};
+      const byCommit = ownerByCommits(commits, windows, phase);
+      if (byCommit.owner !== undefined) return { owner: byCommit.owner, how: 'commit' };
+      return byCommit.candidates ? { candidates: byCommit.candidates, how: 'commit' } : {};
+    };
+    const own: RedShare[] = [];
+    const inherited: InheritedRed[] = [];
+    for (const [shares, isNew] of [[split.inherited, false], [split.own, true]] as const) {
+      for (const share of shares) {
+        if (isNew && !baselined(share)) { own.push(share); continue; }
+        const groups = new Map<string, InheritedRed>();
+        const mine: string[] = [];
+        let whole = false;
+        for (const id of share.failures.length ? share.failures : [WHOLE_COMMAND]) {
+          const found = await lookup(share, id, isNew);
+          // A new red nothing names is the phase's own, as it always was.
+          if (isNew && found.owner === undefined && !found.candidates) {
+            if (id === WHOLE_COMMAND) whole = true; else mine.push(id);
+            continue;
+          }
+          const key = JSON.stringify(found);
+          const group = groups.get(key)
+            ?? { command: share.command, ...(share.chain ? { chain: share.chain } : {}), failures: [], ...found };
+          if (id !== WHOLE_COMMAND) group.failures.push(id);
+          groups.set(key, group);
+        }
+        if (mine.length || whole) own.push({ ...share, failures: mine });
+        inherited.push(...groups.values());
+      }
+    }
+    return { own, inherited };
+  }
+
+  /**
+   * The sibling whose recorded `wipRed` names this red (control-tower phase 89):
+   * the same line (or the chain it is a member of), the same failing test or
+   * the whole line, on a WIP commit the verified head carries.
+   */
+  private async wipRedOwner(
+    phase: number, share: RedShare, id: string, verified: { top: string; head: string | null },
+  ): Promise<number | undefined> {
+    const lines = new Set([foldCommand(share.command), ...(share.chain ? [foldCommand(share.chain)] : [])]);
+    for (const other of Object.values(this.state!.phases)) {
+      const wip = other.wipRed;
+      if (other.phase === phase || !wip?.lines?.length || !verified.head) continue;
+      const hit = wip.lines.find((line) => lines.has(line.command)
+        && (id === WHOLE_COMMAND || !line.failures?.length || line.failures.includes(id)));
+      if (hit && await inHistory(verified.top, wip.sha, verified.head)) return other.phase;
+    }
+    return undefined;
+  }
+
+  /** Who wrote each uncommitted path of the verified repository — null when there is none, or git cannot say. */
+  private async wipOf(phase: number, top: string, windows: readonly SessionWindow[]): Promise<Map<string, WipOwner> | null> {
+    const dirty = await uncommittedPaths(top).catch(() => null);
+    return dirty?.paths.length ? wipOwners(dirty.paths, windows, phase) : null;
+  }
+
+  /**
+   * The trees this line was clean of this red on, latest first: the session's
+   * own proof of it (a green chain proves each of its members), then the
+   * ledger's runs of it — and, for a chain's member, the chain's green runs.
+   */
+  private cleanRefs(share: RedShare, id: string, rows: readonly LedgerRow[], proofs: ProofJudgement | null): string[] {
+    const out: string[] = [];
+    const proof = proofs?.recorded.get(foldCommand(share.chain ?? share.command));
+    if (proof && proof.code === 0) out.push(proof.tree);
+    out.push(...cleanTrees(rows, share.command, id));
+    if (share.chain) out.push(...cleanTrees(rows, share.chain, WHOLE_COMMAND));
+    return [...new Set(out)].slice(0, 4);
+  }
+
+  /**
+   * Each inherited red with ONE owner is OWED on that owner's record (#103, the
+   * fifth amendment) — where its own work is read — and journalled against it.
+   * An owner this run keeps no record for (a phase of an earlier run, charged
+   * in the ledger) has the ledger and this phase's `phase.verify-inherited`
+   * line; several candidates owe nothing, since naming one would be a guess.
+   */
+  private recordOwed(phase: number, inherited: readonly InheritedRed[]): void {
+    const state = this.state!;
+    const at = this.now().toISOString();
+    const byOwner = new Map<number, InheritedRed[]>();
+    for (const red of inherited) {
+      if (red.owner === undefined || red.owner === phase || !red.how) continue;
+      if (!Object.values(state.phases).some((record) => record.phase === red.owner)) continue;
+      byOwner.set(red.owner, [...(byOwner.get(red.owner) ?? []), red]);
+    }
+    for (const [owner, reds] of byOwner) {
+      const record = phaseRecord(state, owner);
+      const owed: OwedRed[] = [...(record.owed ?? [])];
+      for (const red of reds) {
+        const same = (entry: OwedRed) => entry.command === red.command && (entry.chain ?? '') === (red.chain ?? '');
+        const before = owed.find(same);
+        const failures = [...new Set([...(before?.failures ?? []), ...red.failures])];
+        const paths = [...new Set([...(before?.paths ?? []), ...(red.paths ?? [])])].slice(0, 20);
+        const entry: OwedRed = {
+          command: red.command, ...(red.chain ? { chain: red.chain } : {}), failures, by: phase, at, how: red.how!,
+          ...(paths.length ? { paths } : {}),
+        };
+        if (before) owed[owed.indexOf(before)] = entry; else owed.push(entry);
+      }
+      record.owed = owed;
+      this.record('phase.verify-owed', {
+        by: phase,
+        reds: reds.map((red) => ({
+          command: red.command, ...(red.chain ? { chain: red.chain } : {}), failures: red.failures, how: red.how,
+          ...(red.paths?.length ? { paths: red.paths } : {}),
+        })),
+      }, owner);
+    }
+  }
+
+  /**
+   * A red `&&` chain, member by member (#103's chained-gate comment): each run
+   * ALONE, with no cascade, under the chain's own clock. What the members read
+   * — every final row the console ran; a member it could not run is simply not
+   * among them.
+   */
+  private async runMembers(
+    chain: string, purpose: 'baseline' | 'attribution',
+    opts: { cwd: string; approvals?: VerifyApprovals; timeoutFor?: (command: string) => number },
+  ): Promise<VerifyRun[]> {
+    const members = chainMembers(chain);
+    if (!members || this.abort?.signal.aborted || this.stopRequested) return [];
+    const verify = this.deps.verify ?? verifyPhase;
+    const limit = opts.timeoutFor?.(chain) ?? VERIFY_TIMEOUT_MS;
+    const ran = await verify(members.map((member) => `- \`${member}\``).join('\n'), {
+      cwd: opts.cwd, purpose, cascade: false,
+      ...(opts.approvals ? { approvals: opts.approvals } : {}),
+      preflightSkip: this.verifyEnv().preflightSkip,
+      timeoutMs: limit, timeoutFor: () => limit,
+      signal: this.abort?.signal ?? undefined,
+    }).then((summary) => summary.ran, () => [] as VerifyRun[]);
+    return RunnerAttempt.finalRows(ran).filter((row) => !row.proven);
+  }
+
+  /**
+   * The phase's §Verification BASELINE (control-tower phase 83, #103): what
+   * its lines read on the tree it boards on, before its session touches it.
+   * Each line's last run on that very tree stands in when the plan's ledger has
+   * one; the rest are run now, every line on its own (no cascade), and
+   * ledgered like any run. A line that is a red `&&` chain is broken into its
+   * members too, each run alone (the fifth amendment), so a member the chain's
+   * first red hid has a baseline of its own. Taken once per phase per run — a
+   * phase boarded again keeps its first, so its own half-done work can never
+   * become its baseline.
+   */
+  protected async takeBaseline(phase: number): Promise<void> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    if (record.baseline || this.abort?.signal.aborted) return;
+    const text = await this.deps.verificationText(state.slug, phase);
+    if (!text?.trim()) return;
+    const approvals = this.verifyApprovalsFor(phase);
+    const commands = extractCommands(text, 'verify', approvals).commands;
+    if (!commands.length) return;
+    // The same tree rule as the verdict's (control-tower phase 89): a tree
+    // holding changes that are not this phase's is measured on a clean
+    // checkout of its HEAD, so the baseline and the verdict read alike.
+    const exported = await this.exportForVerify(phase, await this.verifyCwd(phase));
+    const cwd = exported?.cwd ?? await this.verifyCwd(phase);
+    const at = this.now().toISOString();
+    const base = await workingTreeOf(cwd).catch(() => null);
+    const file = verificationsFile(state.root, state.slug);
+    const rows = readLedger(file, state.slug);
+    const lines: VerifyBaseline['commands'] = [];
+    const reuse = (command: string, chain?: string): boolean => {
+      const prior = base ? lastRunOn(rows, command, base.tree) : undefined;
+      if (!prior) return false;
+      lines.push({
+        command: prior.command, ...(chain ? { chain: foldCommand(chain) } : {}), ok: prior.ok, code: prior.code,
+        ...(prior.failures?.length ? { failures: prior.failures } : {}),
+        from: 'reused', by: { phase: prior.phase, run: prior.run, at: prior.at },
+      });
+      return true;
+    };
+    const measure = (ran: readonly VerifyRun[], chain?: string): void => {
+      for (const row of RunnerAttempt.finalRows(ran).filter((entry) => !entry.proven)) {
+        lines.push({
+          command: foldCommand(row.command), ...(chain ? { chain: foldCommand(chain) } : {}), ok: row.ok, code: row.code,
+          ...(row.failures?.length ? { failures: row.failures } : {}), from: 'measured',
+        });
+      }
+    };
+    const missing = commands.filter((command) => !reuse(command));
+    let limits: { timeoutFor: (command: string) => number; limit: NonNullable<PhaseRecord['verifyLimit']> } | null = null;
+    const limitsFor = async () => (limits ??= await this.verifyLimitsFor(phase, text, approvals));
+    // The commands own the lane while they run: the stall detector stands
+    // down and the restart drain waits on their limit, as for a verification.
+    const owning = async (): Promise<void> => {
+      if (record.baselineSince) return;
+      record.baselineSince = at;
+      record.verifyLimit = (await limitsFor()).limit;
+      this.persist();
+    };
+    try {
+      if (missing.length) {
+        const { timeoutFor } = await limitsFor();
+        const setupText = await this.deps.setupText?.(state.slug, phase);
+        const verify = this.deps.verify ?? verifyPhase;
+        await owning();
+        const measured = await verify(text, {
+          cwd, purpose: 'baseline', cascade: false, only: new Set(missing.map(foldCommand)),
+          onStart: (command, index, total) => this.noteVerifying(phase, 'baseline', { command, index, total }, { startedAt: at, exported: Boolean(exported) }),
+          ...(setupText ? { setupText } : {}),
+          ...(approvals ? { approvals } : {}),
+          preflightSkip: this.verifyEnv().preflightSkip,
+          timeoutMs: VERIFY_TIMEOUT_MS, timeoutFor,
+          signal: this.abort?.signal ?? undefined,
+        });
+        // A stop cut it: nothing was learned, and the next boarding asks again.
+        if (this.abort?.signal.aborted || this.stopRequested) return;
+        measure(measured.ran);
+        appendLedger(file, this.ledgerRows(phase, 'baseline', measured.ran, base));
+      }
+      // Each red chain's members, alone — reused from the ledger where every
+      // one already ran on this tree, measured otherwise.
+      for (const line of lines.filter((entry) => !entry.ok && !entry.chain)) {
+        const members = chainMembers(line.command);
+        if (!members) continue;
+        const chain = commands.find((command) => foldCommand(command) === line.command) ?? line.command;
+        if (members.every((member) => base && lastRunOn(rows, member, base.tree))) {
+          for (const member of members) reuse(member, chain);
+          continue;
+        }
+        await owning();
+        const ran = await this.runMembers(chain, 'baseline', {
+          cwd, ...(approvals ? { approvals } : {}), timeoutFor: (await limitsFor()).timeoutFor,
+        });
+        if (this.abort?.signal.aborted || this.stopRequested) return;
+        measure(ran, chain);
+        appendLedger(file, this.ledgerRows(phase, 'baseline', ran, base, [], chain));
+      }
+    } finally {
+      delete record.baselineSince;
+      await this.endVerifyPass(phase);
+    }
+    record.baseline = { at, tree: base?.tree ?? null, head: base?.head ?? null, commands: lines };
+    this.record('phase.verify-baseline', {
+      tree: record.baseline.tree, head: record.baseline.head,
+      reused: lines.filter((line) => line.from === 'reused').length,
+      measured: lines.filter((line) => line.from === 'measured').length,
+      red: lines.filter((line) => !line.ok).map((line) => line.command),
+    }, phase);
+    this.persist();
+  }
+
+  /**
+   * The `verify-timeout` outcome (control-tower phase 83, #95): a command its
+   * clock cut on its LAST attempt — the second at twice the limit, run by the
+   * console with no session. Not a red verdict: nothing is re-opened, nothing
+   * is charged to the streak. The phase parks for a person, and so does the
+   * run — the board already reads done (the handoff is complete), so a parked
+   * record in a driving loop would be reconciled to done on the next tick, an
+   * unverified phase passing silently (the `verification-preflight` park's
+   * reason, and its shape).
+   */
+  private verifyTimedOut(phase: number, verification: VerifySummary, cut: readonly VerifyRun[], stamps: readonly TreeStamp[]): boolean {
+    const record = phaseRecord(this.state!, phase);
+    const commands = cut.map((row) => row.command);
+    const limits = verification.ran
+      .filter((row) => commands.includes(row.command) && row.timedOut && row.limitMs)
+      .map((row) => row.limitMs!);
+    const clock = limits.length ? ` (cut at ${limits.map(limitWords).join(', then ')})` : '';
+    record.status = 'parked';
+    record.endedAt = new Date().toISOString();
+    record.note = `§Verification timed out${comparedClause(stamps)}: ${commands.map((c) => `\`${c}\``).join(', ')} ran past `
+      + `its clock twice${clock} — not a red, and not charged. Raise the phase's \`- **Verify timeout:**\` `
+      + '(or the plan\'s `**Verify timeout:**`), or look for a hang, then Re-check.';
+    this.record('phase.verify-timeout', {
+      commands, limits, retried: true, reason: verification.reason,
+      ...(stamps.length ? { trees: stamps } : {}),
+    }, phase);
+    this.emit('phase', { phase, status: 'parked', note: record.note });
+    this.park(`phase ${phase}'s §Verification timed out: ${commands.join(', ')} ran past its clock twice`, phase, 'verify-timeout');
+    return false;
+  }
+
+  /**
+   * `confirmPass`, with its clean checkout and its lane always given back
+   * (control-tower phase 89): the pass ends them itself once the last command
+   * has run; this is the backstop for one that returns early or throws.
+   */
   private async confirm(phase: number): Promise<boolean> {
+    try {
+      return await this.confirmPass(phase);
+    } finally {
+      await this.endVerifyPass(phase);
+    }
+  }
+
+  /** The clean checkouts a verification pass is running in, by phase — see `exportForVerify`. */
+  private readonly verifyExports = new Map<number, ExportCheckout>();
+
+  /**
+   * Where phase N's §Verification must run (control-tower phase 89, #103,
+   * #41): null — in place — when the verified repository's working tree holds
+   * nothing but the phase's own changes (phase 83's ownership: each
+   * uncommitted path's last write against the run's session windows) and
+   * paperwork; otherwise a clean checkout of its HEAD (`exportCheckout`), and
+   * the verdict says why. The trigger is exact: ONE uncommitted, non-paperwork
+   * path whose writer is not this phase's session — another phase's, or
+   * nobody's for sure. A checkout git refuses is journalled and the pass runs
+   * in place, as before.
+   */
+  private async exportForVerify(phase: number, cwd: string): Promise<{ cwd: string; export: VerifyExport } | null> {
+    const dirty = await uncommittedPaths(cwd).catch(() => null);
+    const paths = (dirty?.paths ?? []).filter((entry) => !isPaperwork(entry.path));
+    if (!dirty || !paths.length) return null;
+    const owners = wipOwners(paths, this.sessionWindows(), phase);
+    const foreign = [...owners].filter(([, owner]) => owner !== 'self');
+    if (!foreign.length) return null;
+    const head = await commitOf(dirty.top, 'HEAD');
+    if (!head) return null;
+    const whose = [...new Set(foreign.map(([, owner]) => (typeof owner === 'number' ? owner : null)))];
+    const named = whose.map((owner) => (owner === null ? 'nobody\'s for sure' : `phase ${owner}'s`)).join(' and ');
+    const reason = `the working tree held ${foreign.length} uncommitted path(s) that are not this phase's own (${named})`;
+    const made = await exportCheckout(dirty.top, head).catch((error: unknown) => ({ refused: String(error) }));
+    const summary: VerifyExport = {
+      head, repo: dirty.top, reason, paths: foreign.map(([path]) => path).sort().slice(0, 20), owners: whose,
+    };
+    if ('refused' in made) {
+      this.record('phase.verify-in-place', { reason, refused: made.refused, head }, phase);
+      return null;
+    }
+    this.verifyExports.set(phase, made);
+    return { cwd: join(made.dir, withinRepo(dirty.top, cwd)), export: summary };
+  }
+
+  /** The pass is over: its clean checkout goes, and the console's lane with it. */
+  private async endVerifyPass(phase: number): Promise<void> {
+    const made = this.verifyExports.get(phase);
+    this.verifyExports.delete(phase);
+    if (made) await made.remove().catch(() => {});
+    this.noteVerifying(phase, null);
+  }
+
+  /**
+   * The loopback ports the phase's session served on — what makes a refused
+   * connection an `environment` outcome rather than a red (control-tower phase
+   * 89): read off the lane while it stands, else the record.
+   */
+  private ownPortsOf(phase: number): number[] {
+    return this.lanes.get(phase)?.signals.ownPorts ?? phaseRecord(this.state!, phase).ownPorts ?? [];
+  }
+
+  private async confirmPass(phase: number): Promise<boolean> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     record.status = 'verifying';
@@ -877,6 +1880,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // halted phase as a success. The carry-on decision for a phase-level ending
     // lives at the ONE place that computes it, in `runAttempt` below.
     if (closed === 'halted') return false;
+    // Cut by the console (a shutdown, a stop): settled `interrupted`, not done.
+    if (closed === 'interrupted') return false;
 
     /* 1. the plan's own verification commands */
     const text = await this.deps.verificationText(state.slug, phase);
@@ -886,6 +1891,13 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const setupText = await this.deps.setupText?.(state.slug, phase);
     const verify = this.deps.verify ?? verifyPhase;
     const cwd = await this.verifyCwd(phase);
+    // The LAST phase's checks run over a mirror without the run's own idle
+    // branches (control-tower phase 62, #47) — before the stamps, so they
+    // name what the commands really read.
+    if (text?.trim()) await this.settleIdleMirror(phase);
+    // What the commands are about to compare against — `{repo, branch, head}`
+    // of every repository they could read (control-tower phase 40, #41).
+    const stamps = await this.stampVerification(phase, cwd, text);
     const approvals = this.verifyApprovalsFor(phase);
     // The opt-in the preflight honoured, honoured here too: a phase that
     // states no verification passes on its handoff, and the record says
@@ -906,24 +1918,48 @@ export abstract class RunnerAttempt extends RunnerLoop {
         stage: 'verify', reason: 'every check was waived at the run\'s start', by: 'launch', notRun: setAside!.waived,
       }, phase);
     }
-    const verification = waived ? {
+    // What the session proved itself (control-tower phase 62, #68): a command
+    // it recorded green at an equivalent tree is not run again. Nothing on file
+    // costs nothing — git is asked only when a proof exists.
+    const proofs = waived || allWaived ? null : await this.sessionProofs(phase, cwd);
+    // Each command's own clock (control-tower phase 83, #95), stored where the
+    // restart drain reads it, and the tree the commands are about to read —
+    // what the ledger files this run under, for the next phase's baseline.
+    const measuring = !waived && !allWaived;
+    const limits = measuring ? await this.verifyLimitsFor(phase, text, approvals) : null;
+    if (limits) record.verifyLimit = limits.limit;
+    // The tree the commands read must be the PHASE's (control-tower phase 89,
+    // #103, #41): a working tree carrying changes that are not its own — a
+    // sibling's uncommitted WIP, anything no session of the phase wrote — is
+    // set aside by running in a clean checkout of the phase's HEAD. A clean
+    // tree, or one holding only the phase's own changes, verifies in place.
+    const exported = measuring ? await this.exportForVerify(phase, cwd) : null;
+    const runCwd = exported?.cwd ?? cwd;
+    const startedAt = this.now().toISOString();
+    const verifiedTree = measuring ? await workingTreeOf(runCwd).catch(() => null) : null;
+    const verification: VerifySummary = waived ? {
       ok: true, ran: [], notRun: [],
       reason: 'the plan states no verification for this phase — passed on the handoff (allowUnverifiedPhases)',
     } : allWaived ? {
       ok: true, ran: [], notRun: [], waived: setAside!.waived,
       reason: 'every check in this phase\'s §Verification was waived at the run\'s start — passed on the handoff',
     } : await verify(text, {
-      cwd,
+      cwd: runCwd,
       ...(setupText ? { setupText } : {}),
       ...(approvals ? { approvals } : {}),
+      ...(proofs?.proven.size ? { proven: proofs.proven } : {}),
+      ...(this.ownPortsOf(phase).length ? { ownPorts: this.ownPortsOf(phase) } : {}),
       preflightSkip: this.verifyEnv().preflightSkip,
       // Explicit, and longer than the 15-minute default: a real phase's
       // verification is a full suite, sometimes a container build, and the
       // default turned a slow-but-passing check into a red one that proved
-      // nothing. Still bounded — a wedged command must end.
+      // nothing. Still bounded — a wedged command must end. Each line's own
+      // limit wins over it (#95): the plan's word, else its measured history.
       timeoutMs: VERIFY_TIMEOUT_MS,
+      ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
       signal: this.abort?.signal ?? undefined,
       onStart: (command, index, total) => {
+        this.noteVerifying(phase, 'verify', { command, index, total }, { startedAt, exported: Boolean(exported) });
         this.emit('verify', { phase, command, index, total });
       },
       // The pairing event. Everything below reaches the client only AFTER the
@@ -945,7 +1981,49 @@ export abstract class RunnerAttempt extends RunnerLoop {
         this.emit('verify', { phase, skipped: skipped.map((s) => ({ ...s })) });
       },
     });
-    record.verification = verification;
+    record.verification = withStamps(verification, stamps);
+    if (exported) record.verification.export = exported.export;
+    // The ONE verdict (control-tower phase 45) — and only the phase's OWN reds
+    // are its verdict (control-tower phase 83, #103). A red its baseline
+    // already had — the tree it boarded on — came with that tree: it is
+    // recorded inherited, with its owner, and charged to nobody here. With no
+    // baseline every red is the phase's, as it always was. A command its clock
+    // cut (#95) is neither: `verdict.timedOut`, the `verify-timeout` outcome.
+    const verdict = verificationVerdict(verification.ran);
+    // Since the fifth amendment (#103's 2026-09-25 comments) a red `&&` chain
+    // is judged member by member, each run alone — the red its first member
+    // hid is seen — and EVERY red is attributed before it counts: a new red
+    // another phase's commit or uncommitted work introduced is that phase's,
+    // and OWED on its record, never this one's.
+    const members: { chain: string; ran: VerifyRun[] }[] = [];
+    const reds: RedRow[] = [];
+    for (const row of verdict.broke) {
+      const ran = measuring && chainMembers(row.command)
+        ? await this.runMembers(row.command, 'attribution', {
+          cwd: runCwd, ...(approvals ? { approvals } : {}), ...(limits ? { timeoutFor: limits.timeoutFor } : {}),
+        })
+        : [];
+      if (ran.length) members.push({ chain: row.command, ran });
+      const red = ran.filter((entry) => !entry.ok && !entry.timedOut);
+      if (red.length) reds.push(...red.map((entry) => ({ command: entry.command, failures: entry.failures, chain: row.command })));
+      else reds.push(row);
+    }
+    const split = splitReds(reds, record.baseline?.commands);
+    const ledgerRowsNow = measuring ? readLedger(verificationsFile(state.root, state.slug), state.slug) : [];
+    const attributed = measuring && reds.length && !this.abort?.signal.aborted && !this.stopRequested
+      ? await this.attribute(phase, split, ledgerRowsNow, verifiedTree, proofs)
+      : { own: split.own, inherited: split.inherited.map((share): InheritedRed => ({ ...share })) };
+    // Nothing below runs a command: the clean checkout and the console's lane
+    // end here (`confirm`'s wrapper is the backstop for a pass that throws).
+    await this.endVerifyPass(phase);
+    const broke = verdict.broke.filter((row) => attributed.own.some((share) => (share.chain ?? share.command) === row.command));
+    // Every red inherited, nothing cut: the phase's own work verified.
+    const inheritedOnly = !verification.ok && verdict.broke.length > 0 && !broke.length && !verdict.timedOut.length;
+    // …and a line the MACHINE failed (control-tower phase 89, #41): an exit
+    // 127, a named precondition, the session's own server gone. Unproven — never
+    // red, never charged, never a re-open — and said on the record.
+    const unprovenOnly = !verification.ok && !broke.length && !verdict.timedOut.length && verdict.unproven.length > 0;
+    const passed = verification.ok || inheritedOnly || unprovenOnly;
     // A partial set-aside rides the same line, so the record names the checks
     // the operator answered at the door rather than letting them vanish.
     if (!allWaived && verification.waived?.length) {
@@ -980,10 +2058,29 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // Where they ran. A verification that passed in the wrong directory and
       // one that passed in the right one are indistinguishable without this.
       cwd: record.verifiedIn,
-      ran: verification.ran.map((r) => ({ command: r.command, code: r.code, ms: r.ms })),
+      // `retry` rides the row: without it the journal could not tell a rescued
+      // command's two attempts from two commands (control-tower phase 45).
+      ran: verification.ran.map((r) => ({
+        command: r.command, code: r.code, ms: r.ms,
+        ...(r.retry ? { retry: true } : {}),
+        // Not run by the console: the session proved it (control-tower phase 62).
+        ...(r.proven ? { proven: true } : {}),
+        // Cut by its clock, not exited 124 (control-tower phase 83, #95).
+        ...(r.timedOut ? { timedOut: true } : {}),
+        // The machine, not the work (control-tower phase 89).
+        ...(r.environment ? { environment: r.environment } : {}),
+      })),
       notRun: verification.notRun,
       ...(verification.skipped?.length ? { skipped: verification.skipped } : {}),
+      ...(stamps.length ? { trees: stamps } : {}),
+      // Run on a clean checkout, and why (control-tower phase 89) — the verdict says so.
+      ...(exported ? { export: exported.export } : {}),
+      ...(verification.unproven?.length ? { unproven: verification.unproven } : {}),
     }, phase);
+    if (proofs) this.recordProofVerdicts(phase, proofs, verification.ran);
+    // A settle holds only for a verdict that closes the phase: anything else
+    // brings sessions back into the mirror, so its branches come back now.
+    if (!passed) await this.restoreIdleMirror('not-green');
 
     // The console is stopping: whatever the summary claims, nothing more can
     // be proven or settled in this pass. The record keeps its in-flight
@@ -992,6 +2089,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // over three commands that never ran, and the phase settled done on it.
     if (this.abort?.signal.aborted || this.stopRequested) {
       this.record('phase.verify-stopped', { ran: verification.ran.length, notRun: verification.notRun.length }, phase);
+      // …and the proof is OWED, not waived (control-tower phase 48, #69): the
+      // next drive re-runs it before reconcile may close the record on the
+      // board's word, which is how a phase once settled done with none of its
+      // commands run.
+      record.reverify = {
+        at: this.now().toISOString(),
+        cause: this.stopRequested && !this.shuttingDown ? 'stop' : 'shutdown',
+        ran: verification.ran.length,
+        notRun: verification.notRun.length,
+      };
+      this.persist();
       return false;
     }
 
@@ -1022,7 +2130,39 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // "failed" is how this run ended up stopped on a phase nothing had actually
     // found fault with, showing a Retry button that could only ever reproduce
     // the same non-result. The two are now told apart.
-    const broke = verification.ran.filter((r) => !r.ok);
+    //
+    // And a command's verdict is its LAST attempt (control-tower phase 45,
+    // #45). This read `ran.filter(!ok)`, which counted the rescued first row of
+    // a command green on its retry — so `verification.ok` said true, the board
+    // check below was skipped, and the phase halted `verify-failed` in the same
+    // second. Every verify-failed halt of the measured week was that shape.
+    if (measuring) {
+      const ledger = verificationsFile(state.root, state.slug);
+      if (attributed.inherited.length) {
+        record.verification.inherited = attributed.inherited;
+        this.record('phase.verify-inherited', {
+          inherited: attributed.inherited, own: attributed.own,
+          ...(record.baseline ? { baseline: { tree: record.baseline.tree, head: record.baseline.head, at: record.baseline.at } } : {}),
+        }, phase);
+        this.recordOwed(phase, attributed.inherited);
+      }
+      appendLedger(ledger, this.ledgerRows(phase, 'verify', verification.ran, verifiedTree, attributed.own));
+      for (const { chain, ran } of members) {
+        appendLedger(ledger, this.ledgerRows(phase, 'verify', ran, verifiedTree, attributed.own, chain));
+      }
+      // What this phase OWED is paid by its own line running green here — or,
+      // for a chain's member, by that member green alone while the chain is
+      // red for another.
+      if (record.owed?.length) {
+        const green = new Set(RunnerAttempt.finalRows(verification.ran).filter((row) => row.ok).map((row) => foldCommand(row.command)));
+        for (const { chain, ran } of members) {
+          for (const row of ran) if (row.ok) green.add(`${foldCommand(chain)}\u0000${foldCommand(row.command)}`);
+        }
+        record.owed = record.owed.filter((entry) => !green.has(foldCommand(entry.chain ?? entry.command))
+          && !(entry.chain && green.has(`${foldCommand(entry.chain)}\u0000${foldCommand(entry.command)}`)));
+        if (!record.owed.length) delete record.owed;
+      }
+    }
     // The halt the board retracts. Measured in one night: state-path-hardening
     // raised SEVEN verify-failed halts and console-concurrent-plans an eighth —
     // in every one the session had finished its work and written a COMPLETE
@@ -1036,12 +2176,22 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // false; QA gating and people read it), and the run keeps driving. The
     // halts below survive for the case they were written for: a red
     // verification over work the board does NOT vouch for.
-    const overtaken = !verification.ok && await this.boardOvertookVerification(phase);
+    const overtaken = !passed && await this.boardOvertookVerification(phase);
+    // …and since control-tower phase 62 (#68) the board's word no longer stands
+    // over a red FINAL verdict. Letting it stand made §Verification a record
+    // rather than a gate: the verdict travelled on a record that read `done`,
+    // the dependents boarded on it, and nothing the red said could change any
+    // outcome — while its retries held the lock and the scope grant (2.0 h of
+    // still-red retry rows in one week). The phase is RE-OPENED instead: one
+    // fix rung, its dependents held, and the halt-that-reconcile-dissolves the
+    // board-first rule was written against cannot come back, because the
+    // re-opened record is exactly what reconcile now leaves alone.
+    if (broke.length && overtaken) return this.reopen(phase, verification, broke, stamps);
     if (broke.length && !overtaken) {
       record.status = 'failed';
-      state.consecutiveFailures++;
+      this.chargeFailure(phase, 'verify-red', 'verification failed');
       this.halt(
-        `phase ${phase} did not verify: ${broke.length} of ${verification.ran.length} command(s) failed `
+        `phase ${phase} did not verify${comparedClause(stamps)}: ${broke.length} of ${verification.ran.length} command(s) failed `
         + `— ${broke.map((r) => r.command).join(', ')}`
         + await this.verifyHint(phase),
         phase,
@@ -1049,13 +2199,27 @@ export abstract class RunnerAttempt extends RunnerLoop {
       );
       return false;
     }
+    // Cut by its clock, twice (#95): not a red, never charged — a person's.
+    if (verdict.timedOut.length) return this.verifyTimedOut(phase, verification, verdict.timedOut, stamps);
 
     /* 2. the plan still lints */
     const lint = readLint(await this.script('validate.sh', [state.slug]));
-    record.lint = { ok: lint.ok, summary: lint.summary };
-    if (!lint.ok) {
+    record.lint = { ok: lint.ok, summary: lint.summary, ...(lint.crashed ? { crashed: true } : {}) };
+    // A reading that PROVED NOTHING is not a verdict, and acting on one is how
+    // a run with nothing wrong with it ended up parked (#17). The engine died
+    // in the allocator, `readLint` called that a failing plan, and this halt
+    // fired after every completed phase of a 71-phase run — each time counting
+    // a consecutive failure and withdrawing the queue, which dequeued the
+    // scoped siblings waiting behind it. Say so in the journal, where it can be
+    // read later, and carry on: the streak, the queue and the phase are
+    // untouched, because nothing has been learned about any of them.
+    if (lint.crashed || lint.timedOut) {
+      this.record('phase.lint-unrun', {
+        why: lint.crashed ? 'crashed' : 'timeout', summary: lint.summary,
+      }, phase);
+    } else if (!lint.ok) {
       record.status = 'failed';
-      state.consecutiveFailures++;
+      this.chargeFailure(phase, 'plan-lint', 'the plan stopped linting');
       this.halt(`phase ${phase} left the plan failing validate.sh: ${lint.summary}`, phase, 'plan-lint');
       return false;
     }
@@ -1090,30 +2254,53 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // the autonomy. `halt-on-everything` keeps asking about everything —
     // that is what the setting means.
     const vouched = overtaken && verification.ran.length > 0;
-    if (askable.length && ((!verification.ok && !vouched) || state.autonomy === 'halt-on-everything')) {
+    if (askable.length && ((!passed && !vouched) || state.autonomy === 'halt-on-everything')) {
       if (!await this.askHuman(phase, verification, askable)) return false;
-    } else if (!overtaken && !verification.ok) {
+    } else if (!overtaken && !passed) {
       record.status = 'failed';
-      state.consecutiveFailures++;
-      this.halt(`phase ${phase} did not verify: ${verification.reason}`, phase, 'verify-failed');
+      this.chargeFailure(phase, 'verify-red', 'verification failed');
+      this.halt(`phase ${phase} did not verify${comparedClause(stamps)}: ${verification.reason}`, phase, 'verify-failed');
       return false;
     }
 
     record.status = 'done';
     record.endedAt = new Date().toISOString();
     this.lastDonePhase = phase;
+    // A re-opened phase that verifies green is closed by that verdict — the only
+    // thing that closes it (control-tower phase 62).
+    const reopened = record.reopened;
+    delete record.reopened;
     // The honest verdict travels with the record: a phase that passed with
     // checks skipped is not the same fact as one whose every check ran.
     if (verification.skipped?.length) {
       record.note = `verified with ${verification.skipped.length} check(s) skipped — unrunnable `
         + `on this machine (${[...new Set(verification.skipped.map((s) => s.lead))].join(', ')})`;
     }
+    // Verified on its own work, with reds that are another phase's — its base
+    // tree's, a sibling's commit or uncommitted work (control-tower phase 83,
+    // #103): said on the record, never charged here.
+    if (inheritedOnly) {
+      const inherited = record.verification?.inherited ?? [];
+      const owners = [...new Set(inherited.flatMap((red) => (red.owner !== undefined ? [red.owner] : red.candidates ?? [])))];
+      const count = inherited.reduce((n, red) => n + Math.max(1, red.failures.length), 0);
+      record.note = `verified on its own work — ${count} red(s) inherited, not its own`
+        + `${owners.length ? `, owned by phase ${owners.join(', phase ')}` : ', owner unknown'}; not charged to this phase`
+        + (record.note ? `; ${record.note}` : '');
+    }
+    // Lines the MACHINE failed (control-tower phase 89): the verdict is not
+    // green, and the record says so — unproven, never charged.
+    if (unprovenOnly && verification.unproven?.length) {
+      record.note = `verified with ${verification.unproven.length} line(s) UNPROVEN — ${verification.unproven[0]!.why}`
+        + '; not charged to this phase' + (record.note ? `; ${record.note}` : '');
+    }
+    // Its own §Verification is green on the lines its wrap-up WIP failed: the WIP is not red any more.
+    if (record.wipRed && passed && !broke.length) delete record.wipRed;
     if (overtaken) {
       // The Repos-column hint used to ride the verify-failed halt; with the
       // board's word standing there is no halt to carry it, and losing it
       // would cost exactly the plan edit it exists to prompt. It travels on
       // the record instead, next to the verdict it qualifies.
-      record.note = `§Verification is red (${verification.reason}) but the handoff already reads `
+      record.note = `§Verification is red (${verification.reason})${comparedClause(stamps)} but the handoff already reads `
         + "complete — the board's word stands; the red verdict travels on this record"
         + await this.verifyHint(phase);
       this.record('phase.verify-overtaken', {
@@ -1122,7 +2309,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         ...(broke.length ? { failed: broke.map((r) => r.command) } : {}),
       }, phase);
     }
-    state.consecutiveFailures = 0;
+    resetStreak(state);
     // Not a flat `null`: with another lane still running, clearing the pointer
     // here would tell the console the run was between phases while a session
     // was mid-edit. `syncMirror` moves it to whatever is still live, and only
@@ -1132,6 +2319,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
     this.record('phase.done', {
       costUsd: record.costUsd, attempts: record.attempts,
       ...(verification.skipped?.length ? { skippedChecks: verification.skipped.length } : {}),
+      ...(reopened ? { reopened: reopened.times } : {}),
+      ...(inheritedOnly ? { inherited: record.verification?.inherited?.length ?? 0 } : {}),
+      ...(verification.unproven?.length ? { unproven: verification.unproven.length } : {}),
+      ...(record.verification?.export ? { exported: true } : {}),
     }, phase);
     this.emit('phase', { phase, status: 'done' });
     // AFTER the phase reads done and its `phase.done` line is journalled, and
@@ -1311,7 +2502,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     let prompt = brief;
     const boardFresh = async (): Promise<boolean> => {
       let boot = '';
-      try { boot = (await this.engine(['--boot-prompt', String(phase)])).stdout; } catch { boot = ''; }
+      try { boot = (await this.engine(['--boot-prompt', String(phase)], { ...LOCK_MIRROR_ENV })).stdout; } catch { boot = ''; }
       if (!boot.trim()) {
         this.record('phase.qa-session-skipped', {
           reason: `the engine produced no boot prompt for phase ${phase}, so no fresh session could be boarded`,
@@ -1360,7 +2551,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // a closeout's turns) unless the caller decided either — a `qa-recover`
     // round's own budget, a fix round's phase-sized turn allowance.
     const caps = capsFor({
-      mode: 'qa', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd,
+      mode: 'qa', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd,
       ...(opts.turns ? { turns: opts.turns } : {}),
       ...(opts.usd ? { usd: opts.usd } : {}),
     });
@@ -1427,6 +2618,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // sibling helper, so a site cannot state the mailbox and forget the ledger.
           ...this.issuesEnv(),
           PE_RULINGS_FILE: rulingsFile(state.root, state.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
+          PE_PROOFS_FILE: proofsFile(state.root, state.slug),
           PE_TASKS_FILE: this.armTasksFile(phase),
         }),
         signal: this.abort?.signal,
@@ -1463,11 +2656,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // replaces has already been superseded by the one that just did the work.
     if (opts.fresh && outcome.sessionId) record.sessionId = outcome.sessionId;
 
-    // The same three lines every extra session uses, so this money shows up in
-    // the cost panels without those panels knowing this feature exists.
-    state.spentUsd += outcome.costUsd;
-    record.costUsd += outcome.costUsd;
-    chargeRung(state.recoveries?.[String(record.phase)], outcome.costUsd);
+    // The money was booked by the spawn door like every session's (`bookSpend`),
+    // so it shows up in the cost panels without those panels knowing this
+    // feature exists; what this round spent is `booked`.
+    const booked = outcome.bookedUsd ?? outcome.costUsd;
     record.turns = (record.turns ?? 0) + outcome.turns;
 
     let after = '';
@@ -1502,7 +2694,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // round it produced; a session that recorded two rounds spent its money
       // once, and charging both would double it in every cost panel.
       ...(entry === settled[0] || !settled.length
-        ? { costUsd: outcome.costUsd, turns: outcome.turns }
+        ? { costUsd: booked, turns: outcome.turns }
         : {}),
       at,
     })));
@@ -1510,7 +2702,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const landedRound = landed[landed.length - 1]?.round ?? round;
     const landedReport = landed[landed.length - 1]?.reportPath ?? report;
     this.record('phase.qa-session-done', {
-      costUsd: outcome.costUsd, turns: outcome.turns, verdict: after || 'pending',
+      costUsd: booked, turns: outcome.turns, verdict: after || 'pending',
       round: landedRound,
       report: landedReport,
       rounds: (record.qa ?? []).length,
@@ -1521,7 +2713,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       verdict: after || 'pending',
       round: landedRound,
       report: landedReport,
-      costUsd: outcome.costUsd,
+      costUsd: booked,
       turns: outcome.turns,
     };
   }
@@ -1640,7 +2832,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         const gone = !record.sessionId || isSessionGone(record);
         const fresh = options.strategy === 'fresh' || gone;
         const roundUsd = roundBudgetUsd(options.roundBudgetUsd, state.phaseBudgetUsd);
-        const roundSize = await this.sizeOf(phase);
+        const roundCaps = phaseCaps(this.capTable());
         const round = await this.qaRound(phase, {
           verb,
           fresh: verb === 'qa-rerun' ? gone : fresh,
@@ -1651,11 +2843,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
               value: roundUsd,
               source: typeof options.roundBudgetUsd === 'number' && options.roundBudgetUsd > 0 ? 'qa-round' : 'run',
             }
-            : sizeUsd(roundSize),
+            : roundCaps.usd,
           // A fix may legitimately have to run a suite, so it gets a phase's
           // turn allowance rather than a closeout's. A review-only round keeps
           // the closeout cap it has always had (the QA mode's own).
-          ...(verb === 'qa-rerun' ? {} : { turns: sizeTurns(roundSize) }),
+          ...(verb === 'qa-rerun' ? {} : { turns: roundCaps.turns }),
           name: `${state.slug} p${phase} ${verb}`,
           // What the file says right now, read at the top of this round — so a
           // re-review's brief opens with a true sentence.
@@ -1709,7 +2901,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // as `runRecovery` does it.
         this.record('phase.qa-recovered', { verb, verdict, rounds: failures, costUsd: spentUsd }, phase);
         if (state.halt?.phase === phase) state.halt = null;
-        state.status = 'parked';
+        setRunState(state, 'parked');
         state.finishedReason = `phase ${phase} passed QA after ${failures} round${failures === 1 ? '' : 's'}. `
           + 'Continue to carry on through the rest of the plan.';
         return;
@@ -1754,7 +2946,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // and the board releases the dependents on its next read.
           record.note = `QA failed ${failures} of ${options.maxRounds} rounds — waived by policy (qa.exhausted: waive); dependents release on the next board read`;
           if (state.halt?.phase === phase) state.halt = null;
-          state.status = 'parked';
+          setRunState(state, 'parked');
           state.finishedReason = `phase ${phase}'s QA was waived by policy after ${failures} failed round${failures === 1 ? '' : 's'} `
             + '(qa.exhausted: waive). Continue to carry on through the rest of the plan.';
           return;
@@ -2206,6 +3398,44 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * that cannot be read answers `false`: when in doubt the loud stop stands,
    * because a silent pass is the one trade this question must never make.
    */
+  /**
+   * Re-open a phase the board reads done whose §Verification's FINAL verdict
+   * is red (control-tower phase 62, #68). Never a halt: the run keeps driving
+   * whatever does not depend on the phase. The record reads `failed` with
+   * `reopened` set, which is what the ladder's pass admits despite the board
+   * (`verify-red:reopened` — one fix rung, the phase's own session resumed with
+   * the failure, then an errand), what reconcile and the finished-run checks
+   * leave alone, and what holds the phase's dependents. A verdict red on its
+   * last attempt is a merit failure (#45's rule), so the streak is charged — a
+   * second ending of the same phase is not.
+   */
+  private async reopen(
+    phase: number, verification: VerifySummary, broke: readonly VerifyRun[], stamps: readonly TreeStamp[],
+  ): Promise<boolean> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const failed = broke.map((row) => row.command);
+    record.reopened = { at: this.now().toISOString(), failed, times: (record.reopened?.times ?? 0) + 1 };
+    record.status = 'failed';
+    record.endedAt = new Date().toISOString();
+    record.note = `§Verification is red (${verification.reason})${comparedClause(stamps)} although the handoff reads `
+      + 'complete — re-opened: the phase is not done until it verifies green, and its dependents wait'
+      + await this.verifyHint(phase);
+    this.record('phase.verification-failed', {
+      reopened: true, times: record.reopened.times, failed, reason: verification.reason,
+      ...(stamps.length ? { trees: stamps } : {}),
+    }, phase);
+    this.emit('phase', { phase, status: record.status, note: record.note });
+    if (this.lanes.size > 1) this.syncMirror();
+    else state.activePhase = null;
+    this.chargeFailure(phase, 'verify-red', 'verification failed');
+    if (state.consecutiveFailures >= state.maxConsecutiveFailures) {
+      this.halt(streakSentence(state), phase, 'failure-streak');
+    }
+    this.persist();
+    return false;
+  }
+
   private async boardOvertookVerification(phase: number): Promise<boolean> {
     try {
       const board = await this.board();
@@ -2264,8 +3494,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * be asked to finish rather than have the run halted under it.
    */
   private async closed(
-    phase: number, declared: PhaseOutcome | null,
-  ): Promise<'done' | 'waiting' | 'halted' | 'frozen'> {
+    phase: number, declared: PhaseOutcome | null, raises = 0,
+  ): Promise<'done' | 'waiting' | 'halted' | 'frozen' | 'interrupted'> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
 
@@ -2307,6 +3537,28 @@ export abstract class RunnerAttempt extends RunnerLoop {
       return this.closedBlocked(phase, board, null);
     }
 
+    // How the newest session ENDED, before a missing handoff is called anything
+    // (control-tower phase 46, #61). A resume that the console cut or that spent
+    // its cap was halted `no-handoff` — "ended cleanly" — because this method
+    // read neither `endedBy` nor `terminalReason`, and the resume vehicle had
+    // stamped a closeout that never ran. A recheck re-reads an old ending and
+    // acts on none of it.
+    const last = this.rechecking === phase ? undefined : record.lastSession;
+    // RC-6: the console ended it — a shutdown, a stop. Not a failure and not a
+    // closeout's cue: the phase keeps its session for the `--resume`.
+    if (this.stopRequested || this.shuttingDown || this.abort?.signal.aborted
+      || last?.endedBy === 'shutdown' || last?.endedBy === 'stop') {
+      return this.settleCut(phase);
+    }
+    // RC-5: a resume that spent its cap mid-work is the ending `errors.ts` has
+    // always classed "resume, raise" — the attempt loop's own path, which the
+    // resume vehicle never took. The same session carries on under double the
+    // cap, a bounded number of times, and this method asks again.
+    const spent = last?.mode === 'resume' ? spentCapOf(last) : null;
+    if (spent && last && raises < MAX_ATTEMPTS - 1 && await this.raiseResume(phase, last, spent)) {
+      return this.closed(phase, this.takeOutcome(phase), raises + 1);
+    }
+
     const attempt = await this.closeout(phase, board.states[phase] ?? 'unknown');
     // The console was frozen, so no closeout session was started — and this
     // phase must NOT be convicted for it. The fall-through below reads "no
@@ -2338,7 +3590,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
       // the ordinary case `freezeFleet` has already set it — this covers the
       // window where a lane resolved between the marker landing and the
       // signal, which is precisely the window this gate exists for.
-      if (state.status === 'running') state.status = 'frozen';
+      if (state.status === 'running') setRunState(state, 'frozen');
       this.record('phase.closeout-frozen', {
         note: attempt.note, sessionId: record.sessionId ?? null,
       }, phase);
@@ -2376,10 +3628,27 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // written (RCV-4). A recheck that RECORDS a failure for the first time — a
     // phase whose console died before its ending was written — still counts
     // it, because the failure is real and this is its first record.
-    if (attempted && !(this.rechecking === phase && record.halt?.kind === 'no-handoff')) state.consecutiveFailures++;
+    //
+    // And only a session that left NOTHING is a merit failure (control-tower
+    // phase 45, #60): work on disk with no handoff is unfinished paperwork, which
+    // the ladder's `work-in-progress` rungs answer — not a claim that the plan
+    // is broken. The closeout already asked the tree when it got that far; a
+    // closeout that stopped earlier (one already spent, a recheck) asks here.
+    if (attempted && !(this.rechecking === phase && record.halt?.kind === 'no-handoff')) {
+      const worked = attempt.worked ?? (await this.producedWork(phase, board.states[phase] ?? 'unknown')).did;
+      this.chargeFailure(phase, worked ? 'no-handoff-worked' : 'no-handoff', 'the session ended with no complete handoff');
+    }
+    // Said as it happened: "ended cleanly" only about a session that did.
+    const ended = record.lastSession ? spentCapOf(record.lastSession) : null;
+    if (ended === 'budget') this.notePhaseBudgetSpent(phase);
+    const how = ended === 'turns'
+      ? `spent its turn cap (${record.lastSession?.maxTurns?.value ?? '?'} turns)`
+      : ended === 'budget'
+        ? `spent its dollar cap ($${record.lastSession?.maxBudgetUsd?.value ?? '?'})`
+        : 'ended cleanly';
     this.halt(
       (attempted
-        ? `the session for phase ${phase} ended cleanly but the board still reads `
+        ? `the session for phase ${phase} ${how} but the board still reads `
         : `nothing has been run for phase ${phase} and the board still reads `)
       + `"${board.states[phase] ?? 'unknown'}" — no handoff was written, or it is not marked complete`
       + (attempt.note ? `. ${attempt.note}` : '')
@@ -2392,6 +3661,78 @@ export abstract class RunnerAttempt extends RunnerLoop {
       'no-handoff',
     );
     return 'halted';
+  }
+
+  /**
+   * RC-6 (control-tower phase 46, #61): the console ended the phase's session —
+   * it shut down, or a person stopped it. That is not a failure to diagnose and
+   * not a missing handoff: the phase settles `interrupted` with its session
+   * kept for the `--resume`, exactly as the attempt loop settles the same
+   * ending, and nothing charges the streak. It used to fall through to the
+   * closeout — "already attempted", because the resume vehicle had stamped one —
+   * and halt `no-handoff` over a resume the shutdown cut 4.8 s in.
+   */
+  private settleCut(phase: number): 'interrupted' {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const lane = this.lanes.get(phase);
+    if (lane?.stopped) {
+      this.settleStoppedLane(lane, phase);
+      return 'interrupted';
+    }
+    record.status = 'interrupted';
+    record.endedAt = new Date().toISOString();
+    record.resumeSessionId ??= record.sessionId;
+    if (this.shuttingDown || record.lastSession?.endedBy === 'shutdown') {
+      record.note = consoleStoppedNote(phase);
+      state.stoppedBy = 'system';
+    } else {
+      const stamp = this.stopStamp();
+      record.note = stamp.note;
+      state.stoppedBy = stamp.stoppedBy;
+    }
+    // The word the attempt loop writes for the same ending: a halt that stands
+    // keeps its run `halted`, anything else is `paused` for Continue.
+    setRunState(state, state.halt ? 'halted' : 'paused');
+    this.emit('phase', { phase, status: record.status });
+    this.persist();
+    return 'interrupted';
+  }
+
+  /**
+   * RC-5 (control-tower phase 46, #61): resume the phase's session that spent
+   * its cap mid-work, under double the cap it spent (`raiseCap`) — the path
+   * `classify()` has always named for `error_max_turns` and
+   * `error_max_budget_usd`, which the phase attempt takes and the resume
+   * vehicle never did. True when the session ran; false when it could not be
+   * resumed, and the caller carries on to the closeout and the verdict.
+   */
+  private async raiseResume(
+    phase: number, last: NonNullable<PhaseRecord['lastSession']>, spent: 'turns' | 'budget',
+  ): Promise<boolean> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const base = capsFor({
+      mode: 'resume', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd, spentTurns: record.turns ?? 0,
+    });
+    const turns = last.maxTurns ?? base.maxTurns;
+    const usd = last.maxBudgetUsd ?? base.maxBudgetUsd;
+    const caps: SessionCaps = spent === 'budget'
+      ? { maxTurns: turns, maxBudgetUsd: raiseCap(usd, 'the session spent its dollar cap') }
+      : { maxTurns: raiseCap(turns, 'the session spent its turn cap'), maxBudgetUsd: usd };
+    this.record('phase.resume', {
+      raise: spent, vehicle: 'resume',
+      budget: caps.maxBudgetUsd.value, budgetSource: caps.maxBudgetUsd.source,
+      maxTurns: caps.maxTurns.value, maxTurnsSource: caps.maxTurns.source,
+    }, phase);
+    const words = spent === 'budget'
+      ? `The console raised your dollar cap to $${caps.maxBudgetUsd.value}: you spent the $${usd.value} it gave you mid-work.`
+      : `The console raised your turn cap to ${caps.maxTurns.value}: you spent the ${turns.value} turns it gave you mid-work.`;
+    const said = await this.resumeWithInstruction(phase,
+      `${words} Nothing is wrong with the work — carry on from exactly where you stopped, then close the phase out.`,
+      null, { caps, name: `${state.slug} p${phase} resume` });
+    if (this.drainTasks(phase)) this.persist();
+    return said === null;
   }
 
   /**
@@ -2455,9 +3796,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     // The plan's word on how long this phase may stay parked, read before
-    // anything is spent — the only await on this path, so nothing it decides
-    // below can be interleaved with another lane's writes.
-    const budget = declared.status === 'waiting-external' ? await this.waitBudgetOf(phase) : undefined;
+    // anything is spent — the only awaits on this path, so nothing it decides
+    // below can be interleaved with another lane's writes. A declared WALL
+    // (`needs-human`, `blocked`) reads it too, and the scopes of this run's
+    // phases: the budget is stamped on the declaration (`declared.budget`, the
+    // fence and the `cmd:` clock end with it) and the scopes decide whether
+    // the wall folds into one already standing (control-tower phase 6, #19).
+    const walled = declared.status === 'needs-human' || declared.status === 'blocked';
+    const budget = declared.status === 'waiting-external' || walled ? await this.waitBudgetOf(phase) : undefined;
+    const scopes = new Map<number, string[]>();
+    if (walled) for (const p of Object.keys(state.phases).map(Number)) scopes.set(p, await this.scopeFor(p));
+    const budgetStamp = budget ? { budget: { ms: budget.budgetMs, source: budget.source } } : {};
     // Before anything routes: the ladder's own bookkeeping, from the session's
     // own words. A no-op unless the ladder is what boarded this attempt.
     this.settleRungFromOutcome(phase, declared, record.said);
@@ -2495,11 +3844,24 @@ export abstract class RunnerAttempt extends RunnerLoop {
           ...(declared.reason ? { reason: declared.reason } : {}),
           ...(declared.watch.length ? { watch: declared.watch } : {}),
           ...needsOf(declared),
+          ...budgetStamp,
           at: new Date().toISOString(),
         };
         clearWatchBookkeeping(record);
         const clock = this.armDeclaredClock(phase, record, declared);
+        // What was asked, on the testimony — the instant a `poll-park` of this
+        // block is judged against (control-tower phase 87), as a wait's is.
+        if (clock) record.declared.requested = clock.requested;
         const lockRef = declared.watch.find((ref) => ref.startsWith('lock:'));
+        // A lock block whose ONLY lock was the phase's own (#42): the screen
+        // refused the ref, and there is no holder to queue behind — the lock
+        // ladder's one rung would re-board the phase the moment its own
+        // closeout released that lock. What it is blocked on is a person's to
+        // read, so it parks with the errand, like the needs-human it is.
+        if (!lockRef && declared.refused?.length
+          && declaredSubKind(declared, { refs: declared.watch }) === 'lock') {
+          return this.parkOwnLockBlock(phase, declared);
+        }
         if (lockRef) {
           // Not a defect: a foreign lock the session correctly refused to
           // force. Back to the queue — admission waits on the holder with the
@@ -2548,8 +3910,24 @@ export abstract class RunnerAttempt extends RunnerLoop {
           ...(declared.reason ? { reason: declared.reason } : {}),
           ...(declared.watch.length ? { watch: declared.watch } : {}),
           ...needsOf(declared),
+          // A person's turn is not somebody else's clock: no wait budget is
+          // stamped, so nothing about a human step ends with it.
+          ...(declared.step ? {} : budgetStamp),
           at: record.endedAt,
         };
+        // A HUMAN STEP (control-tower phase 41): the ledger, the one inbox row
+        // and the one push are the service's (`deps.humanStep`); the park here
+        // waits on a PERSON and charges no external-wait budget (`parkOnStep`).
+        const step = declared.step
+          ? this.deps.humanStep?.({
+            slug: state.slug, phase, birth: 'session', step: declared.step, runId: state.id,
+            ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          }) ?? null
+          : null;
+        if (step) {
+          parkOnStep(record, step, 'session', record.endedAt);
+          this.record('phase.human-step', stepJournalFields(step), phase);
+        }
         // The refs ride the record like a wait's do: when they are
         // machine-checkable (`gh:…`), the healer polls them and resumes this
         // session the moment the world changes — the person is asked AND the
@@ -2579,16 +3957,74 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // permission wall names the policy, a credential names the sign-in, an
         // external wait names its refs — instead of one sentence for all of
         // them, which was the errand nobody could act on.
-        const declaredKey = `blocked-declared:${blockerSubKind(record.note, declared.watch)}`;
+        // The session's `--needs` word first, exactly as the classifier reads
+        // it (control-tower phase 6): `needs-human --needs external` with no
+        // `gh:` ref and no telltale wording used to file `:unknown` here while
+        // the classifier called the same park `:external`.
+        // `declaredSubKind` — the classifier's own reading, so the card and the
+        // situation line name one wall; it is what tells the CLI's protected
+        // path from this console's rule (#43).
+        const deniedRule = record.toolDenied && record.toolDenied.rule !== 'in-turn-wait';
+        const declaredKey = `blocked-declared:${declaredSubKind(record.declared, { denied: Boolean(deniedRule), text: record.note, refs: declared.watch })}`;
+        // The SAME external wall a sibling already declared folds into its
+        // errand (#19 ask 2): no second errand, no second announcement, and no
+        // second park of the run — the first one already told a person.
+        const fold = declaredKey === 'blocked-declared:external'
+          ? errandFoldTarget(state, phase, (p) => scopes.get(p) ?? ['all'])
+          : null;
+        if (fold !== null) {
+          const target = state.recoveries![String(fold)]!.errand!;
+          target.alsoPhases = [...new Set([...(target.alsoPhases ?? []), phase])].sort((a, b) => a - b);
+          slot.foldedInto = fold;
+          delete slot.errand;
+          this.record('phase.errand-folded', { into: fold, situation: declaredKey, need: record.note }, phase);
+          this.emit('phase', { phase, status: 'parked', note: record.note, foldedInto: fold });
+          this.persist();
+          return 'waiting';
+        }
+        delete slot.foldedInto;
+        // `need` is the session's own words; `how` is the sub-kind's. What the
+        // watch clock does with the refs (#19 ask 4) is NOT written here: this
+        // runs before the scheduler's first probe, and a clause frozen now said
+        // "watching … resumes the session" for 69 minutes about a ref refused
+        // three seconds later (#125). `watching` marks it; every reader derives
+        // the clause from the record as it stands (`liveErrandHow`).
+        const watching = pollableRefs(declared.watch).length > 0;
+        // A permission wall this console holds no rule for names the act and
+        // the path the session declared, not "a tool" (#43).
+        const plain = errandFor(declaredKey, [], phase, record.endedAt);
+        const composed = deniedRule
+          ? plain
+          : errandFor(declaredKey, [], phase, record.endedAt, null, null, null, null, null, record.declared);
+        const namesAct = composed.need !== plain.need;
         slot.errand = {
           phase,
           situation: declaredKey,
           at: record.endedAt,
           tried: (slot.rungs ?? []).map((r) => `${r.rung}${r.outcome ? ` → ${r.outcome}` : ''}`),
-          need: record.note,
-          how: errandFor(declaredKey, [], phase, record.endedAt).how
-            + (declared.watch.length ? ' The console is also watching its refs and resumes the session when they land.' : ''),
+          need: namesAct ? `${composed.need}${declared.reason ? ` The session said: ${declared.reason}` : ''}` : record.note,
+          how: composed.how,
+          ...(watching ? { watching: true } : {}),
         };
+        // A plan the console held for a person (control-tower phase 11, #34):
+        // the errand names the plan and the two answers, not a generic gate.
+        if (step) {
+          // The errand names the act in the step's own words — what, where,
+          // and what proves it — rather than the generic `human-acts` ask.
+          const meta = KIND_META[step.kind];
+          slot.errand.need = `Your turn — ${meta.label.toLowerCase()}: ${step.title}`;
+          slot.errand.how = `${step.where === 'host' ? 'At the machine this console runs on' : 'From any device'}`
+            + `${step.openUrl ? `, open ${step.openUrl}` : step.openCommand ? `, run \`${step.openCommand}\`` : ''}`
+            + `${step.proof ? `; ${step.proof} proves it` : ''}. When it is done, Retry the phase — the same session resumes.`;
+        }
+        const planHeld = declared.needs === PLAN_APPROVAL_NEED;
+        const held = planHeld ? record.planApproval : undefined;
+        if (planHeld) {
+          slot.errand.need = `A decision on the plan phase ${phase}'s session presented`
+            + (held ? ` (${held.bytes} bytes, sha ${held.sha.slice(0, 12)}; the text is kept at ${held.path}).` : '.');
+          slot.errand.how = 'Read the plan, then Approve — the same session resumes in acceptEdits and carries it '
+            + 'out — or Reject, saying why; the phase stays parked until one of them is pressed.';
+        }
         this.record('phase.errand', { ...slot.errand }, phase);
         this.emit('phase', { phase, status: 'parked', note: record.note, errand: slot.errand });
         // The approvals-timeout vocabulary: nothing is wrong with the work,
@@ -2596,7 +4032,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // answers. Not counted against the failure budget. The KIND is what
         // lets the classifier read this park for what it is even on a record
         // written before `declared` existed.
-        this.park(`phase ${phase} needs a person: ${record.note}`, phase, 'needs-human');
+        // A held plan parks under its own kind, so the classifier, the inbox and
+        // the halt card read it as a plan to decide rather than an unnamed ask.
+        this.park(`phase ${phase} needs a person: ${record.note}`, phase, planHeld ? 'plan-approval' : 'needs-human');
         return 'halted';
       }
       case 'partial': {
@@ -2612,6 +4050,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // Before the climb: the gate reads it at boarding, and a `budget` or
         // `context` reason boards the next attempt fresh (`resumePolicy`).
         record.lastPartial = { sessionId: record.sessionId ?? null, reason: declared.reason ?? null, at: new Date().toISOString() };
+        // The console's OWN steer is not a remedy (control-tower phase 5, #14
+        // ask 2). A `partial --reason context|budget` from the session the
+        // wrap-up notice reached is what that notice told it to declare — so
+        // its resume is the console's park, boarded fresh with the resume brief
+        // under the phase's own budget, and priced as no rung. Measured on run
+        // 31285928: the obedient declaration was refused as a spent run cap one
+        // second later, and parked a session's work one merge from done.
+        if (this.wrapupAsked(record, declared.reason)) return await this.resumeAfterWrapup(phase, record, declared.reason!);
         const climbed = await this.climb(record, board, 'outcome', {
           situation: situationOf('work-in-progress', why),
           sessionId: record.sessionId,
@@ -2633,6 +4079,240 @@ export abstract class RunnerAttempt extends RunnerLoop {
   }
 
   /**
+   * The wrap-up's FAST gate (control-tower phase 89, #127): P43's wrap-up
+   * commit said itself that the suite had not run, and on a shared run branch
+   * it was at once every sibling's base — red for 15 files, every push
+   * blocked, a sibling's own red masked under it. After a `partial --reason
+   * context|budget` the console runs the plan's fast gate (`fastGateLines`:
+   * this phase's §Verification lines measured fast, within a ten-minute
+   * budget) on the COMMITTED work — a clean checkout of HEAD when the tree
+   * holds anything uncommitted — and records the answer: red writes `wipRed
+   * {sha, files, lines}` on this phase (the boarding order puts the WIP's owner
+   * first, every sibling's brief names the files, attribution gives their reds
+   * to it); green clears it. Journalled `phase.wip-gate` either way, and when
+   * no line is measured fast, that too — nothing was checked, and the record
+   * must not read as if something had been.
+   */
+  protected async wipGate(phase: number): Promise<void> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    if (this.abort?.signal.aborted || this.stopRequested) return;
+    const text = await this.deps.verificationText(state.slug, phase);
+    const approvals = this.verifyApprovalsFor(phase);
+    const commands = extractCommands(text, 'verify', approvals).commands;
+    const gate = fastGateLines(commands, readLedger(verificationsFile(state.root, state.slug), state.slug));
+    const cwd = await this.verifyCwd(phase);
+    const tree = await workingTreeOf(cwd).catch(() => null);
+    const sha = tree?.head ?? null;
+    if (!gate.lines.length || !sha) {
+      this.record('phase.wip-gate', {
+        sha, skipped: !sha ? 'git could not name the commit' : 'no line of this phase\'s §Verification is measured fast',
+        lines: 0,
+      }, phase);
+      return;
+    }
+    // The COMMITTED WIP is what siblings build on; anything uncommitted is set aside.
+    const dirty = await uncommittedPaths(cwd).catch(() => null);
+    const made = dirty?.paths.some((entry) => !isPaperwork(entry.path)) ? await exportCheckout(dirty.top, sha).catch(() => null) : null;
+    const checkout = made && !('refused' in made) ? made : null;
+    const runCwd = checkout ? join(checkout.dir, withinRepo(dirty!.top, cwd)) : cwd;
+    const startedAt = this.now().toISOString();
+    const verify = this.deps.verify ?? verifyPhase;
+    let ran: VerifyRun[] = [];
+    try {
+      const summary = await verify(gate.lines.map((line) => `- \`${line}\``).join('\n'), {
+        cwd: runCwd, purpose: 'wip-gate', cascade: false,
+        ...(approvals ? { approvals } : {}),
+        preflightSkip: this.verifyEnv().preflightSkip,
+        timeoutMs: FAST_GATE_BUDGET_MS, timeoutFor: (command) => gate.limitMs[foldCommand(command)] ?? FAST_GATE_BUDGET_MS,
+        signal: this.abort?.signal ?? undefined,
+        onStart: (command, index, total) => this.noteVerifying(phase, 'wip-gate', { command, index, total }, { startedAt, exported: Boolean(checkout) }),
+      });
+      ran = RunnerAttempt.finalRows(summary.ran).filter((row) => !row.proven);
+    } finally {
+      this.noteVerifying(phase, null);
+      await checkout?.remove().catch(() => {});
+    }
+    if (this.abort?.signal.aborted || this.stopRequested) return;
+    const red = ran.filter((row) => !row.ok && !row.timedOut && !row.environment);
+    const ms = ran.reduce((sum, row) => sum + row.ms, 0);
+    if (!red.length) {
+      const was = record.wipRed?.sha;
+      delete record.wipRed;
+      this.record('phase.wip-gate', {
+        sha, ok: true, lines: ran.length, ms, ...(checkout ? { exported: true } : {}), ...(was ? { cleared: was } : {}),
+      }, phase);
+      return;
+    }
+    // The WIP's files: what was committed on top of the head the phase's first
+    // boarding stood on (its baseline's), exactly; by the clock only without
+    // one — git dates are whole seconds, so the clock also counts a commit made
+    // in the second the phase boarded (WU-1 flaked on it, phase 89).
+    const repo = dirty?.top ?? cwd;
+    const baseHead = record.baseline?.head;
+    const since = record.attemptWindows?.[0]?.startedAt ?? record.attemptStartedAt ?? record.startedAt;
+    const files = (baseHead ? await filesCommittedBetween(repo, baseHead, sha).catch(() => null) : null)
+      ?? (since ? await filesCommittedSince(repo, since, sha).catch(() => null) : null);
+    const wip: WipRed = {
+      sha, at: this.now().toISOString(),
+      ...(files?.length ? { files } : {}),
+      lines: red.map((row) => ({ command: foldCommand(row.command), ...(row.failures?.length ? { failures: row.failures.slice(0, 20) } : {}) })),
+    };
+    record.wipRed = wip;
+    this.record('phase.wip-gate', {
+      sha, ok: false, lines: ran.length, ms, red: wip.lines, ...(wip.files ? { files: wip.files } : {}),
+      ...(checkout ? { exported: true } : {}),
+    }, phase);
+  }
+
+  /**
+   * What a booting lane must be told about its tree (control-tower phase 89):
+   *  - a sibling's committed WIP that its wrap-up gate found RED (`wipRed`,
+   *    #127) — the lines, the failing tests, the files, and whose they are;
+   *  - a sibling's UNCOMMITTED work in the shared tree, whatever made it stop
+   *    (a wrap-up, a `scope-cap` partial — #103's 2026-09-25 10:53Z ask 3),
+   *    by file and owner, so it is neither committed nor debugged here;
+   *  - the reds other phases' verifications attributed to THIS phase (`owed`,
+   *    phase 83's deferral);
+   *  - a job of its own that the console's checkpoint ended (`reverify`
+   *    `checkpoint`, #121) — consumed here, its brief being the debt's reader.
+   * It also reads the plan's fast gate for the lane (`Lane.fastGate`), which the
+   * wrap-up notice names. Empty when there is nothing to say.
+   */
+  protected async boardingWipBlock(phase: number, lane: Lane): Promise<string> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    try {
+      const text = await this.deps.verificationText(state.slug, phase);
+      const commands = extractCommands(text, 'verify', this.verifyApprovalsFor(phase)).commands;
+      lane.fastGate = fastGateLines(commands, readLedger(verificationsFile(state.root, state.slug), state.slug)).lines;
+    } catch {
+      lane.fastGate = [];
+    }
+    const some = (items: readonly string[], shown = 12): string => items.slice(0, shown).join(', ')
+      + (items.length > shown ? ` and ${items.length - shown} more` : '');
+    const lines: string[] = [];
+    for (const other of Object.values(state.phases).sort((a, b) => a.phase - b.phase)) {
+      const wip = other.wipRed;
+      if (other.phase === phase || !wip) continue;
+      const red = (wip.lines ?? []).map((line) => `\`${line.command}\`${line.failures?.length ? ` (${some(line.failures, 3)})` : ''}`);
+      lines.push(`- Phase ${other.phase}'s work-in-progress is COMMITTED and RED (commit ${wip.sha.slice(0, 12)}): its fast gate `
+        + `failed on ${red.length ? red.join(', ') : 'its lines'}.${wip.files?.length ? ` Its files: ${some(wip.files)}.` : ''} `
+        + `Those reds are phase ${other.phase}'s — do not debug, revert or fix them here; your §Verification attributes them to phase ${other.phase}.`);
+    }
+    if (!lane.worktree) {
+      const dirty = await uncommittedPaths(await this.verifyCwd(phase)).catch(() => null);
+      const paths = (dirty?.paths ?? []).filter((entry) => !isPaperwork(entry.path));
+      const byOwner = new Map<number, string[]>();
+      if (paths.length) {
+        for (const [path, owner] of wipOwners(paths, this.sessionWindows(), phase)) {
+          if (typeof owner === 'number') byOwner.set(owner, [...(byOwner.get(owner) ?? []), path]);
+        }
+      }
+      for (const [owner, files] of [...byOwner].sort((a, b) => a[0] - b[0])) {
+        const why = state.phases[String(owner)]?.lastPartial?.reason;
+        lines.push(`- This tree holds phase ${owner}'s UNCOMMITTED work${why ? ` (it stopped with \`partial --reason ${why}\`)` : ''}: `
+          + `${files.length} file(s) — ${some(files.sort())}. They are phase ${owner}'s: do not commit, stash, reset or debug them; `
+          + 'stage only your own paths (`git add <path>`, never `git add -A`).');
+      }
+    }
+    for (const owed of record.owed ?? []) {
+      lines.push(`- Phase ${owed.by}'s §Verification found \`${owed.command}\`${owed.chain ? ` (a member of \`${owed.chain}\`)` : ''} red`
+        + `${owed.failures.length ? ` (${some(owed.failures, 3)})` : ''} and attributed it to THIS phase (${owed.how}`
+        + `${owed.paths?.length ? `: ${some(owed.paths, 5)}` : ''}). It stays owed on your record until this line runs green here.`);
+    }
+    if (record.reverify?.cause === 'checkpoint') {
+      const jobs = record.reverify.jobs?.length ? ` (${record.reverify.jobs.join(', ')})` : '';
+      lines.push(`- The console's checkpoint at ${record.reverify.at} ended your previous session while it waited on a job of its own${jobs}. `
+        + 'A checkpoint signals the session\'s whole process group, so that job ended with it unless it was started detached: check its '
+        + 'output, re-run what is missing DETACHED (`nohup setsid <command> > /tmp/<name>.log 2>&1 &`), and declare `waiting-external` '
+        + 'on a marker it writes rather than waiting inside the turn.');
+      delete record.reverify;
+      this.persist();
+    }
+    if (!lines.length) return '';
+    return `\n\nWHAT THE CONSOLE KNOWS ABOUT THIS TREE (read as this phase boarded — control-tower phase 89):\n${lines.join('\n')}\n`;
+  }
+
+  /**
+   * The console's own lane (control-tower phase 89, #68's 2026-09-25 05:44Z
+   * comment): which command of which pass the runner is running for a phase —
+   * under its grant, with no session — written as each command starts and gone
+   * when the pass ends (`purpose` null). `/api/runs` and the Runs page read it
+   * as `state.verifying`; `children` holds only sessions, so a run
+   * mid-verification used to read `running` with nothing in it.
+   */
+  protected noteVerifying(
+    phase: number, purpose: VerifyingLane['purpose'] | null,
+    at?: { command: string; index: number; total: number }, opts: { startedAt?: string; exported?: boolean } = {},
+  ): void {
+    const state = this.state;
+    if (!state) return;
+    const key = String(phase);
+    if (!purpose || !at) {
+      if (!state.verifying?.[key]) return;
+      delete state.verifying[key];
+      if (!Object.keys(state.verifying).length) delete state.verifying;
+    } else {
+      const now = this.now().toISOString();
+      (state.verifying ??= {})[key] = {
+        phase, purpose, command: at.command.replace(/\s+/g, ' ').trim().slice(0, 200), index: at.index + 1, total: at.total,
+        startedAt: opts.startedAt ?? state.verifying[key]?.startedAt ?? now, commandStartedAt: now,
+        ...(opts.exported ? { exported: true } : {}), pid: process.pid,
+      };
+    }
+    this.persist();
+    this.emit('run', { state });
+  }
+
+  /**
+   * Did the console's wrap-up notice reach THIS attempt's session, and is the
+   * declaration the one it asked for? The notice is spent once per session id
+   * (`record.contextWrapup`, `Runner.noteContext`) — so a stamp for the
+   * session that just declared, written after this attempt began, is the proof.
+   */
+  private wrapupAsked(record: PhaseRecord, reason: string | null | undefined): boolean {
+    if (reason !== 'context' && reason !== 'budget') return false;
+    const told = record.contextWrapup;
+    if (!told || told.sessionId !== (record.sessionId ?? null)) return false;
+    return !record.attemptStartedAt || told.at >= record.attemptStartedAt;
+  }
+
+  /**
+   * The wrap-up's resume: fresh, with the resume brief, spending no rung — the
+   * checkpoint's own re-board (`Runner.noteContext`), for the session that
+   * obeyed before the checkpoint had to act. Bounded by the declarations
+   * ledger (`DECLARATIONS_MAX_PER_PHASE`), which counted this `partial` above.
+   */
+  private async resumeAfterWrapup(phase: number, record: PhaseRecord, reason: string): Promise<'waiting'> {
+    const sessionId = record.sessionId ?? null;
+    const told = record.contextWrapup!;
+    // What the wrap-up left on the branch is checked before anything builds on
+    // it (control-tower phase 89, #127): the plan's fast gate, on the commit.
+    await this.wipGate(phase).catch((error: unknown) => {
+      this.record('phase.wip-gate', { skipped: `the gate could not run: ${error instanceof Error ? error.message : String(error)}`, lines: 0 }, phase);
+    });
+    prepareReboard(record);
+    record.resumeSessionId = undefined;
+    const hint: BoardingHint = reboardResumeBrief(
+      `The previous session of this phase handed off at the console's wrap-up notice (${reason}: `
+      + `${Math.round(told.context / 1000)}k of a ${Math.round(told.window / 1000)}k context window). This is the `
+      + 'fresh session that notice asked for: read the handoff\'s Outstanding section, git status and git diff first, '
+      + 'then carry the phase to its exit criteria.',
+    );
+    record.boardingHint = hint;
+    record.wrapupResumes = (record.wrapupResumes ?? 0) + 1;
+    record.note = `handed off at the console's wrap-up notice (${reason}) — the next attempt boards fresh with the resume brief`;
+    this.record('phase.resume-automatic', {
+      trigger: 'outcome', path: 'wrapup', count: record.wrapupResumes, sessionId, reason, by: 'console',
+    }, phase);
+    this.record('phase.outcome-partial', { reason, climbed: false, wrapup: true }, phase);
+    this.persist();
+    this.emit('phase', { phase, status: record.status, note: record.note });
+    return 'waiting';
+  }
+
+  /**
    * A phase whose handoff (or declared outcome) says it is blocked. The
    * situation classifier reads the blocker STATEMENT — the Outstanding text,
    * the declared reason, the watch refs, the session's words — and the ladder
@@ -2642,6 +4322,35 @@ export abstract class RunnerAttempt extends RunnerLoop {
    * the old `phase-blocked` halt, which the service's healer can still act on
    * with a vehicle this loop does not have.
    */
+  /**
+   * Park a `blocked` declaration whose only lock ref named the phase's own
+   * lock (#42): refused at ingest, so there is no holder to wait for, and a
+   * queue rung would re-board the phase the moment its own closeout released
+   * that lock. It is a person's to read — the errand says what was declared
+   * and why the watch was refused.
+   */
+  private parkOwnLockBlock(phase: number, declared: PhaseOutcome): 'waiting' {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const at = new Date().toISOString();
+    record.status = 'parked';
+    record.note = declared.reason ?? `blocked on its own lock (${declared.refused!.join(', ')})`;
+    record.endedAt = at;
+    const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: at });
+    delete slot.foldedInto;
+    const key = 'blocked-declared:unknown';
+    const base = errandFor(key, slot.rungs ?? [], phase, at);
+    slot.errand = {
+      ...base,
+      need: record.note,
+      how: `The watch it declared (${declared.refused!.join(', ')}) was refused — ${OWN_LOCK_WATCH_REFUSAL} ${base.how}`,
+    };
+    this.record('phase.errand', { ...slot.errand, label: 'Declared blocked', reason: 'its only lock ref was its own', by: 'closed' }, phase);
+    this.emit('phase', { phase, status: 'parked', note: record.note, errand: slot.errand });
+    this.persist();
+    return 'waiting';
+  }
+
   private async closedBlocked(
     phase: number, board: Board, declared: PhaseOutcome | null,
   ): Promise<'waiting' | 'halted'> {
@@ -2653,15 +4362,29 @@ export abstract class RunnerAttempt extends RunnerLoop {
         : null,
     });
     if (climbed) return 'waiting';
-    // Parked with an errand, or re-queued behind a lock: the run carries on.
-    if (record.status === 'parked' || record.status === 'pending' || record.status === 'queued') return 'waiting';
+    // Parked with an errand, re-queued behind a lock, or waiting on the refs it
+    // declared (the runner's `poll-park`, control-tower phase 87): the run
+    // carries on.
+    if (['parked', 'pending', 'queued', 'waiting'].includes(record.status)) return 'waiting';
 
     record.status = 'failed';
     record.note = declared?.reason ?? (record.said ? condenseSaid(record.said) : 'the handoff declares this phase blocked');
     record.endedAt = new Date().toISOString();
     // Paperwork, not an attempt: a recheck that re-reads the same blocked
     // handoff charges no failure (RCV-4); the first record of it still counts.
-    if (!(this.rechecking === phase && record.halt?.kind === 'phase-blocked')) state.consecutiveFailures++;
+    // A block that named refs the watch clock can poll is a WAIT (#122) — the
+    // loop parks it before it gets here, so one that arrives anyway is held as
+    // `declared-wait`; one naming none is the phase's `declared-blocked`. Either
+    // is charged on its ROOT CAUSE: the blamed commit, else the refs it watched.
+    const refs = declared?.watch ?? (record.declared?.status === 'blocked' ? record.declared.watch ?? [] : []);
+    const retired = new Set(record.watchRetired ?? []);
+    // A ref that already landed was waited out — blocked again, it is no wait.
+    const waitedOut = !declared && Boolean(record.declared?.landed);
+    const watched = !waitedOut && pollableRefs(refs).some((target) => !retired.has(target.ref));
+    if (!(this.rechecking === phase && record.halt?.kind === 'phase-blocked')) {
+      this.chargeFailure(phase, watched ? 'declared-wait' : 'declared-blocked', 'the handoff declares the phase blocked',
+        failureRootOf({ refs, state }));
+    }
     this.halt(
       declared
         ? `phase ${phase} declared itself blocked: ${declared.reason ?? 'no reason recorded'}`
@@ -2775,29 +4498,44 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
 
   /**
-   * Park a phase on an external clock. True when parked; false when the
-   * allowance is spent and the park became an honest halt instead.
+   * Park a phase on an external clock. True when the phase now waits — on a
+   * clock, or, when the allowance is spent, on its refs alone with a `budgets`
+   * errand (`parkOnSpentBudget`, control-tower phase 45); false only when the
+   * declaration was refused outright (a wait nobody named a ref for).
    *
    * Every park is answered by `evaluateWait` — the one expression, shared with
    * the resume — and says what it granted against what was asked. A declared
-   * window past the budget is refused with the arithmetic in the halt, never
-   * cut short in silence (WAI-1): the 48-hour soak that was quietly parked for
-   * eight and then halted with 2 377 minutes still to run is now a halt at the
-   * moment it is declared, naming the one line that would have allowed it.
+   * window past the budget is never cut short in SILENCE (WAI-1): one naming a
+   * ref the clock can poll is granted what is left, journalled `capped`, and
+   * the ref's landing ends it; one nothing can end sooner is refused with the
+   * arithmetic, naming the one line that would have allowed it.
    *
    * `by` is who parked it (SLF-9): the session, a hand session through the
    * inbox, or the console's own watchdog — whose parks spend a ledger of their
    * own and never the session's allowance (WAI-5). `budget` is the plan's word
    * for this phase (`waitBudgetOf`); a synchronous caller passes nothing and
    * gets what was already read.
+   *
+   * `blocked` (control-tower phase 87, #122, #126) is the runner's `poll-park`:
+   * a `blocked` declaration naming refs the watch clock can poll parks HERE,
+   * through the same budget and window as a `waiting-external` one, and keeps
+   * its own word — `status: 'blocked'`, its `--needs`, `parked: 'poll-park'`.
+   * It used to have no vehicle but the healer's, which only acts on a stopped
+   * run, so on a live run it was settled `failed` and charged to the streak.
    */
   protected parkWaiting(
-    phase: number, declared: PhaseOutcome, opts: { by?: WaitAuthor; budget?: WaitBudget; minted?: string[] } = {},
+    phase: number, declared: PhaseOutcome,
+    opts: { by?: WaitAuthor; budget?: WaitBudget; minted?: string[]; blocked?: boolean } = {},
   ): boolean {
     const state = this.state!;
     const record = phaseRecord(state, phase);
     const by: WaitAuthor = opts.by ?? 'session';
     const ledger = by === 'watchdog' ? 'watchdog' : 'session';
+    // The session's own word and what the park adds to it — the same stamps
+    // on a clock park and on a spent-budget park.
+    const testimony = opts.blocked
+      ? { status: 'blocked' as const, ...needsOf(declared), parked: 'poll-park' as const }
+      : { status: 'waiting-external' as const };
     const now = Date.now();
     const at = new Date(now).toISOString();
     const waits = ledger === 'watchdog' ? (record.watchdogParks ?? 0) : (record.waits ?? 0);
@@ -2853,6 +4591,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // said how to know its wait was over, and a silent clock is not that.
     const unpollable = unpollableRefs(declared.watch);
     for (const { ref, reason } of unpollable) this.record('phase.watch-unpollable', { ref, reason, by }, phase);
+    // A wait on this console's own state alone spends no budget (#126, rule 0).
+    const unbudgeted = !spendsWaitBudget(declared.watch);
     const verdict = evaluateWait({
       now,
       requestedUntil: declared.resume_after ? Date.parse(declared.resume_after) : undefined,
@@ -2862,30 +4602,56 @@ export abstract class RunnerAttempt extends RunnerLoop {
       ledger,
       floorMs: this.deps.waitFloorMs ?? WAIT_FLOOR_MS,
       dates: pollableRefs(declared.watch).flatMap((target) => (target.kind === 'date' ? [[target.ref, target.at] as const] : [])),
+      // Rule 7 (control-tower phase 45, #59): a window past the budget that
+      // names a ref the clock can poll is granted what is left.
+      pollable: pollableRefs(declared.watch).length > 0,
+      unbudgeted,
     });
     if (verdict.verdict !== 'park') {
-      record.status = 'failed';
-      record.note = declared.reason;
-      // The timeout supersedes the declaration: the halt below is the fact
-      // now, and a stale `declared: waiting-external` would send the
-      // classifier back to "it settles itself" about a wait that ran out.
-      const timedOut = consumeDeclaration(record, 'new-outcome');
-      if (timedOut) this.record(DECLARATION_CONSUMED_EVENT, { ...timedOut, next: 'waiting-external-timeout' }, phase);
-      endLockWait(record);
-      state.consecutiveFailures++;
-      this.halt(
-        `phase ${phase} cannot park on external work — ${verdict.reason}`
-        + ` (${declared.reason ?? 'no reason recorded'}`
-        + `${declared.watch.length ? `; watching ${declared.watch.join(', ')}` : ''})`,
-        phase,
-        'waiting-external-timeout',
-      );
-      return false;
+      // A spent budget is a BUDGET event (#59): the phase parks on its refs
+      // with a `budgets` errand — never `failed`, never a streak charge, never
+      // a rung — and a landing still resumes it. This arm used to consume the
+      // declaration with its refs, charge the streak and halt
+      // `waiting-external-timeout`: nothing watched the build it waited on
+      // from then on, and the same phase's two refusals read "2 phases failed
+      // in a row".
+      const budget = opts.budget ?? this.knownWaitBudget(phase);
+      const requested = declared.resume_after && Number.isFinite(Date.parse(declared.resume_after))
+        ? new Date(Date.parse(declared.resume_after)).toISOString()
+        : undefined;
+      clearWatchBookkeeping(record);
+      if (unpollable.length) record.watchUnpollable = unpollable; else delete record.watchUnpollable;
+      this.parkOnSpentBudget(phase, {
+        ledger: verdict.ledger, refusal: verdict.reason, budget,
+        declared: {
+          ...testimony,
+          ...(declared.reason ? { reason: declared.reason } : {}),
+          ...(declared.watch.length ? { watch: declared.watch } : {}),
+          by,
+          ...(requested ? { requested } : {}),
+          ...(minted?.length ? { minted } : {}),
+          budget: { ms: budget.budgetMs, source: budget.source },
+          at,
+        },
+      });
+      return true;
     }
     const until = new Date(verdict.until).toISOString();
     const requested = verdict.requestedSource === 'declared' || verdict.extendedBy
       ? new Date(verdict.requested).toISOString()
       : undefined;
+    // Approaching (control-tower phase 14, #40): a grant that carries the phase
+    // past BUDGET_WARN_PCT of its wait budget says so NOW, while there is still
+    // time to raise it — once per attempt, and again after a raise.
+    const near = unbudgeted ? null : waitApproaching({ parkedMs: verdict.parkedMs, grantedMs: verdict.granted, budget: verdict });
+    if (near) {
+      const fact = waitBudgetFact(record, { budgetMs: verdict.budgetMs, source: verdict.budgetSource }, {
+        now, askedMs: verdict.requested - now,
+      });
+      this.noteBudgetApproaching('phase', phase, fact, `${record.attempts ?? 0}:${verdict.budgetMs}`, {
+        crossesAt: new Date(now + near.crossesInMs).toISOString(),
+      });
+    }
     record.status = 'waiting';
     record.parkedUntil = until;
     // Every park writes BOTH clocks (WAI-6): the run's follows the soonest waiter,
@@ -2898,13 +4664,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // restart or a stop clobbers `status`, which is what kept this park from
     // being re-read as work-in-progress and re-boarded at $10 a pass. `by`
     // says whose testimony it is.
+    const stamped = opts.budget ?? this.knownWaitBudget(phase);
     record.declared = {
-      status: 'waiting-external',
+      ...testimony,
       ...(declared.reason ? { reason: declared.reason } : {}),
       ...(declared.watch.length ? { watch: declared.watch } : {}),
       by,
       ...(requested ? { requested } : {}),
       ...(minted?.length ? { minted } : {}),
+      // What the park was judged against — the `cmd:` clock stops at its end
+      // without asking the engine again (`waitBudgetEndOf`, control-tower phase 6).
+      budget: { ms: stamped.budgetMs, source: stamped.source },
       at,
     };
     clearWatchBookkeeping(record);
@@ -2912,7 +4682,9 @@ export abstract class RunnerAttempt extends RunnerLoop {
     // When the park began — on its own field, and in the history the budget is
     // summed from. `endedAt` is no longer rewritten: it meant three things.
     record.parkedFrom = at;
-    openWaitEntry(record, { parkedFrom: at, parkedUntil: until, ...(requested ? { requested } : {}), by }, now);
+    openWaitEntry(record, {
+      parkedFrom: at, parkedUntil: until, ...(requested ? { requested } : {}), by, ...(unbudgeted ? { unbudgeted: true as const } : {}),
+    }, now);
     record.parkedMs = parkedMsOf(record, now);
     if (!isSessionGone(record, record.sessionId)) record.resumeSessionId ??= record.sessionId;
     this.record('phase.waiting', {
@@ -2924,6 +4696,10 @@ export abstract class RunnerAttempt extends RunnerLoop {
       ...(verdict.extendedBy ? { extendedBy: verdict.extendedBy } : {}),
       ...(ledger === 'watchdog' ? { watchdogParks: record.watchdogParks } : {}),
       ...(unpollable.length ? { unpollable: unpollable.map((entry) => entry.ref) } : {}),
+      // The runner's own `poll-park` of a declared block (#122) — the rung the
+      // healer's table names, driven here and accounted on no ladder.
+      ...(opts.blocked ? { declared: 'blocked', rung: 'poll-park', vehicle: 'runner' } : {}),
+      ...(unbudgeted ? { unbudgeted: true } : {}),
     }, phase);
     this.emit('phase', { phase, status: 'waiting', note: record.parkReason, parkedUntil: until });
     this.armParkPoke(phase, until);
@@ -2944,7 +4720,7 @@ export abstract class RunnerAttempt extends RunnerLoop {
    */
   private async closeout(
     phase: number, boardState: string,
-  ): Promise<{ ran: boolean; frozen?: true; note?: string }> {
+  ): Promise<{ ran: boolean; frozen?: true; note?: string; worked?: boolean }> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
 
@@ -2976,14 +4752,14 @@ export abstract class RunnerAttempt extends RunnerLoop {
 
     const worked = await this.producedWork(phase, boardState);
     if (!worked.did) {
-      return { ran: false, note: `${worked.why}, so there was nothing to close out` };
+      return { ran: false, worked: false, note: `${worked.why}, so there was nothing to close out` };
     }
 
     // The one gate, as every `--resume` takes it — this site never asked, so a
     // closeout could resume a session stamped gone or one still running.
     const gate = this.resumableSession(record, record.sessionId);
     if (!gate.ok) {
-      return { ran: false, note: closeoutSkipNote(gate, record.sessionId) };
+      return { ran: false, worked: true, note: closeoutSkipNote(gate, record.sessionId) };
     }
     const started = new Date().toISOString();
     this.record('phase.closeout', { sessionId: record.sessionId, boardState, because: worked.why }, phase);
@@ -3024,6 +4800,8 @@ export abstract class RunnerAttempt extends RunnerLoop {
           // kept, and a session must be able to record the second without
           // touching the first.
           PE_RULINGS_FILE: rulingsFile(this.state!.root, this.state!.slug),
+          // Where `phase-outcome.sh … verified` records what this session proved (control-tower phase 62).
+          PE_PROOFS_FILE: proofsFile(this.state!.root, this.state!.slug),
           // Where the session publishes its TASK LIST. A clone of the outcome
           // channel next door, for the same reason: the CLI stopped
           // provisioning TodoWrite/TaskCreate to `-p` sessions in August 2026,
@@ -3045,20 +4823,17 @@ export abstract class RunnerAttempt extends RunnerLoop {
         // A closeout is paperwork, not the phase. Capping it — a quarter of the
         // phase's dollars, a closeout's turns — keeps a confused session from
         // re-opening the work it was asked only to record.
-        caps: capsFor({ mode: 'closeout', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
+        caps: capsFor({ mode: 'closeout', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
-      return { ran: false, note: `the closeout session could not be started: ${(error as Error)?.message ?? error}` };
+      return { ran: false, worked: true, note: `the closeout session could not be started: ${(error as Error)?.message ?? error}` };
     } finally {
       this.attachPid(phase, null);
       this.attachHandle(phase, null);
     }
 
-    state.spentUsd += outcome.costUsd;
-    record.costUsd += outcome.costUsd;
-    // The same dollars, booked a second time against the ladder rung that
-    // caused this attempt — a no-op unless the ladder is what reboarded it.
-    chargeRung(state.recoveries?.[String(record.phase)], outcome.costUsd);
+    // The dollars were booked by the spawn door (`bookSpend`): a closeout
+    // resumes the phase's own conversation, so what it cost is the rise.
     record.turns = (record.turns ?? 0) + outcome.turns;
     // The closeout's words live on the closeout, never over `record.said`: the
     // halt that follows a failed closeout quotes the PHASE session — the words
@@ -3073,11 +4848,11 @@ export abstract class RunnerAttempt extends RunnerLoop {
       ...(closeoutSaid ? { said: closeoutSaid } : {}),
     };
     this.record('phase.closeout-done', {
-      ok: record.closeout.ok, costUsd: outcome.costUsd, turns: outcome.turns,
+      ok: record.closeout.ok, costUsd: outcome.bookedUsd ?? outcome.costUsd, turns: outcome.turns,
       said: closeoutSaid,
     }, phase);
 
-    return { ran: true, note: 'the runner asked its session to finish the closeout' };
+    return { ran: true, worked: true, note: 'the runner asked its session to finish the closeout' };
   }
 
   /**
@@ -3114,4 +4889,31 @@ export abstract class RunnerAttempt extends RunnerLoop {
     return { did: false, why: work.why };
   }
 
+}
+
+/**
+ * A verification summary with what it compared against: the stamps on the
+ * record, and the repository each command ran in on every command. A COPY —
+ * the summary the verifier returned is never mutated.
+ */
+function withStamps(verification: VerifySummary, stamps: readonly TreeStamp[]): VerifySummary {
+  if (!stamps.length) return verification;
+  const at = stamps.find((stamp) => stamp.role === 'verify-in');
+  return {
+    ...verification,
+    trees: [...stamps],
+    ran: verification.ran.map((run) => (at ? { ...run, tree: { repo: at.repo, branch: at.branch, head: at.head } } : { ...run })),
+  };
+}
+
+/**
+ * Which cap a session spent, from how the CLI said it ended — `turns` for
+ * `error_max_turns` (or a `max_turns` terminal reason), `budget` for
+ * `error_max_budget_usd`, else null. The structured fields `classify()` reads
+ * for the same verdict, never the prose (control-tower phase 46, #61).
+ */
+function spentCapOf(ending: { subtype?: string; terminalReason?: string }): 'turns' | 'budget' | null {
+  if (ending.subtype === 'error_max_budget_usd') return 'budget';
+  if (ending.subtype === 'error_max_turns' || ending.terminalReason === 'max_turns') return 'turns';
+  return null;
 }

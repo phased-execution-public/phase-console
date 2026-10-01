@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const { SKILL_DIR } = await import('../server/config.ts');
+const { TIMEOUT_RETRY_FACTOR, VERIFY_TIMEOUT_CEILING_MS, VERIFY_TIMEOUT_MS } = await import('../server/runner/verify.ts');
 
 const TRASH: string[] = [];
 process.on('exit', () => { for (const dir of TRASH) rmSync(dir, { recursive: true, force: true }); });
@@ -92,4 +93,18 @@ test('every node --test the release gate runs carries the same bound as the suit
   for (const line of runs) {
     assert.match(line, /node --test "\$\{NODE_TEST_BOUND\[@\]\}"/, `unbounded: ${line.trim()}`);
   }
+});
+
+test('the console\'s clock on a §Verification command outlasts the bound a suite gives one test (control-tower phase 83, #95)', () => {
+  // A hung TEST must be failed and named by the test runner before the console
+  // cuts the whole COMMAND: a cut names nothing, and since phase 83 it is a
+  // `verify-timeout` a person has to judge rather than a red a session can fix.
+  // So the console's floor sits above the per-test bound the suite and every
+  // gate run carry, and the one retry a cut earns still fits under the ceiling.
+  const perTest = Number(TIMEOUT_FLAG.exec(suiteScript())?.[1]);
+  assert.ok(perTest > 0, 'the suite bounds one test');
+  assert.ok(VERIFY_TIMEOUT_MS > perTest,
+    `a §Verification command gets ${VERIFY_TIMEOUT_MS} ms, no more than the ${perTest} ms one test may take`);
+  assert.ok(VERIFY_TIMEOUT_MS * TIMEOUT_RETRY_FACTOR <= VERIFY_TIMEOUT_CEILING_MS,
+    'a cut command\'s retry at the default fits under the ceiling');
 });

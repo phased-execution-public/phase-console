@@ -13,6 +13,7 @@
  * and a veto is written down where it can be read afterwards.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -65,6 +66,12 @@ function serviceOn(profile: string): { service: InstanceType<typeof Service>; no
     note: (event: string, data: Record<string, unknown>, phase?: number) =>
       noted.push({ event, data, phase }),
     park: () => {},
+    // The usage poller's adaptive-cadence probe (ACT-3) asks every runner in
+    // the pool whether it is spending an account, on a clock of its own. A stub
+    // without it throws from a timer AFTER the test that made it has ended —
+    // which surfaces as an unhandled rejection blamed on whichever test the
+    // clock happened to land in, and only in a batch long enough for it to fire.
+    isSpending: () => false,
   });
   return { service, noted };
 }
@@ -213,6 +220,9 @@ function serviceForStop(over: {
     busy: () => true,
     current: () => state,
     note: () => {},
+    // The usage poller's clock asks every runner this too — see `serviceOn`.
+    // It landed inside these Stop tests in a full gate run (control-tower phase 9).
+    isSpending: () => false,
   });
   (service as unknown as { root: unknown }).root = { ok: true, path: '/tmp/nowhere' };
   // The board, as the one reader answers it (`board(slug)` — `boardStates` was
@@ -340,6 +350,7 @@ const laned = (profile: string, extra: Record<string, unknown> = {}) => {
       noted.push({ event, data, phase }),
     noteWaitDenied: (phase: number, denial: { command: string; matched: string }) => denials.push({ phase, ...denial }),
     park: () => {},
+    isSpending: () => false, // the usage poller's clock — see `serviceOn`
   });
   return { service, noted, denials };
 };
@@ -736,6 +747,7 @@ async function relayLaned(profile = 'trusted', extra: Record<string, unknown> = 
     }),
     note: (event: string, data: Record<string, unknown>, phase?: number) => noted.push({ event, data, phase }),
     noteWaitDenied: () => {},
+    isSpending: () => false, // the usage poller's clock — see `serviceOn`
     park: (reason: string, phase: number | null, kind: string) => { parks.push({ reason, phase, kind }); return true; },
     tellRelayAnswer: (phase: number, answers: unknown[]) => { told.push({ phase, answers }); return { ok: true }; },
   });

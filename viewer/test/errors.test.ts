@@ -18,7 +18,10 @@ import { CREDENTIAL_CLASSES } from '../shared/ops-vocab.js';
 import {
   classify, lostResume, parseResetTime, childEnv, childEnvDecisions, nextModel, resetWaitUntil,
   API_RETRY_ERRORS, BG_WAIT_CEILING_MS, RESET_MARGIN_MS, MAX_AUTO_WAIT_MS, type StopSignal,
+  credentialChannel, spentNothing, EVIDENCE_MATCH_MAX, WORKED_TURNS,
+  CONNECTIVITY_BACKOFF_MS, connectivityBackoffMs, isTransportFailure,
 } from '../server/runner/errors.ts';
+import { CONNECTIVITY_PROBE_MS } from '../server/connectivity-probe.ts';
 
 const at = (iso: string) => new Date(iso);
 
@@ -167,16 +170,12 @@ test('429 retries later rather than switching or halting', () => {
   assert.equal(d.kind, 'retry');
 });
 
-test('auth, org policy, billing and a bad certificate all stop the RUN on its credential (RCV-1)', () => {
+test('auth, org policy and billing stop the RUN on its credential (RCV-1)', () => {
   for (const [text, cls] of [
     ['Please run /login · API Error: 401 Invalid authentication credentials', 'auth'],
     ['Login expired · Please run /login', 'auth'],
     ['Your organization has disabled Claude subscription access for Claude Code', 'org-policy'],
     ['Credit balance is too low', 'billing'],
-    // The two zero-cost sessions the audit found classified as nothing (RCV-2):
-    // a TLS interception is a wall no re-board gets past.
-    ['API Error: Unable to connect to API: Self-signed certificate detected.', 'certificate'],
-    ['unable to get local issuer certificate', 'certificate'],
   ] as const) {
     const d = classify(stop({ text }));
     assert.equal(d.kind, 'credential-refused', text);
@@ -185,6 +184,68 @@ test('auth, org policy, billing and a bad certificate all stop the RUN on its cr
   // …and the disposition's kind is the vocabulary's word, exhaustively: every
   // class the owner names is one the classifier can answer with.
   for (const cls of CREDENTIAL_CLASSES) assert.ok(typeof cls === 'string' && cls.length > 3);
+});
+
+test('the credential channel is the API\'s alone once a session has worked (control-tower phase 54, #57)', () => {
+  const line = ['Credit bal', 'ance is too low'].join('');
+  // Nothing spent: the result text can only be the CLI's own, so it is on the channel.
+  assert.equal(spentNothing({ turns: 1, costUsd: 0 }), true);
+  assert.match(credentialChannel({ turns: 1, costUsd: 0, text: line }), new RegExp(line));
+  // Worked — by turns or by dollars — and only the API-error channel is.
+  for (const ledger of [{ turns: WORKED_TURNS }, { costUsd: 0.01 }]) {
+    assert.equal(spentNothing(ledger), false);
+    assert.equal(credentialChannel({ ...ledger, text: line }), '');
+    assert.equal(credentialChannel({ ...ledger, text: line, apiText: `API Error: 400 ${line}` }), `API Error: 400 ${line}`);
+  }
+  // The verdict names what it stood on, bounded to the line it matched.
+  const d = classify(stop({ text: `noise\nAPI Error: 400 ${line} — ${'x'.repeat(400)}\nmore` }));
+  assert.equal(d.kind, 'credential-refused');
+  if (d.kind === 'credential-refused') {
+    assert.equal(d.evidence?.source, 'text');
+    assert.match(d.evidence?.matched ?? '', /^API Error: 400/);
+    assert.ok((d.evidence?.matched.length ?? 0) <= EVIDENCE_MATCH_MAX);
+  }
+});
+
+test('certificate needs the CLI\'s framing: a bare code in prose is narration, a framed one is a fault', () => {
+  // ⚠️ Built by concatenation, never spelled: this file's own text reaches the
+  // classifier when a session reads it (the plan's prose-token rule), which is
+  // the very failure under test. The error codes are NAMED in prose above and
+  // ASSEMBLED below.
+  const selfSigned = ['DEPTH', 'ZERO', 'SELF', 'SIGNED', 'CERT'].join('_');
+  const leaf = ['UNABLE', 'TO', 'VERIFY', 'LEAF', 'SIGNATURE'].join('_');
+  const framing = `API Err${'or'}:`;
+
+  // Sentences a HANDOFF legitimately contains. The measured one is first: a
+  // phase that completed — board `done`, two commits landed, real spend — wrote
+  // it about a transport failure it had SURVIVED, and 5.1.0 retired its account
+  // and its whole organisation two seconds after its own stop hook. Every later
+  // phase quoting that handoff did it again, so the remedy for an outage was
+  // also what reproduced it.
+  const narration = [
+    `that session died mid-gate on a CLI transport error (${selfSigned}), which says nothing about the work`,
+    `the regression table covers ${leaf} and its four siblings`,
+    `a bare self-sign${'ed'} certificate mention in a design note is not a stop`,
+    'unable to get local issuer certificate — the sentence this pattern used to match anywhere',
+  ];
+  for (const text of narration) {
+    const d = classify(stop({ text }));
+    assert.notEqual(d.kind, 'credential-refused', text);
+    assert.notEqual(d.kind, 'connectivity', text);
+  }
+
+  // Framed, with no connect sentence in front of it: a standing interception.
+  const framed = classify(stop({ text: `${framing} certificate verif${'y'} failed (${leaf})` }));
+  assert.equal(framed.kind, 'credential-refused');
+  assert.equal(framed.kind === 'credential-refused' && framed.class, 'certificate');
+
+  // Framed WITH the connect sentence — the shape actually measured — is the
+  // network, and is read as such before the CLI's guess about a proxy.
+  const measured = classify(stop({
+    text: `${framing} Unable to conn${'ect'} to API: Self-sign${'ed'} certificate detected (${selfSigned}).`,
+  }));
+  assert.equal(measured.kind, 'connectivity');
+  assert.equal(measured.kind === 'connectivity' && measured.class, 'certificate');
 });
 
 test('an api_retry category is honoured even with no message text', () => {
@@ -323,7 +384,8 @@ test('API_RETRY_ERRORS is the twelve documented `error` values (chapter 09 row 3
 test('isError disqualifies success before any text is read — and without it, today\'s behaviour stands (SES-5)', () => {
   // An error the classifier has no pattern for: the bit alone keeps it from
   // reading as a completed phase, and the reason quotes what it did not know.
-  const text = 'API Error: Unable to connect to API: the upstream gateway answered 418.';
+  // Deliberately NOT the connect sentence — that one has a name since 5.2.0.
+  const text = `API Err${'or'}: the upstream gateway answered 418.`;
   const broken = classify({ subtype: 'success', code: 0, isError: true, text });
   assert.notEqual(broken.kind, 'ok');
   assert.equal(broken.kind, 'phase-failed');
@@ -333,22 +395,30 @@ test('isError disqualifies success before any text is read — and without it, t
     'the same signal without the bit keeps today\'s reading');
 });
 
-test('the TLS-interception sign-off is a credential wall, with or without the isError bit (RCV-2)', () => {
+test('the TLS-interception sign-off is an OUTAGE, with or without the isError bit (RCV-2, revised)', () => {
   // Twice recorded as a completed phase at 4.1.0; phase 4 made the bit stop
-  // that, phase 9 names the wall — credentials are read BEFORE success is
-  // believed, so the bit is not what stands between this text and `ok`.
-  const text = 'API Error: Unable to connect to API: Self-signed certificate detected.';
+  // that, zero-touch-console phase 9 named it a credential wall — and that
+  // last step was one step too far. The text leads with the connect sentence;
+  // the certificate clause behind it is the CLI's own hedge ("usually a
+  // TLS-inspecting corporate proxy"), and a home connection reconnecting
+  // through a captive portal answers exactly the same way. So it is the
+  // network, retried and charged to nobody — while the class travels, because
+  // three of these from two sessions over ten minutes IS worth believing.
+  const text = `API Err${'or'}: Unable to conn${'ect'} to API: Self-sign${'ed'} certificate detected.`;
   for (const signal of [
     { subtype: 'success' as const, code: 0, isError: true, text },
     { subtype: 'success' as const, code: 0, text },
   ]) {
     const d = classify(signal);
-    assert.equal(d.kind, 'credential-refused');
-    if (d.kind === 'credential-refused') {
+    assert.equal(d.kind, 'connectivity');
+    if (d.kind === 'connectivity') {
       assert.equal(d.class, 'certificate');
-      assert.match(d.reason, /certificate/);
+      assert.match(d.reason, /could not reach the API/);
     }
   }
+  // …and it is still not `ok`: a one-turn, zero-dollar session that never
+  // reached the API has not done the phase.
+  assert.notEqual(classify({ subtype: 'success', code: 0, text, turns: 1, costUsd: 0 }).kind, 'ok');
 });
 
 test('an aborted turn is never ok, whatever its subtype says', () => {
@@ -496,4 +566,37 @@ test('a resume whose conversation the CLI cannot find is a lost session — name
   // Nor is the phrase anywhere else in a session's output: only the CLI's
   // refusal, at the top of stderr, counts.
   assert.equal(lostResume(stop({ subtype: 'success', code: 0, text: 'I searched for "No conversation found with session ID" in the docs' })), false);
+});
+
+/* ------------------------------------------------------------------ *
+ * An outage waits on the probe; the series is the backstop (control-tower phase 80, #108)
+ *
+ * ⚠️ The measured sentences are ASSEMBLED — this file's own text reaches the
+ * classifier when a session reads it.
+ * ------------------------------------------------------------------ */
+
+const LOST_API = `API Err${'or'}: Unable to conn${'ect'} to API: Self-sign${'ed'} certificate `
+  + `detected (${['DEPTH', 'ZERO', 'SELF', 'SIGNED', 'CERT'].join('_')}).`;
+const LOST_DNS = `API Err${'or'}: Unable to conn${'ect'} to API: getaddrinfo ${['ENOT', 'FOUND'].join('')} api.anthropic.com`;
+
+test('OR: isTransportFailure is the connectivity disposition\'s own sentence, and nothing a session writes about its work', () => {
+  for (const text of [LOST_API, LOST_DNS]) {
+    assert.equal(isTransportFailure(text), true, text);
+    assert.equal(classify({ subtype: 'error_during_execution', code: 1, text, turns: 40, costUsd: 6 }).kind, 'connectivity',
+      'the same text, as the disposition reads it — a session that worked and then lost the API');
+  }
+  for (const text of ['', undefined, null, 'The parser is in; running the suite next.', 'API Error: 500 internal server error']) {
+    assert.equal(isTransportFailure(text), false, String(text));
+  }
+});
+
+test('OR: the probe looks at least as often as the backstop\'s first step, so no lane waits longer than the clock alone made it', () => {
+  assert.ok(CONNECTIVITY_PROBE_MS <= CONNECTIVITY_BACKOFF_MS[0],
+    `the probe (${CONNECTIVITY_PROBE_MS} ms) never looks later than the backstop's shortest step`);
+  // The series is unchanged — it is the ceiling a lane whose probe cannot see the API still keeps.
+  assert.deepEqual([...CONNECTIVITY_BACKOFF_MS], [60_000, 120_000, 300_000, 600_000, 900_000]);
+  assert.equal(connectivityBackoffMs(0), 60_000);
+  assert.equal(connectivityBackoffMs(99), 900_000, 'the last step repeats');
+  const total = CONNECTIVITY_BACKOFF_MS.reduce((sum, ms) => sum + ms, 0);
+  assert.ok(total < MAX_AUTO_WAIT_MS, 'the half-day bound is reached by repeats of the last step, not by the climb');
 });

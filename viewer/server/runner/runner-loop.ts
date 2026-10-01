@@ -12,7 +12,7 @@ import { doorActor } from '../actor.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { log } from '../log.ts';
 import { onShutdown, offShutdown } from '../lifecycle.ts';
 import { run as engineRun, readMemoryBlock, readGateStatus, readLint, readNotes, readText, type Board } from '../engine.ts';
@@ -29,8 +29,10 @@ import {
 import { continueMcpParkedRecord, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult } from './mcp-park.ts';
 import { markFor, spawnClaude, type SpawnFn, type SpawnHandle, type SpawnOutcome, type StreamEvent } from './spawn.ts';
 import { killLadder, stopWhereItStands, wake } from './signals.ts';
-import { capsFor, CLOSEOUT_MAX_TURNS as SESSION_CLOSEOUT_TURNS, type Cap } from './session-record.ts';
-import { closeWaitEntry, evaluateWait, parkedMsOf } from './wait-budget.ts';
+import { capsFor, remainingTurns, type Cap } from './session-record.ts';
+import { closeWaitEntry, evaluateWait, hoursText, parkedMsOf, waitBudgetFact, type WaitBudget } from './wait-budget.ts';
+import { budgetFact, budgetHeadline } from '../../shared/budget-model.js';
+import { pollableRefs } from '../watch-refs.ts';
 import {
   lastFinishedPhase, ultraReviewJob, ULTRAREVIEW_EVENTS,
 } from './ultrareview.ts';
@@ -52,42 +54,55 @@ import {
   acquireLane, checkAvailable, copyEnvFiles, discardFreshMounts, discardFreshTree,
   ensureIntegration, ensureDetachedIntegration, ensureMirror, landLane, holdsBranch, landIntegration, pruneRun, reclaimBranch, defaultBranchOf, sweepUnmanaged, deleteMergedBranches,
   lockTree, resolveBase, worktreeLockReason, copyIncluded, type BaseResolution, type ForeignLock,
-  checkedOutIn, commitOf, commitsSince, parseGitmodulesPaths, realish, runBranches, holdsDetached, type Reclaim,
-  pruneRunTree, reattachMirror, resolveMounts, runSetup, scopeConfined, sweepStale, validateMirror,
-  REFUSAL_REASON, UNUSABLE_TREE, heldElsewhere,
-  type LandResult, type LaneNames, type MirrorMount, type StructuralConflict, type WorktreeRefusal,
-  ensureStaging, uncoveredCommits, STAGING_BRANCH,
+  baseBranch, checkedOutIn, commitOf, commitsWithPaths, parseGitmodulesPaths, realish, runBranches, holdsDetached, type Reclaim,
+  pruneRunTree, reattachMirror, repairMirror, resolveMounts, runSetup, scopeConfined, sweepStale, validateMirror,
+  partitionScope,
+  ISOLATION_PARKS, REFUSAL_FIX, REFUSAL_REASON, UNUSABLE_TREE, heldElsewhere, detachHandTree, worktreesRoot,
+  type LandResult, type LaneNames, type MirrorMount, type Quarantined, type StructuralConflict, type WorktreeRefusal,
+  ensureStaging, uncoveredCommits, STAGING_BRANCH, returnTree,
 } from './worktree.ts';
+import {
+  foreignTrees, foreignTreeWarning, readHolds, readTrees, removeHold, writeHold, type TreeHold,
+} from './tree-state.ts';
+import { runFile } from './run-paths.ts';
 import {
   classifySituation, collectEvidence, situation as situationOf, workEvidence,
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './situation.ts';
 import {
-  accountRung, chargeRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, type LadderCaps, type Rung,
+  accountRung, errandFor, nextRung, rungKey, rungsFor, DEFAULT_LADDER_CAPS, PERSON_SLOT_BY, type LadderCaps, type Rung,
 } from './ladder.ts';
 import type { RungRecord } from './state.ts';
 import {
   childrenOf, latestEnding, loadRun, newRun, phaseRecord, procIdentity, retirePhaseHalt, saveRun, pidAlive, pidHoldsWork, processState, IN_FLIGHT, SETTLED,
   setPhaseState, consumeDeclaration, DECLARATION_CONSUMED_EVENT, endLockWait, isSessionGone,
-  PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote,
-  settleInFlightRecords, consoleRunsDir, type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltKind,
+  PHASE_IN_FLIGHT, reconcileRecordsAgainstBoard, mcpReasonText, resetForRetry, consoleStoppedNote, scopeLeftOpen, scopeNotDoneSentence,
+  settleInFlightRecords, consoleRunsDir, type Autonomy, type BoardingBrief, type BoardingHint, type ChildRef, type Errand, type HaltHolder, type HaltKind,
   type McpDegradation, type McpPolicy,
   type OnLimitPolicy, type PhaseOptions, type PhaseRecord, type PreflightWarning,
   type RunState, type PhaseStatus, type RunStatus, type VerifySummary,
-  syncWaitClock,
+  syncWaitClock, retireSpentBudget, carryWaitClock,
+  setRunState, owesVerification,
 } from './state.ts';
+import { PHASE_HALT_KINDS, isPersonErrand } from '../../shared/recovery-model.js';
+import { fleetHoldSentence, SHUTDOWN_CONTINUES } from '../../shared/orchestration-model.js';
 import { consumeOutcome, outcomeFileFor, readOutcome, type PhaseOutcome } from './outcome.ts';
 import {
-  AdmissionAborted, AdmissionCapped, autopilotOwner, type Scheduler, type ScopeGrant, type SessionPeerView,
+  AdmissionAborted, AdmissionCapped, AdmissionSerial, AdmissionWithdrawn, applyScopeFence, autopilotOwner, type Scheduler, type ScopeGrant, type SessionPeerView,
 } from './scheduler.ts';
-import { formatScope } from '../../shared/scope.js';
-import { resolvePhaseChoice } from '../../shared/run-settings.js';
+import { claimsDisjoint, formatScope, normalizeToken, scopesIntersect } from '../../shared/scope.js';
+import { creditDrift, declaredScope } from './scope-drift.ts';
+import { closeQueueEpisode, foldRunBlocked, restartedAt, seniorityOf } from './queue-episodes.ts';
+import { standsAside } from './queue-control.ts';
+import { withdrawnReason } from '../../shared/orchestration-model.js';
+import { resolvePhaseChoice, resolvePermissionMode } from '../../shared/run-settings.js';
+import { gitOverrideInstruction } from '../prelude.ts';
 import {
   ISOLATED, SETTLE_UNSUPPORTED_MULTI, settleOf, WORKTREE_DEFAULTS,
   directiveIsolates, reclaimModeOf, detachedRef, type SettleStrategy,
 } from '../../shared/worktree-model.js';
 import { DEFAULT_BASE_BRANCH, landPolicyOf } from '../../shared/landing-model.js';
-import { runEndedBadly } from '../../shared/run-lifecycle.js';
+import { runEndedBadly, runResumable } from '../../shared/run-lifecycle.js';
 import { Journal } from './journal.ts';
 import { Transcript } from './transcript.ts';
 import { checkAuth, type AuthStatus } from './auth.ts';
@@ -96,16 +111,16 @@ import {
   type Approvals, type PermissionProfile,
 } from './approvals.ts';
 import {
-  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, lockStatusHolder, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, mergeQueuePrompt, messagesBlock, prBlockText, preflight, reasonOf, retryAddendumBlock, survivingChildren, ultracodeOn, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  CLOSEOUT_MAX_TURNS, DEFAULT_BUDGET_RAISE_PCT, ENGINE_BUSY_MAX_WAITS, LADDER_STATES, ladderClassifies, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, LIMIT_RETRY_BURST, LIMIT_RETRY_WINDOW_MS, LIVENESS_GIT_EVERY_MS, LIVENESS_TICK_MS, LOCK_BACKOFF_MAX_MS, LOCK_CAP_PARK_BY_CAP, LOCK_CAP_PARK_NOTE, LOCK_WAIT_CAP_MS, lockStatusHolder, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, MAX_ATTEMPTS, MAX_INJECT_KEYS, MCP_AUTH_PARK_NOTE, MCP_PARK_NOTE, SHUTDOWN_LADDER_MS, SIGTERM_GRACE_MS, TEARDOWN_SETTLES, VERIFICATION_PARK_NOTE, VERIFY_ANSWER_MS, VERIFY_TIMEOUT_MS, DEFAULT_WAIT_BUDGET_MS, WAIT_DEFAULT_MS, WAIT_MAX_PER_PHASE, applySettings, authRefusal, briefForRung, closeoutPrompt, condenseSaid, escalateModel, fixVerificationInstruction, frameQuestion, frameSteer, mergeQueuePrompt, messagesBlock, pinnedNotesBlock, prBlockText, preflight, raiseEffort, reasonOf, retryAddendumBlock, survivingChildren, ultracodeOn, unattendedDirective, waitResumePrompt, wakeSignal, type AskResult, type Lane, type McpResolution, type ReboardRequest, type RecoverMode, type RecoverOptions, type RunSettingsPatch, type RunnerDeps, type RunnerEvent, type StartOptions,
+  LOCK_MIRROR_ENV,
 } from './runner-core.ts';
-import { reboardResumeBrief, resumePolicyInstruction, sessionLostInstruction, settleVehicle } from './runner-core.ts';
+import { reboardResumeBrief, resumePolicyInstruction, sessionLostInstruction, settleVehicle, type VettedResume } from './runner-core.ts';
+import { consoleSkillDirective } from './runner-core.ts';
+import { SCRIPTS_REF } from '../skill-copy.ts';
 import type { Runner } from './runner.ts';
 import { RunnerControl } from './runner-control.ts';
 import { enter, runTraceId } from '../trace.ts';
 import { INSTANCE } from '../config.ts';
-
-/** A wait-resume's turn cap: a continuation, capped like a closeout. */
-const WAIT_RESUME_TURNS: Cap = { value: SESSION_CLOSEOUT_TURNS, source: 'closeout', basis: 'a wait-resume' };
 
 /** A closeout brief's turn cap, as the brief composed it. */
 const closeoutBriefTurns = (value: number): Cap => ({ value, source: 'closeout', basis: 'a closeout brief' });
@@ -193,6 +208,162 @@ export function laneConflictHalt(opts: {
       : '')
     + `Resolve it by hand in ${names.integration}, then Retry phase ${phase}.`;
 }
+
+/**
+ * Who holds a run the drive loop parked with nothing ready, as DATA
+ * (control-tower phase 5) — the same facts the park's sentence is built from,
+ * one row per phase: what holds it (`HALT_HOLDER_KINDS`) and the ONE verb that
+ * clears it (`HALT_HOLDER_VERBS`). The sentence stays for people and for the
+ * readers that predate this; phase 17's halt card lists these instead.
+ *
+ * Every phase appears once, in the order the sentence names them: errands
+ * first (a named ask), then the ready records, the blocked handoffs and the QA
+ * verdicts that hold the plan. A spent-cap errand is a `cap`, cleared by its
+ * setting — a Retry would park it again one second later (#14).
+ */
+export function haltHolders(input: {
+  readyRecords: readonly { p: number; record: PhaseRecord }[];
+  errands: readonly { p: number; errand: Errand }[];
+  stuck: readonly number[];
+  qaHolders: readonly { p: number; verdict: string; blocks?: readonly number[] }[];
+  lockCapPark?: (note: string) => boolean;
+  mcpPark?: (note: string) => boolean;
+  verificationPark?: (note: string) => boolean;
+}): HaltHolder[] {
+  const lockCap = input.lockCapPark ?? ((note: string) => LOCK_CAP_PARK_NOTE.test(note));
+  const mcp = input.mcpPark ?? ((note: string) => MCP_PARK_NOTE.test(note));
+  const verification = input.verificationPark ?? ((note: string) => VERIFICATION_PARK_NOTE.test(note));
+  const holders: HaltHolder[] = [];
+  const seen = new Set<number>();
+  const add = (holder: HaltHolder) => { if (!seen.has(holder.phase)) { seen.add(holder.phase); holders.push(holder); } };
+  for (const { p, errand } of input.errands) {
+    // A person's ask is answered by the person — "Done — continue", the card's
+    // primary button (control-tower phase 88, #124); a Retry that re-read the
+    // stale declaration re-derived it. A machine's spent ladder keeps Retry.
+    add(errand.cap
+      ? { phase: p, kind: 'cap', verb: 'settings', why: errand.need, ...(errand.setting ? { setting: errand.setting } : {}) }
+      : {
+        phase: p, kind: 'errand', verb: isPersonErrand(errand.situation) ? 'errand-answered' : 'retry', why: errand.need,
+        ...(errand.situation ? { situation: errand.situation } : {}),
+      });
+  }
+  for (const { p, record } of input.readyRecords) {
+    const note = record.note ?? '';
+    const why = note || `phase ${p} is ${record.status}`;
+    if (record.status === 'gated') {
+      add({
+        phase: p, kind: 'gate', verb: 'approve-gate', why,
+        ...(record.gate?.detail ? { gate: record.gate.detail } : {}),
+        ...(record.gate?.kind ? { gateKind: record.gate.kind } : {}),
+      });
+    } else if (record.status === 'parked' && mcp(note)) {
+      add({ phase: p, kind: 'mcp', verb: 'mcp-continue', why });
+    } else if (record.status === 'parked' && verification(note)) {
+      add({ phase: p, kind: 'verification', verb: 'retry', why });
+    } else if (record.status === 'parked' && lockCap(note)) {
+      add({ phase: p, kind: 'lock', verb: 'retry', why });
+    } else {
+      add({ phase: p, kind: 'retry', verb: 'retry', why: `phase ${p} is ${record.status}${note ? ` (${note})` : ''}` });
+    }
+  }
+  for (const p of input.stuck) {
+    add({ phase: p, kind: 'blocked', verb: 'retry', why: `phase ${p}'s handoff is marked blocked — its Outstanding section says why` });
+  }
+  for (const { p, verdict, blocks } of input.qaHolders) {
+    add({
+      phase: p, kind: 'qa', verb: 'qa-recover',
+      why: `phase ${p} is done but its QA verdict is ${verdict}`
+        + (blocks?.length ? `, which holds phase${blocks.length === 1 ? '' : 's'} ${blocks.join(', ')}` : ''),
+    });
+  }
+  return holders;
+}
+
+/**
+ * The runs each scheduler has driven (#81). A scheduler is the queue, and it
+ * dies with the console that made it — so the first drive of a run under a
+ * scheduler that has never seen it is a console that came back, and a queue
+ * episode still open then was ended by the restart.
+ */
+const drivenRuns = new WeakMap<Scheduler, Set<string>>();
+
+/**
+ * The record half of a park on a SPENT wait budget (control-tower phase 45,
+ * #59) — `RunnerLoop.parkOnSpentBudget`'s, and the inbox's for a declaration
+ * no runner is driving, so the two cannot drift. See that method for why.
+ * Mutates the record and its recovery slot; answers the errand it filed and
+ * the `phase.wait-budget-spent` line for the caller's journal.
+ */
+export function spentBudgetPark(state: RunState, phase: number, opts: {
+  ledger: 'waits' | 'budget' | 'watchdog';
+  refusal: string;
+  budget: WaitBudget;
+  declared?: NonNullable<PhaseRecord['declared']>;
+  at?: string;
+}): { errand: Errand; data: Record<string, unknown> } {
+  const record = phaseRecord(state, phase);
+  const at = opts.at ?? new Date().toISOString();
+  // A park still holding ended here, on its own stamps — the time the phase
+  // waits on a spent budget is not charged to the next budget a person gives it.
+  closeWaitEntry(record, at);
+  record.parkedMs = parkedMsOf(record, Date.parse(at));
+  const declared = opts.declared ?? record.declared;
+  record.status = 'waiting';
+  record.parkedUntil = undefined;
+  syncWaitClock(state);
+  endLockWait(record);
+  if (declared) {
+    record.declared = { ...declared, budgetSpent: { at, ledger: opts.ledger } };
+    record.parkReason = declared.reason ?? record.parkReason;
+    record.watch = declared.watch?.length ? declared.watch : undefined;
+  }
+  record.note = `waiting on a spent wait budget — ${opts.refusal}`;
+  if (!isSessionGone(record, record.sessionId)) record.resumeSessionId ??= record.sessionId;
+  const refs = pollableRefs(record.watch ?? []).map((target) => target.ref);
+  const raise = 'raise the budget with `- **Waits on:** <ref> · <max>` on this phase (or `**Wait budget:**` in '
+    + '§Session budget), then Retry';
+  const slot = ((state.recoveries ??= {})[String(phase)] ??= { attempts: 0, lastAt: at });
+  // The budget as a fact (control-tower phase 14, #40) — the limit, what the
+  // parks accrued, what was asked — and its headline as the errand's FIRST
+  // line: a phase waiting on a spent budget is not "waiting on CI".
+  const requested = declared?.requested ? Date.parse(declared.requested) : NaN;
+  // Which ledger ran out decides the fact: the COUNT of declared waits is its
+  // own budget (#40's 2026-09-28 thread — the 5th wait of a release phase),
+  // and a phase stopped by it still has minutes left.
+  const fact = opts.ledger === 'waits'
+    ? budgetFact({
+      budget: 'wait', phase, limit: WAIT_MAX_PER_PHASE, spent: record.waits ?? WAIT_MAX_PER_PHASE, unit: 'waits',
+      spentOn: (record.waitHistory ?? []).filter((entry) => entry.by !== 'watchdog' && entry.by !== 'ladder')
+        .map((entry) => ({ what: `declared ${entry.parkedFrom.slice(11, 16)} UTC` })),
+      at,
+    })
+    : waitBudgetFact(record, opts.budget, {
+      now: Date.parse(at), at,
+      askedMs: Number.isFinite(requested) ? Math.max(0, requested - Date.parse(declared?.at ?? at)) : null,
+    });
+  slot.errand = {
+    ...errandFor('waiting-external', slot.rungs ?? [], phase, at, null),
+    decisionKey: 'budgets',
+    need: `${budgetHeadline(fact, 'spent')} — it needs more wait budget for phase ${phase} to wait on a clock again: `
+      + opts.refusal,
+    budget: fact,
+    how: refs.length
+      ? `Nothing needs doing for it to go on: it waits on ${refs.join(', ')} and resumes its own session the `
+        + `moment one lands. To give it a clock again, ${raise}.`
+      : `Nothing it named can be watched, so only a person moves it: ${raise} — or resume its session with a ref to declare.`,
+  };
+  return {
+    errand: slot.errand,
+    data: {
+      ledger: opts.ledger, refusal: opts.refusal, waits: record.waits ?? 0, parkedMs: record.parkedMs,
+      budgetMs: opts.budget.budgetMs, budgetSource: opts.budget.source,
+      watch: refs, parked: true, by: declared?.by ?? 'session',
+    },
+  };
+}
+
+/** `setTimeout`'s ceiling: a longer delay fires at once (Node clamps it to 1 ms). */
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 export abstract class RunnerLoop extends RunnerControl {
   /* ---------------------------------------------------------------- *
@@ -306,6 +477,11 @@ export abstract class RunnerLoop extends RunnerControl {
         // `keep-on-failure`: a red run's checkout holds the only copy of what
         // went wrong, and it is the first thing an operator opens.
         failed: (runId) => runEndedBadly(loadRun(state.root, state.slug, runId)),
+        // …and a run that is only STOPPED — paused, halted, waiting, interrupted
+        // with `resumeOnRestart` — keeps every tree it has (#94): another run
+        // of this plan, or a second console, sweeping here must not take the
+        // mounts it will resume into.
+        resumable: (runId) => runResumable(loadRun(state.root, state.slug, runId)),
       });
       if (result.removed.length || result.kept.length) {
         this.record('run.worktrees-swept', {
@@ -408,6 +584,15 @@ export abstract class RunnerLoop extends RunnerControl {
    * a tree this call minted (`created`).
    */
   private async ensureRunCheckout(): Promise<void> {
+    try {
+      await this.decideRunCheckout();
+    } finally {
+      // A Repair checkout press is spent by the decision it was pressed for.
+      if (this.state?.repairCheckout) delete this.state.repairCheckout;
+    }
+  }
+
+  private async decideRunCheckout(): Promise<void> {
     // Before ANY decision about a tree: the previous drive of this plan may
     // still be sweeping the last one away. See `prunePending`.
     if (this.prunePending) { try { await this.prunePending; } catch { /* journalled by the sweep */ } }
@@ -468,6 +653,10 @@ export abstract class RunnerLoop extends RunnerControl {
       // still prunes the tree the ordinary way, with the run's real phases.
       delete state.workRoot;
       delete state.mountedRepos;
+      // Kept for the park that follows (`parkRefusedIsolation`) and the inbox
+      // errand: git's own words, or the occupied mounts', not only the category.
+      if (detail) state.isolationRefusalDetail = detail.slice(0, 2_000);
+      else delete state.isolationRefusalDetail;
 
       if (!changed) return;
       this.record('run.isolation', {
@@ -523,7 +712,34 @@ export abstract class RunnerLoop extends RunnerControl {
     // on the sibling mount still holding the branch, and the whole run degrades
     // to the shared checkout permanently.
     if (standing && state.mountedRepos?.length) {
-      const verdict = await validateMirror(names.integration, names.runBranch, { explain: true });
+      let verdict = await validateMirror(names.integration, names.runBranch, { explain: true });
+      // 🔴 A LOST mount is rebuilt, never degraded around (#94). A sweep that
+      // read a stopped run as over (fixed in `sweepStale`, but an older console
+      // or a person may still do it) left the mirror with holes; the rebuild
+      // below then refused and the whole run fell back to the shared checkout,
+      // where `pe/<slug>` was still checked out in the surviving mounts. The
+      // manifest names every mount, so the repair is exact.
+      if (!verdict.ok && verdict.refusal === 'mount-missing') {
+        // A mount path a session filled (a clone, a stray checkout) reads as
+        // missing too: it is not the mount's registered worktree. The repair
+        // quarantines it — by itself when clean and pushed, on a person's
+        // confirmed press otherwise (#139) — and never deletes it.
+        const fixed = await repairMirror(names, {
+          runId: state.id, slug: state.slug, ...this.confirmedRepair(state),
+        });
+        this.noteQuarantined(fixed.quarantined ?? []);
+        this.record('run.mirror-repaired', {
+          dir: names.integration, branch: names.runBranch,
+          missing: verdict.missing ?? [], created: fixed.created, ok: fixed.ok,
+          ...(fixed.detail ? { detail: fixed.detail } : {}),
+        });
+        if (fixed.refusal === 'mount-occupied') {
+          // Standing on a mirror with a hole a person must answer: the run is
+          // refused its checkout, by name, and parks (`parkRefusedIsolation`).
+          return refuse('mount-occupied', fixed.detail);
+        }
+        verdict = await validateMirror(names.integration, names.runBranch, { explain: true });
+      }
       if (!verdict.ok && verdict.refusal === 'mirror-drifted') {
         const moved = await reattachMirror(names.integration, names.runBranch);
         this.record('run.mirror-drifted', {
@@ -580,6 +796,7 @@ export abstract class RunnerLoop extends RunnerControl {
       state.workRoot = names.integration;
       state.checkout = 'worktree';
       delete state.isolationRefusal;
+      delete state.isolationRefusalDetail;
       if (!overridden) return;
       // Gated per run+reason, like every other line this preamble writes: a
       // permanently-out-of-scope run drives more than once, and a journal an
@@ -624,6 +841,7 @@ export abstract class RunnerLoop extends RunnerControl {
       delete state.workRoot;
       delete state.mountedRepos;
       delete state.isolationRefusal;
+      delete state.isolationRefusalDetail;
       // …and the detach decision goes with the shape, exactly as in `refuse()`:
       // this is the SECOND door out of the worktree checkout, and a dropped run
       // that kept `detachAt` wrote `PE_BRANCH=detached@<sha>` for a session
@@ -661,7 +879,16 @@ export abstract class RunnerLoop extends RunnerControl {
     // stats the disk, and it creates nothing that a cap slot needs holding for.
     // The documented order is unchanged for a run that is taking a tree:
     // available → cap → scope → create.
-    const outOfScope = !scopeConfined(state.root, this.deps.planScope?.(state.slug) ?? []);
+    // 🔴 Cell by cell, never the union (#94). One phase naming a repository
+    // outside the root refused the checkout for every phase of the plan; now
+    // the run is refused only when NOTHING it names is under the root (the hub
+    // shape — the checkout would contain nobody's work), and a phase whose own
+    // cell reaches outside is refused on its own (`notePhaseOutsideRoot`: its
+    // claim is unqualified, `qualificationFor`). The mirror mounts only what
+    // the root contains.
+    const planScope = this.deps.planScope?.(state.slug) ?? [];
+    const split = partitionScope(state.root, planScope);
+    const outOfScope = split.outside.length > 0 && split.inside.length === 0;
     // For a superproject, WHICH repositories the scope lives in — resolved even
     // for a holding run, because a scope that moved to the root (or grew a
     // mount) is news the keep-with-override path has to be able to tell.
@@ -669,7 +896,9 @@ export abstract class RunnerLoop extends RunnerControl {
     let mountsSkipped: string[] = [];
     let mountRefusal: { refusal: WorktreeRefusal; detail: string } | null = null;
     if (mirrorable && !outOfScope) {
-      const resolved = await resolveMounts(state.root, this.deps.planScope?.(state.slug) ?? []);
+      const resolved = await resolveMounts(
+        state.root, planScope.filter((token) => !split.outside.includes(normalizeToken(token))),
+      );
       if (resolved.ok) {
         mounts = resolved.mounts;
         mountsSkipped = resolved.skipped;
@@ -761,6 +990,152 @@ export abstract class RunnerLoop extends RunnerControl {
    * `branch-in-use` detail then names the paths, which is the one fact that
    * makes the situation fixable — or null when nothing is in the way.
    */
+  /** A person's Repair checkout press, as `ensureMirror`'s option — see `RunState.repairCheckout`. */
+  private confirmedRepair(state: RunState): { quarantine?: 'confirmed' } {
+    return state.repairCheckout ? { quarantine: 'confirmed' } : {};
+  }
+
+  /** One `run.mount-quarantined` line per mount moved aside — where from, where to, and whose word. */
+  private noteQuarantined(moved: readonly Quarantined[]): void {
+    for (const mount of moved) {
+      this.record('run.mount-quarantined', {
+        mount: mount.rel || '.', from: mount.dir, to: mount.to, kind: mount.kind,
+        ...(mount.branch ? { branch: mount.branch } : {}),
+        dirty: mount.dirty, unpushed: mount.unpushed, confirmed: mount.confirmed,
+        ...(mount.confirmed && this.state?.repairCheckout ? { by: this.state.repairCheckout.by } : {}),
+      });
+    }
+  }
+
+  /**
+   * An isolated run whose checkout was REFUSED parks with an errand
+   * (control-tower phase 90, #123 #139). It used to degrade: `refuse()` set
+   * `checkout: 'refused'`, `admissionClaim` then gave every phase the shared
+   * checkout's token, and a run that asked for its own tree queued for hours
+   * behind another plan's run-long branch hold on repositories it never
+   * touched — while the only action on offer was "Drop isolation". A run that
+   * asked for a checkout of its own never becomes a shared claimant without a
+   * person saying so: the park names the refusal and the fix, and dropping
+   * isolation is that person's explicit choice.
+   *
+   * Returns true when the run must not board — it parked, or a halt that
+   * already stands keeps its own word (`park` never overwrites one); either way
+   * nothing boards in the shared checkout.
+   */
+  protected parkRefusedIsolation(): boolean {
+    const state = this.state;
+    if (!state || state.isolation !== ISOLATED || state.checkout !== 'refused') return false;
+    const refusal = state.isolationRefusal ?? 'worktree-failed';
+    // A STRUCTURAL refusal keeps the visible shared fallback — see
+    // `ISOLATION_PARKS` for why parking on it would stop every default run.
+    if (!ISOLATION_PARKS.has(refusal)) return false;
+    const detail = this.refusalDetail(state);
+    this.park(
+      `${state.slug} asked for its own checkout and was refused (${refusal}): `
+        + `${(detail ?? REFUSAL_REASON[refusal]).replace(/[.\s]+$/, '')}. ${REFUSAL_FIX[refusal] ?? REFUSAL_FIX['worktree-failed']} `
+        + 'Nothing boarded in the shared checkout; Drop isolation runs it there instead.',
+      null, 'isolation-refused',
+    );
+    return true;
+  }
+
+  /** The refusal's own words for this run — git's, or the occupied mounts' — when it had any. */
+  private refusalDetail(state: RunState): string | undefined {
+    return state.isolationRefusalDetail;
+  }
+
+  /**
+   * Before a boarding: does the isolated run's checkout still stand? (RB-1,
+   * #123, and the #150 switch.) The drive preamble decides the checkout once
+   * per drive, and every boarding after it trusted that answer — so a mirror
+   * pruned under a parked run, or holed by a session, was only noticed by the
+   * NEXT drive, and a recovery or an automatic resume boarded into it first.
+   * Asked at a boundary only (no lane of this run live), so nothing is switched
+   * or moved under a working session; a run that must still wait for one says
+   * yes and is asked again at the next fill.
+   *
+   * Also where a shared run's `isolateAtBoundary` is applied — the same
+   * boundary, the same decision.
+   *
+   * Returns false when the run parked (its isolation was refused).
+   */
+  protected override async checkoutBeforeBoarding(): Promise<boolean> {
+    const state = this.state;
+    if (!state) return true;
+    if (state.isolateAtBoundary) {
+      if (this.lanes.size) return true;
+      return this.switchToIsolation(state);
+    }
+    if (state.isolation !== ISOLATED) return true;
+    if (this.lanes.size) return true;
+    if (state.checkout === 'worktree' && state.workRoot && await this.runTreeStands(state)) return true;
+    const was = state.checkout;
+    await this.ensureRunCheckout();
+    if (state.checkout === 'worktree') {
+      this.record('run.checkout-rebuilt', {
+        dir: state.workRoot ?? null, was: was ?? null,
+        reason: 'the run\'s checkout did not stand at a boundary, and was rebuilt before the next boarding',
+      });
+      this.persist();
+      return true;
+    }
+    return !this.parkRefusedIsolation();
+  }
+
+  /**
+   * The isolated checkout this run holds, asked of the disk — the preamble's
+   * `holding`, without its repairs. Of `workRoot`, never of this run's own
+   * `integration/` path: an ADOPTED checkout (a previous run's kept tree,
+   * `adoptKeptCheckout`) lives under another run's directory.
+   */
+  private async runTreeStands(state: RunState): Promise<boolean> {
+    const tree = state.workRoot;
+    if (!tree || !existsSync(tree)) return false;
+    const runBranch = this.laneNamesFor(0).runBranch;
+    return state.mountedRepos?.length
+      ? validateMirror(tree, runBranch)
+      : state.detachAt
+        ? holdsDetached(state.root, tree)
+        : holdsBranch(state.root, tree, runBranch);
+  }
+
+  /**
+   * Apply `isolateAtBoundary` (#150): the run asks for its own checkout from
+   * here on, and the preamble takes one exactly as it would at launch —
+   * reclaiming the run branch from the shared root when that tree is clean. A
+   * checkout the preamble refuses leaves the run SHARED, as it was, and says
+   * why: the switch was an escape the operator offered, and failing it must
+   * not stop a run that was working.
+   */
+  private async switchToIsolation(state: RunState): Promise<boolean> {
+    const asked = state.isolateAtBoundary!;
+    delete state.isolateAtBoundary;
+    if (state.gitMode !== 'new-branch' || state.checkout === 'worktree') {
+      this.persist();
+      return true;
+    }
+    state.isolation = ISOLATED;
+    await this.ensureRunCheckout();
+    // Re-read: the preamble moved it, which the narrowing above cannot know.
+    if (this.state?.checkout === 'worktree') {
+      this.record('run.isolation-switched', {
+        dir: state.workRoot ?? null, branch: `pe/${state.slug}`, by: asked.by, asked: asked.at,
+      });
+    } else {
+      const refusal = state.isolationRefusal;
+      delete state.isolation;
+      state.checkout = 'shared';
+      delete state.isolationRefusal;
+      delete state.isolationRefusalDetail;
+      this.record('run.isolation-switch-refused', {
+        by: asked.by, refusal: refusal ?? null,
+        reason: `${refusal ? REFUSAL_REASON[refusal] : 'the checkout could not be taken'} — the run stays in the shared checkout`,
+      });
+    }
+    this.persist();
+    return true;
+  }
+
   /**
    * Take over a previous run's KEPT `integration/`, when it is this plan's own.
    *
@@ -797,6 +1172,7 @@ export abstract class RunnerLoop extends RunnerControl {
     state.checkout = 'worktree';
     delete state.mountedRepos;
     delete state.isolationRefusal;
+    delete state.isolationRefusalDetail;
     this.record('run.isolation-adopted', {
       checkout: 'worktree', mode: ISOLATED, dir, branch: runBranch,
       from: basename(dirname(dir)),
@@ -821,9 +1197,24 @@ export abstract class RunnerLoop extends RunnerControl {
     const own = autopilotOwner(state.id);
     const occupied = (this.deps.occupiedTrees?.(this.deps.planScope?.(state.slug) ?? ['all']) ?? [])
       .filter((claim) => claim.owner !== own);
+    // This plan's own hand checkouts (`phase-lane.sh`, or a session that met a
+    // missing mirror and made its own): detached, never moved and never a
+    // reason to refuse the run its OWN branch (control-tower phase 90, #123).
+    const handRoot = realish(join(worktreesRoot(state.root), 'hand', state.slug));
     for (const repo of repos) {
       const held = await checkedOutIn(repo.source, runBranch);
       if (!held) continue;
+      if (`${realish(held)}${sep}`.startsWith(`${handRoot}${sep}`)) {
+        const freed = await detachHandTree({ tree: held, branch: runBranch, occupied });
+        if (freed.kind === 'detached') {
+          this.record('run.isolation-reclaimed', {
+            tree: freed.tree, from: runBranch, to: 'detached', detached: true,
+            ...(repo.rel ? { repo: repo.rel } : {}),
+          });
+          continue;
+        }
+        if (freed.kind === 'held') return `${freed.tree} is held by a live session (${freed.by})`;
+      }
       let result: Reclaim;
       try {
         result = await reclaimBranch({
@@ -1044,6 +1435,7 @@ export abstract class RunnerLoop extends RunnerControl {
     // list left over from its superproject days would misdescribe it.
     delete state.mountedRepos;
     delete state.isolationRefusal;
+    delete state.isolationRefusalDetail;
     // Once per DECISION, not once per drive. The preamble re-runs on every
     // resume by design, and journalling an unchanged answer each time turns
     // "this run got its checkout" into a line an operator learns to scroll
@@ -1085,7 +1477,9 @@ export abstract class RunnerLoop extends RunnerControl {
       // unrelated object databases, so each detaches at its OWN trunk's head
       // rather than at the sha the run-level decision happens to hold.
       ...(state.detachAt ? { detach: true } : {}),
+      ...this.confirmedRepair(state),
     });
+    this.noteQuarantined(made.quarantined);
     if (!made.ok) {
       return refuse(
         made.refusal ?? 'worktree-failed',
@@ -1143,6 +1537,7 @@ export abstract class RunnerLoop extends RunnerControl {
     state.checkout = 'worktree';
     state.mountedRepos = rels;
     delete state.isolationRefusal;
+    delete state.isolationRefusalDetail;
     if (!already) {
       this.record('run.isolation', {
         checkout: 'worktree', mode: ISOLATED, dir: names.integration, branch: names.runBranch,
@@ -1177,6 +1572,22 @@ export abstract class RunnerLoop extends RunnerControl {
    * the same thing, and the settle's own call reaches here after the run has
    * finished with the branch.
    */
+  /**
+   * Is `phase` this run's LAST? Every OTHER phase on the board is done, this is
+   * the only live lane, and the run is the whole plan (a scoped run finishing
+   * is not the plan finishing). Two leaves finishing together therefore never
+   * both read final — `run.pr-pending` at finish covers that honestly instead.
+   * The pull-request block asks it, and so does the settle before a final
+   * phase's §Verification (control-tower phase 62, #47).
+   */
+  protected isFinalPhase(board: Board, phase: number): boolean {
+    const state = this.state!;
+    const phases = Object.keys(board.states).map(Number);
+    return !state.onlyPhases?.length
+      && phases.filter((p) => p !== phase).every((p) => board.done.includes(p))
+      && this.livePhases().every((p) => p === phase);
+  }
+
   private async pruneRunBranches(state: RunState, opts?: { includeOwn?: boolean }): Promise<void> {
     if (this.deps.worktreePrefs?.().deleteMergedBranches === false) return;
     const repos = state.mountedRepos?.length
@@ -1199,6 +1610,46 @@ export abstract class RunnerLoop extends RunnerControl {
       swept.push(...result.deleted);
     }
     if (swept.length) this.record('run.branches-pruned', { deleted: swept });
+  }
+
+  /**
+   * The run is about to PARK on one phase's stop while a sibling phase holds an
+   * external-wait clock (#53): wait on that clock instead, and let the stop
+   * stand beside it. Answers whether it did.
+   *
+   * Measured on another plan: a lane ended needs-human (a credential errand)
+   * while its sibling waited on a CD window; the run was written `parked`,
+   * nothing drives a parked run, the waiting phase settled `clock-unarmed` and
+   * sat 65 minutes past its clock until a person pressed Start. The two stops
+   * were unrelated, and the errand's cost to the wait was the whole wait.
+   *
+   * Only a PHASE's stop — no run halt at all (an ending the loop reads as "do
+   * not carry on"), or a halt whose kind `PHASE_HALT_KINDS` owns and which names
+   * its phase. A run-level halt stops the run whatever else is waiting, and its
+   * park carries the clock instead (`carryWaitClock`). The run-level halt a
+   * phase's park wrote goes: the run is waiting, and the stop lives where it
+   * always lived as well — its phase's record, its declaration, its errand —
+   * which is what the inbox, the classifier and the ladder read. When the clock
+   * fires, `resumeOverdueWait` boards the waiting phase; the parked one stays
+   * `parked` (settled, never a candidate) until a person answers it.
+   */
+  protected waitBesideStop(): boolean {
+    const state = this.state;
+    if (!state) return false;
+    const halt = state.halt;
+    if (halt && (halt.phase == null || !(PHASE_HALT_KINDS as readonly string[]).includes(halt.kind ?? ''))) return false;
+    const last = halt ? null : latestEnding(Object.values(state.phases));
+    const phase = halt?.phase ?? last?.phase;
+    if (phase == null) return false;
+    const reason = (halt?.reason ?? last?.halt?.reason ?? last?.note ?? `phase ${phase} settled and did not carry on`)
+      .replace(/\s+/g, ' ').slice(0, 300);
+    const nowIso = new Date(this.now().getTime()).toISOString();
+    // A phase that ended on a wait of its own is not a stop BESIDE the wait.
+    const beside = state.phases[String(phase)]?.status === 'waiting' ? null : { phase, kind: halt?.kind ?? null, reason };
+    if (!this.enterRunWaiting(nowIso, null, beside)) return false;
+    this.parkPending = false;
+    state.halt = null;
+    return true;
   }
 
   /**
@@ -1237,6 +1688,12 @@ export abstract class RunnerLoop extends RunnerControl {
     // and a session spawned before this settled would run in the shared tree
     // while the run's own record said otherwise.
     await this.ensureRunCheckout();
+    // A queue episode no admission of THIS loop owns is over (#81): nothing is
+    // queued before this loop boards anything. The first loop this process
+    // drives for the run found it left open by a console that went away —
+    // `restarted`, ended where it was last seen waiting — and a later loop by
+    // one that ended without withdrawing it. The entry's age stays either way.
+    this.closeOrphanedEpisodes();
     this.persist();
     // …and only now, because the preamble is what decides whether this run has
     // a checkout of its own at all. Armed here rather than at `start()` so a
@@ -1253,6 +1710,8 @@ export abstract class RunnerLoop extends RunnerControl {
     const inFlight = new Map<number, Promise<{ phase: number; carryOn: boolean }>>();
     /** Something said stop. Admit nothing more; let what is running finish. */
     let stopping = false;
+    /** The phases whose lanes told the loop not to carry on — read by the usage-wall rule below (#78). */
+    const stoppers = new Set<number>();
 
     /**
      * Wait for the next lane to settle. The only place the loop advances.
@@ -1283,7 +1742,7 @@ export abstract class RunnerLoop extends RunnerControl {
       // `pruneWorktrees` is: the loop must not wait on git to admit the next
       // phase, and a probe that arrives a second late is a probe.
       void this.refreshGit();
-      if (!done.carryOn) stopping = true;
+      if (!done.carryOn) { stopping = true; stoppers.add(done.phase); }
     };
 
     /**
@@ -1301,22 +1760,40 @@ export abstract class RunnerLoop extends RunnerControl {
       await settleOne();
       return true;
     };
+    /**
+     * Board reads that TIMED OUT in a row (control-tower phase 81, #104): each
+     * is waited out on the `engine-busy` back-off, and the first read that
+     * answers clears the count. In memory on purpose — a restart reads afresh.
+     */
+    let engineBusy = 0;
 
     try {
+      // 🔴 A run that asked for its own checkout and was refused for a reason a
+      // person can fix PARKS here, with the refusal and its fix, before a single
+      // phase boards (control-tower phase 90, #123 #139) — it never becomes a
+      // silent shared-checkout claimant. Inside the `try`, so the loop's own
+      // `finally` settles and checkpoints the parked run like any other ending.
+      if (this.parkRefusedIsolation()) return;
       while (true) {
         if (this.abort?.signal.aborted) {
           if (await draining()) continue;
           // A halt that stands keeps its word (`runRecovery`'s rule, now the
           // loop's too): `paused` beside a live halt is two stories at once.
-          state.status = state.halt ? 'halted' : 'paused';
+          setRunState(state, state.halt ? 'halted' : 'paused');
           state.pause = null;
           if (this.shuttingDown) {
             // The console is going away under a run that was working. Said
             // so, and stamped as the system's stop: the convergence loop picks
             // it up at the next boot (`resumeAtBoot`), which it would never do
-            // for a stop the operator asked for.
+            // for a stop the operator asked for. Its promise is true only
+            // while no hold that outlives the process binds the run: under a
+            // freeze or a machine hold the sentence names the hold instead —
+            // who, when, and the one act that ends it (control-tower phase 81,
+            // #93). A restart's own hold lifts with the process, so it keeps it.
             state.stoppedBy = 'system';
-            state.finishedReason ??= 'the console shut down while this run was working — it continues by itself once the console is back';
+            const held = this.fleetFrozen();
+            state.finishedReason ??= 'the console shut down while this run was working — '
+              + (held && held.scope !== 'restart' ? fleetHoldSentence(held) : SHUTDOWN_CONTINUES);
           } else {
             const stamp = this.stopStamp();
             state.stoppedBy = stamp.stoppedBy;
@@ -1348,7 +1825,7 @@ export abstract class RunnerLoop extends RunnerControl {
           // picks the run up from the next ready phase. (A freeze that DID stop
           // a live child leaves that child surviving, the `finally` keeps the
           // slot, and the halt built from it carries the `kill -CONT` remedy.)
-          state.status = 'paused';
+          setRunState(state, 'paused');
           state.stoppedBy = 'operator';
           state.pause = null;
           state.finishedReason ??= `frozen by ${state.freeze?.by ?? 'the operator'} with nothing left running `
@@ -1361,7 +1838,7 @@ export abstract class RunnerLoop extends RunnerControl {
           // — that is what "after this phase" has always meant, and with lanes
           // it means after all of them.
           if (await draining()) continue;
-          state.status = 'paused';
+          setRunState(state, 'paused');
           state.stoppedBy = 'operator';
           this.record('run.paused', { afterPhase: state.pause?.afterPhase ?? null });
           state.finishedReason = state.pause?.afterPhase != null
@@ -1376,10 +1853,13 @@ export abstract class RunnerLoop extends RunnerControl {
           // halting run whose halt is gone is not halting any more — it goes
           // back to driving instead of finalizing a stop about nothing.
           if (!state.halt) {
-            state.status = this.resumedStatus();
+            setRunState(state, this.resumedStatus());
             this.record('run.halt-superseded', { note: 'the board overtook the halt while lanes drained' });
             continue;
           }
+          // …and a park a timed-out approval raised lifts once the phase it was
+          // about has completed (#140): the lane it drained for WAS that phase.
+          if (this.liftApprovalPark()) continue;
           // A halt in one lane stops ADMITTING; what is already running drains
           // — the same shape as a pause, with a worse reason. Only when the
           // last lane settles may the run read `halted`: "halted" with live
@@ -1387,8 +1867,12 @@ export abstract class RunnerLoop extends RunnerControl {
           // compound (halted is not IN_FLIGHT, so a dead console mid-drain
           // would never pid-check those children).
           if (await draining()) continue;
-          state.status = this.parkPending ? 'parked' : 'halted';
+          // A PHASE's park does not cost a sibling its wait clock (#53): the
+          // run waits on that clock and the park stands beside it.
+          if (this.parkPending && this.waitBesideStop()) break;
+          setRunState(state, this.parkPending ? 'parked' : 'halted');
           this.parkPending = false;
+          carryWaitClock(state);
           break;
         }
         // An out-of-band park — the approval-timeout hook is the one that
@@ -1400,11 +1884,31 @@ export abstract class RunnerLoop extends RunnerControl {
         // the default single lane too, as soon as the parked phase's own
         // session finishes.
         if (state.status === 'parked' && state.halt) {
+          if (this.liftApprovalPark()) continue;
           if (await draining()) continue;
+          if (!this.waitBesideStop()) carryWaitClock(state);
           break;
         }
         if (stopping) {
           if (await draining()) continue;
+          // Every lane that stopped the loop parked ITSELF on a usage wall
+          // (#78, control-tower phase 54). Such a stop is not "do not carry
+          // on": it is a clock. A wall that lifted while the loop drained (a
+          // spend beside it, a fresh reading) boards on the next tick; one that
+          // still stands puts the run in `waiting` on its clock — the service
+          // resumes a waiting run from that clock, and a re-read that lifts it
+          // moves the clock to now. It used to land on `parked`, which nothing
+          // drives: the phase sat past its reset until a person pressed Start.
+          const walls = [...stoppers].map((p) => state.phases[String(p)]);
+          if (!state.halt && (state.status === 'running' || state.status === 'queued') && walls.length
+            && walls.every((r) => r?.status === 'waiting' && Boolean(r.usageWall) && Boolean(r.parkedUntil))) {
+            if (walls.some((r) => Date.parse(r!.parkedUntil!) <= Date.now())) {
+              stopping = false;
+              stoppers.clear();
+              continue;
+            }
+            if (this.enterRunWaiting(new Date().toISOString(), null, null)) break;
+          }
           // A terminal word, because nothing else writes one here any more.
           // Until the halt-kind split, "a phase settled and told the loop not
           // to carry on" was ALWAYS accompanied by a run-level halt, and
@@ -1426,11 +1930,14 @@ export abstract class RunnerLoop extends RunnerControl {
           // `pausing`, `halting` and every settled word are owned by branches
           // above, for the same reason.
           if (!state.halt && (state.status === 'running' || state.status === 'queued')) {
+            // …unless a sibling holds an external-wait clock (#53): then the
+            // run waits on it, and this phase's ending stands beside the wait.
+            if (this.waitBesideStop()) break;
             // The ending that happened LAST, not the highest phase number —
             // `Object.values(state.phases)` is integer-keyed. Shared with the
             // end-of-plan headline below so the two cannot drift.
             const last = latestEnding(Object.values(state.phases));
-            state.status = 'parked';
+            setRunState(state, 'parked');
             state.stoppedBy = 'system';
             // Assigned, not `??=`: the newest stop is the headline. A sentence
             // left from an earlier phase's stop would describe a phase this run
@@ -1438,6 +1945,7 @@ export abstract class RunnerLoop extends RunnerControl {
             state.finishedReason = last?.halt
               ? `phase ${last.phase}: ${last.halt.reason}`
               : 'a phase settled and this run was not told to carry on.';
+            carryWaitClock(state);
             this.record('run.parked', { reason: state.finishedReason });
           }
           break;
@@ -1452,6 +1960,7 @@ export abstract class RunnerLoop extends RunnerControl {
         }
 
         const board = await this.board();
+        this.noteBoard(board);
         // Re-read, because `board()` is a `phase-graph.sh` subprocess and the
         // whole gap between the check at the top of this loop and here is time
         // an operator can press Pause in. They did, repeatedly, and watched the
@@ -1463,18 +1972,36 @@ export abstract class RunnerLoop extends RunnerControl {
         if (stopAdmitting(state.status)) continue;
         if (board.error) {
           if (await draining()) continue;
-          this.halt(`the engine could not read the plan: ${board.error}`, undefined, 'plan-unreadable');
+          // A read that TIMED OUT is the machine's load, not the plan (#104):
+          // waited out on the back-off, charging nothing, and read again. Only
+          // a timeout that outlasts the whole series stops the run — saying
+          // how many reads timed out, so the stop is not read as a broken plan.
+          if (board.timedOut && engineBusy < ENGINE_BUSY_MAX_WAITS) {
+            engineBusy += 1;
+            await this.waitOutEngineBusy(engineBusy, board.error);
+            continue;
+          }
+          this.halt(board.timedOut
+            ? `the engine timed out reading the plan ${engineBusy + 1} times in a row — the machine was too busy to `
+              + `read it, which says nothing about the plan: ${board.error}`
+            : `the engine could not read the plan: ${board.error}`, undefined, 'plan-unreadable');
           break;
+        }
+        if (engineBusy) {
+          this.record('run.engine-busy-cleared', { waits: engineBusy });
+          engineBusy = 0;
         }
 
         // Records first: resolutions queued by recoveries, then anything the
         // board has overtaken — a phase finished outside this run flips to
         // done HERE, halts anchored to it clear, and the loop never spends a
         // session on work somebody already did.
-        this.applyReconcile(board);
+        await this.applyReconcile(board);
         // A lock-cap park re-arms the moment the lock it waited on is gone —
         // the docs watcher wakes this tick on the release. See `rearmLockCapParks`.
         await this.rearmLockCapParks(board);
+        // …and every park's own clock is armed, whoever wrote the park (#132).
+        this.armOwnParkPokes();
 
         const outstanding = [...board.ready, ...board.waiting, ...board.inProgress, ...board.stuck];
         // A run asked for specific phases is finished when THOSE are settled —
@@ -1531,12 +2058,21 @@ export abstract class RunnerLoop extends RunnerControl {
             // this filter dropped the hint every time: a rung spent, no
             // session run (RC4, measured on phase-console-commerce).
             const hint = phaseRecord(state, p).boardingHint;
+            // The THIRD: a phase this run re-opened on a red final verdict
+            // (control-tower phase 62, #68) — its fix rung boards a phase the
+            // board reads done for the same reason a QA rung does.
             return at === 'done'
-              && (hint?.rung === FOLLOW_UP_RUNG || String(hint?.situation ?? '').startsWith('qa-'));
+              && (hint?.rung === FOLLOW_UP_RUNG || String(hint?.situation ?? '').startsWith('qa-')
+                || Boolean(phaseRecord(state, p).reopened));
           });
-        const candidates = [...new Set([...board.ready, ...expiredWaits, ...hinted])]
+        // A §Verification a restart cut (control-tower phase 48, #69): owed
+        // before anything else is decided about its phase, whatever the board
+        // reads — it read `done` the moment the handoff landed — and whatever
+        // status the teardown left on the record.
+        const reverifying = Object.values(state.phases).filter((r) => owesVerification(r)).map((r) => r.phase);
+        const candidates = [...new Set([...reverifying, ...board.ready, ...expiredWaits, ...hinted])]
           .filter((p) => !asked || asked.has(p))
-          .filter((p) => !SETTLED.includes(phaseRecord(state, p).status))
+          .filter((p) => !SETTLED.includes(phaseRecord(state, p).status) || owesVerification(phaseRecord(state, p)))
           .filter((p) => {
             const record = phaseRecord(state, p);
             if (record.status !== 'waiting') return true;
@@ -1545,12 +2081,32 @@ export abstract class RunnerLoop extends RunnerControl {
           // A phase this loop is already driving is not a candidate to start
           // again. The board cannot know — it reads handoffs, and a phase in
           // flight has not written one yet.
-          .filter((p) => !inFlight.has(p));
+          .filter((p) => !inFlight.has(p))
+          // …nor one an operator WITHDREW from the queue (control-tower phase
+          // 99, #135 E.21): it takes no lane, its siblings board instead, and
+          // the run names it until it is re-queued.
+          .filter((p) => !phaseRecord(state, p).queueControl?.withdrawn);
+
+        // The scope fence (control-tower phase 6, #19): a phase parked on a
+        // declared EXTERNAL wall holds back the candidates whose scope
+        // intersects its own — they read `queued` behind it, and a disjoint
+        // one boards as `keep-going` always meant. The fenced are still
+        // outstanding work, never "finished".
+        const fenced = await this.fenceCandidates(candidates);
+        // …and a phase whose dependency this run RE-OPENED waits for it to
+        // verify green (control-tower phase 62, #68). Held, not settled: it
+        // stays outstanding, and boards the tick the hold lifts.
+        const held = this.verificationHeld(candidates);
+        const boardable = this.boardingOrder(candidates.filter((p) => !fenced.has(p) && !held.has(p)));
+        // What nothing drives, named (control-tower phase 79, #114): a phase the
+        // board reads in progress that no lane, queue entry, hint, park or
+        // errand of this run holds. Stamped every tick, so it is never stale.
+        this.noteUndriven(board, new Set(boardable));
 
         // Nothing to start, but something is running: it may be about to make
         // more phases ready. Concluding "finished" here is the fastest way to
         // stop a plan one phase in.
-        if (!candidates.length && await draining()) continue;
+        if (!boardable.length && await draining()) continue;
 
         // Everything startable is parked on an external clock: the RUN waits —
         // restart-safe (`waiting`→`paused` keeps the clock on reconcile, and
@@ -1563,7 +2119,7 @@ export abstract class RunnerLoop extends RunnerControl {
         // `done`) — not a reason to hold the run on a clock that has passed.
         // Counting expired waits here was the other half of the livelock: the
         // run went back to `waiting` with a `waitUntil` in the past.
-        if (!candidates.length && this.enterRunWaiting(nowIso, asked)) break;
+        if (!boardable.length && this.enterRunWaiting(nowIso, asked)) break;
 
         // "Settled" here has to mean settled WELL. `SETTLED` includes `parked`,
         // `gated` and `failed`, so a scoped run whose one phase parked used to
@@ -1572,17 +2128,24 @@ export abstract class RunnerLoop extends RunnerControl {
         // world, and it hid the park's own explanation entirely. A scoped run
         // that ends on a phase needing a person falls through to the halt
         // below, which names the blocker and its remedy like any other run.
+        //
+        // …and it was fixed one status short (#43): a `pending` phase with an
+        // open errand and one that never boarded both read as settled, and the
+        // run said "those are settled" over them. Settled-well is now an
+        // allow-list — `done`, or skipped by the operator, with no standing
+        // errand (`phaseSettledWell`, through `scopeLeftOpen`) — so a status
+        // added tomorrow is unsettled until somebody says otherwise.
         const unsettled = asked
-          ? [...asked].filter((p) => ['parked', 'gated', 'failed'].includes(phaseRecord(state, p).status))
+          ? [...new Set([...scopeLeftOpen(state), ...[...asked].filter((p) => fenced.has(p) || held.has(p))])].sort((a, b) => a - b)
           : [];
-        if (asked && !candidates.length && !unsettled.length) {
+        if (asked && !boardable.length && !unsettled.length) {
           // A scoped run finishes HERE and never reaches the settle below, so
           // the at-settle review has to be asked for in both places or an
           // operator who ran two phases and asked for one cloud review would
           // silently get none. Settled-well is the condition either way:
           // `unsettled` is empty, so nothing on this tree is still owed.
           await this.ultraReviewAtSettle();
-          state.status = 'finished';
+          setRunState(state, 'finished');
           // The single most-reported "it doesn't go to the next phase". The run
           // was scoped — usually from a per-row "Run only this" control — did
           // exactly what it was asked, and then said nothing about why it
@@ -1598,7 +2161,7 @@ export abstract class RunnerLoop extends RunnerControl {
           break;
         }
 
-        if (!candidates.length) {
+        if (!boardable.length) {
           // Every phase's landing that is still in flight settles BEFORE the
           // run does: the `pr` settle reads which phase pull requests exist,
           // and a park must not leave a landing session running unwatched.
@@ -1629,8 +2192,11 @@ export abstract class RunnerLoop extends RunnerControl {
           const settled = !outstanding.length && !endedBadly && state.gitMode === 'new-branch'
             ? await this.settleRun()
             : null;
-          state.status = outstanding.length || endedBadly ? 'parked' : 'finished';
-          if (outstanding.length || endedBadly) state.stoppedBy = 'system'; else delete state.stoppedBy;
+          // A scoped run whose asked phases are not settled well is never
+          // finished, even with the board read out (#43).
+          const scopeOpen = asked ? unsettled : [];
+          setRunState(state, outstanding.length || endedBadly || scopeOpen.length ? 'parked' : 'finished');
+          if (outstanding.length || endedBadly || scopeOpen.length) state.stoppedBy = 'system'; else delete state.stoppedBy;
           // Name the phases AND attribute the sentence. Quoting one unlabelled
           // reason under "3 phases did not finish cleanly" sends a person to the
           // wrong phase page, which is the one thing this line exists to prevent.
@@ -1644,6 +2210,9 @@ export abstract class RunnerLoop extends RunnerControl {
                 + `did not finish cleanly — phase ${latest!.phase}: ${latest!.halt!.reason}`
               : `every phase of ${state.slug} is done.`;
           if (settled) state.finishedReason = settled;
+          if (!outstanding.length && scopeOpen.length) {
+            state.finishedReason = `${scopeNotDoneSentence(scopeOpen)} — ${state.finishedReason ?? 'nothing is left to run for them'}`;
+          }
           if (outstanding.length) {
             // Parking with work left is not self-explanatory: every phase this
             // loop will not pick up again needs its ACTUAL blocker named — a
@@ -1655,9 +2224,17 @@ export abstract class RunnerLoop extends RunnerControl {
             // person, written after every automatic rung was tried or when the
             // situation was a person's from the start. Named first: they are
             // the doors that exist, whatever the board reads for them.
+            // A `pending` record's errand is named too (#43): the healer files
+            // an errand without touching the record, and a scoped run that
+            // parked over one used to quote everything but the ask.
             const errands = Object.entries(state.recoveries ?? {})
               .filter(([key, slot]) => slot.errand && /^\d+$/.test(key)
-                && state.phases[key]?.status === 'parked' && (!asked || asked.has(Number(key))))
+                // …and a phase WAITING on a spent budget (control-tower phase
+                // 45): it has no clock, so nothing above names it, and its
+                // `budgets` errand is exactly what this park is waiting for.
+                && (['parked', 'pending'].includes(state.phases[key]?.status ?? '')
+                  || (state.phases[key]?.status === 'waiting' && Boolean(state.phases[key]?.declared?.budgetSpent)))
+                && (!asked || asked.has(Number(key))))
               .map(([key, slot]) => ({ p: Number(key), errand: slot.errand! }));
             const errandPhases = new Set(errands.map((e) => e.p));
             // The phases whose QA verdict is holding the DAG, read from the
@@ -1676,7 +2253,10 @@ export abstract class RunnerLoop extends RunnerControl {
             const held = [
               ...errands.map(({ p, errand }) => `phase ${p} needs you — ${errand.need} (${errand.how})`),
               ...readyRecords.filter(({ p }) => !errandPhases.has(p)).map(({ p, record }) =>
-                `phase ${p} is ${record.status}${record.note ? ` (${record.note})` : ''}`),
+                // An operator's withdrawal is the whole reason (control-tower phase 99).
+                record.queueControl?.withdrawn
+                  ? `phase ${p} is ${withdrawnReason(record.queueControl.withdrawn)}`
+                  : `phase ${p} is ${record.status}${record.note ? ` (${record.note})` : ''}`),
               ...board.stuck.filter((p) => !errandPhases.has(p)).map((p) =>
                 `phase ${p}'s handoff is marked blocked — its Outstanding section says why`),
               ...qaHolders.filter(({ p }) => !errandPhases.has(p)).map(({ p, verdict }) => {
@@ -1694,6 +2274,9 @@ export abstract class RunnerLoop extends RunnerControl {
               record.status === 'parked' && VERIFICATION_PARK_NOTE.test(record.note ?? ''));
             const remedies: string[] = [];
             if (errands.length) remedies.push('a phase parked with an errand takes that errand, then Retry');
+            if (readyRecords.some(({ record }) => record.queueControl?.withdrawn)) {
+              remedies.push('a withdrawn phase takes Re-queue on the queue page, then Resume');
+            }
             if (readyRecords.some(({ record }) => record.status === 'gated')) {
               remedies.push('Gates need your confirmation (then Retry re-checks them)');
             }
@@ -1767,11 +2350,22 @@ export abstract class RunnerLoop extends RunnerControl {
             // board reads done, and therefore one no record-derived anchor
             // could ever have found.
             const deadlocked = qaHolders.length > 0 && !board.ready.length && !board.inProgress.length;
+            // The same facts as data: one holder per phase, each with the verb
+            // that clears it (control-tower phase 5) — never parsed back out
+            // of the sentence below.
+            const holders = haltHolders({
+              readyRecords, errands, stuck: board.stuck,
+              qaHolders: qaHolders.map(({ p, verdict }) => ({ p, verdict, blocks: heldByQa(p) })),
+            });
+            // A scoped run says first that its SCOPE is what is not done —
+            // the sentence a person reads instead of "those are settled" (#43).
+            const scopeClause = scopeOpen.length ? `${scopeNotDoneSentence(scopeOpen)} — ` : '';
             state.halt ??= {
+              holders,
               at: new Date().toISOString(),
-              reason: held
+              reason: scopeClause + (held
                 ? `nothing left to run on its own — ${held}.${tail}`
-                : `nothing is ready to run: ${outstanding.length} phase(s) are still waiting on a gate or an earlier phase.`,
+                : `nothing is ready to run: ${outstanding.length} phase(s) are still waiting on a gate or an earlier phase.`),
               ...(deadlocked
                 ? { kind: 'plan-deadlocked', phase: qaHolders[0].p }
                 : allVerification
@@ -1796,15 +2390,54 @@ export abstract class RunnerLoop extends RunnerControl {
 
         // Fill every free lane this run is allowed, then wait for the first to
         // settle. One lane makes this exactly what it was: start a phase, wait
-        // for it, go round again.
-        for (const phase of candidates) {
-          if (inFlight.size >= this.maxLanes()) break;
+        // for it, go round again. A landing's reservation boards first, and a
+        // sibling whose scope it intersects waits one tick behind it rather
+        // than racing it into the scheduler (`boardingOrder`, `landingHeld`).
+        //
+        // 🔴 A phase whose scope meets a lane of this run in the same tree —
+        // one live, or one boarded earlier in this very pass — is SERIAL work
+        // behind it (#64), not a queue: it stays ready with `serialBehind`,
+        // never joins the scheduler, and boards when that lane ends. Before
+        // this, every sibling of a plan whose phases share a repository sat
+        // `queued` behind its own lane, with a badge, a `waitedMs` and a
+        // whole-plan ETA — 78 % of all queued lane-time was a run queued
+        // behind itself.
+        // RB-1 (control-tower phase 90, #123): the checkout this run boards
+        // into is asked again at a boundary, not only at the drive's start — a
+        // mirror pruned or holed since is rebuilt before the next session, and
+        // a refusal parks. `isolateAtBoundary` (#150) is applied here too.
+        if (boardable.length && !(await this.checkoutBeforeBoarding())) {
+          if (inFlight.size) continue;
+          break;
+        }
+        const ahead = this.ownLanes();
+        const serialNow = new Set<number>();
+        for (const phase of boardable) {
+          const behind = await this.serialBehindOf(phase, ahead);
+          if (behind !== null) {
+            serialNow.add(phase);
+            this.markSerial(phase, behind);
+            continue;
+          }
+          if (inFlight.size >= this.maxLanes()) continue;
+          if (await this.landingHeld(phase, [...boardable, ...inFlight.keys()])) continue;
           // The same re-check as the one above the board read, and for the
           // same reason: `rearmLockCapParks` and `climbLadder` both await
           // between there and here, so a pause or a halt can land in the gap —
           // and it must stop the SECOND lane of a burst as well as the first.
           if (stopAdmitting(state.status)) break;
+          this.clearSerial(phase);
           inFlight.set(phase, this.laneOf(phase, board));
+          ahead.push(await this.laneClaim(phase));
+        }
+        // What this pass decided, for a press that asks whether it boarded
+        // (`boardingVerdict`, control-tower phase 86 RS-5).
+        this.lastFill = { at: Date.now(), order: [...boardable], inFlight: [...inFlight.keys()], max: this.maxLanes() };
+        // Serial behind nothing any more, or no longer a candidate at all.
+        for (const record of Object.values(state.phases)) {
+          if (record.serialBehind != null && !serialNow.has(record.phase) && !inFlight.has(record.phase)) {
+            this.clearSerial(record.phase);
+          }
         }
         await settleOne();
       }
@@ -1824,7 +2457,7 @@ export abstract class RunnerLoop extends RunnerControl {
       // land on the final word: nothing is running past this line. A park that
       // was draining lands on `parked`; only a halt lands on `halted`.
       if (state.status === 'halting') {
-        state.status = this.parkPending ? 'parked' : 'halted';
+        setRunState(state, this.parkPending ? 'parked' : 'halted');
         this.parkPending = false;
       }
       // Park pokes die with the loop: a stopped run's resume is the service's
@@ -1832,6 +2465,19 @@ export abstract class RunnerLoop extends RunnerControl {
       // callback into a loop that no longer exists.
       for (const timer of this.parkPokes.values()) clearTimeout(timer);
       this.parkPokes.clear();
+      // …and the ladder's re-check poke (#114): a next loop arms its own.
+      this.clearLadderRecheck();
+      // The wall re-probes (#78) outlive a loop that settles `waiting`: the
+      // service resumes that run from its clock, and a probe that finds the
+      // account open moves the clock to now. Any other ending stops them —
+      // the record keeps `usageWall`, and the next re-read arms them again.
+      if (state.status !== 'waiting') {
+        for (const timer of this.wallProbes.values()) clearTimeout(timer);
+        this.wallProbes.clear();
+      }
+      // …and so do landing reservations: the landing is on the record, and the
+      // next loop resumes that elapsed wait like any other (`landingReserve`).
+      this.landingReserve.clear();
       // Whatever is left is not running any more, whichever way the loop left.
       for (const lane of this.lanes.values()) this.clearFreezeTimer(lane);
       this.lanes.clear();
@@ -1876,10 +2522,12 @@ export abstract class RunnerLoop extends RunnerControl {
       // explains why, and the halt built from it is what tells the operator to
       // `kill -CONT`. Cleared only once nothing survives.
       if (!live) state.freeze = null;
-      // The token dies with the loop. Anything still waiting on a decision is
-      // answered rather than left holding a socket nobody is watching — this
-      // run's cards only, because another run's are still answerable.
-      this.deps.approvals?.disarm(state.id);
+      // The token dies with the loop — unless a child launched under it is
+      // among the survivors above, which keeps it armed until that child goes
+      // (#74). Otherwise anything still waiting on a decision is answered
+      // rather than left holding a socket nobody is watching — this run's cards
+      // only, because another run's are still answerable.
+      this.releaseRunToken(state);
       // …and neither does the question it was asking. A phase left reading
       // `awaiting-verification` on a run that has stopped goes on presenting as
       // "Waiting on you" — a card whose broker is disarmed, whose run is over,
@@ -1899,12 +2547,284 @@ export abstract class RunnerLoop extends RunnerControl {
       )) {
         this.emit('phase', { phase, status: 'interrupted' });
       }
+      // The RUN has settled — finished, or stopped by an operator — so the
+      // shared trees it held are released, and returned to the branch they
+      // were found on where that is safe (control-tower phase 40, #41).
+      // Bounded: a few git reads and one switch per held repository.
+      if (state.treeHolds?.length && this.treesSettle()) await this.releaseTrees().catch(() => { /* named per tree */ });
       // `persistNow`, not `persist`: this is the run's TERMINAL checkpoint and
       // the loop is about to unwind, so there is no later save to fold into.
       // A debounced write here is the one a process exits before paying.
       this.persistNow();
       this.emit('run', { state });
     }
+  }
+
+  /**
+   * Apply the scope fence to this tick's candidates (control-tower phase 6,
+   * #19) and answer which of them must not board. The one rule lives in
+   * `applyScopeFence`, which the healer asks too; this is only its drive-loop
+   * wiring — the journal, the emits and the save.
+   */
+  /**
+   * The candidates a RE-OPENED phase holds (control-tower phase 62, #68): a
+   * phase whose direct dependency's §Verification came back red after its
+   * handoff read complete waits until that dependency verifies green. Direct
+   * dependencies only — the engine's readiness rule is direct, and a phase two
+   * removes away is already waiting on the one in between. The held phase keeps
+   * its status (it is outstanding work, never settled); its note names the
+   * holder, and `phase.verification-held` is written once per change of it.
+   */
+  private verificationHeld(candidates: readonly number[]): Set<number> {
+    const state = this.state!;
+    const held = new Set<number>();
+    const reopened = new Set(Object.values(state.phases).filter((r) => r.reopened).map((r) => r.phase));
+    const dependencies = this.deps.phaseDependencies;
+    if (!reopened.size || !dependencies) return held;
+    for (const phase of candidates) {
+      if (reopened.has(phase)) continue;
+      let deps: number[] = [];
+      try { deps = dependencies(state.slug, phase) ?? []; } catch { deps = []; }
+      const by = deps.filter((dep) => reopened.has(dep)).sort((a, b) => a - b);
+      if (!by.length) continue;
+      held.add(phase);
+      const record = phaseRecord(state, phase);
+      const note = `verification hold: ${by.map((p) => `P${p}`).join(', ')} re-opened — `
+        + `${by.length === 1 ? 'its' : 'their'} §Verification is red although the handoff reads complete`;
+      if (record.note !== note) {
+        record.note = note;
+        this.record('phase.verification-held', { held: by }, phase);
+      }
+    }
+    return held;
+  }
+
+  private async fenceCandidates(candidates: readonly number[]): Promise<Set<number>> {
+    const state = this.state!;
+    const records = Object.values(state.phases);
+    // Nothing can fence and nothing is fenced: no scope read, no pass.
+    if (!records.some((r) => (r.status === 'parked' && r.declared) || r.waitingOn?.some((h) => h.kind === 'fence'))) {
+      return new Set();
+    }
+    const scopes = new Map<number, string[]>();
+    for (const phase of new Set([...candidates, ...records.map((r) => r.phase)])) {
+      scopes.set(phase, await this.scopeFor(phase));
+    }
+    let changed = false;
+    const fenced = applyScopeFence(state, candidates, (phase) => scopes.get(phase) ?? ['all'], this.now().getTime(), {
+      journal: (event, data, phase) => this.record(event, data, phase),
+      changed: (phase, record) => {
+        changed = true;
+        this.emit('phase', { phase, status: record.status, ...(record.waitingOn ? { waitingOn: record.waitingOn } : {}) });
+      },
+    });
+    if (changed) {
+      this.persist();
+      this.emit('run', { state });
+    }
+    return fenced;
+  }
+
+  /**
+   * The claims of this run's LIVE lanes — the ones holding a grant (#64). No
+   * scheduler, no admission, and nothing is serial: a harness that is not
+   * about concurrency boards exactly as it always did.
+   */
+  private ownLanes(): { phase: number; scope: string[]; branch?: string; tree?: string }[] {
+    if (!this.deps.scheduler) return [];
+    const out: { phase: number; scope: string[]; branch?: string; tree?: string }[] = [];
+    for (const [phase, lane] of this.lanes) {
+      if (!lane.grant) continue;
+      out.push({
+        phase, scope: lane.grant.scope,
+        ...(lane.grant.branch ? { branch: lane.grant.branch } : {}),
+        ...(lane.grant.tree ? { tree: lane.grant.tree } : {}),
+      });
+    }
+    return out;
+  }
+
+  /** A phase just boarded this pass, as a claim the rest of the pass is serial behind. */
+  private async laneClaim(phase: number): Promise<{ phase: number; scope: string[]; branch?: string; tree?: string }> {
+    const claim = await this.admissionClaim(phase);
+    return { phase, scope: claim.admitScope, ...(claim.branch ? { branch: claim.branch } : {}), ...(claim.tree ? { tree: claim.tree } : {}) };
+  }
+
+  /**
+   * The lowest phase of this run whose lane this phase's claim meets in the
+   * same tree — the scheduler's own test (`scopesIntersect`, and not carved
+   * apart by `claimsDisjoint`) — or null. See the boarding loop (#64).
+   */
+  private async serialBehindOf(
+    phase: number, ahead: readonly { phase: number; scope: string[]; branch?: string; tree?: string }[],
+  ): Promise<number | null> {
+    if (!this.deps.scheduler || !ahead.length) return null;
+    const claim = await this.laneClaim(phase);
+    const hits = ahead.filter((other) => other.phase !== phase
+      && scopesIntersect(other.scope, claim.scope) && !claimsDisjoint(other, claim));
+    return hits.length ? Math.min(...hits.map((other) => other.phase)) : null;
+  }
+
+  /**
+   * Close every queue episode no admission of this loop owns (#81) — see the
+   * call in `driveInSpan`. `restarted` when the queue that held it is gone
+   * (this scheduler has never driven the run: a new console), ended where it
+   * was last seen waiting; `withdrawn` when a loop of this console ended
+   * without withdrawing it. The record goes back to startable, its entry's
+   * age and reservation kept for the next admission.
+   */
+  protected closeOrphanedEpisodes(): void {
+    const state = this.state!;
+    const scheduler = this.deps.scheduler;
+    if (!scheduler) return;
+    let seen = drivenRuns.get(scheduler);
+    if (!seen) drivenRuns.set(scheduler, seen = new Set());
+    const restarted = !seen.has(state.id);
+    seen.add(state.id);
+    const now = this.now().toISOString();
+    // The run's blocked stretch ends where its LAST waiting phase was last seen
+    // (#64) — after a restart, never through the downtime; otherwise now.
+    let lastSeen = restarted ? Date.parse(state.blockedOpen?.since ?? '') : Date.parse(now);
+    for (const record of Object.values(state.phases)) {
+      if (!record.queuedAt) continue;
+      const end = restarted ? restartedAt(record, now) : now;
+      if (!(Date.parse(end) <= lastSeen)) lastSeen = Date.parse(end);
+      const closed = restarted
+        ? closeQueueEpisode(record, 'restarted', end)
+        : closeQueueEpisode(record, 'withdrawn', now, 'stop');
+      if (closed) this.record('phase.queue-closed', closed, record.phase);
+      // A dead claim's two hours restart with the console that measures them.
+      record.lockWaitSince = undefined;
+      if (record.status === 'queued') {
+        record.status = 'pending';
+        delete record.waitingOn;
+      }
+    }
+    foldRunBlocked(state, Number.isFinite(lastSeen) ? new Date(lastSeen).toISOString() : now);
+  }
+
+  /**
+   * The order this pass boards its candidates in — SENIORITY (control-tower
+   * phase 86, #128 #132 #114), never "the board's ready phases first":
+   *
+   *   1. a PERSON's re-board (`boardingHint.by` is the person slot): an
+   *      operator's resume-phase or Retry outranks every console candidate;
+   *   ¼. an operator's PIN, then a lane KEPT for it (control-tower phase
+   *      100, #135 B.8, D.16) — the plan's next lane, by a person's word;
+   *   1½. a phase whose committed WIP is RED (`wipRed`, control-tower phase
+   *      89, #127) — a rank, not a seniority clock: its red is every
+   *      sibling's base, so it boards first however young its claim;
+   *   1¾. a phase the scheduling POLICY promotes (control-tower phase 100):
+   *      under `blocker-first` one a sibling declared itself blocked on, under
+   *      `critical-path` one on the plan's critical path — the higher rank first;
+   *   2. a landing's reservation (`landWatch`);
+   *   3. an owed re-verification (`record.reverify`);
+   *   4. every phase with a seniority clock (`seniorityOf` — queue age, hint
+   *      time, an expired park), OLDEST first;
+   *   5. the rest — phases that never waited — in the board's own order.
+   *
+   * Stable: a tie keeps the candidate order, which is the board's. The candidate
+   * list was `[reverifying, board.ready, expiredWaits, hinted]` and the fill
+   * stops at `maxLanes()`, so a phase that had already worked — a wrap-up, a
+   * checkpoint, a wall — lost every free lane to phases that never started. A
+   * phase this order moves past earlier candidates is journalled once per claim
+   * (`phase.seniority`), so "why did P59 board before P80" has an answer.
+   */
+  private boardingOrder(phases: number[]): number[] {
+    if (phases.length < 2) return phases;
+    const state = this.state!;
+    const now = this.now().toISOString();
+    const keyed = phases.map((phase, index) => {
+      const record = phaseRecord(state, phase);
+      const senior = seniorityOf(record, now);
+      const person = record.boardingHint?.by === PERSON_SLOT_BY;
+      // A phase whose committed WIP is red boards next after a person's press
+      // (control-tower phase 89, #127): every sibling on the branch builds on
+      // that red, and only its owner can take it away.
+      const wipRed = !person && Boolean(record.wipRed);
+      // An operator's word on the queue (control-tower phase 99, #135): a bump
+      // is a person's order, so it boards right after a person's re-board — the
+      // most recent bump first — and a held or deferred phase boards LAST, only
+      // to wait in the queue, so its run's lanes go to its siblings first.
+      const bump = !person ? record.queueControl?.bump : undefined;
+      const aside = standsAside(record.queueControl, Date.parse(now));
+      // A pin and a kept lane (control-tower phase 100): a person's word on the
+      // plan's NEXT lane, so right after a person's own re-board.
+      const pin = !person && !aside ? record.queueControl?.pin : undefined;
+      const kept = !person && !aside && !pin ? record.queueControl?.reserve : undefined;
+      const promoted = !person && !aside && !pin && !kept && !bump && !wipRed ? this.promotionOf(phase) : null;
+      const rank = aside ? 6 : person ? 0 : pin ? 0.25 : kept ? 0.3 : bump ? 0.5 : wipRed ? 1 : promoted ? 1.75 : this.landingReserve.has(phase) ? 2 : owesVerification(record) ? 3 : senior ? 4 : 5;
+      const at = pin ? Date.parse(pin.at)
+        : kept ? Date.parse(kept.at)
+          : bump && !aside ? -bump.stamp
+            : promoted ? -promoted.rank
+              : Date.parse((person ? record.boardingHint!.at : wipRed ? record.wipRed!.at : senior?.at) ?? '');
+      return {
+        phase, index, rank, clock: Number.isFinite(at) ? at : Number.POSITIVE_INFINITY,
+        why: person
+          ? { clock: 'operator', since: record.boardingHint!.at }
+          : pin
+            ? { clock: 'pin', since: pin.at }
+          : kept
+            ? { clock: 'reserved', since: kept.at }
+          : bump && !aside
+            ? { clock: 'bump', since: bump.at }
+          : wipRed
+            ? { clock: 'wip-red', since: record.wipRed!.at ?? record.wipRed!.sha }
+          : promoted
+            ? { clock: promoted.policy, since: promoted.text }
+            : senior ? { clock: senior.clock, since: senior.at } : null,
+      };
+    });
+    const ordered = [...keyed].sort((a, b) => a.rank - b.rank || a.clock - b.clock || a.index - b.index);
+    ordered.forEach((row, position) => {
+      if (!row.why) return;
+      const ahead = ordered.slice(position + 1).filter((other) => other.index < row.index).map((other) => other.phase);
+      if (!ahead.length) return;
+      const key = `${row.phase}:${row.why.clock}:${row.why.since}`;
+      if (this.seniorityJournalled.has(key)) return;
+      this.seniorityJournalled.add(key);
+      this.record('phase.seniority', { clock: row.why.clock, since: row.why.since, ahead }, row.phase);
+    });
+    return ordered.map((row) => row.phase);
+  }
+
+  /**
+   * Every park this run holds has its clock armed (control-tower phase 86,
+   * #132). A park written before this loop began — a resumed run, a restart,
+   * a stored record — had no poke: its reset passed with nothing to fire it,
+   * and the phase waited for some OTHER lane to end before a fill pass read it
+   * (vca P19: 41 minutes, while its sibling took the lane). A clock past the
+   * timer ceiling is left for a later tick; arming it would fire at once.
+   */
+  private armOwnParkPokes(): void {
+    const now = Date.now();
+    for (const record of Object.values(this.state!.phases)) {
+      if (record.status !== 'waiting' || !record.parkedUntil || this.parkPokes.has(record.phase)) continue;
+      const delay = Date.parse(record.parkedUntil) - now;
+      if (delay > 0 && delay < MAX_TIMER_MS) this.armParkPoke(record.phase, record.parkedUntil);
+    }
+  }
+
+  /** The seniority decisions this loop already journalled, by `phase:clock:since`. */
+  private readonly seniorityJournalled = new Set<string>();
+
+  /**
+   * Does a landing reservation that has not been admitted yet — one boarding
+   * in this fill, or in a lane still waiting on its scope — share this phase's
+   * scope? Then this phase waits a tick behind it rather than racing it into
+   * the scheduler: `runPhase` reads the gate before it admits, and a sibling
+   * whose gate answered first would take the lane the landing was promised.
+   */
+  private async landingHeld(phase: number, starting: readonly number[]): Promise<boolean> {
+    if (!this.landingReserve.size || this.landingReserve.has(phase)) return false;
+    const reserved = [...this.landingReserve].filter((p) => p !== phase && starting.includes(p));
+    if (!reserved.length) return false;
+    const scope = await this.scopeFor(phase);
+    for (const p of reserved) {
+      if (scopesIntersect(await this.scopeFor(p), scope)) return true;
+    }
+    return false;
   }
 
   /**
@@ -2004,6 +2924,14 @@ export abstract class RunnerLoop extends RunnerControl {
   private async runPhase(phase: number, board: Board): Promise<boolean> {
     const state = this.state!;
     const record = phaseRecord(state, phase);
+    // The identity the run started on, checked before anything boards
+    // (control-tower phase 91, #131): a re-login as somebody else between two
+    // phases parks the run here — it never spends a session on their login.
+    if (this.identityDrifted(phase)) return false;
+    // …and a run an automatic switch moved off its account goes back once that
+    // account has reset (control-tower phase 92, #100): at this boarding, the
+    // lanes' boundary, before the phase spawns anywhere.
+    this.switchBackAtBoundary(phase);
     // `activePhase` is set at SPAWN time by `syncMirror`, never here. The gap
     // between this line and the spawn is three subprocesses and possibly a
     // queue wait; a phase can still turn out not to start, and one that never
@@ -2115,24 +3043,71 @@ export abstract class RunnerLoop extends RunnerControl {
      * this PHASE taken"; admission answers "may anything touch these REPOS
      * right now", which is the larger question and the one that can make a
      * phase wait rather than fail. Asking it after the gate keeps a gated
-     * phase from occupying a queue slot it was never going to use. */
+     * phase from occupying a queue slot it was never going to use.
+     *
+     * A park that is ending — an elapsed wait, or a landing `landWatch` handed
+     * this loop — goes through the queue as itself. `admit` stamps `queued`
+     * while the scope is held, the honest word for that wait, but
+     * `runPhaseAdmitted` asks "is this the wait's own resume?" of `waiting`: a
+     * park that had to queue — a landing's reservation meeting its busy scope,
+     * the very case the reservation exists for — boarded as a fresh attempt,
+     * with the engine's boot text instead of the landing, no
+     * `phase.wait-resume`, and the park's clock left on a running record. The
+     * word comes back the moment the queue is left. */
+    const endingPark = record.status === 'waiting';
     let grant: ScopeGrant | null = null;
-    try {
-      grant = await this.admit(phase, 'phase');
-    } catch (error) {
-      // Waited two hours behind somebody else's lock. `admit` has already
-      // parked the phase and named the holder, so there is nothing to add and
-      // nothing to start — the loop carries on to whatever else is ready.
-      if (error instanceof AdmissionCapped) return true;
-      if (!(error instanceof AdmissionAborted)) throw error;
-      // Stopped while it waited. Nothing started, so nothing is owed an
-      // explanation beyond the journal — and the phase stays startable.
-      if (record.status === 'queued') record.status = 'pending';
-      this.record('phase.not-started', {
-        reason: 'the run was stopped while this phase waited for its scope',
-      }, phase);
-      return true;
+    for (;;) {
+      try {
+        grant = await this.admit(phase, 'phase');
+      } catch (error) {
+        // Serial behind a live lane of its own run (#64): `admit` has already
+        // marked it; it stays startable — a park that was ending stays the park
+        // it was — and the loop boards it when that lane ends.
+        if (error instanceof AdmissionSerial) {
+          if (record.status === 'queued') record.status = endingPark ? 'waiting' : 'pending';
+          return true;
+        }
+        // Waited two hours behind somebody else's lock. `admit` has already
+        // parked the phase and named the holder, so there is nothing to add and
+        // nothing to start — the loop carries on to whatever else is ready.
+        if (error instanceof AdmissionCapped) return true;
+        if (!(error instanceof AdmissionAborted)) throw error;
+        // Stopped while it waited. Nothing started, so nothing is owed an
+        // explanation beyond the journal — and the phase stays startable: a park
+        // stays the park it was, so the next loop resumes it (a landing too, which
+        // rides on its declaration) rather than boarding it fresh.
+        if (record.status === 'queued') record.status = endingPark ? 'waiting' : 'pending';
+        this.record('phase.not-started', {
+          // …or an operator took this one entry out of the queue (control-tower
+          // phase 99): the run carries on, and boards its other phases instead.
+          reason: error instanceof AdmissionWithdrawn
+            ? withdrawnReason(record.queueControl?.withdrawn)
+            : 'the run was stopped while this phase waited for its scope',
+        }, phase);
+        return true;
+      }
+      // The wait inside `admit` can be hours (control-tower phase 86, #136): a
+      // phase queued while the board read its dependency done must not board on
+      // the board it read BEFORE the wait. A grant that waited re-reads a fresh
+      // one; a dependency it shows not done HOLDS the phase — the grant goes
+      // back, and the phase re-enters the queue with its age and an `after`
+      // holder naming the dependency. Never withdrawn: it boards the scan its
+      // dependency is done. An unreadable board is no evidence either way.
+      if (!this.admittedAfterWait.delete(phase)) break;
+      const fresh = await this.board();
+      if (fresh.error || !fresh.phased) break;
+      this.noteBoard(fresh);
+      board = fresh;
+      const after = this.awaitingOf(phase);
+      if (!after) break;
+      this.deps.scheduler?.release(grant);
+      grant = null;
+      this.record('phase.admission-held', { after, age: record.queueSince ?? null }, phase);
+      this.persist();
     }
+    // Compare-and-set: a word somebody else wrote during the wait (a skip, a
+    // per-phase stop) is theirs, and `runPhaseAdmitted` answers it on arrival.
+    if (endingPark && record.status === 'queued') record.status = 'waiting';
 
     // The lane exists from here on, so every control can find this phase even
     // before its child has a pid — and so the `finally` below has exactly one
@@ -2154,9 +3129,13 @@ export abstract class RunnerLoop extends RunnerControl {
     // the worktree IS the session's cwd; after admission, because a phase that
     // never got its scope must not leave a directory behind.
     const boardable = await this.acquireWorktree(phase, lane);
+    await this.notePhaseOutsideRoot(phase, lane);
     // Where every repository this phase is NOT scoped to stands right now, so
     // the `finally` can tell whether the phase committed in one (S6).
     const unscopedBefore = await this.unscopedHeads(phase, lane);
+    // Where each SHARED repository of the scope stood before this run's first
+    // session in it — the branch its settle returns it to (phase 40, #41).
+    if (boardable) await this.noteTreesFound(phase, lane);
 
     try {
       // `false` means it halted on a resync conflict. The `finally` still runs,
@@ -2164,15 +3143,38 @@ export abstract class RunnerLoop extends RunnerControl {
       // for every other way out of this method.
       return boardable ? await this.runPhaseAdmitted(phase, board, lane) : false;
     } finally {
-      await this.reportScopeDrift(phase, unscopedBefore);
-      this.clearLeaseTimer(lane);
-      // Before the scope is released: the merge reads and moves the run branch,
-      // and a sibling lane admitted the instant this one let go could otherwise
-      // start its own worktree from a branch mid-merge.
-      await this.landWorktree(phase, lane);
+      // 🔴 The settle's git work may THROW — a landing's rebase session that
+      // cannot start is the measured case (#117) — and a throw here skipped
+      // every line below it: the grant stayed held against every queued phase
+      // that overlapped the lane, the lane stayed in the table and nothing was
+      // persisted. Journalled, then re-thrown once the scope is given back, so
+      // the lane's catch halts `phase-crashed` exactly as it always has.
+      let settleError: unknown = null;
+      try {
+        await this.reportScopeDrift(phase, unscopedBefore, lane);
+        this.clearLeaseTimer(lane);
+        // Before the scope is released: the merge reads and moves the run branch,
+        // and a sibling lane admitted the instant this one let go could otherwise
+        // start its own worktree from a branch mid-merge.
+        await this.landWorktree(phase, lane);
+        // Before the grant goes, so no phase of this console is admitted into a
+        // tree between this lane letting go and the run's hold on it being on
+        // record: the lock is the PHASE's, the branch is the RUN's (#41).
+        await this.noteTreeHolds(phase, lane);
+      } catch (error) {
+        settleError = error;
+        this.clearLeaseTimer(lane);
+        this.record('phase.landing-threw', { error: (error as Error)?.message ?? String(error) }, phase);
+      }
       this.deps.scheduler?.release(lane.grant);
       this.clearFreezeTimer(lane);
+      // The lane's stall ends with it (#80) — before the lane is gone, while
+      // its signals can still be read.
+      this.endLaneStall(phase);
       this.lanes.delete(phase);
+      // A lane ending may be exactly what a phase the ladder left standing was
+      // waiting on (#114): the pass looks again at any whose scope meets it.
+      this.noteLaneFreed(phase, lane.grant?.scope ?? await this.scopeFor(phase).catch((): string[] => ['all']));
       // No rung stays `running` past its attempt (RCV-6): whatever the
       // outcome-driven settles above left open is settled here from the
       // record the attempt left, so `chargeRung` can never book the NEXT
@@ -2180,6 +3182,9 @@ export abstract class RunnerLoop extends RunnerControl {
       this.settleRungsAfterAttempt(phase, laneStartedAt);
       this.syncMirror();
       this.persist();
+      // Re-thrown only after the lane has given everything back.
+      // eslint-disable-next-line no-unsafe-finally
+      if (settleError) throw settleError;
     }
   }
 
@@ -2212,7 +3217,12 @@ export abstract class RunnerLoop extends RunnerControl {
     // itself in. Silence inherits: `isolationFor` answers `undefined` rather
     // than inventing `shared`, which is what keeps the plan's own word
     // reachable on every plan ever written.
-    const own = this.deps.planIsolation?.(state.slug, phase);
+    // An operator's `isolate-phase` (control-tower phase 90, #150) outranks
+    // the plan for this phase alone: it is the escape from a run-long branch
+    // hold, pressed by a person who read the wait.
+    const own = state.isolatePhases?.includes(phase)
+      ? 'worktree'
+      : this.deps.planIsolation?.(state.slug, phase);
     const directive = own
       ? (directiveIsolates(own) ? 'on' : 'off')
       : this.deps.planWorktrees?.(state.slug);
@@ -2306,6 +3316,19 @@ export abstract class RunnerLoop extends RunnerControl {
   private async pruneWorktrees(): Promise<void> {
     const state = this.state;
     if (!state) return;
+    // 🔴 A loop that ends RESUMABLE keeps its trees (#94). A pause, a halt, a
+    // wait on a clock — the run comes back to the checkout it left, and this
+    // prune took every clean mount of a paused run's mirror, so the resume met
+    // a mirror with holes in it. Retention is a question about a run that is
+    // OVER; a run that is only stopped has not reached it. Decided on the
+    // status the loop's `finally` has already settled (`halting` → `halted`).
+    if (runResumable(state)) {
+      const homes = this.worktreeHomes();
+      if (this.worktreePhases.size || homes.all.some((home) => existsSync(join(home, state.id)))) {
+        this.record('run.worktrees-kept', { status: state.status, reason: 'resumable', ...(state.workRoot ? { dir: state.workRoot } : {}) });
+      }
+      return;
+    }
     // Gated on the DIRECTORY, not on state, and that is the load-bearing part.
     //
     // Two shapes reach here — a run that took per-phase LANES, and an isolated
@@ -2393,7 +3416,7 @@ export abstract class RunnerLoop extends RunnerControl {
    */
   private async unscopedHeads(
     phase: number, lane: Lane,
-  ): Promise<{ scope: string[]; heads: Map<string, string> }> {
+  ): Promise<{ scope: string[]; heads: Map<string, string>; laneBranch?: string }> {
     const state = this.state!;
     const heads = new Map<string, string>();
     // The phase's OWN scope, and the grant's only as a cross-check: the grant
@@ -2418,12 +3441,26 @@ export abstract class RunnerLoop extends RunnerControl {
       // A baseline that could not be taken is no baseline: `reportScopeDrift`
       // then compares nothing, which is the only safe direction for a probe.
     }
-    return { scope: [...new Set(declared)], heads };
+    // The branch the lane's commits ride — the credit's "on the lane's branch".
+    const laneBranch = this.branchFor(phase);
+    return { scope: [...new Set(declared)], heads, ...(laneBranch ? { laneBranch } : {}) };
   }
 
-  /** Journal any repository outside the phase's scope that gained commits. */
+  /**
+   * Journal any repository outside the phase's scope that gained commits THIS
+   * PHASE made (control-tower phase 63, #88).
+   *
+   * A moved HEAD is not a phase's drift: every writer on the machine commits
+   * into the docs root, and a shared submodule moves under other plans. So each
+   * new commit goes through `creditDrift` (`scope-drift.ts`) — never a
+   * `phase-lock:` commit, never another plan's, never a write inside the
+   * declared scope (the Repos tokens plus the docs root's per-slug token), and
+   * only one on the lane's branch or printed by its own session. A repository
+   * with nothing credited says nothing; one with something says what was left
+   * out beside it, so a reader can see the line was filtered and by how much.
+   */
   private async reportScopeDrift(
-    phase: number, before: { scope: string[]; heads: Map<string, string> },
+    phase: number, before: { scope: string[]; heads: Map<string, string>; laneBranch?: string }, lane?: Lane,
   ): Promise<void> {
     if (!before.heads.size) return;
     const state = this.state!;
@@ -2432,13 +3469,22 @@ export abstract class RunnerLoop extends RunnerControl {
         const repo = rel ? join(state.root, rel) : state.root;
         const now = await commitOf(repo, 'HEAD');
         if (!now || now === start) continue;
-        const commits = await commitsSince(repo, start);
+        const standing = before.laneBranch ? await baseBranch(repo) : undefined;
+        const { credited, excluded } = creditDrift(await commitsWithPaths(repo, start), {
+          slug: state.slug,
+          scope: before.scope,
+          rel,
+          onLaneBranch: !!before.laneBranch && standing === before.laneBranch,
+          sessionCommits: lane?.sessionCommits ?? [],
+        });
+        if (!credited.length) continue;
         this.record('phase.scope-drift', {
           repo: rel || '.',
-          scope: formatScope(before.scope),
+          scope: formatScope(declaredScope(before.scope, state.slug)),
           from: start.slice(0, 12),
           to: now.slice(0, 12),
-          commits,
+          commits: credited.map(({ sha, subject }) => ({ sha, subject })),
+          ...(Object.keys(excluded).length ? { excluded } : {}),
           reason: 'this phase committed in a repository its Repos cell does not name — '
             + 'admission, the lock and every concurrent plan were told it would not',
         }, phase);
@@ -2524,11 +3570,193 @@ export abstract class RunnerLoop extends RunnerControl {
     return result;
   }
 
+  /**
+   * Say, once per phase per run, that this phase's own Repos cell reaches
+   * outside the root the run's checkout was taken from (control-tower phase 82,
+   * #94). The run keeps its isolation; this phase cannot have it for the part
+   * outside — its session edits that repository wherever it stands — so its
+   * claim goes unqualified (`qualificationFor`) and collides with every claim it
+   * intersects, which is the truth the console can vouch for. Outside every
+   * `!pro:` region: every boarding calls it, the free tree's too (#161).
+   */
+  private async notePhaseOutsideRoot(phase: number, lane: Lane): Promise<void> {
+    const state = this.state!;
+    if (state.checkout !== 'worktree' && !lane.worktree) return;
+    const scope = lane.grant?.scope ?? await this.scopeFor(phase).catch((): string[] => []);
+    const { outside } = partitionScope(state.root, scope);
+    if (!outside.length) return;
+    const mark = `${state.id}:${phase}`;
+    if (this.outsideRootNoted.has(mark)) return;
+    this.outsideRootNoted.add(mark);
+    this.record('phase.isolation-refused', {
+      refusal: 'scope-outside-root', tokens: outside,
+      reason: `${outside.join(', ')} is not under this run's root, so this phase cannot be isolated there — `
+        + "it runs in the run's checkout with an unqualified claim; the rest of the run keeps its isolation",
+    }, phase);
+  }
+
+  private readonly outsideRootNoted = new Set<string>();
+
 
   /**
    * The phase itself, once its scope is held. Split out so the grant, the lane
    * and the mirror are released in exactly one place however this returns.
    */
+  /* ---- shared trees and the run that holds them (control-tower phase 40, #41) ---- */
+
+  /** Does this phase's session stand in the SHARED checkout — not a mirror, not an isolated run, not a lane? */
+  private sharesTheCheckout(lane?: Lane): boolean {
+    return this.state!.checkout !== 'worktree' && !lane?.worktree;
+  }
+
+  /** Has the RUN settled in the sense a tree hold ends on: finished, or stopped by an operator? */
+  private treesSettle(): boolean {
+    const state = this.state!;
+    return state.status === 'finished' || (state.status === 'interrupted' && state.stoppedBy === 'operator');
+  }
+
+  private standingHolds(): readonly TreeHold[] {
+    try { return this.deps.treeHolds?.() ?? readHolds(); } catch { return []; }
+  }
+
+  /**
+   * Before a phase of a new-branch run boards into the SHARED checkout: the
+   * branch each repository of its scope stands on, recorded ONCE per
+   * repository per run — what the run's settle returns it to.
+   */
+  private async noteTreesFound(phase: number, lane: Lane): Promise<void> {
+    const state = this.state!;
+    if (state.gitMode !== 'new-branch' || !this.sharesTheCheckout(lane)) return;
+    try {
+      const trees = await readTrees(state.root, await this.scopeFor(phase));
+      let changed = false;
+      for (const tree of trees) {
+        if (state.treesFound?.[tree.dir] !== undefined) continue;
+        (state.treesFound ??= {})[tree.dir] = tree.branch ?? (tree.head ? detachedRef(tree.head) : '');
+        changed = true;
+      }
+      if (changed) this.persist();
+    } catch { /* a tree that cannot be read has nothing to be returned to */ }
+  }
+
+  /**
+   * After a phase's session in the SHARED checkout: every repository of its
+   * scope the session left on this run's branch is HELD by the RUN until it
+   * settles — `run.tree-hold`, once per repository, and a record under
+   * `<state>/trees/` that the scheduler and `phase-lock.sh conflicts` both
+   * read. The phase's lock goes with the phase; this does not.
+   */
+  private async noteTreeHolds(phase: number, lane: Lane): Promise<void> {
+    const state = this.state!;
+    if (state.gitMode !== 'new-branch' || !this.sharesTheCheckout(lane)) return;
+    const branch = `pe/${state.slug}`;
+    try {
+      const trees = await readTrees(state.root, await this.scopeFor(phase));
+      let changed = false;
+      for (const tree of trees) {
+        if (tree.branch !== branch || state.treeHolds?.some((hold) => hold.dir === tree.dir)) continue;
+        const foundOn = state.treesFound?.[tree.dir] || undefined;
+        const at = this.now().toISOString();
+        writeHold({
+          run: state.id, slug: state.slug, owner: autopilotOwner(state.id), repo: tree.dir, rel: tree.rel,
+          root: state.root, branch, ...(foundOn ? { foundOn } : {}), at, runFile: runFile(state.root, state.slug, state.id),
+        });
+        (state.treeHolds ??= []).push({ repo: tree.rel || '.', dir: tree.dir, branch, ...(foundOn ? { foundOn } : {}), at });
+        this.record('run.tree-hold', {
+          repo: tree.rel || '.', branch, ...(tree.head ? { head: tree.head } : {}), ...(foundOn ? { foundOn } : {}), phase,
+        });
+        changed = true;
+      }
+      if (changed) this.persist();
+    } catch { /* unread is unheld: the lock still covered the phase itself */ }
+  }
+
+  /**
+   * The run has settled: every tree it held is released (`run.tree-released`),
+   * and one it found on another branch goes back there when no other run
+   * holds it, it still stands on this run's branch, and it is clean. A tree
+   * that cannot be moved is released all the same, with why it stayed.
+   */
+  private async releaseTrees(): Promise<void> {
+    const state = this.state!;
+    for (const hold of state.treeHolds ?? []) {
+      removeHold(state.id, hold.dir);
+      let to: string | undefined;
+      let kept: string | undefined;
+      if (!hold.foundOn) kept = 'the branch it was found on is not known';
+      else if (hold.foundOn.startsWith('detached@')) kept = 'it was found on a detached HEAD';
+      else if (hold.foundOn === hold.branch) kept = 'it was found on this run\'s branch';
+      else if (this.standingHolds().some((other) => other.run !== state.id && realish(other.repo) === realish(hold.dir))) {
+        kept = 'another run holds it';
+      } else {
+        const moved = await returnTree(hold.dir, hold.branch, hold.foundOn);
+        if (moved.kind === 'returned') to = hold.foundOn;
+        else kept = moved.reason;
+      }
+      this.record('run.tree-released', { repo: hold.repo, branch: hold.branch, ...(to ? { to } : { kept }) });
+    }
+    delete state.treeHolds;
+  }
+
+  /**
+   * The boot prompt's loud block: a repository of this phase's scope stands on
+   * another plan's `pe/` branch — held by a run that has not settled (then this
+   * phase was admitted past it only by an operator's word), or left behind by
+   * one. Empty in a tree of the run's own.
+   */
+  private async foreignTreeBlock(phase: number, lane: Lane): Promise<string> {
+    const state = this.state!;
+    if (!this.sharesTheCheckout(lane)) return '';
+    try {
+      const foreign = foreignTrees(await readTrees(state.root, await this.scopeFor(phase)), this.standingHolds(), state.slug);
+      return foreignTreeWarning(foreign, state.gitMode === 'new-branch' ? `pe/${state.slug}` : undefined);
+    } catch {
+      return '';
+    }
+  }
+
+  /**
+   * Park a phase on a SPENT wait budget (control-tower phase 45, #59).
+   *
+   * A budget is a budget, not a verdict. The refusal this replaces set the
+   * record `failed`, consumed the declaration with its refs, charged the
+   * failure streak and halted `waiting-external-timeout` — measured: one phase
+   * refused three times with 0.3 h left, its refusals counted as "2 phases
+   * failed in a row", and nothing watched the builds it waited on, two of which
+   * finished inside the next eighteen minutes. Now the phase WAITS: status
+   * `waiting` with no clock of its own, its declaration kept and stamped
+   * `budgetSpent` so the watch clock goes on polling every ref (a `cmd:` one
+   * too, past the budget's end), and ONE errand under the `budgets` key saying
+   * what would give it a clock again. Nothing here is `failed`, nothing charges
+   * the streak, and no rung is climbed — the healer never climbs a wait. A
+   * landing resumes the phase's own session through the ordinary door;
+   * raising the budget and Retry is the person's.
+   *
+   * `declared` is the declaration being refused when the park is NEW
+   * (`parkWaiting`); absent, the one already on the record stands (a park that
+   * ended over its budget).
+   */
+  protected parkOnSpentBudget(phase: number, opts: {
+    ledger: 'waits' | 'budget' | 'watchdog';
+    refusal: string;
+    budget: WaitBudget;
+    declared?: NonNullable<PhaseRecord['declared']>;
+  }): void {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    this.clearParkPoke(phase);
+    const { errand, data } = spentBudgetPark(state, phase, opts);
+    this.record('phase.wait-budget-spent', data, phase);
+    this.record('phase.errand', { ...errand }, phase);
+    // No errand on the event: a budget park is not a summons. It announces as
+    // what it is instead — a spent budget, under `budget` (control-tower phase
+    // 14, #40) — and the run keeps driving its other phases.
+    this.emit('phase', { phase, status: 'waiting', note: record.note });
+    if (errand.budget) this.emit('budget', { phase, state: 'spent', fact: errand.budget });
+    this.persist();
+    this.emit('run', { state });
+  }
+
   private async runPhaseAdmitted(
     phase: number, board: Board, lane: Lane,
   ): Promise<boolean> {
@@ -2542,8 +3770,16 @@ export abstract class RunnerLoop extends RunnerControl {
     // with the engine's own text, and a declaration a licence already spent
     // says nothing about a wait any more.
     const wasWaiting = record.status === 'waiting';
+    // A declaration whose watch LANDED resumes the same way whichever park it
+    // was — a `needs-human` wall included, which `landWatch` turned into an
+    // elapsed wait (control-tower phase 6, #15).
+    const landedResume = Boolean(record.declared?.landed)
+      && ['waiting-external', 'needs-human', 'blocked'].includes(record.declared?.status ?? '');
+    // …and a block the runner parked on its refs (`poll-park`, control-tower
+    // phase 87) is a wait like any other: its elapsed window resumes its own
+    // session too, never a fresh boot.
     const resuming = wasWaiting
-      && record.declared?.status === 'waiting-external'
+      && (record.declared?.status === 'waiting-external' || record.declared?.parked === 'poll-park' || landedResume)
       && (!record.parkedUntil || Date.parse(record.parkedUntil) <= Date.now());
     // The ladder's instruction for this boarding, if it left one. Read here for
     // the same reason, and consumed (deleted) only when the session actually
@@ -2565,6 +3801,13 @@ export abstract class RunnerLoop extends RunnerControl {
       return true;
     }
 
+    // Owed the verification a restart cut (control-tower phase 48, #69): no
+    // session — the work was handed off before the console went — just the
+    // §Verification again, settled by its verdict exactly as the attempt's end
+    // would have been. Before the settled check below, because the teardown
+    // that cut it wrote `interrupted`, which is settled.
+    if (owesVerification(record)) return this.reverifyAfterRestart(phase);
+
     // Settled while it waited — a per-phase stop or a skip landed during the
     // queue. The guard above only asks about run-level blocks, so a phase
     // skipped or stopped in the queue still spawned a session for work nobody
@@ -2580,28 +3823,47 @@ export abstract class RunnerLoop extends RunnerControl {
      * The budget is evaluated at RESUME too, through the same `evaluateWait`
      * the park used (WAI-4). A declared park whose parked time ran past the
      * budget — a console outage counts, it is time the phase spent parked —
-     * halts here, before the lock and the prompt, instead of boarding a session
-     * onto a clock hours stale: the measured case resumed 9.7 h late with
-     * 11.76 h of an 8 h budget spent, and produced nothing. */
+     * does not board a session onto a clock hours stale (the measured case
+     * resumed 9.7 h late with 11.76 h of an 8 h budget spent, and produced
+     * nothing). It is a BUDGET event since control-tower phase 45 (#59): the
+     * phase parks on its refs with a `budgets` errand — never `failed`, never a
+     * streak charge — and a landing still resumes it.
+     *
+     * A LANDING is not asked at all: the thing the session waited for is done,
+     * and the ref's landing — not the window, not the budget — is what ends a
+     * wait on a ref. And a window rule 7 SHORTENED (it asked past the budget,
+     * named a pollable ref, and was granted what was left) that elapses with
+     * nothing landed has spent the budget exactly: that too is the budget park,
+     * not a session resumed to find the same build still running. */
     const budget = await this.waitBudgetOf(phase);
     const resumeAt = Date.now();
-    const parked = resuming
+    // Evaluated for EVERY resume, because the resume prompt states the budget
+    // either way — and ACTED on only when nothing landed. Phase 45 skipped the
+    // evaluation for a landing, and the prompt, which read the same verdict,
+    // then fell through to the engine's fresh boot text: a landed wait boarded
+    // as a new attempt instead of its own session told what landed (the three
+    // landing cases in `runner-parallel.test.ts`, red since `3cec598a`).
+    const standing = resuming
       ? evaluateWait({
         purpose: 'resume', now: resumeAt, parkedMs: parkedMsOf(record, resumeAt), waits: record.waits ?? 0, budget,
         ledger: record.declared?.by === 'watchdog' ? 'watchdog' : 'session',
       })
       : null;
-    if (parked?.verdict === 'timeout') {
-      record.status = 'failed';
-      record.note = record.parkReason ?? record.note;
-      record.parkedUntil = undefined;
-      syncWaitClock(state);
-      this.clearParkPoke(phase);
-      const timedOut = consumeDeclaration(record, 'new-outcome');
-      if (timedOut) this.record(DECLARATION_CONSUMED_EVENT, { ...timedOut, next: 'waiting-external-timeout' }, phase);
-      endLockWait(record);
-      state.consecutiveFailures++;
-      this.halt(`phase ${phase} was not resumed — ${parked.reason}`, phase, 'waiting-external-timeout');
+    const parked = landedResume ? null : standing;
+    const askedPast = record.declared?.requested ? Date.parse(record.declared.requested) : NaN;
+    const cutShort = Boolean(parked) && parked?.verdict !== 'timeout' && record.declared?.by !== 'watchdog'
+      && Number.isFinite(askedPast) && askedPast > resumeAt
+      && pollableRefs(record.declared?.watch ?? []).length > 0
+      && parkedMsOf(record, resumeAt) >= budget.budgetMs;
+    if (parked?.verdict === 'timeout' || cutShort) {
+      this.parkOnSpentBudget(phase, {
+        ledger: parked?.verdict === 'timeout' ? parked.ledger : 'budget',
+        refusal: parked?.verdict === 'timeout'
+          ? parked.reason
+          : `the phase asked to wait until ${record.declared!.requested} and was granted what was left of its `
+            + `${hoursText(budget.budgetMs)} wait budget, which ran out before anything it watches landed`,
+        budget,
+      });
       return true;
     }
 
@@ -2814,11 +4076,20 @@ export abstract class RunnerLoop extends RunnerControl {
         state.slug, 'claim', String(phase), '--owner', owner,
         '--scope', formatScope(lane.grant?.scope ?? await this.scopeFor(phase)),
         '--lease', String(PROVISIONAL_LEASE_S),
-        ...Object.entries(this.qualificationFor(phase, lane.grant?.scope ?? await this.scopeFor(phase)))
-          .flatMap(([key, value]) => (value ? [key === 'tree' ? '--worktree' : '--branch', value] : [])),
+        // The PAIR only. `qualificationFor` also answers `repo` — the
+        // per-repository cap's key, a path — and mapping every key that was not
+        // `tree` to `--branch` passed that path LAST, so it overwrote the real
+        // branch: the lock read `branch=<the run root>` (control-tower phase 63).
+        ...(({ tree, branch }) => [
+          ...(tree ? ['--worktree', tree] : []),
+          ...(branch ? ['--branch', branch] : []),
+        ])(this.qualificationFor(phase, lane.grant?.scope ?? await this.scopeFor(phase))),
       ]);
       const detail = (claim.stdout + claim.stderr).trim().slice(0, 160);
       this.record('phase.lock-provisional', { ok: claim.code === 0, leaseS: PROVISIONAL_LEASE_S, detail }, phase);
+      // The claim reaches git from here, off the session's turn (#85) — the
+      // session's own claim is file-only under `LOCK_MIRROR_ENV`.
+      if (claim.code === 0) void this.mirrorLock(phase, 'claim');
       if (claim.code !== 0) {
         // REFUSED — and this is the TOCTOU itself, caught for the first time.
         // The `status` read a moment ago said free; between that read and this
@@ -2870,6 +4141,12 @@ export abstract class RunnerLoop extends RunnerControl {
     if (unrunnable) {
       record.status = 'parked';
       record.note = unrunnable;
+      // The claim taken to board goes back: nothing boards this phase until a
+      // person repairs the plan, and the park's own advice — "then Retry" — is
+      // refused while the phase is claimed (control-tower phase 33, the tower
+      // rehearsal: the Retry was told to wait out the provisional lease).
+      this.clearLeaseTimer(lane);
+      await this.release(phase, owner);
       this.record('phase.verify-preflight-parked', { reason: unrunnable }, phase);
       this.emit('phase', { phase, status: 'parked', note: unrunnable });
       return true;
@@ -2966,9 +4243,13 @@ export abstract class RunnerLoop extends RunnerControl {
     // or STOP naming the condition you could not verify. Passed only when the
     // operator asked for it — the default prompt still says a person must clear
     // the gate, because by default one must.
+    // `LOCK_MIRROR_ENV` makes the prompt's claim and conflicts lines FILE-ONLY
+    // (control-tower phase 63, #85): this console mirrors the lock to git
+    // itself, outside the session's turn. The copyable prompt a person reads
+    // (`Service.bootPrompt`) never carries it, and keeps `--git`.
     const engineText = readText(await this.engine(
       ['--boot-prompt', String(phase)],
-      this.gatesPolicy().answer === 'delegated' ? { PE_GATE_DELEGATE: '1' } : undefined,
+      { ...LOCK_MIRROR_ENV, ...(this.gatesPolicy().answer === 'delegated' ? { PE_GATE_DELEGATE: '1' } : {}) },
     ));
     if (!engineText.trim()) {
       await this.release(phase, owner);
@@ -3026,22 +4307,32 @@ export abstract class RunnerLoop extends RunnerControl {
     // resumed, in which case they degrade to the self-contained `resume`.
     const requestedAt = record.declared?.requested ? Date.parse(record.declared.requested) : NaN;
     const clockAt = record.parkedUntil ? Date.parse(record.parkedUntil) : NaN;
-    const waitCause = record.declared?.by === 'watchdog'
-      ? 'watchdog' as const
-      : Number.isFinite(requestedAt) && Number.isFinite(clockAt) && requestedAt > clockAt
-        ? 'budget-elapsed' as const
-        : 'declared-window' as const;
+    const landing = resuming ? record.declared?.landed : undefined;
+    const waitCause = landing
+      ? 'landed' as const
+      : record.declared?.by === 'watchdog'
+        ? 'watchdog' as const
+        : Number.isFinite(requestedAt) && Number.isFinite(clockAt) && requestedAt > clockAt
+          ? 'budget-elapsed' as const
+          : 'declared-window' as const;
     const lateMs = Number.isFinite(clockAt) ? Math.max(0, resumeAt - clockAt) : 0;
-    let base = resuming && parked
+    let base = resuming && standing
       ? waitResumePrompt({
-        scriptsDir: this.deps.scriptsDir, slug: state.slug, phase, reason: record.parkReason, watch: record.watch,
+        // `$PE_SCRIPTS`, which every spawn states: the scripts of the console
+        // resuming it, never a clone's path (#151).
+        scriptsDir: SCRIPTS_REF, slug: state.slug, phase,
+        reason: record.parkReason ?? record.declared?.reason, watch: record.watch,
         cause: waitCause, lateMs,
+        ...(landing ? { landed: { ref: landing.ref, ...(landing.detail ? { detail: landing.detail } : {}), ...(landing.step ? { step: landing.step } : {}) } } : {}),
         externalLeftMs: Number.isFinite(requestedAt) && requestedAt > resumeAt ? requestedAt - resumeAt : null,
-        budgetMs: parked.budgetMs, budgetRemainingMs: parked.budgetRemainingMs, budgetSource: parked.budgetSource,
+        budgetMs: standing.budgetMs, budgetRemainingMs: standing.budgetRemainingMs, budgetSource: standing.budgetSource,
       })
       : engineText;
     let failureInsert = context;
     let resumeId: string | undefined;
+    // The gate's own verdict when the brief asked it (control-tower phase 86,
+    // #134) — handed to the attempt so the spawn door does not ask again.
+    let resumeVetted: VettedResume | undefined;
     let cappedTurns: number | undefined;
     // A resume this boarding makes WITHOUT a ladder hint — the wait's own session,
     // or one a freeze, a shutdown or a live-session hold left named — is put to
@@ -3088,6 +4379,7 @@ export abstract class RunnerLoop extends RunnerControl {
       const composed = await this.composeBrief(phase, board, boarding, engineText);
       base = composed.prompt;
       resumeId = composed.resume;
+      resumeVetted = composed.vetted;
       cappedTurns = composed.maxTurns;
       // The briefs carry the failure evidence themselves; a second copy of it
       // after them would be the same log quoted twice.
@@ -3113,12 +4405,28 @@ export abstract class RunnerLoop extends RunnerControl {
     // verdict, the closeout, the PR and merge-queue sessions) each compose
     // their own prompt and get no licence to fan out, which is the point: they
     // are asked for one artefact and given the budget for one.
-    const prompt = base + (failureInsert ? `\n\n${failureInsert}\n` : '')
-      + (addendum ? `\n\n${retryAddendumBlock(addendum)}\n` : '') + git
+    // Everything after the brief, built once: a brief swapped in place under
+    // this lane's grant (`attempt`, #134) keeps the operator's addendum, the
+    // git strategy and every directive exactly as this boarding composed them.
+    const tail = (addendum ? `\n\n${retryAddendumBlock(addendum)}\n` : '')
+      // The operator's pinned notes (control-tower phase 96, #142), beside the
+      // retry's addendum — both are a person's words about THIS run — and read
+      // from the state at boarding, so a note pinned mid-run reaches the next
+      // phase without a restart.
+      + pinnedNotesBlock(state.notes, phase)
+      + git
+      + await this.foreignTreeBlock(phase, lane)
+      // Work in the tree that is not this session's, and debts that are
+      // (control-tower phase 89): a sibling's red WIP, its uncommitted files,
+      // reds owed here, a job a checkpoint killed.
+      + await this.boardingWipBlock(phase, lane)
       + skillDirective(extraSkills) + mcpDirective(ownMcp, mcp.degraded)
       + credentialsDirective(record.credentialsMissing ?? [])
       + ultracodeDirective(ultracodeOn(state, own))
-      + unattendedDirective(this.deps.scriptsDir, state.slug, phase, { budgetMs: budget.budgetMs, source: budget.source })
+      + unattendedDirective(SCRIPTS_REF, state.slug, phase, { budgetMs: budget.budgetMs, source: budget.source })
+      // The console's commit, and the session's skill copy when it is at
+      // another one (#151) — after the contract, before a peer's mail.
+      + consoleSkillDirective(this.consoleSkillFacts())
       // Mail a peer left for this phase (5.1.0), LAST — after every directive,
       // because a peer's words have the least authority of anything in this
       // prompt and must not appear to qualify the plan or the operator's own
@@ -3127,6 +4435,7 @@ export abstract class RunnerLoop extends RunnerControl {
       // Guarded rather than marked: the free tree supplies no `deliverBoot`,
       // so it is `undefined` there and `messagesBlock` answers ''.
       + mail;
+    const prompt = base + (failureInsert ? `\n\n${failureInsert}\n` : '') + tail;
     // What earlier phases LEFT for this one, as a fact the operator can see.
     // The block itself is inside `engineText` — the engine owns every word of
     // the boot prompt — so nothing else would ever record that it was handed
@@ -3193,6 +4502,12 @@ export abstract class RunnerLoop extends RunnerControl {
       this.halt(record.note, phase, 'credential-refused');
       return true;
     }
+    // A wait-resume continues the phase's work — the thing it waited on landed,
+    // and the next step is the phase's — so it runs under what is left of the
+    // phase's turns, never the closeout's 60 it used to get (control-tower
+    // phase 46, #61: vca-refactor P2, size L, ran 116 minutes into that cap).
+    // Read before the boarding's own spawn adds to `record.turns`.
+    const waitResumeTurns = resuming ? remainingTurns(this.capTable(), record.turns ?? 0, 'a wait-resume') : null;
     if (wasWaiting) {
       // The park is over: close it on its own stamps (so `parkedMsOf` measures
       // the time it actually held — the console may have been down past
@@ -3206,6 +4521,9 @@ export abstract class RunnerLoop extends RunnerControl {
       const endedAt = new Date().toISOString();
       closeWaitEntry(record, endedAt);
       record.parkedMs = parkedMsOf(record, Date.parse(endedAt));
+      // A park on a spent budget ends here too — a landing is what boards it —
+      // and its `budgets` errand is answered (control-tower phase 45).
+      retireSpentBudget(state, phase);
       if (!record.resumeSessionId && record.sessionId && !notWorth) {
         if (isSessionGone(record, record.sessionId)) this.noteGoneResume(record, record.sessionId);
         else record.resumeSessionId = record.sessionId;
@@ -3220,7 +4538,7 @@ export abstract class RunnerLoop extends RunnerControl {
         cause: resuming ? waitCause : 'console-park',
         ...(resuming && parked ? {
           budgetMs: parked.budgetMs, budgetSource: parked.budgetSource, budgetRemainingMs: parked.budgetRemainingMs,
-          capSource: WAIT_RESUME_TURNS.source,
+          capSource: waitResumeTurns?.source ?? 'remaining',
           ...(parked.extendedBy ? { extendedBy: parked.extendedBy } : {}),
         } : {}),
         ...(record.declared?.by === 'watchdog' ? { watchdogParks: record.watchdogParks ?? 0 } : {}),
@@ -3230,6 +4548,17 @@ export abstract class RunnerLoop extends RunnerControl {
         // over (SHD-6).
         declaredBy: { by: record.declared?.by ?? (resuming ? 'session' : null), presence: declarer?.presence ?? 'unknown' },
       }, phase);
+    }
+    // The phase's §Verification BASELINE (control-tower phase 83, #103): what
+    // its lines read on the tree it boards on, before its session touches it —
+    // so a red already there is inherited, never charged to it. Once per phase
+    // per run, at a FRESH first boarding: never a resume, never a phase the
+    // board already reads started, both of which stand on the phase's own
+    // work. Before the boarding is stamped, so a measured baseline is not
+    // counted as the session's working time.
+    if (!resuming && !resumeId && record.attempts === 0 && !record.baseline
+      && board.states[phase] === 'ready' && this.deps.verifyBaseline?.() === true) {
+      await this.takeBaseline(phase);
     }
     record.status = 'running';
     // The previous attempt's ending IS retired here — unlike the declaration
@@ -3244,6 +4573,10 @@ export abstract class RunnerLoop extends RunnerControl {
     // console re-board that never reaches a spawn carries them forward.
     delete record.cause;
     delete record.toolDenied;
+    // A usage wall ends with its park (#78): whatever this attempt parks on
+    // next is its own, and a wall it meets writes a fresh one.
+    delete record.usageWall;
+    this.clearWallProbe(phase);
     // The last declaration is NOT deleted here. It used to be — "a new attempt
     // consumes it" — and the delete ran before the spawn, so a boarding that
     // queued, capped or failed to start threw away the session's own testimony
@@ -3276,20 +4609,38 @@ export abstract class RunnerLoop extends RunnerControl {
       }, phase);
       delete record.retryOverride;
     }
-    if (resumeId) record.resumeSessionId = resumeId;
+    // A brief the boarding COMPOSED decided the resume, whatever it was
+    // (#134): its session, or none — a checkpoint left on the record must not
+    // reach the spawn door and be asked about a second time.
+    if (boarding || resumeId) record.resumeSessionId = resumeId;
     // The phase is now genuinely starting: the active-phase pointer follows
     // the lane table (the mirror rule), written here and nowhere earlier.
     this.syncMirror();
     record.model = record.model ?? chosen.model;
     record.effort = record.effort ?? chosen.effort;
     if (hint?.escalate === 'model') {
-      const stronger = escalateModel(record.model);
-      if (stronger && stronger !== record.model) {
-        this.record('phase.model-escalated', { from: record.model, to: stronger, rung: hint.rung }, phase);
-        record.model = stronger;
+      if (this.modelPolicyOf(phase) === 'pinned') {
+        // #91: a pinned run's rung keeps the model it names — "the next
+        // model/effort step" is the effort step alone.
+        const from = record.effort;
+        const to = raiseEffort(from);
+        if (to && to !== from) record.effort = to;
+        this.record('phase.model-held', {
+          model: record.model ?? null, why: 'rung', rung: hint.rung, effortFrom: from ?? null, effortTo: record.effort ?? null,
+        }, phase);
+      } else {
+        const stronger = escalateModel(record.model);
+        if (stronger && stronger !== record.model) {
+          this.record('phase.model-escalated', { from: record.model, to: stronger, rung: hint.rung }, phase);
+          record.model = stronger;
+        }
       }
     }
     this.record('phase.start', {
+      // The attempt number this boarding's first session takes (control-tower
+      // phase 89, #130) — what `phase.session`, `phase.tokens` and
+      // `record.attempts` carry, so `/attempts` numbers boardings the same way.
+      attempt: (record.attempts ?? 0) + 1,
       model: record.model, effort: record.effort ?? null,
       // Where each choice came from, so a phase that ran on an unexpected model
       // can be explained without re-reading three files.
@@ -3304,12 +4655,30 @@ export abstract class RunnerLoop extends RunnerControl {
 
     /* ---- the session, with the error policy driving retries ---- */
     const settled = await this.attempt(phase, prompt, record.model!, owner, lane, chosen, {
-      // A wait-resume is a continuation, not the phase: capped like a closeout
-      // so a session that misreads the ask and starts new work runs out. A
-      // `closeout` brief is capped the same way, for the same reason; a
-      // `continue` is the phase itself and is not.
-      ...(resuming ? { maxTurns: WAIT_RESUME_TURNS } : cappedTurns ? { maxTurns: closeoutBriefTurns(cappedTurns) } : {}),
+      // A wait-resume continues the phase: what is left of its turns
+      // (`remainingTurns`). A `closeout` brief is paperwork and keeps the
+      // closeout's cap, so a session that misreads the ask and starts new work
+      // runs out; a `continue` is the phase itself and gets the whole row.
+      ...(waitResumeTurns ? { maxTurns: waitResumeTurns } : cappedTurns ? { maxTurns: closeoutBriefTurns(cappedTurns) } : {}),
       mcp,
+      ...(resumeVetted ? { vetted: resumeVetted } : {}),
+      // The brief swapped IN PLACE (control-tower phase 86, #134): the session
+      // this attempt would continue is not worth resuming, so the lane — and
+      // the grant it holds — boards the resume brief instead of re-queueing.
+      rebrief: async (next, why) => {
+        if (why.unspawned) this.supersedeOpenRung(phase, why.why);
+        const composed = await this.composeBrief(phase, board, next, engineText);
+        this.record('phase.brief', {
+          brief: composed.brief, asked: boarding?.brief ?? (resuming ? 'wait-resume' : 'fresh'),
+          situation: next.situation, rung: next.rung, resume: null, bytes: Buffer.byteLength(composed.prompt),
+          rebrief: true, grant: 'held', sessionId: why.sessionId, why: why.why,
+        }, phase);
+        record.note = `session ${why.sessionId} is not worth resuming — ${why.why} — the brief was swapped in place `
+          + 'and the lane kept its grant';
+        this.persist();
+        this.emit('phase', { phase, status: record.status, note: record.note });
+        return composed.prompt + tail;
+      },
     });
     if (!settled.carryOn) { await this.release(phase, owner); return false; }
     if (!settled.completed) { await this.release(phase, owner); return true; }
@@ -3333,6 +4702,39 @@ export abstract class RunnerLoop extends RunnerControl {
       // record is not one of them), `halt-on-everything` stops, which is what
       // asking for it means. A plan that keeps failing still halts on the
       // streak, run-level, one phase later.
+      if (await this.confirmed(phase)) return true;
+      return !this.state!.halt && this.state!.autonomy === 'keep-going';
+    } finally {
+      await this.release(phase, owner);
+    }
+  }
+
+  /**
+   * Re-run a §Verification the console's going-down cut (control-tower phase
+   * 48, #69), and settle the phase by its verdict.
+   *
+   * The phase's session finished and handed off before the console went; what
+   * the restart took was the proof — measured once as a phase closed done with
+   * 0 of its 5 commands run. So nothing is spawned: `confirmed` runs the same
+   * three checks an attempt's end runs (board, §Verification, the verdict's
+   * settle), under the scope this lane was admitted with, and the lock is
+   * released after, as it is there. The marker is consumed first, so a cut
+   * that repeats writes it again rather than looping on the old one.
+   */
+  private async reverifyAfterRestart(phase: number): Promise<boolean> {
+    const state = this.state!;
+    const record = phaseRecord(state, phase);
+    const cut = record.reverify!;
+    delete record.reverify;
+    const owner = autopilotOwner(state.id);
+    this.record('phase.reverify-after-restart', {
+      cutAt: cut.at, cause: cut.cause,
+      ...(cut.ran != null ? { ran: cut.ran } : {}),
+      ...(cut.notRun != null ? { notRun: cut.notRun } : {}),
+      was: record.status,
+    }, phase);
+    this.persist();
+    try {
       if (await this.confirmed(phase)) return true;
       return !this.state!.halt && this.state!.autonomy === 'keep-going';
     } finally {
@@ -3786,7 +5188,7 @@ export abstract class RunnerLoop extends RunnerControl {
         // Paperwork, like a closeout: a quarter of the phase's dollars and a
         // closeout's turns, so a confused session cannot re-open the work it
         // was asked only to publish.
-        caps: capsFor({ mode: 'pr', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
+        caps: capsFor({ mode: 'pr', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
       this.record('phase.pr-session-failed', { error: (error as Error)?.message ?? String(error) }, phase);
@@ -3796,16 +5198,13 @@ export abstract class RunnerLoop extends RunnerControl {
       this.attachHandle(phase, null);
     }
 
-    state.spentUsd += outcome.costUsd;
-    record.costUsd += outcome.costUsd;
-    // The same dollars, booked a second time against the ladder rung that
-    // caused this attempt — a no-op unless the ladder is what reboarded it.
-    chargeRung(state.recoveries?.[String(record.phase)], outcome.costUsd);
+    // The dollars — the run's, the phase's, the rung's — were booked by the
+    // spawn door (`bookSpend`).
     record.turns = (record.turns ?? 0) + outcome.turns;
     const said = outcome.resultText ? outcome.resultText.replace(/\s+/g, ' ').slice(0, 1_200) : undefined;
     const ok = classify(outcome.signal).kind === 'ok';
     this.prBlockEmitted = true;
-    this.record('phase.pr-session-done', { ok, costUsd: outcome.costUsd, turns: outcome.turns, said }, phase);
+    this.record('phase.pr-session-done', { ok, costUsd: outcome.bookedUsd ?? outcome.costUsd, turns: outcome.turns, said }, phase);
     // 🔴 A session that did not END WELL has not settled anything (S10). It was
     // spent — the dollars are booked above and the line is journalled — but a
     // usage wall, a permission refusal or a crash leaves `resultText` non-null,
@@ -3950,18 +5349,17 @@ export abstract class RunnerLoop extends RunnerControl {
         // Reading, like paperwork: a quarter of the phase's dollars and the
         // closeout's turn cap, so a confused reviewer cannot spend a phase's
         // worth of money re-deriving the work.
-        caps: capsFor({ mode: 'review', size: await this.sizeOf(phase), phaseBudgetUsd: state.phaseBudgetUsd }),
+        caps: capsFor({ mode: 'review', table: this.capTable(), phaseBudgetUsd: state.phaseBudgetUsd }),
       });
     } catch (error) {
       this.record('phase.review-session-failed', { error: (error as Error)?.message ?? String(error) }, phase);
       return;
     }
 
-    // The same three lines every extra session uses, so this money appears in
-    // the cost panels without those panels knowing this feature exists.
-    state.spentUsd += outcome.costUsd;
-    record.costUsd += outcome.costUsd;
-    chargeRung(state.recoveries?.[String(record.phase)], outcome.costUsd);
+    // The money was booked by the spawn door like every session's (`bookSpend`),
+    // so it appears in the cost panels without those panels knowing this
+    // feature exists.
+    const booked = outcome.bookedUsd ?? outcome.costUsd;
     record.turns = (record.turns ?? 0) + outcome.turns;
 
     const report = parseReviewerReport(
@@ -3972,7 +5370,7 @@ export abstract class RunnerLoop extends RunnerControl {
       // fact; inventing `approved` from it would be a clean bill of health
       // manufactured by a parser bug.
       this.record('phase.review-session-done', {
-        ok: false, costUsd: outcome.costUsd, turns: outcome.turns,
+        ok: false, costUsd: booked, turns: outcome.turns,
         reason: 'the reviewer did not answer in the required format',
         said: outcome.resultText ? outcome.resultText.replace(/\s+/g, ' ').slice(0, 600) : undefined,
       }, phase);
@@ -3984,7 +5382,7 @@ export abstract class RunnerLoop extends RunnerControl {
       this.deps.reviewer.record(state.slug, phase, report);
     } catch (error) {
       this.record('phase.review-session-done', {
-        ok: false, costUsd: outcome.costUsd, turns: outcome.turns,
+        ok: false, costUsd: booked, turns: outcome.turns,
         reason: `the verdict could not be stored: ${(error as Error)?.message ?? String(error)}`,
       }, phase);
       this.persist();
@@ -3992,7 +5390,7 @@ export abstract class RunnerLoop extends RunnerControl {
     }
 
     this.record('phase.review-session-done', {
-      ok: true, costUsd: outcome.costUsd, turns: outcome.turns,
+      ok: true, costUsd: booked, turns: outcome.turns,
       verdict: report.verdict, findings: report.findings.length,
       // Present only when the run's policy overrode what the session asked
       // for — the one line that explains a `commented` chip on a review whose
@@ -4174,14 +5572,7 @@ export abstract class RunnerLoop extends RunnerControl {
       this.record('run.branch-mismatch', { plan: planNames, run: branch });
     }
 
-    // Final ⇔ every OTHER phase on the board is done, this is the only live
-    // lane, and the run is the whole plan (a scoped run finishing is not the
-    // plan finishing). Two leaves finishing together therefore never both read
-    // final — `run.pr-pending` at finish covers that honestly instead.
-    const phases = Object.keys(board.states).map(Number);
-    const final = !state.onlyPhases?.length
-      && phases.filter((p) => p !== phase).every((p) => board.done.includes(p))
-      && this.livePhases().every((p) => p === phase);
+    const final = this.isFinalPhase(board, phase);
     let pr = final && state.openPr !== false;
     if (pr) this.prBlockEmitted = true;
 
@@ -4236,9 +5627,12 @@ export abstract class RunnerLoop extends RunnerControl {
         + `  \`git worktree add\` yourself — each already has its checkout, and\n`
         + `  \`${branch}\` cannot be checked out twice. Any repository NOT listed above\n`
         + `  lives only in the shared root at ${state.root} — read it there if you need\n`
-        + `  it, and do not edit it from this session${mirrorRepos.includes('')
+        + `  it (\`${state.root}/<repo>\`, READ-ONLY), and do not edit it from this session${mirrorRepos.includes('')
           ? `; here it is an EMPTY\n  directory, which is what an unmounted submodule looks like, not a repo\n  whose files went missing`
-          : ''}. The console made this mirror, keeps\n`
+          : ''}. NEVER \`git clone\` (or \`gh repo clone\`) into this tree and NEVER\n`
+        + `  run \`git submodule update --init\` in it: a clone at a mount path breaks the\n`
+        + `  run's own checkout at its next rebuild, so the console refuses the first and\n`
+        + `  asks a person about the second. The console made this mirror, keeps\n`
         + `  it for every phase of this run, and removes it when the run settles, so\n`
         + `  leave it in place.\n`
         + `- Work-state — the handoff, INDEX, \`.locks/\`, QA rows, gate approvals — does\n`
@@ -4342,12 +5736,17 @@ export abstract class RunnerLoop extends RunnerControl {
           + `  another plan's branch. Later phases of this run reuse it — leave it\n`
           + `  checked out when you finish.`;
 
-    const mismatch = planNames
+    // A run launched OVER the plan's git lines (control-tower phase 11, #18)
+    // tells the session the concrete thing to do with each; only a run that
+    // recorded no override (started before the answer existed) still asks
+    // for the discrepancy to be written down.
+    const overridden = gitOverrideInstruction(state.gitStrategyOverride?.lines, branch, phase);
+    const mismatch = overridden || (planNames
       ? `\n- Note: the plan's §Session budget names the branch \`${planNames}\`. This run\n`
         + `  was started with the console's new-branch strategy, which wins for sessions\n`
         + `  the console mints: use \`${branch}\`, and record the discrepancy in your\n`
         + `  handoff so the plan can be updated.`
-      : '';
+      : '');
 
     const title = this.deps.planTitle?.(state.slug) ?? state.slug;
     const prBlock = pr ? `\n\n${prBlockText(branch, title)}` : '';
@@ -4419,6 +5818,15 @@ export abstract class RunnerLoop extends RunnerControl {
       if (resolved.source) source[key] = resolved.source;
       return resolved.value;
     };
+    const permissionModeOf = (): string | undefined => {
+      const resolved = resolvePermissionMode({
+        retry: attempt.permissionMode, run: chosen.permissionMode,
+        planPhase: plan.permissionMode, runDefault: state.permissionMode,
+      });
+      if (!resolved.source) return undefined;
+      source.permissionMode = resolved.source;
+      return resolved.value;
+    };
 
     return {
       model: pick('model', state.model),
@@ -4430,7 +5838,12 @@ export abstract class RunnerLoop extends RunnerControl {
       // inherits, so an override that names only a model changes only the
       // model.
       tools: attempt.tools ?? chosen.tools,
-      permissionMode: attempt.permissionMode ?? chosen.permissionMode,
+      // control-tower phase 11 (#34): six levels, not four — the attempt, the
+      // run's per-phase choice, the plan's bullet, the plan's line, the run's
+      // default, then `acceptEdits` (`resolvePermissionMode`). Undefined when
+      // nothing spoke, so a run that never names a mode boards and journals
+      // exactly as it always did and the CLI's default stands.
+      permissionMode: permissionModeOf(),
       skills: attempt.skills ?? chosen.skills,
       skillsOff: attempt.skillsOff ?? chosen.skillsOff,
       mcpServers: attempt.mcpServers ?? chosen.mcpServers,

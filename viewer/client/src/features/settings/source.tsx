@@ -26,7 +26,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   Empty,
   Skeleton,
   toast,
@@ -195,7 +195,7 @@ export default function SourceView() {
             >
               <Folder className="size-4 shrink-0 text-ink-faint" aria-hidden />
               <span className="min-w-0 flex-1 truncate text-sm text-ink">{entry.name}</span>
-              {entry.hasDocs && <Chip tone="ok">plans</Chip>}
+              {entry.hasDocs && <Badge tone="ok">plans</Badge>}
             </button>
           ))}
           {listing && !listing.entries.length && (

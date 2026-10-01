@@ -22,7 +22,7 @@
  */
 
 import { useMemo, useState } from 'react';
-import { Checkbox, Chip, field } from '@/components/ui';
+import { Checkbox, Badge, field } from '@/components/ui';
 import { cn } from '@/lib/cn';
 import type { SkillInfo } from '@/lib/api';
 
@@ -126,8 +126,8 @@ export function SkillPicker({
     <details className="rounded-lg border border-rule bg-surface">
       <summary className="flex cursor-pointer flex-wrap items-center gap-2 px-3 py-2 text-sm [@media(hover:none)]:min-h-(--tap-min)">
         <span>{label}</span>
-        {chosenSkills.length > 0 && <Chip tone="ok">{chosenSkills.length} chosen</Chip>}
-        {planSkills.length > 0 && <Chip>{planSkills.length} from the plan</Chip>}
+        {chosenSkills.length > 0 && <Badge tone="ok">{chosenSkills.length} chosen</Badge>}
+        {planSkills.length > 0 && <Badge>{planSkills.length} from the plan</Badge>}
         {!chosenSkills.length && !planSkills.length && (
           <span className="text-2xs text-ink-muted">none, unless the plan names some</span>
         )}
@@ -142,9 +142,9 @@ export function SkillPicker({
             </p>
             <div className="flex flex-wrap gap-1.5">
               {planSkills.map((id) => (
-                <Chip key={id} mono>
+                <Badge key={id} mono>
                   {id}
-                </Chip>
+                </Badge>
               ))}
             </div>
           </div>
@@ -227,9 +227,9 @@ export function SkillPicker({
                     />
                     <span className="shrink-0 font-mono">{skill.id}</span>
                     {byDefault.has(skill.id) && (
-                      <Chip className="shrink-0" title="On by default for every run on this console">
+                      <Badge className="shrink-0" title="On by default for every run on this console">
                         default
-                      </Chip>
+                      </Badge>
                     )}
                     <span className="min-w-0 truncate text-ink-muted" title={skill.description}>
                       {skill.description || 'no description'}

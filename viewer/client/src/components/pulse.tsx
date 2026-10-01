@@ -29,16 +29,17 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { useNow } from '@/lib/clock';
-import { money } from '@/lib/format';
+import { elapsedWords, money } from '@/lib/format';
 import { rungLabel, situationLabelFor } from '@/lib/ladder';
-import { isLiveStatus, runStatusTitle, runUiState } from '@/lib/status-vocab';
+import { isLiveStatus, runStatusTitle, runStatusWord } from '@/lib/status-vocab';
 import { RunStrip } from '@/components/charts';
 import { LaneCost, LaneElapsed, type LaneFacts } from '@/components/lane-facts';
-import { Chip, StatusBadge } from '@/components/ui';
+import { Badge } from '@/components/ui';
+import { RunStatusBadge } from '@/components/ui/status';
 import { navigate } from '@/app/router';
 import { planHref } from '@shared/routes.js';
 import type { ConvergeView, ForeignSession, PhaseRecord, RunState } from '@/lib/api';
-import { foreignVehicle } from '@/features/now/model';
+import { foreignVehicle } from '@/features/runs/lanes-model';
 
 /* ---------------- derivation (exported for tests) ---------------- */
 
@@ -73,7 +74,7 @@ function pulseFacts(lane: PulseLane): LaneFacts {
   const started = lane.startedAt ? Date.parse(lane.startedAt) : NaN;
   return {
     startedAt: Number.isFinite(started) ? started : null,
-    lastOutputAt: null,
+    silence: null,
     costUsd: lane.costUsd || null,
     model: lane.model ?? null,
     effort: null,
@@ -95,7 +96,7 @@ export interface PulseWait {
 }
 
 // The vehicle a hook-reported session is, in words. It lives in
-// `features/now/model.ts` beside `otherSessions` (Phase 10) — the Sessions list
+// `features/runs/lanes-model.ts` beside `otherSessions` (Phase 10) — the Sessions list
 // names the same kinds, and a chart component is the wrong place for a
 // vocabulary two surfaces read. Re-exported so this module's consumers and its
 // test are unchanged by the move.
@@ -253,13 +254,7 @@ export function pulseWaits(run: RunState, titles?: Map<number, string>): PulseWa
 export { useNow };
 
 export function fmtElapsed(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 0) return '—';
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+  return elapsedWords(ms);
 }
 
 /* ---------------- the panel ---------------- */
@@ -323,14 +318,11 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
           <span
             className={cn(
               'absolute inline-flex h-full w-full rounded-full',
-              live ? 'animate-ping bg-progress/60' : 'bg-ink-faint/40',
+              live ? 'animate-ping bg-running/60' : 'bg-ink-faint/40',
             )}
           />
           <span
-            className={cn(
-              'relative inline-flex size-2.5 rounded-full',
-              live ? 'bg-progress' : 'bg-ink-faint',
-            )}
+            className={cn('relative inline-flex size-2.5 rounded-full', live ? 'bg-running' : 'bg-ink-faint')}
           />
         </span>
         {linkHeader ? (
@@ -347,11 +339,9 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
         ) : (
           <span className="font-medium text-ink">Right now</span>
         )}
-        <StatusBadge
-          state={runUiState(run.status)}
-          label={run.status}
-          mono
-          title={runStatusTitle(run.status)}
+        <RunStatusBadge
+          run={run}
+          title={runStatusTitle(runStatusWord(run))}
           pulse={run.status === 'running'}
         />
         <span className="ml-auto shrink-0 font-mono text-2xs tabular-nums text-ink-faint">
@@ -374,7 +364,7 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
             onClick={() => lane.sessionId && navigate(planHref(slug, 'run'))}
             className={cn(
               'flex w-full items-center gap-3 rounded-md border-l-4 bg-ground-deep/60 px-3 py-2 text-left',
-              lane.frozen ? 'border-gated' : 'border-progress',
+              lane.frozen ? 'border-needs-you' : 'border-running',
             )}
             title={
               lane.frozen
@@ -386,8 +376,8 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
             <span className="min-w-0 flex-1">
               <span className="block truncate text-sm text-ink">{lane.title ?? `Phase ${lane.phase}`}</span>
               <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-2xs text-ink-muted">
-                <Chip
-                  tone={lane.frozen ? 'gate' : 'busy'}
+                <Badge
+                  tone={lane.frozen ? 'accent' : 'live'}
                   dot
                   className={cn(!lane.frozen && 'animate-pulse-soft')}
                 >
@@ -400,8 +390,8 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
                       <Bot size={11} aria-hidden /> {lane.vehicle}
                     </>
                   )}
-                </Chip>
-                {lane.status === 'verifying' && <Chip tone="busy">verifying</Chip>}
+                </Badge>
+                {lane.status === 'verifying' && <Badge tone="live">verifying</Badge>}
                 {lane.model && <span className="font-mono">{lane.model}</span>}
                 {(lane.attempts ?? 0) > 1 && <span>attempt {lane.attempts}</span>}
               </span>
@@ -435,9 +425,9 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
                 {titles?.get(session.plan!.phase) ?? `Phase ${session.plan!.phase}`}
               </span>
               <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-2xs text-ink-muted">
-                <Chip tone="neutral" dot>
+                <Badge tone="neutral" dot>
                   <Terminal size={11} aria-hidden /> {foreignVehicle(session)}
-                </Chip>
+                </Badge>
                 {session.user && (
                   <span className="font-mono">
                     {session.user}
@@ -471,7 +461,7 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
             <span className="min-w-0 flex-1">
               <span className="block truncate text-sm text-ink">{wait.title ?? `Phase ${wait.phase}`}</span>
               <span className="mt-0.5 flex flex-wrap items-center gap-1.5 text-2xs text-ink-muted">
-                <Chip tone="warn">
+                <Badge tone="accent">
                   {wait.kind === 'queued' ? (
                     <>
                       <Lock size={11} aria-hidden /> queued
@@ -481,12 +471,12 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
                       <Hourglass size={11} aria-hidden /> waiting
                     </>
                   )}
-                </Chip>
+                </Badge>
                 <span className="min-w-0 truncate">{wait.why}</span>
                 {wait.watch?.map((ref) => (
-                  <Chip key={ref} tone="neutral" className="font-mono">
+                  <Badge key={ref} tone="neutral" className="font-mono">
                     <Eye size={10} aria-hidden /> {ref}
-                  </Chip>
+                  </Badge>
                 ))}
               </span>
             </span>
@@ -524,12 +514,14 @@ export function PlanPulse({ slug, run, board, linkHeader, className, foreign, co
             <CircleDashed size={12} className="text-ink-faint" aria-hidden />
             <span className="mr-1">Up next</span>
             {upNext.map((p) => (
-              <Chip key={p.phase} tone="neutral" title={p.title}>
+              <Badge key={p.phase} tone="neutral" title={p.title}>
                 P{p.phase}
+                {/* What it waits on is why it is not running — read, not
+                    metadata — so muted: faint fails AA at 12px (the e2e register). */}
                 {p.dependsOn && p.dependsOn.length > 0 && (
-                  <span className="text-ink-faint"> after {p.dependsOn.map((d) => `P${d}`).join(' ')}</span>
+                  <span className="text-ink-muted"> after {p.dependsOn.map((d) => `P${d}`).join(' ')}</span>
                 )}
-              </Chip>
+              </Badge>
             ))}
           </div>
         )}

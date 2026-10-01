@@ -112,8 +112,9 @@
  * written before this still name it — and is no longer produced.
  */
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { copyFile, cp, mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { copyFile, cp, lstat, mkdir, mkdtemp as mkdtempAsync, readdir, readFile, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import { DEFAULT_BASE_BRANCH, PUSH_ARGV } from '../../shared/landing-model.js';
@@ -206,7 +207,8 @@ export type WorktreeRefusal =
   | 'branch-in-use'
   | 'cap-reached'
   | 'setup-failed'
-  | 'worktree-failed';
+  | 'worktree-failed'
+  | 'mount-occupied';
 
 export const REFUSAL_REASON: Readonly<Record<WorktreeRefusal, string>> = Object.freeze({
   'not-a-repo': 'the run root is not a git working tree, so there is nothing to make a worktree of',
@@ -241,6 +243,48 @@ export const REFUSAL_REASON: Readonly<Record<WorktreeRefusal, string>> = Object.
   // they never set. The refusal carries git's own words as its `detail`.
   'worktree-failed': 'git declined to create the worktree; its own message is on the run\'s '
     + 'isolation entry',
+  // A mount path holds something that is not the mirror's own worktree — a
+  // clone, another checkout, files — that is dirty or unpushed, so it is not
+  // moved without a person's word (control-tower phase 90, #139).
+  'mount-occupied': 'a mount path of the mirror holds content the console did not make and will not '
+    + 'move by itself (uncommitted or unpushed work); Repair checkout moves it to stale-mounts/, '
+    + 'never deletes it, and rebuilds the mount',
+});
+
+/**
+ * The refusals that PARK a run which asked for its own checkout
+ * (control-tower phase 90, #123 #139): the ones a person can FIX — a checkout
+ * holding the branch, git declining, content at a mount, a setup command, the
+ * cap. The rest are structural facts about the plan and the root (no
+ * repository, a scope outside it or mapping to nothing, no run branch): no
+ * repair will ever give that run a checkout, and because a new-branch run is
+ * isolated by DEFAULT (decision 13), parking on them would stop every such run
+ * at every start. Those keep the visible shared fallback — journalled, an
+ * inbox row, the card — and never silently.
+ */
+export const ISOLATION_PARKS: ReadonlySet<WorktreeRefusal> = new Set<WorktreeRefusal>([
+  'branch-in-use', 'worktree-failed', 'mount-occupied', 'setup-failed', 'cap-reached',
+]);
+
+/**
+ * The FIX for each refusal, as the parked run's errand says it (control-tower
+ * phase 90, #139): `REFUSAL_REASON` says why the checkout could not be had,
+ * and an errand that stops there leaves the operator to work out the remedy —
+ * the gap that made "Drop isolation" the only action anyone was offered.
+ */
+export const REFUSAL_FIX: Readonly<Record<WorktreeRefusal, string>> = Object.freeze({
+  'not-a-repo': 'The run root is not a repository: Drop isolation, or start the run from a git checkout.',
+  'has-submodules': 'Start the run again; a superproject takes a mirror of its scoped submodules.',
+  'no-run-branch': 'Switch the run to the new-branch git strategy, then Retry.',
+  'not-opted-in': 'Nothing to fix: this run did not ask for its own checkout.',
+  'scope-outside-root': "Every Repos cell of this plan is outside the run root: Drop isolation, or start the run from the repository the plan works in.",
+  'root-scoped': 'Start the run again; the root now mounts in the mirror.',
+  'scope-unmapped': 'Initialize the submodule the detail names (`git submodule update --init <path>` in the run root), then Retry.',
+  'branch-in-use': 'Switch the checkout the detail names off the run branch, or end the session holding it, then Retry.',
+  'cap-reached': 'Raise the worktree cap (Settings > Automation) or let another isolated run finish, then Retry.',
+  'setup-failed': 'Fix the worktree setup command (Settings > Automation), then Retry.',
+  'worktree-failed': "Fix what git's own words on the run's isolation entry name, then Retry — or press Repair checkout when a mount path holds content the console did not make.",
+  'mount-occupied': 'Press Repair checkout: the content moves to stale-mounts/ (never deleted), the mounts are rebuilt and the run continues.',
 });
 
 /**
@@ -346,6 +390,30 @@ export function scopeConfined(root: string, scopes: Iterable<string>): boolean {
     if (!existsSync(path)) return false;
   }
   return true;
+}
+
+/**
+ * A scope split by `scopeConfined`'s rule, token by token (control-tower
+ * phase 82, #94): `inside` names a tree under the root (the root's own name
+ * included), `outside` names one it does not contain. `all` and the internal
+ * shared-checkout token are neither — they say nothing about WHERE.
+ *
+ * 🔴 The run's isolation was decided on the union of every Repos cell, so ONE
+ * phase naming a repository outside the root (control-tower's phase 74 and
+ * `homebrew-tap`) refused a checkout for all 75. The split is what lets the
+ * run take its checkout on the cells it contains and refuse only the phase
+ * whose own cell it does not.
+ */
+export function partitionScope(root: string, scopes: Iterable<string>): { inside: string[]; outside: string[] } {
+  const inside: string[] = [];
+  const outside: string[] = [];
+  for (const raw of scopes) {
+    const token = normalizeToken(raw);
+    if (!token || token === 'all' || token === normalizeToken(SHARED_CHECKOUT_TOKEN)) continue;
+    const side = scopeConfined(root, [token]) ? inside : outside;
+    if (!side.includes(token)) side.push(token);
+  }
+  return { inside, outside };
 }
 
 /** How long the operator's setup command may take before it is killed. */
@@ -795,6 +863,119 @@ export function realish(path: string): string {
 export async function commitOf(repo: string, ref: string): Promise<string> {
   const out = await git(repo, ['rev-parse', '--verify', '--quiet', ref]);
   return out.ok ? out.stdout.trim() : '';
+}
+
+/**
+ * The WORKING tree of the repository holding `dir`, as a git tree object — the
+ * tree a session's `phase-outcome.sh … verified` names as the one its command
+ * ran against (control-tower phase 62, #68), computed in the same three steps:
+ * the index copied to a private file (so only what changed is re-hashed), every
+ * change added into THAT copy, the result written as a tree object. Committed
+ * or not, tracked or not — ignored files aside — it is what a suite reads.
+ *
+ * 🔴 `add` and `write-tree` are exempted in this file for this one function,
+ * and the private index is why they are reads in every sense that matters:
+ * `GIT_INDEX_FILE` points git at a scratch copy, so the repository's own index,
+ * the session's staged work, every ref and the working tree are untouched. What
+ * they write is unreferenced objects — the same thing `merge-tree
+ * --write-tree` writes. Null when git could not name the tree.
+ */
+export async function workingTreeOf(
+  dir: string,
+): Promise<{ top: string; tree: string; head: string | null } | null> {
+  const top = await git(dir, ['rev-parse', '--show-toplevel']);
+  const root = top.ok ? top.stdout.trim() : '';
+  if (!root) return null;
+  // A linked worktree's index lives under the main repository's git dir, which
+  // `--git-path` knows; it answers relative to where it was asked.
+  const asked = await git(root, ['rev-parse', '--git-path', 'index']);
+  const named = asked.ok ? asked.stdout.trim() : '';
+  const real = named && !isAbsolute(named) ? join(root, named) : named;
+  const scratchDir = await mkdtempAsync(join(tmpdir(), 'pc-proof-index-'));
+  const scratch = join(scratchDir, 'index');
+  try {
+    if (real && existsSync(real)) {
+      await copyFile(real, scratch);
+      // The index file's mtime travels with the copy, as `cp -p` keeps it in
+      // the script: git re-reads the content of any entry not older than the
+      // index file (its racy-clean check), and a fresh mtime would make a file
+      // rewritten at the same size in the same second it was staged look
+      // unchanged — the tree would name what was staged, not what ran.
+      const was = await stat(real);
+      await utimes(scratch, was.atime, was.mtime);
+    }
+    const env = {
+      ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0',
+      GIT_INDEX_FILE: scratch,
+    };
+    if (!(await git(root, ['add', '-A'], env)).ok) return null;
+    const written = await git(root, ['write-tree'], env);
+    const tree = written.ok ? written.stdout.trim() : '';
+    if (!/^[0-9a-f]{40,64}$/.test(tree)) return null;
+    const head = await commitOf(root, 'HEAD');
+    return { top: root, tree, head: head || null };
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The commits in `from..to`, newest first, each with its committer time — the
+ * range a red first seen on `to` was introduced in (control-tower phase 83,
+ * #103). Null when git cannot answer (an unknown commit, not a repository).
+ */
+export async function commitsBetween(
+  dir: string, from: string, to: string,
+): Promise<{ sha: string; at: string }[] | null> {
+  const log = await git(dir, ['log', '--format=%H%x09%cI', `${from}..${to}`]);
+  if (!log.ok) return null;
+  return log.stdout.split('\n')
+    .map((line) => line.trim().split('\t'))
+    .filter((cells) => /^[0-9a-f]{40,64}$/.test(cells[0] ?? '') && cells[1])
+    .map(([sha, at]) => ({ sha, at }));
+}
+
+/**
+ * The paths whose content differs between two TREE objects, or null when
+ * either is not an object of this repository — a proof recorded in another
+ * clone, or one whose objects were collected. `--no-renames` lists both ends of
+ * a move, so a file moved into a paperwork path is still named where it left.
+ */
+export async function treeChanges(dir: string, from: string, to: string): Promise<string[] | null> {
+  if (from === to) return [];
+  const out = await git(dir, ['diff', '--name-only', '--no-renames', '-z', from, to]);
+  if (!out.ok) return null;
+  return out.stdout.split('\0').filter(Boolean);
+}
+
+/**
+ * The UNCOMMITTED paths of the repository holding `dir`, each with the time it
+ * was last written — whose work-in-progress a red came from (control-tower
+ * phase 83, #103: P61's red was P62's 17 uncommitted files). Every untracked
+ * file by name, both ends of a rename; a deleted path has no write time. Null
+ * when git cannot answer.
+ */
+export async function uncommittedPaths(
+  dir: string,
+): Promise<{ top: string; paths: { path: string; mtimeMs: number | null }[] } | null> {
+  const top = await git(dir, ['rev-parse', '--show-toplevel']);
+  const root = top.ok ? top.stdout.trim() : '';
+  if (!root) return null;
+  const out = await git(root, ['status', '--porcelain', '-z', '--untracked-files=all', '--ignore-submodules=all']);
+  if (!out.ok) return null;
+  const tokens = out.stdout.split('\0');
+  const names: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const entry = tokens[i];
+    if (entry.length < 4) continue;
+    names.push(entry.slice(3));
+    // `R  new\0old` — a rename's (or copy's) source follows as its own token.
+    if (/[RC]/.test(entry.slice(0, 2)) && tokens[i + 1]) names.push(tokens[++i]);
+  }
+  const paths = await Promise.all([...new Set(names)].map(async (path) => ({
+    path, mtimeMs: await lstat(join(root, path)).then((info) => info.mtimeMs, () => null),
+  })));
+  return { top: root, paths };
 }
 
 /** Is `dir` already registered as a worktree of this repository? */
@@ -1757,6 +1938,28 @@ export async function reclaimBranch(opts: {
   return { kind: 'reclaimed', tree, from: opts.branch, to };
 }
 
+/**
+ * Free the run branch from a HAND checkout of this plan (control-tower phase
+ * 90, #123 RB-2): a session that met a missing mirror made its own checkout
+ * (`.worktrees/hand/<slug>/…`) on the run branch, and the rebuild then refused
+ * `branch-in-use` for the run's OWN branch. It is detached where it stands —
+ * `git switch --detach` keeps HEAD, the index and every uncommitted file, so
+ * nothing in it moves and every commit it made is already on the branch —
+ * unless a live claim names it, when a session is in it right now.
+ */
+export async function detachHandTree(opts: {
+  tree: string; branch: string; occupied?: Iterable<OccupiedTree>;
+}): Promise<{ kind: 'detached'; tree: string } | { kind: 'held'; tree: string; by: string } | { kind: 'skipped'; reason: string }> {
+  const tree = realish(opts.tree);
+  const holder = [...(opts.occupied ?? [])]
+    .find((claim) => !claim.tree || sameGround(realish(claim.tree), tree));
+  if (holder) return { kind: 'held', tree, by: holder.by };
+  const on = await git(tree, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (on.stdout.trim() !== opts.branch) return { kind: 'skipped', reason: `the tree stands on ${on.stdout.trim() || 'nothing'}` };
+  const out = await git(tree, ['switch', '--detach']);
+  return out.ok ? { kind: 'detached', tree } : { kind: 'skipped', reason: firstLine(out.stderr) || 'git switch declined' };
+}
+
 /** What a lane reuse did to catch the lane up with the run branch. */
 export type LaneResync =
   /** The run branch had `behind` commits this lane lacked; they are in it now. */
@@ -2432,6 +2635,212 @@ export async function resolveMounts(
 }
 
 /**
+ * Something at a mount path that is not this mirror's own worktree
+ * (control-tower phase 90, #139): a standalone clone a session made to read a
+ * repository (`kind: 'clone'`, a `.git` DIRECTORY), a checkout of something
+ * else (`'checkout'`, a `.git` FILE — a stray linked worktree, a submodule
+ * `update --init` left), or plain files (`'files'`, no `.git` at all).
+ *
+ * `clean` is the one question the quarantine asks before moving it by itself:
+ * a repository with no uncommitted path and no commit that is on no remote.
+ * Plain files are never clean — nothing says whether they are somebody's work.
+ */
+export type ForeignMount = {
+  rel: string;
+  dir: string;
+  kind: 'clone' | 'checkout' | 'files';
+  /** The branch it stands on; absent on a detached HEAD or when git cannot say. */
+  branch?: string;
+  /** Uncommitted paths (untracked included), capped at `DIRTY_PATH_CAP`. */
+  dirty: string[];
+  /** Commits on no remote-tracking ref; `null` when git could not count them. */
+  unpushed: number | null;
+  clean: boolean;
+};
+
+/** A foreign mount moved aside, and where to. Never deleted. */
+export type Quarantined = ForeignMount & {
+  /** `<run>/stale-mounts/<ts>/<mount>` — see `staleMountsDir`. */
+  to: string;
+  /** A person's press moved it (it was dirty or unpushed); `false` when clean content moved by itself. */
+  confirmed: boolean;
+};
+
+/**
+ * What stands at one mount path, when it is NOT this mirror's worktree.
+ *
+ * `null` for the three shapes a build may simply use: nothing there, an empty
+ * directory (`git worktree add` takes one), and a registered worktree of the
+ * mount's own repository (drift is `reattachMirror`'s question, not this one).
+ * The ROOT mount is judged only when it is a repository of its own: a plain
+ * `integration/` holding other mounts is the mirror itself, and moving it would
+ * carry every registered child with it.
+ */
+export async function inspectMount(source: string, dir: string, rel: string): Promise<ForeignMount | null> {
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return null;
+  }
+  if (!entries.length) return null;
+  if (await isRegistered(source, dir)) return null;
+  let kind: ForeignMount['kind'] = 'files';
+  try {
+    const dotGit = await lstat(join(dir, '.git'));
+    kind = dotGit.isDirectory() ? 'clone' : 'checkout';
+  } catch { /* no `.git`: plain files */ }
+  if (!rel && kind === 'files') return null;
+  if (kind === 'files') {
+    return { rel, dir, kind, dirty: entries.slice(0, DIRTY_PATH_CAP), unpushed: null, clean: false };
+  }
+  // `-C dir` finds the directory's OWN `.git` first, so nothing here reads the
+  // superproject around it. A pointer git cannot follow answers `ok: false` —
+  // unknown, and unknown is never clean.
+  const [head, status, ahead] = await Promise.all([
+    git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']),
+    git(dir, ['status', '--porcelain', '--untracked-files=normal']),
+    git(dir, ['rev-list', '--count', 'HEAD', '--branches', '--not', '--remotes']),
+  ]);
+  const branch = head.ok && head.stdout.trim() !== 'HEAD' ? head.stdout.trim() : undefined;
+  const dirty = status.ok
+    ? status.stdout.split('\n').map((line) => line.slice(3).trim()).filter(Boolean).slice(0, DIRTY_PATH_CAP)
+    : ['(git could not read this checkout\'s status)'];
+  const count = ahead.ok ? Number.parseInt(ahead.stdout.trim(), 10) : Number.NaN;
+  const unpushed = Number.isFinite(count) ? count : null;
+  return {
+    rel, dir, kind, ...(branch ? { branch } : {}), dirty, unpushed,
+    clean: status.ok && dirty.length === 0 && unpushed === 0,
+  };
+}
+
+/** One line per occupied mount — what a refusal and its errand say. */
+export function occupiedSentence(occupied: readonly ForeignMount[]): string {
+  const one = (mount: ForeignMount): string => {
+    const what = mount.kind === 'clone' ? 'a standalone clone'
+      : mount.kind === 'checkout' ? 'a checkout of another repository' : 'files that are not a checkout';
+    const state = [
+      mount.branch ? `on ${mount.branch}` : '',
+      mount.dirty.length ? `uncommitted: ${mount.dirty.join(', ')}` : '',
+      mount.unpushed ? `${mount.unpushed} unpushed commit${mount.unpushed === 1 ? '' : 's'}` : '',
+      mount.unpushed === null && mount.kind !== 'files' ? 'unpushed commits unknown' : '',
+    ].filter(Boolean).join('; ');
+    return `${mount.rel || '.'} holds ${what}${state ? ` (${state})` : ''}`;
+  };
+  return `${occupied.map(one).join(' · ')} — the console moves such content to stale-mounts/ only on a `
+    + "person's word (Repair checkout), never deletes it";
+}
+
+/**
+ * Move a foreign mount aside, into `<run>/stale-mounts/<stamp>/<mount>`.
+ *
+ * `rename`, never a copy and never a delete: the content keeps every byte and
+ * its git directory. A `.git` FILE whose pointer is relative (a submodule's
+ * `gitdir: ../.git/modules/x`) would stop resolving after the move, so it is
+ * pinned absolute first; a linked worktree is then re-linked from where it now
+ * stands (`git worktree repair`, best effort — the files are safe either way).
+ */
+async function quarantineMount(
+  integration: string, mount: ForeignMount, stamp: string, confirmed: boolean,
+): Promise<Quarantined> {
+  const to = join(staleMountsDir(integration), stamp, mount.rel || '_root');
+  await mkdir(dirname(to), { recursive: true });
+  if (mount.kind === 'checkout') {
+    try {
+      const file = join(mount.dir, '.git');
+      const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(file, 'utf8'))?.[1]?.trim();
+      if (pointer && !isAbsolute(pointer)) await writeFile(file, `gitdir: ${resolve(mount.dir, pointer)}\n`);
+    } catch { /* an unreadable pointer moves as it is */ }
+  }
+  await rename(mount.dir, to);
+  if (mount.kind === 'checkout') await git(to, ['worktree', 'repair']);
+  return { ...mount, dir: mount.dir, to, confirmed };
+}
+
+/** Where a phase's ERRAND TREE stands: `<root>/.worktrees/hand/<slug>/p<N>-errand`. */
+export function errandTreeDir(root: string, slug: string, phase: number): string {
+  return join(worktreesRoot(root), 'hand', slug, `p${phase}-errand`);
+}
+
+/**
+ * A run's mounts from its recorded `mountedRepos`, each a path of the root —
+ * the errand tree's answer when no manifest can be read. A pruned run takes its
+ * manifest with it, and that is exactly when a person needs the tree: without
+ * this it shrank to a bare worktree of the superproject, submodules empty.
+ */
+export function mountsFromRepos(root: string, rels: readonly string[]): MirrorMount[] {
+  return rels.map((rel) => ({ rel, source: realish(rel ? join(root, rel) : root) }));
+}
+
+/** One repository of an errand tree, and the commit it stands at. */
+export type ErrandMount = {
+  rel: string;
+  sha: string;
+  /** The ref the sha was read from: the PUSHED run branch when there is one. */
+  ref: string;
+  /** False when the run branch has no remote copy and the local tip was used. */
+  pushed: boolean;
+};
+
+/**
+ * A STABLE tree for a person's errand (control-tower phase 90, #123).
+ *
+ * Measured: a parked phase's handoff gave the operator `!` lines that `cd` into
+ * the run's mirror, and the console pruned that mirror at the end of the very
+ * session that wrote them — the production apply lines pointed at a deleted
+ * directory. A person's commands need a directory on the PERSON's schedule, not
+ * the console's: this makes one under `.worktrees/hand/` — the folder no sweep
+ * of this console touches — DETACHED at the pushed tip of the run branch in
+ * every repository the run mounts (so it holds no branch and never blocks the
+ * run), and locked with a reason that is not the console's own (so no prune
+ * takes it). It stays until a person removes it. Pressed again, it is adopted
+ * as it stands.
+ */
+export async function ensureErrandTree(opts: {
+  root: string; slug: string; phase: number;
+  /** The run's mounts, parents first; absent or empty for a single-repository run. */
+  mounts?: readonly MirrorMount[];
+}): Promise<{ ok: boolean; dir: string; mounts: ErrandMount[]; adopted: boolean; detail?: string }> {
+  const dir = errandTreeDir(opts.root, opts.slug, opts.phase);
+  const mounts = opts.mounts?.length
+    ? [...opts.mounts].sort(byMountDepth)
+    : [{ rel: '', source: realish(opts.root) }];
+  const runBranch = `pe/${opts.slug}`;
+  const out: ErrandMount[] = [];
+  let adopted = true;
+  for (const mount of mounts) {
+    const at = join(dir, mount.rel);
+    const remote = `refs/remotes/origin/${runBranch}`;
+    const pushed = await refExists(mount.source, remote);
+    const ref = pushed ? remote
+      : await refExists(mount.source, `refs/heads/${runBranch}`) ? `refs/heads/${runBranch}`
+        : (await defaultBranchOf(mount.source)) ?? 'HEAD';
+    const sha = await commitOf(mount.source, ref);
+    if (!sha) return { ok: false, dir, mounts: out, adopted: false, detail: `${mount.rel || '.'}: ${ref} names no commit` };
+    if (await isRegistered(mount.source, at)) {
+      const head = await git(at, ['rev-parse', 'HEAD']);
+      out.push({ rel: mount.rel, sha: head.stdout.trim() || sha, ref, pushed });
+      continue;
+    }
+    adopted = false;
+    await mkdir(dirname(at), { recursive: true });
+    const made = await git(mount.source, ['worktree', 'add', '--detach', at, sha]);
+    if (!made.ok) {
+      return { ok: false, dir, mounts: out, adopted: false, detail: `${mount.rel || '.'}: ${firstLine(made.stderr) || 'git worktree add failed'}` };
+    }
+    await lockTree(mount.source, at,
+      `errand tree of ${opts.slug} phase ${opts.phase} — a person's checkout; the console never removes it`);
+    out.push({ rel: mount.rel, sha, ref, pushed });
+  }
+  return { ok: true, dir, mounts: out, adopted };
+}
+
+/** A filesystem-safe instant for a quarantine directory: `2026-09-26T10-11-23-000Z`. */
+function quarantineStamp(now = new Date()): string {
+  return now.toISOString().replace(/[:.]/g, '-');
+}
+
+/**
  * Build (or adopt) the mirror: one `ensureCheckout` per mount, parents first,
  * every hard-won behavior of the single-repo path inherited per repository —
  * prunable registrations, adopted-tree branch checks, `branch-in-use` by name.
@@ -2440,9 +2849,24 @@ export async function resolveMounts(
  * deepest first, touches nothing it adopted, and the manifest is written only
  * after the last mount succeeded — so a manifest's presence means the mirror
  * was complete once, and a crash mid-build is a recognisable shape.
+ *
+ * 🔴 Foreign content at a mount is QUARANTINED before anything is built
+ * (control-tower phase 90, #139): a session's clone in an empty mount path made
+ * `worktree add` answer `already exists`, and the run lost its isolation for
+ * eleven hours. Every mount is inspected first, so a refusal leaves nothing on
+ * disk: content that is clean and pushed moves to `stale-mounts/` by itself;
+ * anything dirty or unpushed refuses `mount-occupied`, naming each mount and its
+ * state, until the caller passes `quarantine: 'confirmed'` — a person's press.
+ * Nothing is ever deleted.
  */
 export async function ensureMirror(opts: {
   names: LaneNames; runId: string; slug: string; mounts: MirrorMount[];
+  /**
+   * A person confirmed that dirty or unpushed content at a mount may be moved
+   * to `stale-mounts/` (the Repair checkout press). Absent: only clean, pushed
+   * content moves, and anything else refuses `mount-occupied`.
+   */
+  quarantine?: 'confirmed';
   /**
    * Detach every mount instead of standing it on the run branch.
    *
@@ -2457,18 +2881,32 @@ export async function ensureMirror(opts: {
   ok: boolean;
   created: string[];
   adopted: string[];
-  refusal?: 'branch-in-use' | 'worktree-failed';
+  refusal?: 'branch-in-use' | 'worktree-failed' | 'mount-occupied';
   detail?: string;
+  /** Foreign mount content moved to `stale-mounts/` by this call. */
+  quarantined: Quarantined[];
+  /** On `mount-occupied`: what stands at each mount, untouched, awaiting a person's word. */
+  occupied?: ForeignMount[];
 }> {
   const { names, mounts } = opts;
   const created: MirrorMount[] = [];
   const adopted: string[] = [];
+  const quarantined: Quarantined[] = [];
+
+  // 🔴 THE ADOPTION MARKER (#139). The directory is this call's to remove
+  // wholesale only when this call MADE it. The failure path used to `rm -rf`
+  // `integration/` whenever no mount had been adopted — and "no mount adopted"
+  // is exactly the shape of a mirror whose mounts were lost and whose paths a
+  // session then filled with clones: the teardown deleted work it never made.
+  // A directory that already stood is adopted, and an adopted directory keeps
+  // everything this call did not create.
+  const madeDir = !existsSync(names.integration);
 
   const fail = async (refusal: 'branch-in-use' | 'worktree-failed', detail: string) => {
     for (const mount of [...created].sort(byMountDepth).reverse()) {
       await discardFreshDir(mount.source, join(names.integration, mount.rel));
     }
-    if (!adopted.length) {
+    if (!adopted.length && madeDir) {
       await rm(names.integration, { recursive: true, force: true });
       await rm(mirrorManifestPath(names.integration), { force: true });
     }
@@ -2485,16 +2923,47 @@ export async function ensureMirror(opts: {
     for (const source of new Set(mounts.map((mount) => mount.source))) {
       await git(source, ['worktree', 'prune']);
     }
-    return { ok: false, created: [], adopted, refusal, detail };
+    return { ok: false, created: [], adopted, refusal, detail, quarantined };
   };
+
+  // Every mount path is read BEFORE anything is created or moved, so a refusal
+  // leaves the disk exactly as it was found. Parents first: a foreign parent
+  // carries its children with it when it moves, and they are not asked twice.
+  const foreign: ForeignMount[] = [];
+  for (const mount of [...mounts].sort(byMountDepth)) {
+    const dir = join(names.integration, mount.rel);
+    if (foreign.some((f) => dir.startsWith(`${f.dir}${sep}`))) continue;
+    const found = await inspectMount(mount.source, dir, mount.rel);
+    if (found) foreign.push(found);
+  }
+  const confirmed = opts.quarantine === 'confirmed';
+  const occupied = foreign.filter((mount) => !mount.clean && !confirmed);
+  if (occupied.length) {
+    return {
+      ok: false, created: [], adopted, refusal: 'mount-occupied', quarantined, occupied,
+      detail: occupiedSentence(occupied),
+    };
+  }
 
   try {
     await mkdir(names.integration, { recursive: true });
   } catch (error) {
     return {
-      ok: false, created: [], adopted, refusal: 'worktree-failed',
+      ok: false, created: [], adopted, refusal: 'worktree-failed', quarantined,
       detail: (error as Error)?.message ?? 'could not create the mirror directory',
     };
+  }
+
+  if (foreign.length) {
+    const stamp = quarantineStamp();
+    for (const mount of foreign) {
+      try {
+        quarantined.push(await quarantineMount(names.integration, mount, stamp, !mount.clean));
+      } catch (error) {
+        return fail('worktree-failed',
+          `${mount.rel || '.'}: could not move foreign content to stale-mounts/: ${(error as Error)?.message ?? error}`);
+      }
+    }
   }
 
   for (const mount of mounts) {
@@ -2533,7 +3002,7 @@ export async function ensureMirror(opts: {
       (error as Error)?.message ?? 'could not write the mirror manifest');
   }
 
-  return { ok: true, created: created.map((mount) => mount.rel), adopted };
+  return { ok: true, created: created.map((mount) => mount.rel), adopted, quarantined };
 }
 
 /**
@@ -2549,8 +3018,61 @@ export async function ensureMirror(opts: {
  * is only borrowing. Reads still fall back to the old path so a mirror built
  * by an earlier console still validates instead of being rebuilt.
  */
+/**
+ * Put back the mounts a mirror has LOST — the repair `mount-missing` makes
+ * reachable (control-tower phase 82, #94).
+ *
+ * The manifest beside the mirror names every mount the run was built with, so
+ * the repair is `ensureMirror` over that list again: a mount still standing is
+ * adopted as it is, and a lost one is added back on the run branch. Stale
+ * registrations are pruned first, because a mount whose directory was deleted
+ * without `git worktree prune` still holds the branch, and `worktree add` would
+ * refuse `already checked out` for a checkout nobody can find. Never touches a
+ * mount that is standing: dirty work in one is exactly what the rest of the
+ * mirror was kept for.
+ */
+export async function repairMirror(
+  names: LaneNames, opts: { runId: string; slug: string; quarantine?: 'confirmed' },
+): Promise<{
+  ok: boolean; created: string[]; detail?: string;
+  refusal?: 'branch-in-use' | 'worktree-failed' | 'mount-occupied';
+  quarantined?: Quarantined[]; occupied?: ForeignMount[];
+}> {
+  const manifest = await readMirror(names.integration);
+  if (!manifest?.mounts.length) {
+    return { ok: false, created: [], detail: 'the mirror has no manifest to rebuild its mounts from' };
+  }
+  for (const source of new Set(manifest.mounts.map((mount) => mount.source))) {
+    await git(source, ['worktree', 'prune']);
+  }
+  const made = await ensureMirror({
+    names, runId: opts.runId, slug: opts.slug, mounts: manifest.mounts,
+    ...(manifest.detached ? { detach: true } : {}),
+    ...(opts.quarantine ? { quarantine: opts.quarantine } : {}),
+  });
+  return {
+    ok: made.ok, created: made.created,
+    ...(made.detail ? { detail: made.detail } : {}),
+    ...(made.refusal ? { refusal: made.refusal } : {}),
+    ...(made.quarantined.length ? { quarantined: made.quarantined } : {}),
+    ...(made.occupied?.length ? { occupied: made.occupied } : {}),
+  };
+}
+
 export function mirrorManifestPath(integration: string): string {
   return join(dirname(integration), MIRROR_MANIFEST);
+}
+
+/**
+ * Where a run's quarantined mount content goes: `<run>/stale-mounts/`, BESIDE
+ * the mirror like its manifest (control-tower phase 90, #139). Inside the run's
+ * own directory so a person finds it next to the tree it came out of, and never
+ * inside `integration/`, which the next rebuild owns.
+ */
+export const STALE_MOUNTS_DIR = 'stale-mounts';
+
+export function staleMountsDir(integration: string): string {
+  return join(dirname(integration), STALE_MOUNTS_DIR);
 }
 
 /** The manifest for `integration`, when there is one this code once wrote. */
@@ -2697,9 +3219,16 @@ export async function reattachMirror(integration: string, runBranch: string): Pr
     if (await isDirty(dir)) {
       return { ok: false, moved, detail: `${rel}: the mount holds uncommitted work` };
     }
+    // A branch mount whose run branch is GONE was settled before a final
+    // phase's §Verification (`settleIdleMirrorBranches`, control-tower phase
+    // 62): it was detached at the very commit its branch named, so re-creating
+    // the branch where the mount stands puts back exactly what was there — a
+    // squash-merged branch's own commits included (phase 89).
     const args = manifest.detached
       ? ['switch', '--detach', 'HEAD']
-      : ['switch', runBranch];
+      : await refExists(dir, `refs/heads/${runBranch}`)
+        ? ['switch', runBranch]
+        : ['switch', '-c', runBranch];
     const out = await git(dir, args);
     if (!out.ok) {
       return { ok: false, moved, detail: `${rel}: ${firstLine(out.stderr) || 'git switch failed'}` };
@@ -2707,6 +3236,201 @@ export async function reattachMirror(integration: string, runBranch: string): Pr
     moved.push(rel);
   }
   return { ok: true, moved };
+}
+
+/**
+ * How a settled branch was shown to hold nothing its trunk lacks — one per
+ * settled mount, so a deleted branch can always be named and re-created.
+ */
+export type MergedProof = {
+  /** Root-relative mount; `''` is the root. */
+  mount: string;
+  /**
+   * `ancestry` — the tip is reachable from the trunk, 0 commits ahead (the one
+   * proof phase 62 knew). `content` — merging the branch into the trunk would
+   * change nothing: every change in it is already there, under commits that
+   * are not the branch's own (a squash merge, a rebase, a cherry-pick).
+   */
+  by: 'ancestry' | 'content';
+  /** Where it is held: the trunk (`main`), or only its remote copy (`origin/main`). */
+  into: string;
+  /** The commit the branch named when it was proved — where the mount stands, and what it is re-created at. */
+  tip: string;
+};
+
+/** What settling a mirror's idle branches did, per mount. */
+export type IdleSettle = {
+  /** Root-relative mounts now detached, whose `pe/<slug>` was deleted. */
+  settled: string[];
+  /** Mounts that qualified by their branch and were left standing, with why. */
+  kept: { mount: string; reason: string }[];
+  /** Why each settled branch could go, in `settled` order. */
+  proofs: MergedProof[];
+};
+
+/**
+ * Does the trunk already HOLD every change `tip` makes (control-tower phase 89,
+ * #47)? The settle's whole safety argument, asked of the trunk by name.
+ *
+ * Two proofs, cheapest first. Ancestry — `rev-list --count <trunk>..<tip>` is
+ * 0 — is the fast-forward and the true merge. Content — `merge-tree
+ * --write-tree <trunk> <tip>` merges cleanly AND writes the trunk's own tree —
+ * is every other way a change reaches a trunk: a SQUASH-merged pull request's
+ * commits are on no trunk by identity, so `for-each-ref --merged` never lists
+ * one, yet merging it back changes not one path. A trunk that has moved on
+ * since still merges back to itself; one that REVERTED a change, or a branch
+ * with one more commit, does not. A merge that would conflict is never read as
+ * merged: the rule may keep a branch it could have taken, never the reverse.
+ * `merge-tree` writes loose objects only and moves nothing (see its entry at
+ * the top of this file).
+ *
+ * Asked of the local trunk, then of `origin/<trunk>`: a pull request merges on
+ * the remote, and the local trunk learns of it only on a pull — which is also
+ * the ref the fleet's own hygiene judges a branch against.
+ */
+async function heldByTrunk(
+  repo: string, tip: string, trunk: string,
+): Promise<Pick<MergedProof, 'by' | 'into'> | null> {
+  const trunks = [{ ref: `refs/heads/${trunk}`, into: trunk }];
+  if (await refExists(repo, `refs/remotes/origin/${trunk}`)) {
+    trunks.push({ ref: `refs/remotes/origin/${trunk}`, into: `origin/${trunk}` });
+  }
+  for (const { ref, into } of trunks) {
+    const ahead = await git(repo, ['rev-list', '--count', `${ref}..${tip}`]);
+    if (ahead.ok && ahead.stdout.trim() === '0') return { by: 'ancestry', into };
+  }
+  for (const { ref, into } of trunks) {
+    const [merged, own] = await Promise.all([
+      git(repo, ['merge-tree', '--write-tree', ref, tip]),
+      git(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{tree}`]),
+    ]);
+    const tree = merged.ok ? (merged.stdout.split('\n')[0] ?? '').trim() : '';
+    if (tree && own.ok && tree === own.stdout.trim()) return { by: 'content', into };
+  }
+  return null;
+}
+
+/**
+ * Delete the run's own branch from every mount where it holds NOTHING the
+ * trunk lacks — before a final phase's §Verification (control-tower phase 62,
+ * #47; the root and squash merges since phase 89).
+ *
+ * The mirror mints `pe/<slug>` in every repository it mounts, and in most of
+ * them no phase ever commits: the branch sits 0 commits ahead of the trunk,
+ * checked out by the mirror, where nothing but the console could delete it. A
+ * ship phase whose §Verification judged the checkout's hygiene could therefore
+ * never pass while its own run was live — every one of those branches reads as
+ * "fully merged; delete it". So the final phase's verification is handed a
+ * checkout where they are gone: each such mount is DETACHED at the commit it
+ * stands on (a clean tree, so not one file changes) and its branch deleted.
+ *
+ * 🔴 A branch is a candidate only when its trunk already holds every change in
+ * it (`heldByTrunk`): reachable from the trunk, or merging into it without
+ * changing a path, which is how a squash-merged pull request is seen at all.
+ * Anything else — one change the trunk lacks, a merge that would conflict — is
+ * this run's work and never a candidate. A mount holding uncommitted work is
+ * kept. The ROOT mount is settled like the others since phase 89: phase 62
+ * skipped it because landings commit there, and a root carrying a landing the
+ * trunk lacks is refused by that same rule — while a MERGED root branch was the
+ * one run-owned ref nobody could clear, because the run's own integration
+ * worktree held it. Detaching the root moves no nested mount: a switch to the
+ * commit it already stands on touches no gitlink.
+ *
+ * The delete is always `-d` — never `-D`, which `never-push.test.ts` keeps out
+ * of the server — asked where git's own check can mean something. A branch the
+ * LOCAL trunk reaches is deleted in the SOURCE repository, whose HEAD makes
+ * `-d` a second opinion: if the two ever disagree, git wins, the mount is
+ * switched back, and the branch stays. A branch proved by content, or held only
+ * by `origin/<trunk>`, is one git's source-side check can never agree to (a
+ * squash's commits are reachable from no trunk), so it is asked from the MOUNT,
+ * detached at the proved tip: there `-d` deletes only a branch that still names
+ * that commit — one that moved after the proof is refused and kept — and the
+ * mount's own HEAD keeps the commit reachable for as long as the mirror stands.
+ *
+ * Undone by `restoreSettledMirror` before any session is spawned into the
+ * mirror again, and by `reattachMirror`'s re-mint on the next drive.
+ */
+export async function settleIdleMirrorBranches(integration: string, runBranch: string): Promise<IdleSettle> {
+  const settled: string[] = [];
+  const kept: IdleSettle['kept'] = [];
+  const proofs: MergedProof[] = [];
+  const manifest = await readMirror(integration);
+  // A detached mirror owns no branch anywhere, so there is nothing to settle.
+  if (!manifest || manifest.detached) return { settled, kept, proofs };
+  for (const mount of manifest.mounts) {
+    const dir = join(integration, mount.rel);
+    if ((await branchAt(mount.source, dir)) !== runBranch) continue;
+    const trunk = await defaultBranchOf(mount.source);
+    if (!trunk) {
+      kept.push({ mount: mount.rel, reason: 'the repository names no trunk to be merged into' });
+      continue;
+    }
+    // Held by the trunk, by ancestry or by content. Anything else is work.
+    const tip = await commitOf(mount.source, `refs/heads/${runBranch}`);
+    const proof = tip ? await heldByTrunk(mount.source, tip, trunk) : null;
+    if (!proof) continue;
+    if (await isDirty(dir)) {
+      kept.push({ mount: mount.rel, reason: 'the mount holds uncommitted work' });
+      continue;
+    }
+    const detach = await git(dir, ['switch', '--detach']);
+    if (!detach.ok) {
+      kept.push({ mount: mount.rel, reason: firstLine(detach.stderr) || 'git switch --detach failed' });
+      continue;
+    }
+    const askedIn = proof.by === 'ancestry' && proof.into === trunk ? mount.source : dir;
+    const deleted = await git(askedIn, ['branch', '-d', runBranch]);
+    if (!deleted.ok) {
+      await git(dir, ['switch', runBranch]);
+      kept.push({ mount: mount.rel, reason: firstLine(deleted.stderr) || 'git declined the delete' });
+      continue;
+    }
+    settled.push(mount.rel);
+    proofs.push({ mount: mount.rel, ...proof, tip });
+  }
+  return { settled, kept, proofs };
+}
+
+/**
+ * Put back what `settleIdleMirrorBranches` settled: in each named mount,
+ * `pe/<slug>` re-created at the commit the mount stands on, and the mount on
+ * it. A settled mount was detached at the very commit its branch named — the
+ * root's too, and a squash-merged branch's own tip (phase 89) — so that IS the
+ * state before the settle. A mount already back on the branch counts as
+ * restored; one on ANOTHER branch, or whose re-created branch points
+ * elsewhere, is reported and left alone — a switch that moves a tree is a
+ * change to somebody's work.
+ */
+export async function restoreSettledMirror(
+  integration: string, runBranch: string, mounts: readonly string[],
+): Promise<{ restored: string[]; failed: { mount: string; reason: string }[] }> {
+  const restored: string[] = [];
+  const failed: { mount: string; reason: string }[] = [];
+  const manifest = await readMirror(integration);
+  for (const rel of mounts) {
+    const mount = manifest?.mounts.find((m) => m.rel === rel);
+    const dir = join(integration, rel);
+    if (!mount || !existsSync(dir)) {
+      failed.push({ mount: rel, reason: 'the mount is no longer in the mirror' });
+      continue;
+    }
+    const on = await branchAt(mount.source, dir);
+    if (on === runBranch) { restored.push(rel); continue; }
+    if (on !== undefined) { failed.push({ mount: rel, reason: `the mount stands on ${on}` }); continue; }
+    let args = ['switch', '-c', runBranch];
+    if (await refExists(dir, `refs/heads/${runBranch}`)) {
+      const [tip, head] = await Promise.all([commitOf(dir, `refs/heads/${runBranch}`), commitOf(dir, 'HEAD')]);
+      if (!tip || tip !== head) {
+        failed.push({ mount: rel, reason: `${runBranch} was re-created at another commit` });
+        continue;
+      }
+      args = ['switch', runBranch];
+    }
+    const out = await git(dir, args);
+    if (out.ok) restored.push(rel);
+    else failed.push({ mount: rel, reason: firstLine(out.stderr) || 'git switch failed' });
+  }
+  return { restored, failed };
 }
 
 /**
@@ -2754,6 +3478,59 @@ async function mirrorShape(root: string, integration: string): Promise<MirrorMou
   return detected.length ? detected : null;
 }
 
+/** Every working tree these repositories have registered, as physical paths. */
+async function registeredTrees(sources: readonly string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const source of new Set(sources)) {
+    const list = await git(source, ['worktree', 'list', '--porcelain']);
+    if (!list.ok) continue;
+    for (const line of list.stdout.split('\n')) {
+      if (line.startsWith('worktree ')) out.add(realish(line.slice('worktree '.length).trim()));
+    }
+  }
+  return out;
+}
+
+/**
+ * The repositories under `dir` that are NOT one of `ours` — a bounded walk for
+ * a `.git` entry (a directory: a clone; a file: somebody else's checkout).
+ * `node_modules` and dot-directories are not descended into; the depth is the
+ * mirror's own nesting cap plus the mount itself.
+ */
+async function foreignReposUnder(dir: string, ours: ReadonlySet<string>): Promise<string[]> {
+  const found: string[] = [];
+  const walk = async (at: string, depth: number): Promise<void> => {
+    if (depth > MOUNT_DEPTH_CAP + 1) return;
+    let entries;
+    try {
+      entries = await readdir(at, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (entries.some((entry) => entry.name === '.git') && !ours.has(realish(at))) found.push(at);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      await walk(join(at, entry.name), depth + 1);
+    }
+  };
+  await walk(dir, 0);
+  return found;
+}
+
+/**
+ * Does a run's directory hold quarantined content? Then no prune or sweep may
+ * remove it wholesale: `stale-mounts/` is what the console moved aside INSTEAD
+ * of deleting (control-tower phase 90), and it outlives the run it came from
+ * until a person clears it.
+ */
+export function holdsQuarantine(runDir: string): boolean {
+  try {
+    return readdirSync(join(runDir, STALE_MOUNTS_DIR)).length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Remove a mirror's mounts, deepest first, under the one rule every prune
  * here obeys: a tree holding work is KEPT and named. A superproject mount
@@ -2766,9 +3543,20 @@ export async function pruneMirror(opts: {
 }): Promise<{ removed: string[]; kept: string[] }> {
   const removed: string[] = [];
   const kept: string[] = [];
+  // 🔴 Every worktree the mounts' repositories own, read once: the question
+  // below is "is anything in here a repository the console did NOT make" — a
+  // session's clone in a mount path, or in the empty directory of a submodule
+  // the mirror never mounted (#139) — and both `rm -rf`s in this function
+  // would otherwise take it. A tree holding such content is KEPT and named,
+  // the rule every prune here already keeps for a dirty tree.
+  const ours = await registeredTrees(opts.mounts.map((mount) => mount.source));
+  const foreignIn = (dir: string): Promise<string[]> => foreignReposUnder(dir, ours);
   for (const mount of [...opts.mounts].sort(byMountDepth).reverse()) {
     const dir = join(opts.integration, mount.rel);
-    if (!(await isRegistered(mount.source, dir))) continue;
+    if (!(await isRegistered(mount.source, dir))) {
+      if ((await foreignIn(dir)).length) kept.push(dir);
+      continue;
+    }
     // 🔴 BEFORE any removal attempt: `worktree remove --force` deletes a tree
     // that contains submodules, so removing a superproject mount while a kept
     // child still lives inside it would delete the exact work the child was
@@ -2789,11 +3577,17 @@ export async function pruneMirror(opts: {
     }
     // A clean, child-free tree git still refuses (an older git refuses any
     // submodule-containing worktree outright) gets the operator-deleted-tree
-    // treatment: delete the directory, then prune the stale registration.
+    // treatment: delete the directory, then prune the stale registration —
+    // unless it holds a repository the console did not make (#139).
+    if ((await foreignIn(dir)).length) {
+      kept.push(dir);
+      continue;
+    }
     await rm(dir, { recursive: true, force: true });
     await git(mount.source, ['worktree', 'prune']);
     removed.push(dir);
   }
+  if (!kept.length && (await foreignIn(opts.integration)).length) kept.push(opts.integration);
   if (!kept.length) {
     await rm(opts.integration, { recursive: true, force: true });
     // The manifest sits BESIDE the mirror (`mirrorManifestPath`), so removing
@@ -2939,8 +3733,13 @@ export async function pruneRun(
     // caller's: `kept` names only trees this call LOOKED at, and a lane the
     // caller never named (WT-1's empty list, a lane from an earlier attempt)
     // would be deleted wholesale by a recursive remove of the run directory.
-    if (!kept.length && !(await registeredLanes(root, opts)).length) {
-      await rm(join(laneHome(opts), opts.runId), { recursive: true, force: true });
+    // …and never over a quarantine: `stale-mounts/` is content the console
+    // moved aside instead of deleting (control-tower phase 90), so it is kept
+    // and named like any tree that holds work.
+    const runHome = join(laneHome(opts), opts.runId);
+    if (holdsQuarantine(runHome)) kept.push(join(runHome, STALE_MOUNTS_DIR));
+    else if (!kept.length && !(await registeredLanes(root, opts)).length) {
+      await rm(runHome, { recursive: true, force: true });
     }
   }
 
@@ -3091,6 +3890,12 @@ export type SweepResult = {
   runs: string[];
   /** Trees a person (or another tool) locked. Reported once each, never taken. */
   lockedForeign: ForeignLock[];
+  /**
+   * Run ids passed over because the run is RESUMABLE — paused, halted, waiting,
+   * interrupted with `resumeOnRestart` (`runResumable`, control-tower phase 82,
+   * #94). Every tree of theirs is left standing, clean mounts included.
+   */
+  spared: string[];
 };
 
 /**
@@ -3142,6 +3947,15 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   retention?: string | ((runId: string) => string | undefined);
   /** Did this run end badly? `keep-on-failure`'s one question, per run. */
   failed?: (runId: string) => boolean;
+  /**
+   * Will anything drive this run again? `runResumable(loadRun(...))`, injected.
+   * 🔴 "Not live" is not "over" (#94): the boot sweep runs before any runner
+   * re-registers, so `liveRunIds` is empty there by construction, and a paused
+   * run's clean mirror mounts were taken on every console restart. A resumable
+   * run is passed over whole, like a live one. Absent — a caller with no run
+   * records to offer — answers no, as before.
+   */
+  resumable?: (runId: string) => boolean;
   /** Injected clock, for `ttl:<h>`. */
   now?: number;
 }): Promise<SweepResult> {
@@ -3155,6 +3969,8 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   const kept: string[] = [];
   const runs: string[] = [];
   const lockedForeign: ForeignLock[] = [];
+  const spared: string[] = [];
+  const resumable = opts.resumable ?? (() => false);
   const locks = await lockIndex(root);
   const policyFor = (runId: string): string =>
     (typeof opts.retention === 'function' ? opts.retention(runId) : opts.retention) ?? DEFAULT_RETENTION;
@@ -3183,6 +3999,7 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
 
     for (const runId of entries) {
       if (live.has(runId)) continue;
+      if (resumable(runId)) { spared.push(runId); continue; }
       const pids = childrenOfRun(runId).filter((pid): pid is number => typeof pid === 'number' && pid > 0);
       if (pids.some((pid) => probe(pid))) continue;
 
@@ -3231,6 +4048,8 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
         }
       }
 
+      // A quarantine outlives its run (control-tower phase 90): kept and named.
+      if (holdsQuarantine(dir)) keptHere.push(join(dir, STALE_MOUNTS_DIR));
       kept.push(...keptHere);
       if (!keptHere.length) {
         await rm(dir, { recursive: true, force: true });
@@ -3242,7 +4061,7 @@ export async function sweepStale(root: string, opts: ({ homes: readonly string[]
   // Once, at the end: registrations whose directories are gone — the ones this
   // sweep just removed by hand, and any an operator deleted themselves.
   if (removed.length || runs.length) await git(root, ['worktree', 'prune']);
-  return { removed, kept, runs, lockedForeign };
+  return { removed, kept, runs, lockedForeign, spared };
 }
 
 /** What a registration sweep found: what it dropped, and what it will not touch. */
@@ -3600,6 +4419,31 @@ export async function baseBranch(root: string): Promise<string | undefined> {
 }
 
 /**
+ * Return a SHARED repository a settled run held to the branch it was found on
+ * (control-tower phase 40, #41) — this module's, because it is the only one
+ * allowed to move a checkout (`never-push.test.ts`).
+ *
+ * Moves nothing unless all of it holds: the tree still stands on `from` (the
+ * run's branch — anyone who moved it since owns that decision), it carries no
+ * uncommitted change to a tracked file (a switch must never carry somebody's
+ * edits onto another branch, nor refuse halfway), and `to` still exists. The
+ * refusal says which, in words the journal line carries as `kept`.
+ */
+export async function returnTree(
+  dir: string, from: string, to: string,
+): Promise<{ kind: 'returned' } | { kind: 'kept'; reason: string }> {
+  const on = await baseBranch(dir);
+  if (on !== from) return { kind: 'kept', reason: on ? `it stands on ${on} now` : 'its HEAD is detached now' };
+  const status = await git(dir, ['status', '--porcelain', '--untracked-files=no']);
+  if (!status.ok) return { kind: 'kept', reason: 'its status could not be read' };
+  if (status.stdout.trim()) return { kind: 'kept', reason: 'it has uncommitted changes' };
+  if (!await commitOf(dir, `refs/heads/${to}`)) return { kind: 'kept', reason: `${to} no longer exists` };
+  const moved = await git(dir, ['switch', '--quiet', to]);
+  if (moved.ok) return { kind: 'returned' };
+  return { kind: 'kept', reason: moved.stderr.trim().split('\n')[0] || 'git switch refused' };
+}
+
+/**
  * How far `branch` has moved from `base`, both ways, in one process.
  *
  * `rev-list --count --left-right base...branch` answers both halves at
@@ -3677,6 +4521,36 @@ export async function commitsSince(
       return { sha: sha ?? '', subject: rest.join('\0') };
     })
     .filter((row) => row.sha);
+}
+
+/**
+ * `commitsSince`, with the paths each commit touched — what the scope-drift
+ * credit (control-tower phase 63, #88) needs to tell a phase's own declared
+ * write (`docs/handoffs/<slug>/…`) and another plan's from a commit that left
+ * the scope. ONE `log` for all of them rather than one call per commit, and
+ * still the same verb, so `never-push.test.ts` has nothing new to reason
+ * about. A merge lists no paths (`log` diffs a merge against nothing without
+ * `-m`), which the credit reads as "paths unknown", never as "touched nothing".
+ */
+export async function commitsWithPaths(
+  repo: string, base: string, cap = 20,
+): Promise<{ sha: string; subject: string; paths: string[] }[]> {
+  const out = await git(repo, [
+    'log', `--max-count=${cap}`, '--name-only', '--format=%x01%h%x00%s', `${base}..HEAD`,
+  ]);
+  if (!out.ok) return [];
+  const rows: { sha: string; subject: string; paths: string[] }[] = [];
+  for (const chunk of out.stdout.split('\x01')) {
+    const [head = '', ...rest] = chunk.split('\n');
+    const [sha = '', ...subject] = head.split('\0');
+    if (!sha.trim()) continue;
+    rows.push({
+      sha: sha.trim(),
+      subject: subject.join('\0'),
+      paths: rest.map((line) => line.trim()).filter(Boolean),
+    });
+  }
+  return rows;
 }
 
 /** The same, plus whether the cap swallowed anything. */
@@ -4238,3 +5112,146 @@ export async function pushRef(
   }
   return { ok: true, flag: status.flag, sha: local, ref, remote, summary: status.summary };
 }
+
+/* ------------------------------------------------------------------ *
+ * A clean checkout for a verification (control-tower phase 89)
+ * ------------------------------------------------------------------ */
+
+/** The dependency directories a clean checkout borrows from the working tree, by name. */
+const BORROWED_DEPS = new Set(['node_modules', '.venv', 'venv']);
+/** How deep, and how many directories, the search for them may go. */
+const BORROW_DEPTH = 3;
+const BORROW_DIRS = 2_000;
+
+/** A clean checkout — see `exportCheckout`. */
+export type ExportCheckout = {
+  /** The checkout's root: the repository's files at `head`, nothing else. */
+  dir: string;
+  head: string;
+  /** The dependency directories borrowed from the working tree, repository-relative. */
+  borrowed: string[];
+  /** Take it away again — the linked worktree's registration and the directory. */
+  remove: () => Promise<void>;
+};
+
+/**
+ * A clean checkout of the repository holding `repo`, at `head`, in a temporary
+ * directory — what a §Verification runs on when the working tree carries
+ * changes that are not the phase's own (control-tower phase 89, #103's
+ * 2026-09-25 comments, #41's). P61's verdict went red on P62's 17 uncommitted
+ * files, and was 132/132 on a `git archive` of P61's own commit.
+ *
+ * A DETACHED linked worktree rather than an archive: its files are exactly
+ * the archive's — the commit's tree, nothing untracked, nothing another
+ * session left — and it is still a git checkout, so a line that asks git (a
+ * scrub over `git ls-files`, a hygiene check) answers about the commit instead
+ * of refusing to run in a directory that is not a repository. Hooks are off
+ * for the checkout.
+ *
+ * Dependencies are installed, never committed, so the working tree's are
+ * BORROWED: a `node_modules` becomes a directory holding one link per entry of
+ * the working tree's — never a link to the directory itself, because `npm ci`
+ * empties the directory it is handed, and through a link that would be the
+ * working tree's — and a virtualenv is linked whole. The phase's own
+ * `- **Setup:**` still runs in the checkout.
+ *
+ * Refused, with the reason, for a superproject (`.gitmodules`: a linked
+ * worktree of one has EMPTY submodule directories, so a verification there
+ * would read less than the commit) and when git cannot make one.
+ */
+export async function exportCheckout(repo: string, head: string): Promise<ExportCheckout | { refused: string }> {
+  const top = await git(repo, ['rev-parse', '--show-toplevel']);
+  const root = top.ok ? top.stdout.trim() : '';
+  if (!root) return { refused: 'not a git repository' };
+  if (existsSync(join(root, '.gitmodules'))) {
+    return { refused: 'the repository has submodules, and a clean checkout of it would hold none of their files' };
+  }
+  const base = await mkdtempAsync(join(tmpdir(), 'pc-verify-export-'));
+  const dir = join(base, 'tree');
+  const env = {
+    ...process.env, LC_ALL: 'C', NO_COLOR: '1', TERM: 'dumb', GIT_TERMINAL_PROMPT: '0',
+    // No hook of the repository's runs for a checkout the console makes to read.
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+  };
+  const made = await git(root, ['worktree', 'add', '--detach', dir, head], env);
+  const remove = async (): Promise<void> => {
+    const gone = await git(root, ['worktree', 'remove', '--force', dir]);
+    await rm(base, { recursive: true, force: true });
+    if (!gone.ok) await git(root, ['worktree', 'prune']);
+  };
+  if (!made.ok) {
+    await remove();
+    return { refused: firstLine(made.stderr) || `git could not check out ${head.slice(0, 12)}` };
+  }
+  const borrowed: string[] = [];
+  try {
+    for (const rel of await dependencyDirs(root)) {
+      const from = join(root, rel);
+      const to = join(dir, rel);
+      if (existsSync(to)) continue;
+      await mkdir(dirname(to), { recursive: true });
+      if (basename(rel) === 'node_modules') {
+        await mkdir(to);
+        for (const entry of await readdir(from)) await symlink(join(from, entry), join(to, entry));
+      } else {
+        await symlink(from, to);
+      }
+      borrowed.push(rel);
+    }
+  } catch {
+    // A dependency that could not be borrowed is installed by the phase's
+    // Setup, or its line says what it lacked; the checkout still stands.
+  }
+  return { dir, head, borrowed, remove };
+}
+
+/** The working tree's dependency directories, repository-relative — never one inside another. */
+async function dependencyDirs(root: string): Promise<string[]> {
+  const out: string[] = [];
+  let seen = 0;
+  const walk = async (rel: string, depth: number): Promise<void> => {
+    if (depth > BORROW_DEPTH || seen >= BORROW_DIRS) return;
+    let entries: import('node:fs').Dirent[];
+    try { entries = await readdir(join(root, rel), { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === '.git') continue;
+      seen += 1;
+      const path = rel ? join(rel, entry.name) : entry.name;
+      if (BORROWED_DEPS.has(entry.name)) { out.push(path); continue; }
+      if (entry.name.startsWith('.')) continue;
+      await walk(path, depth + 1);
+    }
+  };
+  await walk('', 1);
+  return out;
+}
+
+/**
+ * The paths the commits reachable from `head` and made since `since` touched —
+ * what a phase's work-in-progress changed while it was on the board
+ * (control-tower phase 89, `WipRed.files`). Bounded; null when git cannot say.
+ */
+export async function filesCommittedSince(repo: string, since: string, head: string, limit = 50): Promise<string[] | null> {
+  const out = await git(repo, ['log', `--since=${since}`, '--name-only', '--format=', head]);
+  if (!out.ok) return null;
+  return [...new Set(out.stdout.split('\n').map((line) => line.trim()).filter(Boolean))].sort().slice(0, limit);
+}
+
+/**
+ * The files the commits after `base` up to `head` changed, sorted and bounded —
+ * null when git cannot say (a `base` this repository does not have). Exact where
+ * `filesCommittedSince` is a clock: git dates are whole seconds, so a commit made
+ * in the second a window opened reads as inside it (control-tower phase 89).
+ */
+export async function filesCommittedBetween(repo: string, base: string, head: string, limit = 50): Promise<string[] | null> {
+  const out = await git(repo, ['log', '--name-only', '--format=', `${base}..${head}`]);
+  if (!out.ok) return null;
+  return [...new Set(out.stdout.split('\n').map((line) => line.trim()).filter(Boolean))].sort().slice(0, limit);
+}
+
+/** Is `sha` in `head`'s history (or `head` itself)? False when git cannot say. */
+export async function inHistory(repo: string, sha: string, head: string): Promise<boolean> {
+  const out = await git(repo, ['rev-list', '--count', `${head}..${sha}`]);
+  return out.ok && out.stdout.trim() === '0';
+}
+

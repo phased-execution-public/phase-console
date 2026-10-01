@@ -29,7 +29,7 @@
 
 import type { ReactNode } from 'react';
 import { Search, SlidersHorizontal, X } from 'lucide-react';
-import { Button, ButtonGroup, Chip, Sheet, SheetContent, SheetTrigger, fieldSurface } from '@/components/ui';
+import { Button, ButtonGroup, Badge, Sheet, SheetContent, SheetTrigger, fieldSurface } from '@/components/ui';
 import { usePhone } from '@/lib/media';
 import { cn } from '@/lib/cn';
 
@@ -191,7 +191,7 @@ export function Toolbar({
               <Button size="sm" className="shrink-0">
                 <SlidersHorizontal size={14} aria-hidden />
                 Sort
-                {activeCount > 0 && <Chip tone="warn">{activeCount}</Chip>}
+                {activeCount > 0 && <Badge tone="accent">{activeCount}</Badge>}
               </Button>
             </SheetTrigger>
             <SheetContent title={sheetTitle}>

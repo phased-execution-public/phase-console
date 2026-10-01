@@ -94,6 +94,18 @@ function pair(token: string): { paper: Oklch; night: Oklch } | null {
   return { paper: colours[0], night: colours[1] };
 }
 
+/**
+ * A token's colour pair, following `var(--x)` aliases to the declaration that
+ * holds one — `--action: var(--ink)` measures as `--ink`.
+ */
+function resolvedPair(token: string, depth = 0): { paper: Oklch; night: Oklch } | null {
+  const direct = pair(token);
+  if (direct || depth > 8) return direct;
+  const line = THEME.split('\n').find((l) => l.trim().startsWith(`${token}:`));
+  const alias = line && /:\s*var\((--[\w-]+)\)\s*;/.exec(line)?.[1];
+  return alias ? resolvedPair(alias, depth + 1) : null;
+}
+
 const STATES = ['done', 'running', 'verifying', 'queued', 'waiting', 'needs-you', 'failed', 'skipped'];
 /** Every surface a status may be painted ON as text. */
 const TEXT_SURFACES = ['--ground', '--ground-deep', '--surface', '--surface-raised'];
@@ -169,9 +181,10 @@ describe('the status palette clears AA in both themes', () => {
   }
 
   it('keeps the ink readable on every surface, both themes', () => {
-    // Not a status, but the same promise: the body text and the muted text
-    // must clear AA wherever they land. Faint ink is metadata and is held to
-    // the large-text floor.
+    // Not a status, but the same promise: every ink is TEXT and clears AA
+    // wherever it lands. Faint ink is metadata, and metadata is set at 12px —
+    // 6.0 holds it to 4.5:1 (it was the large-text 3:1, and the tour's axe
+    // counted 768 places a person read it small).
     const ink = pair('--ink')!;
     const muted = pair('--ink-muted')!;
     const faint = pair('--ink-faint')!;
@@ -188,8 +201,42 @@ describe('the status palette clears AA in both themes', () => {
         expect(
           contrast(faint[theme], surfaces[surface][theme]),
           `ink-faint on ${surface} ${theme}`,
-        ).toBeGreaterThanOrEqual(3);
+        ).toBeGreaterThanOrEqual(4.5);
       }
+    }
+  });
+});
+
+describe('tokens 6.0: the focus ring and the primary button are ink, and read', () => {
+  const surfaces = Object.fromEntries(TEXT_SURFACES.map((token) => [token, pair(token)!])) as Record<
+    string,
+    { paper: Oklch; night: Oklch }
+  >;
+
+  it('the focus ring is at least 3:1 against every surface it can land on, both themes', () => {
+    // WCAG 2.2 SC 1.4.11: a focus indicator is a non-text control state and
+    // needs 3:1 against what it sits on. The ring moved from amber to ink in
+    // 6.0 because a focused control is not a person being summoned; this holds
+    // the new colour to the same floor the old one met.
+    const focus = resolvedPair('--focus');
+    expect(focus, '--focus resolves to a light-dark pair').toBeTruthy();
+    for (const theme of THEMES) {
+      for (const surface of TEXT_SURFACES) {
+        const ratio = contrast(focus![theme], surfaces[surface][theme]);
+        expect(ratio, `focus ring on ${surface} (${theme}): ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(3);
+      }
+    }
+  });
+
+  it('primary-button text is at least 4.5:1 on the action fill, both themes', () => {
+    // `Button variant="action"` is ink-solid: `bg-action text-ground`. The fill
+    // and the label are measured, not assumed.
+    const fill = resolvedPair('--action');
+    const label = pair('--ground');
+    expect(fill, '--action resolves to a light-dark pair').toBeTruthy();
+    for (const theme of THEMES) {
+      const ratio = contrast(label![theme], fill![theme]);
+      expect(ratio, `ground on action (${theme}): ${ratio.toFixed(2)}:1`).toBeGreaterThanOrEqual(4.5);
     }
   });
 });

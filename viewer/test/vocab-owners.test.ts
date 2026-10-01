@@ -35,6 +35,9 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
 import { BOARD_BUCKETS, BOARD_OVERLAY_STATES, BOARD_STATE_UI, PHASE_ACTORS, PHASE_ACTOR_LABELS } from '../shared/status-vocab.js';
+import { BAYS, FACT_KINDS, OUTCOMES, TENSES } from '../shared/status-model.js';
+import { BUDGET_KINDS } from '../shared/budget-model.js';
+import { NOTE_SEVERITIES } from '../shared/status-notes.js';
 import { BOARD_ORDER } from '../shared/phase-model.js';
 import {
   BOARD_WORDS,
@@ -43,7 +46,10 @@ import {
   RULING_KINDS,
   VERIFICATION_WORDS,
 } from '../shared/evidence-model.js';
-import { PERMISSION_MODES, PERMISSION_PROFILES, PROFILE_LABELS } from '../shared/run-settings.js';
+import {
+  AGENT_INTENTS, PERMISSION_MODES, PERMISSION_PROFILES, PROFILE_LABELS, SETTING_EFFECT_WORDS,
+} from '../shared/run-settings.js';
+import { AGENT_INTENTS as SERVER_AGENT_INTENTS } from '../server/agent.ts';
 import {
   BLOCKED_ON,
   CLOSED_PLAN_STATUSES,
@@ -68,6 +74,7 @@ import {
   LEAVE_KINDS,
   MCP_STATUSES,
   MCP_TRANSPORTS,
+  METER_STATES,
 } from '../shared/ops-vocab.js';
 import {
   CENSUS_DISCREPANCIES,
@@ -86,6 +93,7 @@ import {
 } from '../shared/orchestration-model.js';
 import {
   ACTOR_FIELDS,
+  RUN_PROGRESS_FIELDS,
   ACTOR_VIAS,
   CLASSIFIED_BY,
   OPERATOR_DOOR,
@@ -97,7 +105,9 @@ import {
   DISPOSITION_KINDS,
   ENDED_BY,
   GIT_MODES,
+  HOLDER_CLASSES,
   HOLDER_KINDS,
+  FENCE_LIFT_REASONS,
   MCP_POLICIES,
   ON_LIMIT_POLICIES,
   OUTCOME_STATUSES,
@@ -107,6 +117,7 @@ import {
   PRESENCE,
   PRESENCE_END_SOURCES,
   QUEUE_KINDS,
+  QUEUE_OUTCOMES,
   REVIEWER_POLICIES,
   ULTRA_REVIEW_MODES,
   RUNG_OUTCOMES,
@@ -118,10 +129,21 @@ import {
   USAGE_DECISION_ACTIONS,
   WATCH_STATES,
 } from '../shared/run-lifecycle.js';
+import { TRIGGER_EVENTS, TRIGGER_MODES, TRIGGER_STATES, VERB_ACTOR_CLASSES, VERB_NAMES } from '../shared/verb-model.js';
+import {
+  CHAT_CONFIRM_MODES, CHAT_CONTEXT_KINDS, CHAT_EVENTS, CHAT_STATES,
+  REMEDY_CLASSES, SUPERVISOR_CATEGORIES, SUPERVISOR_EVENTS, SUPERVISOR_OUTCOMES, SUPERVISOR_POLICIES, SUPERVISOR_SITUATIONS,
+} from '../shared/supervisor-model.js';
+import { INTERVAL_REGISTERS } from '../shared/interval-format.js';
+import { PHASE_CLOCK_FIELDS } from '../shared/phase-clocks.js';
+import { SILENCE_KINDS } from '../shared/attention-model.js';
+import { LOCK_EVENT_KINDS, LOCK_FILTERS, LOCK_HOLDER_KINDS } from '../shared/lock-model.js';
 import { RESUME_AT_BOOT_MODES } from '../shared/automation-model.js';
 import { DECISION_KEYS, DECISION_STATES, DECISION_SOURCES, NEED_CLASSES } from '../shared/decisions-model.js';
 import { REFUSAL_CAUSES, SITUATIONS, parseSituationKey } from '../shared/situation-model.js';
-import { RUNG_DRIVERS, RUNG_VEHICLES } from '../shared/ladder-model.js';
+import { RUNG_DRIVERS, RUNG_FAILURE_CAUSES, RUNG_VEHICLES } from '../shared/ladder-model.js';
+import { HALT_HOLDER_KINDS, HALT_HOLDER_VERBS } from '../shared/recovery-model.js';
+import { HALT_CATEGORIES } from '../shared/halt-categories.js';
 import { POLICY_CLASSES, POLICY_SOURCES } from '../shared/policy-model.js';
 import { RELAY_MODES } from '../shared/run-settings.js';
 import {
@@ -137,6 +159,8 @@ import {
   ISOLATION_MODES,
   RADAR_STATES,
   SETTLE_STRATEGIES,
+  SETTLE_KINDS,
+  CHECKOUT_ROLES,
   ISOLATION_RECLAIM,
   isolationMode,
   WORKTREE_ROOTS,
@@ -166,8 +190,13 @@ import {
   ISSUE_STATES,
   ISSUE_FIELDS,
 } from '../shared/issues-model.js';
+import {
+  HUMAN_STEP_KINDS, HUMAN_STEP_STATES, HUMAN_STEP_BULLET_KEYS, SECRET_QUERY_KEYS,
+} from '../shared/human-step-model.js';
 
 import {
+  FAILURE_CAUSES,
+  MERIT_FAILURE_CAUSES,
   PHASE_IN_FLIGHT,
   RUN_IN_FLIGHT,
   RUN_SETTLED,
@@ -198,6 +227,7 @@ const sorted = (xs: readonly string[]) => [...xs].sort();
 test('the server re-exports the OWNER object, not a copy that matches it', () => {
   // `===`, deliberately. A copy passes deepEqual today and drifts tomorrow.
   assert.equal(SERVER_QA_RESULTS, QA_RESULTS, 'qa-session.ts QA_RESULTS');
+  assert.equal(SERVER_AGENT_INTENTS, AGENT_INTENTS, 'agent.ts AGENT_INTENTS (control-tower phase 12)');
   assert.equal(SERVER_MCP_TRANSPORTS, MCP_TRANSPORTS, 'mcp/store.ts MCP_TRANSPORTS');
   assert.equal(CLOSED_STATUSES, CLOSED_PLAN_STATUSES, 'analysis/stats.ts CLOSED_STATUSES');
 });
@@ -428,6 +458,15 @@ test('the lifecycle subsets take their MEMBERS from the full lists, never a seco
     sorted(RUNG_OUTCOMES.filter((o) => o !== 'running' && o !== 'work-in-progress')),
   );
 
+  // The merit causes: every failure cause but the three that say nothing about
+  // the plan — work on disk with the paperwork missing, the weather, and a
+  // declared block a watch will end (someone else's work — control-tower
+  // phase 87, #122).
+  assert.deepEqual(
+    sorted(MERIT_FAILURE_CAUSES),
+    sorted(FAILURE_CAUSES.filter((c) => c !== 'no-handoff-worked' && c !== 'connectivity' && c !== 'declared-wait')),
+  );
+
   // The client's notion of live differs from the server's by exactly `queued`,
   // and that difference is a documented decision rather than a drift.
   assert.deepEqual(
@@ -536,6 +575,17 @@ const VOCABULARIES: {
     ],
   },
   {
+    name: 'agent intents',
+    members: AGENT_INTENTS,
+    owner: 'shared/run-settings.js',
+    allow: [
+      // `RunSetupMode` is a superset that happens to contain the intents' words
+      // — the run-setup dialog's own modes, a different vocabulary; the same
+      // reasoning as the queue-kinds allowance below.
+      'client/src/features/run-setup/modes.ts',
+    ],
+  },
+  {
     name: 'permission modes',
     members: PERMISSION_MODES,
     owner: 'shared/run-settings.js',
@@ -562,6 +612,10 @@ const VOCABULARIES: {
   { name: 'MCP transports', members: MCP_TRANSPORTS, owner: 'shared/ops-vocab.js' },
   { name: 'account kinds', members: ACCOUNT_KINDS, owner: 'shared/ops-vocab.js' },
   { name: 'auth states', members: AUTH_STATES, owner: 'shared/ops-vocab.js' },
+  // An account's meter, whatever its buckets (control-tower phase 13, #33).
+  { name: 'meter states', members: METER_STATES, owner: 'shared/ops-vocab.js' },
+  // When a settings patch takes effect, per field (control-tower phase 13, #31).
+  { name: 'setting effects', members: SETTING_EFFECT_WORDS, owner: 'shared/run-settings.js' },
   { name: 'entitlement states', members: ENTITLEMENT_STATES, owner: 'shared/ops-vocab.js' },
   { name: 'leave kinds', members: LEAVE_KINDS, owner: 'shared/ops-vocab.js' },
   { name: 'credential classes', members: CREDENTIAL_CLASSES, owner: 'shared/ops-vocab.js' },
@@ -577,6 +631,9 @@ const VOCABULARIES: {
   { name: 'settle strategies', members: SETTLE_STRATEGIES, owner: 'shared/worktree-model.js' },
   { name: 'isolation reclaim modes', members: ISOLATION_RECLAIM, owner: 'shared/worktree-model.js' },
   { name: 'worktree roots', members: WORKTREE_ROOTS, owner: 'shared/worktree-model.js' },
+  // The Repo destination's two tables paint these (control-tower phase 26).
+  { name: 'settle kinds', members: SETTLE_KINDS, owner: 'shared/worktree-model.js' },
+  { name: 'checkout roles', members: CHECKOUT_ROLES, owner: 'shared/worktree-model.js' },
   {
     name: 'run priorities',
     members: RUN_PRIORITIES,
@@ -620,6 +677,9 @@ const VOCABULARIES: {
   { name: 'outcome statuses', members: OUTCOME_STATUSES, owner: 'shared/run-lifecycle.js' },
   { name: 'presence', members: PRESENCE, owner: 'shared/run-lifecycle.js' },
   { name: 'holder kinds', members: HOLDER_KINDS, owner: 'shared/run-lifecycle.js' },
+  { name: 'fence lift reasons', members: FENCE_LIFT_REASONS, owner: 'shared/run-lifecycle.js' },
+  { name: 'queue outcomes', members: QUEUE_OUTCOMES, owner: 'shared/run-lifecycle.js' },
+  { name: 'holder classes', members: HOLDER_CLASSES, owner: 'shared/run-lifecycle.js' },
   {
     name: 'queue kinds',
     members: QUEUE_KINDS,
@@ -640,8 +700,35 @@ const VOCABULARIES: {
    * an actor reached the console. Owned before any emitter exists, so the
    * first emitter imports a word rather than inventing one. */
   { name: 'start doors', members: START_DOORS, owner: 'shared/run-lifecycle.js' },
+
+  /* The operator verbs are ONE table (control-tower phase 98, #137 #144): the
+   * routes, the CLI and the stored triggers read it. Its names are derived from
+   * its rows, so they are held here as the list a re-declaration would copy. */
+  { name: 'operator verbs', members: VERB_NAMES, owner: 'shared/verb-model.js' },
+  { name: 'verb actor classes', members: VERB_ACTOR_CLASSES, owner: 'shared/verb-model.js' },
+  { name: 'trigger events', members: TRIGGER_EVENTS, owner: 'shared/verb-model.js' },
+  { name: 'trigger modes', members: TRIGGER_MODES, owner: 'shared/verb-model.js' },
+  { name: 'trigger states', members: TRIGGER_STATES, owner: 'shared/verb-model.js' },
   { name: 'actor vias', members: ACTOR_VIAS, owner: 'shared/run-lifecycle.js' },
   { name: 'classified by', members: CLASSIFIED_BY, owner: 'shared/run-lifecycle.js' },
+
+  /* The supervisor's ONE table (control-tower phase 101, #145): the autonomy
+   * words, a remedy row's class, what became of a detection, the situations it
+   * raises and the journal lines it writes. Phase 27's chat EXTENDS it; the
+   * pass in `server/pro/supervisor/` and the CLI import every word from it. */
+  { name: 'supervisor policies', members: SUPERVISOR_POLICIES, owner: 'shared/supervisor-model.js' },
+  { name: 'supervisor remedy classes', members: REMEDY_CLASSES, owner: 'shared/supervisor-model.js' },
+  { name: 'supervisor outcomes', members: SUPERVISOR_OUTCOMES, owner: 'shared/supervisor-model.js' },
+  { name: 'supervisor situations', members: SUPERVISOR_SITUATIONS, owner: 'shared/supervisor-model.js' },
+  { name: 'supervisor categories', members: SUPERVISOR_CATEGORIES, owner: 'shared/supervisor-model.js' },
+  { name: 'supervisor events', members: SUPERVISOR_EVENTS, owner: 'shared/supervisor-model.js' },
+  /* The chat's words (control-tower phase 27): its states, the confirm modes,
+   * its journal names. `CHAT_TOOL_KINDS` IS `VERB_KINDS` — `supervisor-tools.test.ts` holds the identity. */
+  { name: 'chat states', members: CHAT_STATES, owner: 'shared/supervisor-model.js' },
+  { name: 'chat confirm modes', members: CHAT_CONFIRM_MODES, owner: 'shared/supervisor-model.js' },
+  { name: 'chat events', members: CHAT_EVENTS, owner: 'shared/supervisor-model.js' },
+  /** What *Ask the supervisor* carries in (phase 28) — the dock's chip and the server's preamble read one list. */
+  { name: 'chat context kinds', members: CHAT_CONTEXT_KINDS, owner: 'shared/supervisor-model.js' },
 
   /* The session ledger (zero-touch-console phase 4, chapter 03 SES-1/SES-8/
    * SES-9): who ended a session, what each spawn site's session was for,
@@ -657,6 +744,12 @@ const VOCABULARIES: {
    * the four ways `record.declared` is ever spent. `consumeDeclaration` takes
    * one as `why` and every one journals `phase.declaration-consumed`. */
   { name: 'declaration consumers', members: DECLARATION_CONSUMERS, owner: 'shared/run-lifecycle.js' },
+
+  /* The failure streak's causes (control-tower phase 45, #45, #59): what an
+   * ending is offered to `chargeFailure` as, and the MERIT subset — the only
+   * causes the streak counts. The subset is a filter over the full list. */
+  { name: 'failure causes', members: FAILURE_CAUSES, owner: 'shared/run-lifecycle.js' },
+  { name: 'merit failure causes', members: MERIT_FAILURE_CAUSES, owner: 'shared/run-lifecycle.js' },
 
   /* The decision manifest (zero-touch-console phase 3, chapter 13 §1.1): the
    * seventeen keys a plan answers before a run starts, the states a row can be
@@ -687,6 +780,17 @@ const VOCABULARIES: {
    * a comparison, not a re-declaration. */
   { name: 'rung vehicles', members: RUNG_VEHICLES, owner: 'shared/ladder-model.js' },
   { name: 'rung drivers', members: RUNG_DRIVERS, owner: 'shared/ladder-model.js' },
+  /* Why a settled rung ended (control-tower phase 5, #36): `RungRecord.cause`
+   * derives its type from the owner, and the ladder climbs on the words. */
+  { name: 'rung causes', members: RUNG_FAILURE_CAUSES, owner: 'shared/ladder-model.js' },
+  /* What holds a `nothing-ready` park, and the verb that clears each
+   * (control-tower phase 5): `HaltHolder` derives both from the owner. */
+  { name: 'halt holder kinds', members: HALT_HOLDER_KINDS, owner: 'shared/recovery-model.js' },
+  { name: 'halt holder verbs', members: HALT_HOLDER_VERBS, owner: 'shared/recovery-model.js' },
+  /* Why a run stopped, in nine words (control-tower phase 17, §Architecture 4):
+   * the halt card, the errand card, the inbox row and the approve page all read
+   * the family through the owner — a second list would be a second opinion. */
+  { name: 'halt categories', members: HALT_CATEGORIES, owner: 'shared/halt-categories.js' },
 
   /* The wait axis's reasons. `run-lifecycle.js` compares against each member
    * in turn (`recorded === 'external' || …`) because `status-vocab.js`, the
@@ -737,6 +841,15 @@ const VOCABULARIES: {
   { name: 'shutdown clock sources', members: SHUTDOWN_CLOCK_SOURCES, owner: 'shared/ops-vocab.js' },
   { name: 'boot hold kinds', members: BOOT_HOLD_KINDS, owner: 'shared/ops-vocab.js' },
   { name: 'presence end sources', members: PRESENCE_END_SOURCES, owner: 'shared/run-lifecycle.js' },
+  { name: 'run progress fields', members: RUN_PROGRESS_FIELDS, owner: 'shared/run-lifecycle.js' },
+  // #28: the interval registers, the phase-clock fields and the silence kinds.
+  { name: 'interval registers', members: INTERVAL_REGISTERS, owner: 'shared/interval-format.js' },
+  { name: 'phase clock fields', members: PHASE_CLOCK_FIELDS, owner: 'shared/phase-clocks.js' },
+  { name: 'silence kinds', members: SILENCE_KINDS, owner: 'shared/attention-model.js' },
+  // #24: the lock view's holder kinds, ledger events and filters.
+  { name: 'lock holder kinds', members: LOCK_HOLDER_KINDS, owner: 'shared/lock-model.js' },
+  { name: 'lock event kinds', members: LOCK_EVENT_KINDS, owner: 'shared/lock-model.js' },
+  { name: 'lock filters', members: LOCK_FILTERS, owner: 'shared/lock-model.js' },
 
   /* Many plans in one repository (5.1.0): where a phase's work lands, what a
    * message between two sessions is spelled with, and what a session may ask
@@ -791,8 +904,28 @@ const VOCABULARIES: {
   { name: 'issue actions', members: ISSUE_ACTIONS, owner: 'shared/issues-model.js' },
   { name: 'issue states', members: ISSUE_STATES, owner: 'shared/issues-model.js' },
   { name: 'issue fields', members: ISSUE_FIELDS, owner: 'shared/issues-model.js' },
+  /* A person's turn (control-tower phase 41): the sixteen kinds, the eight
+   * states, the plan bullet's keys and the URL parameters whose value is a
+   * secret. `HUMAN_STEP_WHERE` (`host, any`) and the one-word lists are not
+   * registered for the reason MESSAGING_WORDS is not — two common words match
+   * prose everywhere — and are pinned by their bash twin in gates-vocab. */
+  { name: 'human-step kinds', members: HUMAN_STEP_KINDS, owner: 'shared/human-step-model.js' },
+  { name: 'human-step states', members: HUMAN_STEP_STATES, owner: 'shared/human-step-model.js' },
+  { name: 'human-step bullet keys', members: HUMAN_STEP_BULLET_KEYS, owner: 'shared/human-step-model.js' },
+  { name: 'secret query keys', members: SECRET_QUERY_KEYS, owner: 'shared/human-step-model.js' },
   { name: 'isolation directives', members: ISOLATION_DIRECTIVES, owner: 'shared/worktree-model.js' },
   { name: 'worktree retention', members: WORKTREE_RETENTION, owner: 'shared/worktree-model.js' },
+  /* Status model v2 (control-tower phase 16): the three questions a status now
+   * answers instead of one enum — its tense, how a settled thing ended, and the
+   * Tower's bays — plus the facts a view carries beside its word and the note
+   * severities `StatusStack` speaks in. The badge family's prop types derive
+   * from these; a third spelling anywhere fails here. */
+  { name: 'status tenses', members: TENSES, owner: 'shared/status-model.js' },
+  { name: 'budget kinds', members: BUDGET_KINDS, owner: 'shared/budget-model.js' },
+  { name: 'status outcomes', members: OUTCOMES, owner: 'shared/status-model.js' },
+  { name: 'tower bays', members: BAYS, owner: 'shared/bays.js' },
+  { name: 'status facts', members: FACT_KINDS, owner: 'shared/status-model.js' },
+  { name: 'note severities', members: NOTE_SEVERITIES, owner: 'shared/status-notes.js' },
 ];
 
 /** Every source file the scan covers — tests excluded; they may say anything. */
@@ -875,6 +1008,66 @@ test('no file outside the owner re-declares a vocabulary as a literal', () => {
 });
 
 /* ------------------------------------------------------------------ *
+ * 2a. The stray status tables are folded into the model (control-tower phase 16)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Four tables once painted status words the paint owner never saw — the fleet's
+ * liveness, the QA verdict, the handoff word and the note severity — and a fifth
+ * site painted `stuck` red where every other page painted it amber. Each now
+ * reads `shared/status-model.js`. This holds them gone: the declarations by
+ * name, and the red `stuck` by its shape.
+ */
+test('the stray status tables are gone — each consumer reads the status model', () => {
+  const src = (rel: string) => readFileSync(join(VIEWER, rel), 'utf8');
+  /** Each stray: where it lived, its shape, and the files that draw the concept now. */
+  const STRAYS: { file: string; gone: RegExp; what: string; readers: string[] }[] = [
+    {
+      file: 'client/src/lib/status-vocab.ts',
+      gone: /\bQA_RESULT_UI\b|\bqaUiState\b/,
+      what: 'the QA verdict paint table',
+      readers: [
+        // The QA tab folded into the phase table's QA column and the drawer's
+        // QA section (control-tower phase 23).
+        'client/src/features/runs/phase-table.tsx',
+        'client/src/features/runs/phase-drawer.tsx',
+        'client/src/features/insights/index.tsx',
+        'client/src/components/qa-launcher.tsx',
+      ],
+    },
+    {
+      file: 'client/src/features/plans/phase-panel.tsx',
+      gone: /function handoffState\b/,
+      what: 'the handoff word mapping',
+      readers: ['client/src/features/plans/phase-panel.tsx', 'client/src/features/plans/handoff-panel.tsx'],
+    },
+    {
+      file: 'client/src/components/ui/status-stack.tsx',
+      gone: /\bconst ORDER\b|border-blocked|border-progress|border-action/,
+      what: 'the note severity order and colour table',
+      readers: ['client/src/components/ui/status-stack.tsx', 'client/src/components/ui/toast.tsx'],
+    },
+    {
+      file: 'client/src/features/runs/waiting-pane.tsx',
+      gone: /row\.stuck \? 'bad'/,
+      what: 'the red `stuck` chip',
+      readers: ['client/src/features/runs/waiting-pane.tsx'],
+    },
+  ];
+  const left = STRAYS.filter((s) => s.gone.test(src(s.file))).map((s) => `${s.file}: ${s.what}`);
+  assert.deepEqual(left, [], 'fold these into shared/status-model.js');
+  // …and every file that draws the concept now reads the model, by import.
+  const readsModel = /shared\/status-(model|notes)\.js|@\/components\/ui\/status['"/]|\.\/status\/(status|note)-icons/;
+  const unread = STRAYS.flatMap((s) => s.readers).filter((f) => !readsModel.test(src(f)));
+  assert.deepEqual(unread, [], 'these draw a status word, but nothing tells them how');
+  // The retired helpers have no callers anywhere.
+  for (const gone of ['handoffState(', 'qaUiState(']) {
+    const users = sourceFiles().filter((f) => readFileSync(f, 'utf8').includes(gone)).map((f) => relative(VIEWER, f));
+    assert.deepEqual(users, [], `${gone} has callers left`);
+  }
+});
+
+/* ------------------------------------------------------------------ *
  * 2b. Every situation an errand names is one the vocabulary can parse (RCV-11)
  * ------------------------------------------------------------------ */
 
@@ -897,7 +1090,11 @@ test('every `situation:` literal under server/ parses to a SITUATIONS member —
       // own family (`unknown:declaration-cap`, phase 6) passes; an invented
       // head like `silent-session` does not.
       const { id } = parseSituationKey(m[1]);
-      const known = (SITUATIONS as readonly string[]).includes(id) && m[1].split(':')[0] === id;
+      // The supervisor's detections (control-tower phase 101) are their own
+      // vocabulary, `SUPERVISOR_SITUATIONS` — held to that list, not the healer's.
+      const known = rel.startsWith('server/pro/supervisor/')
+        ? (SUPERVISOR_SITUATIONS as readonly string[]).includes(m[1])
+        : (SITUATIONS as readonly string[]).includes(id) && m[1].split(':')[0] === id;
       if (!known) offences.push(`${rel}: situation: '${m[1]}' parses to ${id}`);
     }
   }
@@ -912,19 +1109,35 @@ test('every `situation:` literal under server/ parses to a SITUATIONS member —
  * 3. The doors, the actor, and the wait reasons have writers (phase 2 of zero-touch-console)
  * ------------------------------------------------------------------ */
 
-test('START_DOORS is the census — fourteen doors, owned once — and the actor shape is spelled once', () => {
-  assert.equal(START_DOORS.length, 14, 'chapter 02 of the sep-review audit counted fourteen automatic-start doors');
+test('START_DOORS is the census — fifteen doors, owned once — and the actor shape is spelled once', () => {
+  // Fourteen from chapter 02 of the sep-review audit, and `trigger` since
+  // control-tower phase 98 (#137): a stored trigger's act is automatic.
+  assert.equal(START_DOORS.length, 16, 'the audit counted fourteen automatic-start doors; phase 98 added the trigger, phase 101 the supervisor');
+  assert.deepEqual(START_DOORS.slice(-2), ['trigger', 'supervisor'], 'the trigger and the supervisor ride their verb\'s own door, so they follow the five that are not startRun sites');
   assert.equal(new Set(START_DOORS).size, START_DOORS.length, 'no door may be listed twice');
   for (const door of START_DOORS) assert.match(door, /^[a-z][a-z0-9-]*$/, `${door} is not a kebab-case word`);
   assert.ok(Object.isFrozen(START_DOORS) && Object.isFrozen(ACTOR_VIAS) && Object.isFrozen(ACTOR_FIELDS));
   // Seven since phase 7: `event` is the transport of a door opened by an
   // observation (a recovery exiting, a declaration landing) — three of the
   // fourteen — which is neither a clock nor a request.
-  assert.deepEqual([...ACTOR_VIAS], ['api', 'cli', 'signal', 'timer', 'boot', 'hook', 'event']);
+  // Eight since control-tower phase 101: `supervisor` is the supervisor's
+  // pass pressing a remedy (#145) — an observation acted on, told apart from
+  // a trigger's `event` so the journal can say which of the two did it.
+  // Nine in Pro since control-tower phase 27: `supervisor-chat` is an act the
+  // operator asked for in the supervisor chat — a person's press, by its word.
+  const vias = ['api', 'cli', 'signal', 'timer', 'boot', 'hook', 'event', 'supervisor'];
+  assert.deepEqual([...ACTOR_VIAS], vias);
   assert.deepEqual([...CLASSIFIED_BY], ['drive', 'outcome', 'closed', 'heal']);
   assert.equal(OPERATOR_DOOR, 'operator');
   assert.ok(!(START_DOORS as readonly string[]).includes(OPERATOR_DOOR), 'the press is not an automatic door');
-  assert.deepEqual([...ACTOR_FIELDS], ['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter']);
+  assert.deepEqual([...ACTOR_FIELDS], ['by', 'via', 'origin', 'remoteUser', 'door', 'trigger', 'guard', 'counter', 'reason']);
+  // The `run:progress` wire. Both ends read it — the server builds the frame
+  // from it and the client's patch writes each field — so a name added here
+  // without a reader is a field nothing paints.
+  assert.deepEqual(
+    [...RUN_PROGRESS_FIELDS],
+    ['phase', 'status', 'attempt', 'attemptStartedAt', 'tasks', 'spentUsd', 'contextTokens', 'stall', 'phaseClocks'],
+  );
   // The nine `startRun` doors lead, then the five that spawn some other way —
   // the census's order, which phase 7's lint reads back.
   assert.deepEqual(START_DOORS.slice(0, 9), [

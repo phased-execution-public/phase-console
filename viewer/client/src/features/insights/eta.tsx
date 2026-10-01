@@ -15,9 +15,9 @@
  */
 
 import { Button, Card, CardBody, CardHeader, CardTitle, Empty, KeyValue, Tile } from '@/components/ui';
-import { nowHref } from '@/app/routes';
-import { planHref } from '@shared/routes.js';
-import { plural, weight } from '@/lib/format';
+import { runsBayHref } from '@/app/routes';
+import { planHref, planViewHref } from '@shared/routes.js';
+import { duration, plural, weight } from '@/lib/format';
 import type { EtaEstimate, PlanSummaryFull, Portfolio } from '@/lib/api';
 import { recentRate } from './portfolio';
 
@@ -27,6 +27,17 @@ const BASIS_NOTE: Record<string, string> = {
   portfolio: 'pooled across every plan — this one has not finished enough phases to speak for itself.',
   heuristic: 'the shipped constants. Nothing has completed yet, so this is a placeholder, not a forecast.',
 };
+
+/**
+ * `N measured phase(s) weighted` — and, when some finished phases taught the
+ * rate nothing (a closeout-only completion, a duration nobody recorded), how
+ * many were left out. The evidence count is never silently smaller than what
+ * actually finished.
+ */
+function samplesRow(samples: number, missing: number): string {
+  const leftOut = missing ? `, ${missing} left out — no usable measurement` : '';
+  return `${plural(samples, 'measured phase')} weighted${leftOut}`;
+}
 
 export function EtaPanel({
   stats,
@@ -53,11 +64,15 @@ export function EtaPanel({
           value={weight(t.remainingWeight)}
           hint={`across ${plural(t.plans - t.closed, 'open plan')}`}
         />
-        <Tile label="Sessions left" value={t.remainingSessions} hint="at this model’s session budget" />
+        <Tile
+          label="Sessions left"
+          value={t.remainingSessions}
+          hint="1 phase ≥ 1 session, measured per phase"
+        />
         <Tile
           label="Ready now"
           value={t.ready}
-          state={t.ready > 0 ? 'state-ready' : undefined}
+          state={t.ready > 0 ? 'state-queued' : undefined}
           hint={`${t.inProgress} in flight`}
         />
         <Tile
@@ -86,7 +101,11 @@ export function EtaPanel({
                   ['Estimate', planEta.label],
                   ['Phases left', `${planEta.remainingPhases} · ${weight(planEta.remainingWeight)}`],
                   ['Basis', `${planEta.basis} — ${BASIS_NOTE[planEta.basis] ?? 'unknown'}`],
-                  ['Samples', `${plural(planEta.samples, 'completed phase')} behind the rate`],
+                  ['Samples', samplesRow(planEta.samples, planEta.missing)],
+                  [
+                    'Model',
+                    `${duration(planEta.floorMs)} + ${Math.round(planEta.slopeMsPerWeight)} ms per weight`,
+                  ],
                   ...floorRow(plan, planStats),
                 ]}
               />
@@ -109,16 +128,17 @@ export function EtaPanel({
                   `${recentRate(rate, mediumWeight).replace(/^ · recent rate ≈ /, '') || 'unknown'}`,
                 ],
                 ['Basis', `${rate.basis} — ${BASIS_NOTE[rate.basis] ?? 'unknown'}`],
-                ['Samples', `${plural(rate.samples, 'completed phase')}`],
+                ['Samples', samplesRow(rate.samples, rate.missing)],
                 [
-                  // NOT a fastest-vs-slowest ratio: `spreadFor` (server/
-                  // analysis/stats.ts) reads the SAMPLE COUNT and nothing else
-                  // — 0.35 at four finished phases, 0.5 at two, 0.7 below that
-                  // — so it never looks at a duration and cannot describe one.
-                  // It also has a floor, which made the `> 0` fallback here
-                  // unreachable.
+                  // The band is the spread of the MEASURED phases around the
+                  // model — the 75th percentile of how far each one fell from
+                  // it (server/analysis/stats.ts) — never a reading of how
+                  // many of them there were. `spread` runs the same FACTOR
+                  // above the point and below it (point ÷ (1+spread) … point
+                  // × (1+spread)), so it is stated as that factor both ways —
+                  // a `±` percent would misstate the lower end.
                   'Confidence band',
-                  `±${Math.round(rate.spread * 100)}% — widened when there are fewer completed phases to measure from`,
+                  `÷${(1 + rate.spread).toFixed(1)} to ×${(1 + rate.spread).toFixed(1)} of the estimate — where three in four measured phases fell`,
                 ],
               ]}
             />
@@ -128,7 +148,7 @@ export function EtaPanel({
               body="Estimates fall back to the shipped constants until phases start completing."
               action={
                 <Button asChild size="sm">
-                  <a href={nowHref('next')}>See what could start</a>
+                  <a href={runsBayHref('ready')}>See what could start</a>
                 </Button>
               }
             />
@@ -172,7 +192,7 @@ function floorRow(plan: string, stats: PlanSummaryFull | undefined): [string, Re
           ? `${plural(beside, 'session')} of the ${remaining} could run beside the chain`
           : 'the dependency chain accounts for all of it'}
         .{' '}
-        <a href={planHref(plan, 'route')} className="text-action underline">
+        <a href={planViewHref(plan, 'map')} className="text-action underline">
           The route map
         </a>{' '}
         draws it.

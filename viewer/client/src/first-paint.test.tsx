@@ -18,7 +18,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
-import { RouteTab } from '@/features/plans/route-tab';
+import { PlanCards } from '@/features/plans/map-view';
 import { TooltipProvider } from '@/components/ui';
 import { ROUTE_TABLE, preloadView, type PageRoute } from '@/app/router';
 import { EVENT_EFFECTS, applyEffect, keys, queryClientConfig } from '@/lib/queries';
@@ -63,7 +63,7 @@ function client() {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  window.location.hash = '#/now';
+  window.location.hash = '#/runs';
   state.mockResolvedValue(READY_STATE);
 });
 
@@ -131,7 +131,7 @@ describe('the route chunk does not wait for /api/state', () => {
    * a redirect entry instead of returning.
    */
   it('preloads nothing for a redirect head', () => {
-    const spy = vi.spyOn(ROUTE_TABLE.now as PageRoute, 'preload');
+    const spy = vi.spyOn(ROUTE_TABLE.runs as PageRoute, 'preload');
     preloadView('dashboard');
     expect(spy).not.toHaveBeenCalled();
     spy.mockRestore();
@@ -171,7 +171,7 @@ const DETAIL = {
 describe('opening a plan spends no engine invocations', () => {
   /**
    * UNDO THAT REDS THIS: delete `collapsed` from the ready-phase `PromptCard`s
-   * in `features/plans/route-tab.tsx`.
+   * in `features/plans/map-view.tsx` (`PlanCards`, under every view of the Phases tab).
    *
    * Each boot prompt is a `phase-graph.sh` shell-out SERVER-side, and
    * `PromptCard` fetches on `enabled: open`. Three ready phases meant three
@@ -182,7 +182,7 @@ describe('opening a plan spends no engine invocations', () => {
     render(
       <QueryClientProvider client={client()}>
         <TooltipProvider>
-          <RouteTab detail={DETAIL} />
+          <PlanCards detail={DETAIL} />
         </TooltipProvider>
       </QueryClientProvider>,
     );

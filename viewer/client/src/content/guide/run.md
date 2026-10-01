@@ -37,7 +37,7 @@ While a blocking row is outstanding, Launch stays disabled and names it —
 `Decision outstanding: <key> — <why>` — and the one way past is **Start anyway, recorded as**, which
 writes who signed the override on the run (`run.manifest-override`).
 
-The one amber **Launch** button sits on every stage on a desk — the ticket has already said what will
+The one primary **Launch** button sits on every stage on a desk — the ticket has already said what will
 happen — and on the **Review stage only** on a phone.
 
 ## What you choose at launch 🟡
@@ -221,8 +221,8 @@ produced nothing, never as an approval.
 ## Where the time went 🟢
 
 Two charts sit under the console, and they answer two different questions. The **Timeline** card
-splits each phase's own clock into working, waiting and frozen — a run that is mostly amber was
-blocked, not slow. The **Run timeline** above it puts every phase on one absolute axis, so you can
+splits each phase's own clock into working, waiting and frozen — a run whose bars are mostly the
+waiting paint was blocked, not slow. The **Run timeline** above it puts every phase on one absolute axis, so you can
 line a bar up against the thing you were watching elsewhere: a CI run, a deploy, a wall.
 
 Read it for the shape. A row per phase; each bar bracketed by two journal entries, so nothing on

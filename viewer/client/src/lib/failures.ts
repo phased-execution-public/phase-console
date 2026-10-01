@@ -11,6 +11,7 @@
  * runs fleet and the dashboard all ask the same question of the same string.
  */
 
+import { isAuthHalt } from '@shared/halt-categories.js';
 import type { AccountView, AuthStatus, RunState } from './api';
 
 /**
@@ -34,8 +35,8 @@ export function looksLikeAuthFailure(
 ): boolean {
   if (run?.accountId && account && account.id === run.accountId) {
     if (account.authState === 'expired' || account.authState === 'signed-out') return true;
-    return /sign(ed)? in|authenticat/i.test(run?.halt?.reason ?? '');
+    return isAuthHalt(run?.halt);
   }
   if (!run?.accountId && auth && auth.loggedIn === false) return true;
-  return /sign(ed)? in|authenticat/i.test(run?.halt?.reason ?? '');
+  return isAuthHalt(run?.halt);
 }

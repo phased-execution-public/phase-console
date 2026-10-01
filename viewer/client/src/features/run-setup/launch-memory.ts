@@ -45,6 +45,7 @@ export const MAX_PLANS = 12;
 export const REMEMBERED_FIELDS: readonly RunSetupField[] = Object.freeze([
   'model',
   'effort',
+  'modelPolicy',
   'autonomy',
   'permissionProfile',
   'accountId',
@@ -69,6 +70,9 @@ export const REMEMBERED_FIELDS: readonly RunSetupField[] = Object.freeze([
   'autoRecover',
   'maxParallel',
   'maxConsecutiveFailures',
+  'approvalTimeoutMinutes',
+  'ladderPerRunRungs',
+  'ladderPerPhaseRungs',
 ]);
 
 export interface LaunchMemory {

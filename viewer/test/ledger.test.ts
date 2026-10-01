@@ -56,7 +56,7 @@ const JOURNAL: JournalEntry[] = [
   session(10, 1),
   at(11, 'run.account-switched', undefined, { from: 'default', account: 'backup', at: 'ladder' }),
   session(20, 2, { endedBy: 'watchdog', costUsd: 0.75, turns: 4 }),
-  at(21, 'phase.rung-settled', 2, { rung: 'switch-account', outcome: 'failed', situation: 'resource-wall:usage', costUsd: 0.75, params: null }),
+  at(21, 'phase.rung-settled', 2, { rung: 'switch-account', outcome: 'failed', cause: 'environment', situation: 'resource-wall:usage', costUsd: 0.75, params: null }),
   at(22, 'phase.start', 3, {}),
   RELAUNCH,
   session(40, 3, { costSource: 'none', costUsd: 0, turns: 12 }),
@@ -109,6 +109,10 @@ test('a rung carries its vehicle’s driver, and its cost is shown beside the se
   assert.equal(ledger.rungs[0].rung, 'switch-account');
   assert.equal(ledger.rungs[0].driver, drivableBy('switch-account'));
   assert.equal(ledger.rungs[0].costUsd, 0.75);
+  // Its cause rides the settle line, so the ledger can paint it (control-tower phase 24).
+  assert.equal(ledger.rungs[0].cause, 'environment');
+  const bare = projectLedger([at(0, 'phase.rung-settled', 1, { rung: 'resume', outcome: 'withdrawn' })], null);
+  assert.equal(bare.rungs[0].cause, null, 'a settlement with no cause says none rather than inventing one');
   assert.equal(ledger.totals.rungsUsd, 0.75);
   assert.equal(ledger.totals.sessionsUsd, 2.25, 'the rung’s spend is its session’s, already counted once');
 });

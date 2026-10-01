@@ -15,6 +15,7 @@
  * where several phases are ready at once, which is what lanes are for.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from 'node:fs';
@@ -87,8 +88,10 @@ afterEach(() => {
 });
 
 after(() => { rmSync(STATE_HOME, { recursive: true, force: true }); });
-const { loadRun, journalFile } = await import('../server/runner/state.ts');
+const { loadRun, journalFile, newRun, saveRun } = await import('../server/runner/state.ts');
 import type { SpawnFn, SpawnOutcome } from '../server/runner/spawn.ts';
+import type { PhaseRecord } from '../server/runner/state.ts';
+import type { ScopeGrant } from '../server/runner/scheduler.ts';
 
 const PHASES = [1, 2, 3];
 
@@ -410,8 +413,10 @@ test("a stranger's live lock holds a phase back, and releasing it lets the phase
 
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   // Phases 2 and 3 are disjoint from the stranger and go straight through;
-  // phase 1 shares `repo-1` with it and waits.
-  await sleep(400);
+  // phase 1 shares `repo-1` with it and waits. Polled, never a fixed sleep
+  // (#156): on a loaded machine the board read alone outlasted the 400 ms this
+  // slept, and "held up" was read off a phase the loop had not reached yet.
+  await until('a phase disjoint from the lock to board', () => order.includes('start 2'));
   assert.ok(!order.includes('start 1'), `phase 1 must wait for the lock, order was ${order.join(', ')}`);
   assert.ok(order.includes('start 2'), 'and a disjoint phase must not be held up by it');
 
@@ -445,7 +450,9 @@ test('a phase blocked at admission reads `queued`, and says what it is waiting o
   });
 
   const state = await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-  await sleep(300);
+  // Polled, never a fixed sleep (#156): on a loaded machine the loop reaches
+  // admission later than the 300 ms this used to sleep.
+  await until('phase 1 to queue at admission', () => state.phases['1']?.status === 'queued');
 
   assert.equal(state.phases['1']?.status, 'queued', 'the phase says it is waiting');
   // Not in IN_FLIGHT on purpose: a queued run has done nothing, so a restart
@@ -682,10 +689,10 @@ test('a pause armed while a phase waits for its scope abandons it back to pendin
   r.cleanup();
 });
 
-test('a queued second lane does not repaint a run that is still driving its first', async () => {
+test('a sibling behind its own run’s lane is serial, not queued, and the run keeps reading running (#64)', async () => {
   const r = repo();
   const gate = deferred<void>();
-  let sampled: { run?: string; waiting?: string } = {};
+  let sampled: { run?: string; waiting?: string; serialBehind?: number } = {};
   let driving: number | undefined;
   let instance!: InstanceType<typeof Runner>;
   const spawn: SpawnFn = async (request) => {
@@ -710,7 +717,7 @@ test('a queued second lane does not repaint a run that is still driving its firs
         await sleep(50);
         const state = instance.current()!;
         const status = state.phases[other]?.status;
-        if (status) sampled = { run: state.status, waiting: status };
+        if (status) sampled = { run: state.status, waiting: status, serialBehind: state.phases[other]?.serialBehind };
       }
       gate.resolve();
     }
@@ -726,8 +733,11 @@ test('a queued second lane does not repaint a run that is still driving its firs
   // Seen live: phase 4 driving with a real child while the RUN read `queued`,
   // because phases 5–6 sat behind its scope. The lane's own record is where
   // "queued" belongs; the run is running for as long as anything drives.
-  assert.equal(sampled.run, 'running', "queued is the lane's word, not a driving run's");
-  assert.equal(sampled.waiting, 'queued', 'the waiting lane itself says so');
+  assert.equal(sampled.run, 'running', "a driving run is running");
+  // control-tower phase 60 (#64): the sibling is SERIAL work behind its own
+  // run's live lane — ready, never `queued`, never in the scheduler.
+  assert.equal(sampled.waiting, 'pending', 'the waiting sibling is not queued behind its own run');
+  assert.equal(sampled.serialBehind, driving, 'it reads ready (behind this run’s P<n>)');
   assert.equal(instance.current()!.status, 'finished');
   r.cleanup();
 });
@@ -863,25 +873,38 @@ test('stopping one lane records interrupted, spares the streak, and the rest car
   r.cleanup();
 });
 
+/**
+ * Another run holding the repository, so the first phase QUEUES — contention,
+ * the one thing a queue is for since control-tower phase 60 (#64); its
+ * siblings are serial behind it and never enter the scheduler at all.
+ */
+async function foreignHolder(scheduler: InstanceType<typeof Scheduler>, scope: string[]): Promise<ScopeGrant> {
+  return scheduler.admit({ slug: 'other-plan', phase: 1, runId: 'ffffffffffff', scope });
+}
+
+async function queuedPhase(instance: InstanceType<typeof Runner>): Promise<number[]> {
+  for (let tick = 0; tick < 200; tick++) {
+    const queued = Object.values(instance.current()?.phases ?? {}).filter((p) => p.status === 'queued').map((p) => p.phase);
+    if (queued.length) return queued.sort();
+    await sleep(20);
+  }
+  return [];
+}
+
 test('a queued phase can be taken out of the line, and never spawns on arrival', async () => {
   const r = repo();
   const held = sleeperLanes(r);
-  // One scope between three phases: one runs, the others queue behind it.
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
+  const foreign = await foreignHolder(scheduler, ['one-repo']);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-  await held.lanesUp(1);
-  await sleep(200);
-
-  const queued = Object.values(instance.current()!.phases)
-    .filter((p) => p.status === 'queued')
-    .map((p) => p.phase)
-    .sort();
-  assert.ok(queued.length >= 1, `something queues behind the scope (saw ${JSON.stringify(queued)})`);
+  const queued = await queuedPhase(instance);
+  assert.ok(queued.length >= 1, `something queues behind the other run (saw ${JSON.stringify(queued)})`);
   const target = queued[0];
 
   assert.deepEqual(instance.stopPhase(target, 'tester'), { ok: true });
   assert.equal(instance.current()!.phases[String(target)].status, 'interrupted');
 
+  scheduler.release(foreign);
   held.release();
   await instance.wait();
   assert.ok(!held.pids.has(target), 'the dequeued phase never spawned a session');
@@ -894,23 +917,46 @@ test('a phase skipped while queued does not spawn when its admission arrives', a
   const r = repo();
   const held = sleeperLanes(r);
   const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
+  const foreign = await foreignHolder(scheduler, ['one-repo']);
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
-  await held.lanesUp(1);
-  await sleep(200);
-
-  const queued = Object.values(instance.current()!.phases)
-    .filter((p) => p.status === 'queued')
-    .map((p) => p.phase)
-    .sort();
+  const queued = await queuedPhase(instance);
   assert.ok(queued.length >= 1);
   const target = queued[0];
   instance.skip(target);
   assert.equal(instance.current()!.phases[String(target)].status, 'skipped');
 
+  scheduler.release(foreign);
   held.release();
   await instance.wait();
   assert.ok(!held.pids.has(target),
     'a settled record is abandoned on arrival — the latent spawn was the bug');
+  assert.equal(instance.current()!.phases[String(target)].status, 'skipped');
+  scheduler.close();
+  r.cleanup();
+});
+
+test('a phase serial behind its own lane can be skipped, and never spawns (#64)', async () => {
+  const r = repo();
+  const held = sleeperLanes(r);
+  // One scope between three phases: one runs, the others are serial behind it.
+  const { instance, scheduler } = runnerOn(r, held.spawn, () => ['one-repo']);
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
+  await held.lanesUp(1);
+  await sleep(200);
+
+  const serial = Object.values(instance.current()!.phases)
+    .filter((p) => p.serialBehind != null)
+    .map((p) => p.phase)
+    .sort();
+  assert.ok(serial.length >= 1, `siblings are serial behind the live lane (saw ${JSON.stringify(serial)})`);
+  assert.equal(scheduler.snapshot().entries.length, 0, 'and none of them waits in the scheduler');
+  const target = serial[0];
+  instance.skip(target);
+  assert.equal(instance.current()!.phases[String(target)].status, 'skipped');
+
+  held.release();
+  await instance.wait();
+  assert.ok(!held.pids.has(target), 'the skipped phase never spawned');
   assert.equal(instance.current()!.phases[String(target)].status, 'skipped');
   scheduler.close();
   r.cleanup();
@@ -1248,11 +1294,15 @@ test('P9: an isolated run probes its branch, and a verdict that has not moved jo
     // in-flight probe can land AFTER `wait()` resolves and emit into the tally
     // this test is about. Asserting straight after `wait()` is asserting on a
     // race (the same shape `pruneWorktrees` taught P6). Polled rather than
-    // slept-on a fixed ceiling: a loaded machine is slow, not broken.
+    // slept-on a fixed ceiling: a loaded machine is slow, not broken. And a
+    // window is quiet only once the first view has LANDED (#162): before it,
+    // three silent windows were read as "settled" while the settle's probe had
+    // not yet answered, and a probe slower than ~150 ms failed the assertion
+    // below. A probe that never lands still fails it, at the same ceiling.
     for (let quiet = 0, i = 0; quiet < 3 && i < 100; i += 1) {
       const n = emitted();
       await sleep(50);
-      quiet = emitted() === n ? quiet + 1 : 0;
+      quiet = emitted() === n && runner.gitSnapshot() ? quiet + 1 : 0;
     }
     // A view exists without anyone asking for one: each settle probes, so the
     // answer is on the run by the time it stops rather than five minutes later.
@@ -1297,5 +1347,338 @@ test('P9: an isolated run probes its branch, and a verdict that has not moved jo
   } finally {
     scheduler.close();
     r.cleanup();
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * A watch that lands while the run is live (control-tower phase 6)
+ * ------------------------------------------------------------------ *
+ * The measured shape: a phase parked on a declared external wait, the thing it
+ * waited on came back, and the phase could not get its repository back — the
+ * healer's `recoverPhase` refused it as "in progress" for as long as any
+ * sibling lane of the run was live, which under `keep-going` is always. The
+ * landing now boards through the run's OWN lanes, ahead of its scope:
+ * `landWatch` reserves it, the loop boards it first, and its admission carries
+ * `reserve`, so a same-scope sibling that queued EARLIER does not take the
+ * scope the landing was promised.
+ */
+
+const LANDED_REF = 'gh:acme/app#run/4242';
+
+/**
+ * A stored run whose phase 1 is `waiting` on a declared external ref, naming
+ * the session a resume continues — the record a real park writes. `clockMs`
+ * places the park's clock: ahead, for a wait only a landing can end early;
+ * behind, for one the loop resumes on its own.
+ */
+function waitingOnWatch(r: Repo, clockMs: number, phase = 1): string {
+  const stale = newRun({ slug: 'demo', root: r.root });
+  stale.status = 'paused';
+  stale.stoppedBy = 'system';
+  stale.phases[String(phase)] = {
+    phase, status: 'waiting', attempts: 1, costUsd: 0, waits: 1,
+    parkedUntil: new Date(Date.now() + clockMs).toISOString(),
+    parkReason: 'the CI run', watch: [LANDED_REF],
+    sessionId: 'sess-land', resumeSessionId: 'sess-land',
+    declared: {
+      status: 'waiting-external', reason: 'the CI run', watch: [LANDED_REF],
+      at: new Date(Date.now() - 5 * 60_000).toISOString(),
+    },
+  } as PhaseRecord;
+  saveRun(stale);
+  return stale.id;
+}
+
+/** Wait for something the run reaches on its own clock — polled, never a fixed sleep. */
+async function until(what: string, reached: () => boolean, ms = 20_000): Promise<void> {
+  for (const end = Date.now() + ms; !reached();) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await sleep(10);
+  }
+}
+
+/** A runner that keeps every event, and reads its journal lines back per phase. */
+function landingRunner(
+  r: Repo, spawn: SpawnFn, scheduler: InstanceType<typeof Scheduler>, scope: (phase: number) => string[],
+) {
+  const events: { event: string; data: Record<string, unknown> }[] = [];
+  const instance = new Runner({
+    scriptsDir: r.scripts,
+    spawn,
+    scheduler,
+    maxParallel: 3,
+    verificationText: () => '`true`',
+    phaseScope: (_slug, phase) => scope(phase),
+    onEvent: (event, data) => events.push({ event, data: data as Record<string, unknown> }),
+  });
+  const journalled = (name: string, phase: number): Record<string, unknown>[] => events
+    .filter((e) => e.event === 'run:journal' && e.data.event === name && e.data.phase === phase)
+    .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
+  return { instance, events, journalled };
+}
+
+test("a watch landing on a live run resumes the phase's own session in the run's own lane, ahead of a sibling queued first", async () => {
+  const r = repo();
+  // A stranger holds the landing's repository, and phase 2 — the same
+  // repository — queues behind it FIRST, which is what a first-come queue rewards.
+  let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
+  const scheduler = new Scheduler({ max: 3, locks: () => locks });
+  const hold3 = deferred<void>();
+  const order: string[] = [];
+  const sessions: { phase: number; prompt: string; resume?: string }[] = [];
+  const spawn: SpawnFn = async (request) => {
+    // Both prompts name the phase this way: the engine's boot text, and the
+    // landed resume's opening line.
+    const phase = Number(/phase (\d+) of/.exec(request.prompt)![1]);
+    order.push(`start ${phase}`);
+    sessions.push({ phase, prompt: request.prompt, resume: request.resume });
+    // Phase 3 keeps the loop driving: `landWatch` hands a landing only to a
+    // live loop, never to a run nobody drives.
+    if (phase === 3) await hold3.promise;
+    appendFileSync(join(r.state, 'done'), `${phase}\n`);
+    return ok({ sessionId: request.resume ?? `sess-${phase}` });
+  };
+  const { instance, journalled } = landingRunner(r, spawn, scheduler, (phase) => [phase === 3 ? 'repo-b' : 'repo-a']);
+  const queued = (phase: number) => scheduler.snapshot().entries.find((entry) => entry.phase === phase);
+
+  try {
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: waitingOnWatch(r, 60 * 60_000) });
+    await until('phase 3 in its session, phase 2 queued behind the stranger',
+      () => order.includes('start 3') && queued(2) !== undefined);
+    assert.equal(instance.current()!.phases['1'].status, 'waiting', 'phase 1 waits: its clock is an hour off');
+
+    // What `resumeOnWatchLanded` writes before it hands a landing to a live
+    // run: the landing goes ON the declaration, on the loop's own record.
+    const landed = { ref: LANDED_REF, detail: 'completed/failure' };
+    instance.current()!.phases['1'].declared!.landed = { ...landed, at: new Date().toISOString(), resumes: 1 };
+    assert.equal(instance.landWatch(1, landed, { count: 1, sessionId: 'sess-land' }), true);
+    assert.ok(instance.landingPending(1), 'the watch clock is told the landing is on its way');
+
+    // It boards at once, RESERVED: scanned ahead of the sibling that queued
+    // before it and, its scope blocked, holding its tokens against it.
+    await until('the landing in the queue with its reservation', () => queued(1)?.reserve === true);
+    assert.equal(queued(1)!.reserving, true, 'blocked by the stranger, the reservation holds at once');
+    assert.ok(queued(1)!.order! < queued(2)!.order!, 'the landing is scanned before the sibling that queued first');
+    assert.equal(queued(2)!.reserve, undefined, 'and the sibling carries no reservation of its own');
+
+    locks = [];
+    scheduler.poll();
+    // Decided in that one scan: the landing takes the freed repository, and
+    // the sibling that was there first waits behind it.
+    assert.deepEqual(scheduler.snapshot().grants.map((grant) => grant.phase).sort(), [1, 3]);
+    // …and the sibling, whose one holder is now the landing — a lane of its OWN
+    // run — leaves the queue: it is serial behind P1, not contention (#64).
+    await until('phase 2 serial behind the landing', () => instance.current()!.phases['2']?.serialBehind === 1);
+    assert.equal(queued(2), undefined, 'no longer queued behind its own run’s lane');
+
+    await until('phase 2 boards once the landing lets its scope go', () => order.includes('start 2'));
+    hold3.resolve();
+    await instance.wait();
+
+    const state = instance.current()!;
+    assert.equal(state.status, 'finished', `the run settles (halt: ${state.halt?.reason ?? 'none'})`);
+    assert.deepEqual(r.doneList().sort(), PHASES);
+    assert.ok(order.indexOf('start 1') < order.indexOf('start 2'), `the landing boards first: ${order.join(', ')}`);
+
+    const automatic = journalled('phase.resume-automatic', 1);
+    assert.equal(automatic.length, 1, 'one automatic resume, said once');
+    assert.equal(automatic[0].trigger, 'watch');
+    assert.equal(automatic[0].path, 'live-lane');
+    assert.equal(automatic[0].ref, LANDED_REF);
+    assert.equal(automatic[0].count, 1);
+    assert.equal(automatic[0].sessionId, 'sess-land');
+    assert.deepEqual(journalled('phase.admitted', 1).map((line) => line.reserved), [true], 'the admission says it was reserved');
+    assert.deepEqual(journalled('phase.admitted', 2).map((line) => line.reserved), [undefined], "the sibling's does not");
+
+    // The phase's OWN session, resumed, with the landing as the news.
+    const one = sessions.filter((session) => session.phase === 1);
+    assert.equal(one.length, 1, 'phase 1 boarded once');
+    assert.equal(one[0].resume, 'sess-land', 'a resume of the session that declared the wait');
+    assert.match(one[0].prompt, /has LANDED/, 'the resume says the ref landed');
+    assert.ok(one[0].prompt.includes(LANDED_REF), 'names it');
+    assert.match(one[0].prompt, /It FAILED/, 'and how it concluded');
+    assert.doesNotMatch(one[0].prompt, /BOOT phase/, 'never the engine boot text of a fresh attempt');
+    assert.deepEqual(journalled('phase.wait-resume', 1).map((line) => line.cause), ['landed']);
+  } finally {
+    hold3.resolve();
+  }
+});
+
+test('a landing stopped while it waits for its scope stays a wait, and the next loop resumes it as the landing', async () => {
+  const r = repo();
+  let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
+  const scheduler = new Scheduler({ max: 3, locks: () => locks });
+  const sessions: { phase: number; prompt: string; resume?: string }[] = [];
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/phase (\d+) of/.exec(request.prompt)![1]);
+    sessions.push({ phase, prompt: request.prompt, resume: request.resume });
+    if (phase === 3) {
+      // Keeps the first loop driving until the stop reaches it.
+      await new Promise<void>((resolve) => {
+        if (request.signal?.aborted) { resolve(); return; }
+        request.signal?.addEventListener('abort', () => resolve(), { once: true });
+        setTimeout(resolve, 10_000).unref?.();
+      });
+      return ok({ signal: { subtype: 'error', code: 143, text: 'terminated' } });
+    }
+    appendFileSync(join(r.state, 'done'), `${phase}\n`);
+    return ok({ sessionId: request.resume ?? `sess-${phase}` });
+  };
+  const { instance, journalled } = landingRunner(r, spawn, scheduler, (phase) => [phase === 3 ? 'repo-b' : 'repo-a']);
+  const queued = (phase: number) => scheduler.snapshot().entries.find((entry) => entry.phase === phase);
+  const runId = waitingOnWatch(r, 60 * 60_000);
+
+  await instance.start({ slug: 'demo', root: r.root, resumeRunId: runId });
+  await until('phase 3 in its session, phase 2 queued behind the stranger',
+    () => sessions.some((session) => session.phase === 3) && queued(2) !== undefined);
+  const landed = { ref: LANDED_REF, detail: 'completed/success' };
+  instance.current()!.phases['1'].declared!.landed = { ...landed, at: new Date().toISOString(), resumes: 1 };
+  assert.equal(instance.landWatch(1, landed, { count: 1, sessionId: 'sess-land' }), true);
+  await until('the landing in the queue with its reservation', () => queued(1)?.reserve === true);
+
+  // Stopped while the landing waits for its scope — which a console shutting
+  // down does too. The reservation dies with the loop; the landing must not.
+  await instance.stop();
+  const stopped = instance.current()!.phases;
+  assert.equal(stopped['1'].status, 'waiting', 'the landing is still a wait, never a fresh attempt');
+  assert.ok(stopped['1'].declared?.landed, 'and it still carries the landing');
+  assert.equal(stopped['2'].status, 'pending', 'a sibling that was merely queued goes back to pending');
+  assert.ok(!sessions.some((session) => session.phase === 1), 'nothing of phase 1 started');
+
+  // The next loop: the stranger gone, phase 3 closed outside this run.
+  locks = [];
+  appendFileSync(join(r.state, 'done'), '3\n');
+  await instance.start({ slug: 'demo', root: r.root, resumeRunId: runId });
+  await instance.wait();
+
+  assert.deepEqual(r.doneList().sort(), PHASES);
+  const one = sessions.filter((session) => session.phase === 1);
+  assert.equal(one.length, 1, 'phase 1 boarded once');
+  assert.equal(one[0].resume, 'sess-land', 'its own session');
+  assert.match(one[0].prompt, /has LANDED/, 'resumed as the landing, not the engine boot text');
+  assert.deepEqual(journalled('phase.wait-resume', 1).map((line) => line.cause), ['landed']);
+});
+
+test('landWatch leaves alone a phase holding no declaration, and one already in a lane: false, and not one event', async () => {
+  const r = repo();
+  const scheduler = new Scheduler({ max: 3, locks: () => [] });
+  const release = deferred<void>();
+  const inSession = new Set<number>();
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/phase (\d+) of/.exec(request.prompt)![1]);
+    inSession.add(phase);
+    await release.promise;
+    appendFileSync(join(r.state, 'done'), `${phase}\n`);
+    return ok({ sessionId: request.resume ?? `sess-${phase}` });
+  };
+  // Disjoint, so all three lanes open together and nothing queues.
+  const { instance, events } = landingRunner(r, spawn, scheduler, (phase) => [`repo-${phase}`]);
+  const landed = { ref: LANDED_REF, detail: 'completed/success' };
+  /** One synchronous call, and every event it caused. */
+  const offer = (phase: number) => {
+    const before = events.length;
+    const answer = instance.landWatch(phase, landed, { count: 1, sessionId: 'sess-land' });
+    return { answer, events: events.slice(before).map((e) => e.event) };
+  };
+
+  try {
+    assert.deepEqual(offer(1), { answer: false, events: [] }, 'no loop is driving: nothing to hand a landing to');
+    // Phase 1's clock has already run out, so the loop resumes it on its own:
+    // when the landing comes it is IN A LANE and still holds its declaration.
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: waitingOnWatch(r, -60_000) });
+    await until('phases 1 and 2 in their sessions', () => inSession.has(1) && inSession.has(2));
+    const phases = instance.current()!.phases;
+    assert.ok(phases['1'].declared, 'phase 1 still holds its declaration, so only its lane can refuse it');
+    assert.deepEqual(offer(1), { answer: false, events: [] }, 'a phase already in a lane: refused, and nothing said');
+    assert.equal(phases['2'].declared, undefined);
+    assert.deepEqual(offer(2), { answer: false, events: [] }, 'a phase holding no declaration: refused, and nothing said');
+
+    release.resolve();
+    await instance.wait();
+    assert.deepEqual(r.doneList().sort(), PHASES);
+    assert.equal(events.filter((e) => e.event === 'run:journal' && e.data.event === 'phase.resume-automatic').length, 0,
+      'no landing was ever journalled');
+  } finally {
+    release.resolve();
+  }
+});
+
+test('a landing on a wait already queued for its scope is given the reservation there, and still resumes as the landing', async () => {
+  const r = repo();
+  let locks = [{ slug: 'other', phase: 9, owner: 'someone/else', expired: false, scope: ['repo-a'] }];
+  const scheduler = new Scheduler({ max: 4, locks: () => locks });
+  const hold3 = deferred<void>();
+  const sessions: { phase: number; prompt: string; resume?: string }[] = [];
+  const spawn: SpawnFn = async (request) => {
+    const phase = Number(/phase (\d+) of/.exec(request.prompt)![1]);
+    sessions.push({ phase, prompt: request.prompt, resume: request.resume });
+    if (phase === 3) await hold3.promise;
+    appendFileSync(join(r.state, 'done'), `${phase}\n`);
+    return ok({ sessionId: request.resume ?? `sess-${phase}` });
+  };
+  // Phase 2's wait is on repo-a; phase 1 works a repository of its own and
+  // phase 3 keeps the loop driving. Since control-tower phase 60 (#64) a queue
+  // is contention between RUNS — a sibling of the same run would be serial —
+  // so the entry that queued first is another run's.
+  const { instance, journalled } = landingRunner(r, spawn, scheduler,
+    (phase) => [phase === 3 ? 'repo-b' : phase === 1 ? 'repo-c' : 'repo-a']);
+  const queued = (slug: string, phase: number) => scheduler.snapshot().entries
+    .find((entry) => entry.slug === slug && entry.phase === phase);
+  // The other run's entry is the OLDER one (control-tower phase 86, #128): an
+  // expired park's age is its end, so phase 2 — parked until a second ago —
+  // would otherwise be the senior entry, and this test is about the reservation.
+  const earlier = scheduler.admit({
+    slug: 'elsewhere', phase: 5, runId: 'eeeeeeeeeeee', scope: ['repo-a'], since: Date.now() - 60_000,
+  });
+  earlier.catch(() => {});
+
+  try {
+    // Phase 2's clock has already run out: the loop resumes it as an elapsed
+    // wait, and it queues behind the stranger AFTER the other run's entry.
+    await instance.start({ slug: 'demo', root: r.root, resumeRunId: waitingOnWatch(r, -1_000, 2) });
+    await until('the elapsed wait queued behind the stranger, after the other run',
+      () => queued('demo', 2) !== undefined && queued('elsewhere', 5) !== undefined);
+    assert.notEqual(queued('demo', 2)!.reserve, true, 'an elapsed wait is born without a reservation');
+    assert.ok(queued('elsewhere', 5)!.order! < queued('demo', 2)!.order!, 'first-come: the other run is ahead');
+
+    const landed = { ref: LANDED_REF, detail: 'completed/success' };
+    instance.current()!.phases['2'].declared!.landed = { ...landed, at: new Date().toISOString(), resumes: 1 };
+    assert.equal(instance.landWatch(2, landed, { count: 1, sessionId: 'sess-land' }), true);
+    // The entry that was already waiting takes the reservation — no second entry.
+    assert.equal(queued('demo', 2)!.reserve, true, 'the queued entry is reserved in place');
+    assert.equal(scheduler.snapshot().entries.filter((entry) => entry.slug === 'demo' && entry.phase === 2).length, 1);
+    assert.ok(queued('demo', 2)!.order! < queued('elsewhere', 5)!.order!, 'and is scanned ahead of the entry that queued first');
+
+    // The grant set is asserted whole, so first wait for the two lanes it is
+    // made of to stand still (control-tower phase 83, #120): phase 3 in its
+    // session, holding its grant until `hold3` resolves, and phase 1 finished
+    // with its own released. The wait above names only the queue, and a set
+    // read straight after it raced the scheduler — [2] with phase 3 not yet
+    // admitted, [1, 2, 3] with phase 1 not yet let go.
+    const demoGrants = () => scheduler.snapshot().grants
+      .filter((grant) => grant.slug === 'demo').map((grant) => grant.phase).sort();
+    await until('phase 3 holding its grant in its session, and phase 1 finished with its own released',
+      () => sessions.some((session) => session.phase === 3) && demoGrants().includes(3)
+        && r.doneList().includes(1) && !demoGrants().includes(1));
+
+    locks = [];
+    scheduler.poll();
+    assert.deepEqual(demoGrants(), [2, 3], 'the landing takes the freed repository, beside phase 3 holding its own');
+    assert.ok(queued('elsewhere', 5), 'the other run waits behind it');
+
+    hold3.resolve();
+    await instance.wait();
+    scheduler.release(await earlier);
+
+    assert.equal(instance.current()!.status, 'finished');
+    assert.deepEqual(journalled('phase.admitted', 2).map((line) => line.reserved), [true], 'the admission says it was reserved');
+    assert.deepEqual(journalled('phase.resume-automatic', 2).map((line) => line.path), ['live-lane']);
+    const two = sessions.filter((session) => session.phase === 2);
+    assert.equal(two.length, 1, 'phase 2 boarded once');
+    assert.equal(two[0].resume, 'sess-land', 'its own session');
+    assert.match(two[0].prompt, /has LANDED/, 'resumed as the landing, not as the elapsed window');
+    assert.deepEqual(journalled('phase.wait-resume', 2).map((line) => line.cause), ['landed']);
+  } finally {
+    hold3.resolve();
   }
 });

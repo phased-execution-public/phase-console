@@ -12,7 +12,7 @@ A category that is off leaves no trace anywhere. Worth stating, because the obvi
 silencing only the buzz — leaves the badge climbing and the inbox filling, which is how people end up
 ignoring the inbox entirely.
 
-## The seventeen categories
+## The nineteen categories
 
 | Category | Tells you | Default |
 |---|---|---|
@@ -30,11 +30,13 @@ ignoring the inbox entirely.
 | **Console problems** | The console degraded, its file watch went deaf, or it restarted after a crash. | On |
 | **Usage limits** | A Claude account hit a usage window, with when it resets and what the run did about it — and an account that needs signing in again. | On |
 | **Issue drafted by a session** | A session tripped over a problem outside its phase and drafted an issue for it, where the plan's `Issues:` word allows. Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this says what landed. | On |
-| **Usage climbing** | Early warning while a window fills: 80% and 95% crossings. The meters show the same numbers all the time. | **Off** |
+| **Usage climbing** | Early warning while a window fills: 80% and 95% crossings, and hours ahead of a wall an account's measured burn will reach. The meters show the same numbers all the time. | On |
+| **Budget spent or running low** | A budget that can stop work — a phase's wait, a phase's or the run's dollars, the recovery ladder's cap, the failure streak — reached 80% or ran out. The first line says which budget and the arithmetic (`60m wait budget · 39.7m accrued · 20.3m left · asked for 90m`) and what spent it; the run page's card raises it where it was declared and retries in one press. | On |
+| **Hourly digest** | Once an hour, a summary instead of a stream: every decision waiting on you with its deadline, every parked run and stalled session, and what an outage kept from arriving. Nothing waiting sends nothing. | **Off** |
 | **Work became ready** | A phase became startable — including because of work you finished yourself, elsewhere. | **Off** |
 | **Plans changed on disk** | Any plan or handoff was written. An agent editing a handoff mid-phase fires this. | **Off** |
 
-The last three are off by default because they are early warnings or firehoses rather than signals.
+The last three are off by default because they are summaries or firehoses rather than signals.
 A channel that always buzzes is a channel you turn off, and the notification it was hiding goes with
 it. The wall itself — and everything a run does about one — still announces under **Usage limits**,
 so muting the climb never mutes the crash.
@@ -45,7 +47,7 @@ buzzes a wrist for it would be turned off within a week. The console names which
 it saw (silent, spinning, stalemate, retrying, waiting on an external clock) and offers the verbs that
 answer one — steer the session, freeze it where it stands, stop that lane. With one exception below it
 does not act by itself. A phase inside its
-own §Verification is exempt, because a build is silent and fine. On the Now inbox a stalled lane
+own §Verification is exempt, because a build is silent and fine. In the Tower's Needs-you bay a stalled lane
 becomes a row of its own only once it has been silent for half an hour: this notification arrives
 sooner, and it is the one you can dismiss.
 
@@ -124,7 +126,7 @@ about — a plan, a run, a phase, a session — so it routes to the thing rather
 
 - **Reading a page reads its notifications.** Sitting on a plan or session page for a moment marks
   that page's records read, scoped to that page. The count falls because you actually looked.
-- **Mark all read** on the dashboard card zeroes the count in one act, for the flood you are never
+- **Mark all read** in the bell's drawer zeroes the count in one act, for the flood you are never
   going to read item by item.
 - Nothing is deleted by either. The record stays; only its unread state changes.
 

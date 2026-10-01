@@ -43,7 +43,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -51,7 +51,9 @@ import {
   type RetentionAction,
   applyRetention,
   collectRetention,
+  keptTreeBytes,
   planRetention,
+  retentionReport,
   sanitiseRetention,
 } from '../server/retention.ts';
 
@@ -98,7 +100,35 @@ test('RET-1 — the shipped defaults are the table the docs promise', () => {
     gitTraceDirMaxBytes: 64 * 1024 * 1024,
     messagesRotateBytes: 8 * 1024 * 1024,
     messagesRetainDays: 90,
+    crashRetainDays: 14,
+    locksRotateBytes: 4 * 1024 * 1024,
+    humanStepsRotateBytes: 4 * 1024 * 1024,
+    runWorktreeRetainDays: 14,
+    runWorktreesMaxBytes: 2 * 1024 * 1024 * 1024,
   });
+});
+
+test('RET-1b — the crash sink ages out the snapshots and never the ledger', () => {
+  const dir = fixture();
+  mkdirSync(join(dir, 'diag'), { recursive: true });
+  plant(join(dir, 'crashes.json'), 900, 400 * DAY);
+  // Sized small; what is under test is the AGE rule. In the field each of
+  // these is the size of the heap that wrote it, which is the whole reason the
+  // sink exists.
+  plant(join(dir, 'diag', 'Heap.old.heapsnapshot'), 4_000, 30 * DAY);
+  plant(join(dir, 'diag', 'Heap.new.heapsnapshot'), 4_000, 1 * DAY);
+
+  const actions = planRetention(
+    collectRetention({ instanceDir: dir, stateHome: dir, runsDir: null, liveRunIds: new Set() }),
+    RETENTION_DEFAULTS,
+    NOW,
+  ).filter((action) => action.sink === 'crashes');
+
+  assert.deepEqual(
+    actions.map((action) => basename(action.path)),
+    ['Heap.old.heapsnapshot'],
+    'a snapshot is four gigabytes and stops being worth its disk; the twenty-line ledger that names it does not',
+  );
 });
 
 test('RET-2 — a nonsense policy value falls back rather than unbounding a sink', () => {
@@ -407,6 +437,8 @@ test('RET-17 — every sink the policy names is one the inventory can report', (
   plant(join(plan, 'outcomes', 'phase-01.json'), 1);
   plant(join(plan, 'rulings.ndjson'), 1);
   plant(join(plan, 'messages.ndjson'), 1);
+  plant(join(instance, 'locks.ndjson'), 1);
+  plant(join(instance, 'human-steps.ndjson'), 1);
   plant(join(plan, 'run-aaaaaaaa.jsonl'), 1);
   writeFileSync(join(plan, 'run-aaaaaaaa.json'), '{"id":"aaaaaaaa","status":"finished"}');
 
@@ -421,6 +453,8 @@ test('RET-17 — every sink the policy names is one the inventory can report', (
     'rulings',
     'messages',
     'run-records',
+    'locks',
+    'human-steps',
   ]) {
     assert.ok(seen.has(sink as never), `the inventory never reported ${sink} — its policy row is unreachable`);
   }
@@ -485,6 +519,54 @@ test('RET-19 — pruneRuns removes the run’s five sidecars, not just the recor
   rmSync(plan, { recursive: true, force: true });
 });
 
+test('RP-7b — per-phase and archived replays age with their run record, and go with it', async () => {
+  // control-tower phase 94, #133: the replay is one file per PHASE now, and the
+  // 2026-09-25 workaround left full files moved aside as `.old` and
+  // `.full-<stamp>`. The sidecar pattern knew none of them, so the inventory
+  // never counted them and a swept run left them behind for ever.
+  const dir = fixture();
+  const runs = join(dir, 'runs');
+  const plan = join(runs, 'demo');
+  mkdirSync(plan, { recursive: true });
+  writeFileSync(
+    join(plan, 'run-aaaaaaaa.json'),
+    JSON.stringify({ id: 'aaaaaaaa', status: 'finished', updatedAt: '2026-09-17T12:00:00.000Z' }),
+  );
+  const replays = [
+    'run-aaaaaaaa.p3.log.jsonl',
+    'run-aaaaaaaa.p12.log.jsonl',
+    'run-aaaaaaaa.log.jsonl.old',
+    'run-aaaaaaaa.log.jsonl.full-20260925T170500Z',
+    'run-aaaaaaaa.p3.log.jsonl.full-20260926T070000Z',
+  ];
+  for (const name of replays) plant(join(plan, name), 10, 400 * DAY);
+  plant(join(plan, 'run-aaaaaaaabbbb.p3.log.jsonl'), 10, 400 * DAY);
+
+  const inventory = collectRetention({ instanceDir: join(dir, 'state'), runsDir: runs });
+  const mine = inventory.files.filter((one) => one.runId === 'aaaaaaaa').map((one) => basename(one.path)).sort();
+  assert.deepEqual(mine, ['run-aaaaaaaa.json', ...replays].sort(), 'every replay is counted, and counted as this run’s');
+  for (const file of inventory.files.filter((one) => one.runId === 'aaaaaaaa')) {
+    assert.equal(file.at, Date.parse('2026-09-17T12:00:00.000Z'), `${file.path} ages with its record`);
+  }
+  assert.equal(inventory.files.find((one) => basename(one.path) === 'run-aaaaaaaabbbb.p3.log.jsonl')?.runId, 'aaaaaaaabbbb');
+
+  // …and a swept run takes them with it, and nothing of a longer id.
+  const { pruneRuns, runDir } = await import('../server/runner/state.ts');
+  const slug = `retention-replays-${Date.now()}`;
+  const swept = runDir('/tmp/retention-fixture-root', slug);
+  mkdirSync(swept, { recursive: true });
+  writeFileSync(
+    join(swept, 'run-aaaaaaaa.json'),
+    JSON.stringify({ id: 'aaaaaaaa', status: 'finished', updatedAt: '2026-01-01T00:00:00.000Z' }),
+  );
+  for (const name of replays) writeFileSync(join(swept, name), 'x');
+  writeFileSync(join(swept, 'run-aaaaaaaabbbb.p3.log.jsonl'), 'keep me');
+  assert.deepEqual(pruneRuns('/tmp/retention-fixture-root', slug, null, NOW, 30 * DAY, 0), ['aaaaaaaa']);
+  for (const name of replays) assert.equal(existsSync(join(swept, name)), false, `${name} outlived its run record`);
+  assert.equal(readFileSync(join(swept, 'run-aaaaaaaabbbb.p3.log.jsonl'), 'utf8'), 'keep me');
+  rmSync(swept, { recursive: true, force: true });
+});
+
 test('RET-20 — an unreadable or unfinished record is still never swept', async () => {
   const { pruneRuns, runDir } = await import('../server/runner/state.ts');
   const slug = `retention-unfinished-${Date.now()}`;
@@ -514,4 +596,121 @@ test('RET-21 — appendFileSync through a fresh descriptor after a trim also lan
   appendFileSync(path, 'next\n');
   assert.ok(readFileSync(path, 'utf8').endsWith('next\n'));
   assert.ok(statSync(path).size < 200);
+});
+
+test('RET-LK — the lock history ledger is a sink: rotated past its cap, its rotated copy never rotated again', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  mkdirSync(instance, { recursive: true });
+  plant(join(instance, 'locks.ndjson'), 500, 0);
+  plant(join(instance, 'locks.ndjson.1'), 500, 0);
+  const inventory = collectRetention({ instanceDir: instance, runsDir: null });
+  assert.deepEqual(
+    inventory.files.filter((one) => one.sink === 'locks').map((one) => one.path.slice(instance.length + 1)).sort(),
+    ['locks.ndjson', 'locks.ndjson.1'],
+  );
+  const actions = planRetention(inventory, sanitiseRetention({ locksRotateBytes: 100 } as never), NOW);
+  const rows = actionsFor(actions, 'locks');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'rotate');
+  assert.ok(rows[0].path.endsWith('locks.ndjson'));
+  // Under the cap, nothing is due.
+  assert.equal(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'locks').length, 0);
+});
+
+// ------------------------------------------------------------------ the human-step ledger (control-tower phase 41)
+
+test('RET-HS — the human-step ledger rotates past its cap like the lock ledger, and the reader still folds the rotated copy', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  mkdirSync(instance, { recursive: true });
+  plant(join(instance, 'human-steps.ndjson'), 500, 0);
+  plant(join(instance, 'human-steps.ndjson.1'), 500, 0);
+  const inventory = collectRetention({ instanceDir: instance, runsDir: null });
+  assert.deepEqual(
+    inventory.files.filter((one) => one.sink === 'human-steps').map((one) => one.path.slice(instance.length + 1)).sort(),
+    ['human-steps.ndjson', 'human-steps.ndjson.1'],
+  );
+  const rows = actionsFor(planRetention(inventory, sanitiseRetention({ humanStepsRotateBytes: 100 } as never), NOW), 'human-steps');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'rotate');
+  assert.ok(rows[0].path.endsWith('human-steps.ndjson'));
+  // Under the cap, nothing is due; a nonsense cap falls back to the default.
+  assert.equal(actionsFor(planRetention(inventory, sanitiseRetention({}), NOW), 'human-steps').length, 0);
+  assert.equal(sanitiseRetention({ humanStepsRotateBytes: -1 } as never).humanStepsRotateBytes, 4 * 1024 * 1024);
+});
+
+// ------------------------------------------------------------------ kept run worktrees (#75)
+
+test('RET-WT — a kept run worktree has its own byte and age budget in the report, apart from the run records', () => {
+  const dir = fixture();
+  const instance = join(dir, 'state');
+  const runs = join(dir, 'runs');
+  const plan = join(runs, 'demo');
+  const project = join(dir, 'root', '.worktrees', 'runs');
+  mkdirSync(instance, { recursive: true });
+  mkdirSync(plan, { recursive: true });
+  const record = (id: string, ageDays: number, status = 'finished') => writeFileSync(join(plan, `run-${id}.json`),
+    JSON.stringify({ id, status, updatedAt: new Date(NOW - ageDays * DAY).toISOString() }));
+  record('aaaaaaaa', 40);                 // an old finished run, its tree under the STATE root
+  record('bbbbbbbb', 1);                  // a recent finished run, its tree under the PROJECT root
+  record('cccccccc', 60, 'running');      // a live run: never a candidate, however old
+  const oldTree = join(plan, 'worktrees', 'aaaaaaaa');
+  const newTree = join(project, 'demo', 'bbbbbbbb');
+  const liveTree = join(project, 'demo', 'cccccccc');
+  const unknownTree = join(project, 'demo', 'dddddddd');
+  for (const tree of [oldTree, newTree, liveTree, unknownTree]) mkdirSync(join(tree, 'integration'), { recursive: true });
+  const GIB = 1024 * 1024 * 1024;
+  const sizes = new Map<string, number>([[oldTree, 3 * GIB], [newTree, 100 * 1024 * 1024], [liveTree, 5 * GIB]]);
+
+  const inventory = collectRetention({
+    instanceDir: instance, runsDir: runs, projectWorktrees: project,
+    live: { demo: ['cccccccc'] },
+    treeBytes: (tree) => sizes.get(tree),
+  });
+  const trees = inventory.files.filter((one) => one.sink === 'run-worktrees');
+  assert.deepEqual(trees.map((one) => one.path).sort(), [liveTree, newTree, oldTree, unknownTree].sort(),
+    'both worktree roots are walked, one row per run tree');
+  assert.equal(trees.find((one) => one.path === oldTree)!.at, NOW - 40 * DAY, 'a tree ages with its run record');
+  assert.equal(trees.find((one) => one.path === unknownTree)!.unmeasured, true, 'a tree not measured yet says so');
+
+  const report = retentionReport(inventory, RETENTION_DEFAULTS, NOW);
+  const sink = report.sinks.find((one) => one.sink === 'run-worktrees')!;
+  assert.equal(sink.files, 4);
+  assert.equal(sink.bytes, 3 * GIB + 100 * 1024 * 1024 + 5 * GIB);
+  assert.equal(sink.unmeasured, 1);
+  const records = report.sinks.find((one) => one.sink === 'run-records')!;
+  assert.ok(records.bytes < 1024 * 1024, 'the run-records cap still counts records, and the trees are their own row');
+
+  // The AGE budget: the 40-day tree is past 14 days; the live one never is.
+  const byAge = actionsFor(report.actions, 'run-worktrees');
+  assert.deepEqual(byAge.map((one) => one.path), [oldTree]);
+  assert.equal(byAge[0].kind, 'oversized', 'reported, never deleted by the sweep');
+  assert.match(byAge[0].why, /past 14 days/);
+
+  // The BYTE budget: over the KEPT trees — finished runs', measured — oldest
+  // first until they fit. A live run's checkout is in use, not kept, and an
+  // unmeasured tree has no bytes to be over budget with.
+  const tight = planRetention(inventory, { ...RETENTION_DEFAULTS, runWorktreeRetainDays: 100, runWorktreesMaxBytes: 50 * 1024 * 1024 }, NOW);
+  assert.deepEqual(actionsFor(tight, 'run-worktrees').map((one) => one.path).sort(), [newTree, oldTree].sort());
+  assert.ok(actionsFor(tight, 'run-worktrees').every((one) => one.kind === 'oversized' && one.path !== liveTree));
+
+  // And nothing the executor does to an `oversized` row touches the tree.
+  applyRetention(actionsFor(tight, 'run-worktrees'));
+  assert.ok(existsSync(join(oldTree, 'integration')), 'the sweep never removes a checkout');
+});
+
+test('RET-WT — a kept tree is measured off the loop, once per mtime, and read from what is known', async () => {
+  const dir = fixture();
+  const tree = join(dir, 'tree');
+  mkdirSync(tree, { recursive: true });
+  let measured = 0;
+  const measure = async () => { measured++; return 4096; };
+  assert.equal(keptTreeBytes(tree, measure), undefined, 'the first read measures in the background and answers nothing yet');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(keptTreeBytes(tree, measure), 4096);
+  assert.equal(keptTreeBytes(tree, measure), 4096);
+  assert.equal(measured, 1, 'an unchanged tree is measured once');
+  rmSync(tree, { recursive: true, force: true });
+  assert.equal(keptTreeBytes(tree, measure), undefined, 'a tree that has gone has no size');
 });

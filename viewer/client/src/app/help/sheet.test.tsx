@@ -210,9 +210,11 @@ describe('the help sheet', () => {
     await waitFor(() => {
       const halted = [...panel.querySelectorAll('code')].find((el) => el.textContent === 'halted');
       expect(halted, 'the glossary names halted as inline code').toBeTruthy();
-      // A halted run needs a person: the badge wears the needs-you state class
-      // and paints by `--state`, never a colour of its own.
-      expect(halted!.className, "painted as the run badge's own UI state").toContain('state-needs-you');
+      // A halted run is the status model's quiet wait — amber is a summons, and
+      // a word alone never is one (control-tower phase 31: it read needs-you).
+      // The word paints by `--state`, never a colour of its own.
+      expect(halted!.className, "painted as the run badge's own paint").toContain('state-waiting');
+      expect(halted!.className).not.toContain('state-needs-you');
       expect(halted!.className).toContain('text-state');
       expect(halted!.getAttribute('title')).toMatch(/must not be automated past/);
     });

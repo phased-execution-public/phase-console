@@ -4,7 +4,7 @@
  */
 
 import { request, post, q } from './client';
-import { type HEALTH_SEVERITIES } from '../../../../shared/ops-vocab.js';
+import { type DUTY_UNKNOWN_REASONS, type HEALTH_SEVERITIES } from '../../../../shared/ops-vocab.js';
 import { type GATE_KINDS } from '../../../../shared/plan-vocab.js';
 import type { LandPolicy } from '../../../../shared/landing-model.js';
 import { PLAN_INCLUDES, includeParam } from '../../../../shared/projection.js';
@@ -77,15 +77,24 @@ export interface PlanSummaryFull {
   closedOn?: string;
   closedReason?: string;
   created?: string;
+  /** When work on the plan began — its runs' earliest boarding, ISO with time (#28). */
+  startedAt?: string;
+  /** From `startedAt` to now while a run is live, else to the last recorded end (#28). */
+  spanMs?: number;
   activity: number;
   phases: number;
   declaredPhases?: number;
-  done: number;
+  /** Null when the board could not be read and no reading stands in for it (#96). */
+  done: number | null;
   ready: number[];
   waiting: number;
   inProgress: number[];
   stuck: number[];
-  percent: number;
+  percent: number | null;
+  /** `unknown` when this read of the board failed or timed out (#96) — draw it with `progressReading`. */
+  progress?: 'unknown';
+  /** The last good reading beside an unknown progress, and its age when served (#96). */
+  lastGood?: { done: number; phases: number; percent: number; at: number; ageMs: number };
   remainingWeight: number;
   remainingSessions: number;
   criticalPath: number[];
@@ -111,6 +120,8 @@ export interface PlanSummaryFull {
   medianGapDays?: number;
   issues: HealthIssue[];
   engineError?: string;
+  /** Set when the board is the LAST GOOD one, served because this read timed out (#44): when it landed, and its age when served. */
+  boardStale?: { at: number; ageMs: number };
   issueCounts: { error: number; warning: number; info: number };
   hasHandoffs: boolean;
   /** How long this plan has left. Absent only when nothing is left. */
@@ -198,6 +209,10 @@ export interface PhaseView {
   qaMode?: { mode: string; source: 'phase' | 'plan' };
   /** The rounds the ledger records for this phase — how many, and the latest. */
   qaRounds?: { count: number; latest: { round: number; result: string; report?: string } };
+  /** The unmet dependencies holding this phase, with the engine's reason (`not-done`, `qa:<verdict>`). */
+  blockedBy?: { phase: number; why: string }[];
+  /** The phases this phase's QA verdict holds — the HELD state. */
+  qaHeld?: number[];
   lock?: PhaseLock;
   handoff?: PhaseHandoffRef;
   /**
@@ -282,6 +297,22 @@ export interface LintResult {
   issues: string[];
   summary: string;
   timedOut?: boolean;
+  /**
+   * The engine could not RUN (#17, `server/engine.ts` `readLint`): the reading
+   * proves nothing about the plan, `ok` is true so nothing reads it as a broken
+   * plan, and the summary says what happened. Plan health reads "could not
+   * run" — never red. Absent on an older server.
+   */
+  crashed?: boolean;
+  /** Set when this is the last verdict that proved something, served while this revision's runs or after it timed out (#44). */
+  stale?: { at: number; revision: number };
+}
+
+/** The engine pool now — reads holding a slot, reads queued behind them, the slot count (`GET /api/engine`). */
+export interface EngineQueue {
+  active: number;
+  queued: number;
+  max: number;
 }
 
 export interface SessionBudgetView {
@@ -443,11 +474,17 @@ export interface PlanCost {
   runs: { runId: string; spentUsd: number; budgetUsd: number | null; status?: string }[];
 }
 
+/** Why a calendar forecast reads unknown instead of a date — `shared/ops-vocab.js` owns the words. */
+export type DutyUnknownReason = (typeof DUTY_UNKNOWN_REASONS)[number];
+
 /** The share of elapsed wall-clock a plan has spent with a phase actually running. */
 export interface DutyCycle {
   ratio: number;
   samples: number;
-  assumed: boolean;
+  /** False when the window cannot say how this plan is being driven — then there is no date. */
+  known: boolean;
+  /** Why it is not known. Absent when `known`. */
+  reason?: DutyUnknownReason;
   workingMs: number;
   elapsedMs: number;
 }
@@ -459,13 +496,23 @@ export interface DutyCycle {
  * duration-shaped and therefore zone-free. `assumptions` is not decoration:
  * a date gets quoted long after the caveats around it are forgotten, so every
  * surface that prints one of these instants prints the list beside it.
+ *
+ * `earliest`/`expected`/`latest` are present only when `calendar === 'known'`
+ * — with no measurable duty cycle there is no date at all, and `label` reads
+ * `calendar time unknown` rather than inventing one off an idle ratio.
  */
 export interface Forecast {
-  earliest: string;
-  expected: string;
-  latest: string;
+  earliest?: string;
+  expected?: string;
+  latest?: string;
+  /** A calendar figure — stretched by the duty cycle, unlike `EtaEstimate`'s `'working'`. */
+  clock: 'calendar';
+  /** Whether a date exists at all: `'unknown'` never renders a date off an idle ratio. */
+  calendar: 'known' | 'unknown';
   basis: EtaEstimate['basis'];
   samples: number;
+  /** Finished phases with no usable measurement, reported beside the count. */
+  missing: number;
   remainingPhases: number;
   remainingWeight: number;
   workingLowMs: number;
@@ -496,6 +543,26 @@ export interface PlanDetail {
   phases: PhaseView[];
   route: RouteView;
   batches: SessionPlanView | null;
+  /**
+   * The sizing model as it reads this plan (control-tower phase 59, #83): the
+   * unit every session count is in, the forecast in sessions, a session's
+   * context, and the repository's boot floor as its own line. Optional: an
+   * older server does not send it.
+   */
+  sizing?: {
+    unit: string;
+    forecast: { sessions: number; phases: number; basis: 'measured' | 'shipped' };
+    forecastLine: string;
+    context: {
+      floor: number;
+      slope: number;
+      boot: number;
+      work: number;
+      basis: 'measured' | 'shipped';
+      samples: number;
+    };
+    bootLine: string;
+  };
   boardText: string;
   lint: LintResult | null;
   handoffs: HandoffRow[];
@@ -777,6 +844,11 @@ export interface WriteResult {
 /** The plan surface's fetchers — merged into `api` by `./index`. */
 export const plansApi = {
   plans: () => request<PlanSummary[]>('/api/plans'),
+  /** The engine's lint, run again now — the plan page reads the cached verdict; this is the fresh one. */
+  planLint: (slug: string) => request<LintResult | null>(`/api/plans/${q(slug)}/lint`),
+  /** What is left: its weight, its phases, and the sessions it forecasts at this plan's budget. */
+  planWork: (slug: string) =>
+    request<{ weight: number; sessions: number; phases: number } | null>(`/api/plans/${q(slug)}/work`),
 
   /* ---- plans ----
      The prompt endpoints answer `text/plain`; `request` already returns a
@@ -786,6 +858,8 @@ export const plansApi = {
    * omitted, the server answers the board projection — 47.8 KB on the measured
    * 23-phase plan, against 286.5 KB for `include=full`.
    */
+  /** The engine pool now — what a plan page whose own read is queued says while it waits (#44). */
+  engineQueue: () => request<EngineQueue>('/api/engine'),
   plan: (slug: string, opts?: { model?: string; include?: Iterable<string> }) => {
     const params = new URLSearchParams();
     if (opts?.model) params.set('model', opts.model);

@@ -222,7 +222,7 @@ console's id, so two consoles never overwrite each other's cards. That namespaci
 once, at 5.0.0: a card delivered before the upgrade stands beside its successor rather than being
 replaced by it.
 
-**Seventeen categories, per device**, because a phone and a laptop rarely want the same ones. This
+**Nineteen categories, per device**, because a phone and a laptop rarely want the same ones. This
 table is the catalogue (`viewer/server/push/catalogue.ts`), and a test holds it to it — if the two
 ever disagree, the catalogue is right:
 
@@ -230,7 +230,7 @@ ever disagree, the catalogue is right:
 |---|---|---|
 | **Permission needed** | on | A session is blocked on a decision only you can make — a command outside its rules, a gate, or a check it cannot make itself. Nothing proceeds until you answer. |
 | **Session waiting on you** | on | A Claude session is stopped at a permission prompt or a question — a lane of the autopilot, one you ran in a terminal, or an agent session. The body is the question itself, with the plan and phase when the console can tell which, never the directory. A lane whose phase already has a card waiting in the approval queue is not pushed twice. The row is resolved when the wait is answered or the session ends, and a wait still unanswered after an hour is pushed once more. A question a relayed session asks arrives here too, answered by rule when its window closes unless you answer first. |
-| **A phase needs you** | on | A phase did its work and stopped at something no automation may sign off — a check written as prose, a verification only a person can make. It is not failed and not finished; it is waiting, and it will keep waiting. |
+| **A phase needs you** | on | A phase did its work and stopped at something no automation may sign off — a check written as prose, a verification only a person can make, or a human step: a sign-in, a code, a secret, an approval only you can give, named with Open and I did it (and, for a device code, the code). It is not failed and not finished; it is waiting, and it will keep waiting. |
 | **Gate needs a person** | on | A phase is held at a gate only a person may clear — a physical act, a third party, a credential no session holds. The board will call the phase ready the moment it is approved and not one second before, so nothing else moves and nothing else will ask. |
 | **QA verdict owed or failed** | on | A finished phase still owes its QA verdict, or QA recorded a fail. Either way the plan gates on it: every dependent phase is held until pass or waived is recorded, and nothing records one by itself. Sent only after the console's own chase (the at-finish dispatcher, then the ladder) left the verdict owed. |
 | **Run halted** | on | A run stopped on something that must not be automated past — a failed verification, a phase that would not settle. Includes a run that was interrupted with nothing driving it. |
@@ -242,13 +242,27 @@ ever disagree, the catalogue is right:
 | **Plans changed on disk** | off | Any plan or handoff was written. Genuinely everything — an agent editing a handoff mid-phase fires this. Off by default because it is a firehose, not a signal. |
 | **A session ended** | on | An agent session or terminal finished while you were not watching it, or exited with an error. Closing one yourself is not announced — you already know. |
 | **Console problems** | on | The console degraded, its file watch went deaf, or it restarted after a crash. The supervisor failing quietly is the worst case, because everything else still looks fine. |
-| **Usage limits** | on | A Claude account this console runs work as hit a usage window — the 5-hour session, the weekly allowance, or a per-model one — with when it resets, plus what the run did about it (waited, switched account, paused) and an account that needs signing in again. |
-| **Usage climbing** | off | Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next long phase will not finish". Off by default: the meters show the same numbers all the time, and the wall itself still announces under Usage limits. |
+| **Usage limits** | on | A Claude account this console runs work as hit a usage window — the 5-hour session, the weekly allowance, or a per-model one — with when it resets, plus what the run did about it (waited, switched account, paused) and an account that needs signing in again. Also **Login needs renewing** — before a login a live or queued run depends on can no longer be renewed (see below). |
+| **Usage climbing** | on | Early warning while a window fills — 80% is "plan your afternoon", 95% is "the next long phase will not finish" — and, hours ahead, an account serving live runs that its measured burn will wall: when, when it resets, and which runs are burning it (2 hours before by default). On by default since control-tower phase 92 (#141): the warning that could have said "walls ≈10:50, resets in four days" was off. The wall itself still announces under Usage limits. The lead is the `usageForecastLeadHours` preference (hours, default 2); `usageForecastHold: true` also holds new admissions on that account until the window resets. |
+| **Budget spent or running low** | on | A budget that can stop work reached 80% or ran out — a phase's wait (its `Waits on:` max or the plan's `Wait budget:`), a phase's or the run's dollars, the recovery ladder's cap, the failure streak. The first line says which budget and the arithmetic — `60m wait budget · 39.7m accrued · 20.3m left · asked for 90m` — and what spent it; the run page's card beside it raises the budget where it was declared (the plan's line for a wait, the run's setting for dollars and rungs, Clear streak for the streak) and retries in one press. Once per budget per attempt; not urgent (control-tower phase 14, #40). |
 | **Issue drafted by a session** | on | A session tripped over a problem outside its phase and drafted an issue for it (the plan's `Issues:` word allows it). Under `draft` it waits in the inbox for your Approve, Discard or edit; under `file` it was filed at once and this tells you what landed. Not urgent: nothing is spending while a draft waits, and a filed issue is a record, not a wall. |
+| **Hourly digest** | off | A summary instead of a stream: once an hour, every decision waiting on you with how long it has waited and when it expires, every parked run and every stalled session — and, once the channel answers again, the notifications an outage kept from arriving. Nothing waiting sends nothing. Off by default: the categories above already say each thing as it happens. |
+
+**Login needs renewing** (under *Usage limits*, control-tower phase 91). A signed-in account's
+access token lapses every few hours; while the console runs it renews each one through the Claude
+CLI's own refresh a few minutes before it lapses, so an unattended run does not stop for it. When a
+renewal FAILS — the refresh was refused, or the CLI could not reach the sign-in service — and a live
+or queued run depends on that account, the phone and the notification inbox say so once, with the
+runs that wait on it and the exact fix: `CLAUDE_CONFIG_DIR=$HOME/…/<profile>/config claude auth login`
+for a profile, `claude auth login` for the machine login, or "paste a new setup-token" for a token
+account. A run already stopped by an expired or signed-out login resumes by itself once `claude auth
+status` and a usage read both succeed on the identity it started on; an organisation or policy refusal
+still waits for your press. For runs left alone for days, a long-lived token (`claude setup-token`)
+never needs renewing — the account card and the start door offer it.
 
 Five are sent **urgent** — *Permission needed*, *Session waiting on you*, *A phase needs you*,
 *QA verdict owed or failed* and *Run halted* — because they are the ones that mean nothing moves
-until you act; urgent interrupts a focus mode and buzzes a wrist. The other twelve arrive quietly.
+until you act; urgent interrupts a focus mode and buzzes a wrist. The other fourteen arrive quietly.
 A channel that always buzzes is a channel you turn off, and the notification it gets turned off for
 is the one that mattered.
 
@@ -259,6 +273,30 @@ while it waits.
 Payloads are encrypted to a key only your browser holds ([RFC 8291][rfc8291]), so the push service
 relays a notification about your plans without being able to read one. Nothing is installed to make
 that work — the implementation is `node:crypto` and about four hundred lines.
+
+### Your turn — a human step on the phone
+
+When a run needs an act only you can do — a sign-in that opens a browser, a device code, a token to
+paste, an approval on somebody else's dashboard — the push says so as *A phase needs you*, titled
+"Your turn: …" with the kind and the phase, and its body says what to do and where: *at the machine
+the console runs on* for a step that must be done there, nothing added for one you can do from the
+phone. A `device-code` step puts the code itself in the body, so the phone is enough. The push names
+two actions, *Open* and *I did it*. **I did it** is a real button: pressing it runs the step's proof
+on the console, and a proof that lands resumes the phase's own session told what was proven — one
+that does not land is simply said, and the step waits on. *Open* is the tap: it opens the phase,
+where the step's inbox row offers *I did it — check*, *Snooze an hour* and *I can't do this*. No code
+you type, token or password is ever in a push — only a device code, which is useless without your
+own signed-in browser.
+
+A step you have not done is **reminded**: 15 minutes after the first push, then an hour after that,
+six hours after that, then daily — each gap counted from the last reminder or from your last open or
+check, whichever is later. A reminder replaces the step's notification rather than stacking beside it
+("Still your turn … Reminder 2"). *Snooze* holds the next reminder back (an hour, a day at most), and
+the **reminder quiet hours** (`reminderQuiet`, `HH:MM`–`HH:MM` on the console's clock) defer one that
+falls inside them to their end — deferred, never dropped. Reminders stop when the step is proven,
+when you press *I can't do this* (it becomes an errand carrying your reason), or when it is
+withdrawn; a step whose window closes (seven days when it names none) expires into an errand too, so
+nothing reminds for ever.
 
 ### When nothing would reach you
 
@@ -298,6 +336,8 @@ Some notifications carry buttons, and pressing one answers without opening anyth
 | **Allow** | Permission needed | Answers the card. The session unblocks where it stands. |
 | **Deny** | Permission needed | Answers the card the other way; the session is told. |
 | **Approve** | Gate needs a person, when the gate is a person's to clear (`manual`, or overdue) — never an `ai`/`auto` gate | Records the gate clearance in `gate-status.md` and lets the phase board. |
+| **Extend 2 h** | Permission needed — the T-15 and T-5 warning a card sends before it runs out, beside **Allow** | Moves the card's deadline two hours later. Inside the hook call's hour it simply moves; past it the session is told no at the hour and the card stands for twelve hours, and allowing it then resumes the phase with that one call granted once. |
+| **I did it** | A phase needs you — a human step ("Your turn: …") | Runs the step's proof on the console. A proof that lands marks the step proven and resumes the phase's own session saying what was proven; one that does not land records what it read, and the step waits on. A step that names no proof is proven on your word. |
 
 Android and desktop render them. **iOS ignores the array and shows the notification**, which is the
 correct degradation — tapping it opens `#/approve`, below, where the same buttons are.
@@ -317,6 +357,7 @@ Three things this deliberately cannot do, and the reasons are worth knowing befo
 
 A relayed question carries no buttons: a button may allow or deny, never choose one of several
 labels, so its answer is a tap on `#/approve`.
+
 
 ### `#/approve` — the whole queue, thumb-sized
 

@@ -5,9 +5,16 @@
  * Radix surface here keeps.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Disclosure } from './disclosure';
+
+// Through a helper, never `new URL('<literal>', import.meta.url)` inline — Vite
+// rewrites that shape as an asset reference and the path stops being a file.
+const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
+const THEME = readFileSync(here('../../styles/theme.css'), 'utf8');
 
 describe('Disclosure', () => {
   it('starts folded: content unmounted, the count drawn, the fold named', () => {
@@ -80,5 +87,21 @@ describe('Disclosure', () => {
       </Disclosure>,
     );
     expect(screen.getByRole('button').className).toContain('min-h-(--tap-min)');
+  });
+
+  it('opens through the expand transition: a grid row grown from 0fr, on the duration token', () => {
+    // docs/design.md §5: motion answers actions, and the expand is a CSS
+    // `grid-rows 0fr→1fr` transition — no library, no measured height.
+    render(<Disclosure label="Show everything">detail</Disclosure>);
+    fireEvent.click(screen.getByRole('button'));
+    const region = screen.getByText('detail');
+    expect(region.parentElement?.className).toBe('expand-region');
+    const rule = THEME.match(/\.expand-region\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(rule).toMatch(/grid-template-rows:\s*1fr/);
+    expect(rule).toMatch(
+      /transition:\s*grid-template-rows var\(--transition-duration-medium\) var\(--ease-transit\)/,
+    );
+    // The first frame: a region that MOUNTS on open still grows from nothing.
+    expect(THEME).toMatch(/@starting-style\s*\{\s*\.expand-region\s*\{\s*grid-template-rows:\s*0fr;/);
   });
 });

@@ -20,6 +20,8 @@
  */
 
 /** Same header the app sends: the server refuses a mutation without it. */
+import { DEVICE_CODE_RE, HUMAN_STEP_KINDS } from './human-step-model.js';
+
 export const CONSOLE_HEADERS = Object.freeze({
   'content-type': 'application/json',
   'x-phase-console': '1',
@@ -47,6 +49,7 @@ export const NOTIFICATION_BADGE = '/icons/icon-badge-96.png';
  * @property {{action: string, title: string}[]|null} [actions]
  * @property {string|null} [callback]
  * @property {{id?: string, name?: string}|null} [console] which console spoke (zero-touch phase 17, FLT-4)
+ * @property {{id?: unknown, kind?: unknown, where?: unknown, code?: unknown}|null} [step] a person's turn (control-tower phase 41/42)
  */
 
 /**
@@ -100,6 +103,7 @@ export function consoleName(data) {
  * @returns {NotificationOptions}
  */
 export function notificationOptions(data) {
+  const step = stepOf(data);
   return {
     body: data.body || 'Something needs you.',
     // Same tag replaces rather than stacks: a run that re-renders three times
@@ -117,6 +121,11 @@ export function notificationOptions(data) {
       actions: notificationActions(data) || null,
       callback: data.callback || null,
       console: consoleName(data),
+      // A person's turn (control-tower phase 42): the step's id and kind ride
+      // the notification, so a press hours later still knows which card to
+      // open. Only a step whose kind this worker knows — any other payload is
+      // a plain link.
+      ...(step ? { step } : {}),
     },
     // Answering from the lock screen, without unlocking and finding the queue.
     // (Android and desktop honour these; iOS ignores the array and shows the
@@ -154,6 +163,20 @@ export const MAX_NOTIFICATION_ACTIONS = 2;
  * @returns {NotificationAction[]|undefined}
  */
 export function notificationActions(data) {
+  // A person's turn (control-tower phase 42): *Open* — the step's card, one
+  // tap from the lock screen — and *I did it*, the signed check the server
+  // bound to the token, when it did. Open is the worker's own and posts
+  // nothing; the check is answered through `/api/push/action` like any other.
+  if (stepOf(data)) {
+    const signed =
+      Array.isArray(data.actions) && data.callback
+        ? data.actions.find((entry) => entry && entry.action === 'check' && typeof entry.title === 'string')
+        : undefined;
+    return [
+      { action: STEP_OPEN_ACTION, title: 'Open' },
+      ...(signed ? [{ action: 'check', title: signed.title }] : []),
+    ].slice(0, MAX_NOTIFICATION_ACTIONS);
+  }
   if (Array.isArray(data.actions)) {
     const clean = data.actions
       .filter(
@@ -204,6 +227,8 @@ export function decisionOf(action) {
  */
 export function actionOf(action, data) {
   if (typeof action !== 'string' || !action) return null;
+  // *Open* on a step opens its card; it is never an answer to post.
+  if (action === STEP_OPEN_ACTION && data?.step) return null;
   const offered = notificationActions(data ?? {});
   if (!offered) return null;
   return offered.some((entry) => entry.action === action) ? action : null;
@@ -310,6 +335,9 @@ export const ANSWER_RECEIPTS = Object.freeze({
   allow: 'Allowed. The session is carrying on.',
   deny: 'Denied. The session was told.',
   approve: 'Gate approved. The phase can board.',
+  // A person's turn (control-tower phase 42): the press runs the proof on the
+  // console — it may not land, and the reminders go on until it does.
+  check: 'Sent. The console is running the proof; you will be reminded if it does not land.',
 });
 
 /**
@@ -354,4 +382,51 @@ export function resubscribeRequest(subscription, label = 'a browser (re-register
       body: JSON.stringify({ subscription, label }),
     },
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * A person's turn (control-tower phase 42)
+ * ------------------------------------------------------------------ */
+
+/** The step's own button: open its card. Never a signed verb — it posts nothing. */
+export const STEP_OPEN_ACTION = 'open';
+
+/**
+ * The step a payload is about — `{id, kind, where, code?}` — when its kind is
+ * one this worker knows (`HUMAN_STEP_KINDS`), else null: a step of a kind a
+ * newer console added is drawn as a plain link, never half a card.
+ *
+ * @param {PushPayload} data
+ * @returns {{id: string, kind: string, where: 'host'|'any', code?: string}|null}
+ */
+export function stepOf(data) {
+  const step = data && typeof data === 'object' ? /** @type {Record<string, unknown>} */ (data).step : null;
+  if (!step || typeof step !== 'object') return null;
+  const { id, kind, where, code } = /** @type {Record<string, unknown>} */ (step);
+  if (typeof id !== 'string' || !id || typeof kind !== 'string') return null;
+  if (!(/** @type {readonly string[]} */ (HUMAN_STEP_KINDS).includes(kind))) return null;
+  return {
+    id,
+    kind,
+    where: where === 'host' ? 'host' : 'any',
+    ...(typeof code === 'string' && DEVICE_CODE_RE.test(code) ? { code } : {}),
+  };
+}
+
+/**
+ * Where a step's notification lands — its card on the phone's answer page
+ * (`#/approve?step=<id>`), under whatever path the payload's own url is
+ * mounted at (a console under the fleet's `/c/<id>/`), clamped to this origin
+ * like every click. One tap from the lock screen to the whole step.
+ *
+ * @param {{url?: string, step?: {id?: string}|null}|null|undefined} info the notification's `data`
+ * @param {string} origin
+ * @returns {string}
+ */
+export function stepTarget(info, origin) {
+  const base = new URL(clickTarget(info, origin));
+  const id = info?.step?.id;
+  if (typeof id !== 'string' || !id) return base.href;
+  base.hash = `/approve?step=${encodeURIComponent(id)}`;
+  return base.href;
 }

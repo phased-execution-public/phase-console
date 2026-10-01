@@ -50,8 +50,9 @@ import { dirname, join } from 'node:path';
 
 import { STATE_DIR } from '../config.ts';
 import { log } from '../log.ts';
+import type { RetirementEvidence } from '../runner/errors.ts';
 import {
-  ENTITLEMENT_STATES, PROBE_STATUSES, entitlementMayMove, isEntitlementState,
+  ENTITLEMENT_STATES, PROBE_STATUSES, WALL_PCT, entitlementMayMove, isEntitlementState,
   type CredentialClass, type EntitlementState, type LeaveKind, type ProbeStatus,
 } from '../../shared/ops-vocab.js';
 
@@ -69,6 +70,60 @@ export type { EntitlementState, CredentialClass, LeaveKind, ProbeStatus };
  */
 export const ACCOUNT_COOLDOWN_MS = 30 * 60_000;
 
+/**
+ * How long a contradiction has to STAND before a green read alone clears a
+ * `suspect` (control-tower phase 54, #57): the same half hour as a cool-down —
+ * the poller's longest gap — so at least one more read agrees. A check the API
+ * takes, or a spend, clears it at once; a refusal meanwhile retires it again.
+ */
+export const SUSPECT_CLEAR_MS = ACCOUNT_COOLDOWN_MS;
+
+/**
+ * The walls that hold a whole ACCOUNT out, rather than one model: the shared
+ * windows, and the nameless one a live wall files when the CLI named no
+ * window (`scheduler.ts` `LEARNED_WALL_BUCKET`).
+ */
+export const SHARED_WALLS = Object.freeze(['five_hour', 'seven_day', 'learned_window'] as const);
+/** The nameless wall — no meter speaks for it by name, so the shared windows do. */
+export const NAMELESS_WALL = 'learned_window';
+
+/** What a fresh reading moved (control-tower phase 54, #78). */
+export type WallReread = {
+  /** Walls a reading showed open, dropped. */
+  lifted: string[];
+  /** Walls whose reset a reading showed earlier, moved to it. */
+  moved: { bucket: string; from: string; to: string }[];
+  /** A usage cooling that ended, or that a standing wall's earlier reset shortened. */
+  cooling?: 'ended' | { from: string; to: string };
+};
+
+/* ---------------- certificate corroboration ---------------- */
+
+/**
+ * What it takes to believe a certificate fault is STANDING rather than the
+ * weather. Three numbers, and each answers a way one blip could fake it:
+ * strikes, so a single stop never decides; sessions, so one wedged lane
+ * failing three times against one dropout does not count as three opinions;
+ * and a span, so three stops inside twenty seconds — the measured shape of the
+ * incident this exists to survive — stay one event.
+ */
+export const CERT_STRIKES_NEEDED = 3;
+export const CERT_SESSIONS_NEEDED = 2;
+export const CERT_SPAN_NEEDED_MS = 10 * 60_000;
+/** Older than this and a strike is a different incident, not corroboration. */
+export const CERT_STRIKE_WINDOW_MS = 60 * 60_000;
+/** Kept on the row: the verdict reads the first and the last, never the middle. */
+const CERT_STRIKES_KEPT = 8;
+
+/** What the ledger says after a strike — the caller decides what to do about it. */
+export type CertificateVerdict = {
+  strikes: number;
+  sessions: number;
+  spanMs: number;
+  /** Enough strikes, from enough sessions, over enough time, uninterrupted. */
+  corroborated: boolean;
+};
+
 /** The file's own schema version; readers accept `>=`, writers stamp this. */
 const LEARNED_VERSION = 1;
 
@@ -77,7 +132,14 @@ const LEARNED_VERSION = 1;
  * helper, and (phase 15) `probe`: a one-turn session a person asked for, whose
  * answer is evidence about the credential rather than about any run.
  */
-export type LeaveBy = 'classifier' | 'live-wall' | 'preflight' | 'operator' | 'runner' | 'poller' | 'console' | 'probe';
+export type LeaveBy = 'classifier' | 'live-wall' | 'preflight' | 'operator' | 'runner' | 'poller' | 'console' | 'probe'
+  /**
+   * An authenticated call that LANDED, later than a retirement that claimed
+   * this machine could not reach the API. The one automatic door out of
+   * `retired`, and it opens for exactly one class (`certificate`), because it
+   * is the only one a successful read is evidence about.
+   */
+  | 'proof';
 
 export type Entitlement = {
   state: EntitlementState;
@@ -89,8 +151,18 @@ export type Entitlement = {
   by?: LeaveBy;
   /** `cooling` only: ISO — when the cool-down (or the wall's own reset) ends. */
   until?: string;
-  /** `retired` only: which credential class refused. */
+  /** `retired` and `suspect`: which credential class refused. */
   class?: CredentialClass;
+  /**
+   * `retired` and `suspect` (control-tower phase 54, #57): what the verdict
+   * stood on — a kind the API returned or a sentence on its error channel, the
+   * words that matched, and whose stop it was.
+   */
+  evidence?: RetirementEvidence;
+  /** `suspect` only: the retirement it demoted — when, by whom, and why. */
+  retired?: { at?: string; by?: LeaveBy; reason?: string };
+  /** `suspect` only: the green read or check that contradicts the retirement. */
+  contradicted?: { at: string; by: LeaveBy; reason: string };
 };
 
 /** Where a credential stands, EFFECTIVELY, at `nowMs` — the reader's answer. */
@@ -114,10 +186,24 @@ export type LearnedCredential = {
   lastErrorAt?: string;
   /** The last time a run left this account for another, and who moved it. */
   lastLeftAt?: { at: string; by: LeaveBy; kind: LeaveKind; reason: string };
+  /**
+   * The certificate-shaped stops seen against this credential, newest last —
+   * the corroboration ledger. Dropped whole by a successful read, because
+   * "and nothing worked in between" is half of what corroboration means.
+   */
+  certificateStrikes?: { at: string; session: string }[];
   /** Set when the last registration naming this credential was removed. */
   tombstone?: { name: string; retiredAt: string };
   /** The newest one-turn check of whether the credential may run work, and how many there have been. */
   probe?: LearnedProbe;
+  /**
+   * Whose login the credential was when this row learned what it holds — the
+   * facade's identity key (control-tower phase 91, #109's deferral). `default`
+   * is keyed by its LOCATOR, so a re-login as somebody else keeps the
+   * fingerprint; this is what tells the two logins apart, and a change of it
+   * drops the walls and the breaker that belonged to the previous one.
+   */
+  identity?: string;
 };
 
 /**
@@ -195,6 +281,23 @@ function narrowEntitlement(raw: unknown): Entitlement {
     ...(typeof e.by === 'string' ? { by: e.by as LeaveBy } : {}),
     ...(typeof e.until === 'string' ? { until: e.until } : {}),
     ...(typeof e.class === 'string' ? { class: e.class as CredentialClass } : {}),
+    ...(e.evidence && typeof e.evidence === 'object' ? { evidence: narrowEvidence(e.evidence as Record<string, unknown>) } : {}),
+    ...(e.retired && typeof e.retired === 'object' ? { retired: { ...(e.retired as NonNullable<Entitlement['retired']>) } } : {}),
+    ...(e.contradicted && typeof e.contradicted === 'object'
+      && typeof (e.contradicted as { at?: unknown }).at === 'string'
+      ? { contradicted: { ...(e.contradicted as NonNullable<Entitlement['contradicted']>) } } : {}),
+  };
+}
+
+/** A retirement's evidence read from disk: a source it does not know reads as a text match. */
+function narrowEvidence(e: Record<string, unknown>): RetirementEvidence {
+  return {
+    source: e.source === 'api' ? 'api' : 'text',
+    matched: typeof e.matched === 'string' ? e.matched.slice(0, 200) : '',
+    ...(typeof e.session === 'string' ? { session: e.session } : {}),
+    ...(typeof e.phase === 'number' ? { phase: e.phase } : {}),
+    ...(typeof e.slug === 'string' ? { slug: e.slug } : {}),
+    ...(typeof e.runId === 'string' ? { runId: e.runId } : {}),
   };
 }
 
@@ -221,8 +324,24 @@ function narrowCredential(fingerprint: string, raw: unknown): LearnedCredential 
     ...(tomb && typeof tomb.name === 'string' && typeof tomb.retiredAt === 'string'
       ? { tombstone: { name: tomb.name, retiredAt: tomb.retiredAt } }
       : {}),
+    ...(narrowStrikes(c.certificateStrikes) ?? {}),
     ...(narrowProbe(c.probe) ?? {}),
+    // Whose login the row learned under (control-tower phase 91) — kept, or a
+    // re-login would never be seen past the next read of the file.
+    ...(typeof c.identity === 'string' && /^[0-9a-f]{8,64}$/.test(c.identity) ? { identity: c.identity } : {}),
   };
+}
+
+/** The corroboration ledger, or nothing when the row carries none worth reading. */
+function narrowStrikes(raw: unknown): { certificateStrikes: { at: string; session: string }[] } | null {
+  if (!Array.isArray(raw)) return null;
+  const kept = raw.flatMap((entry) => {
+    const s = entry as Record<string, unknown> | undefined;
+    return s && typeof s.at === 'string' && typeof s.session === 'string'
+      ? [{ at: s.at, session: s.session }]
+      : [];
+  });
+  return kept.length ? { certificateStrikes: kept } : null;
 }
 
 /** A stored probe record, or nothing when the row carries none a reader can believe. */
@@ -333,7 +452,7 @@ export class LearnedAccounts {
     const row = data.credentials[fingerprint];
     const org = orgId ?? row?.orgId;
     const orgWord = org ? data.orgs[org]?.entitlement : undefined;
-    if (orgWord?.state === 'retired') return { ...orgWord, via: 'org' };
+    if (orgWord?.state === 'retired' || orgWord?.state === 'suspect') return { ...orgWord, via: 'org' };
     if (!row) return { state: 'unknown', via: 'none' };
     const own = row.entitlement;
     if (own.state === 'cooling') {
@@ -452,7 +571,54 @@ export class LearnedAccounts {
     });
   }
 
-  /** A meter read succeeded (or failed) at `at`. Success also proves entitlement. */
+  /**
+   * The identity a credential answers NOW (control-tower phase 91, #109's
+   * deferral, #131). The first observation is remembered and moves nothing; a
+   * DIFFERENT identity under the same row drops what the previous login
+   * earned — its walls, its breaker word, its certificate strikes — because a
+   * wall another person's week hit, or a refusal of another person's login,
+   * says nothing about this one. Machine-wide and on disk, so a re-login that
+   * happened while every console was down is still seen. Answers what went
+   * (`changed: false` for a first observation), or null when nothing did.
+   */
+  noteIdentityKey(fingerprint: string, key: string, label?: string): { changed: boolean; walls: string[]; breaker: EntitlementView['state'] | null } | null {
+    return this.withLock((data) => {
+      const row = this.row(data, fingerprint, label);
+      if (row.identity === key) return null;
+      const before = row.identity;
+      row.identity = key;
+      if (before === undefined) return { changed: false, walls: [], breaker: null };
+      const walls = Object.keys(row.walls);
+      row.walls = {};
+      delete row.certificateStrikes;
+      const breaker = row.entitlement.state === 'unknown' ? null : row.entitlement.state;
+      row.entitlement = {
+        state: 'unknown', at: new Date(this.now()).toISOString(), by: 'console',
+        reason: 'the login under this credential changed identity — what the previous one learned does not carry',
+      };
+      return { changed: true, walls, breaker };
+    });
+  }
+
+  /**
+   * A meter read succeeded (or failed) at `at`. Success also proves
+   * entitlement — and, since 5.2.0, REOPENS a certificate-class retirement.
+   *
+   * The rule it breaks is deliberate and narrow. A `retired` normally stays
+   * retired however well a check went, because the classes that write it are
+   * statements about the credential or its organisation, and a poll succeeding
+   * says nothing about those. A CERTIFICATE retirement is not such a
+   * statement: it is a claim about the network path, and an authenticated call
+   * that lands is direct, positive proof the path is fine. The measured cost
+   * of throwing that proof away was two and a half hours during which the
+   * poller kept succeeding, hourly, against seven credentials the breaker
+   * insisted were unusable — the evidence that would open the door was being
+   * collected and discarded.
+   *
+   * `retired → unknown → entitled` in one write, because both legs are on the
+   * transition table and stopping at `unknown` would leave the account ranked
+   * below one nobody has ever read.
+   */
   noteRead(fingerprint: string, read: { successAt?: string; errorAt?: string }, label?: string): void {
     this.withLock((data) => {
       const row = this.row(data, fingerprint, label);
@@ -460,16 +626,233 @@ export class LearnedAccounts {
       if (read.successAt) {
         row.lastSuccessAt = read.successAt;
         changed = true;
-        // A successful read is the positive fact `entitled` stands for. It
-        // never reopens a `retired` credential (the table refuses), and it
-        // does not cut a `cooling` short — the wall's own clock does that.
-        if (row.entitlement.state === 'unknown') {
+        const own = row.entitlement;
+        const reopens = own.state === 'retired'
+          && own.class === 'certificate'
+          // Later than the retirement, or the proof is older than the fault.
+          && Date.parse(read.successAt) > Date.parse(own.at ?? '');
+        if (reopens) {
+          row.entitlement = {
+            state: 'entitled', at: read.successAt, by: 'proof',
+            reason: 'an authenticated read reached the API after this credential was retired for a certificate',
+          };
+          // The strikes were about a path that demonstrably works.
+          delete row.certificateStrikes;
+          log.info('accounts.retired.reopened', { fingerprint, by: 'proof', class: 'certificate', at: read.successAt });
+        } else if (own.state === 'unknown') {
+          // A successful read is the positive fact `entitled` stands for. It
+          // does not cut a `cooling` short — the wall's own clock does that.
           row.entitlement = { state: 'entitled', at: read.successAt, by: 'poller', reason: 'the usage endpoint answered' };
+        }
+        // A CLASSIFIER's retirement — this credential's, or its organisation's
+        // — contradicted by a read that landed after it (control-tower phase
+        // 54, #57). A usage read is evidence the credential reaches the API,
+        // not that it may spend, so it DEMOTES to `suspect` and never clears in
+        // the same write; a contradiction that has STOOD for
+        // `SUSPECT_CLEAR_MS` is what clears it.
+        if (!reopens && !this.demote(data, row, {
+          at: read.successAt, by: 'poller', reason: 'the usage endpoint answered after the retirement',
+        })) {
+          this.settleSuspect(data, row, {
+            at: read.successAt, by: 'poller', reason: 'green reads have contradicted the retirement for half an hour',
+          }, SUSPECT_CLEAR_MS);
+        }
+        // Proof of reach also ends a certificate streak: corroboration means
+        // "and nothing succeeded in between".
+        if (!reopens && row.certificateStrikes?.length) {
+          delete row.certificateStrikes;
         }
       }
       if (read.errorAt) { row.lastErrorAt = read.errorAt; changed = true; }
       return changed ? true : null;
     });
+  }
+
+  /**
+   * Proof the credential can do WORK (control-tower phase 54, #57): a one-turn
+   * check the API took (`probe`), or a session that spent under it (`runner`).
+   * A classifier's retirement is demoted and cleared in one write — both legs
+   * are on the transition table, and the proof answers the question the
+   * retirement asked — a `suspect` is cleared, and an `unknown` is proved.
+   * Its organisation's classifier word goes the same way. A retirement a
+   * person or a refused check wrote is not the classifier's and is untouched.
+   * Answers the move, or null when nothing moved.
+   */
+  noteProof(
+    fingerprint: string, proof: { at: string; by: LeaveBy; reason: string }, label?: string,
+  ): { from: EntitlementState; to: EntitlementState } | null {
+    return this.withLock((data) => {
+      const row = this.row(data, fingerprint, label);
+      const from = this.viewOf(data, fingerprint, row.orgId).state;
+      this.demote(data, row, proof);
+      this.settleSuspect(data, row, proof, 0);
+      if (row.entitlement.state === 'unknown') {
+        row.entitlement = { state: 'entitled', at: proof.at, by: proof.by, reason: proof.reason };
+      }
+      const to = this.viewOf(data, fingerprint, row.orgId).state;
+      return from === to ? null : { from, to };
+    });
+  }
+
+  /**
+   * Move a classifier's `retired` that `c` post-dates to `suspect` — the
+   * credential's own word and its organisation's. Answers whether anything
+   * moved. The retirement travels inside the suspect: its reason, class and
+   * evidence, and when and by whom it was written.
+   */
+  private demote(data: LearnedFile, row: LearnedCredential, c: { at: string; by: LeaveBy; reason: string }): boolean {
+    let moved = false;
+    if (contradicts(row.entitlement, c.at)) {
+      row.entitlement = suspectOf(row.entitlement, c);
+      log.info('accounts.retired.suspect', { fingerprint: row.fingerprint, by: c.by, class: row.entitlement.class ?? null, at: c.at });
+      moved = true;
+    }
+    const org = row.orgId ? data.orgs[row.orgId] : undefined;
+    if (org && contradicts(org.entitlement, c.at)) {
+      org.entitlement = suspectOf(org.entitlement, c);
+      log.info('accounts.retired.suspect', { org: hashedOrgId(row.orgId), by: c.by, class: org.entitlement.class ?? null, at: c.at });
+      moved = true;
+    }
+    return moved;
+  }
+
+  /**
+   * Clear a `suspect` at least `minAgeMs` old at `c.at` — the credential's to
+   * `entitled`, its organisation's row dropped — because the contradiction
+   * stood, or proof arrived. Answers whether anything moved.
+   */
+  private settleSuspect(
+    data: LearnedFile, row: LearnedCredential, c: { at: string; by: LeaveBy; reason: string }, minAgeMs: number,
+  ): boolean {
+    const old = (word: Entitlement | undefined) => word?.state === 'suspect'
+      && Date.parse(c.at) - Date.parse(word.at ?? '') >= minAgeMs;
+    let moved = false;
+    if (old(row.entitlement)) {
+      row.entitlement = { state: 'entitled', at: c.at, by: c.by, reason: c.reason };
+      moved = true;
+    }
+    if (row.orgId && old(data.orgs[row.orgId]?.entitlement)) {
+      delete data.orgs[row.orgId];
+      moved = true;
+    }
+    if (moved) log.info('accounts.suspect.cleared', { fingerprint: row.fingerprint, by: c.by, at: c.at });
+    return moved;
+  }
+
+  /**
+   * One more certificate-shaped stop against this credential — and is that
+   * now enough to believe it?
+   *
+   * The question exists because the two conditions that produce this text are
+   * indistinguishable from one stop: a corporate MITM appliance, which is
+   * standing and needs a person, and a home connection reconnecting through a
+   * captive portal or a router answering TLS for itself, which clears in
+   * minutes with nothing for anyone to fix. The console used to assume the
+   * first, on one sighting, and retire the organisation.
+   *
+   * Corroboration is three strikes, from at least two SESSIONS, spanning at
+   * least ten minutes, with no successful read in between (`noteRead` drops
+   * the streak). Several sessions because one wedged session can fail three
+   * times against one blip; ten minutes because a blip is shorter than the
+   * thing worth stopping for.
+   */
+  noteCertificateStrike(
+    fingerprint: string, strike: { at: string; session: string; reason: string }, label?: string,
+  ): CertificateVerdict {
+    return this.withLock((data) => {
+      const row = this.row(data, fingerprint, label);
+      const kept = (row.certificateStrikes ?? [])
+        .filter((s) => Date.parse(strike.at) - Date.parse(s.at) <= CERT_STRIKE_WINDOW_MS);
+      kept.push({ at: strike.at, session: strike.session.slice(0, 64) });
+      // Bounded: the verdict only ever reads the first and the last.
+      row.certificateStrikes = kept.slice(-CERT_STRIKES_KEPT);
+      const strikes = row.certificateStrikes;
+      const sessions = new Set(strikes.map((s) => s.session)).size;
+      const spanMs = Date.parse(strikes[strikes.length - 1].at) - Date.parse(strikes[0].at);
+      return {
+        strikes: strikes.length,
+        sessions,
+        spanMs,
+        corroborated: strikes.length >= CERT_STRIKES_NEEDED
+          && sessions >= CERT_SESSIONS_NEEDED
+          && spanMs >= CERT_SPAN_NEEDED_MS,
+      };
+    }) ?? { strikes: 0, sessions: 0, spanMs: 0, corroborated: false };
+  }
+
+  /**
+   * A fresh usage reading re-reads every wall it can speak for (control-tower
+   * phase 54, #78). A wall is "until AT THE LATEST": the reset the CLI reported
+   * once is a ceiling, never a promise — measured, a weekly window reported
+   * ~12 h late held a park while the same account served the same run again.
+   * So a bucket read below `WALL_PCT` lifts its wall, a reading whose reset is
+   * EARLIER shortens it (never later), and a nameless live wall
+   * (`learned_window`) lifts once every shared window reads below it. A usage
+   * `cooling` then ends when no shared wall is left and the shared windows
+   * read open, or shortens to the latest shared wall that stands; a
+   * certificate's cooling is not a usage fact and is untouched. Answers what
+   * moved, or null when nothing did.
+   */
+  rereadWalls(
+    fingerprint: string, buckets: Record<string, { utilization: number; resetsAt: string }>, atIso: string, label?: string,
+  ): WallReread | null {
+    const nowMs = Date.parse(atIso);
+    if (!Number.isFinite(nowMs)) return null;
+    // EVERY named shared window, read and open: a reading that lacks one says
+    // nothing about it, and the nameless wall may be that very window.
+    const named = SHARED_WALLS.filter((name) => name !== NAMELESS_WALL);
+    const sharedOpen = named.every((name) => buckets[name] !== undefined && buckets[name].utilization < WALL_PCT);
+    return this.withLock((data) => {
+      const row = data.credentials[fingerprint];
+      if (!row) return null;
+      if (label && !row.ids.includes(label)) row.ids.push(label);
+      const change: WallReread = { lifted: [], moved: [] };
+      for (const [name, until] of Object.entries(row.walls)) {
+        if (Date.parse(until) <= nowMs) continue;
+        const reading = buckets[name];
+        if (reading ? reading.utilization < WALL_PCT : name === NAMELESS_WALL && sharedOpen) {
+          delete row.walls[name];
+          change.lifted.push(name);
+        } else if (reading && Date.parse(reading.resetsAt) > nowMs && Date.parse(reading.resetsAt) < Date.parse(until)) {
+          row.walls[name] = reading.resetsAt;
+          change.moved.push({ bucket: name, from: until, to: reading.resetsAt });
+        }
+      }
+      const own = row.entitlement;
+      if (own.state === 'cooling' && own.class !== 'certificate' && own.until && Date.parse(own.until) > nowMs) {
+        const standing = SHARED_WALLS.map((name) => row.walls[name]).filter((iso) => iso && Date.parse(iso) > nowMs) as string[];
+        if (!standing.length && sharedOpen) {
+          row.entitlement = { state: 'entitled', at: atIso, by: 'poller', reason: 'a fresh reading shows headroom before the reported reset' };
+          change.cooling = 'ended';
+        } else if (standing.length) {
+          const latest = standing.reduce((a, b) => (Date.parse(a) > Date.parse(b) ? a : b));
+          if (Date.parse(latest) < Date.parse(own.until)) {
+            change.cooling = { from: own.until, to: latest };
+            row.entitlement = { ...own, until: latest };
+          }
+        }
+      }
+      return change.lifted.length || change.moved.length || change.cooling ? change : null;
+    });
+  }
+
+  /**
+   * A session SPENT under this credential (control-tower phase 54, #78): its
+   * shared windows — and the model it ran on — had headroom when it did, so
+   * those walls lift and a usage `cooling` ends. Answers what lifted.
+   */
+  liftWalls(fingerprint: string, names: readonly string[], atIso: string, label?: string): { lifted: string[]; cooled: boolean } {
+    return this.withLock((data) => {
+      const row = data.credentials[fingerprint];
+      if (!row) return null;
+      if (label && !row.ids.includes(label)) row.ids.push(label);
+      const lifted = names.filter((name) => row.walls[name] !== undefined);
+      for (const name of lifted) delete row.walls[name];
+      const own = row.entitlement;
+      const cooled = own.state === 'cooling' && own.class !== 'certificate';
+      if (cooled) row.entitlement = { state: 'entitled', at: atIso, by: 'runner', reason: 'a session spent under it' };
+      return lifted.length || cooled ? { lifted, cooled } : null;
+    }) ?? { lifted: [], cooled: false };
   }
 
   /** Record an exhausted window; lapsed windows are dropped on the same write. */
@@ -488,12 +871,26 @@ export class LearnedAccounts {
 
   /**
    * Move the breaker. Refused — logged, not applied — outside the transition
-   * table. `retired` also writes the ORGANISATION's row when the credential's
-   * orgId is known, which is what excludes every sibling account; `unknown`
-   * (a clearance) clears the organisation's too. Answers the effective state
-   * after the write, or null when the write was refused.
+   * table. Answers the effective state after the write, or null when the write
+   * was refused.
+   *
+   * `orgScoped` is what lets a `retired` reach the ORGANISATION's row, which
+   * excludes every sibling account at once. It is an explicit opt-in rather
+   * than "the credential has an orgId, so use it", because every credential
+   * has an orgId and the caller is the only one who knows whether the refusal
+   * was ABOUT the organisation: `Accounts.leaveAccount` requires both an
+   * org-scoped class and a structured verdict from the API. Without the
+   * opt-in, one session's transient stop retired both organisations on this
+   * machine inside eight minutes, and multi-account failover — the thing that
+   * exists for "this credential cannot spend" — had no survivor.
+   *
+   * A `unknown` (a clearance) still clears the organisation's row, because
+   * opening a door needs no permission that closing it did.
    */
-  setEntitlement(fingerprint: string, next: Entitlement, opts: { orgId?: string; label?: string } = {}): EntitlementView | null {
+  setEntitlement(
+    fingerprint: string, next: Entitlement,
+    opts: { orgId?: string; label?: string; orgScoped?: boolean } = {},
+  ): EntitlementView | null {
     return this.withLock((data) => {
       const row = this.row(data, fingerprint, opts.label);
       const orgId = opts.orgId ?? row.orgId;
@@ -504,7 +901,7 @@ export class LearnedAccounts {
         return null;
       }
       row.entitlement = { ...next, at: next.at ?? new Date(this.now()).toISOString() };
-      if (next.state === 'retired' && orgId) {
+      if (next.state === 'retired' && orgId && opts.orgScoped) {
         data.orgs[orgId] = { entitlement: { ...row.entitlement } };
       }
       if (next.state === 'unknown' && orgId && data.orgs[orgId]?.entitlement.state === 'retired') {
@@ -526,7 +923,7 @@ export class LearnedAccounts {
       let changed = false;
       if (data.orgs[orgId]) { delete data.orgs[orgId]; changed = true; }
       for (const row of Object.values(data.credentials)) {
-        if (row.orgId === orgId && row.entitlement.state === 'retired') {
+        if (row.orgId === orgId && (row.entitlement.state === 'retired' || row.entitlement.state === 'suspect')) {
           row.entitlement = { state: 'unknown', at: new Date(this.now()).toISOString(), by, reason: `organisation cleared by ${by}` };
           changed = true;
         }
@@ -569,7 +966,7 @@ export class LearnedAccounts {
 
   private viewOf(data: LearnedFile, fingerprint: string, orgId: string | undefined): EntitlementView {
     const org = orgId ? data.orgs[orgId]?.entitlement : undefined;
-    if (org?.state === 'retired') return { ...org, via: 'org' };
+    if (org?.state === 'retired' || org?.state === 'suspect') return { ...org, via: 'org' };
     const row = data.credentials[fingerprint];
     return row ? { ...row.entitlement, via: 'credential' } : { state: 'unknown', via: 'none' };
   }
@@ -577,3 +974,25 @@ export class LearnedAccounts {
 
 /** Every breaker word, for a reader that renders them in order. */
 export const ENTITLEMENT_ORDER: readonly EntitlementState[] = ENTITLEMENT_STATES;
+
+/**
+ * Is `word` a CLASSIFIER's retirement that something at `atIso` post-dates?
+ * The one retirement a green read or check may argue with (#57): a person's
+ * and a refused check's are statements nothing automatic contradicts.
+ */
+function contradicts(word: Entitlement | undefined, atIso: string): boolean {
+  return word?.state === 'retired' && word.by === 'classifier'
+    && Date.parse(atIso) > Date.parse(word.at ?? '');
+}
+
+/** The `suspect` a contradicted retirement becomes — the retirement kept inside it. */
+function suspectOf(word: Entitlement, c: { at: string; by: LeaveBy; reason: string }): Entitlement {
+  return {
+    state: 'suspect', at: c.at, by: c.by,
+    ...(word.reason ? { reason: word.reason } : {}),
+    ...(word.class ? { class: word.class } : {}),
+    ...(word.evidence ? { evidence: word.evidence } : {}),
+    retired: { ...(word.at ? { at: word.at } : {}), ...(word.by ? { by: word.by } : {}), ...(word.reason ? { reason: word.reason } : {}) },
+    contradicted: { at: c.at, by: c.by, reason: c.reason },
+  };
+}

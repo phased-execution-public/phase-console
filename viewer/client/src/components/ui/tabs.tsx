@@ -46,9 +46,15 @@ export function TabsList({ className, ...props }: ComponentProps<typeof TabsPrim
     <TabsPrimitive.List
       ref={list}
       className={cn(
-        'flex items-stretch gap-1 overflow-x-auto border-b border-rule',
+        // The rule under the strip is an inset shadow, not a border the
+        // triggers reach down over with a negative margin: a scroll box clips
+        // whatever leaves it, and a trigger 1px outside the list lost its own
+        // bottom corners to the list — the touch tour counted every tab strip
+        // (6.0 cut this, control-tower phase 31).
+        'flex items-stretch gap-1 overflow-x-auto shadow-[inset_0_-1px_0_var(--rule)]',
         '[scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
         'max-md:[mask-image:linear-gradient(90deg,black_88%,transparent)]',
+        'rtl:max-md:[mask-image:linear-gradient(270deg,black_88%,transparent)]',
         className,
       )}
       {...props}
@@ -61,7 +67,7 @@ export function TabsTrigger({ className, ...props }: ComponentProps<typeof TabsP
     <TabsPrimitive.Trigger
       className={cn(
         'relative shrink-0 whitespace-nowrap px-3 py-2 text-sm text-ink-muted',
-        'border-b-2 border-transparent -mb-px transition-colors duration-fast ease-transit',
+        'border-b-2 border-transparent transition-colors duration-fast ease-transit',
         'hover:text-ink',
         'data-[state=active]:border-action data-[state=active]:text-ink',
         '[@media(hover:none)]:min-h-(--tap-min)',

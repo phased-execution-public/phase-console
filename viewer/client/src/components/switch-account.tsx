@@ -18,17 +18,60 @@
  */
 
 import { useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Button, toast } from '@/components/ui';
 import { api, type AccountView } from '@/lib/api';
 import { keys, useAccounts } from '@/lib/queries';
+import type { SwitchWhen } from '@shared/run-lifecycle.js';
+
+/** Phases as prose: "phase 3", "phases 3 and 5", "phases 3, 5 and 7". */
+function phasesText(phases: readonly number[]): string {
+  if (phases.length === 1) return `phase ${phases[0]}`;
+  return `phases ${phases.slice(0, -1).join(', ')} and ${phases[phases.length - 1]}`;
+}
+
+/** What a switch would do to the live lanes, in a sentence — from the server's own preview. */
+export function previewText(
+  when: SwitchWhen,
+  preview: { wouldCheckpoint?: number[]; deferred?: number[] },
+): string {
+  const cut = preview.wouldCheckpoint ?? [];
+  const finish = preview.deferred ?? [];
+  if (!cut.length && !finish.length) return 'No session is live — the next one starts on the new account.';
+  const parts = [
+    cut.length ? `Checkpoints ${phasesText(cut)} now (the session id is kept)` : 'Checkpoints nothing',
+    finish.length
+      ? `${phasesText(finish)} finish${finish.length === 1 ? 'es' : ''} on the old account first`
+      : null,
+  ];
+  return `${when === 'boundary' ? 'At the next boundary: ' : ''}${parts.filter(Boolean).join('; ')}.`;
+}
+
+/** What a switch did, in a sentence — `checkpointed`, `deferred` and `rekeyed` as the verb answered them. */
+export function switchedText(outcome: {
+  checkpointed?: number;
+  deferred?: number[];
+  rekeyed?: number;
+}): string {
+  const parts = ['Switched'];
+  if (outcome.checkpointed)
+    parts.push(`${outcome.checkpointed} live session${outcome.checkpointed === 1 ? '' : 's'} checkpointed`);
+  if (outcome.deferred?.length)
+    parts.push(`${phasesText(outcome.deferred)} finish${outcome.deferred.length === 1 ? 'es' : ''} first`);
+  if (outcome.rekeyed)
+    parts.push(`${outcome.rekeyed} queued phase${outcome.rekeyed === 1 ? '' : 's'} moved with it`);
+  return `${parts.join(' — ')}. The next session runs under the other account.`;
+}
 
 /** How an account reads in a picker: name, email, plan, and its 5-hour meter. */
 function accountOptionLabel(account: AccountView, current: string): string {
   const name = account.builtIn
     ? (account.name ?? 'machine login')
     : (account.name ?? account.email ?? account.id);
-  const email = !account.builtIn || account.name ? account.email : undefined;
+  // The built-in row carries its email too (control-tower phase 13, #33): the
+  // picker that decides who pays was the one surface that would not say which
+  // Claude account "machine login" actually is.
+  const email = account.email;
   const five = account.usage?.buckets.five_hour?.utilization;
   return [
     name,
@@ -70,7 +113,17 @@ export function SwitchAccountRow({
   const accounts = accountsState?.accounts ?? [];
   const current = run?.accountId ?? 'default';
   const [choice, setChoice] = useState<string | null>(null);
+  const [when, setWhen] = useState<SwitchWhen>('now');
   const [busy, setBusy] = useState(false);
+  const pending = choice !== null && choice !== (run?.accountId ?? 'default') ? choice : null;
+  // The server's own answer to "what would this cut?" (#107 ask 2) — asked
+  // while a choice is pending, never guessed from the lanes on this page.
+  const preview = useQuery({
+    queryKey: ['switch-preview', slug, pending, when] as const,
+    queryFn: () => api.runSwitchPreview(slug, pending!, when),
+    enabled: pending !== null,
+    staleTime: 5_000,
+  });
   if (!run || (accounts.length < 2 && !accountsState?.allowAccounts)) return null;
 
   const currentView = accounts.find((account) => account.id === current);
@@ -115,23 +168,33 @@ export function SwitchAccountRow({
           </option>
         ))}
       </select>
+      <select
+        className="h-8 [@media(hover:none)]:min-h-(--tap-min) rounded border border-rule bg-ground px-2 text-xs disabled:opacity-50"
+        value={when}
+        disabled={disabled || busy}
+        onChange={(event) => setWhen(event.target.value as SwitchWhen)}
+        aria-label="When to switch"
+      >
+        <option value="now">now</option>
+        <option value="boundary">at the next boundary</option>
+      </select>
       <Button
         size="sm"
         disabled={disabled || busy || value === current}
         title={
           value === current
             ? 'The run is already on this account — pick another, or auto.'
-            : 'A live session is checkpointed (its session id kept) and re-attempted under the chosen account right away.'
+            : when === 'boundary'
+              ? 'No live session is cut: each finishes on the account it started on, and everything after runs on the new one.'
+              : 'A live session is checkpointed (its session id kept) and re-attempted under the chosen account right away.'
         }
         onClick={() => {
           setBusy(true);
           api
-            .runSwitchAccount(slug, value)
+            .runSwitchAccount(slug, value, when)
             .then((outcome) => {
               toast(
-                outcome.ok
-                  ? 'Switched — the next session runs under the other account.'
-                  : (outcome.reason ?? 'Could not switch.'),
+                outcome.ok ? switchedText(outcome) : (outcome.reason ?? 'Could not switch.'),
                 outcome.ok ? 'ok' : 'warn',
               );
               if (outcome.ok) setChoice(null);
@@ -144,6 +207,13 @@ export function SwitchAccountRow({
       >
         Switch account
       </Button>
+      {pending !== null && preview.data ? (
+        <p className="basis-full text-2xs text-ink-muted" data-testid="switch-preview">
+          {preview.data.ok
+            ? previewText(when, preview.data)
+            : (preview.data.reason ?? 'This switch would be refused.')}
+        </p>
+      ) : null}
     </div>
   );
 }

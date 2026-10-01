@@ -85,6 +85,8 @@ export const AUTOMATION_MAP = Object.freeze({
   ladderExtendOnProgress: ['caps', 'extendOnProgress'],
 
   autoAccountSwitch: ['accounts', 'autoSwitch'],
+  usageForecastLeadHours: ['accounts', 'forecastLeadHours'],
+  usageForecastHold: ['accounts', 'forecastHold'],
   mcpPolicy: ['mcp', 'policy'],
   mcpRequireTimeoutMs: ['mcp', 'requireTimeoutMs'],
   watchCmdRefs: ['watch', 'cmdRefs'],

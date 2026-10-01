@@ -530,3 +530,78 @@ test('...and a start is NOT refused once that child has exited', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * #99 — a liveness snapshot names the process it describes
+ * (control-tower phase 80)
+ *
+ * The identity of a session process is the `(pid, procStartedAt)` tuple the
+ * child record carries. The record's liveness used to carry neither, and kept a
+ * dead attempt's clocks until the next session wrote — so a reader holding the
+ * record could not tell "this process has been silent 102 minutes" from "a
+ * process 102 minutes gone was". Each attempt now stamps its snapshot with the
+ * child's own start and its attempt number, the moment the pid is known.
+ * ------------------------------------------------------------------ */
+
+test('#99: on every attempt the record\'s liveness carries the live child\'s own procStartedAt and the attempt number', async () => {
+  const { chmodSync } = await import('node:fs');
+  const { Runner } = await import('../server/runner/runner.ts');
+  const root = mkdtempSync(join(tmpdir(), 'pc-phase-liveness-99-'));
+  const scripts = join(root, 'scripts');
+  const stub = join(root, '.stub');
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(stub, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  writeFileSync(join(stub, 'done'), '');
+  const exe = (path: string, body: string) => { writeFileSync(path, body, 'utf8'); chmodSync(path, 0o755); };
+  exe(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+S="${stub}"; mode="\${2:-}"; arg="\${3:-}"
+case "$mode" in
+  --memory-block)
+    if grep -qx 1 "$S/done"; then echo "done: 1"; echo "ready: "; else echo "done: "; echo "ready: 1"; fi
+    echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --boot-prompt) echo "BOOT phase $arg" ;;
+  --size) echo M ;;
+  *) exit 0 ;;
+esac
+`);
+  exe(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n');
+  exe(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho "VALIDATE OK"\n');
+
+  const seen: { pid?: number; child?: string; snapshot?: { attempt?: number; procStartedAt?: string } }[] = [];
+  let runner!: InstanceType<typeof Runner>;
+  runner = new Runner({
+    scriptsDir: scripts,
+    verificationText: () => '`true`',
+    spawn: async (request) => {
+      request.onPid?.(77_000 + seen.length);
+      const state = runner.current()!;
+      seen.push({
+        pid: state.children?.['1']?.pid,
+        child: state.children?.['1']?.procStartedAt,
+        snapshot: state.phases['1'].liveness,
+      });
+      if (seen.length === 1) {
+        // A spent turn cap: the loop resumes the same session in place — a new process, the same lane.
+        return { signal: { subtype: 'error_max_turns', code: 1, text: '' }, sessionId: 'sess-99', costUsd: 0.5, turns: 40, resultText: '', durationMs: 5, argv: [], injected: 0 };
+      }
+      writeFileSync(join(stub, 'done'), '1\n');
+      return { signal: { subtype: 'success', code: 0, text: '' }, sessionId: 'sess-99', costUsd: 0.1, turns: 3, resultText: 'done', durationMs: 5, argv: [], injected: 0 };
+    },
+  });
+  try {
+    await runner.start({ slug: 'demo', root, autonomy: 'keep-going', onlyPhases: [1] });
+    await runner.wait();
+    assert.equal(seen.length, 2, 'two attempts, one lane');
+    for (const [index, entry] of seen.entries()) {
+      assert.equal(entry.pid, 77_000 + index, 'the child record names this attempt\'s process');
+      assert.ok(entry.child, 'and its start');
+      assert.equal(entry.snapshot?.attempt, index + 1, 'the snapshot says which attempt it describes');
+      assert.equal(entry.snapshot?.procStartedAt, entry.child, 'and names the same process, by its start');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

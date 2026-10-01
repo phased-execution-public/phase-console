@@ -223,7 +223,10 @@ test('P2\'s wall: no account to move to and a reset hours away — the FIRST bur
     assert.equal(record.status, 'waiting');
     assert.equal(record.parkedUntil, reset);
     assert.deepEqual(journalled(events, 'phase.rung').map((rung) => rung.rung), ['switch-account', 'wait-window']);
-    assert.match(String(journalled(events, 'phase.situation').at(-1)?.why), /resets in 2 h 48 min/);
+    // The ABSOLUTE reset, with the span as it read at the park (control-tower
+    // phase 86, #132): a stored "resets in 2 h 48 min" was false an hour later.
+    const why = String(journalled(events, 'phase.situation').at(-1)?.why);
+    assert.ok(why.includes(`resets at ${reset} (in 2 h 48 min at the park)`), why);
   } finally {
     held.release();
     await instance.stop();
@@ -418,7 +421,7 @@ test('the brake outlasts a reading of ANOTHER window, and is released at the fir
   }
 });
 
-test('with an account that has headroom, nothing is braked — the live wall moves the run at the wall (H6)', async () => {
+test('with an account that has headroom, nothing is braked — the switch is enacted at the lanes\' boundary (H6, #100)', async () => {
   const r = repo();
   const held = streamingSession(r);
   const scheduler = new Scheduler({ locks: () => [] });
@@ -430,7 +433,10 @@ test('with an account that has headroom, nothing is braked — the live wall mov
     const decision = journalled(events, 'run.usage-decision')[0];
     assert.equal(decision.headroom, 'spare');
     assert.equal(decision.brake, false);
-    assert.equal(decision.enacted, false);
+    // Enacted at the lanes' boundary since control-tower phase 92 (#100 ask 3):
+    // the live session spends what is left, the next spawn pays with `spare`.
+    assert.equal(decision.enacted, true);
+    assert.equal(decision.when, 'boundary');
     assert.deepEqual(journalled(events, 'run.usage-brake'), []);
     assert.equal(scheduler.brakeOf(undefined), null);
   } finally {
@@ -566,4 +572,114 @@ test('O11: the pre-first-turn spend clause is per SESSION, and rolls over like e
     !/delete\s+\w+\.spentUsd/.test(base),
     'nothing clears spentUsd — which is exactly why it is the wrong field here',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * A wrap-up steer that did not arrive is tried again (control-tower phase 46, #79)
+ * ------------------------------------------------------------------ */
+
+const usageAt = (context: number, calls: number): StreamEvent => ({
+  kind: 'usage', id: `msg_${context}`, rebuild: false,
+  call: { input: 2, cacheWrite: 1_000, cacheRead: context - 1_002, output: 300, context },
+  totals: {
+    calls, lastContext: context, peakContext: context,
+    input: 2 * calls, cacheWrite: 1_000 * calls, cacheRead: context - 1_002, output: 300 * calls, rebuilds: 0,
+  },
+});
+
+const journalledOn = (events: { event: string; data: Record<string, unknown> }[], name: string) => events
+  .filter((e) => e.event === 'run:journal' && e.data.event === name && e.data.phase === 1)
+  .map((e) => (e.data.data ?? {}) as Record<string, unknown>);
+
+test('#79: an undelivered wrap-up journals WHY, and is retried on each usage event until it arrives — once', async () => {
+  const r = repo();
+  try {
+    let open = false;
+    const sent: string[] = [];
+    let calls = 0;
+    const spawn: SpawnFn = async (request) => {
+      calls += 1;
+      request.onHandle?.({ pid: undefined, open: () => open, send: (text) => { sent.push(text); return true; }, setFrozen: () => {} });
+      request.onEvent?.({ kind: 'init', sessionId: 'sess-0001', model: 'claude-opus-5[1m]', tools: 0 } as StreamEvent);
+      // many-plans P15's shape: past 0.6 × the window with the steer refused.
+      request.onEvent?.(usageAt(623_975, 150));
+      request.onEvent?.(usageAt(640_000, 151));
+      open = true;
+      request.onEvent?.(usageAt(655_000, 152));
+      request.onEvent?.(usageAt(670_000, 153));
+      r.markDone(1);
+      return ok();
+    };
+    const { instance, events } = runner(r, spawn, { phaseDefaults: () => ({ model: 'opus' }) });
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+
+    assert.equal(calls, 1);
+    assert.equal(sent.length, 1, 'delivered on the retry, and never said twice');
+    assert.match(sent[0], /partial --reason context/);
+    const refused = journalledOn(events, 'phase.wrapup-undelivered');
+    assert.equal(refused.length, 1, 'one line per refusal reason, not one per API call');
+    assert.equal(refused[0].sessionId, 'sess-0001');
+    assert.equal(refused[0].context, 623_975);
+    assert.equal(refused[0].attempt, 1);
+    assert.match(String(refused[0].reason), /no session is running|stopped accepting|nothing is running/,
+      'the steer\'s own refusal, kept rather than discarded');
+    const wrapups = journalledOn(events, 'phase.context-wrapup');
+    assert.deepEqual(wrapups.map((line) => [line.stage, line.context, line.delivered, line.attempt]),
+      [['wrap-up', 655_000, true, 3]], 'the wrap-up line is the one that arrived, on its third try');
+    const mark = instance.current()!.phases['1'].contextWrapup;
+    assert.equal(mark?.delivered, true);
+    assert.equal(mark?.attempts, 3);
+  } finally { r.cleanup(); }
+});
+
+test('#79: the retries stop where the checkpoint fires — the backstop, not a second steer', async () => {
+  const r = repo();
+  try {
+    let calls = 0;
+    const spawn: SpawnFn = async (request) => {
+      calls += 1;
+      if (calls === 1) {
+        request.onHandle?.({ pid: undefined, open: () => false, send: () => false, setFrozen: () => {} });
+        request.onEvent?.({ kind: 'init', sessionId: 'sess-0001', model: 'claude-opus-5[1m]', tools: 0 } as StreamEvent);
+        request.onEvent?.(usageAt(601_592, 150));
+        request.onEvent?.(usageAt(700_000, 180));
+        request.onEvent?.(usageAt(800_976, 200));
+        request.onEvent?.(usageAt(810_000, 201));
+        return ok({ resultText: 'cut at the checkpoint' });
+      }
+      r.markDone(1);
+      return ok({ sessionId: 'sess-fresh' });
+    };
+    const { instance, events } = runner(r, spawn, { phaseDefaults: () => ({ model: 'opus' }) });
+    await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
+    await instance.wait();
+
+    const mark = instance.current()!.phases['1'].contextWrapup;
+    assert.equal(mark?.delivered, false, 'it never arrived');
+    assert.equal(mark?.attempts, 2, 'tried at 601k and 700k; 800k is the checkpoint\'s');
+    assert.equal(journalledOn(events, 'phase.wrapup-undelivered').length, 1);
+    assert.deepEqual(journalledOn(events, 'phase.context-wrapup').map((line) => line.stage), ['checkpoint']);
+    assert.equal(calls, 2, 'and the phase boarded fresh, as a checkpoint does');
+  } finally { r.cleanup(); }
+});
+
+test('a phase held by one account\'s brake boards at once when its run is re-keyed to another — the live lane stays counted where it boarded (control-tower phase 78, #92)', async () => {
+  const scheduler = new Scheduler({ locks: () => [] });
+  try {
+    const live = await scheduler.admit({ slug: 'demo', phase: 1, runId: 'run-1', scope: ['a'], accountId: 'work' });
+    scheduler.brake('work', { untilMs: null, pct: 96 });
+    let boarded = false;
+    const waiting = scheduler.admit({ slug: 'demo', phase: 2, runId: 'run-1', scope: ['b'], accountId: 'work' })
+      .then((grant) => { boarded = true; return grant; });
+    await settle();
+    assert.equal(boarded, false, 'braked behind the live lane');
+    assert.equal(scheduler.rekeyRun('run-1', 'spare'), 1, 'a grant is not an entry — only the waiting one moves');
+    const grant = await waiting;
+    assert.equal(grant.accountId, 'spare');
+    assert.equal(scheduler.liveOn('work'), 1, 'the live lane is still counted against the account it boarded on');
+    assert.equal(scheduler.liveOn('spare'), 1);
+    scheduler.release(live);
+    scheduler.release(grant);
+  } finally { scheduler.close(); }
 });

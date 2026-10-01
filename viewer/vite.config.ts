@@ -174,5 +174,13 @@ export default defineConfig({
     // hang still fails — 15 s later. Nothing is timing-sensitive in the other
     // direction, so the margin is free. Raise it rather than skip a test.
     testTimeout: 20_000,
+    // Vitest's stock 10 000 ms for a hook, raised on the same terms.
+    // `test-setup.ts` has one `beforeAll`, and it imports the figures chunk
+    // every file shares. The first file a worker runs transforms that chunk
+    // INSIDE the hook, so the hook pays for the cold import the testTimeout
+    // note describes, and nothing else bounds it. At load average 68 (control-
+    // tower phase 103, a cache emptied by `npm ci`) it took more than 10 s, and
+    // `launch-flow.test.tsx` failed in the hook before its first test ran.
+    hookTimeout: 60_000,
   },
 });

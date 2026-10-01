@@ -1,0 +1,18 @@
+{
+  "about": "What the CLI's system/init frame reported as the model for each alias — the ids scripts/models.env's MODEL_IDS must follow (control-tower phase 54, #91). Measured from phase records' actualModel on this machine's pe-hub console, runs of 2026-09-22 to 2026-09-24; the latest resolution per request.",
+  "cli": "2.1.281",
+  "measured": "2026-09-24",
+  "resolved": {
+    "opus": "claude-opus-5-5",
+    "opus[1m]": "claude-opus-5-5[1m]",
+    "fable": "claude-fable-5-1",
+    "fable[1m]": "claude-fable-5-1",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5-20251001"
+  },
+  "before": {
+    "opus": "claude-opus-5",
+    "opus[1m]": "claude-opus-5[1m]",
+    "fable": "claude-fable-5"
+  }
+}

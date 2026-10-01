@@ -1,5 +1,5 @@
 /**
- * Stage 3 — Money and stops.
+ * Money and stops — the Money tile's panel (control-tower phase 22).
  *
  * Opens on the answer, not the fields: where this run stops, in clauses
  * read off the values, and what it does instead of stopping. The ceilings
@@ -8,6 +8,7 @@
  */
 
 import { SectionHeading } from '@/components/ui';
+import { plural } from '@/lib/format';
 import { useLaunchFacts } from './facts';
 import { useSetupForm } from './form-context';
 import { MoneySection, StopsSection } from './sections';
@@ -42,6 +43,12 @@ export function MoneyAndStops() {
             {cost.lines.map((line) => (
               <li key={line}>{line}</li>
             ))}
+            {facts.detail?.summary.remainingWeight ? (
+              <li className="text-2xs">
+                The plan's own sizes put what is left at ≈{' '}
+                {plural(facts.detail.summary.remainingSessions, 'session')} of work — a size, not a price.
+              </li>
+            ) : null}
           </ul>
         </section>
       )}

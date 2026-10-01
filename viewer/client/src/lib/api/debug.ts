@@ -12,7 +12,8 @@
  * write flag.
  */
 
-import { q, request } from './client';
+import type { ProbeStatus } from '@shared/ops-vocab.js';
+import { post, q, request } from './client';
 
 /**
  * Where a row came from. The server's list, in the server's order.
@@ -181,6 +182,50 @@ export function debugIndexPath(base: string, params: DebugIndexParams = {}): str
   return `${base}${all.length ? `?${all.join('&')}` : ''}`;
 }
 
+/** The follow stream's path — the same parameters as the index, so a filter follows exactly what it shows. */
+export function debugTailPath(params: DebugIndexParams = {}): string {
+  return debugIndexPath('/api/debug/tail', params);
+}
+
+/**
+ * `GET /api/doctor` — the run-start prelude's probes and the machine checks,
+ * the same report `phase-console doctor` prints (`server/doctor.ts`). A row
+ * whose `blocking` is true fails the report; `firstFailing` is the one to fix
+ * first, and the page leads with it.
+ */
+export interface DoctorRow {
+  id: string;
+  label: string;
+  status: ProbeStatus;
+  blocking: boolean;
+  reason: string;
+  warnings?: string[];
+}
+
+export interface DoctorReport {
+  instance: { id: string; name: string; root: string | null; port: number; default: boolean } | null;
+  mode: 'console' | 'offline';
+  rows: DoctorRow[];
+  ok: boolean;
+  firstFailing: DoctorRow | null;
+  cliFloor: string;
+  at: string;
+}
+
+/**
+ * `GET /api/debug/level` — how loud this console's own log is, and until when.
+ * An override reverts by itself at `until`; `null` means the configured level.
+ */
+export interface DebugLevelState {
+  level: string;
+  debug?: string | null;
+  /** `override` while a person's change stands; `env` once it reverted, or never was. */
+  source: 'override' | 'env';
+  /** Epoch ms the override reverts at — present only on `override`. */
+  until?: number;
+  levels: string[];
+}
+
 /** One sink's live size, its policy row, and how many files the next sweep would touch. */
 export type RetentionSinkReport = {
   sink: string;
@@ -217,6 +262,11 @@ export const debugApi = {
   debugRuns: (slug: string) => request<DebugRuns>(`/api/debug/runs${query({ slug })}`),
   debugBundle: (params: { slug?: string } = {}) => request<DebugBundle>(`/api/debug/bundle${query(params)}`),
   debugRetention: () => request<RetentionReport>('/api/debug/retention'),
+  doctor: () => request<DoctorReport>('/api/doctor'),
+  debugLevel: () => request<DebugLevelState>('/api/debug/level'),
+  /** Turn the log up (or down) for `ttlMs`; the server reverts it by itself at the deadline. */
+  setDebugLevel: (body: { level: string; ttlMs: number }) => post<DebugLevelState>('/api/debug/level', body),
+  revertDebugLevel: () => request<DebugLevelState>('/api/debug/level', { method: 'DELETE' }),
   /*
      A plain href, not a fetch: the browser's own download machinery names the
      file from `content-disposition` and streams it to disk. The same reason

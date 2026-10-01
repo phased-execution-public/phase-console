@@ -734,6 +734,8 @@ test('SLF-2: the probe names itself — PE_OWNER console/mcp-probe and PHASE_CON
   assert.equal(seenEnv.length, 1);
   assert.equal(seenEnv[0].PE_OWNER, PROBE_OWNER, 'the probe\'s own owner, whatever the console\'s environment carried');
   assert.equal(seenEnv[0][PROBE_FLAG], '1');
+  // #73: a probe is not a session — the presence hook registers nothing for this kind.
+  assert.equal(seenEnv[0].PE_SESSION_KIND, 'probe');
   assert.equal(seenEnv[0].PATH, '/bin', 'the rest of the environment passes through');
   assert.equal(PROBE_OWNER, 'console/mcp-probe');
 });
@@ -855,6 +857,7 @@ test('no resolved config outlives its run — the runner drops its own, the boot
   assert.ok(existsSync(kept), 'a live run keeps its own');
   pruneMcpConfigs([]);
 });
+
 
 test('a registry from a NEWER console is read, not erased — and is copied aside before a rewrite', () => {
   // The fuse is our own next release. A future build writes `version: 2`; the

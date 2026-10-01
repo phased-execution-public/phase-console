@@ -16,6 +16,7 @@
  *     last two are precisely the endings nobody is watching for.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test, before } from 'node:test';
 import assert from 'node:assert/strict';
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -48,7 +49,7 @@ process.env.PHASE_CONSOLE_NOTIFY = NOTIFIER;
 // Route vocabulary is asserted against the shared SSOT, not scraped from client
 // source. `shared/route-meta.js` and `shared/routes.js` are plain dependency-free
 // ESM, importable from Node with no build — that split is what makes this possible.
-import { ROUTE_HEADS, PLAN_TABS } from '../shared/route-meta.js';
+import { ROUTE_HEADS, LEGACY_PLAN_TABS, PLAN_TABS } from '../shared/route-meta.js';
 
 let notifications: typeof import('../server/notifications.ts');
 let catalogue: typeof import('../server/push/catalogue.ts');
@@ -244,7 +245,12 @@ test('every category resolves to a route the client actually matches', () => {
       const [, tab] = rest;
       // The exact defect this test exists for: `autopilot` parsed fine, matched
       // no tab, and silently fell back to Route.
-      assert.ok(tab === undefined || tabs.includes(tab) || tab === 'phase' || tab === 'handoff',
+      // A retired tab id that REDIRECTS is a registered address, not a
+      // fallback: phase 23 folded Route into the one phase table and kept
+      // `route` in LEGACY_PLAN_TABS precisely because the server still mints
+      // it for `changed` (the same acceptance route-contract.test.ts states).
+      const redirected = tab !== undefined && Object.hasOwn(LEGACY_PLAN_TABS, tab);
+      assert.ok(tab === undefined || tabs.includes(tab) || redirected || tab === 'phase' || tab === 'handoff',
         `${category.id} → ${url} — "${tab}" is not a tab the plan view registers`);
     }
   }
@@ -913,7 +919,7 @@ async function stalledService(escalateMs: number, runId = 'run-d22') {
     id: runId, slug: 'demo', status: 'running',
     phases: { 3: { phase: 3, status: 'running', stall: { signal: 'silent' } } },
   };
-  inner.runners.set('demo', { current: () => run });
+  inner.runners.set('demo', { current: () => run, isSpending: () => false });
 
   // Leg 4 captured rather than sent: what this asserts is the URGENCY of the
   // escalation, which only the push leg carries.
@@ -1115,6 +1121,7 @@ test('ACC-8.16 (AC-5): an unanswerable relayed question is ONE push and one row 
   };
   const parks: string[] = [];
   inner.runners.set('demo', {
+    isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
     busy: () => true,
     current: () => ({
       id: 'r1', slug: 'demo', activePhase: 2, permissionProfile: 'trusted', phases: {}, status: 'running',

@@ -41,6 +41,9 @@
 #     claim its lock as itself — and the other live sessions the registry
 #     shows in the same repository (REG-3 iv), from the console's answer or the
 #     drain's;
+#   - on any event but SessionEnd, prints the console's `notice` (control-tower
+#     phase 82, #119) as a `systemMessage` — the one line saying this session
+#     has started blocking a queued phase, sent once per run;
 #   - ALWAYS exits 0. A hook that could stop a session would be a session
 #     killed by a console's absence. Nothing here is load-bearing for safety.
 # Set PHASE_CONSOLE_HOOK_OFF=1 to make it a no-op, PHASE_CONSOLE_HOOK_INGEST=0 to
@@ -50,6 +53,13 @@
 set -u
 
 [ "${PHASE_CONSOLE_HOOK_OFF:-}" = 1 ] && exit 0
+# A console probe is not a session (#73): its MCP health probe and its
+# entitlement probe spawn with PE_SESSION_KIND=probe, and nothing is registered
+# for them — no POST, no inbox drop, no answer. They used to be kept and hidden,
+# and were 307 of 319 records. PHASE_CONSOLE_PROBE=1 is the flag a console
+# older than that rule sets on the same probes.
+[ "${PE_SESSION_KIND:-}" = probe ] && exit 0
+[ "${PHASE_CONSOLE_PROBE:-}" = 1 ] && exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -177,11 +187,6 @@ host_="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf '')"
 # gone has ended even when no SessionEnd ever arrived (a crash, a kill -9).
 pid="${CLAUDE_PID:-${PPID:-0}}"
 case "$pid" in ''|*[!0-9]*) pid=0 ;; esac
-# The console's own MCP health probe sets PHASE_CONSOLE_PROBE=1 beside its
-# PE_OWNER (console/mcp-probe): forwarded as a flag so the registry keeps the
-# record, files it as the console's, and leaves it out of the operator's list.
-probe_=0
-[ "${PHASE_CONSOLE_PROBE:-}" = 1 ] && probe_=1
 # Which Claude login the session spends, so a usage decision can count who else
 # is on an account's window (autopilot-token-drain H6): the config dir the CLI
 # reads its credentials from — unset is the CLI's own default, ~/.claude — and a
@@ -215,7 +220,7 @@ fi
 # arrival and its run could only be matched by cwd and clock. Always stated
 # (empty when there is none), because the body is a fixed-shape object every
 # field of which the registry reads positionally by name.
-body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"trace\":\"$(_js "${PE_TRACE_ID:-}")\",\"span\":\"$(_js "${PE_SPAN_ID:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"probe\":$probe_,\"config_dir\":\"$(_js "$config_dir")\",\"auth_env\":$auth_env_,\"messaging_socket\":\"$(_js "$messaging_socket")\",\"messaging_token\":\"$(_js "$messaging_token")\",\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
+body="{\"version\":1,\"session_id\":\"$session_id\",\"event\":\"$(_js "$event")\",\"cwd\":\"$(_js "$cwd")\",\"transcript_path\":\"$(_js "$transcript")\",\"source\":\"$(_js "$source_")\",\"reason\":\"$(_js "$reason")\",\"owner\":\"$(_js "${PE_OWNER:-}")\",\"scope\":\"$(_js "${PE_SCOPE:-}")\",\"trace\":\"$(_js "${PE_TRACE_ID:-}")\",\"span\":\"$(_js "${PE_SPAN_ID:-}")\",\"user\":\"$(_js "$user_")\",\"host\":\"$(_js "$host_")\",\"pid\":$pid,\"root\":\"$(_js "$root")\",\"message\":\"$(_js "$message")\",\"notification_type\":\"$(_js "$notification_type")\",\"config_dir\":\"$(_js "$config_dir")\",\"auth_env\":$auth_env_,\"messaging_socket\":\"$(_js "$messaging_socket")\",\"messaging_token\":\"$(_js "$messaging_token")\",\"owner_kind\":\"$(_js "$owner_kind")\",\"owner_how\":\"$(_js "$owner_how")\",\"at\":\"$at\"}"
 
 # ---- deliver: POST to the console, else the inbox ------------------------------
 delivered=0
@@ -267,6 +272,14 @@ fi
 # (curl 28) is up and slow, and drains its own. At SessionStart the drain is
 # waited for, because the new session's context wants the one line it prints;
 # every other event leaves it running in the background and returns.
+# The console's one-line notice (control-tower phase 82, #119): this session
+# has started blocking a queued phase, said once per run. Shown to the PERSON
+# as a systemMessage — the session did not know, and neither did its user.
+notice=""
+if [ "$delivered" = 1 ] && [ "$event" != SessionEnd ]; then
+  notice="$(_jget_in "$answer" notice | cut -c1-600)"
+fi
+
 peers=""
 if [ "$delivered" = 1 ] && [ "$event" = SessionStart ]; then
   peers="$(_jget_in "$answer" peers)"
@@ -302,6 +315,13 @@ if [ "$event" = SessionStart ] && [ -n "$root" ]; then
     ctx="$ctx $(printf '%s' "$peers" | cut -c1-1200)"
     ctx="$ctx Before you claim a phase, check that nothing live shares your working tree: scripts/phase-lock.sh <slug> conflicts <N> --scope \"<csv>\" --here — exit 0 is clear, 1 names the holders. Never build over a live session."
   fi
-  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$(_js "$ctx")"
+  if [ -n "$notice" ]; then
+    printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' \
+      "$(_js "$notice")" "$(_js "$ctx")"
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$(_js "$ctx")"
+  fi
+elif [ -n "$notice" ]; then
+  printf '{"systemMessage":"%s"}\n' "$(_js "$notice")"
 fi
 exit 0

@@ -137,3 +137,38 @@ load ../helpers/test_helper
   [ "$status" -eq 0 ]
   assert_contains "$output" "F16 phase 1"
 }
+
+# The narrowed loop arms (control-tower phase 47, #52). A `while [ … ]` or
+# `until …` loop used to be a wait by shape alone, so a counter that waits on
+# nothing — twenty `printf`s in a throwaway container — was refused in a
+# session and would be warned about here. A loop is a wait only when it holds
+# a clock (a sleep, a timed read, a `wait`, a network verb), and it cannot
+# borrow one from a statement after its own `done`: both readers split there.
+@test "F16: a counter loop with no clock stays silent; the same loop with a sleep is named" {
+  setup_docs bounded-loops bl
+  run pg bl --lint
+  [ "$status" -eq 0 ]
+  [[ "$output" != *"F16 phase 1"* ]]
+  assert_contains "$output" "F16 phase 2"
+}
+
+@test "F16: a loop does not borrow a sleep from after its own done" {
+  setup_docs bounded-loops bl
+  run pg bl --lint
+  [[ "$output" != *"F16 phase 3"* ]]
+}
+
+@test "F16: a loop whose clock is a remote verb is a wait with no sleep in it" {
+  setup_docs bounded-loops bl
+  run pg bl --lint
+  assert_contains "$output" "F16 phase 4"
+}
+
+@test "F16: the reader is external_wait_hit from scripts/verify.env, the one JS mirrors" {
+  run "$SYS_BASH" -c '. "$1/verify.env"; printf "%s" "until curl -sf localhost:1; do sleep 2; done; echo ok" | external_wait_hit' _ "$PE_SCRIPTS"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" "until"
+  run "$SYS_BASH" -c '. "$1/verify.env"; printf "%s" "while [ \$i -lt 3 ]; do i=\$((i+1)); done; sleep 3" | external_wait_hit' _ "$PE_SCRIPTS"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}

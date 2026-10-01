@@ -93,7 +93,7 @@ export const MECHANISM_LEGEND =
 /**
  * A halt kind, as a type — the array below is the one truth and this is the only
  * way to name it in a type position. Without it every consumer had to
- * retype the twenty-five words, which is exactly what `server/runner/state.ts`
+ * retype the twenty-nine words, which is exactly what `server/runner/state.ts`
  * and `client/src/lib/api/runs.ts` both did. (The count in that sentence is held
  * to the array by `test/docs-parity.test.ts`: it read "seventeen" for months
  * while the array held eighteen — LFC-10.)
@@ -112,6 +112,9 @@ export const HALT_KINDS = Object.freeze(
     'phase-blocked',
     'waiting-external-timeout',
     'needs-human',
+    // A plan-mode session presented its plan and a person decides it
+    // (control-tower phase 11, #34) — a `needs-human` with its own reason.
+    'plan-approval',
     'plan-lint',
     'phase-crashed',
     'budget',
@@ -171,6 +174,25 @@ export const HALT_KINDS = Object.freeze(
     // stops, the account is retired for its organisation (`leaveAccount`) and
     // the errand names the sign-in.
     'credential-refused',
+    // The identity behind the run's account is not the one it started on
+    // (control-tower phase 91, #131): `default` is a slot that follows the
+    // machine login, and a person signing the machine in as somebody else must
+    // not move a run onto their quota. RUN-level and press-only: the run parks
+    // with an errand offering both ways on — continue on the new login, or move
+    // to the profile of the identity it started on — and no heal resumes it.
+    'identity-changed',
+    // A §Verification command its CLOCK cut, twice — the second time at twice
+    // the limit (control-tower phase 83, #95). Not a verdict: control-tower's
+    // suite was killed at 2043 s under the autopilot's own load and ran green
+    // in 850 s on the same head. PHASE-level, never charged to the streak, and
+    // parked for a person, who raises the phase's `Verify timeout:` or finds
+    // the hang, then Re-checks.
+    'verify-timeout',
+    // A run that asked for its OWN checkout was refused one (control-tower
+    // phase 90, #123 #139). RUN-level: every phase would board in the shared
+    // checkout, which is exactly what the run asked not to do — so it parks
+    // with the refusal and its fix, and dropping isolation is a person's act.
+    'isolation-refused',
   ]),
 );
 
@@ -218,6 +240,7 @@ export const PHASE_HALT_KINDS = Object.freeze(
     'phase-blocked',
     'waiting-external-timeout',
     'needs-human',
+    'plan-approval',
     'awaiting-person',
     'phase-crashed',
     'verification-preflight',
@@ -226,10 +249,25 @@ export const PHASE_HALT_KINDS = Object.freeze(
     'orphaned-session',
     'worktree-merge',
     'landing-conflict',
+    'verify-timeout',
   ]),
 );
 
 /** The kinds that stop the whole run — see `PHASE_HALT_KINDS`. */
+/**
+ * The halts only a person's press relaunches — owned here since control-tower
+ * phase 101 so the supervisor's replay can read them without the convergence
+ * loop; `server/converge.ts` re-exports this object and is where the rule is
+ * explained. The supervisor escalates a run halted by one of these and never
+ * presses it (`never widen PRESS_ONLY_HALT_KINDS`).
+ * @type {readonly string[]}
+ */
+export const PRESS_ONLY_HALT_KINDS = Object.freeze([
+  'failure-streak',
+  'credential-refused',
+  'identity-changed',
+]);
+
 export const RUN_HALT_KINDS = Object.freeze(
   /** @type {const} */ ([
     'budget',
@@ -247,6 +285,11 @@ export const RUN_HALT_KINDS = Object.freeze(
     'operator-stop',
     // The wall the run's own credential is: no phase can board under it.
     'credential-refused',
+    // Its account now answers another identity (phase 91): a person chooses.
+    'identity-changed',
+    // The checkout the run asked for could not be had: no phase may board in
+    // the shared one instead (control-tower phase 90).
+    'isolation-refused',
   ]),
 );
 
@@ -254,6 +297,75 @@ export const RUN_HALT_KINDS = Object.freeze(
 export function isPhaseHalt(kind) {
   return PHASE_HALT_KINDS.includes(kind);
 }
+
+/**
+ * The halts whose remedy might be "use another account" — the only ones that
+ * carry `halt.accounts` (how many of this console's registered accounts the
+ * breaker refuses, out of how many).
+ *
+ * It is a fact about the machine, not about the run, and it is on the halt
+ * because that is where the operator is looking. Measured: four runs read
+ * "halted — the API refused the connection", pressing Continue did nothing,
+ * and the fact that every account on this machine was unusable — so there was
+ * nothing to switch to — sat on a separate page.
+ * @type {readonly HaltKind[]}
+ */
+export const ACCOUNT_HALT_KINDS = Object.freeze(
+  /** @type {const} */ (['credential-refused', 'identity-changed', 'run-preflight', 'models-exhausted']),
+);
+
+/**
+ * What can HOLD a run the drive loop parked with nothing ready — one word per
+ * row of `halt.holders` (control-tower phase 5). The park's sentence already
+ * named each of these in prose ("phase 4 needs you — …; phase 6 is gated
+ * (…)"), and a card that wanted one action per holder had to parse it back:
+ *
+ *   - `gate` — a gate a person clears; `errand` — a ladder errand, a person's
+ *     ask; `cap` — a spent ladder cap, cleared by its setting rather than by
+ *     a Retry; `retry` — a failed (or otherwise settled) phase waiting for
+ *     Retry; `lock` — a lock-wait park; `blocked` — a handoff marked blocked;
+ *     `qa` — a done phase whose QA verdict holds its dependents; `mcp` — an
+ *     MCP park; `verification` — an unrunnable §Verification park.
+ */
+export const HALT_HOLDER_KINDS = Object.freeze(
+  /** @type {const} */ (['gate', 'errand', 'cap', 'retry', 'lock', 'blocked', 'qa', 'mcp', 'verification']),
+);
+
+/** @typedef {(typeof HALT_HOLDER_KINDS)[number]} HaltHolderKind */
+
+/**
+ * The verb that clears a holder — each a door the console already has: the
+ * Gate card's Approve, the phase's Retry, the run's settings patch (a cap's
+ * setting), the QA recovery loop, and Continue without the MCP servers.
+ */
+export const HALT_HOLDER_VERBS = Object.freeze(
+  /** @type {const} */ ([
+    'approve-gate',
+    'retry',
+    'settings',
+    'qa-recover',
+    'mcp-continue',
+    'errand-answered',
+  ]),
+);
+
+/**
+ * Is this errand a PERSON's ask — a `blocked`/`needs-human` declaration the
+ * session made — rather than a machine's spent ladder? Its holder verb is
+ * `errand-answered` ("Done — continue", control-tower phase 88, #124), because
+ * a person who did the errand must be able to SAY so; a Retry that re-read the
+ * stale declaration re-derived the same ask. A lock or an external wall is
+ * answered by the world (a lock freeing, a ref landing), so those keep Retry.
+ *
+ * @param {string | null | undefined} situation — the errand's situation key
+ * @returns {boolean}
+ */
+export function isPersonErrand(situation) {
+  const [id, sub] = String(situation ?? '').split(':');
+  return id === 'blocked-declared' && sub !== 'lock' && sub !== 'external';
+}
+
+/** @typedef {(typeof HALT_HOLDER_VERBS)[number]} HaltHolderVerb */
 
 /**
  * The phase-level kinds that are a VERDICT this run reached about the work,
@@ -304,6 +416,27 @@ export function isAdjudicatedHalt(kind) {
 }
 
 /**
+ * The stops that are about the PLAN, not about any phase: the plan fails
+ * `validate.sh`, or the engine could not read it. Only the plan answers them —
+ * a clean lint — which is why no board reading supersedes one (control-tower
+ * phase 81, #97).
+ *
+ * Measured on hub 4123, 2026-09-24: a `plan-lint` halt is anchored on the phase
+ * whose handoff broke the lint, and that phase always reads done, because the
+ * lint runs after it closes. Reconcile dissolved the halt on its first read,
+ * the resolver wrote "superseded" over it, and the run sat halted with three
+ * phases ready — converge will not relaunch a resolved run, and nothing had
+ * asked the lint.
+ * @type {readonly HaltKind[]}
+ */
+export const PLAN_HALT_KINDS = Object.freeze(/** @type {const} */ (['plan-lint', 'plan-unreadable']));
+
+/** True when this stop is about the plan — see `PLAN_HALT_KINDS`. */
+export function isPlanHalt(kind) {
+  return PLAN_HALT_KINDS.includes(kind);
+}
+
+/**
  * How each kind is treated, decided ONCE:
  *
  *   - `sessionShaped`: the halt banner may offer the phase's own session
@@ -347,6 +480,9 @@ export const KIND_PROFILE = {
     autoClass: 'halted-missing-handoff',
   },
   'needs-human': { sessionShaped: false, humanClass: null, autoClass: null },
+  // Nothing is wrong with the work: a plan waits for a person's Approve or
+  // Reject, and no ladder rung may answer it on their behalf.
+  'plan-approval': { sessionShaped: false, humanClass: null, autoClass: null },
   'awaiting-person': { sessionShaped: false, humanClass: null, autoClass: null },
   'plan-lint': { sessionShaped: false, humanClass: 'plan-repair', autoClass: 'halted-verification' },
   'phase-crashed': {
@@ -365,6 +501,11 @@ export const KIND_PROFILE = {
     park: true,
   },
   'mcp-preflight': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
+  // A person's, at once: the console already retried the command itself at
+  // twice the limit, and no session can make a suite finish sooner. What is
+  // owed is a judgement — raise `Verify timeout:` or find the hang — and then
+  // Re-check, which runs the three checks and spawns nothing.
+  'verify-timeout': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
   'run-preflight': { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource', park: true },
   'recovery-failed': { sessionShaped: false, humanClass: 'interrupted-resume', autoClass: 'ladder' },
   'orphaned-session': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
@@ -402,6 +543,15 @@ export const KIND_PROFILE = {
   // the wall did nothing wrong. Not a park: the run STOPPED, and the breaker
   // (`accounts/learned.ts`) keeps it stopped until a person clears the account.
   'credential-refused': { sessionShaped: false, humanClass: null, autoClass: 'ladder:resource' },
+  // The account's identity changed under the run (control-tower phase 91,
+  // #131): nothing automatic may answer it — continuing on somebody else's
+  // login, or moving to a profile of the identity the run started on, is a
+  // person's choice, pressed on the run's own errand.
+  'identity-changed': { sessionShaped: false, humanClass: null, autoClass: null },
+  // The run's own checkout was refused (control-tower phase 90, #123 #139): a
+  // PARK, and a person's at once — Repair checkout, or Drop isolation to run
+  // in the shared tree. No session or agent briefing applies; nothing boarded.
+  'isolation-refused': { sessionShaped: false, humanClass: null, autoClass: null, park: true },
 };
 
 /**
@@ -567,6 +717,30 @@ export const ACTION_VOCAB = {
     blurb:
       "The same resume of the phase's own session, carrying the words you type first — " +
       'for when it must fix something before closing out.',
+  },
+  // The answer to a phase parked on acts the plan keeps for a person
+  // (`--needs human-acts`, control-tower phase 53, #54): the owner's "let it
+  // run" had no button, and raising the profile alone did not help — the
+  // resumed session re-read a handoff saying the acts were the owner's.
+  delegate: {
+    label: 'Delegate to the session',
+    mechanism: 'own-session',
+    flag: 'run',
+    blurb:
+      'Hands the acts this phase kept for a person to its own session: records a deviation ruling naming you, ' +
+      'then resumes the session — or boards a fresh one with the resume brief — carrying your words. ' +
+      "The run's permission policy still applies: an act it refuses comes back as a permission block.",
+  },
+  // The answer to a person's errand that has been DONE in the world
+  // (control-tower phase 88, #124): the operator ran the two applies and the
+  // only button that looked like an answer, Recover, re-derived the same ask.
+  'errand-answered': {
+    label: 'Done — continue',
+    mechanism: 'own-session',
+    flag: 'run',
+    blurb:
+      'You did what this phase asked a person for. Records your answer (and your note), sets the ask aside, ' +
+      'and re-boards the phase with your note — resuming its session, or a fresh one with the resume brief.',
   },
   retry: {
     label: 'Retry from scratch',
@@ -803,7 +977,7 @@ export function classifyBoardPhase(state) {
  * @param {string|undefined|null} id
  * @param {string|undefined} sub
  * @param {boolean} resumable
- * @returns {'retry'|'resume'|'closeout'|'recheck'|'plan-repair'|undefined}
+ * @returns {'retry'|'resume'|'closeout'|'recheck'|'plan-repair'|'delegate'|'errand-answered'|undefined}
  */
 export function leadActionFor(id, sub, resumable) {
   switch (id) {
@@ -818,8 +992,14 @@ export function leadActionFor(id, sub, resumable) {
     case 'blocked-declared':
       if (sub === 'lock') return 'retry';
       if (sub === 'external') return 'recheck';
-      if (sub === 'unknown' || sub == null) return resumable ? 'resume' : undefined;
-      return undefined;
+      // Whether or not the session can be resumed: a press whose policy says
+      // fresh boards the resume brief with the words (control-tower phase 53).
+      if (sub === 'human-acts') return 'delegate';
+      // An unnamed block with a session to resume keeps Resume-with-words.
+      if ((sub === 'unknown' || sub == null) && resumable) return 'resume';
+      // Every other person's ask leads with its answer (control-tower phase
+      // 88, #124): "Done — continue" re-boards with the person's note.
+      return 'errand-answered';
     case 'plan-broken':
       return 'plan-repair';
     case 'superseded':
@@ -951,6 +1131,13 @@ export function recoveryActionsFor(ctx = {}) {
     else if (lead === 'closeout') push('closeout', first, busy);
     else if (lead === 'recheck') push('recheck', first);
     else if (lead === 'plan-repair') pushAgent('plan-repair', first);
+    else if (lead === 'delegate') push('delegate', first, busy);
+    else if (lead === 'errand-answered') push('errand-answered', first, busy);
+    // A phase the verification preflight parked never boarded: a Recheck asks
+    // whether it is DONE and spawns nothing, so it can only answer "unchanged".
+    // The park's own words are "fix the plan, then Retry", and Retry is the
+    // button that boards it (control-tower phase 33, the tower rehearsal).
+    if (!lead && kind === 'verification-preflight') push('retry', first, busy);
     const sessionShaped = profile ? profile.sessionShaped : true;
     if (resumable && sessionShaped) {
       push('closeout', first, busy);

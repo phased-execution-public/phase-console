@@ -58,6 +58,9 @@ describe('SwitchAccountRow', () => {
     const labels = Array.from(select.querySelectorAll('option')).map((option) => option.textContent);
     expect(labels[0]).toMatch(/auto — most headroom/);
     expect(labels.some((label) => /machine login.*· current/.test(label ?? ''))).toBe(true);
+    // …and which Claude account the machine login IS (control-tower phase 13,
+    // #33): the picker that decides who pays used to drop its email.
+    expect(labels.some((label) => /machine login \(me@example\.com\)/.test(label ?? ''))).toBe(true);
     expect(labels.some((label) => /info.*info@example.com/.test(label ?? ''))).toBe(true);
 
     // The select shows where the run IS; Switch has nothing to do yet.
@@ -124,15 +127,16 @@ describe('Continue, over a run whose session has not stopped', () => {
     expect(screen.getByText('Stopped')).toBeInTheDocument();
   });
 
-  it('refuses — with the reason — when a lane still has a live session', () => {
+  it('refuses Continue — with the reason — and offers Settings as a patch, when a lane still has a live session', () => {
     // `resumable` read `!isLiveStatus(run.status)` alone, so a halted run with
     // a session still writing the tree offered the button, and pressing it put
     // a second agent on one working tree. The server refuses that now; this is
     // the same refusal shown BEFORE the press rather than as a toast after it.
     mountControls(WORKING);
-    const button = screen.getByRole('button', { name: /Something is still running/ });
-    expect(button).toBeDisabled();
     expect(screen.queryByRole('button', { name: /Continue this run/ })).toBeNull();
+    // …and the sheet is no longer shut in the one state it is most needed
+    // (control-tower phase 13, #31): it opens as a settings PATCH.
+    expect(screen.getByRole('button', { name: /^Settings$/ })).toBeEnabled();
     // And the card stops calling it stopped, which was the other half of the
     // lie: a run reading "Stopped" over a session that was not.
     expect(screen.queryByText('Stopped')).toBeNull();

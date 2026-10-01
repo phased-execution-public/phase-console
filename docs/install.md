@@ -1,13 +1,14 @@
 # Install
 
 You need [Claude Code](https://claude.com/claude-code); the skill itself needs just Bash. The
-**console** additionally needs **Node 22.18 or newer (or 23.6+) with npm** — its client is built
-output: one `npm ci && npm run build` inside `viewer/` per machine. You do not have to remember
-that: an unbuilt console serves a page naming the two commands and the exact directory to run them in.
+**console** additionally needs **Node 22.18 or newer (or 23.6+) with npm**. Run from a tree (Route A or B),
+it has a client that is built output: one `npm ci && npm run build` inside `viewer/` per machine. You do not
+have to remember that: an unbuilt console serves a page naming the two commands and the exact directory to
+run them in.
 
-Pick a route. Both give you the skill **and** the console from one tree.
-There is no package: the repository is the only channel, and a release is a tag on it —
-`docs/releasing.md`.
+Pick a route. Routes A and B give you the skill **and** the console from one tree, from the public
+repository. The free edition is not published as a package: the repository is the only channel, and a
+release is a tag on it — `docs/releasing.md`.
 
 ## Route A — as a plugin *(recommended: one line, updates itself)*
 
@@ -71,6 +72,7 @@ Restart Claude Code. The skill is `/phased-execution` — no prefix, because it 
 Build the console's client once (`cd ~/.claude/skills/phased-execution/viewer && npm ci && npm run
 build`), then start it with `~/.claude/skills/phased-execution/start`. Update with `git pull`, then
 rebuild.
+
 
 
 ## Which route?

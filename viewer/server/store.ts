@@ -38,8 +38,16 @@ export type PlanRecord = {
    */
   decisionsTwin: DecisionRow[];
   locks: Lock[];
-  /** Newest mtime across the plan and every handoff artefact — the sort key. */
+  /** Newest mtime across the plan and every handoff artefact — the sort key, in whole milliseconds (#28: a timestamp with fake precision is compared for equality eventually). */
   activity: number;
+  /**
+   * `activity` without the lock files: the newest mtime across what the ENGINE
+   * reads. The revision's fingerprint uses this one, because neither
+   * `phase-graph.sh` nor `validate.sh` reads `.locks/` — a claim, a lease
+   * refresh or a release changes no answer cached under the revision (#44).
+   * Absent when the plan has no handoff folder, where the two are the same.
+   */
+  engineActivity?: number;
   bytes: number;
   revision: number;
 };
@@ -126,7 +134,8 @@ export class Store {
     return [...slugs];
   }
 
-  private slugForPath(path: string): string | undefined {
+  /** The plan a watched path belongs to, or undefined for a path no slug owns (a watched directory itself). */
+  slugForPath(path: string): string | undefined {
     const { plansDir, handoffsDir } = this.root;
     if (plansDir && path.startsWith(plansDir)) {
       const file = basename(path);
@@ -156,7 +165,7 @@ export class Store {
       record.kind = record.plan.phased ? 'plan' : 'document';
       record.planPath = path;
       record.planMtime = stat.mtimeMs;
-      record.activity = stat.mtimeMs;
+      record.activity = Math.floor(stat.mtimeMs);
       record.bytes = stat.size;
     } catch {
       record.kind = 'document';
@@ -171,31 +180,34 @@ export class Store {
     record.qa = [];
     record.decisionsTwin = [];
     record.locks = [];
+    // Lock mtimes join `activity` (the sort key) after the loop, never
+    // `engineActivity` (the fingerprint's): see `engineActivity`.
+    let lockActivity = 0;
 
     for (const file of safeList(dir)) {
       const full = join(dir, file);
       try {
         if (file === 'INDEX.md') {
           record.index = parseIndex(readFileSync(full, 'utf8'));
-          record.activity = Math.max(record.activity, statSync(full).mtimeMs);
+          record.activity = Math.max(record.activity, Math.floor(statSync(full).mtimeMs));
         } else if (file === 'test-status.md') {
           record.qa = parseTestStatus(readFileSync(full, 'utf8'));
-          record.activity = Math.max(record.activity, statSync(full).mtimeMs);
+          record.activity = Math.max(record.activity, Math.floor(statSync(full).mtimeMs));
         } else if (file === 'decisions.md') {
           // The first pipe table under `## Decisions` — `twin_decisions()` in
           // phase-graph.sh reads the same file the same way.
           record.decisionsTwin = parseDecisionsTable(readFileSync(full, 'utf8'), { after: /^##\s+decisions/i });
-          record.activity = Math.max(record.activity, statSync(full).mtimeMs);
+          record.activity = Math.max(record.activity, Math.floor(statSync(full).mtimeMs));
         } else if (file === '.locks') {
           for (const lockFile of safeList(full)) {
             const lock = parseLock(readFileSync(join(full, lockFile), 'utf8'), lockFile);
             if (lock) record.locks.push(lock);
-            record.activity = Math.max(record.activity, statSync(join(full, lockFile)).mtimeMs);
+            lockActivity = Math.max(lockActivity, Math.floor(statSync(join(full, lockFile)).mtimeMs));
           }
         } else if (file.endsWith('.md') && parseHandoffFilename(file).phase !== undefined) {
           const stat = statSync(full);
           record.handoffs.push(parseHandoff(readFileSync(full, 'utf8'), record.slug, file, full, stat));
-          record.activity = Math.max(record.activity, stat.mtimeMs);
+          record.activity = Math.max(record.activity, Math.floor(stat.mtimeMs));
           record.bytes += stat.size;
         }
       } catch {
@@ -205,7 +217,32 @@ export class Store {
 
     record.handoffs.sort((a, b) => a.phase - b.phase);
     record.locks.sort((a, b) => a.phase - b.phase);
+    record.engineActivity = record.activity;
+    record.activity = Math.max(record.activity, lockActivity);
   }
+}
+
+/** A path under a plan's `.locks/` folder, or the folder itself. */
+export function isLockPath(path: string): boolean {
+  return /[/\\]\.locks([/\\]|$)/.test(path);
+}
+
+/**
+ * The plans a watch batch touched ONLY through their `.locks/` (#44) — the ones
+ * whose cached engine answers a lock write must not throw away. Empty when any
+ * path belongs to no plan: that is a directory flush, which knows something
+ * changed but not what, so nothing may be kept.
+ */
+export function lockOnlySlugs(paths: readonly string[], slugOf: (path: string) => string | undefined): Set<string> {
+  const locks = new Set<string>();
+  const docs = new Set<string>();
+  for (const path of paths) {
+    const slug = slugOf(path);
+    if (!slug) return new Set();
+    (isLockPath(path) ? locks : docs).add(slug);
+  }
+  for (const slug of docs) locks.delete(slug);
+  return locks;
 }
 
 function isDir(path: string): boolean {
@@ -217,15 +254,20 @@ function isDir(path: string): boolean {
  *
  * Every input is an mtime, a size or a count taken during the scan that just
  * ran — no extra syscalls — and every artefact the engine reads is represented:
- * the plan file, each handoff, and the INDEX / test-status / lock files, whose
- * mtimes `attachHandoffs` folds into `activity` as it goes.
+ * the plan file, each handoff, and the INDEX / test-status files, whose mtimes
+ * `attachHandoffs` folds into `engineActivity` as it goes.
+ *
+ * The lock files are deliberately NOT in it (#44). Neither script the revision
+ * keys reads `.locks/`, and a live run claims, refreshes and releases a lock
+ * every few minutes — so each one threw away every cached answer of exactly
+ * the plan a person was most likely to open. The record still carries the
+ * locks it read (`detail()` shows them); they just do not move the revision.
  */
 function fingerprint(record: PlanRecord): string {
   return [
-    record.kind, record.planMtime, record.bytes, record.activity,
+    record.kind, record.planMtime, record.bytes, record.engineActivity ?? record.activity,
     record.index.length, record.qa.length,
     record.handoffs.map((h) => `${h.phase}:${h.mtime}:${h.bytes}`).join(','),
-    record.locks.map((l) => `${l.phase}:${l.owner}:${l.leaseUntil ?? 0}`).join(','),
   ].join('|');
 }
 

@@ -54,6 +54,7 @@ function withEnv(vars: Record<string, string | undefined>, body: () => void): vo
 test('an engine subprocess never inherits the console\'s own PE_*/PHASE_* vocabulary', () => {
   withEnv({
     PE_MCP_SERVERS: 'inherited-from-somewhere',
+    PE_WAIT_TIMEOUTS: 'gh:someone/else#run/1=999',
     PE_MCP_POLICY: 'require',
     PE_OWNER: 'somebody@else',
     PE_SESSION_ID: 'not-this-run',
@@ -288,5 +289,18 @@ test('opts.mcpPolicy is a deliberate statement too — never an inheritance', ()
     assert.equal(scriptEnv(OPTS).PE_MCP_POLICY, undefined, 'an inherited one must not speak for this console');
     assert.equal(scriptEnv({ ...OPTS, mcpPolicy: 'require' }).PE_MCP_POLICY, 'require');
     assert.equal(scriptEnv({ ...OPTS, mcpPolicy: 'continue' }).PE_MCP_POLICY, 'continue');
+  });
+});
+
+test('opts.waitTimeouts tells F36 the learned workflow timeouts: set-but-empty is an answer, absent turns it off (control-tower phase 14, #40)', () => {
+  withEnv({ PE_WAIT_TIMEOUTS: 'gh:inherited/repo#run/1=999' }, () => {
+    // A console that learned nothing still answered: the advisory runs and finds nothing to compare.
+    assert.equal(scriptEnv({ ...OPTS, waitTimeouts: [] }).PE_WAIT_TIMEOUTS, '');
+    assert.equal(
+      scriptEnv({ ...OPTS, waitTimeouts: ['gh:acme/app#run/42=100', 'gh:acme/app#run/43=360'] }).PE_WAIT_TIMEOUTS,
+      'gh:acme/app#run/42=100 gh:acme/app#run/43=360',
+    );
+    // Absent means no console here — and an inherited value never answers for this one.
+    assert.equal(scriptEnv(OPTS).PE_WAIT_TIMEOUTS, undefined);
   });
 });

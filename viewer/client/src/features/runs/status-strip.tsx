@@ -74,14 +74,17 @@ import {
 } from '@/lib/api';
 import { toastError } from '@/lib/queries';
 import { money, plural } from '@/lib/format';
-import { waitReasonOf } from '@/lib/status-vocab';
+import { runStatusWord, waitReasonOf } from '@/lib/status-vocab';
+import { waitSentence } from '@shared/status-model.js';
 import { RECOVERY_BLURBS, RECOVERY_LABELS, type RecoveryClass } from '@/lib/recovery';
-import { RecoveryActions } from '@/components/recovery-actions';
+import { HaltCard } from '@/components/halt-card';
 import { ErrandCard } from '@/components/errand';
-import { LaunchDialog } from '@/features/run-setup/launch-dialog';
+import { LaunchDialog } from '@/features/run-setup/lazy-launch-dialog';
 import { errandsOf, situationLabelFor } from '@/lib/ladder';
 import { sessionsHref, settingsHref } from '@/app/routes';
 import { useState } from 'react';
+import { heldStopReason } from '@shared/orchestration-model.js';
+import type { FleetHoldView } from '@/components/fleet-freeze';
 
 /** The declared order. Index in this array IS the priority. */
 export const NOTE_ORDER = [
@@ -125,6 +128,39 @@ function budgetRaiseText(run: RunState | null): string | undefined {
 }
 
 /**
+ * The two ways on from an identity park (control-tower phase 91, #131): the
+ * run's account now answers somebody else's login, and whether to spend it is
+ * a person's call — continue on the new login, or move back to a profile of
+ * the person the run started on. Each press resumes the run; a refusal (no
+ * such profile, a hold) comes back as a toast in the server's own words.
+ */
+function IdentityChoice({ run }: { run: RunState }) {
+  const [busy, setBusy] = useState(false);
+  const who = run.identity?.email ?? run.identity?.org ?? 'the login it started on';
+  const answer = async (choice: 'continue' | 'move') => {
+    setBusy(true);
+    try {
+      await api.runIdentity(run.slug, choice);
+      toast(choice === 'continue' ? 'Continuing on the new login.' : `Moved to ${who}'s profile.`);
+    } catch (error) {
+      toastError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <span className="mt-2 flex flex-wrap gap-2">
+      <Button size="sm" disabled={busy} onClick={() => void answer('continue')}>
+        Continue on the new login
+      </Button>
+      <Button size="sm" variant="ghost" disabled={busy} onClick={() => void answer('move')}>
+        Move to {who}&rsquo;s profile
+      </Button>
+    </span>
+  );
+}
+
+/**
  * Every notice this run is currently raising, worst-first.
  *
  * Pure and exported so a test can force each state and assert exactly one slot
@@ -140,11 +176,19 @@ export function runNotes({
   onClearScope,
   onGuard,
   recovery,
+  fleetHold,
 }: {
   run: RunState | null;
   live: boolean;
   allowRun: boolean;
   busy?: string;
+  /**
+   * The hold binding this console now (`bindingHoldOf`). A stopped run's stored
+   * "it continues by itself" is read through it, so a freeze that survived a
+   * restart is named — who, when, and how it ends — instead of promised away
+   * (control-tower phase 81, #93). Absent reads as no hold.
+   */
+  fleetHold?: FleetHoldView | null;
   /**
    * The branch probe's cached view, when the console has one.
    *
@@ -174,7 +218,6 @@ export function runNotes({
   const notes: RunNote[] = [];
 
   if (run?.halt) {
-    const streak = run.consecutiveFailures ?? 0;
     // A standing halt over a run that is LIVE again is history, not a summons.
     //
     // The server keeps `run.halt` on purpose: `recover()` flips the status to
@@ -191,6 +234,7 @@ export function runNotes({
     // button either: every remedy here spawns a session onto a phase that
     // already holds one.
     const healing = live;
+    const raised = budgetRaiseText(run);
     notes.push({
       id: 'halt',
       severity: healing ? 'warn' : 'error',
@@ -199,67 +243,23 @@ export function runNotes({
         : run.halt.kind === 'needs-human'
           ? 'Halted — needs you.'
           : 'Halted.',
+      // ONE card explains the stop (control-tower phase 17): its family, one
+      // sentence, the fix beside the cause, and the recommended recovery —
+      // which the card draws first through the shared recovery model, so the
+      // remedy is here, where the reason is. While the run is live again the
+      // card shows the stop as history and offers nothing: every remedy boards
+      // a session onto a phase that already holds one.
       body: (
-        <>
-          {healing && (
-            <span className="mb-1 block">The console picked this run back up. What stopped it:</span>
-          )}
-          {run.halt.reason}
-          {run.halt.phase != null && <span className="text-ink-faint"> (phase {run.halt.phase})</span>}
-          {!healing && run.halt.kind === 'needs-human' && (
-            <span className="mt-1 block text-2xs text-ink-faint">
-              This is a step no session can take for you — do it, then Continue.
-            </span>
-          )}
-          {streak >= 2 && (
-            <span className="mt-1 block text-2xs text-ink-faint">
-              {streak} consecutive failures — the counter resets on a success, a Retry, or Continue.
-            </span>
-          )}
-          {budgetRaiseText(run) && (
-            <span className="mt-1 block text-2xs text-ink-faint">{budgetRaiseText(run)}</span>
-          )}
-        </>
+        <HaltCard
+          run={run}
+          live={healing}
+          authFailure={Boolean(recovery?.authFailure)}
+          {...(recovery?.target ? { target: recovery.target } : {})}
+        >
+          {!healing && run.halt.kind === 'identity-changed' && <IdentityChoice run={run} />}
+          {raised && <span className="block text-2xs text-ink-muted">{raised}</span>}
+        </HaltCard>
       ),
-      // The halt is the one note whose remedy may be a whole session. Rendered
-      // here rather than in the controls strip because this is where the reason
-      // is — an operator reading "did not verify" should not have to go looking
-      // for the thing that fixes it. The shared recovery model decides WHAT to
-      // offer (closeout leads a session-shaped halt, mcp-continue leads an MCP
-      // park, phase-blocked never gets the closeout that looped on it), and the
-      // one component renders it with the exact what-will-happen blurbs.
-      //
-      // …but only while the run is actually stopped. See `healing` above: every
-      // remedy this offers boards a session, and the phase the halt names is
-      // the phase the live one is already working.
-      ...(healing
-        ? {}
-        : {
-            action: (() => {
-              const phase = run.halt.phase;
-              const record = phase != null ? run.phases?.[String(phase)] : undefined;
-              return (
-                <RecoveryActions
-                  target={recovery?.target ?? { slug: run.slug, ...(phase != null ? { phase } : {}) }}
-                  ctx={{
-                    run,
-                    ...(record
-                      ? {
-                          record: {
-                            status: record.status,
-                            resumable: Boolean(record.sessionId ?? record.resumeSessionId),
-                            ...(record.situation ? { situation: { key: record.situation.key } } : {}),
-                          },
-                        }
-                      : {}),
-                    ...(recovery?.authFailure ? { authFailure: true } : {}),
-                  }}
-                  max={2}
-                  legend
-                />
-              );
-            })(),
-          }),
     });
   }
 
@@ -279,9 +279,13 @@ export function runNotes({
     // full: a parked run's "needs you" is these, not the status word.
     const errands = resolved || run.status === 'finished' ? [] : errandsOf(run);
     const raised = budgetRaiseText(run);
+    // A promise the hold has made false reads as the hold, and it is a person's
+    // to end — so it wears a warning, not the calm of a stop that heals itself.
+    const reason = heldStopReason(run.finishedReason, fleetHold);
+    const held = reason !== run.finishedReason;
     notes.push({
       id: 'ended',
-      severity: run.status === 'finished' ? 'ok' : resolved ? 'info' : parked ? 'warn' : 'info',
+      severity: run.status === 'finished' ? 'ok' : resolved ? 'info' : parked || held ? 'warn' : 'info',
       title:
         run.status === 'finished'
           ? 'Run finished.'
@@ -291,10 +295,10 @@ export function runNotes({
               ? 'Parked — needs you.'
               : 'Run stopped.',
       body: resolved ? (
-        (run.resolved?.reason ?? run.finishedReason)
+        (run.resolved?.reason ?? reason)
       ) : errands.length || raised ? (
         <>
-          {run.finishedReason}
+          {reason}
           {raised && <span className="mt-1 block text-ink-muted">{raised}</span>}
           {errands.length > 0 && (
             <span className="mt-2 flex flex-col gap-1.5" data-testid="ended-errands">
@@ -309,7 +313,7 @@ export function runNotes({
           )}
         </>
       ) : (
-        run.finishedReason
+        reason
       ),
     });
   }
@@ -425,9 +429,30 @@ export function runNotes({
         </>
       ),
     });
+  } else if (run?.waitUntil && run.status === 'paused' && runStatusWord(run) === 'waiting') {
+    // Nobody paused this run (control-tower phase 88, #148): a console restart
+    // kept its clock, and the console re-arms it by itself. It reads as the
+    // wait it is — in the sentence every surface uses — never "Stopped". The
+    // slot keeps its id: it is still the note that owns a paused run's clock.
+    notes.push({
+      id: 'limit-paused',
+      severity: 'info',
+      title: `${waitSentence(run as Parameters<typeof waitSentence>[0]) ?? 'Waiting'}.`,
+      body:
+        waitReason === 'usage-limit' ? (
+          <>
+            Nobody paused this run: it sleeps until the window reopens at {at(run.waitUntil)}, then resumes by
+            itself. Continue now under another account, or switch this run's account below.
+          </>
+        ) : (
+          <>
+            Nobody paused this run: it is asleep on its clock and resumes by itself at {at(run.waitUntil)}.
+            Nothing is spent while it waits — Continue picks the phase's own session back up now.
+          </>
+        ),
+    });
   } else if (run?.waitUntil && run.status === 'paused') {
-    // Stopped ON the clock: the run's own policy said "pause and ask", a
-    // console restart preserved the clock and the re-arm has not fired, or
+    // Stopped ON the clock: the run's own policy said "pause and ask", or
     // someone stopped a run that was parked.
     notes.push({
       id: 'limit-paused',

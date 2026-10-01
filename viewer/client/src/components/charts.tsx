@@ -5,14 +5,22 @@
  * Ported from `web/components/charts.js` — restyled, not redesigned. The
  * geometry is unchanged; what changed is that **every colour is a token**.
  * The old versions took a `color` string per segment and the call sites passed
- * `var(--line-done)` by hand, which meant a chart could be given a raw hex and
+ * `var(--status-done)` by hand, which meant a chart could be given a raw hex and
  * nothing would notice. Here the palette is a closed set of state names and the
  * component resolves them, so a chart cannot be painted a colour the design
  * system does not have. `charts.test.tsx` asserts that.
  *
- * No chart library. These are seven shapes totalling ~300 lines; the smallest
- * charting dependency is larger than the whole plan surface's chunk, and it
- * would arrive with its own colour vocabulary to fight.
+ * **Where the library line sits (control-tower phase 29, #32 gap 2).** The
+ * MARKS below are hand-drawn and stay so: one datum of a row needs no axis, no
+ * zoom and no readout, and a library would be the heaviest thing on the row.
+ * The four FIGURES grew a crosshair, a zoom and keyboard reach, which is an
+ * axis's work — so their DRAWINGS moved to `components/figures/`, built on
+ * visx's scale, axis, shape and event modules and reached only through
+ * `figures/lazy` (a chunk first paint never carries). What did not move is
+ * what makes a figure a figure here: its name in `CHART_FIGURES`, its numbers
+ * table, and the rule that every colour is a state token — visx's own `#222`
+ * never reaches the page. `viewer/docs/design.md` § Figures and marks is the
+ * decision written down.
  *
  * **The seven are two kinds, and the difference decides what each one owes.**
  *
@@ -36,13 +44,16 @@
  * numbers.
  */
 
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import { useNarrow } from '@/lib/media';
 import { cn } from '@/lib/cn';
 import { Disclosure } from '@/components/ui/disclosure';
 import { Legend, stateEntries, stateTally, type LegendCounts } from '@/components/ui/legend';
-import { useTableFit } from '@/components/ui/table';
-import { UI_STATES, boardUiState, phaseUiState, type UiState } from '@/lib/status-vocab';
+import { useTableFit } from '@/components/data-table';
+import { UI_STATES, type UiState } from '@/lib/status-vocab';
+import { describePhase, describeWord } from '@shared/status-model.js';
+// The door, never the drawings: `figures/lazy` reaches them through `import()`.
+import { BarListFigure, BarsFigure, CalendarFigure, StackBarFigure } from '@/components/figures/lazy';
 
 /**
  * The only colours a chart may use: the eight UI states of the status
@@ -243,53 +254,9 @@ export function Bars({
   height?: number;
   label?: string;
 }) {
-  const max = Math.max(1, ...data.map((d) => d.count));
-  const width = 100;
-  const gap = 1.2;
-  const barWidth = Math.max(0.8, width / Math.max(1, data.length) - gap);
-
-  const chart = (
-    <svg
-      viewBox={`0 0 ${width} ${height}`}
-      preserveAspectRatio="none"
-      height={height}
-      className="w-full"
-      role="img"
-      aria-label={`${label} per week`}
-    >
-      {data.map((point, i) => {
-        const barHeight = (point.count / max) * (height - 14);
-        const current = i === data.length - 1;
-        return (
-          <rect
-            key={point.week ?? i}
-            x={i * (barWidth + gap)}
-            y={height - 12 - barHeight}
-            width={barWidth}
-            height={Math.max(point.count ? 1.5 : 0, barHeight)}
-            rx="0.6"
-            fill={current ? 'var(--action)' : toneVar('running')}
-            opacity={current ? 1 : 0.75}
-          >
-            <title>{`${point.week}: ${point.count} ${label}`}</title>
-          </rect>
-        );
-      })}
-      <line
-        x1="0"
-        y1={height - 11}
-        x2={width}
-        y2={height - 11}
-        stroke="var(--rule)"
-        strokeWidth="0.5"
-        vectorEffect="non-scaling-stroke"
-      />
-    </svg>
-  );
-
   return (
     <>
-      {chart}
+      <BarsFigure data={data} height={height} label={label} />
       <ChartNumbers
         label="weeks"
         caption={`${label} per week, the numbers behind the chart`}
@@ -326,73 +293,51 @@ export interface CalendarDay {
  * ⚠️ `today` is read once per render rather than per cell: building 180 cells
  * each of which asks the clock is how a chart ends up straddling midnight.
  */
+/** One day of a `Calendar`: where it sits (week column, weekday row) and how full it is. */
+export interface CalendarCell {
+  date: string;
+  count: number;
+  week: number;
+  day: number;
+  intensity: number;
+}
+
+/**
+ * The cells of a `span`-week calendar ending today, oldest first — built here,
+ * beside the table, so the numbers under the figure and the squares in it
+ * (`figures/bars.tsx`) are the same days by construction.
+ *
+ * ⚠️ `today` is read once per build rather than per cell: building 180 cells
+ * each of which asks the clock is how a chart ends up straddling midnight.
+ */
+export function calendarCells(data: CalendarDay[], span: number): CalendarCell[] {
+  const byDate = new Map(data.map((d) => [d.date, d.count]));
+  const max = Math.max(1, ...data.map((d) => d.count));
+  const today = new Date();
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - span * 7 - start.getUTCDay());
+  const out: CalendarCell[] = [];
+  for (let week = 0; week <= span; week++) {
+    for (let day = 0; day < 7; day++) {
+      const date = new Date(start);
+      date.setUTCDate(start.getUTCDate() + week * 7 + day);
+      if (date > today) continue;
+      const key = date.toISOString().slice(0, 10);
+      const count = byDate.get(key) ?? 0;
+      out.push({ date: key, count, week, day, intensity: count ? 0.25 + (count / max) * 0.75 : 0 });
+    }
+  }
+  return out;
+}
+
 export function Calendar({ data, weeks = 26 }: { data: CalendarDay[]; weeks?: number }) {
-  const [picked, setPicked] = useState<CalendarDay | null>(null);
   const narrow = useNarrow();
   const span = narrow ? Math.min(weeks, 13) : weeks;
-
-  const cells = useMemo(() => {
-    const byDate = new Map(data.map((d) => [d.date, d.count]));
-    const max = Math.max(1, ...data.map((d) => d.count));
-    const today = new Date();
-    const start = new Date(today);
-    start.setUTCDate(start.getUTCDate() - span * 7 - start.getUTCDay());
-
-    const out: { date: string; count: number; x: number; y: number; intensity: number }[] = [];
-    for (let w = 0; w <= span; w++) {
-      for (let d = 0; d < 7; d++) {
-        const date = new Date(start);
-        date.setUTCDate(start.getUTCDate() + w * 7 + d);
-        if (date > today) continue;
-        const key = date.toISOString().slice(0, 10);
-        const count = byDate.get(key) ?? 0;
-        out.push({
-          date: key,
-          count,
-          x: w * 11,
-          y: d * 11,
-          intensity: count ? 0.25 + (count / max) * 0.75 : 0,
-        });
-      }
-    }
-    return out;
-  }, [data, span]);
+  const cells = useMemo(() => calendarCells(data, span), [data, span]);
 
   return (
     <div>
-      <svg
-        viewBox={`0 0 ${(span + 1) * 11} 78`}
-        height="86"
-        className="w-full"
-        role="img"
-        aria-label="Phase completions by day"
-      >
-        {cells.map((cell) => (
-          <rect
-            key={cell.date}
-            x={cell.x}
-            y={cell.y}
-            width="9"
-            height="9"
-            rx="1.5"
-            fill={
-              cell.count
-                ? `color-mix(in oklab, ${toneVar('done')} ${Math.round(cell.intensity * 100)}%, var(--track))`
-                : 'var(--track)'
-            }
-            onMouseEnter={() => setPicked(cell)}
-            onMouseLeave={() => setPicked(null)}
-            onClick={() => setPicked((current) => (current?.date === cell.date ? null : cell))}
-          >
-            <title>{`${cell.date}: ${cell.count} phase${cell.count === 1 ? '' : 's'}`}</title>
-          </rect>
-        ))}
-      </svg>
-      <div className="min-h-[1.2em] text-2xs text-ink-faint">
-        {picked
-          ? `${picked.date} · ${picked.count} phase${picked.count === 1 ? '' : 's'} completed`
-          : `last ${span} weeks`}
-      </div>
+      <CalendarFigure cells={cells} span={span} />
       {/* Only the days something landed on. A year of squares is ~180 rows of
           which most are zero, and a table whose every other row says `0` buries
           the answer it exists to give — the empty squares ARE the absence, and
@@ -436,36 +381,12 @@ export function BarList({
   label?: string;
   className?: string;
 }) {
-  const max = Math.max(1, ...items.map((item) => item.value));
   const total = items.reduce((sum, item) => sum + item.value, 0);
   if (!items.length) return <span className="text-sm text-ink-faint">Nothing recorded yet.</span>;
 
   return (
     <div className={cn('min-w-0', className)}>
-      <div className="flex flex-col gap-1">
-        {items.map((item) => (
-          <div
-            key={item.name}
-            className="grid grid-cols-[minmax(0,1fr)_2.5fr_auto] items-center gap-2"
-            // The whole row, not just the truncated name: a pointer asking a
-            // 6px bar what it is should get the reading, not the label it can
-            // already see. The table below is the same answer for everyone else.
-            title={`${item.name}: ${item.value}${unit}`}
-          >
-            <span className="truncate text-xs text-ink-muted">{item.name}</span>
-            <span className="h-1.5 overflow-hidden rounded-full bg-track">
-              <span
-                className="block h-full rounded-full"
-                style={{ width: `${(item.value / max) * 100}%`, background: toneVar(tone) }}
-              />
-            </span>
-            <span className="text-right font-mono text-2xs tabular-nums text-ink">
-              {item.value}
-              {unit}
-            </span>
-          </div>
-        ))}
-      </div>
+      <BarListFigure items={items} unit={unit} tone={tone} />
       {/* Two things the ranked bars cannot say: the name in full — the rows
           truncate, and four plan slugs sharing a dated prefix truncate to the
           same six characters — and each row's share of the whole, which is the
@@ -519,25 +440,7 @@ export function StackBar({ segments, label }: { segments: StackSegment[]; label?
   const total = sum || 1;
   return (
     <div>
-      <div
-        className="flex h-2.5 overflow-hidden rounded-full bg-track"
-        role="img"
-        aria-label={segments.map((s) => `${s.label} ${s.value}`).join(', ')}
-      >
-        {segments.map((segment) => (
-          // `title` the ATTRIBUTE, not a `<title>` child. `Bars` and `Calendar`
-          // put a `<title>` inside a `<rect>` and that is correct — inside the
-          // SVG namespace `<title>` IS the tooltip element. This bar is HTML: a
-          // `<title>` here is the HEAD element, parsed out of place, so the
-          // segments had no tooltip at all and stray `<title>` nodes leaked
-          // into the document.
-          <span
-            key={segment.label}
-            title={`${segment.label}: ${segment.value}`}
-            style={{ width: `${(segment.value / total) * 100}%`, background: toneVar(segment.tone) }}
-          />
-        ))}
-      </div>
+      <StackBarFigure segments={segments} />
       {/* The shared key, drawing each segment's own paint at legend size. */}
       <Legend
         className="mt-2 text-ink-muted"
@@ -650,16 +553,18 @@ export interface StripPhase {
 }
 
 /**
- * The states a strip's segments are in, tallied.
+ * The paints a strip's segments wear, tallied.
  *
- * Walked through `UI_STATES` by `stateEntries`/`stateTally` afterwards, so a
- * ninth state counts itself: nothing here names a state, which is the point —
- * both strips used to compute `done` and only `done`, and "9 done" out of 12
- * does not say whether the other three are running, waiting on a lock, or red.
+ * Each paint is the status model's (`describeWord('board', …)`,
+ * `describePhase(…)`), and they are walked through `UI_STATES` by
+ * `stateEntries`/`stateTally` afterwards, so a ninth paint counts itself:
+ * nothing here names a paint, which is the point — both strips used to compute
+ * `done` and only `done`, and "9 done" out of 12 does not say whether the
+ * other three are running, waiting on a lock, or red.
  */
-function tally(states: readonly UiState[]): LegendCounts {
+function tally(paints: readonly UiState[]): LegendCounts {
   const counts: LegendCounts = {};
-  for (const state of states) counts[state] = (counts[state] ?? 0) + 1;
+  for (const paint of paints) counts[paint] = (counts[paint] ?? 0) + 1;
   return counts;
 }
 
@@ -712,13 +617,17 @@ export function RouteStrip({
   className?: string;
 }) {
   if (!phases.length) return null;
-  const counts = tally(phases.map((p) => boardUiState(p.state)));
+  // The board word → its view, through the status model: an engine that learns
+  // a new word paints it as the first-class Unknown, never as an undeclared
+  // custom property (transparent — "this phase does not exist").
+  const paints = phases.map((p) => describeWord('board', p.state).paint);
+  const counts = tally(paints);
   const name = stateTally(counts, { total: phases.length });
 
   return (
     <span className={cn('flex min-w-0 flex-col gap-1', className)}>
       <span className="flex h-3 w-full min-w-0 items-stretch gap-px" role="img" aria-label={name}>
-        {phases.map((p) => {
+        {phases.map((p, i) => {
           const ready = p.state === 'ready';
           return (
             <span
@@ -730,10 +639,7 @@ export function RouteStrip({
                 // 6px segment, which is not a difference on a phone in daylight.
                 ready ? 'self-stretch' : 'my-[3px]',
               )}
-              // The board word → its UI state, through the vocabulary: an engine
-              // that learns a new word paints it as the unknown state, never as an
-              // undeclared custom property (transparent — "this phase does not exist").
-              style={{ background: toneVar(boardUiState(p.state)) }}
+              style={{ background: toneVar(paints[i]!) }}
               title={`P${p.phase} · ${p.state}${p.title ? ` · ${p.title}` : ''}`}
             />
           );
@@ -750,15 +656,13 @@ export function RouteStrip({
 
 export interface RunPhase {
   phase: number;
-  /** A `PhaseStatus` from the runner — a different vocabulary to a plan's. */
-  status: string;
   /**
-   * Why it stopped, when the record carries it (`lifecycle.stop`). The two
-   * parks nobody is being asked about — behind another lane's scope, or an MCP
-   * server that would not connect — paint `waiting` rather than `needs-you`,
-   * and the status word alone cannot tell them from the six that ARE an ask.
+   * A `PhaseStatus` from the runner — a different vocabulary to a plan's. Its
+   * paint is `describePhase`'s: every stop is a quiet wait there (amber comes
+   * from an open inbox item, never from the word), so why a phase parked no
+   * longer changes its segment and the strip needs no `stop`.
    */
-  stop?: { kind?: string };
+  status: string;
   /** The caller's one-line reading, for the tooltip. Cost and attempts belong here. */
   detail?: string;
 }
@@ -788,13 +692,17 @@ export function RunStrip({
   className?: string;
 }) {
   if (!phases.length) return null;
-  const counts = tally(phases.map((p) => phaseUiState(p.status, p.stop)));
+  // The runner's word → its view, through the same model a badge draws:
+  // `failed` is red, a stop is a quiet wait, and a word the model does not
+  // know is the first-class Unknown.
+  const paints = phases.map((p) => describePhase({ status: p.status }).paint);
+  const counts = tally(paints);
   const name = stateTally(counts, { total: phases.length });
 
   return (
     <span className={cn('flex min-w-0 flex-col gap-1', className)}>
       <span className="flex h-3 w-full min-w-0 items-stretch gap-px" role="img" aria-label={name}>
-        {phases.map((p) => {
+        {phases.map((p, i) => {
           const active = p.status === 'running' || p.status === 'verifying';
           return (
             <span
@@ -803,9 +711,7 @@ export function RunStrip({
                 'block min-w-0 flex-1 rounded-[1px] first:rounded-l-sm last:rounded-r-sm',
                 active ? 'self-stretch' : 'my-[3px]',
               )}
-              // The runner's word → its UI state, through the same vocabulary a
-              // badge reads: `parked` needs a person (never red), `failed` is red.
-              style={{ background: toneVar(phaseUiState(p.status, p.stop)) }}
+              style={{ background: toneVar(paints[i]!) }}
               title={`P${p.phase} · ${p.status}${p.detail ? ` · ${p.detail}` : ''}`}
             />
           );

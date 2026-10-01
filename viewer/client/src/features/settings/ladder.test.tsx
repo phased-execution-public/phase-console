@@ -55,9 +55,11 @@ describe('<LadderCard>', () => {
     // deliberately: `allowUnverifiedPhases` (it lowers the proof bar to the
     // handoff) and `ladderExtendOnProgress` (one more rung is one more
     // session's money) — server/config.ts. `resumeAtBoot` is no longer a toggle
-    // at all — it is three-valued since 3.5.0 and opens on Ask.
+    // at all — it is three-valued since 3.5.0 and opens on Ask. The third Off
+    // is `usageForecastHold` (control-tower phase 92): holding admissions on a
+    // forecast is the operator's opt-in.
     expect(screen.getAllByRole('button', { name: 'On' })).toHaveLength(5);
-    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(3);
     expect(screen.getByRole('button', { name: 'Ask' })).toBeTruthy();
   });
 
@@ -115,9 +117,9 @@ describe('<LadderCard>', () => {
     expect(field('Spend per day').value).toBe('900');
     expect(field('Sweep every').value).toBe('0');
     expect(field('Park on a required MCP server for').value).toBe('0');
-    // The two opt-ins stay Off (delegation ships on since 5.0.0);
-    // `resumeAtBoot: false` renders as its own three-valued control reading Never.
-    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(2);
+    // The three opt-ins stay Off (delegation ships on since 5.0.0; the forecast
+    // hold is phase 92's); `resumeAtBoot: false` renders as its own three-valued control reading Never.
+    expect(screen.getAllByRole('button', { name: 'Off' })).toHaveLength(3);
     expect(screen.getByRole('button', { name: 'Never' })).toBeTruthy();
   });
 

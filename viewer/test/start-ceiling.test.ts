@@ -190,3 +190,64 @@ test('the N+1th automatic start inside the window is refused by name, journalled
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ------------------------------------------------------------------ *
+ * What the $/hour half counts (control-tower phase 46, #62, CC-4)
+ * ------------------------------------------------------------------ */
+
+test('CC-4: the $/hour ceiling counts what each spawn BOOKED — a resumed conversation\'s earlier dollars are not counted again', async () => {
+  // On hub, 2026-09-22 16:02: $297.29 counted against $129.46 of real spend,
+  // because every resume re-reported its conversation's running total — and
+  // three automatic starts were refused on the difference.
+  const root = mkdtempSync(join(tmpdir(), 'pc-ceiling-booked-'));
+  const stub = join(root, '.stub');
+  const scripts = join(root, 'scripts');
+  mkdirSync(stub, { recursive: true });
+  mkdirSync(scripts, { recursive: true });
+  mkdirSync(join(root, 'docs', 'plans'), { recursive: true });
+  writeFileSync(join(root, 'docs', 'plans', 'demo.md'), '# demo\n');
+  writeFileSync(join(scripts, 'phase-graph.sh'), `#!/usr/bin/env bash
+case "\${2:-}" in
+  --memory-block)
+    if [ -f "${stub}/done" ]; then echo "done: 1"; echo "ready: "; else echo "done: "; echo "ready: 1"; fi
+    echo "in-progress: "; echo "stuck: "; echo "waiting: " ;;
+  --gate-status) echo "clear (no gate)" ;;
+  --boot-prompt) echo "BOOT phase 1 of demo" ;;
+  --size) echo L ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+  writeFileSync(join(scripts, 'phase-lock.sh'), '#!/usr/bin/env bash\n[ "${2:-}" = "status" ] && echo "phase ${3:-?}: free"\nexit 0\n', { mode: 0o755 });
+  writeFileSync(join(scripts, 'validate.sh'), '#!/usr/bin/env bash\necho ok\n', { mode: 0o755 });
+  const { Runner } = await import('../server/runner/runner.ts');
+  const ceiling = new StartCeiling(() => ({ startsPerHour: 0, usdPerHour: DEFAULT_USD_PER_HOUR }));
+  // One conversation, reported four times: the attempt, then three resumes
+  // after spent caps. The old booking counted 60 + 90 + 110 + 129.46.
+  const totals = [60, 90, 110, 129.46];
+  let n = 0;
+  const runner = new Runner({
+    scriptsDir: scripts,
+    startCeiling: ceiling,
+    verificationText: () => '`true`',
+    verify: async () => ({ ok: true, reason: 'green', notRun: [], ran: [] }),
+    spawn: async () => {
+      const total = totals[n++];
+      if (n === totals.length) writeFileSync(join(stub, 'done'), '1\n');
+      return {
+        signal: n < totals.length
+          ? { subtype: 'error_max_turns', terminalReason: 'max_turns', isError: true, code: 1, text: '' }
+          : { subtype: 'success', code: 0, text: '' },
+        sessionId: 'sess-hub', costUsd: total, turns: 5, resultText: '', durationMs: 10, argv: [],
+      };
+    },
+  } as never);
+  try {
+    await runner.start({ slug: 'demo', root, onlyPhases: [1] });
+    await runner.wait();
+    assert.equal(n, 4, 'four spawns of one conversation');
+    assert.equal(ceiling.snapshot().usd, 129.46, 'the hour holds the conversation\'s final total, once');
+    assert.equal(ceiling.admit(clock()).ok, true, 'so the next automatic start is admitted — $389.46 would have refused it');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -44,19 +44,61 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { queryClientConfig } from '@/lib/queries';
 import { RUN_SETTINGS_FIELDS, RUN_START_FIELDS } from '@shared/run-settings.js';
 import { shows } from './modes';
+import type { RunSetupField } from './schema';
 
-const { state, skills, runStart, runSettings, savePrefs } = vi.hoisted(() => ({
+const { state, skills, runStart, runSettings, savePrefs, runPrelude } = vi.hoisted(() => ({
   state: vi.fn(),
   skills: vi.fn(),
   runStart: vi.fn(),
   runSettings: vi.fn(),
   savePrefs: vi.fn(),
+  runPrelude: vi.fn(),
 }));
 
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, state, skills, runStart, runSettings, savePrefs } };
+  return { ...actual, api: { ...actual.api, state, skills, runStart, runSettings, savePrefs, runPrelude } };
 });
+
+/** A prelude with nothing open. */
+const PRELUDE = {
+  slug: 'alpha',
+  rows: [],
+  blocking: [],
+  waived: [],
+  acknowledged: [],
+  manifestPresent: false,
+  probes: {
+    accounts: { status: 'ok', ok: true, reason: 'ok' },
+    mcp: { status: 'skip', ok: true, reason: 'none' },
+    credentials: { status: 'skip', ok: true, reason: 'none' },
+    delivery: { status: 'ok', ok: true, reason: '1 subscribed device' },
+  },
+  accounts: [{ id: 'default', minHeadroomPct: 0 }],
+  credentials: { policy: 'continue', ids: [], held: [], missing: [] },
+  delivery: { ok: true, channels: ['1 subscribed device'], acknowledged: false },
+  at: '2026-09-29T00:00:00.000Z',
+};
+
+/**
+ * The same prelude with one plan git line this launch will not honour (#18) —
+ * the only state in which the Git tile draws its reconcile panel, so the
+ * `gitStrategyAck` control exists only here.
+ */
+const MISMATCH = {
+  ...PRELUDE,
+  probes: {
+    ...PRELUDE.probes,
+    'git-strategy': {
+      status: 'ok',
+      ok: true,
+      reason: '1 of the plan’s git lines is not honoured',
+      detail: {
+        lines: [{ kind: 'checkout', plan: 'Checkout: main on phase 1', run: 'inert', honourable: true }],
+      },
+    },
+  },
+};
 
 async function mount(props: Record<string, unknown>, consoleState: Record<string, unknown> = {}) {
   state.mockResolvedValue({
@@ -82,6 +124,7 @@ beforeEach(() => {
   runStart.mockResolvedValue({ run: { id: 'r', slug: 'alpha' } });
   runSettings.mockResolvedValue({ run: null });
   savePrefs.mockResolvedValue({});
+  runPrelude.mockResolvedValue({ prelude: PRELUDE });
 });
 
 /**
@@ -144,10 +187,14 @@ describe('every option has a control an operator can actually reach', () => {
     onLimit: /^On usage limit$/,
     autonomy: /^If something is unclear$/,
     permissionProfile: /^Permissions$/,
+    permissionMode: /^Permission mode$/,
+    gitStrategyAck: /^Plan git lines$/,
     phaseBudgetUsd: /^Budget per phase/,
     runBudgetUsd: /^Budget for the run/,
     maxParallel: /^Max parallel$/,
     maxConsecutiveFailures: /^Stop after N failures$/,
+    ladderPerRunRungs: /^Recovery rungs per run$/,
+    ladderPerPhaseRungs: /^Recovery rungs per phase$/,
     gitMode: /^Branch$/,
     priority: /^Queue priority$/,
     onlyPhases: /^Only these phases$/,
@@ -183,6 +230,9 @@ describe('every option has a control an operator can actually reach', () => {
   it.each(Object.keys(LABELS))('renders a control for %s', async (field) => {
     const mode = RUN_MODES.find((m) => shows(m, field as never));
     expect(mode, `${field} is offered by no run mode`).toBeTruthy();
+    // The plan's git lines are answered only where the plan and the launch
+    // disagree (control-tower phase 22) — so the prelude says they do.
+    if (field === 'gitStrategyAck') runPrelude.mockResolvedValue({ prelude: MISMATCH });
     await mount({
       mode,
       context: { slug: 'alpha', run: null },
@@ -217,29 +267,40 @@ describe('every option has a control an operator can actually reach', () => {
   });
 });
 
-describe('every option is reachable through the stage bar', () => {
+describe('every field has a category, and every one is within two interactions of the quick view', () => {
   /**
-   * The same controls, in the STAGED overlay: the stage bar has to lead to
-   * each one, on the stage `stages.ts` says it is on. The panels stay mounted
-   * while hidden, so a label query alone would find a control on any stage;
-   * scoping the query to the ACTIVE panel is what makes this a test of the
-   * map rather than of the DOM.
+   * The staged overlay is ONE screen since control-tower phase 22: nine
+   * category tiles, each expanding in place onto the category's controls. So
+   * reachability is counted, not assumed: from the quick view, a control must
+   * be on screen after pressing its tile's Edit (one interaction) or, for a
+   * control that exists only once a sibling is set, after that one more
+   * (two). The tile is the one `CATEGORY_OF` names — which makes this a test
+   * of the map as well as of the DOM — and every staged mode is walked, not
+   * only the widest that offers a field.
    */
-  // `qa-fix` last, for `RUN_MODES`' reason: it is staged, and it is the only
-  // staged mode that offers QA recovery's two fields.
   const STAGED = ['start', 'continue', 'live', 'phase', 'qa-fix'] as const;
-  const LABELS = {
+  const LABELS: Partial<Record<RunSetupField, RegExp>> = {
     model: /^Model$/,
     effort: /^Effort$/,
+    modelPolicy: /^Model policy$/,
     accountId: /^Account$/,
+    accounts: /^Accounts it may spend/,
     onLimit: /^On usage limit$/,
     autonomy: /^If something is unclear$/,
     permissionProfile: /^Permissions$/,
+    permissionMode: /^Permission mode$/,
+    approvalTimeoutMinutes: /^Approvals wait for you/,
+    gitStrategyAck: /^Plan git lines$/,
     phaseBudgetUsd: /^Budget per phase/,
     runBudgetUsd: /^Budget for the run/,
     maxParallel: /^Max parallel$/,
     maxConsecutiveFailures: /^Stop after N failures$/,
+    ladderPerRunRungs: /^Recovery rungs per run$/,
+    ladderPerPhaseRungs: /^Recovery rungs per phase$/,
     gitMode: /^Branch$/,
+    baseBranch: /^Base branch$/,
+    maxConcurrentPerRepo: /^Runs beside it in the repository$/,
+    worktreeRetention: /^When the run settles, its checkouts$/,
     priority: /^Queue priority$/,
     onlyPhases: /^Only these phases$/,
     startAfter: /^Start after/,
@@ -251,7 +312,8 @@ describe('every option is reachable through the stage bar', () => {
     mcpPolicy: /^If one will not connect$/,
     autoRecover: /^Auto-recover/,
     skills: /^Skills for this run$/,
-    qa: /Turn the QA gate on/,
+    // A launch turns the gate on; the live sheet shows it as it is.
+    qa: /Turn the QA gate on|The QA gate for this plan/,
     ultracode: /^Ultracode$/,
     ultraReview: /^Cloud review$/,
     qaModel: /^QA model$/,
@@ -259,56 +321,90 @@ describe('every option is reachable through the stage bar', () => {
     qaMaxRounds: /^Stop after N failed QA rounds$/,
     qaFixStrategy: /^How the fix session starts$/,
     qaRoundBudgetUsd: /^Budget per QA round \(\$\)$/,
-  } as const;
-  const UNLOCK: Partial<Record<keyof typeof LABELS, RegExp>> = {
+    resumeOnRestart: /If the console restarts, continue this run/,
+    relay: /^Relay questions to a person$/,
+  };
+  /** Controls that exist once a sibling is set — the second interaction, and what it is. */
+  const UNLOCK: Partial<Record<RunSetupField, RegExp>> = {
     settle: /^Branch$/,
     isolation: /^Branch$/,
+    baseBranch: /^Branch$/,
+    maxConcurrentPerRepo: /^Branch$/,
+    worktreeRetention: /^Branch$/,
     reviewerPolicy: /^Review each phase/,
   };
 
-  it.each(Object.keys(LABELS) as (keyof typeof LABELS)[])(
-    'reaches %s on the stage the map names',
-    async (field) => {
-      const mode = STAGED.find((m) => shows(m, field));
-      expect(mode, `${field} is offered by no staged mode`).toBeTruthy();
+  it('gives every field a category, and each category a tile', async () => {
+    const { CATEGORY_OF, CATEGORIES } = await import('./categories');
+    const { FIELD_LABELS } = await import('./stages');
+    for (const field of Object.keys(FIELD_LABELS)) {
+      const id = CATEGORY_OF[field as RunSetupField];
+      expect(id, `${field} has no category`).toBeTruthy();
+      expect(
+        CATEGORIES.some((c) => c.id === id),
+        `${field}'s category ${id} is not a tile`,
+      ).toBe(true);
+    }
+    for (const field of CANONICAL) {
+      if (CONTEXT_FIELDS.has(field)) continue;
+      expect(CATEGORY_OF[field as RunSetupField], `${field} has no category`).toBeTruthy();
+    }
+  });
+
+  const found = (scope: HTMLElement, label: RegExp) =>
+    within(scope).queryAllByLabelText(label).length > 0 ||
+    within(scope).queryAllByRole('button', { name: label }).length > 0 ||
+    within(scope).queryAllByRole('radiogroup', { name: label }).length > 0 ||
+    within(scope).queryAllByText(label).length > 0;
+
+  it.each(STAGED)(
+    'in %s, every field it offers is within two interactions',
+    async (mode) => {
+      runPrelude.mockResolvedValue({ prelude: MISMATCH });
       await mount({
         mode,
-        context: { slug: 'alpha', run: null },
+        context: { slug: 'alpha', run: null, phase: 1 },
         planPhases: [{ phase: 1, title: 'one' }],
         planMcp: ['ctx'],
         qaMode: 'off',
         overlay: { open: true, onOpenChange: () => {}, title: 'test' },
       });
-      // Every staged mode's own submit word, `qa-fix`'s included — the button
-      // is what says the form has finished mounting, so a mode missing from
-      // this alternation fails as a timeout rather than as the miss it is.
+      // Every staged mode's own submit word — the button says the form mounted.
       await waitFor(() =>
-        expect(screen.getByRole('button', { name: /Start|Apply|Run phase|Fix & re-QA/ })).toBeTruthy(),
+        expect(
+          screen.getByRole('button', { name: /Start|Continue|Apply|Run phase|Fix & re-QA/ }),
+        ).toBeTruthy(),
       );
-
-      const { STAGE_OF, STAGES } = await import('./stages');
-      const stage = STAGES.find((s) => s.id === STAGE_OF[field])!;
-      fireEvent.click(screen.getByRole('tab', { name: new RegExp(stage.label) }));
-      const active = () => screen.getByRole('tabpanel');
-
-      const unlock = UNLOCK[field];
-      if (unlock) {
-        const select = within(active())
-          .queryAllByLabelText(unlock)
-          .find((el) => el instanceof HTMLSelectElement);
-        if (select) fireEvent.change(select, { target: { value: 'new-branch' } });
-        else fireEvent.click(within(active()).getByRole('checkbox', { name: unlock }));
+      const { CATEGORY_OF, categoryById } = await import('./categories');
+      const offered = (Object.keys(LABELS) as RunSetupField[]).filter((field) => shows(mode, field));
+      expect(offered.length).toBeGreaterThan(5);
+      for (const field of offered) {
+        const label = categoryById(CATEGORY_OF[field]).label;
+        // Back to the quick view: fold whatever is open.
+        for (const done of screen.queryAllByRole('button', { name: /^Done / })) fireEvent.click(done);
+        // Interaction one: the tile's Edit (Answer, on a summons).
+        fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^(Edit|Answer) ${label}$`) }));
+        const region = () => screen.getByRole('region', { name: label });
+        let interactions = 1;
+        await waitFor(() => expect(region()).toBeTruthy());
+        const want = LABELS[field]!;
+        if (!found(region(), want) && UNLOCK[field]) {
+          // Interaction two: the sibling that makes the control exist.
+          const unlock = UNLOCK[field]!;
+          const select = within(region())
+            .queryAllByLabelText(unlock)
+            .find((el) => el instanceof HTMLSelectElement);
+          if (select) fireEvent.change(select, { target: { value: 'new-branch' } });
+          else fireEvent.click(within(region()).getByRole('checkbox', { name: unlock }));
+          interactions += 1;
+        }
+        await waitFor(() =>
+          expect(found(region(), want), `no control for ${field} in the ${label} tile of ${mode}`).toBe(true),
+        );
+        expect(interactions).toBeLessThanOrEqual(2);
       }
-
-      await waitFor(() => {
-        const label = LABELS[field];
-        const found =
-          within(active()).queryAllByLabelText(label).length > 0 ||
-          within(active()).queryAllByRole('button', { name: label }).length > 0 ||
-          within(active()).queryAllByText(label).length > 0;
-        expect(found, `no control found for ${field} on "${stage.label}" in mode ${mode}`).toBe(true);
-      });
     },
+    60_000,
   );
 });
 
@@ -398,3 +494,4 @@ describe('an option edited under another name', () => {
     expect(OWNED_BY.openPr).toBe('settle');
   });
 });
+

@@ -1,7 +1,7 @@
 import { useId } from 'react';
 import { LifeBuoy } from 'lucide-react';
 import { cn } from '@/lib/cn';
-import { Chip, SectionHeading, Sheet, SheetContent } from '@/components/ui';
+import { Badge, SectionHeading, Sheet, SheetContent } from '@/components/ui';
 import { LimitsWidget } from '@/components/limits-widget';
 import { useNavigate } from '@/app/router';
 import { destinationFor, helpHref, type Route } from '@/app/routes';
@@ -79,7 +79,7 @@ export function MoreSheet({
                     aria-current={current === item.id ? 'page' : undefined}
                     onClick={() => go(item.id)}
                     className={cn(
-                      'flex min-h-(--tap-min) items-center gap-3 rounded px-2 py-2 text-left',
+                      'flex min-h-(--tap-min) items-center gap-3 rounded px-2 py-2 text-start',
                       current === item.id ? 'bg-surface-raised' : 'hover:bg-surface-raised',
                     )}
                   >
@@ -107,7 +107,7 @@ export function MoreSheet({
             <button
               type="button"
               onClick={() => go(helpHref(undefined, undefined, route))}
-              className="flex min-h-(--tap-min) items-center gap-3 rounded px-2 py-2 text-left hover:bg-surface-raised"
+              className="flex min-h-(--tap-min) items-center gap-3 rounded px-2 py-2 text-start hover:bg-surface-raised"
             >
               <LifeBuoy size={17} className="shrink-0 text-ink-muted" aria-hidden />
               <span className="min-w-0 flex-1">
@@ -131,11 +131,11 @@ export function MoreSheet({
           <div className="flex items-center justify-between gap-2">
             <SectionHeading as="span">Writes</SectionHeading>
             {state?.allowWrites ? (
-              <Chip tone="warn">enabled</Chip>
+              <Badge tone="accent">enabled</Badge>
             ) : (
-              <Chip title="Start with --allow-writes to enable scaffolding, QA records and locks">
+              <Badge title="Start with --allow-writes to enable scaffolding, QA records and locks">
                 read-only
-              </Chip>
+              </Badge>
             )}
           </div>
         </div>

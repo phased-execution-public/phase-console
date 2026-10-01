@@ -17,12 +17,17 @@ import { describe, expect, it, vi } from 'vitest';
 import { keys, queryClientConfig } from '@/lib/queries';
 import { TooltipProvider } from '@/components/ui';
 import type { PhaseView, RunState } from '@/lib/api';
+import { budgetFact, budgetHeadline } from '@shared/budget-model.js';
 import { NextSteps, nextStepRows } from './ways-forward';
 
-const { runRecheck } = vi.hoisted(() => ({ runRecheck: vi.fn() }));
+const { runRecheck, runClearStreak, runRaiseBudget } = vi.hoisted(() => ({
+  runRecheck: vi.fn(),
+  runClearStreak: vi.fn(),
+  runRaiseBudget: vi.fn(),
+}));
 vi.mock('@/lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/api')>();
-  return { ...actual, api: { ...actual.api, runRecheck } };
+  return { ...actual, api: { ...actual.api, runRecheck, runClearStreak, runRaiseBudget } };
 });
 
 const phase = (over: Partial<PhaseView>): PhaseView =>
@@ -469,5 +474,203 @@ describe('a plan wedged by a QA verdict', () => {
   it('says nothing about QA when the plan does not gate on it', () => {
     const noQa: PhaseView[] = [phase({ phase: 1, state: 'done', title: 'backend' })];
     expect(nextStepRows('demo', noQa, parked).some((r) => r.phase === 1)).toBe(false);
+  });
+});
+
+/**
+ * The run-level facts a stopped run could not say about itself (#37, #35).
+ *
+ * Both were measured on 2026-09-21. A run sat at 3 of a maximum 2 with nothing
+ * anywhere that zeroed the number, and four runs read "halted — the API
+ * refused this credential" while the fact that EVERY account on the machine
+ * was unusable — so there was nothing to switch to — lived on another page.
+ */
+describe('the run-level strip', () => {
+  function mountCard(node: React.ReactElement, flags: { allowWrites?: boolean } = {}) {
+    const client = new QueryClient({
+      ...queryClientConfig,
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(keys.state(), {
+      allowRun: true,
+      allowAgent: true,
+      allowWrites: flags.allowWrites ?? false,
+      autopilot: true,
+      root: { ok: true, path: '/repo' },
+    });
+    client.setQueryData(keys.terminal(), {
+      allowed: false,
+      agentAllowed: true,
+      available: 'yes',
+      sessions: [],
+    });
+    return render(
+      <QueryClientProvider client={client}>
+        <TooltipProvider>{node}</TooltipProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it('a live run says none of it — advice stacked on a moving run reads as alarm', () => {
+    mountCard(
+      <NextSteps
+        slug="demo"
+        planPhases={[]}
+        run={run({ status: 'running', consecutiveFailures: 1 })}
+        live
+        authFailure={false}
+      />,
+    );
+    expect(screen.queryByText(/failed in a row/)).toBeNull();
+  });
+
+  /* ---------------------------------------------------------------- *
+   * The raise beside the reason (control-tower phase 14, #40)
+   * ---------------------------------------------------------------- */
+
+  const waitFact = budgetFact({
+    budget: 'wait',
+    phase: 3,
+    limit: 60,
+    spent: 60,
+    asked: 90,
+    spentOn: [{ what: 'parked 09:00–10:00 UTC (session)', amount: 60 }],
+    at: '2026-09-29T10:00:00.000Z',
+  });
+  const waitingOnBudget = run({
+    status: 'waiting',
+    phases: { '3': { phase: 3, status: 'waiting', attempts: 1, costUsd: 0 } },
+    recoveries: {
+      '3': {
+        attempts: 0,
+        lastAt: '',
+        errand: {
+          phase: 3,
+          situation: 'waiting-external',
+          tried: [],
+          need: `${budgetHeadline(waitFact)} — it needs more wait budget for phase 3 to wait on a clock again`,
+          how: 'It resumes its own session the moment gh:acme/app#run/42 lands.',
+          at: waitFact.at,
+          budget: waitFact,
+        },
+      },
+    },
+  } as unknown as Partial<RunState>);
+
+  it('offers +30m, +60m and any amount for a spent wait budget, and raises in one press', async () => {
+    runRaiseBudget.mockResolvedValue({
+      budget: 'wait',
+      phase: 3,
+      was: 60,
+      now: 90,
+      retried: true,
+      run: null,
+    });
+    mountCard(
+      <NextSteps
+        slug="demo"
+        planPhases={[phase({ phase: 3, title: 'Cart API', state: 'in-progress' })]}
+        run={waitingOnBudget}
+        live={false}
+        authFailure={false}
+      />,
+      { allowWrites: true },
+    );
+    // The first line says BUDGET with the arithmetic — never "waiting on CI".
+    expect(
+      screen.getAllByText(/^Wait budget spent — 60m wait budget · 60m accrued · 0m left · asked for 90m/)
+        .length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/CI, a PR/)).toBeNull();
+    expect(screen.getByRole('button', { name: '+30m' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '+60m' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: '+30m' }));
+    expect(runRaiseBudget).toHaveBeenCalledWith('demo', { budget: 'wait', phase: 3, add: 30 });
+    expect(await screen.findByText(/Raised 60m → 90m and retried\./)).toBeTruthy();
+  });
+
+  it('raises a wait by any amount typed, and says why it cannot on a console without --allow-writes', () => {
+    runRaiseBudget.mockClear();
+    runRaiseBudget.mockResolvedValue({
+      budget: 'wait',
+      phase: 3,
+      was: 60,
+      now: 105,
+      retried: true,
+      run: null,
+    });
+    const { unmount } = mountCard(
+      <NextSteps
+        slug="demo"
+        planPhases={[phase({ phase: 3, state: 'in-progress' })]}
+        run={waitingOnBudget}
+        live={false}
+        authFailure={false}
+      />,
+      { allowWrites: true },
+    );
+    fireEvent.change(screen.getByLabelText('Raise by, in minutes'), { target: { value: '45' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Raise and retry' }));
+    expect(runRaiseBudget).toHaveBeenCalledWith('demo', { budget: 'wait', phase: 3, add: 45 });
+    unmount();
+    mountCard(
+      <NextSteps
+        slug="demo"
+        planPhases={[phase({ phase: 3, state: 'in-progress' })]}
+        run={waitingOnBudget}
+        live={false}
+        authFailure={false}
+      />,
+    );
+    expect((screen.getByRole('button', { name: '+30m' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/start the console with --allow-writes/)).toBeTruthy();
+  });
+
+  it('offers rungs for a spent recovery cap, and Clear the streak — never a raise — for the streak', () => {
+    runRaiseBudget.mockClear();
+    const ladder = budgetFact({
+      budget: 'ladder',
+      phase: 2,
+      limit: 12,
+      spent: 12,
+      unit: 'rungs',
+      setting: 'ladderPerRunRungs',
+    });
+    const streak = budgetFact({ budget: 'streak', phase: 2, limit: 2, spent: 2 });
+    mountCard(
+      <NextSteps
+        slug="demo"
+        planPhases={[phase({ phase: 2, state: 'in-progress' })]}
+        run={run({
+          status: 'halted',
+          consecutiveFailures: 2,
+          maxConsecutiveFailures: 2,
+          halt: { at: '', reason: '2 phases failed in a row', kind: 'failure-streak', budget: streak },
+          phases: { '2': { phase: 2, status: 'parked', attempts: 1, costUsd: 0 } },
+          recoveries: {
+            '2': {
+              attempts: 1,
+              lastAt: '',
+              errand: {
+                phase: 2,
+                situation: 'work-in-progress',
+                tried: [],
+                need: "The run's ladder budget is spent — 12 of 12 rungs.",
+                how: 'Raise it.',
+                at: '',
+                budget: ladder,
+              },
+            },
+          },
+        } as unknown as Partial<RunState>)}
+        live={false}
+        authFailure={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: '+4 rungs' }));
+    expect(runRaiseBudget).toHaveBeenCalledWith('demo', { budget: 'ladder', phase: 2, add: 4 });
+    // The streak is never raised; its Clear is the halt card's (control-tower
+    // phase 17, `components/halt-card.test.tsx`).
+    expect(screen.queryByRole('button', { name: /\+2 phases/ })).toBeNull();
   });
 });

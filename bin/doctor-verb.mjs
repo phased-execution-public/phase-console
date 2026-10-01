@@ -21,6 +21,8 @@ import { join, resolve } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { pathToFileURL } from 'node:url';
 
+import { listStrayConsoles, stopStrayConsoles } from './stray-consoles.mjs';
+
 // A list rather than one template, so the free build can drop the one row the
 // free tree has no machinery for (the marker pair strips whole lines).
 const USAGE = [
@@ -29,12 +31,16 @@ const USAGE = [
   "  Runs the run-start prelude's probes with no plan in front of them, and the",
   '  machine checks a console needs to be worth starting: accounts, MCP servers,',
   '  the machine claude login, a delivery channel, the session-presence hooks,',
+  "  the node arguments the console runs with, node-pty's spawn helper,",
   '  the Claude CLI version against the relay floor, gh auth status, the',
   "  environment doctor, and whether a console answers on the instance's port.",
   '',
   '  [instance]   an id, a name, or a project directory; default: the console for',
   '               the directory you are standing in',
   '  --json       print the report as GET /api/doctor serves it',
+  '  --stop-strays  stop every stray console process this scan finds (#155):',
+  '               a server whose own package root no longer exists, process',
+  '               group, TERM then KILL, each one named',
   '  --help       this text',
   '',
   '  Exit 0 when every blocking row passes; exit 1 naming the first that does not.',
@@ -91,6 +97,9 @@ async function askConsole(port) {
         serverStale: Boolean(state.body.serverStale),
         version: 'a build from before doctor existed — restart it onto this checkout for the live rows',
       },
+      // The console's own node arguments when its state carries them (#71) —
+      // this process is a person's shell, and its execArgv would answer nothing.
+      execArgv: Array.isArray(state.body.execArgv) ? state.body.execArgv : null,
     };
   }
   return {};
@@ -98,6 +107,10 @@ async function askConsole(port) {
 
 function readJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+}
+
+function readText(path) {
+  try { return readFileSync(path, 'utf8').trim() || null; } catch { return null; }
 }
 
 /** The machine `claude` login, read the way the console's own probe reads it, without the console. */
@@ -130,11 +143,12 @@ export async function doctorVerb(argv, ctx) {
     return 0;
   }
   const json = args.includes('--json');
+  const stopStrays = args.includes('--stop-strays');
   let selector;
   let rootArg;
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
-    if (arg === '--json') continue;
+    if (arg === '--json' || arg === '--stop-strays') continue;
     if (arg === '--instance') { selector = args[++i]; continue; }
     if (arg === '--root' || arg === '-r') { rootArg = args[++i]; continue; }
     if (!arg.startsWith('-') && selector === undefined && rootArg === undefined) {
@@ -180,6 +194,7 @@ export async function doctorVerb(argv, ctx) {
     const { environmentReport, probeGit } = await load('env-doctor');
     const { probeAccounts, probeCredentials, probeDelivery } = await load('prelude');
     const { probeCredential } = await load('credentials-probe');
+    const skillCopies = await load('skill-copy');
     const stateDir = instance ? instances.instanceStateDir(instance.id, instance.default) : null;
     const probeDeps = { claudeLogin, cwd: instance?.root ?? process.cwd() };
     const deps = {
@@ -215,6 +230,12 @@ export async function doctorVerb(argv, ctx) {
         };
       },
       hooks: async () => hooksStatus({ skillDir: ctx.root }),
+      // The skill copy each config dir loads, against the commit THIS copy's
+      // client was built from — the console's own `distRev`, read off disk (#151).
+      skillCopy: () => skillCopies.skillCopyReport({
+        configDirs: skillCopies.claudeConfigDirs(),
+        consoleRev: readText(join(ctx.root, 'viewer', 'client', 'dist', '.build-rev')),
+      }),
       unit: async () => {
         return null;
       },
@@ -235,11 +256,45 @@ export async function doctorVerb(argv, ctx) {
       git: () => probeGit((file, args, opts) => run(file, args, 10_000, opts?.cwd), instance?.root ?? null),
       environment: () => environmentReport(),
       console: async () => asked.state ?? null,
+      // No console process is at hand offline: its own answer, when its state
+      // gave one, else unknown — never this shell's execArgv.
+      execArgv: () => asked.execArgv ?? null,
     };
     report = await doctor.doctorReport(deps);
+  }
+
+  // Stray console processes (#155, PS-3) — a machine-wide fact, asked and
+  // named the same way whether or not an instance resolved above and whether
+  // or not a live console answered for it, so appended to `report.rows` here
+  // rather than built into either deps path. Never blocking: a stray costs
+  // memory and a port, not the health of THIS instance.
+  const strays = await listStrayConsoles();
+  const stopped = stopStrays && strays.length ? await stopStrayConsoles(strays) : [];
+  report.rows.push(strayRow(strays, stopped));
+  for (const one of stopped) {
+    process.stderr.write(`phase-console doctor: stray pid ${one.pid} (root gone: ${one.root}) — ${one.stopped ? 'stopped' : 'still running; stop it by hand'}\n`);
   }
 
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else process.stdout.write(`${doctor.formatDoctor(report)}\n`);
   return doctor.doctorExitCode(report);
+}
+
+/** The `strays` row — shaped like `doctor.ts`'s `DoctorRow`, built by hand: this fact is never asked of `doctorReport()`, see the module header. */
+function strayRow(strays, stopped) {
+  if (!strays.length) {
+    return {
+      id: 'strays', label: 'Stray console processes', blocking: false, status: 'ok',
+      reason: 'none — every phase-console server this scan can see still has its package root',
+    };
+  }
+  const named = strays.map((s) => `pid ${s.pid} (root gone: ${s.root})`).join('; ');
+  const tail = stopped.length
+    ? ` — ${stopped.filter((s) => s.stopped).length}/${stopped.length} stopped just now`
+    : ' — rerun with --stop-strays to stop them';
+  return {
+    id: 'strays', label: 'Stray console processes', blocking: false, status: 'fail',
+    reason: `${strays.length} stray process${strays.length === 1 ? '' : 'es'}: ${named}${tail}`,
+    detail: strays,
+  };
 }

@@ -38,10 +38,10 @@ export function ToggleItem({ className, ...props }: ComponentProps<typeof Toggle
   return (
     <ToggleGroupPrimitive.Item
       className={cn(
-        'inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap border-r border-rule px-2.5 text-xs font-medium text-ink-muted last:border-r-0',
+        'inline-flex h-8 items-center justify-center gap-1.5 whitespace-nowrap border-e border-rule px-2.5 text-xs font-medium text-ink-muted last:border-e-0',
         // −1px on the end segments: they nest inside the root's 1px border, and
         // the root no longer clips them into its own radius (see `ToggleGroup`).
-        'first:rounded-l-[calc(var(--radius)-1px)] last:rounded-r-[calc(var(--radius)-1px)]',
+        'first:rounded-s-[calc(var(--radius)-1px)] last:rounded-e-[calc(var(--radius)-1px)]',
         'transition-colors duration-fast ease-transit hover:bg-surface hover:text-ink',
         'disabled:pointer-events-none disabled:opacity-50',
         '[@media(hover:none)]:min-h-(--tap-min) [@media(hover:none)]:min-w-(--tap-min)',

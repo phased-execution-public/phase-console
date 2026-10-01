@@ -8,6 +8,12 @@
  * caps it ran under with where each cap came from. A session that never reported
  * a cost reads *unknown*, never $0.00.
  *
+ * The turn cap binds per PROMPT (control-tower phase 89, #62's SIZ-7): a session
+ * woken more than once sums its prompts past the cap and never nears it in any
+ * one. So the Turns cell names the largest prompt beside the sum when the two
+ * differ, and the Caps cell says what its turn cap counts — the summed total is
+ * never the figure set against the cap.
+ *
  * Under the table, the reconciliation: the sessions' own figures against the
  * run's running `spentUsd`. They agree when every spend went through the spawn
  * door and every session reported; when they do not, the gap is shown as a
@@ -15,16 +21,37 @@
  * settled with — its situation, its cost and who drives that vehicle (the ladder
  * table's drivability column, phase 10). A rung's cost is its boarded session's,
  * already in the table above, so it is shown beside the total and never added.
+ * Its outcome and its cause are badges with their icons (control-tower phase
+ * 24) — `withdrawn` (#16) and `environment` included — never plain words.
  */
 
 import { RUNG_DRIVER_LABELS, VEHICLE_DRIVERS } from '@shared/ladder-model.js';
-import { Badge, Card, CardBody, CardHeader, CardTitle, DataTable, type Column } from '@/components/ui';
+import { Badge, Card, CardBody, CardHeader, CardTitle } from '@/components/ui';
+import { DataTable, type Column } from '@/components/data-table';
+import { OpsBadge, type WordOf } from '@/components/ui/status';
 import type { LedgerCap, LedgerRung, LedgerSession, LedgerTotals, RunLedger } from '@/lib/api';
 import { cn } from '@/lib/cn';
 import { duration, money } from '@/lib/format';
 
 function capText(cap: LedgerCap, format: (value: number) => string): string {
   return cap ? `${format(cap.value)} · ${cap.source}` : '—';
+}
+
+/** The largest prompt, when it is a different figure from the sum — `null` for one prompt or a line from before it. */
+function largestPrompt(session: LedgerSession): number | null {
+  return session.promptTurns != null && session.turns != null && session.promptTurns !== session.turns
+    ? session.promptTurns
+    : null;
+}
+
+function turnsTitle(session: LedgerSession): string | undefined {
+  const counted = session.turnsSource ? `counted from the ${session.turnsSource}` : null;
+  const largest = largestPrompt(session);
+  const perPrompt =
+    largest != null
+      ? `${session.turns} turns across its prompts; the largest ran ${largest} — the figure its turn cap binds, per prompt`
+      : null;
+  return [counted, perPrompt].filter(Boolean).join(' · ') || undefined;
 }
 
 const SESSION_COLUMNS: Column<LedgerSession>[] = [
@@ -56,7 +83,7 @@ const SESSION_COLUMNS: Column<LedgerSession>[] = [
             console
           </Badge>
         )}
-        {session.isError && <span className="text-2xs text-blocked">error</span>}
+        {session.isError && <span className="text-2xs text-failed">error</span>}
       </span>
     ),
   },
@@ -84,14 +111,19 @@ const SESSION_COLUMNS: Column<LedgerSession>[] = [
     head: 'Turns',
     align: 'end',
     priority: 2,
-    cell: (session) => (
-      <span
-        className="font-mono text-xs"
-        title={session.turnsSource ? `counted from the ${session.turnsSource}` : undefined}
-      >
-        {session.turns ?? '—'}
-      </span>
-    ),
+    cell: (session) => {
+      const largest = largestPrompt(session);
+      return (
+        <span className="inline-flex flex-col items-end" title={turnsTitle(session)}>
+          <span className="font-mono text-xs">{session.turns ?? '—'}</span>
+          {largest != null && (
+            <span className="text-2xs text-ink-faint" data-testid="ledger-prompt-turns">
+              max {largest} per prompt
+            </span>
+          )}
+        </span>
+      );
+    },
   },
   {
     id: 'time',
@@ -108,7 +140,8 @@ const SESSION_COLUMNS: Column<LedgerSession>[] = [
     priority: 3,
     cell: (session) => (
       <span className="text-2xs text-ink-muted">
-        {capText(session.maxTurns, (value) => `${value} turns`)} · {capText(session.maxBudgetUsd, money)}
+        {capText(session.maxTurns, (value) => `${value} turns per prompt`)} ·{' '}
+        {capText(session.maxBudgetUsd, money)}
       </span>
     ),
   },
@@ -146,7 +179,24 @@ const RUNG_COLUMNS: Column<LedgerRung>[] = [
     id: 'outcome',
     head: 'Outcome',
     priority: 1,
-    cell: (rung) => <span className="text-xs">{rung.outcome}</span>,
+    // A word with its icon, never bare text (control-tower phase 24): a
+    // `withdrawn` rung never ran (#16), and reads as its own settled word.
+    cell: (rung) => (
+      <OpsBadge vocab="rung" word={rung.outcome as WordOf<'rung'>} data-testid="ledger-outcome" />
+    ),
+  },
+  {
+    id: 'cause',
+    head: 'Why',
+    priority: 2,
+    cell: (rung) =>
+      rung.cause ? (
+        <OpsBadge vocab="rungCause" word={rung.cause as WordOf<'rungCause'>} data-testid="ledger-cause" />
+      ) : (
+        <span className="text-2xs text-ink-faint" title="This settlement names no cause.">
+          —
+        </span>
+      ),
   },
   {
     id: 'situation',
@@ -216,7 +266,7 @@ export function LedgerCard({ ledger }: { ledger: RunLedger | undefined }) {
         <p
           data-testid="ledger-reconcile"
           data-gap={gap ? 'true' : undefined}
-          className={cn('text-xs', gap ? 'text-blocked' : 'text-ink-muted')}
+          className={cn('text-xs', gap ? 'text-failed' : 'text-ink-muted')}
         >
           {text}
         </p>

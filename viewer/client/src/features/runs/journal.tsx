@@ -36,12 +36,12 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  DataList,
   Empty,
   Input,
   RelativeTime,
   copy,
 } from '@/components/ui';
+import { DataList } from '@/components/ui/data-list';
 import { usePhone } from '@/lib/media';
 import { cn } from '@/lib/cn';
 import { scrollIntoScroller } from '@/lib/scroll';

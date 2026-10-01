@@ -282,3 +282,53 @@ export const GATE_KINDS = Object.freeze(/** @type {const} */ (['human', 'ai', 'a
 export function isGateKind(v) {
   return typeof v === 'string' && GATE_KINDS.includes(/** @type {GateKind} */ (v));
 }
+
+/**
+ * What a plan summary's progress may SAY (control-tower phase 84, #96) — the
+ * one reading the plan header and the plans list row both draw.
+ *
+ * A board the engine could not read is `unknown`: with the last good reading
+ * and its age when one exists, and never "0/72 · 0%", which is what an
+ * unreadable board used to summarise as while the engine's own text said
+ * 41/72. A summary with a null count is not a reading either, whether or not
+ * it carries the word — a client older than the word is still told.
+ * @param {{ phases?: number; done?: number | null; percent?: number | null; progress?: string;
+ *   lastGood?: { done: number; phases: number; percent: number; at: number } }} summary
+ * @param {number} [nowMs]
+ * @returns {{ known: boolean; text: string; title: string }}
+ */
+export function progressReading(summary, nowMs = Date.now()) {
+  const phases = summary.phases ?? 0;
+  const counted = typeof summary.done === 'number' && typeof summary.percent === 'number';
+  if (summary.progress !== 'unknown' && counted) {
+    return {
+      known: true,
+      text: `${summary.done}/${phases} · ${summary.percent}%`,
+      title: 'Read from the engine just now.',
+    };
+  }
+  const last = summary.lastGood;
+  if (!last) {
+    return {
+      known: false,
+      text: 'progress unknown',
+      title:
+        'The engine could not read this plan, and this console has no earlier reading of it — nothing is claimed.',
+    };
+  }
+  const age = ageWords(Math.max(0, nowMs - last.at));
+  return {
+    known: false,
+    text: `progress unknown · last read ${last.done}/${last.phases} · ${last.percent}%, ${age} ago`,
+    title: 'The engine could not read this plan just now; the numbers are the last reading it did take.',
+  };
+}
+
+/** `42s`, `17m`, `3h`, `2d` — the one unit a glance needs. */
+function ageWords(ms) {
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return `${Math.floor(ms / 1000)}s`;
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
+}

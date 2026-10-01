@@ -137,6 +137,14 @@ export const PERMISSION_MODES = Object.freeze(
   /** @type {const} */ (['acceptEdits', 'auto', 'dontAsk', 'plan', 'manual']),
 );
 
+/**
+ * The mode a phase's session starts in when nothing states one — the attempt,
+ * the run's per-phase choice, the plan's bullet and line, and the run default
+ * all silent (`resolvePermissionMode`). `scripts/permission.env` is the bash twin.
+ * @type {PermissionMode}
+ */
+export const DEFAULT_PERMISSION_MODE = 'acceptEdits';
+
 export const RUN_START_FIELDS = Object.freeze([
   'model',
   'effort',
@@ -152,6 +160,12 @@ export const RUN_START_FIELDS = Object.freeze([
   'mcpServers',
   'mcpPolicy',
   'permissionProfile',
+  // control-tower phase 11 (#34): the run's DEFAULT permission mode — below the
+  // plan's line and bullet, above `acceptEdits` (`resolvePermissionMode`).
+  'permissionMode',
+  // control-tower phase 11 (#18): the launch's answer to the prelude's
+  // git-strategy rows — `honour` or `override`. A launch decision, so start-only.
+  'gitStrategyAck',
   'gitMode',
   'openPr',
   'isolation',
@@ -194,6 +208,11 @@ export const RUN_START_FIELDS = Object.freeze([
   'qaMaxRounds',
   'qaModel',
   'qaEffort',
+  // How long an approval card waits for a person before it times out
+  // (control-tower phase 97, #140) — inside the hook call's hour, which is
+  // its default and its ceiling. On both lists: an operator who will be away
+  // must be able to shorten it — or lengthen it back — without stopping the run.
+  'approvalTimeoutMinutes',
   // QA RECOVERY's own two, and on both lists for the reason the three above
   // are: an operator watching a recovery loop spend more per round than they
   // meant must be able to change THAT without stopping the run.
@@ -204,17 +223,28 @@ export const RUN_START_FIELDS = Object.freeze([
   // spends the phase's entire allowance on round one.
   'qaFixStrategy',
   'qaRoundBudgetUsd',
+  // The ladder's rung caps for THIS run (control-tower phase 5, #14 ask 6) —
+  // beat the console's `ladder*` preferences, the way `qaMaxRounds` beats
+  // nothing but its own default. On BOTH lists: a spent cap's errand names the
+  // setting, and raising it mid-run is the way through (phase 14 announces it).
+  'ladderPerRunRungs',
+  'ladderPerPhaseRungs',
   'accountId',
   'onLimit',
+  'modelPolicy',
   'autoRecover',
   // The prelude's four required answers and its one recorded override (phase
-  // 11, ZTD-2/QRL-2). START-only, every one: they are the run's answers to the
-  // decision manifest — `resume.on-restart`, `relay`, `accounts` and the
-  // acknowledgement of every `waived` row — and a settings patch cannot
-  // re-answer what the door was refused on. `accounts` is a list of
-  // `{id, minHeadroomPct}` (the plan's `**Accounts:**` clause, `id:min`);
-  // `manifestOverride` is `{rows, by}` — the one way past a blocking row, and
-  // it is journalled as `run.manifest-override` so nothing is silent.
+  // 11, ZTD-2/QRL-2) — the run's answers to the decision manifest:
+  // `resume.on-restart`, `relay`, `accounts` and the acknowledgement of every
+  // `waived` row. The first three are on BOTH lists since control-tower phase
+  // 77 (#101): they answer questions about the run's FUTURE — what a restart
+  // does, who answers a question, which accounts pay — and a run launched with
+  // the wrong one stranded at every restart with no door to change it. The
+  // acknowledgement and the override stay START-only: they are how the door
+  // itself was passed, and a patch cannot re-answer a door already walked
+  // through. `accounts` is a list of `{id, minHeadroomPct}` (the plan's
+  // `**Accounts:**` clause, `id:min`); `manifestOverride` is `{rows, by}` — the
+  // one way past a blocking row, journalled as `run.manifest-override`.
   'resumeOnRestart',
   'relay',
   'accounts',
@@ -306,11 +336,13 @@ export function versionAtLeast(version, floor) {
  * Fields `POST /api/run/:slug/settings` reads off the body.
  *
  * The difference from `start` is the point, so it is spelled out rather than
- * derived: `resumeRunId`, `qa`, `accountId` and `startAfter` are START-only — a
- * settings patch cannot mint a run, turn a plan's QA gate on, move a run's
- * account (that last one is its own verb, `switch-account`) or retroactively
- * unstart a run that has already begun. `by` is not a setting: it is the audit
- * attribution the route stamps.
+ * derived: `resumeRunId`, `accountId` and `startAfter` are START-only — a
+ * settings patch cannot mint a run, move a run's account (that one is its own
+ * verb, `switch-account` — `SETTING_VERBS`) or retroactively unstart a run
+ * that has already begun — and so are the prelude's waiver acknowledgements,
+ * its override, its git answer and its verification answers. `by`, `reason`
+ * and `confirm` are not settings: the first two are the audit attribution the
+ * route derives, the third a person's acknowledgement (`QA_CONFIRM`).
  */
 export const RUN_SETTINGS_FIELDS = Object.freeze([
   'model',
@@ -327,6 +359,9 @@ export const RUN_SETTINGS_FIELDS = Object.freeze([
   'mcpServers',
   'mcpPolicy',
   'permissionProfile',
+  // control-tower phase 11 (#34): the run's DEFAULT permission mode — below the
+  // plan's line and bullet, above `acceptEdits` (`resolvePermissionMode`).
+  'permissionMode',
   'gitMode',
   'openPr',
   // Read on `settings` and only half-honoured, which is why it is on BOTH
@@ -360,19 +395,34 @@ export const RUN_SETTINGS_FIELDS = Object.freeze([
   'ultracode',
   'ultraReview',
   'attachDefaultSkills',
-  // Changeable mid-run, all three — see the comment on the start list. Note
-  // `qa` itself is NOT here and stays start-only: turning a plan's QA gate on
-  // writes `test-status.md`, and these three only say how the reviewing is
-  // done once something has decided there is reviewing to do.
+  // The plan's QA gate itself, mid-run (control-tower phase 13, #31). It was
+  // start-only while its three companions below were live, so an operator
+  // could tune a reviewer they could not switch on. Turning it on writes
+  // `test-status.md` (earlier complete phases backfilled `waived`) — a side
+  // effect, not an impossibility — so the door asks for `QA_CONFIRM` and
+  // `--allow-writes`; turning it off writes the plan's QA-gate line `off`.
+  'qa',
+  // Changeable mid-run, all three — see the comment on the start list. They
+  // say how the reviewing is done once something has decided there is
+  // reviewing to do.
   'qaMaxRounds',
   'qaModel',
   'qaEffort',
+  // How long an approval card waits for a person before it times out
+  // (control-tower phase 97, #140) — inside the hook call's hour, which is
+  // its default and its ceiling. On both lists: an operator who will be away
+  // must be able to shorten it — or lengthen it back — without stopping the run.
+  'approvalTimeoutMinutes',
   // Changeable mid-run, both — see the start list. Neither creates anything on
   // disk (that is `qa`'s reason for being start-only): they only say how the
   // next recovery round is boarded and what it may spend.
   'qaFixStrategy',
   'qaRoundBudgetUsd',
+  // Changeable mid-run both ways — see the start list (#14).
+  'ladderPerRunRungs',
+  'ladderPerPhaseRungs',
   'onLimit',
+  'modelPolicy',
   // Phase 15's seven, every one read here too — three of them with a RULE
   // that lives at the door and in `applySettings`, not in this list (the
   // `isolation` precedent above: the list describes what the route READS).
@@ -392,12 +442,143 @@ export const RUN_SETTINGS_FIELDS = Object.freeze([
   'conflictPolicy',
   'messaging',
   'issuesMode',
+  // Three of the prelude's answers, changeable after launch (control-tower
+  // phase 77, #101) — see the start list. `resumeOnRestart` is read at the next
+  // console boot, `relay` at the next spawn, `accounts` at the next failover;
+  // a pool naming no account this console knows is a 400, never an empty list
+  // that would read as "every account".
+  'resumeOnRestart',
+  'relay',
+  'accounts',
 ]);
 
 /** Accepted on `start` and refused on `settings` — asserted, not assumed. */
 export const START_ONLY_FIELDS = Object.freeze(
   RUN_START_FIELDS.filter((field) => !RUN_SETTINGS_FIELDS.includes(field)),
 );
+
+/**
+ * The word a settings patch carries as `confirm` to turn a plan's QA gate on
+ * (control-tower phase 13, #31): the patch creates `test-status.md`, and the
+ * sheet says so before it posts. Without it the door refuses `qa` by name.
+ */
+export const QA_CONFIRM = /** @type {const} */ ('creates-test-status');
+
+/**
+ * WHEN a settings patch takes effect, per field (control-tower phase 13, #31).
+ *
+ * The sheet used to print one sentence — "applies from the next phase" — over
+ * a form where it was true of half the fields: the scheduler and ladder inputs
+ * are read at the loop's next decision, which is sooner than the next phase
+ * and is the whole point of lowering `maxParallel` on a run fanning out
+ * further than meant. Each word below is where the runner READS the field:
+ *
+ *   - `now`          the loop's next decision — an admission, a failure count,
+ *                    a budget check, a wall, a rung, the permission hook's
+ *                    next call — so it lands before anything else boards;
+ *   - `next-phase`   a session's spawn (its argv, prompt, settings or MCP
+ *                    file, its env) — the session running now keeps what it
+ *                    was started with;
+ *   - `next-finish`  a phase settling — the reviewers, QA's dispatch, the
+ *                    landing and the tree it leaves;
+ *   - `run-end`      the run settling its branch;
+ *   - `next-restart` the console's next boot.
+ * @typedef {'now'|'next-phase'|'next-finish'|'run-end'|'next-restart'} SettingEffect
+ * @type {readonly SettingEffect[]}
+ */
+export const SETTING_EFFECT_WORDS = Object.freeze(
+  /** @type {const} */ (['now', 'next-phase', 'next-finish', 'run-end', 'next-restart']),
+);
+
+/** What each effect word is CALLED beside a field — decided once, for the sheet and the docs. */
+export const SETTING_EFFECT_LABELS = Object.freeze({
+  now: 'Takes effect now',
+  'next-phase': 'From the next phase to board',
+  'next-finish': 'At the next phase-finish',
+  'run-end': 'When the run settles',
+  'next-restart': "At the console's next restart",
+});
+
+/**
+ * Every field of `RUN_SETTINGS_FIELDS`, and when it takes effect — total, and
+ * held so by `test/settings-live.test.ts` (SL-4). A field added to the door
+ * without a row here is a field whose sheet label would have to guess.
+ * @type {Readonly<Record<string, SettingEffect>>}
+ */
+export const SETTING_EFFECTS = Object.freeze({
+  model: 'next-phase',
+  effort: 'next-phase',
+  // `maxLanes()` reads the run's own cap at every admission.
+  maxParallel: 'now',
+  autoRecover: 'now',
+  autonomy: 'now',
+  // It reaches the session as `--max-budget-usd`; the run's own budget below
+  // is checked at every admission and every spend.
+  phaseBudgetUsd: 'next-phase',
+  runBudgetUsd: 'now',
+  maxConsecutiveFailures: 'now',
+  onlyPhases: 'now',
+  phaseOptions: 'next-phase',
+  skills: 'next-phase',
+  mcpServers: 'next-phase',
+  mcpPolicy: 'next-phase',
+  // The hook classifier reads the profile off the live run on every call, so
+  // the running phase stops being asked from its very next tool use.
+  permissionProfile: 'now',
+  permissionMode: 'next-phase',
+  gitMode: 'next-phase',
+  openPr: 'run-end',
+  isolation: 'next-phase',
+  settle: 'run-end',
+  priority: 'now',
+  reviewEachPhase: 'next-finish',
+  reviewerPolicy: 'next-finish',
+  ultracode: 'next-phase',
+  ultraReview: 'next-finish',
+  attachDefaultSkills: 'next-phase',
+  // The gate is read by the board, so a verdict starts (or stops) holding
+  // dependents from the next board read.
+  qa: 'now',
+  qaMaxRounds: 'next-finish',
+  qaModel: 'next-finish',
+  qaEffort: 'next-finish',
+  approvalTimeoutMinutes: 'now',
+  qaFixStrategy: 'next-phase',
+  qaRoundBudgetUsd: 'next-phase',
+  ladderPerRunRungs: 'now',
+  ladderPerPhaseRungs: 'now',
+  onLimit: 'now',
+  modelPolicy: 'next-phase',
+  baseBranch: 'next-phase',
+  maxConcurrentPerRepo: 'now',
+  worktreeRetention: 'next-finish',
+  landing: 'next-finish',
+  conflictPolicy: 'next-finish',
+  messaging: 'next-phase',
+  issuesMode: 'next-phase',
+  resumeOnRestart: 'next-restart',
+  relay: 'next-phase',
+  accounts: 'now',
+});
+
+/**
+ * The settings that cannot move while a lane of the run is in flight
+ * (control-tower phase 13, #31) — they describe the checkout and the branch a
+ * live session is committing in, and moving either under it changes how its
+ * work lands. The sheet opens while a lane is wedged; the door refuses these
+ * by name in one 409, applies the rest, and a value the run already has is
+ * never refused (a form resubmits every field). `baseBranch` has its own door
+ * rule — it is refused once the run's branch exists.
+ */
+export const LIVE_LANE_LOCKED_FIELDS = Object.freeze(/** @type {const} */ (['gitMode', 'isolation']));
+
+/**
+ * Fields a settings patch does not carry, and the verb that moves each
+ * instead (control-tower phase 13, #31): moving a run's account checkpoints
+ * its live sessions first, which is a different act from editing a budget.
+ * The door refuses the field by naming the verb; the sheet links to it.
+ */
+export const SETTING_VERBS = Object.freeze({ accountId: 'switch-account' });
 
 /** What one phase may override for itself (`PhaseOptions`, `phaseOptions()` in the route). */
 export const PHASE_OPTION_FIELDS = Object.freeze([
@@ -416,6 +597,48 @@ export const PHASE_OPTION_FIELDS = Object.freeze([
   // both choices about one phase's work, and silence is what inherits the run's.
   'ultracode',
 ]);
+
+/**
+ * A launch's answer to the plan git lines its strategy will not honour
+ * (control-tower phase 11, #18) — `honour` makes the plan's lines hold where
+ * the console can (a checkout of the run's own), `override` runs over them and
+ * tells the sessions the concrete branch. Asked by the prelude's git-strategy
+ * probe; the launch form sends it, every automatic door answers `override`.
+ */
+export const GIT_STRATEGY_ACKS = Object.freeze(/** @type {const} */ (['honour', 'override']));
+
+/**
+ * Which `--permission-mode` one phase's session starts in (control-tower phase
+ * 11, #34), and which of the six places that may say it answered: the attempt's
+ * Retry-with-edits, the run's per-phase choice, the plan's bullet, the plan's
+ * line, the run's default — then `acceptEdits`.
+ *
+ * `resolvePhaseChoice`'s order with the plan split in two. A permission mode is
+ * ONE answer, so the more specific statement wins at every step: overrides,
+ * never unions, as `MCP policy:` does. `source` names the level in
+ * `PhaseChoiceSource`'s words — the bullet and the line are both `plan`, the
+ * run's default is `default` — and is undefined when nothing spoke and the
+ * machine's own `acceptEdits` answers. A word off `PERMISSION_MODES` at any
+ * level is not an answer and falls through.
+ * @param {{ retry?: string, run?: string, planPhase?: string, planLine?: string, runDefault?: string }} [levels]
+ * @returns {{ value: PermissionMode, source: PhaseChoiceSource | undefined }}
+ */
+export function resolvePermissionMode({ retry, run, planPhase, planLine, runDefault } = {}) {
+  /** @param {string | undefined} word */
+  const mode = (word) =>
+    PERMISSION_MODES.includes(/** @type {PermissionMode} */ (word))
+      ? /** @type {PermissionMode} */ (word)
+      : undefined;
+  const chosen = resolvePhaseChoice({
+    retry: mode(retry),
+    run: mode(run),
+    plan: mode(planPhase) ?? mode(planLine),
+    fallback: mode(runDefault),
+  });
+  return chosen.source
+    ? { value: /** @type {PermissionMode} */ (chosen.value), source: chosen.source }
+    : { value: DEFAULT_PERMISSION_MODE, source: undefined };
+}
 
 /**
  * Where a phase's model or effort came from: `retry` (this attempt's Retry with
@@ -462,8 +685,32 @@ export function resolvePhaseChoice({ retry, run, plan, fallback } = {}) {
  * @returns {string | undefined}
  */
 export function planModelOf(text) {
-  const match = /\b(?:claude-)?(?:fable|opus|sonnet|haiku)(?:-[0-9a-z.]+)*(?:\[1m\])?/i.exec(text ?? '');
-  return match ? match[0].toLowerCase() : undefined;
+  const source = text ?? '';
+  const match = /\b(?:claude-)?(?:fable|opus|sonnet|haiku)(?:-[0-9a-z.]+)*(?:\[1m\])?/i.exec(source);
+  if (!match) return undefined;
+  return withWindowNote(match[0].toLowerCase(), source.slice(match.index + match[0].length));
+}
+
+/**
+ * A 1M window written as PROSE right after the model name — `claude-opus-5-5
+ * (1M window)`, `` `opus` (Opus 5.5, 1M context) `` — opening the text that
+ * follows it: a parenthetical, behind an optional closing backtick, naming
+ * `1M` as a word. `scripts/phase-graph.sh` `_model_window` is the bash twin.
+ */
+export const ONE_M_WINDOW_NOTE = /^[`\s]*\((?:[^)]*[^\w.])?1\s?m(?:\W[^)]*)?\)/i;
+
+/**
+ * The model a plan line asked for, with the window its prose named
+ * (control-tower phase 13, #91's second item): a "(1M window)" after the name
+ * was read as decoration and dropped, so a pinned run boarded without the
+ * window it asked for. The note reads as the `[1m]` suffix every reader of a
+ * model acts on; a model that already carries it is left alone.
+ * @param {string} model the model token as read
+ * @param {string} after the text right after it on the line
+ * @returns {string}
+ */
+export function withWindowNote(model, after) {
+  return /\[1m\]$/i.test(model) || !ONE_M_WINDOW_NOTE.test(after ?? '') ? model : `${model}[1m]`;
 }
 
 /**
@@ -540,6 +787,29 @@ function sentenceLead(text, at) {
 }
 
 /**
+ * The briefings a claude ticket may ask the server to compose — its `intent`.
+ * Absent is a bare session with the operator's own `prompt`.
+ *
+ * `plan` authors a plan, `recovery` repairs a parked phase, `qa` reviews one.
+ * `fix` fixes ONE issue with no plan at all (#29), and `issue` investigates an
+ * operator's complaint into one issue draft (#30) — both Pro, and so are their
+ * words here: the free tree's list is the first three, so its refusal names
+ * only doors it has (control-tower phase 12). Read by identity: `agent.ts`
+ * validates against it and `SessionMeta.intent` derives from it.
+ */
+export const AGENT_INTENTS = Object.freeze(
+  /** @type {const} */ ([
+    'plan',
+    'recovery',
+    'qa',
+  ]),
+);
+
+/**
+ * @typedef {(typeof AGENT_INTENTS)[number]} AgentIntent
+ */
+
+/**
  * What `POST /api/agent/ticket` takes for the two launches this form mints —
  * a QA review and a recovery. Not a run: an agent ticket opens ONE interactive
  * session, so it has no budget, no git strategy and no per-phase matrix.
@@ -568,7 +838,8 @@ export const AGENT_TICKET_FIELDS = Object.freeze([
   // The issues a plan-from-issues ticket is about, as `owner/repo#12` REFS.
   // Refs and not text: the server resolves them against its own issue cache and
   // composes the "Issues to solve" section itself, so nine selected issues cost
-  // the operator's 8 KB brief nothing (`server/issues/prompt.ts`).
+  // the operator's 8 KB brief nothing (`server/issues/prompt.ts`). A fix ticket
+  // carries exactly one (control-tower phase 12, #29).
   'issues',
   'skills',
   // One session, one standing opt-in: a ticket that says `ultracode` gets the

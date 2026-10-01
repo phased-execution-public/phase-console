@@ -30,13 +30,20 @@
 
 import { createHash } from 'node:crypto';
 
-import { LOCAL_JOB_GRACE_MS, STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS } from '../../shared/attention-model.js';
+import {
+  LOCAL_JOB_GRACE_MS, STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS, WAIT_CHAIN_GAP_MS, type SilenceKind,
+} from '../../shared/attention-model.js';
 
 import { externalWaitHit, externalWaitMatch, foldWhitespace, type VerifyEnv } from './verify-env.ts';
 
 import type { StreamEvent } from './spawn.ts';
 import { contextStage, type TokenCounters } from './usage.ts';
 import { isStatusCapable, newPollLoop, observeCall, type PollLoopState } from '../../shared/poll-loop.js';
+import { cmdRefProblem } from '../watch-refs.ts';
+import {
+  KIND_META, REDACTED, SUSPECT_OPEN_WORDS, SUSPECT_WAIT_WORDS, isOpenableUrl, redactSecrets,
+  type HumanStepKind, type HumanStepWhere,
+} from '../../shared/human-step-model.js';
 
 export type StallSignal = (typeof STALL_SIGNALS)[number];
 
@@ -112,6 +119,14 @@ export type StallContext = {
 export type WaitScope = 'local' | 'external';
 
 /**
+ * A loopback host, as the text of a URL spells it, followed by where a host
+ * ends. Shared by `LOCAL_JOB` (a probe of one is the session's own clock) and
+ * `REMOTE_WAIT` (which must not claim it), so the two cannot disagree.
+ */
+const LOOPBACK_HOST = '(localhost|127\\.[0-9.]+|\\[::1\\]|0\\.0\\.0\\.0)([:/\\s\'"]|$)';
+const LOOPBACK_URL = `https?://${LOOPBACK_HOST}`;
+
+/**
  * Text that names something on THIS machine, produced by THIS session.
  *
  * Text alone, and deliberately no process probe. The plan sketched one — "a
@@ -133,7 +148,15 @@ const LOCAL_JOB = new RegExp(
   // corpus (`--watch` ×16 of 37). `REMOTE_WAIT` is asked first, so
   // `gh pr checks --watch` and `kubectl … --watch` stay somebody else's clock
   // (zero-touch-console phase 9, RCV-5).
-  + '| --watch([^A-Za-z]|$)|(^|[\\s;&|])watch -n|(^|[\\s;&|])tail -[a-zA-Z]*f',
+  + '| --watch([^A-Za-z]|$)|(^|[\\s;&|])watch -n|(^|[\\s;&|])tail -[a-zA-Z]*f'
+  // A server on THIS machine, and a question to the local repository
+  // (control-tower phase 47, AUD-34): 4 of the week's 15 refusals probed a
+  // loopback server the session had started, 2 waited on its own commit.
+  // Loopback is spelled out, never "a URL without a dot": `localhost.example`
+  // is somebody else's host. The git verbs are the ones that never leave the
+  // disk; `fetch`, `pull`, `push` and `ls-remote` are not among them.
+  + `|${LOOPBACK_URL}`
+  + '|(^|[\\s\'"(&|;!])git (diff|log|status|rev-list|rev-parse|show|ls-files|cat-file|merge-base|describe|for-each-ref)(\\s|$)',
 );
 
 /**
@@ -144,7 +167,7 @@ const LOCAL_JOB = new RegExp(
  * GitHub's clock. Whose clock it is, is decided by the thing being waited on,
  * never by where the output happens to land.
  */
-const REMOTE_WAIT = new RegExp(
+const REMOTE_VERB = new RegExp(
   '(^|[\\s\'"(&|;])(gh|aws|kubectl|ssh|scp|rsync|vercel|terraform|flyctl|fly|gcloud|az|doctl|heroku)\\s'
   // The verb set is `MUTATION_DENY`'s, not a shorter guess. `task deploy` alone
   // missed `task hetzner:update` — this fleet's actual production deploy verb —
@@ -152,13 +175,43 @@ const REMOTE_WAIT = new RegExp(
   // 45 minutes of exclusive lock instead of the five-minute park.
   + '|task [a-z:]*(deploy|ship|update|apply|destroy|release)'
   + '|(npm|pnpm|yarn) run [a-z:_-]*(deploy|ship|release|publish|promote)'
-  + '|make [a-z:_-]*(deploy|ship|release|publish|promote)'
+  + '|make [a-z:_-]*(deploy|ship|release|publish|promote)',
+);
+
+/**
+ * The half of `REMOTE_WAIT` that names a THING rather than a command — a
+ * script named for a verb of consequence, a URL that is not loopback. Read on
+ * the command as written: a path or a URL is commonly quoted, and quoting it
+ * does not make it data.
+ */
+const REMOTE_TARGET = new RegExp(
   // And a script named for a verb of consequence, the same signal
   // `MUTATING_SCRIPT` reads: `bash scripts/ship.sh > /tmp/ship.log` is a deploy
   // however its output is redirected.
-  + '|[a-z0-9_./-]*(deploy|ship|release|provision|rollout)[a-z0-9_.-]*\\.(sh|bash|py)'
-  + '|https?://',
+  '[a-z0-9_./-]*(deploy|ship|release|provision|rollout)[a-z0-9_.-]*\\.(sh|bash|py)'
+  // Any URL but a loopback one: `http://127.0.0.1:8197` is a server the
+  // session started, and it used to outrank `LOCAL_JOB` here (AUD-34).
+  + `|https?://(?!${LOOPBACK_HOST})`,
 );
+
+/**
+ * `REMOTE_WAIT`: text that names somebody else's machine — a remote verb
+ * outside quoted DATA, or a remote target anywhere (control-tower phase 89,
+ * #121). A quoted string is data to the command that receives it: P27's local
+ * chain on its own verify jobs read `external` two calls in because one call
+ * quoted a phrase starting `"aws ` — and the checkpoint came 35 minutes before
+ * the local budget. A shell's `-c` payload and an `eval`'s are code, and stay.
+ */
+function remoteWait(folded: string): boolean {
+  return REMOTE_TARGET.test(folded) || REMOTE_VERB.test(maskQuotedData(folded));
+}
+
+/** Every quoted string emptied, unless it is a `-c` or `eval` payload — see `remoteWait`. */
+export function maskQuotedData(text: string): string {
+  // A SHELL's `-c` (`bash -c`, `sh -lc`), never any `-c` — `grep -c "…"` counts.
+  return text.replace(/((?:^|[\s;&|(])(?:bash|sh|zsh|dash|ksh)(?:\s+-[a-zA-Z]+)*\s+-[a-zA-Z]*c\s+|\beval\s+)?("(?:[^"\\]|\\.)*"|'[^']*')/g,
+    (whole: string, runs: string | undefined, quoted: string) => (runs ? whole : `${quoted[0]}${quoted[0]}`));
+}
 
 /**
  * A poll loop's own condition, as a `cmd:` watch ref — or null.
@@ -168,7 +221,8 @@ const REMOTE_WAIT = new RegExp(
  * done` is a session saying, in shell, "resume me when that file exists". So
  * the park lifts the condition out and hands it to the watch scheduler, which
  * runs it on a timer under the same read-only policy a §Verification command
- * gets — bounded at 60 s, capped at 12 runs per phase. The lane is released
+ * gets — bounded at 60 s, on a cadence that backs off until the phase's wait
+ * budget ends (`WATCH_CMD_BACKOFF_MS`). The lane is released
  * and comes back the moment the job it was watching is genuinely done, instead
  * of at the end of a window somebody guessed.
  *
@@ -202,12 +256,79 @@ export function localWatchRef(summary: string): string | null {
     if (!cond.startsWith('!')) return null;
     cond = cond.slice(1).trim();
   }
-  const bracket = /^\[\s+(.*?)\s+\]$/.exec(cond);
-  if (bracket) cond = `test ${bracket[1]}`;
-  if (!cond || cond.startsWith('!')) return null;
-  const lead = cond.split(/\s+/)[0]?.replace(/^.*\//, '') ?? '';
-  if (!WATCH_REF_PROBES.has(lead)) return null;
-  return `cmd:"${cond.replace(/"/g, "'")}"`;
+  // PARSED, never sliced (control-tower phase 88, #121 item 3): P27's
+  // `[ -f a.rc ] && [ -f b.rc ]` was read as ONE bracket from the first `[` to
+  // the last `]`, and minted `test -f a.rc ] && [ -f b.rc` — unbalanced, never
+  // landing. Each `&&`/`||` member is its own expression, and each must be a probe.
+  const parts = splitConditions(cond);
+  if (!parts) return null;
+  const probes: string[] = [];
+  for (const part of parts) {
+    if (part === '&&' || part === '||') { probes.push(part); continue; }
+    const bracket = /^\[\s+(.*)\s+\]$/.exec(part);
+    const member = bracket ? `test ${bracket[1]}` : part;
+    if (!member || member.startsWith('!') || /(^|\s)[[\]](\s|$)/.test(member)) return null;
+    const lead = member.split(/\s+/)[0]?.replace(/^.*\//, '') ?? '';
+    if (!WATCH_REF_PROBES.has(lead)) return null;
+    probes.push(member);
+  }
+  return mintedCmd(probes.join(' '));
+}
+
+/**
+ * A condition split at its top-level `&&`/`||` — quotes respected — into
+ * members and operators in order, or null when it is not a clean chain (an
+ * operator first or last, two in a row, an unclosed quote).
+ */
+function splitConditions(cond: string): string[] | null {
+  const out: string[] = [];
+  let quote = '';
+  let start = 0;
+  for (let i = 0; i < cond.length; i++) {
+    const c = cond[i];
+    if (quote) { if (c === quote) quote = ''; continue; }
+    if (c === '\'' || c === '"') { quote = c; continue; }
+    const op = cond.slice(i, i + 2);
+    if (op === '&&' || op === '||') {
+      out.push(cond.slice(start, i).trim(), op);
+      start = i + 2;
+      i += 1;
+    }
+  }
+  if (quote) return null;
+  out.push(cond.slice(start).trim());
+  return out.every((part, i) => (i % 2 === 0 ? Boolean(part) && part !== '&&' && part !== '||' : true)) ? out : null;
+}
+
+/**
+ * The `cmd:` ref the console mints for a probe command — or null when the
+ * command is not self-contained (control-tower phase 88, #121, #152): the
+ * console runs a ref from its own root in a shell of its own, so a session's
+ * `$L` or a path relative to its cwd would never land. Such a wait parks on
+ * its window instead, saying so.
+ */
+function mintedCmd(command: string): string | null {
+  const ref = command.replace(/"/g, "'");
+  return ref && !cmdRefProblem(ref) ? `cmd:"${ref}"` : null;
+}
+
+/**
+ * Why a poll loop's own condition could not be minted as a ref — its `$L`,
+ * its relative path, its unbalanced quote — or null when it has none, or
+ * minted fine (control-tower phase 89, #121's 2026-09-26 comment: vca P10's
+ * `until grep -q … "$L"` minted a ref that could never land). What a park
+ * with no ref SAYS, rather than "no ref the console can poll".
+ */
+export function unmintedReason(summary: string): string | null {
+  if (localWatchRef(summary)) return null;
+  const hit = /(^|[\s;&|])(until|while)\s+(.+?)\s*;?\s*\bdo\b/.exec(foldWhitespace(summary));
+  if (!hit) return null;
+  let cond = hit[3].trim();
+  if (hit[2] === 'while') {
+    if (!cond.startsWith('!')) return null;
+    cond = cond.slice(1).trim();
+  }
+  return cmdRefProblem(cond.replace(/"/g, "'"));
 }
 
 /**
@@ -243,10 +364,10 @@ export function mintWatchRef(command: string, at: number = Date.now()): string |
   }
   const repo = /(?:^|\s)(?:-R|--repo)[= ]([\w.-]+\/[\w.-]+)(?=$|\s)/.exec(text)?.[1] ?? null;
   const ghRun = /(^|[\s;&|])gh run watch\s+(\d+)/.exec(text);
-  if (ghRun) return repo ? `gh:${repo}#run/${ghRun[2]}` : `cmd:"gh run view ${ghRun[2]} --exit-status${repo ? ` -R ${repo}` : ''}"`;
+  if (ghRun) return repo ? `gh:${repo}#run/${ghRun[2]}` : mintedCmd(`gh run view ${ghRun[2]} --exit-status`);
   const ghPr = /(^|[\s;&|])gh pr checks\s+(\d+)/.exec(text);
   if (ghPr && / --watch(?=$|[^A-Za-z])/.test(text)) {
-    return repo ? `gh:${repo}#pr/${ghPr[2]}` : `cmd:"gh pr checks ${ghPr[2]}${repo ? ` -R ${repo}` : ''}"`;
+    return repo ? `gh:${repo}#pr/${ghPr[2]}` : mintedCmd(`gh pr checks ${ghPr[2]}`);
   }
   // `watch -n N <cmd>` — the watched command is the probe.
   const watched = /(^|[\s;&|])watch\s+(?:-n\s*\d+(?:\.\d+)?\s+|--interval[= ]\d+\s+)?(?:-[a-z]+\s+)*(.+)$/.exec(text);
@@ -270,7 +391,7 @@ function oneShot(command: string): string | null {
   if (!bare) return null;
   const lead = bare.split(/\s+/)[0]?.replace(/^.*\//, '') ?? '';
   if (!WATCH_REF_PROBES.has(lead) && !WATCH_ONESHOT_LEADS.has(lead)) return null;
-  return `cmd:"${bare.replace(/"/g, "'")}"`;
+  return mintedCmd(bare);
 }
 
 /**
@@ -333,10 +454,162 @@ export const WATCH_ONESHOT_LEADS = new Set([
  * (the status quo, no regression), while calling an external wait local costs
  * one nudge and a delay before the same park.
  */
-export function waitScope(summary: string): WaitScope {
+export function waitScope(summary: string, opts: { ownPids?: readonly number[] } = {}): WaitScope {
   const folded = foldWhitespace(summary);
-  if (REMOTE_WAIT.test(folded)) return 'external';
-  return LOCAL_JOB.test(folded) ? 'local' : 'external';
+  if (remoteWait(folded)) return 'external';
+  if (LOCAL_JOB.test(folded)) return 'local';
+  return ownPidProbe(folded, opts.ownPids ?? []) ? 'local' : 'external';
+}
+
+/**
+ * A process probe — `kill -0 <pid>`, `ps -p <pid>` — and the pid it names.
+ * The pid is a literal or a shell expansion (`$!`, `"$pid"`, `$(cat x.pid)`).
+ */
+const PID_PROBE = /(?:^|[\s'"(&|;!])(?:kill -0|ps -p) +("?\$[!{(A-Za-z_][^\s;&|)]*"?|[0-9]+)/g;
+
+/**
+ * Does every process this command probes belong to the session (AUD-34)?
+ *
+ * Text cannot tell a pid the session started from one it found: `until ! kill
+ * -0 15438` over its own two jobs and `until ! ps -p 56406` over ANOTHER
+ * session's verify run read the same. So a pid is the session's own only when
+ * the session said so — an expansion (`$!` is how a shell names its own job,
+ * and a variable holding it is the same thing), or a literal it announced
+ * earlier in its own output (`LaneSignals.ownPids`). Every probed pid must be
+ * one; a single found pid makes the whole wait somebody else's.
+ */
+function ownPidProbe(folded: string, ownPids: readonly number[]): boolean {
+  const targets = [...folded.matchAll(PID_PROBE)].map((match) => match[1]!);
+  return targets.length > 0 && targets.every((pid) => !/^[0-9]+$/.test(pid) || ownPids.includes(Number(pid)));
+}
+
+/** A command that starts a server — what a port beside it is the session's own. */
+const SERVES = /(^|[\s;&|/])(next|vite|serve|uvicorn|gunicorn|flask|rails|php|http-server|webpack-dev-server|astro|nuxt|remix|node|bun|deno|python3?|npm|pnpm|yarn|npx)\b.*\b(start|serve|dev|preview|server|runserver|http\.server)\b/;
+
+/**
+ * The loopback ports a Bash call starts a server on (control-tower phase 89,
+ * `LaneSignals.ownPorts`): `PORT=8151 …`, `… http.server 8000`, and a
+ * `--port`/`-p`/`-l` value on a command that serves. A port a call merely
+ * PROBES (`curl localhost:8151`) is not one — probing is not serving.
+ */
+export function servedPorts(summary: string): number[] {
+  const text = foldWhitespace(summary);
+  const out = new Set<number>();
+  for (const match of text.matchAll(/(?:^|[\s;&|(])PORT=(\d{2,5})\b/g)) out.add(Number(match[1]));
+  for (const match of text.matchAll(/\bhttp\.server\s+(\d{2,5})\b/g)) out.add(Number(match[1]));
+  if (SERVES.test(text)) {
+    for (const match of text.matchAll(/(?:--port[= ]|\s-p\s+|\s-l\s+)(\d{2,5})\b/g)) out.add(Number(match[1]));
+  }
+  return [...out].filter((port) => port > 0 && port < 65536);
+}
+
+/** How many announced pids a lane remembers — the newest win. */
+const OWN_PIDS_KEPT = 32;
+
+/**
+ * The pids a Bash call printed when its command read `$!` — the only way a
+ * shell tells anyone the pid of a job it started. Every free-standing number
+ * of two to seven digits in the result counts: the result is whitespace-folded
+ * by `spawn.ts`, and a call that echoes `$!` is a call about its own jobs.
+ */
+function announcedPids(detail: string): number[] {
+  return [...detail.matchAll(/(?:^|[^0-9.])([0-9]{2,7})(?![0-9.])/g)].map((match) => Number(match[1]));
+}
+
+/**
+ * The first thing a command names that a wait can be ON: a URL (query and
+ * fragment dropped), a probed pid, a GitHub run or PR, or a path — never
+ * `/dev/…`. Leftmost wins.
+ */
+const TARGET = new RegExp(
+  '(https?://[^\\s\'"|;&)<>?#]+)'
+  + '|(?:kill -0|ps -p) +("?\\$[!{(A-Za-z_][^\\s;&|)"]*|[0-9]+)'
+  + '|gh (run|pr) (?:watch|view|checks) +([0-9]+)'
+  + '|(?:^|[\\s\'"=<>(])((?:~|\\.{0,2})/[^\\s\'";&|)<>]+|[A-Za-z0-9_.-]+/[^\\s\'";&|)<>]+|[A-Za-z0-9_.-]+\\.(?:log|out|exit|done|pid|flag|status))',
+);
+
+function firstTarget(text: string): string | null {
+  const hit = TARGET.exec(text);
+  if (!hit) return null;
+  if (hit[1]) return hit[1];
+  if (hit[2]) return `pid ${hit[2].replace(/"/g, '')}`;
+  if (hit[4]) return `gh ${hit[3]} ${hit[4]}`;
+  const path = hit[5] ?? '';
+  return path.startsWith('/dev/') ? firstTarget(text.slice(hit.index + hit[0].length)) : path;
+}
+
+/**
+ * What a Bash call waits ON — the key its calls are chained by (control-tower
+ * phase 47, #67), and what a card about the chain names.
+ *
+ * The same wait re-issued is rarely the same text: a session re-polls with
+ * `end=$((SECONDS+590))` one slice and without it the next, greps for a
+ * different marker, tails a few more lines. What it keeps is the THING it
+ * watches — the log, the URL, the pid. So the key is the first target the
+ * command names, looked for in the loop's condition first, then its body,
+ * then the whole command with any leading `cd <dir>` dropped (the directory a
+ * command runs in is not what it waits on). A command that names no target
+ * keys on its own words — the loop condition, or the command — with digits
+ * and quotes flattened, so a counter's bound does not split one wait in two.
+ */
+export function probeSignature(summary: string): string {
+  const folded = foldWhitespace(summary).trim().replace(/(^|[;&|] *)cd [^;&|]+(&&|;) */g, '$1');
+  const loop = /(?:^|[;&|({] *)(?:until|while) (.+?);? *do(?: |;|$)(.*)$/.exec(folded);
+  for (const place of loop ? [loop[1]!, loop[2]!, folded] : [folded]) {
+    const target = firstTarget(place);
+    if (target) return target;
+  }
+  return (loop ? loop[1]! : folded).replace(/["']/g, '').replace(/[0-9]+/g, '#').trim().slice(0, 120);
+}
+
+/** How many wait chains a lane keeps — live ones are never the ones dropped. */
+const MAX_WAIT_CHAINS = 8;
+
+/**
+ * Fold a Bash call into the lane's wait chains; answers the chain key it
+ * joined, or undefined when it is not a wait and continues none.
+ *
+ * A call that matches the vocabulary is a wait: it continues the live chain of
+ * its probe signature, or starts one. A call that does not match joins only a
+ * chain already live — a single `grep -q DONE /tmp/t.log` between two slices
+ * of a poll on that log is the same wait — and starts nothing.
+ */
+function joinChain(signals: LaneSignals, summary: string, at: number, env: VerifyEnv | undefined): string | undefined {
+  const key = probeSignature(summary);
+  const chains = (signals.waitChains ??= []);
+  const live = chains.find((chain) => chain.key === key && chainLive(signals, chain, at));
+  const waits = Boolean(env && externalWaitMatch(env, summary));
+  if (!live && !waits) return undefined;
+  for (let i = chains.length - 1; i >= 0; i -= 1) {
+    if (chains[i] !== live && !chainLive(signals, chains[i]!, at)) chains.splice(i, 1);
+  }
+  if (live) {
+    live.calls += 1;
+    live.lastAt = at;
+    if (waits) live.summary = summary;
+    return key;
+  }
+  chains.push({ key, since: at, lastAt: at, calls: 1, summary, scope: waitScope(summary, { ownPids: signals.ownPids }) });
+  if (chains.length > MAX_WAIT_CHAINS) chains.shift();
+  return key;
+}
+
+/** A chain is live while one of its calls is open, or its last one ended inside the gap. */
+function chainLive(signals: Pick<LaneSignals, 'openTools'>, chain: WaitChain, at: number): boolean {
+  return signals.openTools.some((tool) => tool.chain === chain.key) || at - chain.lastAt <= WAIT_CHAIN_GAP_MS;
+}
+
+/**
+ * Does this event end a refused wait's episode (control-tower phase 47, #52)?
+ * The session's next call of its own that is not the refused probe again —
+ * it moved on — or anything durable (a commit, a declaration). It used to end
+ * ONLY on the second, so a session that took the refusal and simply went on
+ * working read as still acting on it 16 minutes later, and was killed for it.
+ */
+function endsDeniedWait(denied: NonNullable<LaneSignals['waitDenied']>, event: StreamEvent): boolean {
+  if (isDurableProgress(event)) return true;
+  if (event.kind !== 'tool' || event.parent) return false;
+  return event.name !== EXTERNAL_WAIT_TOOL || probeSignature(event.summary ?? '') !== probeSignature(denied.command);
 }
 
 /**
@@ -1166,6 +1439,132 @@ export type StallState = {
    * `LaneSignals.waitDenied` instead (RCV-5). Absent reads as `open`.
    */
   source?: 'open' | 'denied';
+  /**
+   * `external-wait` only: the wait chain the episode is about — its probe key
+   * and how many calls it has held (control-tower phase 47, #67). `since` is
+   * the chain's first call, so the episode outlives each 10-minute slice.
+   */
+  chain?: { key: string; calls: number };
+  /**
+   * `external-wait` on the session's OWN job only: the chain has outlived the
+   * local-job budget (`stallLocalJobMs`). Until then a local wait is silent —
+   * no card, no push — because it is the wait procedure being followed; this
+   * is the one moment it is announced.
+   */
+  overBudget?: true;
+  /**
+   * `silent` only: WHAT the quiet lane is inside (control-tower phase 95,
+   * #138) — its oldest open call (`open: true`), else the last call it made
+   * and how that came back. `gh run watch`, `npm test` and a hung `ssh` were
+   * the same "the oldest open tool call is Bash"; the command is the evidence.
+   * Absent when the lane has made no call at all.
+   */
+  waitingOn?: CallRef;
+  /**
+   * `silent` only: the lane's last output read as a PERSON'S TURN (control-tower
+   * phase 44, §Architecture 12's third birth channel) — a link and waiting words
+   * (`suspectedStepOf`), with when it was said. Raised for a person to convert
+   * into a human step (the inbox's silent row offers it); never converted or
+   * opened by the console itself.
+   */
+  suspectedStep?: SuspectedStep & { at: string };
+};
+
+/**
+ * What the stall reading saw in a lane's last output: the kind of person's turn
+ * it reads as, the link (redacted — a URL query secret keeps its name and loses
+ * its value), the waiting words that matched, where the act can be done (`host`
+ * when the link is the machine's own `localhost` callback). Never a code: a
+ * device code the words carry stays in the transcript it came from, because
+ * this reading rides a journal line (`phase.stall`), and no code enters one.
+ */
+export type SuspectedStep = { kind: HumanStepKind; url: string; words: string; where: HumanStepWhere };
+
+/** How much of one output the reading looks at — its END, where a waiting CLI's last words are. */
+const SUSPECT_READ = 4000;
+const SUSPECT_WORD_RES = SUSPECT_WAIT_WORDS.map((source) => new RegExp(source, 'i'));
+const SUSPECT_OPEN_RES = SUSPECT_OPEN_WORDS.map((source) => new RegExp(source, 'i'));
+const URL_IN_TEXT = /https?:\/\/[^\s<>"'`)\]]+/gi;
+const SUSPECT_LOOPBACK = /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?:[:/?#]|$)/i;
+/** A device flow's code (`ABCD-1234`), wherever it sits — a link's `?user_code=` included. */
+const SUSPECT_CODE = /\b[A-Z0-9]{4,9}-[A-Z0-9]{4,9}\b/g;
+/** The floor's redaction, and a device code on top of it: the reading rides journal lines, and no code enters one. */
+const scrubReading = (text: string): string => redactSecrets(text).replace(SUSPECT_CODE, REDACTED);
+
+/**
+ * Read one output — what the session said, or what one of its own calls
+ * answered — as a person's turn: an openable http(s) link AND one of
+ * `SUSPECT_WAIT_WORDS`, or null. A link alone is every test log and "waiting
+ * for" alone is every server start, so it takes both. `SUSPECT_OPEN_WORDS`
+ * ("open this URL in your browser") count as well, but only for a link that is
+ * not the machine's own loopback, which is how a dev server talks. The link
+ * nearest the words is the one kept.
+ */
+export function suspectedStepOf(text: unknown): SuspectedStep | null {
+  const tail = String(text ?? '').slice(-SUSPECT_READ);
+  if (!tail) return null;
+  const firstHit = (res: readonly RegExp[]): RegExpExecArray | null => {
+    for (const re of res) {
+      const found = re.exec(tail);
+      if (found) return found;
+    }
+    return null;
+  };
+  const waiting = firstHit(SUSPECT_WORD_RES);
+  const hit = waiting ?? firstHit(SUSPECT_OPEN_RES);
+  if (!hit) return null;
+  const at = hit.index;
+  let url: string | null = null;
+  let best = Infinity;
+  for (const match of tail.matchAll(URL_IN_TEXT)) {
+    const candidate = match[0].replace(/[.,;:!?]+$/, '');
+    if (!isOpenableUrl(candidate)) continue;
+    const distance = Math.abs((match.index ?? 0) - at);
+    if (distance < best) { best = distance; url = candidate; }
+  }
+  if (!url) return null;
+  if (!waiting && SUSPECT_LOOPBACK.test(url)) return null;
+  const kind = suspectKindOf(tail);
+  return {
+    kind,
+    url: scrubReading(url).slice(0, 500),
+    words: scrubReading(hit[0].replace(/\s+/g, ' ').trim()).slice(0, 160),
+    where: SUSPECT_LOOPBACK.test(url) ? 'host' : KIND_META[kind].where,
+  };
+}
+
+/** Which kind of turn the words read as — a device flow, a mailbox, a bot wall, somebody else's approval, else a sign-in. */
+function suspectKindOf(text: string): HumanStepKind {
+  if (/captcha/i.test(text)) return 'captcha';
+  if (/check your (?:e-?mail|inbox)|magic link|verification (?:e-?mail|link)/i.test(text)) return 'email-link';
+  // A code in a device flow's own shape (`ABCD-1234`) beside the word "code".
+  if (/\bcode\b/i.test(text) && /\b[A-Z0-9]{4,9}-[A-Z0-9]{4,9}\b/.test(text)) return 'device-code';
+  if (/\b(?:approv(?:e|al)|review)\b/i.test(text) && !/\b(?:log ?in|sign ?in|authenti)/i.test(text)) return 'third-party-approval';
+  return 'browser-login';
+}
+
+/** A call as a surface names it: the tool, its own one-line summary, when it went out. */
+export type CallRef = { tool: string; summary?: string; open: boolean; since: string; ok?: boolean };
+
+/** One wait: calls of one probe signature, each starting inside the gap of the last one's end. */
+export type WaitChain = {
+  /** `probeSignature` — what the calls wait on. */
+  key: string;
+  /** When the chain's first call went out (ms) — the age every rung reads. */
+  since: number;
+  /** The chain's newest activity, a call going out or coming back (ms). */
+  lastAt: number;
+  /** How many calls the chain has held. */
+  calls: number;
+  /** The newest WAIT call's summary — what the park mints a ref from. */
+  summary: string;
+  /**
+   * Whose clock, decided by the chain's FIRST wait and kept (control-tower
+   * phase 89, #121): a later slice of the same wait — the same file, the same
+   * pid — is the same job, whatever else its text happens to mention. Absent
+   * on a chain from before; read as `waitScope` of its summary then.
+   */
+  scope?: WaitScope;
 };
 
 /**
@@ -1230,8 +1629,26 @@ export type OpenTool = { id: string; name: string; since: string; summary?: stri
  * decide whether a session has anything to lose, and a phase-wide count is
  * permanently non-zero for every attempt after the one that committed.
  */
+/** See `LaneLiveness.silence` and `SILENCE_KINDS` (`shared/attention-model.js`). */
+export type LaneSilence = {
+  kind: SilenceKind;
+  sinceMs: number;
+  thresholdMs: number;
+  graceMs?: number;
+};
+
 export type LaneLiveness = {
   phase: number;
+  /**
+   * Which attempt of the phase these clocks belong to, and when its process
+   * started (ISO, the child record's own `procStartedAt`) — control-tower
+   * phase 80, #99. A lane's liveness is its LIVE process's: an attempt the loop
+   * starts in place begins with fresh clocks, so a reader can tell "this
+   * session has been quiet for 100 minutes" from "a session 100 minutes gone
+   * was". Absent on a snapshot written before the stamp existed.
+   */
+  attempt?: number;
+  procStartedAt?: string;
   /**
    * ISO — the last stream event of any kind, retries included. "When did we
    * last hear from it", which is NOT the clock `silent` runs on: see
@@ -1246,6 +1663,12 @@ export type LaneLiveness = {
   treeDirty: boolean;
   /** The call that has been open longest, when one is. */
   openTool?: OpenTool;
+  /**
+   * The last call this attempt's conversation finished — tool, summary, when
+   * it went out, how it came back (control-tower phase 95, #138): what a card
+   * names when nothing is open. Absent until one has come back.
+   */
+  lastCall?: Omit<CallRef, 'open'>;
   /** The episode in progress, when the lane is in one. */
   stall?: StallState;
   /**
@@ -1278,6 +1701,14 @@ export type LaneLiveness = {
    * `Lane.spentUsd`, not by `livenessOf`, which reads only the signals.
    */
   spentUsd?: number;
+  /**
+   * Which silence clock is running, and what it is measured against (#28) —
+   * present on every live lane except one the console silenced itself
+   * (verifying, frozen). `sinceMs` is the INSTANT the silence began (epoch
+   * ms), so `now − sinceMs` is the figure and a snapshot never goes stale;
+   * the thresholds are the detector's own (`stallThresholds`).
+   */
+  silence?: LaneSilence;
 };
 
 /**
@@ -1315,6 +1746,14 @@ export type LaneTokens = {
 export type LaneSignals = {
   /** When this ATTEMPT's session started — the window `spinning` counts in. */
   startedAt: number;
+  /**
+   * The attempt these signals were made for, and the start (ms) of the process
+   * that is feeding them, once the console has seen its pid (control-tower
+   * phase 80, #99). `attemptSignals` makes a new accumulator per attempt; these
+   * two are what say which one a snapshot describes.
+   */
+  attempt?: number;
+  procStartedAt?: number;
   /**
    * The last stream event of ANY kind, retries and rate-limit heartbeats
    * included. This is the DISPLAY clock — "when did we last hear from it" —
@@ -1392,6 +1831,26 @@ export type LaneSignals = {
    */
   waitDenied?: { since: number; lastAt: number; command: string; matched: string; scope: WaitScope; count: number };
   /**
+   * The pids this session announced itself — printed by a Bash call whose
+   * command read `$!` — newest last, at most `OWN_PIDS_KEPT`. What lets
+   * `waitScope` tell a probe of the session's own job from a probe of a
+   * process it found (control-tower phase 47, AUD-34). Absent until one.
+   */
+  ownPids?: number[];
+  /**
+   * The loopback ports this session SERVED on — read off its Bash calls that
+   * start a server (`--port 8151`, `-p 8151` beside a serve verb, `PORT=8151`,
+   * `http.server 8000`), newest last (control-tower phase 89, #41): a refused
+   * connection to one of them in the console's §Verification is the session's
+   * server gone with the session — `environment`, never a red. Absent until one.
+   */
+  ownPorts?: number[];
+  /**
+   * The lane's wait chains, oldest first, at most `MAX_WAIT_CHAINS` — see
+   * `WaitChain`. Absent until the first wait.
+   */
+  waitChains?: WaitChain[];
+  /**
    * The background tasks the CLI is holding open for this session, oldest
    * first — the stream's `background` events, folded. Optional because a lane
    * that has started none carries none; `awaitingBackground` reads it.
@@ -1415,6 +1874,13 @@ export type LaneSignals = {
   tokens?: TokenCounters;
   /** The context window this lane's thresholds are judged against, once the runner knows the model. */
   contextWindow?: number;
+  /**
+   * The stall reading's evidence (control-tower phase 44): the lane's LAST
+   * output read as a person's turn (`suspectedStepOf`), and when (ms). Replaced
+   * by every later output and dropped by one that reads as nothing, so it is
+   * only ever about the newest thing the session said or was answered.
+   */
+  suspectedStep?: SuspectedStep & { at: number };
 };
 
 /**
@@ -1438,7 +1904,7 @@ export type BackgroundTask = {
   since: number;
 };
 
-type OpenToolAt = { id: string; name: string; since: number; summary?: string };
+type OpenToolAt = { id: string; name: string; since: number; summary?: string; chain?: string };
 
 /**
  * One FINISHED tool call of the lane's own conversation.
@@ -1538,9 +2004,10 @@ export function loopRun(
 const MAX_OPEN_TOOLS = 64;
 
 /** A fresh accumulator for a lane that has just been spawned. */
-export function newLaneSignals(startedAt: number, carry?: { idleAttempts?: number }): LaneSignals {
+export function newLaneSignals(startedAt: number, carry?: { idleAttempts?: number; attempt?: number }): LaneSignals {
   return {
     startedAt,
+    ...(carry?.attempt ? { attempt: carry.attempt } : {}),
     lastOutputAt: startedAt,
     lastProductiveAt: startedAt,
     retriesSinceProgress: 0,
@@ -1555,6 +2022,34 @@ export function newLaneSignals(startedAt: number, carry?: { idleAttempts?: numbe
     stall: null,
     pollLoop: newPollLoop(),
   };
+}
+
+/**
+ * The accumulator for the lane's NEXT attempt (control-tower phase 80, #99).
+ *
+ * A lane outlives its attempts — a spent cap, a usage window, an outage and a
+ * retry all start the next session inside the same lane — and its signals used
+ * to be made once, when the lane was. So an attempt booted after a long wait
+ * read the dead session's clocks until it wrote: measured, a session two
+ * minutes old reported "no output for 102 min" with its predecessor's context,
+ * and a watchdog called it hung.
+ *
+ * Everything the dead session wrote starts over — the clocks, retries, tool
+ * calls, loop ring, waits, background tasks, own pids, the poll-loop tracker
+ * and the tokens. Kept are only the facts about the PHASE or the lane: the
+ * stalemate count (and a `stalemate` episode, which is about the phase and
+ * ends when an attempt commits), the tree, the console's own freeze and
+ * verification flags, the spent poll-loop notice and the model's window.
+ */
+export function attemptSignals(previous: LaneSignals, startedAt: number, attempt: number): LaneSignals {
+  const next = newLaneSignals(startedAt, { idleAttempts: previous.idleAttempts, attempt });
+  next.treeDirty = previous.treeDirty;
+  next.verifying = previous.verifying;
+  next.frozen = previous.frozen;
+  if (previous.stall?.signal === 'stalemate') next.stall = previous.stall;
+  if (previous.pollNudged) next.pollNudged = true;
+  if (previous.contextWindow) next.contextWindow = previous.contextWindow;
+  return next;
 }
 
 /**
@@ -1602,7 +2097,7 @@ export function isDurableProgress(event: StreamEvent): boolean {
   return /\bgit\b[^;&|\n]*\bcommit\b/.test(command) || /phase-outcome\.sh\b/.test(command);
 }
 
-export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number): void {
+export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number, env?: VerifyEnv): void {
   // Every event is output. `stderr` included: a session writing to stderr is a
   // session doing something, and a lane that only ever complained is not
   // silent — it is failing, which is a different card.
@@ -1625,15 +2120,26 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
   }
 
   signals.lastProductiveAt = at;
-  // A denied wait's episode ends when the session does something that lasts —
-  // the rule a declaration is spent by (`isDurableProgress`).
-  if (signals.waitDenied && isDurableProgress(event)) delete signals.waitDenied;
+  // A denied wait's episode ends when the session moves on (`endsDeniedWait`).
+  if (signals.waitDenied && endsDeniedWait(signals.waitDenied, event)) delete signals.waitDenied;
   // The burst is consecutive by definition: one real event ends it. Left
   // as-is when nothing productive has happened, so a burst's `since` is when
   // the FIRST retry landed rather than when the tick noticed the fifth.
   signals.retriesSinceProgress = 0;
   delete signals.retryBurstSince;
   delete signals.lastRetryCategory;
+
+  // The stall reading's evidence (control-tower phase 44): every OUTPUT of the
+  // lane's own conversation — its words, or a call of its own answering — is
+  // read for a link and waiting words, and the newest one wins. A subagent's
+  // output is its own.
+  if (event.kind === 'text' || (event.kind === 'tool-result' && !event.parent)) {
+    // A result's `detail` is its first 200 characters, folded; the reading
+    // `spawn.ts` made over its WHOLE text rides the event instead.
+    const seen = event.kind === 'text' ? suspectedStepOf(event.text) : (event.suspected ?? suspectedStepOf(event.detail));
+    if (seen) signals.suspectedStep = { ...seen, at };
+    else delete signals.suspectedStep;
+  }
 
   switch (event.kind) {
     case 'tool': {
@@ -1653,9 +2159,18 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
         // carried verbatim so the external-clock vocabulary — which spells its
         // one whitespace requirement as a literal space — matches against the
         // same normalisation the bash side gets from `tr`.
+        // …and into the lane's wait chains, which is how a wait waited on in
+        // 10-minute slices is judged as the one wait it is (#67).
+        const chain = event.name === EXTERNAL_WAIT_TOOL && event.summary
+          ? joinChain(signals, event.summary, at, env) : undefined;
+        if (event.name === EXTERNAL_WAIT_TOOL && event.summary) {
+          const ports = servedPorts(event.summary);
+          if (ports.length) signals.ownPorts = [...new Set([...(signals.ownPorts ?? []), ...ports])].slice(-OWN_PIDS_KEPT);
+        }
         signals.openTools.push({
           id: event.id, name: event.name, since: at,
           ...(event.summary ? { summary: event.summary } : {}),
+          ...(chain ? { chain } : {}),
         });
         if (signals.openTools.length > MAX_OPEN_TOOLS) signals.openTools.shift();
       }
@@ -1673,6 +2188,15 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
       if (i >= 0) {
         const call = signals.openTools[i]!;
         signals.openTools.splice(i, 1);
+        const chain = call.chain ? signals.waitChains?.find((c) => c.key === call.chain) : undefined;
+        if (chain && event.refused) {
+          // A call the console refused never waited: the denial is its own
+          // evidence (`waitDenied`), and counting it here would say it twice.
+          chain.calls -= 1;
+          if (chain.calls <= 0) signals.waitChains!.splice(signals.waitChains!.indexOf(chain), 1);
+        } else if (chain) {
+          chain.lastAt = at;
+        }
         const calls = (signals.recentCalls ??= []);
         calls.push({
           ok: event.ok,
@@ -1683,6 +2207,10 @@ export function applyEvent(signals: LaneSignals, event: StreamEvent, at: number)
           ...(call.id ? { id: call.id } : {}),
         });
         if (calls.length > LOOP_WINDOW) calls.splice(0, calls.length - LOOP_WINDOW);
+        if (call.name === 'Bash' && call.summary?.includes('$!') && event.detail) {
+          const pids = announcedPids(event.detail);
+          if (pids.length) signals.ownPids = [...new Set([...(signals.ownPids ?? []), ...pids])].slice(-OWN_PIDS_KEPT);
+        }
       }
       break;
     }
@@ -1757,6 +2285,14 @@ export function awaitingBackground(signals: Pick<LaneSignals, 'backgroundTasks'>
 }
 
 /** The oldest unanswered call, as it goes on the wire. */
+/** The last call the lane's own conversation FINISHED, as a surface names it — or undefined. */
+export function lastCallOf(signals: Pick<LaneSignals, 'recentCalls'>): CallRef | undefined {
+  const call = signals.recentCalls?.[signals.recentCalls.length - 1];
+  return call
+    ? { tool: call.tool, ...(call.summary ? { summary: call.summary } : {}), open: false, since: new Date(call.at).toISOString(), ok: call.ok }
+    : undefined;
+}
+
 export function oldestOpenTool(signals: LaneSignals): OpenTool | undefined {
   const tool = signals.openTools[0];
   return tool
@@ -1791,19 +2327,40 @@ const EXTERNAL_WAIT_TOOL = 'Bash';
  */
 export function externalWaitTool(
   signals: LaneSignals, at: number, thresholdMs: number, env?: VerifyEnv,
-): { tool: OpenToolAt; matched: string; scope: WaitScope } | null {
+): { tool: OpenToolAt | null; matched: string; scope: WaitScope; since: number; chain?: WaitChain } | null {
   // Zero is "never": `stallExternalWaitMs: 0` switches the signal off.
   if (!env || thresholdMs <= 0) return null;
   for (const tool of signals.openTools) {
     if (tool.name !== EXTERNAL_WAIT_TOOL || !tool.summary) continue;
-    if (at - tool.since < thresholdMs) continue;
+    // The CHAIN's age, not the call's (control-tower phase 47, #67): the wait
+    // procedure caps one call at 10 minutes, so a per-call clock could never
+    // reach a rung past that.
+    const chain = tool.chain ? signals.waitChains?.find((c) => c.key === tool.chain) : undefined;
+    const since = chain?.since ?? tool.since;
+    if (at - since < thresholdMs) continue;
     // Through `externalWaitMatch` rather than a bare `exec`: the fold and the
     // `docker compose up -d` carve-out are part of what the vocabulary MEANS,
     // and a second reader applying them differently is the drift `verify.env`
     // exists to prevent. The matched fragment is returned because it is the
-    // evidence a person reads on the card.
-    const matched = externalWaitMatch(env, tool.summary);
-    if (matched) return { tool, matched, scope: waitScope(tool.summary) };
+    // evidence a person reads on the card. A single poll that continues a
+    // chain is judged by the chain's newest wait.
+    const matched = externalWaitMatch(env, tool.summary) ?? (chain ? externalWaitMatch(env, chain.summary) : null);
+    if (matched) {
+      return {
+        tool, matched, since, scope: chain?.scope ?? waitScope(chain?.summary ?? tool.summary, { ownPids: signals.ownPids }),
+        ...(chain ? { chain } : {}),
+      };
+    }
+  }
+  // …and a chain BETWEEN two of its calls: a session re-issuing its poll every
+  // 10 minutes is waiting in the seconds between them too, and letting the
+  // episode lapse there is what made every slice a new card.
+  for (const chain of signals.waitChains ?? []) {
+    if (!chainLive(signals, chain, at) || at - chain.since < thresholdMs) continue;
+    const matched = externalWaitMatch(env, chain.summary);
+    if (matched) {
+      return { tool: null, matched, since: chain.since, chain, scope: chain.scope ?? waitScope(chain.summary, { ownPids: signals.ownPids }) };
+    }
   }
   return null;
 }
@@ -1823,7 +2380,7 @@ export function noteWaitDenied(
     lastAt: at,
     command: denial.command,
     matched: denial.matched,
-    scope: waitScope(denial.command),
+    scope: waitScope(denial.command, { ownPids: signals.ownPids }),
     count: continuing ? prior!.count + 1 : 1,
   };
 }
@@ -1948,17 +2505,22 @@ export function evaluateStall(
     signals, now, thresholds.stallExternalWaitMs, context.verifyEnv,
   );
   if (waiting) {
+    const age = now - waiting.since;
+    const calls = waiting.chain?.calls ?? 1;
+    const key = waiting.chain?.key ?? probeSignature(waiting.tool?.summary ?? '');
+    const whose = waiting.scope === 'local' ? 'a background job this session started' : 'a clock outside this session';
     return {
       signal: 'external-wait',
-      // When the call went out — the moment the waiting began.
-      since: new Date(waiting.tool.since).toISOString(),
-      detail: `a Bash call matching \`${waiting.matched}\` has been open for `
-        + `${minutes(now - waiting.tool.since)} min — it waits on `
-        + (waiting.scope === 'local'
-          ? 'a background job this session started'
-          : 'a clock outside this session'),
+      // When the chain's first call went out — the moment the waiting began.
+      since: new Date(waiting.since).toISOString(),
+      // One card per chain, naming what it waits on (#67).
+      detail: waiting.tool && calls === 1
+        ? `a Bash call matching \`${waiting.matched}\` has been open for ${minutes(age)} min — it waits on ${whose}: \`${key}\``
+        : `${calls} calls on \`${key}\` over ${minutes(age)} min, the newest matching \`${waiting.matched}\` — it waits on ${whose}`,
       scope: waiting.scope,
       source: 'open',
+      chain: { key, calls },
+      ...(waiting.scope === 'local' && age >= thresholds.stallLocalJobMs ? { overBudget: true as const } : {}),
     };
   }
 
@@ -1994,6 +2556,9 @@ export function evaluateStall(
     && awaitingBackground(signals).length > 0;
   if (quietFor >= thresholds.stallSilentMs && !awaitingOwnWork) {
     const open = signals.openTools[0];
+    // WHAT it is quiet inside (#138): the open call's own command, else the
+    // last one it ran — a person reads the command, not the tool's name.
+    const last = open ? undefined : lastCallOf(signals);
     return {
       signal: 'silent',
       // When the silence began, not when the tick noticed it — otherwise the
@@ -2002,7 +2567,17 @@ export function evaluateStall(
       detail: `no output for ${minutes(quietFor)} min`
         + (open
           ? `; the oldest open tool call is ${open.name}, out for ${minutes(now - open.since)} min`
-          : '; no tool call is open'),
+            + (open.summary ? ` — \`${open.summary.slice(0, 160)}\`` : '')
+          : '; no tool call is open'
+            + (last ? ` — the last was ${last.tool}${last.summary ? ` \`${last.summary.slice(0, 160)}\`` : ''}, which ${last.ok ? 'came back ok' : 'failed'}` : '')),
+      ...(open
+        ? { waitingOn: { tool: open.name, ...(open.summary ? { summary: open.summary } : {}), open: true, since: new Date(open.since).toISOString() } }
+        : last ? { waitingOn: last } : {}),
+      // Silent with a link and waiting words in its last output: a person's
+      // turn, suspected (phase 44) — raised for conversion, never acted on.
+      ...(signals.suspectedStep
+        ? { suspectedStep: { ...signals.suspectedStep, at: new Date(signals.suspectedStep.at).toISOString() } }
+        : {}),
     };
   }
 
@@ -2035,21 +2610,63 @@ export function evaluateStall(
 }
 
 /**
- * The wire view of a lane. Kept beside the evaluator so the two can never
- * disagree about which fields exist.
+ * Which silence a lane is in, on which clock, against which threshold (#28).
+ *
+ * The same reading `evaluateStall` makes, answered ALWAYS rather than only
+ * past a threshold: the detector decides when a silence becomes a card; this
+ * names it before then, so a lane row can say "no productive output 12m" or
+ * "waiting on its own job 12m (grace 10m)" instead of a bare figure. Undefined
+ * while the console itself silenced the lane (verifying, frozen) — the same
+ * carve-out the detector makes.
  */
-export function livenessOf(phase: number, signals: LaneSignals): LaneLiveness {
+export function silenceOf(signals: LaneSignals, thresholds: StallThresholds = stallThresholds()): LaneSilence | undefined {
+  if (signals.verifying || signals.frozen) return undefined;
+  const ownJob = (sinceMs: number): LaneSilence => ({
+    kind: 'own-job', sinceMs, thresholdMs: thresholds.stallLocalJobMs,
+    graceMs: localNudgeAfterMs(thresholds.stallExternalWaitMs),
+  });
+  // The detector already named a wait: its episode's clock is the tool's own age.
+  const stall = signals.stall;
+  if (stall?.signal === 'external-wait') {
+    const since = Date.parse(stall.since);
+    const sinceMs = Number.isFinite(since) ? since : signals.lastProductiveAt;
+    return stall.scope === 'local'
+      ? ownJob(sinceMs)
+      : { kind: 'external-wait', sinceMs, thresholdMs: thresholds.stallExternalWaitMs };
+  }
+  const sinceMs = signals.lastProductiveAt;
+  if (signals.openTools.length > 0) return { kind: 'in-tool', sinceMs, thresholdMs: thresholds.stallSilentMs };
+  if (awaitingBackground(signals).length > 0) return ownJob(sinceMs);
+  return {
+    kind: signals.lastOutputAt > signals.lastProductiveAt ? 'unproductive' : 'no-output',
+    sinceMs,
+    thresholdMs: thresholds.stallSilentMs,
+  };
+}
+
+/**
+ * The wire view of a lane. Kept beside the evaluator so the two can never
+ * disagree about which fields exist. `thresholds` are the ones the detector
+ * judged this lane by — the labelled silence quotes them.
+ */
+export function livenessOf(phase: number, signals: LaneSignals, thresholds?: StallThresholds): LaneLiveness {
   const open = oldestOpenTool(signals);
+  const called = lastCallOf(signals);
+  const last = called ? { tool: called.tool, ...(called.summary ? { summary: called.summary } : {}), since: called.since, ok: called.ok } : undefined;
+  const silence = silenceOf(signals, thresholds);
   const tokens = signals.tokens;
   const stage = tokens ? contextStage(tokens.lastContext, signals.contextWindow) : 'ok';
   return {
     phase,
+    ...(signals.attempt ? { attempt: signals.attempt } : {}),
+    ...(signals.procStartedAt ? { procStartedAt: new Date(signals.procStartedAt).toISOString() } : {}),
     lastOutputAt: new Date(signals.lastOutputAt).toISOString(),
     ...(signals.lastToolUseAt ? { lastToolUseAt: new Date(signals.lastToolUseAt).toISOString() } : {}),
     turnsSinceLastTool: signals.turnsSinceLastTool,
     commitsSinceStart: signals.commitsSinceStart,
     treeDirty: signals.treeDirty,
     ...(open ? { openTool: open } : {}),
+    ...(last ? { lastCall: last } : {}),
     ...(signals.stall ? { stall: signals.stall } : {}),
     ...(signals.retriesSinceProgress > 0
       ? {
@@ -2076,5 +2693,6 @@ export function livenessOf(phase: number, signals: LaneSignals): LaneLiveness {
         },
       }
       : {}),
+    ...(silence ? { silence } : {}),
   };
 }

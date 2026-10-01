@@ -142,6 +142,7 @@ EOF
   # and, since 7 is not in this plan, fails the plan's own F26 the moment a
   # handoff is created. Every freshly scaffolded handoff, on every plan.
   pe_newho diamond 1 root complete >/dev/null
+  write_body diamond phase-01-root.md
   run pg diamond --notes 2
   [ "$status" -eq 0 ]
   [ -z "$output" ]

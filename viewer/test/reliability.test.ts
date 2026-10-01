@@ -12,6 +12,7 @@
 // before `watch.ts` is imported. That forces the dynamic import below.
 process.env.PHASE_CONSOLE_HEARTBEAT_MS = '250';
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';

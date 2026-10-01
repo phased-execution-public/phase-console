@@ -1,0 +1,129 @@
+{
+  "about": "AUD-34 (autopilot-week audit, 2026-09-23): the 15 commands the in-turn-wait guard refused between 2026-09-16 and 2026-09-23 (hub 13, pe-hub 2). recovered=true is the session transcript text verbatim; false is rebuilt from the journal matched fragment. Project names and home paths are neutralised. verdict local = the guard must NOT refuse it (not a wait, or a wait on the session's own job); external = refused. ownPids = the pids the session announced itself with $! before the call.",
+  "items": [
+    {
+      "id": "01",
+      "what": "local git: waits for its own handoff commit to land on HEAD",
+      "wait": true,
+      "verdict": "local",
+      "recovered": false,
+      "command": "until git diff --quiet -- docs/handoffs/theme-refactor/phase-01-theme-collapse.md && [ \"$(git rev-list --count origin/main..HEAD)\" = 0 ]; do sleep 10; done"
+    },
+    {
+      "id": "02",
+      "what": "loopback probe of a dev server the session restarted",
+      "wait": true,
+      "verdict": "local",
+      "recovered": false,
+      "command": "until curl -s -o /dev/null -m 5 http://localhost:8081/status 2>/dev/null; do sleep 5; done"
+    },
+    {
+      "id": "03",
+      "what": "clock-free counter loop inside docker run … sh -c (#52)",
+      "wait": false,
+      "verdict": "local",
+      "recovered": true,
+      "command": "cd /tmp && docker rm -f dbg1 >/dev/null 2>&1; docker run -d --name dbg1 --log-driver json-file --log-opt max-size=1m --log-opt max-file=2 --memory 64m --network none --read-only busybox:1.36 sh -c 'line=$(head -c 1048576 /dev/zero | tr \"\\0\" \"x\"); i=0; while [ $i -lt 20 ]; do printf \"%s\\n\" \"$line\"; i=$((i+1)); done' 2>&1 | tail -3; echo \"run-exit=$?\"; sleep 3; echo \"--- state ---\"; docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} err={{.State.Error}}' dbg1; echo \"--- logs (first 200 chars) ---\"; docker logs dbg1 2>&1 | head -c 200; echo; echo \"--- wait ---\"; docker wait dbg1; echo \"wait-exit=$?\""
+    },
+    {
+      "id": "04",
+      "what": "its own push chain, whose command also reads gh — a mixed wait",
+      "wait": true,
+      "verdict": "external",
+      "recovered": true,
+      "command": "until grep -q -E \"PUSH_EXIT=0|CHAIN_DONE\" /tmp/p9-tb-chain.log 2>/dev/null; do sleep 15; done; grep -E \"COMMIT=|PUSH_EXIT|VERIFY_LOCAL_EXIT|CHAIN_DONE|pre-push|failed|error:\" /tmp/p9-tb-chain.log | head -8; echo \"=== #183 head + CI\"; gh pr view 183 -R acme/api --json headRefOid,isDraft -q '\"head=\\(.headRefOid[0:8]) draft=\\(.isDraft)\"'; gh run list -R acme/api -b pe/obs-plane -L 3 --json databaseId,workflowName,status,headSha,createdAt -q '.[]|[.databaseId,.workflowName,.status,.headSha[0:8],.createdAt]|@tsv'"
+    },
+    {
+      "id": "05",
+      "what": "its own phase-outcome.sh ruling, a quoted --what that holds a ;",
+      "wait": false,
+      "verdict": "local",
+      "recovered": false,
+      "command": "bash scripts/phase-outcome.sh app-audit 7 ruling --kind deviation --what \"ran the tier suite in the background; waited with until test -f /tmp/p7-tiers.exit; do sleep 10; done\" --why \"the suite outlives one Bash call\""
+    },
+    {
+      "id": "06",
+      "what": "machine load — every other process on the machine",
+      "wait": true,
+      "verdict": "external",
+      "recovered": false,
+      "command": "until [ \"$(sysctl -n vm.loadavg | awk '{print int($2)}')\" -lt 24 ]; do sleep 30; done"
+    },
+    {
+      "id": "07",
+      "what": "loopback probe of an API the session started",
+      "wait": true,
+      "verdict": "local",
+      "recovered": false,
+      "command": "until curl -sf -o /dev/null http://localhost:8100/v1/monitoring/health/; do sleep 3; done"
+    },
+    {
+      "id": "08",
+      "what": "its own background pids, announced by $! earlier in the session",
+      "wait": true,
+      "verdict": "local",
+      "recovered": false,
+      "ownPids": [
+        15438,
+        16585
+      ],
+      "command": "until ! kill -0 15438 2>/dev/null && ! kill -0 16585 2>/dev/null; do sleep 10; done"
+    },
+    {
+      "id": "09",
+      "what": "loopback probe of its own uvicorn, or its pid dying",
+      "wait": true,
+      "verdict": "local",
+      "recovered": true,
+      "command": "until curl -sf -o /dev/null http://127.0.0.1:8197/openapi.json || ! kill -0 887 2>/dev/null; do sleep 3; done; kill -0 887 2>/dev/null && echo \"UP\" || (echo \"DIED\"; tail -20 /tmp/p21-uvicorn.log); curl -s \"http://127.0.0.1:8197/v1/i18n/bundle?locale=en&ns=wallet\" | python3 -c \"import json,sys; d=json.load(sys.stdin); print('runCost' in json.dumps(d))\""
+    },
+    {
+      "id": "10",
+      "what": "local git: waits for its own handoff commit",
+      "wait": true,
+      "verdict": "local",
+      "recovered": true,
+      "command": "until git log -1 --format=%s | grep -q \"phase 1 handoff\"; do sleep 5; done; git log -1 --oneline; git status --porcelain docs/handoffs/builder-mcp/ | head -3"
+    },
+    {
+      "id": "11",
+      "what": "its own waiting-external declaration, --watch on a backslash-continued line",
+      "wait": false,
+      "verdict": "local",
+      "recovered": false,
+      "command": "bash scripts/phase-outcome.sh builder-mcp 8 waiting-external \\\n  --wait-minutes 45 --reason \"the preview deploy builds for about 30 minutes\" \\\n  --watch 'cmd:\"curl -sf https://preview.example.invalid/health\"'"
+    },
+    {
+      "id": "12",
+      "what": "ANOTHER session's verify process, found by pid — a real wait on another party",
+      "wait": true,
+      "verdict": "external",
+      "recovered": true,
+      "command": "cd /home/op/work/hub && DOCS_ROOT=/home/op/work/hub bash phased-execution/scripts/phase-tasks.sh builder-mcp 6 update --id p6.task2 --status completed >/dev/null 2>&1\nDOCS_ROOT=/home/op/work/hub bash phased-execution/scripts/phase-tasks.sh builder-mcp 6 update --id p6.task3 --status in_progress >/dev/null 2>&1\nn=0\nuntil ! ps -p 56406 >/dev/null 2>&1; do n=$((n+1)); if [ $n -gt 55 ]; then echo \"STILL_RUNNING_AFTER_9MIN\"; break; fi; sleep 10; done\nif ps -p 56406 >/dev/null 2>&1; then echo \"FOREIGN_VERIFY=alive\"; else echo \"FOREIGN_VERIFY=finished\"; fi\ndocker ps --format '{{.Names}}' 2>/dev/null | grep -c app-verify"
+    },
+    {
+      "id": "13",
+      "what": "loopback poll of the operator's own panel (counted local by AUD-34)",
+      "wait": true,
+      "verdict": "local",
+      "recovered": true,
+      "command": "T=$(tr -d '[:space:]' < ~/.config/ops-panel/token); n=0; until [ $n -ge 30 ]; do curl -fsS -H \"Authorization: Bearer $T\" http://127.0.0.1:4620/api/state -o /tmp/p14v/mc-state.json 2>/dev/null && python3 -c \"import json,sys;sys.exit(0 if json.load(open('/tmp/p14v/mc-state.json'))['slices']['boxes'].get('hasData') else 1)\" && break; sleep 10; n=$((n+1)); done; echo \"tries=$n\"; python3 - <<'PY'\nimport json\nb=json.load(open('/tmp/p14v/mc-state.json'))['slices']['boxes']\nprint(list(b.keys()))\ntxt=json.dumps(b)\ni=txt.find('mcp')\nprint(len(txt), txt[max(0,i-300):i+1800] if i>=0 else txt[:600])\nPY"
+    },
+    {
+      "id": "14",
+      "what": "loopback poll of a rehearsal console the session started",
+      "wait": true,
+      "verdict": "local",
+      "recovered": true,
+      "command": "until curl -s -H 'x-phase-console: 1' http://127.0.0.1:4199/api/runs | grep -q '\"slug\":\"rehearsal-c\"[^}]*\"status\":\"\\(finished\\|parked\\|halted\\|failed\\)\"' ; do sleep 10; done; curl -s -H 'x-phase-console: 1' http://127.0.0.1:4199/api/runs | node -e 'const rs=JSON.parse(require(\"fs\").readFileSync(0,\"utf8\")); const list = Array.isArray(rs)?rs:(rs.runs??[]); for (const r of list) if (r.slug===\"rehearsal-c\") console.log(r.slug, r.status, \"spent\", r.spentUsd ?? r.costUsd, JSON.stringify(r.phases?.[\"2\"]?.status ?? r.phases));'; S=/var/folders/q7/vn9l8tw57238n0kgthswx6mc0000gn/T/pc-rehearsal-20260921-101444; j=$(find \"$S/state\" -path '*rehearsal-c*' -name 'journal*.ndjson' | head -1); [ -n \"$j\" ] || j=$(find \"$S/state\" -name '*.ndjson' -path '*80e07a77e35c*' | head -1); echo \"journal: $j\"; grep -n \"run.converge\\|run.resume\\|run.start\\|phase.not-started\\|phase.admitted\\|run.finished\\|run.halt\" \"$j\" | tail -12 | cut -c1-330"
+    },
+    {
+      "id": "15",
+      "what": "clock-free counter loops writing a fixture plan",
+      "wait": false,
+      "verdict": "local",
+      "recovered": true,
+      "command": "F=tests/fixtures/plans/lint-f17-spans.md && {\ncat <<'HDR'\n---\nslug: lint-f17-spans\ncreated: 2026-01-01\nstatus: active\nphases: 36\nhandoffs: docs/handoffs/lint-f17-spans/\nmemory: project_lint-f17-spans\n---\n\n# F17 span-loop fixture — the shape that crashed bash 3.2\n\nThe plan that took `--lint` down (#17): 36 phases, each with a §Verification\nthe F17/F18 span extractors walk span by span, and a phase 36 whose five\ncommand bullets are the reproducer's own — neutral names, the SAME byte\nlengths (39 / 170 / 154 / 23 / 101 / 132), because the crash was heap\ncorruption and the bisect turned on length and count, not on the words.\nTruncated to 35 phases it linted OK; with 36 it died in `libsystem_malloc`\nwith nothing on either stream. It must lint OK, repeatedly, under /bin/bash.\n\n## Phase graph\n\n| Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |\n|------:|-------|-----------|--------------------|-------|---------------|\nHDR\ni=1\nwhile [ $i -le 36 ]; do\n  if [ $i -eq 1 ]; then dep=\"—\"; else dep=$((i - 1)); fi\n  printf '| %d | Step %d | %s | — | web-frontend | checked |\\n' \"$i\" \"$i\" \"$dep\"\n  i=$((i + 1))\ndone\necho\ni=1\nwhile [ $i -le 35 ]; do\n  cat <<PH\n\n### Phase $i — Step $i\n\n- **Size:** S\n- **Verification:**\n  - **Verify in:** web-frontend\n  - \\`pnpm vitest run src/features/step-$i src/components/step-$i src/hooks\\`\n  - \\`git log --oneline -1\\`\n  - \\`test \"\\$(ls src/features/step-$i/*.tsx 2>/dev/null | wc -l | tr -d ' ')\" = 4\\`\nPH\n  i=$((i + 1))\ndone\ncat <<'P36'\n\n### Phase 36 — Step 36\n\n- **Size:** S\n- **Verification:**\n  - **Verify in:** widgets/web-frontend\n  - `pnpm vitest run src/components/waybar src/panels src/features/asset-catalogue src/components/action-palette src/features/firstrun src/features/walkthrough src/hooks`\n  - `test \"$(ls src/panels/{summaries,filters,saved-searches,drafts-orders,deal-stages,indicators}/\\[id\\]/index.tsx 2>/dev/null | wc -l | tr -d ' ')\" = 6`\n  - `pnpm verify:local`\n  - `gh pr checks pe/web-frontend-audit-remediation-p36 -R ExampleOrg/widget-web-frontend --required`\n  - `python3 ../../scripts/audits-coverage-check.py --status ../../docs/audits/sept/web-frontend/remediation-status.yaml --phase 36`\nP36\n} > \"$F\" && awk 'NR>=1 && /Verify in:\\*\\* widgets/,0 { printf \"%d\\n\", length($0) }' \"$F\" && wc -l \"$F\""
+    }
+  ]
+}

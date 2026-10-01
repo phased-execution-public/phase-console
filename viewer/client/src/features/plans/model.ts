@@ -31,7 +31,8 @@
 import { plainText } from '@/components/markdown';
 import { defineFilters, defineSorts, matchesWords, words, type SortSpec } from '@/lib/list-model';
 import { plural } from '@/lib/format';
-import { runUiState, type UiState } from '@/lib/status-vocab';
+import { runStatusWord } from '@/lib/status-vocab';
+import { describeRun, type StatusView } from '@shared/status-model.js';
 import { isClosed as readClosed } from '@/lib/closure';
 import { countsTowardAttention } from '@shared/attention-model.js';
 import { PLAN_STATUS_ORDER } from '@shared/plan-vocab.js';
@@ -41,8 +42,14 @@ import type { EtaEstimate, PlanSummaryFull, RunState } from '@/lib/api';
 export interface RowRun {
   id: string;
   status: string;
-  /** The run's status through the vocabulary. */
-  ui: UiState;
+  /** The stored word, as a filter or a sort reads it — `status`, except a run asleep on a clock nobody paused (`runStatusWord`, #148). */
+  word: string;
+  /**
+   * The run as the status model reads it IN CONTEXT (`describeRun`): its plan's
+   * closure, the inbox's summons for it and the clock decide what its word
+   * means. The chip draws this view; the running tally reads its paint.
+   */
+  view: StatusView;
   activePhase: number | null;
   updatedAt: number;
 }
@@ -69,8 +76,12 @@ export interface PlanRow {
   closedReason?: string;
 
   phases: number;
+  /** The last good reading's when the board could not be read (#96) — `progress` says so. */
   done: number;
   percent: number;
+  /** `unknown` when this read of the board failed or timed out (#96); `Track` draws `progressReading`. */
+  progress?: 'unknown';
+  lastGood?: { done: number; phases: number; percent: number; at: number; ageMs: number };
   readyPhases: number[];
   inProgress: number[];
   stuck: number[];
@@ -137,21 +148,21 @@ export function toRows(
     waiting.set(item.slug, (waiting.get(item.slug) ?? 0) + 1);
   }
 
-  const newest = new Map<string, RowRun>();
-  for (const run of runs) {
-    if (newest.has(run.slug)) continue;
-    newest.set(run.slug, {
+  const newest = new Map<string, RunState>();
+  for (const run of runs) if (!newest.has(run.slug)) newest.set(run.slug, run);
+  const rowRun = (run: RunState | undefined, planClosed: boolean): RowRun | undefined =>
+    run && {
       id: run.id,
       status: run.status,
-      ui: runUiState(run.status),
+      word: runStatusWord(run),
+      view: describeRun(run as Parameters<typeof describeRun>[0], { planClosed, inbox, now }),
       activePhase: run.activePhase ?? null,
       updatedAt: Date.parse(run.updatedAt) || 0,
-    });
-  }
+    };
 
   return plans.map((plan) => {
     const phases = plan.phases ?? 0;
-    const done = plan.done ?? 0;
+    const done = plan.done ?? plan.lastGood?.done ?? 0;
     const issues = plan.issues ?? [];
     // The engine failing to read a plan is an error whether or not it made it
     // into `issues` — a plan nobody can parse is the most broken kind there is.
@@ -174,7 +185,9 @@ export function toRows(
 
       phases,
       done,
-      percent: plan.percent ?? 0,
+      percent: plan.percent ?? plan.lastGood?.percent ?? 0,
+      ...(plan.progress ? { progress: plan.progress } : {}),
+      ...(plan.lastGood ? { lastGood: plan.lastGood } : {}),
       readyPhases: (plan.ready ?? []).filter((n): n is number => typeof n === 'number'),
       inProgress: plan.inProgress ?? [],
       stuck: plan.stuck ?? [],
@@ -198,7 +211,7 @@ export function toRows(
       // belt to that braces.
       needsYou: closed ? 0 : (waiting.get(plan.slug) ?? 0),
 
-      run: newest.get(plan.slug),
+      run: rowRun(newest.get(plan.slug), closed),
     };
   });
 }
@@ -659,7 +672,7 @@ export function rowTotals(rows: readonly PlanRow[]) {
     ready += row.readyPhases.length;
     sessions += row.remainingSessions;
     if (row.errors) errors++;
-    if (row.run?.ui === 'running') running++;
+    if (row.run?.view.paint === 'running') running++;
   }
 
   return { plans, documents, closed, phases, done, ready, sessions, errors, running, total: rows.length };

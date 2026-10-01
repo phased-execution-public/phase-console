@@ -24,7 +24,7 @@ import {
 import { hooksStatus, installHooks, uninstallHooks, type HooksStatus, type HooksWrite } from './hooks-install.ts';
 import { Store, handoffFor, lockFor, qaFor, readLock, type PlanRecord } from './store.ts';
 import {
-  ConvergeScheduler, convergePlan, evidenceFingerprint, HALT_DELAY_MS, MAX_BOOT_RESUMES, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
+  ConvergeScheduler, convergePlan, evidenceFingerprint, phaseFingerprint, HALT_DELAY_MS, MAX_BOOT_RESUMES, type ConvergeDeps, type ConvergeReport, type ConvergeTrigger, convergeView, type ConvergeView } from './converge.ts';
 import { RECOVER_MAX_PER_PHASE, resumePolicyInstruction } from './runner/runner-core.ts';
 import { resumePolicy } from './runner/usage.ts';
 import { planWrite, runWrite } from './writes.ts';
@@ -41,7 +41,7 @@ import {
 } from './lifecycle.ts';
 import { log } from './log.ts';
 import {
-  CATEGORIES, Push, isPlanProgress, routeFor, sanitiseCategories, tagFor, type CategoryId,
+  CATEGORIES, Push, isPlanProgress, parseQuietHours, routeFor, sanitiseCategories, tagFor, type CategoryId,
 } from './push/index.ts';
 import { Notifications, type NotificationQuery, type NotificationRecord } from './notifications.ts';
 import { repoInfo, lastCommit, commitsTouching, type GitRepoInfo, type GitFileInfo } from './git.ts';
@@ -68,7 +68,9 @@ import {
   Runner, applySettings, VERIFICATION_PARK_NOTE, MCP_PARK_NOTE,
   type AskResult, type RecoverMode, type RunSettingsPatch, type StartOptions,
 } from './runner/runner.ts';
-import { Scheduler, lockLapsed, type LockView } from './runner/scheduler.ts';
+import {
+  Scheduler, applyScopeFence, errandFoldTarget, foldStands, isExternalWall, lockLapsed, type LockView,
+} from './runner/scheduler.ts';
 import { offeredModels } from './runner/models.ts';
 import {
   continueMcpParkedRecord, mcpParkDueAt, DEFAULT_MCP_REQUIRE_TIMEOUT_MS, type McpContinueResult,
@@ -78,12 +80,15 @@ import {
   type EvidenceDeps, type PhaseEvidence, type Situation,
 } from './runner/situation.ts';
 import {
-  accountRung, capRefusal, errandFor, errandSaid, ladderCaps, lastSettledRung, nextRung, parseSituationKey, progressExtension,
+  accountRung, accountWallForgives, capErrand, capRefusal, countedRungs, errandFor, errandSaid, forgiveRungs, ladderCaps, lastSettledRung,
+  nextRung, openRunRungs, parseSituationKey, progressExtension, retryForgives, runLadderCaps,
   policyAnsweredPayload,
-  rungSettledPayload, rungsFor, sameErrand, settleRung, situationLabel, undrivableSentence, type Rung, widenCard, widenInstruction,
+  rungSettledPayload, rungWasWithdrawn, personRetryOwed, rungsFor, sameErrand, settleRung, situationLabel, undrivableSentence, type Rung, widenCard, widenInstruction,
 } from './runner/ladder.ts';
 import { policyForSituation, policyPrefsOf } from './runner/policy.ts';
-import { pollableRefs, redeliverAfter, type WatchState } from './watch-refs.ts';
+import {
+  landingDirective, parseWatchRef, pollableRefs, redeliverAfter, watchClause, watchSummary, type WatchState,
+} from './watch-refs.ts';
 
 /**
  * How many times a landing's drive may REJECT before the landing becomes an
@@ -104,13 +109,22 @@ import { environmentReport, type EnvIssue } from './env-doctor.ts';
 import { Terminals, type SessionEvent, type SessionInfo, type SessionKind } from './terminal.ts';
 import { Journal } from './runner/journal.ts';
 import {
+  HUMAN_STEPS_LISTED, STEP_TERMINAL_SCRIPT, STEP_WITHDRAW_GRACE_MS, isOpenStep, provenDetail, provenInstruction,
+  refusedMove, stepJournalFields, stepViewOf, storeStepSecret, tickHumanSteps, windowEndOf,
+  type HumanStep, type ReminderQuiet, type StepClockPass, type StepVerbResult, type StepView,
+} from './human-steps.ts';
+import {
+  HUMAN_STEP_SNOOZE_DEFAULT_MS, HUMAN_STEP_SNOOZE_MAX_MS, KIND_META, REMINDER_SERIES_MS, isOpenableUrl, redactSecrets,
+} from '../shared/human-step-model.js';
+import { openUrlOnHost, type HostOpen } from './host-open.ts';
+import {
   FREEZE_ESCALATE_MS, escalatePersistedFreeze, freezeVerdict, type PersistedEscalation,
 } from './runner/freeze.ts';
 import type { LaneLiveness } from './runner/liveness.ts';
 import { appendAck as appendRulingAck, ingestRulings, readRulings, rulingsFile, type Ruling } from './runner/rulings.ts';
 import {
   autoResolveRun, childrenOf, latestRun, listRuns, loadRun, newRun, phaseRecord, pidAlive, retirePhaseHalt,
-  reconcileRecordsAgainstBoard, resetForRetry, resolveRunsAgainst, saveRun, setRunState, syncWaitClock,
+  reconcileRecordsAgainstBoard, resetForRetry, resetStreak, resolveRunsAgainst, saveRun, setRunState, syncWaitClock,
   slugsNeedingBoard, runDir, waitReasonOf, IN_FLIGHT, PHASE_IN_FLIGHT, RESOLVABLE, isMcpPolicy, mcpReasonText,
   type BoardingBrief, type Errand, type McpPolicy, type PreflightWarning, type RungRecord, type RunState, type VerifySummary, mergeQaHistory,
 } from './runner/state.ts';
@@ -144,7 +158,7 @@ import {
   type Evidence, type PolicyScope, type PermissionProfile,
 } from './runner/approvals.ts';
 import {
-  AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView,
+  AUTO_GRANT_REASONS, ETA_POOL_MS, EVENT_BUFFER, HOOK_EVENTS_PER_MINUTE, HookPayloadError, HookRateError, INBOX_SOURCES, MAX_TIMER_MS, OUTCOME_INBOX_DEBOUNCE_MS, OUTCOME_INBOX_MAX_AGE_MS, PhaseClaimedError, RecoveryBusyError, RunBusyError, UNSUPERVISED_WAIT_DEFAULT_MS, autoRecoveryClass, bucketLabel, describeExit, describeToolInput, effortOf, gitPorcelain, gitRead, lockView, modelAlias, recoveryActions, recoveryOwner, seedSkills, situationOfHalt, titleOf, type AutoRecoverResult, type Cached, type ControlResult, type DriveVehicle, type EtaPool, type EvidenceView, type LiveEvent, type LiveListener, type LockRelease, type PhaseDiagnosis, type PhaseLockView, type PhaseView, type PlanDetail, type PlanSummary, type QaOutcome, type RecoveryAction, type RouteView,
 } from './service-core.ts';
 import type { Service } from './service.ts';
 import { ServiceRuns } from './service-runs.ts';
@@ -162,35 +176,21 @@ import { ServiceRuns } from './service-runs.ts';
  * deferral). It is one number now.
  */
 
+/** Owned by `watch-refs.ts` since control-tower phase 6 — the runner's live-lane resume says it too. */
+export { landingDirective };
+
 /**
- * What a resumed session is actually being asked to do, given HOW the thing it
- * waited on ended.
- *
- * "Landed" is one word for four outcomes and they call for different next
- * moves. The instruction used to say "re-check it now" for all of them, which
- * is wrong in the case that costs the most: a workflow run that ended
- * `cancelled` (the measured p12 shape — a `workflow_run` cancelled at its 24 h
- * expiry) is not a result to read, it is a run that never produced one, and a
- * session told to "re-check it" reads a cancelled run, finds nothing, and
- * declares the same wait again. Naming the conclusion is the difference
- * between resuming a session and resuming a loop.
- *
- * Deliberately a directive and not a decision: none of these tells the session
- * what the answer is, only which question it is now looking at. A failure is
- * still possibly expected; a cancellation is still possibly fine.
+ * Is this a `lock:` ref the CONSOLE added around a declared phase rather than
+ * one the session declared — the scheduler's implied ref from `waitingOn`, or
+ * a minted one? Such a ref never resumes the declaration and never writes an
+ * errand (control-tower phase 6, #15 ask 3).
  */
-export function landingDirective(landed: { detail?: string }): string {
-  const detail = (landed.detail ?? '').toLowerCase();
-  if (detail.includes('cancelled') || detail.includes('canceled')) {
-    return 'It was CANCELLED, so there is no result to read — decide whether to re-run it (`gh run rerun <id>`) or to proceed without it;';
-  }
-  if (detail.includes('failure') || detail.includes('timed_out')) {
-    return 'It FAILED, so read why before anything else — a green step is not waiting for you;';
-  }
-  if (detail.includes('closed') && !detail.includes('merged')) {
-    return 'It was CLOSED rather than merged — check whether the work it carried still needs a home;';
-  }
-  return 'Re-check it now,';
+export function consoleLockRef(
+  record: { declared?: { watch?: string[]; minted?: string[] }; watch?: string[] }, ref: string,
+): boolean {
+  if (parseWatchRef(ref)?.kind !== 'lock') return false;
+  const own = record.declared?.watch?.length ? record.declared.watch : record.watch ?? [];
+  return !own.includes(ref) || Boolean(record.declared?.minted?.includes(ref));
 }
 
 export abstract class ServiceRecovery extends ServiceRuns {
@@ -524,7 +524,9 @@ export abstract class ServiceRecovery extends ServiceRuns {
    * test) answers "unchanged" exactly as the loop would.
    */
   protected fingerprintFor(slug: string, state: RunState, board: Record<number, string>, qa?: Parameters<typeof evidenceFingerprint>[4]): string {
-    return evidenceFingerprint(state, board, this.allLocks().filter((lock) => lock.slug === slug), this.gateStampFor(slug), qa);
+    return evidenceFingerprint(
+      state, board, this.allLocks().filter((lock) => lock.slug === slug), this.gateStampFor(slug), qa, Date.now(), this.accountsStampFor(),
+    );
   }
 
   /**
@@ -725,10 +727,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
         slot.fixed = true;
         delete slot.lastReason;
         state.halt = null;
-        state.consecutiveFailures = 0;
+        resetStreak(state);
         state.resolved = null;
         state.reopenedAt = null;
-        state.status = 'parked';
+        setRunState(state, 'parked');
         state.finishedReason = `the plan's §Verification is runnable again — repaired by ${by}. `
           + 'Continue to carry on through the rest of the plan.';
       });
@@ -746,7 +748,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         state.halt = null;
         state.resolved = null;
         state.reopenedAt = null;
-        state.status = 'parked';
+        setRunState(state, 'parked');
         state.finishedReason = `the plan validates again — closed by ${by}. `
           + 'Continue to carry on through the rest of the plan.';
         const slot = ((state.recoveries ??= {}).plan ??= { attempts: 0, lastAt: now });
@@ -769,7 +771,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         delete slot.lastReason;
         state.halt = null;
         retirePhaseHalt(state.phases[String(phase)]);
-        state.consecutiveFailures = 0;
+        resetStreak(state);
         state.resolved ??= {
           at: now,
           auto: true,
@@ -798,12 +800,12 @@ export abstract class ServiceRecovery extends ServiceRuns {
       // the classifier read it (arm 11, `verify-red`) over the `done-unrecorded`
       // the evidence actually supports.
       retirePhaseHalt(record);
-      state.consecutiveFailures = 0;
+      resetStreak(state);
       // Same rule as `start` on resume: the resolution was about the stop this
       // recovery just ended, and left in place it silences the next one's card.
       state.resolved = null;
       state.reopenedAt = null;
-      state.status = 'parked';
+      setRunState(state, 'parked');
       state.finishedReason = `phase ${phase} was closed by ${by}. `
         + 'Continue to carry on through the rest of the plan.';
     });
@@ -901,14 +903,31 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (!slot) return null;
     const settled = settleRung(slot, outcome, costUsd, note);
     if (settled && this.root?.ok) {
-      new Journal(this.root.path, state.slug, state.id).append('phase.rung-settled', rungSettledPayload(settled), phase);
+      Journal.for(this.root.path, state.slug, state.id).append('phase.rung-settled', rungSettledPayload(settled), phase);
     }
     return settled;
   }
 
+  /**
+   * Why a run a rung just FIXED must not continue by itself — or null when it
+   * may (control-tower phase 81, #105). Asked of evidence read now: the board,
+   * re-read from disk (the session's last commit lands a moment before its
+   * process exits), must show the phase done; a `halt-on-everything` run is one
+   * the operator continues; and a standing errand is a decision still owed.
+   */
+  protected async recoveryContinueRefusal(slug: string, after: RunState, phase: number): Promise<string | null> {
+    this.reread(slug);
+    const board = await this.board(slug).catch(() => null);
+    if (!board || board.error) return `the board could not be read after the recovery${board?.error ? ` (${board.error})` : ''} — nothing continues on a guess`;
+    if (board.states[phase] !== 'done') return `the board reads phase ${phase} ${board.states[phase] ?? 'unknown'}, not done — the recovery's fix is not on disk`;
+    if (after.autonomy === 'halt-on-everything') return 'the run is halt-on-everything — the operator continues it';
+    if (after.errand) return `a decision is owed first: ${after.errand.need}`;
+    return null;
+  }
+
   async maybeAutoRecover(
     slug: string,
-    pass: { trigger?: string; fingerprint?: string } = {},
+    pass: { trigger?: string; fingerprint?: string; gates?: Record<number, string> } = {},
   ): Promise<AutoRecoverResult> {
     const no = (reason: string, extra: Partial<AutoRecoverResult> = {}): AutoRecoverResult =>
       ({ launched: false, reason, ...extra });
@@ -948,7 +967,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         const record = state.phases[key];
         const open = [...slot.rungs].reverse().find((r) => r.outcome === 'running')!;
         const sitId = String(open.situation ?? '').split(':')[0];
-        let outcome: 'fixed' | 'no-defect' | 'failed' | 'interrupted';
+        let outcome: 'fixed' | 'no-defect' | 'failed' | 'interrupted' | 'withdrawn';
         let note: string;
         // A standing `widen-rule` card is a rung still running (phase 9): the
         // record is `parked` with a declaration behind it, which the `no-defect`
@@ -1001,6 +1020,19 @@ export abstract class ServiceRecovery extends ServiceRuns {
           outcome = 'no-defect';
           note = `the session declared ${record.declared.status}`
             + (record.declared.reason ? `: ${record.declared.reason.replace(/\s+/g, ' ').slice(0, 120)}` : '');
+        } else if (rungWasWithdrawn(record, open) && personRetryOwed(record, open)) {
+          // A person's Retry a halt withdrew before it boarded (control-tower
+          // phase 91, #131): still owed — left open, boarded first on resume.
+          continue;
+        } else if (rungWasWithdrawn(record, open)) {
+          // NOTHING HAPPENED. The lane was never spawned — a sibling took the
+          // scope, or a park withdrew the queue entry it was waiting in — and
+          // "the record reads pending" is the PROOF of that, not a verdict
+          // against the rung. Scored `failed`, it exhausted a one-rung table
+          // over a phase nothing was wrong with and parked the run for five
+          // hours (#16). Void it: no cost, no count, the rung still available.
+          outcome = 'withdrawn';
+          note = 'the lane never spawned — the record never moved past pending';
         } else {
           outcome = 'failed'; note = `the record reads ${record?.status ?? 'absent'}`;
         }
@@ -1028,7 +1060,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
           if (String(record.situation?.key ?? '').startsWith('qa-')) delete record.situation;
         }
         touched = true;
-        new Journal(this.root.path, slug, state.id).append(
+        Journal.for(this.root.path, slug, state.id).append(
           'phase.errand-cleared', { situation: sitId, verdict }, phaseNo,
         );
       }
@@ -1064,15 +1096,131 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const read = await this.board(slug);
     if (read.error) return no(`the console could not read the board: ${read.error}`);
     const board = read.states;
+
+    /* An errand must not outlive the condition that made it (#16, ask 3).
+     *
+     * A `never-started` errand says "the ladder could not board this phase".
+     * When the record still reads `pending`, the board still reads `ready`,
+     * and nothing holds a queue entry for it, that sentence is simply false —
+     * and a heal pass looking at those three facts has everything it needs to
+     * board the phase itself. The measured cost of not doing so: an errand
+     * standing since 15:17Z refused ~60 heal passes over five hours, and a
+     * bare Retry boarded the phase first time.
+     *
+     * The rungs the errand was built on are re-settled by the SAME rule the
+     * doors use, because they are the same claim: a rung over a record that
+     * never moved was withdrawn, whatever an older build wrote on it. That is
+     * what makes the remedy available again rather than merely un-asked. */
+    for (const [key, slot] of Object.entries(state.recoveries ?? {})) {
+      if (parseSituationKey(String(slot?.errand?.situation ?? '')).id !== 'never-started') continue;
+      const phaseNo = Number(key);
+      if (!Number.isFinite(phaseNo)) continue;
+      const record = state.phases[key];
+      // `pending` IS "holds no queue entry": the scheduler writes `queued` on a
+      // phase it has admitted, and the withdrawal that produced this state is
+      // exactly what put the word back to `pending` (`phase.not-started`). A
+      // live lane of this run is the other way the phase could be in hand.
+      if (record?.status !== 'pending' || board[phaseNo] !== 'ready') continue;
+      if (Object.values(state.children ?? {}).some((child) => child?.phase === phaseNo)) continue;
+      const voided = (slot!.rungs ?? []).filter((r) => r.outcome !== 'withdrawn' && rungWasWithdrawn(record, r) && !personRetryOwed(record, r));
+      for (const rung of voided) {
+        rung.outcome = 'withdrawn';
+        rung.note = 'the lane never spawned — the record never moved past pending';
+      }
+      delete slot!.errand;
+      this.editStoredRunById(slug, state.id, (stored) => {
+        const held = stored.recoveries?.[key];
+        if (!held) return;
+        delete held.errand;
+        for (const rung of held.rungs ?? []) {
+          if (rung.outcome !== 'withdrawn' && rungWasWithdrawn(stored.phases[key], rung)) {
+            rung.outcome = 'withdrawn';
+            rung.note = 'the lane never spawned — the record never moved past pending';
+          }
+        }
+      });
+      Journal.for(this.root.path, slug, state.id).append(
+        'phase.errand-cleared', { reason: 'never-ran', withdrew: voided.length }, phaseNo,
+      );
+    }
+    /* A resource wall's errand must not outlive the wall either (#36, ask 3).
+     *
+     * `resource-wall:auth` and `resource-wall:usage` ask for an ACCOUNT — "a
+     * signed-in Claude account for this run … then Continue". Once the breaker
+     * says one is usable that ask is answered, so the errand is retracted and
+     * the rungs the wall defeated are forgiven (`accountWallForgives`): the
+     * ladder climbs the remedy the errand named instead of quoting it. The
+     * measured latch: an outage retired every account, the one `switch-account`
+     * rung failed with nowhere to switch to, and Recover answered the same
+     * errand for two and a half hours after the accounts were cleared. The
+     * accounts stamp in the fingerprint is what brings the healer here. */
+    const usable = this.accountsUsable();
+    if (usable.total > 0 && usable.unusable < usable.total) {
+      const accountWall = (situation: string | undefined): boolean => {
+        const { id, sub } = parseSituationKey(String(situation ?? ''));
+        return id === 'resource-wall' && (sub === 'auth' || sub === 'usage');
+      };
+      for (const [key, slot] of Object.entries(state.recoveries ?? {})) {
+        if (!slot?.errand || !accountWall(slot.errand.situation)) continue;
+        const phaseNo = Number(key);
+        if (!Number.isFinite(phaseNo)) continue;
+        const at = new Date().toISOString();
+        const situation = slot.errand.situation;
+        delete slot.errand;
+        const forgave = forgiveRungs(slot, accountWallForgives, at, 'accounts-changed').length;
+        // The run's own errand about the same wall is the same false ask.
+        const alsoRun = accountWall(state.errand?.situation);
+        if (alsoRun) delete state.errand;
+        this.editStoredRunById(slug, state.id, (stored) => {
+          const held = stored.recoveries?.[key];
+          if (held) { delete held.errand; forgiveRungs(held, accountWallForgives, at, 'accounts-changed'); }
+          if (alsoRun && accountWall(stored.errand?.situation)) delete stored.errand;
+        });
+        Journal.for(this.root.path, slug, state.id).append('phase.errand-cleared', {
+          reason: 'accounts-changed', situation, forgave, usable: usable.total - usable.unusable, total: usable.total,
+          ...(alsoRun ? { alsoRun: true } : {}),
+        }, phaseNo);
+      }
+    }
     // ONE cache for the whole pass (RCV-9): `git status` per scope directory,
     // the plan's health and each gate read are asked once, however many
-    // candidates there are. The fingerprint is the converge pass's when it
-    // handed one over, else the same function over the same facts — so a
-    // direct caller (the Recover press, a test) gets the same "unchanged"
-    // answer the loop would.
+    // candidates there are.
     const cache = newEvidenceCache();
-    const fingerprint = pass.fingerprint ?? this.fingerprintFor(slug, state, board, read.qa);
-    const candidates = await this.classifyOpenPhases(slug, state, board, cache);
+    // Each phase is judged on its OWN evidence (control-tower phase 51, #84):
+    // its record, board word, locks, watch refs and the pass's gate verdict.
+    // The run-wide fingerprint this compared against moved whenever anything
+    // anywhere did, so every candidate was re-journalled on every such move.
+    const planLocks = this.allLocks().filter((lock) => lock.slug === slug);
+    const own = (phase: number) => phaseFingerprint(state, phase, board, planLocks, pass.gates?.[phase]);
+    // A standing needs-human declaration is re-examined only when what it
+    // NAMES changes — it is re-declared, or a ref it watches moves — never
+    // because a sibling's evidence did. Its ask already stands (an errand, or
+    // a fold into a sibling's), so there is nothing a re-read could add; the
+    // measured cost was 77 passes re-deriving one declaration over 5.5 hours.
+    const standing: number[] = [];
+    for (const record of Object.values(state.phases)) {
+      if (record.declared?.status !== 'needs-human' || board[record.phase] === 'done') continue;
+      const seen = record.situation;
+      if (!seen?.fingerprint || !seen.key.startsWith('blocked-declared') || seen.fingerprint !== own(record.phase)) continue;
+      if (!state.recoveries?.[String(record.phase)]?.errand && !foldStands(state, record.phase)) continue;
+      standing.push(record.phase);
+    }
+    const candidates = await this.classifyOpenPhases(slug, state, board, cache, new Set(standing));
+    if (!candidates.length && standing.length) {
+      standing.sort((a, b) => a - b);
+      // Still a sentence about the park, so it says what the watch clock will
+      // actually do with each phase's refs (`watchClause`, control-tower phase
+      // 6) — read off the record, so nothing is classified for it. The
+      // operator's Recover quotes this refusal as its reason.
+      const watching = standing
+        .map((phase) => ({ phase, clause: watchClause(watchSummary(state.phases[String(phase)]), phase) }))
+        .filter((w) => w.clause);
+      return no(
+        `phase ${standing.join(', ')} declared needs-human — nothing ${standing.length === 1 ? 'it names' : 'they name'} has changed since it was last read`
+        + watching.map((w) => (standing.length === 1 ? ` — ${w.clause}` : ` — phase ${w.phase}: ${w.clause}`)).join(''),
+        { phase: standing[0] },
+      );
+    }
     if (!candidates.length) {
       // No candidate does NOT mean nothing is wrong. The candidate list is
       // deliberately record-shaped — a phase the board reads done is closed by
@@ -1090,7 +1238,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       try {
         const { situation } = await this.classifyPhase(slug, anchor, state, board, cache);
         if (situation.actor === 'person' || situation.actor === 'machine') {
-          const journal = new Journal(this.root.path, slug, state.id);
+          const journal = Journal.for(this.root.path, slug, state.id);
           const errand = errandFor(situation.key, [], anchor, undefined,
             errandSaid(situation, state.phases[String(anchor)]?.said));
           // A standing errand is not rewritten: this arm runs on every sweep,
@@ -1114,7 +1262,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       return no('no open phase of this run has a record to act on');
     }
 
-    const journal = new Journal(this.root.path, slug, state.id);
+    const journal = Journal.for(this.root.path, slug, state.id);
     // ONE per-phase ceiling: the ladder's, from Settings ▸ Automation.
     //
     // There used to be a second — `state.autoRecover.attempts`, hardcoded `2`
@@ -1125,10 +1273,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // saying why — the measured run parked one rung short of its own fix,
     // refusing forever with "recovery budget is spent (2 launches)".
     // `autoRecover` now means only what the dialog offers: opted in, or not.
-    const caps = ladderCaps(this.prefs);
+    // The console's caps with the RUN's own rung caps over them (#14 ask 6).
+    const caps = runLadderCaps(state, this.prefs);
     const recoveries = (state.recoveries ??= {});
-    const runHistory = Object.values(recoveries).flatMap((slot) => slot.rungs ?? []);
-    const totalAttempts = Object.values(recoveries).reduce((sum, slot) => sum + (slot.attempts ?? 0), 0);
+    // The ONE run-wide counter (#14 ask 4) — the runner's climb reads the same
+    // helper. It used to be raw `Σ slot.attempts` here and `countedRungs` of a
+    // flattened history there, which agreed only by coincidence.
+    const run = openRunRungs(recoveries, (p) => board[p] === 'done');
 
     let chosen: {
       phase: number; evidence: PhaseEvidence; situation: Situation; rung: Rung; vehicle: DriveVehicle;
@@ -1137,6 +1288,24 @@ export abstract class ServiceRecovery extends ServiceRuns {
     const refuse = (reason: string, c: { phase: number; situation: Situation }) => {
       firstRefusal ??= { launched: false, reason, phase: c.phase, situation: c.situation.key, label: c.situation.label };
     };
+
+    // The scope fence (control-tower phase 6, #19) — the SAME rule the drive
+    // loop applies, asked of the phases this pass could BOARD: a phase of this
+    // run parked on a declared external wall holds back every such phase
+    // whose scope intersects its own. The measured shape was exactly this
+    // pass: a run parked on one session's `needs-human --needs external`, and
+    // the heal boarded the next ready sibling into the same wall, three times.
+    const fenceable = candidates
+      .filter((c) => {
+        const record = state.phases[String(c.phase)];
+        const declared = record?.declared?.status;
+        return Boolean(record) && ['pending', 'queued', 'failed', 'interrupted'].includes(record!.status)
+          && !(declared && ['needs-human', 'waiting-external', 'blocked'].includes(declared));
+      })
+      .map((c) => c.phase);
+    const fenced = applyScopeFence(state, fenceable, (p) => this.scopeOf(slug, p) ?? ['all'], Date.now(), {
+      journal: (event, data, phase) => journal.append(event, { ...data, by: 'heal' }, phase),
+    });
 
     let reJournalled = 0;
     let unchanged = 0;
@@ -1148,7 +1317,9 @@ export abstract class ServiceRecovery extends ServiceRuns {
       // same fingerprint is what the record already says, and every pass
       // used to write it again — 1 332 lines, 1 249 of them unsigned, most
       // of them "still parked". The candidate is still walked and may still
-      // climb; only the journal line is spared.
+      // climb; only the journal line is spared. The evidence is the PHASE's
+      // own (#84), never the run's.
+      const fingerprint = own(c.phase);
       const same = record?.situation?.key === c.situation.key && record?.situation?.fingerprint === fingerprint;
       if (same) unchanged += 1; else {
         reJournalled += 1;
@@ -1158,6 +1329,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
         }, c.phase);
       }
       if (record) record.situation = { key: c.situation.key, at: c.evidence.at, why: c.situation.why, fingerprint, by };
+
+      // Fenced: boarding it would board into a wall a sibling declared. Its
+      // record already says so (`queued`, the `fence` holder, the note).
+      if (fenced.has(c.phase)) {
+        refuse(`phase ${c.phase} is ${record?.note ?? 'fenced behind a declared external wall in its scope'}`, c);
+        continue;
+      }
 
       /* A DECLARED park is the session's own testimony — a person was asked
        * (needs-human), or the world is being waited on. The ladder does not
@@ -1182,28 +1360,55 @@ export abstract class ServiceRecovery extends ServiceRuns {
         // nothing had changed. What stays is this arm's real job: standing down,
         // and keeping the declared errand standing while it does.
         const slot2 = (recoveries[key] ??= { attempts: 0, lastAt: new Date().toISOString() });
-        if (declaredPark.status === 'needs-human'
+        // What the watch clock will ACTUALLY do with the refs, read from
+        // `watchState` — never "watching its refs" with none of them live
+        // (control-tower phase 6, #19 ask 4).
+        const watching = watchClause(watchSummary(record), c.phase);
+        const situationKey = c.situation.id === 'blocked-declared' ? c.situation.key : 'blocked-declared:unknown';
+        // A fold that still stands is this phase's errand (#19 ask 2): another
+        // phase's errand names it, and nothing is written or announced here.
+        const folded = foldStands(state, c.phase);
+        if (declaredPark.status === 'needs-human' && !folded
           && (!slot2.errand || parseSituationKey(slot2.errand.situation).id !== 'blocked-declared')) {
-          const errand: Errand = {
-            phase: c.phase,
-            situation: c.situation.id === 'blocked-declared' ? c.situation.key : 'blocked-declared:unknown',
-            at: new Date().toISOString(),
-            tried: (slot2.rungs ?? []).map((r) => `${r.rung}${r.outcome ? ` → ${r.outcome}` : ''}`),
-            need: declaredPark.reason ?? record.note ?? 'the session asked for a person',
-            // The sub-kind's own remedy, then the watch note. One sentence for
-            // every kind of blocker was the errand nobody could act on: a
-            // permission wall names the policy, a credential names the sign-in.
-            how: errandFor(c.situation.id === 'blocked-declared' ? c.situation.key : 'blocked-declared:unknown', [], c.phase).how
-              + (declaredRefs.length ? ' The console is also watching its refs and resumes the session when they land.' : ''),
-          };
-          slot2.errand = errand;
-          journal.append('phase.errand', { ...errand }, c.phase);
-          this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
+          // The same external wall a sibling already stood up folds into its
+          // errand — the declaration the inbox delivered wrote no errand, so
+          // this is where a second copy would otherwise be born.
+          const into = situationKey === 'blocked-declared:external' && isExternalWall(record, { situation: situationKey })
+            ? errandFoldTarget(state, c.phase, (p) => this.scopeOf(slug, p) ?? ['all'])
+            : null;
+          const target = into !== null ? recoveries[String(into)]?.errand : undefined;
+          if (into !== null && target) {
+            target.alsoPhases = [...new Set([...(target.alsoPhases ?? []), c.phase])].sort((a, b) => a - b);
+            slot2.foldedInto = into;
+            delete slot2.errand;
+            journal.append('phase.errand-folded', { into, situation: situationKey, need: declaredPark.reason ?? null, by }, c.phase);
+          } else {
+            delete slot2.foldedInto;
+            const errand: Errand = {
+              phase: c.phase,
+              situation: situationKey,
+              at: new Date().toISOString(),
+              tried: (slot2.rungs ?? []).map((r) => `${r.rung}${r.outcome ? ` → ${r.outcome}` : ''}`),
+              need: declaredPark.reason ?? record.note ?? 'the session asked for a person',
+              // The sub-kind's own remedy. One sentence for every kind of blocker
+              // was the errand nobody could act on: a permission wall names the
+              // policy, a credential names the sign-in. The watch note is DERIVED
+              // wherever the errand is shown (`liveErrandHow`, control-tower
+              // phase 88, #125) — frozen here it outlived the ref's refusal.
+              how: errandFor(situationKey, [], c.phase).how,
+              ...(pollableRefs(declaredPark.watch).length ? { watching: true } : {}),
+            };
+            slot2.errand = errand;
+            journal.append('phase.errand', { ...errand }, c.phase);
+            this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
+          }
         }
+        const into = recoveries[key]?.foldedInto;
         refuse(
           `phase ${c.phase} declared ${declaredPark.status}`
           + (declaredPark.reason ? `: ${declaredPark.reason.replace(/\s+/g, ' ').slice(0, 140)}` : '')
-          + (declaredRefs.length ? ' — the console is watching its refs' : " — a person's to settle"),
+          + (into !== undefined && foldStands(state, c.phase) ? ` — the same wall as phase ${into}'s errand` : '')
+          + (watching ? ` — ${watching}` : " — a person's to settle"),
           c,
         );
         continue;
@@ -1231,36 +1436,45 @@ export abstract class ServiceRecovery extends ServiceRuns {
           continue;
         }
       }
-      // The run's own per-phase launch cap (the launch dialog's number) and the
-      // per-run cap still bound the healer, for the records and readers that
-      // predate rungs; the ladder's caps apply on top.
+      // The run's per-run cap still bounds the healer up front, for the records
+      // and readers that predate rungs; the ladder's other caps apply on top.
       //
-      // Both write the errand before refusing. They used to `refuse` and move
-      // on in silence — and a spent budget is exactly when a person has to be
-      // told: "everything the ladder had was tried and none of it worked" is
-      // the most actionable thing this system ever knows, and it was the one
-      // case that said nothing. (`ladder.ts`'s own exhaustion path always did.)
-      const askFor = (c2: { phase: number; situation: Situation }) => {
-        const key2 = String(c2.phase);
-        const slot2 = (recoveries[key2] ??= { attempts: 0, lastAt: new Date().toISOString() });
-        if (slot2.errand) return;
-        const errand = errandFor(c2.situation.key, slot2.rungs ?? [], c2.phase, undefined,
-          errandSaid(c2.situation, state.phases[key2]?.said));
-        slot2.errand = errand;
-        journal.append('phase.errand', { ...errand }, c2.phase);
-        this.announceErrand({ slug, runId: state.id, phase: c2.phase, errand });
-      };
+      // It writes the errand before refusing. It used to `refuse` and move on
+      // in silence — and a spent budget is exactly when a person has to be
+      // told. (`ladder.ts`'s own exhaustion path always did.)
       // No per-phase check here any more — `nextRung` owns it (`perPhaseRungs`
       // against `history.length`), writes the errand through the exhaustion
       // path below, and says which cap and how much of it is spent.
       //
       // The run-wide ceiling is the LADDER's, not a second hardcoded number.
-      // `if (totalAttempts >= 5)` contradicted `ladderPerRunRungs` in Settings:
+      // A hardcoded `>= 5` over raw attempts contradicted `ladderPerRunRungs` in Settings:
       // an operator who raised the budget to 20 still got five, with nothing
       // saying why.
-      if (totalAttempts >= caps.perRunRungs) {
-        askFor(c);
-        return no(`the run recovery budget is spent (${caps.perRunRungs} launches)`,
+      //
+      // It counts through `openRunRungs` now, and says so honestly: which cap,
+      // the arithmetic, the share on phases already done, and the setting —
+      // never "N launches", a count of launches nobody made.
+      if (run.open >= caps.perRunRungs) {
+        const refused = nextRung({ situation: c.situation.key, history: [], run, caps });
+        const key2 = String(c.phase);
+        const slot2 = (recoveries[key2] ??= { attempts: 0, lastAt: new Date().toISOString() });
+        if (!slot2.errand) {
+          const errand = capErrand(refused, {
+            phase: c.phase, tried: slot2.rungs ?? [], onDonePhases: run.onDonePhases,
+            replenishes: countedRungs(slot2.rungs ?? []).some(retryForgives),
+          });
+          slot2.errand = errand;
+          const cap = capRefusal(refused);
+          if (cap) journal.append('phase.ladder-refused', { situation: c.situation.key, ...cap, by, trigger }, c.phase);
+          journal.append('phase.errand', { ...errand }, c.phase);
+          this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
+          // Written down before the early return — the loop's own save below is
+          // never reached from here, and an errand only the push saw is an ask
+          // no page can show.
+          try { saveRun(state); } catch { /* the verdict matters more than the write */ }
+        }
+        return no(`the run's ladder budget is spent (${run.open} of ${caps.perRunRungs} rungs on its open phases`
+          + `${run.onDonePhases ? `; ${run.onDonePhases} more on phases already done no longer count` : ''}) — raise ladderPerRunRungs`,
           { phase: c.phase, situation: c.situation.key, label: c.situation.label });
       }
 
@@ -1268,7 +1482,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       // recorded, is read as having climbed the rung the old healer drove —
       // the own session when it had one, the agent otherwise — so the ladder
       // escalates from there instead of repeating it.
-      const history: typeof runHistory = slot?.rungs ? [...slot.rungs] : [];
+      const history: RungRecord[] = slot?.rungs ? [...slot.rungs] : [];
       if (!slot?.rungs && slot?.lastReason && state.halt?.reason === slot.lastReason && (slot.attempts ?? 0) >= 1) {
         const resumable = Boolean(record?.sessionId ?? record?.resumeSessionId);
         for (const rung of rungsFor(c.situation.key)) {
@@ -1295,7 +1509,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
       const climbInput = {
         // The same day budget the runner's own climb counts against, so the
         // loop's rungs and the healer's cannot each spend it in full.
-        situation: c.situation.key, history, runHistory, caps, dayHistory: this.dayRungs(),
+        situation: c.situation.key, history, run, caps, dayHistory: this.dayRungs(),
         available: (rung: Rung) => this.vehicleForRung(rung, c.situation, record, c.evidence, slug, state) !== null,
       };
       let next = nextRung(climbInput);
@@ -1327,7 +1541,16 @@ export abstract class ServiceRecovery extends ServiceRuns {
           const planIssue = c.situation.id === 'plan-broken'
             ? c.evidence?.health?.find((i) => i.phase == null || i.phase === c.phase)
             : null;
-          const errand = errandFor(
+          // A spent CAP writes the cap's own errand (#14 ask 5), which no policy
+          // row answers; anything else is the situation's.
+          const capped = capRefusal(next)
+            ? capErrand(next, {
+              phase: c.phase, tried: slot?.rungs ?? [], onDonePhases: run.onDonePhases,
+              replenishes: !String(next.ok ? '' : next.cap ?? '').endsWith('usd')
+                && countedRungs(slot?.rungs ?? []).some(retryForgives),
+            })
+            : null;
+          const errand = capped ?? errandFor(
             c.situation.key, slot?.rungs ?? [], c.phase, undefined,
             // The session's own words when they ARE the evidence — the one
             // rule for both paths (RCV-7, `errandSaid`): a refusal, a skill
@@ -1351,6 +1574,9 @@ export abstract class ServiceRecovery extends ServiceRuns {
             // ZTD-10): the run's manifest, this console's `policy.<key>`, the
             // shipped default — the same reading the drive loop makes.
             policyForSituation(c.situation.key, state, policyPrefsOf(this.prefs)),
+            // …and, where the console recorded no rule, what the session
+            // declared: the act and the path the errand then names (#43).
+            record?.declared ?? null,
           );
           // A class whose row answered AUTOMATICALLY is not a person's: the
           // ruling is journalled under its decision key, once per answer per
@@ -1400,6 +1626,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
             ? this.unavailableRungHint(c.situation, record, c.evidence, slug, state)
             : null;
           if (hint) errand.how = `${errand.how} ${hint}`;
+          // A declared block PARKS its phase when the ladder has nothing left
+          // to drive (#43). This writer used to leave the record `pending`
+          // under the errand it had just written (or found standing) — and a `pending` phase with
+          // an open errand is the shape a scoped run then called "settled".
+          // Only a phase nothing is driving or re-boarding: a hint means a
+          // door already chose to board it.
+          if (record && c.situation.id === 'blocked-declared' && record.status === 'pending' && !record.boardingHint) {
+            record.status = 'parked';
+            record.note = `${c.situation.label} — ${errand.need}`;
+            record.endedAt ??= errand.at;
+          }
           // A standing errand is not rewritten: this path runs on every sweep
           // for every person's situation, and each rewrite re-pushed the same
           // ask with a fresh clock (51 times in a day for one manual gate).
@@ -1442,6 +1679,27 @@ export abstract class ServiceRecovery extends ServiceRuns {
 
     const { phase, situation, rung, vehicle } = chosen;
     const key = String(phase);
+    /* A plan repair over a stop whose only evidence is the ENGINE's say-so —
+     * the lint went red, or the engine could not read the plan — climbs only
+     * over a lint that RAN and is red NOW (control-tower phase 81, #104).
+     * Measured at a load average of 35–42: a timed-out read halted a run
+     * `plan-unreadable`, and four `plan-repair-script` rungs and a paid repair
+     * session were spent on a plan `validate.sh` called clean that same minute —
+     * each rung needing the very engine read that was timing out. A clean lint
+     * says the stop was the machine; converge relaunches it once the plan reads.
+     * A lint that could not run proves nothing either way, so nothing is spent. */
+    if (situation.id === 'plan-broken' && (situation.sub === 'lint' || situation.sub === 'unreadable')) {
+      const lint = await this.lint(slug);
+      const said = { phase, situation: situation.key, label: situation.label };
+      if (!lint || lint.timedOut || lint.crashed) {
+        return no(`phase ${phase} reads ${situation.label} — the plan's lint could not run`
+          + `${lint?.timedOut ? ' (it timed out)' : ''}, so nothing shows the plan is broken; no repair is spent until one does`, said);
+      }
+      if (lint.ok) {
+        return no(`phase ${phase} reads ${situation.label}, but the plan lints clean (${lint.summary.slice(0, 120)}) — `
+          + 'the stop was the engine, not the plan; the run is relaunched once the plan reads', said);
+      }
+    }
     const gate = await this.preRecoveryGate(slug, state, phase);
     if (gate === 'superseded') {
       return no('the board had already moved past the halt — records reconciled, nothing to launch', { phase, situation: situation.key, label: situation.label });
@@ -1477,7 +1735,12 @@ export abstract class ServiceRecovery extends ServiceRuns {
       if (state.halt?.reason) slot.lastReason = state.halt.reason;
       saveRun(state);
       this.emit('run:state', { state });
-      journal.append('phase.rung', { situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: vehicle.kind, attempt: slot.attempts, by, trigger }, phase);
+      journal.append('phase.rung', {
+        situation: situation.key, rung: rung.vehicle, params: rung.params ?? null, vehicle: vehicle.kind, attempt: slot.attempts, by, trigger,
+        // The `switch-account` rung's own reading (control-tower phase 78, #106):
+        // why it resumed where the run is instead of moving it.
+        ...(vehicle.kind === 'switch-account' && vehicle.why ? { why: vehicle.why } : {}),
+      }, phase);
       log.info('run.auto-recovery', { slug, runId: state.id, phase, situation: situation.key, rung: rung.vehicle, vehicle: vehicle.kind, attempt: slot.attempts });
       // Plan progress about a phase, not a session ending — on `session` the
       // deep link landed on the terminal list and the card read "A session
@@ -1530,7 +1793,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         const fresh = loadRun(this.root!.path, slug, state.id, null);
         const freshSlot = fresh?.recoveries?.[key];
         const open = freshSlot?.rungs?.find((r) => r.cardId === approval.id && r.outcome === 'running');
-        const line = new Journal(this.root!.path, slug, state.id);
+        const line = Journal.for(this.root!.path, slug, state.id);
         line.append('phase.widen-decided', {
           decision: outcome.decision, by: outcome.by, rule: denied.rule, cardId: approval.id,
           ...(outcome.reason ? { reason: outcome.reason } : {}),
@@ -1593,7 +1856,10 @@ export abstract class ServiceRecovery extends ServiceRuns {
     if (vehicle.kind === 'switch-account') {
       if (!this.flags.allowRun) return no('the account switch relaunches the run, which needs --allow-run', { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       climb();
-      const moved = this.switchAccountRun(slug, vehicle.accountId,
+      // Staying on the run's own account is a relaunch, not a switch: nothing
+      // is moved, and no `run.account-switched` line claims otherwise.
+      const staying = vehicle.accountId === vehicle.from;
+      const moved: { ok: boolean; reason?: string } = staying ? { ok: true } : this.switchAccountRun(slug, vehicle.accountId,
         doorActor('converge-heal', { by, via: viaOfTrigger(trigger), origin: `converge:${trigger}`, trigger: situation.key, guard: `ladder:${rung.vehicle}` }));
       if (!moved.ok) {
         this.settleRungOn(state, phase, 'failed', moved.reason ?? 'the account switch was refused');
@@ -1601,7 +1867,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         return no(`phase ${phase} reads ${situation.label} — the switch to ${vehicle.accountId} was refused: ${moved.reason ?? 'unknown'}`,
           { phase, situation: situation.key, label: situation.label, rung: rung.vehicle });
       }
-      journal.append('run.account-switched', { at: 'ladder', reason: situation.key, from: vehicle.from, account: vehicle.accountId, by, phase });
+      if (!staying) journal.append('run.account-switched', { at: 'ladder', reason: situation.key, from: vehicle.from, account: vehicle.accountId, by, phase });
       void this.startRun(slug, {
         actor: healActor(situation.key, rung.vehicle, slot.attempts, caps.perPhaseRungs),
         resumeRunId: state.id,
@@ -1624,7 +1890,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         stored.runBudgetUsd = vehicle.to;
         // The halt this rung answers dissolves with the raise: the run has
         // budget again, and a standing `budget` halt would refuse the relaunch.
-        if (stored.halt?.kind === 'budget') { stored.halt = null; stored.status = 'parked'; }
+        if (stored.halt?.kind === 'budget') { stored.halt = null; setRunState(stored, 'parked'); }
         if (stored.errand?.situation === 'resource-wall:budget') delete stored.errand;
       });
       if (!raised) {
@@ -1741,6 +2007,12 @@ export abstract class ServiceRecovery extends ServiceRuns {
         ...(instruction ? { instruction } : {}),
         ...(vehicle.mode === 'repair' && vehicle.cls ? { cls: vehicle.cls } : {}),
         ...(vehicle.mode === 'repair' ? { situation: situation.key } : {}),
+        // The verdict below is read at the recovery's END (control-tower phase
+        // 81, #105). Without this the promise resolved the moment the recovery
+        // was ARMED — the run reading `running` — so a rung that went on to fix
+        // its phase was read as "still driving", and the continue never fired:
+        // a keep-going run sat parked on a Continue sentence with work ready.
+        settled: true,
       })
         .then(async () => {
           const after = this.runners.get(slug)?.current()
@@ -1775,10 +2047,20 @@ export abstract class ServiceRecovery extends ServiceRuns {
             // relaunched under it would be the console starting work the
             // instant the operator stopped it. The verdict is already saved
             // above, so the thaw's converge kick picks the run up.
-            const frozen = this.fleetHold();
+            const frozen = this.fleetHoldFor(slug);
+            // The run continues only on evidence, and parks only for a decision
+            // (#105): the board re-read must show the phase done, and a run the
+            // operator set to halt on everything — or one with an ask standing —
+            // parks, saying which, on the run's own record.
+            const parkWhy = frozen ? null : await this.recoveryContinueRefusal(slug, after, phase);
+            const runJournal = this.root ? Journal.for(this.root.path, slug, after.id) : null;
             if (frozen) {
               log.info('run.recovery-continue-frozen', { slug, runId: after.id, by: frozen.by });
+            } else if (parkWhy) {
+              runJournal?.append('run.recovery-parked', { phase, situation: situation.key, rung: rung.vehicle, why: parkWhy }, phase);
+              log.info('run.recovery-parked', { slug, runId: after.id, phase, why: parkWhy });
             } else if (this.prefs.autoContinueRecovery !== false && this.flags.allowRun && !this.liveRunner(slug)) {
+              runJournal?.append('run.recovery-continue', { phase, situation: situation.key, rung: rung.vehicle }, phase);
               log.info('run.recovery-continue', { slug, runId: after.id });
               await this.startRun(slug, {
                 // The recovery session's exit is an observation: the run goes
@@ -2088,7 +2370,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
   private async runRepairScript(slug: string, phase: number, state: RunState): Promise<void> {
     const key = String(phase);
     const slot = ((state.recoveries ??= {})[key] ??= { attempts: 0, lastAt: new Date().toISOString() });
-    const journal = this.root ? new Journal(this.root.path, slug, state.id) : null;
+    const journal = this.root ? Journal.for(this.root.path, slug, state.id) : null;
     // 🔴 THIS rung's phase, and only when THIS run can prove nothing wrote its
     // handoff. `attempts === 0` across every record is a far weaker warrant than
     // the script's own contract: `phaseRecord()` mints a zero-attempt record for
@@ -2187,7 +2469,13 @@ export abstract class ServiceRecovery extends ServiceRuns {
    */
   watchResumeInFlight(slug: string, phase: number): boolean {
     return this.watchDrives.has(`${slug}#${phase}`)
-      || Boolean(this.liveRunner(slug))
+      // A live runner holds the offer only while IT holds the landing — handed
+      // to `landWatch` and not boarded yet, or boarded (control-tower phase 6,
+      // #15). It used to hold every landing for as long as the run was live,
+      // which under `keep-going` is the whole run: the landing waited out
+      // every sibling lane, and the one that reached `recoverPhase` meanwhile
+      // was refused as "in progress" and charged.
+      || Boolean(this.liveRunner(slug)?.landingPending(phase))
       || Boolean(this.liveRecoveryFor({ slug, phase }));
   }
 
@@ -2242,13 +2530,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
   /**
    * The errand a landing becomes when its resumes are spent — over the delivery
    * cap, or over the rejection cap (RCV-8, where it was unreachable). Written
-   * ONCE per landing (`watchLandedErrandFor` is the stamp) and the row retires.
+   * ONCE per DECLARATION — `watchLandedErrandFor` is the stamp, and it is
+   * cleared with the declaration's bookkeeping — so a phase whose several refs
+   * land gets one errand, not one per ref (control-tower phase 6, #15 ask 3);
+   * and never for a `lock:` ref the console added around the phase.
    */
   private landingErrand(
     slug: string, state: RunState, record: RunPhaseRecord, c: { phase: number; situation: { id: string; key: string } },
     landed: WatchState, need: string, journal: Journal,
+    how = 'Open the phase, settle what its Outstanding section names, then Retry — or resume the session with an instruction.',
   ): boolean {
-    if (record.watchLandedErrandFor === landed.ref) return false;
+    if (record.watchLandedErrandFor !== undefined || consoleLockRef(record, landed.ref)) return false;
     record.watchLandedErrandFor = landed.ref;
     const errand: Errand = {
       phase: c.phase,
@@ -2256,13 +2548,432 @@ export abstract class ServiceRecovery extends ServiceRuns {
       at: new Date().toISOString(),
       tried: [],
       need,
-      how: 'Open the phase, settle what its Outstanding section names, then Retry — or resume the session with an instruction.',
+      how,
     };
     ((state.recoveries ??= {})[String(c.phase)] ??= { attempts: 0, lastAt: errand.at }).errand = errand;
     journal.append('phase.errand', { ...errand }, c.phase);
     this.announceErrand({ slug, runId: state.id, phase: c.phase, errand });
     try { saveRun(state); } catch { /* the errand matters more than the write */ }
     return true;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * A person's turn — the verbs (control-tower phase 43)
+   *
+   * Every verb goes through the ledger's one door (`HumanStepLedger.move`),
+   * journals on the step's own run, and — when it settles the step short of
+   * proven — rewrites the park's errand in the step's words. A proven step
+   * resumes the SAME session through the declared-resume path a landed watch
+   * ref takes (`resumeOnWatchLanded`), told what was proven.
+   * ------------------------------------------------------------------ */
+
+  /** The platform opener, for *Open on the machine* — a seam, so no test opens a browser. */
+  protected hostOpener: (url: string) => Promise<HostOpen> = (url) => openUrlOnHost(url);
+
+  /**
+   * Where a `secret-entry` step's secret goes — the credential registry
+   * (`storeStepSecret`: the keychain, else a 0600 file under the instance's
+   * state). A seam, so no test writes the operator's keychain. Nothing reads
+   * a stored secret back.
+   */
+  protected stepSecretStore: (id: string, secret: string) => Promise<{ stored: 'keychain' | 'file'; probe: string }> =
+    (id, secret) => storeStepSecret({ dir: join(INSTANCE_STATE_DIR, 'secrets') }, id, secret);
+
+  /** The reminder quiet hours, from the preference — null when none are set. */
+  protected reminderQuiet(): ReminderQuiet | null {
+    const quiet = parseQuietHours(this.prefs?.reminderQuiet);
+    return quiet && !('error' in quiet) ? { start: quiet.start, end: quiet.end } : null;
+  }
+
+  /** The run and phase record a step was declared under — the live objects while its loop drives. */
+  private stepRun(step: Pick<HumanStep, 'slug' | 'phase' | 'runId'>): { state: RunState; record: RunPhaseRecord; journal: Journal } | null {
+    if (!this.root?.ok || !step.runId) return null;
+    const live = this.liveRunner(step.slug)?.current();
+    const state = live?.id === step.runId ? live : loadRun(this.root.path, step.slug, step.runId, this.liveRunId());
+    const record = state?.phases[String(step.phase)];
+    if (!state || !record) return null;
+    return { state, record, journal: Journal.for(this.root.path, step.slug, state.id) };
+  }
+
+  /** One journal line about a step, on its run's journal (ids and words — never a code). */
+  private stepJournal(step: HumanStep, event: string, data: Record<string, unknown>): void {
+    try {
+      this.stepRun(step)?.journal.append(event, { stepId: step.id, kind: step.kind, ...data }, step.phase);
+    } catch { /* the ledger is the durable fact */ }
+  }
+
+  /** One step as the API answers it, with its moves. */
+  private stepView(id: string): StepView | undefined {
+    const row = this.humanStepsNow().withHistory().find((entry) => entry.step.id === id);
+    return row ? stepViewOf(row.step, row.moves, this.reminderQuiet()) : undefined;
+  }
+
+  /** `GET /api/human-steps` — every step, or (`open`) the ones still waiting on a person. */
+  humanStepsView(opts: { open?: boolean } = {}): {
+    steps: StepView[];
+    reminders: { series: number[]; quiet: ReminderQuiet | null };
+    can: { openHost: boolean; terminal: boolean; resume: boolean };
+  } {
+    const quiet = this.reminderQuiet();
+    const rows = this.humanStepsNow().withHistory().filter(({ step }) => !opts.open || isOpenStep(step));
+    return {
+      steps: rows.slice(-HUMAN_STEPS_LISTED).map(({ step, moves }) => stepViewOf(step, moves, quiet)),
+      reminders: { series: [...REMINDER_SERIES_MS], quiet },
+      can: {
+        openHost: Boolean(this.flags.allowTerminal) || agentEnabled(this.flags),
+        terminal: Boolean(this.flags.allowTerminal),
+        resume: Boolean(this.flags.allowRun),
+      },
+    };
+  }
+
+  /**
+   * *Make it a person's turn* (control-tower phase 44): a silent lane whose
+   * last output read as a sign-in or an approval (`phase.human-step-suspected`)
+   * becomes a human step, `birth: 'console'` — on a PERSON's request, never by
+   * itself. The step carries the link the reading saw and the words that
+   * raised it. The lane is not parked: its session is still waiting on that
+   * link and carries on by itself the moment the person finishes, so nothing is
+   * resumed either — proving the step settles it, and the ledger's clock
+   * reminds meanwhile. 409 once the lane is not silent on a suspicion any more:
+   * it spoke, or it ended, and there is nothing left to convert.
+   */
+  convertSuspectedStep(input: { slug?: unknown; phase?: unknown }, opts: { by: string }): StepVerbResult {
+    const slug = typeof input.slug === 'string' ? input.slug.trim() : '';
+    const phase = Number(input.phase);
+    if (!slug || !Number.isInteger(phase) || phase <= 0) return { ok: false, status: 400, error: 'a plan and a phase are required' };
+    const state = this.liveRunner(slug)?.current();
+    const record = state?.phases[String(phase)];
+    if (!state || !record) return { ok: false, status: 404, error: `no live run of ${slug} holds phase ${phase}` };
+    const seen = record.status === 'running' && record.stall?.signal === 'silent' ? record.stall.suspectedStep : undefined;
+    if (!seen) {
+      return { ok: false, status: 409, error: `phase ${phase} is not silent on a suspected person's turn any more — it spoke, or it ended` };
+    }
+    // One step per suspicion: a second press — a double click, the phone and
+    // the desk — answers the step the first one made, and pushes nothing.
+    const held = this.humanStepsNow().open()
+      .find((step) => step.birth === 'console' && step.slug === slug && step.phase === phase && step.runId === state.id);
+    if (held) return { ok: true, already: true, step: this.stepView(held.id) };
+    const step = this.recordHumanStep({
+      slug, phase, birth: 'console', runId: state.id,
+      ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+      step: {
+        kind: seen.kind,
+        title: `Finish what phase ${phase}'s session is waiting on`,
+        open_url: seen.url,
+        where: seen.where,
+        lines: [
+          `The session went silent after saying: "${seen.words}".`,
+          'Open the link and do what it asks; the session carries on by itself once it is done. Then press I did it.',
+        ],
+      },
+    });
+    if (!step) return { ok: false, status: 500, error: 'the step could not be recorded — the ledger refused the write' };
+    this.stepJournal(step, 'phase.human-step-converted', {
+      ...stepJournalFields(step), by: opts.by, url: seen.url, words: seen.words, suspectedAt: seen.at,
+    });
+    return { ok: true, step: this.stepView(step.id) };
+  }
+
+  /** A step still open, or the refusal a verb answers. */
+  private openStepOf(id: string): { step: HumanStep; refusal?: undefined } | { step?: undefined; refusal: StepVerbResult } {
+    const step = this.humanStepsNow().get(id);
+    if (!step) return { refusal: { ok: false, status: 404, error: 'no such step' } };
+    if (!isOpenStep(step)) {
+      return { refusal: { ok: false, status: 409, error: `this step is ${step.state} — nothing more can be done to it`, state: step.state } };
+    }
+    return { step };
+  }
+
+  /**
+   * *Open* and *Open again* — any number of times, in any state short of
+   * settled. A link: `here` answers it for the caller's own browser; `host`
+   * opens it on the machine, behind `--allow-terminal` or `--allow-agent`, and
+   * only once the caller has been shown the FULL URL and sent it back as
+   * `confirm` (until then nothing opens and nothing is counted). A command: the
+   * embedded terminal, with the command shown and run on the person's Enter
+   * (`STEP_TERMINAL_SCRIPT`) — without `--allow-terminal`, the command to run
+   * in a terminal of their own. Anything but http(s) is refused. Every open is
+   * counted and journalled (`phase.human-step-opened`).
+   */
+  async openHumanStep(
+    id: string, input: { where?: unknown; what?: unknown; confirm?: unknown }, opts: { by: string },
+  ): Promise<StepVerbResult> {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const { step } = found;
+    const ledger = this.humanStepsNow();
+    const where: 'here' | 'host' = input.where === 'host' ? 'host' : 'here';
+    const what: 'url' | 'command' = input.what === 'command' || (input.what !== 'url' && !step.openUrl && step.openCommand)
+      ? 'command' : 'url';
+    if (what === 'url') {
+      const url = step.openUrl;
+      if (!url) return { ok: false, status: 409, error: 'this step names no link to open' };
+      if (!isOpenableUrl(url)) return { ok: false, status: 400, error: 'only an http or https link is opened' };
+      if (where === 'host') {
+        if (!(this.flags.allowTerminal || agentEnabled(this.flags))) {
+          return { ok: false, status: 403, error: 'Opening on the machine is disabled. Restart with --allow-terminal or --allow-agent to enable it.' };
+        }
+        if (input.confirm !== url) return { ok: true, confirm: { url, where: 'host' }, step: this.stepView(id) };
+        const opened = await this.hostOpener(url);
+        if (!opened.opened) return { ok: false, status: 502, error: opened.detail ?? 'the machine did not open it', url };
+      }
+      const moved = ledger.move(id, 'opened', { by: opts.by, verb: 'open', where });
+      if ('refused' in moved) return refusedMove(moved);
+      this.stepJournal(moved, 'phase.human-step-opened', { n: moved.opened, where, what, by: opts.by });
+      return { ok: true, opened: { n: moved.opened, where, what, url }, step: this.stepView(id) };
+    }
+    const command = step.openCommand;
+    if (!command) return { ok: false, status: 409, error: 'this step names no command to run' };
+    const ticket = this.flags.allowTerminal
+      ? await this.terminals.mint(undefined, undefined, {
+        kind: 'shell',
+        file: process.env.SHELL || '/bin/bash',
+        args: ['-ilc', STEP_TERMINAL_SCRIPT, command],
+        label: `Your turn · ${KIND_META[step.kind].label}`,
+        ...(this.root?.path ? { cwd: this.root.path } : {}),
+        meta: { humanStep: { id: step.id } },
+      })
+      : null;
+    const via: 'terminal' | 'here' = ticket?.ok ? 'terminal' : 'here';
+    const moved = ledger.move(id, 'opened', { by: opts.by, verb: 'open', where: via });
+    if ('refused' in moved) return refusedMove(moved);
+    this.stepJournal(moved, 'phase.human-step-opened', { n: moved.opened, where: via, what, by: opts.by });
+    return {
+      ok: true,
+      opened: {
+        n: moved.opened, where: via, what, command,
+        ...(ticket?.ok ? { terminal: { sessionId: ticket.sessionId, token: ticket.token, expiresAt: ticket.expiresAt } } : {}),
+        ...(ticket && !ticket.ok ? { why: ticket.error } : {}),
+        ...(!ticket ? { why: 'The embedded terminal is disabled (restart with --allow-terminal) — run the command in a terminal of your own.' } : {}),
+      },
+      step: this.stepView(id),
+    };
+  }
+
+  /**
+   * *I did it — check now*: run the proof NOW. A `cmd:` or `gh:` proof is asked
+   * through the watch clock's own probe (`probeNow`); a terminal's exit is the
+   * proof when the step names none; a step with no proof at all is proven on a
+   * PERSON's word — never on the supervisor's (`byPerson: false`, phase 27). A
+   * landed proof moves the step to `proven`, journals it and resumes the SAME
+   * session saying what was proven; an unlanded one answers what the proof
+   * read, in its own words, and the step waits on.
+   */
+  async checkHumanStep(
+    id: string, opts: { by: string; terminalExit?: number; byPerson?: boolean; secret?: unknown },
+  ): Promise<StepVerbResult> {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const { step } = found;
+    const ledger = this.humanStepsNow();
+    // A `secret-entry` step's form posts its secret here: it goes to the
+    // credential registry under the step's id and NOWHERE else — not the
+    // ledger (which records only where it went), not a journal, not the answer.
+    let stored: { stored: 'keychain' | 'file'; probe: string } | null = null;
+    if (opts.secret !== undefined) {
+      if (step.kind !== 'secret-entry') return { ok: false, status: 400, error: 'only a secret-entry step takes a secret' };
+      if (!this.flags.allowAccounts) {
+        return { ok: false, status: 403, error: 'Storing a secret is disabled. Restart with --allow-accounts to enable it.' };
+      }
+      if (!step.credential) return { ok: false, status: 409, error: 'this step names no credential id to store its secret under' };
+      try {
+        stored = await this.stepSecretStore(step.credential, typeof opts.secret === 'string' ? opts.secret : '');
+      } catch (error) {
+        return { ok: false, status: 400, error: `the secret was not stored: ${redactSecrets((error as Error)?.message ?? String(error)).slice(0, 160)}` };
+      }
+    }
+    const begun = ledger.move(id, 'checking', { by: opts.by, verb: 'check', ...(stored ? { stored: stored.stored } : {}) });
+    if ('refused' in begun) return refusedMove(begun);
+    const ref = step.proof;
+    let landed: boolean;
+    let read: string;
+    if (stored && !ref) {
+      // The registry answered: the credential probe is green by construction.
+      landed = true;
+      read = `stored in the ${stored.stored} as ${stored.stored === 'keychain' ? stored.probe : 'a 0600 file'}`;
+    } else if (opts.terminalExit !== undefined && (opts.terminalExit !== 0 || !ref)) {
+      landed = opts.terminalExit === 0;
+      read = `the command exited ${opts.terminalExit}`;
+    } else if (ref) {
+      const verdict = await this.watchClock.probeNow(ref);
+      landed = verdict.state === 'landed';
+      read = `${verdict.state}${verdict.detail ? ` — ${verdict.detail}` : ''}`;
+    } else if (opts.byPerson !== false) {
+      landed = true;
+      read = 'it named no proof, and a person said it is done';
+    } else {
+      landed = false;
+      read = 'it names no proof, so only a person can say it is done';
+    }
+    read = redactSecrets(read.replace(/[\u0000-\u001f]+/g, ' ')).slice(0, 280);
+    if (!landed) {
+      ledger.move(id, 'notified', { by: opts.by, verb: 'check', note: read });
+      this.stepJournal(step, 'phase.human-step-checked', { landed: false, proof: ref ?? null, read, by: opts.by });
+      return { ok: true, check: { landed: false, read, ...(ref ? { ref } : {}) }, step: this.stepView(id) };
+    }
+    const proven = ledger.move(id, 'proven', { by: opts.by, verb: 'prove', note: read });
+    if ('refused' in proven) return refusedMove(proven);
+    this.stepJournal(proven, 'phase.human-step-proven', { proof: ref ?? null, read, by: opts.by });
+    const resumed = this.resumeProvenStep(proven, read, opts.by);
+    return { ok: true, check: { landed: true, read, ...(ref ? { ref } : {}) }, resumed, step: this.stepView(id) };
+  }
+
+  /**
+   * Resume the phase a proven step parked — its OWN session, told what was
+   * proven. A proof with a watch ref is offered again by the watch clock if
+   * the resume cannot start now; one with none (a terminal's exit, a person's
+   * word) becomes an errand saying the step is done and a Retry carries on.
+   */
+  private resumeProvenStep(step: HumanStep, read: string, by: string): { launched: boolean; why?: string } {
+    const run = this.stepRun(step);
+    if (!run) return { launched: false, why: 'no run holds this step — Retry the phase to carry on' };
+    const { state, record, journal } = run;
+    if (record.declared?.status !== 'needs-human' || record.declared.step?.id !== step.id) {
+      return { launched: false, why: 'the phase is no longer parked on this step' };
+    }
+    const key = record.situation?.key ?? 'blocked-declared:human-acts';
+    const parsed = parseSituationKey(key);
+    const driven = this.resumeOnWatchLanded(
+      step.slug, state,
+      { phase: step.phase, situation: { id: parsed.id, key, label: situationLabel(parsed.id, parsed.sub) } },
+      record,
+      { ref: step.proof ?? `human-step:${step.id}`, state: 'landed', detail: provenDetail(step, read, by) },
+      journal,
+      { instruction: provenInstruction(step, read, by), step: { id: step.id, kind: step.kind, by } },
+    );
+    if (driven?.launched) return { launched: true };
+    const why = !this.flags.allowRun ? 'runs are disabled on this console (--allow-run)' : 'its resume could not start now';
+    if (!step.proof) {
+      this.writeStepErrand(state, journal, step,
+        `The step is done — ${KIND_META[step.kind].label.toLowerCase()}: ${step.title} — but phase ${step.phase} could not be resumed: ${why}.`,
+        'Retry the phase to carry on from where it parked.');
+    }
+    return { launched: false, why };
+  }
+
+  /** The park's errand, rewritten in the step's words — once per settle. */
+  private writeStepErrand(state: RunState, journal: Journal, step: HumanStep, need: string, how: string): void {
+    const errand: Errand = {
+      phase: step.phase, situation: 'blocked-declared:human-acts', at: new Date().toISOString(), tried: [], need, how,
+    };
+    ((state.recoveries ??= {})[String(step.phase)] ??= { attempts: 0, lastAt: errand.at }).errand = errand;
+    journal.append('phase.errand', { ...errand }, step.phase);
+    this.announceErrand({ slug: step.slug, runId: state.id, phase: step.phase, errand });
+    try { saveRun(state); } catch { /* the ledger is the durable fact */ }
+    this.emit('run:state', { state });
+  }
+
+  /**
+   * A step settled short of proven — its window closed, a person said *I can't
+   * do this*, or it was withdrawn — written onto the phase it parked: its proof
+   * leaves the watch (`declared.step.settled`) and the errand says what a
+   * person does now. The phase stays parked; a person's Retry moves it.
+   */
+  private settleStepOnPhase(step: HumanStep, settled: 'expired' | 'cannot' | 'dismissed', need: string, how: string): void {
+    const run = this.stepRun(step);
+    if (!run || run.record.declared?.step?.id !== step.id) return;
+    run.record.declared.step.settled = settled;
+    this.writeStepErrand(run.state, run.journal, step, need, how);
+  }
+
+  /** *Snooze*: no reminder before `minutes` from now (an hour when unsaid, a day at most). */
+  snoozeHumanStep(id: string, input: { minutes?: unknown }, opts: { by: string }): StepVerbResult {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const asked = Number(input.minutes);
+    const ms = Number.isFinite(asked) && asked > 0 ? Math.min(asked * 60_000, HUMAN_STEP_SNOOZE_MAX_MS) : HUMAN_STEP_SNOOZE_DEFAULT_MS;
+    const until = new Date(Date.now() + ms).toISOString();
+    const moved = this.humanStepsNow().move(id, 'notified', { by: opts.by, verb: 'snooze', snoozeUntil: until });
+    if ('refused' in moved) return refusedMove(moved);
+    this.stepJournal(moved, 'phase.human-step-snoozed', { until, by: opts.by });
+    return { ok: true, snoozed: { until }, step: this.stepView(id) };
+  }
+
+  /**
+   * *I can't do this*: the step settles at once and becomes an errand carrying
+   * the person's reason — never a loop, and no reminder follows it.
+   */
+  cannotHumanStep(id: string, input: { reason?: unknown }, opts: { by: string }): StepVerbResult {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+    if (!reason) return { ok: false, status: 400, error: 'say why — the errand this becomes carries your reason' };
+    const moved = this.humanStepsNow().move(id, 'cannot', { by: opts.by, verb: 'cannot', note: reason });
+    if ('refused' in moved) return refusedMove(moved);
+    this.stepJournal(moved, 'phase.human-step-cannot', { reason: moved.note ?? null, by: opts.by });
+    this.settleStepOnPhase(moved, 'cannot',
+      `${opts.by} can't do this — ${KIND_META[moved.kind].label.toLowerCase()}: ${moved.title}. Their reason: ${moved.note}.`,
+      'Someone who can must do it and then Retry the phase — or change the plan so the phase no longer needs it.');
+    return { ok: true, step: this.stepView(id) };
+  }
+
+  /** *Dismiss*: withdraw the step. The phase's park stands, and its errand says so. */
+  dismissHumanStep(id: string, input: { note?: unknown }, opts: { by: string }): StepVerbResult {
+    const found = this.openStepOf(id);
+    if (found.refusal) return found.refusal;
+    const note = typeof input.note === 'string' && input.note.trim() ? input.note.trim() : 'withdrawn by a person';
+    const moved = this.humanStepsNow().move(id, 'dismissed', { by: opts.by, verb: 'dismiss', note });
+    if ('refused' in moved) return refusedMove(moved);
+    this.stepJournal(moved, 'phase.human-step-dismissed', { note: moved.note ?? null, by: opts.by });
+    this.settleStepOnPhase(moved, 'dismissed',
+      `${opts.by} withdrew the step — ${KIND_META[moved.kind].label.toLowerCase()}: ${moved.title} (${moved.note}).`,
+      'Retry the phase to board it again, or resume its session with an instruction.');
+    return { ok: true, step: this.stepView(id) };
+  }
+
+  /** The reminder clock's pass: remind what is due, expire what is past its window, withdraw the orphans. */
+  protected humanStepClockTick(now = Date.now()): StepClockPass {
+    return tickHumanSteps({
+      ledger: this.humanStepsNow(), now, quiet: this.reminderQuiet(),
+      remind: (step, n) => {
+        const pushed = this.announceHumanStep(step, n);
+        this.stepJournal(step, 'phase.human-step-reminded', { n, pushed });
+        return pushed;
+      },
+      expired: (step) => {
+        this.stepJournal(step, 'phase.human-step-expired', { until: new Date(windowEndOf(step)).toISOString() });
+        this.settleStepOnPhase(step, 'expired',
+          `The step's window closed with nothing proven — ${KIND_META[step.kind].label.toLowerCase()}: ${step.title}.`,
+          'Do it, then Retry the phase — or change the plan so the phase no longer needs it.');
+      },
+      withdrawn: (step) => {
+        // The launch door asks before any run exists (control-tower phase 44),
+        // so a plan step names none: its phase's handoff reading `complete`
+        // is what says the turn is no longer needed.
+        if (step.birth === 'plan' && this.handoffComplete(step.slug, step.phase)) return 'the phase closed';
+        const run = this.stepRun(step);
+        if (!run) return null;
+        if (run.record.status === 'done' || run.record.status === 'skipped') return 'the phase closed';
+        if (run.record.declared?.step?.id === step.id) return null;
+        const aged = now - Date.parse(step.declaredAt) > STEP_WITHDRAW_GRACE_MS;
+        // A converted suspicion was raised for the session waiting on its
+        // link: once that lane is not running, the session it served is gone.
+        if (step.birth === 'console') {
+          return aged && run.record.status !== 'running' ? 'the session it was raised for is no longer running' : null;
+        }
+        // A plan step never parked its phase, so "no longer parked on it"
+        // says nothing about it: only a closed phase withdraws one.
+        if (step.birth !== 'session') return null;
+        return aged ? 'the phase moved on — it is no longer parked on this step' : null;
+      },
+    });
+  }
+
+  /** Does the plan's handoff for this phase read `complete` — the store's own read, no engine call. */
+  private handoffComplete(slug: string, phase: number): boolean {
+    try {
+      return (this.store?.get(slug)?.handoffs ?? []).some((handoff) => handoff.phase === phase && handoff.status === 'complete');
+    } catch {
+      return false;
+    }
+  }
+
+  /** A human step's embedded terminal exited: its exit is checked as the step's proof. */
+  protected async humanStepTerminalExited(id: string, code: number): Promise<void> {
+    const step = this.humanStepsNow().get(id);
+    if (!step || !isOpenStep(step)) return;
+    await this.checkHumanStep(id, { by: 'terminal', terminalExit: code });
   }
 
   /**
@@ -2284,10 +2995,54 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // nothing more — and `done` retires the row, because nothing is waiting.
     const declared = record.declared;
     if (!declared || !['needs-human', 'waiting-external', 'blocked'].includes(declared.status)) return 'done';
+    // A `lock:` ref the CONSOLE put around this phase — derived from a stale
+    // `waitingOn`, or minted — is not what the declaration waits on, so its
+    // landing resumes nothing and can never become an errand (control-tower
+    // phase 6, #15 ask 3). Measured: four of them landed around one parked
+    // phase and each wrote the phase another errand line.
+    if (consoleLockRef(record, landed.ref)) return 'done';
+    // On a LIVE run a phase no longer parked on its declaration — failed,
+    // interrupted, gated, finished — has nothing a landing could resume in
+    // this run; the row retires rather than being offered every minute. A
+    // FAILED one still holding the declaration this ref answers is said, not
+    // retired in silence (control-tower phase 87, #126): see `landedOnFailed`.
+    const live = this.liveRunner(slug)?.current();
+    const liveStatus = live && live.id === state.id ? live.phases[String(phase)]?.status : undefined;
+    if (liveStatus && !['waiting', 'parked', 'pending', 'queued'].includes(liveStatus)) {
+      if (liveStatus === 'failed') this.landedOnFailed(slug, live!, phase, landed);
+      return 'done';
+    }
     if (!this.root?.ok) return 'deferred';
     const key = record.situation?.key ?? 'blocked-declared:external';
     const parsed = parseSituationKey(key);
-    const journal = new Journal(this.root.path, slug, state.id);
+    const journal = Journal.for(this.root.path, slug, state.id);
+    // A person's turn (control-tower phase 43): the ref that landed is an open
+    // human step's PROOF. The step is proven — once; a re-offer finds it proven
+    // already — and the session is resumed told what was proven, not that
+    // "external work" landed.
+    const onStep = record.declared?.step;
+    if (onStep?.proof === landed.ref && !onStep.settled) {
+      const ledger = this.humanStepsNow();
+      let step = ledger.get(onStep.id);
+      if (step && isOpenStep(step)) {
+        const read = redactSecrets(`landed${landed.detail ? ` — ${landed.detail}` : ''}`).slice(0, 280);
+        const proven = ledger.move(step.id, 'proven', { by: 'watch', verb: 'prove', note: read });
+        if (!('refused' in proven)) {
+          step = proven;
+          journal.append('phase.human-step-proven', { stepId: step.id, kind: step.kind, proof: landed.ref, read, by: 'watch' }, phase);
+        }
+      }
+      if (step?.state === 'proven') {
+        const by = step.provenBy ?? 'watch';
+        const drove = this.resumeOnWatchLanded(
+          slug, state,
+          { phase, situation: { id: parsed.id, key, label: situationLabel(parsed.id, parsed.sub) } },
+          record, { ...landed, detail: provenDetail(step, step.read, by) }, journal,
+          { instruction: provenInstruction(step, step.read, by), step: { id: step.id, kind: step.kind, by } },
+        );
+        return drove?.launched ? 'resumed' : 'deferred';
+      }
+    }
     const driven = this.resumeOnWatchLanded(
       slug, state,
       { phase, situation: { id: parsed.id, key, label: situationLabel(parsed.id, parsed.sub) } },
@@ -2307,6 +3062,36 @@ export abstract class ServiceRecovery extends ServiceRuns {
   }
 
   /**
+   * A watched ref LANDED on a phase this live run reads `failed`
+   * (control-tower phase 87, #126) — a declared block the old build settled
+   * `failed` instead of parking it, or a park a person's Stop ended. Nothing in
+   * the run resumes a failed phase by itself, and #126 measured the landing
+   * retired in silence: P50 and P41 sat `failed` for hours behind watches that
+   * had landed, and nothing on the card said a Retry was all it took. Now the
+   * landing is journalled (`resumed: false`) and becomes ONE errand per
+   * declaration naming it and the press that acts on it; the caller answers
+   * `done`, which the scheduler keeps on the record, so it is never re-offered.
+   */
+  private landedOnFailed(slug: string, state: RunState, phase: number, landed: WatchState): void {
+    const record = state.phases[String(phase)];
+    if (!record || !this.root?.ok) return;
+    const journal = Journal.for(this.root.path, slug, state.id);
+    const journalled = record.watchLandedJournalledFor ?? [];
+    if (!journalled.includes(landed.ref)) {
+      record.watchLandedJournalledFor = [...journalled, landed.ref];
+      journal.append('phase.watch-landed', {
+        ref: landed.ref, detail: landed.detail ?? null, resumed: false, why: 'the phase reads failed',
+      }, phase);
+    }
+    const key = record.situation?.key ?? 'blocked-declared:external';
+    const what = `${landed.ref} landed${landed.detail ? ` (${landed.detail})` : ''}`;
+    this.landingErrand(slug, state, record, { phase, situation: { id: parseSituationKey(key).id, key } }, landed,
+      `${what}, but phase ${phase} reads failed, and nothing in this run resumes a failed phase by itself.`,
+      journal,
+      'Press Retry to board it again now that what it waited on has landed — or resume its session with an instruction.');
+  }
+
+  /**
    * The declared resume: the external thing the session parked on has landed,
    * so its OWN session continues — the rung table's `poll-park` promise, made
    * real. No rung is accounted: this is not a remedy for a failure, it is the
@@ -2320,8 +3105,11 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // situation KEY and no reason to reconstruct a classification around them.
     c: { phase: number; situation: { id: string; key: string; label: string } },
     record: RunPhaseRecord, landed: WatchState, journal: Journal,
+    // A proven human step (control-tower phase 43) resumes through this same
+    // path, with its own words and the step on the landing.
+    opts: { instruction?: string; step?: { id: string; kind: string; by: string } } = {},
   ): AutoRecoverResult | null {
-    const frozen = this.fleetHold();
+    const frozen = this.fleetHoldFor(slug);
     if (frozen) {
       log.info('run.watch-landed-frozen', { slug, phase: c.phase, ref: landed.ref, by: frozen.by });
       return null;
@@ -2333,6 +3121,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
     // landing is offered again once the drive in flight has settled.
     const driveKey = `${slug}#${c.phase}`;
     if (this.watchDrives.has(driveKey)) return null;
+    // A run whose loop is LIVE is written through its own objects — the
+    // watch clock usually hands us exactly those (`watchableRuns`), and a copy
+    // read from disk a moment before the loop started would have its writes
+    // overwritten by the loop's next save. The landing then goes to that
+    // loop's own lanes (`landWatch`, below), never to `recoverPhase`.
+    const liveLane = this.liveRunner(slug);
+    const liveState = liveLane?.current();
+    if (liveLane && liveState?.id === state.id && liveState !== state) {
+      state = liveState;
+      record = liveState.phases[String(c.phase)] ?? record;
+    }
     // Once per LANDING, not once per delivery. The landing is re-offered until
     // a resume actually starts, so a line written here unconditionally appeared
     // four times for one event — three of them saying the world had landed
@@ -2383,12 +3182,17 @@ export abstract class ServiceRecovery extends ServiceRuns {
       return null;
     }
     record.watchResumes = resumes;
-    // One of the six automatic resumes, journalled in the one shape with what
+    const onLiveLane = Boolean(liveLane) && liveLane!.current()?.id === state.id;
+    // One of the automatic resumes, journalled in the one shape with what
     // woke it (LFC-7). Its bound is its own — a landing's deliveries, which
-    // retire with the declaration they answer — so it is counted there.
-    journal.append('phase.resume-automatic', {
-      trigger: 'watch', path: 'watch-landed', count: resumes, sessionId: sessionId ?? null, ref: landed.ref, by: 'watch',
-    }, c.phase);
+    // retire with the declaration they answer — so it is counted there. The
+    // live-lane delivery journals its own line (`landWatch`, path `live-lane`).
+    if (!onLiveLane) {
+      journal.append('phase.resume-automatic', {
+        trigger: 'watch', path: 'watch-landed', count: resumes, sessionId: sessionId ?? null, ref: landed.ref, by: 'watch',
+        ...(opts.step ? { stepId: opts.step.id } : {}),
+      }, c.phase);
+    }
     // The delivery stamp — written HERE, beside the charge, where the
     // settlement below can still reach it, and never by the scheduler. Round
     // 3's H1: the scheduler stamped it after `onLanded` returned, so a fast
@@ -2420,11 +3224,35 @@ export abstract class ServiceRecovery extends ServiceRuns {
         ...(landed.detail ? { detail: landed.detail } : {}),
         at: new Date().toISOString(),
         resumes,
+        ...(opts.step ? { step: opts.step } : {}),
+      };
+      // A landing takes a declared wall down as a FENCE (control-tower phase
+      // 6, #19): its siblings read `landed` as why, whatever happens next.
+      if (record.declared.status === 'needs-human' || record.declared.status === 'blocked') {
+        record.fenceLifted = { why: 'landed', at: record.declared.landed.at };
+      }
+    }
+    if (onLiveLane) {
+      // The run's loop is driving: the landing boards through its own lanes,
+      // ahead of its scope, and no `recoverPhase` is called — so there is no
+      // "in progress" refusal to charge (control-tower phase 6, #15).
+      if (!liveLane!.landWatch(c.phase, landed, { count: resumes, sessionId: sessionId ?? null })) {
+        this.voidWatchDelivery(record, landed.ref, resumes);
+        return null;
+      }
+      this.announce('phase', {
+        title: opts.step ? `A person's turn is done · ${slug} P${c.phase}` : `External work landed · ${slug} P${c.phase}`,
+        body: `${landed.ref}${landed.detail ? ` (${landed.detail})` : ''} — the phase's own session resumes in this run's next lane.`,
+        tag: tagFor('phase', state.id, `watch-landed-${c.phase}`),
+      }, { slug, runId: state.id, phase: c.phase });
+      return {
+        launched: true, phase: c.phase, situation: c.situation.key, label: c.situation.label,
+        rung: 'poll-park', vehicle: sessionId ? 'session' : 'retry',
       };
     }
     try { saveRun(state); } catch { /* the launch matters more than the write */ }
     this.emit('run:state', { state });
-    const instruction = `The external work this phase declared it was waiting on has landed: `
+    const instruction = opts.instruction ?? `The external work this phase declared it was waiting on has landed: `
       + `${landed.ref}${landed.detail ? ` (${landed.detail})` : ''}. ${landingDirective(landed)} then carry the `
       + 'phase to its exit criteria — verify, commit, and write the handoff — or declare the next '
       + 'honest outcome with phase-outcome.sh.';
@@ -2498,7 +3326,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         // admission. Every guard the freeze/flags family imposes re-applies.
         if (!after || after.id !== state.id) return;
         if (after.status !== 'parked' || after.halt) return;
-        if (this.fleetHold() || this.prefs.autoContinueRecovery === false || !this.flags.allowRun || this.liveRunner(slug)) return;
+        if (this.fleetHoldFor(slug) || this.prefs.autoContinueRecovery === false || !this.flags.allowRun || this.liveRunner(slug)) return;
         await this.startRun(slug, {
           actor: watchActor,
           resumeRunId: after.id,
@@ -2518,6 +3346,15 @@ export abstract class ServiceRecovery extends ServiceRuns {
         // backed off, and the warning said once per reason per lease (SLF-8,
         // RCV-8) — the un-charged offer used to come back every minute.
         this.voidWatchDelivery(record, landed.ref, resumes);
+        // The console busy with ITSELF is not a rejection of the landing
+        // (control-tower phase 6, #15 ask 2): this plan's runner went live
+        // between the offer and the drive. Un-charged above, never counted,
+        // and offered again — to `landWatch`, now that a loop is driving.
+        if (error instanceof RunBusyError) {
+          log.info('run.watch-resume-void', { slug, phase: c.phase, ref: landed.ref, busy: true });
+          try { saveRun(state); } catch { /* the next pass re-derives it anyway */ }
+          return;
+        }
         const rejection = this.chargeWatchRejection(record, landed.ref, error);
         if (!rejection.repeated) {
           log.warn('run.watch-resume-failed', {
@@ -2540,7 +3377,7 @@ export abstract class ServiceRecovery extends ServiceRuns {
         log.warn('run.watch-resume-settle-failed', { slug, phase: c.phase, ref: landed.ref, error: (error as Error)?.message ?? String(error) });
       });
     this.announce('phase', {
-      title: `External work landed · ${slug} P${c.phase}`,
+      title: opts.step ? `A person's turn is done · ${slug} P${c.phase}` : `External work landed · ${slug} P${c.phase}`,
       body: `${landed.ref}${landed.detail ? ` (${landed.detail})` : ''} — the phase's own session resumes to finish.`,
       tag: tagFor('phase', state.id, `watch-landed-${c.phase}`),
     }, { slug, runId: state.id, phase: c.phase });

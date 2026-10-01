@@ -100,6 +100,24 @@ pe_landing() { DOCS_ROOT="${DOCS_ROOT:?}" "$SYS_BASH" "$PE_SCRIPTS/phase-landing
   [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]
 }
 
+@test "writers at the same moment never lose a row — two lanes that land at once are both on the ledger" {
+  # The upsert reads the file, writes a copy and moves it over the original. Two
+  # writers that read before either moved lost the first one's row: a parked
+  # phase's `conflict` row went missing beside its sibling's `held` whenever the
+  # two lanes landed together (worktree.test.ts EC2, red at load ~70).
+  setup_docs landing landing
+  local n=12 i
+  for i in $(seq 1 "$n"); do
+    pe_landing landing 4 held --repo "r$i" --ref "pe/landing-p$i" >/dev/null 2>&1 &
+  done
+  wait
+  run pg landing --landing 4
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c .)" -eq "$n" ]
+  # Nothing is left behind: no section, no temporary copy.
+  [ -z "$(find "$DOCS_ROOT/docs/handoffs/landing" -name '*.tmp.*' -o -name '*.lock' | head -1)" ]
+}
+
 @test "a note with a pipe in it cannot break the table" {
   setup_docs landing landing
   run pe_landing landing 4 failed --note 'git said: a | b'

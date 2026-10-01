@@ -24,7 +24,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { openInEditor, WriteError } from '../server/writes.ts';
+import { openInEditor, planWrite, WriteError } from '../server/writes.ts';
 
 function library(): { root: string; docs: string } {
   const root = mkdtempSync(join(tmpdir(), 'phase-writes-'));
@@ -101,4 +101,23 @@ test('insideDir is the same predicate, shared — and answers for the QA-report 
   assert.equal(insideDir(docs, join(docs, '..', '..', 'etc', 'passwd')), false);
   assert.equal(insideDir(docs, docs), false, 'the base itself is not a file inside it');
   assert.equal(insideDir(docs, join(docs, '..')), false);
+});
+
+test('the wait-budget write stays inside the one plan it names: no path in the slug, no flag in a ref, no --git (control-tower phase 14, #40)', () => {
+  const root = '/repo';
+  const ok = planWrite({ action: 'wait-budget', slug: 'alpha', phase: 2, minutes: 90, refs: ['gh:acme/app#run/42'] }, { root });
+  assert.equal(ok.script, 'wait-budget.sh');
+  assert.deepEqual(ok.args, ['alpha', '--phase', '2', '--ref', 'gh:acme/app#run/42', '90m']);
+  assert.ok(!ok.args.includes('--git'));
+  assert.deepEqual(planWrite({ action: 'wait-budget', slug: 'alpha', minutes: 720 }, { root }).args, ['alpha', '720m']);
+  for (const bad of [
+    { slug: '../escape', phase: 2, minutes: 90 },
+    { slug: 'alpha', phase: 2, minutes: 90, refs: ['--git'] },
+    { slug: 'alpha', phase: 2, minutes: 90, refs: ['a`b'] },
+    { slug: 'alpha', phase: 2, minutes: 90.5 },
+    { slug: 'alpha', phase: 2, minutes: 99_999 },
+    { slug: 'alpha', minutes: 90, refs: ['gh:acme/app#run/42'] },
+  ]) {
+    assert.throws(() => planWrite({ action: 'wait-budget', ...bad }, { root }), WriteError, JSON.stringify(bad));
+  }
 });

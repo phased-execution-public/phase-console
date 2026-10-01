@@ -37,21 +37,28 @@
  */
 
 import { Snowflake } from 'lucide-react';
-import { Badge, Duration, Heartbeat } from '@/components/ui';
-import { money } from '@/lib/format';
+import { Badge, Duration } from '@/components/ui';
+import { clockWords, money } from '@/lib/format';
+import { useNow } from '@/lib/clock';
 import { cn } from '@/lib/cn';
-import { STALL_DEFAULTS } from '@shared/attention-model.js';
-import type { NowLane } from '@/features/now/model';
+import { SILENCE_LABELS } from '@shared/attention-model.js';
+import type { NowLane } from '@/features/runs/lanes-model';
+import type { LaneLiveness } from '@/lib/api';
 
-/** The stall detector's own floor, so a dot and the runner agree on "silent". */
-const SILENT_AFTER_MS: number = STALL_DEFAULTS.stallSilentMs;
+/** The server's reading of which silence a lane is in (`liveness.silence`, #28). */
+export type LaneSilence = NonNullable<LaneLiveness['silence']>;
 
 /** What every surface knows about a lane, in the one shape they all have. */
 export interface LaneFacts {
   /** Epoch ms, or `null` when the lane has not started. */
   startedAt: number | null;
-  /** Epoch ms of the last thing this session said, for the heartbeat. */
-  lastOutputAt: number | null;
+  /**
+   * Which silence the lane is in, since when and against which threshold —
+   * the server's own reading (`server/runner/liveness.ts` `silenceOf`), or
+   * `null` while it reports none. Never a gap timed here off the last output
+   * (#28): keepalives and API retries move that clock while nothing is made.
+   */
+  silence: LaneSilence | null;
   costUsd: number | null;
   model: string | null;
   effort: string | null;
@@ -63,10 +70,9 @@ export interface LaneFacts {
 /** The `NowLane` adapter — the one model most surfaces already hold. */
 export function laneFacts(lane: NowLane): LaneFacts {
   const started = lane.startedAt ? Date.parse(lane.startedAt) : NaN;
-  const beat = lane.liveness?.lastOutputAt ? Date.parse(lane.liveness.lastOutputAt) : NaN;
   return {
     startedAt: Number.isFinite(started) ? started : null,
-    lastOutputAt: Number.isFinite(beat) ? beat : null,
+    silence: lane.liveness?.silence ?? null,
     costUsd: lane.costUsd ?? null,
     model: lane.model ?? null,
     effort: lane.effort ?? null,
@@ -76,15 +82,36 @@ export function laneFacts(lane: NowLane): LaneFacts {
 }
 
 /**
- * Silence, drawn as silence.
+ * Silence, named (control-tower phase 24, #28).
  *
- * It stops pulsing once the gap passes the stall floor and writes the gap out
- * instead. A dot that keeps beating over a wedged session is the lie this
- * console exists not to tell.
+ * WHICH quiet the lane is in — no output, no productive output, inside a tool
+ * call, waiting on its own job or on an outside clock — how long, and the
+ * threshold it is measured against, all as the server read them. "silent 12m"
+ * alone said none of that, and it was timed off the last output, which a
+ * keepalive resets while the lane makes nothing. Nothing is drawn while the
+ * server reports no silence: a figure this browser invented would be a sixth
+ * clock.
  */
 export function LaneBeat({ facts, live }: { facts: LaneFacts; live: boolean }) {
+  const silence = live ? facts.silence : null;
+  const now = useNow(Boolean(silence), 5_000);
+  if (!silence) return null;
+  const label = (SILENCE_LABELS as Readonly<Record<string, string>>)[silence.kind] ?? silence.kind;
+  const ms = Math.max(0, now - silence.sinceMs);
+  const past = ms >= silence.thresholdMs;
   return (
-    <Heartbeat lastBeatAt={facts.lastOutputAt} staleAfterMs={SILENT_AFTER_MS} live={live} label="lane" />
+    <span
+      className={cn('shrink-0 text-2xs tabular-nums', past ? 'text-ink' : 'text-ink-muted')}
+      data-testid="lane-silence"
+      data-silence={silence.kind}
+      title={`The server's reading: ${label} since ${new Date(silence.sinceMs).toLocaleTimeString()}, measured against ${clockWords({ verb: 'a threshold of', ms: silence.thresholdMs, tense: 'for' })}.`}
+    >
+      {clockWords({ verb: label, ms, tense: 'for' })}
+      <span className="text-ink-faint">
+        {' '}
+        / {clockWords({ verb: 'stalls at', ms: silence.thresholdMs, tense: 'for' })}
+      </span>
+    </span>
   );
 }
 

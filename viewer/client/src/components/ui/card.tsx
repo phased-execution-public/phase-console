@@ -67,7 +67,7 @@ export function Tile({
   label: string;
   value: React.ReactNode;
   hint?: React.ReactNode;
-  /** Paints the value with a state colour — `state-ready` for a ready count. */
+  /** Paints the value with a state colour — `state-queued` for a ready count. */
   state?: string;
 } & HTMLAttributes<HTMLDivElement>) {
   return (

@@ -21,7 +21,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   CopyButton,
   Spinner,
 } from '@/components/ui';
@@ -86,7 +86,7 @@ export function LandingCard({ detail }: { detail: PlanDetail }) {
       <CardHeader>
         <CardTitle>Landing packet</CardTitle>
         <div className="flex items-center gap-2">
-          {view?.finished && <Chip tone="ok">every phase done</Chip>}
+          {view?.finished && <Badge tone="ok">every phase done</Badge>}
           <Button size="sm" variant="ghost" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
             {open ? 'Hide' : 'Show'}
           </Button>

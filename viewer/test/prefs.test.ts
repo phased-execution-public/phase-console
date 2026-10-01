@@ -9,6 +9,7 @@
  * rather than stored.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
@@ -159,6 +160,8 @@ test('sanitiseAutomation is the single coercion table', () => {
     ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
     // The start ceiling (phase 7): forty automatic starts and $250 per sliding hour.
     ceilingStartsPerHour: 40, ceilingUsdPerHour: 250,
+    // The account forecast's warning lead and its opt-in hold (control-tower phase 92).
+    usageForecastLeadHours: 2, usageForecastHold: false,
     // `delegateHumanGates` is ON since 5.0.0 (phase 11, operator decision 11:
     // `gates: delegated`) — this console's word for the manifest's `gates` row.
     unblockAttempts: true, delegateHumanGates: true, staleClaimTakeover: true,
@@ -514,4 +517,24 @@ test('P7: the per-repository cap, the retention word and the base branch all hav
   // `worktreeSetup` does: a half-coerced value must never reach a git argv.
   assert.equal(sanitiseAutomation({ baseBranch: 12 } as never).baseBranch, 'origin/HEAD');
   assert.equal(sanitiseAutomation({ baseBranch: '  release/5.1  ' }).baseBranch, 'release/5.1');
+});
+
+test('PR-10 (control-tower phase 53, #56): a pref set to null returns to its shipped default, in memory and on disk', () => {
+  writeConfig({});
+  const service = makeService();
+  try {
+    assert.equal(service.savePreferences({ ladderPerPhaseRungs: 6 }).ladderPerPhaseRungs, 6);
+    assert.equal(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')).ladderPerPhaseRungs, 6);
+    // It used to be dropped like a typo: 200, and the raised cap stayed.
+    const back = service.savePreferences({ ladderPerPhaseRungs: null } as never);
+    assert.equal(back.ladderPerPhaseRungs, 3, 'null is how an override is taken back');
+    assert.equal(JSON.parse(readFileSync(CONFIG_FILE, 'utf8')).ladderPerPhaseRungs, 3);
+    // A null for a key with no shipped default is still dropped, and moves nothing else.
+    const again = service.savePreferences({ somethingElse: null, mcpPolicy: 'require' } as never);
+    assert.ok(!('somethingElse' in again));
+    assert.equal(again.mcpPolicy, 'require');
+    assert.equal(again.ladderPerPhaseRungs, 3);
+  } finally {
+    service.close();
+  }
 });

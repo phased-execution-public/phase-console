@@ -31,7 +31,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   Empty,
   Spinner,
   field,
@@ -66,12 +66,12 @@ export function ReviewVerdictChip({
   if (!review) return null;
   const copy = VERDICT_COPY[review.verdict as ReviewVerdict];
   const label = copy?.label ?? review.verdict;
-  const tone = review.verdict === 'requested-changes' ? 'gate' : undefined;
+  const tone = review.verdict === 'requested-changes' ? 'accent' : undefined;
   const title = `Review: ${label}${review.by ? ` by ${review.by}` : ''} — ${copy?.hint ?? ''}`;
   const chip = (
-    <Chip {...(tone ? { tone } : {})} title={title}>
+    <Badge {...(tone ? { tone } : {})} title={title}>
       review {label}
-    </Chip>
+    </Badge>
   );
   return href ? <a href={href}>{chip}</a> : chip;
 }
@@ -320,10 +320,10 @@ export function ReviewCard({
         <div className="flex flex-wrap items-center gap-1.5">
           <ReviewVerdictChip {...(view.review ? { review: view.review } : {})} />
           {data && !data.diff.failed && (
-            <Chip mono>
+            <Badge mono>
               {files.length} file{files.length === 1 ? '' : 's'} · +{data.diff.additions} −
               {data.diff.deletions}
-            </Chip>
+            </Badge>
           )}
           <Button size="sm" variant="ghost" onClick={() => setOpen((v) => !v)}>
             {open ? 'Hide diff' : 'Read the diff'}

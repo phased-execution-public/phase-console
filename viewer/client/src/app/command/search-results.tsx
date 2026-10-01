@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { Chip, CommandGroup, CommandItem, Spinner } from '@/components/ui';
+import { Badge, CommandGroup, CommandItem, Spinner } from '@/components/ui';
 import { usePlans, useSearch } from '@/lib/queries';
 import { closedTitle, isClosed } from '@/lib/closure';
 import { handoffHref, phaseHref, planHref } from '@/app/routes';
@@ -148,7 +148,7 @@ export function SearchResults({ query, onPick }: { query: string; onPick: (href:
           <span className="min-w-0 flex-1">
             <span className="flex items-baseline gap-1.5">
               <span className="shrink-0 font-mono text-2xs text-ink-faint">{slug}</span>
-              {closed.has(slug) && <Chip title={closedTitle(closed.get(slug))}>closed</Chip>}
+              {closed.has(slug) && <Badge title={closedTitle(closed.get(slug))}>closed</Badge>}
               <span className="truncate text-2xs tracking-wide text-ink-faint uppercase">
                 {KIND_LABEL[hit.kind] ?? hit.kind} · {hit.section}
               </span>

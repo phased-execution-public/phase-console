@@ -38,7 +38,7 @@ import {
   CardTitle,
   CardSkeleton,
   Checkbox,
-  Chip,
+  Badge,
   Empty,
   SectionHeading,
   field,
@@ -238,7 +238,7 @@ function Destination({
               : ' · never reached'}
           </span>
           {hook.failures > 0 && (
-            <span className="mt-0.5 block text-2xs text-blocked">
+            <span className="mt-0.5 block text-2xs text-failed">
               {plural(hook.failures, 'failure')} in a row
               {hook.lastFailure
                 ? ` — ${hook.lastFailure.status || 'no answer'}${hook.lastFailure.reason ? ` ${hook.lastFailure.reason}` : ''}`
@@ -274,9 +274,9 @@ function Destination({
               <span className="min-w-0">
                 <span className="text-ink">{category.label}</span>
                 {category.urgent && (
-                  <Chip tone="warn" className="ml-1.5">
+                  <Badge tone="accent" className="ml-1.5">
                     urgent
-                  </Chip>
+                  </Badge>
                 )}
                 <span className="mt-0.5 block text-2xs text-ink-muted">{category.detail}</span>
               </span>

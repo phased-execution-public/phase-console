@@ -11,7 +11,7 @@
 
 import { Bars, Calendar } from '@/components/charts';
 import { Button, Card, CardBody, CardHeader, CardTitle, Empty } from '@/components/ui';
-import { nowHref } from '@/app/routes';
+import { runsBayHref } from '@/app/routes';
 import type { Portfolio } from '@/lib/api';
 
 export function VelocityPanel({ stats }: { stats: Portfolio }) {
@@ -46,7 +46,7 @@ export function VelocityPanel({ stats }: { stats: Portfolio }) {
               body="A handoff with status: complete is what puts a bar here."
               action={
                 <Button asChild size="sm">
-                  <a href={nowHref('next')}>See what could start</a>
+                  <a href={runsBayHref('ready')}>See what could start</a>
                 </Button>
               }
             />

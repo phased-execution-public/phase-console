@@ -21,6 +21,7 @@ test('selfRestartPlan: the process\'s own executable, its own argv minus the exe
     ['/opt/node/bin/node', '/srv/console/viewer/server/index.ts', '--allow-run', '--allow-writes', '--port', '4130', '--remote', 'box.ts.net'],
     '/opt/node/bin/node',
     '/srv/console',
+    [],
   );
   assert.equal(plan.file, '/opt/node/bin/node');
   assert.deepEqual(plan.args, ['/srv/console/viewer/server/index.ts', '--allow-run', '--allow-writes', '--port', '4130', '--remote', 'box.ts.net']);
@@ -32,8 +33,28 @@ test('selfRestartPlan: the process\'s own executable, its own argv minus the exe
 test('selfRestartPlan defaults to this very process', () => {
   const plan = selfRestartPlan();
   assert.equal(plan.file, process.execPath);
-  assert.deepEqual(plan.args, process.argv.slice(1));
+  assert.deepEqual(plan.args, [...process.execArgv, ...process.argv.slice(1)]);
   assert.equal(plan.cwd, process.cwd());
+});
+
+test('selfRestartPlan carries the NODE arguments too — a successor is never less able', () => {
+  // node strips its own flags out of `process.argv`, so a plan built from argv
+  // alone restarted a 6 GB console onto V8's default 4 GB and met the same heap
+  // limit an hour later. `execArgv` is where they went.
+  const plan = selfRestartPlan(
+    ['/opt/node/bin/node', '/srv/console/viewer/server/index.ts', '--port', '4130'],
+    '/opt/node/bin/node',
+    '/srv/console',
+    ['--max-old-space-size=6144', '--heapsnapshot-near-heap-limit=1'],
+  );
+  assert.deepEqual(plan.args, [
+    '--max-old-space-size=6144',
+    '--heapsnapshot-near-heap-limit=1',
+    '/srv/console/viewer/server/index.ts',
+    '--port',
+    '4130',
+  ], 'node arguments come FIRST — after the script path they are the console\'s, not node\'s');
+  assert.ok(plan.command.startsWith('node --max-old-space-size=6144 '));
 });
 
 test('restartVerdict: supervised → ok without a self-restart; unsupervised → ok BY self-restart', () => {

@@ -492,7 +492,17 @@ export type VerifyApprovals = {
  * display and must never key anything.
  */
 export function commandFingerprint(text: string): string {
-  return createHash('sha256').update(text.replace(/\s+/g, ' ').trim()).digest('hex');
+  return createHash('sha256').update(foldCommand(text)).digest('hex');
+}
+
+/**
+ * A command's text with its whitespace folded — what `commandFingerprint`
+ * hashes, and the key a session's recorded proof is matched on (`proofs.ts`,
+ * control-tower phase 62). `phase-outcome.sh … verified` folds the same way
+ * before it writes, so the two ends compare equal strings.
+ */
+export function foldCommand(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 /**
@@ -999,6 +1009,54 @@ function closingParen(text: string, open: number): number {
   return -1;
 }
 
+/** A chain member that only sets up the ones after it — carried into each, never a check of its own. */
+const CHAIN_SETUP_LEADS: ReadonlySet<string> = new Set(['cd', 'pushd', 'export', 'source', '.', 'set', 'unset', 'umask', 'ulimit']);
+
+/**
+ * The members of a top-level `&&` chain, each runnable ALONE — what #103's
+ * chained-gate comment asks attribution to do (control-tower phase 83, the
+ * fifth amendment). A chain stops at its first red member, so `vitest run &&
+ * node ratchet.mjs` red on vitest never said whether the ratchet was red too:
+ * one owner was reported where there were two. Only `&&` separates members
+ * (outside quotes and parentheses); a member keeps its own `||`, `|` and `;`.
+ * A member that only sets up the rest — `cd`, `export`, … — is carried as a
+ * prefix into every member after it, because `npm test` alone would run in
+ * the wrong directory. Null when there are not two checks to tell apart, or
+ * the quoting cannot be read.
+ */
+export function chainMembers(command: string): string[] | null {
+  const parts: string[] = [];
+  let buffer = '';
+  let quote: string | null = null;
+  let depth = 0;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote) {
+      if (quote === '"' && ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+      if (ch === quote) quote = null;
+      buffer += ch;
+      continue;
+    }
+    if (ch === '\\' && next !== undefined) { buffer += ch + next; i++; continue; }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    else if (ch === '&' && next === '&' && depth === 0) { parts.push(buffer.trim()); buffer = ''; i++; continue; }
+    buffer += ch;
+  }
+  if (quote || depth !== 0) return null;
+  parts.push(buffer.trim());
+  if (parts.some((part) => !part)) return null;
+  const prefix: string[] = [];
+  const members: string[] = [];
+  for (const part of parts) {
+    if (CHAIN_SETUP_LEADS.has(part.split(/\s+/)[0])) { prefix.push(part); continue; }
+    members.push([...prefix, part].join(' && '));
+  }
+  return members.length >= 2 ? members : null;
+}
+
 /** `(cd api && pytest -q)` is one command wearing parentheses. */
 function unwrap(command: string): string {
   let text = command.trim();
@@ -1165,6 +1223,194 @@ function condense(text: string): string {
 }
 
 /* ------------------------------------------------------------------ *
+ * The clock, and what a red names
+ * ------------------------------------------------------------------ */
+
+/**
+ * Per §Verification command, when nothing more specific says (control-tower
+ * phase 83, #95: a plan's `Verify timeout:`, else the line's measured history
+ * — `verify-ledger.ts` `resolveVerifyLimit`). Half an hour, because the number
+ * is a statement about what a phase's verification IS: a full suite, often a
+ * build, sometimes a container. At the old 15-minute default a slow-but-green
+ * check came back red and halted a phase that had done nothing wrong.
+ * `runner-core.ts` re-exports it under the same name.
+ */
+export const VERIFY_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * No command's limit exceeds this, however long its history or its retry: a
+ * wedged command must still end, and four hours is past any suite measured.
+ */
+export const VERIFY_TIMEOUT_CEILING_MS = 4 * 60 * 60_000;
+
+/**
+ * A cut command's one retry runs at this multiple of its limit (#95). A cut
+ * proves only "longer than the limit"; the measured case was a suite at 34 min
+ * against 30 under the autopilot's own load, and the same limit again would
+ * have cut it again.
+ */
+export const TIMEOUT_RETRY_FACTOR = 2;
+
+/** How many failing tests one command's record names at most. */
+export const FAILURE_CAP = 200;
+
+/**
+ * The failing tests a test runner's output names, each once, in order
+ * (control-tower phase 83, #103) — what a verification baseline is compared by.
+ *
+ * Three shapes, the ones this codebase's §Verification lines print: node's
+ * `spec` reporter (`✖ name (1.2ms)` — node 24 prints it even into a pipe, and
+ * repeats every failure under `✖ failing tests:`), TAP from `node --test
+ * --test-reporter=tap` (`not ok 3 - name`, indented when nested), and TAP from
+ * bats (`not ok 3 name`). A `# TODO` failure is not a failure. Output that
+ * names no test — a crash, a compiler error — answers nothing, and the caller
+ * compares the whole command instead.
+ */
+export function failureIds(output: string): string[] {
+  const scanner = new FailureScanner();
+  scanner.push(output);
+  return scanner.end();
+}
+
+const SPEC_FAILURE = /^\s*✖ (.+?) \(\d+(?:\.\d+)?m?s\)\s*$/;
+const TAP_FAILURE = /^\s*not ok \d+(?: -)? (.+?)\s*$/;
+
+/** `failureIds` over a stream — one command's output arrives in chunks that split lines anywhere. */
+export class FailureScanner {
+  private partial = '';
+  private readonly seen = new Set<string>();
+
+  push(chunk: string): void {
+    const text = this.partial + chunk;
+    const lines = text.split('\n');
+    this.partial = lines.pop() ?? '';
+    for (const line of lines) this.line(line);
+  }
+
+  end(): string[] {
+    if (this.partial) this.line(this.partial);
+    this.partial = '';
+    return [...this.seen];
+  }
+
+  private line(raw: string): void {
+    if (this.seen.size >= FAILURE_CAP) return;
+    const line = raw.replace(/\r$/, '');
+    const spec = SPEC_FAILURE.exec(line);
+    if (spec) { this.seen.add(spec[1]); return; }
+    const tap = TAP_FAILURE.exec(line);
+    if (!tap) return;
+    if (/\s#\s*(?:TODO|SKIP)\b/i.test(tap[1])) return;
+    this.seen.add(tap[1].replace(/\s+#\s.*$/, ''));
+  }
+}
+
+/** A verification's rows, judged — see `verificationVerdict`. */
+export type VerificationVerdict = {
+  /** No command's FINAL attempt is red, and none was cut by the clock. */
+  ok: boolean;
+  /** The rows that ARE a command's verdict and are red: the halt's list. */
+  broke: VerifyRun[];
+  /**
+   * The rows that ARE a command's verdict and failed on the MACHINE — an exit
+   * 127, a named `PRECONDITION`, a refused connection to the session's own
+   * port (control-tower phase 89, `environmentOf`). Not green and not red:
+   * `unproven`, never charged, never a re-open.
+   */
+  unproven: VerifyRun[];
+  /** Red (or cut) first attempts a green retry of the same command answered. */
+  rescued: VerifyRun[];
+  /**
+   * The rows that ARE a command's verdict and were cut by the verification's
+   * clock (control-tower phase 83, #95): `verify-timeout`, which is not a red.
+   */
+  timedOut: VerifyRun[];
+};
+
+/**
+ * The ONE verdict over a verification's rows (control-tower phase 45, #45).
+ *
+ * A red command is retried once and BOTH attempts stay on the record, the
+ * second marked `retry` — so the rows are attempts, and a command's verdict is
+ * its last attempt. A red row that a green retry of the same command follows is
+ * therefore `rescued`, never `broke`. The runner used to read
+ * `ran.filter(!ok)` for its halt while `verify` read the last attempt for its
+ * `ok`, and the two disagreed in the same second: measured over one week, all
+ * 6 verify-failed halts were commands the verdict itself called green.
+ * `verify` and the runner now both read this, so they cannot.
+ *
+ * A row the verification's CLOCK cut (`timedOut`) is its own verdict since
+ * control-tower phase 83 (#95): `timedOut`, never `broke`. Killed at 2043 s, a
+ * suite that ran green in 850 s on the same head was a red — a streak charge
+ * and a re-opened phase for a machine that was merely busy.
+ */
+export function verificationVerdict(ran: readonly VerifyRun[]): VerificationVerdict {
+  const broke: VerifyRun[] = [];
+  const rescued: VerifyRun[] = [];
+  const timedOut: VerifyRun[] = [];
+  const unproven: VerifyRun[] = [];
+  ran.forEach((row, index) => {
+    const next = ran[index + 1];
+    // Superseded by its own retry: the retry is the command's verdict.
+    if (!row.retry && next?.retry && next.command === row.command) {
+      if (!row.ok && next.ok) rescued.push(row);
+      return;
+    }
+    if (row.ok) return;
+    if (row.timedOut) timedOut.push(row);
+    else if (row.environment) unproven.push(row);
+    else broke.push(row);
+  });
+  return { ok: broke.length === 0 && timedOut.length === 0 && unproven.length === 0, broke, unproven, rescued, timedOut };
+}
+
+/* ------------------------------------------------------------------ *
+ * The machine, not the work (control-tower phase 89, #41)
+ * ------------------------------------------------------------------ */
+
+/** A line of output that names a precondition — `PRECONDITION FAILED: Metro already serving on :8081 …`. */
+const PRECONDITION_LINE = /^.*\bPRECONDITION\b.*$/m;
+/** A refused connection, as node, curl, a browser and python spell it. */
+const REFUSED = /ECONNREFUSED|ERR_CONNECTION_REFUSED|[Cc]onnection refused/;
+/** The loopback ports a refusal names: `127.0.0.1:8151`, `localhost:8151`, `port 8151`. */
+const REFUSED_PORT = /(?:(?:127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0):|\bport )(\d{2,5})\b/g;
+
+/**
+ * Why a failed command failed on the MACHINE rather than on the work, or null
+ * — the `environment` outcome (control-tower phase 89, #41's 2026-09-25
+ * 06:11Z comment: 26 such records across four plans, every one a permanent
+ * red on a phase whose work was complete).
+ *
+ * Three shapes, each a fact about the machine the verification ran on:
+ *  - a runtime exit 127: the shell could not find what it was told to run
+ *    (a lead missing from the PATH is skipped before this; this is a script
+ *    or a binary a line calls further in);
+ *  - a line naming a `PRECONDITION` — a check the suite makes of its world
+ *    before it tests anything (vca's `PRECONDITION FAILED: Metro already
+ *    serving on :8081 but METRO_LOG … empty`, whose default pointed at
+ *    another plan's log);
+ *  - a refused connection to a loopback port the phase's OWN session served
+ *    on (`ownPorts`, `LaneSignals.ownPorts`): the server ended with the
+ *    session, before the console's verification ran (vca P13/P14 on :8151).
+ * A command its clock cut is never one — that is `verify-timeout`'s.
+ */
+export function environmentOf(row: Pick<VerifyRun, 'ok' | 'code' | 'output' | 'timedOut'>, ownPorts: readonly number[] = []): string | null {
+  if (row.ok || row.timedOut) return null;
+  if (row.code === 127) return 'exit 127: the shell could not find a command it was given — a fact about this machine, not the work';
+  const precondition = PRECONDITION_LINE.exec(row.output ?? '');
+  if (precondition) return `a precondition failed: ${precondition[0].trim().slice(0, 200)}`;
+  if (ownPorts.length && REFUSED.test(row.output ?? '')) {
+    for (const match of (row.output ?? '').matchAll(REFUSED_PORT)) {
+      const port = Number(match[1]);
+      if (ownPorts.includes(port)) {
+        return `connection refused on :${port}, a port the phase's own session served on — it stopped with the session`;
+      }
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
  * Running them
  * ------------------------------------------------------------------ */
 
@@ -1172,6 +1418,31 @@ export type VerifyOptions = {
   cwd: string;
   /** Per-command ceiling. A full suite is slow; a wedged one must still end. */
   timeoutMs?: number;
+  /**
+   * Each command's own ceiling, when the caller resolved one per line
+   * (control-tower phase 83, #95 — the plan's `Verify timeout:`, else the
+   * line's measured history). Wins over `timeoutMs`; the Setup preamble keeps
+   * its own shorter clock.
+   */
+  timeoutFor?: (command: string) => number;
+  /**
+   * Run only these commands (folded text, `foldCommand`) — a verification
+   * BASELINE measures the lines it could not reuse (#103). The rest are not
+   * run and not reported. Absent: every command runs.
+   */
+  only?: ReadonlySet<string>;
+  /**
+   * `false` runs every command whatever the one before it did — a baseline
+   * wants each line's own answer, and a red first line would otherwise hide
+   * the rest. Default: stop at the first command that is not green.
+   */
+  cascade?: boolean;
+  /**
+   * Who asked: the phase's verdict (`verify`, the default), its baseline at
+   * boarding, or the attribution of a red `&&` chain — its members, each run
+   * alone (`chainMembers`, #103).
+   */
+  purpose?: 'verify' | 'baseline' | 'attribution' | 'wip-gate';
   signal?: AbortSignal;
   env?: NodeJS.ProcessEnv;
   onStart?: (command: string, index: number, total: number) => void;
@@ -1217,6 +1488,19 @@ export type VerifyOptions = {
   setupText?: string;
   /** This phase's start-door answers (`approvalsForPhase`) — for both the Setup and the verification lanes. */
   approvals?: VerifyApprovals;
+  /**
+   * Commands the phase's session already proved green at an equivalent tree,
+   * keyed by folded text (`proofs.ts` `judgeProofs`, control-tower phase 62,
+   * #68). Such a command is not run again: its row is the proof's, green, with
+   * `proven` naming it. Everything else runs exactly as before.
+   */
+  proven?: ReadonlyMap<string, NonNullable<VerifyRun['proven']>>;
+  /**
+   * The loopback ports the phase's session served on (`LaneSignals.ownPorts`):
+   * a refused connection to one of them is `environment`, never red
+   * (control-tower phase 89, `environmentOf`).
+   */
+  ownPorts?: readonly number[];
 };
 
 /**
@@ -1312,10 +1596,32 @@ const KILL_GRACE_MS = 5_000;
 export const CASCADE_SKIP_REASON = 'skipped after an earlier command failed';
 export const STOPPED_SKIP_REASON = 'the run was stopped before this command';
 
+/** A limit as a person reads it: `30 min`, `1h 30m`, `0.4 s`. */
+export function limitWords(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 100) / 10} s`;
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes} min`;
+  const rest = minutes % 60;
+  return `${Math.floor(minutes / 60)}h${rest ? ` ${rest}m` : ''}`;
+}
+
+/** Why a command's final attempt is not green, in the words a halt or a park carries. */
+function endingWords(row: VerifyRun, retriedCut: boolean): string {
+  if (row.environment) return `\`${condense(row.command)}\` could not be judged here — ${row.environment} (unproven, not a red)`;
+  if (!row.timedOut) return `\`${condense(row.command)}\` exited ${row.code}`;
+  const at = row.limitMs ? ` after ${limitWords(row.limitMs)}` : '';
+  return `\`${condense(row.command)}\` timed out${at}${retriedCut ? ', twice' : ''} — its clock cut it, not a red`;
+}
+
 export async function verifyPhase(
   verificationText: string | undefined, opts: VerifyOptions,
 ): Promise<VerifySummary> {
-  const { commands, notRun, waived } = extractCommands(verificationText, 'verify', opts.approvals);
+  const extracted = extractCommands(verificationText, 'verify', opts.approvals);
+  const { notRun, waived } = extracted;
+  // A baseline measures only the lines it could not reuse (#103).
+  const commands = opts.only
+    ? extracted.commands.filter((command) => opts.only!.has(foldCommand(command)))
+    : extracted.commands;
   // Bring-up first, and its result kept OUT of everything below. It runs even
   // when §Verification turns out to be unrunnable here — the whole point is
   // that the two are separate questions, and "the stack came up but nothing
@@ -1354,7 +1660,9 @@ export async function verifyPhase(
       runnable = [];
       for (const command of commands) {
         const lead = resolveLead(command);
-        if (lead && missing.has(lead)) {
+        // A command the session proved is not run here at all, so a lead this
+        // machine lacks says nothing about it.
+        if (lead && missing.has(lead) && !opts.proven?.has(foldCommand(command))) {
           skipped.push({
             command: condense(command),
             lead,
@@ -1386,7 +1694,6 @@ export async function verifyPhase(
   }
 
   const ran: VerifyRun[] = [];
-  const rescued: { command: string; firstCode: number }[] = [];
   let failedRun: VerifyRun | null = null;
   for (const [index, command] of runnable.entries()) {
     if (opts.signal?.aborted) {
@@ -1394,28 +1701,56 @@ export async function verifyPhase(
       continue;
     }
     opts.onStart?.(command, index, runnable.length);
-    let result = await runOne(command, opts);
+    // Proven by the session at an equivalent tree (control-tower phase 62,
+    // #68): the proof is the row, and the command is not paid for twice.
+    const proof = opts.proven?.get(foldCommand(command));
+    if (proof) {
+      const row: VerifyRun = { command, ok: true, code: 0, ms: 0, output: '', proven: proof };
+      ran.push(row);
+      opts.onDone?.(row, index, runnable.length);
+      continue;
+    }
+    const limit = opts.timeoutFor?.(command) ?? opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    let result = await runOne(command, { ...opts, timeoutMs: limit });
+    // The machine, not the work (control-tower phase 89): said on the row, and
+    // never retried — an unchanged precondition fails the same way twice, and
+    // vca's verifier retried exactly that twice without changing anything.
+    const environment = environmentOf(result, opts.ownPorts);
+    if (environment) result = { ...result, environment };
     ran.push(result);
     // One recorded retry for a command that ran and exited red. Measured:
     // three spurious full-suite reds in one night, each judged green later —
-    // one of them cost a 3h52m park. A timeout kill (124) is not retried (a
-    // hang would just hang twice, at up to half an hour a try), a 127 is not
-    // (the missing binary will not appear between attempts), and neither is
-    // anything after the abort signal. Both attempts stay on the record; the
-    // verdict is the last one's.
-    if (!result.ok && result.code !== 124 && result.code !== 127 && !opts.signal?.aborted) {
-      const second = await runOne(command, opts);
+    // one of them cost a 3h52m park. A 127 is not retried (the missing binary
+    // will not appear between attempts), and neither is anything after the
+    // abort signal. Both attempts stay on the record; the verdict is the last
+    // one's.
+    //
+    // A command the CLOCK cut is retried too since control-tower phase 83
+    // (#95), at twice its limit: a cut proves only "longer than the limit",
+    // and the measured cut was a suite at 34 min under the autopilot's own
+    // load against a 30-minute clock. It is retried by the console, never by a
+    // session, and a second cut is `verify-timeout` — which is not a red.
+    // A command that EXITS 124 by itself is a red like any other: the clock's
+    // cut is `timedOut`, and the abort signal's is excluded here by name.
+    if (!result.ok && !result.environment && !opts.signal?.aborted) {
+      // Never past the ceiling — unless the plan's own word already was, and
+      // then never below it.
+      const again = result.timedOut
+        ? Math.min(limit * TIMEOUT_RETRY_FACTOR, Math.max(VERIFY_TIMEOUT_CEILING_MS, limit))
+        : limit;
+      const second = await runOne(command, { ...opts, timeoutMs: again });
       ran.push({ ...second, retry: true });
-      if (second.ok) rescued.push({ command: condense(command), firstCode: result.code });
       result = second;
     }
     // After the retry, so the stream reports the outcome the VERDICT is judged
     // on rather than a red that was about to be rescued a second later.
     opts.onDone?.(result, index, runnable.length);
     // Stop at the first red: later commands usually depend on earlier ones, and
-    // a wall of cascading failures buries the one that actually matters.
+    // a wall of cascading failures buries the one that actually matters. A
+    // baseline (`cascade: false`) wants every line's own answer instead.
     if (!result.ok) {
-      failedRun = result;
+      failedRun ??= result;
+      if (opts.cascade === false) continue;
       for (const rest of runnable.slice(index + 1)) {
         notRun.push({ text: condense(rest), reason: CASCADE_SKIP_REASON });
       }
@@ -1424,8 +1759,14 @@ export async function verifyPhase(
   }
 
   const failed = failedRun;
+  // The ONE verdict (control-tower phase 45): `ok` below and the runner's halt
+  // are both read off it, so they cannot disagree about a rescued command.
+  const verdict = verificationVerdict(ran);
+  const cutTwice = (row: VerifyRun): boolean => ran.some((other) => other !== row && other.command === row.command && other.timedOut);
   // Commands, not attempts: a rescued flake is one green command with two rows.
   const greens = ran.filter((r) => !r.retry).length;
+  const provenCount = ran.filter((r) => r.proven).length;
+  const provenNote = provenCount ? ` (${provenCount} proven by the session at an equivalent tree)` : '';
   // A verification the abort signal cut off proved nothing about whatever it
   // never ran. `ok: !failed` alone once answered `true, "0 commands green"`
   // over three commands a console shutdown skipped — and the phase settled
@@ -1436,18 +1777,21 @@ export async function verifyPhase(
     ? `; ${skipped.length} skipped — unrunnable here (${[...new Set(skipped.map((s) => s.lead))].join(', ')})`
     : '';
   return {
-    ok: !failed && !stopped,
+    ok: verdict.ok && !failed && !stopped,
     reason: failed
-      ? `\`${condense(failed.command)}\` exited ${failed.code}`
+      ? endingWords(failed, cutTwice(failed))
       : stopped
         ? `the run was stopped mid-verification — ${ran.length} of ${runnable.length} command(s) ran`
-        : `${greens} command${greens === 1 ? '' : 's'} green${skipNote}`
-          + rescued.map((r) => `; \`${r.command}\` green on retry (first exited ${r.firstCode})`).join(''),
+        : `${greens} command${greens === 1 ? '' : 's'} green${provenNote}${skipNote}`
+          + verdict.rescued.map((r) => `; \`${condense(r.command)}\` green on retry (first ${
+            r.timedOut ? `timed out after ${limitWords(r.limitMs ?? 0)}` : `exited ${r.code}`})`).join(''),
     ran,
     notRun,
     ...(skipped.length ? { skipped } : {}),
     ...(waived.length ? { waived } : {}),
     ...(setup ? { setup } : {}),
+    ...(verdict.timedOut.length ? { timedOut: verdict.timedOut.map((row) => row.command) } : {}),
+    ...(verdict.unproven.length ? { unproven: verdict.unproven.map((row) => ({ command: row.command, why: row.environment! })) } : {}),
   };
 }
 
@@ -1538,6 +1882,12 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     let cut: 'timeout' | 'abort' | null = null;
     let how: LadderEnding | undefined;
     let settled = false;
+    // What the output names as failing, read off the WHOLE stream — the tail
+    // kept below is 8 KB, and a suite prints its first failure long before its
+    // last line (#103). One scanner per stream, so a line split across chunks
+    // is never spliced to the other stream's.
+    const failingOut = new FailureScanner();
+    const failingErr = new FailureScanner();
 
     const child = spawn('bash', ['-c', command], {
       cwd: opts.cwd,
@@ -1551,6 +1901,7 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
     // so a chatty suite that would have blown the buffer now simply has its
     // middle dropped instead of being reported as a failure it was not.
     const take = (chunk: string, into: 'out' | 'err'): void => {
+      (into === 'out' ? failingOut : failingErr).push(chunk);
       bytes += chunk.length;
       if (bytes > MAX_OUTPUT) {
         const keep = chunk.slice(-KEEP_OUTPUT);
@@ -1595,6 +1946,7 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
       opts.signal?.removeEventListener('abort', onAbort);
       const killed = cut !== null || Boolean(opts.signal?.aborted);
       const output = `${out}${err}`.trim();
+      const failures = [...new Set([...failingOut.end(), ...failingErr.end()])].slice(0, FAILURE_CAP);
       resolve({
         command,
         // A killed command proves nothing — report it red, but say why.
@@ -1603,6 +1955,11 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
         ms: Date.now() - started,
         output: (killed ? `[timed out or cancelled]\n${output}` : output).slice(-KEEP_OUTPUT),
         ...(how ? { how } : {}),
+        // The CLOCK cut it — not the abort signal, and not an exit 124 of its
+        // own (control-tower phase 83, #95). Only this is `verify-timeout`.
+        ...(cut === 'timeout' && !opts.signal?.aborted ? { timedOut: true } : {}),
+        limitMs: timeoutMs,
+        ...(failures.length ? { failures } : {}),
       });
     };
 
@@ -1632,18 +1989,8 @@ function runOne(command: string, opts: VerifyOptions): Promise<VerifyRun> {
 export async function runSingleCommand(
   command: string, opts: VerifyOptions,
 ): Promise<{ refused?: string; ok: boolean; code?: number; detail?: string; ms?: number }> {
-  const verdict = refuse(command);
-  // `PREAMBLE` is a SENTINEL, not a sentence — a NUL-prefixed marker the plan
-  // path (`:277`) consumes by skipping the line entirely. This caller has
-  // nowhere to skip to: a watch ref that is pure preamble (`cmd:"export FOO=1"`
-  // — note `cd /tmp` is NOT one, it is an allowed command that exits 0 and so
-  // lands instantly) can never exit 0 in a way that means anything, so it
-  // is a refusal — but it must be a refusal in words, or `\u0000preamble`
-  // reaches a journal line and an operator errand verbatim.
-  if (verdict === PREAMBLE) {
-    return { ok: false, refused: 'sets something up and then runs nothing — there is no result to wait for' };
-  }
-  if (verdict) return { ok: false, refused: verdict.reason };
+  const refused = judgeCommand(command);
+  if (refused) return { ok: false, refused };
   const run = await runOne(command, opts);
   return {
     ok: run.ok,
@@ -1653,4 +2000,24 @@ export async function runSingleCommand(
     // log pane. A whole suite's output in an errand is an errand nobody reads.
     detail: `exit ${run.code}${run.output ? ` — ${condense(run.output.slice(-400))}` : ''}`,
   };
+}
+
+/**
+ * The policy's verdict on ONE command without running it — why it would be
+ * refused, or null. `runSingleCommand` runs only what this passes, and the
+ * ingest probe asks it at declaration (control-tower phase 88, #125), so a
+ * `cmd:` ref the console would never run is refused while the session that
+ * wrote it can still fix it, whether or not `watchCmdRefs` is on.
+ */
+export function judgeCommand(command: string): string | null {
+  const verdict = refuse(command);
+  // `PREAMBLE` is a SENTINEL, not a sentence — a NUL-prefixed marker the plan
+  // path (`:277`) consumes by skipping the line entirely. This caller has
+  // nowhere to skip to: a watch ref that is pure preamble (`cmd:"export FOO=1"`
+  // — note `cd /tmp` is NOT one, it is an allowed command that exits 0 and so
+  // lands instantly) can never exit 0 in a way that means anything, so it
+  // is a refusal — but it must be a refusal in words, or `\u0000preamble`
+  // reaches a journal line and an operator errand verbatim.
+  if (verdict === PREAMBLE) return 'sets something up and then runs nothing — there is no result to wait for';
+  return verdict ? verdict.reason : null;
 }

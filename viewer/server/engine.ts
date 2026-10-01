@@ -6,8 +6,8 @@
  * never recomputes any of that in JavaScript. Everything here shells out to
  * the skill's own scripts and reports what they said.
  *
- * Runs are capped (8 concurrent), time-limited (45 s — see TIMEOUT_MS, whose
- * own comment says why that ceiling) and cached per plan revision; the file
+ * Runs are capped (8 concurrent), time-limited (45 s — 120 s for the two reads
+ * that walk the whole plan; see `timeoutFor`) and cached per plan revision; the file
  * watcher bumps a plan's revision, which invalidates every cached answer for it
  * at once. `--git` is never passed, so nothing here can commit or push.
  *
@@ -36,6 +36,24 @@ export type EngineResult = {
   ms: number;
   /** The run was killed by the timeout — a non-zero code here means nothing. */
   timedOut: boolean;
+  /** The signal that killed the script, when one did — `null` when none did. */
+  signal?: NodeJS.Signals | null;
+  /**
+   * The script could not RUN: it died on a signal, or exited in the signal
+   * range (≥ 128), having decided nothing.
+   *
+   * A third fact beside `timedOut` and `overflow`, and for the same reason
+   * they are separate from each other — each is a different answer to "what
+   * is this exit code worth?". A crash is worth NOTHING, and reading it as a
+   * verdict is what made the console halt a 71-phase run after every completed
+   * phase with a blank where the reason goes (#17): macOS `/bin/bash` 3.2
+   * corrupted its own allocator inside the advisory pass and died with no
+   * output at all, and `code !== 0` was taken for "this plan is broken".
+   *
+   * A timeout is deliberately NOT crashed. We killed that one on purpose and
+   * we know exactly when; this one died on its own and we know nothing.
+   */
+  crashed?: boolean;
   /**
    * The run was killed because it wrote more than `maxBuffer`, which is a
    * different fact from a timeout: the script ANSWERED, at length, and we threw
@@ -95,17 +113,85 @@ export type EngineOptions = {
    * join the cache key: they change the answer.
    */
   credentials?: string[];
+  /**
+   * The workflow timeouts this console has learned, for F36
+   * `wait-window-short` (control-tower phase 14, #40): `<ref>=<minutes>` per
+   * `gh:…#run/<id>` ref it asked GitHub about (`watch-refs.ts`, once per run
+   * id). Told, not asked — bash 3.2 does not call GitHub on every lint — and
+   * the same absent/empty rule as `mcpServers`: absent turns the advisory off,
+   * set-but-empty is an answer (a console that knows no timeout). It joins the
+   * cache key, because it changes the answer.
+   */
+  waitTimeouts?: string[];
   accounts?: string[];
 };
 
-// validate.sh walks every phase of a plan, which is 13 s on a 31-phase graph;
-// phase-graph.sh answers in a fifth of a second. The ceiling has to clear the
-// slow one, or a big plan silently reports a lint failure it does not have.
-const TIMEOUT_MS = 45_000;
+// Every engine read but one answers in a fraction of a second — the board, a
+// boot prompt, a gate. This is their ceiling, and it is generous for them.
+export const ENGINE_TIMEOUT_MS = 45_000;
+
+/**
+ * The ceiling for the two reads that walk the WHOLE plan.
+ *
+ * `validate.sh` re-enters `phase-graph.sh` once per phase, so its cost grows
+ * with the graph rather than sitting flat like every other read: ~23 s on a
+ * 72-phase plan on an idle laptop, and past 45 s whenever the console is busy.
+ * Under the old shared ceiling those reads answered `timedOut` — benign by
+ * itself, since a timeout is never a failure, but it meant the `plan-health`
+ * decision was never actually evaluated for exactly the plans big enough to
+ * need it. A ceiling should bound a hang, not the work.
+ *
+ * 180 s since control-tower phase 55 (#44): `validate.sh` measured 79.8 s on a
+ * 72-phase plan idle and 136 s under load, so 120 s still killed a lint that
+ * would have succeeded — and a killed lint is re-run on the next cold read, for
+ * ever. The lint is off the page's render path, so a long ceiling holds nobody.
+ */
+export const LINT_TIMEOUT_MS = 180_000;
+
+/** The two ceilings as `timeoutFor` reads them — a test narrows them (`setEngineTimeouts`). */
+let ceilings = { board: ENGINE_TIMEOUT_MS, lint: LINT_TIMEOUT_MS };
+
+/**
+ * Test seam: narrow the ceilings so a suite can time a read out without waiting
+ * 45 s for it. `null` restores the shipped values. Returns the previous ones.
+ */
+export function setEngineTimeouts(next: Partial<typeof ceilings> | null): typeof ceilings {
+  const previous = ceilings;
+  ceilings = next ? { ...ceilings, ...next } : { board: ENGINE_TIMEOUT_MS, lint: LINT_TIMEOUT_MS };
+  return previous;
+}
+
+/**
+ * Which ceiling a given engine call gets — per verb, not one constant. `validate.sh`
+ * is a lint whatever its arguments; `phase-graph.sh` is one only under `--lint`.
+ */
+/**
+ * `phase-lock.sh mirror`'s ceiling (control-tower phase 63, #85): the console's
+ * lock commit runs off every turn, may wait out the docs root's critical
+ * section (30 s) and then commits through that repository's own hooks — on the
+ * hub monorepo those alone ran to minutes. Nothing waits on it, so a board
+ * read's 45 s would only cut a commit off half-way.
+ */
+export const MIRROR_TIMEOUT_MS = 180_000;
+
+export function timeoutFor(script: string, args: readonly string[]): number {
+  if (script === 'phase-lock.sh' && args[1] === 'mirror') return Math.max(ceilings.board, MIRROR_TIMEOUT_MS);
+  return script === 'validate.sh' || args.includes('--lint') ? ceilings.lint : ceilings.board;
+}
+
 const MAX_CONCURRENT = 8;
 
 let active = 0;
 const queue: (() => void)[] = [];
+
+/**
+ * The pool right now: reads holding a slot, reads queued behind them, and the
+ * slot count. What a page says while its own read waits (#44) — "computing the
+ * board (N queued)" is the difference between a slow console and a dead one.
+ */
+export function engineQueue(): { active: number; queued: number; max: number } {
+  return { active, queued: queue.length, max: MAX_CONCURRENT };
+}
 
 function acquire(): Promise<void> {
   if (active < MAX_CONCURRENT) { active++; return Promise.resolve(); }
@@ -170,6 +256,9 @@ export function scriptEnv(
   // two inputs, stated the same way (phase 11).
   if (opts.credentials) env.PE_CREDENTIALS = opts.credentials.join(' ');
   if (opts.accounts) env.PE_ACCOUNTS = opts.accounts.join(' ');
+  // The workflow timeouts F36 holds a `Waits on:` max to (phase 14), stated
+  // the same way: after the denial, so an inherited one never answers.
+  if (opts.waitTimeouts) env.PE_WAIT_TIMEOUTS = opts.waitTimeouts.join(' ');
   // AFTER the denial filter, and for the same reason the four lines above are
   // assignments rather than inheritances: the filter denies every `PE_*` this
   // console happened to be STARTED with, and two of these begin `PE_`. Stating
@@ -297,6 +386,7 @@ export async function run(
       + (opts.mcpPolicy ? `\u0000mcppolicy:${opts.mcpPolicy}` : '')
       + (opts.credentials ? `\u0000cred:${[...opts.credentials].sort().join(',')}` : '')
       + (opts.accounts ? `\u0000acct:${[...opts.accounts].sort().join(',')}` : '')
+      + (opts.waitTimeouts ? `\u0000wt:${[...opts.waitTimeouts].sort().join(',')}` : '')
       // The ROOT joins the key for the same reason the registry does: it changes the
       // answer. `<slug>` at `<revision>` under one source directory is a different plan
       // from the same name under another, and `invalidate(slug)` cannot help — nothing
@@ -349,39 +439,74 @@ async function spawn(
 ): Promise<EngineResult> {
   await acquire();
   try {
-    const run = await shell('bash', [join(opts.scriptsDir, script), ...args], {
-      channel: 'engine',
-      intent: script,
-      timeout: TIMEOUT_MS,
-      cwd: opts.root,
-      // `scriptEnv` has already applied the denial filter; the seam's trace
-      // carrier is spread AFTER it, so the four ids reach the script even
-      // though two of them begin `PE_`. The cache key is computed in `run()`
-      // and is untouched by any of this.
-      env: scriptEnv(opts, extra) as NodeJS.ProcessEnv,
-      // `head`: every reader below parses this output line by line.
-      capture: { keep: 8 * 1024 * 1024, mode: 'head' },
-      // A non-zero exit is how the engine says `LINT FAIL`, `--closed`, or
-      // "this gate is blocked". Every one of them is read as a value.
-      expectFailure: true,
-    });
-    // An overflow is NOT a timeout, and the difference decides the verdict: a
-    // killed-at-45 s run proves nothing, while a run that overran 8 MB of
-    // output proves there was a great deal to report. Reporting the second as
-    // the first turned the loudest possible lint failure into `ok: true`.
-    // Under the seam the two are separate facts rather than one `killed` flag
-    // that had to be disambiguated by an error code string.
-    return {
-      code: run.code ?? 1,
-      stdout: run.stdout,
-      stderr: run.stderr,
-      ms: run.ms,
-      timedOut: run.timedOut,
-      overflow: run.truncatedBytes > 0,
-    };
+    return await spawnUnpooled(opts, script, args, extra);
   } finally {
     release();
   }
+}
+
+/**
+ * One engine subprocess that does NOT queue behind the pool — for a lane's
+ * lease keepalive alone (control-tower phase 56, #77).
+ *
+ * The pool is eight slots, and plan-page reads saturate it: a refresh queued
+ * behind them could spend its whole cadence waiting for a slot while the lease
+ * it exists to extend ran down. A refresh is one short `phase-lock.sh claim`
+ * per live lane every ten minutes, so it cannot starve the pool by running
+ * beside it — and it never reads the cache: a claim is a write.
+ */
+export async function runOutsidePool(
+  opts: EngineOptions,
+  script: string,
+  args: string[],
+): Promise<EngineResult> {
+  if (args.includes('--git')) throw new Error('refusing to run a script with --git');
+  return spawnUnpooled(opts, script, args);
+}
+
+/** The subprocess itself, and how its end reads. Callers decide about the pool. */
+async function spawnUnpooled(
+  opts: EngineOptions,
+  script: string,
+  args: string[],
+  extra?: { env?: Record<string, string> },
+): Promise<EngineResult> {
+  const run = await shell('bash', [join(opts.scriptsDir, script), ...args], {
+    channel: 'engine',
+    intent: script,
+    timeout: timeoutFor(script, args),
+    cwd: opts.root,
+    // `scriptEnv` has already applied the denial filter; the seam's trace
+    // carrier is spread AFTER it, so the four ids reach the script even
+    // though two of them begin `PE_`. The cache key is computed in `run()`
+    // and is untouched by any of this.
+    env: scriptEnv(opts, extra) as NodeJS.ProcessEnv,
+    // `head`: every reader below parses this output line by line.
+    capture: { keep: 8 * 1024 * 1024, mode: 'head' },
+    // A non-zero exit is how the engine says `LINT FAIL`, `--closed`, or
+    // "this gate is blocked". Every one of them is read as a value.
+    expectFailure: true,
+  });
+  // An overflow is NOT a timeout, and the difference decides the verdict: a
+  // killed-at-45 s run proves nothing, while a run that overran 8 MB of
+  // output proves there was a great deal to report. Reporting the second as
+  // the first turned the loudest possible lint failure into `ok: true`.
+  // Under the seam the two are separate facts rather than one `killed` flag
+  // that had to be disambiguated by an error code string.
+  const code = run.code ?? 1;
+  return {
+    code,
+    stdout: run.stdout,
+    stderr: run.stderr,
+    ms: run.ms,
+    timedOut: run.timedOut,
+    signal: run.signal,
+    // A timeout is excluded by name: `shell` reports one as `code: null`
+    // with the signal IT sent, so without this every timed-out read would
+    // also read as a crash and the two facts would collapse back into one.
+    crashed: !run.timedOut && (run.signal != null || code >= 128),
+    overflow: run.truncatedBytes > 0,
+  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -399,6 +524,14 @@ export type Board = {
   /** False when the plan has no parsable `## Phase graph` — a document, not a plan. */
   phased: boolean;
   error?: string;
+  /** The read hit its ceiling: `error` says so, and nothing else here is an answer. */
+  timedOut?: boolean;
+  /**
+   * Set only where a page is served the LAST GOOD board because this read timed
+   * out (#44): when that good read landed, and how old it was when served.
+   * Every other field is that read's answer, not the current revision's.
+   */
+  stale?: { at: number; ageMs: number };
   states: Record<number, PhaseState>;
   done: number[];
   inProgress: number[];
@@ -463,7 +596,7 @@ function readBlocked(spec: string, blockedBy: Record<number, number[]>, qa: Reco
  *   blocked: 2<-1(qa:fail) 4<-2(not-done),3(qa:pending)
  */
 export function readMemoryBlock(result: EngineResult): Board {
-  if (result.timedOut) return { ...EMPTY_BOARD, error: 'the engine timed out reading this plan' };
+  if (result.timedOut) return { ...EMPTY_BOARD, error: 'the engine timed out reading this plan', timedOut: true };
   if (result.code !== 0) {
     return { ...EMPTY_BOARD, error: (result.stderr.split('\n')[0] || 'engine error').replace(/^ERROR:\s*/, '') };
   }
@@ -545,6 +678,16 @@ export function readWaitBudget(result: EngineResult): { minutes: number; source:
   const minutes = Number(minutesText);
   if (!Number.isSafeInteger(minutes) || minutes <= 0) return undefined;
   return source === 'phase' || source === 'plan' ? { minutes, source } : undefined;
+}
+
+/**
+ * `--verify-timeout [N]` — `minutes<TAB>phase|plan`: how long one §Verification
+ * command may run before the console cuts it (control-tower phase 83, #95).
+ * Undefined is silence, and the runner then scales the limit from the line's
+ * measured history. The JS twin is `verifyTimeoutFor` in parse/plan.ts.
+ */
+export function readVerifyTimeout(result: EngineResult): { minutes: number; source: 'phase' | 'plan' } | undefined {
+  return readWaitBudget(result);
 }
 
 /** `--waits-on N` — the refs the phase's `Waits on:` bullet names, one per line; empty when none. */
@@ -663,7 +806,12 @@ export type SessionGroup = {
 
 export type SessionPlan = {
   budget?: string;
+  /** `1 phase ≥ 1 session` — the unit the console runs in (control-tower phase 59, #83). */
+  unit?: string;
+  /** The phases left, forecast from measured sessions per phase — never the batches below. */
+  forecast?: { sessions: number; phases: number };
   excluded: number[];
+  /** The batches a person driving by hand may run; the console's autopilot runs none of them. */
   groups: SessionGroup[];
   raw: string;
 };
@@ -673,6 +821,10 @@ export function readSessionPlan(result: EngineResult): SessionPlan {
   const raw = result.stdout;
   const plan: SessionPlan = { excluded: [], groups: [], raw };
   plan.budget = /budget ~([^\s·)]+)/i.exec(raw)?.[1];
+  const unit = /^Unit: (1 phase ≥ 1 session)/m.exec(raw)?.[1];
+  if (unit) plan.unit = unit;
+  const forecast = /^Forecast: ≈ (\d+) sessions for (\d+) phases/m.exec(raw);
+  if (forecast) plan.forecast = { sessions: Number(forecast[1]), phases: Number(forecast[2]) };
 
   const excluded = /already done, excluded:\s*([^)]*)\)/i.exec(raw)?.[1];
   if (excluded) plan.excluded = numbers(excluded);
@@ -709,7 +861,17 @@ export function readSessionPlan(result: EngineResult): SessionPlan {
   return plan;
 }
 
-export type LintResult = { ok: boolean; issues: string[]; summary: string; timedOut: boolean };
+export type LintResult = {
+  ok: boolean; issues: string[]; summary: string; timedOut: boolean;
+  /** The engine could not RUN — this reading proves nothing about the plan. */
+  crashed: boolean;
+  /**
+   * Set only where a page is served the last verdict that proved something,
+   * because the current revision's is still running or timed out (#44): when
+   * that verdict landed, and the revision it was computed against.
+   */
+  stale?: { at: number; revision: number };
+};
 
 export function readLint(result: EngineResult): LintResult {
   const text = `${result.stdout}\n${result.stderr}`.trim();
@@ -730,6 +892,33 @@ export function readLint(result: EngineResult): LintResult {
       issues: lines.filter((l) => !/^(LINT|VALIDATE)\s+(OK|FAIL)/.test(l)),
       summary: 'validation produced more output than the console can hold — run scripts/validate.sh yourself',
       timedOut: false,
+      crashed: false,
+    };
+  }
+  // COULD NOT RUN — the third answer, and the one this function used to lack.
+  //
+  // Three ways to reach it, all the same claim: the engine died on a signal,
+  // it exited in the signal range, or it came back without ever printing a
+  // `LINT`/`VALIDATE` verdict. The last is the load-bearing one: it catches a
+  // death this process never saw the signal for, and it is the shape that
+  // reached the runner as `ok: false, summary: ''` — a halt announced with a
+  // blank where its reason goes. A verdict is a LINE, not an exit code, so
+  // the absence of the line is the absence of a verdict.
+  //
+  // `ok: true` because a reading that proves nothing must never be read as
+  // proof of a broken plan, and the summary always says what happened: an
+  // empty one is what made the measured halt unactionable.
+  if (!result.timedOut && (result.crashed || !verdicts.length)) {
+    const why = result.signal ? `the engine died on ${result.signal}`
+      : result.crashed ? `the engine died with exit ${result.code}`
+        : `the engine exited ${result.code} without a verdict`;
+    return {
+      ok: true,
+      issues: [],
+      summary: `validation could not run: ${why}`
+        + ' — run scripts/validate.sh yourself, or under bash 5',
+      timedOut: false,
+      crashed: true,
     };
   }
   return {
@@ -738,6 +927,7 @@ export function readLint(result: EngineResult): LintResult {
     issues: result.timedOut ? [] : lines.filter((l) => !/^(LINT|VALIDATE)\s+(OK|FAIL)/.test(l)),
     summary: result.timedOut ? 'validation timed out — run scripts/validate.sh yourself' : summary,
     timedOut: result.timedOut,
+    crashed: false,
   };
 }
 

@@ -9,6 +9,7 @@
 
 import { request, post } from './client';
 import type { RestartUpdateView } from './system';
+import type { StateInclude } from '@shared/projection.js';
 import type { SchedulePolicy } from '@shared/schedule-policy.js';
 import type { ResumeAtBootMode } from '@shared/automation-model.js';
 import { type RunPriority } from '@shared/orchestration-model.js';
@@ -127,7 +128,7 @@ export interface FleetState {
   /** Does a supervisor beat on this machine right now? What offers the machine-wide destination. */
   reachable?: boolean;
   /** A hold on every console of the machine, beside this console's own freeze. */
-  hold?: { at: string; by: string } | null;
+  hold?: { at: string; by: string; scope?: 'machine' | 'restart' } | null;
 }
 
 /** `state.reach` — the Settings card's one line about the fleet's door. */
@@ -151,6 +152,22 @@ export interface BootHold {
   by: string;
   why: string;
   marker?: { resurrect?: string; label?: string; durability?: string };
+}
+
+/**
+ * A holder's remaining time, as the queue reports it (`HolderEta` on the
+ * server). `of` says whose: the holder `phase` (its estimate minus what it has
+ * worked — what the wait actually runs to), or its `plan` where no phase is
+ * known. A figure from before 6.0 has no `of`, and was always the plan's.
+ */
+export interface HolderEtaView {
+  remainingWeight?: number;
+  label?: string;
+  of?: 'phase' | 'plan';
+  remainingMs?: number;
+  lowMs?: number;
+  highMs?: number;
+  overrun?: boolean;
 }
 
 /** Who is holding a scope an entry is waiting on, and which tokens collided. */
@@ -177,13 +194,22 @@ export interface QueueHolder {
   /** The working tree the holder's work rides, when it declared one. */
   tree?: string;
   /**
-   * How much longer the holder's OWN plan has (`Holder.eta`).
+   * The carve-out would have parted this pair but for a dimension a claim left
+   * undeclared (`Holder.unqualified`, control-tower phase 90, #149) — `claim`
+   * says whose (`this` is the waiting entry's) and `reason` is the sentence:
+   * "blocked: this claim declares no branch, so the carve-out cannot apply".
+   */
+  unqualified?: { claim: 'this' | 'holder'; missing: ('branch' | 'tree')[]; reason: string };
+  /**
+   * How much longer the holder has (`Holder.eta`) — the holder PHASE's
+   * remaining working time since control-tower phase 60 (#63), or its plan's,
+   * labelled `plan remaining`, where no phase is known. See `holderEtaText`.
    *
    * The question a queue could not answer: *how long*. Absent whenever nothing
-   * of that plan has finished, because there is then no rate to measure — and
-   * a number invented for the card would read exactly like a measured one.
+   * is known, because a number invented for the card would read exactly like a
+   * measured one.
    */
-  eta?: { remainingWeight?: number; label?: string };
+  eta?: HolderEtaView;
   /**
    * The holding session's id (`Holder.session`, off the lock's `session=`).
    *
@@ -211,6 +237,15 @@ export interface QueueHolder {
   /** A `session` holder's working directory: where the peer is standing. */
   cwd?: string;
   /**
+   * How a `session` holder's scope was read (control-tower phase 82, #119):
+   * `declared` (its `PE_SCOPE`), `touched` (what its transcript shows it
+   * edited, changed or named), `unknown` (nothing touched yet — what its cwd
+   * could reach, for a bounded lease). The card names the terminal by it.
+   */
+  scopeBasis?: 'declared' | 'touched' | 'unknown' | (string & {});
+  /** What that reading rests on, a few lines. */
+  evidence?: string[];
+  /**
    * This holder is a CLOCK, not another actor (`Holder.clock`): the operator's
    * boarding window, the live-session cap, an account's usage wall, a fleet
    * freeze, a hold, a chain.
@@ -224,6 +259,19 @@ export interface QueueHolder {
    * the console punishing its own policy).
    */
   clock?: true;
+  /**
+   * A `branch` holder is a RUN (control-tower phase 90, #150): which run, of
+   * which plan, with how many phases left — and the ways out a person can take
+   * instead of waiting for it to finish.
+   */
+  holderRun?: { run: string; slug: string; remainingPhases?: number };
+  escapes?: {
+    verb: string;
+    label: string;
+    endpoint: string;
+    method: 'POST';
+    body?: Record<string, unknown>;
+  }[];
 }
 
 export interface QueueEntry {
@@ -241,6 +289,13 @@ export interface QueueEntry {
   branch?: string;
   /** The working tree this entry's session would edit, when qualified. */
   tree?: string;
+  /**
+   * The account this entry's session would spend — `default` for the machine
+   * login (control-tower phase 78, #92). A switch re-keys it, so an entry held
+   * by `usage window · account A` while it names account B is a defect you can
+   * see, not one only the code can say.
+   */
+  accountId?: string;
   since: number;
   waitingOn: QueueHolder[];
   bypassed: number;
@@ -253,6 +308,164 @@ export interface QueueEntry {
   held?: { at: string; by?: string };
   /** The plan this entry is chained behind and still waiting on. */
   after?: string;
+  /** Its place in the scan, 0-based — the order it will board in. */
+  order?: number;
+  /** An operator's marks on it, with who and why (control-tower phase 99, #135). */
+  control?: QueueControl;
+}
+
+/** Who set an operator's queue mark, when, and why (control-tower phase 99). */
+export interface QueueMark {
+  at: string;
+  by?: string;
+  reason?: string;
+}
+
+/**
+ * An operator's standing word on one phase's place in the queue — on the
+ * phase's record (`PhaseRecord.queueControl`), so it outlives the entry.
+ */
+export interface QueueControl {
+  bump?: QueueMark & { stamp: number };
+  hold?: QueueMark;
+  defer?: QueueMark & { until: string };
+  withdrawn?: QueueMark;
+}
+
+/** A press the queue view carries — the route and body that act on a row. */
+export interface QueuePress {
+  verb: string;
+  method: 'POST';
+  endpoint: string;
+  body: Record<string, unknown>;
+}
+
+/**
+ * One entry as `GET /api/queue` widens it (control-tower phase 99, #135 A):
+ * everything the queue page shows, so the CLI and the supervisor read the
+ * same words a person does.
+ */
+export interface QueueViewEntry extends QueueEntry {
+  waitingOn: (QueueHolder & { laneWait?: QueueLaneWait })[];
+  /** 1-based place in the scan. */
+  position: number;
+  title?: string;
+  /** The class, always named — `normal` included. */
+  class: string;
+  /** The account it will board on, always named — `default` included. */
+  account: string;
+  clocks: { since: string; waitedMs: number; seniority?: { clock: string; since: string } };
+  /** Why it sits where it does: the first of the scan's keys that applies, and all that do. */
+  reason: { key: string; text: string; all: { key: string; text: string }[] };
+  /** What it waits on, in words. */
+  waits: string;
+  /** Pinned next in its plan (control-tower phase 100). */
+  pinned?: true;
+  /** A lane is kept for it (control-tower phase 100). */
+  laneReserved?: { by?: string; reason?: string; lane?: { slug: string; phase: number } };
+  /** The scheduling policy's promotion, when one applies. */
+  promotion?: { policy: string; rank: number; text: string; holdsSiblings?: boolean };
+  /** Its fair-share turn, when the turn put it behind a younger entry of another plan. */
+  share?: { round: number; lanes: number };
+}
+
+/** The machine-load guard's reading (control-tower phase 100). `factor` null: the guard is off. */
+export interface QueueLoad {
+  avg5: number;
+  cores: number;
+  factor: number | null;
+  threshold: number | null;
+  holding: boolean;
+}
+
+/** A lane kept for a phase (control-tower phase 100) — armed once the lane it waits for has ended. */
+export interface QueueReservation {
+  slug: string;
+  runId: string;
+  phase: number;
+  scope: string[];
+  at: string;
+  armed: boolean;
+  by?: string;
+  reason?: string;
+  lane?: { slug: string; phase: number };
+}
+
+/** A lane in a wait chain — polling its own job, or on an outside clock (#67). */
+export interface QueueLaneWait {
+  scope: 'local' | 'external';
+  minutes: number;
+  calls?: number;
+  text: string;
+}
+
+export interface QueueLane {
+  slug: string;
+  phase: number | null;
+  runId: string;
+  scope: string[];
+  account: string;
+  since: string;
+  title?: string;
+  wait?: QueueLaneWait;
+  /** The entries whose head holder is this lane. */
+  behind: { slug: string; phase: number | null }[];
+}
+
+export interface QueueHintedRow {
+  slug: string;
+  runId: string;
+  phase: number;
+  since: string;
+  waitedMs: number;
+  rung: string;
+  brief: string | null;
+  by: string | null;
+  serialBehind?: number;
+  title?: string;
+  why: string;
+  control?: QueueControl;
+  /** The press that queues it now. */
+  queue: QueuePress;
+}
+
+export interface QueueWithdrawnRow {
+  slug: string;
+  runId: string;
+  phase: number;
+  at: string;
+  by: string;
+  reason?: string;
+  title?: string;
+  text: string;
+  requeue: QueuePress;
+}
+
+/** One queue change, as the audit strip shows it — newest first. */
+export interface QueueAuditRow {
+  at: string | null;
+  slug: string;
+  runId: string;
+  phase: number | null;
+  verb: string;
+  by: string | null;
+  reason?: string;
+  text: string;
+}
+
+/** `GET /api/queue`, widened (control-tower phase 99). */
+export interface QueueView extends Omit<QueueSnapshot, 'entries'> {
+  entries: QueueViewEntry[];
+  lanes: QueueLane[];
+  hinted: QueueHintedRow[];
+  withdrawn: QueueWithdrawnRow[];
+  audit: QueueAuditRow[];
+  /** The scheduling policy — the console's, each plan's own, the default (control-tower phase 100). */
+  policy?: { console: string; plans: Record<string, string>; default: string };
+  /** The machine-load guard's reading. */
+  load?: QueueLoad;
+  /** The lanes kept for a phase. */
+  reservations?: QueueReservation[];
 }
 
 /**
@@ -308,8 +521,37 @@ export interface ApprovalCounts {
   pending: number;
 }
 
+/** One config dir's plugin install of the skill, as `server/skill-copy.ts` reads `installed_plugins.json`. */
+export interface SkillCopyEntry {
+  configDir: string;
+  install: {
+    id: string;
+    scope: string;
+    installPath: string;
+    version: string | null;
+    commit: string | null;
+  } | null;
+  /** A `skills/phased-execution` directory beside the plugin — a second copy. */
+  skillDir: string | null;
+  parseError?: string;
+}
+
+/** The skill copies sessions load, against the console's commit (#151) — `SkillCopyReport` on the wire. */
+export interface SkillCopyView {
+  plugin: string;
+  consoleRev: string | null;
+  copies: SkillCopyEntry[];
+  /** The copies at another commit than the console's; empty when either side is unknown. */
+  drift: SkillCopyEntry[];
+  /** How a person moves the skill to the console, in this edition's words. */
+  update: string;
+}
+
 export interface ConsoleState {
+  /** Counts the docs changes this console has read; rides the `hello` and `changed` frames too. */
   generation?: number;
+  /** The arguments node started this process with — the heap limit among them (phase 48). */
+  execArgv?: string[];
   root?: RootInfo;
   /**
    * Which console this is, on a machine that may be running several.
@@ -362,6 +604,12 @@ export interface ConsoleState {
   staticRoot?: 'dist' | 'not-built';
   /** The commit `dist` was built from (`dist/.build-rev`); null when unstamped. */
   distRev?: string | null;
+  /**
+   * The skill copy each Claude Code config dir's sessions load, against the
+   * console's commit (control-tower phase 98, #151) — `server/skill-copy.ts`.
+   * Absent from a server before it.
+   */
+  skillCopy?: SkillCopyView | null;
   supervisor?: SupervisorInfo;
   unread?: number;
   /** Cards raised and auto-granted since the console started counting (TRS-5). Absent on a build before 5.0.0. */
@@ -430,6 +678,12 @@ export interface ConsoleState {
    * refusal may not be in this one.
    */
   refusalReasons?: Record<string, string>;
+  /**
+   * `REFUSAL_FIX` — what fixes each refusal (control-tower phase 90). A run
+   * that asked for its own checkout and was refused PARKS, so the card names
+   * the remedy beside the reason.
+   */
+  refusalFixes?: Record<string, string>;
   sizing?: Sizing;
   searchDocs?: number;
   repo?: {
@@ -551,6 +805,8 @@ export interface ConsoleState {
     /** The per-instance start ceiling (server `start-ceiling.ts`): automatic starts and session dollars per sliding hour; 0 = off. */
     ceilingStartsPerHour?: number;
     ceilingUsdPerHour?: number;
+    usageForecastLeadHours?: number;
+    usageForecastHold?: boolean;
     unblockAttempts?: boolean;
     staleClaimTakeover?: boolean;
     /**
@@ -744,6 +1000,8 @@ export const LADDER_PREF_DEFAULTS = {
   unblockAttempts: true,
   staleClaimTakeover: true,
   autoAccountSwitch: true,
+  usageForecastLeadHours: 2,
+  usageForecastHold: false,
   delegateHumanGates: true,
   allowUnverifiedPhases: false,
   ladderExtendOnProgress: false,
@@ -763,6 +1021,8 @@ export type LadderPrefs = {
   unblockAttempts: boolean;
   staleClaimTakeover: boolean;
   autoAccountSwitch: boolean;
+  usageForecastLeadHours: number;
+  usageForecastHold: boolean;
   delegateHumanGates: boolean;
   allowUnverifiedPhases: boolean;
   ladderExtendOnProgress: boolean;
@@ -798,6 +1058,8 @@ export function ladderPrefs(state: ConsoleState | undefined): LadderPrefs {
     unblockAttempts: bool(prefs.unblockAttempts, d.unblockAttempts),
     staleClaimTakeover: bool(prefs.staleClaimTakeover, d.staleClaimTakeover),
     autoAccountSwitch: bool(prefs.autoAccountSwitch, d.autoAccountSwitch),
+    usageForecastLeadHours: num(prefs.usageForecastLeadHours, d.usageForecastLeadHours),
+    usageForecastHold: bool(prefs.usageForecastHold, d.usageForecastHold),
     delegateHumanGates: bool(prefs.delegateHumanGates, d.delegateHumanGates),
     allowUnverifiedPhases: bool(prefs.allowUnverifiedPhases, d.allowUnverifiedPhases),
     ladderExtendOnProgress: bool(prefs.ladderExtendOnProgress, d.ladderExtendOnProgress),
@@ -809,11 +1071,61 @@ export function ladderPrefs(state: ConsoleState | undefined): LadderPrefs {
 }
 
 /** The shell's fetchers — merged into `api` by `./index`. */
+
+/**
+ * Each lane verb's route, spelled out (control-tower phase 31): the dispatcher
+ * answers `isolate`, `isolate-phase` and `yield` as rows of their own, and
+ * `test/route-coverage.test.ts` holds every route to a caller it can read.
+ */
+const LANE_PATHS: Readonly<Record<string, string>> = Object.freeze({
+  pin: '/api/lane/pin',
+  unpin: '/api/lane/unpin',
+  reserve: '/api/lane/reserve',
+  unreserve: '/api/lane/unreserve',
+  yield: '/api/lane/yield',
+  'isolate-phase': '/api/lane/isolate-phase',
+  isolate: '/api/lane/isolate',
+});
 export const stateApi = {
   /* ---- shell ---- */
   state: () => request<ConsoleState>('/api/state'),
-  /** The admission queue: what holds a scope, and what is waiting on it. */
-  queue: () => request<QueueSnapshot>('/api/queue'),
+  /**
+   * `/api/state` with its projection widened (`?include=runs|full`,
+   * `shared/projection.js`): the default carries run SUMMARIES; `runs`
+   * restores the whole records and `full` everything. For a reader that needs
+   * the whole of it — never the shell's every-page read.
+   */
+  stateWith: (include: readonly StateInclude[]) =>
+    request<ConsoleState>(`/api/state${include.length ? `?include=${include.join(',')}` : ''}`),
+  /**
+   * The admission queue: what holds a scope, and what is waiting on it —
+   * widened since control-tower phase 99 (#135) to the whole view the queue
+   * page draws: every entry's reason and holder in words, the lanes, the
+   * hinted and withdrawn phases, and the audit strip.
+   */
+  queue: () => request<QueueView>('/api/queue'),
+  /**
+   * An operator's word on one phase's place (control-tower phase 99, #135):
+   * `bump`, `hold`, `release`, `defer` (`until`), `withdraw`, `requeue`
+   * (`position: 'front'`), `reorder` (`slug`, `phases`) — naming an entry by
+   * `entryId` or a phase by `{slug, phase}`, with the `reason` it is written
+   * down with. Durable: the mark is on the phase's record.
+   */
+  queueAct: (verb: string, body: Record<string, unknown>) =>
+    post<QueueSnapshot & { change: { verb: string; slug: string; phase: number | null; changed: boolean } }>(
+      `/api/queue/${encodeURIComponent(verb)}`,
+      body,
+    ),
+  /**
+   * An operator's word on a LANE (control-tower phase 100, #135 B.8, D.15–16):
+   * `pin` / `unpin`, `reserve` / `unreserve`, `yield` (`to`), `isolate-phase`,
+   * `isolate` — naming `{slug, phase}`, with the `reason` it is written down with.
+   */
+  laneAct: (verb: string, body: Record<string, unknown>) =>
+    post<QueueSnapshot>(LANE_PATHS[verb] ?? `/api/lane/${encodeURIComponent(verb)}`, body),
+  /** The scheduling policy (the console's, or `slug`'s) and the load guard's factor (control-tower phase 100). */
+  queuePolicy: (body: { policy?: string | null; slug?: string; loadFactor?: number; reason?: string }) =>
+    post<{ policy: NonNullable<QueueView['policy']>; load: QueueLoad }>('/api/queue/policy', body),
   /**
    * Move one queued entry to the front of its class.
    *
@@ -823,6 +1135,16 @@ export const stateApi = {
    * which says so out loud. See `Scheduler.bump`.
    */
   queueBump: (entryId: string) => post<QueueSnapshot>('/api/queue/bump', { entryId }),
+  /**
+   * Stop the queue waiting on a terminal session (control-tower phase 82,
+   * #119): for `hours`, or — with none — for as long as that session lives.
+   * 404s on a session the registry does not know; 403s without `--allow-run`.
+   */
+  releaseSessionHold: (sessionId: string, hours?: number) =>
+    post<{ ok: true; sessionId: string }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/release`,
+      hours ? { hours } : {},
+    ),
   /**
    * The panic button. Freeze every live lane where it stands and hold every
    * list; thaw puts the whole fleet back exactly where it was.

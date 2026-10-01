@@ -506,7 +506,7 @@ describe('the plan-created banner', () => {
     expect(await screen.findByText(/was created/i)).toBeInTheDocument();
     expect(screen.getByText('cart-api-endpoint')).toBeInTheDocument();
     const link = screen.getByRole('link', { name: /open it/i });
-    expect(link).toHaveAttribute('href', '#/plan/cart-api-endpoint/route');
+    expect(link).toHaveAttribute('href', '#/plan/cart-api-endpoint/phases');
 
     // Dismiss is a choice, not a timeout.
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }));

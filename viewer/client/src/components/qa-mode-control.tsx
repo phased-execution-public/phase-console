@@ -110,7 +110,7 @@ export function QaModeControl({
       {/* Printed rather than a dead button: a console that cannot write can
           still do this — in a terminal, with this exact line. */}
       {sealed && (
-        <p className="text-2xs text-ink-faint">
+        <p className="text-2xs text-ink-muted">
           By hand: <code className="rounded bg-surface-raised px-1 font-mono break-all">{hand}</code>
         </p>
       )}

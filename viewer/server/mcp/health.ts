@@ -51,6 +51,18 @@ export const PROBE_OWNER = 'console/mcp-probe';
 export const PROBE_FLAG = 'PHASE_CONSOLE_PROBE';
 
 /**
+ * What KIND of session a console child is, for the presence hook
+ * (control-tower phase 49, #73). A probe is not a session: the hook sees
+ * `PE_SESSION_KIND=probe` and registers nothing — no record, no inbox drop, no
+ * event. Until then the probe was a record the registry kept and hid, which
+ * made it 307 of 319 records, and its ended records came back as "stuck"
+ * whenever the pid they named was recycled. `PROBE_FLAG` still rides beside it
+ * for a hook script older than this rule, which the registry also refuses.
+ */
+export const SESSION_KIND_ENV = 'PE_SESSION_KIND';
+export const PROBE_SESSION_KIND = 'probe';
+
+/**
  * How long the probe gets to leave on SIGTERM before the group is SIGKILLed.
  *
  * The CLI runs its SessionEnd hook on SIGTERM — that is why the runner's own
@@ -159,11 +171,13 @@ export async function probeMcp(doc: McpConfigDoc, opts: ProbeOptions = {}): Prom
     try {
       child = spawnFn('claude', argv, {
         cwd: opts.cwd,
-        // The probe names itself (SLF-2, REG-6): `PE_OWNER` is what the
-        // presence hook posts as the session's owner, and the flag is what
-        // tells the registry this is the console's own probe rather than one
-        // of its agent sessions.
-        env: { ...(opts.env ?? process.env), PE_OWNER: PROBE_OWNER, [PROBE_FLAG]: '1' },
+        // The probe names itself (SLF-2, REG-6): `PE_OWNER` for the locks and
+        // the ceiling's actor, and `PE_SESSION_KIND=probe`, on which the
+        // presence hook registers nothing at all (#73).
+        env: {
+          ...(opts.env ?? process.env),
+          PE_OWNER: PROBE_OWNER, [PROBE_FLAG]: '1', [SESSION_KIND_ENV]: PROBE_SESSION_KIND,
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
         // The probe's whole job is to make the CLI start MCP servers, so it is
         // the one console child guaranteed to have descendants worth killing:

@@ -41,6 +41,9 @@ export * from './webhooks';
 export * from './repo';
 export * from './issues';
 export * from './debug';
+// Types only — the fetchers stay out of `api` (first paint), like the chat's:
+// the card that presses them is lazy and imports `humanStepsApi` itself.
+export type * from './human-steps';
 
 export const api = {
   ...stateApi,

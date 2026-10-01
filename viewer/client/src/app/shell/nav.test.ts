@@ -1,5 +1,6 @@
 /**
- * The navigation is **eight destinations**, and that is the whole point.
+ * The navigation is **seven destinations** (six until 4.0 added two, eight
+ * until 6.0 folded Now into Runs), and that is the whole point.
  *
  * 2.x had thirteen entries, a gate on two of them, and three lists that each
  * kept their own copy — which is how the phone once ended up unable to reach
@@ -22,7 +23,15 @@
 import { describe, expect, it } from 'vitest';
 import { DESTINATIONS } from '@shared/route-meta.js';
 import type { ConsoleState } from '@/lib/api';
-import { BANDS, NAV, navBands, sheetItems, tabItems, visibleNav } from './nav';
+import { BANDS, NAV, TAB_BAR, navBands, sheetItems, tabItems, visibleNav } from './nav';
+
+/**
+ * The fourth tab slot — Insights in the Free tree for good; in the Pro tree
+ * the Supervisor's (control-tower phase 28), which then sends Insights to the
+ * sheet. `CHAT` is what offers it: a server with the chat says `state.chat`.
+ */
+const FOURTH: string[] = ['insights'];
+const CHAT: Partial<ConsoleState> = {};
 
 const BASE: ConsoleState = {
   autopilot: true,
@@ -41,12 +50,11 @@ const BASE: ConsoleState = {
 
 const ids = (state?: ConsoleState) => visibleNav(state).map((item) => item.id);
 
-describe('the eight destinations', () => {
-  it('is exactly eight, in the documented order', () => {
+describe('the seven destinations', () => {
+  it('is exactly seven, in the documented order — Runs first, the home', () => {
     expect(NAV.map((item) => item.id)).toEqual([
-      'now',
-      'plans',
       'runs',
+      'plans',
       'sessions',
       'repo',
       'insights',
@@ -73,13 +81,13 @@ describe('the eight destinations', () => {
 
   it('badges only what a person can act on, and never the same number twice', () => {
     const badges = NAV.map((item) => item.badge).filter(Boolean);
-    // `needsYou` is Now's and nothing else's; Runs is deliberately unbadged,
-    // because its approvals count IS `needsYou` and one number on two entries
-    // is the duplication this redesign exists to end. Repo and Debug are
-    // unbadged for a different reason: neither has a number that is a call to
+    // `needsYou` was Now's; the Tower answers "does anything need me?" since
+    // 6.0, so Runs wears it — and it is still ONE entry's number, never two.
+    // Repo and Debug stay unbadged: neither has a number that is a call to
     // action, and a count that is never zero stops being read.
     expect(badges).toEqual(['needsYou', 'ready', 'sessions']);
-    for (const id of ['runs', 'repo', 'debug']) {
+    expect(NAV.find((item) => item.id === 'runs')?.badge).toBe('needsYou');
+    for (const id of ['repo', 'insights', 'debug']) {
       expect(NAV.find((item) => item.id === id)?.badge, id).toBeUndefined();
     }
   });
@@ -101,9 +109,8 @@ describe('the one gate', () => {
 
   it('gates nothing else', () => {
     expect(ids({ ...BASE, allowTerminal: false, allowAgent: false })).toEqual([
-      'now',
-      'plans',
       'runs',
+      'plans',
       'repo',
       'insights',
       'debug',
@@ -126,20 +133,40 @@ describe('a phone can reach everything', () => {
     }
   });
 
-  it('keeps the tab bar to four slots plus More', () => {
+  it('keeps the tab bar to four slots plus More — Runs, Plans, Sessions, then the fourth', () => {
     // Five buttons is what a 390px bar fits with a thumb-sized target each.
-    expect(tabItems({ ...BASE, allowTerminal: true, allowAgent: true })).toHaveLength(4);
+    // The fourth is the slot Now freed (control-tower phase 21): Insights holds
+    // it — the Free tree's for good, the Pro tree's until the Supervisor's own
+    // head is registered ahead of it in `TAB_BAR`.
+    expect(TAB_BAR.slice(0, 3)).toEqual(['runs', 'plans', 'sessions']);
+    expect(tabItems({ ...BASE, ...CHAT, allowTerminal: true, allowAgent: true }).map((i) => i.id)).toEqual([
+      'runs',
+      'plans',
+      'sessions',
+      ...FOURTH,
+    ]);
     // The gated one takes its slot with it rather than promoting a sheet item —
     // a bar whose contents change between machines is worse than a shorter bar.
-    expect(tabItems({ ...BASE, allowTerminal: false, allowAgent: false }).map((i) => i.id)).toEqual([
-      'now',
-      'plans',
+    expect(tabItems({ ...BASE, ...CHAT, allowTerminal: false, allowAgent: false }).map((i) => i.id)).toEqual([
       'runs',
+      'plans',
+      ...FOURTH,
     ]);
   });
 
-  it('puts the record and the console in the sheet, where 2.x lost them', () => {
-    expect(sheetItems(BASE).map((item) => item.id)).toEqual(['repo', 'insights', 'debug', 'settings']);
+  it('takes the first four of TAB_BAR as declared, so a fifth pushes the last one into More', () => {
+    // The rule the Supervisor's slot rides on: the bar is the first four
+    // DECLARED, not the first four offered — so a gated entry leaves a gap
+    // rather than promoting the next, and a fourth entry declared ahead of
+    // Insights moves Insights to the sheet.
+    expect(new Set(TAB_BAR).size).toBe(TAB_BAR.length);
+    for (const id of TAB_BAR) expect(DESTINATIONS as readonly string[], id).toContain(id);
+  });
+
+  it('puts the rest of the record and the console in the sheet, where 2.x lost them', () => {
+    expect(sheetItems({ ...BASE, ...CHAT }).map((item) => item.id)).toEqual(
+      ['repo', 'insights', 'debug', 'settings'].filter((id) => !FOURTH.includes(id)),
+    );
   });
 });
 
@@ -168,13 +195,15 @@ describe('the three bands', () => {
     expect(navBands(sheet).map((band) => band.id)).toEqual(['record', 'console']);
   });
 
-  it('is the phone tab bar, exactly — the work band and nothing else', () => {
-    // The bar and the band are one idea stated twice, which is the shape that
-    // drifts. If a fifth work destination ever arrives, the four-slot bar and
-    // this assertion have to be reconciled deliberately.
-    const state = { ...BASE, allowTerminal: true, allowAgent: true };
-    expect(tabItems(state).map((item) => item.id)).toEqual(
-      NAV.filter((item) => item.band === 'work').map((item) => item.id),
+  it('puts the whole work band on the phone tab bar, and one of the record', () => {
+    // 6.0 took Now out of the work band, and the slot it left went to Insights
+    // (the Free tree's for good). The bar is its own list now (`TAB_BAR`), so
+    // the work band is asserted to be IN it rather than to BE it.
+    const state = { ...BASE, ...CHAT, allowTerminal: true, allowAgent: true };
+    const tabs = tabItems(state).map((item) => item.id);
+    for (const item of NAV.filter((entry) => entry.band === 'work')) expect(tabs, item.id).toContain(item.id);
+    expect(tabs.filter((id) => NAV.find((item) => item.id === id)?.band === 'record')).toEqual(
+      FOURTH.filter((id) => id === 'insights'),
     );
   });
 });

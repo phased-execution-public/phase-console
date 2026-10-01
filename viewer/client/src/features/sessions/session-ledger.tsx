@@ -9,7 +9,7 @@
  * shell, a plan wizard) shows nothing here: its door is the person who opened it.
  */
 
-import { Chip } from '@/components/ui';
+import { Badge } from '@/components/ui';
 import type { TerminalSession } from '@/lib/api';
 import { money } from '@/lib/format';
 import { useLedger } from '@/lib/queries';
@@ -34,17 +34,17 @@ export function SessionLedger({ session }: { session: TerminalSession }) {
   return (
     <span className="inline-flex flex-wrap items-center gap-1" data-testid="session-ledger">
       {started?.door && (
-        <Chip mono title={`${started.said}${started.trigger ? ` · fired by ${started.trigger}` : ''}`}>
+        <Badge mono title={`${started.said}${started.trigger ? ` · fired by ${started.trigger}` : ''}`}>
           door {started.door}
-        </Chip>
+        </Badge>
       )}
       {ended && (
-        <Chip
+        <Badge
           title={`${ended.mode} · ${ended.turns ?? '?'} turns${ended.consoleEnded ? ' · ended by the console' : ''}`}
         >
           ended by {ended.endedBy ?? 'exit'}
           {ended.costUsd != null ? ` · ${money(ended.costUsd)}` : ' · cost unknown'}
-        </Chip>
+        </Badge>
       )}
     </span>
   );

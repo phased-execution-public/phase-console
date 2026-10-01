@@ -11,6 +11,7 @@
  * expressible here, and it is the case that matters most.
  */
 
+import '../e2e/fixture/steady-load.mjs';
 import { RETRY_STORM_PARK_MS } from '../shared/attention-model.js';
 import { HALT_KINDS } from '../shared/recovery-model.js';
 import { test } from 'node:test';
@@ -36,6 +37,7 @@ const {
   IN_FLIGHT,
 } = await import('../server/runner/state.ts');
 const { Journal } = await import('../server/runner/journal.ts');
+const { liveErrandHow } = await import('../server/watch-refs.ts');
 const { Scheduler } = await import('../server/runner/scheduler.ts');
 const { LOCK_CAP_PARK_BY_LOCK, LOCK_CAP_PARK_NOTE, LEASE_REFRESH_MS, LIMIT_ACTION_COOLDOWN_MS, PROVISIONAL_LEASE_S, PROVISIONAL_REFUSAL_LIMIT, RUNNER_LEASE_S } = await import('../server/runner/runner-core.ts');
 const { freezeVerdict } = await import('../server/runner/freeze.ts');
@@ -303,6 +305,10 @@ function runner(
     verificationText: () => verification,
     phaseDefaults,
     onEvent: (event, data) => events.push({ event, data }),
+    // The watchdog's parks here pin the ref it MINTS, which it arms only when
+    // the console runs minted refs (`watchMintedCmdRefs`, control-tower phase
+    // 88, #121 item 3); the switch-off park is wait-chains.test.ts MR-2.
+    mintedCmdRefs: () => true,
     ...extra,
   });
   return { instance, events };
@@ -433,12 +439,17 @@ test('a command red once and green on retry verifies green, and says so', async 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('a timed-out command is not retried', async () => {
-  // A command that hangs once will hang twice, at up to half an hour a try.
+test('a timed-out command is retried ONCE, at twice its limit — and a second cut is a timeout, not a red', async () => {
+  // It was never retried: "a command that hangs once will hang twice". Since
+  // control-tower phase 83 (#95) a clock's cut proves only "longer than the
+  // limit" — a suite at 34 min under load against a 30-minute clock — so the
+  // console tries once more at twice the limit, and a second cut is its own
+  // outcome (`verify-timeout.test.ts`), never a red verdict.
   const summary = await verifyPhase('`node -e "setTimeout(() => {}, 5000)"`', { cwd: process.cwd(), timeoutMs: 300 });
   assert.equal(summary.ok, false);
-  assert.equal(summary.ran.length, 1, 'no second attempt for a kill');
-  assert.equal(summary.ran[0].code, 124);
+  assert.equal(summary.ran.length, 2, 'one retry for a cut');
+  assert.ok(summary.ran.every((row) => row.timedOut), 'both attempts were cut by the clock');
+  assert.equal(summary.ran[1].retry, true);
 });
 
 test('an aborted verification is never vacuously green', async () => {
@@ -810,27 +821,32 @@ test('a session that claims success but writes nothing halts the run', async () 
   r.cleanup();
 });
 
-test('a red verification over a complete handoff records the verdict and does not halt', async () => {
+test('a red verification over a complete handoff records the verdict, does not halt, and RE-OPENS the phase', async () => {
   // The reversal of "a red verification halts before the board is even
   // consulted", and deliberate: eight production halts in one night were each
   // dissolved by reconcile sixty seconds later, because the session had
   // written a complete handoff and the board — the one authority on done —
-  // had already overtaken the verdict. The board's word now stands at once;
-  // the red verification travels on the record instead of stopping the run.
+  // had already overtaken the verdict. So the red never halts. But letting the
+  // board's word stand made §Verification a record rather than a gate — the
+  // dependents boarded on a red — so since control-tower phase 62 (#68) the
+  // phase is RE-OPENED instead: failed, with `reopened` set, which reconcile
+  // leaves alone (`verification-gates.test.ts` holds the rest).
   const r = repo();
   const { instance, events } = runner(r, workingSession(r), '`false`');
   await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going' });
   await instance.wait();
 
   const state = instance.current()!;
-  assert.notEqual(state.status, 'halted', 'the board vouched for the phase; no halt');
-  assert.equal(state.phases['1'].status, 'done');
+  // Never the phantom `verify-failed` halt. This plan's second phase verifies
+  // red too, and two phases re-opened in a row is a real failure streak — the
+  // settle-as-done that used to reset the streak over a red is gone.
+  assert.notEqual(state.halt?.kind, 'verify-failed', 'the board vouched for the handoff; no verify-failed halt');
+  assert.notEqual(state.phases['1'].status, 'done', 'but a red final verdict is not a done phase');
+  assert.deepEqual(state.phases['1'].reopened?.failed, ['false']);
   assert.equal(state.phases['1'].verification?.ok, false, 'the red verdict is not erased');
   assert.match(state.phases['1'].note ?? '', /Verification is red/);
-  assert.ok(
-    journalled(events, 'phase.verify-overtaken').length > 0,
-    'the retraction-in-advance is journalled',
-  );
+  assert.ok(journalled(events, 'phase.verification-failed').length > 0, 'the re-open is journalled');
+  assert.equal(journalled(events, 'phase.verify-overtaken').length, 0, "the board's word no longer stands over it");
   assert.equal(
     journalled(events, 'run.halt').filter((h) => h.kind === 'verify-failed').length, 0,
     'no phantom verify-failed halt',
@@ -1163,7 +1179,9 @@ test('an expired login stops the run instead of failing every phase the same way
   assert.equal(state.phases['1'].cause?.kind, 'credential-refused');
   assert.equal(state.phases['1'].cause?.class, 'auth');
   assert.equal(state.phases['1'].attempts, 1, 'no point retrying a wall');
-  assert.equal(state.consecutiveFailures, 1, 'the wall counts toward the streak (RCV-1)');
+  // NOT charged since 5.2.0 (#37): the counter means "this PLAN keeps
+  // failing", and being refused entry says nothing about the plan.
+  assert.equal(state.consecutiveFailures, 0, 'a refused credential is not a failed plan');
   assert.equal(state.errand?.situation, 'resource-wall:auth', 'the one errand is the run\'s');
   r.cleanup();
 });
@@ -2448,7 +2466,11 @@ test('a lane inside a poll loop is parked, and its lock is let go', async () => 
   // The context that knows what it was waiting for is the context that should
   // read the answer — the same rule a declared `waiting-external` follows.
   assert.equal(record.resumeSessionId, 'sess-waiting');
-  assert.match(String(record.watch?.[0]), /gh run view 42/);
+  // Its condition is built on `$(…)`, which a watch can never run as written
+  // (control-tower phase 88, #152): nothing is minted, and the park says why
+  // rather than arming a ref that could never land.
+  assert.equal(record.watch, undefined, 'a `$(…)` condition is never minted into a cmd: ref');
+  assert.match(record.parkReason ?? '', /cannot succeed as a watch/);
 
   held.release();
   await instance.wait();
@@ -2542,10 +2564,12 @@ test('a lane watching its OWN job is nudged, not parked, and only parked much la
   await instance.tickLiveness();
   const parked = instance.current()!.phases['1'];
   assert.equal(parked.status, 'waiting');
-  // And the park carries the loop's OWN landing condition, so the lane comes
-  // back when the job is genuinely done rather than at the end of a guessed
-  // window.
-  assert.equal(parked.watch?.[0], 'cmd:"test -f /tmp/suite.done"');
+  // The job is the session's OWN, and the checkpoint ends it with the session
+  // (control-tower phase 89, #121): no ref is armed on a marker nothing will
+  // write any more — the record owes the job a re-run, and the park says so.
+  assert.equal(parked.watch, undefined);
+  assert.match(parked.parkReason ?? '', /no watch is armed on its output; the next session re-runs it/);
+  assert.equal(parked.reverify?.cause, 'checkpoint');
 
   s.gates[0].release();
   await instance.wait();
@@ -2626,9 +2650,13 @@ test('the refusal latch is per episode — a second wait on the same lane is sai
   await instance.tickLiveness();
   assert.equal(instance.current()!.phases['1'].stall?.signal, 'external-wait', 'episode one');
 
-  // The call returns: the episode is over, and the latch with it.
+  // The call returns and no call of the same probe follows inside the chain's
+  // gap (control-tower phase 47): the episode is over, and the latch with it.
   s.say({ kind: 'tool-result', id: 'toolu_one', ok: true, detail: 'done' });
   clock.wind(60_000);
+  await instance.tickLiveness();
+  assert.equal(instance.current()!.phases['1'].stall?.signal, 'external-wait', 'inside the gap the wait holds');
+  clock.wind(3 * 60_000);
   await instance.tickLiveness();
   assert.equal(instance.current()!.phases['1'].stall, undefined, 'the episode cleared');
 
@@ -4312,12 +4340,21 @@ function call(
     startRun: async (slug: string, options: unknown) => { started.push({ slug, options }); return { id: 'r1' }; },
     verificationPreflight: async () => ['phase 3 has no §Verification — it will park at boarding'],
     pauseRun: record('pauseRun'),
-    resumePause: record('resumePause'),
+    // Resume answers which of its two acts it did (control-tower phase 77, #102).
+    resumeRun: async (...args: unknown[]) => {
+      calls.push({ method: 'resumeRun', args });
+      return { ok: true, run: { id: 'r1', status: 'running' }, resumed: { runId: 'r1', from: 'pausing', act: 'pause-cancelled' } };
+    },
     configureRun: record('configureRun'),
     askRun: (...args: unknown[]) => { calls.push({ method: 'askRun', args }); return { ok: true }; },
     stopRun: record('stopRun'),
     skipPhase: record('skipPhase'),
     retryPhase: record('retryPhase'),
+    // A person's Retry answers what it launched (control-tower phase 53, #56).
+    pressRetry: (...args: unknown[]) => {
+      calls.push({ method: 'pressRetry', args });
+      return { ok: true, run: { id: 'r1', status: 'running' }, launched: { runId: 'r1', phase: 2, session: null, brief: 'retry' } };
+    },
     // Async since the board resolver joined the read path — a stopped run whose
     // phases the board has finished stops asking for a person (`state.ts`
     // `autoResolveRun`). `runIdFor` is the sync half, for the journal and
@@ -4430,7 +4467,10 @@ test('a proper start request reaches the service with its options', async () => 
   assert.equal(options.effort, 'high');
   assert.equal(options.autonomy, 'keep-going');
   assert.equal(options.phaseBudgetUsd, 4);
-  assert.equal(options.runBudgetUsd, null, 'an unsent budget is no budget, not zero');
+  // Unsent is "you did not say" (control-tower phase 77, #102): `newRun`
+  // makes it no budget on a fresh run, and a resume keeps the run's own —
+  // the door used to send `null` and so remove a resumed run's ceiling.
+  assert.equal(options.runBudgetUsd, undefined, 'an unsent budget is unsaid, not zero and not removed');
   assert.equal(options.resumeRunId, undefined);
 });
 
@@ -4544,7 +4584,11 @@ test('an unknown autonomy value falls back to the run default', async () => {
     method: 'POST', allowRun: true, headers: { 'x-phase-console': '1' },
     body: { autonomy: 'yolo' },
   });
-  assert.equal((started[0] as { options: { autonomy: string } }).options.autonomy, 'keep-going');
+  // The door reads it as "you did not say" (control-tower phase 77, #102) —
+  // `newRun` supplies `keep-going` to a fresh run, and a RESUME keeps its own
+  // rather than being flipped to keep-going by a word nobody sent.
+  assert.equal((started[0] as { options: { autonomy?: string } }).options.autonomy, undefined);
+  assert.equal(newRun({ slug: 'demo', root: '/tmp/demo' }).autonomy, 'keep-going');
 });
 
 test('halting on everything is still reachable, and only by asking for it', async () => {
@@ -4569,8 +4613,8 @@ test('every control verb goes through the service, so it works after a restart',
   // screen, the API answered 200, and nothing happened. Stop, Skip and Retry
   // were fixed for exactly this; Pause was left behind.
   for (const [verb, method] of [
-    ['pause', 'pauseRun'], ['resume', 'resumePause'], ['stop', 'stopRun'],
-    ['skip', 'skipPhase'], ['retry', 'retryPhase'], ['settings', 'configureRun'],
+    ['pause', 'pauseRun'], ['resume', 'resumeRun'], ['stop', 'stopRun'],
+    ['skip', 'skipPhase'], ['retry', 'pressRetry'], ['settings', 'configureRun'],
     ['ask', 'askRun'],
   ]) {
     const { status, calls } = await call(`/api/run/demo/${verb}`, {
@@ -4846,14 +4890,31 @@ test('the queue is readable without a flag, and says what each entry is waiting 
   // payload or the `run:queue` event, precisely so a board read per queued
   // plan is charged to the page that asked for it and to nothing else.
   const advice = [{ slug: 'beta', remainingWeight: 12, remainingPhases: 3, label: '~2–4 h left' }];
+  // …and so do the hinted phases no entry holds yet (control-tower phase 86,
+  // #128): `ServiceBase.queueHinted`, read through `hintedPhases`.
+  const hinted = [{ slug: 'alpha', runId: 'r1', phase: 4, since: '2026-09-26T16:09:43Z', rung: 'reboard-resume-brief', brief: 'resume', by: 'console' }];
+  // …and since control-tower phase 99 (#135) the door answers the whole VIEW
+  // (`ServiceRuns.queueView`), composed here through the real `queueView` over
+  // the same stubs.
+  const { queueView } = await import('../server/queue-view.ts');
   const { status, payload } = await call('/api/queue', {
-    overrides: { queueSnapshot: () => snapshot, queueAdvice: async () => advice },
+    overrides: {
+      queueSnapshot: () => snapshot,
+      queueAdvice: async () => advice,
+      queueHinted: () => hinted,
+      queueView: () => ({ ...snapshot, ...queueView({ snapshot: snapshot as never, hinted, runs: [], now: Date.now() }) }),
+    },
   });
   assert.equal(status, 200);
-  const body = payload as typeof snapshot & { advice: typeof advice };
+  const body = payload as typeof snapshot & { advice: typeof advice; hinted: typeof hinted };
   assert.equal(body.max, 3);
   assert.equal(body.queued, 1);
   assert.deepEqual(body.advice, advice, 'the advice rides the read, not the event');
+  // Widened since control-tower phase 99 (#135): each hinted row is phase 86's
+  // row whole, plus how long it has waited, why, and the press that queues it.
+  const [row] = body.hinted as (typeof hinted[number] & { queue: { endpoint: string; body: unknown } })[];
+  assert.deepEqual({ ...hinted[0], ...row }, row, 'a hinted phase with no entry is named beside the entries, whole');
+  assert.deepEqual(row!.queue.body, { slug: 'alpha', phase: 4 }, 'and carries the press that queues it');
   // The part that matters: "queued" alone is the same non-answer `pausing`
   // used to be — it names something that is not happening without naming what
   // would have to change for it to happen.
@@ -5132,6 +5193,15 @@ test('a verification with nothing runnable parks the phase BEFORE a session is s
   const journal = events.filter((e) => e.event === 'run:journal')
     .map((e) => e.data as { event: string });
   assert.ok(journal.some((j) => j.event === 'phase.verify-preflight-parked'));
+  // …and gives back the claim it took to board. The park's own advice is
+  // "fix the plan, then Retry", and a Retry is refused while the phase is
+  // claimed: the tower rehearsal (control-tower phase 33) pressed it and was
+  // told to wait out the provisional lease.
+  const calls = readFileSync(join(r.state, 'locks'), 'utf8').split('\n').filter(Boolean);
+  const claimed = calls.findIndex((call) => /^demo claim 1 /.test(call));
+  assert.ok(claimed >= 0, `it claimed the phase to board it: ${calls.join(' | ')}`);
+  assert.ok(calls.slice(claimed + 1).some((call) => /^demo release 1 /.test(call)),
+    `and releases the claim when it parks: ${calls.join(' | ')}`);
   r.cleanup();
 });
 
@@ -5604,7 +5674,7 @@ test('a declared waiting-external parks the phase — no halt, no closeout nudge
   } finally { r.cleanup(); }
 });
 
-test('the wait budget is finite: a phase that keeps re-filing the same wait halts honestly', async () => {
+test('the wait budget is finite: a phase that keeps re-filing the same wait parks honestly on a budgets errand', async () => {
   const r = repo();
   try {
     const spawn: SpawnFn = async (request) => {
@@ -5627,11 +5697,15 @@ test('the wait budget is finite: a phase that keeps re-filing the same wait halt
     }
 
     assert.equal(state.status, 'parked', 'the fourth re-file spends the budget');
-    assert.equal(state.phases['1'].halt?.kind, 'waiting-external-timeout');
+    // Rule 7 (control-tower phase 45, #59): a spent budget PARKS the phase on a
+    // `budgets` errand — never `failed`, never a halt. Re-pointed from the old
+    // halt by phase 47, whose §Verification runs this file.
+    assert.equal(state.phases['1'].status, 'waiting');
+    assert.equal(state.phases['1'].halt, undefined);
     // The sentence names WHICH ledger ran out — the declared waits, here, not
-    // the hours (WAI-5: the halt must say which allowance was spent).
-    assert.match(state.phases['1'].halt?.reason ?? '', /already declared 4 wait\(s\) — the most one phase may \(4\)/);
-    assert.equal(state.phases['1'].status, 'failed');
+    // the hours (WAI-5: the park must say which allowance was spent).
+    assert.match(state.phases['1'].note ?? '', /already declared 4 wait\(s\) — the most one phase may \(4\)/);
+    assert.equal(state.recoveries?.['1']?.errand?.decisionKey, 'budgets');
   } finally { r.cleanup(); }
 });
 
@@ -5715,7 +5789,10 @@ test('outcome blocked on a lock re-queues the phase without a halt; needs-human 
       if (calls === 1) {
         fileOutcome(request, {
           phase: 1, status: 'blocked', reason: 'lock held by mobinzarekar@laptop',
-          watch: ['lock:demo/1'],
+          // Somebody ELSE's lock: phase 1's own is refused at ingest and parks
+          // for a person (#42, `own-lock-watch.test.ts`), because the only
+          // release it could ever see is its own closeout's.
+          watch: ['lock:other-plan/3'],
         });
         return ok();
       }
@@ -7314,7 +7391,7 @@ test('budget wall: a spent run budget is raised once within the cap and journall
   const halted = second.instance.current()!;
   assert.equal(halted.status, 'halted');
   assert.equal(halted.halt?.kind, 'budget');
-  assert.match(halted.halt?.reason ?? '', /^the run budget of \$2\.5 is spent \(raised once from \$2\)/);
+  assert.match(halted.halt?.reason ?? '', /^Run budget spent — \$2\.50 run budget · \$3\.00 accrued · \$0\.00 left — the run budget of \$2\.5 is spent \(raised once from \$2\)/);
   assert.deepEqual(seen2, [1, 2, 3], 'the raise bought the third phase');
   assert.equal(ladderJournal(second.events, 'run.budget-raised').length, 1, 'raised ONCE');
   assert.equal(halted.errand?.situation, 'resource-wall:budget');
@@ -8855,9 +8932,16 @@ test('a run started with no budget still caps every session it spawns, each cap 
       assert.equal(session.mode, 'phase');
       assert.equal(session.endedBy, 'exit', 'a session that ended itself says so, rather than leaving a blank');
     }
-    assert.deepEqual(sessions[0].maxBudgetUsd, { value: 120, source: 'size', basis: 'L' });
-    assert.deepEqual(sessions[0].maxTurns, { value: 600, source: 'size', basis: 'L' });
-    assert.deepEqual(sessions[1].maxBudgetUsd, { value: 60, source: 'size', basis: 'M' }, 'an unsized phase is M');
+    // Measured caps (control-tower phase 59, #83): with no census the shipped
+    // table, whatever the phase's size — an L and an unsized phase alike — and
+    // each cap names its derivation.
+    for (const session of sessions.slice(0, 2)) {
+      assert.equal((session.maxBudgetUsd as LedgerCap).source, 'measured');
+      assert.equal((session.maxBudgetUsd as LedgerCap).value, 120);
+      assert.equal((session.maxTurns as LedgerCap).value, 490);
+      assert.equal((session.maxTurns as { derivation?: { basis: string; percentile: number } }).derivation?.basis, 'shipped');
+      assert.equal((session.maxTurns as { derivation?: { basis: string; percentile: number } }).derivation?.percentile, 0.99);
+    }
     // …and the CLI-side ceilings each child ran under, once per spawn.
     const ceilings = journalled(events, 'phase.retry-ceiling');
     assert.equal(ceilings.length, requests.length);
@@ -8918,7 +9002,9 @@ test('a resume with an instruction is in the census — the same session record 
     assert.equal(resumes.length, 1, 'the resume wrote a session record');
     assert.deepEqual(resumes[0].argv, ['--print', '--resume', 'sess-login']);
     assert.equal(resumes[0].ms, 42);
-    assert.equal((resumes[0].maxTurns as LedgerCap).source, 'closeout');
+    // `remaining` since control-tower phase 46 (#61): a resume continues the phase's work, so it runs
+    // under what is left of the size row — it was `closeout`, the paperwork cap.
+    assert.equal((resumes[0].maxTurns as LedgerCap).source, 'remaining');
     assert.equal(journalled(events, 'phase.resume-done').length, 1, 'beside the resume\'s own done line, not instead of it');
   } finally { r.cleanup(); }
 });
@@ -9248,7 +9334,7 @@ test('WAI-1/WAI-11: a declared park says what it granted against what it asked, 
   } finally { r.cleanup(); }
 });
 
-test('WAI-1: a declared window past the budget halts at park with the arithmetic — never parked for a cut-down eight hours', async () => {
+test('WAI-1: a declared window past the budget parks on a budgets errand with the arithmetic — never for a cut-down eight hours', async () => {
   const r = repo();
   try {
     const spawn: SpawnFn = async (request) => {
@@ -9262,11 +9348,17 @@ test('WAI-1: a declared window past the budget halts at park with the arithmetic
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1] });
     await instance.wait();
     const rec = instance.current()!.phases['1'];
-    assert.notEqual(rec.status, 'waiting');
-    assert.equal(rec.halt?.kind, 'waiting-external-timeout');
-    assert.match(rec.halt?.reason ?? '', /asked to wait until .* \(48 h from now\)/);
-    assert.match(rec.halt?.reason ?? '', /does not cut a declared window short/);
+    // Rule 7 (control-tower phase 45, #59): past the budget and naming no ref
+    // the clock can poll, the phase parks on a `budgets` errand that carries
+    // the arithmetic — never a halt, and never a clock cut down to what was
+    // left. Re-pointed from the old halt by phase 47.
+    assert.equal(rec.status, 'waiting');
+    assert.equal(rec.halt, undefined);
+    assert.equal(rec.parkedUntil, undefined, 'no cut-down window');
+    assert.match(rec.note ?? '', /asked to wait until .* \(48 h from now\)/);
+    assert.match(rec.note ?? '', /does not cut a declared window short/);
     assert.equal(journalled(events, 'phase.waiting').length, 0);
+    assert.equal(journalled(events, 'phase.wait-budget-spent').length, 1);
   } finally { r.cleanup(); }
 });
 
@@ -9284,13 +9376,15 @@ test('WAI-4: phase.wait-resume carries the lateness, the cause and the turn cap\
     const resumed = journalled(events, 'phase.wait-resume')[0];
     assert.equal(resumed.cause, 'declared-window');
     assert.ok(Number(resumed.lateMs) >= 20 * 60_000 - 5_000, `lateMs ${resumed.lateMs}`);
-    assert.equal(resumed.capSource, 'closeout');
+    // `remaining` since control-tower phase 46 (#61): a wait-resume continues the phase, so it runs
+    // under what is left of the size row — it was `closeout`, 60, the cap 4 of 5 max_turns endings hit.
+    assert.equal(resumed.capSource, 'remaining');
     assert.equal(resumed.budgetSource, 'default');
     assert.ok(resumed.declaredBy, 'whose declaration this resume answers');
   } finally { r.cleanup(); }
 });
 
-test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own ledger, the lifted cmd: ref marked minted', async () => {
+test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own ledger, and no ref on a job the checkpoint ends', async () => {
   const r = repo();
   try {
     const s = silentSession(r, { attempts: 1 });
@@ -9306,7 +9400,9 @@ test('WAI-5/SLF-9: the watchdog parks in its OWN name — by watchdog, its own l
     const parked = instance.current()!.phases['1'];
     assert.equal(parked.status, 'waiting');
     assert.equal(parked.declared?.by, 'watchdog', 'the console\'s inference, never the session\'s testimony');
-    assert.deepEqual(parked.declared?.minted, ['cmd:"test -f /tmp/suite.done"']);
+    // A local job's park arms no ref (control-tower phase 89, #121), so none
+    // is minted onto the declaration either.
+    assert.equal(parked.declared?.minted, undefined);
     assert.equal(parked.watchdogParks, 1);
     assert.equal(parked.waits ?? 0, 0, 'the session\'s declared waits are untouched');
     const waiting = journalled(events, 'phase.waiting')[0];
@@ -9339,7 +9435,7 @@ test('SLF-9: with stallAutomaticPark off, the watchdog parks nothing — the sta
   } finally { r.cleanup(); }
 });
 
-test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches the local-job ladder — nudged, then parked with a minted cmd: ref', async () => {
+test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches the local-job ladder — nudged, then parked with no ref and the job owed', async () => {
   const r = repo();
   try {
     const s = silentSession(r, { attempts: 1 });
@@ -9363,15 +9459,19 @@ test('RCV-5 (firing half): a wait the console REFUSED inside the turn reaches th
     await instance.tickLiveness();
     const parked = instance.current()!.phases['1'];
     assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
-    assert.equal(parked.watch?.[0], 'cmd:"test -f /tmp/ring.done"', 'with the landing condition the console minted');
-    assert.deepEqual(parked.declared?.minted, ['cmd:"test -f /tmp/ring.done"']);
+    // The refused wait was on the session's OWN job, which the checkpoint ends
+    // (control-tower phase 89, #121): no ref, and the record owes a re-run.
+    assert.equal(parked.watch, undefined, 'no watch on a marker the ended job will never write');
+    assert.equal(parked.declared?.minted, undefined);
+    assert.match(parked.parkReason ?? '', /no watch is armed on its output; the next session re-runs it/);
+    assert.equal(parked.reverify?.cause, 'checkpoint');
     assert.equal(journalled(events, 'phase.external-wait')[0].source, 'denied');
     s.gates[0].release();
     await instance.wait();
   } finally { r.cleanup(); }
 });
 
-test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder — nudged, then parked with the one-shot form as the minted cmd: ref', async () => {
+test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder — nudged, then parked with no ref and the job owed', async () => {
   const r = repo();
   try {
     const s = silentSession(r, { attempts: 1 });
@@ -9399,12 +9499,17 @@ test('RCV-5 (phase 9): a refused `--watch` reaches the same local-job ladder —
     await instance.tickLiveness();
     const parked = instance.current()!.phases['1'];
     assert.equal(parked.status, 'waiting', 'rung 2: parked within stallLocalJobMs of the refusal');
-    assert.deepEqual(parked.watch, ['cmd:"node --test viewer/test"'], 'the one-shot form, redirections dropped');
-    assert.deepEqual(parked.declared?.minted, ['cmd:"node --test viewer/test"']);
+    // A `--watch` runner is the session's OWN job, which the checkpoint ends
+    // (control-tower phase 89, #121): nothing is armed; the record owes it.
+    assert.equal(parked.watch, undefined, 'no ref on a job the checkpoint ended');
+    assert.equal(parked.declared?.minted, undefined);
+    assert.equal(parked.reverify?.cause, 'checkpoint');
     assert.equal(parked.declared?.by, 'watchdog');
     const wait = journalled(events, 'phase.external-wait')[0];
     assert.equal(wait.source, 'denied');
-    assert.equal(wait.watch, 'cmd:"node --test viewer/test"');
+    // The journal names the command it read, and arms nothing on it.
+    assert.equal(wait.command, 'node --test --watch viewer/test > /tmp/t.log 2>&1');
+    assert.equal(wait.watch, null);
     s.gates[0].release();
     await instance.wait();
   } finally { r.cleanup(); }
@@ -9710,7 +9815,12 @@ test('autopilot-token-drain P4: a switch to another account at 824k does not car
     assert.match(spawns[1].prompt, /another account/, 'and its brief says why it starts over');
     assert.deepEqual(journalled(events, 'phase.resume-policy').map((line) => [line.choice, line.reason, line.contextTokens, line.accountChanged]),
       [['fresh', 'account-changed', 824_343, true]]);
-    assert.equal(journalled(events, 'phase.reboard-requested').at(-1)?.brief, 'resume');
+    // The brief is swapped in the lane that holds the grant (control-tower phase
+    // 86, #134): a re-board would have given the grant back and boarded again
+    // at the back of the queue.
+    const swapped = journalled(events, 'phase.brief').filter((line) => line.rebrief === true);
+    assert.deepEqual(swapped.map((line) => [line.brief, line.grant, line.sessionId]), [['resume', 'held', 'sess-p3']]);
+    assert.deepEqual(journalled(events, 'phase.reboard-requested'), [], 'never a re-board — the grant was never given back');
     const record = instance.current()!.phases['1'];
     assert.equal(record.tokens?.[0].account, 'default', 'the counters name the account that wrote the cache');
     assert.equal(record.status, 'done');
@@ -10300,8 +10410,9 @@ test('RCV-1 + SES-2: an org-policy refusal halts the RUN on credential-refused �
   assert.equal(state.phases['1'].cause?.class, 'org-policy');
   assert.equal(state.phases['1'].cause?.account, 'p');
   assert.match(state.phases['1'].note ?? '', /organization policy blocks this credential \(account: p\)/);
-  // The wall counts toward the streak (the branch used to return before it).
-  assert.equal(state.consecutiveFailures, 1);
+  // The wall no longer counts toward the streak (#37): one outage used to
+  // spend a run's whole allowance in 39 seconds.
+  assert.equal(state.consecutiveFailures, 0);
   // The account is retired through the one helper, class named, journalled.
   assert.equal(left.length, 1);
   assert.equal(left[0].accountId, 'p');
@@ -10531,7 +10642,11 @@ test('RCV-6: a rung the attempt left open is settled at the lane\'s end — situ
       // so nothing but the lane-end backstop can settle the rung.
       if (calls === 1) return ok({ costUsd: 3, resultText: 'nothing happened' });
       r.markDone(1);
-      return ok({ costUsd: 7 });
+      // The closeout resumes the attempt's conversation, and a `--resume`
+      // reports the conversation's running total — its own $7 on top of the
+      // attempt's $3. What it is BOOKED, and so what its rung is charged, is
+      // the $7 it added (control-tower phase 46, #62).
+      return ok({ costUsd: 10 });
     };
     const { instance, events } = runner(r, spawn);
     await instance.start({ slug: 'demo', root: r.root, onlyPhases: [1], autonomy: 'keep-going', autoRecover: true });
@@ -10701,7 +10816,7 @@ test('P12-QA allowUnverifiedPhases: a plan WITH a command still runs it — a re
   } finally { r.cleanup(); }
 });
 
-test('P12-QA the runner\'s declared errand: a permission-wall reason reads blocked-declared:permission with the policy remedy; an external one keeps the watch note', async () => {
+test('P12-QA the runner\'s declared errand: a permission wall on the CLI\'s own path reads blocked-declared:protected-path with a person\'s remedy; an external one keeps the watch note', async () => {
   const WALL = "Edit/Write on .claude/** is permission-denied in this unattended session ('sensitive file'); run the edits by hand.";
   const r = repo();
   try {
@@ -10712,10 +10827,13 @@ test('P12-QA the runner\'s declared errand: a permission-wall reason reads block
     const state = instance.current()!;
     assert.equal(state.status, 'parked');
     const errand = state.recoveries?.['1']?.errand;
-    assert.equal(errand?.situation, 'blocked-declared:permission');
-    assert.equal(errand?.need, WALL, 'need is the session\'s own words');
-    assert.match(errand?.how ?? '', /Settings ▸ Permissions/);
-    assert.match(errand?.how ?? '', /Never strike a deny rule/);
+    // #43 (control-tower phase 39): `.claude/**` is the CLI's own wall, which
+    // no rule on this console recorded or could widen — so it is a person's
+    // edit, never a trip to Settings ▸ Permissions.
+    assert.equal(errand?.situation, 'blocked-declared:protected-path');
+    assert.match(errand?.need ?? '', /\.claude\/\*\*/, 'the errand names the path the session declared');
+    assert.match(errand?.how ?? '', /Make that edit by hand/);
+    assert.doesNotMatch(errand?.how ?? '', /Settings ▸ Permissions/);
     assert.doesNotMatch(errand?.how ?? '', /watching its refs/);
     assert.deepEqual(errand?.tried, []);
   } finally { r.cleanup(); }
@@ -10731,7 +10849,189 @@ test('P12-QA the runner\'s declared errand: a permission-wall reason reads block
     const errand = instance.current()!.recoveries?.['1']?.errand;
     assert.equal(errand?.situation, 'blocked-declared:external');
     assert.match(errand?.how ?? '', /^Check its watch refs/);
-    assert.match(errand?.how ?? '', /watching its refs and resumes the session when they land/);
+    // The errand is stored in its own words and the watch clause is DERIVED
+    // from the record's live watch state by every reader (control-tower phase
+    // 88, #125) — never frozen at the park, when no ref has been asked yet.
+    assert.equal(errand?.watching, true);
+    assert.doesNotMatch(errand?.how ?? '', /resumes the session/);
+    // Once the clock has a pending row, the card names the live ref rather than
+    // promising to watch "its refs" (#19 ask 4, control-tower phase 6).
+    const record = instance.current()!.phases['1']!;
+    const at = new Date().toISOString();
+    const live = {
+      ...record,
+      watchState: { at, refs: [{ ref: 'gh:acme/app#run/123', scheme: 'gh-run', state: 'pending', checkedAt: at, nextDueAt: Date.now() + 60_000 }] },
+    };
+    assert.match(
+      liveErrandHow(errand!, live as never),
+      /watching one live ref \(gh:acme\/app#run\/123\) and resumes the session when one lands/,
+    );
   } finally { r2.cleanup(); }
 });
 
+
+/* ------------------------------------------------------------------ *
+ * An outage is not a credential fault (control-tower phase 3, #35/#37/#38)
+ *
+ * ⚠️ Matched strings are built by CONCATENATION. This file's own text reaches
+ * the classifier when a session reads it, and a literal here would arm the
+ * exact trap the phase removes.
+ * ------------------------------------------------------------------ */
+
+/** The CLI's line for a connection it could not make, assembled. */
+const CANNOT_REACH = `API Err${'or'}: Unable to conn${'ect'} to API: getaddrinfo `
+  + `${['ENOT', 'FOUND'].join('')} api.anthropic.com`;
+
+/** The same, with the CLI's own guess about a proxy behind it. */
+const CANNOT_REACH_TLS = `API Err${'or'}: Unable to conn${'ect'} to API: Self-sign${'ed'} certificate `
+  + `detected (${['DEPTH', 'ZERO', 'SELF', 'SIGNED', 'CERT'].join('_')}).`;
+
+/** A refused login, framed as the CLI frames it. */
+const LOGIN_REFUSED = `API Err${'or'}: 401 ${['oauth', 'token', 'expired'].join(' ')}`;
+
+test('connectivity waits uncharged: no attempt is spent, no failure is charged, and the phase runs when the network comes back', async () => {
+  const r = repo();
+  const texts: string[] = [];
+  let calls = 0;
+  const flaky: SpawnFn = async (request) => {
+    calls += 1;
+    if (calls <= 2) { texts.push(CANNOT_REACH); return ok({ signal: { subtype: 'error_during_execution', code: 1, text: CANNOT_REACH }, costUsd: 0, turns: 0 }); }
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1]);
+    r.markDone(phase);
+    return ok();
+  };
+  // The waits are real clock time in production; the harness shortens them.
+  const { instance, events } = runner(r, flaky, '`true`', undefined, { sleep: async () => {} });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  const state = instance.current()!;
+
+  assert.equal(calls, 3, 'it came back and did the work');
+  assert.equal(state.phases['1'].status, 'done');
+  assert.equal(state.consecutiveFailures, 0, 'the weather is not a failed plan');
+  assert.equal(state.phases['1'].attempts, 1, 'two dropouts did not spend two of three attempts');
+  const waits = journalled(events, 'phase.connectivity-wait');
+  assert.equal(waits.length, 2);
+  assert.equal(waits[0].waitMs, 60_000, 'the series starts at a minute');
+  assert.equal(waits[1].waitMs, 120_000, 'and doubles');
+  assert.equal(journalled(events, 'run.account-retired').length, 0, 'nothing was retired');
+  r.cleanup();
+});
+
+test('a certificate-shaped connect failure files a strike and waits — it does not retire anything', async () => {
+  const r = repo();
+  const left: { accountId?: string; leaving: LeaveReason }[] = [];
+  let calls = 0;
+  const flaky: SpawnFn = async (request) => {
+    calls += 1;
+    if (calls === 1) return ok({ signal: { subtype: 'error_during_execution', code: 1, text: CANNOT_REACH_TLS }, costUsd: 0, turns: 0 });
+    const phase = Number(/BOOT phase (\d+)/.exec(request.prompt)?.[1]);
+    r.markDone(phase);
+    return ok();
+  };
+  const { instance } = runner(r, flaky, '`true`', undefined, {
+    sleep: async () => {},
+    leaveAccount: (accountId, leaving) => { left.push({ ...(accountId ? { accountId } : {}), leaving }); return leaveStub(accountId, leaving); },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  const state = instance.current()!;
+
+  assert.equal(state.phases['1'].status, 'done');
+  assert.equal(state.status, 'finished');
+  assert.equal(left.length, 1, 'one strike filed');
+  assert.equal(left[0].leaving.class, 'certificate');
+  assert.equal(left[0].leaving.structured, false, 'prose, not a verdict the API returned');
+  r.cleanup();
+});
+
+test('RF-1: a credential refusal halts the run and charges NOTHING', async () => {
+  const r = repo();
+  const refusing: SpawnFn = async () => ok({
+    signal: { subtype: 'error_during_execution', code: 1, text: LOGIN_REFUSED }, costUsd: 0, turns: 1,
+  });
+  const { instance } = runner(r, refusing, '`true`', undefined, {
+    leaveAccount: (accountId, leaving) => leaveStub(accountId, leaving),
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', onlyPhases: [1] });
+  await instance.wait();
+  const state = instance.current()!;
+  assert.equal(state.halt?.kind, 'credential-refused');
+  assert.equal(state.consecutiveFailures, 0);
+  r.cleanup();
+});
+
+test('RF-2: a SECOND lane meeting the same wall neither charges nor re-halts', async () => {
+  const r = repo();
+  r.setParallel(true);
+  const left: { accountId?: string; leaving: LeaveReason }[] = [];
+  const refusing: SpawnFn = async () => ok({
+    signal: { subtype: 'error_during_execution', code: 1, text: LOGIN_REFUSED }, costUsd: 0, turns: 1,
+  });
+  const { instance, events } = runner(r, refusing, '`true`', undefined, {
+    leaveAccount: (accountId, leaving) => { left.push({ ...(accountId ? { accountId } : {}), leaving }); return leaveStub(accountId, leaving); },
+  });
+  await instance.start({ slug: 'demo', root: r.root, autonomy: 'keep-going', maxParallel: 3 });
+  await instance.wait();
+  const state = instance.current()!;
+
+  assert.equal(state.halt?.kind, 'credential-refused');
+  assert.equal(state.consecutiveFailures, 0, 'no lane charges this wall');
+  assert.equal(journalled(events, 'run.halt').filter((h) => h.kind === 'credential-refused').length, 1, 'one halt');
+  assert.equal(left.length, 1, 'one retirement, however many lanes met the wall');
+  assert.equal(journalled(events, 'run.errand').length, 1, 'one errand');
+  r.cleanup();
+});
+
+test('RF-3: the streak can never exceed its maximum, and clear-streak zeroes it', async () => {
+  const r = repo();
+  // Seeded AT the bound, which is the state #37 measured a run arriving at and
+  // then passing: `consecutiveFailures: 3, maxConsecutiveFailures: 2`. It
+  // resumes through `watch-landed` — an automatic door, so the streak carries
+  // forward (RCV-3) rather than being cleared by the press rule, and not
+  // `converge-relaunch`, which is refused outright on a spent streak.
+  const stored = newRun({ slug: 'demo', root: r.root });
+  stored.status = 'halted';
+  stored.consecutiveFailures = 2;
+  stored.maxConsecutiveFailures = 2;
+  stored.halt = { at: new Date().toISOString(), reason: 'two failed in a row', kind: 'failure-streak' };
+  saveRun(stored);
+
+  // Every phase genuinely fails — the session errors and writes no handoff, so
+  // the board never vouches for it and the failure is real. (A session that
+  // marks its phase done and then fails VERIFICATION is a different case: the
+  // board's word stands, the phase settles, and the streak resets.)
+  const failing: SpawnFn = async () => ok({
+    signal: { subtype: 'error_during_execution', code: 1, text: 'the phase could not be completed' },
+  });
+  const { instance, events } = runner(r, failing, '`true`', undefined, { sleep: async () => {} });
+  await instance.start({
+    slug: 'demo', root: r.root, resumeRunId: stored.id, autonomy: 'keep-going',
+    actor: doorActor('watch-landed', { by: 'watch', via: 'timer', origin: 'watch:test' }),
+  });
+  await instance.wait();
+  const state = instance.current()!;
+
+  // THE property, and the one #37 measured broken: `3 of a maximum 2` is not a
+  // stronger verdict than 2 of 2, it is a number nothing can explain and
+  // nothing automatic resets.
+  assert.equal(state.maxConsecutiveFailures, 2);
+  assert.equal(state.consecutiveFailures, 2,
+    `${state.consecutiveFailures} of a maximum ${state.maxConsecutiveFailures}`);
+  // …and the refusal to count is on the record rather than silent: a counter
+  // that quietly stopped moving is how `3 of 2` went a day unexplained.
+  const held = journalled(events, 'run.failure-streak-held');
+  assert.ok(held.length >= 1, 'the clamp said so');
+  assert.equal(held[0].max, 2);
+  assert.equal(held[0].why, 'the counter is at its maximum');
+
+  // And the operator's verb zeroes it, saying what it was and who did it.
+  const was = instance.clearStreak('tester', 'clear-streak');
+  assert.equal(was, 2);
+  assert.equal(instance.current()!.consecutiveFailures, 0);
+  const reset = journalled(events, 'run.failure-streak-reset').filter((line) => line.via === 'clear-streak');
+  assert.equal(reset.length, 1);
+  assert.equal(reset[0].was, 2);
+  assert.equal(reset[0].by, 'tester');
+  r.cleanup();
+});

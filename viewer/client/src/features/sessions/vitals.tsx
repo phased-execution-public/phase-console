@@ -19,7 +19,7 @@
 
 import { Timer } from 'lucide-react';
 
-import { Chip } from '@/components/ui';
+import { Badge } from '@/components/ui';
 import { usePlan } from '@/lib/queries';
 import { useNow } from '@/lib/clock';
 import { SessionLedger } from './session-ledger';
@@ -53,18 +53,18 @@ export function SessionVitals({ session }: { session: TerminalSession }) {
     <div className="flex min-w-0 flex-wrap items-center gap-2 text-2xs">
       {slug && (
         <a href={planHref(slug, 'run')} className="min-w-0">
-          <Chip
+          <Badge
             mono
             className="max-w-56 truncate"
             title="The plan this session serves — opens its autopilot page."
           >
             {slug}
             {phase != null ? ` · P${phase}` : ''}
-          </Chip>
+          </Badge>
         </a>
       )}
       {session.meta?.intent === 'plan' && !slug && (
-        <Chip title="Authoring a plan — it gets a slug when you approve one.">plan session</Chip>
+        <Badge title="Authoring a plan — it gets a slug when you approve one.">plan session</Badge>
       )}
       <span
         className="inline-flex items-center gap-1 font-mono text-sm font-semibold tabular-nums text-ink"
@@ -74,13 +74,17 @@ export function SessionVitals({ session }: { session: TerminalSession }) {
         {elapsed(ms)}
       </span>
       {eta && (
+        // This session's own elapsed time, not the phase's worked time (a
+        // resume or a repair can carry prior sessions this one never sees) —
+        // the estimate is still named as working time so the two clocks are
+        // never confused for one.
         <span
           className="font-mono tabular-nums text-ink-faint"
           title={`This phase's own estimate — ${eta.label}. Past it the honest word is "over", not a countdown.`}
         >
           {over ? 'over the ~' : '/ ~'}
           {elapsed(eta.estMs)}
-          {over ? ' estimate' : ' est'}
+          {over ? ' estimate of work' : ' est of work'}
         </span>
       )}
       {/* Which door started it and how it ended, off the run's ledger (phase 19). */}

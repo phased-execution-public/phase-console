@@ -62,6 +62,12 @@ export type LifecycleVerb = 'pause' | 'resume' | 'hold' | 'release' | 'freeze' |
  */
 export interface LifecycleContext {
   queued?: boolean;
+  /**
+   * What Resume actually did, from the door's own answer (control-tower phase
+   * 77, #102): took back a pause the loop had not reached, or started a
+   * settled pause again. Filled by the performer, never by a caller.
+   */
+  resumed?: { act: 'pause-cancelled' | 'relaunched' };
 }
 
 /** A run's freeze, wherever it is recorded — the run's slot, or the lane's. */
@@ -152,6 +158,9 @@ export function lifecycleToast(
         tone: 'ok',
       };
     case 'resume':
+      if (context.resumed?.act === 'relaunched') {
+        return { message: `${slug} started again — with its own settings, from where it paused`, tone: 'ok' };
+      }
       return after?.status === 'pausing'
         ? {
             message: 'The pause could not be cancelled — reload and look at the status',
@@ -172,7 +181,10 @@ export function lifecycleToast(
 }
 
 /** The door each verb goes through. One table, so nothing is reachable twice. */
-const DOORS: Record<LifecycleVerb, (slug: string, phase?: number) => Promise<{ run?: RunState | null }>> = {
+const DOORS: Record<
+  LifecycleVerb,
+  (slug: string, phase?: number) => Promise<{ run?: RunState | null; resumed?: LifecycleContext['resumed'] }>
+> = {
   freeze: (slug, phase) => api.runFreeze(slug, phase),
   thaw: (slug, phase) => api.runThaw(slug, phase),
   stop: (slug, phase) => api.runStop(slug, phase),
@@ -199,8 +211,14 @@ export async function performLifecycle(
   context: LifecycleContext = {},
 ): Promise<void> {
   try {
-    const { run: after } = await DOORS[verb](slug, phase);
-    const { message, tone } = lifecycleToast(verb, slug, phase, after, context);
+    const { run: after, resumed } = await DOORS[verb](slug, phase);
+    const { message, tone } = lifecycleToast(
+      verb,
+      slug,
+      phase,
+      after,
+      resumed ? { ...context, resumed } : context,
+    );
     toast(message, tone);
   } catch (error) {
     toast(String((error as Error)?.message ?? error), 'error');

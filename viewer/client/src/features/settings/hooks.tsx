@@ -16,7 +16,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { keys, toastError, useConsoleState, useHooksStatus } from '@/lib/queries';
-import { Banner, Button, Card, CardBody, CardHeader, CardTitle, Chip, toast } from '@/components/ui';
+import { Banner, Button, Card, CardBody, CardHeader, CardTitle, Badge, toast } from '@/components/ui';
 import { homePath } from '@/lib/format';
 
 export function SessionHookCard() {
@@ -74,9 +74,9 @@ export function SessionHookCard() {
     <Card>
       <CardHeader>
         <CardTitle>Session presence</CardTitle>
-        <Chip tone={tone as never} data-testid="hook-status">
+        <Badge tone={tone as never} data-testid="hook-status">
           {word}
-        </Chip>
+        </Badge>
       </CardHeader>
       <CardBody className="flex flex-col gap-3">
         <p className="m-0 text-sm text-ink-muted">

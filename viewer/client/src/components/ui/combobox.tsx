@@ -69,7 +69,7 @@ export function Combobox({
           disabled={disabled}
           className={cn(
             field,
-            'inline-flex w-full items-center justify-between gap-2 text-left',
+            'inline-flex w-full items-center justify-between gap-2 text-start',
             selected ? 'text-ink' : 'text-ink-faint',
             'hover:border-rule-strong',
             className,
@@ -104,7 +104,7 @@ export function Combobox({
                   />
                   <span className="min-w-0 flex-1 truncate">{option.label}</span>
                   {option.hint != null && (
-                    <span className="ml-auto pl-3 text-2xs text-ink-faint">{option.hint}</span>
+                    <span className="ms-auto ps-3 text-2xs text-ink-faint">{option.hint}</span>
                   )}
                 </CommandItem>
               ))}

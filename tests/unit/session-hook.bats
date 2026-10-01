@@ -13,7 +13,7 @@ setup() {
   export STUB="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$STUB"
   # Nothing inherited from the session this suite may itself be running in.
-  unset PE_SESSION_ID PE_OWNER PE_SCOPE PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF PHASE_CONSOLE_PROBE CLAUDE_CODE_SESSION_ID
+  unset PE_SESSION_ID PE_OWNER PE_SCOPE PE_SESSION_KIND PHASE_CONSOLE_URL PHASE_CONSOLE_HOOK_OFF PHASE_CONSOLE_PROBE CLAUDE_CODE_SESSION_ID
   # …and the rest of what a console exports into every session it spawns —
   # including the one running THIS suite under an autopilot. The hook honours
   # `$DOCS_ROOT` by design (a lane worktree's cwd is the wrong root), so with
@@ -265,20 +265,30 @@ EOS
   assert_contains "$body" '"scope":"web-app"'
 }
 
-@test "hook: the console's MCP probe (PE_OWNER=console/mcp-probe, PHASE_CONSOLE_PROBE=1) posts its owner and probe:1; anyone else posts probe:0" {
-  # SLF-2 / REG-6: the probe used to arrive with no owner and was filed
-  # foreign; it names itself now and the hook forwards the flag so the
-  # registry can keep it out of the operator's list.
+@test "PS-1: a console probe (PE_SESSION_KIND=probe) registers nothing — no POST, no inbox drop, no answer" {
+  # #73: the MCP probe was a record the registry kept and hid — 307 of 319 —
+  # and its ended records came back as "stuck" on a recycled pid. A probe is
+  # not a session: every event of it is dropped here, before anything is read.
+  local ev
+  for ev in SessionStart Stop Notification SessionEnd; do
+    PE_OWNER=console/mcp-probe PE_SESSION_KIND=probe run bash -c "printf '%s' '$(payload "$ev" ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [ ! -e "$STUB/curl.body" ]
+  done
+  # …and the flag a console older than the rule sets on the same probes.
   PE_OWNER=console/mcp-probe PHASE_CONSOLE_PROBE=1 run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
-  body="$(cat "$STUB/curl.body")"
-  assert_contains "$body" '"owner":"console/mcp-probe"'
-  assert_contains "$body" '"probe":1'
-  rm -f "$STUB/curl.body"
-  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ -z "$output" ]
+  [ ! -e "$STUB/curl.body" ]
+  [ -z "$(inbox_files "$BATS_TEST_TMPDIR/sd")" ]
+  [ -z "$(inbox_files "$XDG_STATE_HOME")" ]
+  # Any other kind is a session like any other, and no body carries a probe flag.
+  PE_SESSION_KIND=agent run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
   [ "$status" -eq 0 ]
   body="$(cat "$STUB/curl.body")"
-  assert_contains "$body" '"probe":0'
+  assert_contains "$body" '"event":"SessionStart"'
+  refute_contains "$body" '"probe"'
 }
 
 @test "hook: PHASE_CONSOLE_URL overrides the resolved console; PHASE_CONSOLE_HOOK_OFF=1 makes it a no-op" {
@@ -533,4 +543,33 @@ STUB
   body="$(cat "$STUB/curl.body")"
   assert_contains "$body" '"messaging_socket":""'
   assert_contains "$body" '"messaging_token":""'
+}
+
+# SS-4 (control-tower phase 82, #119): the console answers a hook event with
+# `notice` when this session has started blocking a queued phase — once per
+# run — and the hook shows it to the person in the session. A session in the
+# root once froze a whole run and never knew.
+@test "hook (SS-4): a Stop answered with a notice shows it to the person as a systemMessage" {
+  export CURL_STUB_BODY='{"ok":true,"notice":"Phase Console: this session is holding alpha P2 (run 0f3a9c21) — release it from the queued phase on the Runs page."}'
+  run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  assert_contains "$output" '{"systemMessage":"Phase Console: this session is holding alpha P2 (run 0f3a9c21)'
+  [ "$(printf '%s\n' "$output" | grep -c systemMessage)" -eq 1 ]
+}
+
+@test "hook (SS-4): no notice in the answer, nothing is printed on Stop" {
+  export CURL_STUB_BODY='{"ok":true}'
+  run bash -c "printf '%s' '$(payload Stop)' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  refute_contains "$output" "systemMessage"
+  [ -z "$output" ]
+}
+
+@test "hook (SS-4): at SessionStart the notice rides the same JSON as the session's context" {
+  export CURL_STUB_BODY='{"ok":true,"notice":"Phase Console: this session is holding alpha P2 (run 0f3a9c21)."}'
+  run bash -c "printf '%s' '$(payload SessionStart ',"source":"startup"')' | '$SYS_BASH' '$PE_SCRIPTS/session-hook.sh'"
+  [ "$status" -eq 0 ]
+  [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]
+  assert_contains "$output" '"systemMessage":"Phase Console: this session is holding alpha P2'
+  assert_contains "$output" '"hookSpecificOutput":{"hookEventName":"SessionStart"'
 }

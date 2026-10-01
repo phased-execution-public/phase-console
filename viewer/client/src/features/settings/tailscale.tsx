@@ -31,12 +31,12 @@ import {
   CardHeader,
   CardTitle,
   CopyButton,
-  DataTable,
   Empty,
   KeyValue,
   RelativeTime,
   Skeleton,
 } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
 
 /**
  * The HTTPS port Tailscale should publish THIS console on.

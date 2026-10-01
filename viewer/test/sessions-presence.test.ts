@@ -492,21 +492,27 @@ test('an unsupervised waiting-external park is answered by the wait budget — r
       };
 
       // A week out. The budget is eight hours: REFUSED, with the arithmetic —
-      // never parked for a silent eight and then woken 51 hours early.
+      // never parked for a silent eight and then woken 51 hours early. Since
+      // control-tower phase 45 (rule 7, #59) a refusal PARKS the phase on the
+      // spent budget — `waiting` with NO clock and a `budgets` errand, never a
+      // cut-down window (re-pointed by phase 49, whose verification runs this).
       declare(String(7 * 24 * 60));
       assert.ok(await poll(() => latestRun(root, 'alpha') !== null, 6_000), 'a run exists');
       assert.ok(await poll(() => refusals() === 1, 12_000), 'the week-long window is refused on the record');
       const refused = latestRun(root, 'alpha')!;
-      assert.notEqual(refused.phases['2']?.status, 'waiting', 'not parked for a cut-down eight hours');
+      assert.equal(refused.phases['2']?.status, 'waiting', 'parked on the spent budget');
+      assert.equal(refused.phases['2']?.parkedUntil, undefined, 'with no clock — not a cut-down eight hours');
+      assert.equal(refused.recoveries?.['2']?.errand?.decisionKey, 'budgets', 'and a person\'s errand to raise it');
       assert.equal(refused.phases['2']?.waits ?? 0, 0, 'a refused window spends no wait');
       const refusal = lines().find((line) => line.event === 'phase.wait-budget-spent')!.data;
       assert.equal(refusal.ledger, 'budget');
+      assert.equal(refusal.parked, true);
       assert.match(String(refusal.refusal), /8\.0 h \(the console default\)/, 'the arithmetic names the budget and its source');
       assert.match(String(refusal.refusal), /does not cut a declared window short/);
 
       // Inside the budget: parked for exactly the window it asked for.
       declare('60');
-      assert.ok(await poll(() => latestRun(root, 'alpha')!.phases['2']?.status === 'waiting', 12_000));
+      assert.ok(await poll(() => Boolean(latestRun(root, 'alpha')!.phases['2']?.parkedUntil), 12_000));
       const parked = latestRun(root, 'alpha')!;
       const until = Date.parse(parked.phases['2'].parkedUntil!);
       assert.ok(Math.abs(until - (Date.now() + 60 * 60_000)) < 3 * 60_000,
@@ -548,7 +554,13 @@ test('an unsupervised waiting-external park is answered by the wait budget — r
         'and it names the ledger that ran out — the declared waits, not the hours');
       const after = latestRun(root, 'alpha')!;
       assert.equal(after.phases['2'].waits, 4, 'the fifth declaration does NOT park again');
-      assert.equal(after.phases['2'].parkedUntil, parkedUntilBefore, 'and the clock is not pushed out');
+      // Rule 7 (phase 45): the spent ledger parks the phase with no clock at
+      // all, rather than keeping the last window — never pushed out, and never
+      // a clock nobody granted. Raising the budget is the person's errand.
+      assert.ok(parkedUntilBefore, 'the fourth park had its window');
+      assert.equal(after.phases['2'].parkedUntil, undefined, 'and the clock is not pushed out — it is gone');
+      assert.equal(after.phases['2'].status, 'waiting');
+      assert.equal(after.recoveries?.['2']?.errand?.decisionKey, 'budgets');
     } finally { svc.close(); }
   } finally { cleanup(); }
 });
@@ -610,6 +622,7 @@ test('WAI-7: a stale or invalid inbox file is SET ASIDE under outcomes/ignored/ 
       // A live runner: the declaration goes through `declareOutcome`.
       const declared: unknown[] = [];
       (svc as unknown as { runners: Map<string, unknown> }).runners.set('alpha', {
+        isSpending: () => false, // the usage poller's clock asks every runner (phase 9)
         busy: () => true,
         current: () => ({ id: 'r1', slug: 'alpha' }),
         declareOutcome: (phase: number, outcome: unknown, by: string) => { declared.push({ phase, outcome, by }); return 'parked'; },

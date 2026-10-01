@@ -113,6 +113,7 @@ const ANSWER_RECEIPTS = {
   allow: 'Allowed. The session is carrying on.',
   deny: 'Denied. The session was told.',
   approve: 'Gate approved. The phase can board.',
+  check: 'Sent. The console is running the proof; you will be reminded if it does not land.',
 };
 
 /**

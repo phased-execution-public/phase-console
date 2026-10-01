@@ -21,6 +21,7 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
+  Disclosure,
   Empty,
   Meter,
   MoneyAmount,
@@ -73,7 +74,7 @@ export function CostVsCapsPanel({ spend, plan }: { spend: SpendView | undefined;
         <Tile
           label="Day cap"
           value={cap == null ? 'none' : money(cap)}
-          state={atCap ? 'state-blocked' : undefined}
+          state={atCap ? 'state-needs-you' : undefined}
           hint={cap == null ? 'set one in Settings ▸ Automation' : `${money(today.ladderUsd)} of ladder`}
         />
         <Tile label="Last 7 days" value={money(seriesTotal)} hint="settled + ladder" />
@@ -98,7 +99,7 @@ export function CostVsCapsPanel({ spend, plan }: { spend: SpendView | undefined;
               value={today.ladderUsd}
               max={cap}
               valueText={`${money(today.ladderUsd)} of ${money(cap)}`}
-              tone="running"
+              paint="running"
             >
               <span className="text-2xs text-ink-faint">
                 {atCap
@@ -134,10 +135,13 @@ export function CostVsCapsPanel({ spend, plan }: { spend: SpendView | undefined;
         </CardHeader>
         <CardBody>
           {runs.length ? (
-            <ul className="flex min-w-0 flex-col gap-1">
-              {runs.map((run) => (
-                <li key={run.runId} className="flex min-w-0 items-center gap-2">
-                  {/* `tap-row`, and the clip on an inner span. This one row
+            // Folded as a chart's numbers are: the tiles above are the glance,
+            // and each run's figure is one press away (control-tower phase 26).
+            <Disclosure label="The runs" openLabel="Hide the runs" count={runs.length}>
+              <ul className="flex min-w-0 flex-col gap-1">
+                {runs.map((run) => (
+                  <li key={run.runId} className="flex min-w-0 items-center gap-2">
+                    {/* `tap-row`, and the clip on an inner span. This one row
                       carried both of the ways an overlay floor is not a floor,
                       each measured against the shipped stylesheet with the
                       coarse-pointer branch live.
@@ -155,19 +159,20 @@ export function CostVsCapsPanel({ spend, plan }: { spend: SpendView | undefined;
                       VISIBLE slug opened the row below's plan. So the floor is
                       the row's own box. A list of links meant for a thumb is a
                       list of 44px rows. */}
-                  <a
-                    href={planHref(run.slug, 'run')}
-                    className="tap-row min-w-0 flex-1 text-sm text-ink hover:text-action"
-                  >
-                    <span className="block truncate">{run.slug}</span>
-                  </a>
-                  <MoneyAmount usd={run.spentUsd} against={run.budgetUsd} className="text-sm" />
-                  <span className="shrink-0 text-2xs text-ink-faint">
-                    {run.budgetUsd == null ? 'no budget' : `of ${money(run.budgetUsd)}`}
-                  </span>
-                </li>
-              ))}
-            </ul>
+                    <a
+                      href={planHref(run.slug, 'run')}
+                      className="tap-row min-w-0 flex-1 text-sm text-ink hover:text-action"
+                    >
+                      <span className="block truncate">{run.slug}</span>
+                    </a>
+                    <MoneyAmount usd={run.spentUsd} against={run.budgetUsd} className="text-sm" />
+                    <span className="shrink-0 text-2xs text-ink-faint">
+                      {run.budgetUsd == null ? 'no budget' : `of ${money(run.budgetUsd)}`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </Disclosure>
           ) : (
             <p className="text-sm text-ink-faint">
               {plan ? 'No run of this plan has cost anything yet.' : 'No run has cost anything yet.'}

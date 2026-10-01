@@ -18,12 +18,23 @@ import type { PhaseTask } from '@/lib/api';
 
 export function TaskLine({
   tasks,
+  live,
   className,
 }: {
   tasks?: readonly PhaseTask[] | undefined;
+  /**
+   * What the lane last REPORTED, from a `run:progress` frame.
+   *
+   * The list on the record is only as fresh as the last event that invalidated
+   * it, which between phase boundaries is never — so a row rendering the list
+   * alone froze at boot while the session worked through it. The frame carries
+   * the summary and not the list (it arrives every three seconds; the list does
+   * not belong on that clock), so it is preferred here and nowhere else.
+   */
+  live?: { total: number; done: number; active: string | null } | undefined;
   className?: string;
 }) {
-  const { total, done, active } = taskSummary(tasks as PhaseTask[] | undefined);
+  const { total, done, active } = live ?? taskSummary(tasks as PhaseTask[] | undefined);
   // A session that published no list gets no row furniture saying so. Absence
   // here means "it did not say", which is not a fact worth a line.
   if (!total) return null;

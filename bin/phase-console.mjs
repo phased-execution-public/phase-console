@@ -10,6 +10,10 @@
 //   phase-console uninstall-hooks        take it out again · hooks-status: is it there?
 //   phase-console doctor [instance]      the prelude's probes and the machine checks; exit 1 names the first failing row
 //   phase-console sessions ingest [instance]  drain the session-presence inbox with no console up
+//   phase-console report [instance] --since <iso> [--until] [--replay] [--json]
+//                                        the week in numbers, read from the state directory alone
+//   phase-console run <verb> [args] [--flags] [--console <name|port>] [--json]
+//                                        the operator verb table's reads — run --help lists them; acts refuse, naming Pro
 //
 // This file replaces `bin/phase-console.mjs`, which is Pro: it is the
 // multi-instance CLI (`list`, `open`, `start`, `stop`, `restart`, `status`,
@@ -104,11 +108,40 @@ function skillDest() {
   return join(base, 'skills', 'phased-execution');
 }
 
-function installSkill(force) {
+/**
+ * The plugin install Claude Code loads the skill from in one config dir, or
+ * null — `viewer/server/skill-copy.ts`, the one reader (#151). A reader that
+ * cannot load refuses nothing.
+ */
+async function pluginCopy(configDir) {
+  try {
+    const mod = await import(pathToFileURL(preferBuilt(join(root, 'viewer', 'server'), 'skill-copy')).href);
+    const install = mod.readSkillCopy(configDir).install;
+    return install ? { ...install, id: install.id ?? mod.SKILL_PLUGIN_ID, fix: mod.UPDATE_SKILL_COMMAND } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function installSkill(force) {
   const dest = skillDest();
   if (safeRealpath(dest) === safeRealpath(root)) {
     process.stdout.write(`phase-console: the skill already lives where Claude Code reads it (${dest}).\n`);
     return 0;
+  }
+  // ONE copy (#151): while this config dir loads the skill from the plugin, a
+  // copy under skills/ is a second one beside it — fourteen copies were
+  // counted, and nothing said which one was live. Refused by name; --force
+  // installs it anyway, as it replaces a directory this command did not make.
+  const plugin = force ? null : await pluginCopy(dirname(dirname(dest)));
+  if (plugin) {
+    process.stderr.write(
+      `phase-console: the plugin ${plugin.id} is installed in ${dirname(dirname(dest))} — Claude Code already loads the skill`
+      + ` from ${plugin.installPath} (at ${(plugin.commit ?? plugin.version ?? 'an unknown commit').slice(0, 12)}).\n`
+      + `A copy at ${dest} would be a second one beside it. Move the plugin instead: ${plugin.fix}\n`
+      + 'Re-run with --force to install the second copy anyway.\n',
+    );
+    return 1;
   }
   if (existsSync(join(dest, '.git'))) {
     process.stderr.write(
@@ -153,7 +186,7 @@ function uninstallSkill() {
 }
 
 if (['install-skill', '--install-skill'].includes(args[0])) {
-  process.exit(installSkill(args.includes('--force')));
+  process.exit(await installSkill(args.includes('--force')));
 }
 if (['uninstall-skill', '--uninstall-skill'].includes(args[0])) {
   process.exit(uninstallSkill());
@@ -243,6 +276,29 @@ if (args[0] === 'sessions') {
 if (args[0] === 'diagnostics') {
   const { diagnosticsVerb } = await import(pathToFileURL(join(root, 'bin', 'diagnostics-verb.mjs')).href);
   process.exit(await diagnosticsVerb(args.slice(1), { root, preferBuilt }));
+}
+
+// ---- the week in numbers -------------------------------------------------
+// `phase-console report [instance] --since <iso> [--until <iso>] [--replay]
+// [--json]` (control-tower phase 64, AUD-37): what the autopilot-week audit
+// measured, read-only from the state directory, and with `--replay` re-derived
+// through today's models. The verb lives in `bin/report-verb.mjs`, shared with
+// the Pro bin — a report reads and never acts, so both editions carry it.
+if (args[0] === 'report') {
+  const { reportVerb } = await import(pathToFileURL(join(root, 'bin', 'report-verb.mjs')).href);
+  process.exit(await reportVerb(args.slice(1), { root, preferBuilt }));
+}
+
+// ---- pressing an operator verb, reads only (control-tower phase 98, EC6) --
+// `phase-console run <verb> [args] [--flags]` — the exact module the Pro bin
+// uses (`bin/run-verb.mjs`), so this file carries no second copy of the verb
+// table's dispatch. `edition: 'free'` is the one difference from the Pro call
+// below: it is what makes every act row (and `wait`, the one read the table
+// marks Pro too) refuse before any request leaves this machine, naming Pro in
+// one sentence — this build carries no Pro gate to ask at all.
+if (args[0] === 'run') {
+  const { runVerb } = await import(pathToFileURL(join(root, 'bin', 'run-verb.mjs')).href);
+  process.exit(await runVerb(args.slice(1), { root, preferBuilt, edition: 'free' }));
 }
 
 // ---- the fleet verbs, named rather than mistaken for a directory -----------

@@ -1,24 +1,24 @@
 /**
  * The launch flow's stages, and which stage each field lives on.
  *
- * The form is one object (`schema.ts`) shown as four stages: WHAT runs (the
- * plan, the phases ready now, where the run picks up), HOW it runs (the model,
- * the guard rails, the branch, the tools), MONEY AND STOPS (the ceilings and
- * every condition that halts it), and the REVIEW (every choice, its source,
- * every warning, the one Launch). `STAGE_OF` is the map, and it is a table
- * rather than an inference because the review's "change" links, the stepper's
- * "2 changed" notes and the reachability test all read it — three readers,
- * one answer.
+ * The form is one object (`schema.ts`), grouped in five stages: the DECISIONS
+ * a run could ask mid-run, WHAT runs (the scope), HOW it runs (the model, the
+ * guard rails, the branch, the tools), MONEY AND STOPS (the ceilings and every
+ * condition that halts it), and the REVIEW. Since control-tower phase 22 no
+ * stage bar draws them: a staged launch is the QUICK VIEW (`quick.tsx`) — one
+ * screen of nine category tiles (`categories.ts`), each nesting inside exactly
+ * one of these stages. `STAGE_OF` stays the flat layout's order and the
+ * summary's grouping.
  *
  * ## Staged or flat
  *
- * A stage bar over five fields is furniture, so `LAUNCH_SURFACE` says which
- * modes are staged. The rule: a mode whose door is a RUN (`runStart`,
- * `runSettings`) is staged — it carries the whole field set — and a mode that
- * mints one session (a QA review, a recovery, the launcher, the plan wizard)
- * or edits preferences is flat. Staging is a property of the overlay: a
- * `RunSetup` rendered inline on a page (the Automation card, the launcher)
- * is always flat, whatever its mode.
+ * Nine tiles over five fields are furniture, so `LAUNCH_SURFACE` says which
+ * modes are staged — drawn as the quick view. The rule: a mode whose door is a
+ * RUN (`runStart`, `runSettings`) is staged — it carries the whole field set —
+ * and a mode that mints one session (a QA review, a recovery, the launcher,
+ * the plan wizard) or edits preferences is flat. Staging is a property of the
+ * overlay: a `RunSetup` rendered inline on a page (the Automation card, the
+ * launcher) is always flat, whatever its mode.
  *
  * ## Adding a mode — the extension point Phase 9 uses
  *
@@ -100,7 +100,6 @@ export type ControlStage = Exclude<StageId, 'review'>;
 export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.freeze({
   resumeOnRestart: 'decisions',
   relay: 'decisions',
-  accounts: 'decisions',
   acknowledgedWaivers: 'decisions',
   manifestOverride: 'decisions',
   verifyAnswers: 'decisions',
@@ -110,11 +109,19 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
 
   model: 'how',
   effort: 'how',
+  modelPolicy: 'how',
   phaseOptions: 'how',
   permissionProfile: 'how',
   permissionMode: 'how',
+  // An approval card is the permission ask, so its clock is asked beside the profile.
+  approvalTimeoutMinutes: 'how',
   accountId: 'how',
+  // The account pool is asked beside the account (control-tower phase 22): the
+  // Accounts tile nests in one stage, and it is this one.
+  accounts: 'how',
   gitMode: 'how',
+  // #18's answer to the plan's git lines, asked beside the git it is about.
+  gitStrategyAck: 'how',
   openPr: 'how',
   isolation: 'how',
   settle: 'how',
@@ -150,6 +157,9 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
   runBudgetUsd: 'money',
   maxParallel: 'money',
   maxConsecutiveFailures: 'money',
+  // Where recovery stops — a stop, so it is asked beside the other stops.
+  ladderPerRunRungs: 'money',
+  ladderPerPhaseRungs: 'money',
   priority: 'money',
   onLimit: 'money',
   autoRecover: 'money',
@@ -164,9 +174,11 @@ export const STAGE_OF: Readonly<Record<RunSetupField, ControlStage>> = Object.fr
 export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.freeze({
   model: 'Model',
   effort: 'Effort',
+  modelPolicy: 'Model policy',
   autonomy: 'If something is unclear',
   permissionProfile: 'Permissions',
   permissionMode: 'Permission mode',
+  approvalTimeoutMinutes: 'Approvals wait for you (minutes)',
   accountId: 'Account',
   onLimit: 'On usage limit',
   phaseBudgetUsd: 'Budget per phase ($)',
@@ -201,11 +213,16 @@ export const FIELD_LABELS: Readonly<Record<RunSetupField, string>> = Object.free
   autoRecover: 'Auto-recover halts',
   maxParallel: 'Max parallel',
   maxConsecutiveFailures: 'Stop after N failures',
+  // Settings ▸ the ladder card's "Rungs per run" / "Rungs per phase", named
+  // for what they bound, since this form has no ladder card around them.
+  ladderPerRunRungs: 'Recovery rungs per run',
+  ladderPerPhaseRungs: 'Recovery rungs per phase',
   onlyPhases: 'Only these phases',
   phaseOptions: 'Per-phase overrides',
   prompt: 'First prompt',
   resumeOnRestart: 'If the console restarts, continue this run',
   relay: 'Relay questions to a person',
+  gitStrategyAck: 'Plan git lines',
   accounts: 'Accounts it may spend (id:minimum headroom %)',
   acknowledgedWaivers: 'Acknowledged waivers',
   manifestOverride: 'Start anyway, recorded as',
@@ -226,6 +243,7 @@ export const LAUNCH_SURFACE: Readonly<Record<RunSetupMode, 'staged' | 'flat'>> =
   recovery: 'flat',
   session: 'flat',
   plan: 'flat',
+  fix: 'flat',
   defaults: 'flat',
 });
 
@@ -255,7 +273,7 @@ export const HEADINGS: Readonly<
   live: {
     title: 'Run settings',
     description:
-      'Applies from the next phase to board. The session running now was started with its model and budget fixed in its own command line.',
+      'Each setting lands when its kind does — the lane cap, budgets and permission profile at the loop’s next decision; model, effort and skills from the next phase to board.',
   },
   phase: (ctx) => ({
     title: `Run only phase ${ctx.phase ?? ''}`.trim(),
@@ -283,6 +301,10 @@ export const HEADINGS: Readonly<
   plan: {
     title: 'Start authoring',
     description: 'A plan-authoring session, in plan mode until the plan is approved.',
+  },
+  fix: {
+    title: 'Fix one issue',
+    description: 'A session on its own branch, cut from trunk, that commits the fix and never pushes.',
   },
   defaults: { title: 'Automation defaults', description: 'What every new run opens on.' },
 });

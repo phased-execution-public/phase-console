@@ -16,12 +16,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  applyEvent, evaluateStall, livenessOf, newLaneSignals, noteWaitDenied, oldestOpenTool, stallThresholds,
+  applyEvent, attemptSignals, evaluateStall, livenessOf, newLaneSignals, noteWaitDenied, oldestOpenTool, stallThresholds,
   type LaneSignals,
   mintWatchRef, WATCH_ONESHOT_LEADS, waitScope,
 } from '../server/runner/liveness.ts';
 import { VERIFY_ENV_FALLBACK } from '../server/runner/verify-env.ts';
-import { STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS } from '../shared/attention-model.js';
+import {
+  LOCAL_JOB_GRACE_MS, SILENCE_KINDS, STALL_DEFAULTS, STALL_LOCAL_JOB_MS, STALL_SIGNALS,
+} from '../shared/attention-model.js';
 import type { StreamEvent } from '../server/runner/spawn.ts';
 
 const MINUTE = 60_000;
@@ -340,6 +342,10 @@ test('the wire view carries every field the run payload promises, and omits what
     turnsSinceLastTool: 1,
     commitsSinceStart: 0,
     treeDirty: false,
+    // Always present on a live lane (#28): it names WHICH silence clock runs
+    // and what it is measured against. Its `sinceMs` is an instant, so the
+    // figure a reader prints never goes stale between two snapshots.
+    silence: { kind: 'no-output', sinceMs: T0 + MINUTE, thresholdMs: STALL_DEFAULTS.stallSilentMs },
   });
   assert.ok(!('lastToolUseAt' in bare), 'a lane that has called nothing has no last-call time');
   assert.ok(!('openTool' in bare) && !('stall' in bare));
@@ -668,4 +674,262 @@ test('O6: the local-job nudge waits out the window the wait procedure grants', a
     localNudgeAfterMs(STALL_DEFAULTS.stallExternalWaitMs) < STALL_LOCAL_JOB_MS,
     'rung 1 must still be reachable before rung 2 parks the lane',
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * The labelled silence (#28 §4)
+ * ------------------------------------------------------------------ */
+
+test('LS-1 — the silence kinds are one vocabulary, owned by attention-model', () => {
+  assert.deepEqual([...SILENCE_KINDS], ['no-output', 'unproductive', 'in-tool', 'own-job', 'external-wait']);
+});
+
+test('LS-2 — nothing on the wire at all: `no-output`, on the productive clock, against stallSilentMs', () => {
+  const signals = fold([[step(1), T0 + MINUTE]]);
+  assert.deepEqual(livenessOf(4, signals).silence, {
+    kind: 'no-output', sinceMs: T0 + MINUTE, thresholdMs: STALL_DEFAULTS.stallSilentMs,
+  });
+});
+
+test('LS-3 — heard from but producing nothing: `unproductive`, and the clock is NOT the last output', () => {
+  const signals = fold([[step(1), T0 + MINUTE]]);
+  applyEvent(signals, { kind: 'retry', category: 'rate_limit' }, T0 + 4 * MINUTE);
+  const silence = livenessOf(4, signals).silence!;
+  assert.equal(silence.kind, 'unproductive');
+  // The retry moved `lastOutputAt`; the silence still runs from the last PRODUCTIVE event.
+  assert.equal(silence.sinceMs, T0 + MINUTE);
+  assert.equal(livenessOf(4, signals).lastOutputAt, new Date(T0 + 4 * MINUTE).toISOString());
+  assert.equal(silence.thresholdMs, STALL_DEFAULTS.stallSilentMs);
+});
+
+test('LS-4 — a tool call out: `in-tool`, measured exactly as `silent` measures it', () => {
+  const signals = fold([[tool('a', 'Read'), T0 + 2 * MINUTE]]);
+  const silence = livenessOf(4, signals).silence!;
+  assert.equal(silence.kind, 'in-tool');
+  assert.equal(silence.sinceMs, signals.lastProductiveAt);
+  assert.equal(silence.thresholdMs, STALL_DEFAULTS.stallSilentMs);
+  // The same clock the detector fires on: past the threshold, `silent` holds.
+  const stall = evaluateStall(signals, stallThresholds(), silence.sinceMs + silence.thresholdMs);
+  assert.equal(stall?.signal, 'silent');
+});
+
+test('LS-5 — a turn ended on its own background work: `own-job`, with the 45-minute bound and the 10-minute grace', () => {
+  const signals = fold([[step(1), T0 + MINUTE]]);
+  signals.backgroundTasks = [{ id: 'bg1', taskType: 'local_agent', since: T0 + MINUTE }];
+  const silence = livenessOf(4, signals).silence!;
+  assert.equal(silence.kind, 'own-job');
+  assert.equal(silence.sinceMs, T0 + MINUTE);
+  // The owner's numbers — and NOT the issue's misquote: the grace is ten minutes.
+  assert.equal(silence.thresholdMs, STALL_LOCAL_JOB_MS);
+  assert.equal(silence.graceMs, LOCAL_JOB_GRACE_MS);
+  assert.equal(LOCAL_JOB_GRACE_MS, 10 * MINUTE);
+  // It is exactly the stretch `silent` stays quiet through.
+  assert.equal(evaluateStall(signals, stallThresholds(), T0 + MINUTE + STALL_LOCAL_JOB_MS - 1), null);
+});
+
+test('LS-6 — a wait on somebody else\'s clock is `external-wait`; on its own job it is `own-job`', () => {
+  const signals = fold([[bash('w', 'gh run watch 123'), T0 + MINUTE]]);
+  signals.stall = {
+    signal: 'external-wait', since: new Date(T0 + MINUTE).toISOString(), detail: 'x', scope: 'external', source: 'open',
+  };
+  assert.deepEqual(livenessOf(4, signals).silence, {
+    kind: 'external-wait', sinceMs: T0 + MINUTE, thresholdMs: STALL_DEFAULTS.stallExternalWaitMs,
+  });
+  signals.stall = { ...signals.stall, scope: 'local' };
+  assert.deepEqual(livenessOf(4, signals).silence, {
+    kind: 'own-job', sinceMs: T0 + MINUTE, thresholdMs: STALL_LOCAL_JOB_MS, graceMs: LOCAL_JOB_GRACE_MS,
+  });
+});
+
+test('LS-7 — the thresholds are the ones the detector uses, prefs included; a verifying or frozen lane has none', () => {
+  const signals = fold([[step(1), T0 + MINUTE]]);
+  const widened = stallThresholds({ stallSilentMs: 20 * MINUTE, stallExternalWaitMs: 15 * MINUTE });
+  assert.equal(livenessOf(4, signals, widened).silence?.thresholdMs, 20 * MINUTE);
+  signals.backgroundTasks = [{ id: 'bg1', taskType: 'local_agent', since: T0 + MINUTE }];
+  // The grace is the larger of the wait signal's own threshold and the ten minutes.
+  assert.equal(livenessOf(4, signals, widened).silence?.graceMs, 15 * MINUTE);
+  signals.verifying = true;
+  assert.equal(livenessOf(4, signals).silence, undefined, 'the console arranged this silence');
+  signals.verifying = false;
+  signals.frozen = true;
+  assert.equal(livenessOf(4, signals).silence, undefined);
+});
+
+/* ------------------------------------------------------------------ *
+ * The in-turn-wait guard's two questions, over the AUD-34 corpus
+ * (control-tower phase 47, #52)
+ * ------------------------------------------------------------------ */
+
+/**
+ * 12 of the 15 refusals in the autopilot week were the session's own local
+ * work (AUD-34). The guard refuses only when BOTH answers say so — the command
+ * waits (`inTurnWait`) and the wait is on somebody else's clock (`waitScope`).
+ * `verify-env.test.ts` holds bash and JS to the first answer; this holds the
+ * pair to the corpus's verdicts, with the pids each session had announced.
+ */
+test('AUD-34: the guard refuses 3 of the 15 — the counters, the declarations and the local waits go through', async () => {
+  const { inTurnWait } = await import('../server/runner/liveness.ts');
+  const { readFileSync } = await import('node:fs');
+  const corpus = JSON.parse(readFileSync(new URL('./fixtures/wait-corpus/aud-34.json', import.meta.url), 'utf8')) as {
+    items: { id: string; wait: boolean; verdict: 'local' | 'external'; ownPids?: number[]; command: string }[];
+  };
+  let local = 0;
+  for (const item of corpus.items) {
+    const matched = inTurnWait(item.command, EXTERNAL_WAIT);
+    assert.equal(matched !== null, item.wait, `#${item.id}: inTurnWait read ${matched ?? 'no wait'}`);
+    const refused = matched !== null && waitScope(item.command, { ownPids: item.ownPids }) === 'external';
+    assert.equal(refused, item.verdict === 'external', `#${item.id}: the guard ${refused ? 'refused' : 'allowed'} it`);
+    if (!refused) local += 1;
+  }
+  assert.equal(local, 12, '12 of 15 local, as AUD-34 counted them');
+});
+
+test('waitScope: a loopback URL, a local git probe and an announced pid are the session\'s own clock', () => {
+  assert.equal(waitScope('until curl -sf http://localhost:3000/health; do sleep 2; done'), 'local');
+  assert.equal(waitScope('until curl -sf http://127.0.0.1:8197/openapi.json; do sleep 3; done'), 'local');
+  assert.equal(waitScope('until curl -sf http://[::1]:8080/; do sleep 3; done'), 'local');
+  assert.equal(waitScope('until curl -sf https://api.example.invalid/health; do sleep 3; done'), 'external');
+  // A host that merely STARTS with a loopback spelling is somebody else's.
+  assert.equal(waitScope('until curl -sf http://localhost.example.invalid/; do sleep 3; done'), 'external');
+  assert.equal(waitScope('until git log -1 --format=%s | grep -q handoff; do sleep 5; done'), 'local');
+  assert.equal(waitScope('until git diff --quiet; do sleep 5; done'), 'local');
+  assert.equal(waitScope('until git ls-remote origin pe/x | grep -q .; do sleep 5; done'), 'external');
+  // A pid is the session's own only when it said so: `$!` in a variable, or a
+  // literal it announced earlier. Any other pid is a process it FOUND.
+  assert.equal(waitScope('until ! kill -0 "$pid"; do sleep 5; done'), 'local');
+  assert.equal(waitScope('until ! kill -0 4242; do sleep 5; done', { ownPids: [4242] }), 'local');
+  assert.equal(waitScope('until ! kill -0 4242; do sleep 5; done'), 'external');
+  assert.equal(waitScope('until ! ps -p 4242 && ! ps -p 77; do sleep 5; done', { ownPids: [4242] }), 'external',
+    'one pid it did not start is a wait on somebody else');
+});
+
+test('the pids a session announces with $! are remembered on its lane, and nothing else is', () => {
+  const signals = fold([
+    [bash('bg', 'npm test > /tmp/t.log 2>&1 & echo $!'), T0 + MINUTE],
+    [{ kind: 'tool-result', id: 'bg', ok: true, detail: '51616' }, T0 + MINUTE + 1],
+    [bash('ls', 'wc -l src/*.ts'), T0 + 2 * MINUTE],
+    [{ kind: 'tool-result', id: 'ls', ok: true, detail: '4242 total' }, T0 + 2 * MINUTE + 1],
+  ]);
+  assert.deepEqual(signals.ownPids, [51616]);
+});
+
+/* ------------------------------------------------------------------ *
+ * Each attempt's liveness is its own (control-tower phase 80, #99)
+ * ------------------------------------------------------------------ */
+
+/** A dead session's accumulator: everything a working session leaves behind. */
+function worn(): LaneSignals {
+  const signals = fold([
+    [{ kind: 'retry', category: 'overloaded' } as StreamEvent, T0 + MINUTE],
+    [tool('t1'), T0 + 2 * MINUTE],
+    [step(1), T0 + 3 * MINUTE],
+  ]);
+  signals.idleAttempts = 2;
+  signals.attempt = 4;
+  signals.procStartedAt = T0;
+  signals.commitsSinceStart = 3;
+  signals.treeDirty = true;
+  signals.ownPids = [51616];
+  signals.backgroundTasks = [{ id: 'bg-1', since: T0 }];
+  signals.tokens = {
+    calls: 9, firstContext: 40_000, lastContext: 180_000, peakContext: 180_000,
+    input: 90, cacheWrite: 0, cacheRead: 900_000, output: 4_000, rebuilds: 0,
+  } as LaneSignals['tokens'];
+  signals.pollNudged = true;
+  signals.contextWindow = 1_000_000;
+  signals.stall = { signal: 'silent', since: new Date(T0 + 3 * MINUTE).toISOString(), detail: 'quiet' };
+  return signals;
+}
+
+test('AL: attemptSignals starts the next attempt over — clocks, retries, tools, waits and tokens — stamped with its number', () => {
+  const booted = T0 + 102 * MINUTE;
+  const next = attemptSignals(worn(), booted, 5);
+  assert.equal(next.attempt, 5);
+  assert.equal(next.startedAt, booted);
+  assert.equal(next.lastOutputAt, booted, 'the silent clock starts at this attempt\'s boot');
+  assert.equal(next.lastProductiveAt, booted);
+  assert.equal(next.retriesSinceProgress, 0);
+  assert.equal(next.retryBurstSince, undefined);
+  assert.equal(next.lastToolUseAt, undefined);
+  assert.equal(next.turnsSinceLastTool, 0);
+  assert.deepEqual(next.openTools, []);
+  assert.deepEqual(next.recentCalls, []);
+  assert.equal(next.ownPids, undefined, 'a dead process\'s pids are nobody\'s job now');
+  assert.equal(next.backgroundTasks, undefined);
+  assert.equal(next.tokens, undefined, 'the context is the live session\'s, from its first call');
+  assert.equal(next.procStartedAt, undefined, 'stamped when the new process is seen, not inherited');
+  assert.equal(next.commitsSinceStart, 0, 'this attempt has committed nothing yet');
+  assert.equal(next.stall, null, 'the dead session\'s episode is not the live one\'s');
+});
+
+test('AL: attemptSignals keeps what belongs to the phase — the stalemate count and episode, the tree, the spent notice, the window', () => {
+  const previous = worn();
+  const next = attemptSignals(previous, T0 + 102 * MINUTE, 5);
+  assert.equal(next.idleAttempts, 2);
+  assert.equal(next.treeDirty, true, 'the tree did not change when the process did');
+  assert.equal(next.pollNudged, true, 'one poll-loop notice per lane');
+  assert.equal(next.contextWindow, 1_000_000);
+  previous.stall = { signal: 'stalemate', since: new Date(T0).toISOString(), detail: '3 attempts in a row' };
+  assert.equal(attemptSignals(previous, T0 + 102 * MINUTE, 5).stall?.signal, 'stalemate',
+    'a stalemate is about the phase, and ends when an attempt commits');
+});
+
+test('AL: the wire view names the attempt and the process it describes — and says nothing until it knows', () => {
+  const signals = newLaneSignals(T0, { attempt: 3 });
+  signals.procStartedAt = Date.parse('2026-09-24T11:32:23.000Z');
+  const view = livenessOf(26, signals);
+  assert.equal(view.attempt, 3);
+  assert.equal(view.procStartedAt, '2026-09-24T11:32:23.000Z');
+  const bare = livenessOf(26, newLaneSignals(T0));
+  assert.equal('attempt' in bare, false);
+  assert.equal('procStartedAt' in bare, false);
+});
+
+test('AL: 102 minutes after the last attempt spoke is silence for that attempt, and not for the one just booted', () => {
+  const thresholds = stallThresholds();
+  const previous = fold([[step(0), T0]]);
+  assert.equal(evaluateStall(previous, thresholds, T0 + 102 * MINUTE)?.signal, 'silent', 'the inherited clock says hung');
+  const next = attemptSignals(previous, T0 + 102 * MINUTE, 2);
+  assert.equal(evaluateStall(next, thresholds, T0 + 103 * MINUTE), null, 'the live process is one minute old');
+});
+
+test('the wire view names the last call a lane finished, beside the one it has open (control-tower phase 95, #138)', () => {
+  const signals = fold([[tool('a'), T0], [result('a'), T0 + MINUTE], [tool('b', 'Read'), T0 + 2 * MINUTE]]);
+  const view = livenessOf(4, signals);
+  assert.equal(view.openTool?.name, 'Read');
+  assert.deepEqual(view.lastCall, { tool: 'Bash', summary: 'Bash', since: new Date(T0).toISOString(), ok: true });
+  assert.equal(livenessOf(4, fold([[step(1), T0]])).lastCall, undefined, 'no call finished, nothing named');
+});
+
+/* ------------------------------------------------------------------ *
+ * The stall reading (control-tower phase 44): silent + a link + waiting words
+ * ------------------------------------------------------------------ */
+
+test('a silent lane whose last output is a link and waiting words reads as a suspected human step — only on silence, only the last output', () => {
+  const thresholds = stallThresholds();
+  const login = 'Opening browser to https://cli-auth.heroku.com/auth/cli/browser/5f1\nheroku: Waiting for login...';
+  const signals = fold([
+    [{ kind: 'tool', id: 'h', name: 'Bash', summary: 'npx heroku-cli-plugin auth' }, T0 + 1],
+    [{ kind: 'tool-result', id: 'h', ok: false, detail: login }, T0 + 2],
+  ]);
+  assert.deepEqual(signals.suspectedStep, {
+    kind: 'browser-login', url: 'https://cli-auth.heroku.com/auth/cli/browser/5f1', words: 'Waiting for login',
+    where: 'host', at: T0 + 2,
+  });
+  // The signal is `silent` either way — the reading only says WHAT it is quiet on.
+  const stall = evaluateStall(signals, thresholds, T0 + 2 + thresholds.stallSilentMs);
+  assert.equal(stall?.signal, 'silent');
+  assert.equal(stall?.suspectedStep?.url, 'https://cli-auth.heroku.com/auth/cli/browser/5f1');
+  // A retry is not output: the reading stands through a 429 loop.
+  applyEvent(signals, { kind: 'retry', attempt: 1, category: 'rate_limit' } as StreamEvent, T0 + 3);
+  assert.ok(signals.suspectedStep);
+  // A call going out is not output either; its answer is, and it replaces the reading.
+  applyEvent(signals, { kind: 'tool', id: 'g', name: 'Bash', summary: 'git status' }, T0 + 4);
+  assert.ok(signals.suspectedStep);
+  applyEvent(signals, { kind: 'tool-result', id: 'g', ok: true, detail: 'nothing to commit, working tree clean' }, T0 + 5);
+  assert.equal(signals.suspectedStep, undefined);
+  // A link without waiting words is every test log.
+  applyEvent(signals, { kind: 'text', text: 'The suite passed; the report is at https://ci.example.com/run/9.' }, T0 + 6);
+  assert.equal(signals.suspectedStep, undefined);
+  assert.equal(evaluateStall(signals, thresholds, T0 + 6 + thresholds.stallSilentMs)?.suspectedStep, undefined);
 });

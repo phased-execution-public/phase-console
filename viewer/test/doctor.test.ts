@@ -10,7 +10,7 @@ import './state-sandbox.ts';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,10 +19,12 @@ import { RELAY_CLI_FLOOR } from '../shared/run-settings.js';
 import { PROBE_STATUSES } from '../shared/ops-vocab.js';
 import {
   atLeast, cliVerdict, consoleVerdict, doctorExitCode, doctorReport, environmentVerdict, formatDoctor, gitVerdict, hooksVerdict,
-  skipped,
+  nodeArgsVerdict, ptyHelperVerdict, skipped,
   type DoctorDeps, type DoctorRow,
 } from '../server/doctor.ts';
 import type { HooksStatus } from '../server/hooks-install.ts';
+import { spawnHelperFacts } from '../server/pty/spawn-helper.ts';
+import { skillCopyReport } from '../server/skill-copy.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..', '..');
@@ -52,14 +54,18 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     git: async () => ({ version: 'git version 2.50.0', code: 0, insideWorkTree: true, path: '/opt/homebrew/bin/git', root: '/home/someone/demo' }),
     environment: () => [],
     console: async () => ({ healthy: true, serverStale: false, version: 'built at deadbeef' }),
+    execArgv: () => [HEAP],
+    ptyHelper: () => ({ state: 'executable', path: '/home/someone/console/viewer/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper', mode: 0o755 }),
     now: () => NOW,
     ...over,
   };
 }
 
+const HEAP = '--max-old-space-size=6144';
+
 test('every row answers ok|fail|skip with a reason, in the documented order; a clean machine is ok', async () => {
   const report = await doctorReport(deps());
-  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
+  const order = ['accounts', 'mcp', 'credentials', 'delivery', 'hooks', 'skill', 'node', 'pty', 'cli', 'gh', 'publish', 'git', 'environment', 'console'];
   assert.deepEqual(report.rows.map((r) => r.id), order);
   for (const row of report.rows) {
     assert.ok((PROBE_STATUSES as readonly string[]).includes(row.status), `${row.id}: ${row.status}`);
@@ -183,6 +189,76 @@ test('`phase-console doctor --help` exits 0 with the usage, from both bins', () 
 });
 
 /* ------------------------------------------------------------------ *
+ * The `skill` row (control-tower phase 98, #151)
+ * ------------------------------------------------------------------ */
+
+/**
+ * The console updated itself and the skill every session read did not: the
+ * plugin sat 49 commits behind, and nothing on the machine said which of about
+ * fourteen copies was the one in use. The row names it — per config dir, the
+ * plugin install's path and commit — against the console's own commit.
+ */
+function pluginDir(root: string, name: string, commit: string): string {
+  const dir = join(root, name);
+  const installPath = join(dir, 'plugins', 'cache', 'phased-execution-public', 'phased-execution', commit.slice(0, 12));
+  mkdirSync(installPath, { recursive: true });
+  writeFileSync(join(dir, 'plugins', 'installed_plugins.json'), JSON.stringify({
+    version: 2,
+    plugins: { 'phased-execution@phased-execution-public': [{ scope: 'user', installPath, version: commit.slice(0, 12), gitCommitSha: commit }] },
+  }));
+  return dir;
+}
+
+const CONSOLE_REV = '8bd2f800320d9ca5519a791a83affb65bd4de561';
+const OLDER_REV = '77e57a59b79b1f2c3d4e5f60718293a4b5c6d7e8';
+
+test('SKILL-1 — the row names each config dir’s copy and its commit; one at another commit fails the row, never the report', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-doctor-skill-'));
+  try {
+    const here = pluginDir(root, '.claude', CONSOLE_REV);
+    const behind = pluginDir(root, '.claude-a', OLDER_REV);
+    const same = await doctorReport(deps({ skillCopy: () => skillCopyReport({ configDirs: [here], consoleRev: CONSOLE_REV }) }));
+    const ok = same.rows.find((r) => r.id === 'skill')!;
+    assert.equal(ok.status, 'ok');
+    assert.ok(ok.reason.includes(here) && ok.reason.includes(CONSOLE_REV.slice(0, 12)), ok.reason);
+
+    const drifted = await doctorReport(deps({ skillCopy: () => skillCopyReport({ configDirs: [here, behind], consoleRev: CONSOLE_REV }) }));
+    const row = drifted.rows.find((r) => r.id === 'skill')!;
+    assert.equal(row.status, 'fail');
+    assert.equal(row.blocking, false);
+    assert.equal(drifted.ok, true, 'a drifted skill is told, never a failed doctor');
+    assert.ok(row.reason.includes(behind) && row.reason.includes(OLDER_REV.slice(0, 12)), row.reason);
+    assert.match(formatDoctor(drifted), /✗ Skill copy .*update it: /);
+    assert.equal((await doctorReport(deps({ skillCopy: () => { throw new Error('unreadable'); } }))).rows
+      .find((r) => r.id === 'skill')?.status, 'skip', 'a reader that throws is a skip, never a crash');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('SKILL-2 — the offline doctor reads the same copies, through the same reader, with no console answering', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-doctor-skill-cli-'));
+  try {
+    const behind = pluginDir(root, '.claude', OLDER_REV);
+    const run = spawnSync(process.execPath, [join(REPO, 'bin', 'phase-console.mjs'), 'doctor', '--json'], {
+      encoding: 'utf8', cwd: root, timeout: 60_000,
+      // No `claude` and no `gh` on this PATH: the machine's own logins are never asked.
+      env: {
+        ...process.env, PHASE_CONSOLE_HOME: REPO, HOME: root, PE_CLAUDE_CONFIG_DIRS: behind,
+        PATH: [dirname(process.execPath), '/usr/bin', '/bin'].join(':'),
+      },
+    });
+    const report = JSON.parse(run.stdout) as { mode: string; rows: DoctorRow[] };
+    assert.equal(report.mode, 'offline');
+    const row = report.rows.find((r) => r.id === 'skill');
+    assert.ok(row, run.stderr);
+    assert.ok(row.reason.includes(behind) && row.reason.includes(OLDER_REV.slice(0, 12)), row.reason);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ *
  * The `git` row (5.1.0, errand E7)
  * ------------------------------------------------------------------ */
 
@@ -256,5 +332,86 @@ test('GIT-7 — the row is in the report, blocking, and a red one fails the exit
   const red = await doctorReport(deps({ git: async () => ({ version: null, code: 69, stderr: 'Xcode license', insideWorkTree: null }) }));
   assert.equal(doctorExitCode(red), 1, 'E7 must be an exit code, not a sentence nobody reads');
   assert.equal(red.firstFailing?.id, 'git');
+});
+
+/* ------------------------------------------------------------------ *
+ * The `node` row — this console's node arguments, and its unit's
+ * ------------------------------------------------------------------ */
+
+/**
+ * A console's heap is a NODE argument, so `process.argv` never shows it and a
+ * console started without one runs on V8's default with nothing anywhere
+ * saying so. The row reports what the process actually runs with.
+ */
+test('NODE-1 — the node row reports this console’s execArgv, and a console with none runs on V8’s default heap', async () => {
+  const given = nodeArgsVerdict({ execArgv: [HEAP] });
+  assert.equal(given.status, 'ok');
+  assert.match(given.reason, /--max-old-space-size=6144/);
+  const none = nodeArgsVerdict({ execArgv: [] });
+  assert.equal(none.status, 'ok');
+  assert.match(none.reason, /default heap/);
+  assert.equal(nodeArgsVerdict({ execArgv: null }).status, 'skip', 'no console answered: its arguments are its own to report');
+
+  // In the report: never blocking, and read from THIS process when the running
+  // console builds the report itself — offline there is no process to ask.
+  const report = await doctorReport(deps({ execArgv: undefined }));
+  const row = report.rows.find((r) => r.id === 'node')!;
+  assert.equal(row.blocking, false);
+  assert.deepEqual((row.detail as { execArgv: string[] }).execArgv, process.execArgv);
+  const offline = await doctorReport(deps({ mode: 'offline', execArgv: undefined, unit: async () => null }));
+  assert.equal(offline.rows.find((r) => r.id === 'node')?.status, 'skip');
+});
+
+/* ------------------------------------------------------------------ *
+ * The `pty` row — node-pty's spawn helper (control-tower #89)
+ * ------------------------------------------------------------------ */
+
+/**
+ * npm 11 skips node-pty's install scripts, so an `npm ci` leaves its helper
+ * 0644, and every terminal then fails `posix_spawnp failed` — a message that
+ * says nothing about a mode bit. The doctor names the file and the fix.
+ */
+test('PTY-1 — a spawn helper nothing may execute fails the pty row, naming the file and the chmod; never blocking', async () => {
+  const path = '/home/someone/console/viewer/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper';
+  const broken = ptyHelperVerdict({ state: 'not-executable', path, mode: 0o644 });
+  assert.equal(broken.status, 'fail');
+  assert.match(broken.reason, /0644/);
+  assert.match(broken.reason, /posix_spawnp/);
+  assert.ok(broken.reason.includes(`chmod +x ${path}`), broken.reason);
+  assert.equal(ptyHelperVerdict({ state: 'executable', path, mode: 0o755 }).status, 'ok');
+  assert.equal(ptyHelperVerdict({ state: 'absent' }).status, 'skip');
+  assert.equal(ptyHelperVerdict({ state: 'no-helper', root: '/x/node-pty' }).status, 'skip');
+
+  const report = await doctorReport(deps({ ptyHelper: () => ({ state: 'not-executable', path, mode: 0o644 }) }));
+  const row = report.rows.find((r) => r.id === 'pty')!;
+  assert.equal(row.status, 'fail');
+  assert.equal(row.blocking, false, 'terminals are optional — everything else still works');
+  assert.equal(report.ok, true);
+  assert.match(formatDoctor(report), /✗ Terminal helper .*chmod \+x/);
+});
+
+test('PTY-2 — spawnHelperFacts reads the helper node-pty would execute, beside the pty.node it loads', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pc-doctor-pty-'));
+  try {
+    assert.deepEqual(spawnHelperFacts(null), { state: 'absent' });
+    assert.deepEqual(spawnHelperFacts(root), { state: 'no-helper', root });
+    const prebuild = join(root, 'prebuilds', `${process.platform}-${process.arch}`);
+    mkdirSync(prebuild, { recursive: true });
+    writeFileSync(join(prebuild, 'pty.node'), '');
+    writeFileSync(join(prebuild, 'spawn-helper'), '#!/bin/sh\n', { mode: 0o644 });
+    chmodSync(join(prebuild, 'spawn-helper'), 0o644);
+    assert.deepEqual(spawnHelperFacts(root), { state: 'not-executable', path: join(prebuild, 'spawn-helper'), mode: 0o644 });
+    chmodSync(join(prebuild, 'spawn-helper'), 0o755);
+    assert.equal(spawnHelperFacts(root).state, 'executable');
+    // A local build wins when it is the one that loads: node-pty looks there first.
+    const release = join(root, 'build', 'Release');
+    mkdirSync(release, { recursive: true });
+    writeFileSync(join(release, 'pty.node'), '');
+    writeFileSync(join(release, 'spawn-helper'), '#!/bin/sh\n', { mode: 0o644 });
+    chmodSync(join(release, 'spawn-helper'), 0o644);
+    assert.deepEqual(spawnHelperFacts(root), { state: 'not-executable', path: join(release, 'spawn-helper'), mode: 0o644 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 

@@ -31,7 +31,11 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
-import { brotliCompressSync, constants as ZLIB, gzipSync } from 'node:zlib';
+import { promisify } from 'node:util';
+import { brotliCompress, constants as ZLIB, gzip } from 'node:zlib';
+
+const brotliAsync = promisify(brotliCompress);
+const gzipAsync = promisify(gzip);
 
 /** The two codings this server speaks, in preference order. */
 export type Encoding = 'br' | 'gzip';
@@ -119,17 +123,25 @@ export function negotiate(header: string | string[] | undefined): Encoding | nul
   return null;
 }
 
-/** Compress once, synchronously. Bodies here are already fully in memory. */
-export function compress(body: Buffer, encoding: Encoding): Buffer {
+/**
+ * Compress once, on the threadpool.
+ *
+ * Asynchronous since control-tower phase 56 (#75): a brotli pass at quality 5
+ * over `/api/runs`' 1.2 MB (p50; 8 MB at the worst) ran ON the event loop,
+ * and every hook, every SSE write and every other read waited behind it. The
+ * zlib bindings' async forms run the same compressor on libuv's pool, so the
+ * loop keeps answering while the bytes are packed.
+ */
+export function compress(body: Buffer, encoding: Encoding): Promise<Buffer> {
   if (encoding === 'br') {
-    return brotliCompressSync(body, {
+    return brotliAsync(body, {
       params: {
         [ZLIB.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY,
         [ZLIB.BROTLI_PARAM_SIZE_HINT]: body.length,
       },
     });
   }
-  return gzipSync(body, { level: 6 });
+  return gzipAsync(body, { level: 6 });
 }
 
 /**
@@ -178,7 +190,30 @@ export type SendOptions = {
    * meaningless, and a 304 to a 4xx is a lie.
    */
   revalidate?: boolean;
+  /**
+   * The entity's validator, when the caller already holds it — so the body is
+   * not hashed again on every request (#75). A caller that memoises an entity
+   * computes its tag once, with the body, and hands both in.
+   */
+  etag?: string;
+  /**
+   * The coded body, when the caller memoises that too: asked for the coding
+   * `negotiate` picked, instead of compressing here.
+   */
+  packed?: (encoding: Encoding) => Promise<Buffer>;
 };
+
+/**
+ * The write a response is still finishing. A body worth compressing is packed
+ * off the loop, so `sendBody` can return before the response has ended; a
+ * caller that must know it ended — `handleApi`, for its callers — awaits this.
+ */
+const inFlight = new WeakMap<ServerResponse, Promise<void>>();
+
+/** Resolves once whatever `sendBody` started on `res` has been written. */
+export function sendSettled(res: ServerResponse): Promise<void> {
+  return inFlight.get(res) ?? Promise.resolve();
+}
 
 /**
  * Write one complete body, in whatever form the client can read most cheaply.
@@ -196,7 +231,7 @@ export function sendBody(
   body: Buffer,
   headers: Record<string, string | number>,
   options: SendOptions = {},
-): void {
+): Promise<void> {
   const req = (res as ServerResponse & { req?: IncomingMessage }).req;
   const out: Record<string, string | number> = { ...headers };
   const compressible = options.compressible !== false;
@@ -207,7 +242,7 @@ export function sendBody(
   }
 
   if (options.revalidate && status === 200 && req?.method === 'GET') {
-    const etag = etagOf(body);
+    const etag = options.etag ?? etagOf(body);
     out.etag = etag;
     if (etagMatches(req.headers['if-none-match'], etag)) {
       // A 304 carries validators and cache directives and NOTHING that
@@ -217,24 +252,29 @@ export function sendBody(
       delete out['content-type'];
       res.writeHead(304, out);
       res.end();
-      return;
+      return Promise.resolve();
     }
   }
 
-  let wire = body;
-  if (compressible && body.length >= MIN_COMPRESS_BYTES) {
-    const encoding = negotiate(req?.headers['accept-encoding']);
-    if (encoding) {
-      const packed = compress(body, encoding);
-      // Rule 2: a body that grew is a body sent as it was.
-      if (packed.length < body.length) {
-        wire = packed;
-        out['content-encoding'] = encoding;
-      }
-    }
+  const write = (wire: Buffer, encoding?: Encoding): void => {
+    if (encoding) out['content-encoding'] = encoding;
+    out['content-length'] = wire.length;
+    res.writeHead(status, out);
+    res.end(wire);
+  };
+  const encoding = compressible && body.length >= MIN_COMPRESS_BYTES
+    ? negotiate(req?.headers['accept-encoding'])
+    : null;
+  if (!encoding) {
+    write(body);
+    return Promise.resolve();
   }
-
-  out['content-length'] = wire.length;
-  res.writeHead(status, out);
-  res.end(wire);
+  const pending = (options.packed ? options.packed(encoding) : compress(body, encoding))
+    // Rule 2: a body that grew is a body sent as it was.
+    .then((packed) => (packed.length < body.length ? write(packed, encoding) : write(body)))
+    // A coding that failed is an identity body, never a response left hanging.
+    .catch(() => { if (!res.headersSent) write(body); })
+    .finally(() => { if (inFlight.get(res) === pending) inFlight.delete(res); });
+  inFlight.set(res, pending);
+  return pending;
 }

@@ -23,8 +23,14 @@
  *   delivery     a channel for announcements: device, notify command, webhook;
  *                under --remote, Tailscale up and Serve on this port
  *   hooks        the session-presence hooks installed and pointing at THIS copy BLOCKING
+ *   skill        the skill copy each config dir's sessions load (the plugin's
+ *                path and commit) against the console's own commit (#151)
  *   unit         the instance's launchd unit: present, enabled, RunAtLoad,
  *                and no stopped-by-console marker                          (Pro)
+ *   node         the node arguments the console runs with (`execArgv`), and
+ *                the ones its unit gives node against `nodeArgsFor(profile)` (#71)
+ *   pty          node-pty's spawn helper is executable — `npm ci` leaves it
+ *                0644, and every terminal then fails `posix_spawnp` (#89)
  *   cli          the Claude CLI version against the relay floor
  *   gh           `gh auth status`
  *   publish      `--allow-publish`: may this console push `pe/*` branches and
@@ -41,9 +47,12 @@ import { RELAY_CLI_FLOOR, versionAtLeast } from '../shared/run-settings.js';
 import { DELIVERY_ISSUE_ID, type EnvIssue } from './env-doctor.ts';
 import type { HooksStatus } from './hooks-install.ts';
 import type { ProbeVerdict } from './prelude.ts';
+import { spawnHelperFacts, type SpawnHelperFacts } from './pty/spawn-helper.ts';
+import { skillCopyVerdict, type SkillCopyReport } from './skill-copy.ts';
 
 export type DoctorRowId =
-  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'unit' | 'cli' | 'gh' | 'publish' | 'git' | 'environment' | 'console';
+  | 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'hooks' | 'skill' | 'unit' | 'node' | 'pty'
+  | 'cli' | 'gh' | 'publish' | 'git' | 'environment' | 'console';
 
 export type DoctorRow = {
   id: DoctorRowId;
@@ -79,6 +88,12 @@ export type DoctorDeps = {
   delivery: () => Promise<ProbeVerdict>;
   hooks: () => Promise<HooksStatus | null>;
   /**
+   * Which skill copy each Claude Code config dir's sessions load, against the
+   * console's commit — `skill-copy.ts`, the one reader (#151). Absent (an
+   * older deps builder) is a `skip`, never a guess.
+   */
+  skillCopy?: () => SkillCopyReport | null;
+  /**
    * The launchd unit's state, or `null` when the platform has none / the
    * caller cannot read it (`skip`). Pro-only in the free tree, where no unit
    * exists.
@@ -101,6 +116,14 @@ export type DoctorDeps = {
   environment: () => EnvIssue[];
   /** A console on the instance's port: reachable, healthy, and whether its dist is stale. `null` = nothing answered. */
   console: () => Promise<{ healthy: boolean; serverStale?: boolean; version?: string } | null>;
+  /**
+   * `process.execArgv` of the console the report is about (#71). Absent means
+   * THIS process's own in `console` mode — the running console builds those
+   * deps itself — and unknown offline, where no console process is at hand.
+   */
+  execArgv?: () => readonly string[] | null;
+  /** node-pty's spawn helper (#89). Absent means the helper of the copy this process runs from. */
+  ptyHelper?: () => SpawnHelperFacts;
   now?: () => string;
 };
 
@@ -114,6 +137,21 @@ export type UnitFacts = {
   /** The `stopped-by-console.json` marker (phase 16) is present. */
   stoppedMarker: boolean;
   label: string;
+  /** Its ProgramArguments, judged against the node arguments an install renders (#71). */
+  args?: UnitArgsView | null;
+};
+
+/**
+ * A unit's node arguments as `pro/unit-args.ts` reads them — the fields the
+ * `node` row speaks from, named here so this file needs nothing Pro to type it.
+ */
+export type UnitArgsView = {
+  label: string;
+  state: 'clean' | 'drifted' | 'absent' | 'unreadable';
+  programArguments: string[] | null;
+  nodeArgs: string[];
+  expected: string[];
+  why?: string;
 };
 
 /** A verdict that says the probe could not be asked here. */
@@ -261,6 +299,52 @@ export function publishVerdict(on: boolean): ProbeVerdict {
     };
 }
 
+/** What the `node` row reads: the console's own node arguments, and its unit's. */
+export type NodeArgsFacts = {
+  /** The console's `process.execArgv`; null when no console process answered. */
+  execArgv: readonly string[] | null;
+  /** Its launchd unit's arguments, as `unitFacts` read them (Pro); null or absent when there is none. */
+  unit?: UnitArgsView | null;
+  /** The console under report IS that unit's job, so what it runs with must be what the unit says. */
+  ownUnit?: boolean;
+};
+
+function argsInWords(args: readonly string[]): string {
+  return args.length ? args.join(' ') : 'no node arguments (V8’s default heap)';
+}
+
+/**
+ * The heap a console runs with is a NODE argument, so `process.argv` never
+ * shows it — a console started without one sat on V8's default for weeks, and
+ * nothing said so (#71). Never blocking: a console on the default heap still
+ * works; it is told, not stopped.
+ */
+export function nodeArgsVerdict(facts: NodeArgsFacts): ProbeVerdict {
+  const execArgv = facts.execArgv;
+  if (!execArgv) return skipped('no console answered — the node arguments it runs with are its own to report');
+  return { status: 'ok', ok: true, reason: `this console runs with ${argsInWords(execArgv)}`, detail: { execArgv } };
+}
+
+
+/**
+ * node-pty's spawn helper (#89). It ships without its executable bit and npm
+ * 11 skips the install script that would set it, so an `npm ci` — the update
+ * path runs one — leaves every terminal failing with `posix_spawnp failed`, a
+ * message that says nothing about a mode. The pty broker heals it before each
+ * spawn; this row names it meanwhile. Never blocking: terminals are optional.
+ */
+export function ptyHelperVerdict(facts: SpawnHelperFacts | null): ProbeVerdict {
+  if (!facts) return skipped('the spawn helper could not be looked for');
+  if (facts.state === 'absent') return skipped('node-pty is not installed in this copy — there is no terminal to break');
+  if (facts.state === 'no-helper') return skipped(`node-pty at ${facts.root} carries no spawn helper to check`);
+  if (facts.state === 'executable') return { status: 'ok', ok: true, reason: `${facts.path} is executable` };
+  return {
+    status: 'fail', ok: false,
+    reason: `${facts.path} is ${facts.mode.toString(8).padStart(4, '0')}, so every terminal fails with "posix_spawnp failed" `
+      + `— the pty broker heals it before its next spawn; to fix it now: chmod +x ${facts.path}`,
+  };
+}
+
 export function cliVerdict(version: string | undefined): ProbeVerdict {
   const ok = atLeast(version, RELAY_CLI_FLOOR);
   if (ok === null) return skipped('the claude CLI did not answer --version');
@@ -328,6 +412,12 @@ export async function doctorReport(deps: DoctorDeps): Promise<DoctorReport> {
   rows.push(row('credentials', 'Credentials (machine login)', true, await settle(deps.credentials, 'the credential probe')));
   rows.push(row('delivery', 'Delivery channel', false, await settle(deps.delivery, 'the delivery probe')));
   rows.push(row('hooks', 'Session-presence hooks', true, hooksVerdict(await deps.hooks().catch(() => null))));
+  // Never blocking: a skill at another commit still runs a console — it is
+  // told (and the inbox and the boot prompt say so), not stopped.
+  rows.push(row('skill', 'Skill copy', false, skillCopyVerdict(safeSkillCopy(deps))));
+  let unit: UnitFacts | null = null;
+  rows.push(row('node', 'Node arguments', false, nodeArgsVerdict(nodeArgsFacts(deps, unit))));
+  rows.push(row('pty', 'Terminal helper', false, ptyHelperVerdict(safePtyHelper(deps))));
   rows.push(row('cli', 'Claude CLI', false, cliVerdict(await deps.cliVersion().catch(() => undefined))));
   rows.push(row('gh', 'GitHub CLI', false, await settle(deps.gh, 'gh auth status')));
   rows.push(row('publish', 'Outward writes (--allow-publish)', false, publishVerdict(safePublish(deps))));
@@ -355,6 +445,33 @@ function safeIssues(deps: DoctorDeps): EnvIssue[] {
 
 function safePublish(deps: DoctorDeps): boolean {
   try { return deps.publish?.() === true; } catch { return false; }
+}
+
+function safeSkillCopy(deps: DoctorDeps): SkillCopyReport | null {
+  try { return deps.skillCopy?.() ?? null; } catch { return null; }
+}
+
+/**
+ * The `node` row's facts. In `console` mode this very process is the console
+ * the report is about, so its own `execArgv` answers when the deps say
+ * nothing; offline, a person's shell is not the console, and nothing does.
+ */
+function nodeArgsFacts(deps: DoctorDeps, unit: UnitFacts | null): NodeArgsFacts {
+  let execArgv: readonly string[] | null = null;
+  try {
+    execArgv = deps.execArgv ? deps.execArgv() : deps.mode === 'console' ? process.execArgv : null;
+  } catch { execArgv = null; }
+  return {
+    execArgv,
+    unit: unit?.args ?? null,
+    // The unit's own job: its label in the environment AND launchd (pid 1) as
+    // the parent — the label alone is inherited by everything a console starts.
+    ownUnit: deps.mode === 'console' && unit !== null && process.env.XPC_SERVICE_NAME === unit.label && process.ppid === 1,
+  };
+}
+
+function safePtyHelper(deps: DoctorDeps): SpawnHelperFacts | null {
+  try { return deps.ptyHelper ? deps.ptyHelper() : spawnHelperFacts(); } catch { return null; }
 }
 
 /** The CLI's exit code: 1 when a blocking row failed, else 0. */

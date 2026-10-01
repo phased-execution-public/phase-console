@@ -14,17 +14,17 @@
  * factor, which is the mistake the two variants exist to prevent.
  */
 
-import { useState } from 'react';
+import { lazy, Suspense, useState } from 'react';
 import { Gauge } from 'lucide-react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
 
-import { keys, useAccounts, useConsoleState } from '@/lib/queries';
-import { api } from '@/lib/api';
+import { useAccounts } from '@/lib/queries';
 import type { AccountView, UsageBucket } from '@/lib/api';
-import { countdown, relativeTime } from '@/lib/format';
 import { cn } from '@/lib/cn';
-import { Banner, Button, Chip, Dialog, DialogContent, Empty, toast } from '@/components/ui';
-import { RefreshMeters } from '@/components/refresh-meters';
+import { Dialog, DialogContent } from '@/components/ui';
+import { burnPhrase, trendPhrase } from '@shared/ops-vocab.js';
+import type { BucketForecast } from '@/lib/api/accounts';
+
+const LimitsOverview = lazy(() => import('./limits-overview').then((m) => ({ default: m.LimitsOverview })));
 
 /** Human names for the endpoint's bucket keys; unknown keys stay readable. */
 export function bucketLabel(bucket: string): string {
@@ -43,8 +43,8 @@ export function bucketLabel(bucket: string): string {
  * the hue is read in the two places CLAUDE.md declares and nowhere else.
  *
  * It used to name the legacy 2.x aliases directly, and the 3.0 rebuild
- * re-pointed those: `bg-ready` resolves through `--color-ready` → `--line-ready`
- * → `--status-queued`, one of the two deliberate NEUTRALS. So crossing the 80%
+ * re-pointed those: its `bg-ready` resolved, through the 2.x line alias, to
+ * `--status-queued`, one of the two deliberate NEUTRALS. So crossing the 80%
  * warning threshold made the bar go QUIETER than it was at 79 — the one moment
  * it exists to be noticed.
  */
@@ -54,7 +54,7 @@ function tone(pct: number): string {
   return 'state-done';
 }
 
-function Meter({ pct, className }: { pct: number; className?: string }) {
+export function Meter({ pct, className }: { pct: number; className?: string }) {
   const clamped = Math.max(0, Math.min(100, pct));
   return (
     <div
@@ -98,24 +98,75 @@ function orderedBuckets(account: AccountView): { key: string; bucket: UsageBucke
  * this size because it is not asking to be read precisely: it is asking to be
  * GLANCED at, and the exact numbers are one press away.
  */
+/** Why an account has no window to draw, in words — the bar it gets instead says the same. */
+export function meterWords(account: AccountView): string {
+  if (account.meter === 'broken')
+    return `meter broken${account.usage?.error ? ` (${account.usage.error})` : ''}`;
+  if (account.meter === 'unsupported' || account.usage?.unsupported)
+    return 'the usage endpoint does not serve this credential';
+  return 'no reading yet';
+}
+
+/** The runs paying as this account, as words for a label — empty when none is. */
+function payingWords(account: AccountView): string {
+  return account.paying?.length ? ` — paying for ${account.paying.map((p) => p.slug).join(', ')}` : '';
+}
+
 function AccountBars({ accounts, height = 14 }: { accounts: AccountView[]; height?: number }) {
   return (
     <span className="flex items-end gap-1.5">
       {accounts.map((account) => {
         const buckets = orderedBuckets(account);
-        if (!buckets.length) return null;
         const label = accountName(account);
+        const paying = Boolean(account.paying?.length);
+        // The account a live run pays as carries a mark above its bars (#33).
+        const mark = paying ? (
+          <span aria-hidden className="size-1 self-start rounded-full bg-action" />
+        ) : null;
+        if (!buckets.length) {
+          // Every account has a bar (phase 25, #33): one with no window is drawn
+          // as what it is — a broken meter dashed in the failure hue, a
+          // credential the endpoint does not serve or no reading yet as an
+          // empty track — never left out, which read as "no such account".
+          return (
+            <span
+              key={account.id}
+              className="flex items-end gap-px"
+              role="img"
+              data-meter={account.meter ?? 'none'}
+              data-paying={paying ? 'true' : undefined}
+              aria-label={`${label}: ${meterWords(account)}${payingWords(account)}`}
+            >
+              <span
+                className={cn(
+                  'relative w-[3px] shrink-0 rounded-[1px]',
+                  account.meter === 'broken' ? 'state-failed border border-dashed border-state' : 'bg-track',
+                )}
+                style={{ height }}
+              />
+              {mark}
+            </span>
+          );
+        }
         return (
           <span
             key={account.id}
             className="flex items-end gap-px"
             role="img"
-            aria-label={`${label}: ${buckets
-              .map((b) => `${bucketLabel(b.key)} ${Math.round(b.bucket.utilization)}%`)
-              .join(', ')}`}
+            data-meter={account.meter ?? 'ok'}
+            data-paying={paying ? 'true' : undefined}
+            aria-label={`${label}: ${buckets.map((b) => bucketWords(account, b.key, b.bucket)).join(', ')}${payingWords(account)}`}
           >
             {buckets.map(({ key, bucket }) => {
               const pct = Math.max(0, Math.min(100, bucket.utilization));
+              // The next hour at the measured burn, drawn faint above the fill
+              // (control-tower phase 92, #33): 78 % and climbing has a ghost, 78 %
+              // and flat has none. Clipped at the top — the wall is the column's end.
+              const forecast = account.forecast?.buckets[key];
+              const ahead =
+                forecast?.trend === 'climbing' && forecast.burnPctPerHour
+                  ? Math.min(100 - pct, forecast.burnPctPerHour)
+                  : 0;
               return (
                 <span
                   key={key}
@@ -128,14 +179,45 @@ function AccountBars({ accounts, height = 14 }: { accounts: AccountView[]; heigh
                     // missing bar look identical, and they mean opposite things.
                     style={{ height: `${Math.max(pct, 4)}%` }}
                   />
+                  {ahead > 0 ? (
+                    <span
+                      data-forecast="climbing"
+                      className={cn('absolute inset-x-0 block opacity-40', tone(Math.min(100, pct + ahead)))}
+                      style={{ bottom: `${Math.max(pct, 4)}%`, height: `${ahead}%` }}
+                    />
+                  ) : null}
                 </span>
               );
             })}
+            {mark}
           </span>
         );
       })}
     </span>
   );
+}
+
+/**
+ * A window's forecast in words (control-tower phase 92, #33's trend): "and
+ * climbing · +4 %/h · walls ≈10:50", "and flat", or nothing while its burn is
+ * not measured. The card and the bar say it the same way.
+ */
+export function forecastWords(forecast: BucketForecast | undefined): string {
+  const trend = trendPhrase(forecast);
+  if (!forecast || !trend) return '';
+  // Flat is the whole sentence: a burn under the flat line is noise, not news.
+  if (forecast.trend !== 'climbing') return trend;
+  const burn = burnPhrase(forecast.burnPctPerHour);
+  const walls = forecast.wallsAt
+    ? `walls ≈${new Date(forecast.wallsAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+    : '';
+  return [trend, burn, walls].filter(Boolean).join(' · ');
+}
+
+/** A bucket's reading and its trend, for a title or a label. */
+function bucketWords(account: AccountView, key: string, bucket: UsageBucket): string {
+  const trend = forecastWords(account.forecast?.buckets[key]);
+  return `${bucketLabel(key)} ${Math.round(bucket.utilization)}%${trend ? ` ${trend}` : ''}`;
 }
 
 /** Every account and bucket as one line of text — the title behind the picture. */
@@ -144,9 +226,7 @@ function usageTitle(accounts: AccountView[]): string {
     .map((account) => {
       const buckets = orderedBuckets(account);
       if (!buckets.length) return `${accountName(account)}: no usage data yet`;
-      return `${accountName(account)} — ${buckets
-        .map((b) => `${bucketLabel(b.key)} ${Math.round(b.bucket.utilization)}%`)
-        .join(' · ')}`;
+      return `${accountName(account)} — ${buckets.map((b) => bucketWords(account, b.key, b.bucket)).join(' · ')}`;
     })
     .join('\n');
 }
@@ -195,7 +275,7 @@ function worstWeeklyAcross(
   return worst;
 }
 
-function accountName(account: AccountView): string {
+export function accountName(account: AccountView): string {
   if (account.builtIn) return account.name ?? account.email ?? 'This machine’s login';
   return account.name ?? account.email ?? account.id;
 }
@@ -217,8 +297,10 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
     (!five && accounts?.some((a) => a.usage?.error || a.usage?.unsupported)),
   );
 
-  // Every account that actually reports a window — what the bars draw.
+  // Every account that actually reports a window — what the title reads out.
   const metered = (accounts ?? []).filter((account) => orderedBuckets(account).length > 0);
+  // Every account gets a bar (phase 25, #33) — the ones with no window drawn as such.
+  const drawn = accounts ?? [];
   const fiveTitle = five && several ? `5-hour — ${accountName(five.account)}` : '5-hour window';
   const weeklyTitle =
     weekly && several
@@ -252,16 +334,20 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
                 stops a run soonest — and the bars behind it say whose, and
                 which window, without a click. */}
             <span className="tnum">{Math.round(five.bucket.utilization)}%</span>
-            {metered.length > 0 && (
+            {drawn.length > 0 && (
               <span className="hidden sm:flex">
-                <AccountBars accounts={metered} />
+                <AccountBars accounts={drawn} />
               </span>
             )}
           </>
         ) : (
-          <span className="text-ink-faint">no data</span>
+          // Muted, never faint, like the rest of the button's label: "no
+          // data" and "stale" are read — the second is the warning that the
+          // figures may be old — and faint fails AA at 12px on the header's
+          // ground (the e2e register, on every desk page).
+          <span className="text-ink-muted">no data</span>
         )}
-        {stale && <span className="text-ink-faint">stale</span>}
+        {stale && <span className="text-ink-muted">stale</span>}
       </button>
     ) : variant === 'phone' ? (
       <button
@@ -273,7 +359,7 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
       >
         <Gauge size={16} aria-hidden />
         {five ? <span className="tnum">{Math.round(five.bucket.utilization)}%</span> : null}
-        {metered.length > 0 && <AccountBars accounts={metered} height={12} />}
+        {drawn.length > 0 && <AccountBars accounts={drawn} height={12} />}
       </button>
     ) : variant === 'sheet' ? (
       <button
@@ -286,7 +372,7 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
         </span>
         <span className="flex items-center gap-2 text-xs text-ink-muted">
           {five ? `5h ${Math.round(five.bucket.utilization)}%` : 'no data'}
-          {metered.length > 0 && <AccountBars accounts={metered} height={12} />}
+          {drawn.length > 0 && <AccountBars accounts={drawn} height={12} />}
         </span>
       </button>
     ) : (
@@ -318,9 +404,9 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
             worst window anywhere, which is the right alarm and the wrong map.
             This says whose window that was, and whether the other login has
             room — the question the alarm makes you ask. */}
-        {several && metered.length > 0 ? (
+        {several && drawn.length > 0 ? (
           <span className="flex flex-col gap-0.5 pt-1">
-            {metered.map((account) => (
+            {drawn.map((account) => (
               <span key={account.id} className="flex items-center gap-1.5">
                 <span className="max-w-16 truncate text-2xs text-ink-faint" title={accountName(account)}>
                   {accountName(account)}
@@ -347,199 +433,15 @@ export function LimitsWidget({ variant }: { variant: 'header' | 'rail' | 'phone'
       {trigger}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent title="Claude usage limits">
-          <LimitsOverview accounts={data?.accounts} />
+          {/* The overview is its own chunk (phase 25): it is behind a press,
+              and first paint is held to its budget. */}
+          {open ? (
+            <Suspense fallback={null}>
+              <LimitsOverview accounts={data?.accounts} />
+            </Suspense>
+          ) : null}
         </DialogContent>
       </Dialog>
     </>
-  );
-}
-
-/** Every account × every bucket, with resets and staleness. Reused by Settings. */
-/**
- * Registered accounts that are really the SAME Claude identity.
- *
- * Two entries pointing at one login look like failover and are not: their
- * windows are the same windows, so `onLimit: 'switch'` moves a run onto the
- * wall it just hit, and `auto` picks between two identical scores. It happens
- * for an ordinary reason — signing the machine's own `claude` login in as the
- * account you also registered as a profile — and nothing in the console said
- * so, because each entry reads correctly on its own.
- *
- * Matched on email, which is the only identity the usage endpoint gives us.
- */
-function duplicateIdentities(accounts: AccountView[]): { email: string; ids: string[] }[] {
-  const byEmail = new Map<string, string[]>();
-  for (const account of accounts) {
-    const email = account.email?.trim().toLowerCase();
-    if (!email) continue;
-    byEmail.set(email, [...(byEmail.get(email) ?? []), account.id]);
-  }
-  return [...byEmail.entries()].filter(([, ids]) => ids.length > 1).map(([email, ids]) => ({ email, ids }));
-}
-
-export function LimitsOverview({ accounts }: { accounts: AccountView[] | undefined }) {
-  // The mute renders even with nothing to meter. A console with no REGISTERED
-  // account still runs work as the default one, and still announces when that
-  // hits a window — so "no accounts to meter yet" must not be a page with no
-  // way to switch those announcements off.
-  if (!accounts?.length) {
-    return (
-      <div className="flex flex-col gap-4">
-        <Empty title="No accounts to meter yet" />
-        <RefreshMeters />
-        <UsageAlerts />
-      </div>
-    );
-  }
-  const duplicates = duplicateIdentities(accounts);
-  return (
-    <div className="flex flex-col gap-4">
-      {duplicates.map(({ email, ids }) => (
-        <Banner key={email} severity="warn">
-          <span>
-            <strong>{ids.join(' and ')}</strong> are the same Claude account ({email}). They share one set of
-            windows, so switching between them buys no headroom — a run set to{' '}
-            <code className="font-mono">switch</code> at a limit will move onto the wall it just hit. For real
-            failover, register a second account with a different login.
-          </span>
-        </Banner>
-      ))}
-      {/* The numbers below are polled on a courtesy budget — up to ten minutes
-          old on an idle account. One press re-reads every one of them. */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-2xs text-ink-faint">
-          Polled on a budget: ~90s while a session is running, ten minutes when idle.
-        </span>
-        <RefreshMeters />
-      </div>
-      {accounts.map((account) => {
-        const buckets = Object.entries(account.usage?.buckets ?? {});
-        const fetched = account.usage?.fetchedAt ? Date.parse(account.usage.fetchedAt) : undefined;
-        return (
-          <section key={account.id} className="flex flex-col gap-2">
-            <header className="flex flex-wrap items-center gap-2">
-              <span className="text-sm font-medium">{accountName(account)}</span>
-              {account.plan ? <Chip>{account.plan}</Chip> : null}
-              {account.kind === 'token' ? <Chip>token</Chip> : null}
-              {account.kind === 'profile' && account.signedIn === false ? <Chip>not signed in</Chip> : null}
-              {account.authState === 'expired' ? <Chip tone="bad">login expired</Chip> : null}
-              {account.authState === 'signed-out' && account.signedIn !== false ? (
-                <Chip tone="bad">signed out</Chip>
-              ) : null}
-              {fetched !== undefined ? (
-                <span className="text-2xs text-ink-faint">as of {relativeTime(fetched)}</span>
-              ) : null}
-              <RefreshMeters accountId={account.id} variant="ghost" className="ml-auto" />
-            </header>
-            {account.usage?.unsupported ? (
-              <p className="text-xs text-ink-muted">
-                The usage endpoint does not serve this credential — limits are learned when a run hits one.
-              </p>
-            ) : buckets.length ? (
-              buckets.map(([key, bucket]) => (
-                /* The label takes its own line on a phone. Four `shrink-0`
-                   boxes — a 160px label, 36px of percentage and an 80px
-                   countdown — left the one `flex-1` element in the row with
-                   about two pixels at 360: a meter rendered as a sliver, on the
-                   screen where the number matters most. `flex-wrap` and a floor
-                   on the bar make the bar the last thing to give rather than
-                   the first. */
-                <div key={key} className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className="w-full shrink-0 truncate text-ink-muted sm:w-40">{bucketLabel(key)}</span>
-                  <Meter pct={bucket.utilization} className="min-w-24 flex-1" />
-                  <span className="w-9 shrink-0 text-right">{Math.round(bucket.utilization)}%</span>
-                  <span
-                    className="w-20 shrink-0 truncate text-right text-ink-faint"
-                    title={new Date(bucket.resetsAt).toLocaleString()}
-                  >
-                    {countdown(Date.parse(bucket.resetsAt)) || '—'}
-                  </span>
-                </div>
-              ))
-            ) : (
-              <p className="text-xs text-ink-faint">
-                No usage data{account.usage?.error ? ` — ${account.usage.error}` : ' yet'}.
-              </p>
-            )}
-            {Object.entries(account.limitedUntil ?? {}).map(([bucket, iso]) => (
-              <p key={bucket} className="text-xs font-medium text-ink-muted">
-                Hit its {bucketLabel(bucket).toLowerCase()} limit —{' '}
-                {countdown(Date.parse(iso)) || 'reset due'} (
-                {new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}).
-              </p>
-            ))}
-          </section>
-        );
-      })}
-
-      <UsageAlerts />
-    </div>
-  );
-}
-
-/**
- * The mute, put where the noise is.
- *
- * The switch itself is not new — `notify.limits` has always been one of the
- * eleven categories on Notifications ▸ Settings, and the server gates on it
- * before the inbox record, the live event, `PHASE_CONSOLE_NOTIFY` and push
- * alike. What was missing is that nobody forms the intention "stop telling me
- * about usage" while reading a list of notification categories. They form it
- * looking at the meter that just buzzed them, which is here.
- *
- * So this is the same preference, written from the place the irritation
- * happens. It reads server state rather than keeping its own, because a
- * preference that governs a server process has to render what that process
- * holds — a local copy would show the operator their intention instead of the
- * setting.
- *
- * It says what stays audible, deliberately. The category also carries a run
- * that parked waiting for a window, an account that could not sign in, and a
- * run refused before it started — silence about those looks exactly like a
- * console that has stopped working.
- */
-function UsageAlerts() {
-  const client = useQueryClient();
-  const { data: state } = useConsoleState();
-  const on = state?.prefs?.notify?.limits !== false;
-
-  const save = useMutation({
-    // A delta, not the whole map: the server merges it over what is stored, so
-    // two tabs toggling different categories do not overwrite each other.
-    mutationFn: (next: boolean) => api.savePrefs({ notify: { limits: next } }),
-    onSuccess: async () => {
-      await client.invalidateQueries({ queryKey: keys.state() });
-    },
-    onError: (error: Error) => toast(String(error.message ?? error), 'error'),
-  });
-
-  if (!state) return null;
-
-  return (
-    <div className="flex flex-col gap-1.5 border-t border-rule pt-3">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-sm">Usage alerts</span>
-        <Button
-          size="sm"
-          variant={on ? 'ghost' : 'default'}
-          disabled={save.isPending}
-          aria-pressed={on}
-          onClick={() => save.mutate(!on)}
-        >
-          {on ? 'Turn off' : 'Turn on'}
-        </Button>
-      </div>
-      <p className="text-2xs text-ink-faint">
-        {on
-          ? 'The console announces a window that was hit, a run that parked waiting for one to ' +
-            'reopen, and an account that could not sign in. Turning this off silences all of ' +
-            'them everywhere — inbox, push and any notify command. The meters above keep ' +
-            'updating, and the early "usage climbing" warning has its own switch under ' +
-            'Notifications (off unless you turn it on).'
-          : 'Silenced everywhere — inbox, push and any notify command. Runs still wait, switch ' +
-            'account or pause as you asked; they just do it without telling you. The meters ' +
-            'above keep updating.'}
-      </p>
-    </div>
   );
 }

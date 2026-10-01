@@ -27,9 +27,14 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
 
 ## Session budget
 <!-- The model these phases are SIZED FOR, so a future session can re-check it. See references/sizing.md.
-     Budget is summed phase WEIGHT (S/M/L), ~0.2 × the effective window (real context runs ~3× weight,
-     so a full session lands near ~60% of the window): 1M-class models → ~200K; Haiku 200K → ~40K. -->
+     Budget is summed phase WEIGHT (S/M/L), ~0.2 × the effective window: 1M-class models → ~200K; Haiku
+     200K → ~40K. A session's context is a FLOOR paid once (the repository's boot + the work every phase
+     does) plus a slope × weight — measured, not a multiple of the weight.
+     Sessions: under Phase Console the unit is 1 phase ≥ 1 session — the autopilot never batches — so
+     state the count `--session-plan` FORECASTS from measured sessions per phase, and paste its
+     generated `Weight:` line rather than typing a sum. Its batches are for a person driving by hand. -->
 **Target model:** `claude-opus-5`  ·  **Budget:** ~200K weight/session (≈60% of a 1M window)  ·  **Branch:** current branch (no new branch)
+**Sessions:** <!-- paste `scripts/phase-graph.sh <slug> --session-plan <model>`'s `Weight:` and `Forecast:` lines — generated, in the unit 1 phase ≥ 1 session. -->
 **Skills (every session):** <!-- optional — backtick each skill to use across ALL phases, e.g. `design-system`, `some-plugin:test-first`; the engine re-injects them into every phase's boot prompt + QA brief. Remove this line if none. -->
 **MCP servers (every session):** <!-- optional — backtick each MCP server id this work needs across ALL phases, e.g. `github`, `context7`. Registered in Phase Console → MCP; checked before a phase spends a token, so a wall costs a probe rather than an hour. Keep it to 3-6. Remove this line if none. -->
 <!-- **MCP policy:** require   <-- optional. By default a server that cannot connect does NOT stop the
@@ -140,8 +145,9 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
      `date`/`deadline`/`by`/`phase`/`phases`/`plan`/`cmd` (self-evaluating). -->
 <!--
      Tag each phase's rough working-set with "- **Size:** S|M|L" in its ### Phase N block, then
-     `scripts/phase-graph.sh <slug> --session-plan <model>` proposes which sequential small phases
-     to batch into one session. See references/sizing.md. -->
+     `scripts/phase-graph.sh <slug> --session-plan <model>` forecasts the plan in sessions (1 phase ≥ 1
+     session under the console) and proposes which sequential small phases a person driving by hand
+     may batch into one session. See references/sizing.md. -->
 
 | Phase | Title | Depends on | Parallel-safe with | Repos | Exit criteria |
 |------:|-------|-----------|--------------------|-------|---------------|
@@ -172,7 +178,9 @@ it is in fact committed at sha XXXXXXX. Use `git log` as the source of truth; ig
                                       inherits the RUN, which is a different fact from `shared`.
      - **Issues:** draft          <-- off | draft | file — OVERRIDES the plan-wide Issues
      - **Waits on:** gh:<repo>#run · 45m <-- an expected external wait: the ref, and its maximum
-     - **Human step:** <who, what, proof ref>   <-- a step denied to an agent, and what proves it landed
+     - **Human step:** browser-login · <what> · open: <url or command> · proof: <ref> · where: host · window: 2d
+                                  <-- an act only a person can do: one of sixteen kinds (scripts/human-steps.env),
+                                      what proves it, where; `auto-open: host` lets it open by itself. --human-steps N
      - **Person-check:** halt     <-- allow | halt | <owner> when a §Verification fragment is prose
      Read back with phase-graph.sh --size/--qa-mode/--mcp/--mcp-policy/--credentials/--credential-policy/--decisions <N>. -->
   <!-- Externally gated? mark *(GATED)* in the heading, write the conditions (numbered operator steps

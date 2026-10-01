@@ -26,6 +26,7 @@ import {
   type ResumeAtBootMode,
 } from '../shared/automation-model.js';
 import { sanitisePolicyPrefs } from '../shared/policy-model.js';
+import { FORECAST_LEAD_HOURS } from '../shared/ops-vocab.js';
 import { sanitiseRelayRules, type RelayRule } from '../shared/relay-model.js';
 import type { DecisionKey } from '../shared/decisions-model.js';
 import { sanitiseSchedule, type SchedulePolicy } from '../shared/schedule-policy.js';
@@ -896,7 +897,15 @@ function printHelp(): void {
  * Which client is being served
  * ------------------------------------------------------------------ */
 
-export const DIST_DIR = join(VIEWER_DIR, 'client', 'dist');
+/**
+ * The built client this console serves. `PHASE_CONSOLE_DIST_DIR` points it at
+ * another build — the real-browser harness (`e2e/`) touring a production build
+ * of its own rather than `client/dist`, which a runtime copy serves per request
+ * and nothing under test may rebuild. Read once, like every path here.
+ */
+export const DIST_DIR = process.env.PHASE_CONSOLE_DIST_DIR
+  ? resolve(process.env.PHASE_CONSOLE_DIST_DIR)
+  : join(VIEWER_DIR, 'client', 'dist');
 
 let distRevCache: { at: number; value: string | null } | null = null;
 
@@ -1233,6 +1242,25 @@ export type Prefs = {
    */
   ceilingStartsPerHour?: number;
   ceilingUsdPerHour?: number;
+  /**
+   * The scheduling policy (control-tower phase 100, #135 F): the console's,
+   * and each plan's own over it (`schedulingPolicies[slug]`) —
+   * `shared/orchestration-model.js` `SCHEDULING_POLICIES`, `seniority` when
+   * unset. And the machine-load guard's factor: new admissions wait while the
+   * 5-minute load is above it × the cores; 0 switches it off; unset is 1.5.
+   */
+  schedulingPolicy?: string;
+  schedulingPolicies?: Record<string, string>;
+  loadGuardFactor?: number;
+  /**
+   * The account forecast (control-tower phase 92, #141): how many hours before
+   * an account serving live runs is projected to wall `usage-climbing` warns
+   * (`FORECAST_LEAD_HOURS`, 2, by default), and whether that projection also
+   * HOLDS new admissions on the account (the usage brake) — off unless the
+   * operator turns it on.
+   */
+  usageForecastLeadHours?: number;
+  usageForecastHold?: boolean;
   unblockAttempts?: boolean;
   staleClaimTakeover?: boolean;
   delegateHumanGates?: boolean;
@@ -1297,6 +1325,13 @@ export type Prefs = {
    * every write like `boardingSchedule`, and edited in the policy card.
    */
   relayRules?: RelayRule[];
+  /**
+   * The reminder quiet hours for human steps (control-tower phase 43):
+   * `HH:MM` on this machine's clock, a window that may cross midnight. A
+   * reminder due inside it is deferred to its end, never dropped. Absent means
+   * none. Written through `savePreferences`, read through `parseQuietHours`.
+   */
+  reminderQuiet?: { start: string; end: string };
   /**
    * When a lane that is still alive stops being work (`runner/liveness.ts`).
    *
@@ -1401,6 +1436,7 @@ const DEFAULT_PREFS: Prefs = {
   autoRecoverByDefault: true, autoContinueRecovery: true, watchCmdRefs: true, watchMintedCmdRefs: false, mcpPolicy: 'continue',
   ladderPerPhaseRungs: 3, ladderPerPhaseUsd: 100, ladderPerRunRungs: 10, ladderPerRunUsd: 400, ladderPerDayUsd: 600,
   ceilingStartsPerHour: DEFAULT_STARTS_PER_HOUR, ceilingUsdPerHour: DEFAULT_USD_PER_HOUR,
+  usageForecastLeadHours: FORECAST_LEAD_HOURS, usageForecastHold: false,
   unblockAttempts: true, staleClaimTakeover: true, resumeAtBoot: 'ask', autoAccountSwitch: true,
   delegateHumanGates: true, policy: {}, allowUnverifiedPhases: false, ladderExtendOnProgress: false,
   convergeEveryMs: 300_000,
@@ -1515,7 +1551,7 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
   | 'reviewEachPhaseByDefault' | 'reviewerPolicy'
   | 'autoRecoverByDefault' | 'autoContinueRecovery' | 'watchCmdRefs' | 'watchMintedCmdRefs' | 'mcpPolicy'
   | 'ladderPerPhaseRungs' | 'ladderPerPhaseUsd' | 'ladderPerRunRungs' | 'ladderPerRunUsd' | 'ladderPerDayUsd'
-  | 'ceilingStartsPerHour' | 'ceilingUsdPerHour'
+  | 'ceilingStartsPerHour' | 'ceilingUsdPerHour' | 'usageForecastLeadHours' | 'usageForecastHold'
   | 'unblockAttempts' | 'staleClaimTakeover' | 'resumeAtBoot' | 'autoAccountSwitch'
   | 'delegateHumanGates' | 'policy' | 'allowUnverifiedPhases' | 'ladderExtendOnProgress' | 'convergeEveryMs'
   | 'budgetAutoRaisePct' | 'mcpRequireTimeoutMs' | 'boardingSchedule' | 'relayRules'
@@ -1620,6 +1656,8 @@ export function sanitiseAutomation(parsed: Partial<Prefs>): Pick<Prefs,
     ladderPerDayUsd: cap(parsed.ladderPerDayUsd, 600),
     ceilingStartsPerHour: cap(parsed.ceilingStartsPerHour, DEFAULT_STARTS_PER_HOUR),
     ceilingUsdPerHour: cap(parsed.ceilingUsdPerHour, DEFAULT_USD_PER_HOUR),
+    usageForecastLeadHours: cap(parsed.usageForecastLeadHours, FORECAST_LEAD_HOURS),
+    usageForecastHold: bool(parsed.usageForecastHold, false),
     unblockAttempts: bool(parsed.unblockAttempts, true),
     delegateHumanGates: bool(parsed.delegateHumanGates, true),
     policy: sanitisePolicyPrefs(parsed.policy),
@@ -1709,6 +1747,18 @@ function readJson(file: string): Partial<Prefs> {
  * time that instance saves anything, because writes always go to the keyed
  * file.
  */
+/**
+ * Does this preference have a shipped default, and what is it (control-tower
+ * phase 53, #56)? What a `null` in a settings patch returns the key to — the
+ * one way an operator takes an override back. A copy, so no caller can edit
+ * the table the loader spreads.
+ */
+export function prefDefault(key: string): { known: boolean; value?: unknown } {
+  if (!Object.prototype.hasOwnProperty.call(DEFAULT_PREFS, key)) return { known: false };
+  const value = (DEFAULT_PREFS as Record<string, unknown>)[key];
+  return { known: true, value: value && typeof value === 'object' ? structuredClone(value) : value };
+}
+
 export function loadPrefs(instance: Instance = INSTANCE): Prefs {
   const shared = readJson(CONFIG_FILE);
   const file = instancePrefsFile(instance);

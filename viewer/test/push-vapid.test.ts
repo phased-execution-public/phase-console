@@ -16,6 +16,7 @@
 // to happen before anything pulls it in. A private mkdtemp rather than the
 // shared `state-sandbox.ts`, because these tests deliberately write a BROKEN
 // key file and must not hand one to another suite in the same process.
+import '../e2e/fixture/steady-load.mjs';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

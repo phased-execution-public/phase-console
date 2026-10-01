@@ -752,7 +752,7 @@ function RuleChips({
                 aria-label={`Remove ${r}`}
                 disabled={busy}
                 onClick={() => onRemove(r)}
-                className="tap-area text-ink-faint hover:text-blocked disabled:opacity-50"
+                className="tap-area text-ink-faint hover:text-failed disabled:opacity-50"
               >
                 <X className="size-3" aria-hidden />
               </button>

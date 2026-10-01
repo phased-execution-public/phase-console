@@ -13,7 +13,7 @@
  * takes the server down.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 import { STATE_DIR, defaultLogFile } from './config.ts';
@@ -324,9 +324,16 @@ function write(level: Level, event: string, data?: Record<string, unknown>): voi
   // launchd captures stderr, so a problem is visible even without the file.
   // `debug` stays out of it: its whole reason to exist is volume nobody wants
   // on a terminal.
+  //
+  // The line OPENS with the entry's own instant (control-tower phase 89, #71's
+  // CON-6). The supervisor's stderr file has no clock of its own: the only
+  // record of two OOMs was an undated trace there, placed in time from V8's
+  // uptime stamp and a pid. `entry.time`, never a second `new Date()`, so the
+  // mirror and the file log name the same moment — and first, because that is
+  // where the Debug index's supervisor reader looks for a stamp.
   if ((level === 'warn' || level === 'error') && !consoleGone) {
     try {
-      process.stderr.write(`[phase-console] ${level} ${event}${entry.data ? ` ${JSON.stringify(entry.data)}` : ''}\n`);
+      process.stderr.write(`${entry.time} [phase-console] ${level} ${event}${entry.data ? ` ${JSON.stringify(entry.data)}` : ''}\n`);
     } catch { consoleGone = true; }
   }
 
@@ -383,30 +390,26 @@ export function logFilePath(): string | null {
   return file;
 }
 
+/** The boot's verdict on the console before it. See `previousRunEndedCleanly`. */
+let previousRun: boolean | null = null;
+
+/** The entry point's to call, once, with what `settleBootMarkers` found. */
+export function notePreviousRun(endedCleanly: boolean | null): void {
+  previousRun = endedCleanly;
+}
+
 /**
- * Did the previous run end without writing an exit record?
+ * Did the console before this one end cleanly? `false` is a hard ending, `true`
+ * a clean one, `null` nothing to conclude.
  *
- * `SIGKILL`, an OOM kill and a hard power loss all leave `start` as the last
- * entry — nothing can be logged from a process that is already gone. So two
- * consecutive `start` records with no `exit` between them *are* the crash
- * signature, and saying so at boot beats hoping someone notices the gap.
- * Returns null when there is no prior run to judge.
+ * Settled once at boot from the boot marker that console left
+ * (`crash-ledger.ts`), and remembered here, where every reader already asks.
+ * It used to be a read of this log — the whole file, walked back 400 lines for
+ * a `start` with no `exit` after it — so the answer depended on how much had
+ * been logged since, and every caller paid for the read.
  */
 export function previousRunEndedCleanly(): boolean | null {
-  if (!file) return null;
-  try {
-    // The last few KB is plenty; the records we care about are one line each.
-    const raw = readFileSync(file, 'utf8');
-    const lines = raw.trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0 && i > lines.length - 400; i--) {
-      const event = (JSON.parse(lines[i]) as Entry).event;
-      if (event === 'exit') return true;
-      if (event === 'start') return false;
-    }
-  } catch {
-    /* no log yet, or a truncated line — nothing to conclude */
-  }
-  return null;
+  return previousRun;
 }
 
 export function stateDir(): string {

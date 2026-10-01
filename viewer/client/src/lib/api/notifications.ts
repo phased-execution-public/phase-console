@@ -37,6 +37,9 @@ export interface NotificationRecord {
   delivery: DeliveryRecord[];
   /** Its subject dissolved on its own (the board moved past the halt). */
   resolved?: { at: string; reason: string };
+  /** The buttons the phone's notification offered, and the one-shot token that answers them (phase 25). */
+  actions?: { action: string; title: string }[];
+  callback?: string;
 }
 
 /**
@@ -145,6 +148,13 @@ export const notificationsApi = {
      Subscribing is `lib/push.ts` — it needs a service worker and a permission
      prompt, neither of which belongs in a fetch helper. */
   push: () => request<PushState>('/api/push'),
+  /**
+   * Answer a notification from the app with the same signed token its phone
+   * buttons carry (`POST /api/push/action`) — one answer per notification,
+   * whichever device or drawer gives it first.
+   */
+  pushAction: (token: string, action: string) =>
+    post<{ ok: boolean; detail?: string }>('/api/push/action', { token, action }),
   pushSubscribe: (body: { subscription: unknown; label: string; categories?: Record<string, boolean> }) =>
     post<{ device?: PushDevice; state?: PushState; error?: string }>('/api/push/subscribe', body),
   pushUnsubscribe: (endpoint: string) =>

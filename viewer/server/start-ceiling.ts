@@ -1,7 +1,7 @@
 /**
  * The per-instance ceiling over every automatic `claude` start.
  *
- * Fourteen doors start a `claude` with no person asking (`START_DOORS`), and
+ * Sixteen doors start a `claude` with no person asking (`START_DOORS`), and
  * each is bounded on its own — a boot re-adopts once per plan, the wait clock
  * fires once per wait, the ladder climbs its rungs — but nothing bounded the
  * SUM: five starts in 109 seconds, a $22.23 re-board, an 11.76-hour stale
@@ -39,14 +39,29 @@ export const CEILING_WINDOW_MS = 60 * 60_000;
 
 /**
  * The shipped limits. Forty starts an hour is roomy for a healthy console —
- * twelve of them are the MCP health probe on its five-minute clock when a
- * registry exists, and a busy three-lane console relaunches a handful more —
+ * the MCP health probe no longer spends it (control-tower phase 100, #73: it
+ * has `PROBE_STARTS_PER_HOUR` of its own), and a busy three-lane console
+ * relaunches a handful —
  * and still catches a once-a-minute self-invocation loop inside the hour.
- * $250 an hour is above any session's own cap (`SESSION_CAPS_BY_SIZE` tops
- * out at $120) and below what three runaway lanes would burn.
+ * $250 an hour is above any session's own cap (the shipped phase cap is
+ * $120, `SHIPPED_CAP_TABLE`) and below what three runaway lanes would burn.
  */
 export const DEFAULT_STARTS_PER_HOUR = 40;
 export const DEFAULT_USD_PER_HOUR = 250;
+
+/**
+ * The MCP health probe's own budget (control-tower phase 100, #73): twice its
+ * five-minute clock, so a boarding preflight beside the clock always fits and
+ * a probe loop is still caught inside the hour. Probes report no spend worth a
+ * dollar limit, so it counts starts only. It is NOT the work-start ceiling:
+ * the twelve probes an hour used to spend a third of that ceiling's room.
+ */
+export const PROBE_STARTS_PER_HOUR = 24;
+
+/** A ceiling of the probe's own, never the one work sessions are counted against. */
+export function probeCeiling(now: () => number = Date.now): StartCeiling {
+  return new StartCeiling(() => ({ startsPerHour: PROBE_STARTS_PER_HOUR, usdPerHour: 0 }), now);
+}
 
 export type CeilingLimits = {
   /** Automatic starts allowed per sliding hour; 0 = unbounded. */

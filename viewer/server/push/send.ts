@@ -79,7 +79,16 @@ export type PushMessage = {
    * to — and, from phase 18, the fleet's one subscription — says whose it is.
    */
   console?: { id: string; name: string };
+  /**
+   * A human step this push is about (control-tower phase 41): its id, kind,
+   * where it can be done, the actions it names (*Open*, *I did it*) and, for a
+   * `device-code`, the code. Data, not buttons — `push/catalogue.ts`
+   * `humanStepPush`. Never a secret.
+   */
+  step?: HumanStepPush;
 };
+
+import type { HumanStepPush } from './catalogue.ts';
 
 /**
  * A message a push service will accept is small. Apple's limit is the tightest

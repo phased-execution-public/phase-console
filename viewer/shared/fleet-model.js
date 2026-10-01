@@ -103,6 +103,7 @@ export const UNOWNED_HOWS = Object.freeze(/** @type {const} */ (['none', 'candid
 export const INSTANCE_HEALTH_KINDS = Object.freeze(
   /** @type {const} */ ([
     'unread-unheard',
+    'previous-run-crashed',
     'tailscale-stopped',
     'serve-elsewhere',
     'sibling-orphaned',

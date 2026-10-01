@@ -121,6 +121,18 @@ test('every construct in the shared vocabulary is legal in BOTH dialects', async
     ['npm test', false],
     ['sleep 30', false],
     ['git push origin main', false],
+    // A loop is a wait only when it holds a clock (control-tower phase 47,
+    // #52): a counter that waits on nothing is not one, the same loop with a
+    // sleep, a timed read, a `wait` or a network verb is.
+    ['while [ $i -lt 20 ]; do printf "%s\\n" "$line"; i=$((i+1)); done', false],
+    ['until [ $n -ge 3 ]; do n=$((n+1)); done', false],
+    ['until test -f /tmp/x; do :; done', false],
+    ['while [ $i -lt 20 ]; do sleep 1; done', true],
+    ['while true; do sleep 5; done', true],
+    ['while ! grep -q DONE build.log; do sleep 5; done', true],
+    ['until [ $n -ge 30 ]; do curl -fsS http://api.example.invalid/state; n=$((n+1)); done', true],
+    ['until gh run view 1 -q .status | grep -q completed; do :; done', true],
+    ['while [ $i -lt 9 ]; do read -t 5 line; i=$((i+1)); done', true],
   ];
   for (const [input, want] of cases) {
     assert.equal(js.test(input), want, `JS disagrees about: ${input}`);
@@ -130,6 +142,50 @@ test('every construct in the shared vocabulary is legal in BOTH dialects', async
     ], { encoding: 'utf8' }).trim();
     assert.equal(code === '1', want, `bash disagrees about: ${input}`);
   }
+});
+
+/**
+ * The AUD-34 corpus: the fifteen commands the in-turn-wait guard refused in the
+ * autopilot week, twelve of them the session's own local work
+ * (`fixtures/wait-corpus/aud-34.json`). This half asks the SHARED question —
+ * does the command wait at all — of both readers: bash through
+ * `external_wait_hit` (the function lint F16 calls, sourced from
+ * scripts/verify.env) and JS through `externalWaitMatch`. Whose clock a wait
+ * is on is the guard's second question, answered in `liveness.test.ts`.
+ */
+test('the AUD-34 corpus: bash and JS agree, command by command, on which ones wait', async () => {
+  const { externalWaitMatch, loadVerifyEnv } = await import('../server/runner/verify-env.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const { execFileSync } = await import('node:child_process');
+  const { readFileSync } = await import('node:fs');
+  const scripts = join(SKILL_DIR, 'scripts');
+  const env = loadVerifyEnv(scripts);
+  const corpus = JSON.parse(readFileSync(new URL('./fixtures/wait-corpus/aud-34.json', import.meta.url), 'utf8')) as {
+    items: { id: string; wait: boolean; command: string }[];
+  };
+  assert.equal(corpus.items.length, 15);
+  for (const item of corpus.items) {
+    const js = externalWaitMatch(env, item.command);
+    assert.equal(js !== null, item.wait, `JS: #${item.id} read ${js === null ? 'no wait' : `\`${js}\``}`);
+    const bash = execFileSync('bash', ['-c', `. "${scripts}/verify.env"; external_wait_hit`], {
+      input: item.command, encoding: 'utf8',
+    }).trim();
+    assert.equal(bash !== '', item.wait, `bash: #${item.id} read ${bash === '' ? 'no wait' : `\`${bash}\``}`);
+  }
+});
+
+test('a backslash-continued line is one statement to both readers, and a quoted ; stays inside a declaration', async () => {
+  const { externalWaitMatch, foldWhitespace, loadVerifyEnv } = await import('../server/runner/verify-env.ts');
+  const { SKILL_DIR } = await import('../server/config.ts');
+  const env = loadVerifyEnv(join(SKILL_DIR, 'scripts'));
+  // A continuation joins; a newline separates.
+  assert.equal(foldWhitespace('a \\\n  --b c\nd'), 'a --b c; d');
+  // The `--watch` of a continued declaration used to become a statement of its
+  // own, and the carve-out stopped at the `;` the fold had put there (AUD-34).
+  assert.equal(externalWaitMatch(env, 'bash scripts/phase-outcome.sh p 8 waiting-external \\\n  --watch "cmd:test -f x"'), null);
+  assert.equal(externalWaitMatch(env, 'bash scripts/phase-outcome.sh p 7 ruling --what "a; until x; do sleep 9; done"'), null);
+  // …while a real wait after the declaration is still a wait.
+  assert.ok(externalWaitMatch(env, 'bash scripts/phase-outcome.sh p 7 ruling --what "x"; gh run watch 9'));
 });
 
 test('a malformed vocabulary degrades to the fallback instead of throwing on a tick', async () => {

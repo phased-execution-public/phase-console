@@ -312,7 +312,7 @@ function WriteDialog({
                 </pre>
               )}
               {outcome.stderr && (
-                <pre className="max-h-48 overflow-auto rounded border border-rule bg-ground p-2 font-mono text-2xs whitespace-pre-wrap text-blocked">
+                <pre className="max-h-48 overflow-auto rounded border border-rule bg-ground p-2 font-mono text-2xs whitespace-pre-wrap text-failed">
                   {outcome.stderr}
                 </pre>
               )}

@@ -147,7 +147,8 @@ export function Controls({
         <CardTitle>
           {frozen ? 'Frozen' : live || stillWorking ? 'Running' : resumable ? 'Stopped' : 'No run yet'}
         </CardTitle>
-        <span className="max-w-prose text-2xs text-ink-faint">
+        {/* A sentence a person reads, so muted ink: faint is 4.01:1 on the card. */}
+        <span className="max-w-prose text-2xs text-ink-muted">
           {frozen
             ? 'The session is alive and stopped. Nothing has been lost.'
             : stillWorking
@@ -183,24 +184,19 @@ export function Controls({
             stillWorking={stillWorking}
             // Enabled WITHOUT --allow-run since Phase 8: the sheet opens and
             // says what the console cannot do and the line that would fix it,
-            // which a greyed button never could. A lane still working is the
-            // one state that keeps it shut — the reason is on the header.
+            // which a greyed button never could. Since phase 13 (#31) it opens
+            // while a lane is still working too — as a settings PATCH, the
+            // wedged run being the one where a budget most needs lowering.
             trigger={
-              <Button variant={live ? 'ghost' : 'action'} disabled={stillWorking}>
-                {live
-                  ? 'Settings'
-                  : stillWorking
-                    ? 'Something is still running'
-                    : resumable
-                      ? 'Continue this run'
-                      : 'Start a run'}
+              <Button variant={live || stillWorking ? 'ghost' : 'action'}>
+                {live || stillWorking ? 'Settings' : resumable ? 'Continue this run' : 'Start a run'}
               </Button>
             }
           />
-          {live && (
+          {(live || stillWorking) && (
             <span className="max-w-prose text-2xs text-ink-faint">
-              Settings apply from the <strong>next</strong> phase — the session running now was started with
-              its model and budget fixed in its own command line.
+              Each setting lands when its kind does: the lane cap and budgets at the next decision, model and
+              skills from the next phase to board.
             </span>
           )}
         </div>

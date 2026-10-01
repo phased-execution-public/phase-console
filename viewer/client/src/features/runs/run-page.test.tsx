@@ -13,18 +13,23 @@
  *    table was rebuilt for is offering to re-run a phase the board calls done.
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { NO_ACTIVITY, activity, fold, toLine } from './console-model';
 import { DEFAULTS, EFFORTS, MODELS, effortAlias, isLive, modelAlias } from './defaults';
 import { LiveConsole } from './console';
 import { displayState } from './phase-table';
 import { seedSkills } from './lane-setup';
 import { RunHeader, RunTiles, phaseProgress } from './tiles';
+import { RUN_SECTIONS, RunSection } from './run-sections';
+import { getPrefs, setPrefs } from '@/lib/prefs';
 import { phaseActions } from '@shared/phase-model.js';
-import { queryClientConfig } from '@/lib/queries';
-import type { RunState } from '@/lib/api';
+import { keys, queryClientConfig } from '@/lib/queries';
+import type { PhaseReport, RunState } from '@/lib/api';
 
 /** RunHeader reads the accounts cache for the paying-account chip. */
 function mount(node: React.ReactElement) {
@@ -227,8 +232,8 @@ describe('seedSkills — which boxes the picker opens with ticked', () => {
 });
 
 describe('phaseProgress — a running phase against its estimate', () => {
-  it('shows the estimate while the phase is inside it', () => {
-    expect(phaseProgress(10 * 60_000, 40 * 60_000)).toBe('~40 min');
+  it('shows the estimate while the phase is inside it, naming its clock', () => {
+    expect(phaseProgress(10 * 60_000, 40 * 60_000)).toBe('~40 min of work');
   });
 
   it('says "over estimate" rather than counting down to zero', () => {
@@ -265,17 +270,28 @@ describe('the run header emphasis', () => {
     child: { pid: 1, phase: 2, sessionId: 's', startedAt: '2026-08-04T10:10:00Z' },
   } as unknown as RunState;
 
-  it('gives the phase clock the weight, and the icons no voice', () => {
+  it('SW-7 (#100 ask 4): a run with no accountId names the machine login it is spending, never nothing', () => {
+    const client = new QueryClient(queryClientConfig);
+    client.setQueryData(keys.accounts(), {
+      accounts: [
+        { id: 'default', kind: 'default', builtIn: true, name: 'default', email: 'info@example.com' },
+      ],
+      allowAccounts: true,
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <RunHeader run={{ ...RUN, accountId: undefined } as RunState} live={false} eta={null} />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText('machine login · info@example.com')).toBeTruthy();
+  });
+
+  it('names the run’s own clock in words, and gives the icons no voice (the attempt clock is the strip’s, #28)', () => {
     const { container } = mount(<RunHeader run={RUN} live={false} eta={null} />);
-
-    // The clock is still exactly the time — an icon that announced itself
-    // would land inside this accessible text.
-    const clock = screen.getByTitle(/How long the phase running now has been going/);
-    expect(clock.textContent?.trim()).toMatch(/^\d/);
-    // ...and it is the biggest thing on the line, which is the whole change.
-    expect(clock.className).toMatch(/text-base|text-lg/);
-    expect(clock.className).toMatch(/font-semibold/);
-
+    // A labelled clock, never a bare figure: `ran 20m 00s`, the run's own.
+    expect(screen.getByTestId('run-clock').textContent).toMatch(/^ran \d/);
+    // The status word and the attempt clock are drawn once — by the strip above.
+    expect(container.querySelector('[data-status]')).toBeNull();
     for (const svg of container.querySelectorAll('svg')) {
       expect(svg).toHaveAttribute('aria-hidden');
     }
@@ -290,6 +306,31 @@ describe('the run header emphasis', () => {
     for (const svg of container.querySelectorAll('svg')) {
       expect(svg).toHaveAttribute('aria-hidden');
     }
+  });
+
+  it('#91: the model tile says what the request resolved to, when it moved, and that the run is pinned', () => {
+    const { unmount } = render(<RunTiles run={RUN} phases={[]} />);
+    expect(screen.queryByTestId('resolved-model')).toBeNull();
+    unmount();
+    render(
+      <RunTiles
+        run={{
+          ...RUN,
+          modelPolicy: 'pinned',
+          resolvedModels: {
+            opus: { resolved: 'claude-opus-5-5', at: '2026-09-24T10:00:00Z', from: 'claude-opus-5' },
+          },
+        }}
+        phases={[]}
+      />,
+    );
+    const line = screen.getByTestId('resolved-model');
+    expect(line).toHaveTextContent('resolves to claude-opus-5-5');
+    expect(line).toHaveTextContent('moved from claude-opus-5');
+    expect(line).toHaveTextContent('pinned');
+    // Which model ran is the fix's evidence, not a hint: it reads in muted ink,
+    // which holds AA at the hint's 12 px where faint ink does not (the e2e register).
+    expect(screen.getByText('resolves to claude-opus-5-5')).toHaveClass('text-ink-muted');
   });
 });
 
@@ -320,6 +361,28 @@ describe('the completion promise', () => {
     mount(<RunHeader run={{ ...LIVE, onlyPhases: [4] } as RunState} live eta={null} />);
     expect(screen.queryByText('runs to plan completion')).toBeNull();
     expect(screen.queryByText(/^failures /)).toBeNull();
+  });
+
+  it('#148: a run asleep on a clock nobody paused reads "waiting", and says on what and until when', () => {
+    const until = '2099-09-26T08:57:36.000Z';
+    const asleep = {
+      ...LIVE,
+      status: 'paused',
+      stoppedBy: 'system',
+      pause: null,
+      waitUntil: until,
+      waitReason: 'external',
+      phases: {
+        '10': { phase: 10, status: 'waiting', parkedUntil: until, watch: [], declared: { by: 'watchdog' } },
+      },
+    } as unknown as RunState;
+    mount(<RunHeader run={asleep} live={false} eta={null} />);
+    // The word itself is the strip's (control-tower phase 24); the facts line
+    // says what it waits on and until when, and never calls it paused.
+    expect(screen.queryByText('paused')).toBeNull();
+    expect(screen.getByTestId('run-wait-note').textContent).toBe(
+      'on phase 10 · its own job · resumes Sep 26 08:57Z',
+    );
   });
 });
 
@@ -430,5 +493,139 @@ describe('spend that was never reported is named, not shown as zero', () => {
       />,
     );
     expect(container.textContent).not.toMatch(/at least/);
+  });
+});
+
+describe('the run page shows a Now panel per live lane (control-tower phase 95, #163)', () => {
+  it("draws each live phase's report under the tiles, and the page mounts it for a live run", async () => {
+    const { LiveNow } = await import('./now-panel');
+    const REPORT: PhaseReport = {
+      slug: 'demo',
+      runId: 'r1',
+      phase: 11,
+      at: '2026-09-26T10:56:00Z',
+      status: 'running',
+      live: true,
+      doing: {
+        operation: {
+          label: 'iOS sweep vendor',
+          done: 45,
+          of: 68,
+          pct: 66,
+          at: '2026-09-26T10:50:00Z',
+          source: [],
+        },
+      },
+      done: { count: 0, total: 0, items: [] },
+      left: { count: 0, items: [] },
+      waitingOn: [],
+      whySlow: [],
+      eta: {
+        minutes: null,
+        confidence: 'none',
+        basis: 'no task has finished and no operation reports progress',
+        source: [],
+      },
+      timeline: [],
+      summary: 'Phase 11 is running.',
+    };
+    const client = new QueryClient({
+      ...queryClientConfig,
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData([...keys.phaseNow('demo'), '11', 'report'], REPORT);
+    client.setQueryData([...keys.phaseNow('demo'), '12', 'report'], { ...REPORT, phase: 12, live: false });
+    render(
+      <QueryClientProvider client={client}>
+        <LiveNow slug="demo" phases={[11, 12]} />
+      </QueryClientProvider>,
+    );
+    const panels = screen.getAllByTestId('now-panel');
+    expect(panels).toHaveLength(1);
+    expect(panels[0]).toHaveTextContent('Now — phase 11');
+    expect(panels[0]).toHaveTextContent('iOS sweep vendor: 45/68');
+    const page = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'run-page.tsx'), 'utf8');
+    expect(page).toMatch(/\{run && live && \(\s*<LiveNow\s+slug=\{slug\}/);
+  });
+});
+
+describe('the run page’s folds: named, counted while folded, remembered (control-tower phase 24)', () => {
+  beforeEach(() => setPrefs({ runSectionsOpen: [] }));
+
+  it('names what it holds and draws its count while folded — and only while folded', () => {
+    render(
+      <RunSection id="journal" name="Journal" count={42}>
+        <p>the lines</p>
+      </RunSection>,
+    );
+    const toggle = screen.getByRole('button', { name: /Journal/ });
+    expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByTestId('run-section-count').textContent).toBe('(42)');
+    expect(screen.queryByText('the lines')).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('the lines')).toBeTruthy();
+    // Open, the count has done its job: the fold's own content says how much.
+    expect(screen.queryByTestId('run-section-count')).toBeNull();
+  });
+
+  it('remembers each fold per person — open stays open on the next visit, and one fold never opens another', () => {
+    const page = () => (
+      <>
+        <RunSection id="journal" name="Journal" count={2}>
+          <p>the lines</p>
+        </RunSection>
+        <RunSection id="notes" name="Notes" count={1}>
+          <p>the note</p>
+        </RunSection>
+      </>
+    );
+    const first = render(page());
+    fireEvent.click(screen.getByRole('button', { name: /Journal/ }));
+    expect(getPrefs().runSectionsOpen).toEqual(['journal']);
+    first.unmount();
+
+    render(page());
+    expect(screen.getByRole('button', { name: /Journal/ })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: /Notes/ })).toHaveAttribute('aria-expanded', 'false');
+    fireEvent.click(screen.getByRole('button', { name: /Journal/ }));
+    expect(getPrefs().runSectionsOpen).toEqual([]);
+  });
+
+  it('keeps the console’s fold mounted while folded — hidden, never unmounted — so no stream line is lost', () => {
+    render(
+      <RunSection id="sessions" name="Sessions and their consoles" count={1} keepMounted>
+        <p>a live line</p>
+      </RunSection>,
+    );
+    const line = screen.getByText('a live line', { selector: 'p' });
+    expect(line.closest('[hidden]')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /Sessions and their consoles/ }));
+    expect(screen.getByText('a live line').closest('[hidden]')).toBeNull();
+  });
+
+  it('opens for a link into it, whatever the preference says', () => {
+    render(
+      <RunSection id="journal" name="Journal" count={2} forceOpen>
+        <p>the linked line</p>
+      </RunSection>,
+    );
+    expect(screen.getByText('the linked line')).toBeTruthy();
+    expect(getPrefs().runSectionsOpen).toEqual([]);
+  });
+
+  it('every fold the page draws is a declared section, drawn once', () => {
+    const source = (name: string) =>
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), name), 'utf8');
+    const files = ['run-page.tsx'];
+    const ids = [
+      ...files
+        .map(source)
+        .join('\n')
+        .matchAll(/<RunSection\s+id="([a-z-]+)"/g),
+    ].map((match) => match[1]);
+    expect(ids.length).toBeGreaterThan(8);
+    for (const id of ids) expect(RUN_SECTIONS).toContain(id);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });

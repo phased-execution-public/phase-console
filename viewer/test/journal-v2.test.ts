@@ -237,3 +237,59 @@ test('a journal whose file cannot be written costs the audit trail, never the ru
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── One counter per run file (#51, control-tower phase 52) ───────────────────
+// The registry is where the v2 promises meet the sequence: two callers of
+// `Journal.for` are one instance, so their lines are one sequence under one
+// derived trace — and a caller reaching in from another trace is still a
+// crossing, never the line's own trace. `journal-one-counter.test.ts` holds
+// the counter itself.
+test('two callers of Journal.for write one sequence under the run\'s one trace — and a foreign span is still a crossing', () => {
+  const dir = root();
+  try {
+    const runner = Journal.for(dir, 'slug', 'run1');
+    const traceId = runner.traceId;
+    assert.equal(traceId, new Journal(dir, 'slug', 'run1').traceId, 'derived from the run, not remembered by the instance');
+
+    enter({ traceId, name: 'run.drive' }, () => runner.append('run.start', {}));
+    // The watch scheduler, from a span of its own trace, through the registry.
+    const foreign = runTraceId(INSTANCE, 'watch', 'scheduler');
+    enter({ traceId: foreign, name: 'watch.poll' }, () => Journal.for(dir, 'slug', 'run1').append('phase.watch-checked', { state: 'pending' }, 4));
+    runner.append('phase.ruling', { id: 'e88ea20539da' }, 4);
+
+    const lines = linesOf(dir, 'slug', 'run1');
+    assert.deepEqual(lines.map((l) => l.seq), [1, 2, 3], 'one counter, whichever caller wrote');
+    assert.ok(lines.every((l) => l.traceId === traceId), 'every line is the run\'s');
+    assert.equal(lines[1].viaTraceId, foreign, 'the scheduler\'s line names the trace that reached in');
+    assert.equal(lines[0].viaTraceId, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a journal cut back under its cap is written to again — the overflow it had went with the lines — and a second crossing marks again', () => {
+  const dir = root();
+  try {
+    const journal = new Journal(dir, 'slug', 'run1', { instanceId: INSTANCE, maxBytes: 4096, reserveBytes: 1024 });
+    const filler = 'x'.repeat(400);
+    for (let i = 0; i < 12; i++) journal.append('phase.tool', { filler, i });
+    const full = () => linesOf(dir, 'slug', 'run1').filter((l) => l.event === 'journal.full').length;
+    assert.equal(full(), 1, 'the first crossing is marked in band');
+
+    // Cut back to its first line (a restore, a hand edit): the instance sizes
+    // the file afresh, so an ordinary line is written rather than dropped…
+    const path = journalFile(dir, 'slug', 'run1');
+    writeFileSync(path, `${readFileSync(path, 'utf8').split('\n')[0]}\n`);
+    const after = journal.append('phase.started', {}, 1);
+    assert.equal(after.seq, 2, 'numbered from the file as it is now');
+    assert.deepEqual(linesOf(dir, 'slug', 'run1').map((l) => l.event), ['phase.tool', 'phase.started']);
+
+    // …and crossing the cap again says so again, once.
+    for (let i = 0; i < 12; i++) journal.append('phase.tool', { filler, i });
+    assert.equal(full(), 1, 'the new file carries its own marker, once');
+    const marker = linesOf(dir, 'slug', 'run1').find((l) => l.event === 'journal.full')!;
+    assert.equal(marker.data?.lastSeq, marker.seq - 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

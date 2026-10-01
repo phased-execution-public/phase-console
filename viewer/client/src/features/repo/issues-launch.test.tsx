@@ -226,3 +226,4 @@ describe('every ticket field is reachable, or its absence is written down', () =
     expect(MODES.plan.door).toBe('launch');
   });
 });
+

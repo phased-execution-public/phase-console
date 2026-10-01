@@ -25,9 +25,12 @@ for p in \
   "viewer/server/index.ts" \
   "viewer/server/index.js" \
   "viewer/server/platform.ts" \
+  "viewer/server/connectivity-probe.ts" \
   "viewer/server/registry-file.ts" \
   "viewer/server/watch-refs.ts" \
   "viewer/server/watch-scheduler.ts" \
+  "viewer/server/declared-probe.ts" \
+  "viewer/server/verify-watch.ts" \
   "viewer/server/debug/index.ts" \
   "viewer/server/debug/sources.ts" \
   "viewer/server/debug/deps.ts" \
@@ -51,8 +54,11 @@ for p in \
   "viewer/server/accounts/transcripts.ts" \
   "viewer/server/accounts/learned.ts" \
   "viewer/server/accounts/entitlement-probe.ts" \
+  "viewer/server/accounts/keep-alive.ts" \
   "viewer/server/launcher.ts" \
   "viewer/server/launcher.js" \
+  "viewer/server/host-open.ts" \
+  "viewer/server/host-open.js" \
   "viewer/server/hooks-install.ts" \
   "viewer/server/hooks-install.js" \
   "viewer/server/pty/broker.ts" \
@@ -65,20 +71,28 @@ for p in \
   "viewer/shared/scope.js" \
   "viewer/shared/landing-model.js" \
   "viewer/shared/issues-model.js" \
+  "viewer/shared/human-step-model.js" \
   "viewer/shared/instances.mjs" \
   "viewer/shared/recovery-model.js" \
+  "viewer/shared/halt-categories.js" \
   "viewer/shared/situation-model.js" \
   "viewer/shared/decisions-model.js" \
   "viewer/shared/cli-tools.js" \
   "viewer/shared/ladder-model.js" \
   "viewer/shared/attention-model.js" \
   "viewer/shared/run-lifecycle.js" \
+  "viewer/shared/verb-model.js" \
+  "viewer/shared/supervisor-model.js" \
   "viewer/shared/fact-map.js" \
   "viewer/shared/evidence-model.js" \
   "viewer/shared/routes.js" \
   "viewer/shared/diff.js" \
   "viewer/shared/run-settings.js" \
   "viewer/shared/status-vocab.js" \
+  "viewer/shared/status-model.js" \
+  "viewer/shared/bays.js" \
+  "viewer/shared/budget-model.js" \
+  "viewer/shared/status-notes.js" \
   "viewer/shared/plan-vocab.js" \
   "viewer/shared/ops-vocab.js" \
   "viewer/shared/task-model.js" \
@@ -87,17 +101,25 @@ for p in \
   "viewer/shared/worktree-model.js" \
   "viewer/shared/automation-model.js" \
   "viewer/shared/orchestration-model.js" \
+  "viewer/shared/queue-model.js" \
   "viewer/server/inbox.ts" \
   "viewer/server/analysis/spend.ts" \
+  "viewer/server/analysis/week-report.ts" \
+  "viewer/server/analysis/phase-report.ts" \
   "viewer/server/runner/models.ts" \
   "viewer/server/runner/liveness.ts" \
   "viewer/server/runner/session-record.ts" \
   "viewer/server/runner/wait-budget.ts" \
+  "viewer/server/runner/queue-episodes.ts" \
   "viewer/server/runner/run-paths.ts" \
+  "viewer/server/runner/tree-state.ts" \
+  "viewer/server/runner/scope-drift.ts" \
   "viewer/server/actor.ts" \
   "viewer/server/api/actor.ts" \
   "viewer/server/start-ceiling.ts" \
   "viewer/server/runner/rulings.ts" \
+  "viewer/server/runner/proofs.ts" \
+  "viewer/server/runner/verify-ledger.ts" \
   "viewer/server/runner/ultrareview.ts" \
   "viewer/shared/policy-model.js" \
   "viewer/server/runner/policy.ts" \
@@ -109,6 +131,8 @@ for p in \
   "viewer/server/counters.ts" \
   "viewer/shared/message-model.js" \
   "viewer/server/doctor.ts" \
+  "viewer/server/skill-copy.ts" \
+  "viewer/server/skill-copy.js" \
   "viewer/shared/relay-model.js" \
   "viewer/server/relay.ts" \
   "viewer/server/relay-host.ts" \
@@ -118,11 +142,16 @@ for p in \
   "viewer/shared/fleet-model.js" \
   "viewer/server/fleet.ts" \
   "viewer/shared/poll-loop.js" \
+  "viewer/shared/phase-clocks.js" \
+  "viewer/shared/lock-model.js" \
+  "viewer/server/locks.ts" \
   "viewer/server/runner/usage.ts" \
   "viewer/server/runner/verify-review.ts" \
   "bin/doctor-verb.mjs" \
   "bin/sessions-verb.mjs" \
   "bin/diagnostics-verb.mjs" \
+  "bin/report-verb.mjs" \
+  "bin/run-verb.mjs" \
   "viewer/server/retention.ts" \
   "viewer/server/retention-policy.ts" \
   "viewer/server/debug/bundle.ts" \
@@ -140,6 +169,7 @@ for p in \
   "scripts/new-handoff.sh" \
   "scripts/qa-record.sh" \
   "scripts/qa-mode.sh" \
+  "scripts/wait-budget.sh" \
   "scripts/decisions.sh" \
   "scripts/phase-outcome.sh" \
   "scripts/phase-tasks.sh" \
@@ -159,6 +189,9 @@ for p in \
   "scripts/landing.env" \
   "scripts/messages.env" \
   "scripts/issues.env" \
+  "scripts/human-steps.env" \
+  "scripts/permission.env" \
+  "scripts/skill-api.env" \
   "templates/plan.md" \
   "templates/handoff.md" \
   "templates/INDEX.md" \
@@ -189,12 +222,18 @@ grep -vxF "package/viewer/client/src/assets/fonts/OFL.txt" "$list" > "$scan"
 # the shared/ modules NOTHING under server/ imports from creeping in.
 # `status-vocab` left this list in Phase 6: server/inbox.ts imports its
 # `isLiveStatus` rather than keeping a private copy, so it must ship.
+# `launch-presets` (control-tower phase 22) is the launch form's own table —
+# only the client and its tests read it.
+# `status-model` and `status-notes` left it in control-tower phase 88: the
+# "is waiting" push says `waitSentence`, the sentence every run surface prints.
 # `assets/console.gif` is 34 MB of demo screencast: every npm install and every
 # Homebrew bottle paid for it to sit unread on disk, so the README links a
 # hosted copy and the allowlist names `assets/report-template.md` instead of
 # the whole directory.
 for a in \
   "viewer/test/" \
+  "viewer/e2e/" \
+  "viewer/playwright.config.ts" \
   "viewer/client/src/" \
   "assets/console.gif" \
   "viewer/client/public/" \
@@ -217,6 +256,8 @@ for a in \
   "viewer/shared/console-model" \
   "viewer/shared/phase-model" \
   "viewer/shared/route-meta" \
+  "viewer/shared/interval-format" \
+  "viewer/shared/launch-presets" \
   "viewer/shared/sw-push"; do
   if grep -q "package/$a" "$scan"; then
     echo "MUST NOT ship, but is in tarball: $a" >&2

@@ -127,8 +127,8 @@ test('retractStall sends an all-clear only for an episode that escalated, on tha
 test('escalateStall remembers an episode only when the urgent re-say was actually announced', () => {
   const { sv, inner, pushed } = harness();
   try {
-    const live = { id: 'run-3', status: 'running', phases: { 2: { stall: { signal: 'silent' } } } };
-    inner.runners.set('demo', { current: () => live });
+    const live = { id: 'run-3', status: 'running', phases: { 2: { status: 'running', stall: { signal: 'silent' } } } };
+    inner.runners.set('demo', { current: () => live, isSpending: () => false });
     const arm = (key: string) => inner.stallEscalations.set(key, {
       timer: setTimeout(() => {}, 0), slug: 'demo', phase: 2, runId: 'run-3', signal: 'silent',
       title: 'Nothing is happening — demo P2', body: 'silent.', at: Date.now() - 45 * 60_000,

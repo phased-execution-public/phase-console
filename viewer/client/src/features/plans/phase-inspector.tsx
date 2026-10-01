@@ -160,6 +160,30 @@ export function PhaseInspector({
 }
 
 /**
+ * A phase's prose, under its row in the phase table (control-tower phase 23).
+ *
+ * The same boundary as the sheet above, for the same reason: the table's
+ * views ask for the board projection only, and the prose is fetched here, on
+ * open, with the sheet's own module-level include set — so on the Autopilot
+ * tab (which asks for exactly that set) it costs nothing, and on the Phases
+ * tab it costs one request the first time any row is opened. The live record
+ * wins every field it carries (`merged`), exactly as in the sheet.
+ */
+export function PhaseProse({
+  slug,
+  phase,
+  eta,
+}: {
+  slug: string;
+  phase: PhaseView;
+  eta?: PhaseEta | undefined;
+}) {
+  const { data: full } = usePlan(slug, INSPECTOR_INCLUDES);
+  const prose = full?.phases.find((p) => p.phase === phase.phase);
+  return <PhaseDetails slug={slug} phase={prose ? merged(prose, phase) : phase} eta={eta} />;
+}
+
+/**
  * The way in — one spelling, on every surface that lists a phase.
  *
  * A word rather than an icon: this sits inside table cells and card control

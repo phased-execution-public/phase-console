@@ -157,12 +157,16 @@ test('a nonce is spendable exactly once', () => {
  * 2. the verb set, and the buttons it produces
  * ------------------------------------------------------------------ */
 
-test('the answerable verbs are exactly the three that ANSWER something', () => {
+test('the answerable verbs are exactly the five that ANSWER something', () => {
   // Named literally rather than derived: this list is a decision, and a test
   // that recomputed it from the object would pass whatever the object said.
   // A notification button may answer a question that is already waiting; it
-  // may never start or kill work.
-  assert.deepEqual(Object.keys(PUSH_ACTION_VERBS), ['allow', 'deny', 'approve']);
+  // may never start or kill work. `extend` (control-tower phase 97, #140) is
+  // the answer "not yet": it moves a waiting card's deadline and nothing else.
+  // `check` (control-tower phase 43) is a person's *I did it* on a waiting
+  // step: it asks the console to run the step's proof, and only a proof that
+  // lands resumes anything — an answer, never a start.
+  assert.deepEqual(Object.keys(PUSH_ACTION_VERBS), ['allow', 'deny', 'approve', 'extend', 'check']);
   for (const forbidden of ['recover', 'stop', 'freeze', 'steer', 'release', 'restart', 'dismiss', 'login']) {
     assert.equal(isPushActionVerb(forbidden), false, `${forbidden} must not be answerable from a notification`);
   }

@@ -10,6 +10,7 @@ setup() {
 
 @test "validate: a well-formed generated handoff (non-trivial deps) passes" {
   pe_newho demo 4 merge complete >/dev/null      # phase 4 depends on [2,3]
+  write_body demo phase-04-merge.md
   run pe_validate demo
   [ "$status" -eq 0 ]
   assert_contains "$output" "VALIDATE OK"
@@ -17,6 +18,7 @@ setup() {
 
 @test "validate: a handoff whose depends_on disagrees with the graph is rejected (F10)" {
   pe_newho demo 4 merge complete >/dev/null
+  write_body demo phase-04-merge.md
   sed -i.bak 's/^depends_on:.*/depends_on: [1]/' "$DOCS_ROOT/docs/handoffs/demo/phase-04-merge.md"
   run pe_validate demo
   [ "$status" -ne 0 ]
@@ -25,6 +27,7 @@ setup() {
 
 @test "validate: a handoff missing the boot section is rejected (F10)" {
   pe_newho demo 1 root complete >/dev/null
+  write_body demo phase-01-root.md
   sed -i.bak '/Start next phase/d' "$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md"
   run pe_validate demo
   [ "$status" -ne 0 ]
@@ -57,6 +60,7 @@ setup() {
 
 @test "validate: the scaffolded handoff carries the notes section, and it lints clean" {
   pe_newho demo 1 root complete >/dev/null
+  write_body demo phase-01-root.md
   local body; body="$(cat "$DOCS_ROOT/docs/handoffs/demo/phase-01-root.md")"
   assert_contains "$body" "## Notes for later phases"
   # The section is scaffolded as an HTML comment that TEACHES the grammar by

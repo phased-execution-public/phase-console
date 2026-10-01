@@ -17,7 +17,14 @@
  * | `gh:` | `gh:owner/repo#run/<id>` · `gh:owner/repo#pr/<n>` | the run reaches `completed` (whatever its conclusion) · the PR leaves `OPEN` | fixed argv, never a shell |
  * | `date:` / `until:` | `date:<ISO8601>` | `now ≥ t` | arithmetic; nothing is executed |
  * | `lock:` | `lock:<slug>/<phase>` | nothing holds the phase's scope any more | the console's own lock store — NOT a grant |
+ * | `phase:` | `phase:<slug>/<phase>` | the console's RECORD of that phase reads `done` — after its own §Verification, which re-opens a red one | the console's own run state; nothing is executed |
+ * | `verify:` | `verify:<slug>/<phase>` (the declaring phase) | its red §Verification lines, re-run when the branch head moves, all pass | the policy §Verification gets, only on a new head |
  * | `cmd:` | `cmd:<command>` or `cmd:"<command>"` | the command exits 0 | the policy §Verification gets, 60 s, off-switchable, run-bounded |
+ *
+ * `lock:` is true of a sibling that is merely QUEUED, so it cannot say "that
+ * phase is done" — `phase:` can (control-tower phase 88, #129), and it is
+ * re-probed the moment the board moves (`WatchScheduler.boardMoved`). A
+ * `phase:` ref UN-lands when its phase is re-opened.
  *
  * "Landed" always means the thing CONCLUDED. A run merely starting is not a
  * landing; a session resumed to watch a progress bar is the burn this exists
@@ -47,17 +54,19 @@
  * ⚠️ That is NOT the same as "read-only", and the difference matters here in a
  * way it does not for a §Verification block: `npm ci`, `cargo build` and
  * `uv sync` all pass the policy and all write, and a §Verification runs once
- * where a `cmd:` ref runs every five minutes for as long as the phase is parked.
- * So it carries three gates that nothing else here does — `--allow-run`, the
- * `watchCmdRefs` pref, and `MAX_CMD_RUNS_PER_PHASE` — because it is the one
- * scheme whose refs are WRITTEN by a session rather than read by one.
+ * where a `cmd:` ref runs for as long as the phase is parked. So it carries
+ * gates that nothing else here does — `--allow-run`, the `watchCmdRefs` pref,
+ * a cadence that backs off (`WATCH_CMD_BACKOFF_MS`), the phase's wait budget
+ * and a `MAX_CMD_RUNS_PER_PHASE` backstop — because it is the one scheme whose
+ * refs are WRITTEN by a session rather than read by one.
  */
 
 import type { WatchStateWord } from '../shared/run-lifecycle.js';
+import { waitBudgetEndOf } from './runner/wait-budget.ts';
 import { shell } from './shell.ts';
 
 /** Every scheme this console will poll. The list is written here and nowhere else. */
-export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'cmd'] as const;
+export const WATCH_SCHEMES = ['gh-run', 'gh-pr', 'date', 'lock', 'phase', 'verify', 'cmd'] as const;
 export type WatchScheme = (typeof WATCH_SCHEMES)[number];
 
 export type WatchRefTarget =
@@ -66,6 +75,8 @@ export type WatchRefTarget =
   /** `at` is epoch ms — parsed once here so no consumer re-parses a string. */
   | { kind: 'date'; at: number; ref: string }
   | { kind: 'lock'; slug: string; phase: number; ref: string }
+  | { kind: 'phase'; slug: string; phase: number; ref: string }
+  | { kind: 'verify'; slug: string; phase: number; ref: string }
   | { kind: 'cmd'; command: string; ref: string };
 
 export type WatchState = {
@@ -87,13 +98,19 @@ export type WatchState = {
  * `date` is absent on purpose: its due time IS its instant, so the scheduler
  * schedules it exactly once (see `nextDueFor`). The others are chosen against
  * what they cost — `gh` is a network round trip and a rate-limited one, `cmd`
- * may be a whole test command, and a lock is a file read.
+ * may be a whole test command, and a lock is a file read. `cmd` is the FIRST
+ * step of its back-off (`WATCH_CMD_BACKOFF_MS`), not a flat cadence.
  */
 export const WATCH_POLL_MS: Readonly<Record<WatchScheme, number>> = Object.freeze({
   'gh-run': 120_000,
   'gh-pr': 300_000,
   date: 0,
   lock: 60_000,
+  // A read of the console's own run record — and a board transition asks it
+  // at once besides (`WatchScheduler.boardMoved`), so the minute is a backstop.
+  phase: 60_000,
+  // A `git rev-parse` per ask; the lines themselves run only on a new head.
+  verify: 120_000,
   cmd: 300_000,
 });
 
@@ -177,20 +194,130 @@ export const WATCH_FLOOR_MS = 60_000;
 export const WATCH_CMD_TIMEOUT_MS = 60_000;
 
 /**
- * How many times ONE `cmd:` ref may be executed for one phase before the
- * console stops running it.
+ * The `cmd:` cadence: five minutes after the first run, fifteen after the
+ * second, an hour after the third, then six hours for as long as the phase's
+ * wait budget lasts (control-tower phase 6, #19). Indexed by how many times
+ * the command has RUN — a probe that executed nothing stays on the first step.
  *
- * The other four schemes read something; this one RUNS something, every five
- * minutes, for as long as the phase is parked — which is days, not minutes. The
- * policy it goes through is not "read-only" in the strict sense (`npm ci`,
- * `cargo build` and `uv sync` all pass it and all write), so an unbounded
- * `cmd:` ref is an unbounded number of side effects nobody is watching. Twelve
- * is two hours at the `cmd:` cadence: long enough to be the useful answer to
- * "has the deploy finished", short enough that a ref nobody meant to leave
- * running stops on its own. Past it the ref reads `refused`, with words saying
- * so, which is a state the operator can see rather than a silence.
+ * This replaced a flat five minutes capped at twelve runs, which was one hour
+ * of watching: the measured case was an organisation's plan restored after a
+ * day, a `cmd:` ref refused after its twelfth run, and the one probe that
+ * would have noticed the fix gone before the fix arrived. A wait that is an
+ * external WALL is measured in days, and what keeps a days-long `cmd:` ref
+ * cheap is the cadence, not a count — a day costs seven runs.
  */
-export const MAX_CMD_RUNS_PER_PHASE = 12;
+export const WATCH_CMD_BACKOFF_MS: readonly number[] = Object.freeze([300_000, 900_000, 3_600_000, 21_600_000]);
+
+/** The back-off step after `runs` executions — the last step repeats. */
+export function cmdBackoffMs(runs: number): number {
+  return WATCH_CMD_BACKOFF_MS[Math.min(Math.max(runs, 1), WATCH_CMD_BACKOFF_MS.length) - 1];
+}
+
+/**
+ * The back-off step `elapsedMs` after the declared window ENDED — the same
+ * steps, anchored at the window's end rather than counted in runs (#87). A
+ * window asked often by design, so the runs it made say how busy it was and
+ * nothing about how long the wait has been overdue: the next probe after an
+ * hour-long window is five minutes out, not the six hours its twelfth run
+ * would read. The steps fall on +5, +20, +80 and +440 minutes past the end,
+ * then every six hours — phase 6's schedule, moved to where it belongs.
+ */
+export function cmdBackoffAfterMs(elapsedMs: number): number {
+  let edge = 0;
+  for (const step of WATCH_CMD_BACKOFF_MS) {
+    edge += step;
+    if (elapsedMs < edge) return step;
+  }
+  return WATCH_CMD_BACKOFF_MS[WATCH_CMD_BACKOFF_MS.length - 1];
+}
+
+/**
+ * How often a `cmd:` ref that wraps `gh run` or `gh pr` is asked inside its
+ * window (#87): a workflow or a pull request is the one thing such a ref
+ * reads, and it moves on `gh`'s clock, not on a back-off's.
+ */
+export const WATCH_CMD_GH_MS = 300_000;
+
+/**
+ * Does this command ask `gh` about a run or a pull request? Read as a word at
+ * a command boundary — the start, after a separator, or inside a quoted
+ * `bash -c` — so `gh api …` and `echo gh-runner` are not.
+ */
+export function cmdWrapsGh(command: string): boolean {
+  return /(^|[\s;&|(`$'"])gh\s+(run|pr)\b/.test(command);
+}
+
+/** A declaration's window: its own instant to the clock it asked for, epoch ms. */
+export type DeclaredWindow = { from: number; until: number };
+
+/**
+ * The window a phase's declaration asked for (#87) — from the declaration's
+ * own instant to the instant it named (`declared.requested`, what
+ * `--wait-minutes`/`--until` wrote), else to the clock the park wrote
+ * (`parkedUntil`). Null when either end is missing or the window is empty: a
+ * park whose budget is spent waits with no clock (rule 7), and its refs keep
+ * the plain run-count back-off.
+ *
+ * CLAMPED to the wait budget's end (control-tower phase 87, #126): P41 asked
+ * for twelve hours against an eight-hour budget, so its `cmd:` step was a sixth
+ * of twelve hours, and the probe that should have run before the budget ended
+ * fell after it — refused, the ref retired. The window a park is watched in is
+ * the one it can actually have: what it asked, or the budget's end, whichever
+ * comes first. A spent-budget park and a wait on console state alone have no
+ * budget end (`waitBudgetEndOf`), so nothing clamps them.
+ */
+export function declaredWindowOf(record: {
+  parkedUntil?: string | null;
+  declared?: { at?: string; requested?: string; budgetSpent?: unknown; status?: string; step?: { until?: string } | null } | null;
+}): DeclaredWindow | null {
+  const from = Date.parse(record.declared?.at ?? '');
+  let until = Date.parse(record.declared?.requested ?? record.parkedUntil ?? '');
+  if (!Number.isFinite(from) || !Number.isFinite(until) || until <= from) return null;
+  // The stored record carries everything `waitBudgetEndOf` reads; a caller
+  // holding only the two stamps gets the console default, which is what an
+  // unstamped declaration was judged against. A park on a HUMAN STEP has no
+  // budget (control-tower phase 43): its window's end is the clamp.
+  const stepUntil = record.declared?.status === 'needs-human' ? Date.parse(record.declared.step?.until ?? '') : NaN;
+  const end = record.declared?.budgetSpent ? null
+    : Number.isFinite(stepUntil) ? stepUntil
+      : waitBudgetEndOf(record as Parameters<typeof waitBudgetEndOf>[0]);
+  if (end !== null && end < until) until = end;
+  return until > from ? { from, until } : null;
+}
+
+/**
+ * The next step of one `cmd:` ref (#87). Inside the declared window it is at
+ * most a sixth of the window — six looks at least, so a landing near the end
+ * is still seen before the window resumes the session anyway — and at most
+ * five minutes for a ref that wraps `gh run`/`gh pr`; never more than the
+ * back-off step, and never under the scheduler's own floor. After the window,
+ * the back-off, counted from the window's end. With no window, the run-count
+ * back-off phase 6 wrote.
+ */
+export function cmdStepMs(command: string, runs: number, now: number, window?: DeclaredWindow | null): number {
+  if (!window) return cmdBackoffMs(runs);
+  if (now >= window.until) return cmdBackoffAfterMs(now - window.until);
+  const sixth = Math.max(WATCH_FLOOR_MS, Math.floor((window.until - window.from) / 6));
+  const step = Math.min(cmdBackoffMs(runs), sixth);
+  return cmdWrapsGh(command) ? Math.min(step, WATCH_CMD_GH_MS) : step;
+}
+
+/**
+ * The BACKSTOP on one `cmd:` ref's executions for one phase — not the bound a
+ * wait normally meets.
+ *
+ * The other four schemes read something; this one RUNS something, and the
+ * policy it goes through is not "read-only" in the strict sense (`npm ci`,
+ * `cargo build` and `uv sync` all pass it and all write). What bounds it in
+ * the ordinary case is the back-off above and the phase's WAIT BUDGET: past the
+ * budget the ref reads `refused` with words saying so (`watch-scheduler.ts`).
+ * Two hundred runs is seven weeks at the six-hour step — a number only a
+ * runaway reaches (a budget nobody meant, a record from a console that never
+ * wrote one), and past it the ref reads `refused` too, which is a state the
+ * operator can see rather than a silence. Until control-tower phase 6 this was
+ * twelve, and terminal: an hour of watching for a wait measured in days.
+ */
+export const MAX_CMD_RUNS_PER_PHASE = 200;
 
 const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -264,11 +391,12 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
     const at = parseInstant(ref.slice(ref.indexOf(':') + 1).trim());
     return Number.isFinite(at) ? { kind: 'date', at, ref } : null;
   }
-  if (ref.startsWith('lock:')) {
-    const m = /^([^/]+)\/(\d+)$/.exec(ref.slice(5).trim());
+  for (const kind of ['lock', 'phase', 'verify'] as const) {
+    if (!ref.startsWith(`${kind}:`)) continue;
+    const m = /^([^/]+)\/(\d+)$/.exec(ref.slice(kind.length + 1).trim());
     if (!m || !SLUG_RE.test(m[1])) return null;
     const phase = Number(m[2]);
-    return Number.isSafeInteger(phase) && phase > 0 ? { kind: 'lock', slug: m[1], phase, ref } : null;
+    return Number.isSafeInteger(phase) && phase > 0 ? { kind, slug: m[1], phase, ref } : null;
   }
   if (ref.startsWith('cmd:')) {
     // The conventional spelling quotes the command (`cmd:"npm test"`), because
@@ -281,9 +409,9 @@ export function parseWatchRef(ref: string): WatchRefTarget | null {
   return null;
 }
 
-/** The five shapes, in words — what a person needs beside a ref nothing can poll. */
+/** The seven shapes, in words — what a person needs beside a ref nothing can poll. */
 export const WATCH_REF_SHAPES =
-  'gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · cmd:"<command>"';
+  'gh:<owner/repo>#run/<id> · gh:<owner/repo>#pr/<n> · date:<ISO8601> · lock:<slug>/<phase> · phase:<slug>/<phase> · verify:<slug>/<phase> · cmd:"<command>"';
 
 /**
  * Why `parseWatchRef` would not poll this ref, or null when it would.
@@ -298,9 +426,66 @@ export function watchRefProblem(ref: string): string | null {
   if (parseWatchRef(ref)) return null;
   if (ref.startsWith('gh:')) return 'a gh: ref is gh:<owner/repo>#run/<id> or gh:<owner/repo>#pr/<n>';
   if (ref.startsWith('date:') || ref.startsWith('until:')) return 'not a real ISO8601 instant (date:2026-09-20T06:00:00Z)';
-  if (ref.startsWith('lock:')) return 'a lock: ref is lock:<slug>/<phase>';
+  for (const kind of ['lock', 'phase', 'verify']) {
+    if (ref.startsWith(`${kind}:`)) return `a ${kind}: ref is ${kind}:<slug>/<phase>`;
+  }
   if (ref.startsWith('cmd:')) return 'a cmd: ref names no command';
   return `no watch scheme — the console polls ${WATCH_REF_SHAPES}`;
+}
+
+/** The longest ref `phase-outcome.sh` records (`WATCH_REF_MAX`) — a longer one is refused, never cut (#125). */
+export const WATCH_REF_MAX = 1000;
+
+/**
+ * The first word of a command that is a path relative to the working
+ * directory, or null — `phase-outcome.sh` `_relative_path_in`'s twin (#152).
+ * The console runs a `cmd:` ref from ITS root, so a path relative to the
+ * session's cwd names another file there, or none. Words are read with the
+ * quotes dropped; a flag, a URL, an assignment, `owner/repo` after `-R`/
+ * `--repo` and a sed expression are not paths.
+ */
+export function relativePathIn(command: string): string | null {
+  const words = command.replace(/["']/g, ' ').split(/\s+/).filter(Boolean);
+  let prev = '';
+  for (const word of words) {
+    const after = prev;
+    prev = word;
+    if (after === '-R' || after === '--repo') { prev = word; continue; }
+    if (word.startsWith('./') || word.startsWith('../')) return word;
+    if (/^(\/|~|-)/.test(word) || word.includes('://') || word.includes('=') || /^[sy]\//.test(word)) continue;
+    if (!word.includes('/') || /[^A-Za-z0-9._/@+-]/.test(word)) continue;
+    if (/\/.*\//.test(word) || /\.[A-Za-z0-9]{1,8}$/.test(word)) return word;
+  }
+  return null;
+}
+
+/**
+ * Why the console could not run a `cmd:` ref AS WRITTEN, or null — the
+ * shapes `phase-outcome.sh` refuses with exit 2 (`_cmd_ref_problem`) and the
+ * console never MINTS (control-tower phase 88, #125, #152, #121 item 3). A
+ * `cmd:` ref is self-contained: absolute paths, no shell variable, no
+ * substitution, every quote closed. The run policy (`verify.ts`) is the second
+ * judge, asked at declaration by the ingest probe.
+ */
+export function cmdRefProblem(command: string): string | null {
+  if (command.includes('$')) {
+    return 'it carries a shell variable or substitution ($) — the console runs a cmd: ref in a shell of its own, where the session\'s variables do not exist';
+  }
+  if (command.includes('`')) return 'it carries a command substitution (a backtick) whose inner command the console cannot judge';
+  let quote = '';
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (!quote) {
+      if (c === '\\') i++;
+      else if (c === '\'' || c === '"') quote = c;
+    } else if (quote === '\'') {
+      if (c === '\'') quote = '';
+    } else if (c === '\\') i++;
+    else if (c === '"') quote = '';
+  }
+  if (quote) return 'its quoting does not balance (a quote never closes) — the console would refuse it as unreadable';
+  const rel = relativePathIn(command);
+  return rel ? `it names a relative path (${rel}) — the console runs a cmd: ref from its own root, not the session's working directory` : null;
 }
 
 /** The declared refs nothing will poll, each with why — in declaration order, deduped. */
@@ -320,6 +505,128 @@ export function unpollableRefs(refs: readonly string[] | undefined | null): { re
 export function dateOfRef(ref: string): number | null {
   const target = parseWatchRef(ref);
   return target?.kind === 'date' ? target.at : null;
+}
+
+/**
+ * The same bound `phase-outcome.sh` puts on `--watch`, enforced on the read
+ * side too: the scheduler polls the first eight pollable refs and no more.
+ * Written here, beside the parser, so the summary below counts exactly what the
+ * scheduler watches; `watch-scheduler.ts` re-exports it.
+ */
+export const MAX_WATCH_REFS = 8;
+
+/** What a phase's declared refs are, as the watch clock has actually found them. */
+export type WatchSummary = {
+  /** Refs the console has asked and been told "not yet" — a `pending` row. */
+  live: string[];
+  /** Refs whose landing is being delivered. */
+  landed: string[];
+  /** Refs this console will never run again — the policy, the backstop, the wait budget — with why. */
+  refused: { ref: string; detail?: string }[];
+  /**
+   * Refs with no answer: never probed yet (no row), or asked and unanswerable
+   * (an `unknown` row — no `gh` auth, `watchCmdRefs` off, a minted ref held).
+   * Until control-tower phase 88 (#125) these counted as `live`, so an errand
+   * composed before the first probe promised a resume the probe then refused.
+   */
+  unknown: string[];
+};
+
+/**
+ * Which of a phase's declared refs the console is actually WATCHING, read from
+ * `watchState` and `watchRetired` rather than from the declaration alone
+ * (control-tower phase 6, #19 ask 4).
+ *
+ * Every "the console is watching its refs" sentence used to be written from the
+ * declaration: a ref that had been refused an hour earlier still read as
+ * watched, and a halt card said "watching its refs" for a day with nothing
+ * behind it. The heal's refusal, the errand's `how` and the plan-recover
+ * answer now say what this finds (`watchClause`).
+ */
+export function watchSummary(record: {
+  declared?: { watch?: string[] };
+  watch?: string[];
+  watchState?: { refs: readonly { ref: string; state: string; detail?: string }[] };
+  watchRetired?: readonly string[];
+}): WatchSummary {
+  const declared = record.declared?.watch?.length ? record.declared.watch : record.watch ?? [];
+  const rows = record.watchState?.refs ?? [];
+  const retired = new Set(record.watchRetired ?? []);
+  const summary: WatchSummary = { live: [], landed: [], refused: [], unknown: [] };
+  for (const target of pollableRefs(declared).slice(0, MAX_WATCH_REFS)) {
+    const row = rows.find((r) => r.ref === target.ref);
+    if (row?.state === 'refused' || retired.has(target.ref)) {
+      summary.refused.push({ ref: target.ref, ...(row?.detail ? { detail: row.detail } : {}) });
+    } else if (row?.state === 'landed') summary.landed.push(target.ref);
+    else if (row?.state === 'pending') summary.live.push(target.ref);
+    else summary.unknown.push(target.ref);
+  }
+  return summary;
+}
+
+/**
+ * The clause a sentence about a declared park ends with — naming the live refs
+ * and the refused ones, and never claiming to be watching when nothing is live.
+ * Empty when the phase declared no pollable ref at all: the caller's own words
+ * ("a person's to settle") are the whole story then. With `phase`, a park whose
+ * every ref was refused says what a person does about it (#125 ask 4).
+ */
+export function watchClause(summary: WatchSummary, phase?: number): string {
+  const refused = summary.refused.length
+    ? `refused, not watched: ${summary.refused.map((r) => r.ref).join(', ')}`
+    : '';
+  const unknown = summary.unknown.length ? `no answer yet about ${summary.unknown.join(', ')}` : '';
+  const also = [unknown, refused].filter(Boolean).join('; ');
+  if (summary.live.length) {
+    return `the console is watching ${summary.live.length === 1 ? 'one live ref' : `${summary.live.length} live refs`} `
+      + `(${summary.live.join(', ')}) and resumes the session when one lands${also ? `; ${also}` : ''}`;
+  }
+  if (summary.landed.length) {
+    return `${summary.landed.join(', ')} landed — the console is resuming the session${also ? `; ${also}` : ''}`;
+  }
+  if (unknown) return `the console is asking, with ${unknown}${refused ? `; ${refused}` : ''}`;
+  if (refused) {
+    return `none of its refs is live (${refused}) — nothing will resume it by itself`
+      + (phase !== undefined ? `: do the errand, then press Retry on phase ${phase}` : '');
+  }
+  return '';
+}
+
+/**
+ * An errand's "how", as it is TRUE now (control-tower phase 88, #125): the
+ * errand's own words, then — for an errand the runner marked `watching` — the
+ * clause over the record's live `watchState`. The runner used to freeze the
+ * clause into `how` when it composed the errand, before the first probe, so a
+ * ref refused three seconds later went on being "watched" on every card, halt
+ * and push for as long as the errand stood. Nothing stores the derived text.
+ */
+export function liveErrandHow(
+  errand: { phase: number; how: string; watching?: boolean },
+  record: Parameters<typeof watchSummary>[0] | null | undefined,
+): string {
+  if (!errand.watching || !record) return errand.how;
+  const clause = watchClause(watchSummary(record), errand.phase);
+  return clause ? `${errand.how} ${clause[0].toUpperCase()}${clause.slice(1)}.` : errand.how;
+}
+
+/**
+ * The run as a page should see it: every standing errand's `how` derived from
+ * its phase's record now (`liveErrandHow`). A projection onto a COPY — the
+ * stored run keeps the errand's own words — applied where `/api/runs` and
+ * `/api/run/:slug` answer, beside the wall readings.
+ */
+export function withLiveErrands<T extends { phases?: Record<string, unknown>; recoveries?: Record<string, { errand?: { phase: number; how: string; watching?: boolean } | null } | undefined> } | null | undefined>(run: T): T {
+  const recoveries = run?.recoveries;
+  if (!run) return run;
+  if (!recoveries || !Object.values(recoveries).some((slot) => slot?.errand?.watching)) return run;
+  const next: Record<string, unknown> = {};
+  for (const [phase, slot] of Object.entries(recoveries)) {
+    const errand = slot?.errand;
+    next[phase] = errand?.watching
+      ? { ...slot, errand: { ...errand, how: liveErrandHow(errand, run.phases?.[phase] as Parameters<typeof watchSummary>[0]) } }
+      : slot;
+  }
+  return { ...run, recoveries: next };
 }
 
 /** The pollable subset of a declared watch list, in declaration order, deduped. */
@@ -353,13 +660,55 @@ export function pollableRefs(refs: readonly string[] | undefined | null): WatchR
  *     bound lives where it was always written, on `record.watchResumes`, and
  *     the row retires when the declaration it answers is spent.
  *   - **everything else is a cadence**, except a pending `date:`, which has
- *     exactly one interesting moment and is scheduled at it.
+ *     exactly one interesting moment and is scheduled at it, and a `cmd:`,
+ *     whose cadence backs off with the number of times it has RUN (`runs`,
+ *     the row's own count after this verdict — `cmdBackoffMs`) — and, since
+ *     control-tower phase 50 (#87), only once the declaration's `window` is
+ *     over: inside it the step is held to a sixth of the window (`cmdStepMs`).
  */
-export function nextDueFor(target: WatchRefTarget, state: WatchState['state'], now: number): number | null {
+export function nextDueFor(
+  target: WatchRefTarget, state: WatchState['state'], now: number, runs = 0, window?: DeclaredWindow | null,
+): number | null {
   if (state === 'refused') return null;
   if (state === 'landed') return now + WATCH_REDELIVER_MS;
   if (target.kind === 'date') return Math.max(now, target.at);
+  if (target.kind === 'cmd') return now + cmdStepMs(target.command, runs, now, window);
   return now + WATCH_POLL_MS[target.kind];
+}
+
+/**
+ * What a resumed session is actually being asked to do, given HOW the thing it
+ * waited on ended.
+ *
+ * "Landed" is one word for four outcomes and they call for different next
+ * moves. The instruction used to say "re-check it now" for all of them, which
+ * is wrong in the case that costs the most: a workflow run that ended
+ * `cancelled` (the measured p12 shape — a `workflow_run` cancelled at its 24 h
+ * expiry) is not a result to read, it is a run that never produced one, and a
+ * session told to "re-check it" reads a cancelled run, finds nothing, and
+ * declares the same wait again. Naming the conclusion is the difference
+ * between resuming a session and resuming a loop.
+ *
+ * Deliberately a directive and not a decision: none of these tells the session
+ * what the answer is, only which question it is now looking at. A failure is
+ * still possibly expected; a cancellation is still possibly fine.
+ *
+ * Lives here, beside the landing it reads, since control-tower phase 6: the
+ * healer's resume and the runner's live-lane resume (`waitResumePrompt`,
+ * cause `landed`) both say it.
+ */
+export function landingDirective(landed: { detail?: string }): string {
+  const detail = (landed.detail ?? '').toLowerCase();
+  if (detail.includes('cancelled') || detail.includes('canceled')) {
+    return 'It was CANCELLED, so there is no result to read — decide whether to re-run it (`gh run rerun <id>`) or to proceed without it;';
+  }
+  if (detail.includes('failure') || detail.includes('timed_out')) {
+    return 'It FAILED, so read why before anything else — a green step is not waiting for you;';
+  }
+  if (detail.includes('closed') && !detail.includes('merged')) {
+    return 'It was CLOSED rather than merged — check whether the work it carried still needs a home;';
+  }
+  return 'Re-check it now,';
 }
 
 /** A workflow run's answer. `completed` is the only landing — see the module comment. */
@@ -407,6 +756,15 @@ export type WatchProbeDeps = {
    * command, it simply did not ask.
    */
   runCommand?: (command: string) => Promise<{ refused?: string; ok: boolean; detail?: string }>;
+  /**
+   * `phase:<slug>/<N>` — what the console's own RECORD of that phase says
+   * (control-tower phase 88, #129): `landed` once it reads `done`, which a phase
+   * reaches only after the console's §Verification (a red final verdict re-opens
+   * it — phase 62); `pending` otherwise. `null` means no answer.
+   */
+  phaseDone?: (slug: string, phase: number) => { state: 'landed' | 'pending' | 'unknown'; detail?: string } | null;
+  /** `verify:<slug>/<N>` — the declaring phase's red lines, re-run on a new head (`verify-watch.ts`). */
+  verifyProbe?: (target: Extract<WatchRefTarget, { kind: 'verify' }>) => Promise<WatchState>;
 };
 
 /**
@@ -432,6 +790,18 @@ export async function probeWatchRef(
     return free
       ? { ref: target.ref, state: 'landed', detail: 'nothing holds its scope any more' }
       : { ref: target.ref, state: 'pending', detail: 'still held' };
+  }
+  if (target.kind === 'phase') {
+    let answer: ReturnType<NonNullable<WatchProbeDeps['phaseDone']>> = null;
+    try { answer = opts.phaseDone?.(target.slug, target.phase) ?? null; } catch { answer = null; }
+    if (!answer) return { ref: target.ref, state: 'unknown', detail: opts.phaseDone ? `no record of ${target.slug} phase ${target.phase}` : 'no run-state oracle wired' };
+    return { ref: target.ref, state: answer.state, ...(answer.detail ? { detail: answer.detail.slice(0, 160) } : {}) };
+  }
+  if (target.kind === 'verify') {
+    if (!opts.verifyProbe) return { ref: target.ref, state: 'unknown', detail: 'no verification oracle wired' };
+    try { return await opts.verifyProbe(target); } catch (error) {
+      return { ref: target.ref, state: 'unknown', detail: String((error as Error)?.message ?? error).slice(0, 160) };
+    }
   }
   if (target.kind === 'cmd') {
     if (!opts.runCommand) return { ref: target.ref, state: 'unknown', detail: 'cmd refs are not being run' };
@@ -498,4 +868,122 @@ function probeGh(
       return { ref: target.ref, state: 'unknown', detail: 'unparseable gh output' };
     }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * How long the workflow behind a `gh:…#run/<id>` ref may run
+ * (control-tower phase 14, #40 — told to F36 `wait-window-short`)
+ * ------------------------------------------------------------------ */
+
+/** GitHub's own ceiling for a job that states no `timeout-minutes`. */
+export const GH_DEFAULT_JOB_TIMEOUT_MIN = 360;
+
+/**
+ * The longest a workflow's jobs may run, read from its YAML: each job's own
+ * `timeout-minutes`, and GitHub's 360 for a job that states none. Job level
+ * only — a step's timeout bounds nothing its job does not already bound. Null
+ * when the file has no `jobs:` block. Read by indentation, not parsed: the
+ * console ships no YAML parser, and the job keys under `jobs:` are the one
+ * shape every workflow file shares.
+ */
+export function workflowTimeoutOf(yaml: string): number | null {
+  const lines = yaml.split(/\r?\n/);
+  const start = lines.findIndex((line) => /^jobs:\s*(#.*)?$/.test(line));
+  if (start < 0) return null;
+  let jobIndent: number | null = null;
+  const jobs: { timeout: number | null; child: number | null }[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (!line.trim() || /^\s*#/.test(line)) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) break; // the next top-level key ends `jobs:`
+    jobIndent ??= indent;
+    if (indent === jobIndent) {
+      if (/^\s*[\w.-]+:\s*(#.*)?$/.test(line)) jobs.push({ timeout: null, child: null });
+      continue;
+    }
+    const job = jobs.at(-1);
+    if (!job) continue;
+    job.child ??= indent;
+    if (indent !== job.child) continue;
+    const own = /^\s*timeout-minutes:\s*(\d+)\s*(#.*)?$/.exec(line);
+    if (own) job.timeout = Number(own[1]);
+  }
+  if (!jobs.length) return null;
+  return Math.max(...jobs.map((job) => job.timeout ?? GH_DEFAULT_JOB_TIMEOUT_MIN));
+}
+
+/** One answer per run id: a day for a timeout, ten minutes for "could not ask". */
+const workflowTimeouts = new Map<string, { at: number; minutes: number | null }>();
+const WORKFLOW_TIMEOUT_TTL_MS = 24 * 60 * 60_000;
+const WORKFLOW_TIMEOUT_MISS_TTL_MS = 10 * 60_000;
+
+type GhAsk = (argv: string[]) => Promise<{ ok: boolean; stdout: string }>;
+
+const askGh: GhAsk = async (argv) => {
+  const run = await shell('gh', argv, {
+    channel: 'shell',
+    intent: 'workflow-timeout',
+    timeout: 10_000,
+    capture: { keep: 512 * 1024, mode: 'head' },
+    // Signed out, a deleted run, no network: the advisory stays silent.
+    expectFailure: true,
+  });
+  return { ok: run.ok, stdout: run.stdout };
+};
+
+/**
+ * Ask GitHub, once per run id, how long the workflow behind a
+ * `gh:<repo>#run/<id>` ref may run: the run names its workflow file and the
+ * commit it ran at, and that file's jobs name their timeouts. Null when it
+ * cannot be known; remembered either way, so a lint never asks twice.
+ */
+export async function resolveWorkflowTimeout(
+  ref: string, opts: { gh?: GhAsk; now?: () => number } = {},
+): Promise<number | null> {
+  const target = parseWatchRef(ref);
+  if (!target || target.kind !== 'gh-run') return null;
+  const now = opts.now?.() ?? Date.now();
+  const hit = workflowTimeouts.get(ref);
+  if (hit && now - hit.at < (hit.minutes === null ? WORKFLOW_TIMEOUT_MISS_TTL_MS : WORKFLOW_TIMEOUT_TTL_MS)) return hit.minutes;
+  const gh = opts.gh ?? askGh;
+  let minutes: number | null = null;
+  try {
+    const run = await gh(['api', `repos/${target.repo}/actions/runs/${target.id}`, '--jq', '[.path, .head_sha] | @tsv']);
+    const [path, sha] = run.ok ? run.stdout.trim().split('\t') : [];
+    if (path && sha && /^[\w./-]+$/.test(path) && /^[0-9a-f]{7,40}$/.test(sha)) {
+      const file = await gh(['api', `repos/${target.repo}/contents/${path}?ref=${sha}`, '-H', 'Accept: application/vnd.github.raw']);
+      if (file.ok) minutes = workflowTimeoutOf(file.stdout);
+    }
+  } catch {
+    minutes = null;
+  }
+  workflowTimeouts.set(ref, { at: now, minutes });
+  return minutes;
+}
+
+/**
+ * Learn the timeouts of these refs, bounded by `budgetMs` so a slow GitHub
+ * never holds a lint: answers whether anything new was learned (the caller
+ * then re-lints, since the engine is told what it knows).
+ */
+export async function learnWorkflowTimeouts(refs: readonly string[], budgetMs = 5_000): Promise<boolean> {
+  const fresh = [...new Set(refs)].filter((ref) => !workflowTimeouts.has(ref) && parseWatchRef(ref)?.kind === 'gh-run');
+  if (!fresh.length) return false;
+  await Promise.race([
+    Promise.all(fresh.map((ref) => resolveWorkflowTimeout(ref))),
+    new Promise((resolve) => { setTimeout(resolve, budgetMs).unref?.(); }),
+  ]);
+  return fresh.some((ref) => typeof workflowTimeouts.get(ref)?.minutes === 'number');
+}
+
+/** What this console has learned, as `PE_WAIT_TIMEOUTS` pairs: `<ref>=<minutes>`. */
+export function waitTimeoutsCached(): string[] {
+  return [...workflowTimeouts.entries()]
+    .filter(([, value]) => typeof value.minutes === 'number')
+    .map(([ref, value]) => `${ref}=${value.minutes}`);
+}
+
+/** Tests only: forget every learned timeout. */
+export function forgetWorkflowTimeouts(): void {
+  workflowTimeouts.clear();
 }

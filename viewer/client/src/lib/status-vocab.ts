@@ -39,6 +39,7 @@ export {
   isLiveStatus,
   isUiState,
   phaseUiState,
+  runStatusWord,
   runUiState,
   situationUiState,
   uiLabel,
@@ -399,22 +400,9 @@ export const QA_RESULT_HELP: Record<QaResultWord, StatusHelp> = {
   },
 };
 
-/**
- * A QA verdict → UI state. `pass` is done, `fail` is failed, `waived` is
- * skipped; `pending` is queued — a review asked for and not yet answered is
- * closer to "in line" than to a verdict.
- */
-export const QA_RESULT_UI: Record<QaResultWord | 'unknown', UiState> = {
-  pass: 'done',
-  fail: 'failed',
-  waived: 'skipped',
-  pending: 'queued',
-  unknown: 'queued',
-};
-
-export function qaUiState(result: string | undefined): UiState {
-  return QA_RESULT_UI[(result ?? 'unknown') as QaResultWord | 'unknown'] ?? 'queued';
-}
+// A verdict's paint, icon and word are `shared/status-model.js`'s `qa-result`
+// rows, drawn by `QaBadge` (`@/components/ui/status`) — this file keeps only
+// what each verdict MEANS.
 
 export function qaResultTitle(result: string | undefined): string | undefined {
   return line(QA_RESULT_HELP[result as QaResultWord]);

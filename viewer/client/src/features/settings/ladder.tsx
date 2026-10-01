@@ -501,6 +501,26 @@ export function LadderCard() {
           </span>
           {onOff(prefs.autoAccountSwitch, 'autoAccountSwitch')}
         </div>
+        <NumberField
+          pref="usageForecastLeadHours"
+          id="usage-forecast-lead-hours"
+          label="Warn before an account walls"
+          value={prefs.usageForecastLeadHours}
+          unit="hours"
+          hint={`How long before an account serving live runs is projected to wall, at its measured burn, the "Usage climbing" notification says so (shipped: ${LADDER_PREF_DEFAULTS.usageForecastLeadHours}).`}
+          disabled={busy}
+          onSave={num('usageForecastLeadHours')}
+        />
+        <div className={row}>
+          <span className="min-w-0">
+            <span className="text-sm text-ink">Hold new work on an account projected to wall</span>
+            <span className="mt-0.5 block text-2xs text-ink-muted">
+              When that warning fires, the account takes no new lane while one is live on it, until the window
+              resets — so no phase starts work the wall will cut off. Off: the warning only warns.
+            </span>
+          </span>
+          {onOff(prefs.usageForecastHold, 'usageForecastHold')}
+        </div>
         <div className={row}>
           <span className="min-w-0">
             <span className="text-sm text-ink">Let a session clear a human gate</span>

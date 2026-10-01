@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Scaffold a phase handoff + create/update the per-plan INDEX.md.
 # Auto-fills graph-derived frontmatter (depends_on / blocks) and the
-# "▶ Start next phase(s)" section (one boot prompt per phase THIS phase unblocks)
-# by delegating to scripts/phase-graph.sh.
+# "▶ Start next phase(s)" section — the boot prompt of the one phase THIS phase
+# unblocks, or, for a fan-out, the shared boot once plus each phase's own block
+# (#115) — by delegating to scripts/phase-graph.sh.
 #
 # Usage: new-handoff.sh <slug> <phase-number> <title> [status]
 #   status : complete | in-progress | blocked | pending  (default: complete)
@@ -210,29 +211,55 @@ if [ "$plan_qa_mode" != off ]; then
 fi
 
 # Scaffold the handoff from template.
+#
+# The BODY is written first and `status:` is flipped LAST (control-tower phase
+# 51, #46). A reader of the working tree — the autopilot's board — used to see
+# `status: complete` from the first write on, before the boot prompts were
+# spliced in and long before the session wrote a word of its body, and boarded
+# the next phase from that empty scaffold 13 seconds later. Until the final
+# step the file carries the status it already had (a `--force` repair) or
+# `in-progress` (a fresh scaffold) — never `complete` — so a scaffold cut off
+# half-way never reads finished. (And a `complete` handoff whose "What this
+# phase did" is still the template reads `in-progress` on the board anyway, so
+# the session writing its body is not a race either.)
 dest="$dir/${this_handoff}"
 if [ -e "$dest" ] && [ "$force" = 0 ]; then
   echo "refusing to overwrite existing handoff: $dest (use --force to repair)" >&2
   exit 1
 fi
-[ -e "$dest" ] && echo "overwriting existing handoff (--force): $dest"
+prior=""
+if [ -e "$dest" ]; then
+  echo "overwriting existing handoff (--force): $dest"
+  prior="$(grep -m1 '^status:' "$dest" | sed 's/^status:[[:space:]]*//; s/[[:space:]]*#.*$//' || true)"
+fi
+interim="$status"
+if [ "$status" = complete ]; then
+  case "$prior" in in-progress|blocked|pending) interim="$prior" ;; *) interim="in-progress" ;; esac
+fi
+draft="$dest.draft.$$"
+trap 'rm -f "$draft" "$draft.next"' EXIT
 sed -e "s|{{SLUG}}|${slug}|g" \
     -e "s|{{DATE}}|${date_str}|g" \
     -e "s|{{PHASE}}|${phase}|g" \
     -e "s|{{TITLE}}|${title}|g" \
-    -e "s|{{STATUS}}|${status}|g" \
+    -e "s|{{STATUS}}|${interim}|g" \
     -e "s|{{NEXT_PHASE}}|${next_phase}|g" \
     -e "s|{{THIS_HANDOFF}}|${this_handoff}|g" \
     -e "s|{{DEPENDS_ON}}|${deps_csv}|g" \
     -e "s|{{BLOCKS}}|${blocks_csv}|g" \
     -e "s|{{MEMORY_KEY}}|${memory_key}|g" \
-  "$SKILL_DIR/templates/handoff.md" > "$dest"
+  "$SKILL_DIR/templates/handoff.md" > "$draft"
 
 # ---------------------------------------------------------------------------
 # Build the "▶ Start next phase(s)" body and splice it into the {{NEXT_PROMPTS}}
-# placeholder. One self-contained boot prompt per phase this phase unblocks.
+# placeholder: the whole boot prompt of a lone next phase, or a fan-out's shared
+# boot once and a block per phase.
 # ---------------------------------------------------------------------------
 prompts_tmp="$(mktemp)"
+# The handoff being written lands LAST (one rename, below), yet it is the first
+# thing every phase it unblocks reads — so the engine is told its name rather
+# than splicing prompts that omit their own predecessor (#115).
+export PE_HANDOFF_WRITING="$((10#$phase)):${this_handoff}"
 {
   if [ "$next_phase" = none ]; then
     printf '## 🏁 Final phase — closeout\n\n'
@@ -241,9 +268,11 @@ prompts_tmp="$(mktemp)"
       on*)     printf -- '- Dispatch the fresh **qa-full** QA subagent (this plan runs QA) — brief via `scripts/next-phase-prompt.sh %s none`.\n' "$slug" ;;
       waived*) printf -- '- QA gate waived for this plan — no qa-full subagent; verify yourself.\n' ;;
     esac
-    printf -- '- Set `status: complete` in `docs/plans/%s.md`.\n' "$slug"
+    # `complete` is written LAST (#153): every reader acts on the word, so it
+    # follows the lines that prove it rather than leading them.
     printf -- '- Run §End-to-end verification in the plan (always — QA on or off).\n'
     printf -- '- Confirm every phase is `done` (`scripts/phase-graph.sh %s` shows 🏁), not just this one.\n' "$slug"
+    printf -- '- Then, only once every line above ran green, set `status: complete` in `docs/plans/%s.md` — a line owed, deferred or skipped leaves the plan open.\n' "$slug"
     printf -- '- Check memory `%s` for outstanding user gates (push / prod deploy).\n' "$memory_key"
     printf -- '- `/clear` when done.\n'
   elif [ "$GRAPH_OK" = 1 ]; then
@@ -255,41 +284,52 @@ prompts_tmp="$(mktemp)"
       nready=$(printf '%s\n' $ready | grep -c . || true)
       if [ "$nready" -gt 1 ]; then
         printf '> Phases **%s** are all unblocked — run them in any order. Ones with DISJOINT\n' "$(echo $ready | sed 's/ /, /g')"
-        printf '> scopes may run as concurrent sessions; ones sharing a repo run one at a time. Each boot\n'
-        printf '> prompt below states its scope and the `phase-lock.sh … conflicts` check to run first.\n'
-        printf '> If the remaining budget allows, the finishing session MAY instead continue straight into\n'
-        printf '> ONE of them (not a 🔒GATED one). Commit before switching sessions; never `git stash`.\n\n'
+        printf '> scopes may run as concurrent sessions; ones sharing a repo run one at a time. Each\n'
+        printf '> phase'\''s prompt states its scope and the `phase-lock.sh … conflicts` check to run first.\n'
+        printf '> The console runs one phase per session; driving by hand, if the remaining budget allows, the\n'
+        printf '> finishing session MAY instead continue straight into ONE of them (not a 🔒GATED one).\n'
+        printf '> Commit before switching sessions; never `git stash`.\n\n'
       else
-        # Single next phase — batch-friendly whenever the remaining budget fits (gated
-        # phases excepted: they always start fresh after their gates are confirmed).
+        # Single next phase — batch-friendly BY HAND whenever the remaining budget fits
+        # (gated phases excepted: they always start fresh after their gates are
+        # confirmed). The console never batches: it boards the next phase itself (#153).
         sz="$(bash "$ENGINE" "$slug" --size "$ready" 2>/dev/null || echo M)"
         rdeps=" $(bash "$ENGINE" "$slug" --deps "$ready" 2>/dev/null || true) "
         gated_next="$(bash "$ENGINE" "$slug" --gated "$ready" 2>/dev/null || echo no)"
         if [ "$gated_next" != yes ]; then
           case "$rdeps" in
             *" $phase "*)
-              printf '> _Phase %s (size %s) is sequential on this one — you MAY continue into it in the SAME\n> session if it fits the remaining budget (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
+              printf '> _Phase %s (size %s) is sequential on this one. The console runs one phase per session;\n> driving by hand, you MAY continue into it in the SAME session if it fits the remaining budget\n> (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
             *)
-              printf '> _Phase %s (size %s) is independent of this one — it may still share the SAME session\n> if the remaining budget allows (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
+              printf '> _Phase %s (size %s) is independent of this one. The console runs one phase per session;\n> driving by hand, it may still share the SAME session if the remaining budget allows\n> (`references/sizing.md`); otherwise use the prompt below in a fresh session._\n\n' "$ready" "$sz" ;;
           esac
         fi
       fi
-      for p in $ready; do
-        gated="$(bash "$ENGINE" "$slug" --gated "$p" 2>/dev/null || echo no)"
-        gmark=""
-        if [ "$gated" = yes ]; then
-          gk="$(bash "$ENGINE" "$slug" --gate-kind "$p" 2>/dev/null || echo human)"
-          case "$gk" in
-            ai)   gmark=' — 🔒 GATED·ai (the session clears the gate first)' ;;
-            auto) gmark=' — 🔒 GATED·auto (confirm --gate-status reads clear)' ;;
-            *)    gmark=' — 🔒 GATED·human (operator must approve first)' ;;
-          esac
-        fi
-        printf '### Phase %s%s\n\n' "$p" "$gmark"
-        printf '```\n'
-        bash "$ENGINE" "$slug" --boot-prompt "$p"
-        printf '```\n\n'
-      done
+      # A fan-out writes the shared boot ONCE and each phase only its own block
+      # (#115): eight whole prompts were ~1,100 lines of copies of each other,
+      # and every session told to read this handoff read them all. The full
+      # prompt is composed at launch — `--boot-prompt`, next-phase-prompt.sh
+      # `--phase N`, Phase Console — never copied out of a handoff.
+      if [ "$nready" -gt 1 ]; then
+        bash "$ENGINE" "$slug" --boot-fanout "$ready"
+      else
+        for p in $ready; do
+          gated="$(bash "$ENGINE" "$slug" --gated "$p" 2>/dev/null || echo no)"
+          gmark=""
+          if [ "$gated" = yes ]; then
+            gk="$(bash "$ENGINE" "$slug" --gate-kind "$p" 2>/dev/null || echo human)"
+            case "$gk" in
+              ai)   gmark=' — 🔒 GATED·ai (the session clears the gate first)' ;;
+              auto) gmark=' — 🔒 GATED·auto (confirm --gate-status reads clear)' ;;
+              *)    gmark=' — 🔒 GATED·human (operator must approve first)' ;;
+            esac
+          fi
+          printf '### Phase %s%s\n\n' "$p" "$gmark"
+          printf '```\n'
+          bash "$ENGINE" "$slug" --boot-prompt "$p"
+          printf '```\n\n'
+        done
+      fi
     fi
   else
     # Legacy fallback: no parseable graph → single linear next-phase prompt.
@@ -310,13 +350,24 @@ prompts_tmp="$(mktemp)"
 awk -v sf="$prompts_tmp" '
   $0 == "{{NEXT_PROMPTS}}" { while ((getline l < sf) > 0) print l; next }
   { print }
-' "$dest" > "$dest.tmp" && mv "$dest.tmp" "$dest"
+' "$draft" > "$draft.next" && mv "$draft.next" "$draft"
 rm -f "$prompts_tmp"
+# The whole body lands in ONE rename, still under its interim status.
+mv "$draft" "$dest"
 
 # Append INDEX row if not already listed.
 if ! grep -qF "${this_handoff}" "$index"; then
   printf '| %s | %s | %s | [%s](%s) |\n' \
     "$padded" "$title" "$status" "${this_handoff}" "${this_handoff}" >> "$index"
+fi
+
+# LAST: the status. Only the first `status:` line — the frontmatter's — and its
+# trailing comment is kept; one rename, so no reader sees a half-written file.
+if [ "$interim" != "$status" ]; then
+  awk -v st="$status" '
+    !flipped && /^status:/ { sub(/^status:[[:space:]]*[A-Za-z-]*/, "status: " st); flipped = 1 }
+    { print }
+  ' "$dest" > "$draft" && mv "$draft" "$dest"
 fi
 
 echo "created $dest"

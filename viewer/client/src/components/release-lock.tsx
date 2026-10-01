@@ -32,6 +32,7 @@ function useAfterRelease() {
     (slug?: string) => {
       void client.invalidateQueries({ queryKey: keys.plans() });
       void client.invalidateQueries({ queryKey: keys.stats() });
+      void client.invalidateQueries({ queryKey: keys.locks() });
       if (slug) void client.invalidateQueries({ queryKey: keys.plan(slug) });
     },
     [client],

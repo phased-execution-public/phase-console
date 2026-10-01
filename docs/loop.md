@@ -101,12 +101,16 @@ prescribing a lint that is already passing.
 
 **A halt is either about the phase or about the run.** `shared/recovery-model.js` splits `HALT_KINDS`
 into `PHASE_HALT_KINDS` (`verify-failed` · `no-handoff` · `phase-blocked` · `needs-human` ·
-`awaiting-person` · `waiting-external-timeout` · `verification-preflight` · `mcp-preflight` ·
-`recovery-failed` · `orphaned-session` · `phase-crashed` · `worktree-merge` · `landing-conflict`) and `RUN_HALT_KINDS` (`budget` ·
+`plan-approval` · `awaiting-person` · `waiting-external-timeout` · `verification-preflight` · `mcp-preflight` ·
+`recovery-failed` · `orphaned-session` · `phase-crashed` · `worktree-merge` · `landing-conflict` ·
+`verify-timeout`) and `RUN_HALT_KINDS` (`budget` ·
 `failure-streak` · `models-exhausted` · `run-preflight` · `plan-unreadable` · `plan-lint` ·
 `runner-crashed` · `plan-deadlocked` · `nothing-ready` · `interrupted-by-restart` · `operator-stop` ·
-`credential-refused`).
-The four before the last are the parks and stops that used to carry no kind at all (LFC-1); the last is the
+`credential-refused` · `identity-changed` · `isolation-refused`).
+The four before `credential-refused` are the parks and stops that used to carry no kind at all (LFC-1);
+`identity-changed` is the run's account answering somebody else's login (control-tower phase 91, #131 —
+parked for a person's choice, press-only), and `isolation-refused` the checkout the run asked for that
+could not be had (control-tower phase 90). `credential-refused` is the
 API refusing the run's OWN credential — an organisation policy, an expired login, a billing hold, a
 certificate — which stops the run and retires the account for its organisation (RCV-1: it used to ride
 `needs-human`, a PHASE-level kind, so one blocked credential settled the phase and the loop boarded the next
@@ -138,6 +142,16 @@ relaunch (`run.relaunch-refused`; the planner never proposes one for a `failure-
 `credential-refused` halt — `PRESS_ONLY_HALT_KINDS`). A recovery that confirms a phase done resets it too:
 a success breaks "N in a row" by definition. The classifier reads `rec.halt ?? state.halt`.
 
+**A stop about the plan is answered by the plan** (control-tower phase 81, #97, #104). `plan-lint` and
+`plan-unreadable` are `PLAN_HALT_KINDS`: a `plan-lint` halt is anchored on the phase whose handoff broke
+the lint, which reads done by construction, so reconcile closes the record but keeps the stop, and the
+resolver never calls it "superseded". Converge reads the plan's lint on each pass that finds one — clean
+relaunches the run, red keeps it down quoting `validate.sh`, a lint that could not run decides nothing —
+and Recover asks the same lint before anything else. An engine TIMEOUT is not such a stop: the drive loop
+waits a timed-out board read out as `waiting` on `engine-busy` (15 s, 30 s, 1, 2, then 5 min a wait, up to
+8 waits), charging nothing, and only a timeout that outlasts the whole back-off halts `plan-unreadable`. A
+plan-repair rung over either stop climbs only once a lint that RAN is red.
+
 **Recover and recheck keep ledgers of their own** (RCV-4). The operator's recover verb counts per phase
 on `recoveries[phase].recovers`: past `RECOVER_MAX_PER_PHASE` (6) it is refused `capped`, and over the
 same evidence fingerprint the last recovery ran under it is refused `unchanged` — each a
@@ -164,7 +178,11 @@ label, why[], by, fingerprint?}` — `by` is who classified, one of `CLASSIFIED_
 `closed` · `heal`), and `phase.rung` carries the same word — and cached on the record
 (`PhaseRecord.situation {key, at, why, fingerprint?, by?}`) for the table and the Ways-forward strip. The
 healer writes the line once per evidence: a pass that re-derives the same key from the same fingerprint
-journals nothing (RCV-9 counted 1 332 lines of "still parked", 1 249 of them unsigned), and its console
+journals nothing (RCV-9 counted 1 332 lines of "still parked", 1 249 of them unsigned). The fingerprint
+is the PHASE's own (`phaseEvidence` — its record, board word, locks, watch-ref states and gate verdict,
+control-tower phase 51, #84), never the run's, so one phase moving re-journals that phase alone; and a
+standing needs-human declaration whose ask stands is not classified at all until what it names moves
+(it is re-declared, or a ref it watches changes state). Its console
 log line `run.heal-pass` counts what it `journalled` against what was `unchanged`. The diagnosis endpoint (`GET /api/run/:slug/diagnosis/:phase`) returns the
 situation with the evidence lines it read.
 
@@ -177,8 +195,10 @@ for one situation on one phase**, and bounded by the caps below. A rung's record
 the spend (`accountRung`: `phase.rung {situation, rung, params, brief, vehicle, attempt}`) and settled
 when the session ends (`settleRung`, with one of `RUNG_OUTCOMES`' verdicts: `fixed` · `no-defect` ·
 `superseded` · `failed` · `interrupted`, plus `work-in-progress` for a session that declared `partial`
-and asked to be resumed; `running` is the word while it climbs), so a console that dies mid-rung
-still remembers it tried.
+and asked to be resumed, and `withdrawn` for a rung whose lane never spawned at all — a sibling took
+the scope, or a park withdrew the queue entry it was waiting in — which costs nothing, counts toward
+no cap and leaves the rung climbable; `running` is the word while it climbs), so a console that dies
+mid-rung still remembers it tried.
 
 **The settlement doors, and a backstop behind them.** The outcome-driven settles are one door; the
 other is `settleRungsAfterAttempt` (`runner-base.ts`), which runs when a lane's attempt ends and
@@ -331,12 +351,18 @@ streak paragraph above for which counter it reads and who may reset it.
 7. **Health** — records ahead of the board surface as a health issue, not a silent contradiction.
 
 A pass that healed nothing remembers its fingerprint and does not run the healer again until something
-changes; the operator's press always asks afresh. The pass is journalled as `run.converge {trigger,
+changes; the operator's press always asks afresh. The fingerprint is built from the OUTSTANDING phases'
+own evidence (a done phase's record, locks and board word do not move it) plus the plan-wide stamps and
+the verdict of every automatic gate on those phases — read fresh each pass, so a `plan <slug>:<N>` gate
+clearing when ANOTHER plan lands is a change. A boarded phase parked `gated` whose gate now reads clear
+is relaunched by name (`reboard`, counted under the `gate-cleared` resume path); a run whose plan is
+closed is settled once (`run.closed-plan`) and never woken, whatever its gates say (control-tower
+phase 51, #48). The pass is journalled as `run.converge {trigger,
 action: relaunch|heal, why, reboard[], rearm[], launched, phase, situation, rung}` (or
 `run.converge-failed`), and the flattened report rides the event stream as **`run:converge`** and
 answers `GET /api/converge` (`{automatic, everyMs, pending[], running[], reports[]}`) — the Pulse's
 **Converge** line ("re-boarded P12 (Never started → Re-board fresh) · released a stale claim on P3")
-is that view, and Now's *Running now* band states whether the loop runs by itself on this console.
+is that view, and the Tower's empty *Needs you* bay states whether the loop runs by itself on this console.
 `--no-converge` keeps the automatic passes off while Recover & continue still works; a console without
 `--allow-run` never converges (it cannot start anything).
 
@@ -347,7 +373,9 @@ Every code path that starts a `claude` with no person asking is a **door**, name
 `boot-readopt` · `wait-clock` · `converge-relaunch` · `converge-heal` · `recovery-continue` ·
 `pty-continue` · `watch-landed` · `mcp-require-timeout` · `outcome-inbox` — then the spawns that are
 not runs: `mcp-health-probe` · `mcp-boarding-preflight` · `auto-reviewer` · `ultrareview` ·
-`ladder-pty-agent`. A person's Start, Retry, Recover or Continue is `OPERATOR_DOOR` (`operator`),
+`ladder-pty-agent` — then `trigger` (a stored trigger firing, phase 98) and `supervisor` (the
+supervisor's pass pressing a remedy under its `act` policy, phase 101, `via: 'supervisor'`), which
+ride their verb's own door. A person's Start, Retry, Recover or Continue is `OPERATOR_DOOR` (`operator`),
 deliberately not a member. Every start carries the one attribution shape, `ACTOR_FIELDS`:
 `run.start {…, by, via, origin, remoteUser, door, trigger, guard, counter}` — who, the transport
 (`ACTOR_VIAS`), where from, the authenticated remote user or `null`, the door, what fired it, the
@@ -386,12 +414,23 @@ first — the session's own testimony — else `record.watch`), plus a `lock:` r
 | `gh:` run | `gh:owner/repo#run/<id>` | the run reaches `completed`, whatever its conclusion | 2 min | fixed argv, never a shell |
 | `gh:` pr | `gh:owner/repo#pr/<n>` | the PR leaves `OPEN` (merged **or** closed) | 5 min | same |
 | `date:` / `until:` | `date:<ISO8601>` | `now ≥ t` | **once**, at its instant | arithmetic; nothing executes |
-| `lock:` | `lock:<slug>/<phase>` | nothing holds that phase's scope — no lock, a lapsed lease, or a holder whose session **ended** | 1 min | the console's own lock store (a GRANT is not seen — see the phase-2 handoff) |
-| `cmd:` | `cmd:<command>` or `cmd:"<command>"` | the command exits 0 | 5 min, **≤ 12 runs per phase** | the policy §Verification gets (NOT read-only — `npm ci` passes it), 60 s, `watchCmdRefs` |
+| `lock:` | `lock:<slug>/<phase>` — somebody ELSE's: one naming the declaring phase is refused at the script and at ingest (`phase.watch-refused {why: own-lock}`), and retired if it was armed before that | nothing holds that phase's scope — no lock, a lapsed lease, or a holder whose session **ended** | 1 min | the console's own lock store (a GRANT is not seen — see the phase-2 handoff) |
+| `cmd:` | `cmd:<command>` or `cmd:"<command>"` | the command exits 0 | 5 min, 15 min, 1 h, then **6 h until the phase's wait budget ends** | the policy §Verification gets (NOT read-only — `npm ci` passes it), 60 s, `watchCmdRefs` |
 
 The scheduler's own timer fires at `min(nextDueAt)` with a **60 s floor**, so a ref due in thirty
 seconds does not buy a wake in thirty seconds. One probe per ref per pass, however many plans
 declared it.
+
+**A `cmd:` ref backs off; it does not run out** (control-tower phase 6, #19).
+`WATCH_CMD_BACKOFF_MS` is `[5 min, 15 min, 1 h, 6 h]`, indexed by how many times the command has
+RUN (`cmdBackoffMs(runs)`, the last step repeats; a probe that executed nothing stays on the first
+step). What ends it is the phase's **wait budget** (`waitBudgetEndOf`, below): past it the ref
+reads `refused`, "the phase's wait budget ended … — this console will not run it again".
+`MAX_CMD_RUNS_PER_PHASE` (200, seven weeks at the last step) is a backstop only a runaway reaches,
+and it refuses in words too. It used to be a flat five minutes capped at 12 runs — an hour of
+watching. The measured case was an organisation's plan restored after a day: the ref was refused
+after its last run, before the fix arrived. A wall is measured in days, and at this cadence a day
+costs seven runs.
 
 **Four states, and one of them is not a state.** `pending` · `landed` · `unknown` (could not ask —
 no `gh`, no auth, a deleted run, no oracle wired; the caller behaves exactly as it did before this
@@ -410,11 +449,12 @@ than read by one.
 **What it writes:** `record.watchState = {at, refs[{ref, scheme, state, detail, checkedAt,
 nextDueAt, runs?, deliveredAt?, minted?}]}` — a CONTRACT, persisted with the run, written additively so a ref
 not probed this pass keeps its row (rows for refs no longer declared are pruned). `runs` counts
-`cmd:` executions against `MAX_CMD_RUNS_PER_PHASE`; `deliveredAt` marks the last delivery that
-actually launched a resume — history, not a gate (below). A `cmd:` ref the policy refused or the cap
-exhausted is RETIRED on `record.watchRetired` (SLF-8): its `refused` row stays while it is declared,
-it is never a probe target again — a re-declaration does not buy twelve fresh runs — and only an
-operator's Retry un-retires it. A `minted` ref — one the CONSOLE wrote rather than a session: the watchdog's park lifting the polled
+`cmd:` executions, which pick the back-off step and are held to the `MAX_CMD_RUNS_PER_PHASE`
+backstop; `deliveredAt` marks the last delivery that actually launched a resume — history, not a
+gate (below). A `cmd:` ref that the policy refused, that outlived the wait budget or that reached
+the backstop is RETIRED on `record.watchRetired` (SLF-8). Its `refused` row stays while it is
+declared, it is never a probe target again (a re-declaration does not buy a fresh run count), and
+only an operator's Retry un-retires it. A `minted` ref — one the CONSOLE wrote rather than a session: the watchdog's park lifting the polled
 command out of a Bash tool summary, or a ref-less `waiting-external` adopting the command the in-turn-wait
 guard refused (`mintWatchRef`, the wait budget below) — is never run unless `watchMintedCmdRefs` is on:
 written once as `unknown` with no clock.
@@ -437,7 +477,57 @@ the moment the declaration it answers is spent. A drive that REJECTS the landing
 recovery already in flight) is charged on `record.watchRejections` — bounded at the same three, then
 the same errand — and the next offer waits `WATCH_REDELIVER_SERIES_MS` (1, 2, 5, 15, 30 min) or the
 rejection's own clock (the lease's end) when that is later; `run.watch-resume-failed` is said once
-per distinct reason per lease (SLF-8, RCV-8).
+per distinct reason per lease (SLF-8, RCV-8). A **busy** refusal is not a rejection: `recoverPhase`
+throws a typed `RunBusyError` when the run is live, and the landing is un-charged
+(`run.watch-resume-void {busy: true}`) with no errand. At most one landing errand is written per
+declaration (`watchLandedErrandFor`), and never for a `lock:` ref the console implied or minted
+(`consoleLockRef`): such a landing on a declared phase answers `done` — no resume, no errand — because
+the console's own lock bookkeeping is not the world the session was waiting on.
+
+**A landing on a LIVE run boards through the run's own lanes** (control-tower phase 6, #15). The
+healer stands down while a runner is live, and a landing used to go to `recoverPhase` anyway, which
+refused because the run was live. The refusal was charged as a rejection, and three of them wrote an
+errand about a landing that had worked. Now `resumeOnWatchLanded` hands it to the live runner's
+`Runner.landWatch(phase, landed)`:
+
+- It acts only on a phase of this run that holds its declaration, has no lane, and reads `waiting`,
+  `parked`, `pending` or `queued`. Otherwise it returns false and touches nothing.
+- A `parked` record becomes `waiting`. A `waiting` record gets `parkedUntil = now`, with its clock
+  and poke synced.
+- The phase joins `landingReserve`. The runner journals `phase.resume-automatic {trigger: watch,
+  path: live-lane, count, ref}`, persists, emits and wakes the loop.
+- The loop boards reserved phases first (`boardingOrder`). A same-scope sibling waits a tick while a
+  reservation is unadmitted (`landingHeld`).
+- Admission carries `reserve`, so `phase.admitted` says `reserved: true`, and the reservation is
+  spent there. The resume is `phase.wait-resume {cause: landed}`, and its prompt says the ref LANDED
+  and names the conclusion (`landingDirective`).
+- A phase ALREADY waiting in admission — an elapsed wait queued behind its scope — has that entry
+  reserved in place (`Scheduler.reserveQueued`), so it does not keep its first-come place.
+
+`watchResumeInFlight` holds only while `landingPending(phase)` — not whenever a runner is live, which
+is what used to keep a landing from ever being offered again.
+
+**A park that ends through the queue is still a park.** `admit` marks a phase `queued` while its
+scope is held, and `runPhaseAdmitted` asks "is this the wait's own resume?" of `waiting`. So an
+elapsed wait or a landing that had to queue — the very case the reservation exists for — used to
+board as a fresh attempt: the engine's boot text instead of its resume, no `phase.wait-resume`, and
+the park's clock left on a running record. `runPhase` now puts `waiting` back when admission returns.
+It is a compare-and-set, so a word somebody else wrote during the wait (a skip, a stop) stands. A stop
+while it queued leaves the phase `waiting` rather than `pending`, so the next loop resumes it as the
+wait it was.
+
+**`reserve` is aged at birth** (`AdmitRequest.reserve`). `scanOrder` puts the entry ahead of
+everything, and the moment its scope blocks it, it holds its tokens as an aged entry would. It never
+preempts a granted lane and never passes a clock: a freeze, a window, a hold, a chain, the throttle,
+the brake and the repository cap all still stand. The queue snapshot shows `reserve: true`.
+
+**The sentences say what is live.** Every "the console is watching its refs" sentence used to be
+written from the declaration, so a ref refused an hour earlier still read as watched.
+`watchSummary(record)` sorts the declared refs into `live`, `landed` and `refused` from `watchState`
+and `watchRetired`. `watchClause` turns that into the heal's refusal (which `run.plan-recover`
+quotes as its reason) and the errand's `how`: the live refs by name, the refused ones as "refused,
+not watched", and — when nothing is live — "none of its refs is live … nothing will resume it by
+itself", never a claim to be watching.
 
 The offer is held back by the things that actually KNOW, never by a stamp or a clock: while the
 healer's own drive promise has not settled (`resumeInFlight`) the landing is not offered again, and
@@ -451,10 +541,13 @@ from one that never happened (three offers burned in three minutes), and a recei
 silently, with no errand (QA rounds 2–3, G1/H1). `deliveredAt` remains on the row as history: the
 last delivery that really launched.
 
-**And a due ref is a change.** `evidenceFingerprint` carries `min(nextDueAt)`; while something is
-overdue the term becomes the current minute, which advances — so the "found nothing to climb" latch
-cannot hide a landing across the sweep. It is the one deliberate exception to *the clock is not part
-of the evidence*, and it earns it by measuring something outside this console rather than inside it.
+**And a due ref is a change.** While something is overdue, `evidenceFingerprint` carries the current
+minute, which advances — so the "found nothing to climb" latch cannot hide a landing across the sweep.
+It is the one deliberate exception to *the clock is not part of the evidence*, and it earns it by
+measuring something outside this console rather than inside it. The schedule itself (`min(nextDueAt)`)
+is not a term since control-tower phase 51: it moved on every probe that found nothing, and a heal pass
+after one could only stand down again. A ref's STATE is in its phase's evidence, so a landing is a
+change.
 
 ## The wait budget — how long a phase may stay parked
 
@@ -476,14 +569,26 @@ of the evidence*, and it earns it by measuring something outside this console ra
    ask — is granted as asked (`extendedBy`);
 6. past it with no countersign, a DEFAULT window (the session named none) is shortened to what is left,
    and only that grant is `capped`;
-7. past it, a DECLARED window is **refused, never cut**: a `waiting-external-timeout` halt whose sentence
-   states the arithmetic — asked, the budget and its source, already parked, remaining — and names the
-   `Waits on:` line that would allow it.
+7. past it, a DECLARED window naming a POLLABLE ref (any `--watch` ref the watch clock parses — `gh:`,
+   `date:`, `lock:`, `cmd:`) is granted what is left, `min(asked, remaining)`, and `capped`: the ref's
+   landing decides, not the window (control-tower phase 45, #59 — an all-or-nothing refusal halted one
+   phase three times while the builds it waited on finished inside the remainder). With no pollable
+   ref, or less than the floor left, it is refused — and a refusal is a **budget event, never a
+   failure**. `parkOnSpentBudget` (the pure `spentBudgetPark`, shared with the inbox and the boot's
+   overdue ruling) parks the phase `waiting` with no clock of its own, keeps its declaration stamped
+   `budgetSpent` and its refs watched (a `cmd:` one past the budget's end), and files ONE errand under
+   the `budgets` key whose sentence states the arithmetic — asked, the budget and its source, already
+   parked, remaining — and names the `Waits on:` line that would give it a clock again
+   (`phase.wait-budget-spent`). Nothing is `failed`, the streak is not charged, no rung climbs, and a
+   landing resumes the phase's own session.
 
 At resume only the allowance is asked: a declared park whose parked time is past its budget — the
-console's own outage counts, it is time the phase spent parked — halts rather than boards, unless the
-countersign reaches now; the watchdog's parks always resume. The session's unattended brief tells it
-the budget, where it came from, and that a window past it is refused rather than shortened.
+console's own outage counts, it is time the phase spent parked — takes that same budget park rather
+than boarding, unless the countersign reaches now; so does a rule-7 grant that ran out with nothing
+landed. A resume that a watched ref's LANDING asked for skips the budget, and the watchdog's parks
+always resume. `resumeWithInstruction` closes the open wait entry, so a resumed session's working time
+is never charged to the budget. The session's unattended brief tells it the budget, where it came
+from, and what happens past it.
 
 **A resume reads presence** (REG-1). Before an automatic resume of a park, the gate asks the registry
 about the session that declared it: a declarer still running is not resumed on top of itself —
@@ -522,6 +627,93 @@ behind. `isCappableBlocker` (`runner/scheduler.ts`) is the single rule, asked at
 successful claim). Left standing, one 25.4-hour queue made the next admission compute
 `remaining = max(0, 2h − 25.4h) = 0` and fire its cap 1 ms after `phase.queued`. `phase.queued` also
 carries `headKind` and, when the head holder is a lock with a lease, an `eta`.
+
+## Admitted on the branch — a run holds the trees it checked out
+
+A phase lock says who may WRITE a repository for the length of a phase. It says nothing about which
+branch the tree is left on — and a new-branch run in the SHARED checkout leaves its scoped
+repositories on `pe/<slug>` for as long as the RUN lives, across every phase and every lock it takes.
+A sibling admitted between its phases built and verified against that run's in-flight work (#41: a
+drift gate, a contract suite and a trunk check, all red on work that had shipped).
+
+So the lock is per PHASE and the branch is per RUN:
+
+- **The hold.** After a phase's session in the shared checkout, every repository of its scope the
+  session left on this run's branch is held by the run — `run.tree-hold`, once per repository, with the
+  branch it stood on before (`foundOn`, recorded before the run's first session there). The record lives
+  under `<state>/trees/`, one `key=value` file per repository, so the scheduler and
+  `phase-lock.sh conflicts` read the same thing (`runner/tree-state.ts`).
+- **The admission.** A phase in the shared checkout whose scope reaches a repository standing on a
+  branch another open run holds reads `queued` behind a `branch` holder — the repository, the branch,
+  the run — with one `phase.queued` line. A superproject scope reaches every initialized repository
+  under it. The holder is a SKIP, like the repository cap: the entry never reserves tokens, a `reserve`
+  never passes it, and it is never capped into a park. It lifts when the tree leaves that branch (read
+  again every `TREE_POLL_MS` while the phase waits) or when the holding run settles (seen at the next
+  scan). Asked of the loop's admissions and of every door that boards through them — a heal's resume
+  included.
+- **The release.** When the run settles — finished, or stopped by an operator — every hold is given up
+  (`run.tree-released`), and a repository still on the run's branch, clean, and held by nobody else is
+  switched back to the branch it was found on. A tree that cannot be moved is released all the same and
+  named with why it stayed. A run that is parked, halted, paused, or whose console died under it has not
+  settled: it still owns what it checked out.
+- **Trees of its own are untouched.** A mirror, an isolated run and a lane worktree never ask, never
+  hold and never write a line.
+- **The boot prompt warns.** A phase boarding into a repository on another plan's `pe/` branch — one no
+  open run holds any more, left behind — carries a loud block naming it.
+- **Every verdict names what it compared.** A verification records `{repo, branch, head}` of every
+  repository the commands could read (`VerifySummary.trees`, and each command's `tree`), and a
+  verify-failed halt's first line says `compared against <repo>@<branch> <head>`.
+- **The launch door says so first.** The prelude's trees probe names the holder and recommends
+  isolation when this console can grant it; it never blocks a start.
+
+## The scope fence — a declared wall fences its scope
+
+`keep-going` means a phase that failed does not stop its siblings. It never meant "board a sibling
+into a wall another phase has just declared", and that is what it did (#19). One session declared
+`needs-human --needs external` because every check on the repository was refused. Within the hour,
+more sessions were boarded into the same repository, and each paid to rediscover the wall and filed
+another copy of the same errand. This is a STATED behaviour change of control-tower phase 6.
+
+**The rule is one function**, `applyScopeFence` (`runner/scheduler.ts`), and both boarders call it
+before they board anything: the drive loop's candidate filter (`fenceCandidates`) and the healer's
+pass (`service-recovery.ts`). They can never disagree about a wall.
+
+- **Who fences:** a phase of this run that is `parked` on a declared EXTERNAL wall — `needs-human`
+  or `blocked` with `--needs external`, or filed `blocked-declared:external` (`isExternalWall`) —
+  and whose wall can still come down by itself. It must hold a live watch ref (`watchSummary`), or
+  an errand that stands inside its wait budget. A wall that landed, that the operator lifted since it
+  was declared, or that is past its wait budget does not fence (`fenceHolderOf`).
+- **Whom it fences:** every other candidate whose scope intersects the holder's (`scopesIntersect`,
+  the lock's own rule). A disjoint phase still boards — that is `keep-going`, unchanged.
+- **What a fenced phase says:** a `pending` phase reads `queued`, with
+  `waitingOn: [{kind: 'fence', phase, owner, refs, until, wall}]` and a note naming the holder, its
+  live refs and when the fence lifts by itself. Any other status keeps its word and gains only the
+  holder, so a wait's own resume is not lost to the fence. `phase.fenced` is written once per wall
+  per phase. A scoped run with a fenced asked phase counts it `unsettled`, never finished.
+- **What lifts it** (`phase.fence-lifted {fence, why, wall}`, `why` from `FENCE_LIFT_REASONS`):
+  - the wall landed (`landed`);
+  - the operator retried the holder (`retry`, stamped by `resetForRetry`);
+  - the holder's lock was released (`release`, stamped by `noteFenceReleased`);
+  - the holder's wait budget ended (`budget`) — a clock, so `evidenceFingerprint` carries the soonest
+    future fence end as a `fence@<minute>` term, and a sweep cannot sleep through it;
+  - anything else that stops it being a wall (`cleared`).
+
+  A lifted `queued` phase reads `pending` and boards on the next pass.
+
+**A second declaration of the same wall folds** (#19 ask 2). The same wall means the fingerprints
+meet (`wallFingerprint`): the reason with its numbers and punctuation folded away, or any pollable
+ref both declared. Two sessions rarely write one sentence twice, but they very often hand the console
+the same ref. When a phase whose scope intersects a standing external-wall errand's declares such a
+wall, the fold happens in the runner's `needs-human` arm, or in the healer's declared-park arm for an
+inbox declaration (`errandFoldTarget`):
+
+- the new phase gets no errand, and `recoveries[N].foldedInto` points at the first phase;
+- the first errand's `alsoPhases` gains it;
+- `phase.errand-folded` is written, nothing is announced, and the run is not parked a second time.
+
+A fold whose target errand no longer names the phase is void (`foldStands`), and the healer writes
+that phase an errand of its own. The runner's errand key reads `--needs` before the prose, exactly as
+the classifier does.
 
 ## Resource walls — the ladder at the top of the run
 
@@ -815,7 +1007,7 @@ past it (`run.manifest-override`) — is [Decisions](decisions.md) and `viewer/s
 
 **A card is a WAIT** (WAI-10). While a verification card or a tool approval card stands, the run is
 `waiting` with `waitReason: 'person'` (`WAIT_REASONS`: `usage-limit` · `external` · `scope` ·
-`schedule` · `person`), its `waitUntil` at the soonest card's expiry, and the wait ends with the LAST
+`schedule` · `person` · `connectivity` · `engine-busy`), its `waitUntil` at the soonest card's expiry, and the wait ends with the LAST
 card (`enterPersonWait` → `run.waiting-person`, then `leavePersonWait`) — restart-safe like every wait.
 A verification card nobody answered is not a person saying the checks failed: the phase parks with the
 question standing, the streak untouched, under the halt kind `awaiting-person` — a person was asked and
@@ -1001,8 +1193,11 @@ the streak reads, and a shutdown is always `system`, because the run must resume
 **Every session runs under both caps.** Each spawn carries `--max-turns` and `--max-budget-usd`, with the
 source beside each on `phase.session` (`CAP_SOURCES`) and the purpose (`SESSION_MODES`: `phase` · `resume`
 · `repair` · `qa` · `closeout` · `pr` · `review`). A run's own `phaseBudgetUsd` wins; without one, a phase
-attempt and a resume take the size row (`SESSION_CAPS_BY_SIZE`: S $25 and 150 turns · M $60 and 300 · L
-$120 and 600, about three times the most any measured session spent). Every side session takes a quarter
+attempt and a resume take the phase's MEASURED caps (control-tower phase 59, #83): each mode's p99 over
+this console's own `phase.session` lines of the last two weeks plus 50 %, re-derived hourly
+(`deriveCapTable`), else the table shipped with the release — $120 and 490 turns for a phase — with the
+derivation (percentile, headroom, window, samples) on every `phase.session`; the size tag sets no cap
+since, because it did not separate an M's spend from an L's. Every side session takes a quarter
 of the dollars (`SIDE_SESSION_SHARE`, never under $1); turns are `REPAIR_MAX_TURNS` (90) for a repair and
 `CLOSEOUT_MAX_TURNS` (60) for everything that is paperwork or a bounded review. A cap the CLI reports
 spent is not a failure: the same session is resumed with it doubled (`raiseCap`, source `raise`).
@@ -1083,7 +1278,7 @@ is missing — with `--rule` and `--command` beside it for a permission block.
 | key | default | means |
 |---|---|---|
 | `autoRecoverByDefault` | on | new runs opt into the ladder (`run.autoRecover`) |
-| `autoContinueRecovery` | on | a run resumes by itself when a recovery leaves the board fixed |
+| `autoContinueRecovery` | on | a run resumes by itself when a recovery leaves the board fixed — read at the recovery's END, the board re-read; a `halt-on-everything` run, or one with an errand standing, parks instead and journals why (`run.recovery-parked`, control-tower phase 81) |
 | `ladderPerPhaseRungs` / `ladderPerPhaseUsd` | 3 / 100 | the per-phase caps |
 | `ladderPerRunRungs` / `ladderPerRunUsd` | 10 / 400 | the per-run caps |
 | `ladderPerDayUsd` | 600 | the per-console-day cap |
@@ -1124,7 +1319,7 @@ the console emits, with its sink and its meaning, is in
 `viewer/server/{converge,service,hooks-install,relay,start-ceiling,prelude,inbox}.ts` ·
 `viewer/server/accounts/{index,learned}.ts` · `viewer/server/sessions/registry.ts` ·
 `scripts/{session-hook,instance,phase-lock,phase-outcome}.sh` · `bin/sessions-verb.mjs` · the client's
-`components/{errand,recovery-actions,pulse}.tsx`, `features/now/index.tsx`,
+`components/{errand,recovery-actions,pulse}.tsx`, `features/runs/tower/tower.tsx`,
 `features/settings/{automation,ladder,hooks}.tsx` · tests: `viewer/test/{situation,ladder,converge,
 auto-recovery,sessions-*,hooks-install,liveness,rulings}.test.ts` and
 `tests/unit/{session-hook,lock,outcome}.bats`.

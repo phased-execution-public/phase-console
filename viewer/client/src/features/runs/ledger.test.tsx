@@ -2,7 +2,9 @@
  * What the run cost and how long it ran (zero-touch phase 19): a session the
  * console ended still renders its own cost; a cost never reported reads unknown;
  * and the reconciliation against the run's spend is flagged when it does not
- * hold — and says reconciled when it does.
+ * hold — and says reconciled when it does. And (control-tower phase 89, #62's
+ * SIZ-7, PT-1) the turn cap binds per PROMPT, so the Turns cell beside it names
+ * the largest prompt next to the sum, and the cap says what it counts.
  */
 
 import { render, screen } from '@testing-library/react';
@@ -23,6 +25,7 @@ const session = (over: Partial<LedgerSession>): LedgerSession => ({
   consoleEnded: false,
   isError: false,
   turns: 12,
+  promptTurns: 12,
   turnsSource: 'result',
   costUsd: 1.5,
   costSource: 'result',
@@ -93,6 +96,64 @@ describe('the ledger card', () => {
     expect(screen.getByTestId('ledger-driver').textContent).toBeTruthy();
   });
 
+  it('paints each rung’s outcome and cause as a badge with its icon — withdrawn (#16) and environment included', () => {
+    const rung = {
+      driver: 'console',
+      costUsd: 0,
+      note: null,
+      by: 'drive',
+    };
+    mount({
+      runId: 'r1',
+      starts: [],
+      sessions: [],
+      rungs: [
+        {
+          ...rung,
+          at: '2026-09-15T10:11:00.000Z',
+          phase: 2,
+          rung: 'resume',
+          outcome: 'withdrawn',
+          cause: 'never-ran',
+          situation: 'crashed',
+        },
+        {
+          ...rung,
+          at: '2026-09-15T10:12:00.000Z',
+          phase: 3,
+          rung: 'switch-account',
+          outcome: 'failed',
+          cause: 'environment',
+          situation: 'resource-wall:auth',
+        },
+        {
+          ...rung,
+          at: '2026-09-15T10:13:00.000Z',
+          phase: 4,
+          rung: 'resume',
+          outcome: 'fixed',
+          cause: null,
+          situation: 'crashed',
+        },
+      ],
+      totals: totals({}),
+    });
+    const outcomes = screen.getAllByTestId('ledger-outcome');
+    expect(outcomes.map((badge) => badge.getAttribute('data-status'))).toEqual([
+      'withdrawn',
+      'failed',
+      'fixed',
+    ]);
+    expect(outcomes[0]!.textContent).toContain('Withdrawn');
+    const causes = screen.getAllByTestId('ledger-cause');
+    expect(causes.map((badge) => badge.getAttribute('data-status'))).toEqual(['never-ran', 'environment']);
+    // Never plain text: every word rides a badge that draws its icon beside it.
+    for (const badge of [...outcomes, ...causes]) {
+      expect(badge.querySelector('svg')).not.toBeNull();
+      expect(badge.getAttribute('data-vocab')).toMatch(/^rung/);
+    }
+  });
+
   it('flags a gap against the run’s spend', () => {
     mount({
       runId: 'r1',
@@ -104,6 +165,40 @@ describe('the ledger card', () => {
     const line = screen.getByTestId('ledger-reconcile');
     expect(line.getAttribute('data-gap')).toBe('true');
     expect(line.textContent).toMatch(/\$3\.50 of it no session line accounts for/);
+  });
+
+  it('PT-1: the Turns cell names the largest prompt beside the sum, and the turn cap reads per prompt', () => {
+    // many-plans-one-repo P15 in #62: 338 turns in sum under a 300 cap the CLI
+    // enforces per prompt — its largest prompt was the figure to read against it.
+    mount({
+      runId: 'r1',
+      starts: [],
+      sessions: [
+        session({ turns: 338, promptTurns: 300, maxTurns: { value: 300, source: 'measured' } }),
+        session({ turns: 40, promptTurns: null, sessionId: 's-2', at: '2026-09-15T10:20:00.000Z' }),
+      ],
+      rungs: [],
+      totals: totals({ sessions: 2, turns: 378 }),
+    });
+    const beside = screen.getAllByTestId('ledger-prompt-turns');
+    expect(beside.map((node) => node.textContent)).toEqual(['max 300 per prompt']);
+    expect(screen.getByText('338')).toBeTruthy();
+    expect(screen.getAllByText(/300 turns per prompt · measured/).length).toBe(1);
+    expect(screen.queryByText(/^300 turns · /)).toBeNull();
+  });
+
+  it('PT-1: one prompt, or a line from before the field, shows the count alone — nothing invented beside it', () => {
+    mount({
+      runId: 'r1',
+      starts: [],
+      sessions: [
+        session({}),
+        session({ promptTurns: null, sessionId: 's-2', at: '2026-09-15T10:20:00.000Z' }),
+      ],
+      rungs: [],
+      totals: totals({}),
+    });
+    expect(screen.queryByTestId('ledger-prompt-turns')).toBeNull();
   });
 
   it('says reconciled when the sessions account for every cent', () => {

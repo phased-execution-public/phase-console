@@ -16,7 +16,7 @@
  */
 
 import { useState } from 'react';
-import { Banner, Button, Checkbox, Chip, ConfirmButton, field } from '@/components/ui';
+import { Banner, Button, Checkbox, Badge, ConfirmButton, field } from '@/components/ui';
 import { Markdown } from '@/components/markdown';
 import { api } from '@/lib/api';
 import { keys, useApiMutation, useConsoleState, useGateStatus, usePlan, useRun } from '@/lib/queries';
@@ -93,7 +93,7 @@ export function GateCard({
           <strong>
             {approved ? 'Gate approved.' : gate?.clear ? 'Gate is clear.' : 'Gates must clear first.'}
           </strong>
-          <Chip tone="gate">{copy.label}</Chip>
+          <Badge tone="accent">{copy.label}</Badge>
         </div>
         <p className="mt-0.5 text-2xs text-ink-muted">{copy.hint}</p>
         {view.gates && <Markdown text={view.gates} />}

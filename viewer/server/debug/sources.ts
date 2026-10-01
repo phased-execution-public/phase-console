@@ -517,6 +517,8 @@ export function readSupervisorLogs(): { entries: DebugEntry[]; paths: string[]; 
 export const ERROR_SEGMENTS: readonly string[] = [
   'failed', 'refused', 'denied', 'lost', 'halt', 'halted',
   'unrunnable', 'mismatch', 'unsupported',
+  // A run's own session whose hook calls are refused (#74): it works on, unsupervised.
+  'unauthorised',
 ];
 
 export const WARN_SEGMENTS: readonly string[] = [
@@ -603,7 +605,7 @@ export function readJournals(root: string, slug: string, runId?: string): DebugE
     if (entries.length >= PER_SOURCE_CAP) break;
     const remaining = PER_SOURCE_CAP - entries.length;
     let lines: JournalEntry[] = [];
-    try { lines = new Journal(root, slug, id).read(remaining); } catch { continue; }
+    try { lines = Journal.for(root, slug, id).read(remaining); } catch { continue; }
     for (const line of lines) entries.push(fromJournalEntry(line, slug, id));
   }
   return entries;

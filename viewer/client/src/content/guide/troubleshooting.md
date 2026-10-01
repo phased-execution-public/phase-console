@@ -56,7 +56,7 @@ account with headroom rather than waiting at all — and it does so *while the w
 the session's own stream, rather than waiting for the session to exit. That matters because a session
 that hits the wall mid-turn often never exits: the CLI absorbs the 429 and retries every thirty
 seconds indefinitely. A lane in that state reads **Retrying** on its row, and if no account had
-headroom to move it to, the Now inbox raises it after a quarter of an hour. The run does not sit there
+headroom to move it to, the Tower's Needs-you bay raises it after a quarter of an hour. The run does not sit there
 silently either: the third such wall inside an hour with nowhere to move stops being merely noted —
 the phase waits out the window when its reset is known, or parks with an errand — and it announces
 under **Usage limits** either way.

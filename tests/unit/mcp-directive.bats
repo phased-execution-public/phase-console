@@ -110,11 +110,14 @@ load ../helpers/test_helper
 }
 
 @test "session-plan: attached servers add weight to the phases that carry them" {
-  # mcp.md is four S phases (15K each). Without a surcharge all four would batch
-  # into one 60K session at the default budget; the servers are what splits them.
+  # mcp.md is four S phases, 60K by their tags, carrying seven attachments at
+  # 1.5K each (context7 on all four, github on 1, playwright + sentry on 3), so
+  # the generated weight reads 71K. A session count no longer shows it: since the
+  # session floor (control-tower phase 59) the 40K default splits every phase
+  # whatever it carries, and this plan's own model fits all four in one.
   setup_docs mcp mcp
   run pg mcp --session-plan
   [ "$status" -eq 0 ]
-  assert_contains "$output" "Session 1"
-  assert_contains "$output" "Session 2"
+  assert_contains "$output" "4 S = 71K over 4 phases"
+  assert_contains "$output" "Session 1  batch  (~70K):  1 → 2 → 3 → 4"
 }

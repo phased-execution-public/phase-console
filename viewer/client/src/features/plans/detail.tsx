@@ -1,5 +1,6 @@
 /**
- * One plan: its route, its board, its phases, handoffs and analysis.
+ * One plan, in three tabs: its phases (one table, four views — control-tower
+ * phase 23), its autopilot, and its source.
  *
  * Two things here are deliberate and easy to undo by accident:
  *
@@ -27,17 +28,17 @@ import {
   TabsList,
   TabsTrigger,
 } from '@/components/ui';
-import { useAutoReadNotifications, usePlan } from '@/lib/queries';
-import { navigate, planHref } from '@shared/routes.js';
+import { useAutoReadNotifications, useEngineQueue, usePlan } from '@/lib/queries';
+import { navigate, planHref, planViewHref } from '@shared/routes.js';
 import { Page } from '@/components/page';
 import { PlanHeader } from './header';
-import { RouteTab } from './route-tab';
 import { PhasesTab } from './phases-tab';
 import {
   DETAIL_TABS,
   TAB_IDS,
   includesForTab,
   isDetailRoute,
+  phasesViewOf,
   resolveTab,
   sourceViewOf,
   tabLabel,
@@ -57,30 +58,42 @@ import type { ViewProps } from '@/app/router';
 const RunView = lazy(() => import('@/features/runs/run-page'));
 
 /**
- * The four tab bodies nobody opens first.
+ * The bodies nobody opens first.
  *
- * `route` is the default and `phases` is what the Route tab BECOMES on a phone,
- * so both stay in this chunk — making them lazy would buy nothing and cost the
- * phone an extra round trip on the one surface where round trips are dearest.
- * The other four are opened deliberately, by someone who has already read the
- * route map, and each drags something the route map does not need: the two
- * handoff surfaces pull the handoff renderer, and Source pulls `marked` and the
- * whole plan document.
+ * `phases` is the default, so it stays in this chunk — making it lazy would buy
+ * nothing and cost the phone an extra round trip on the one surface where
+ * round trips are dearest. The rest are opened deliberately, and each drags
+ * something the phase table does not need: the phase page pulls every prose
+ * field's renderer, the handoff page the handoff renderer, and Source `marked`
+ * and the whole plan document.
  *
  * ⚠️ A helper imported from one of these files is a static import of the file.
- * That is why `sourceViewOf` moved to `./tabs` — see the note there.
+ * That is why `sourceViewOf` and `phasesViewOf` live in `./tabs`.
  */
 const PhasePanel = lazy(() => import('./phase-panel').then((m) => ({ default: m.PhasePanel })));
-const HandoffPanel = lazy(() => import('./handoffs-tab').then((m) => ({ default: m.HandoffPanel })));
-const HandoffsTab = lazy(() => import('./handoffs-tab').then((m) => ({ default: m.HandoffsTab })));
-const QaTab = lazy(() => import('./qa-tab').then((m) => ({ default: m.QaTab })));
+const HandoffPanel = lazy(() => import('./handoff-panel').then((m) => ({ default: m.HandoffPanel })));
 const SourceTab = lazy(() => import('./source-tab').then((m) => ({ default: m.SourceTab })));
+
+/**
+ * Why the page is still empty (#44): a cold plan's board queues behind every
+ * other engine read, and a skeleton alone reads as a console that is down.
+ */
+export function EngineQueueLine() {
+  const { data } = useEngineQueue(true);
+  const queued = data?.queued ?? 0;
+  return (
+    <p className="text-sm text-ink-muted" role="status">
+      {queued > 0 ? `Computing the board (${queued} queued)` : 'Computing the board'}
+    </p>
+  );
+}
 
 function PlanSkeleton() {
   return (
     <Page>
       <div className="flex flex-col gap-3">
         <Skeleton className="h-9 w-72" />
+        <EngineQueueLine />
         <Skeleton className="h-4 w-96" />
         <Skeleton className="h-9 w-full" />
         <Skeleton className="h-96 w-full" />
@@ -110,7 +123,7 @@ function TabBody({
   tab: string;
   arg?: string;
   detail: PlanDetail;
-  /** `?view=` — which half of a tab, for the one tab that has two. */
+  /** `?view=` — which reading of a tab: the phase table's four, Source's two. */
   view?: string;
   /** `?report=<phase>[:<round>]` — the QA report sheet, open ⟺ the address says so. */
   report?: string;
@@ -121,12 +134,6 @@ function TabBody({
       return <PhasePanel detail={detail} phase={arg} />;
     case 'handoff':
       return <HandoffPanel detail={detail} phase={arg} />;
-    case 'phases':
-      return <PhasesTab detail={detail} />;
-    case 'qa':
-      return <QaTab detail={detail} report={report} />;
-    case 'handoffs':
-      return <HandoffsTab detail={detail} />;
     case 'source':
       return <SourceTab detail={detail} slug={slug} view={sourceViewOf(view)} />;
     case 'run':
@@ -135,8 +142,11 @@ function TabBody({
           <RunView detail={detail} />
         </Suspense>
       );
+    // `phases` is also the fallback, so an id the vocabulary gains before its
+    // panel lands on the table rather than on nothing.
+    case 'phases':
     default:
-      return <RouteTab detail={detail} />;
+      return <PhasesTab detail={detail} view={phasesViewOf(view)} report={report} />;
   }
 }
 
@@ -181,7 +191,6 @@ export default function PlanView({ route }: ViewProps) {
             <TabsTrigger key={id} value={id}>
               {tabLabel(id)}
               {id === 'phases' && <Count n={data.phases.length} />}
-              {id === 'handoffs' && <Count n={data.handoffs.length} />}
             </TabsTrigger>
           ))}
         </TabsList>
@@ -193,8 +202,14 @@ export default function PlanView({ route }: ViewProps) {
                 {detailKind && (
                   <div className="mb-3">
                     <Button asChild variant="ghost" size="sm">
-                      <a href={planHref(data.summary.slug, DETAIL_TABS[detailKind])}>
-                        ← All {DETAIL_TABS[detailKind]}
+                      <a
+                        href={
+                          detailKind === 'handoff'
+                            ? planViewHref(data.summary.slug, 'handoffs')
+                            : planHref(data.summary.slug, DETAIL_TABS[detailKind])
+                        }
+                      >
+                        ← All {detailKind === 'handoff' ? 'handoffs' : DETAIL_TABS[detailKind]}
                       </a>
                     </Button>
                   </div>

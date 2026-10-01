@@ -45,11 +45,14 @@ import { DECISION_KEYS, type DecisionKey, type DecisionRow } from '../shared/dec
 import { MANIFEST_BLOCKING, POLICY_DEFAULTS, resolvePolicy } from '../shared/policy-model.js';
 import { MCP_POLICIES } from '../shared/run-lifecycle.js';
 import type { ProbeStatus } from '../shared/ops-vocab.js';
-import type { RelayMode } from '../shared/run-settings.js';
+import { GIT_STRATEGY_ACKS, type RelayMode } from '../shared/run-settings.js';
 import type { HeadroomVerdict } from './accounts/index.ts';
 import type { CredentialVerdict } from './credentials-probe.ts';
 import type { PolicyPrefs } from './runner/policy.ts';
 import type { AccountRequirement, ManifestDecision, ResolvedManifest, RunVerifyApprovals } from './runner/state.ts';
+import type { SkillApi, SkillApiMismatch } from './skill-copy.ts';
+import type { HumanStepDirective } from './parse/plan.ts';
+import { isOpenableUrl, type HumanStepKind, type HumanStepWhere } from '../shared/human-step-model.js';
 
 /** One probe's answer: the word, the reason, and (when some but not all failed) the warnings. */
 export type ProbeVerdict = {
@@ -63,7 +66,34 @@ export type ProbeVerdict = {
 /** A manifest row as the prelude rendered it, plus the probe that judged it. */
 export type PreludeRow = ManifestDecision & { probe?: PreludeProbeId };
 
-export type PreludeProbeId = 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'verification';
+export type PreludeProbeId = 'accounts' | 'mcp' | 'credentials' | 'delivery' | 'verification' | 'trees' | 'git-strategy' | 'skill'
+  | 'human-steps';
+
+/**
+ * Where a plan-declared step stands at the launch door (control-tower phase
+ * 44): `pre-cleared` — its proof ran at the door and already holds, so the
+ * run will not need anyone for it; `needed` — it ran and does not, so a
+ * person is asked NOW, before anything spawns; `unchecked` — it names no
+ * proof, or the proof could not run here, so only a person can say.
+ */
+export type PreludeStepState = 'pre-cleared' | 'needed' | 'unchecked';
+
+/** One plan-declared step as the launch door lists it — the directive, its open action, and what its proof said. */
+export type PreludeStep = {
+  phase: number;
+  kind: HumanStepKind;
+  what: string;
+  where: HumanStepWhere;
+  state: PreludeStepState;
+  /** What a person opens to do it: a link, or a command for the embedded terminal. */
+  open?: { url: string } | { command: string };
+  proof?: string;
+  /** What the proof answered at the door, in its own words. */
+  read?: string;
+  windowMinutes?: number;
+  autoOpen?: 'host';
+  credential?: string;
+};
 
 export type Prelude = {
   slug: string;
@@ -81,6 +111,12 @@ export type Prelude = {
   delivery: ResolvedManifest['delivery'];
   /** The draft's §Verification answers, resolved to exact texts — what `startRun` stores on the run. */
   verifyApprovals?: RunVerifyApprovals;
+  /**
+   * The plan-declared human steps of the phases this run will drive, each
+   * proof run at the door (control-tower phase 44) — "this run will need you N
+   * times", asked before anything spawns rather than at three in the morning.
+   */
+  humanSteps: PreludeStep[];
   at: string;
 };
 
@@ -104,6 +140,9 @@ export type PreludeOptions = {
    * names no approvable command answers nothing.
    */
   verifyAnswers?: { approve?: string[]; waive?: string[] };
+  /** The draft's git mode and isolation — whether this run would stand in trees of its own (probe 6). */
+  gitMode?: string;
+  isolation?: string;
 };
 
 /**
@@ -164,9 +203,105 @@ export type PreludeDeps = {
    * the probe answers `skip`.
    */
   verification?: () => Promise<VerificationFacts | null>;
+  /**
+   * Probe 6's facts — which repository of the plan's scope stands on another
+   * open run's branch in the shared checkout, and whether this run would be
+   * isolated from it (control-tower phase 40, #41). Optional, like probe 5.
+   */
+  trees?: () => Promise<TreeFacts | null>;
+  /**
+   * Probe 7's facts — the plan's git lines and the strategy this launch would
+   * run under (control-tower phase 11, #18). Optional, like probe 6.
+   */
+  gitStrategy?: () => Promise<GitStrategyFacts | null>;
+  /**
+   * Probe 8's facts — this console's `skill-api.env` and the plugin copy the
+   * run's accounts' sessions load, with theirs (control-tower phase 98, #151).
+   * Optional, like probe 6: absent answers `skip` and refuses nothing.
+   */
+  skillApi?: (accountIds: string[]) => SkillApiFacts | null;
+  /**
+   * Probe 9's facts (control-tower phase 44): the plan-declared human steps of
+   * the phases this run will drive — `onlyPhases`, else every phase not done —
+   * and the one-ref probe their proofs are run with (the watch clock's own,
+   * `WatchScheduler.probeNow`, so a `cmd:` proof is judged exactly as the check
+   * verb and the watch judge it). Optional, like probe 6: absent lists nothing.
+   */
+  humanSteps?: () => Promise<readonly { phase: number; step: HumanStepDirective }[]>;
+  probeStep?: (ref: string) => Promise<{ landed: boolean; read: string }>;
   prefs: PolicyPrefs;
   now?: () => string;
 };
+
+/**
+ * The plan-declared steps of the phases a run will drive: its `onlyPhases`
+ * when it is scoped, else every phase the board does not read done — in the
+ * plan's phase order, each phase's steps in the order the plan writes them.
+ */
+export function scopedSteps(
+  stepsOf: (phase: number) => readonly HumanStepDirective[],
+  phases: readonly number[],
+  scope: { onlyPhases?: readonly number[] | undefined; done?: readonly number[] | undefined } = {},
+): { phase: number; step: HumanStepDirective }[] {
+  const only = scope.onlyPhases?.length ? new Set(scope.onlyPhases) : null;
+  const done = new Set(scope.done ?? []);
+  return phases
+    .filter((phase) => (only ? only.has(phase) : !done.has(phase)))
+    .flatMap((phase) => stepsOf(phase).map((step) => ({ phase, step })));
+}
+
+/**
+ * Run every listed step's proof AT ONCE and say where each stands: a proof
+ * that lands pre-clears its step; one that does not leaves it `needed`; no
+ * proof — or a probe that threw — leaves it `unchecked`. The open action is
+ * the step's `open:` value, read as a link when it is http(s) and as a command
+ * otherwise.
+ */
+export async function doorSteps(
+  listed: readonly { phase: number; step: HumanStepDirective }[],
+  probe: ((ref: string) => Promise<{ landed: boolean; read: string }>) | undefined,
+): Promise<PreludeStep[]> {
+  return Promise.all(listed.map(async ({ phase, step }): Promise<PreludeStep> => {
+    const base: PreludeStep = {
+      phase, kind: step.kind, what: step.what, where: step.where, state: 'unchecked',
+      ...(step.open ? { open: isOpenableUrl(step.open) ? { url: step.open.trim() } : { command: step.open.trim() } } : {}),
+      ...(step.proof ? { proof: step.proof } : {}),
+      ...(step.windowMinutes !== undefined ? { windowMinutes: step.windowMinutes } : {}),
+      ...(step.autoOpen ? { autoOpen: step.autoOpen } : {}),
+      ...(step.credential ? { credential: step.credential } : {}),
+    };
+    if (!step.proof || !probe) return base;
+    try {
+      const answer = await probe(step.proof);
+      return { ...base, state: answer.landed ? 'pre-cleared' : 'needed', read: answer.read.slice(0, 280) };
+    } catch (error) {
+      return { ...base, read: `the proof could not run: ${String((error as Error)?.message ?? error).slice(0, 200)}` };
+    }
+  }));
+}
+
+/**
+ * Probe 9 — a person's turns the run will need. It never refuses a start: a
+ * step still owed is an ASK, answered at the door or later, so the verdict is
+ * `ok` either way and names what is owed as warnings. `skip` when the plan
+ * declares no step for these phases.
+ */
+export function probeHumanSteps(steps: readonly PreludeStep[]): ProbeVerdict {
+  if (!steps.length) return { status: 'skip', ok: true, reason: 'the plan declares no human step for these phases' };
+  const owed = steps.filter((step) => step.state !== 'pre-cleared');
+  const cleared = steps.length - owed.length;
+  if (!owed.length) {
+    return { status: 'ok', ok: true, reason: `every step the plan declares for these phases is already done (${cleared} pre-cleared at the door)`, detail: { steps } };
+  }
+  return {
+    status: 'ok',
+    ok: true,
+    reason: `this run will need you ${owed.length} time${owed.length === 1 ? '' : 's'}`
+      + (cleared ? ` (${cleared} more pre-cleared at the door)` : ''),
+    warnings: owed.map((step) => `phase ${step.phase}: ${step.what}${step.state === 'needed' && step.read ? ` — its proof read ${step.read}` : ''}`),
+    detail: { steps },
+  };
+}
 
 export type DeliveryFacts = {
   devices: number;
@@ -501,6 +636,257 @@ export function probeVerification(facts: VerificationFacts | null): ProbeVerdict
  * The prelude
  * ------------------------------------------------------------------ */
 
+/** Probe 6's facts: the shared trees another run holds, and this run's isolation. */
+export type TreeFacts = {
+  held: { repo: string; branch: string; run: string; slug: string }[];
+  /** This run would stand in trees of its own (a mirror, an isolated checkout). */
+  isolated: boolean;
+  /** Could the console isolate this plan? `null` when that could not be asked. */
+  grantable: boolean | null;
+  /** Why it could not, in the isolation preflight's words. */
+  refusal?: string;
+};
+
+/**
+ * Probe 6 — the shared trees (control-tower phase 40, #41). Names every
+ * repository of the plan's scope that stands on another open run's branch,
+ * and says what that means for THIS run: an isolated run is not held by it;
+ * a shared one will queue its phases in that scope until the tree leaves the
+ * branch or the holder settles — so it recommends isolation, but only when
+ * the console can grant it. Never a block: a held tree queues, it does not
+ * refuse a start.
+ */
+export function probeTrees(facts: TreeFacts | null): ProbeVerdict {
+  if (!facts) return { status: 'skip', ok: true, reason: 'the shared checkout was not read' };
+  if (!facts.held.length) return { status: 'ok', ok: true, reason: "no scoped repository stands on another run's branch" };
+  const named = facts.held.map((hold) => `\`${hold.repo}\` on \`${hold.branch}\` (run ${hold.run} of ${hold.slug})`);
+  const holds = `another run holds ${named.join(', ')}`;
+  if (facts.isolated) {
+    return { status: 'ok', ok: true, reason: `${holds} — this run is isolated — it stands in trees of its own and is not held by it`, detail: facts };
+  }
+  const advice = facts.grantable === false
+    ? ` — this run's phases in that scope will queue until the tree leaves that branch or that run settles; `
+      + `isolation is not available here${facts.refusal ? ` (${facts.refusal})` : ''}`
+    : ' — start this run isolated so it works in trees of its own; in the shared checkout its phases in that '
+      + 'scope will queue until that run settles';
+  return { status: 'ok', ok: true, reason: holds + advice, warnings: named, detail: facts };
+}
+
+/* ------------------------------------------------------------------ *
+ * Probe 7 — the plan's git lines against the chosen strategy (#18)
+ * ------------------------------------------------------------------ */
+
+/** Probe 7's facts: what the plan's git lines ask and what this launch would do. */
+export type GitStrategyFacts = {
+  /** The launch's git mode — only `new-branch` imposes a branch of the console's. */
+  gitMode?: string;
+  /** The branch the console's new-branch strategy puts every phase on (`pe/<slug>`). */
+  runBranch: string;
+  /** This run would stand in a checkout of its own (a run tree, or a superproject's mirror). */
+  isolated: boolean;
+  /** The plan's root has submodules — per-lane worktrees are refused `has-submodules`. */
+  superproject: boolean;
+  /** §Session budget's `**Branch:**` prose, verbatim. */
+  planBranch?: string;
+  /** §Session budget says `Worktrees: on`. */
+  planWorktrees: boolean;
+  /** The phases whose `- **Checkout:**` asks to board detached at the trunk. */
+  checkoutPhases: number[];
+};
+
+/** One plan git line the chosen strategy will not honour. */
+export type GitStrategyLine = {
+  kind: 'branch' | 'worktrees' | 'checkout';
+  /** What the plan says. */
+  plan: string;
+  /** What this run does instead. */
+  run: string;
+  /** Whether `honour` can make the plan's line hold (by giving the run a checkout of its own). */
+  honourable: boolean;
+  /** The phases a `checkout` line names. */
+  phases?: number[];
+};
+
+/** A person's answer to probe 7's rows at launch — `shared/run-settings.js` owns the words. */
+export { GIT_STRATEGY_ACKS };
+export type GitStrategyAck = (typeof GIT_STRATEGY_ACKS)[number];
+
+/**
+ * Every git line of the plan the chosen strategy will not honour (#18) — the
+ * three a plan author could not learn from the format until now:
+ *
+ * - `branch` — the console's new-branch strategy puts every phase on
+ *   `pe/<slug>`, so §Session budget's `**Branch:**` naming another branch is
+ *   never created. The default idioms ("current branch", "no new branch",
+ *   "default") name none, and prose that names the run branch itself agrees.
+ *   No launch setting honours it.
+ * - `worktrees` — `Worktrees: on` is a per-LANE ask: a shared checkout cannot
+ *   grant it, and a superproject never grants it (the run-level mirror is its
+ *   answer, refused per lane `has-submodules`). Honourable only by isolating a
+ *   plain repository.
+ * - `checkout` — `- **Checkout:** main` means "board detached at the trunk"
+ *   only in a checkout the run owns; in the shared one it is inert and the
+ *   phase stands on the run branch. Honoured by isolating the run.
+ */
+export function gitStrategyLines(facts: GitStrategyFacts | null): GitStrategyLine[] {
+  if (!facts) return [];
+  const lines: GitStrategyLine[] = [];
+  const newBranch = facts.gitMode === 'new-branch';
+  const prose = facts.planBranch?.replace(/\s+/g, ' ').trim();
+  if (newBranch && prose && !/current|no new branch|default/i.test(prose) && !prose.includes(facts.runBranch)) {
+    lines.push({
+      kind: 'branch', plan: prose.slice(0, 240), honourable: false,
+      run: `every phase works on \`${facts.runBranch}\`; the plan's branch is never created`,
+    });
+  }
+  if (facts.planWorktrees && (facts.superproject || !facts.isolated)) {
+    lines.push({
+      kind: 'worktrees', plan: 'Worktrees: on',
+      honourable: newBranch && !facts.superproject,
+      run: facts.superproject
+        ? 'a superproject never grants a worktree per lane — its phases share the run\'s mirror'
+        : 'the phases share one checkout — a shared-checkout run cannot grant a worktree per lane',
+    });
+  }
+  if (facts.checkoutPhases.length && !facts.isolated) {
+    const list = facts.checkoutPhases.join(', ');
+    lines.push({
+      kind: 'checkout', plan: `Checkout: main on phase${facts.checkoutPhases.length === 1 ? '' : 's'} ${list}`,
+      honourable: newBranch, phases: [...facts.checkoutPhases],
+      run: newBranch
+        ? `inert in the shared checkout — the phase${facts.checkoutPhases.length === 1 ? ' stands' : 's stand'} on \`${facts.runBranch}\``
+        : 'inert in the shared checkout — the phases stand on whatever it has checked out',
+    });
+  }
+  return lines;
+}
+
+/** One line as a sentence — the prelude's warning and the refusal's list. */
+export function gitStrategySentence(line: GitStrategyLine): string {
+  return `the plan's \`${line.plan}\` is not honoured: ${line.run}`;
+}
+
+/**
+ * Probe 7 — the plan's git lines (control-tower phase 11, #18). Names each
+ * line the chosen strategy will not honour, BEFORE anything spawns — a
+ * journal line nobody is watching is not a decision. Never blocks here: the
+ * start door asks for `gitStrategyAck` while a line stands
+ * (`GitStrategyRefusal`), and an automatic door answers `override` for itself.
+ */
+export function probeGitStrategy(facts: GitStrategyFacts | null): ProbeVerdict {
+  if (!facts) return { status: 'skip', ok: true, reason: "the plan's git lines were not read" };
+  const lines = gitStrategyLines(facts);
+  if (!lines.length) return { status: 'ok', ok: true, reason: "the chosen git strategy honours every git line the plan states", detail: { lines } };
+  return {
+    status: 'ok', ok: true,
+    reason: `${lines.length} of the plan's git line${lines.length === 1 ? ' is' : 's are'} not honoured by this launch — `
+      + 'answer honour (make the plan hold where the console can) or override (run over it, and tell the sessions)',
+    warnings: lines.map(gitStrategySentence),
+    detail: { lines },
+  };
+}
+
+/**
+ * What a session is told about each plan git line its run was launched over
+ * (control-tower phase 11, #18) — the concrete instruction, never "record the
+ * discrepancy in your handoff", which in a zero-touch run nobody reads: four
+ * sessions each rediscovered that the plan's per-phase branches did not exist
+ * and repaired their own `gh pr checks` line while eighty stayed wrong.
+ * Empty when nothing was overridden, so the boot prompt says what it always said.
+ */
+export function gitOverrideInstruction(
+  lines: readonly { kind: string; plan: string; run: string; phases?: number[] }[] | undefined,
+  branch: string, phase: number,
+): string {
+  const out: string[] = [];
+  for (const line of lines ?? []) {
+    if (line.kind === 'branch') {
+      out.push(`- The plan's §Session budget names the branch \`${line.plan}\`, and this run was launched\n`
+        + `  OVER it: \`${branch}\` IS this plan's branch for the whole run. Every branch the plan names\n`
+        + `  instead — that one, a per-phase \`${branch}-pN\`, the branch in a \`gh pr checks …\` line —\n`
+        + `  does not exist here: read each as \`${branch}\` and carry on. There is no discrepancy to record.`);
+    } else if (line.kind === 'worktrees') {
+      out.push(`- The plan asks for \`Worktrees: on\`; this run was launched over it (${line.run}). Work in the\n`
+        + '  checkout named above and nowhere else — no worktree of your own exists or will be made.');
+    } else if (line.kind === 'checkout' && (!line.phases?.length || line.phases.includes(phase))) {
+      out.push(`- This phase's \`Checkout: main\` is inert in this run: it stands on \`${branch}\` like every\n`
+        + '  other phase, and commits there. Do not switch to the trunk.');
+    }
+  }
+  return out.length ? `\n${out.join('\n')}` : '';
+}
+
+/**
+ * A start refused on probe 7 (→ 409): a line stands and the launch did not
+ * answer it, or answered `honour` where a line cannot be honoured.
+ */
+export class GitStrategyRefusal extends Error {
+  lines: GitStrategyLine[];
+  ack: GitStrategyAck | null;
+
+  constructor(lines: GitStrategyLine[], ack: GitStrategyAck | null) {
+    super(ack === 'honour'
+      ? `The run cannot honour ${lines.length === 1 ? 'this plan git line' : 'these plan git lines'}: `
+        + `${lines.map(gitStrategySentence).join('; ')}. Start with gitStrategyAck "override", or change the launch.`
+      : `The chosen git strategy does not honour ${lines.length === 1 ? 'a git line' : `${lines.length} git lines`} the plan states: `
+        + `${lines.map(gitStrategySentence).join('; ')}. Answer gitStrategyAck "honour" or "override" to start.`);
+    this.name = 'GitStrategyRefusal';
+    this.lines = lines;
+    this.ack = ack;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Probe 8 — the skill's interface against the console's (#151)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Probe 8's facts: this console's interface pair, and each copy a session of
+ * the run would load — with `skill-copy.ts`'s verdict on the two already
+ * reached, so this file stays a runtime leaf and the comparison lives once.
+ */
+export type SkillApiFacts = {
+  console: SkillApi | null;
+  copies: { configDir: string; installPath: string | null; api: SkillApi | null; mismatch: SkillApiMismatch | null }[];
+};
+
+/**
+ * Probe 8 — the skill against the console (control-tower phase 98, #151). The
+ * console runs its own scripts and tells every session to; the session reads
+ * SKILL.md from the plugin copy its config dir carries. When that copy's
+ * scripts reject flags the console uses — or the console's reject what the
+ * skill tells a session to use — the run goes wrong in the middle, so the
+ * start is refused here, naming the half to update. Chosen over a refusal at
+ * boarding because a boarding refusal would need a halt kind of its own, and
+ * the door is where the prelude's other preconditions already stop a run.
+ * A copy or a console carrying no `skill-api.env` is no verdict, never a pass
+ * dressed as one: the probe answers `skip`.
+ */
+export function probeSkillApi(facts: SkillApiFacts | null): ProbeVerdict {
+  if (!facts) return { status: 'skip', ok: true, reason: 'the skill copies were not read' };
+  const installed = facts.copies.filter((copy) => copy.installPath);
+  if (!installed.length) {
+    return { status: 'skip', ok: true, reason: "no plugin copy of the skill is installed for this run's accounts — nothing to compare" };
+  }
+  if (!facts.console) return { status: 'skip', ok: true, reason: "this console's scripts carry no skill-api.env — no verdict" };
+  const refused = installed.find((copy) => copy.mismatch);
+  if (refused?.mismatch) {
+    return {
+      status: 'fail', ok: false, reason: `${refused.configDir}: ${refused.mismatch.reason}`,
+      detail: { ...facts, update: refused.mismatch.update },
+    };
+  }
+  const unstamped = installed.filter((copy) => !copy.api);
+  if (unstamped.length === installed.length) {
+    return { status: 'skip', ok: true, reason: `the skill copy carries no skill-api.env (${unstamped[0]!.installPath}) — no verdict` };
+  }
+  return {
+    status: 'ok', ok: true,
+    reason: `this console's interface ${facts.console.api} and the skill's meet in ${installed.map((copy) => copy.configDir).join(', ')}`,
+    ...(unstamped.length ? { warnings: unstamped.map((copy) => `${copy.configDir}: its copy carries no skill-api.env — no verdict`) } : {}),
+  };
+}
+
 export async function preludeFor(slug: string, options: PreludeOptions, deps: PreludeDeps): Promise<Prelude> {
   const at = (deps.now ?? (() => new Date().toISOString()))();
   const manifest = deps.decisions();
@@ -567,10 +953,60 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
     ? { status: 'skip', ok: true, reason: `the verification review could not run: ${verificationError}` }
     : probeVerification(verificationFacts);
 
+  // Probe 6 — the shared trees. Like probe 5, a read that could not RUN
+  // refuses nothing; and unlike every other probe, this one never blocks.
+  let treesVerdict: ProbeVerdict = { status: 'skip', ok: true, reason: 'the shared checkout was not read' };
+  if (deps.trees) {
+    try {
+      treesVerdict = probeTrees(await deps.trees());
+    } catch (error) {
+      treesVerdict = { status: 'skip', ok: true, reason: `the shared checkout could not be read: ${String((error as Error)?.message ?? error)}` };
+    }
+  }
+
+  // Probe 7 — the plan's git lines (#18). Never blocks: the start door asks
+  // for the acknowledgement, which a probe cannot do.
+  let gitVerdict: ProbeVerdict = { status: 'skip', ok: true, reason: "the plan's git lines were not read" };
+  if (deps.gitStrategy) {
+    try {
+      gitVerdict = probeGitStrategy(await deps.gitStrategy());
+    } catch (error) {
+      gitVerdict = { status: 'skip', ok: true, reason: `the plan's git lines could not be read: ${String((error as Error)?.message ?? error)}` };
+    }
+  }
+
+  // Probe 8 — the skill's interface against this console's (#151): the copies
+  // the run's accounts would load. A read that could not RUN refuses nothing.
+  let skillVerdict: ProbeVerdict = { status: 'skip', ok: true, reason: 'the skill copies were not read' };
+  if (deps.skillApi) {
+    try {
+      skillVerdict = probeSkillApi(deps.skillApi(accounts.map((a) => a.id)));
+    } catch (error) {
+      skillVerdict = { status: 'skip', ok: true, reason: `the skill copies could not be read: ${String((error as Error)?.message ?? error)}` };
+    }
+  }
+
+  // Probe 9 (control-tower phase 44): the plan's own human steps, each proof
+  // run now. Like probe 6 it never blocks — a step still owed is an ask.
+  let humanSteps: PreludeStep[] = [];
+  let stepsVerdict: ProbeVerdict = { status: 'skip', ok: true, reason: "the plan's human steps were not read" };
+  if (deps.humanSteps) {
+    try {
+      humanSteps = await doorSteps(await deps.humanSteps(), deps.probeStep);
+      stepsVerdict = probeHumanSteps(humanSteps);
+    } catch (error) {
+      stepsVerdict = { status: 'skip', ok: true, reason: `the plan's human steps could not be read: ${String((error as Error)?.message ?? error)}` };
+    }
+  }
+
   const probes: Record<PreludeProbeId, ProbeVerdict> = {
     accounts: accountsVerdict, mcp: mcpVerdict, credentials: credentialsVerdict,
     delivery: { status: delivery.status, ok: delivery.ok, reason: delivery.reason, ...(delivery.warnings ? { warnings: delivery.warnings } : {}) },
     verification: verificationVerdict,
+    trees: treesVerdict,
+    'git-strategy': gitVerdict,
+    skill: skillVerdict,
+    'human-steps': stepsVerdict,
   };
   for (const row of rows) {
     if (row.key === 'accounts') row.probe = 'accounts';
@@ -603,6 +1039,9 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
   // Under the manifest row that owns the class — a new key would be a decision
   // key the plan format does not have.
   if (!verificationVerdict.ok) blocking.push({ key: 'verification.person-check', why: verificationVerdict.reason });
+  // Under its own key: no decision row owns "the two halves of the install
+  // disagree" — the answer is an update, never a word in the plan.
+  if (!skillVerdict.ok) blocking.push({ key: 'skill', why: skillVerdict.reason });
   const deliveryAcknowledged = acknowledged.includes('announce');
   if (!delivery.ok) {
     const announce = rows.find((r) => r.key === 'announce');
@@ -631,6 +1070,7 @@ export async function preludeFor(slug: string, options: PreludeOptions, deps: Pr
     },
     delivery: { ok: delivery.ok, channels: delivery.channels, acknowledged: deliveryAcknowledged },
     ...(verificationFacts?.answers ? { verifyApprovals: verificationFacts.answers } : {}),
+    humanSteps,
     at,
   };
 }

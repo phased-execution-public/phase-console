@@ -21,18 +21,18 @@ import {
   CardBody,
   CardHeader,
   CardTitle,
-  Chip,
+  Badge,
   CopyButton,
-  DataTable,
   Empty,
   PageError,
   Skeleton,
 } from '@/components/ui';
+import { DataTable } from '@/components/data-table';
 import { Markdown, MarkdownInline } from '@/components/markdown';
 import { usePlanRaw } from '@/lib/queries';
 import { DECISION_STATES } from '@shared/decisions-model.js';
 import { countdown, pad2 } from '@/lib/format';
-import { navigate, phaseHref, planHref } from '@shared/routes.js';
+import { navigate, phaseHref, planHref, planViewHref } from '@shared/routes.js';
 import type { PlanDetail } from '@/lib/api';
 import { DepsCell, LockCell } from './phase-cells';
 import type { SourceView } from './tabs';
@@ -127,7 +127,7 @@ function Reading({ detail, switcher }: { detail: PlanDetail; switcher: React.Rea
           body="This slug has handoffs but no plan in docs/plans, so there is no phase graph, no session budget and no prose to read."
           action={
             <Button asChild size="sm">
-              <a href={planHref(detail.summary.slug, 'handoffs')}>Read the handoffs</a>
+              <a href={planViewHref(detail.summary.slug, 'handoffs')}>Read the handoffs</a>
             </Button>
           }
         />
@@ -350,14 +350,14 @@ function Reading({ detail, switcher }: { detail: PlanDetail; switcher: React.Rea
                   // shown as breakable text rather than dressed as a word we know.
                   cell: (row) =>
                     (DECISION_STATES as readonly string[]).includes(row.state) ? (
-                      <Chip
+                      <Badge
                         tone={
                           row.state === 'answered' ? 'ok' : row.state === 'outstanding' ? 'accent' : 'neutral'
                         }
                         dot={row.state === 'outstanding'}
                       >
                         {row.state}
-                      </Chip>
+                      </Badge>
                     ) : (
                       <span className="max-w-full break-all whitespace-normal font-mono text-xs">
                         {row.state || '—'}
@@ -462,7 +462,7 @@ function Reading({ detail, switcher }: { detail: PlanDetail; switcher: React.Rea
             <CardBody className="flex flex-col gap-1.5">
               {detail.locks.map((lock) => (
                 <div key={lock.phase} className="flex items-center justify-between gap-2 text-sm">
-                  <Chip mono>P{pad2(lock.phase ?? 0)}</Chip>
+                  <Badge mono>P{pad2(lock.phase ?? 0)}</Badge>
                   <span className="min-w-0 truncate font-mono text-xs text-ink-muted">{lock.owner}</span>
                   <span className="shrink-0 text-xs text-ink-faint">
                     {lock.expired ? 'expired' : countdown(lock.leaseUntil)}

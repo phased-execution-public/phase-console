@@ -1,0 +1,1335 @@
+{
+  "$comment": "The 71-phase plan the route map is held to (control-tower phase 30). Its dependency shape is a real plan of that size (the one #17 measured); its titles are neutral. Layers and rows are the server's own routeLayout (server/analysis/graph.ts) over that shape. The states are a run caught mid-way; `verifying` and `critical` are what the plan page joins beside the route.",
+  "verifying": [
+    62
+  ],
+  "critical": [
+    66,
+    67,
+    68,
+    13,
+    14,
+    17,
+    19,
+    20,
+    21,
+    28,
+    42,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    65
+  ],
+  "route": {
+    "nodes": [
+      {
+        "phase": 1,
+        "layer": 0,
+        "row": 0,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Project charter"
+      },
+      {
+        "phase": 2,
+        "layer": 1,
+        "row": 0,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Repository layout"
+      },
+      {
+        "phase": 3,
+        "layer": 2,
+        "row": 0,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Build pipeline"
+      },
+      {
+        "phase": 4,
+        "layer": 2,
+        "row": 1,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Config loader"
+      },
+      {
+        "phase": 5,
+        "layer": 3,
+        "row": 0,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Logging core"
+      },
+      {
+        "phase": 6,
+        "layer": 4,
+        "row": 0,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Error model"
+      },
+      {
+        "phase": 7,
+        "layer": 2,
+        "row": 2,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Process runner"
+      },
+      {
+        "phase": 8,
+        "layer": 3,
+        "row": 1,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Signal handling"
+      },
+      {
+        "phase": 9,
+        "layer": 6,
+        "row": 0,
+        "state": "done",
+        "size": "S",
+        "gated": false,
+        "title": "Core services land"
+      },
+      {
+        "phase": 10,
+        "layer": 7,
+        "row": 12,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Storage schema"
+      },
+      {
+        "phase": 11,
+        "layer": 7,
+        "row": 0,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Query layer"
+      },
+      {
+        "phase": 12,
+        "layer": 13,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Cache tier"
+      },
+      {
+        "phase": 13,
+        "layer": 13,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Auth tokens"
+      },
+      {
+        "phase": 14,
+        "layer": 14,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Rate limits"
+      },
+      {
+        "phase": 15,
+        "layer": 7,
+        "row": 1,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Test harness"
+      },
+      {
+        "phase": 16,
+        "layer": 8,
+        "row": 1,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Status words"
+      },
+      {
+        "phase": 17,
+        "layer": 15,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Alert categories"
+      },
+      {
+        "phase": 18,
+        "layer": 8,
+        "row": 2,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Grid engine"
+      },
+      {
+        "phase": 19,
+        "layer": 16,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Summary strip"
+      },
+      {
+        "phase": 20,
+        "layer": 17,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Dashboard bays"
+      },
+      {
+        "phase": 21,
+        "layer": 18,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "History ledger"
+      },
+      {
+        "phase": 22,
+        "layer": 14,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Setup wizard"
+      },
+      {
+        "phase": 23,
+        "layer": 13,
+        "row": 2,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Detail page"
+      },
+      {
+        "phase": 24,
+        "layer": 17,
+        "row": 2,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Session page"
+      },
+      {
+        "phase": 25,
+        "layer": 15,
+        "row": 2,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Settings band"
+      },
+      {
+        "phase": 26,
+        "layer": 14,
+        "row": 2,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Source browser"
+      },
+      {
+        "phase": 27,
+        "layer": 17,
+        "row": 3,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Chat backend"
+      },
+      {
+        "phase": 28,
+        "layer": 19,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Chat panel"
+      },
+      {
+        "phase": 29,
+        "layer": 8,
+        "row": 3,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Chart layer"
+      },
+      {
+        "phase": 30,
+        "layer": 14,
+        "row": 3,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Map at scale"
+      },
+      {
+        "phase": 31,
+        "layer": 21,
+        "row": 0,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Cutover sweep"
+      },
+      {
+        "phase": 32,
+        "layer": 22,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Guides in two languages"
+      },
+      {
+        "phase": 33,
+        "layer": 23,
+        "row": 0,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Dress rehearsal"
+      },
+      {
+        "phase": 34,
+        "layer": 24,
+        "row": 0,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Release candidate"
+      },
+      {
+        "phase": 35,
+        "layer": 25,
+        "row": 0,
+        "state": "waiting",
+        "size": "S",
+        "gated": false,
+        "title": "Release day"
+      },
+      {
+        "phase": 36,
+        "layer": 26,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Demo sandbox"
+      },
+      {
+        "phase": 37,
+        "layer": 27,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Website refresh"
+      },
+      {
+        "phase": 38,
+        "layer": 28,
+        "row": 0,
+        "state": "waiting",
+        "size": "M",
+        "gated": true,
+        "title": "Fleet rollout"
+      },
+      {
+        "phase": 39,
+        "layer": 5,
+        "row": 0,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Scoped finish"
+      },
+      {
+        "phase": 40,
+        "layer": 5,
+        "row": 1,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Branch checks"
+      },
+      {
+        "phase": 41,
+        "layer": 15,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Handover words"
+      },
+      {
+        "phase": 42,
+        "layer": 20,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Handover card"
+      },
+      {
+        "phase": 43,
+        "layer": 16,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Handover verbs"
+      },
+      {
+        "phase": 44,
+        "layer": 17,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Handover guard"
+      },
+      {
+        "phase": 45,
+        "layer": 7,
+        "row": 2,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Failure counts"
+      },
+      {
+        "phase": 46,
+        "layer": 7,
+        "row": 3,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Resume path"
+      },
+      {
+        "phase": 47,
+        "layer": 7,
+        "row": 4,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Wait chains"
+      },
+      {
+        "phase": 48,
+        "layer": 7,
+        "row": 5,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Restart path"
+      },
+      {
+        "phase": 49,
+        "layer": 8,
+        "row": 0,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Child processes"
+      },
+      {
+        "phase": 50,
+        "layer": 7,
+        "row": 6,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Declared waits"
+      },
+      {
+        "phase": 51,
+        "layer": 7,
+        "row": 7,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Repair evidence"
+      },
+      {
+        "phase": 52,
+        "layer": 7,
+        "row": 8,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Journal counter"
+      },
+      {
+        "phase": 53,
+        "layer": 7,
+        "row": 9,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Button semantics"
+      },
+      {
+        "phase": 54,
+        "layer": 7,
+        "row": 10,
+        "state": "done",
+        "size": "L",
+        "gated": false,
+        "title": "Identity checks"
+      },
+      {
+        "phase": 55,
+        "layer": 7,
+        "row": 11,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Fast reads"
+      },
+      {
+        "phase": 56,
+        "layer": 8,
+        "row": 4,
+        "state": "done",
+        "size": "M",
+        "gated": false,
+        "title": "Read timeouts"
+      },
+      {
+        "phase": 57,
+        "layer": 9,
+        "row": 0,
+        "state": "done",
+        "size": "S",
+        "gated": false,
+        "title": "Stability lands"
+      },
+      {
+        "phase": 58,
+        "layer": 10,
+        "row": 0,
+        "state": "in-progress",
+        "size": "L",
+        "gated": false,
+        "title": "Estimate fitting"
+      },
+      {
+        "phase": 59,
+        "layer": 11,
+        "row": 0,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Sizing curve"
+      },
+      {
+        "phase": 60,
+        "layer": 11,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Queue accuracy"
+      },
+      {
+        "phase": 61,
+        "layer": 11,
+        "row": 2,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Timeline accuracy"
+      },
+      {
+        "phase": 62,
+        "layer": 10,
+        "row": 1,
+        "state": "in-progress",
+        "size": "L",
+        "gated": false,
+        "title": "Checks run once"
+      },
+      {
+        "phase": 63,
+        "layer": 10,
+        "row": 2,
+        "state": "stuck",
+        "size": "M",
+        "gated": false,
+        "title": "Root scope"
+      },
+      {
+        "phase": 64,
+        "layer": 12,
+        "row": 0,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Weekly numbers"
+      },
+      {
+        "phase": 65,
+        "layer": 29,
+        "row": 0,
+        "state": "waiting",
+        "size": "S",
+        "gated": false,
+        "title": "Final confirmation"
+      },
+      {
+        "phase": 66,
+        "layer": 10,
+        "row": 3,
+        "state": "ready",
+        "size": "S",
+        "gated": false,
+        "title": "Terms update"
+      },
+      {
+        "phase": 67,
+        "layer": 11,
+        "row": 3,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Access module"
+      },
+      {
+        "phase": 68,
+        "layer": 12,
+        "row": 1,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Package build"
+      },
+      {
+        "phase": 69,
+        "layer": 10,
+        "row": 4,
+        "state": "ready",
+        "size": "M",
+        "gated": false,
+        "title": "Key service"
+      },
+      {
+        "phase": 70,
+        "layer": 11,
+        "row": 4,
+        "state": "waiting",
+        "size": "L",
+        "gated": false,
+        "title": "Order fulfilment"
+      },
+      {
+        "phase": 71,
+        "layer": 12,
+        "row": 2,
+        "state": "waiting",
+        "size": "M",
+        "gated": false,
+        "title": "Pricing pages"
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 2
+      },
+      {
+        "from": 2,
+        "to": 3
+      },
+      {
+        "from": 2,
+        "to": 4
+      },
+      {
+        "from": 3,
+        "to": 5
+      },
+      {
+        "from": 4,
+        "to": 5
+      },
+      {
+        "from": 5,
+        "to": 6
+      },
+      {
+        "from": 2,
+        "to": 7
+      },
+      {
+        "from": 7,
+        "to": 8
+      },
+      {
+        "from": 3,
+        "to": 9
+      },
+      {
+        "from": 4,
+        "to": 9
+      },
+      {
+        "from": 5,
+        "to": 9
+      },
+      {
+        "from": 6,
+        "to": 9
+      },
+      {
+        "from": 7,
+        "to": 9
+      },
+      {
+        "from": 8,
+        "to": 9
+      },
+      {
+        "from": 39,
+        "to": 9
+      },
+      {
+        "from": 40,
+        "to": 9
+      },
+      {
+        "from": 7,
+        "to": 10
+      },
+      {
+        "from": 9,
+        "to": 10
+      },
+      {
+        "from": 9,
+        "to": 11
+      },
+      {
+        "from": 6,
+        "to": 12
+      },
+      {
+        "from": 10,
+        "to": 12
+      },
+      {
+        "from": 11,
+        "to": 12
+      },
+      {
+        "from": 57,
+        "to": 12
+      },
+      {
+        "from": 68,
+        "to": 12
+      },
+      {
+        "from": 8,
+        "to": 13
+      },
+      {
+        "from": 11,
+        "to": 13
+      },
+      {
+        "from": 53,
+        "to": 13
+      },
+      {
+        "from": 57,
+        "to": 13
+      },
+      {
+        "from": 68,
+        "to": 13
+      },
+      {
+        "from": 3,
+        "to": 14
+      },
+      {
+        "from": 5,
+        "to": 14
+      },
+      {
+        "from": 13,
+        "to": 14
+      },
+      {
+        "from": 45,
+        "to": 14
+      },
+      {
+        "from": 9,
+        "to": 15
+      },
+      {
+        "from": 15,
+        "to": 16
+      },
+      {
+        "from": 14,
+        "to": 17
+      },
+      {
+        "from": 16,
+        "to": 17
+      },
+      {
+        "from": 15,
+        "to": 18
+      },
+      {
+        "from": 10,
+        "to": 19
+      },
+      {
+        "from": 17,
+        "to": 19
+      },
+      {
+        "from": 19,
+        "to": 20
+      },
+      {
+        "from": 18,
+        "to": 21
+      },
+      {
+        "from": 20,
+        "to": 21
+      },
+      {
+        "from": 13,
+        "to": 22
+      },
+      {
+        "from": 16,
+        "to": 22
+      },
+      {
+        "from": 10,
+        "to": 23
+      },
+      {
+        "from": 16,
+        "to": 23
+      },
+      {
+        "from": 18,
+        "to": 23
+      },
+      {
+        "from": 57,
+        "to": 23
+      },
+      {
+        "from": 68,
+        "to": 23
+      },
+      {
+        "from": 13,
+        "to": 24
+      },
+      {
+        "from": 16,
+        "to": 24
+      },
+      {
+        "from": 17,
+        "to": 24
+      },
+      {
+        "from": 18,
+        "to": 24
+      },
+      {
+        "from": 19,
+        "to": 24
+      },
+      {
+        "from": 10,
+        "to": 25
+      },
+      {
+        "from": 13,
+        "to": 25
+      },
+      {
+        "from": 14,
+        "to": 25
+      },
+      {
+        "from": 16,
+        "to": 25
+      },
+      {
+        "from": 18,
+        "to": 25
+      },
+      {
+        "from": 29,
+        "to": 25
+      },
+      {
+        "from": 12,
+        "to": 26
+      },
+      {
+        "from": 16,
+        "to": 26
+      },
+      {
+        "from": 18,
+        "to": 26
+      },
+      {
+        "from": 10,
+        "to": 27
+      },
+      {
+        "from": 14,
+        "to": 27
+      },
+      {
+        "from": 43,
+        "to": 27
+      },
+      {
+        "from": 17,
+        "to": 28
+      },
+      {
+        "from": 21,
+        "to": 28
+      },
+      {
+        "from": 27,
+        "to": 28
+      },
+      {
+        "from": 15,
+        "to": 29
+      },
+      {
+        "from": 23,
+        "to": 30
+      },
+      {
+        "from": 29,
+        "to": 30
+      },
+      {
+        "from": 19,
+        "to": 31
+      },
+      {
+        "from": 20,
+        "to": 31
+      },
+      {
+        "from": 21,
+        "to": 31
+      },
+      {
+        "from": 22,
+        "to": 31
+      },
+      {
+        "from": 23,
+        "to": 31
+      },
+      {
+        "from": 24,
+        "to": 31
+      },
+      {
+        "from": 25,
+        "to": 31
+      },
+      {
+        "from": 26,
+        "to": 31
+      },
+      {
+        "from": 27,
+        "to": 31
+      },
+      {
+        "from": 28,
+        "to": 31
+      },
+      {
+        "from": 29,
+        "to": 31
+      },
+      {
+        "from": 30,
+        "to": 31
+      },
+      {
+        "from": 42,
+        "to": 31
+      },
+      {
+        "from": 58,
+        "to": 31
+      },
+      {
+        "from": 59,
+        "to": 31
+      },
+      {
+        "from": 60,
+        "to": 31
+      },
+      {
+        "from": 61,
+        "to": 31
+      },
+      {
+        "from": 62,
+        "to": 31
+      },
+      {
+        "from": 63,
+        "to": 31
+      },
+      {
+        "from": 64,
+        "to": 31
+      },
+      {
+        "from": 66,
+        "to": 31
+      },
+      {
+        "from": 67,
+        "to": 31
+      },
+      {
+        "from": 68,
+        "to": 31
+      },
+      {
+        "from": 31,
+        "to": 32
+      },
+      {
+        "from": 32,
+        "to": 33
+      },
+      {
+        "from": 33,
+        "to": 34
+      },
+      {
+        "from": 34,
+        "to": 35
+      },
+      {
+        "from": 35,
+        "to": 36
+      },
+      {
+        "from": 36,
+        "to": 37
+      },
+      {
+        "from": 71,
+        "to": 37
+      },
+      {
+        "from": 37,
+        "to": 38
+      },
+      {
+        "from": 5,
+        "to": 39
+      },
+      {
+        "from": 6,
+        "to": 39
+      },
+      {
+        "from": 6,
+        "to": 40
+      },
+      {
+        "from": 6,
+        "to": 41
+      },
+      {
+        "from": 11,
+        "to": 41
+      },
+      {
+        "from": 13,
+        "to": 41
+      },
+      {
+        "from": 14,
+        "to": 41
+      },
+      {
+        "from": 39,
+        "to": 41
+      },
+      {
+        "from": 17,
+        "to": 42
+      },
+      {
+        "from": 20,
+        "to": 42
+      },
+      {
+        "from": 22,
+        "to": 42
+      },
+      {
+        "from": 28,
+        "to": 42
+      },
+      {
+        "from": 44,
+        "to": 42
+      },
+      {
+        "from": 41,
+        "to": 43
+      },
+      {
+        "from": 43,
+        "to": 44
+      },
+      {
+        "from": 9,
+        "to": 45
+      },
+      {
+        "from": 9,
+        "to": 46
+      },
+      {
+        "from": 9,
+        "to": 47
+      },
+      {
+        "from": 9,
+        "to": 48
+      },
+      {
+        "from": 9,
+        "to": 49
+      },
+      {
+        "from": 15,
+        "to": 49
+      },
+      {
+        "from": 9,
+        "to": 50
+      },
+      {
+        "from": 9,
+        "to": 51
+      },
+      {
+        "from": 9,
+        "to": 52
+      },
+      {
+        "from": 9,
+        "to": 53
+      },
+      {
+        "from": 9,
+        "to": 54
+      },
+      {
+        "from": 9,
+        "to": 55
+      },
+      {
+        "from": 9,
+        "to": 56
+      },
+      {
+        "from": 55,
+        "to": 56
+      },
+      {
+        "from": 45,
+        "to": 57
+      },
+      {
+        "from": 46,
+        "to": 57
+      },
+      {
+        "from": 47,
+        "to": 57
+      },
+      {
+        "from": 48,
+        "to": 57
+      },
+      {
+        "from": 49,
+        "to": 57
+      },
+      {
+        "from": 50,
+        "to": 57
+      },
+      {
+        "from": 51,
+        "to": 57
+      },
+      {
+        "from": 52,
+        "to": 57
+      },
+      {
+        "from": 53,
+        "to": 57
+      },
+      {
+        "from": 54,
+        "to": 57
+      },
+      {
+        "from": 55,
+        "to": 57
+      },
+      {
+        "from": 56,
+        "to": 57
+      },
+      {
+        "from": 57,
+        "to": 58
+      },
+      {
+        "from": 58,
+        "to": 59
+      },
+      {
+        "from": 58,
+        "to": 60
+      },
+      {
+        "from": 29,
+        "to": 61
+      },
+      {
+        "from": 58,
+        "to": 61
+      },
+      {
+        "from": 57,
+        "to": 62
+      },
+      {
+        "from": 57,
+        "to": 63
+      },
+      {
+        "from": 59,
+        "to": 64
+      },
+      {
+        "from": 60,
+        "to": 64
+      },
+      {
+        "from": 61,
+        "to": 64
+      },
+      {
+        "from": 62,
+        "to": 64
+      },
+      {
+        "from": 63,
+        "to": 64
+      },
+      {
+        "from": 38,
+        "to": 65
+      },
+      {
+        "from": 57,
+        "to": 66
+      },
+      {
+        "from": 66,
+        "to": 67
+      },
+      {
+        "from": 67,
+        "to": 68
+      },
+      {
+        "from": 57,
+        "to": 69
+      },
+      {
+        "from": 69,
+        "to": 70
+      },
+      {
+        "from": 66,
+        "to": 71
+      },
+      {
+        "from": 70,
+        "to": 71
+      }
+    ],
+    "layers": 30,
+    "rows": 13
+  }
+}

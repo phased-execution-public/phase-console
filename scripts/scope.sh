@@ -186,6 +186,79 @@ _same_ground() {
   return 0
 }
 
+# claim_disjoint_hold <held-branch> <held-repo> <branch> <tree>
+#   → exit 0 when a claim is carved away from a RUN's hold on a shared tree.
+# The twin of `holdDisjoint` in viewer/shared/scope.js (control-tower phase 40,
+# #41): a lock is per PHASE, a hold is per RUN — "this repository stands on my
+# branch until my run settles". Against a hold the SAME branch is no collision
+# (the tree already stands where the claim needs it), and a different branch on
+# the same ground is exactly the collision a lock never saw. A claim naming no
+# branch (a run on the trunk) or no tree (a hand session anywhere) collides.
+claim_disjoint_hold() {
+  local hb ht cb ct
+  hb="$(_claim_trim "${1:-}")"; ht="$(_claim_trim "${2:-}")"
+  cb="$(_claim_trim "${3:-}")"; ct="$(_claim_trim "${4:-}")"
+  if [ -z "$hb" ] || [ -z "$ht" ]; then return 1; fi
+  if [ -n "$cb" ] && [ "$cb" = "$hb" ]; then return 0; fi
+  [ -n "$ct" ] || return 1
+  while [ -n "$ht" ] && [ "${ht%/}" != "$ht" ]; do ht="${ht%/}"; done
+  while [ -n "$ct" ] && [ "${ct%/}" != "$ct" ]; do ct="${ct%/}"; done
+  if [ "$ht" = "$ct" ]; then return 1; fi
+  if _same_ground "$ct" "$ht"; then return 1; fi
+  if _same_ground "$ht" "$ct"; then return 1; fi
+  return 0
+}
+
+# hold_lapsed <run-file> → exit 0 when the run behind a hold has SETTLED: its
+# state file is gone, reads `finished`, or reads `interrupted` by an operator's
+# stop. The twin of `holdLapsed` in viewer/server/runner/tree-state.ts; the
+# top-level keys of a run file sit exactly two spaces in, which is what makes a
+# line-shaped read of JSON safe here (bash 3.2 parses no JSON).
+hold_lapsed() {
+  local rf="${1:-}" st
+  [ -n "$rf" ] || return 1
+  [ -f "$rf" ] || return 0
+  st="$(grep -m1 '^  "status": ' "$rf" 2>/dev/null | sed 's/^  "status": "\([a-z-]*\)".*/\1/' || true)"
+  [ "$st" = finished ] && return 0
+  if [ "$st" = interrupted ] && grep -q '^  "stoppedBy": "operator"' "$rf" 2>/dev/null; then return 0; fi
+  return 1
+}
+
+# hold_in_scope <root> <scope-csv> <held-repo> → exit 0 when a token of the
+# scope reaches the held repository the way the console's `resolveMounts` does:
+# `all` reaches the root and every repository under it; any other token reaches
+# the repository its path is in, and every repository under THAT (a
+# superproject scope considers its submodules). The root's OWN name reaches the
+# root repository alone (control-tower phase 90, #150 — `holdReach` in
+# `runner/tree-state.ts`): a hub-root phase commits by explicit pathspec and
+# never stages a held submodule's gitlink, so a run-long hold on one does not
+# reach it.
+hold_in_scope() {
+  local root="${1:-}" csv="${2:-}" repo="${3:-}" t dir top rootp own
+  [ -n "$root" ] && [ -n "$repo" ] || return 1
+  rootp="$(cd "$root" 2>/dev/null && pwd -P || printf '%s' "$root")"
+  own="$(scope_normalize "$(basename "$rootp")")"
+  for t in $(printf '%s' "$csv" | tr ',' ' '); do
+    if [ -n "$own" ] && [ "$t" = "$own" ]; then
+      [ "$repo" = "$rootp" ] && return 0
+      continue
+    fi
+    if [ "$t" = all ]; then
+      dir="$rootp"
+    else
+      dir="$rootp/$t"
+      [ -e "$dir" ] || continue
+      [ -d "$dir" ] || dir="$(dirname "$dir")"
+    fi
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$top" ] || continue
+    top="$(cd "$top" 2>/dev/null && pwd -P || printf '%s' "$top")"
+    [ "$repo" = "$top" ] && return 0
+    _same_ground "$top" "$repo" && return 0
+  done
+  return 1
+}
+
 # scope_overlap <csv-a> <csv-b> → the colliding tokens, space separated (for
 # saying WHICH repo collided instead of only that something did).
 scope_overlap() {
@@ -198,4 +271,18 @@ scope_overlap() {
     done
   done
   printf '%s' "${out# }"
+}
+
+# The docs root's per-slug path token (control-tower phase 63, #88): the part
+# of the ROOT a phase writes whatever its Repos cell says — its handoffs, INDEX,
+# locks and ledgers under `docs/handoffs/<slug>/`. Declared, never admitted on:
+# a plan's own lanes all write it, and the root's critical section in
+# `phase-lock.sh` orders those writes for the length of a commit rather than
+# serialising whole phases. Mirrored by `rootScopeToken` in `shared/scope.js`;
+# empty for a slug with nothing usable left.
+scope_root_token() {
+  local s
+  s="$(scope_normalize "${1:-}")"
+  case "$s" in *[,\ ]*|'') return 0 ;; esac
+  printf 'docs/handoffs/%s' "$s"
 }

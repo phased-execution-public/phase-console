@@ -18,7 +18,8 @@ import { plural, weight } from '@/lib/format';
 import { countdown } from '@/lib/format';
 import { phaseHref, planHref } from '@shared/routes.js';
 import { plansHref } from '@/app/routes';
-import { Button, ButtonGroup, Card, CardBody, CardHeader, CardTitle, Chip, Empty } from '@/components/ui';
+import { Button, ButtonGroup, Card, CardBody, CardHeader, CardTitle, Badge, Empty } from '@/components/ui';
+import { OpsBadge } from '@/components/ui/status';
 import { BarList, StackBar, type ChartTone } from '@/components/charts';
 import { ReleaseAllStaleButton, ReleaseStaleButton } from '@/components/release-lock';
 import { classifyIssue } from '@/lib/recovery';
@@ -26,9 +27,6 @@ import type { HealthIssue, Portfolio, Sizing } from '@/lib/api';
 import { RecoveryActions } from '@/components/recovery-actions';
 
 const SEVERITY_ORDER: Record<string, number> = { error: 0, warning: 1, info: 2 };
-
-/** An issue's severity, as a chip tone. Never amber — amber means actionable. */
-const SEVERITY_TONE = { error: 'bad', warning: 'warn', info: 'neutral' } as const;
 
 /** Phase sizes, in the order the engine declares them. */
 const SIZE_TONE: ChartTone[] = ['done', 'running', 'waiting'];
@@ -197,23 +195,23 @@ export function PortfolioPanel({
                           chore. Still listed and still releasable — this card is
                           the lock inventory — just not shouted about. */}
                       {lock.closed ? (
-                        <Chip title="This plan is closed, so the lock is leftover debris — phase-lock.sh skips it and it blocks no session. Releasing it is tidying, not a fix.">
+                        <Badge title="This plan is closed, so the lock is leftover debris — phase-lock.sh skips it and it blocks no session. Releasing it is tidying, not a fix.">
                           debris
-                        </Chip>
+                        </Badge>
                       ) : lock.expired ? (
-                        <Chip
+                        <Badge
                           tone="bad"
                           title="The lease ran out and nobody renewed it — the session is gone. Safe to release (Plans page offers it), and a takeover recovery may claim the phase."
                         >
                           expired
-                        </Chip>
+                        </Badge>
                       ) : (
-                        <Chip
-                          tone="busy"
+                        <Badge
+                          tone="live"
                           title="A live lease — a session is (or very recently was) working this phase. Never release a live lease."
                         >
                           {countdown(lock.leaseUntil)}
-                        </Chip>
+                        </Badge>
                       )}
                       {/* The owner is right there in the row and the server
                           reads it from the file — nobody retypes it. */}
@@ -282,9 +280,11 @@ export function PortfolioPanel({
             <ul className="flex flex-col gap-1.5">
               {issues.map((issue, i) => (
                 <li key={`${issue.slug}-${issue.kind}-${i}`} className="flex flex-wrap items-baseline gap-2">
-                  <Chip tone={SEVERITY_TONE[issue.severity]} title={issue.message}>
-                    {issue.kind}
-                  </Chip>
+                  {/* The severity as the health words say it — icon, word, hue —
+                      and the kind beside it as the engine names it. The kind
+                      alone, painted by severity, said the severity in hue only. */}
+                  <OpsBadge vocab="health" word={issue.severity} title={issue.message} />
+                  <code className="font-mono text-2xs text-ink-muted">{issue.kind}</code>
                   <a
                     href={issue.phase ? phaseHref(issue.slug, issue.phase) : planHref(issue.slug)}
                     className="font-mono text-2xs text-ink hover:text-action"
@@ -293,9 +293,9 @@ export function PortfolioPanel({
                     {issue.phase ? ` P${issue.phase}` : ''}
                   </a>
                   {closedSlugs.has(issue.slug) && (
-                    <Chip title="This plan is closed. What is left here is structural — the engine kept it and demoted it, so it is a record, not a job.">
+                    <Badge title="This plan is closed. What is left here is structural — the engine kept it and demoted it, so it is a record, not a job.">
                       closed
-                    </Chip>
+                    </Badge>
                   )}
                   {/* `break-words`: an issue message quotes plan text — slugs,
                       paths, `bash -c '…'` — and a token with no space in it for

@@ -60,6 +60,22 @@ function baseline(): Dist {
       // all could not tell a clean graph from a missing one.
       'detail-jjjj.js': 'import { x } from "./phase-groups-kkkk.js";\nexport const Plan = x;\n',
       'phase-groups-kkkk.js': 'export const x = 1;\n',
+      // The table engine (control-tower phase 18): TanStack Table's row model,
+      // reached from the grid's chunk by a DYNAMIC import only, marked by an
+      // option name only the library spells.
+      'data-table-tttt.js': 'export const load = () => import("./engine-uuuu.js");\n',
+      'engine-uuuu.js': 'export const options = { maxLeafRowFilterDepth: 100 };\n',
+      // The figures (control-tower phase 29): visx drawings behind
+      // `components/figures/lazy.tsx`, found by the attribute they spell.
+      'lazy-ffff.js': 'export const load = () => [import("./bars-gggg.js"), import("./run-chart-hhhh.js")];\n',
+      'bars-gggg.js': 'export const Bars = { "data-figure": "Bars" };\n',
+      'run-chart-hhhh.js': 'export const RunCost = { "data-figure": "RunCost" };\n',
+      // The status model's word tables (control-tower phase 16), in a page's
+      // chunk — never the entry, never a preload.
+      'status-vvvv.js': 'export const Rows = { cooling: ["Cooling", "thermometer-snowflake"] };\n',
+      // The peek's hover card (control-tower phase 19), in the Runs page's
+      // chunk — never the entry, never a preload.
+      'runs-pppp.js': 'export const Trigger = { displayName: "HoverCardTrigger" };\n',
     },
     html: { preload: [], entry: 'index-aaaa.js', extraHead: '' },
     sw: {
@@ -222,6 +238,37 @@ test('React Flow reached from the repo chunk by a STATIC import fails', () => {
   assert.match(out, /lazy-landscape/, 'the detail names the module to import instead');
 });
 
+/*
+ * The plan route's half of the same rule (control-tower phase 30).
+ *
+ * The route map stayed hand-rolled — the phase's spike measured React Flow
+ * taking the page's scroll on a phone — so no map library may reach the plan
+ * chunk's static graph, in either tree. A statically imported map chunk
+ * carrying React Flow is the one shape that would put it there.
+ */
+test('a map library reached from the plan chunk by a STATIC import fails, in either tree', () => {
+  const dist = baseline();
+  dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
+  dist.assets['detail-jjjj.js'] =
+    'import { x } from "./phase-groups-kkkk.js";\nimport { Map } from "./map-rrrr.js";\nexport const Plan = [x, Map];\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(
+    failures(out).some((l) => l.includes("the plan route's static graph carries no map library")),
+    out,
+  );
+  assert.match(out, /components\/dag\.tsx/, 'the detail names the map the plan route draws');
+});
+
+test('a map library behind a dynamic import from the plan chunk passes', () => {
+  const dist = baseline();
+  dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
+  dist.assets['detail-jjjj.js'] =
+    'import { x } from "./phase-groups-kkkk.js";\nexport const Plan = x;\nexport const map = () => import("./map-rrrr.js");\n';
+  const { out } = runGate(dist);
+  assert.ok(failures(out).every((l) => !l.includes('carries no map library')), out);
+});
+
 test('a React Flow chunk in the precache fails, whatever it is called', () => {
   const dist = baseline();
   dist.assets['map-rrrr.js'] = 'export const Map = "react-flow__pane";\n';
@@ -269,6 +316,17 @@ test('modulepreloading the emulator fails — the second way a lazy chunk stops 
   assert.ok(failures(out).some((l) => l.includes('never modulepreloads the emulator')), out);
 });
 
+test('a SECOND chunk carrying the emulator fails — every terminal shares the one lazy door', () => {
+  // control-tower phase 42: a human step's terminal sheet reaches the pane
+  // through the same `import('@/features/sessions/pane')` the sessions page
+  // uses. A static import anywhere would put xterm in a second chunk.
+  const dist = baseline();
+  dist.assets['step-terminal-iiii.js'] = 'import { Terminal } from "xterm";\nexport const Sheet = 1;\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the terminal emulator is in exactly one lazy chunk')), out);
+});
+
 test('an emulator folded into the Sessions destination chunk fails, and names the edit', () => {
   const dist = baseline();
   dist.assets['sessions-bbbb.js'] = 'import { Terminal } from "xterm";\nexport const Sessions = 1;\n';
@@ -301,6 +359,50 @@ test('first paint over budget fails even when the ENTRY is comfortably under it'
     'the ENTRY budget still passes — that is the whole point of the first-paint gate');
 });
 
+/*
+ * The table engine (control-tower phase 18): TanStack Table behind the grid's
+ * filters, groups and picks, ~17 KB gz that a page with a plain table never
+ * needs. `components/data-table/data-table.tsx` reaches it through `import()`;
+ * found by CONTENT (an option name only the library spells), never by name.
+ */
+test('the table engine reached by a STATIC import fails, from any chunk', () => {
+  const dist = baseline();
+  dist.assets['detail-jjjj.js'] =
+    'import { x } from "./phase-groups-kkkk.js";\nimport { options } from "./engine-uuuu.js";\nexport const Plan = [x, options];\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('no chunk imports the table engine statically')), out);
+});
+
+test('modulepreloading the table engine fails — first paint would carry it', () => {
+  const dist = baseline();
+  dist.html.preload.push('engine-uuuu.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('never modulepreloads the table engine')), out);
+});
+
+test('the table engine folded into the grid chunk fails — it must be a lazy chunk of its own', () => {
+  const dist = baseline();
+  delete dist.assets['engine-uuuu.js'];
+  dist.assets['data-table-tttt.js'] = 'export const options = { maxLeafRowFilterDepth: 100 };\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the table engine is its own lazy chunk')), out);
+});
+
+test('first paint above its figure before the grid left the barrel fails, though under the old 200 KB', () => {
+  // Phase 18 moved the grid and the long list out of the preloaded barrel and
+  // set the gate at first paint as it stood BEFORE that move (189.3 KB served,
+  // rounded up). 195 KB would have passed the old gate and must not pass this.
+  const dist = baseline();
+  dist.assets['big-iiii.js'] = randomBytes(195 * 1024);
+  dist.html.preload.push('big-iiii.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('first paint is') && l.includes('of 190 KB')), out);
+});
+
 test('a dist with no .build-rev fails — the staleness warning reads it', () => {
   const dist = baseline();
   dist.buildRev = false;
@@ -329,3 +431,87 @@ test('an empty dist is refused before any check, with the command to fix it', ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/*
+ * The figures (control-tower phase 29): the four figures' drawings and the
+ * run's cost strip, visx behind `components/figures/lazy.tsx`, by the table
+ * engine's three rules.
+ */
+test('a figure drawing reached by a STATIC import fails, from any chunk', () => {
+  const dist = baseline();
+  dist.assets['lazy-ffff.js'] = 'import { Bars } from "./bars-gggg.js";\nexport const load = () => Bars;\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('no chunk imports a figure drawing statically')), out);
+});
+
+test('modulepreloading a figure drawing fails — first paint would carry visx', () => {
+  const dist = baseline();
+  dist.html.preload.push('bars-gggg.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('never modulepreloads a figure drawing')), out);
+});
+
+test('a figure drawing folded into its importer fails — it must be a lazy chunk of its own', () => {
+  const dist = baseline();
+  delete dist.assets['bars-gggg.js'];
+  dist.assets['lazy-ffff.js'] = 'export const Bars = { "data-figure": "Bars" };\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the figures are lazy chunks of their own')), out);
+});
+
+/*
+ * The status model (control-tower phase 16): the word tables and the 98-icon
+ * map belong to the pages that draw the badge family. First paint draws four
+ * note severities and takes them from modules of their own — found by the
+ * cooling entitlement's icon name, which only the tables spell.
+ */
+test('the status word tables in a preloaded chunk fail — first paint would carry every vocabulary', () => {
+  const dist = baseline();
+  dist.assets['ui-wwww.js'] = 'export const Rows = { cooling: ["Cooling", "thermometer-snowflake"] };\n';
+  dist.html.preload.push('ui-wwww.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('first paint carries none of the status word tables')), out);
+});
+
+test('the status word tables in the entry fail too', () => {
+  const dist = baseline();
+  dist.assets['index-aaaa.js'] += 'export const icons = ["thermometer-snowflake"];\n';
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('first paint carries none of the status word tables')), out);
+});
+
+test('no chunk spelling the tables fails — the guard would find nothing to guard', () => {
+  const dist = baseline();
+  delete dist.assets['status-vvvv.js'];
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the status word tables are built')), out);
+});
+
+/*
+ * The peek (control-tower phase 19): `components/peek.tsx` wraps the hover
+ * card OUTSIDE the preloaded barrel; a re-export from it would put the library
+ * in every visitor's first load. Found by the trigger's display name.
+ */
+test('the hover card in a preloaded chunk fails — first paint would carry the peek', () => {
+  const dist = baseline();
+  dist.assets['ui-wwww.js'] = 'export const Trigger = { displayName: "HoverCardTrigger" };\n';
+  dist.html.preload.push('ui-wwww.js');
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('first paint carries no hover card')), out);
+});
+
+test('no chunk spelling the hover card fails — the guard would find nothing to guard', () => {
+  const dist = baseline();
+  delete dist.assets['runs-pppp.js'];
+  const { ok, out } = runGate(dist);
+  assert.equal(ok, false);
+  assert.ok(failures(out).some((l) => l.includes('the hover card is built')), out);
+});
+

@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest';
 import { configure } from '@testing-library/react';
-import { vi } from 'vitest';
+import { beforeAll, vi } from 'vitest';
 
 // `waitFor` polls until its expectation holds, and gives up after
 // `asyncUtilTimeout` — testing-library's own bound, stock 1000 ms, which
@@ -106,3 +106,12 @@ if (!('ResizeObserver' in globalThis)) {
   }
   Object.defineProperty(globalThis, 'ResizeObserver', { value: FakeResizeObserver, writable: true });
 }
+
+// The figures chunk (control-tower phase 29) is a dynamic import in the app —
+// `components/figures/lazy.tsx`. Loaded once here, every figure draws in its
+// first render, exactly as it does in a browser once the chunk has arrived, so
+// a test reads the drawing rather than its placeholder.
+beforeAll(async () => {
+  const { loadFigures } = await import('@/components/figures/lazy');
+  await loadFigures();
+});

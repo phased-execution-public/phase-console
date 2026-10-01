@@ -30,6 +30,7 @@ import { useConsoleState } from '@/lib/queries';
 import { useFleetLifecycle } from '@/lib/run-lifecycle';
 import { AlertDialog, AlertDialogContent, AlertDialogTrigger, Banner, Button } from '@/components/ui';
 import { relativeTime } from '@/lib/format';
+import type { FleetState } from '@/lib/api';
 
 /** The fleet's state as the client reads it, with an old server's silence as "not frozen". */
 export function fleetOf(
@@ -37,6 +38,22 @@ export function fleetOf(
 ) {
   return state?.fleet ?? { frozen: false, at: null, by: null };
 }
+
+/**
+ * The hold binding this console's runs now, in the shape `heldStopReason` reads:
+ * its own freeze first, then the machine's. Null when neither stands — the one
+ * reading under which a stopped run's "it continues by itself" is true
+ * (control-tower phase 81, #93).
+ */
+export function bindingHoldOf(state: { fleet?: FleetState } | undefined): FleetHoldView | null {
+  const fleet = state?.fleet;
+  if (!fleet) return null;
+  if (fleet.frozen) return { at: fleet.at, by: fleet.by };
+  return fleet.hold ? { at: fleet.hold.at, by: fleet.hold.by, scope: fleet.hold.scope ?? 'machine' } : null;
+}
+
+/** A hold as the shared sentences read it. */
+export type FleetHoldView = { at: string | null; by: string | null; scope?: 'machine' | 'restart' };
 
 /**
  * The app-wide banner. Renders nothing at all when the console is not frozen,

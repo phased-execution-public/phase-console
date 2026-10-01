@@ -53,7 +53,7 @@ import {
 } from '@/lib/queries';
 import { estimateTerminalSize } from '@/lib/terminal';
 import { navigate, type Route } from '@/app/router';
-import { Button, Chip, Empty, Spinner, toast } from '@/components/ui';
+import { Button, Badge, Empty, Spinner, toast } from '@/components/ui';
 import { EndedBanner, SessionGone } from './ended';
 import { SessionVitals } from './vitals';
 import { SessionControls, sessionStateNote } from './session-controls';
@@ -360,9 +360,9 @@ export default function SessionPage({ sessionId, starting, extra }: SessionPageP
                     inside the session and tells nothing out here, so the chip is
                     a record of the launch and the title says exactly that — a
                     label that silently went stale would be worse than none. */}
-                  <Chip mono title={MODE_TITLE}>
+                  <Badge mono title={MODE_TITLE}>
                     launched in {modeName(open.meta?.permissionMode)}
-                  </Chip>
+                  </Badge>
                   <span className="hidden items-center gap-1.5 text-2xs text-ink-faint md:flex">
                     <kbd className="rounded border border-rule bg-surface-raised px-1 py-0.5 font-mono text-2xs">
                       ⇧Tab
@@ -371,9 +371,9 @@ export default function SessionPage({ sessionId, starting, extra }: SessionPageP
                   </span>
                 </>
               )}
-              <Chip mono className="hidden shrink-0 md:inline-flex" title={open.cwd}>
+              <Badge mono className="hidden shrink-0 md:inline-flex" title={open.cwd}>
                 {(size ?? open).cols}×{(size ?? open).rows}
-              </Chip>
+              </Badge>
             </>
           )
         }

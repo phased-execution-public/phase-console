@@ -143,9 +143,13 @@ test('`delivered` and `acked` are two words, because the socket answers nothing'
   assert.ok(MESSAGE_STATES.indexOf('delivered') < MESSAGE_STATES.indexOf('acked'));
 });
 
-test('`boot` is the only delivery request that can name a phase which has not started', () => {
-  assert.deepEqual([...MESSAGE_DELIVER], ['now', 'next-turn', 'boot']);
-  assert.equal(MESSAGE_DELIVER[MESSAGE_DELIVER.length - 1], 'boot');
+test('`boot` and `next-attempt` are the only delivery requests that can name a phase which has not started', () => {
+  // `next-attempt` (control-tower phase 98, #137) is held for the phase's NEXT
+  // session — for a phase that has not boarded, its first — so it joins `boot`
+  // at the deferred end of the list; `now` and `next-turn` ask for a session
+  // that is already there.
+  assert.deepEqual([...MESSAGE_DELIVER], ['now', 'next-turn', 'boot', 'next-attempt']);
+  assert.deepEqual(MESSAGE_DELIVER.slice(MESSAGE_DELIVER.indexOf('boot')), ['boot', 'next-attempt']);
 });
 
 test('the caps are numbers a reader can act on, not strings', () => {

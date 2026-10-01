@@ -390,7 +390,7 @@ test('start(): an inherited freeze is RULED on, not erased — the child is ende
 /* ---------------- the fourth boot clock ---------------- */
 
 /** A run a restart left parked on a wait whose clock went by `lateMs` ago, parked `parkedForMs` in all. */
-function overdueWait(root: string, lateMs: number, parkedForMs: number): RunState {
+function overdueWait(root: string, lateMs: number, parkedForMs: number, watch = 'date:2026-01-01T00:00:00Z'): RunState {
   const state = newRun({ slug: 'alpha', root });
   state.status = 'paused';
   state.stoppedBy = 'system';
@@ -404,7 +404,7 @@ function overdueWait(root: string, lateMs: number, parkedForMs: number): RunStat
   record.parkedUntil = until;
   record.waits = 1;
   record.declared = {
-    status: 'waiting-external', reason: 'the image build', watch: ['date:2026-01-01T00:00:00Z'],
+    status: 'waiting-external', reason: 'the image build', watch: [watch],
     at: new Date(Date.now() - parkedForMs).toISOString(),
   };
   record.waitHistory = [{ parkedFrom: new Date(Date.now() - parkedForMs).toISOString(), parkedUntil: until, by: 'session' }];
@@ -439,22 +439,31 @@ test('boot: a wait already past its clock is RULED ON — lateness journalled, r
   } finally { cleanup(); }
 });
 
-test('boot: a wait past its clock AND past its budget halts waiting-external-timeout on readoptQueued, and spawns nothing (WAI-4)', async () => {
+test('boot: a wait past its clock AND past its budget parks on the spent budget — waiting on its refs, no clock, a budgets errand — and spawns nothing (WAI-4, #59)', async () => {
   const { root, cleanup } = scratch();
   try {
-    const run = overdueWait(root, 60 * 60_000, 10 * 60 * 60_000);
+    // A ref that has not landed: a landed one would be the watch clock's to resume.
+    const run = overdueWait(root, 60 * 60_000, 10 * 60 * 60_000, 'date:2099-01-01T00:00:00Z');
     const { svc, started } = service(root, (s) => { s.prefs.resumeAtBoot = 'auto'; });
     await svc.bootSettled;
     const deadline = Date.now() + 5_000;
-    while (loadRun(root, 'alpha', run.id, null)?.phases['1']?.status === 'waiting' && Date.now() < deadline) await sleep(20);
+    while (!loadRun(root, 'alpha', run.id, null)?.phases['1']?.declared?.budgetSpent && Date.now() < deadline) await sleep(20);
     await sleep(80);
     assert.deepEqual(started, [], 'nothing boards onto a clock hours stale with the budget spent');
     const after = loadRun(root, 'alpha', run.id, null)!;
-    assert.equal(after.phases['1'].halt?.kind, 'waiting-external-timeout');
-    assert.match(after.phases['1'].halt?.reason ?? '', /parked 10 h against its 8\.0 h wait budget/);
-    assert.equal(after.phases['1'].status, 'failed');
+    const record = after.phases['1']!;
+    assert.equal(record.status, 'waiting', 'a spent budget is a budget — never a failed phase');
+    assert.equal(record.halt, undefined, 'and never a halt');
+    assert.equal(record.parkedUntil, undefined, 'no clock of its own');
+    assert.equal(record.declared?.budgetSpent?.ledger, 'budget', 'the declaration is kept, stamped spent');
+    assert.deepEqual(record.watch, ['date:2099-01-01T00:00:00Z'], 'its refs are still watched, so a landing resumes it');
+    assert.match(record.note ?? '', /parked 10 h against its 8\.0 h wait budget/);
+    assert.equal(after.recoveries?.['1']?.errand?.decisionKey, 'budgets');
     assert.equal(after.waitUntil, null, 'no clock left to fire');
-    assert.ok(journal(root, run.id).some((e) => e.event === 'phase.halted' && e.data.kind === 'waiting-external-timeout'));
+    const events = journal(root, run.id);
+    assert.ok(events.some((e) => e.event === 'phase.wait-budget-spent' && e.data.parked === true));
+    assert.ok(events.some((e) => e.event === 'phase.errand' && e.data.decisionKey === 'budgets'));
+    assert.ok(!events.some((e) => e.event === 'phase.halted'), 'no halt line');
   } finally { cleanup(); }
 });
 

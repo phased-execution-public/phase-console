@@ -63,6 +63,7 @@ import type { Duplex } from 'node:stream';
 
 import { INSTANCE_STATE_DIR } from './config.ts';
 import { log } from './log.ts';
+import type { AgentIntent } from '../shared/run-settings.js';
 import { BrokerClient } from './pty/client.ts';
 import { SCROLLBACK_BYTES, Scrollback } from './pty/scrollback.ts';
 import { healSpawnHelper } from './pty/spawn-helper.ts';
@@ -229,7 +230,7 @@ export type SessionMeta = {
    * `CLAUDE_CONFIG_DIR`) — its exit is what tells the accounts registry to
    * read back who the operator became.
    */
-  intent?: 'plan' | 'recovery' | 'qa' | 'login';
+  intent?: AgentIntent | 'login';
   /** The account this session runs as — display + the login exit hook. */
   accountId?: string;
   /**
@@ -260,6 +261,13 @@ export type SessionMeta = {
    * record — the whole point of the mint.
    */
   verify?: { slug: string; phase: number; runId?: string; command: string };
+  /**
+   * A human step's terminal (control-tower phase 43): the step's own
+   * `open_command`, shown and run on the person's Enter, and its exit read
+   * back as the step's proof. The id is all the ticket carries — never a
+   * code, never what the person typed.
+   */
+  humanStep?: { id: string };
 };
 
 /**

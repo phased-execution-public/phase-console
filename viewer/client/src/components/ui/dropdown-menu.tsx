@@ -56,7 +56,7 @@ export function DropdownMenuItem({
     <DropdownMenuPrimitive.Item
       className={cn(
         itemClass,
-        inset && 'pl-8',
+        inset && 'ps-8',
         destructive && 'text-failed data-[highlighted]:bg-failed/10',
         className,
       )}
@@ -71,8 +71,8 @@ export function DropdownMenuCheckboxItem({
   ...props
 }: ComponentProps<typeof DropdownMenuPrimitive.CheckboxItem>) {
   return (
-    <DropdownMenuPrimitive.CheckboxItem className={cn(itemClass, 'pl-8', className)} {...props}>
-      <span className="absolute left-2 inline-flex size-4 items-center justify-center">
+    <DropdownMenuPrimitive.CheckboxItem className={cn(itemClass, 'ps-8', className)} {...props}>
+      <span className="absolute start-2 inline-flex size-4 items-center justify-center">
         <DropdownMenuPrimitive.ItemIndicator>
           <Check size={14} aria-hidden />
         </DropdownMenuPrimitive.ItemIndicator>
@@ -88,8 +88,8 @@ export function DropdownMenuRadioItem({
   ...props
 }: ComponentProps<typeof DropdownMenuPrimitive.RadioItem>) {
   return (
-    <DropdownMenuPrimitive.RadioItem className={cn(itemClass, 'pl-8', className)} {...props}>
-      <span className="absolute left-2 inline-flex size-4 items-center justify-center">
+    <DropdownMenuPrimitive.RadioItem className={cn(itemClass, 'ps-8', className)} {...props}>
+      <span className="absolute start-2 inline-flex size-4 items-center justify-center">
         <DropdownMenuPrimitive.ItemIndicator>
           <span className="block size-2 rounded-full bg-accent" />
         </DropdownMenuPrimitive.ItemIndicator>
@@ -108,7 +108,7 @@ export function DropdownMenuLabel({
     <DropdownMenuPrimitive.Label
       className={cn(
         'px-2 py-1.5 text-2xs font-medium uppercase tracking-wide text-ink-faint',
-        inset && 'pl-8',
+        inset && 'ps-8',
         className,
       )}
       {...props}
@@ -125,7 +125,7 @@ export function DropdownMenuSeparator({
 
 export function DropdownMenuShortcut({ className, ...props }: React.HTMLAttributes<HTMLSpanElement>) {
   return (
-    <span className={cn('ml-auto font-mono text-2xs tracking-wide text-ink-faint', className)} {...props} />
+    <span className={cn('ms-auto font-mono text-2xs tracking-wide text-ink-faint', className)} {...props} />
   );
 }
 
@@ -137,11 +137,11 @@ export function DropdownMenuSubTrigger({
 }: ComponentProps<typeof DropdownMenuPrimitive.SubTrigger> & { inset?: boolean }) {
   return (
     <DropdownMenuPrimitive.SubTrigger
-      className={cn(itemClass, inset && 'pl-8', 'data-[state=open]:bg-surface-raised', className)}
+      className={cn(itemClass, inset && 'ps-8', 'data-[state=open]:bg-surface-raised', className)}
       {...props}
     >
       {children}
-      <ChevronRight size={14} aria-hidden className="ml-auto" />
+      <ChevronRight size={14} aria-hidden className="ms-auto" />
     </DropdownMenuPrimitive.SubTrigger>
   );
 }

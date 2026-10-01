@@ -319,3 +319,26 @@ commit_in() { # <dir> <file> <body> <message>
   [ "$status" -eq 0 ]
   assert_contains "$output" "deleted pe/demo-p2"
 }
+
+# control-tower phase 90 (#154): under a console run the console owns the run's
+# trees and branches. A console-spawned session (PE_OWNER=autopilot/<run>) may
+# still take a review tree or a QA round's, and never a build lane or a merge —
+# the merge checks the run branch out beside the run's own checkout, which is
+# how a resumed session's hand tree once refused its run the mirror.
+@test "lane: a console-spawned session takes a review or QA tree, never a build lane or a merge" {
+  setup_lane_hub
+  PE_OWNER=autopilot/r-demo run pe_lane demo create 2
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "a session the console spawned (PE_OWNER=autopilot/r-demo) does not create a build lane"
+  [ ! -e "$HUB/.worktrees/hand/demo/p2" ]
+  PE_OWNER=autopilot/r-demo run pe_lane demo create 2 --detach
+  [ "$status" -eq 0 ]
+  PE_OWNER=autopilot/r-demo run pe_lane demo create 3 --qa 1
+  [ "$status" -eq 0 ]
+  PE_OWNER=autopilot/r-demo run pe_lane demo merge 3 --qa 1
+  [ "$status" -eq 1 ]
+  assert_contains "$output" "does not merge a build lane"
+  # A person driving by hand is not the console: the same verbs work.
+  PE_OWNER=op@host run pe_lane demo create 1
+  [ "$status" -eq 0 ]
+}

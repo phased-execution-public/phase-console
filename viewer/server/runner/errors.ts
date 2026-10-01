@@ -18,7 +18,7 @@
  */
 
 import type { EndedBy } from '../../shared/run-lifecycle.js';
-import type { CredentialClass } from '../../shared/ops-vocab.js';
+import type { CredentialClass, CredentialEvidenceSource } from '../../shared/ops-vocab.js';
 import { MODELS_ENV_FALLBACK, modelFamily } from './models.ts';
 import { envCarrier } from '../trace.ts';
 
@@ -65,7 +65,22 @@ export type Disposition =
    * account's organisation (`leaveAccount`) and halts the RUN on it; `class`
    * is the owner's word (`shared/ops-vocab.js` `CREDENTIAL_CLASSES`).
    */
-  | { kind: 'credential-refused'; reason: string; class: CredentialClass }
+  | { kind: 'credential-refused'; reason: string; class: CredentialClass; evidence?: CredentialEvidence }
+  /**
+   * This machine could not reach the API at all. Nobody's fault — not the
+   * credential's, not the phase's, not the plan's — so the runner backs off
+   * and tries again, charging nothing: no attempt, no failure streak, no
+   * ladder rung.
+   *
+   * `class` is present only when the stop was certificate-SHAPED. A home
+   * connection dropping out, a captive portal, a DNS hijack to a splash page
+   * and a router intercepting its own reconnect all answer TLS, so the first
+   * sighting of one is an outage, not a verdict about the credential. The
+   * class travels so the corroboration ledger can count it: three such stops
+   * from two sessions over ten minutes with no success between is a standing
+   * interception, and only then does one credential cool.
+   */
+  | { kind: 'connectivity'; reason: string; class?: CredentialClass }
   /** The phase itself failed. Runner decides retry-vs-halt by its own counters. */
   | { kind: 'phase-failed'; reason: string }
   /** Finished normally. */
@@ -103,7 +118,56 @@ export type StopSignal = {
   terminalReason?: string;
   /** Background tasks the CLI started and never reported finished. */
   backgroundTasks?: { id: string; description: string; taskType?: string }[];
+  /**
+   * Turns the session booked, and dollars it spent — the CLI's own ledger,
+   * carried in so the classifier can tell a session that DID something from
+   * one that did nothing. A phase that ran for six turns and $4 is reporting
+   * on work; a one-turn, zero-dollar `success` is the expired-login shape.
+   */
+  turns?: number;
+  costUsd?: number;
+  /**
+   * What the CLI's API-ERROR channels said on this stop, and nothing else
+   * (control-tower phase 54, #57): the words of every assistant message the
+   * CLI flagged as an API error (`error` / `is_api_error_message`), the
+   * result's own `errors`, and stderr. The billing, auth and org-policy
+   * patterns read THIS — never `text`, which also carries the session's own
+   * prose. A phase building a purchase flow quotes its fixtures; that is not
+   * the API refusing the credential.
+   */
+  apiText?: string;
+  /**
+   * The `error` kind of every assistant message the CLI flagged as an API
+   * error (`SDKAssistantMessageError`: `billing_error`, `authentication_failed`…)
+   * — data the API returned, the same standing as an `api_retry` category.
+   */
+  apiErrors?: string[];
 };
+
+/**
+ * What a credential verdict stood on (#57): a kind the API RETURNED as data
+ * (`api`), or a sentence matched on one of the CLI's API-error channels
+ * (`text`), with what matched. It travels to the retirement, the halt and the
+ * account view, so a person can see why a credential was retired — and that a
+ * later probe contradicts it.
+ */
+export type CredentialEvidence = { source: CredentialEvidenceSource; matched: string };
+
+/**
+ * A retirement's evidence as the breaker keeps it: what the verdict stood on,
+ * and whose stop it was — the session, the phase, the plan and the run.
+ */
+export type RetirementEvidence = CredentialEvidence & { session?: string; phase?: number; slug?: string; runId?: string };
+
+/** The longest `matched` a verdict carries — the line, never a log. */
+export const EVIDENCE_MATCH_MAX = 200;
+
+/**
+ * Turns that count as a session having worked. Two, not one: the CLI books a
+ * refused session's single turn, so one turn is exactly what "it never
+ * started" looks like.
+ */
+export const WORKED_TURNS = 2;
 
 /**
  * The CLI's `system/api_retry` `error` values — the closed set the docs give
@@ -119,6 +183,98 @@ export const API_RETRY_ERRORS = Object.freeze([
 
 /** Past this, sitting and waiting is worse than telling someone. */
 export const MAX_AUTO_WAIT_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * The LATEST a lane waits out an outage, by how many it has already met on
+ * this phase: a minute, two, five, ten, then a quarter of an hour for as long
+ * as it lasts.
+ *
+ * Since control-tower phase 80 (#108) this is the backstop, not the wait. The
+ * lane waits on the connectivity probe (`connectivity-probe.ts`, a look every
+ * `CONNECTIVITY_PROBE_MS`) and boards again at the first look that finds the
+ * API answering; measured before that, a lane whose API came back one minute
+ * into a fifteen-minute step waited out the other fourteen. The series stays
+ * as the ceiling because the probe is the console's own `fetch` and the
+ * session is the CLI — a machine where only one of them can reach the API (a
+ * proxy the CLI honours and Node does not) must never wait longer than it
+ * did before the probe existed.
+ *
+ * The TOTAL is bounded by `MAX_AUTO_WAIT_MS`, charged at this series — past
+ * twelve hours of no network this stops being weather and becomes something a
+ * person has to look at.
+ */
+export const CONNECTIVITY_BACKOFF_MS = Object.freeze([60_000, 120_000, 300_000, 600_000, 900_000]);
+
+/** The wait after `seen` outages on this phase; the last step repeats. */
+export function connectivityBackoffMs(seen: number): number {
+  const index = Math.min(Math.max(seen, 0), CONNECTIVITY_BACKOFF_MS.length - 1);
+  return CONNECTIVITY_BACKOFF_MS[index];
+}
+
+/**
+ * Is this text the CLI saying it could not reach the API — the sentence the
+ * `connectivity` disposition is read from? The one predicate a record uses to
+ * decide that a session's result is the network's words rather than its own
+ * (control-tower phase 80, #108; `session-record.ts` `lastWords`).
+ */
+export function isTransportFailure(text: string | undefined | null): boolean {
+  return Boolean(text) && RE.connectivity.test(text!);
+}
+
+/**
+ * Did the API RETURN a credential verdict, as data, on this stop? The
+ * difference between a category the CLI reported and a sentence a session
+ * happened to print — and the only thing that may reach an organisation's row.
+ */
+export function structuredRefusal(signal: StopSignal): boolean {
+  return structuredVerdict(apiKinds(signal)) !== null;
+}
+
+/** Every credential kind the API returned as data: the retry stream's categories, then the API-error messages' kinds. */
+function apiKinds(signal: StopSignal): string[] {
+  return [...(signal.retryCategories ?? []), ...(signal.apiErrors ?? [])];
+}
+
+/** The credential verdict a set of API kinds amounts to, strongest first — or null when none is one. */
+function structuredVerdict(kinds: string[]): { reason: string; class: CredentialClass; kind: string } | null {
+  if (kinds.includes('oauth_org_not_allowed')) {
+    return { reason: 'organization policy blocks this credential', class: 'org-policy', kind: 'oauth_org_not_allowed' };
+  }
+  if (kinds.includes('authentication_failed')) return { reason: AUTH_REFUSED, class: 'auth', kind: 'authentication_failed' };
+  const billing = kinds.find((kind) => kind === 'billing_error' || kind === 'account_on_hold');
+  return billing ? { reason: 'billing or credit balance needs attention', class: 'billing', kind: billing } : null;
+}
+
+/**
+ * Did this session spend NOTHING — fewer turns than a session that worked, and
+ * no dollar figure? Then no model output exists, and its result text can only
+ * be the CLI's own words: the expired-login shape, one turn and $0, whose one
+ * sentence IS the API's answer.
+ */
+export function spentNothing(signal: StopSignal): boolean {
+  return (signal.turns ?? 0) < WORKED_TURNS && !((signal.costUsd ?? 0) > 0);
+}
+
+/**
+ * The only text the billing, auth and org-policy patterns may read (#57): the
+ * CLI's API-error channels — and, for a session that spent nothing, its result
+ * text too, since nothing but the CLI can have written it. A session that did
+ * work wrote prose, and prose in a codebase that bills or authenticates
+ * legitimately names every one of those product words.
+ */
+export function credentialChannel(signal: StopSignal): string {
+  const api = signal.apiText ?? '';
+  return spentNothing(signal) ? [api, signal.text ?? ''].filter(Boolean).join('\n') : api;
+}
+
+/** The line a pattern matched on, bounded — what a person reads as the evidence. */
+function matchedLine(re: RegExp, text: string): string | null {
+  const hit = re.exec(text);
+  if (!hit) return null;
+  const start = text.lastIndexOf('\n', hit.index) + 1;
+  const end = text.indexOf('\n', hit.index + hit[0].length);
+  return text.slice(start, end === -1 ? undefined : end).trim().slice(0, EVIDENCE_MATCH_MAX);
+}
 /** Never come back the instant a window opens — clocks disagree. */
 export const RESET_MARGIN_MS = 90_000;
 
@@ -320,6 +476,36 @@ function zoneShown(at: Date, timeZone: string): number | null {
  * Code actually prints — `API Error:`, a full sentence — never a bare number or
  * a single common word.
  */
+
+/**
+ * The CLI's own lead-in on a failed request — what it prints, and what a
+ * session narrating an incident in prose does not. Either half is framing:
+ * the connect sentence carries the error on its own.
+ */
+const CERT_FRAME = 'api error:?|unable to connect to api';
+
+/**
+ * The CLI's sentence for a connection it could not make. It is framing AND
+ * evidence: no session writes it about itself except when it happened.
+ */
+const CONNECT_SENTENCE = 'unable to connect to api';
+
+/**
+ * One sentence, two callers: the structured verdict and the prose match. It
+ * names every login change a refusal may be (control-tower phase 91, #131): the
+ * classifier is account-blind and cannot tell a lapse from a machine signed in
+ * as somebody else, so it says both, and the runner — which knows the identity
+ * the run started on — halts on `identity-changed` when that is what it was.
+ */
+const AUTH_REFUSED = 'authentication failed — the API refused the session\'s Claude login: it lapsed, it was signed out, '
+  + 'or the machine was signed in as somebody else; sign that account in again, then continue the run';
+
+/** The certificate diagnoses, bare — only ever matched behind `CERT_FRAME`. */
+const CERT_TOKEN = 'self.signed certificate|certificate (?:verify|verification|validation) failed'
+  + '|unable to (?:get local issuer|verify the first) certificate'
+  + '|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+  + '|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID';
+
 const RE = {
   // Shared across every model — switching model does NOT help, only time does.
   planLimit: /you'?ve hit your (session|weekly) limit|usage limit reached|claude ai usage limit/i,
@@ -333,12 +519,37 @@ const RE = {
   billing: /credit balance is too low|insufficient credits|usage credits required|billing (error|issue|problem)|spend limit (reached|exceeded)|payment (required|method)/i,
   orgPolicy: /organization has (been )?disabled|oauth_org_not_allowed|disabled api key authentication|disabled claude subscription/i,
   // A TLS interception (a corporate proxy, an MITM appliance) between this
-  // machine and the API. Measured twice in the audit's zero-cost sessions as
-  // "API Error: Unable to connect to API: Self-signed certificate detected."
-  // and classified as nothing — so the phase re-boarded into the same wall.
-  // Node's own error codes ride beside the sentence for the day the CLI
-  // prints the code rather than the prose.
-  certificate: /self.signed certificate|certificate (verify|verification|validation) failed|unable to (get local issuer|verify the first) certificate|DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|CERT_HAS_EXPIRED|ERR_TLS_CERT_ALTNAME_INVALID/i,
+  // machine and the API — BEHIND the CLI's own framing, on the same line, like
+  // every sibling here and unlike the version that shipped through 5.1.0.
+  //
+  // That version matched five bare Node codes anywhere in a session's text,
+  // which broke this table's own rule two paragraphs up and had the most
+  // destructive consequence in the system wired to it. The measured cost: a
+  // phase that COMPLETED — board `done`, two commits landed, $5.76 spent —
+  // wrote a correct sentence about a transport failure it had survived, and
+  // the console retired its account and every sibling in the organisation for
+  // saying so, two seconds after the phase's own stop hook. The remedy for an
+  // outage is to write it down, so the pattern disarmed the repair for the
+  // thing it was repairing, every time.
+  //
+  // `CERT_FRAME` is the framing; `CERT_TOKEN` the diagnosis. The bare codes
+  // still count — but only where the CLI actually printed them.
+  certificate: new RegExp(`(?:${CERT_FRAME})[^\\n]{0,240}?(?:${CERT_TOKEN})`, 'i'),
+  // "This machine cannot reach the API" — the single commonest way a long
+  // unattended run meets the world, and the one condition the table could not
+  // name until 5.2.0. Ordered AHEAD of `certificate` in `classify`, because
+  // the measured incident's text leads with the connect sentence and only then
+  // offers the CLI's own hedge about a proxy ("usually a TLS-inspecting
+  // corporate proxy") — a guess about the network path, which the console used
+  // to promote to a verdict about the organisation.
+  connectivity: new RegExp(
+    // Either the CLI's connect sentence on its own…
+    `(?:${CONNECT_SENTENCE})`
+    // …or its error framing followed, on the same line, by a Node network code.
+    + `|(?:${CERT_FRAME})[^\\n]{0,240}?\\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETDOWN`
+    + '|ENETUNREACH|EHOSTUNREACH|EHOSTDOWN|EPIPE|ERR_SOCKET_CONNECTION_TIMEOUT)\\b',
+    'i',
+  ),
   serverError: /api error:?\s*5\d\d|internal server error/i,
   timeout: /request timed out/i,
   // The CLI's own sentence when its background-task ceiling ends a `-p` run:
@@ -356,39 +567,91 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
   const text = signal.text ?? '';
   const cats = signal.retryCategories ?? [];
 
-  // Credentials are checked BEFORE `success` is believed. A session whose OAuth
-  // token had expired was seen reporting `subtype: success` after one turn and
-  // $0.00, having done nothing at all — and a runner that takes that at face
-  // value goes on to verify work that was never attempted, on every remaining
-  // phase, until something else stops it. What the output says outranks what
-  // the exit status claims.
-  const brokenCredentials: { reason: string; class: CredentialClass } | null =
-    RE.orgPolicy.test(text) || cats.includes('oauth_org_not_allowed')
-      ? { reason: 'organization policy blocks this credential', class: 'org-policy' }
-      : RE.auth.test(text) || cats.includes('authentication_failed')
-        // Deliberately account-agnostic: this classifier cannot see which login
-        // the session ran as, and "run /login in this workspace" was flatly
-        // wrong advice for a profile or token account. The runner appends the
-        // account id; the service composes the exact command.
-        ? {
-          reason: 'authentication failed — the session\'s Claude login is expired or signed out; '
-            + 'sign that account in again, then continue the run',
-          class: 'auth',
-        }
-        : RE.billing.test(text) || cats.includes('billing_error') || cats.includes('account_on_hold')
-          ? { reason: 'billing or credit balance needs attention', class: 'billing' }
-          : RE.certificate.test(text)
-            // Not the credential's fault and not the phase's: the connection
-            // itself is intercepted. Filed as a credential class all the same,
-            // because the remedy is identical — nothing this run can spend
-            // gets through, and a person has to change the machine or the account.
-            ? {
-              reason: 'the API refused the connection: a certificate this machine does not trust '
-                + '(a self-signed or intercepting certificate) — fix the trust store or the proxy, then continue the run',
-              class: 'certificate',
-            }
-            : null;
-  if (brokenCredentials) return { kind: 'credential-refused', ...brokenCredentials };
+  // `success` is believed only when nothing else contradicts it (SES-5): not
+  // the CLI's own error bit, not a turn the CLI says was aborted, and not a
+  // session the console ended before its turn was done.
+  const aborted = Boolean(signal.terminalReason?.startsWith('aborted'));
+  const endedByConsole = Boolean(signal.endedBy) && signal.endedBy !== 'exit';
+  const believedSuccess = signal.subtype === 'success' && !signal.isError && !aborted && !endedByConsole;
+
+  // A STRUCTURED verdict — a category the API itself returned on an
+  // `api_retry` event, or the kind on an assistant message the CLI flagged as
+  // an API error — is evidence about this session's fate and outranks
+  // everything below, success included.
+  const structured = structuredVerdict(apiKinds(signal));
+  if (structured) {
+    return {
+      kind: 'credential-refused', reason: structured.reason, class: structured.class,
+      evidence: { source: 'api', matched: structured.kind },
+    };
+  }
+
+  // Everything below reads the session's PROSE, which is its output as well as
+  // its stderr — and a session that did a phase's worth of work and reported
+  // success is narrating, not confessing. Measured: a completed phase wrote an
+  // accurate sentence about a transport failure it had survived and had its
+  // account, and its whole organisation, retired for it; every later phase
+  // that quoted that handoff did it again, so the remedy for an outage was the
+  // thing that reproduced it.
+  //
+  // The case the credentials-before-success ordering was built for is
+  // untouched and stays distinguishable on the CLI's own ledger: an expired
+  // login reports success after ONE turn and zero dollars, having done nothing
+  // at all.
+  const worked = !spentNothing(signal);
+  if (!(believedSuccess && worked)) {
+    // The network first. The measured certificate incident's text LEADS with
+    // the connect sentence and only then offers the CLI's hedge about a proxy,
+    // so reading the hedge first is what turned half an hour of no internet
+    // into a permanent, machine-wide, latched outage of the product.
+    if (RE.connectivity.test(text) || cats.includes('cloud_credential_error')) {
+      // Certificate-shaped? Then the class rides along, not as a verdict but
+      // as something to corroborate: a home connection dropping out, a captive
+      // portal and a router intercepting its own reconnect all answer TLS.
+      const shaped = RE.certificate.test(text);
+      return {
+        kind: 'connectivity',
+        reason: shaped
+          ? 'this machine could not reach the API, and the connection answered with a certificate '
+            + 'it does not trust — retrying; a standing interception shows up as a repeat'
+          : 'this machine could not reach the API — retrying',
+        ...(shaped ? { class: 'certificate' as CredentialClass } : {}),
+      };
+    }
+
+    // The organisation, the login and the bill are read off the CLI's
+    // API-error channels ONLY (#57) — `credentialChannel`. A session that did
+    // work and then failed has written prose, and a phase building a checkout
+    // quotes the 402 title and the empty-wallet copy of its own fixtures; read
+    // as a verdict, that retired a whole organisation with no API error in the
+    // transcript. The certificate keeps phase 3's framing rule on `text`,
+    // because its breaker cools only on corroboration.
+    const channel = credentialChannel(signal);
+    const org = matchedLine(RE.orgPolicy, channel);
+    // Deliberately account-agnostic: this classifier cannot see which login
+    // the session ran as, and "run /login in this workspace" was flatly wrong
+    // advice for a profile or token account. The runner appends the account
+    // id; the service composes the exact command.
+    const auth = org ? null : matchedLine(RE.auth, channel);
+    const bill = org || auth ? null : matchedLine(RE.billing, channel);
+    const brokenCredentials: { reason: string; class: CredentialClass; evidence?: CredentialEvidence } | null =
+      org ? { reason: 'organization policy blocks this credential', class: 'org-policy', evidence: { source: 'text', matched: org } }
+        : auth ? { reason: AUTH_REFUSED, class: 'auth', evidence: { source: 'text', matched: auth } }
+          : bill ? { reason: 'billing or credit balance needs attention', class: 'billing', evidence: { source: 'text', matched: bill } }
+            : RE.certificate.test(text)
+              // Framed, and with no connect sentence in front of it: a
+              // standing interception rather than a blip. Still not the
+              // credential's fault — but the remedy is the same, and the
+              // breaker only moves once the corroboration ledger agrees.
+              ? {
+                reason: 'the API refused the connection: a certificate this machine does not trust '
+                  + '(a self-signed or intercepting certificate) — fix the trust store or the proxy, then continue the run',
+                class: 'certificate',
+                evidence: { source: 'text', matched: matchedLine(RE.certificate, text) ?? '' },
+              }
+              : null;
+    if (brokenCredentials) return { kind: 'credential-refused', ...brokenCredentials };
+  }
 
   // The spawn's own clock ended this child — the first-event backstop or the
   // init→result bound (SES-10, SES-11). Its diagnosis is precise and its remedy
@@ -418,13 +681,8 @@ export function classify(signal: StopSignal, now = new Date()): Disposition {
     };
   }
 
-  // `success` is believed only when nothing else contradicts it (SES-5): not
-  // the CLI's own error bit, not a turn the CLI says was aborted, and not a
-  // session the console ended before its turn was done. The patterns below
-  // then choose WHICH non-ok disposition applies.
-  const aborted = Boolean(signal.terminalReason?.startsWith('aborted'));
-  const endedByConsole = Boolean(signal.endedBy) && signal.endedBy !== 'exit';
-  if (signal.subtype === 'success' && !signal.isError && !aborted && !endedByConsole) return { kind: 'ok' };
+  // Nothing above contradicted it, so the success stands.
+  if (believedSuccess) return { kind: 'ok' };
 
   // Killed by a supervisor or the OS — not the model's doing.
   if (signal.code === 143) return { kind: 'needs-human', reason: 'session was terminated (SIGTERM)' };

@@ -5,9 +5,12 @@
 
 import { request, post, q } from './client';
 import type { PhaseTask } from './runs';
+import type { HolderEtaView } from './state';
 import type { RecoveryClass } from '../recovery';
 import type { QaProfile } from '../qa';
+import type { AgentIntent } from '@shared/run-settings.js';
 import type { Presence, PresenceEndSource } from '@shared/run-lifecycle.js';
+import type { LockHolderKind } from '@shared/lock-model.js';
 
 /* ---------------- the terminal ---------------- */
 
@@ -34,7 +37,8 @@ export interface TerminalSession {
     permissionMode?: string;
     /** What `claude --resume <id>` takes after this pty is gone. */
     claudeSessionId?: string;
-    intent?: 'plan' | 'recovery' | 'qa';
+    /** The briefing the session was composed from — the owner's list (`AGENT_INTENTS`). */
+    intent?: AgentIntent;
     /** Set by the server on a recovery session — what it was launched to fix. */
     recovery?: { kind: string; slug?: string; phase?: number; runId?: string };
     /**
@@ -143,6 +147,45 @@ export interface ForeignSession {
   waiting?: { since: string; kind: 'permission' | 'input'; note?: string };
 }
 
+/** One hook event as the presence registry recorded it (`server/sessions/registry.ts`). */
+export interface SessionEventLine {
+  at: string;
+  appliedAt: string;
+  lateMs: number;
+  via: string;
+  event: string;
+  payload: Record<string, unknown>;
+}
+
+
+/**
+ * One phase claim, as `GET /api/locks` serves it (#24) — `server/locks.ts`'s
+ * `LockRow`. Times are epoch milliseconds; `scope` is empty when the claim
+ * named none, which collides with everything.
+ */
+export interface LockRow {
+  slug: string;
+  phase: number;
+  phaseTitle: string;
+  owner: string;
+  host?: string;
+  claimedAt?: number;
+  leaseUntil?: number;
+  scope: string[];
+  session?: string;
+  presence: Presence;
+  branch?: string;
+  worktree?: string;
+  /** `lockLapsed` on the server: past its lease, or its session ended. */
+  lapsed: boolean;
+  holderKind: LockHolderKind;
+  runId?: string;
+  /** The queue entries waiting on this claim. */
+  blocking: { slug: string; phase: number | null; runId: string }[];
+  /** The holder's remaining time — its phase's, or its plan's labelled as such (#63). */
+  eta?: HolderEtaView;
+}
+
 export interface SessionRegistryView {
   sessions: ForeignSession[];
 }
@@ -218,7 +261,7 @@ export const sessionsApi = {
     prompt?: string;
     skills?: string[];
     resume?: string;
-    intent?: 'plan' | 'recovery' | 'qa';
+    intent?: AgentIntent;
     brief?: string;
     /**
      * The issues a plan-from-issues ticket is about, as `owner/repo#12` REFS.
@@ -269,6 +312,13 @@ export const sessionsApi = {
 
   /* ---- session presence: the registry the hook feeds, and the hook installer ---- */
   sessionRegistry: () => request<SessionRegistryView>('/api/sessions/registry'),
+  /** The raw hook payloads of one session, in order — how its registry record came to say what it says. */
+  sessionEvents: (id: string, limit = 50) =>
+    request<{ sessionId: string; events: SessionEventLine[] }>(
+      `/api/sessions/${q(id)}/events?limit=${limit}`,
+    ),
+  /** Every phase claim this console can see, worst-first (#24). */
+  locks: () => request<{ rows: LockRow[] }>('/api/locks'),
   hooksStatus: () => request<HooksStatusView>('/api/hooks-install'),
   hooksInstall: (action: 'install' | 'uninstall') => post<HooksWriteView>('/api/hooks-install', { action }),
 };

@@ -47,13 +47,15 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
 import { SPAWN_FIRST_EVENT_MS, SPAWN_INIT_IDLE_MS } from '../../shared/attention-model.js';
-import { isProductiveEvent } from './liveness.ts';
+import { isProductiveEvent, suspectedStepOf, type SuspectedStep } from './liveness.ts';
 import { MAX_TASKS, MAX_TASK_TEXT } from '../../shared/task-model.js';
 import { ENDED_BY, type EndedBy } from '../../shared/run-lifecycle.js';
+import { CHAT_TOOL_SERVER } from '../../shared/supervisor-model.js';
 import { log } from '../log.ts';
 import { API_RETRY_ERRORS, childEnv, type PermissionDenial, type StopSignal } from './errors.ts';
 import { DEFAULT_KILL_AFTER_MS, INT_GRACE_MS, forgetInterrupt, groupSignal, interruptOnce, wakeAndTerm } from './signals.ts';
 import { resolveCaps, type SessionCaps } from './session-record.ts';
+import { printedCommits } from './scope-drift.ts';
 import { foldUsage, newUsageTracker, usageOf, type CallUsage, type TokenCounters } from './usage.ts';
 import { PERMISSION_MODES, type PERMISSION_PROFILES } from '../../shared/run-settings.js';
 
@@ -309,6 +311,14 @@ export type StreamEvent =
     /** Which agent, when the call said. It is optional on the tool itself. */
     agent?: string;
     parent?: string;
+    /**
+     * The call's scalar arguments — ONLY for the supervisor chat's own tools
+     * (`mcp__pcchat__*`, control-tower phase 28), whose arguments are a slug,
+     * a phase and a handful of words, and which the chat's action card names
+     * as its target. Never for any other tool: an MCP server's arguments can
+     * be a credential, and a stream event is written to transcripts.
+     */
+    args?: Record<string, string | number | boolean>;
   }
   /**
    * The result of one, paired back by `id`. See above.
@@ -318,7 +328,18 @@ export type StreamEvent =
    * sentence (`REFUSAL_RE`) — and `tool` then names the call. The words the
    * session READ, distinct from the denial the CLI recorded (`permission-denied`).
    */
-  | { kind: 'tool-result'; id: string; ok: boolean; ms?: number; detail?: string; parent?: string; refused?: boolean; tool?: string; target?: string }
+  | {
+    kind: 'tool-result'; id: string; ok: boolean; ms?: number; detail?: string; parent?: string; refused?: boolean;
+    tool?: string; target?: string; commits?: string[];
+    /**
+     * The stall reading over the result's WHOLE text (control-tower phase 44,
+     * `liveness.ts` `suspectedStepOf`) — a link and waiting words, redacted and
+     * without a code — because `detail` is the first 200 characters and a
+     * waiting CLI's link and words come last. Only the reading rides the event:
+     * a stream event is written to transcripts, and the text itself is not.
+     */
+    suspected?: SuspectedStep;
+  }
   /**
    * A tool call the CLI's permission system denied. `stream` is the CLI's
    * best-effort `system/permission_denied` message, which carries the reason;
@@ -439,7 +460,17 @@ export type StreamEvent =
    * same reading as a PERCENT (0–100, the account meters' unit), which is the
    * one a threshold is compared against.
    */
-  | { kind: 'limits'; status: string; window?: string; utilization?: number; utilizationPct?: number; resetsAt?: number }
+  | {
+    kind: 'limits'; status: string; window?: string; utilization?: number; utilizationPct?: number; resetsAt?: number;
+    /**
+     * The CLI's overage fields (control-tower phase 93, #146), kept as the
+     * CLI sends them: `isUsingOverage` (the window is spent and the session is
+     * running on credit), `overageStatus` (`allowed`, `allowed_warning`,
+     * `rejected`), `overageResetsAt` (epoch seconds) and
+     * `overageDisabledReason` (`out_of_credits`, `org_spend_cap_reached`, …).
+     */
+    usingOverage?: boolean; overageStatus?: string; overageResetsAt?: number; overageDisabledReason?: string;
+  }
   | {
     kind: 'retry';
     /** The CLI's `error` — one of `API_RETRY_ERRORS` — or, marked `inferred`, a guess from its text. */
@@ -607,6 +638,15 @@ export type SpawnRequest = {
   /** How long an aborted child gets to close its turn after SIGINT before SIGTERM. Test seam; defaults to `INT_GRACE_MS`. */
   interruptGraceMs?: number;
   env?: NodeJS.ProcessEnv;
+  /**
+   * A CONVERSATION rather than a phase (the supervisor chat, control-tower
+   * phase 27): stdin stays open across results and closes only on abort, and
+   * the idle watchdog never arms — silence between an operator's messages is
+   * the conversation, not a wedged session. Every other watchdog still holds.
+   */
+  conversation?: boolean;
+  /** Text appended to the CLI's own system prompt (`--append-system-prompt`) — the supervisor chat's rules. */
+  appendSystemPrompt?: string;
   signal?: AbortSignal;
   onEvent?: (event: StreamEvent) => void;
   /** Told the pid as soon as there is one, so a checkpoint can record it. */
@@ -618,9 +658,36 @@ export type SpawnRequest = {
 export type SpawnOutcome = {
   signal: StopSignal;
   sessionId?: string;
+  /**
+   * The model the session's own `system/init` frame reported (control-tower
+   * phase 54, #91) — what the request RESOLVED to, beside `request.model`,
+   * which is only what was asked. Absent when the child never got that far.
+   */
+  resolvedModel?: string;
   costUsd: number;
+  /** Every prompt's `num_turns`, summed — the session's total, never a figure to read against `--max-turns`. */
   turns: number;
+  /**
+   * The largest turn count of any ONE prompt of the session (control-tower
+   * phase 89, #62's SIZ-7): the CLI's `--max-turns` binds per prompt, so a
+   * session woken more than once — by its own background subagent, by an
+   * operator's message — can pass its cap in sum and never near it in any one
+   * prompt. This is the figure a turn cap is read against, and the one cap
+   * calibration samples. A prompt still open at the end counts the assistant
+   * turns the stream showed since the last `result`; a session that never
+   * reported one was one prompt, so it is the session's whole count. Optional
+   * in the type like the ledger's other fields; `spawnClaude` always sets it.
+   */
+  promptTurns?: number;
   resultText: string;
+  /**
+   * The last prose the phase's OWN conversation wrote — no subagent's, and no
+   * assistant line the CLI flagged as an API error (control-tower phase 80,
+   * #108). When the result is the CLI reporting it could not reach the API,
+   * this is what the session actually said last (`session-record.ts`
+   * `lastWords`). Absent when it wrote none.
+   */
+  lastText?: string;
   durationMs: number;
   /** Exactly what ran, for the journal. The prompt is not repeated here. */
   argv: string[];
@@ -643,6 +710,21 @@ export type SpawnOutcome = {
   turnsSource?: 'result' | 'stream';
   /** Where `costUsd` came from; `none` means no `total_cost_usd` ever arrived. */
   costSource?: 'result' | 'stream' | 'none';
+  /**
+   * The conversation's running `total_cost_usd` when the session first ran on
+   * credit (`isUsingOverage`, control-tower phase 93, #146) — what it spent
+   * past this mark it spent from the account's credits. Absent: no turn of
+   * this spawn ran on credit.
+   */
+  creditFromUsd?: number;
+  /**
+   * What the console BOOKED for this spawn — `costUsd` less the session's
+   * high-water mark, because a `--resume` re-reports the conversation's running
+   * total (control-tower phase 46, #62). Set by the runner's spawn door
+   * (`RunnerBase.bookSpend`), never by `spawnClaude`; every figure a caller books
+   * or journals as "what this session cost" reads this one.
+   */
+  bookedUsd?: number;
   /** The caps that reached argv, with their sources. */
   caps?: SessionCaps;
   /** The session's API calls folded (`runner/usage.ts`): context, caching, rebuilds. Zero calls when none streamed. */
@@ -655,6 +737,14 @@ export type SpawnFn = (request: SpawnRequest) => Promise<SpawnOutcome>;
 const MAX_PROMPT_BYTES = 512 * 1024;
 /** Keep the last of stderr for classification — not a whole build log. */
 const KEEP_STDERR = 16_000;
+/**
+ * The API-error channel's own pieces, kept newest last (control-tower phase 54,
+ * #57): an API error is one sentence, and a session that met eight of them has
+ * said everything the classifier needs.
+ */
+const KEEP_API_PARTS = 8;
+/** One API-error message's words, bounded — the CLI's sentence, never a transcript. */
+const MAX_API_PART = 2_000;
 /** A single NDJSON line past this is a runaway, not a message. */
 const MAX_LINE = 8 * 1024 * 1024;
 /**
@@ -776,6 +866,7 @@ export function buildArgv(request: SpawnRequest): string[] {
   if (request.subagentText) argv.push('--forward-subagent-text');
   if (request.hookEvents) argv.push('--include-hook-events');
   if (request.settings) argv.push('--settings', request.settings);
+  if (request.appendSystemPrompt?.trim()) argv.push('--append-system-prompt', request.appendSystemPrompt);
   return sanitize(argv, { allowBypass: bypass });
 }
 
@@ -865,12 +956,27 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
 
   let sessionId = request.resume ?? undefined;
   let costUsd = 0;
+  let creditFromUsd: number | undefined;
   let turns = 0;
   let resultText = '';
+  // The phase's own last prose (#108) — never a subagent's, never an assistant
+  // line the CLI flagged as the API speaking.
+  let lastText = '';
   let subtype: string | undefined;
   let stopReason: string | null | undefined;
   let stderr = '';
   const retryCategories: string[] = [];
+  // What the init frame said the request resolved to (#91).
+  let resolvedModel: string | undefined;
+  // The CLI's API-ERROR channel, apart from everything the model wrote (#57):
+  // the kinds and the words of the assistant messages it flags as API errors,
+  // and the result's own `errors`. stderr joins them at the close.
+  const apiErrors: string[] = [];
+  const apiParts: string[] = [];
+  const noteApiPart = (text: string): void => {
+    apiParts.push(text.slice(0, MAX_API_PART));
+    if (apiParts.length > KEEP_API_PARTS) apiParts.shift();
+  };
   let settled = false;
 
   /* ---- the session ledger ---- *
@@ -884,6 +990,10 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    *   `reportedTurns`    the CLI's own `num_turns`, summed over the session's
    *                      turns — the CLI counts each turn from one (see the
    *                      `result` handler).
+   *   `largestPrompt`    the largest of those counts, one prompt's: what the
+   *                      CLI's per-prompt `--max-turns` binds (#62's SIZ-7).
+   *   `stepsAtResult`    the stream's count when the last `result` came, so a
+   *                      prompt still open at the end has a count of its own.
    *   `turnIds`          distinct `message.id`s of the phase's own assistant
    *                      messages. One API turn arrives as SEVERAL assistant
    *                      lines — its thinking and its tool call share one id
@@ -900,6 +1010,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    */
   let costSource: 'result' | 'stream' | 'none' = 'none';
   let reportedTurns: number | null = null;
+  let largestPrompt = 0;
+  let stepsAtResult = 0;
   const turnIds = new Set<string>();
   let anonymousTurns = 0;
   const usage = newUsageTracker({ resumed: Boolean(request.resume) });
@@ -1147,7 +1259,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
    */
   const armIdle = (delay = idleAfter): void => {
     if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-    if (!phaseTurnDone || !stdinOpen || settled || idleAfter <= 0) return;
+    if (!phaseTurnDone || !stdinOpen || settled || idleAfter <= 0 || request.conversation) return;
     // A frozen lane is silent BY CONSTRUCTION. Measuring that silence and
     // acting on it is the watchdog mistaking the operator's own act for the
     // failure it exists to catch.
@@ -1404,6 +1516,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
             : [];
         }).slice(0, MAX_TOOL_NAMES)
         : undefined;
+      if (typeof message.model === 'string' && message.model) resolvedModel = message.model.slice(0, 120);
       emit({
         kind: 'init',
         sessionId: sessionId ?? '',
@@ -1518,6 +1631,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     if (type === 'rate_limit_event') {
       const info = (message.rate_limit_info ?? {}) as Record<string, unknown>;
       const utilization = typeof info.utilization === 'number' ? info.utilization : undefined;
+      const usingOverage = typeof info.isUsingOverage === 'boolean' ? info.isUsingOverage : undefined;
+      if (usingOverage && creditFromUsd === undefined) creditFromUsd = costUsd;
       emit({
         kind: 'limits',
         status: String(info.status ?? 'unknown'),
@@ -1528,6 +1643,12 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         // the audit's 1 062 rows), the account meters' a percent.
         ...(utilization === undefined ? {} : { utilizationPct: percentOf(utilization) }),
         resetsAt: typeof info.resetsAt === 'number' ? info.resetsAt : undefined,
+        // The credit fields ride beside the window's, verbatim (#146).
+        ...(usingOverage === undefined ? {} : { usingOverage }),
+        ...(typeof info.overageStatus === 'string' ? { overageStatus: info.overageStatus } : {}),
+        ...(typeof info.overageResetsAt === 'number' ? { overageResetsAt: info.overageResetsAt } : {}),
+        ...(typeof info.overageDisabledReason === 'string' && info.overageDisabledReason
+          ? { overageDisabledReason: info.overageDisabledReason } : {}),
       });
       return;
     }
@@ -1603,6 +1724,19 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       flushPartials();
       const content = (message.message as { content?: unknown[]; stop_reason?: string } | undefined);
       if (content?.stop_reason) stopReason = content.stop_reason;
+      // An assistant message the CLI flags as an API ERROR — its `error` kind
+      // (`SDKAssistantMessageError`), or `is_api_error_message` — is the API
+      // speaking, not the model: its kind and its words go to the channel the
+      // credential classes read (#57). Every other assistant line is prose.
+      const apiError = typeof message.error === 'string' && message.error ? message.error.slice(0, 60) : undefined;
+      const apiSpeaking = Boolean(apiError) || message.is_api_error_message === true;
+      if (apiSpeaking) {
+        if (apiError) apiErrors.push(apiError);
+        for (const block of content?.content ?? []) {
+          const item = block as { type?: string; text?: string };
+          if (item.type === 'text' && item.text) noteApiPart(item.text);
+        }
+      }
       for (const block of content?.content ?? []) {
         const item = block as { type?: string; text?: string; name?: string; id?: string; input?: unknown };
         if (item.type === 'text' && item.text) {
@@ -1611,6 +1745,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
           // Without it the answer lands in the middle of a wall of build output
           // and the operator never sees that anything replied at all.
           const answering = !parent ? operatorMark(item.text.slice(0, 400)) : null;
+          if (!parent && !apiSpeaking) lastText = item.text;
           if (answering) emit({ kind: 'answer', text: stripMark(item.text), mark: answering });
           else if (parent) emit({ kind: 'subagent', text: item.text, parent });
           else emit({ kind: 'text', text: item.text });
@@ -1647,6 +1782,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
             ...(delegates ? { delegates } : {}),
             ...(agent ? { agent } : {}),
             ...(parent ? { parent } : {}),
+            ...(item.name.startsWith(CHAT_TOOL_PREFIX) ? { args: chatToolArgs(input) } : {}),
           });
           // The task list is in the stream and was being thrown away one
           // function call before it would have been kept: `summarise` reduces
@@ -1722,6 +1858,13 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         // by id, or in the CLI's own refusal sentence. Never an interrupted
         // call's "the tool use was rejected" (see `REFUSAL_RE`).
         const refused = item.is_error === true && (deniedIds.has(item.tool_use_id) || REFUSAL_RE.test(detail));
+        // The commits this call's git printed, from the UNCLIPPED text — the
+        // scope-drift credit's "by its session" (control-tower phase 63, #88).
+        // A subagent's count: delegated work is the phase's work.
+        const full = resultFullText(item.content);
+        const commits = printedCommits(full);
+        // A subagent's output is its own; the lane's reading is its own conversation's.
+        const suspected = parent ? null : suspectedStepOf(full);
         emit({
           kind: 'tool-result',
           id: item.tool_use_id,
@@ -1738,6 +1881,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
           // A subagent's tool calls are its own; attributing them to the phase
           // is how a delegated `rm -rf` reads as something the phase did.
           ...(parent ? { parent } : {}),
+          ...(commits.length ? { commits } : {}),
+          ...(suspected ? { suspected } : {}),
         });
       }
       if (results) return;
@@ -1787,9 +1932,18 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       if (newTurn && reported !== null) {
         turns += reported;
         reportedTurns = (reportedTurns ?? 0) + reported;
+        // …and the sum is not what the cap binds. `--max-turns` is enforced per
+        // PROMPT (#62's SIZ-7: 338 turns "over" a 300 cap, finished), so the
+        // largest one prompt is kept beside it — `SpawnOutcome.promptTurns`.
+        largestPrompt = Math.max(largestPrompt, reported);
       }
+      stepsAtResult = turnIds.size + anonymousTurns;
       const text = message.result ?? message.error;
       if (typeof text === 'string') resultText = text;
+      // The error subtypes' own `errors` are the CLI's words, not the model's.
+      if (Array.isArray(message.errors)) {
+        for (const entry of message.errors) if (typeof entry === 'string' && entry) noteApiPart(entry);
+      }
       // The authoritative denial ledger. A denial the stream already announced
       // is not announced twice; one it missed is announced now, with the input
       // this record carries and the reason it does not.
@@ -1856,6 +2010,8 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       phaseTurnDone = true;
       const wroteUntagged = sentSinceLastResult;
       sentSinceLastResult = false;
+      // A conversation's stdin is the operator's, and only an abort closes it.
+      if (request.conversation) return;
       if (!wroteUntagged && !unecho.size) closeStdin();
       else armIdle();
     }
@@ -1893,6 +2049,9 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     // Result text first: it is the CLI's own account of why it stopped. stderr
     // follows because some failures never reach a result message at all.
     const text = [resultText, stderr].filter(Boolean).join('\n');
+    // …and the channel the credential classes read (#57): the API-error
+    // messages, the result's `errors`, stderr — never the model's prose.
+    const apiText = [...apiParts, stderr].filter(Boolean).join('\n');
     // The ledger (SES-1). A session whose turn closed is booked on the CLI's
     // own count; one that ended with a turn still open is booked on whatever
     // is larger — that count, or the assistant turns the stream showed — since
@@ -1901,6 +2060,12 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
     const midTurn = turnOpen;
     const bookedTurns = midTurn ? Math.max(reportedTurns ?? 0, steps) : (reportedTurns ?? steps);
     const turnsSource: 'result' | 'stream' = reportedTurns !== null && bookedTurns === reportedTurns ? 'result' : 'stream';
+    // The largest one prompt (SIZ-7). No result at all: the session was one
+    // prompt, and its count is the booked one. A prompt still open at the end
+    // is its own: the stream's turns since the last result.
+    const promptTurns = reportedTurns === null
+      ? bookedTurns
+      : Math.min(bookedTurns, Math.max(largestPrompt, midTurn ? steps - stepsAtResult : 0));
     const endedBy: EndedBy = ending?.endedBy ?? 'exit';
     const openTasks = [...backgroundTasks].map(([id, task]) => ({
       id, description: task.description, ...(task.taskType ? { taskType: task.taskType } : {}),
@@ -1916,18 +2081,29 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
         stopReason,
         text,
         retryCategories,
+        ...(apiText ? { apiText } : {}),
+        ...(apiErrors.length ? { apiErrors: [...apiErrors] } : {}),
         model: request.model,
         isError,
         permissionDenials,
         endedBy,
+        // The CLI's own ledger, handed to the classifier rather than only to
+        // the record: it is what separates a session that DID a phase from one
+        // that never got past the door, and therefore what stops a completed
+        // phase's own write-up of an outage from being read as its confession.
+        turns: bookedTurns,
+        costUsd,
         ...(ending?.reason ? { endedReason: ending.reason } : {}),
         ...(terminalReason ? { terminalReason } : {}),
         ...(openTasks.length ? { backgroundTasks: openTasks } : {}),
       },
       sessionId,
+      ...(resolvedModel ? { resolvedModel } : {}),
       costUsd,
       turns: bookedTurns,
+      promptTurns,
       resultText,
+      ...(lastText ? { lastText } : {}),
       durationMs: Date.now() - started,
       argv: shown,
       injected,
@@ -1937,6 +2113,7 @@ export const spawnClaude: SpawnFn = (request) => new Promise<SpawnOutcome>((reso
       steps,
       turnsSource,
       costSource,
+      ...(creditFromUsd === undefined ? {} : { creditFromUsd }),
       caps: resolveCaps(request),
       tokens: { ...usage.counters },
     });
@@ -1948,6 +2125,7 @@ function fail(reason: string, started: number, argv: string[], caps: SessionCaps
     signal: { subtype: 'error_during_execution', code: null, text: reason, endedBy: 'exit' },
     costUsd: 0,
     turns: 0,
+    promptTurns: 0,
     resultText: reason,
     durationMs: Date.now() - started,
     argv,
@@ -1981,7 +2159,26 @@ function firstString(source: Record<string, unknown>, keys: string[]): string | 
   return undefined;
 }
 
-function summarise(input: unknown): string {
+/** The supervisor chat's own tools, as the CLI names them (`mcp__<server>__<tool>`). */
+const CHAT_TOOL_PREFIX = `mcp__${CHAT_TOOL_SERVER}__`;
+
+/**
+ * A chat tool call's arguments for its action card: scalars only, eight at
+ * most, each string cut to 120 characters. The tools take a slug, a phase and
+ * a few words (`shared/supervisor-model.js` `CHAT_TOOLS[].args`); anything
+ * else is dropped rather than carried.
+ */
+export function chatToolArgs(input: Record<string, unknown>): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(input).slice(0, 8)) {
+    if (typeof value === 'string') out[key] = value.slice(0, 120);
+    else if (typeof value === 'number' && Number.isFinite(value)) out[key] = value;
+    else if (typeof value === 'boolean') out[key] = value;
+  }
+  return out;
+}
+
+export function summarise(input: unknown): string {
   if (!input || typeof input !== 'object') return '';
   const record = input as Record<string, unknown>;
   // A todo write has none of the keys below, so it used to summarise as the
@@ -2074,6 +2271,13 @@ function resultDetail(content: unknown): string {
       ? content.map((b) => (b as { text?: string })?.text).filter((t) => typeof t === 'string' && t).join(' ')
       : '';
   return text.replace(/\s+/g, ' ').trim().slice(0, MAX_RESULT_TEXT);
+}
+
+/** A tool result's whole text, lines intact — what `printedCommits` reads. */
+function resultFullText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((b) => (b as { text?: string })?.text).filter((t) => typeof t === 'string' && t).join('\n');
 }
 
 /**
